@@ -25,22 +25,133 @@ def install_local_frp(destination: Path) -> Path:
     if system != "windows" or machine not in {"amd64", "x86_64"}:
         raise ConfigurationError(f"local frp installer does not support {system}/{machine}")
     frpc = destination / "frpc.exe"
-    if frpc.exists():
-        _assert_executable(frpc)
-        return frpc
-    archive = destination.parent / f"frp_{FRP_VERSION}_windows_amd64.zip"
+    frps = destination / "frps.exe"
+    if frpc.exists() and frps.exists():
+        try:
+            _assert_frp_pair(frpc, frps)
+            return frpc
+        except ConfigurationError:
+            frpc.unlink(missing_ok=True)
+            frps.unlink(missing_ok=True)
+    errors: list[str] = []
+    for installer in (
+        _install_frp_from_scoop,
+        _install_frp_from_source,
+        _install_frp_from_release_archive,
+    ):
+        try:
+            installer(destination, FRP_VERSION)
+            _assert_frp_pair(frpc, frps)
+            return frpc
+        except ConfigurationError as exc:
+            errors.append(f"{installer.__name__}: {exc}")
+        except OSError as exc:
+            errors.append(f"{installer.__name__}: {exc}")
+    raise ConfigurationError("failed to install frp: " + "; ".join(errors))
+
+
+def _install_frp_from_scoop(destination: Path, version: str) -> None:
+    if shutil.which("scoop") is None:
+        raise ConfigurationError("scoop is not available")
+    result = _run_scoop(["list", "frp"], check=False)
+    if result.returncode != 0 or version not in result.stdout:
+        _run_scoop(["install", "frp"], check=True)
+    frpc_source = _scoop_which("frpc")
+    frps_source = _scoop_which("frps")
+    shutil.copy2(frpc_source, destination / "frpc.exe")
+    shutil.copy2(frps_source, destination / "frps.exe")
+
+
+def _scoop_which(binary: str) -> Path:
+    result = _run_scoop(["which", binary], check=False)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise ConfigurationError(f"scoop cannot locate {binary}: {detail}")
+    path = Path(result.stdout.strip().splitlines()[-1])
+    if not path.exists():
+        raise ConfigurationError(f"scoop reported missing path for {binary}: {path}")
+    return path
+
+
+def _run_scoop(args: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "scoop " + " ".join(shlex.quote(arg) for arg in args),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise ConfigurationError(f"scoop command failed: {detail}")
+    return result
+
+
+def _install_frp_from_source(destination: Path, version: str) -> None:
+    if shutil.which("git") is None or shutil.which("go") is None:
+        raise ConfigurationError("git and go are required for source build")
+    with tempfile.TemporaryDirectory(prefix="clio-relay-frp-") as temp_dir:
+        source_dir = Path(temp_dir) / "frp"
+        _run(
+            [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                f"v{version}",
+                "https://github.com/fatedier/frp.git",
+                str(source_dir),
+            ]
+        )
+        _run(
+            [
+                "go",
+                "build",
+                "-trimpath",
+                "-tags",
+                "frpc,noweb",
+                "-o",
+                "frpc.exe",
+                "./cmd/frpc",
+            ],
+            cwd=source_dir,
+        )
+        _run(
+            [
+                "go",
+                "build",
+                "-trimpath",
+                "-tags",
+                "frps,noweb",
+                "-o",
+                "frps.exe",
+                "./cmd/frps",
+            ],
+            cwd=source_dir,
+        )
+        shutil.copy2(source_dir / "frpc.exe", destination / "frpc.exe")
+        shutil.copy2(source_dir / "frps.exe", destination / "frps.exe")
+
+
+def _install_frp_from_release_archive(destination: Path, version: str) -> None:
+    archive = destination.parent / f"frp_{version}_windows_amd64.zip"
     url = (
         "https://github.com/fatedier/frp/releases/download/"
-        f"v{FRP_VERSION}/frp_{FRP_VERSION}_windows_amd64.zip"
+        f"v{version}/frp_{version}_windows_amd64.zip"
     )
     urlretrieve(url, archive)
     with zipfile.ZipFile(archive) as zipped:
         zipped.extractall(destination.parent)
-    extracted = destination.parent / f"frp_{FRP_VERSION}_windows_amd64"
+    extracted = destination.parent / f"frp_{version}_windows_amd64"
     shutil.copy2(extracted / "frpc.exe", destination / "frpc.exe")
     shutil.copy2(extracted / "frps.exe", destination / "frps.exe")
-    _assert_executable(frpc)
-    return frpc
 
 
 def bootstrap_cluster_over_ssh(
@@ -183,6 +294,11 @@ def _assert_executable(path: Path) -> None:
         subprocess.run([str(path), "--version"], check=True, capture_output=True, text=True)
     except (OSError, subprocess.CalledProcessError) as exc:
         raise ConfigurationError(f"installed executable cannot run: {path}: {exc}") from exc
+
+
+def _assert_frp_pair(frpc: Path, frps: Path) -> None:
+    _assert_executable(frpc)
+    _assert_executable(frps)
 
 
 def _run(
