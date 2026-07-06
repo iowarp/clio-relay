@@ -13,6 +13,11 @@ from clio_relay.bootstrap import bootstrap_cluster_over_ssh, install_local_frp
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, default_registry_path
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.deployment import (
+    install_endpoint_user_service_over_ssh,
+    render_endpoint_user_service,
+    write_endpoint_user_service,
+)
 from clio_relay.doctor import run_doctor
 from clio_relay.endpoint import EndpointWorker
 from clio_relay.errors import ConfigurationError, RelayError
@@ -26,7 +31,13 @@ from clio_relay.models import (
     RelayJob,
     RemoteAgentTaskSpec,
 )
-from clio_relay.relay_host import FrpsConfig, render_frps_config
+from clio_relay.relay_host import (
+    FrpcConfig,
+    FrpsConfig,
+    FrpTransportProtocol,
+    render_frpc_config,
+    render_frps_config,
+)
 
 app = typer.Typer(no_args_is_help=True)
 endpoint_app = typer.Typer(no_args_is_help=True)
@@ -65,27 +76,64 @@ def init() -> None:
 def render_frps(
     token: Annotated[str, typer.Option(help="frp authentication token.")],
     bind_port: Annotated[int, typer.Option(help="frps bind port.")] = 7000,
+    transport_protocol: Annotated[
+        FrpTransportProtocol,
+        typer.Option(help="frpc-to-frps transport protocol."),
+    ] = FrpTransportProtocol.WSS,
     dashboard_port: Annotated[
         int | None,
         typer.Option(help="Optional frps dashboard port."),
     ] = None,
 ) -> None:
     """Render an frps config with no relay application state."""
-    config = FrpsConfig(bind_port=bind_port, token=token, dashboard_port=dashboard_port)
+    config = FrpsConfig(
+        bind_port=bind_port,
+        token=token,
+        transport_protocol=transport_protocol,
+        dashboard_port=dashboard_port,
+    )
     typer.echo(render_frps_config(config))
+
+
+@relay_host_app.command("render-frpc-config")
+def render_frpc(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    token: Annotated[str, typer.Option(help="frp authentication token.")],
+    local_port: Annotated[int, typer.Option(help="Local relay endpoint port.")],
+    secret_key: Annotated[str, typer.Option(help="stcp shared secret.")],
+    proxy_name: Annotated[str, typer.Option(help="stcp proxy name.")] = "relay-stcp",
+) -> None:
+    """Render an frpc config using the cluster's configured frp transport."""
+    definition = _require_cluster(cluster)
+    transport = definition.frp_transport
+    config = FrpcConfig(
+        server_addr=transport.server_addr,
+        server_port=transport.server_port,
+        token=token,
+        transport_protocol=FrpTransportProtocol(transport.protocol),
+        proxy_name=proxy_name,
+        local_port=local_port,
+        secret_key=secret_key,
+    )
+    typer.echo(render_frpc_config(config))
 
 
 @endpoint_app.command("start")
 def endpoint_start(
     role: Annotated[EndpointRole, typer.Option(help="Endpoint role.")],
-    cluster: Annotated[str, typer.Option(help="Configured cluster name.")] = "ares",
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster name for worker endpoints."),
+    ] = None,
     once: Annotated[bool, typer.Option(help="Run one worker iteration and exit.")] = False,
 ) -> None:
     """Start a desktop or worker endpoint."""
     settings = RelaySettings.from_env()
     if role == EndpointRole.WORKER:
+        if cluster is None:
+            raise typer.BadParameter("--cluster is required for worker endpoints")
         _require_cluster(cluster)
-    worker = EndpointWorker(role=role, settings=settings, cluster=cluster)
+    worker = EndpointWorker(role=role, settings=settings, cluster=cluster or "local")
     worker.register()
     if once:
         worker.run_once()
@@ -105,6 +153,23 @@ def endpoint_status() -> None:
         typer.echo(f"{job.job_id} {job.cluster} {job.kind.value} {job.state.value}")
 
 
+@endpoint_app.command("render-user-service")
+def endpoint_render_user_service(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    output: Annotated[
+        Path | None,
+        typer.Option(help="Optional path to write the systemd user service."),
+    ] = None,
+) -> None:
+    """Render a sudo-less systemd user service for a worker endpoint."""
+    definition = _require_cluster(cluster)
+    service_text = render_endpoint_user_service(cluster=cluster, definition=definition)
+    if output is None:
+        typer.echo(service_text)
+        return
+    typer.echo(write_endpoint_user_service(output, service_text))
+
+
 @cluster_app.command("list")
 def cluster_list() -> None:
     """List configured clusters."""
@@ -115,7 +180,7 @@ def cluster_list() -> None:
 
 @cluster_app.command("bootstrap")
 def cluster_bootstrap(
-    cluster: Annotated[str, typer.Option(help="Configured cluster name.")] = "ares",
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     ssh_host: Annotated[
         str | None,
         typer.Option(help="Override SSH host alias for this run."),
@@ -129,8 +194,36 @@ def cluster_bootstrap(
                 bootstrap_profile=definition.bootstrap_profile,
                 ssh_host=ssh_host or definition.ssh_host,
                 source_root=Path.cwd(),
+                agent_adapter=definition.agent_adapter,
                 agent_npm_package=definition.agent_npm_package,
                 agent_npm_bin=definition.agent_npm_bin,
+                agent_args=definition.agent_args,
+            )
+        )
+    )
+
+
+@cluster_app.command("install-endpoint-service")
+def cluster_install_endpoint_service(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    ssh_host: Annotated[
+        str | None,
+        typer.Option(help="Override SSH host alias for this run."),
+    ] = None,
+    start: Annotated[bool, typer.Option(help="Restart the service after installing.")] = True,
+    enable: Annotated[bool, typer.Option(help="Enable the user service.")] = True,
+) -> None:
+    """Install and optionally start a sudo-less worker endpoint service over SSH."""
+    definition = _require_cluster(cluster)
+    service_text = render_endpoint_user_service(cluster=cluster, definition=definition)
+    _run_or_exit(
+        lambda: _echo_lines(
+            install_endpoint_user_service_over_ssh(
+                cluster=cluster,
+                ssh_host=ssh_host or definition.ssh_host,
+                service_text=service_text,
+                start=start,
+                enable=enable,
             )
         )
     )
@@ -198,7 +291,10 @@ def job_cancel(job_id: str) -> None:
 def agent_run(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     prompt: Annotated[Path, typer.Option(help="Prompt file path on the cluster.")],
-    mcp_config: Annotated[Path, typer.Option(help="MCP config path on the cluster.")],
+    mcp_config: Annotated[
+        Path | None,
+        typer.Option(help="Optional MCP config/profile path on the cluster."),
+    ] = None,
     idempotency_key: Annotated[
         str | None,
         typer.Option(help="Submit/retry idempotency key."),
@@ -242,7 +338,7 @@ def mcp_call(
 
 @app.command("doctor")
 def doctor(
-    cluster: Annotated[str, typer.Option(help="Configured cluster name.")] = "ares",
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
 ) -> None:
     """Check local or live cluster configuration."""
     _require_cluster(cluster)
@@ -251,7 +347,7 @@ def doctor(
 
 @app.command("live-test")
 def live_test(
-    cluster: Annotated[str, typer.Option(help="Configured cluster name.")] = "ares",
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
 ) -> None:
     """Run live acceptance preflight checks for a configured cluster."""
     _require_cluster(cluster)

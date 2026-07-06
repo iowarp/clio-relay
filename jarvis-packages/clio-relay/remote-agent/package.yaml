@@ -5,12 +5,18 @@ parameters:
   agent_bin:
     type: string
     required: true
+  agent_adapter:
+    type: string
+    required: false
+  agent_args:
+    type: array
+    required: false
   prompt_path:
     type: string
     required: true
   mcp_config_path:
     type: string
-    required: true
+    required: false
   model:
     type: string
     required: false

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -20,6 +21,8 @@ class RelaySettings(BaseModel):
     jarvis_bin: str = "jarvis"
     frpc_bin: str = "frpc"
     agent_bin: str = "codex"
+    agent_adapter: str = "codex"
+    agent_args: list[str] = Field(default_factory=list)
 
     @classmethod
     def from_env(cls) -> RelaySettings:
@@ -35,4 +38,12 @@ class RelaySettings(BaseModel):
                 "CLIO_RELAY_AGENT_BIN",
                 "codex",
             ),
+            agent_adapter=os.getenv("CLIO_RELAY_AGENT_ADAPTER", "codex"),
+            agent_args=_split_args(os.getenv("CLIO_RELAY_AGENT_ARGS")),
         )
+
+
+def _split_args(value: str | None) -> list[str]:
+    if value is None or value.strip() == "":
+        return []
+    return shlex.split(value)

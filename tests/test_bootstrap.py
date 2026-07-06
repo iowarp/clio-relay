@@ -13,6 +13,8 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert "CLIO_RELAY_AGENT_NPM_BIN" in script
     assert 'npm install -g "$AGENT_NPM_PACKAGE"' in script
     assert "CLIO_RELAY_AGENT_BIN" in script
+    assert "CLIO_RELAY_AGENT_ADAPTER=codex" in script
+    assert "CLIO_RELAY_AGENT_ARGS=''" in script
     assert "github.com/grc-iit/jarvis-cd.git" in script
     assert 'jarvis repo add "$DEST/jarvis-packages/clio_relay" --force true' in script
     assert "CLIO_RELAY_CORE_DIR" in script

@@ -2,7 +2,7 @@
 
 Private relay for running configured cluster work from CLIO without putting application state in the network relay.
 
-`frp` is used only as a byte transport. `clio-core` queue records are the durable state source. JARVIS-CD owns deployment, scheduler submission, provenance, and output collection.
+`frp` is used only as a byte transport. The frpc-to-frps protocol is configurable: use `wss` for Cloudflare-backed homelab routing now, and switch to `tcp` later when a cloud or institutional relay host provides raw TCP. `clio-core` queue records are the durable state source. JARVIS-CD owns deployment, scheduler submission, provenance, and output collection.
 
 ## Roles
 
@@ -18,6 +18,7 @@ uv run clio-relay init
 uv run clio-relay install-frp
 uv run clio-relay cluster bootstrap --cluster ares
 uv run clio-relay relay-host render-frps-config --token $env:CLIO_RELAY_FRP_TOKEN
+uv run clio-relay relay-host render-frpc-config --cluster ares --token $env:CLIO_RELAY_FRP_TOKEN --local-port 8848 --secret-key $env:CLIO_RELAY_STCP_SECRET
 uv run clio-relay endpoint status
 ```
 

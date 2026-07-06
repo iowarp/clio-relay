@@ -2,7 +2,7 @@
 
 `clio-relay` has three roles and one source of truth.
 
-The relay host is only `frps` configuration. It has no queue, no job records, and no application logic.
+The relay host is only `frps` configuration. It has no queue, no job records, and no application logic. The frpc-to-frps transport protocol is deploy-time configuration. For the current Cloudflare-backed homelab path, use WebSocket/TLS (`wss`) over port 443. For a later VPS or institutional relay host with raw TCP, use `tcp` without changing endpoint semantics.
 
 The desktop endpoint submits configured-cluster work into the durable queue and exposes job, event, artifact, cancellation, remote-agent, and MCP-call surfaces for CLIO consumers.
 

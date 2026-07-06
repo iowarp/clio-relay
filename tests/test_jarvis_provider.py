@@ -23,7 +23,11 @@ def test_bounded_command_yaml_generation() -> None:
 
 
 def test_remote_agent_task_yaml_generation(tmp_path: Path) -> None:
-    provider = JarvisCdProvider(agent_bin="/opt/agent/bin/current-agent")
+    provider = JarvisCdProvider(
+        agent_bin="/opt/agent/bin/current-agent",
+        agent_adapter="exec",
+        agent_args=["--prompt", "{prompt_path}"],
+    )
     rendered = provider.render_remote_agent_task_yaml(
         RemoteAgentTaskSpec(
             prompt_path=tmp_path / "prompt.md",
@@ -35,6 +39,8 @@ def test_remote_agent_task_yaml_generation(tmp_path: Path) -> None:
     package = document["pkgs"][0]
     assert package["pkg_type"] == "clio_relay.remote_agent"
     assert package["agent_bin"] == "/opt/agent/bin/current-agent"
+    assert package["agent_adapter"] == "exec"
+    assert package["agent_args"] == ["--prompt", "{prompt_path}"]
     assert package["prompt_path"].endswith("prompt.md")
 
 

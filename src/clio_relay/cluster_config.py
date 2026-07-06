@@ -10,6 +10,17 @@ from pydantic import BaseModel, ConfigDict, Field
 from clio_relay.errors import ConfigurationError
 
 
+class FrpTransportConfig(BaseModel):
+    """Transport settings for frpc-to-frps connections."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    protocol: str = "wss"
+    server_addr: str = "frps.jcernuda.com"
+    server_port: int = 443
+    token_env: str = "CLIO_RELAY_FRP_TOKEN"
+
+
 class ClusterDefinition(BaseModel):
     """A locally configured cluster target."""
 
@@ -20,8 +31,11 @@ class ClusterDefinition(BaseModel):
     bootstrap_profile: str = "linux-user"
     core_dir: str = "$HOME/.local/share/clio-relay/core"
     spool_dir: str = "$HOME/.local/share/clio-relay/spool"
+    agent_adapter: str = "codex"
     agent_npm_package: str = "@openai/codex"
     agent_npm_bin: str = "codex"
+    agent_args: list[str] = Field(default_factory=list)
+    frp_transport: FrpTransportConfig = Field(default_factory=FrpTransportConfig)
 
 
 class ClusterRegistry(BaseModel):

@@ -21,9 +21,18 @@ from clio_relay.models import JarvisRunSpec, McpCallSpec, RemoteAgentTaskSpec
 class JarvisCdProvider:
     """Materialize and invoke relay jobs through JARVIS-CD."""
 
-    def __init__(self, *, jarvis_bin: str = "jarvis", agent_bin: str = "codex") -> None:
+    def __init__(
+        self,
+        *,
+        jarvis_bin: str = "jarvis",
+        agent_bin: str = "codex",
+        agent_adapter: str = "codex",
+        agent_args: list[str] | None = None,
+    ) -> None:
         self.jarvis_bin = jarvis_bin
         self.agent_bin = agent_bin
+        self.agent_adapter = agent_adapter
+        self.agent_args = agent_args or []
 
     def require_available(self) -> None:
         """Raise if the configured JARVIS executable is unavailable."""
@@ -64,8 +73,12 @@ class JarvisCdProvider:
                     "pkg_type": "clio_relay.remote_agent",
                     "pkg_name": "remote_agent",
                     "agent_bin": self.agent_bin,
+                    "agent_adapter": self.agent_adapter,
+                    "agent_args": self.agent_args,
                     "prompt_path": str(spec.prompt_path),
-                    "mcp_config_path": str(spec.mcp_config_path),
+                    "mcp_config_path": (
+                        str(spec.mcp_config_path) if spec.mcp_config_path is not None else None
+                    ),
                     "model": spec.model,
                     "workdir": str(spec.workdir) if spec.workdir is not None else None,
                     "timeout_seconds": spec.timeout_seconds,

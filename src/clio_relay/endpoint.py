@@ -35,7 +35,7 @@ class EndpointWorker:
         *,
         role: EndpointRole,
         settings: RelaySettings,
-        cluster: str = "ares",
+        cluster: str = "local",
         queue: ClioCoreQueue | None = None,
         provider: JarvisCdProvider | None = None,
     ) -> None:
@@ -46,6 +46,8 @@ class EndpointWorker:
         self.provider = provider or JarvisCdProvider(
             jarvis_bin=settings.jarvis_bin,
             agent_bin=settings.agent_bin,
+            agent_adapter=settings.agent_adapter,
+            agent_args=settings.agent_args,
         )
         self.endpoint: EndpointRegistration | None = None
 
@@ -143,7 +145,12 @@ def bootstrap_cluster_environment(settings: RelaySettings) -> None:
     settings.spool_dir.mkdir(parents=True, exist_ok=True)
     queue = ClioCoreQueue(settings.core_dir)
     queue.initialize()
-    provider = JarvisCdProvider(jarvis_bin=settings.jarvis_bin, agent_bin=settings.agent_bin)
+    provider = JarvisCdProvider(
+        jarvis_bin=settings.jarvis_bin,
+        agent_bin=settings.agent_bin,
+        agent_adapter=settings.agent_adapter,
+        agent_args=settings.agent_args,
+    )
     provider.require_available()
     if settings.frps_addr is None or settings.frp_token is None:
         raise ConfigurationError("CLIO_RELAY_FRPS_ADDR and CLIO_RELAY_FRP_TOKEN are required")

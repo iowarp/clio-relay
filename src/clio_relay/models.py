@@ -101,7 +101,7 @@ class RemoteAgentTaskSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     prompt_path: Path
-    mcp_config_path: Path
+    mcp_config_path: Path | None = None
     model: str | None = None
     workdir: Path | None = None
     timeout_seconds: int | None = Field(default=None, gt=0)

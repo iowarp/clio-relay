@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -47,8 +48,10 @@ def bootstrap_cluster_over_ssh(
     bootstrap_profile: str,
     ssh_host: str,
     source_root: Path,
+    agent_adapter: str = "codex",
     agent_npm_package: str = "@openai/codex",
     agent_npm_bin: str = "codex",
+    agent_args: list[str] | None = None,
     frp_version: str = FRP_VERSION,
 ) -> list[str]:
     """Install relay dependencies and the current source tree on a cluster over SSH."""
@@ -65,8 +68,10 @@ def bootstrap_cluster_over_ssh(
         script_path.write_text(
             render_linux_user_bootstrap_script(
                 frp_version=frp_version,
+                agent_adapter=agent_adapter,
                 agent_npm_package=agent_npm_package,
                 agent_npm_bin=agent_npm_bin,
+                agent_args=agent_args or [],
             ),
             encoding="utf-8",
             newline="\n",
@@ -79,10 +84,14 @@ def bootstrap_cluster_over_ssh(
 def render_linux_user_bootstrap_script(
     *,
     frp_version: str = FRP_VERSION,
+    agent_adapter: str = "codex",
     agent_npm_package: str = "@openai/codex",
     agent_npm_bin: str = "codex",
+    agent_args: list[str] | None = None,
 ) -> str:
     """Render the idempotent shell script used for the current Linux cluster bootstrap."""
+    rendered_agent_adapter = shlex.quote(agent_adapter)
+    rendered_agent_args = shlex.quote(" ".join(agent_args or []))
     script = f"""set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$HOME/.local/bin" "$HOME/.local/src" "$HOME/.local/share/clio-relay"
@@ -154,6 +163,8 @@ CLIO_RELAY_SPOOL_DIR="$HOME/.local/share/clio-relay/spool" \
 CLIO_RELAY_JARVIS_BIN="$HOME/.local/bin/jarvis" \
 CLIO_RELAY_FRPC_BIN="$HOME/.local/bin/frpc" \
 CLIO_RELAY_AGENT_BIN="$AGENT_BIN" \
+CLIO_RELAY_AGENT_ADAPTER={rendered_agent_adapter} \
+CLIO_RELAY_AGENT_ARGS={rendered_agent_args} \
 clio-relay init
 
 echo "frpc=$("$HOME/.local/bin/frpc" --version)"

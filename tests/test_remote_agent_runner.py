@@ -1,0 +1,77 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+from pathlib import Path
+from types import ModuleType
+from typing import Protocol, cast
+
+
+class RemoteAgentRunnerModule(Protocol):
+    def run_remote_agent_from_params(self, params: dict[str, object]) -> int:
+        """Run a remote-agent task from serialized parameters."""
+        ...
+
+
+def test_exec_adapter_runs_configured_agent_with_templates(tmp_path: Path) -> None:
+    runner = _load_runner()
+    agent_script = tmp_path / "agent.py"
+    output_path = tmp_path / "args.json"
+    prompt_path = tmp_path / "prompt.md"
+    mcp_path = tmp_path / "mcp.toml"
+    agent_script.write_text(
+        (
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            f"Path({str(output_path)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+        ),
+        encoding="utf-8",
+    )
+    prompt_path.write_text("do the work", encoding="utf-8")
+    mcp_path.write_text("[mcp_servers.local]\ncommand = 'python'\n", encoding="utf-8")
+
+    return_code = cast(RemoteAgentRunnerModule, runner).run_remote_agent_from_params(
+        {
+            "agent_bin": "python",
+            "agent_adapter": "exec",
+            "agent_args": [
+                str(agent_script),
+                "--prompt",
+                "{prompt}",
+                "--mcp",
+                "{mcp_config_path}",
+                "--model",
+                "{model}",
+            ],
+            "prompt_path": str(prompt_path),
+            "mcp_config_path": str(mcp_path),
+            "model": "configured-model",
+        }
+    )
+
+    assert return_code == 0
+    assert json.loads(output_path.read_text(encoding="utf-8")) == [
+        "--prompt",
+        "do the work",
+        "--mcp",
+        str(mcp_path),
+        "--model",
+        "configured-model",
+    ]
+
+
+def _load_runner() -> ModuleType:
+    path = (
+        Path(__file__).parents[1]
+        / "jarvis-packages"
+        / "clio_relay"
+        / "clio_relay"
+        / "remote_agent"
+        / "runner.py"
+    )
+    spec = importlib.util.spec_from_file_location("clio_relay_remote_agent_runner", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("failed to load remote agent runner")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module

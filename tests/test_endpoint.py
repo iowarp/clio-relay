@@ -40,6 +40,7 @@ def test_worker_runs_one_job_and_indexes_artifacts(tmp_path: Path) -> None:
     worker = EndpointWorker(
         role=EndpointRole.WORKER,
         settings=settings,
+        cluster="ares",
         queue=queue,
         provider=provider,
     )
