@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 from pathlib import Path
 from types import ModuleType
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
+
+from pytest import MonkeyPatch
 
 
 class RemoteAgentRunnerModule(Protocol):
@@ -57,6 +60,38 @@ def test_exec_adapter_runs_configured_agent_with_templates(tmp_path: Path) -> No
         str(mcp_path),
         "--model",
         "configured-model",
+    ]
+
+
+def test_codex_adapter_disables_interactive_approvals(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("use the tool", encoding="utf-8")
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured["command"] = command
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(cast(Any, runner).subprocess, "run", fake_run)
+
+    return_code = cast(RemoteAgentRunnerModule, runner).run_remote_agent_from_params(
+        {
+            "agent_bin": "codex",
+            "agent_adapter": "codex",
+            "prompt_path": str(prompt_path),
+        }
+    )
+
+    assert return_code == 0
+    assert captured["command"][:4] == [
+        "codex",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "exec",
+        "--json",
     ]
 
 

@@ -29,6 +29,15 @@ uv run clio-relay job submit --cluster ares --jarvis-yaml .\pipeline.yaml
 uv run clio-relay job watch <job-id>
 ```
 
+Expose relay submission tools to an agent process:
+
+```powershell
+uv run clio-relay agent render-mcp-config --output .\clio-relay-agent.config.toml
+uv run clio-relay agent run --cluster ares --prompt /path/on/cluster/prompt.md --mcp-config /path/on/cluster/clio-relay-agent.config.toml
+```
+
+The MCP server provides `relay_submit_jarvis_pipeline`, `relay_get_job`, and `relay_watch_job_events`. These tools submit and inspect the same durable `RelayJob` records as the CLI and HTTP surfaces. Workload-specific systems are expressed as JARVIS pipeline YAML supplied by the caller, not as relay-native tools.
+
 Live acceptance requires `CLIO_RELAY_CORE_DIR`, `CLIO_RELAY_FRPS_ADDR`, `CLIO_RELAY_FRP_TOKEN`, `jarvis`, `frpc`, and the target cluster shell environment used interactively.
 
 ## Cloudflare-backed frps edge

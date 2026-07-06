@@ -63,6 +63,7 @@ def _codex_command(
     output_path = Path.cwd() / "agent-last-message.txt"
     command = [
         agent_bin,
+        "--dangerously-bypass-approvals-and-sandbox",
         "exec",
         "--json",
         "--output-last-message",

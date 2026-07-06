@@ -22,6 +22,7 @@ from clio_relay.doctor import run_cluster_doctor, run_doctor
 from clio_relay.endpoint import EndpointWorker
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.frp_check import run_frpc_connection_check
+from clio_relay.mcp_server import render_codex_mcp_profile, serve_stdio
 from clio_relay.models import (
     Cursor,
     EndpointRole,
@@ -125,13 +126,13 @@ def test_frpc(
     token: Annotated[str, typer.Option(help="frp authentication token.")],
     local_port: Annotated[int, typer.Option(help="Local relay endpoint port.")],
     secret_key: Annotated[str, typer.Option(help="stcp shared secret.")],
-    proxy_name: Annotated[str, typer.Option(help="stcp proxy name.")] = "relay-stcp-smoke",
+    proxy_name: Annotated[str, typer.Option(help="stcp proxy name.")] = "relay-stcp-live-check",
     timeout_seconds: Annotated[
         float,
         typer.Option(help="Seconds frpc must stay connected before success."),
     ] = 10.0,
 ) -> None:
-    """Run a live frpc login smoke test for the cluster transport."""
+    """Run a live frpc login check for the cluster transport."""
     settings = RelaySettings.from_env()
     definition = _require_cluster(cluster)
     transport = definition.frp_transport
@@ -373,6 +374,29 @@ def mcp_call(
     typer.echo(saved.job_id)
 
 
+@app.command("mcp-server")
+def mcp_server() -> None:
+    """Serve relay job tools over stdio MCP."""
+    serve_stdio()
+
+
+@agent_app.command("render-mcp-config")
+def agent_render_mcp_config(
+    output: Annotated[
+        Path | None,
+        typer.Option(help="Optional path to write the Codex MCP profile TOML."),
+    ] = None,
+) -> None:
+    """Render a Codex profile that exposes the relay MCP tools."""
+    rendered = render_codex_mcp_profile(settings=RelaySettings.from_env())
+    if output is None:
+        typer.echo(rendered)
+        return
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(rendered, encoding="utf-8")
+    typer.echo(output)
+
+
 @app.command("doctor")
 def doctor(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
@@ -399,7 +423,7 @@ def live_test(
         _echo_lines(run_cluster_doctor(definition))
 
     _run_or_exit(_run)
-    typer.echo("live preflight passed; submit a JARVIS smoke job to complete acceptance")
+    typer.echo("live preflight passed; submit a full JARVIS acceptance workload")
 
 
 def _file_idempotency_key(path: Path, text: str) -> str:
