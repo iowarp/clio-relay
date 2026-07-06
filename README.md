@@ -15,6 +15,8 @@ Private relay for running Ares work from CLIO without putting application state 
 ```powershell
 uv sync
 uv run clio-relay init
+uv run clio-relay install-frp
+uv run clio-relay ares bootstrap --ssh-host ares
 uv run clio-relay relay-host render-frps-config --token $env:CLIO_RELAY_FRP_TOKEN
 uv run clio-relay endpoint status
 ```

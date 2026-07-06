@@ -9,6 +9,7 @@ from typing import Annotated
 
 import typer
 
+from clio_relay.bootstrap import bootstrap_ares_over_ssh, install_local_frp
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.doctor import run_doctor
@@ -97,10 +98,31 @@ def endpoint_status() -> None:
 
 
 @ares_app.command("bootstrap")
-def ares_bootstrap() -> None:
-    """Bootstrap the Ares endpoint directories and required live tools."""
+def ares_bootstrap(
+    ssh_host: Annotated[
+        str | None,
+        typer.Option(help="SSH host alias for autonomous remote bootstrap."),
+    ] = None,
+) -> None:
+    """Bootstrap Ares tools, relay package, and endpoint directories."""
+    if ssh_host is not None:
+        _run_or_exit(
+            lambda: _echo_lines(bootstrap_ares_over_ssh(ssh_host=ssh_host, source_root=Path.cwd()))
+        )
+        return
     _run_or_exit(lambda: bootstrap_ares(RelaySettings.from_env()))
     typer.echo("Ares endpoint bootstrap checks passed")
+
+
+@app.command("install-frp")
+def install_frp(
+    destination: Annotated[
+        Path,
+        typer.Option(help="Directory for frpc/frps binaries."),
+    ] = Path(".tools/frp/bin"),
+) -> None:
+    """Download and install frp for the local desktop."""
+    _run_or_exit(lambda: typer.echo(f"frpc={install_local_frp(destination)}"))
 
 
 @job_app.command("submit")
