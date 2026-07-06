@@ -21,6 +21,7 @@ from clio_relay.deployment import (
 from clio_relay.doctor import run_cluster_doctor, run_doctor
 from clio_relay.endpoint import EndpointWorker
 from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.frp_check import run_frpc_connection_check
 from clio_relay.models import (
     Cursor,
     EndpointRole,
@@ -116,6 +117,42 @@ def render_frpc(
         secret_key=secret_key,
     )
     typer.echo(render_frpc_config(config))
+
+
+@relay_host_app.command("test-frpc-connection")
+def test_frpc(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    token: Annotated[str, typer.Option(help="frp authentication token.")],
+    local_port: Annotated[int, typer.Option(help="Local relay endpoint port.")],
+    secret_key: Annotated[str, typer.Option(help="stcp shared secret.")],
+    proxy_name: Annotated[str, typer.Option(help="stcp proxy name.")] = "relay-stcp-smoke",
+    timeout_seconds: Annotated[
+        float,
+        typer.Option(help="Seconds frpc must stay connected before success."),
+    ] = 10.0,
+) -> None:
+    """Run a live frpc login smoke test for the cluster transport."""
+    settings = RelaySettings.from_env()
+    definition = _require_cluster(cluster)
+    transport = definition.frp_transport
+    config = FrpcConfig(
+        server_addr=transport.server_addr,
+        server_port=transport.server_port,
+        token=token,
+        transport_protocol=FrpTransportProtocol(transport.protocol),
+        proxy_name=proxy_name,
+        local_port=local_port,
+        secret_key=secret_key,
+    )
+    _run_or_exit(
+        lambda: _echo_lines(
+            run_frpc_connection_check(
+                frpc_bin=settings.frpc_bin,
+                config=config,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+    )
 
 
 @endpoint_app.command("start")
