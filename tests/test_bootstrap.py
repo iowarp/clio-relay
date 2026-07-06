@@ -12,3 +12,4 @@ def test_ares_bootstrap_script_installs_required_components() -> None:
     assert "github.com/grc-iit/jarvis-cd.git" in script
     assert "CLIO_RELAY_CORE_DIR" in script
     assert "clio-relay init" in script
+    assert "\r" not in script

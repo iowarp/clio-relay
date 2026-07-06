@@ -62,7 +62,7 @@ def bootstrap_ares_over_ssh(
 
 def render_ares_bootstrap_script(*, frp_version: str = FRP_VERSION) -> str:
     """Render the idempotent shell script used for Ares bootstrap."""
-    return f"""set -euo pipefail
+    script = f"""set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$HOME/.local/bin" "$HOME/.local/src" "$HOME/.local/share/clio-relay"
 
@@ -131,6 +131,7 @@ echo "frps=$("$HOME/.local/bin/frps" --version)"
 echo "jarvis=$("$HOME/.local/bin/jarvis" --help | head -n 1)"
 echo "relay=$(clio-relay --help | head -n 1)"
 """
+    return script.replace("\r\n", "\n")
 
 
 def _assert_executable(path: Path) -> None:
