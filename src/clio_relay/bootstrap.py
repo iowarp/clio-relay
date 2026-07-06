@@ -52,11 +52,18 @@ def bootstrap_ares_over_ssh(
     if shutil.which("ssh") is None or shutil.which("scp") is None or shutil.which("git") is None:
         raise ConfigurationError("ssh, scp, and git are required for remote Ares bootstrap")
     with tempfile.TemporaryDirectory() as temp_dir:
-        archive = Path(temp_dir) / "clio-relay-head.tar"
+        temp_path = Path(temp_dir)
+        archive = temp_path / "clio-relay-head.tar"
+        script_path = temp_path / "clio-relay-bootstrap.sh"
         _run(["git", "archive", "--format=tar", "-o", str(archive), "HEAD"], cwd=source_root)
         _run(["scp", str(archive), f"{ssh_host}:/tmp/clio-relay-head.tar"])
-    script = render_ares_bootstrap_script(frp_version=frp_version)
-    result = _run(["ssh", ssh_host, "bash -s"], input_text=script)
+        script_path.write_text(
+            render_ares_bootstrap_script(frp_version=frp_version),
+            encoding="utf-8",
+            newline="\n",
+        )
+        _run(["scp", str(script_path), f"{ssh_host}:/tmp/clio-relay-bootstrap.sh"])
+    result = _run(["ssh", ssh_host, "bash", "/tmp/clio-relay-bootstrap.sh"])
     return result.stdout.splitlines()
 
 
@@ -145,13 +152,11 @@ def _run(
     command: list[str],
     *,
     cwd: Path | None = None,
-    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     result = subprocess.run(
         command,
         cwd=cwd,
-        input=input_text,
         text=True,
         capture_output=True,
         check=False,
