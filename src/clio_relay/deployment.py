@@ -61,15 +61,16 @@ def install_endpoint_user_service_over_ssh(
     )
     result = subprocess.run(
         ["ssh", ssh_host, "bash", "-s"],
-        input=remote_script,
-        text=True,
+        input=remote_script.encode("utf-8"),
         capture_output=True,
         check=False,
     )
     if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip()
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        detail = stderr.strip() or stdout.strip()
         raise RelayError(f"failed to install endpoint user service: {detail}")
-    return result.stdout.splitlines()
+    return result.stdout.decode("utf-8", errors="replace").splitlines()
 
 
 def _remote_install_script(
