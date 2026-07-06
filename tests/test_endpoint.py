@@ -25,7 +25,7 @@ class RecordingProvider(JarvisCdProvider):
         return subprocess.CompletedProcess(args=["jarvis"], returncode=0, stdout="ok\n", stderr="")
 
 
-def test_ares_worker_runs_one_job_and_indexes_artifacts(tmp_path: Path) -> None:
+def test_worker_runs_one_job_and_indexes_artifacts(tmp_path: Path) -> None:
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     provider = RecordingProvider()
@@ -38,7 +38,7 @@ def test_ares_worker_runs_one_job_and_indexes_artifacts(tmp_path: Path) -> None:
         )
     )
     worker = EndpointWorker(
-        role=EndpointRole.ARES,
+        role=EndpointRole.WORKER,
         settings=settings,
         queue=queue,
         provider=provider,

@@ -30,5 +30,5 @@ def run_doctor(settings: RelaySettings, *, live: bool = False) -> list[str]:
         lines.append(f"frps_addr: {settings.frps_addr}")
         lines.append(check_required_binary("frpc", settings.frpc_bin))
         lines.append(check_required_binary("jarvis", settings.jarvis_bin))
-        lines.append(check_required_binary("codex", settings.codex_bin))
+        lines.append(check_required_binary("agent", settings.agent_bin))
     return lines

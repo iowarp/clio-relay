@@ -19,7 +19,7 @@ class RelaySettings(BaseModel):
     frp_token: str | None = None
     jarvis_bin: str = "jarvis"
     frpc_bin: str = "frpc"
-    codex_bin: str = "codex"
+    agent_bin: str = "codex"
 
     @classmethod
     def from_env(cls) -> RelaySettings:
@@ -31,5 +31,8 @@ class RelaySettings(BaseModel):
             frp_token=os.getenv("CLIO_RELAY_FRP_TOKEN"),
             jarvis_bin=os.getenv("CLIO_RELAY_JARVIS_BIN", "jarvis"),
             frpc_bin=os.getenv("CLIO_RELAY_FRPC_BIN", "frpc"),
-            codex_bin=os.getenv("CLIO_RELAY_CODEX_BIN", "codex"),
+            agent_bin=os.getenv(
+                "CLIO_RELAY_AGENT_BIN",
+                "codex",
+            ),
         )

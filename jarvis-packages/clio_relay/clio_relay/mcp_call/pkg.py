@@ -10,7 +10,7 @@ from jarvis_cd.core.pkg import Application
 
 
 class McpCall(Application):
-    """Call a stdio MCP server tool from Ares."""
+    """Call a stdio MCP server tool."""
 
     def _init(self) -> None:
         """Initialize package state."""

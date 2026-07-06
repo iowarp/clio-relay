@@ -1,4 +1,4 @@
-"""JARVIS package entrypoint for Codex agent runs."""
+"""JARVIS package entrypoint for remote agent runs."""
 
 from __future__ import annotations
 
@@ -11,13 +11,15 @@ from typing import Any
 
 
 def main() -> int:
-    """Run Codex with the same shell-visible binary configured for the endpoint."""
+    """Run the configured agent binary."""
     params = _load_params()
-    codex_bin = str(params.get("codex_bin", "codex"))
+    if "agent_bin" not in params:
+        raise ValueError("agent_bin is required")
+    agent_bin = str(params["agent_bin"])
     prompt_path = Path(str(params["prompt_path"]))
     mcp_config_path = Path(str(params["mcp_config_path"]))
     command = [
-        codex_bin,
+        agent_bin,
         "--mcp-config",
         str(mcp_config_path),
         "exec",

@@ -1,4 +1,4 @@
-"""Ares spool directory helpers for logs and artifact backing files."""
+"""Spool directory helpers for logs and artifact backing files."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from clio_relay.models import ArtifactRef, RelayJob
 
 
 class JobSpool:
-    """Per-job execution spool rooted on Ares shared storage."""
+    """Per-job execution spool rooted on cluster-accessible storage."""
 
     def __init__(self, root: Path, job: RelayJob) -> None:
         self.root = root

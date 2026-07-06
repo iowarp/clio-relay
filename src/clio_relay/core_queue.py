@@ -125,15 +125,21 @@ class ClioCoreQueue:
             )
         return job
 
-    def acquire_next_job(self, endpoint_id: str, *, ttl_seconds: int = 300) -> Lease | None:
-        """Lease the next queued Ares job for a single active worker."""
+    def acquire_next_job(
+        self,
+        endpoint_id: str,
+        *,
+        cluster: str,
+        ttl_seconds: int = 300,
+    ) -> Lease | None:
+        """Lease the next queued job for a cluster worker."""
         self.initialize()
         with self._lock:
             active = self._active_lease_for_endpoint(endpoint_id)
             if active is not None:
                 return active
             for job in self.list_jobs():
-                if job.cluster != "ares" or job.state != JobState.QUEUED:
+                if job.cluster != cluster or job.state != JobState.QUEUED:
                     continue
                 lease = Lease.new(job.job_id, endpoint_id, ttl_seconds)
                 job = job.model_copy(

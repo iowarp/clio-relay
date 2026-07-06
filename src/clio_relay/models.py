@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -25,7 +25,7 @@ class EndpointRole(StrEnum):
     """Long-running endpoint roles."""
 
     DESKTOP = "desktop"
-    ARES = "ares"
+    WORKER = "worker"
 
 
 class JobKind(StrEnum):
@@ -96,7 +96,7 @@ class JarvisRunSpec(BaseModel):
 
 
 class RemoteAgentTaskSpec(BaseModel):
-    """A remote Codex task to execute on Ares through JARVIS-CD."""
+    """A remote agent task to execute on a cluster through JARVIS-CD."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -130,7 +130,7 @@ class RelayJob(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     job_id: str = Field(default_factory=lambda: new_id("job"))
-    cluster: Literal["ares"]
+    cluster: str
     kind: JobKind
     state: JobState = JobState.QUEUED
     spec: JobSpec

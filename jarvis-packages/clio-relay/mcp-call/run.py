@@ -14,7 +14,7 @@ def main() -> int:
     """Call an MCP tool through a stdio server command.
 
     The `server` parameter is interpreted as an executable command available in
-    the Ares environment. This keeps relay code provider-neutral while letting
+    the cluster environment. This keeps relay code provider-neutral while letting
     JARVIS-CD capture process provenance.
     """
     params = _load_params()

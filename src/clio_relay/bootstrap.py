@@ -1,4 +1,4 @@
-"""Autonomous installation helpers for desktop and Ares targets."""
+"""Autonomous installation helpers for desktop and cluster targets."""
 
 from __future__ import annotations
 
@@ -42,15 +42,20 @@ def install_local_frp(destination: Path) -> Path:
     return frpc
 
 
-def bootstrap_ares_over_ssh(
+def bootstrap_cluster_over_ssh(
     *,
+    bootstrap_profile: str,
     ssh_host: str,
     source_root: Path,
+    agent_npm_package: str = "@openai/codex",
+    agent_npm_bin: str = "codex",
     frp_version: str = FRP_VERSION,
 ) -> list[str]:
-    """Install relay dependencies and the current source tree on Ares over SSH."""
+    """Install relay dependencies and the current source tree on a cluster over SSH."""
+    if bootstrap_profile != "linux-user":
+        raise ConfigurationError(f"unsupported bootstrap profile: {bootstrap_profile}")
     if shutil.which("ssh") is None or shutil.which("scp") is None or shutil.which("git") is None:
-        raise ConfigurationError("ssh, scp, and git are required for remote Ares bootstrap")
+        raise ConfigurationError("ssh, scp, and git are required for remote bootstrap")
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
         archive = temp_path / "clio-relay-head.tar"
@@ -58,7 +63,11 @@ def bootstrap_ares_over_ssh(
         _run(["git", "archive", "--format=tar", "-o", str(archive), "HEAD"], cwd=source_root)
         _run(["scp", str(archive), f"{ssh_host}:/tmp/clio-relay-head.tar"])
         script_path.write_text(
-            render_ares_bootstrap_script(frp_version=frp_version),
+            render_linux_user_bootstrap_script(
+                frp_version=frp_version,
+                agent_npm_package=agent_npm_package,
+                agent_npm_bin=agent_npm_bin,
+            ),
             encoding="utf-8",
             newline="\n",
         )
@@ -67,8 +76,13 @@ def bootstrap_ares_over_ssh(
     return result.stdout.splitlines()
 
 
-def render_ares_bootstrap_script(*, frp_version: str = FRP_VERSION) -> str:
-    """Render the idempotent shell script used for Ares bootstrap."""
+def render_linux_user_bootstrap_script(
+    *,
+    frp_version: str = FRP_VERSION,
+    agent_npm_package: str = "@openai/codex",
+    agent_npm_bin: str = "codex",
+) -> str:
+    """Render the idempotent shell script used for the current Linux cluster bootstrap."""
     script = f"""set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$HOME/.local/bin" "$HOME/.local/src" "$HOME/.local/share/clio-relay"
@@ -89,8 +103,11 @@ if [ ! -x "$HOME/.local/bin/uv" ]; then
 fi
 uv python install 3.12
 
-if [ ! -x "$HOME/.local/bin/codex" ] && command -v npm >/dev/null 2>&1; then
-  npm install -g @openai/codex
+AGENT_NPM_PACKAGE="${{CLIO_RELAY_AGENT_NPM_PACKAGE:-{agent_npm_package}}}"
+AGENT_NPM_BIN="${{CLIO_RELAY_AGENT_NPM_BIN:-{agent_npm_bin}}}"
+AGENT_BIN="${{CLIO_RELAY_AGENT_BIN:-$HOME/.local/bin/$AGENT_NPM_BIN}}"
+if [ ! -x "$AGENT_BIN" ] && [ -n "$AGENT_NPM_PACKAGE" ] && command -v npm >/dev/null 2>&1; then
+  npm install -g "$AGENT_NPM_PACKAGE"
 fi
 
 JARVIS_VENV="$HOME/.local/share/clio-relay/jarvis-venv"
@@ -136,13 +153,13 @@ CLIO_RELAY_CORE_DIR="$HOME/.local/share/clio-relay/core" \
 CLIO_RELAY_SPOOL_DIR="$HOME/.local/share/clio-relay/spool" \
 CLIO_RELAY_JARVIS_BIN="$HOME/.local/bin/jarvis" \
 CLIO_RELAY_FRPC_BIN="$HOME/.local/bin/frpc" \
-CLIO_RELAY_CODEX_BIN="$HOME/.local/bin/codex" \
+CLIO_RELAY_AGENT_BIN="$AGENT_BIN" \
 clio-relay init
 
 echo "frpc=$("$HOME/.local/bin/frpc" --version)"
 echo "frps=$("$HOME/.local/bin/frps" --version)"
-if [ -x "$HOME/.local/bin/codex" ]; then
-  echo "codex=$("$HOME/.local/bin/codex" --version)"
+if [ -x "$AGENT_BIN" ]; then
+  echo "agent=$("$AGENT_BIN" --version)"
 fi
 echo "jarvis=$("$HOME/.local/bin/jarvis" --help | head -n 1)"
 echo "relay=$(clio-relay --help | head -n 1)"

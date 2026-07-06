@@ -1,4 +1,4 @@
-"""Long-running desktop and Ares endpoint behavior."""
+"""Long-running desktop and cluster endpoint behavior."""
 
 from __future__ import annotations
 
@@ -28,22 +28,24 @@ from clio_relay.spool import JobSpool
 
 
 class EndpointWorker:
-    """Endpoint worker for desktop or Ares roles."""
+    """Endpoint worker for desktop or cluster roles."""
 
     def __init__(
         self,
         *,
         role: EndpointRole,
         settings: RelaySettings,
+        cluster: str = "ares",
         queue: ClioCoreQueue | None = None,
         provider: JarvisCdProvider | None = None,
     ) -> None:
         self.role = role
+        self.cluster = cluster
         self.settings = settings
         self.queue = queue or ClioCoreQueue(settings.core_dir)
         self.provider = provider or JarvisCdProvider(
             jarvis_bin=settings.jarvis_bin,
-            codex_bin=settings.codex_bin,
+            agent_bin=settings.agent_bin,
         )
         self.endpoint: EndpointRegistration | None = None
 
@@ -51,7 +53,7 @@ class EndpointWorker:
         """Register this endpoint in the durable queue."""
         endpoint = EndpointRegistration(
             role=self.role,
-            cluster="ares" if self.role == EndpointRole.ARES else None,
+            cluster=self.cluster if self.role == EndpointRole.WORKER else None,
             hostname=socket.gethostname(),
             pid=os.getpid(),
         )
@@ -59,11 +61,11 @@ class EndpointWorker:
         return self.endpoint
 
     def run_once(self) -> RelayJob | None:
-        """Run one leased Ares job if available."""
-        if self.role != EndpointRole.ARES:
+        """Run one leased cluster job if available."""
+        if self.role != EndpointRole.WORKER:
             return None
         endpoint = self.endpoint or self.register()
-        lease = self.queue.acquire_next_job(endpoint.endpoint_id)
+        lease = self.queue.acquire_next_job(endpoint.endpoint_id, cluster=self.cluster)
         if lease is None:
             return None
         job = self.queue.get_job(lease.job_id)
@@ -79,7 +81,7 @@ class EndpointWorker:
         if self.role == EndpointRole.DESKTOP:
             while True:
                 time.sleep(poll_seconds)
-        with self._single_ares_worker_lock():
+        with self._single_cluster_worker_lock():
             while True:
                 self.run_once()
                 time.sleep(poll_seconds)
@@ -114,32 +116,34 @@ class EndpointWorker:
         if job.kind == JobKind.JARVIS and isinstance(job.spec, JarvisRunSpec):
             return self.provider.render_bounded_command_yaml(job.spec)
         if job.kind == JobKind.REMOTE_AGENT and isinstance(job.spec, RemoteAgentTaskSpec):
-            return self.provider.render_codex_task_yaml(job.spec)
+            return self.provider.render_remote_agent_task_yaml(job.spec)
         if job.kind == JobKind.MCP_CALL and isinstance(job.spec, McpCallSpec):
             return self.provider.render_mcp_call_yaml(job.spec)
         raise ConfigurationError(f"job kind/spec mismatch for {job.job_id}")
 
     @contextmanager
-    def _single_ares_worker_lock(self) -> Generator[None]:
-        lock_path = self.settings.core_dir / "ares-worker.lock"
+    def _single_cluster_worker_lock(self) -> Generator[None]:
+        lock_path = self.settings.core_dir / f"{self.cluster}-worker.lock"
         lock = FileLock(str(lock_path), timeout=0)
         try:
             lock.acquire()
         except Timeout as exc:
-            raise ConfigurationError("another Ares endpoint worker is already active") from exc
+            raise ConfigurationError(
+                f"another {self.cluster} endpoint worker is already active"
+            ) from exc
         try:
             yield
         finally:
             lock.release()
 
 
-def bootstrap_ares(settings: RelaySettings) -> None:
-    """Create Ares endpoint directories and verify required executables are configured."""
+def bootstrap_cluster_environment(settings: RelaySettings) -> None:
+    """Create endpoint directories and verify required executables are configured."""
     settings.core_dir.mkdir(parents=True, exist_ok=True)
     settings.spool_dir.mkdir(parents=True, exist_ok=True)
     queue = ClioCoreQueue(settings.core_dir)
     queue.initialize()
-    provider = JarvisCdProvider(jarvis_bin=settings.jarvis_bin, codex_bin=settings.codex_bin)
+    provider = JarvisCdProvider(jarvis_bin=settings.jarvis_bin, agent_bin=settings.agent_bin)
     provider.require_available()
     if settings.frps_addr is None or settings.frp_token is None:
         raise ConfigurationError("CLIO_RELAY_FRPS_ADDR and CLIO_RELAY_FRP_TOKEN are required")

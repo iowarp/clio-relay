@@ -44,8 +44,12 @@ def test_lease_survives_restart_without_duplicate_execution(tmp_path: Path) -> N
         )
     )
 
-    lease = queue.acquire_next_job("endpoint-1", ttl_seconds=60)
-    duplicate = ClioCoreQueue(tmp_path).acquire_next_job("endpoint-2", ttl_seconds=60)
+    lease = queue.acquire_next_job("endpoint-1", cluster="ares", ttl_seconds=60)
+    duplicate = ClioCoreQueue(tmp_path).acquire_next_job(
+        "endpoint-2",
+        cluster="homelab",
+        ttl_seconds=60,
+    )
 
     assert lease is not None
     assert duplicate is None

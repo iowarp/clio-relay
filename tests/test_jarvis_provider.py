@@ -22,9 +22,9 @@ def test_bounded_command_yaml_generation() -> None:
     assert package["timeout_seconds"] == 30
 
 
-def test_codex_task_yaml_generation(tmp_path: Path) -> None:
-    provider = JarvisCdProvider(codex_bin="/opt/codex/bin/codex")
-    rendered = provider.render_codex_task_yaml(
+def test_remote_agent_task_yaml_generation(tmp_path: Path) -> None:
+    provider = JarvisCdProvider(agent_bin="/opt/agent/bin/current-agent")
+    rendered = provider.render_remote_agent_task_yaml(
         RemoteAgentTaskSpec(
             prompt_path=tmp_path / "prompt.md",
             mcp_config_path=tmp_path / "mcp.json",
@@ -33,8 +33,8 @@ def test_codex_task_yaml_generation(tmp_path: Path) -> None:
     document = yaml.safe_load(rendered)
 
     package = document["pkgs"][0]
-    assert package["pkg_type"] == "clio_relay.codex_agent"
-    assert package["codex_bin"] == "/opt/codex/bin/codex"
+    assert package["pkg_type"] == "clio_relay.remote_agent"
+    assert package["agent_bin"] == "/opt/agent/bin/current-agent"
     assert package["prompt_path"].endswith("prompt.md")
 
 

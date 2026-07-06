@@ -1,8 +1,8 @@
-name: clio-relay.codex-agent
-description: Execute a Codex remote-agent task under JARVIS-CD.
+name: clio-relay.remote-agent
+description: Execute a configured remote-agent task under JARVIS-CD.
 script: run.py
 parameters:
-  codex_bin:
+  agent_bin:
     type: string
     required: true
   prompt_path:

@@ -1,4 +1,4 @@
-"""JARVIS-CD package for Codex agent tasks."""
+"""JARVIS-CD package for remote agent tasks."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from typing import Any
 from jarvis_cd.core.pkg import Application
 
 
-class CodexAgent(Application):
-    """Run Codex against a prompt and MCP config on Ares."""
+class RemoteAgent(Application):
+    """Run a configured agent binary against a prompt and MCP config."""
 
     def _init(self) -> None:
         """Initialize package state."""
@@ -24,12 +24,14 @@ class CodexAgent(Application):
         self.config.update(kwargs)
 
     def start(self) -> None:
-        """Run Codex."""
-        codex_bin = str(self.config.get("codex_bin", "codex"))
+        """Run the configured agent binary."""
+        if "agent_bin" not in self.config:
+            raise ValueError("agent_bin is required")
+        agent_bin = str(self.config["agent_bin"])
         prompt_path = Path(str(self.config["prompt_path"]))
         mcp_config_path = Path(str(self.config["mcp_config_path"]))
         command = [
-            codex_bin,
+            agent_bin,
             "--mcp-config",
             str(mcp_config_path),
             "exec",
@@ -44,10 +46,10 @@ class CodexAgent(Application):
         timeout = int(timeout_value) if timeout_value is not None else None
         result = subprocess.run(command, cwd=workdir, timeout=timeout, check=False)
         if result.returncode != 0:
-            raise RuntimeError(f"codex failed with exit code {result.returncode}")
+            raise RuntimeError(f"agent failed with exit code {result.returncode}")
 
     def stop(self) -> None:
-        """Stop hook for Codex tasks."""
+        """Stop hook for remote agent tasks."""
 
     def clean(self) -> None:
-        """Clean hook for Codex tasks."""
+        """Clean hook for remote agent tasks."""

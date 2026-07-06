@@ -21,9 +21,9 @@ from clio_relay.models import JarvisRunSpec, McpCallSpec, RemoteAgentTaskSpec
 class JarvisCdProvider:
     """Materialize and invoke relay jobs through JARVIS-CD."""
 
-    def __init__(self, *, jarvis_bin: str = "jarvis", codex_bin: str = "codex") -> None:
+    def __init__(self, *, jarvis_bin: str = "jarvis", agent_bin: str = "codex") -> None:
         self.jarvis_bin = jarvis_bin
-        self.codex_bin = codex_bin
+        self.agent_bin = agent_bin
 
     def require_available(self) -> None:
         """Raise if the configured JARVIS executable is unavailable."""
@@ -55,15 +55,15 @@ class JarvisCdProvider:
         }
         return yaml.safe_dump(_drop_none(document), sort_keys=False)
 
-    def render_codex_task_yaml(self, spec: RemoteAgentTaskSpec) -> str:
-        """Render a JARVIS pipeline for a remote Codex agent task."""
+    def render_remote_agent_task_yaml(self, spec: RemoteAgentTaskSpec) -> str:
+        """Render a JARVIS pipeline for a remote agent task."""
         document: dict[str, Any] = {
-            "name": "clio-relay-codex-agent",
+            "name": "clio-relay-remote-agent",
             "pkgs": [
                 {
-                    "pkg_type": "clio_relay.codex_agent",
-                    "pkg_name": "codex_agent",
-                    "codex_bin": self.codex_bin,
+                    "pkg_type": "clio_relay.remote_agent",
+                    "pkg_name": "remote_agent",
+                    "agent_bin": self.agent_bin,
                     "prompt_path": str(spec.prompt_path),
                     "mcp_config_path": str(spec.mcp_config_path),
                     "model": spec.model,
