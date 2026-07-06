@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 
+from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
-from clio_relay.errors import ConfigurationError
+from clio_relay.errors import ConfigurationError, RelayError
 
 
 def check_required_binary(name: str, value: str) -> str:
@@ -29,6 +31,34 @@ def run_doctor(settings: RelaySettings, *, live: bool = False) -> list[str]:
             raise ConfigurationError("CLIO_RELAY_FRP_TOKEN is required for live checks")
         lines.append(f"frps_addr: {settings.frps_addr}")
         lines.append(check_required_binary("frpc", settings.frpc_bin))
-        lines.append(check_required_binary("jarvis", settings.jarvis_bin))
-        lines.append(check_required_binary("agent", settings.agent_bin))
     return lines
+
+
+def run_cluster_doctor(definition: ClusterDefinition) -> list[str]:
+    """Run live cluster-side checks over SSH and return status lines."""
+    script = f"""set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+echo "cluster: {definition.name}"
+echo "ssh_host: {definition.ssh_host}"
+echo "frpc=$(frpc --version)"
+echo "frps=$(frps --version)"
+echo "jarvis=$(jarvis --help | head -n 1)"
+AGENT_BIN="${{CLIO_RELAY_AGENT_BIN:-$HOME/.local/bin/{definition.agent_npm_bin}}}"
+if [ ! -x "$AGENT_BIN" ]; then
+  AGENT_BIN="$(command -v {definition.agent_npm_bin})"
+fi
+echo "agent=$("$AGENT_BIN" --version)"
+echo "clio_relay=$(clio-relay --help | head -n 1)"
+"""
+    result = subprocess.run(
+        ["ssh", definition.ssh_host, "bash", "-s"],
+        input=script.encode("utf-8"),
+        capture_output=True,
+        check=False,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+    if result.returncode != 0:
+        detail = stderr.strip() or stdout.strip()
+        raise RelayError(f"cluster doctor failed for {definition.name}: {detail}")
+    return stdout.splitlines()

@@ -18,7 +18,7 @@ from clio_relay.deployment import (
     render_endpoint_user_service,
     write_endpoint_user_service,
 )
-from clio_relay.doctor import run_doctor
+from clio_relay.doctor import run_cluster_doctor, run_doctor
 from clio_relay.endpoint import EndpointWorker
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.models import (
@@ -341,8 +341,13 @@ def doctor(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
 ) -> None:
     """Check local or live cluster configuration."""
-    _require_cluster(cluster)
-    _run_or_exit(lambda: _echo_lines(run_doctor(RelaySettings.from_env(), live=True)))
+    definition = _require_cluster(cluster)
+
+    def _run() -> None:
+        _echo_lines(run_doctor(RelaySettings.from_env(), live=True))
+        _echo_lines(run_cluster_doctor(definition))
+
+    _run_or_exit(_run)
 
 
 @app.command("live-test")
@@ -350,8 +355,13 @@ def live_test(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
 ) -> None:
     """Run live acceptance preflight checks for a configured cluster."""
-    _require_cluster(cluster)
-    _run_or_exit(lambda: _echo_lines(run_doctor(RelaySettings.from_env(), live=True)))
+    definition = _require_cluster(cluster)
+
+    def _run() -> None:
+        _echo_lines(run_doctor(RelaySettings.from_env(), live=True))
+        _echo_lines(run_cluster_doctor(definition))
+
+    _run_or_exit(_run)
     typer.echo("live preflight passed; submit a JARVIS smoke job to complete acceptance")
 
 
