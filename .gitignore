@@ -1,0 +1,10 @@
+.venv/
+.ruff_cache/
+.pytest_cache/
+.pyright/
+__pycache__/
+*.pyc
+.clio-relay/
+dist/
+build/
+*.egg-info/

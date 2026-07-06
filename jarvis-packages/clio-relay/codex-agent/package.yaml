@@ -1,0 +1,22 @@
+name: clio-relay.codex-agent
+description: Execute a Codex remote-agent task under JARVIS-CD.
+script: run.py
+parameters:
+  codex_bin:
+    type: string
+    required: true
+  prompt_path:
+    type: string
+    required: true
+  mcp_config_path:
+    type: string
+    required: true
+  model:
+    type: string
+    required: false
+  workdir:
+    type: string
+    required: false
+  timeout_seconds:
+    type: integer
+    required: false
