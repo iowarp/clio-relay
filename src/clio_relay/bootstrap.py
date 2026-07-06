@@ -89,6 +89,10 @@ if [ ! -x "$HOME/.local/bin/uv" ]; then
 fi
 uv python install 3.12
 
+if [ ! -x "$HOME/.local/bin/codex" ] && command -v npm >/dev/null 2>&1; then
+  npm install -g @openai/codex
+fi
+
 JARVIS_VENV="$HOME/.local/share/clio-relay/jarvis-venv"
 python3 -m venv "$JARVIS_VENV"
 . "$JARVIS_VENV/bin/activate"
@@ -132,10 +136,14 @@ CLIO_RELAY_CORE_DIR="$HOME/.local/share/clio-relay/core" \
 CLIO_RELAY_SPOOL_DIR="$HOME/.local/share/clio-relay/spool" \
 CLIO_RELAY_JARVIS_BIN="$HOME/.local/bin/jarvis" \
 CLIO_RELAY_FRPC_BIN="$HOME/.local/bin/frpc" \
+CLIO_RELAY_CODEX_BIN="$HOME/.local/bin/codex" \
 clio-relay init
 
 echo "frpc=$("$HOME/.local/bin/frpc" --version)"
 echo "frps=$("$HOME/.local/bin/frps" --version)"
+if [ -x "$HOME/.local/bin/codex" ]; then
+  echo "codex=$("$HOME/.local/bin/codex" --version)"
+fi
 echo "jarvis=$("$HOME/.local/bin/jarvis" --help | head -n 1)"
 echo "relay=$(clio-relay --help | head -n 1)"
 """

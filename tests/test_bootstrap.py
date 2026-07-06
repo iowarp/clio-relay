@@ -9,6 +9,7 @@ def test_ares_bootstrap_script_installs_required_components() -> None:
     assert 'FRP_VERSION="0.69.1"' in script
     assert 'ARCHIVE="frp_${FRP_VERSION}_linux_amd64.tar.gz"' in script
     assert "uv python install 3.12" in script
+    assert "npm install -g @openai/codex" in script
     assert "github.com/grc-iit/jarvis-cd.git" in script
     assert 'jarvis repo add "$DEST/jarvis-packages/clio_relay" --force true' in script
     assert "CLIO_RELAY_CORE_DIR" in script
