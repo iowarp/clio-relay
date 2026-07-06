@@ -42,15 +42,14 @@ class JarvisCdProvider:
             )
         document: dict[str, Any] = {
             "name": spec.package or "clio-relay-bounded-command",
-            "packages": [
+            "pkgs": [
                 {
-                    "name": "clio-relay.bounded-command",
-                    "parameters": {
-                        "command": spec.command,
-                        "workdir": str(spec.workdir) if spec.workdir is not None else None,
-                        "env": spec.env,
-                        "timeout_seconds": spec.timeout_seconds,
-                    },
+                    "pkg_type": "clio_relay.bounded_command",
+                    "pkg_name": "bounded_command",
+                    "command": spec.command,
+                    "workdir": str(spec.workdir) if spec.workdir is not None else None,
+                    "env": spec.env,
+                    "timeout_seconds": spec.timeout_seconds,
                 }
             ],
         }
@@ -60,17 +59,16 @@ class JarvisCdProvider:
         """Render a JARVIS pipeline for a remote Codex agent task."""
         document: dict[str, Any] = {
             "name": "clio-relay-codex-agent",
-            "packages": [
+            "pkgs": [
                 {
-                    "name": "clio-relay.codex-agent",
-                    "parameters": {
-                        "codex_bin": self.codex_bin,
-                        "prompt_path": str(spec.prompt_path),
-                        "mcp_config_path": str(spec.mcp_config_path),
-                        "model": spec.model,
-                        "workdir": str(spec.workdir) if spec.workdir is not None else None,
-                        "timeout_seconds": spec.timeout_seconds,
-                    },
+                    "pkg_type": "clio_relay.codex_agent",
+                    "pkg_name": "codex_agent",
+                    "codex_bin": self.codex_bin,
+                    "prompt_path": str(spec.prompt_path),
+                    "mcp_config_path": str(spec.mcp_config_path),
+                    "model": spec.model,
+                    "workdir": str(spec.workdir) if spec.workdir is not None else None,
+                    "timeout_seconds": spec.timeout_seconds,
                 }
             ],
         }
@@ -80,15 +78,14 @@ class JarvisCdProvider:
         """Render a JARVIS pipeline for a remote MCP tool call."""
         document: dict[str, Any] = {
             "name": "clio-relay-mcp-call",
-            "packages": [
+            "pkgs": [
                 {
-                    "name": "clio-relay.mcp-call",
-                    "parameters": {
-                        "server": spec.server,
-                        "tool": spec.tool,
-                        "arguments": spec.arguments,
-                        "timeout_seconds": spec.timeout_seconds,
-                    },
+                    "pkg_type": "clio_relay.mcp_call",
+                    "pkg_name": "mcp_call",
+                    "server": spec.server,
+                    "tool": spec.tool,
+                    "arguments": spec.arguments,
+                    "timeout_seconds": spec.timeout_seconds,
                 }
             ],
         }
@@ -108,7 +105,7 @@ class JarvisCdProvider:
     ) -> subprocess.CompletedProcess[str]:
         """Invoke JARVIS-CD for an already materialized pipeline."""
         self.require_available()
-        command = [self.jarvis_bin, "pipeline", "run", str(pipeline_path)]
+        command = [self.jarvis_bin, "ppl", "run", "yaml", str(pipeline_path)]
         try:
             return subprocess.run(
                 command,

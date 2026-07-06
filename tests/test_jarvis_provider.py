@@ -15,11 +15,11 @@ def test_bounded_command_yaml_generation() -> None:
     )
     document = yaml.safe_load(rendered)
 
-    package = document["packages"][0]
-    assert package["name"] == "clio-relay.bounded-command"
-    assert package["parameters"]["command"] == ["python", "-V"]
-    assert package["parameters"]["env"] == {"A": "B"}
-    assert package["parameters"]["timeout_seconds"] == 30
+    package = document["pkgs"][0]
+    assert package["pkg_type"] == "clio_relay.bounded_command"
+    assert package["command"] == ["python", "-V"]
+    assert package["env"] == {"A": "B"}
+    assert package["timeout_seconds"] == 30
 
 
 def test_codex_task_yaml_generation(tmp_path: Path) -> None:
@@ -32,10 +32,10 @@ def test_codex_task_yaml_generation(tmp_path: Path) -> None:
     )
     document = yaml.safe_load(rendered)
 
-    package = document["packages"][0]
-    assert package["name"] == "clio-relay.codex-agent"
-    assert package["parameters"]["codex_bin"] == "/opt/codex/bin/codex"
-    assert package["parameters"]["prompt_path"].endswith("prompt.md")
+    package = document["pkgs"][0]
+    assert package["pkg_type"] == "clio_relay.codex_agent"
+    assert package["codex_bin"] == "/opt/codex/bin/codex"
+    assert package["prompt_path"].endswith("prompt.md")
 
 
 def test_mcp_call_yaml_generation() -> None:
@@ -45,8 +45,8 @@ def test_mcp_call_yaml_generation() -> None:
     )
     document = yaml.safe_load(rendered)
 
-    package = document["packages"][0]
-    assert package["name"] == "clio-relay.mcp-call"
-    assert package["parameters"]["server"] == "science"
-    assert package["parameters"]["tool"] == "inspect"
-    assert package["parameters"]["arguments"] == {"path": "x"}
+    package = document["pkgs"][0]
+    assert package["pkg_type"] == "clio_relay.mcp_call"
+    assert package["server"] == "science"
+    assert package["tool"] == "inspect"
+    assert package["arguments"] == {"path": "x"}

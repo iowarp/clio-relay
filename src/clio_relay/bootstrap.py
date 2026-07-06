@@ -126,6 +126,7 @@ jarvis init \
   "$HOME/.local/share/clio-relay/jarvis-config" \
   "$HOME/.local/share/clio-relay/jarvis-private" \
   "$HOME/.local/share/clio-relay/jarvis-shared" || true
+jarvis repo add "$DEST/jarvis-packages/clio_relay" --force
 
 CLIO_RELAY_CORE_DIR="$HOME/.local/share/clio-relay/core" \
 CLIO_RELAY_SPOOL_DIR="$HOME/.local/share/clio-relay/spool" \

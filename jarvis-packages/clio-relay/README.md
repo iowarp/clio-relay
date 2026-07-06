@@ -1,6 +1,9 @@
 # clio-relay JARVIS packages
 
-These packages are the relay-owned execution shims referenced by generated JARVIS-CD pipelines.
+These scripts are legacy standalone shims. The JARVIS-CD package repository registered by
+`clio-relay ares bootstrap --ssh-host ares` is `jarvis-packages/clio_relay`.
+
+The registered packages are the relay-owned execution shims referenced by generated JARVIS-CD pipelines.
 
 They are intentionally narrow:
 
