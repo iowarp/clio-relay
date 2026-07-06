@@ -90,10 +90,11 @@ def _remote_install_script(
         'echo linger=$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)\n'
         f"systemctl --user --no-pager --full status {shlex.quote(service_name)} || true\n"
     )
-    return f"""set -euo pipefail
+    script = f"""set -euo pipefail
 mkdir -p "$HOME/.config/systemd/user"
 printf '%s' {service_literal} > "$HOME/.config/systemd/user/{service_name}"
 {command}"""
+    return script.replace("\r\n", "\n")
 
 
 def write_endpoint_user_service(path: Path, service_text: str) -> Path:
