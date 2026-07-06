@@ -89,7 +89,9 @@ def _remote_install_script(
     command += (
         "echo user_systemd=$(systemctl --user is-system-running || true)\n"
         'echo linger=$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)\n'
-        f"systemctl --user --no-pager --full status {shlex.quote(service_name)} || true\n"
+        "export SYSTEMD_COLORS=0 LANG=C LC_ALL=C\n"
+        f"systemctl --user --no-pager --plain --full status "
+        f"{shlex.quote(service_name)} || true\n"
     )
     script = f"""set -euo pipefail
 mkdir -p "$HOME/.config/systemd/user"
