@@ -11,6 +11,12 @@ from typing import Any, TextIO, cast
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.models import Cursor, JarvisRunSpec, JobKind, RelayJob
+from clio_relay.relay_ops import (
+    monitor_job,
+    read_artifact_bytes,
+    read_job_log,
+    wait_for_terminal,
+)
 
 JSON = dict[str, Any]
 
@@ -33,14 +39,19 @@ def serve_stdio(
         except JSONDecodeError as exc:
             response = _error(None, -32700, f"parse error: {exc.msg}")
         else:
-            response = handle_request(request, queue=queue)
+            response = handle_request(request, queue=queue, settings=resolved)
         if response is None:
             continue
         stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
         stdout.flush()
 
 
-def handle_request(request: JSON, *, queue: ClioCoreQueue) -> JSON | None:
+def handle_request(
+    request: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings | None = None,
+) -> JSON | None:
     """Handle one JSON-RPC MCP request."""
     request_id = request.get("id")
     method = request.get("method")
@@ -53,7 +64,7 @@ def handle_request(request: JSON, *, queue: ClioCoreQueue) -> JSON | None:
             result = {"tools": _tool_definitions()}
         elif method == "tools/call":
             params = _object(request.get("params"))
-            result = _call_tool(params, queue=queue)
+            result = _call_tool(params, queue=queue, settings=settings or RelaySettings.from_env())
         else:
             return _error(request_id, -32601, f"unknown method: {method}")
     except Exception as exc:
@@ -100,6 +111,9 @@ def _tool_definitions() -> list[JSON]:
                     "cluster": {"type": "string"},
                     "pipeline_yaml": {"type": "string"},
                     "idempotency_key": {"type": "string"},
+                    "wait_for_terminal": {"type": "boolean", "default": False},
+                    "timeout_seconds": {"type": "number", "default": 600},
+                    "poll_seconds": {"type": "number", "default": 2},
                 },
                 "required": ["cluster", "pipeline_yaml"],
                 "additionalProperties": False,
@@ -111,6 +125,20 @@ def _tool_definitions() -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_monitor_job",
+            "description": "Read job state and event stream data from a cursor.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"},
+                    "cursor": {"type": "integer", "default": 1, "minimum": 1},
+                    "limit": {"type": "integer", "default": 100, "minimum": 1},
+                },
                 "required": ["job_id"],
                 "additionalProperties": False,
             },
@@ -129,16 +157,58 @@ def _tool_definitions() -> list[JSON]:
                 "additionalProperties": False,
             },
         },
+        {
+            "name": "relay_read_job_log",
+            "description": "Read stdout or stderr text from a job log by byte offset.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"},
+                    "stream": {"type": "string", "enum": ["stdout", "stderr"]},
+                    "offset": {"type": "integer", "default": 0, "minimum": 0},
+                    "limit": {"type": "integer", "default": 65536, "minimum": 1},
+                },
+                "required": ["job_id", "stream"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_list_artifacts",
+            "description": "List artifact references indexed for a job.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_read_artifact",
+            "description": "Read a file artifact payload as base64.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"artifact_id": {"type": "string"}},
+                "required": ["artifact_id"],
+                "additionalProperties": False,
+            },
+        },
     ]
 
 
-def _call_tool(params: JSON, *, queue: ClioCoreQueue) -> JSON:
+def _call_tool(params: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -> JSON:
     name = _required_str(params, "name")
     arguments = _object(params.get("arguments", {}))
     if name == "relay_submit_jarvis_pipeline":
         result = _submit_jarvis_pipeline(arguments, queue=queue)
     elif name == "relay_get_job":
         result = queue.get_job(_required_str(arguments, "job_id")).model_dump(mode="json")
+    elif name == "relay_monitor_job":
+        result = monitor_job(
+            queue,
+            _required_str(arguments, "job_id"),
+            cursor=int(arguments.get("cursor", 1)),
+            limit=int(arguments.get("limit", 100)),
+        )
     elif name == "relay_watch_job_events":
         events, cursor = queue.drain_events(
             Cursor(
@@ -151,6 +221,27 @@ def _call_tool(params: JSON, *, queue: ClioCoreQueue) -> JSON:
             "events": [event.model_dump(mode="json") for event in events],
             "next_cursor": cursor.next_seq,
         }
+    elif name == "relay_read_job_log":
+        job = queue.get_job(_required_str(arguments, "job_id"))
+        stream = _required_str(arguments, "stream")
+        if stream not in {"stdout", "stderr"}:
+            raise ValueError("stream must be stdout or stderr")
+        result = read_job_log(
+            settings,
+            job,
+            stream_name="stdout" if stream == "stdout" else "stderr",
+            offset=int(arguments.get("offset", 0)),
+            limit=int(arguments.get("limit", 65536)),
+        )
+    elif name == "relay_list_artifacts":
+        result = {
+            "artifacts": [
+                artifact.model_dump(mode="json")
+                for artifact in queue.list_artifacts(_required_str(arguments, "job_id"))
+            ]
+        }
+    elif name == "relay_read_artifact":
+        result = read_artifact_bytes(queue, _required_str(arguments, "artifact_id"))
     else:
         raise ValueError(f"unknown tool: {name}")
     return {
@@ -173,7 +264,19 @@ def _submit_jarvis_pipeline(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
             idempotency_key=idempotency_key,
         )
     )
-    return {"job_id": job.job_id, "state": job.state.value, "kind": job.kind.value}
+    if bool(arguments.get("wait_for_terminal", False)):
+        job = wait_for_terminal(
+            queue,
+            job.job_id,
+            timeout_seconds=float(arguments.get("timeout_seconds", 600)),
+            poll_seconds=float(arguments.get("poll_seconds", 2)),
+        )
+    return {
+        "job_id": job.job_id,
+        "state": job.state.value,
+        "kind": job.kind.value,
+        "terminal": job.state.value in {"succeeded", "failed", "canceled"},
+    }
 
 
 def _object(value: Any) -> JSON:

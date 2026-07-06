@@ -7,7 +7,7 @@ from pathlib import Path
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.mcp_server import handle_request, render_codex_mcp_profile, serve_stdio
-from clio_relay.models import JarvisRunSpec, JobKind
+from clio_relay.models import ArtifactRef, JarvisRunSpec, JobKind, RelayJob
 
 
 def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
@@ -22,7 +22,11 @@ def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
     tool_names = {tool["name"] for tool in response["result"]["tools"]}
     assert "relay_submit_jarvis_pipeline" in tool_names
     assert "relay_get_job" in tool_names
+    assert "relay_monitor_job" in tool_names
     assert "relay_watch_job_events" in tool_names
+    assert "relay_read_job_log" in tool_names
+    assert "relay_list_artifacts" in tool_names
+    assert "relay_read_artifact" in tool_names
 
 
 def test_mcp_submit_jarvis_pipeline_creates_real_job(tmp_path: Path) -> None:
@@ -120,6 +124,46 @@ def test_mcp_watch_events_returns_cursor(tmp_path: Path) -> None:
     assert structured["next_cursor"] == 2
 
 
+def test_mcp_monitor_returns_job_and_events(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    submit_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_submit_jarvis_pipeline",
+                "arguments": {
+                    "cluster": "test-cluster",
+                    "pipeline_yaml": "name: generic\npkgs: []\n",
+                },
+            },
+        },
+        queue=queue,
+    )
+    assert submit_response is not None
+    job_id = submit_response["result"]["structuredContent"]["job_id"]
+
+    monitor_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_monitor_job",
+                "arguments": {"job_id": job_id, "cursor": 1},
+            },
+        },
+        queue=queue,
+    )
+
+    assert monitor_response is not None
+    structured = monitor_response["result"]["structuredContent"]
+    assert structured["job"]["job_id"] == job_id
+    assert structured["events"][0]["event_type"] == "job.queued"
+    assert structured["terminal"] is False
+
+
 def test_codex_mcp_profile_points_to_clio_relay_server() -> None:
     rendered = render_codex_mcp_profile(
         settings=RelaySettings(core_dir=Path("/tmp/core"), spool_dir=Path("/tmp/spool"))
@@ -156,6 +200,77 @@ def test_mcp_response_content_is_json(tmp_path: Path) -> None:
     assert response is not None
     text = response["result"]["content"][0]["text"]
     assert json.loads(text)["state"] == "queued"
+
+
+def test_mcp_reads_logs_and_artifacts(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="log-artifact",
+        )
+    )
+    spool = settings.spool_dir / job.job_id
+    spool.mkdir(parents=True)
+    stdout_path = spool / "stdout.log"
+    stdout_path.write_text("hello world\n", encoding="utf-8")
+    artifact = queue.append_artifact(
+        ArtifactRef(job_id=job.job_id, uri=stdout_path.as_uri(), kind="stdout")
+    )
+
+    log_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_read_job_log",
+                "arguments": {"job_id": job.job_id, "stream": "stdout", "offset": 0, "limit": 5},
+            },
+        },
+        queue=queue,
+        settings=settings,
+    )
+    list_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_list_artifacts",
+                "arguments": {"job_id": job.job_id},
+            },
+        },
+        queue=queue,
+        settings=settings,
+    )
+    content_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_read_artifact",
+                "arguments": {"artifact_id": artifact.artifact_id},
+            },
+        },
+        queue=queue,
+        settings=settings,
+    )
+
+    assert log_response is not None
+    assert log_response["result"]["structuredContent"]["text"] == "hello"
+    assert log_response["result"]["structuredContent"]["next_offset"] == 5
+    assert list_response is not None
+    assert (
+        list_response["result"]["structuredContent"]["artifacts"][0]["artifact_id"]
+        == artifact.artifact_id
+    )
+    assert content_response is not None
+    assert content_response["result"]["structuredContent"]["encoding"] == "base64"
 
 
 def test_stdio_server_reports_parse_errors(tmp_path: Path) -> None:

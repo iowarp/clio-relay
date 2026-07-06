@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated
@@ -40,6 +41,7 @@ from clio_relay.relay_host import (
     render_frpc_config,
     render_frps_config,
 )
+from clio_relay.relay_ops import monitor_job, read_artifact_bytes, read_job_log, wait_for_terminal
 
 app = typer.Typer(no_args_is_help=True)
 endpoint_app = typer.Typer(no_args_is_help=True)
@@ -313,6 +315,73 @@ def job_watch(
     for event in events:
         typer.echo(f"{event.seq} {event.created_at.isoformat()} {event.event_type} {event.message}")
     typer.echo(f"next_cursor={next_cursor.next_seq}")
+
+
+@job_app.command("monitor")
+def job_monitor(
+    job_id: str,
+    cursor: Annotated[int, typer.Option(help="First event sequence to read.")] = 1,
+    limit: Annotated[int, typer.Option(help="Maximum events to read.")] = 100,
+) -> None:
+    """Read job state and event stream data from a cursor as JSON."""
+    result = monitor_job(
+        ClioCoreQueue(RelaySettings.from_env().core_dir),
+        job_id,
+        cursor=cursor,
+        limit=limit,
+    )
+    typer.echo(json.dumps(result, indent=2))
+
+
+@job_app.command("wait")
+def job_wait(
+    job_id: str,
+    timeout_seconds: Annotated[
+        float,
+        typer.Option(help="Maximum seconds to wait for terminal state."),
+    ] = 600,
+    poll_seconds: Annotated[float, typer.Option(help="Polling interval.")] = 2,
+) -> None:
+    """Wait until a job reaches terminal state."""
+    queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+    job = wait_for_terminal(
+        queue,
+        job_id,
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
+    )
+    typer.echo(job.model_dump_json(indent=2))
+
+
+@job_app.command("read-log")
+def job_read_log(
+    job_id: str,
+    stream: Annotated[str, typer.Option(help="stdout or stderr.")],
+    offset: Annotated[int, typer.Option(help="Byte offset.")] = 0,
+    limit: Annotated[int, typer.Option(help="Maximum bytes.")] = 65536,
+) -> None:
+    """Read stdout or stderr from a job log by byte offset."""
+    settings = RelaySettings.from_env()
+    queue = ClioCoreQueue(settings.core_dir)
+    if stream not in {"stdout", "stderr"}:
+        raise typer.BadParameter("--stream must be stdout or stderr")
+    result = read_job_log(
+        settings,
+        queue.get_job(job_id),
+        stream_name="stdout" if stream == "stdout" else "stderr",
+        offset=offset,
+        limit=limit,
+    )
+    typer.echo(json.dumps(result, indent=2))
+
+
+@job_app.command("read-artifact")
+def job_read_artifact(
+    artifact_id: str,
+) -> None:
+    """Read an artifact payload as base64 JSON."""
+    result = read_artifact_bytes(ClioCoreQueue(RelaySettings.from_env().core_dir), artifact_id)
+    typer.echo(json.dumps(result, indent=2))
 
 
 @job_app.command("cancel")

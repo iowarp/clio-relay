@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -130,6 +132,53 @@ class JarvisCdProvider:
         except OSError as exc:
             raise RelayError(f"failed to execute JARVIS-CD: {exc}") from exc
 
+    def run_pipeline_streaming(
+        self,
+        pipeline_path: Path,
+        *,
+        cwd: Path | None = None,
+        on_stdout: Callable[[str], None] | None = None,
+        on_stderr: Callable[[str], None] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Invoke JARVIS-CD and stream output chunks while retaining final output."""
+        self.require_available()
+        command = [self.jarvis_bin, "ppl", "run", "yaml", str(pipeline_path)]
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=1,
+            )
+        except OSError as exc:
+            raise RelayError(f"failed to execute JARVIS-CD: {exc}") from exc
+
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        stdout_thread = threading.Thread(
+            target=_drain_stream,
+            args=(process.stdout, stdout_chunks, on_stdout),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=_drain_stream,
+            args=(process.stderr, stderr_chunks, on_stderr),
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+        return_code = process.wait()
+        stdout_thread.join()
+        stderr_thread.join()
+        return subprocess.CompletedProcess(
+            command,
+            return_code,
+            stdout="".join(stdout_chunks),
+            stderr="".join(stderr_chunks),
+        )
+
 
 def _drop_none(value: Any) -> Any:
     if isinstance(value, dict):
@@ -139,3 +188,16 @@ def _drop_none(value: Any) -> Any:
         typed_list = cast(list[Any], value)
         return [_drop_none(item) for item in typed_list]
     return value
+
+
+def _drain_stream(
+    stream: Any,
+    chunks: list[str],
+    callback: Callable[[str], None] | None,
+) -> None:
+    if stream is None:
+        return
+    for chunk in stream:
+        chunks.append(chunk)
+        if callback is not None:
+            callback(chunk)

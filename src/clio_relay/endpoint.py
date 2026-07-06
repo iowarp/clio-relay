@@ -95,9 +95,18 @@ class EndpointWorker:
         yaml_text = self._render_job_yaml(job)
         pipeline_path = spool.write_pipeline(yaml_text)
         self.queue.append_artifact(spool.artifact_for(pipeline_path, kind="jarvis_pipeline"))
-        result = self.provider.run_pipeline(pipeline_path, cwd=spool.path)
-        spool.append_stdout(result.stdout)
-        spool.append_stderr(result.stderr)
+        self.queue.append_event(
+            job.job_id,
+            "jarvis.started",
+            "JARVIS-CD pipeline started",
+            payload={"pipeline": str(pipeline_path)},
+        )
+        result = self.provider.run_pipeline_streaming(
+            pipeline_path,
+            cwd=spool.path,
+            on_stdout=lambda text: self._append_output(job, spool, "stdout", text),
+            on_stderr=lambda text: self._append_output(job, spool, "stderr", text),
+        )
         self.queue.append_artifact(spool.artifact_for(spool.path / "stdout.log", kind="stdout"))
         self.queue.append_artifact(spool.artifact_for(spool.path / "stderr.log", kind="stderr"))
         if result.returncode == 0:
@@ -122,6 +131,24 @@ class EndpointWorker:
         if job.kind == JobKind.MCP_CALL and isinstance(job.spec, McpCallSpec):
             return self.provider.render_mcp_call_yaml(job.spec)
         raise ConfigurationError(f"job kind/spec mismatch for {job.job_id}")
+
+    def _append_output(
+        self,
+        job: RelayJob,
+        spool: JobSpool,
+        stream_name: str,
+        text: str,
+    ) -> None:
+        if stream_name not in {"stdout", "stderr"}:
+            raise ConfigurationError(f"unsupported stream: {stream_name}")
+        typed_stream = "stdout" if stream_name == "stdout" else "stderr"
+        spool.append_log(typed_stream, text)
+        self.queue.append_event(
+            job.job_id,
+            f"{stream_name}.delta",
+            text.rstrip("\n") or f"{stream_name} output",
+            payload={"stream": stream_name, "text": text},
+        )
 
     @contextmanager
     def _single_cluster_worker_lock(self) -> Generator[None]:

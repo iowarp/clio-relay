@@ -229,6 +229,14 @@ class ClioCoreQueue:
             if artifact.job_id == job_id
         ]
 
+    def get_artifact(self, artifact_id: str) -> ArtifactRef:
+        """Return an artifact by id."""
+        path = self.root / "artifacts" / f"{artifact_id}.json"
+        artifact = self._read_optional(path, ArtifactRef)
+        if artifact is None:
+            raise NotFoundError(f"artifact not found: {artifact_id}")
+        return artifact
+
     def _append_event_unlocked(
         self,
         job_id: str,

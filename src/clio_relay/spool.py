@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import Literal
 
 from clio_relay.models import ArtifactRef, RelayJob
 
@@ -43,6 +44,33 @@ class JobSpool:
         """Append captured standard error."""
         with (self.path / "stderr.log").open("a", encoding="utf-8") as stream:
             stream.write(text)
+
+    def append_log(self, stream_name: Literal["stdout", "stderr"], text: str) -> None:
+        """Append captured output to a named job log."""
+        if stream_name == "stdout":
+            self.append_stdout(text)
+            return
+        self.append_stderr(text)
+
+    def read_log(
+        self,
+        stream_name: Literal["stdout", "stderr"],
+        *,
+        offset: int = 0,
+        limit: int = 65536,
+    ) -> tuple[str, int, bool]:
+        """Read a byte range from a named log and return text, next offset, and EOF."""
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        path = self.path / f"{stream_name}.log"
+        if not path.exists():
+            return "", offset, True
+        data = path.read_bytes()
+        chunk = data[offset : offset + limit]
+        next_offset = offset + len(chunk)
+        return chunk.decode("utf-8", errors="replace"), next_offset, next_offset >= len(data)
 
     def artifact_for(self, path: Path, *, kind: str) -> ArtifactRef:
         """Build an artifact reference for a spool-backed path."""
