@@ -18,7 +18,7 @@ def run_frpc_connection_check(
 ) -> list[str]:
     """Run frpc briefly and return status lines once login succeeds."""
     with tempfile.TemporaryDirectory(prefix="clio-relay-frpc-") as temp_dir:
-        config_path = Path(temp_dir) / "frpc.ini"
+        config_path = Path(temp_dir) / "frpc.toml"
         config_path.write_text(render_frpc_config(config), encoding="utf-8")
         try:
             result = subprocess.run(

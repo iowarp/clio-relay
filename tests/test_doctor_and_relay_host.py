@@ -27,8 +27,8 @@ def test_render_frps_config_has_no_application_state() -> None:
         )
     )
 
-    assert "bind_port = 7001" in rendered
-    assert "token = secret" in rendered
+    assert "bindPort = 7001" in rendered
+    assert 'auth.token = "secret"' in rendered
     assert "job" not in rendered.lower()
     assert "queue" not in rendered.lower()
 
@@ -45,10 +45,10 @@ def test_render_frpc_config_uses_configured_websocket_transport() -> None:
         )
     )
 
-    assert "server_addr = frps.jcernuda.com" in rendered
-    assert "server_port = 443" in rendered
-    assert "transport.protocol = wss" in rendered
-    assert "type = stcp" in rendered
+    assert 'serverAddr = "frps.jcernuda.com"' in rendered
+    assert "serverPort = 443" in rendered
+    assert 'transport.protocol = "wss"' in rendered
+    assert 'type = "stcp"' in rendered
 
 
 def test_live_doctor_requires_frps_address(tmp_path: Path) -> None:

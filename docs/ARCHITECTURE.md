@@ -4,6 +4,8 @@
 
 The relay host is only `frps` configuration. It has no queue, no job records, and no application logic. The frpc-to-frps transport protocol is deploy-time configuration. For the current Cloudflare-backed homelab path, use WebSocket/TLS (`wss`) over port 443. For a later VPS or institutional relay host with raw TCP, use `tcp` without changing endpoint semantics.
 
+In the Cloudflare-backed homelab deployment, Cloudflare terminates public HTTPS for `frps.jcernuda.com` and forwards to a local HTTP origin. A small nginx edge container owns that HTTP origin, forwards the frp WebSocket path `/~!frp` to `frps` on loopback, and exposes only a simple health endpoint otherwise. `frps` still remains a dumb byte relay: it has no CLIO queue state, no job state, and no application routing logic.
+
 The desktop endpoint submits configured-cluster work into the durable queue and exposes job, event, artifact, cancellation, remote-agent, and MCP-call surfaces for CLIO consumers.
 
 The worker endpoint leases queued jobs for one configured cluster, materializes relay intents into JARVIS-CD YAML, runs JARVIS-CD, and records progress, stdout, stderr, artifacts, and terminal state back into the queue.

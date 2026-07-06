@@ -29,13 +29,14 @@ class FrpsConfig:
 def render_frps_config(config: FrpsConfig) -> str:
     """Render an frps config that contains no application state."""
     lines = [
-        "[common]",
-        f"bind_port = {config.bind_port}",
-        f"token = {config.token}",
-        "tcp_mux = true",
+        'bindAddr = "0.0.0.0"',
+        f"bindPort = {config.bind_port}",
+        'auth.method = "token"',
+        f"auth.token = {_toml_string(config.token)}",
+        "transport.tcpMux = true",
     ]
     if config.dashboard_port is not None:
-        lines.append(f"dashboard_port = {config.dashboard_port}")
+        lines.append(f"webServer.port = {config.dashboard_port}")
     return "\n".join(lines) + "\n"
 
 
@@ -58,17 +59,23 @@ def render_frpc_config(config: FrpcConfig) -> str:
     if config.local_port <= 0:
         raise ConfigurationError("frpc local_port must be configured")
     lines = [
-        "[common]",
-        f"server_addr = {config.server_addr}",
-        f"server_port = {config.server_port}",
-        f"token = {config.token}",
-        f"transport.protocol = {config.transport_protocol.value}",
-        "tcp_mux = true",
+        f"serverAddr = {_toml_string(config.server_addr)}",
+        f"serverPort = {config.server_port}",
+        'auth.method = "token"',
+        f"auth.token = {_toml_string(config.token)}",
+        f"transport.protocol = {_toml_string(config.transport_protocol.value)}",
+        "transport.tcpMux = true",
         "",
-        f"[{config.proxy_name}]",
-        "type = stcp",
-        f"secret_key = {config.secret_key}",
-        f"local_ip = {config.local_ip}",
-        f"local_port = {config.local_port}",
+        "[[proxies]]",
+        f"name = {_toml_string(config.proxy_name)}",
+        'type = "stcp"',
+        f"secretKey = {_toml_string(config.secret_key)}",
+        f"localIP = {_toml_string(config.local_ip)}",
+        f"localPort = {config.local_port}",
     ]
     return "\n".join(lines) + "\n"
+
+
+def _toml_string(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'

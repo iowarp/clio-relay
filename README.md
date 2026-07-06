@@ -30,3 +30,9 @@ uv run clio-relay job watch <job-id>
 ```
 
 Live acceptance requires `CLIO_RELAY_CORE_DIR`, `CLIO_RELAY_FRPS_ADDR`, `CLIO_RELAY_FRP_TOKEN`, `jarvis`, `frpc`, and the target cluster shell environment used interactively.
+
+## Cloudflare-backed frps edge
+
+For homelab deployments behind Cloudflare Tunnel, publish `frps.jcernuda.com` to an HTTP origin such as `http://localhost:7000` and run nginx or another HTTP reverse proxy at that origin. The proxy should forward WebSocket requests for frp's default control path `/~!frp` to a loopback-only `frps` listener, for example `127.0.0.1:7001`.
+
+Endpoints then use `frpc` with `transport.protocol = "wss"` and `serverPort = 443`. This keeps client setup to normal relay config and leaves the Cloudflare-specific routing in homelab infrastructure. If a later relay host supports raw TCP directly, change the configured transport to `tcp` without changing queue, job, agent, or cluster semantics.
