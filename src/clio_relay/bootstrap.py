@@ -307,6 +307,10 @@ set -euo pipefail
 if command -v mpiexec.real >/dev/null 2>&1; then
   exec mpiexec.real "$@"
 fi
+if [ "${{1:-}}" = "--version" ] || [ "${{1:-}}" = "-version" ]; then
+  echo "mpich 4.0.0 clio-relay user-space wrapper"
+  exit 0
+fi
 ranks=""
 passthrough=()
 while [ "$#" -gt 0 ]; do
@@ -315,8 +319,17 @@ while [ "$#" -gt 0 ]; do
       ranks="${{2:-}}"
       shift 2
       ;;
-    -p|-f|--hostfile|-hostfile|--hosts|-hosts)
+    -p|-f|--hostfile|-hostfile|--hosts|-hosts|-ppn|-npernode)
       shift 2
+      ;;
+    -genv|--env)
+      shift 3
+      ;;
+    -x)
+      shift 2
+      ;;
+    --oversubscribe)
+      shift
       ;;
     --)
       shift
