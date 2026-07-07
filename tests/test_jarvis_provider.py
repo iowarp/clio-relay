@@ -99,7 +99,9 @@ def test_scheduled_pipeline_uses_waiting_scheduler_runner(tmp_path: Path) -> Non
 
     assert command[0] == str(bin_dir / "python")
     assert command[1] == "-c"
-    assert "wait=True" in command[2]
+    assert "sbatch" in command[2]
+    assert "--parsable" in command[2]
+    assert "scheduler_job_id=" in command[2]
     assert command[3] == str(pipeline)
 
 

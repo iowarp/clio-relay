@@ -25,17 +25,79 @@ from clio_relay.models import JarvisRunSpec, McpCallSpec, RemoteAgentTaskSpec
 _SCHEDULED_PIPELINE_RUNNER = """
 from __future__ import annotations
 
-import inspect
+import subprocess
 import sys
+import time
 
 from jarvis_cd.core.pipeline_test import load_yaml_auto
 
 _, obj = load_yaml_auto(sys.argv[1])
 submit = getattr(obj, "submit")
-if "wait" in inspect.signature(submit).parameters:
-    submit(submit=True, wait=True)
-else:
-    submit(submit=True)
+script_path = submit(submit=False)
+if script_path is None:
+    raise RuntimeError("Scheduled JARVIS object did not return a scheduler script path")
+
+submission = subprocess.run(
+    ["sbatch", "--parsable", str(script_path)],
+    capture_output=True,
+    text=True,
+    check=False,
+)
+if submission.stderr:
+    print(submission.stderr, file=sys.stderr, end="", flush=True)
+if submission.stdout:
+    print(submission.stdout, end="", flush=True)
+if submission.returncode != 0:
+    raise SystemExit(submission.returncode)
+
+job_id = submission.stdout.strip().splitlines()[-1].split(";", 1)[0].strip()
+if not job_id:
+    raise RuntimeError("sbatch did not return a scheduler job id")
+print(f"scheduler_job_id={job_id}", flush=True)
+
+terminal_success = {"COMPLETED"}
+terminal_cancel = {"CANCELLED", "CANCELLED+"}
+terminal_failure = {
+    "BOOT_FAIL",
+    "DEADLINE",
+    "FAILED",
+    "NODE_FAIL",
+    "OUT_OF_MEMORY",
+    "PREEMPTED",
+    "REVOKED",
+    "SPECIAL_EXIT",
+    "TIMEOUT",
+}
+
+while True:
+    queued = subprocess.run(
+        ["squeue", "-h", "-j", job_id, "-o", "%T"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if queued.stdout.strip():
+        time.sleep(5)
+        continue
+
+    accounting = subprocess.run(
+        ["sacct", "-n", "-P", "-j", job_id, "-o", "State"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    states = [
+        line.split("|", 1)[0].split()[0]
+        for line in accounting.stdout.splitlines()
+        if line.strip()
+    ]
+    if any(state in terminal_success for state in states):
+        raise SystemExit(0)
+    if any(state in terminal_cancel for state in states):
+        raise SystemExit(130)
+    if any(state in terminal_failure for state in states):
+        raise SystemExit(1)
+    time.sleep(5)
 """
 
 
