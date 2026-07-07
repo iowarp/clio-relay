@@ -784,7 +784,12 @@ def _verify_live_package_progress(
             job_id=job_id,
             package_name=package_name,
         ):
-            if not saw_running:
+            if not saw_running and not _remote_job_has_event(
+                definition,
+                job_id,
+                "job.running",
+                runner=runner,
+            ):
                 raise RelayError("package progress was recorded before job.running")
             return
         if event_types & {"job.succeeded", "job.failed", "job.canceled"}:
@@ -793,6 +798,22 @@ def _verify_live_package_progress(
     raise RelayError(
         f"expected live package progress before terminal job state: {expected_adapter}"
     )
+
+
+def _remote_job_has_event(
+    definition: ClusterDefinition,
+    job_id: str,
+    event_type: str,
+    *,
+    runner: CommandRunner,
+) -> bool:
+    monitor = _remote_clio_json(
+        definition,
+        ["job", "monitor", job_id, "--cursor", "1", "--limit", "1000"],
+        runner=runner,
+    )
+    events = cast(list[dict[str, Any]], monitor["events"])
+    return any(str(event.get("event_type")) == event_type for event in events)
 
 
 def _verify_completed_job(
