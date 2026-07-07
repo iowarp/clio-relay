@@ -384,6 +384,15 @@ def job_read_artifact(
     typer.echo(json.dumps(result, indent=2))
 
 
+@job_app.command("list-artifacts")
+def job_list_artifacts(
+    job_id: str,
+) -> None:
+    """List artifact references indexed for a job as JSON."""
+    artifacts = ClioCoreQueue(RelaySettings.from_env().core_dir).list_artifacts(job_id)
+    typer.echo(json.dumps([artifact.model_dump(mode="json") for artifact in artifacts], indent=2))
+
+
 @job_app.command("cancel")
 def job_cancel(job_id: str) -> None:
     """Cancel a queued or running job."""
