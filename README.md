@@ -25,6 +25,8 @@ uv run clio-relay relay-host render-frpc-visitor-config --cluster ares --bind-po
 uv run clio-relay endpoint status
 ```
 
+On Windows, `install-frp` installs into `.tools/frp/bin`; relay commands auto-discover that project-local binary after checking explicit environment configuration, `PATH`, and bootstrap-managed installs.
+
 Submit a JARVIS pipeline intent:
 
 ```powershell

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shlex
 import shutil
+import subprocess
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -60,12 +61,44 @@ def _env_or_bootstrap_bin(env_name: str, executable_name: str) -> str:
     configured = os.getenv(env_name)
     if configured:
         return configured
-    if shutil.which(executable_name) is not None:
+    path_executable = shutil.which(executable_name)
+    if path_executable is not None and _candidate_is_usable(executable_name, Path(path_executable)):
         return executable_name
     bootstrap_path = Path.home() / ".local" / "bin" / executable_name
-    if bootstrap_path.exists():
+    if bootstrap_path.exists() and _candidate_is_usable(executable_name, bootstrap_path):
         return str(bootstrap_path)
+    local_tool_path = _local_tool_bin(executable_name)
+    if local_tool_path is not None and _candidate_is_usable(executable_name, local_tool_path):
+        return str(local_tool_path)
     return executable_name
+
+
+def _candidate_is_usable(executable_name: str, path: Path) -> bool:
+    if executable_name not in {"frpc", "frps"}:
+        return True
+    try:
+        result = subprocess.run(
+            [str(path), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except OSError:
+        return False
+    except subprocess.TimeoutExpired:
+        return False
+    return result.returncode == 0
+
+
+def _local_tool_bin(executable_name: str) -> Path | None:
+    candidates = [Path.cwd() / ".tools" / "frp" / "bin" / executable_name]
+    if os.name == "nt" and not executable_name.lower().endswith(".exe"):
+        candidates.append(Path.cwd() / ".tools" / "frp" / "bin" / f"{executable_name}.exe")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return None
 
 
 def _split_args(value: str | None) -> list[str]:

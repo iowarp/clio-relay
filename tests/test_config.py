@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
 
 from _pytest.monkeypatch import MonkeyPatch
@@ -22,6 +24,11 @@ def test_settings_discover_bootstrap_managed_bins(
     monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
     monkeypatch.delenv("CLIO_RELAY_JARVIS_BIN", raising=False)
     monkeypatch.delenv("CLIO_RELAY_FRPC_BIN", raising=False)
+
+    def always_usable(_name: str, _path: Path) -> bool:
+        return True
+
+    monkeypatch.setattr("clio_relay.config._candidate_is_usable", always_usable)
 
     settings = RelaySettings.from_env()
 
@@ -74,3 +81,63 @@ def test_settings_env_bins_override_bootstrap_managed_bins(
 
     assert settings.jarvis_bin == "/opt/jarvis"
     assert settings.frpc_bin == "/opt/frpc"
+
+
+def test_settings_discovers_project_local_frp_bins(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    bin_dir = tmp_path / ".tools" / "frp" / "bin"
+    bin_dir.mkdir(parents=True)
+    frpc = bin_dir / ("frpc.exe" if os.name == "nt" else "frpc")
+    frpc.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
+    monkeypatch.delenv("CLIO_RELAY_FRPC_BIN", raising=False)
+
+    def always_usable(_name: str, _path: Path) -> bool:
+        return True
+
+    monkeypatch.setattr("clio_relay.config._candidate_is_usable", always_usable)
+
+    settings = RelaySettings.from_env()
+
+    assert settings.frpc_bin == str(frpc.resolve())
+
+
+def test_settings_skips_broken_path_frp_shim_for_project_local_bin(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    bin_dir = tmp_path / ".tools" / "frp" / "bin"
+    bin_dir.mkdir(parents=True)
+    broken = tmp_path / "broken-frpc.exe"
+    local = bin_dir / ("frpc.exe" if os.name == "nt" else "frpc")
+    broken.write_text("broken\n", encoding="utf-8")
+    local.write_text("local\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.delenv("CLIO_RELAY_FRPC_BIN", raising=False)
+
+    def fake_which(name: str) -> str | None:
+        return str(broken) if name == "frpc" else None
+
+    monkeypatch.setattr("clio_relay.config.shutil.which", fake_which)
+
+    def fake_run(
+        command: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            command,
+            0 if Path(command[0]) == local else 1,
+            stdout="0.69.1",
+            stderr="",
+        )
+
+    monkeypatch.setattr("clio_relay.config.subprocess.run", fake_run)
+
+    settings = RelaySettings.from_env()
+
+    assert settings.frpc_bin == str(local.resolve())
