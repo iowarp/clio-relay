@@ -16,6 +16,7 @@ Private relay for running configured cluster work from CLIO without putting appl
 uv sync
 uv run clio-relay init
 uv run clio-relay install-frp
+uv run clio-relay cluster add --name ares --ssh-host ares
 uv run clio-relay cluster bootstrap --cluster ares
 $env:CLIO_RELAY_FRP_TOKEN = "<shared-frp-token>"
 $env:CLIO_RELAY_STCP_SECRET = "<shared-stcp-secret>"
@@ -77,6 +78,8 @@ Run a full configured live acceptance:
 ```powershell
 uv run clio-relay live-test --cluster ares --jarvis-yaml .\.clio-relay\live\ares-lammps.yaml --monitor-pattern "Total.*wall.*time"
 ```
+
+Cluster names are local configuration. `ares` is an example target created with `cluster add`; a second target such as `homelab`, `delta`, or an institutional relay uses the same commands with a different registry entry.
 
 `live-test` does not contain workload recipes. It takes acceptance inputs from CLI options or from the cluster registry's `live_test` object:
 

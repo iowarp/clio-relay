@@ -1,7 +1,7 @@
 # clio-relay JARVIS packages
 
 These scripts are legacy standalone shims. The JARVIS-CD package repository registered by
-`clio-relay cluster bootstrap --cluster ares` is `jarvis-packages/clio_relay`.
+`clio-relay cluster bootstrap --cluster <name>` is `jarvis-packages/clio_relay`.
 
 The registered packages are the relay-owned execution shims referenced by generated JARVIS-CD pipelines.
 

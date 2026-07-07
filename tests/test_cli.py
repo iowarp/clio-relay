@@ -7,6 +7,7 @@ from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
 from clio_relay.cli import app
+from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.models import (
     ArtifactRef,
@@ -16,6 +17,12 @@ from clio_relay.models import (
     RelayJob,
     RelayTask,
 )
+
+
+def _write_test_cluster(root: Path, name: str = "ares") -> None:
+    ClusterRegistry(clusters={name: ClusterDefinition(name=name, ssh_host=name)}).save(
+        root / ".clio-relay" / "clusters.json"
+    )
 
 
 def test_cli_lists_artifacts(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -177,6 +184,7 @@ def test_cli_render_frpc_uses_configured_secret_env(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
     monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "env-frp-token")
     monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "env-stcp-secret")
     runner = CliRunner()
@@ -203,8 +211,9 @@ def test_cli_render_frpc_uses_local_secret_file(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
     secret_dir = tmp_path / ".clio-relay"
-    secret_dir.mkdir()
+    secret_dir.mkdir(exist_ok=True)
     (secret_dir / "secrets.json").write_text(
         json.dumps(
             {
@@ -263,6 +272,7 @@ def test_cli_transport_reports_missing_configured_secret_env(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
     monkeypatch.delenv("CLIO_RELAY_FRP_TOKEN", raising=False)
     monkeypatch.delenv("CLIO_RELAY_STCP_SECRET", raising=False)
     runner = CliRunner()
@@ -283,9 +293,69 @@ def test_cli_transport_reports_missing_configured_secret_env(
     assert "CLIO_RELAY_FRP_TOKEN" in result.output
 
 
+def test_cli_init_creates_empty_cluster_registry(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
+
+    result = CliRunner().invoke(app, ["init"])
+
+    assert result.exit_code == 0
+    assert "clusters=" in result.output
+    assert "ares" not in result.output
+    registry = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json")
+    assert registry.clusters == {}
+
+
+def test_cli_cluster_add_writes_explicit_definition(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "add",
+            "--name",
+            "delta",
+            "--ssh-host",
+            "delta-login",
+            "--agent-adapter",
+            "exec",
+            "--agent-npm-package",
+            "",
+            "--agent-npm-bin",
+            "clio",
+            "--frp-server-addr",
+            "relay.example.edu",
+            "--frp-protocol",
+            "tcp",
+            "--frp-server-port",
+            "7000",
+        ],
+    )
+
+    assert result.exit_code == 0
+    registry = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json")
+    definition = registry.require("delta")
+    assert definition.ssh_host == "delta-login"
+    assert definition.agent_adapter == "exec"
+    assert definition.agent_npm_package == ""
+    assert definition.agent_npm_bin == "clio"
+    assert definition.frp_transport.server_addr == "relay.example.edu"
+    assert definition.frp_transport.protocol == "tcp"
+    assert definition.frp_transport.server_port == 7000
+
+
 def test_cli_mcp_call_preserves_arguments(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     core_dir = tmp_path / "core"
     monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
     runner = CliRunner()
 

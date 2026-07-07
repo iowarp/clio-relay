@@ -14,7 +14,12 @@ import typer
 import uvicorn
 
 from clio_relay.bootstrap import bootstrap_cluster_over_ssh, install_local_frp
-from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, default_registry_path
+from clio_relay.cluster_config import (
+    ClusterDefinition,
+    ClusterRegistry,
+    FrpTransportConfig,
+    default_registry_path,
+)
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.deployment import (
@@ -359,6 +364,93 @@ def cluster_list() -> None:
     registry = ClusterRegistry.load(default_registry_path())
     for name, definition in sorted(registry.clusters.items()):
         typer.echo(f"{name} ssh={definition.ssh_host} profile={definition.bootstrap_profile}")
+
+
+@cluster_app.command("add")
+def cluster_add(
+    name: Annotated[str, typer.Option(help="Cluster name used by relay jobs.")],
+    ssh_host: Annotated[str, typer.Option(help="SSH host or alias for the cluster.")],
+    bootstrap_profile: Annotated[
+        str,
+        typer.Option(help="Bootstrap profile for this cluster."),
+    ] = "linux-user",
+    core_dir: Annotated[
+        str,
+        typer.Option(help="Remote clio-core directory."),
+    ] = "$HOME/.local/share/clio-relay/core",
+    spool_dir: Annotated[
+        str,
+        typer.Option(help="Remote spool directory."),
+    ] = "$HOME/.local/share/clio-relay/spool",
+    jarvis_bin: Annotated[
+        str | None,
+        typer.Option(help="Remote JARVIS-CD executable path."),
+    ] = None,
+    frpc_bin: Annotated[
+        str | None,
+        typer.Option(help="Remote frpc executable path."),
+    ] = None,
+    agent_bin: Annotated[
+        str | None,
+        typer.Option(help="Remote agent executable path."),
+    ] = None,
+    agent_adapter: Annotated[
+        str,
+        typer.Option(help="Remote agent adapter name."),
+    ] = "codex",
+    agent_npm_package: Annotated[
+        str,
+        typer.Option(help="Optional npm package used to install the agent."),
+    ] = "@openai/codex",
+    agent_npm_bin: Annotated[
+        str,
+        typer.Option(help="Agent binary name provided by npm or PATH."),
+    ] = "codex",
+    frp_server_addr: Annotated[
+        str,
+        typer.Option(help="frps server address for this cluster transport."),
+    ] = "frps.jcernuda.com",
+    frp_server_port: Annotated[
+        int,
+        typer.Option(help="frps server port for this cluster transport."),
+    ] = 443,
+    frp_protocol: Annotated[
+        str,
+        typer.Option(help="frpc-to-frps transport protocol."),
+    ] = "wss",
+    frp_token_env: Annotated[
+        str,
+        typer.Option(help="Environment/local-secret key for the frp token."),
+    ] = "CLIO_RELAY_FRP_TOKEN",
+    stcp_secret_env: Annotated[
+        str,
+        typer.Option(help="Environment/local-secret key for the stcp secret."),
+    ] = "CLIO_RELAY_STCP_SECRET",
+) -> None:
+    """Add or update a local cluster definition."""
+    registry = ClusterRegistry.load(default_registry_path())
+    registry.clusters[name] = ClusterDefinition(
+        name=name,
+        ssh_host=ssh_host,
+        bootstrap_profile=bootstrap_profile,
+        core_dir=core_dir,
+        spool_dir=spool_dir,
+        jarvis_bin=jarvis_bin,
+        frpc_bin=frpc_bin,
+        agent_bin=agent_bin,
+        agent_adapter=agent_adapter,
+        agent_npm_package=agent_npm_package,
+        agent_npm_bin=agent_npm_bin,
+        frp_transport=FrpTransportConfig(
+            protocol=frp_protocol,
+            server_addr=frp_server_addr,
+            server_port=frp_server_port,
+            token_env=frp_token_env,
+            stcp_secret_env=stcp_secret_env,
+        ),
+    )
+    registry.save(default_registry_path())
+    typer.echo(f"{name} ssh={ssh_host} profile={bootstrap_profile}")
 
 
 @cluster_app.command("bootstrap")
@@ -729,10 +821,10 @@ def api_start(
 def agent_render_mcp_config(
     output: Annotated[
         Path | None,
-        typer.Option(help="Optional path to write the Codex MCP profile TOML."),
+        typer.Option(help="Optional path to write the agent MCP profile TOML."),
     ] = None,
 ) -> None:
-    """Render a Codex profile that exposes the relay MCP tools."""
+    """Render an agent profile that exposes the relay MCP tools."""
     rendered = render_agent_mcp_profile(settings=RelaySettings.from_env())
     if output is None:
         typer.echo(rendered)

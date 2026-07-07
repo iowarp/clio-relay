@@ -1,7 +1,7 @@
 [project]
 name = "clio-relay"
 version = "0.1.0"
-description = "Ares relay endpoints backed by clio-core and JARVIS-CD."
+description = "Cluster relay endpoints backed by clio-core and JARVIS-CD."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }

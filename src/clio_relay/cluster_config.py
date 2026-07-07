@@ -70,13 +70,8 @@ class ClusterRegistry(BaseModel):
 
     @classmethod
     def default(cls) -> ClusterRegistry:
-        """Return default local cluster definitions."""
-        return cls(
-            clusters={
-                "ares": ClusterDefinition(name="ares", ssh_host="ares"),
-                "homelab": ClusterDefinition(name="homelab", ssh_host="homelab"),
-            }
-        )
+        """Return an empty registry for explicit local cluster definitions."""
+        return cls()
 
     @classmethod
     def load(cls, path: Path) -> ClusterRegistry:
