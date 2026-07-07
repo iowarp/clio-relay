@@ -212,8 +212,8 @@ def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
     assert isinstance(jarvis.spec, JarvisRunSpec)
     assert agent.kind == JobKind.REMOTE_AGENT
     assert isinstance(agent.spec, RemoteAgentTaskSpec)
-    assert agent.spec.prompt_path == prompt_path
-    assert agent.spec.mcp_config_path == mcp_config_path
+    assert agent.spec.prompt_path == str(prompt_path)
+    assert agent.spec.mcp_config_path == str(mcp_config_path)
     assert agent.spec.model == "configured-model"
     assert mcp.kind == JobKind.MCP_CALL
     assert isinstance(mcp.spec, McpCallSpec)

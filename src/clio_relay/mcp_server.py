@@ -6,7 +6,6 @@ import hashlib
 import json
 import sys
 from json import JSONDecodeError
-from pathlib import Path
 from typing import Any, TextIO, cast
 
 from clio_relay.config import RelaySettings
@@ -494,10 +493,10 @@ def _submit_remote_agent(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
             cluster=cluster,
             kind=JobKind.REMOTE_AGENT,
             spec=RemoteAgentTaskSpec(
-                prompt_path=Path(prompt_path),
-                mcp_config_path=None if mcp_config_path is None else Path(mcp_config_path),
+                prompt_path=prompt_path,
+                mcp_config_path=mcp_config_path,
                 model=model,
-                workdir=None if workdir is None else Path(workdir),
+                workdir=workdir,
                 timeout_seconds=timeout_seconds,
             ),
             idempotency_key=idempotency_key,

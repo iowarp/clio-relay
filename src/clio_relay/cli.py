@@ -936,9 +936,9 @@ def monitor_run_once(
 @agent_app.command("run")
 def agent_run(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
-    prompt: Annotated[Path, typer.Option(help="Prompt file path on the cluster.")],
+    prompt: Annotated[str, typer.Option(help="Prompt file path on the cluster.")],
     mcp_config: Annotated[
-        Path | None,
+        str | None,
         typer.Option(help="Optional MCP config/profile path on the cluster."),
     ] = None,
     idempotency_key: Annotated[
@@ -956,12 +956,12 @@ def agent_run(
             "--cluster",
             cluster,
             "--prompt",
-            str(prompt),
+            prompt,
             "--idempotency-key",
             key,
         ]
         if mcp_config is not None:
-            args.extend(["--mcp-config", str(mcp_config)])
+            args.extend(["--mcp-config", mcp_config])
         _run_remote_or_exit(definition, args)
         return
     job = RelayJob(

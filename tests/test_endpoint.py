@@ -933,7 +933,7 @@ def test_worker_indexes_agent_result_artifacts(tmp_path: Path) -> None:
         RelayJob(
             cluster="ares",
             kind=JobKind.REMOTE_AGENT,
-            spec=RemoteAgentTaskSpec(prompt_path=prompt),
+            spec=RemoteAgentTaskSpec(prompt_path=str(prompt)),
             idempotency_key="agent-artifacts",
         )
     )

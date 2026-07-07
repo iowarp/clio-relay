@@ -8,7 +8,6 @@ import asyncio
 import json
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
-from pathlib import Path
 from typing import Annotated
 
 from fastapi import (
@@ -69,10 +68,10 @@ class RemoteAgentSubmitRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     cluster: str
-    prompt_path: Path
-    mcp_config_path: Path | None = None
+    prompt_path: str
+    mcp_config_path: str | None = None
     model: str | None = None
-    workdir: Path | None = None
+    workdir: str | None = None
     timeout_seconds: int | None = Field(default=None, gt=0)
     idempotency_key: str
 

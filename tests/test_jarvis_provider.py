@@ -31,8 +31,8 @@ def test_remote_agent_task_yaml_generation(tmp_path: Path) -> None:
     )
     rendered = provider.render_remote_agent_task_yaml(
         RemoteAgentTaskSpec(
-            prompt_path=tmp_path / "prompt.md",
-            mcp_config_path=tmp_path / "mcp.json",
+            prompt_path=str(tmp_path / "prompt.md"),
+            mcp_config_path=str(tmp_path / "mcp.json"),
             context={"source_event_seq": 7, "match_groups": {"step": "50"}},
         )
     )

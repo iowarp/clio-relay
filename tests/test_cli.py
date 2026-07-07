@@ -637,3 +637,48 @@ def test_cli_remote_wait_passthrough_uses_cluster_core(
     assert json.loads(result.output)["job_id"] == "job_remote"
     assert len(commands) == 1
     assert "clio-relay job wait job_remote" in commands[0][2]
+
+
+def test_cli_remote_agent_run_preserves_posix_prompt_path(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+    _write_test_cluster(tmp_path)
+    commands: list[list[str]] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[bytes]:
+        commands.append(command)
+        assert capture_output is True
+        assert check is False
+        return subprocess.CompletedProcess(command, 0, b"job_agent\n", b"")
+
+    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "agent",
+            "run",
+            "--cluster",
+            "ares",
+            "--prompt",
+            "/home/user/prompt.md",
+            "--mcp-config",
+            "/home/user/mcp.toml",
+            "--idempotency-key",
+            "agent-posix-path",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.output.strip() == "job_agent"
+    assert "--prompt /home/user/prompt.md" in commands[0][2]
+    assert "--mcp-config /home/user/mcp.toml" in commands[0][2]
+    assert "\\home\\user" not in commands[0][2]

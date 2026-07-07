@@ -206,9 +206,9 @@ def _apply_monitor_rule_action(
         return {"rule_id": rule.rule_id, "action": rule.action.value, "matched_seq": event_seq}
     if rule.action == MonitorRuleAction.SUBMIT_AGENT:
         cluster = _required_payload_str(rule, "cluster")
-        prompt_path = Path(_required_payload_str(rule, "prompt_path"))
-        mcp_config_path = _optional_payload_path(rule, "mcp_config_path")
-        workdir = _optional_payload_path(rule, "workdir")
+        prompt_path = _required_payload_str(rule, "prompt_path")
+        mcp_config_path = _optional_payload_str(rule, "mcp_config_path")
+        workdir = _optional_payload_str(rule, "workdir")
         timeout_seconds = rule.action_payload.get("timeout_seconds")
         if timeout_seconds is not None and not isinstance(timeout_seconds, int):
             raise ConfigurationError("monitor action timeout_seconds must be an integer")
@@ -307,13 +307,6 @@ def _optional_payload_str(rule: MonitorRule, key: str) -> str | None:
     if not isinstance(value, str):
         raise ConfigurationError(f"monitor action payload field must be a string: {key}")
     return value
-
-
-def _optional_payload_path(rule: MonitorRule, key: str) -> Path | None:
-    value = _optional_payload_str(rule, key)
-    if value is None:
-        return None
-    return Path(value)
 
 
 def _progress_label(rule: MonitorRule) -> str:

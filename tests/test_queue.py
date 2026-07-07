@@ -506,10 +506,10 @@ def test_monitor_rule_submits_remote_agent_with_event_context(tmp_path: Path) ->
     assert agent_job.cluster == "ares"
     assert agent_job.idempotency_key == f"monitor:{rule.rule_id}:3"
     assert isinstance(agent_job.spec, RemoteAgentTaskSpec)
-    assert agent_job.spec.prompt_path == Path("/tmp/monitor-prompt.md")
-    assert agent_job.spec.mcp_config_path == Path("/tmp/monitor-mcp.json")
+    assert agent_job.spec.prompt_path == "/tmp/monitor-prompt.md"
+    assert agent_job.spec.mcp_config_path == "/tmp/monitor-mcp.json"
     assert agent_job.spec.model == "codex-test"
-    assert agent_job.spec.workdir == Path("/tmp/work")
+    assert agent_job.spec.workdir == "/tmp/work"
     assert agent_job.spec.timeout_seconds == 30
     assert agent_job.spec.context["monitor_rule_id"] == rule.rule_id
     assert agent_job.spec.context["source_job_id"] == job.job_id

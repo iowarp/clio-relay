@@ -109,10 +109,10 @@ class RemoteAgentTaskSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    prompt_path: Path
-    mcp_config_path: Path | None = None
+    prompt_path: str
+    mcp_config_path: str | None = None
     model: str | None = None
-    workdir: Path | None = None
+    workdir: str | None = None
     timeout_seconds: int | None = Field(default=None, gt=0)
     context: dict[str, Any] = Field(default_factory=dict)
 

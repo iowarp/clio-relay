@@ -112,8 +112,8 @@ def test_mcp_submit_remote_agent_creates_real_job(tmp_path: Path) -> None:
     job = queue.get_job(result["job_id"])
     assert job.kind == JobKind.REMOTE_AGENT
     assert isinstance(job.spec, RemoteAgentTaskSpec)
-    assert job.spec.prompt_path == prompt_path
-    assert job.spec.mcp_config_path == mcp_config_path
+    assert job.spec.prompt_path == str(prompt_path)
+    assert job.spec.mcp_config_path == str(mcp_config_path)
     assert job.spec.model == "configured-model"
     assert job.spec.timeout_seconds == 30
 
