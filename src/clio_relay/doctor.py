@@ -41,14 +41,24 @@ def run_doctor(
 
 def run_cluster_doctor(definition: ClusterDefinition) -> list[str]:
     """Run live cluster-side checks over SSH and return status lines."""
+    jarvis_bin = _shell_double_quote(definition.jarvis_bin or "$HOME/.local/bin/jarvis")
+    frpc_bin = _shell_double_quote(definition.frpc_bin or "$HOME/.local/bin/frpc")
+    agent_bin = _shell_double_quote(
+        definition.agent_bin or f"$HOME/.local/bin/{definition.agent_npm_bin}"
+    )
     script = f"""set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 echo "cluster: {definition.name}"
 echo "ssh_host: {definition.ssh_host}"
-echo "frpc=$(frpc --version)"
+FRPC_BIN={frpc_bin}
+JARVIS_BIN={jarvis_bin}
+AGENT_BIN="${{CLIO_RELAY_AGENT_BIN:-}}"
+if [ -z "$AGENT_BIN" ]; then
+  AGENT_BIN={agent_bin}
+fi
+echo "frpc=$("$FRPC_BIN" --version)"
 echo "frps=$(frps --version)"
-echo "jarvis=$(jarvis --help | head -n 1)"
-AGENT_BIN="${{CLIO_RELAY_AGENT_BIN:-$HOME/.local/bin/{definition.agent_npm_bin}}}"
+echo "jarvis=$("$JARVIS_BIN" --help | head -n 1)"
 if [ ! -x "$AGENT_BIN" ]; then
   AGENT_BIN="$(command -v {definition.agent_npm_bin})"
 fi
@@ -67,3 +77,7 @@ echo "clio_relay=$(clio-relay --help | head -n 1)"
         detail = stderr.strip() or stdout.strip()
         raise RelayError(f"cluster doctor failed for {definition.name}: {detail}")
     return stdout.splitlines()
+
+
+def _shell_double_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'

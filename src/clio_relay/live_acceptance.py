@@ -297,14 +297,17 @@ def _remote_shell(ssh_host: str, script: str, *, runner: CommandRunner) -> str:
 
 
 def _remote_env(definition: ClusterDefinition) -> str:
+    jarvis_bin = definition.jarvis_bin or "$HOME/.local/bin/jarvis"
+    frpc_bin = definition.frpc_bin or "$HOME/.local/bin/frpc"
+    agent_bin = definition.agent_bin or f"$HOME/.local/bin/{definition.agent_npm_bin}"
     return " ".join(
         [
             'export PATH="$HOME/.local/bin:$PATH";',
             f"export CLIO_RELAY_CORE_DIR={_shell_double_quoted(definition.core_dir)};",
             f"export CLIO_RELAY_SPOOL_DIR={_shell_double_quoted(definition.spool_dir)};",
-            'export CLIO_RELAY_JARVIS_BIN="$HOME/.local/bin/jarvis";',
-            'export CLIO_RELAY_FRPC_BIN="$HOME/.local/bin/frpc";',
-            f'export CLIO_RELAY_AGENT_BIN="$HOME/.local/bin/{definition.agent_npm_bin}";',
+            f"export CLIO_RELAY_JARVIS_BIN={_shell_double_quoted(jarvis_bin)};",
+            f"export CLIO_RELAY_FRPC_BIN={_shell_double_quoted(frpc_bin)};",
+            f"export CLIO_RELAY_AGENT_BIN={_shell_double_quoted(agent_bin)};",
             f"export CLIO_RELAY_AGENT_ADAPTER={shlex.quote(definition.agent_adapter)};",
         ]
     )

@@ -153,13 +153,16 @@ def _remote_probe_script(
     if api_token is not None:
         token_export = f"export CLIO_RELAY_API_TOKEN={_shell_single_quote(api_token)}"
         require_token = " --require-token"
+    jarvis_bin = definition.jarvis_bin or "$HOME/.local/bin/jarvis"
+    frpc_bin = definition.frpc_bin or "$HOME/.local/bin/frpc"
+    agent_bin = definition.agent_bin or f"$HOME/.local/bin/{definition.agent_npm_bin}"
     return f"""set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 export CLIO_RELAY_CORE_DIR="{definition.core_dir}"
 export CLIO_RELAY_SPOOL_DIR="{definition.spool_dir}"
-export CLIO_RELAY_JARVIS_BIN="$HOME/.local/bin/jarvis"
-export CLIO_RELAY_FRPC_BIN="$HOME/.local/bin/frpc"
-export CLIO_RELAY_AGENT_BIN="$HOME/.local/bin/{definition.agent_npm_bin}"
+export CLIO_RELAY_JARVIS_BIN={_shell_double_quote(jarvis_bin)}
+export CLIO_RELAY_FRPC_BIN={_shell_double_quote(frpc_bin)}
+export CLIO_RELAY_AGENT_BIN={_shell_double_quote(agent_bin)}
 export CLIO_RELAY_AGENT_ADAPTER={_shell_single_quote(definition.agent_adapter)}
 {token_export}
 tmp="$(mktemp -d)"
@@ -169,7 +172,7 @@ cat > "$tmp/frpc.toml" <<'__CLIO_RELAY_FRPC_CONFIG__'
 __CLIO_RELAY_FRPC_CONFIG__
 echo "transport_probe_cluster={cluster}"
 clio-relay api start --host 127.0.0.1 --port {api_port}{require_token} &
-"$HOME/.local/bin/frpc" -c "$tmp/frpc.toml" &
+"$CLIO_RELAY_FRPC_BIN" -c "$tmp/frpc.toml" &
 wait
 """
 
@@ -205,6 +208,10 @@ def _terminate(process: ManagedProcess) -> None:
 
 def _shell_single_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def _shell_double_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _popen(*args: Any, **kwargs: Any) -> ManagedProcess:

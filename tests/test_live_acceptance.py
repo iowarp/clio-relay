@@ -124,6 +124,95 @@ def test_live_acceptance_runs_configured_pipeline_and_monitor(
     assert "live acceptance passed" in lines
     assert pipeline.read_bytes() in uploaded
     assert any("job submit" in " ".join(command) for command in commands)
+    assert any(
+        'CLIO_RELAY_JARVIS_BIN="$HOME/.local/bin/jarvis"' in command[-1] for command in commands
+    )
+
+
+def test_live_acceptance_uses_cluster_executable_overrides(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text("name: generic\npkgs: []\n", encoding="utf-8")
+    commands: list[list[str]] = []
+
+    def fake_cluster_doctor(_definition: ClusterDefinition) -> list[str]:
+        return ["cluster: test-cluster"]
+
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        commands.append(command)
+        script = command[-1]
+        if "mkdir -p" in script or "cat >" in " ".join(command):
+            return _completed(command, "")
+        if "job submit" in script:
+            return _completed(command, "job_abc\n")
+        if "job wait" in script:
+            return _completed(command, json.dumps({"job_id": "job_abc", "state": "succeeded"}))
+        if "job monitor" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    {
+                        "events": [
+                            {"event_type": "job.queued"},
+                            {"event_type": "job.running"},
+                            {"event_type": "jarvis.started"},
+                            {"event_type": "job.succeeded"},
+                        ]
+                    }
+                ),
+            )
+        if "job tasks" in script:
+            return _completed(
+                command,
+                json.dumps([{"task_id": "task_abc", "state": "succeeded"}]),
+            )
+        if "read-log" in script and "--stream stdout" in script:
+            return _completed(command, json.dumps({"next_offset": 12}))
+        if "read-log" in script and "--stream stderr" in script:
+            return _completed(command, json.dumps({"next_offset": 0}))
+        if "list-artifacts" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    [
+                        {"artifact_id": "artifact_pipeline", "kind": "jarvis_pipeline"},
+                        {"artifact_id": "artifact_stdout", "kind": "stdout"},
+                        {"artifact_id": "artifact_stderr", "kind": "stderr"},
+                        {"artifact_id": "artifact_provenance", "kind": "provenance"},
+                    ]
+                ),
+            )
+        if "read-artifact" in script:
+            return _completed(command, json.dumps({"encoding": "base64", "data": "aGVsbG8="}))
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
+
+    run_live_acceptance(
+        LiveAcceptanceOptions(
+            cluster="test-cluster",
+            definition=ClusterDefinition(
+                name="test-cluster",
+                ssh_host="test-host",
+                jarvis_bin="/opt/jarvis/current",
+                frpc_bin="/opt/frp/frpc",
+                agent_bin="/opt/agents/clio",
+            ),
+            jarvis_yaml=pipeline,
+        ),
+        runner=fake_runner,
+    )
+
+    rendered = "\n".join(command[-1] for command in commands)
+    assert 'CLIO_RELAY_JARVIS_BIN="/opt/jarvis/current"' in rendered
+    assert 'CLIO_RELAY_FRPC_BIN="/opt/frp/frpc"' in rendered
+    assert 'CLIO_RELAY_AGENT_BIN="/opt/agents/clio"' in rendered
 
 
 def test_live_acceptance_uses_fresh_idempotency_key_per_run(

@@ -43,6 +43,9 @@ class ClusterDefinition(BaseModel):
     bootstrap_profile: str = "linux-user"
     core_dir: str = "$HOME/.local/share/clio-relay/core"
     spool_dir: str = "$HOME/.local/share/clio-relay/spool"
+    jarvis_bin: str | None = None
+    frpc_bin: str | None = None
+    agent_bin: str | None = None
     agent_adapter: str = "codex"
     agent_npm_package: str = "@openai/codex"
     agent_npm_bin: str = "codex"

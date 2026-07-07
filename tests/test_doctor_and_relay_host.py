@@ -148,3 +148,20 @@ def test_endpoint_user_service_is_sudo_less_and_configured() -> None:
     assert 'Environment="CLIO_RELAY_AGENT_BIN=%h/.local/bin/current-agent"' in rendered
     assert 'Environment="CLIO_RELAY_AGENT_ADAPTER=exec"' in rendered
     assert "sudo" not in rendered
+
+
+def test_endpoint_user_service_uses_cluster_executable_overrides() -> None:
+    rendered = render_endpoint_user_service(
+        cluster="test-cluster",
+        definition=ClusterDefinition(
+            name="test-cluster",
+            ssh_host="test-host",
+            jarvis_bin="/opt/jarvis/current",
+            frpc_bin="/opt/frp/frpc",
+            agent_bin="/opt/agents/clio",
+        ),
+    )
+
+    assert 'Environment="CLIO_RELAY_JARVIS_BIN=/opt/jarvis/current"' in rendered
+    assert 'Environment="CLIO_RELAY_FRPC_BIN=/opt/frp/frpc"' in rendered
+    assert 'Environment="CLIO_RELAY_AGENT_BIN=/opt/agents/clio"' in rendered

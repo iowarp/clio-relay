@@ -19,6 +19,11 @@ def render_endpoint_user_service(
     """Render a user-level systemd service for a configured worker endpoint."""
     core_dir = _systemd_home_path(definition.core_dir)
     spool_dir = _systemd_home_path(definition.spool_dir)
+    jarvis_bin = _systemd_home_path(definition.jarvis_bin or "$HOME/.local/bin/jarvis")
+    frpc_bin = _systemd_home_path(definition.frpc_bin or "$HOME/.local/bin/frpc")
+    agent_bin = _systemd_home_path(
+        definition.agent_bin or f"$HOME/.local/bin/{definition.agent_npm_bin}"
+    )
     agent_args = " ".join(definition.agent_args)
     return f"""[Unit]
 Description=clio-relay worker endpoint for {cluster}
@@ -29,9 +34,9 @@ Type=simple
 Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="CLIO_RELAY_CORE_DIR={core_dir}"
 Environment="CLIO_RELAY_SPOOL_DIR={spool_dir}"
-Environment="CLIO_RELAY_JARVIS_BIN=%h/.local/bin/jarvis"
-Environment="CLIO_RELAY_FRPC_BIN=%h/.local/bin/frpc"
-Environment="CLIO_RELAY_AGENT_BIN=%h/.local/bin/{definition.agent_npm_bin}"
+Environment="CLIO_RELAY_JARVIS_BIN={jarvis_bin}"
+Environment="CLIO_RELAY_FRPC_BIN={frpc_bin}"
+Environment="CLIO_RELAY_AGENT_BIN={agent_bin}"
 Environment="CLIO_RELAY_AGENT_ADAPTER={definition.agent_adapter}"
 Environment="CLIO_RELAY_AGENT_ARGS={agent_args}"
 ExecStart={relay_bin} endpoint start --role worker --cluster {cluster}
