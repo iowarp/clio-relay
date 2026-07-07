@@ -486,7 +486,17 @@ def _submit_remote_agent(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     timeout_seconds = _optional_int(arguments, "timeout_seconds")
     idempotency_key = str(
         arguments.get("idempotency_key")
-        or f"mcp:remote-agent:{cluster}:{prompt_path}:{mcp_config_path}:{model}:{workdir}"
+        or "mcp:remote-agent:"
+        + _stable_digest(
+            {
+                "cluster": cluster,
+                "prompt_path": prompt_path,
+                "mcp_config_path": mcp_config_path,
+                "model": model,
+                "workdir": workdir,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
     )
     job = queue.submit_job(
         RelayJob(
@@ -515,7 +525,17 @@ def _submit_mcp_call(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
         json.dumps(tool_arguments, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     idempotency_key = str(
-        arguments.get("idempotency_key") or f"mcp:mcp-call:{cluster}:{server}:{tool}:{digest}"
+        arguments.get("idempotency_key")
+        or "mcp:mcp-call:"
+        + _stable_digest(
+            {
+                "cluster": cluster,
+                "server": server,
+                "tool": tool,
+                "arguments_digest": digest,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
     )
     job = queue.submit_job(
         RelayJob(
@@ -625,6 +645,12 @@ def _optional_float(value: JSON, key: str) -> float | None:
     if isinstance(item, bool):
         raise ValueError(f"{key} must be a number")
     return float(item)
+
+
+def _stable_digest(value: dict[str, object]) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _error(request_id: Any, code: int, message: str) -> JSON:

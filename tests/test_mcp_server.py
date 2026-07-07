@@ -152,6 +152,82 @@ def test_mcp_submit_mcp_call_creates_real_job_with_arguments(tmp_path: Path) -> 
     assert job.spec.timeout_seconds == 60
 
 
+def test_mcp_remote_agent_default_idempotency_includes_timeout(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    base_arguments = {
+        "cluster": "test-cluster",
+        "prompt_path": "/remote/prompt.md",
+    }
+
+    first = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "tools/call",
+            "params": {"name": "relay_submit_remote_agent", "arguments": base_arguments},
+        },
+        queue=queue,
+    )
+    second = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 32,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_submit_remote_agent",
+                "arguments": {**base_arguments, "timeout_seconds": 30},
+            },
+        },
+        queue=queue,
+    )
+
+    assert first is not None
+    assert second is not None
+    first_result = first["result"]["structuredContent"]
+    second_result = second["result"]["structuredContent"]
+    assert first_result["job_id"] != second_result["job_id"]
+    assert queue.get_job(second_result["job_id"]).spec.timeout_seconds == 30
+
+
+def test_mcp_call_default_idempotency_includes_timeout(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    base_arguments = {
+        "cluster": "test-cluster",
+        "server": "remote-tool-server",
+        "tool": "run",
+        "arguments": {"case": "lammps"},
+    }
+
+    first = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 33,
+            "method": "tools/call",
+            "params": {"name": "relay_submit_mcp_call", "arguments": base_arguments},
+        },
+        queue=queue,
+    )
+    second = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 34,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_submit_mcp_call",
+                "arguments": {**base_arguments, "timeout_seconds": 60},
+            },
+        },
+        queue=queue,
+    )
+
+    assert first is not None
+    assert second is not None
+    first_result = first["result"]["structuredContent"]
+    second_result = second["result"]["structuredContent"]
+    assert first_result["job_id"] != second_result["job_id"]
+    assert queue.get_job(second_result["job_id"]).spec.timeout_seconds == 60
+
+
 def test_mcp_submit_is_idempotent(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path / "core")
     request = {
