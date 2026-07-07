@@ -46,6 +46,7 @@ class ManagedProcess(Protocol):
 
 
 ProcessFactory = Callable[..., ManagedProcess]
+HttpCheck = Callable[[str], list[str]]
 
 
 def run_frp_http_probe(
@@ -61,6 +62,7 @@ def run_frp_http_probe(
     api_token: str | None = None,
     timeout_seconds: float = 30.0,
     process_factory: ProcessFactory | None = None,
+    http_check: HttpCheck | None = None,
 ) -> list[str]:
     """Probe desktop-to-cluster HTTP reachability through frp STCP."""
     if local_bind_port <= 0:
@@ -128,13 +130,16 @@ def run_frp_http_probe(
                 f"http://127.0.0.1:{local_bind_port}/healthz",
                 timeout_seconds=timeout_seconds,
             )
-            return [
+            lines = [
                 f"transport.cluster={cluster}",
                 f"transport.server={transport.server_addr}:{transport.server_port}",
                 f"transport.protocol={transport.protocol}",
                 f"transport.local_url=http://127.0.0.1:{local_bind_port}",
                 "transport.healthz=ok",
             ]
+            if http_check is not None:
+                lines.extend(http_check(f"http://127.0.0.1:{local_bind_port}"))
+            return lines
         finally:
             _terminate(visitor)
             _terminate(remote)

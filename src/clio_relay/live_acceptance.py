@@ -8,6 +8,9 @@ import posixpath
 import re
 import shlex
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 from base64 import b64decode
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -131,6 +134,7 @@ def run_live_acceptance(
                 options,
                 token=transport_token,
                 secret_key=transport_secret_key,
+                pipeline_yaml=jarvis_yaml.read_text(encoding="utf-8"),
             )
         )
     run_id = _acceptance_run_id(jarvis_yaml)
@@ -283,6 +287,7 @@ def _verify_transport(
     *,
     token: str,
     secret_key: str,
+    pipeline_yaml: str,
 ) -> list[str]:
     return run_frp_http_probe(
         cluster=options.cluster,
@@ -305,7 +310,160 @@ def _verify_transport(
         ),
         api_token=options.api_token,
         timeout_seconds=options.timeout_seconds,
+        http_check=lambda local_url: _verify_transport_http_api(
+            local_url,
+            cluster=options.cluster,
+            pipeline_yaml=pipeline_yaml,
+            api_token=options.api_token,
+            timeout_seconds=options.timeout_seconds,
+            poll_seconds=options.poll_seconds,
+        ),
     )
+
+
+def _verify_transport_http_api(
+    local_url: str,
+    *,
+    cluster: str,
+    pipeline_yaml: str,
+    api_token: str | None,
+    timeout_seconds: float,
+    poll_seconds: float,
+) -> list[str]:
+    run_digest = hashlib.sha256(pipeline_yaml.encode("utf-8")).hexdigest()[:16]
+    idempotency_key = f"live-test:http-transport:{cluster}:{run_digest}:{uuid4().hex}"
+    submitted = cast(
+        dict[str, Any],
+        _http_json(
+            local_url,
+            "POST",
+            "/jobs/jarvis",
+            api_token=api_token,
+            body={
+                "cluster": cluster,
+                "pipeline_yaml": pipeline_yaml,
+                "idempotency_key": idempotency_key,
+            },
+            timeout_seconds=10,
+        ),
+    )
+    job_id = str(submitted["job_id"])
+    waited = cast(
+        dict[str, Any],
+        _http_json(
+            local_url,
+            "POST",
+            f"/jobs/{job_id}/wait",
+            api_token=api_token,
+            query={
+                "timeout_seconds": str(timeout_seconds),
+                "poll_seconds": str(poll_seconds),
+            },
+            timeout_seconds=timeout_seconds + 10,
+        ),
+    )
+    if waited["state"] != "succeeded":
+        raise RelayError(f"transport HTTP job did not succeed: {waited['state']}")
+    monitor = cast(
+        dict[str, Any],
+        _http_json(
+            local_url,
+            "GET",
+            f"/jobs/{job_id}/monitor",
+            api_token=api_token,
+            query={"cursor": "1", "limit": "250"},
+            timeout_seconds=10,
+        ),
+    )
+    event_types = {event["event_type"] for event in cast(list[dict[str, Any]], monitor["events"])}
+    required_events = {"job.queued", "job.running", "jarvis.started", "job.succeeded"}
+    missing_events = required_events - event_types
+    if missing_events:
+        raise RelayError(f"transport HTTP job missing events: {sorted(missing_events)}")
+    stdout = cast(
+        dict[str, Any],
+        _http_json(
+            local_url,
+            "GET",
+            f"/jobs/{job_id}/logs/stdout",
+            api_token=api_token,
+            query={"offset": "0", "limit": "65536"},
+            timeout_seconds=10,
+        ),
+    )
+    if int(stdout["next_offset"]) <= 0:
+        raise RelayError("transport HTTP stdout log was empty")
+    artifacts = cast(
+        list[dict[str, Any]],
+        _http_json(
+            local_url,
+            "GET",
+            f"/jobs/{job_id}/artifacts",
+            api_token=api_token,
+            timeout_seconds=10,
+        ),
+    )
+    artifact_kinds = {artifact["kind"] for artifact in artifacts}
+    if not {"jarvis_pipeline", "stdout", "stderr", "provenance"}.issubset(artifact_kinds):
+        raise RelayError(
+            f"transport HTTP artifacts missing required kinds: {sorted(artifact_kinds)}"
+        )
+    provenance_id = next(
+        str(artifact["artifact_id"]) for artifact in artifacts if artifact["kind"] == "provenance"
+    )
+    provenance = cast(
+        dict[str, Any],
+        _http_json(
+            local_url,
+            "GET",
+            f"/artifacts/{provenance_id}/content",
+            api_token=api_token,
+            timeout_seconds=10,
+        ),
+    )
+    if provenance["artifact"]["artifact_id"] != provenance_id:
+        raise RelayError("transport HTTP provenance artifact id mismatch")
+    if provenance["encoding"] != "base64" or str(provenance["data"]) == "":
+        raise RelayError("transport HTTP provenance artifact was empty")
+    return [
+        f"transport.http_job_id={job_id}",
+        "transport.http_wait=succeeded",
+        "transport.http_events=ok",
+        f"transport.http_stdout_bytes={stdout['next_offset']}",
+        "transport.http_artifacts=ok",
+        "transport.http_provenance=ok",
+    ]
+
+
+def _http_json(
+    base_url: str,
+    method: str,
+    path: str,
+    *,
+    api_token: str | None,
+    body: dict[str, object] | None = None,
+    query: dict[str, str] | None = None,
+    timeout_seconds: float,
+) -> dict[str, Any] | list[dict[str, Any]]:
+    encoded_query = "" if not query else "?" + urllib.parse.urlencode(query)
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(
+        base_url + path + encoded_query,
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"} if data is not None else {},
+    )
+    if api_token is not None:
+        request.add_header("Authorization", f"Bearer {api_token}")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            payload = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RelayError(f"transport HTTP request failed: {method} {path}: {detail}") from exc
+    except (OSError, urllib.error.URLError) as exc:
+        raise RelayError(f"transport HTTP request failed: {method} {path}: {exc}") from exc
+    return cast(dict[str, Any] | list[dict[str, Any]], json.loads(payload))
 
 
 def _require_transport_secrets(

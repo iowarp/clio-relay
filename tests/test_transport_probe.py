@@ -49,6 +49,29 @@ def test_frp_http_probe_starts_remote_proxy_and_local_visitor(monkeypatch: Monke
     assert 'auth.token = "frp-token"' in remote_script
 
 
+def test_frp_http_probe_runs_optional_http_check(monkeypatch: MonkeyPatch) -> None:
+    def fake_process_factory(command: list[str], **_kwargs: Any) -> FakeProcess:
+        return FakeProcess(command)
+
+    def fake_healthz(_url: str, *, timeout_seconds: float) -> None:
+        assert timeout_seconds == 30.0
+
+    monkeypatch.setattr("clio_relay.transport_probe._wait_for_healthz", fake_healthz)
+
+    lines = run_frp_http_probe(
+        cluster="test-cluster",
+        definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+        frpc_bin="frpc",
+        token="frp-token",
+        secret_key="stcp-secret",
+        local_bind_port=9876,
+        process_factory=fake_process_factory,
+        http_check=lambda local_url: [f"http_check_url={local_url}", "http_check=ok"],
+    )
+
+    assert lines[-2:] == ["http_check_url=http://127.0.0.1:9876", "http_check=ok"]
+
+
 class FakeProcess:
     def __init__(self, command: list[str]) -> None:
         self.command = command
