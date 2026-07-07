@@ -80,7 +80,7 @@ uv run clio-relay live-test --cluster ares --jarvis-yaml .\.clio-relay\live\ares
 }
 ```
 
-The acceptance runner submits the configured JARVIS YAML on the target cluster, waits for terminal success, verifies event replay, verifies durable task records, reads stdout/stderr by offset, lists and reads artifacts, verifies the provenance artifact, evaluates the configured monitor pattern, and optionally runs a configured remote-agent task. The cluster registry owns what `ares`, `homelab`, or any later target means.
+The acceptance runner submits the configured JARVIS YAML on the target cluster, waits for terminal success, verifies event replay, verifies durable task records, reads stdout/stderr by offset, lists and reads artifacts, verifies the provenance artifact, evaluates the configured monitor pattern, and optionally runs a configured remote-agent task. When an agent MCP config is supplied, acceptance also requires the agent to report a child relay job id and verifies that child job with the same event, task, log, artifact, and provenance checks. The cluster registry owns what `ares`, `homelab`, or any later target means.
 
 ## Cloudflare-backed frps edge
 

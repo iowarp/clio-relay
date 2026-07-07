@@ -780,6 +780,16 @@ def live_test(
         str | None,
         typer.Option(help="Remote MCP config path for optional agent acceptance."),
     ] = None,
+    require_agent_child_job: Annotated[
+        bool | None,
+        typer.Option(
+            "--require-agent-child-job/--no-require-agent-child-job",
+            help=(
+                "Require optional agent acceptance to report and complete a child relay job. "
+                "Defaults to enabled when --agent-mcp-config is set."
+            ),
+        ),
+    ] = None,
     timeout_seconds: Annotated[
         float,
         typer.Option(help="Maximum seconds to wait for acceptance jobs."),
@@ -799,6 +809,7 @@ def live_test(
                     monitor_pattern=monitor_pattern,
                     agent_prompt=agent_prompt,
                     agent_mcp_config=agent_mcp_config,
+                    require_agent_child_job=require_agent_child_job,
                     timeout_seconds=timeout_seconds,
                     poll_seconds=poll_seconds,
                 )

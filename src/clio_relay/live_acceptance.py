@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import posixpath
+import re
 import shlex
 import subprocess
+from base64 import b64decode
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -40,6 +42,7 @@ class LiveAcceptanceOptions:
     monitor_pattern: str | None = None
     agent_prompt: str | None = None
     agent_mcp_config: str | None = None
+    require_agent_child_job: bool | None = None
     timeout_seconds: float = 600
     poll_seconds: float = 2
 
@@ -55,6 +58,11 @@ def run_live_acceptance(
     monitor_pattern = options.monitor_pattern or options.definition.live_test.monitor_pattern
     agent_prompt = options.agent_prompt or options.definition.live_test.agent_prompt
     agent_mcp_config = options.agent_mcp_config or options.definition.live_test.agent_mcp_config
+    require_agent_child_job = (
+        agent_mcp_config is not None
+        if options.require_agent_child_job is None
+        else options.require_agent_child_job
+    )
     if jarvis_yaml is None:
         raise ConfigurationError(
             "live-test requires --jarvis-yaml or cluster live_test.jarvis_yaml"
@@ -94,92 +102,22 @@ def run_live_acceptance(
         raise RelayError(f"live-test submit did not return a job id: {submit}")
     lines.append(f"acceptance.job_id={job_id}")
 
-    job = _remote_clio_json(
+    _wait_for_success(
         options.definition,
-        [
-            "job",
-            "wait",
-            job_id,
-            "--timeout-seconds",
-            str(options.timeout_seconds),
-            "--poll-seconds",
-            str(options.poll_seconds),
-        ],
+        job_id,
+        timeout_seconds=options.timeout_seconds,
+        poll_seconds=options.poll_seconds,
         runner=command_runner,
     )
-    if job["state"] != "succeeded":
-        raise RelayError(f"acceptance job did not succeed: {job['state']}")
     lines.append("acceptance.job_state=succeeded")
 
-    monitor = _remote_clio_json(
+    _verify_completed_job(
         options.definition,
-        ["job", "monitor", job_id, "--cursor", "1", "--limit", "250"],
+        job_id,
+        line_prefix="acceptance",
+        lines=lines,
         runner=command_runner,
     )
-    event_types = {event["event_type"] for event in cast(list[dict[str, Any]], monitor["events"])}
-    required_events = {"job.queued", "job.running", "jarvis.started", "job.succeeded"}
-    missing_events = required_events - event_types
-    if missing_events:
-        raise RelayError(f"acceptance job missing events: {sorted(missing_events)}")
-    lines.append("acceptance.events=ok")
-
-    tasks = _remote_clio_json(
-        options.definition,
-        ["job", "tasks", job_id],
-        runner=command_runner,
-    )
-    task_items = cast(list[dict[str, Any]], tasks)
-    if not task_items or not any(task["state"] == "succeeded" for task in task_items):
-        raise RelayError("acceptance job missing succeeded task record")
-    lines.append(f"acceptance.tasks={len(task_items)}")
-
-    stdout = _remote_clio_json(
-        options.definition,
-        ["job", "read-log", job_id, "--stream", "stdout", "--offset", "0", "--limit", "200000"],
-        runner=command_runner,
-    )
-    stderr = _remote_clio_json(
-        options.definition,
-        ["job", "read-log", job_id, "--stream", "stderr", "--offset", "0", "--limit", "200000"],
-        runner=command_runner,
-    )
-    if int(stdout["next_offset"]) <= 0:
-        raise RelayError("acceptance stdout log is empty")
-    lines.append(f"acceptance.stdout_bytes={stdout['next_offset']}")
-    lines.append(f"acceptance.stderr_bytes={stderr['next_offset']}")
-
-    artifacts = _remote_clio_json(
-        options.definition,
-        ["job", "list-artifacts", job_id],
-        runner=command_runner,
-    )
-    artifact_items = cast(list[dict[str, Any]], artifacts)
-    artifact_kinds = {str(artifact["kind"]) for artifact in artifact_items}
-    if not {"jarvis_pipeline", "stdout", "stderr", "provenance"}.issubset(artifact_kinds):
-        raise RelayError(f"acceptance artifacts incomplete: {sorted(artifact_kinds)}")
-    lines.append(f"acceptance.artifacts={','.join(sorted(artifact_kinds))}")
-
-    stdout_artifact = next(artifact for artifact in artifact_items if artifact["kind"] == "stdout")
-    artifact_payload = _remote_clio_json(
-        options.definition,
-        ["job", "read-artifact", str(stdout_artifact["artifact_id"])],
-        runner=command_runner,
-    )
-    if artifact_payload.get("encoding") != "base64":
-        raise RelayError("acceptance artifact payload was not base64 encoded")
-    lines.append("acceptance.artifact_read=ok")
-
-    provenance_artifact = next(
-        artifact for artifact in artifact_items if artifact["kind"] == "provenance"
-    )
-    provenance_payload = _remote_clio_json(
-        options.definition,
-        ["job", "read-artifact", str(provenance_artifact["artifact_id"])],
-        runner=command_runner,
-    )
-    if provenance_payload.get("encoding") != "base64":
-        raise RelayError("acceptance provenance payload was not base64 encoded")
-    lines.append("acceptance.provenance=ok")
 
     if monitor_pattern is not None:
         _remote_clio_json(
@@ -224,26 +162,208 @@ def run_live_acceptance(
             raw_text=True,
         )
         agent_job_id = agent_submit.strip().splitlines()[-1]
-        agent_job = _remote_clio_json(
+        _wait_for_success(
             options.definition,
-            [
-                "job",
-                "wait",
-                agent_job_id,
-                "--timeout-seconds",
-                str(options.timeout_seconds),
-                "--poll-seconds",
-                str(options.poll_seconds),
-            ],
+            agent_job_id,
+            timeout_seconds=options.timeout_seconds,
+            poll_seconds=options.poll_seconds,
             runner=command_runner,
         )
-        if agent_job["state"] != "succeeded":
-            raise RelayError(f"acceptance agent job did not succeed: {agent_job['state']}")
         lines.append(f"acceptance.agent_job_id={agent_job_id}")
         lines.append("acceptance.agent_state=succeeded")
+        if require_agent_child_job:
+            child_job_id = _find_agent_child_job(
+                options.definition,
+                agent_job_id,
+                runner=command_runner,
+            )
+            _wait_for_success(
+                options.definition,
+                child_job_id,
+                timeout_seconds=options.timeout_seconds,
+                poll_seconds=options.poll_seconds,
+                runner=command_runner,
+            )
+            lines.append(f"acceptance.agent_child_job_id={child_job_id}")
+            _verify_completed_job(
+                options.definition,
+                child_job_id,
+                line_prefix="acceptance.agent_child",
+                lines=lines,
+                runner=command_runner,
+            )
 
     lines.append("live acceptance passed")
     return lines
+
+
+def _wait_for_success(
+    definition: ClusterDefinition,
+    job_id: str,
+    *,
+    timeout_seconds: float,
+    poll_seconds: float,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    job = _remote_clio_json(
+        definition,
+        [
+            "job",
+            "wait",
+            job_id,
+            "--timeout-seconds",
+            str(timeout_seconds),
+            "--poll-seconds",
+            str(poll_seconds),
+        ],
+        runner=runner,
+    )
+    typed = cast(dict[str, Any], job)
+    if typed["state"] != "succeeded":
+        raise RelayError(f"acceptance job did not succeed: {typed['state']}")
+    return typed
+
+
+def _verify_completed_job(
+    definition: ClusterDefinition,
+    job_id: str,
+    *,
+    line_prefix: str,
+    lines: list[str],
+    runner: CommandRunner,
+) -> None:
+    monitor = _remote_clio_json(
+        definition,
+        ["job", "monitor", job_id, "--cursor", "1", "--limit", "250"],
+        runner=runner,
+    )
+    event_types = {event["event_type"] for event in cast(list[dict[str, Any]], monitor["events"])}
+    required_events = {"job.queued", "job.running", "jarvis.started", "job.succeeded"}
+    missing_events = required_events - event_types
+    if missing_events:
+        raise RelayError(f"acceptance job missing events: {sorted(missing_events)}")
+    lines.append(f"{line_prefix}.events=ok")
+
+    tasks = _remote_clio_json(
+        definition,
+        ["job", "tasks", job_id],
+        runner=runner,
+    )
+    task_items = cast(list[dict[str, Any]], tasks)
+    if not task_items or not any(task["state"] == "succeeded" for task in task_items):
+        raise RelayError("acceptance job missing succeeded task record")
+    lines.append(f"{line_prefix}.tasks={len(task_items)}")
+
+    stdout = _remote_clio_json(
+        definition,
+        ["job", "read-log", job_id, "--stream", "stdout", "--offset", "0", "--limit", "200000"],
+        runner=runner,
+    )
+    stderr = _remote_clio_json(
+        definition,
+        ["job", "read-log", job_id, "--stream", "stderr", "--offset", "0", "--limit", "200000"],
+        runner=runner,
+    )
+    if int(stdout["next_offset"]) <= 0:
+        raise RelayError("acceptance stdout log is empty")
+    lines.append(f"{line_prefix}.stdout_bytes={stdout['next_offset']}")
+    lines.append(f"{line_prefix}.stderr_bytes={stderr['next_offset']}")
+
+    artifacts = _remote_clio_json(
+        definition,
+        ["job", "list-artifacts", job_id],
+        runner=runner,
+    )
+    artifact_items = cast(list[dict[str, Any]], artifacts)
+    artifact_kinds = {str(artifact["kind"]) for artifact in artifact_items}
+    if not {"jarvis_pipeline", "stdout", "stderr", "provenance"}.issubset(artifact_kinds):
+        raise RelayError(f"acceptance artifacts incomplete: {sorted(artifact_kinds)}")
+    lines.append(f"{line_prefix}.artifacts={','.join(sorted(artifact_kinds))}")
+
+    stdout_artifact = next(artifact for artifact in artifact_items if artifact["kind"] == "stdout")
+    artifact_payload = _remote_clio_json(
+        definition,
+        ["job", "read-artifact", str(stdout_artifact["artifact_id"])],
+        runner=runner,
+    )
+    if artifact_payload.get("encoding") != "base64":
+        raise RelayError("acceptance artifact payload was not base64 encoded")
+    lines.append(f"{line_prefix}.artifact_read=ok")
+
+    provenance_artifact = next(
+        artifact for artifact in artifact_items if artifact["kind"] == "provenance"
+    )
+    provenance_payload = _remote_clio_json(
+        definition,
+        ["job", "read-artifact", str(provenance_artifact["artifact_id"])],
+        runner=runner,
+    )
+    if provenance_payload.get("encoding") != "base64":
+        raise RelayError("acceptance provenance payload was not base64 encoded")
+    lines.append(f"{line_prefix}.provenance=ok")
+
+
+def _find_agent_child_job(
+    definition: ClusterDefinition,
+    agent_job_id: str,
+    *,
+    runner: CommandRunner,
+) -> str:
+    artifacts = _remote_clio_json(
+        definition,
+        ["job", "list-artifacts", agent_job_id],
+        runner=runner,
+    )
+    artifact_items = cast(list[dict[str, Any]], artifacts)
+    artifact_kinds = {str(artifact["kind"]) for artifact in artifact_items}
+    if "agent_result" not in artifact_kinds:
+        raise RelayError("acceptance agent job missing agent_result artifact")
+    candidate_texts: list[str] = []
+    for artifact in artifact_items:
+        if str(artifact["kind"]) not in {"agent_last_message", "stdout", "agent_result"}:
+            continue
+        payload = _remote_clio_json(
+            definition,
+            ["job", "read-artifact", str(artifact["artifact_id"])],
+            runner=runner,
+        )
+        candidate_texts.append(_decode_artifact_text(payload))
+    stdout = _remote_clio_json(
+        definition,
+        [
+            "job",
+            "read-log",
+            agent_job_id,
+            "--stream",
+            "stdout",
+            "--offset",
+            "0",
+            "--limit",
+            "200000",
+        ],
+        runner=runner,
+    )
+    candidate_texts.append(str(stdout.get("text", "")))
+    child_job_ids = sorted(
+        {
+            match
+            for text in candidate_texts
+            for match in re.findall(r"\bjob_[0-9a-f]{32}\b", text)
+            if match != agent_job_id
+        }
+    )
+    if not child_job_ids:
+        raise RelayError("acceptance agent did not report a child relay job id")
+    return child_job_ids[-1]
+
+
+def _decode_artifact_text(payload: dict[str, Any]) -> str:
+    if payload.get("encoding") != "base64":
+        raise RelayError("acceptance artifact payload was not base64 encoded")
+    data = payload.get("data")
+    if not isinstance(data, str):
+        raise RelayError("acceptance artifact payload missing base64 data")
+    return b64decode(data.encode("ascii")).decode("utf-8", errors="replace")
 
 
 def _configured_path(value: str | None) -> Path | None:
