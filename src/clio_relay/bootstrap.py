@@ -170,6 +170,7 @@ def bootstrap_cluster_over_ssh(
         raise ConfigurationError(f"unsupported bootstrap profile: {bootstrap_profile}")
     if shutil.which("ssh") is None or shutil.which("scp") is None or shutil.which("git") is None:
         raise ConfigurationError("ssh, scp, and git are required for remote bootstrap")
+    assert_clean_git_checkout(source_root)
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
         archive = temp_path / "clio-relay-head.tar"
@@ -287,6 +288,24 @@ echo "jarvis=$("$HOME/.local/bin/jarvis" --help | head -n 1)"
 echo "relay=$(clio-relay --help | head -n 1)"
 """
     return script.replace("\r\n", "\n")
+
+
+def assert_clean_git_checkout(source_root: Path) -> None:
+    """Raise if source_root has uncommitted changes that git archive would omit."""
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=source_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RelayError(f"failed to inspect git checkout before bootstrap: {detail}")
+    if result.stdout.strip():
+        raise ConfigurationError(
+            "remote bootstrap deploys git HEAD; commit or stash local changes before bootstrap"
+        )
 
 
 def _assert_executable(path: Path) -> None:

@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from clio_relay.bootstrap import render_linux_user_bootstrap_script
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from clio_relay.bootstrap import assert_clean_git_checkout, render_linux_user_bootstrap_script
+from clio_relay.errors import ConfigurationError
 
 
 def test_linux_user_bootstrap_script_installs_required_components() -> None:
@@ -20,3 +26,28 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert "CLIO_RELAY_CORE_DIR" in script
     assert "clio-relay init" in script
     assert "\r" not in script
+
+
+def test_bootstrap_refuses_dirty_git_checkout(tmp_path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "tracked.txt").write_text("clean\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match="deploys git HEAD"):
+        assert_clean_git_checkout(tmp_path)
