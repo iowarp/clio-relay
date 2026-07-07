@@ -6,6 +6,8 @@ The relay host is only `frps` configuration. It has no queue, no job records, an
 
 In the Cloudflare-backed homelab deployment, Cloudflare terminates public HTTPS for `frps.jcernuda.com` and forwards to a local HTTP origin. A small nginx edge container owns that HTTP origin, forwards the frp WebSocket path `/~!frp` to `frps` on loopback, and exposes only a simple health endpoint otherwise. `frps` still remains a dumb byte relay: it has no CLIO queue state, no job state, and no application routing logic.
 
+SSH local port forwarding is the closed-environment alternative to frp. It requires existing SSH/VPN reachability and does not solve public NAT traversal, but it gives institutions a simpler, auditable path that exposes only loopback HTTP on both ends. The relay starts an owned remote API session, binds a desktop loopback port with `ssh -L`, and keeps queue/state semantics unchanged.
+
 Direct NAT punching is an optional transport optimization, not the reliability path. Cluster registry entries can enable `frp_transport.direct` with `mode = "xtcp"` and a fallback order such as `["xtcp", "frp_stcp", "queue"]`. A direct probe may try UDP-assisted XTCP for high-volume streams, but any failure must fall back to the configured STCP/WSS relay and then to queue-only observation. The queue remains authoritative in every mode, and no job submission, event cursor, cancellation, progress, artifact, or provenance record can depend on direct transport success.
 
 The desktop endpoint submits configured-cluster work into the durable queue and exposes job, event, artifact, cancellation, remote-agent, and MCP-call surfaces for CLIO consumers.
@@ -27,3 +29,5 @@ Per-job spool directories live on cluster-accessible storage and are backing fil
 - `provenance.json`
 
 Spool files are never the authoritative queue. Reconnects and cursor replay come from clio-core records.
+
+Remote teardown is owned and explicit. Session teardown reads the session PID file and stops only that API process; it does not scan ports or kill by process name. Stopping the persistent cluster worker is a separate explicit operation, exposed as `session teardown --stop-worker`, so a CLIO desktop can offer "detach local UI" and "clean up remote relay" as different shutdown choices.

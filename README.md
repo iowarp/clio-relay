@@ -23,6 +23,7 @@ $env:CLIO_RELAY_STCP_SECRET = "<shared-stcp-secret>"
 uv run clio-relay relay-host render-frps-config
 uv run clio-relay relay-host render-frpc-config --cluster ares --local-port 8848
 uv run clio-relay relay-host render-frpc-visitor-config --cluster ares --bind-port 8765
+uv run clio-relay relay-host test-ssh-transport --cluster ares --local-bind-port 18766 --remote-api-port 8766 --session-id relay-ssh-test
 uv run clio-relay endpoint status
 ```
 
@@ -78,6 +79,10 @@ JARVIS packages can own application-specific progress extraction without adding 
 The HTTP API enforces `CLIO_RELAY_API_TOKEN` when that environment variable is set. Clients can send either `Authorization: Bearer <token>` or `X-Clio-Relay-Token: <token>`. `/healthz` remains unauthenticated for local process checks. When exposing the API through frp or another relay, start it with `clio-relay api start --require-token` so missing API auth fails at startup.
 
 HTTP clients can submit raw `RelayJob` records through `POST /jobs` or use typed submit endpoints: `POST /jobs/jarvis`, `POST /jobs/remote-agent`, and `POST /jobs/mcp-call`. The typed endpoints preserve the same durable queue semantics while keeping provider/workload details in request payloads instead of relay-native hardcoding.
+
+Closed environments can use SSH local port forwarding instead of frp. `relay-host test-ssh-transport` starts an owned cluster-side relay API session, opens `ssh -L 127.0.0.1:<local>:127.0.0.1:<remote>`, verifies `/healthz`, then tears down only the session-owned API process by default. Use `--detach-remote` to leave the remote session alive for a desktop detach/reattach workflow.
+
+Remote sessions are explicit lifecycle objects under `$HOME/.local/share/clio-relay/sessions/<session-id>` on the cluster. `session start`, `session status`, and `session teardown` manage only the PID recorded for that session. `session teardown --stop-worker` additionally stops the persistent user worker service for the configured cluster; this is intended for product shutdown flows such as "close local UI, detach remote", or "close local UI and clean up remote relay processes".
 
 Run a full configured live acceptance:
 

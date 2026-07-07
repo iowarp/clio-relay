@@ -220,6 +220,102 @@ def test_cli_record_progress_cannot_spoof_package_progress(
     assert "run_id" not in progress.metadata
 
 
+def test_cli_tests_ssh_transport(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    calls: list[dict[str, object]] = []
+
+    def fake_probe(**kwargs: object) -> list[str]:
+        calls.append(kwargs)
+        return ["transport.protocol=ssh_forward", "transport.healthz=ok"]
+
+    monkeypatch.setattr("clio_relay.cli.run_ssh_forward_http_probe", fake_probe)
+    monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "relay-host",
+            "test-ssh-transport",
+            "--cluster",
+            "ares",
+            "--local-bind-port",
+            "19001",
+            "--remote-api-port",
+            "9001",
+            "--session-id",
+            "session-1",
+            "--detach-remote",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "transport.healthz=ok" in result.output
+    assert calls[0]["cluster"] == "ares"
+    assert calls[0]["local_bind_port"] == 19001
+    assert calls[0]["remote_api_port"] == 9001
+    assert calls[0]["session_id"] == "session-1"
+    assert calls[0]["api_token"] == "api-token"
+    assert calls[0]["detach_remote"] is True
+
+
+def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    started: list[dict[str, object]] = []
+    torn_down: list[dict[str, object]] = []
+
+    def fake_start(**kwargs: object) -> list[str]:
+        started.append(kwargs)
+        return ["session_started=session-1"]
+
+    def fake_status(**kwargs: object) -> dict[str, object]:
+        return {"session_id": kwargs["session_id"], "running": True}
+
+    def fake_teardown(**kwargs: object) -> list[str]:
+        torn_down.append(kwargs)
+        return ["api_stopped=123", "worker_stopped=clio-relay-worker-ares.service"]
+
+    monkeypatch.setattr("clio_relay.cli.start_remote_session", fake_start)
+    monkeypatch.setattr("clio_relay.cli.status_remote_session", fake_status)
+    monkeypatch.setattr("clio_relay.cli.teardown_remote_session", fake_teardown)
+    monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
+    runner = CliRunner()
+
+    start_result = runner.invoke(
+        app,
+        [
+            "session",
+            "start",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--remote-api-port",
+            "9001",
+            "--replace",
+        ],
+    )
+    status_result = runner.invoke(
+        app,
+        ["session", "status", "--cluster", "ares", "--session-id", "session-1"],
+    )
+    teardown_result = runner.invoke(
+        app,
+        ["session", "teardown", "--cluster", "ares", "--session-id", "session-1", "--stop-worker"],
+    )
+
+    assert start_result.exit_code == 0
+    assert "session_started=session-1" in start_result.output
+    assert started[0]["api_token"] == "api-token"
+    assert started[0]["replace"] is True
+    assert status_result.exit_code == 0
+    assert json.loads(status_result.output)["running"] is True
+    assert teardown_result.exit_code == 0
+    assert torn_down[0]["stop_worker"] is True
+    assert torn_down[0]["cluster"] == "ares"
+
+
 def test_cli_render_frpc_uses_configured_secret_env(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

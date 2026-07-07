@@ -22,6 +22,7 @@ from clio_relay.relay_host import (
     render_frpc_config,
     render_frpc_visitor_config,
 )
+from clio_relay.session_lifecycle import start_remote_session, teardown_remote_session
 
 
 class ManagedProcess(Protocol):
@@ -227,6 +228,85 @@ def run_frp_direct_http_probe(
         "direct_transport.result=xtcp",
         *lines,
     ]
+
+
+def run_ssh_forward_http_probe(
+    *,
+    cluster: str,
+    definition: ClusterDefinition,
+    local_bind_port: int,
+    remote_api_port: int = 8765,
+    session_id: str = "relay-ssh-forward",
+    api_token: str | None = None,
+    timeout_seconds: float = 30.0,
+    process_factory: ProcessFactory | None = None,
+    http_check: HttpCheck | None = None,
+    detach_remote: bool = False,
+    replace_remote: bool = True,
+) -> list[str]:
+    """Probe desktop-to-cluster HTTP reachability through SSH port forwarding."""
+    if local_bind_port <= 0:
+        raise ConfigurationError("local_bind_port must be positive")
+    if remote_api_port <= 0:
+        raise ConfigurationError("remote_api_port must be positive")
+    if timeout_seconds <= 0:
+        raise ConfigurationError("timeout_seconds must be positive")
+    _assert_local_bind_port_available(local_bind_port)
+    start_lines = start_remote_session(
+        cluster=cluster,
+        definition=definition,
+        session_id=session_id,
+        remote_api_port=remote_api_port,
+        api_token=api_token,
+        replace=replace_remote,
+    )
+    factory = process_factory or _popen
+    forward = factory(
+        [
+            "ssh",
+            "-N",
+            "-L",
+            f"127.0.0.1:{local_bind_port}:127.0.0.1:{remote_api_port}",
+            definition.ssh_host,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        time.sleep(1)
+        if forward.poll() is not None:
+            raise RelayError(_process_output_message(forward, "local ssh forward failed"))
+        try:
+            _wait_for_healthz(
+                f"http://127.0.0.1:{local_bind_port}/healthz",
+                timeout_seconds=timeout_seconds,
+            )
+        except RelayError as exc:
+            _terminate(forward)
+            details = [
+                str(exc),
+                _process_output_message(forward, "local ssh forward still running"),
+            ]
+            raise RelayError("\n".join(details)) from exc
+        if forward.poll() is not None:
+            raise RelayError(_process_output_message(forward, "local ssh forward failed"))
+        lines = [
+            f"transport.cluster={cluster}",
+            "transport.protocol=ssh_forward",
+            f"transport.ssh_host={definition.ssh_host}",
+            f"transport.session_id={session_id}",
+            f"transport.remote_api_port={remote_api_port}",
+            f"transport.local_url=http://127.0.0.1:{local_bind_port}",
+            "transport.healthz=ok",
+            *start_lines,
+        ]
+        if http_check is not None:
+            lines.extend(http_check(f"http://127.0.0.1:{local_bind_port}"))
+        return lines
+    finally:
+        _terminate(forward)
+        if not detach_remote:
+            teardown_remote_session(definition=definition, session_id=session_id)
 
 
 def _run_frp_http_probe_with_proxy_type(

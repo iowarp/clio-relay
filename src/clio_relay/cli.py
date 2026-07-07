@@ -73,7 +73,16 @@ from clio_relay.remote_cli import (
     stage_jarvis_yaml,
     write_remote_file,
 )
-from clio_relay.transport_probe import run_frp_direct_http_probe, run_frp_http_probe
+from clio_relay.session_lifecycle import (
+    start_remote_session,
+    status_remote_session,
+    teardown_remote_session,
+)
+from clio_relay.transport_probe import (
+    run_frp_direct_http_probe,
+    run_frp_http_probe,
+    run_ssh_forward_http_probe,
+)
 
 app = typer.Typer(no_args_is_help=True)
 endpoint_app = typer.Typer(no_args_is_help=True)
@@ -83,6 +92,7 @@ cluster_app = typer.Typer(no_args_is_help=True)
 agent_app = typer.Typer(no_args_is_help=True)
 monitor_app = typer.Typer(no_args_is_help=True)
 api_app = typer.Typer(no_args_is_help=True)
+session_app = typer.Typer(no_args_is_help=True)
 
 app.add_typer(endpoint_app, name="endpoint")
 app.add_typer(relay_host_app, name="relay-host")
@@ -91,6 +101,7 @@ app.add_typer(cluster_app, name="cluster")
 app.add_typer(agent_app, name="agent")
 app.add_typer(monitor_app, name="monitor")
 app.add_typer(api_app, name="api")
+app.add_typer(session_app, name="session")
 
 
 @app.callback()
@@ -370,6 +381,46 @@ def test_direct_transport(
     )
 
 
+@relay_host_app.command("test-ssh-transport")
+def test_ssh_transport(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    local_bind_port: Annotated[int, typer.Option(help="Local desktop SSH-forward bind port.")],
+    remote_api_port: Annotated[int, typer.Option(help="Remote cluster API port.")] = 8765,
+    session_id: Annotated[
+        str,
+        typer.Option(help="Owned remote relay session id for this probe."),
+    ] = "relay-ssh-forward-test",
+    timeout_seconds: Annotated[
+        float,
+        typer.Option(help="Seconds to wait for healthz through the SSH forward."),
+    ] = 30.0,
+    detach_remote: Annotated[
+        bool,
+        typer.Option(
+            "--detach-remote/--teardown-remote",
+            help="Leave the remote API session running after the local SSH probe exits.",
+        ),
+    ] = False,
+) -> None:
+    """Run an end-to-end HTTP health check through SSH local port forwarding."""
+    settings = RelaySettings.from_env()
+    definition = _require_cluster(cluster)
+    _run_or_exit(
+        lambda: _echo_lines(
+            run_ssh_forward_http_probe(
+                cluster=cluster,
+                definition=definition,
+                local_bind_port=local_bind_port,
+                remote_api_port=remote_api_port,
+                session_id=session_id,
+                api_token=settings.api_token,
+                timeout_seconds=timeout_seconds,
+                detach_remote=detach_remote,
+            )
+        )
+    )
+
+
 @endpoint_app.command("start")
 def endpoint_start(
     role: Annotated[EndpointRole, typer.Option(help="Endpoint role.")],
@@ -586,6 +637,76 @@ def cluster_install_endpoint_service(
                 service_text=service_text,
                 start=start,
                 enable=enable,
+            )
+        )
+    )
+
+
+@session_app.command("start")
+def session_start(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    session_id: Annotated[str, typer.Option(help="Owned remote relay session id.")],
+    remote_api_port: Annotated[int, typer.Option(help="Remote cluster API port.")] = 8765,
+    replace: Annotated[
+        bool,
+        typer.Option("--replace/--no-replace", help="Replace an existing session API process."),
+    ] = False,
+    require_token: Annotated[
+        bool,
+        typer.Option(help="Require CLIO_RELAY_API_TOKEN on the remote API."),
+    ] = True,
+) -> None:
+    """Start an owned remote relay API session for detach/reattach workflows."""
+    settings = RelaySettings.from_env()
+    definition = _require_cluster(cluster)
+    _run_or_exit(
+        lambda: _echo_lines(
+            start_remote_session(
+                cluster=cluster,
+                definition=definition,
+                session_id=session_id,
+                remote_api_port=remote_api_port,
+                api_token=settings.api_token if require_token else None,
+                replace=replace,
+            )
+        )
+    )
+
+
+@session_app.command("status")
+def session_status(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    session_id: Annotated[str, typer.Option(help="Owned remote relay session id.")],
+) -> None:
+    """Inspect an owned remote relay API session."""
+    definition = _require_cluster(cluster)
+    _run_or_exit(
+        lambda: typer.echo(
+            json.dumps(
+                status_remote_session(definition=definition, session_id=session_id), indent=2
+            )
+        )
+    )
+
+
+@session_app.command("teardown")
+def session_teardown(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    session_id: Annotated[str, typer.Option(help="Owned remote relay session id.")],
+    stop_worker: Annotated[
+        bool,
+        typer.Option(help="Also stop the persistent cluster worker service for this cluster."),
+    ] = False,
+) -> None:
+    """Stop owned remote relay session processes, optionally stopping the worker service."""
+    definition = _require_cluster(cluster)
+    _run_or_exit(
+        lambda: _echo_lines(
+            teardown_remote_session(
+                definition=definition,
+                session_id=session_id,
+                stop_worker=stop_worker,
+                cluster=cluster,
             )
         )
     )

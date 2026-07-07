@@ -12,7 +12,11 @@ from pytest import MonkeyPatch
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import RelayError
-from clio_relay.transport_probe import run_frp_direct_http_probe, run_frp_http_probe
+from clio_relay.transport_probe import (
+    run_frp_direct_http_probe,
+    run_frp_http_probe,
+    run_ssh_forward_http_probe,
+)
 
 
 def test_frp_http_probe_starts_remote_proxy_and_local_visitor(monkeypatch: MonkeyPatch) -> None:
@@ -280,6 +284,97 @@ def test_frp_direct_http_probe_reports_stcp_fallback_when_xtcp_fails(
         for process in processes
         if process.stdin is not None
     )
+
+
+def test_ssh_forward_http_probe_starts_owned_remote_api_and_local_forward(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    processes: list[FakeProcess] = []
+    teardowns: list[str] = []
+
+    def fake_start(**kwargs: object) -> list[str]:
+        assert kwargs["session_id"] == "session-1"
+        assert kwargs["remote_api_port"] == 9001
+        return ["session_started=session-1", "api_pid=123"]
+
+    def fake_teardown(**kwargs: object) -> list[str]:
+        teardowns.append(str(kwargs["session_id"]))
+        return ["session_teardown=session-1"]
+
+    def fake_process_factory(command: list[str], **_kwargs: Any) -> FakeProcess:
+        process = FakeProcess(command)
+        processes.append(process)
+        return process
+
+    def fake_healthz(url: str, *, timeout_seconds: float) -> None:
+        assert url == "http://127.0.0.1:19001/healthz"
+        assert timeout_seconds == 4
+
+    monkeypatch.setattr("clio_relay.transport_probe.start_remote_session", fake_start)
+    monkeypatch.setattr("clio_relay.transport_probe.teardown_remote_session", fake_teardown)
+    monkeypatch.setattr("clio_relay.transport_probe._wait_for_healthz", fake_healthz)
+
+    lines = run_ssh_forward_http_probe(
+        cluster="test-cluster",
+        definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+        local_bind_port=19001,
+        remote_api_port=9001,
+        session_id="session-1",
+        api_token="token",
+        timeout_seconds=4,
+        process_factory=fake_process_factory,
+    )
+
+    assert "transport.protocol=ssh_forward" in lines
+    assert "transport.healthz=ok" in lines
+    assert "session_started=session-1" in lines
+    assert processes[0].command == [
+        "ssh",
+        "-N",
+        "-L",
+        "127.0.0.1:19001:127.0.0.1:9001",
+        "test-host",
+    ]
+    assert teardowns == ["session-1"]
+
+
+def test_ssh_forward_http_probe_can_detach_remote_session(monkeypatch: MonkeyPatch) -> None:
+    teardowns: list[str] = []
+
+    def fake_start(**_kwargs: object) -> list[str]:
+        return ["session_started=session-1"]
+
+    def fake_teardown(**kwargs: object) -> list[str]:
+        teardowns.append(str(kwargs["session_id"]))
+        return ["session_teardown=session-1"]
+
+    def fake_healthz(_url: str, *, timeout_seconds: float) -> None:
+        del timeout_seconds
+
+    def fake_process_factory(command: list[str], **_kwargs: object) -> FakeProcess:
+        return FakeProcess(command)
+
+    monkeypatch.setattr(
+        "clio_relay.transport_probe.start_remote_session",
+        fake_start,
+    )
+    monkeypatch.setattr(
+        "clio_relay.transport_probe.teardown_remote_session",
+        fake_teardown,
+    )
+    monkeypatch.setattr("clio_relay.transport_probe._wait_for_healthz", fake_healthz)
+
+    run_ssh_forward_http_probe(
+        cluster="test-cluster",
+        definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+        local_bind_port=19001,
+        remote_api_port=9001,
+        session_id="session-1",
+        process_factory=fake_process_factory,
+        detach_remote=True,
+    )
+
+    assert teardowns == []
 
 
 @contextmanager
