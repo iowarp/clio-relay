@@ -96,13 +96,13 @@ uv run clio-relay live-test --cluster ares --jarvis-yaml .\.clio-relay\live\ares
     "transport_local_bind_port": 18765,
     "transport_remote_api_port": 8765,
     "transport_proxy_name": "relay-http-live-test",
-    "agent_prompt": "/home/user/.local/share/clio-relay/agent-tests/prompt.md",
+    "agent_child_jarvis_yaml": ".clio-relay/live/agent-child.yaml",
     "agent_mcp_config": "/home/user/.local/share/clio-relay/agent-tests/mcp.toml"
   }
 }
 ```
 
-The acceptance runner submits the configured JARVIS YAML on the target cluster, waits for terminal success, verifies event replay, verifies durable task records, reads stdout/stderr by offset, lists and reads artifacts, verifies the provenance artifact, evaluates the configured monitor pattern, and can record structured progress from stdout events through a configured regex/action payload. With `verify_transport` enabled, it also starts a temporary cluster-side relay API and frpc proxy, starts the desktop-side frpc visitor, and verifies HTTP health over the configured frp transport using the cluster's `frp_transport` settings and local secrets. When an agent MCP config is supplied, acceptance also requires the agent to report a child relay job id and verifies that child job with the same event, task, log, artifact, and provenance checks. The cluster registry owns what `ares`, `homelab`, or any later target means.
+The acceptance runner submits the configured JARVIS YAML on the target cluster, waits for terminal success, verifies event replay, verifies durable task records, reads stdout/stderr by offset, lists and reads artifacts, verifies the provenance artifact, evaluates the configured monitor pattern, and can record structured progress from stdout events through a configured regex/action payload. With `verify_transport` enabled, it also starts a temporary cluster-side relay API and frpc proxy, starts the desktop-side frpc visitor, and verifies HTTP health over the configured frp transport using the cluster's `frp_transport` settings and local secrets. When `agent_child_jarvis_yaml` and an agent MCP config are supplied, acceptance generates a fresh remote prompt that instructs the agent to submit that child pipeline through `relay_submit_jarvis_pipeline`; it then requires the reported child job to have been created by the current agent run and verifies the child with the same event, task, log, artifact, and provenance checks. A prewritten `agent_prompt` can still be supplied for specialized agent acceptance, but it cannot be combined with `agent_child_jarvis_yaml`. The cluster registry owns what `ares`, `homelab`, or any later target means.
 
 ## Cloudflare-backed frps edge
 

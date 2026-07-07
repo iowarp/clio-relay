@@ -59,6 +59,7 @@ class LiveAcceptanceOptions:
     transport_remote_api_port: int | None = None
     transport_proxy_name: str | None = None
     api_token: str | None = None
+    agent_child_jarvis_yaml: Path | None = None
     timeout_seconds: float = 600
     poll_seconds: float = 2
 
@@ -79,6 +80,9 @@ def run_live_acceptance(
         else options.definition.live_test.progress_action_payload
     )
     agent_prompt = options.agent_prompt or options.definition.live_test.agent_prompt
+    agent_child_jarvis_yaml = options.agent_child_jarvis_yaml or _configured_path(
+        options.definition.live_test.agent_child_jarvis_yaml
+    )
     agent_mcp_config = options.agent_mcp_config or options.definition.live_test.agent_mcp_config
     require_agent_child_job = (
         agent_mcp_config is not None
@@ -96,6 +100,19 @@ def run_live_acceptance(
         )
     if not jarvis_yaml.exists():
         raise ConfigurationError(f"live-test JARVIS YAML does not exist: {jarvis_yaml}")
+    if agent_child_jarvis_yaml is not None and not agent_child_jarvis_yaml.exists():
+        raise ConfigurationError(
+            f"live-test agent child JARVIS YAML does not exist: {agent_child_jarvis_yaml}"
+        )
+    if agent_child_jarvis_yaml is not None and agent_mcp_config is None:
+        raise ConfigurationError(
+            "live-test --agent-child-jarvis-yaml requires --agent-mcp-config "
+            "or cluster live_test.agent_mcp_config"
+        )
+    if agent_child_jarvis_yaml is not None and agent_prompt is not None:
+        raise ConfigurationError(
+            "live-test cannot use both an explicit agent prompt and agent_child_jarvis_yaml"
+        )
     transport_token: str | None = None
     transport_secret_key: str | None = None
     if verify_transport:
@@ -125,6 +142,15 @@ def run_live_acceptance(
         runner=command_runner,
     )
     lines.append(f"acceptance.pipeline={remote_yaml}")
+    if agent_child_jarvis_yaml is not None:
+        agent_prompt = _write_generated_agent_prompt(
+            options.definition,
+            cluster=options.cluster,
+            run_id=run_id,
+            child_yaml=agent_child_jarvis_yaml,
+            runner=command_runner,
+        )
+        lines.append(f"acceptance.agent_prompt={agent_prompt}")
 
     submit = _remote_clio_json(
         options.definition,
@@ -292,6 +318,58 @@ def _require_transport_secrets(
     if secret_key is None:
         raise ConfigurationError("live transport acceptance requires an stcp secret")
     return token, secret_key
+
+
+def _write_generated_agent_prompt(
+    definition: ClusterDefinition,
+    *,
+    cluster: str,
+    run_id: str,
+    child_yaml: Path,
+    runner: CommandRunner,
+) -> str:
+    remote_home = _remote_home(definition.ssh_host, runner=runner)
+    remote_prompt = f"{remote_home}/.local/share/clio-relay/live-tests/{run_id}/agent-prompt.md"
+    idempotency_key = f"live-test:{cluster}:{run_id}:agent-child"
+    prompt = _generated_agent_prompt(
+        cluster=cluster,
+        idempotency_key=idempotency_key,
+        pipeline_yaml=child_yaml.read_text(encoding="utf-8"),
+    )
+    _remote_write_file(
+        definition.ssh_host,
+        remote_prompt,
+        prompt.encode("utf-8"),
+        runner=runner,
+    )
+    return remote_prompt
+
+
+def _remote_home(ssh_host: str, *, runner: CommandRunner) -> str:
+    home = _remote_shell(ssh_host, 'printf "%s" "$HOME"', runner=runner).strip()
+    if not home.startswith("/"):
+        raise RelayError(f"remote HOME did not resolve to an absolute path: {home}")
+    return home
+
+
+def _generated_agent_prompt(
+    *,
+    cluster: str,
+    idempotency_key: str,
+    pipeline_yaml: str,
+) -> str:
+    return (
+        "Use only the MCP tool named relay_submit_jarvis_pipeline. "
+        "Do not use shell commands.\n\n"
+        "Call relay_submit_jarvis_pipeline with:\n"
+        f"- cluster: {cluster}\n"
+        f"- idempotency_key: {idempotency_key}\n"
+        "- pipeline_yaml: the exact YAML below\n\n"
+        "After the tool returns, respond with only the relay job id.\n\n"
+        "```yaml\n"
+        f"{pipeline_yaml.rstrip()}\n"
+        "```\n"
+    )
 
 
 def _wait_for_success(

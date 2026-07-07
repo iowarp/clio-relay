@@ -91,11 +91,11 @@ def handle_request(
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
-def render_codex_mcp_profile(
+def render_agent_mcp_profile(
     *,
     settings: RelaySettings | None = None,
 ) -> str:
-    """Render a Codex profile TOML snippet for the relay MCP server."""
+    """Render an agent MCP profile TOML snippet for the relay MCP server."""
     resolved = settings or RelaySettings.from_env()
     return "\n".join(
         [
@@ -109,6 +109,14 @@ def render_codex_mcp_profile(
             "",
         ]
     )
+
+
+def render_codex_mcp_profile(
+    *,
+    settings: RelaySettings | None = None,
+) -> str:
+    """Render a Codex-compatible MCP profile TOML snippet for the relay MCP server."""
+    return render_agent_mcp_profile(settings=settings)
 
 
 def _initialize_result() -> JSON:

@@ -27,7 +27,7 @@ from clio_relay.endpoint import EndpointWorker
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.frp_check import run_frpc_connection_check
 from clio_relay.live_acceptance import LiveAcceptanceOptions, run_live_acceptance
-from clio_relay.mcp_server import render_codex_mcp_profile, serve_stdio
+from clio_relay.mcp_server import render_agent_mcp_profile, serve_stdio
 from clio_relay.models import (
     Cursor,
     EndpointRole,
@@ -733,7 +733,7 @@ def agent_render_mcp_config(
     ] = None,
 ) -> None:
     """Render a Codex profile that exposes the relay MCP tools."""
-    rendered = render_codex_mcp_profile(settings=RelaySettings.from_env())
+    rendered = render_agent_mcp_profile(settings=RelaySettings.from_env())
     if output is None:
         typer.echo(rendered)
         return
@@ -790,6 +790,15 @@ def live_test(
     agent_mcp_config: Annotated[
         str | None,
         typer.Option(help="Remote MCP config path for optional agent acceptance."),
+    ] = None,
+    agent_child_jarvis_yaml: Annotated[
+        Path | None,
+        typer.Option(
+            help=(
+                "Local JARVIS YAML the agent must submit through MCP. "
+                "Generates a remote agent prompt with a fresh idempotency key."
+            ),
+        ),
     ] = None,
     require_agent_child_job: Annotated[
         bool | None,
@@ -854,6 +863,7 @@ def live_test(
                     agent_prompt=agent_prompt,
                     agent_mcp_config=agent_mcp_config,
                     require_agent_child_job=require_agent_child_job,
+                    agent_child_jarvis_yaml=agent_child_jarvis_yaml,
                     verify_transport=verify_transport,
                     transport_token=(
                         _resolve_env_secret(

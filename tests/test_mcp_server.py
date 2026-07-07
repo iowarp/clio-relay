@@ -6,7 +6,12 @@ from pathlib import Path
 
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.mcp_server import handle_request, render_codex_mcp_profile, serve_stdio
+from clio_relay.mcp_server import (
+    handle_request,
+    render_agent_mcp_profile,
+    render_codex_mcp_profile,
+    serve_stdio,
+)
 from clio_relay.models import (
     ArtifactRef,
     Cursor,
@@ -346,8 +351,8 @@ def test_mcp_lists_job_tasks(tmp_path: Path) -> None:
     assert tasks[0]["name"] == "jarvis.execution"
 
 
-def test_codex_mcp_profile_points_to_clio_relay_server() -> None:
-    rendered = render_codex_mcp_profile(
+def test_agent_mcp_profile_points_to_clio_relay_server() -> None:
+    rendered = render_agent_mcp_profile(
         settings=RelaySettings(core_dir=Path("/tmp/core"), spool_dir=Path("/tmp/spool"))
     )
 
@@ -360,6 +365,14 @@ def test_codex_mcp_profile_points_to_clio_relay_server() -> None:
     assert "core" in rendered
     assert "CLIO_RELAY_SPOOL_DIR =" in rendered
     assert "spool" in rendered
+
+
+def test_codex_mcp_profile_alias_matches_generic_agent_profile() -> None:
+    settings = RelaySettings(core_dir=Path("/tmp/core"), spool_dir=Path("/tmp/spool"))
+
+    assert render_codex_mcp_profile(settings=settings) == render_agent_mcp_profile(
+        settings=settings
+    )
 
 
 def test_mcp_response_content_is_json(tmp_path: Path) -> None:

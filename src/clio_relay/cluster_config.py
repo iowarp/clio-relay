@@ -36,6 +36,7 @@ class LiveTestConfig(BaseModel):
     transport_remote_api_port: int = 8765
     transport_proxy_name: str = "relay-http-live-test"
     agent_prompt: str | None = None
+    agent_child_jarvis_yaml: str | None = None
     agent_mcp_config: str | None = None
 
 
