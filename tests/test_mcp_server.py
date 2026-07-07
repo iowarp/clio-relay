@@ -460,3 +460,17 @@ def test_stdio_server_reports_parse_errors(tmp_path: Path) -> None:
 
     response = json.loads(stdout.getvalue())
     assert response["error"]["code"] == -32700
+
+
+def test_stdio_server_accepts_utf8_bom(tmp_path: Path) -> None:
+    stdout = StringIO()
+
+    serve_stdio(
+        stdin=StringIO('\ufeff{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n'),
+        stdout=stdout,
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+    )
+
+    response = json.loads(stdout.getvalue())
+    tool_names = {tool["name"] for tool in response["result"]["tools"]}
+    assert "relay_submit_remote_agent" in tool_names

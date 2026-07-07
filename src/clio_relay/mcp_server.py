@@ -45,7 +45,11 @@ def serve_stdio(
     resolved = settings or RelaySettings.from_env()
     queue = ClioCoreQueue(resolved.core_dir)
     queue.initialize()
+    first_line = True
     for line in stdin:
+        if first_line:
+            line = line.removeprefix("\ufeff")
+            first_line = False
         if not line.strip():
             continue
         try:
