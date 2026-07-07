@@ -16,8 +16,12 @@ class RemoteAgentRunnerModule(Protocol):
         ...
 
 
-def test_exec_adapter_runs_configured_agent_with_templates(tmp_path: Path) -> None:
+def test_exec_adapter_runs_configured_agent_with_templates(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
     runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
     agent_script = tmp_path / "agent.py"
     output_path = tmp_path / "args.json"
     prompt_path = tmp_path / "prompt.md"
@@ -53,6 +57,12 @@ def test_exec_adapter_runs_configured_agent_with_templates(tmp_path: Path) -> No
     )
 
     assert return_code == 0
+    result = json.loads((tmp_path / "agent-result.json").read_text(encoding="utf-8"))
+    assert result["adapter"] == "exec"
+    assert result["agent_bin"] == "python"
+    assert result["returncode"] == 0
+    assert result["prompt_path"] == str(prompt_path)
+    assert result["mcp_config_path"] == str(mcp_path)
     assert json.loads(output_path.read_text(encoding="utf-8")) == [
         "--prompt",
         "do the work",
@@ -68,6 +78,7 @@ def test_codex_adapter_disables_interactive_approvals(
     monkeypatch: MonkeyPatch,
 ) -> None:
     runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
     prompt_path = tmp_path / "prompt.md"
     prompt_path.write_text("use the tool", encoding="utf-8")
     captured: dict[str, list[str]] = {}
@@ -87,12 +98,45 @@ def test_codex_adapter_disables_interactive_approvals(
     )
 
     assert return_code == 0
+    result = json.loads((tmp_path / "agent-result.json").read_text(encoding="utf-8"))
+    assert result["adapter"] == "codex"
+    assert result["returncode"] == 0
     assert captured["command"][:4] == [
         "codex",
         "--dangerously-bypass-approvals-and-sandbox",
         "exec",
         "--json",
     ]
+
+
+def test_agent_timeout_writes_structured_result(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("run too long", encoding="utf-8")
+
+    def fake_run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(command, timeout=1)
+
+    monkeypatch.setattr(cast(Any, runner).subprocess, "run", fake_run)
+
+    return_code = cast(RemoteAgentRunnerModule, runner).run_remote_agent_from_params(
+        {
+            "agent_bin": "agent",
+            "agent_adapter": "exec",
+            "prompt_path": str(prompt_path),
+            "timeout_seconds": 1,
+        }
+    )
+
+    result = json.loads((tmp_path / "agent-result.json").read_text(encoding="utf-8"))
+
+    assert return_code == 124
+    assert result["returncode"] == 124
+    assert result["timed_out"] is True
 
 
 def _load_runner() -> ModuleType:

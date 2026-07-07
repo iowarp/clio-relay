@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -11,6 +13,7 @@ from uuid import uuid4
 
 def run_remote_agent_from_params(params: dict[str, Any]) -> int:
     """Run a configured remote-agent task and return the process exit code."""
+    started_at = time.time()
     agent_bin = _required_str(params, "agent_bin")
     adapter = str(params.get("agent_adapter", "exec"))
     prompt_path = Path(_required_str(params, "prompt_path"))
@@ -21,6 +24,8 @@ def run_remote_agent_from_params(params: dict[str, Any]) -> int:
     model = params.get("model")
     agent_args = _string_list(params.get("agent_args"))
 
+    output_path = Path.cwd() / "agent-last-message.txt"
+    result_path = Path.cwd() / "agent-result.json"
     if adapter == "codex":
         command, cleanup_path = _codex_command(
             agent_bin=agent_bin,
@@ -29,6 +34,7 @@ def run_remote_agent_from_params(params: dict[str, Any]) -> int:
             mcp_config_path=mcp_config_path,
             model=model if isinstance(model, str) else None,
             workdir=workdir,
+            output_path=output_path,
         )
     elif adapter == "exec":
         command = _exec_command(
@@ -44,8 +50,27 @@ def run_remote_agent_from_params(params: dict[str, Any]) -> int:
         raise ValueError(f"unsupported agent_adapter: {adapter}")
 
     try:
-        result = subprocess.run(command, cwd=workdir, timeout=timeout, check=False)
-        return result.returncode
+        try:
+            result = subprocess.run(command, cwd=workdir, timeout=timeout, check=False)
+            returncode = result.returncode
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            returncode = 124
+            timed_out = True
+        _write_agent_result(
+            result_path=result_path,
+            agent_bin=agent_bin,
+            adapter=adapter,
+            prompt_path=prompt_path,
+            mcp_config_path=mcp_config_path,
+            model=model if isinstance(model, str) else None,
+            workdir=workdir,
+            returncode=returncode,
+            timed_out=timed_out,
+            started_at=started_at,
+            output_path=output_path,
+        )
+        return returncode
     finally:
         if cleanup_path is not None:
             cleanup_path.unlink(missing_ok=True)
@@ -59,8 +84,8 @@ def _codex_command(
     mcp_config_path: Path | None,
     model: str | None,
     workdir: Path | None,
+    output_path: Path,
 ) -> tuple[list[str], Path | None]:
-    output_path = Path.cwd() / "agent-last-message.txt"
     command = [
         agent_bin,
         "--dangerously-bypass-approvals-and-sandbox",
@@ -113,6 +138,38 @@ def _exec_command(
     }
     rendered = [replacements.get(arg, arg) for arg in agent_args]
     return [agent_bin, *rendered]
+
+
+def _write_agent_result(
+    *,
+    result_path: Path,
+    agent_bin: str,
+    adapter: str,
+    prompt_path: Path,
+    mcp_config_path: Path | None,
+    model: str | None,
+    workdir: Path | None,
+    returncode: int,
+    timed_out: bool,
+    started_at: float,
+    output_path: Path,
+) -> None:
+    finished_at = time.time()
+    result = {
+        "adapter": adapter,
+        "agent_bin": agent_bin,
+        "prompt_path": str(prompt_path),
+        "mcp_config_path": None if mcp_config_path is None else str(mcp_config_path),
+        "model": model,
+        "workdir": None if workdir is None else str(workdir),
+        "returncode": returncode,
+        "timed_out": timed_out,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_seconds": finished_at - started_at,
+        "last_message_path": str(output_path) if output_path.exists() else None,
+    }
+    result_path.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _required_str(params: dict[str, Any], key: str) -> str:

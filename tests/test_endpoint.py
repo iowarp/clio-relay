@@ -16,6 +16,7 @@ from clio_relay.models import (
     JobState,
     Lease,
     RelayJob,
+    RemoteAgentTaskSpec,
 )
 from clio_relay.relay_ops import cancel_job
 
@@ -227,3 +228,60 @@ def test_worker_renews_lease_while_pipeline_runs(tmp_path: Path) -> None:
     assert result.job_id == job.job_id
     assert result.state == JobState.SUCCEEDED
     assert queue.renew_count == 1
+
+
+def test_worker_indexes_agent_result_artifacts(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("submit the configured pipeline", encoding="utf-8")
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.REMOTE_AGENT,
+            spec=RemoteAgentTaskSpec(prompt_path=prompt),
+            idempotency_key="agent-artifacts",
+        )
+    )
+
+    class ArtifactProvider(RecordingProvider):
+        def run_pipeline_streaming(
+            self,
+            pipeline_path: Path,
+            *,
+            cwd: Path | None = None,
+            on_stdout: Callable[[str], None] | None = None,
+            on_stderr: Callable[[str], None] | None = None,
+            on_start: Callable[[int], None] | None = None,
+            should_cancel: Callable[[], bool] | None = None,
+            on_poll: Callable[[], None] | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            self.runs.append(pipeline_path)
+            assert cwd is not None
+            (cwd / "agent-result.json").write_text('{"returncode": 0}', encoding="utf-8")
+            (cwd / "agent-last-message.txt").write_text("submitted job_abc", encoding="utf-8")
+            if on_start is not None:
+                on_start(321)
+            return subprocess.CompletedProcess(args=["jarvis"], returncode=0, stdout="", stderr="")
+
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=queue,
+        provider=ArtifactProvider(),
+    )
+    worker.register()
+
+    result = worker.run_once()
+    artifacts = queue.list_artifacts(job.job_id)
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=50)
+
+    assert result is not None
+    assert result.state == JobState.SUCCEEDED
+    assert {artifact.kind for artifact in artifacts} >= {
+        "agent_result",
+        "agent_last_message",
+    }
+    assert "agent_result.available" in [event.event_type for event in events]
+    assert "agent_last_message.available" in [event.event_type for event in events]

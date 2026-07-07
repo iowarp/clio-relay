@@ -45,6 +45,8 @@ Job submission is asynchronous by default: submit returns a `job_id`, initial st
 
 The worker streams JARVIS stdout/stderr into durable events while the process is running (`stdout.delta` and `stderr.delta`) and also writes complete `stdout.log` and `stderr.log` files into the job spool. The clio-core boundary owns job state, event cursors, and artifact metadata; spool files are backing data for logs and artifacts, not the queue.
 
+Relay-owned JARVIS packages emit structured result files into the same job spool. Remote-agent jobs produce `agent-result.json` and, when the configured adapter writes one, `agent-last-message.txt`; MCP-call jobs produce `mcp-result.json` with return code and captured server output. The worker indexes these as `agent_result`, `agent_last_message`, and `mcp_result` artifacts so desktop, HTTP, and MCP clients can inspect result evidence without scraping logs.
+
 Cancellation is durable and cooperative. `job cancel`, HTTP `/jobs/{job_id}/cancel`, and MCP `relay_cancel_job` all record `job.cancel_requested` and move the job to `canceled`. A running worker polls clio-core while JARVIS executes; when it observes cancellation it terminates the JARVIS process group, records `execution.canceled`, and does not overwrite the terminal canceled state.
 
 Worker leases are short lived and renewed while JARVIS is running. If a worker process dies or loses access to clio-core, the next worker loop recovers expired `leased` or `running` jobs for that cluster: jobs below the retry cap are requeued with a `job.requeued` event, and jobs at the cap become `failed` with an explicit `job.failed` event. This prevents orphaned long-running work from remaining invisible while avoiding duplicate execution from healthy workers.

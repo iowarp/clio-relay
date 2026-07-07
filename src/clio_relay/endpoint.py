@@ -124,6 +124,7 @@ class EndpointWorker:
         )
         self.queue.append_artifact(spool.artifact_for(spool.path / "stdout.log", kind="stdout"))
         self.queue.append_artifact(spool.artifact_for(spool.path / "stderr.log", kind="stderr"))
+        self._append_optional_result_artifacts(job, spool)
         if self.queue.get_job(job.job_id).state == JobState.CANCELED:
             self.queue.append_event(
                 job.job_id,
@@ -180,6 +181,22 @@ class EndpointWorker:
             f"JARVIS-CD process started: {pid}",
             payload={"pid": pid},
         )
+
+    def _append_optional_result_artifacts(self, job: RelayJob, spool: JobSpool) -> None:
+        candidates = {
+            "agent_result": spool.path / "agent-result.json",
+            "agent_last_message": spool.path / "agent-last-message.txt",
+            "mcp_result": spool.path / "mcp-result.json",
+        }
+        for kind, path in candidates.items():
+            if path.exists():
+                self.queue.append_artifact(spool.artifact_for(path, kind=kind))
+                self.queue.append_event(
+                    job.job_id,
+                    f"{kind}.available",
+                    f"Result artifact available: {kind}",
+                    payload={"path": str(path)},
+                )
 
     def _renew_lease_if_needed(self, lease: Lease, last_renewed_at: list[float]) -> None:
         now = time.monotonic()
