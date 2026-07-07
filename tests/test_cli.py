@@ -80,6 +80,58 @@ def test_cli_lists_tasks(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     assert tasks[0]["name"] == "jarvis.execution"
 
 
+def test_cli_job_status_includes_relay_queue(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="cli-status",
+        )
+    )
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+
+    result = CliRunner().invoke(app, ["job", "status", job.job_id])
+
+    assert result.exit_code == 0
+    status = json.loads(result.output)
+    assert status["job"]["job_id"] == job.job_id
+    assert status["relay_queue"] == {"state": "queued", "jobs_ahead": 0, "position": 1}
+
+
+def test_cli_job_submit_can_request_exclusive_scheduler(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    core_dir = tmp_path / "core"
+    yaml_path = tmp_path / "pipeline.yaml"
+    yaml_path.write_text("name: generic\npkgs: []\n", encoding="utf-8")
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
+    _write_test_cluster(tmp_path, name="test-cluster")
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "job",
+            "submit",
+            "--cluster",
+            "test-cluster",
+            "--jarvis-yaml",
+            str(yaml_path),
+            "--exclusive",
+        ],
+    )
+
+    assert result.exit_code == 0
+    job = ClioCoreQueue(core_dir).list_jobs()[0]
+    assert isinstance(job.spec, JarvisRunSpec)
+    assert "exclusive: true" in str(job.spec.pipeline_yaml)
+
+
 def test_cli_creates_and_evaluates_monitor_rule(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     core_dir = tmp_path / "core"
     queue = ClioCoreQueue(core_dir)

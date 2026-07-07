@@ -50,6 +50,9 @@ from clio_relay.relay_ops import (
     read_job_log,
     wait_for_terminal,
 )
+from clio_relay.relay_ops import (
+    job_status as get_job_status_operation,
+)
 
 
 class JarvisSubmitRequest(BaseModel):
@@ -167,6 +170,13 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     def get_job(job_id: str) -> RelayJob:
         try:
             return queue.get_job(job_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/jobs/{job_id}/status", dependencies=[auth_dependency])
+    def get_job_status(job_id: str) -> dict[str, object]:
+        try:
+            return get_job_status_operation(queue, job_id)
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 

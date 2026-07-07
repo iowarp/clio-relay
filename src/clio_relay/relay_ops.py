@@ -7,7 +7,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 from urllib.parse import unquote, urlparse
 
 from clio_relay.config import RelaySettings
@@ -27,6 +27,7 @@ from clio_relay.models import (
     utc_now,
 )
 from clio_relay.progress_provenance import external_progress_metadata
+from clio_relay.scheduler_status import relay_queue_status
 from clio_relay.spool import JobSpool
 
 
@@ -60,14 +61,54 @@ def monitor_job(
     limit: int = 100,
 ) -> dict[str, object]:
     """Return job state plus event drain data from a cursor."""
-    job = queue.get_job(job_id)
     events, next_cursor = queue.drain_events(Cursor(job_id=job_id, next_seq=cursor), limit=limit)
+    status = job_status(queue, job_id)
     return {
-        "job": job.model_dump(mode="json"),
+        **status,
         "events": [event.model_dump(mode="json") for event in events],
         "next_cursor": next_cursor.next_seq,
+    }
+
+
+def job_status(queue: ClioCoreQueue, job_id: str) -> dict[str, object]:
+    """Return current job, relay queue, and scheduler status."""
+    job = queue.get_job(job_id)
+    return {
+        "job": job.model_dump(mode="json"),
+        "relay_queue": relay_queue_status(queue, job),
+        "scheduler": scheduler_status_for_job(queue, job_id),
         "terminal": job.state in TERMINAL_STATES,
     }
+
+
+def scheduler_status_for_job(queue: ClioCoreQueue, job_id: str) -> list[dict[str, object]]:
+    """Return scheduler status metadata recorded for job tasks."""
+    statuses: list[dict[str, object]] = []
+    for task in queue.list_tasks(job_id):
+        stored = task.metadata.get("scheduler_status")
+        if isinstance(stored, dict):
+            statuses.append(
+                {
+                    "task_id": task.task_id,
+                    "task_name": task.name,
+                    "status": stored,
+                }
+            )
+            continue
+        stored_items = task.metadata.get("scheduler_statuses")
+        if not isinstance(stored_items, list):
+            continue
+        for item in cast(list[object], stored_items):
+            if isinstance(item, dict):
+                typed_item = cast(dict[str, object], item)
+                statuses.append(
+                    {
+                        "task_id": task.task_id,
+                        "task_name": task.name,
+                        "status": typed_item,
+                    }
+                )
+    return statuses
 
 
 def read_job_log(

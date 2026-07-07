@@ -285,6 +285,38 @@ def test_http_lists_job_tasks(tmp_path: Path) -> None:
     assert response.json()[0]["name"] == "jarvis.execution"
 
 
+def test_http_job_status_includes_relay_queue_and_scheduler(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-status",
+        )
+    )
+    task = queue.append_task(RelayTask(job_id=job.job_id, name="jarvis.execution"))
+    queue.update_task_metadata(
+        task.task_id,
+        {
+            "scheduler_status": {
+                "scheduler": "slurm",
+                "scheduler_job_id": "100",
+                "phase": "pending",
+            }
+        },
+    )
+    client = cast(Any, TestClient(create_app(settings)))
+
+    response = client.get(f"/jobs/{job.job_id}/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["relay_queue"]["position"] == 1
+    assert payload["scheduler"][0]["status"]["phase"] == "pending"
+
+
 def test_http_healthz_does_not_require_token(tmp_path: Path) -> None:
     client = cast(
         Any,

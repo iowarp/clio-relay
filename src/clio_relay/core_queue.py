@@ -295,6 +295,26 @@ class ClioCoreQueue:
             )
             return updated
 
+    def update_task_metadata(
+        self,
+        task_id: str,
+        metadata: dict[str, object],
+    ) -> RelayTask:
+        """Merge task metadata without changing task state or emitting a task event."""
+        self.initialize()
+        with self._lock:
+            path = self.root / "tasks" / f"{task_id}.json"
+            task = self._read_optional(path, RelayTask)
+            if task is None:
+                raise NotFoundError(f"task not found: {task_id}")
+            updated_metadata = dict(task.metadata)
+            updated_metadata.update(metadata)
+            updated = task.model_copy(
+                update={"updated_at": utc_now(), "metadata": updated_metadata}
+            )
+            self._write(path, updated)
+            return updated
+
     def list_tasks(self, job_id: str | None = None) -> list[RelayTask]:
         """Return durable task records, optionally filtered by job id."""
         self.initialize()

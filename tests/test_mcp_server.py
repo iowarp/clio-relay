@@ -38,6 +38,7 @@ def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
     assert "relay_submit_remote_agent" in tool_names
     assert "relay_submit_mcp_call" in tool_names
     assert "relay_get_job" in tool_names
+    assert "relay_get_job_status" in tool_names
     assert "relay_monitor_job" in tool_names
     assert "relay_watch_job_events" in tool_names
     assert "relay_list_tasks" in tool_names
@@ -332,6 +333,44 @@ def test_mcp_monitor_returns_job_and_events(tmp_path: Path) -> None:
     assert structured["job"]["job_id"] == job_id
     assert structured["events"][0]["event_type"] == "job.queued"
     assert structured["terminal"] is False
+
+
+def test_mcp_get_job_status_returns_relay_queue(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    submit_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 27,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_submit_jarvis_pipeline",
+                "arguments": {
+                    "cluster": "test-cluster",
+                    "pipeline_yaml": "name: generic\npkgs: []\n",
+                },
+            },
+        },
+        queue=queue,
+    )
+    assert submit_response is not None
+    job_id = submit_response["result"]["structuredContent"]["job_id"]
+
+    status_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 28,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_get_job_status",
+                "arguments": {"job_id": job_id},
+            },
+        },
+        queue=queue,
+    )
+
+    assert status_response is not None
+    status = status_response["result"]["structuredContent"]
+    assert status["relay_queue"] == {"state": "queued", "jobs_ahead": 0, "position": 1}
 
 
 def test_mcp_records_and_lists_progress(tmp_path: Path) -> None:

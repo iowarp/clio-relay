@@ -45,6 +45,7 @@ from clio_relay.progress_provenance import (
     package_progress_metadata,
     validate_package_progress_metadata,
 )
+from clio_relay.scheduler_status import poll_slurm_status
 from clio_relay.spool import JobSpool
 
 
@@ -201,9 +202,11 @@ class EndpointWorker:
                     lease,
                     last_renewed_at,
                     job=job,
+                    task_id=task.task_id,
                     progress_sidecar=progress_sidecar,
                     progress_sidecar_offset=progress_sidecar_offset,
                     progress_sidecar_token=progress_sidecar_token,
+                    scheduler_job_ids=scheduler_job_ids,
                     package_progress_adapter=package_progress_adapter,
                     package_progress_log_offsets=package_progress_log_offsets,
                 ),
@@ -473,9 +476,11 @@ class EndpointWorker:
         last_renewed_at: list[float],
         *,
         job: RelayJob,
+        task_id: str,
         progress_sidecar: Path,
         progress_sidecar_offset: list[int],
         progress_sidecar_token: str,
+        scheduler_job_ids: list[str],
         package_progress_adapter: LammpsThermoProgressAdapter | None = None,
         package_progress_log_offsets: dict[Path, int] | None = None,
     ) -> None:
@@ -492,6 +497,8 @@ class EndpointWorker:
                 package_progress_adapter,
                 package_progress_log_offsets,
             )
+        if scheduler_job_ids:
+            self._refresh_scheduler_status(job, scheduler_job_ids, task_id=task_id)
 
     def _ingest_package_progress_logs(
         self,
@@ -547,6 +554,7 @@ class EndpointWorker:
                 f"Scheduler job detected: {job_id}",
                 payload={"scheduler": "slurm", "scheduler_job_id": job_id},
             )
+            self._refresh_scheduler_status(job, [job_id], task_id=scheduler_task_id)
 
     def _should_cancel_job(
         self,
@@ -604,6 +612,45 @@ class EndpointWorker:
                 "scheduler_job_ids": list(scheduler_job_ids),
             },
         )
+
+    def _refresh_scheduler_status(
+        self,
+        job: RelayJob,
+        scheduler_job_ids: list[str],
+        *,
+        task_id: str | None,
+    ) -> None:
+        for scheduler_job_id in scheduler_job_ids:
+            status = poll_slurm_status(scheduler_job_id)
+            target_task_id = task_id or _task_id_for_scheduler_job(
+                self.queue.list_tasks(job.job_id),
+                scheduler_job_id,
+            )
+            if target_task_id is None:
+                continue
+            previous = _task_scheduler_status(
+                self.queue.list_tasks(job.job_id),
+                target_task_id,
+                scheduler_job_id,
+            )
+            status_payload = status.model_dump(mode="json")
+            self.queue.update_task_metadata(
+                target_task_id,
+                {
+                    "scheduler": "slurm",
+                    "scheduler_job_ids": list(scheduler_job_ids),
+                    "scheduler_status": status_payload,
+                },
+            )
+            previous_phase = previous.get("phase") if previous is not None else None
+            if previous_phase == status.phase.value:
+                continue
+            self.queue.append_event(
+                job.job_id,
+                f"scheduler.{status.phase.value}",
+                f"Scheduler job {scheduler_job_id} is {status.phase.value}",
+                payload=status_payload,
+            )
 
     def _durable_scheduler_job_ids(
         self,
@@ -863,6 +910,31 @@ def _scheduler_job_ids_from_metadata(metadata: dict[str, Any]) -> list[str]:
         if isinstance(item, str) and item not in ids:
             ids.append(item)
     return ids
+
+
+def _task_id_for_scheduler_job(tasks: list[RelayTask], scheduler_job_id: str) -> str | None:
+    for task in tasks:
+        if scheduler_job_id in _scheduler_job_ids_from_metadata(task.metadata):
+            return task.task_id
+    return None
+
+
+def _task_scheduler_status(
+    tasks: list[RelayTask],
+    task_id: str,
+    scheduler_job_id: str,
+) -> dict[str, Any] | None:
+    for task in tasks:
+        if task.task_id != task_id:
+            continue
+        stored = task.metadata.get("scheduler_status")
+        if not isinstance(stored, dict):
+            return None
+        typed = cast(dict[str, Any], stored)
+        if typed.get("scheduler_job_id") != scheduler_job_id:
+            return None
+        return typed
+    return None
 
 
 @contextmanager

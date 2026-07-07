@@ -27,6 +27,7 @@ from clio_relay.relay_ops import (
 )
 from clio_relay.relay_ops import (
     evaluate_monitor_rules,
+    job_status,
     monitor_job,
     read_artifact_bytes,
     read_job_log,
@@ -190,6 +191,16 @@ def _tool_definitions() -> list[JSON]:
         {
             "name": "relay_get_job",
             "description": "Read a relay job record by id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_get_job_status",
+            "description": "Read job state, relay queue position, and scheduler status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"job_id": {"type": "string"}},
@@ -365,6 +376,8 @@ def _call_tool(params: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -
         result = _submit_mcp_call(arguments, queue=queue)
     elif name == "relay_get_job":
         result = queue.get_job(_required_str(arguments, "job_id")).model_dump(mode="json")
+    elif name == "relay_get_job_status":
+        result = job_status(queue, _required_str(arguments, "job_id"))
     elif name == "relay_monitor_job":
         result = monitor_job(
             queue,

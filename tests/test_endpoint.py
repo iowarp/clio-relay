@@ -22,6 +22,8 @@ from clio_relay.models import (
     RelayJob,
     RelayTask,
     RemoteAgentTaskSpec,
+    SchedulerPhase,
+    SchedulerStatus,
 )
 from clio_relay.relay_ops import cancel_job
 
@@ -144,6 +146,85 @@ def test_worker_runs_one_job_and_indexes_artifacts(tmp_path: Path) -> None:
     assert provenance["execution"]["returncode"] == 0
     assert provenance["provider"]["name"] == "jarvis-cd"
     assert provenance["artifacts"]["stdout"]["sha256"] is not None
+
+
+def test_worker_records_scheduler_status_from_polling(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    class SchedulerProvider(RecordingProvider):
+        def run_pipeline_streaming(
+            self,
+            pipeline_path: Path,
+            *,
+            cwd: Path | None = None,
+            on_stdout: Callable[[str], None] | None = None,
+            on_stderr: Callable[[str], None] | None = None,
+            on_start: Callable[[int], None] | None = None,
+            should_cancel: Callable[[], bool] | None = None,
+            on_poll: Callable[[], None] | None = None,
+            timeout_seconds: int | None = None,
+            on_timeout: Callable[[], None] | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            del cwd, on_stderr, should_cancel, timeout_seconds, on_timeout
+            self.runs.append(pipeline_path)
+            if on_start is not None:
+                on_start(123)
+            if on_stdout is not None:
+                on_stdout("Submitted batch job 12345\n")
+            if on_poll is not None:
+                on_poll()
+            return subprocess.CompletedProcess(
+                args=["jarvis"],
+                returncode=0,
+                stdout="Submitted batch job 12345\n",
+                stderr="",
+            )
+
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    provider = SchedulerProvider()
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "hello"]),
+            idempotency_key="worker-scheduler-status",
+        )
+    )
+
+    def fake_poll_slurm_status(scheduler_job_id: str) -> SchedulerStatus:
+        return SchedulerStatus(
+            scheduler_job_id=scheduler_job_id,
+            phase=SchedulerPhase.PENDING,
+            raw_state="PENDING",
+            reason="Resources",
+            partition="compute",
+            queue_position=4,
+            jobs_ahead=3,
+        )
+
+    monkeypatch.setattr("clio_relay.endpoint.poll_slurm_status", fake_poll_slurm_status)
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=queue,
+        provider=provider,
+    )
+    worker.register()
+
+    result = worker.run_once()
+
+    assert result is not None
+    task = queue.list_tasks(job.job_id)[0]
+    status = task.metadata["scheduler_status"]
+    assert isinstance(status, dict)
+    assert status["scheduler_job_id"] == "12345"
+    assert status["phase"] == "pending"
+    assert status["jobs_ahead"] == 3
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=50)
+    assert "scheduler.pending" in [event.event_type for event in events]
 
 
 def test_worker_ignores_forged_stdout_progress_markers(tmp_path: Path) -> None:
@@ -720,7 +801,9 @@ def test_worker_preserves_canceled_state_for_running_job(
     assert "scheduler.job_detected" in event_types
     assert "scheduler.cancel_requested" in event_types
     assert "execution.canceled" in event_types
-    assert scancel_commands == [["scancel", "12345"]]
+    assert [command for command in scancel_commands if command[0] == "scancel"] == [
+        ["scancel", "12345"]
+    ]
     tasks = queue.list_tasks(job.job_id)
     assert tasks
     assert tasks[0].metadata["scheduler"] == "slurm"
@@ -801,7 +884,9 @@ def test_worker_timeout_scancels_scheduler_job(
     assert result is not None
     assert result.state == JobState.FAILED
     assert "execution.timeout" in [event.event_type for event in events]
-    assert scancel_commands == [["scancel", "98765"]]
+    assert [command for command in scancel_commands if command[0] == "scancel"] == [
+        ["scancel", "98765"]
+    ]
     tasks = queue.list_tasks(job.job_id)
     assert tasks
     assert tasks[0].metadata["scheduler"] == "slurm"

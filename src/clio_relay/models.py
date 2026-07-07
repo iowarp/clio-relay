@@ -50,6 +50,19 @@ class JobState(StrEnum):
 TERMINAL_STATES = {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELED}
 
 
+class SchedulerPhase(StrEnum):
+    """Cluster scheduler phase for a task."""
+
+    SUBMITTED = "submitted"
+    PENDING = "pending"
+    ALLOCATED = "allocated"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELED = "canceled"
+    UNKNOWN = "unknown"
+
+
 class MonitorRuleAction(StrEnum):
     """Actions a monitor rule can take when it matches an event."""
 
@@ -164,6 +177,34 @@ class RelayTask(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SchedulerStatus(BaseModel):
+    """Observed scheduler status for a relay task."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scheduler: str = "slurm"
+    scheduler_job_id: str
+    phase: SchedulerPhase = SchedulerPhase.UNKNOWN
+    raw_state: str | None = None
+    reason: str | None = None
+    partition: str | None = None
+    qos: str | None = None
+    user: str | None = None
+    nodes: int | None = Field(default=None, ge=0)
+    cpus: int | None = Field(default=None, ge=0)
+    memory: str | None = None
+    submit_time: str | None = None
+    eligible_time: str | None = None
+    start_time: str | None = None
+    elapsed: str | None = None
+    time_limit: str | None = None
+    queue_position: int | None = Field(default=None, ge=1)
+    jobs_ahead: int | None = Field(default=None, ge=0)
+    queue_position_scope: str | None = None
+    queue_position_note: str | None = None
+    observed_at: datetime = Field(default_factory=utc_now)
 
 
 class RelayEvent(BaseModel):

@@ -12,6 +12,7 @@ from typing import Annotated, cast
 
 import typer
 import uvicorn
+import yaml
 from pydantic import ValidationError
 
 from clio_relay.bootstrap import bootstrap_cluster_over_ssh, install_local_frp
@@ -66,6 +67,9 @@ from clio_relay.relay_ops import (
     read_artifact_bytes,
     read_job_log,
     wait_for_terminal,
+)
+from clio_relay.relay_ops import (
+    job_status as get_job_status,
 )
 from clio_relay.remote_cli import (
     run_remote_clio,
@@ -731,10 +735,16 @@ def job_submit(
         str | None,
         typer.Option(help="Submit/retry idempotency key."),
     ] = None,
+    exclusive: Annotated[
+        bool,
+        typer.Option("--exclusive/--shared", help="Request exclusive scheduler allocation."),
+    ] = False,
 ) -> None:
     """Submit a JARVIS pipeline job."""
     definition = _require_cluster(cluster)
     yaml_text = jarvis_yaml.read_text(encoding="utf-8")
+    if exclusive:
+        yaml_text = _with_exclusive_scheduler(yaml_text)
     key = idempotency_key or _file_idempotency_key(jarvis_yaml, yaml_text)
     if should_execute_on_cluster(definition):
         remote_yaml = stage_jarvis_yaml(
@@ -754,6 +764,7 @@ def job_submit(
                 remote_yaml,
                 "--idempotency-key",
                 key,
+                "--exclusive" if exclusive else "--shared",
             ],
         )
         return
@@ -812,6 +823,21 @@ def job_monitor(
         cursor=cursor,
         limit=limit,
     )
+    typer.echo(json.dumps(result, indent=2))
+
+
+@job_app.command("status")
+def job_status(
+    job_id: str,
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH."),
+    ] = None,
+) -> None:
+    """Read job, relay queue, and scheduler status as JSON."""
+    if _try_remote_cluster_passthrough(cluster, ["job", "status", job_id]):
+        return
+    result = get_job_status(ClioCoreQueue(RelaySettings.from_env().core_dir), job_id)
     typer.echo(json.dumps(result, indent=2))
 
 
@@ -1406,6 +1432,23 @@ def _json_object(value: str) -> dict[str, object]:
     if not isinstance(loaded, dict):
         raise typer.BadParameter("value must be a JSON object")
     return {str(key): item for key, item in cast(dict[object, object], loaded).items()}
+
+
+def _with_exclusive_scheduler(pipeline_yaml: str) -> str:
+    loaded = yaml.safe_load(pipeline_yaml)
+    if not isinstance(loaded, dict):
+        raise ConfigurationError("JARVIS YAML must be an object to request exclusive allocation")
+    document = cast(dict[str, object], loaded)
+    scheduler = document.get("scheduler")
+    if scheduler is None:
+        scheduler = {"name": "slurm"}
+    if not isinstance(scheduler, dict):
+        raise ConfigurationError("scheduler must be an object to request exclusive allocation")
+    typed_scheduler = cast(dict[str, object], scheduler)
+    typed_scheduler.setdefault("name", "slurm")
+    typed_scheduler["exclusive"] = True
+    document["scheduler"] = typed_scheduler
+    return yaml.safe_dump(document, sort_keys=False)
 
 
 def _echo_lines(lines: list[str]) -> None:
