@@ -52,7 +52,9 @@ def test_regex_progress_adapter_writes_side_channel(tmp_path: Path) -> None:
     record = adapter.observe_stdout("iter=4 of 10\n")[0]
     sidecar = tmp_path / "progress.jsonl"
     previous = os.environ.get("CLIO_RELAY_PROGRESS_FILE")
+    previous_token = os.environ.get("CLIO_RELAY_PROGRESS_TOKEN")
     os.environ["CLIO_RELAY_PROGRESS_FILE"] = str(sidecar)
+    os.environ["CLIO_RELAY_PROGRESS_TOKEN"] = "test-token"
     try:
         module.append_progress_record(record)
     finally:
@@ -60,6 +62,10 @@ def test_regex_progress_adapter_writes_side_channel(tmp_path: Path) -> None:
             os.environ.pop("CLIO_RELAY_PROGRESS_FILE", None)
         else:
             os.environ["CLIO_RELAY_PROGRESS_FILE"] = previous
+        if previous_token is None:
+            os.environ.pop("CLIO_RELAY_PROGRESS_TOKEN", None)
+        else:
+            os.environ["CLIO_RELAY_PROGRESS_TOKEN"] = previous_token
 
     decoded = json.loads(sidecar.read_text(encoding="utf-8"))
     assert decoded["label"] == "iteration"
@@ -67,6 +73,7 @@ def test_regex_progress_adapter_writes_side_channel(tmp_path: Path) -> None:
     assert decoded["total"] == 10
     assert decoded["metadata"]["source"] == "jarvis_package"
     assert decoded["metadata"]["package_name"] == "clio_relay.bounded_command"
+    assert decoded["metadata"]["relay_progress_token"] == "test-token"
 
 
 def _load_progress_module() -> ProgressModule:

@@ -7,7 +7,7 @@ from typing import Any
 from clio_relay.errors import ConfigurationError
 
 PROTECTED_PROGRESS_METADATA_KEYS = frozenset(
-    {"source", "package_name", "package_version", "run_id", "execution_id"}
+    {"source", "package_name", "package_version", "run_id", "execution_id", "relay_progress_token"}
 )
 
 
@@ -27,7 +27,11 @@ def package_progress_metadata(
     run_id: str,
 ) -> dict[str, Any]:
     """Return trusted package metadata with mandatory provenance fields."""
-    filtered = {key: value for key, value in metadata.items() if key != "source"}
+    filtered = {
+        key: value
+        for key, value in metadata.items()
+        if key not in {"source", "relay_progress_token"}
+    }
     return {
         **filtered,
         "source": "jarvis_package",

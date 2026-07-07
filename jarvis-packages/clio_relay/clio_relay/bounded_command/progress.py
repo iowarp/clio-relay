@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Protocol
 
 PROGRESS_FILE_ENV = "CLIO_RELAY_PROGRESS_FILE"
+PROGRESS_TOKEN_ENV = "CLIO_RELAY_PROGRESS_TOKEN"
 PACKAGE_NAME = "clio_relay.bounded_command"
 
 
@@ -51,6 +52,7 @@ class GenericRegexProgressAdapter:
                         "metadata": {
                             "source": "jarvis_package",
                             "package_name": PACKAGE_NAME,
+                            "package_version": "builtin",
                             "adapter": "regex",
                             **self.metadata,
                         },
@@ -88,8 +90,13 @@ def adapter_from_config(config: object) -> ProgressAdapter | None:
 def append_progress_record(record: dict[str, object]) -> None:
     """Append a trusted package progress record to the relay side-channel file."""
     path_value = os.getenv(PROGRESS_FILE_ENV)
-    if path_value is None or path_value == "":
+    token = os.getenv(PROGRESS_TOKEN_ENV)
+    if path_value is None or path_value == "" or token is None or token == "":
         return
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    record = {**record, "metadata": {**metadata, "relay_progress_token": token}}
     path = Path(path_value)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:

@@ -136,6 +136,7 @@ def run_live_acceptance(
         runner=command_runner,
     )
     expected_progress_adapter = _expected_progress_adapter(pipeline_yaml_text)
+    expected_progress_package = _expected_progress_package(pipeline_yaml_text)
 
     lines: list[str] = []
     lines.extend(run_cluster_doctor(options.definition))
@@ -149,6 +150,7 @@ def run_live_acceptance(
                 secret_key=transport_secret_key,
                 pipeline_yaml=pipeline_yaml_text,
                 expected_progress_adapter=expected_progress_adapter,
+                expected_progress_package=expected_progress_package,
             )
         )
     remote_yaml = f".local/share/clio-relay/live-tests/{run_id}/pipeline.yaml"
@@ -205,6 +207,7 @@ def run_live_acceptance(
         lines=lines,
         runner=command_runner,
         expected_progress_adapter=expected_progress_adapter,
+        expected_progress_package=expected_progress_package,
     )
 
     if monitor_pattern is not None:
@@ -291,6 +294,7 @@ def run_live_acceptance(
                 lines=lines,
                 runner=command_runner,
                 expected_progress_adapter=expected_progress_adapter,
+                expected_progress_package=expected_progress_package,
             )
 
     lines.append("live acceptance passed")
@@ -304,6 +308,7 @@ def _verify_transport(
     secret_key: str,
     pipeline_yaml: str,
     expected_progress_adapter: str | None,
+    expected_progress_package: str | None,
 ) -> list[str]:
     run_suffix = uuid4().hex[:12]
     return run_frp_http_probe(
@@ -338,6 +343,7 @@ def _verify_transport(
             timeout_seconds=options.timeout_seconds,
             poll_seconds=options.poll_seconds,
             expected_progress_adapter=expected_progress_adapter,
+            expected_progress_package=expected_progress_package,
         ),
     )
 
@@ -355,6 +361,7 @@ def _verify_transport_http_api(
     timeout_seconds: float,
     poll_seconds: float,
     expected_progress_adapter: str | None,
+    expected_progress_package: str | None,
 ) -> list[str]:
     run_digest = hashlib.sha256(pipeline_yaml.encode("utf-8")).hexdigest()[:16]
     idempotency_key = f"live-test:http-transport:{cluster}:{run_digest}:{uuid4().hex}"
@@ -461,7 +468,12 @@ def _verify_transport_http_api(
                 timeout_seconds=10,
             ),
         )
-        _assert_progress_adapter(progress, expected_progress_adapter, job_id=job_id)
+        _assert_progress_adapter(
+            progress,
+            expected_progress_adapter,
+            job_id=job_id,
+            package_name=expected_progress_package,
+        )
         lines.append(f"transport.http_progress_adapter={expected_progress_adapter}")
     return lines
 
@@ -632,6 +644,7 @@ def _verify_completed_job(
     lines: list[str],
     runner: CommandRunner,
     expected_progress_adapter: str | None = None,
+    expected_progress_package: str | None = None,
 ) -> None:
     monitor = _remote_clio_json(
         definition,
@@ -712,6 +725,7 @@ def _verify_completed_job(
             cast(list[dict[str, Any]], progress),
             expected_progress_adapter,
             job_id=job_id,
+            package_name=expected_progress_package,
         )
         lines.append(f"{line_prefix}.progress_adapter={expected_progress_adapter}")
 
@@ -739,11 +753,28 @@ def _expected_progress_adapter(pipeline_yaml: str) -> str | None:
     return None
 
 
+def _expected_progress_package(pipeline_yaml: str) -> str | None:
+    loaded = yaml.safe_load(pipeline_yaml)
+    typed_document = cast(dict[str, Any], loaded) if isinstance(loaded, dict) else {}
+    packages = typed_document.get("pkgs")
+    if not isinstance(packages, list):
+        return None
+    for package in cast(list[object], packages):
+        if not isinstance(package, dict):
+            continue
+        typed_package = cast(dict[str, Any], package)
+        package_type = typed_package.get("pkg_type")
+        if package_type in {"builtin.lammps", "lammps", "jarvis_cd.builtin.lammps"}:
+            return str(package_type)
+    return None
+
+
 def _assert_progress_adapter(
     progress: list[dict[str, Any]],
     expected_adapter: str,
     *,
     job_id: str,
+    package_name: str | None = None,
 ) -> None:
     for item in progress:
         metadata = item.get("metadata")
@@ -754,6 +785,7 @@ def _assert_progress_adapter(
             typed_metadata.get("adapter") == expected_adapter
             and typed_metadata.get("source") == "jarvis_package"
             and isinstance(typed_metadata.get("package_name"), str)
+            and (package_name is None or typed_metadata.get("package_name") == package_name)
             and isinstance(typed_metadata.get("package_version"), str)
             and typed_metadata.get("run_id") == job_id
             and typed_metadata.get("execution_id") == job_id

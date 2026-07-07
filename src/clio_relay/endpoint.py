@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import socket
 import subprocess
 import time
@@ -139,7 +140,8 @@ class EndpointWorker:
         package_progress_adapter = package_progress_adapter_from_pipeline(yaml_text)
         if package_progress_adapter is not None:
             package_progress_adapter.run_id = job.job_id
-        progress_sidecar = spool.path / "progress.jsonl"
+        progress_sidecar_token = secrets.token_urlsafe(32)
+        progress_sidecar = spool.path / f".progress-{secrets.token_hex(16)}.jsonl"
         progress_sidecar_offset = [0]
         scheduler_job_ids: list[str] = []
         scheduler_cancel_attempted = [False]
@@ -150,7 +152,12 @@ class EndpointWorker:
             "JARVIS-CD pipeline started",
             payload={"pipeline": str(pipeline_path)},
         )
-        with _temporary_env("CLIO_RELAY_PROGRESS_FILE", str(progress_sidecar)):
+        with _temporary_env_vars(
+            {
+                "CLIO_RELAY_PROGRESS_FILE": str(progress_sidecar),
+                "CLIO_RELAY_PROGRESS_TOKEN": progress_sidecar_token,
+            }
+        ):
             result = self.provider.run_pipeline_streaming(
                 pipeline_path,
                 cwd=spool.path,
@@ -187,12 +194,14 @@ class EndpointWorker:
                     job=job,
                     progress_sidecar=progress_sidecar,
                     progress_sidecar_offset=progress_sidecar_offset,
+                    progress_sidecar_token=progress_sidecar_token,
                 ),
             )
         self._ingest_progress_sidecar(
             job,
             progress_sidecar,
             progress_sidecar_offset=progress_sidecar_offset,
+            progress_sidecar_token=progress_sidecar_token,
         )
         self.queue.append_artifact(spool.artifact_for(spool.path / "stdout.log", kind="stdout"))
         self.queue.append_artifact(spool.artifact_for(spool.path / "stderr.log", kind="stderr"))
@@ -367,9 +376,13 @@ class EndpointWorker:
         records: list[dict[str, object]],
         *,
         source_event_seq: int | None,
+        progress_sidecar_token: str | None = None,
     ) -> None:
         for typed_payload in records:
             try:
+                metadata = _optional_metadata(typed_payload.get("metadata"))
+                if progress_sidecar_token is not None:
+                    _validate_progress_sidecar_token(metadata, progress_sidecar_token)
                 progress = ProgressRecord(
                     job_id=job.job_id,
                     label=str(typed_payload.get("label", "progress")),
@@ -378,10 +391,7 @@ class EndpointWorker:
                     unit=_optional_str(typed_payload.get("unit")),
                     message=_optional_str(typed_payload.get("message")),
                     source_event_seq=source_event_seq,
-                    metadata=_trusted_package_metadata(
-                        _optional_metadata(typed_payload.get("metadata")),
-                        job_id=job.job_id,
-                    ),
+                    metadata=_trusted_package_metadata(metadata, job_id=job.job_id),
                 )
                 validate_package_progress_metadata(progress.metadata)
             except (ConfigurationError, ValueError) as exc:
@@ -399,6 +409,7 @@ class EndpointWorker:
         progress_sidecar: Path,
         *,
         progress_sidecar_offset: list[int],
+        progress_sidecar_token: str,
     ) -> None:
         if not progress_sidecar.exists():
             return
@@ -425,6 +436,7 @@ class EndpointWorker:
                     job,
                     [cast(dict[str, object], payload)],
                     source_event_seq=None,
+                    progress_sidecar_token=progress_sidecar_token,
                 )
             progress_sidecar_offset[0] = handle.tell()
 
@@ -436,12 +448,14 @@ class EndpointWorker:
         job: RelayJob,
         progress_sidecar: Path,
         progress_sidecar_offset: list[int],
+        progress_sidecar_token: str,
     ) -> None:
         self._renew_lease_if_needed(lease, last_renewed_at)
         self._ingest_progress_sidecar(
             job,
             progress_sidecar,
             progress_sidecar_offset=progress_sidecar_offset,
+            progress_sidecar_token=progress_sidecar_token,
         )
 
     def _append_execution_start(self, job: RelayJob, pid: int) -> None:
@@ -633,6 +647,11 @@ def _optional_metadata(value: object) -> dict[str, object]:
     return {str(key): item for key, item in typed.items()}
 
 
+def _validate_progress_sidecar_token(metadata: dict[str, object], expected_token: str) -> None:
+    if metadata.get("relay_progress_token") != expected_token:
+        raise ConfigurationError("side-channel package progress token did not match")
+
+
 def _trusted_package_metadata(metadata: dict[str, object], *, job_id: str) -> dict[str, object]:
     package_name = metadata.get("package_name")
     package_version = metadata.get("package_version")
@@ -651,13 +670,14 @@ def _job_timeout_seconds(job: RelayJob) -> int | None:
 
 
 @contextmanager
-def _temporary_env(name: str, value: str) -> Generator[None]:
-    previous = os.environ.get(name)
-    os.environ[name] = value
+def _temporary_env_vars(values: dict[str, str]) -> Generator[None]:
+    previous = {name: os.environ.get(name) for name in values}
+    os.environ.update(values)
     try:
         yield
     finally:
-        if previous is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = previous
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value

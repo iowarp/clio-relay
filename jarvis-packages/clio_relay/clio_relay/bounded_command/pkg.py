@@ -16,6 +16,9 @@ from jarvis_cd.core.pkg import Application
 
 from clio_relay.bounded_command.progress import adapter_from_config, append_progress_record
 
+PROGRESS_FILE_ENV = "CLIO_RELAY_PROGRESS_FILE"
+PROGRESS_TOKEN_ENV = "CLIO_RELAY_PROGRESS_TOKEN"
+
 
 class BoundedCommand(Application):
     """Execute a bounded command and let JARVIS-CD capture provenance."""
@@ -40,6 +43,8 @@ class BoundedCommand(Application):
         supplied_env = self.config.get("env", {})
         if isinstance(supplied_env, dict):
             env.update({str(key): str(value) for key, value in supplied_env.items()})
+        env.pop(PROGRESS_FILE_ENV, None)
+        env.pop(PROGRESS_TOKEN_ENV, None)
         workdir_value = self.config.get("workdir")
         workdir = Path(workdir_value) if isinstance(workdir_value, str) else None
         timeout_value = self.config.get("timeout_seconds")
