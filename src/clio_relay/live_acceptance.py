@@ -541,10 +541,17 @@ def _write_generated_agent_prompt(
     remote_home = _remote_home(definition.ssh_host, runner=runner)
     remote_prompt = f"{remote_home}/.local/share/clio-relay/live-tests/{run_id}/agent-prompt.md"
     idempotency_key = f"live-test:{cluster}:{run_id}:agent-child"
+    child_pipeline_yaml = _stage_acceptance_files(
+        definition,
+        jarvis_yaml=child_yaml,
+        pipeline_yaml_text=child_yaml.read_text(encoding="utf-8"),
+        run_id=f"{run_id}-agent-child",
+        runner=runner,
+    )
     prompt = _generated_agent_prompt(
         cluster=cluster,
         idempotency_key=idempotency_key,
-        pipeline_yaml=child_yaml.read_text(encoding="utf-8"),
+        pipeline_yaml=child_pipeline_yaml,
     )
     _remote_write_file(
         definition.ssh_host,

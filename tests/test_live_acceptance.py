@@ -739,8 +739,20 @@ def test_live_acceptance_generates_agent_prompt_from_child_pipeline(
 ) -> None:
     pipeline = tmp_path / "pipeline.yaml"
     pipeline.write_text("name: primary\npkgs: []\n", encoding="utf-8")
+    child_input = tmp_path / "child.in"
+    child_input.write_text("run 5\n", encoding="utf-8")
     child_pipeline = tmp_path / "child.yaml"
-    child_pipeline.write_text("name: child-workload\npkgs: []\n", encoding="utf-8")
+    child_pipeline.write_text(
+        "name: child-workload\n"
+        "x_clio_relay:\n"
+        "  stage_files:\n"
+        "  - local_path: child.in\n"
+        "    remote_path: .local/share/clio-relay/live-tests/{run_id}/child.in\n"
+        "pkgs:\n"
+        "- pkg_type: example.child\n"
+        "  script: .local/share/clio-relay/live-tests/{run_id}/child.in\n",
+        encoding="utf-8",
+    )
     uploads: dict[str, bytes | None] = {}
     commands: list[list[str]] = []
     primary_job_id = "job_11111111111111111111111111111111"
@@ -890,7 +902,11 @@ def test_live_acceptance_generates_agent_prompt_from_child_pipeline(
     prompt_text = prompt.decode("utf-8")
     assert "cluster: test-cluster" in prompt_text
     assert "name: child-workload" in prompt_text
+    assert "x_clio_relay" not in prompt_text
+    assert "{run_id}" not in prompt_text
+    assert "script: .local/share/clio-relay/live-tests/" in prompt_text
     assert "idempotency_key: live-test:test-cluster:" in prompt_text
+    assert any(content is not None and b"run 5" in content for content in uploads.values())
     assert "acceptance.agent_child.provenance=ok" in lines
     assert any(
         "/agent-prompt.md" in command[-1] for command in commands if "agent run" in command[-1]
