@@ -76,6 +76,37 @@ def test_regex_progress_adapter_writes_side_channel(tmp_path: Path) -> None:
     assert decoded["metadata"]["relay_progress_token"] == "test-token"
 
 
+def test_regex_progress_adapter_cannot_spoof_package_identity() -> None:
+    module = _load_progress_module()
+    adapter = cast(
+        Adapter,
+        module.adapter_from_config(
+            {
+                "adapter": "regex",
+                "pattern": r"step=(?P<current>\d+)",
+                "metadata": {
+                    "source": "jarvis_package",
+                    "adapter": "lammps",
+                    "package_name": "builtin.lammps",
+                    "package_version": "builtin",
+                    "run_id": "job_spoofed",
+                    "user_field": "kept",
+                },
+            }
+        ),
+    )
+
+    record = adapter.observe_stdout("step=4\n")[0]
+    metadata = cast(dict[str, object], record["metadata"])
+
+    assert metadata["source"] == "jarvis_package"
+    assert metadata["adapter"] == "regex"
+    assert metadata["package_name"] == "clio_relay.bounded_command"
+    assert metadata["package_version"] == "builtin"
+    assert "run_id" not in metadata
+    assert metadata["user_field"] == "kept"
+
+
 def _load_progress_module() -> ProgressModule:
     path = (
         Path(__file__).parents[1]

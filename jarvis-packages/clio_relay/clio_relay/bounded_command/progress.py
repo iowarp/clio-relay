@@ -50,11 +50,11 @@ class GenericRegexProgressAdapter:
                         "unit": self.unit,
                         "message": message,
                         "metadata": {
+                            **_metadata(config=None, metadata=self.metadata),
                             "source": "jarvis_package",
                             "package_name": PACKAGE_NAME,
                             "package_version": "builtin",
                             "adapter": "regex",
-                            **self.metadata,
                         },
                     }
                 )
@@ -118,9 +118,16 @@ def _optional_str(value: object) -> str | None:
     return value if isinstance(value, str) and value != "" else None
 
 
-def _metadata(config: dict[str, object]) -> dict[str, object]:
-    value = config.get("metadata", {})
-    return value if isinstance(value, dict) else {}
+def _metadata(
+    config: dict[str, object] | None = None,
+    *,
+    metadata: object | None = None,
+) -> dict[str, object]:
+    value = config.get("metadata", {}) if config is not None else metadata
+    if not isinstance(value, dict):
+        return {}
+    protected = {"source", "package_name", "package_version", "run_id", "execution_id", "adapter"}
+    return {str(key): item for key, item in value.items() if str(key) not in protected}
 
 
 def _drop_none(value: dict[str, object | None]) -> dict[str, object]:
