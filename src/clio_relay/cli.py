@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, cast
@@ -97,7 +98,10 @@ def init() -> None:
 
 @relay_host_app.command("render-frps-config")
 def render_frps(
-    token: Annotated[str, typer.Option(help="frp authentication token.")],
+    token: Annotated[
+        str | None,
+        typer.Option(help="frp authentication token. Defaults to CLIO_RELAY_FRP_TOKEN."),
+    ] = None,
     bind_port: Annotated[int, typer.Option(help="frps bind port.")] = 7000,
     transport_protocol: Annotated[
         FrpTransportProtocol,
@@ -109,44 +113,70 @@ def render_frps(
     ] = None,
 ) -> None:
     """Render an frps config with no relay application state."""
-    config = FrpsConfig(
-        bind_port=bind_port,
-        token=token,
-        transport_protocol=transport_protocol,
-        dashboard_port=dashboard_port,
+    _run_or_exit(
+        lambda: typer.echo(
+            render_frps_config(
+                FrpsConfig(
+                    bind_port=bind_port,
+                    token=_resolve_env_secret(token, "CLIO_RELAY_FRP_TOKEN", "frp token"),
+                    transport_protocol=transport_protocol,
+                    dashboard_port=dashboard_port,
+                )
+            )
+        )
     )
-    typer.echo(render_frps_config(config))
 
 
 @relay_host_app.command("render-frpc-config")
 def render_frpc(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
-    token: Annotated[str, typer.Option(help="frp authentication token.")],
     local_port: Annotated[int, typer.Option(help="Local relay endpoint port.")],
-    secret_key: Annotated[str, typer.Option(help="stcp shared secret.")],
+    token: Annotated[
+        str | None,
+        typer.Option(help="frp authentication token. Defaults to cluster token_env."),
+    ] = None,
+    secret_key: Annotated[
+        str | None,
+        typer.Option(help="stcp shared secret. Defaults to cluster stcp_secret_env."),
+    ] = None,
     proxy_name: Annotated[str, typer.Option(help="stcp proxy name.")] = "relay-stcp",
 ) -> None:
     """Render an frpc config using the cluster's configured frp transport."""
     definition = _require_cluster(cluster)
     transport = definition.frp_transport
-    config = FrpcConfig(
-        server_addr=transport.server_addr,
-        server_port=transport.server_port,
-        token=token,
-        transport_protocol=FrpTransportProtocol(transport.protocol),
-        proxy_name=proxy_name,
-        local_port=local_port,
-        secret_key=secret_key,
+    _run_or_exit(
+        lambda: typer.echo(
+            render_frpc_config(
+                FrpcConfig(
+                    server_addr=transport.server_addr,
+                    server_port=transport.server_port,
+                    token=_resolve_env_secret(token, transport.token_env, "frp token"),
+                    transport_protocol=FrpTransportProtocol(transport.protocol),
+                    proxy_name=proxy_name,
+                    local_port=local_port,
+                    secret_key=_resolve_env_secret(
+                        secret_key,
+                        transport.stcp_secret_env,
+                        "stcp secret",
+                    ),
+                )
+            )
+        )
     )
-    typer.echo(render_frpc_config(config))
 
 
 @relay_host_app.command("test-frpc-connection")
 def test_frpc(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
-    token: Annotated[str, typer.Option(help="frp authentication token.")],
     local_port: Annotated[int, typer.Option(help="Local relay endpoint port.")],
-    secret_key: Annotated[str, typer.Option(help="stcp shared secret.")],
+    token: Annotated[
+        str | None,
+        typer.Option(help="frp authentication token. Defaults to cluster token_env."),
+    ] = None,
+    secret_key: Annotated[
+        str | None,
+        typer.Option(help="stcp shared secret. Defaults to cluster stcp_secret_env."),
+    ] = None,
     proxy_name: Annotated[str, typer.Option(help="stcp proxy name.")] = "relay-stcp-live-check",
     timeout_seconds: Annotated[
         float,
@@ -160,11 +190,11 @@ def test_frpc(
     config = FrpcConfig(
         server_addr=transport.server_addr,
         server_port=transport.server_port,
-        token=token,
+        token=_resolve_env_secret(token, transport.token_env, "frp token"),
         transport_protocol=FrpTransportProtocol(transport.protocol),
         proxy_name=proxy_name,
         local_port=local_port,
-        secret_key=secret_key,
+        secret_key=_resolve_env_secret(secret_key, transport.stcp_secret_env, "stcp secret"),
     )
     _run_or_exit(
         lambda: _echo_lines(
@@ -180,9 +210,15 @@ def test_frpc(
 @relay_host_app.command("render-frpc-visitor-config")
 def render_frpc_visitor(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
-    token: Annotated[str, typer.Option(help="frp authentication token.")],
     bind_port: Annotated[int, typer.Option(help="Local desktop visitor bind port.")],
-    secret_key: Annotated[str, typer.Option(help="stcp shared secret.")],
+    token: Annotated[
+        str | None,
+        typer.Option(help="frp authentication token. Defaults to cluster token_env."),
+    ] = None,
+    secret_key: Annotated[
+        str | None,
+        typer.Option(help="stcp shared secret. Defaults to cluster stcp_secret_env."),
+    ] = None,
     server_name: Annotated[str, typer.Option(help="Cluster-side stcp proxy name.")] = "relay-stcp",
     visitor_name: Annotated[
         str,
@@ -196,26 +232,41 @@ def render_frpc_visitor(
     """Render a desktop-side frpc STCP visitor config."""
     definition = _require_cluster(cluster)
     transport = definition.frp_transport
-    config = FrpcVisitorConfig(
-        server_addr=transport.server_addr,
-        server_port=transport.server_port,
-        token=token,
-        transport_protocol=FrpTransportProtocol(transport.protocol),
-        visitor_name=visitor_name,
-        server_name=server_name,
-        bind_addr=bind_addr,
-        bind_port=bind_port,
-        secret_key=secret_key,
+    _run_or_exit(
+        lambda: typer.echo(
+            render_frpc_visitor_config(
+                FrpcVisitorConfig(
+                    server_addr=transport.server_addr,
+                    server_port=transport.server_port,
+                    token=_resolve_env_secret(token, transport.token_env, "frp token"),
+                    transport_protocol=FrpTransportProtocol(transport.protocol),
+                    visitor_name=visitor_name,
+                    server_name=server_name,
+                    bind_addr=bind_addr,
+                    bind_port=bind_port,
+                    secret_key=_resolve_env_secret(
+                        secret_key,
+                        transport.stcp_secret_env,
+                        "stcp secret",
+                    ),
+                )
+            )
+        )
     )
-    typer.echo(render_frpc_visitor_config(config))
 
 
 @relay_host_app.command("test-http-transport")
 def test_http_transport(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
-    token: Annotated[str, typer.Option(help="frp authentication token.")],
-    secret_key: Annotated[str, typer.Option(help="stcp shared secret.")],
     local_bind_port: Annotated[int, typer.Option(help="Local desktop visitor bind port.")],
+    token: Annotated[
+        str | None,
+        typer.Option(help="frp authentication token. Defaults to cluster token_env."),
+    ] = None,
+    secret_key: Annotated[
+        str | None,
+        typer.Option(help="stcp shared secret. Defaults to cluster stcp_secret_env."),
+    ] = None,
     remote_api_port: Annotated[int, typer.Option(help="Remote cluster API port.")] = 8765,
     proxy_name: Annotated[str, typer.Option(help="stcp proxy/server name.")] = "relay-http",
     timeout_seconds: Annotated[
@@ -232,8 +283,12 @@ def test_http_transport(
                 cluster=cluster,
                 definition=definition,
                 frpc_bin=settings.frpc_bin,
-                token=token,
-                secret_key=secret_key,
+                token=_resolve_env_secret(token, definition.frp_transport.token_env, "frp token"),
+                secret_key=_resolve_env_secret(
+                    secret_key,
+                    definition.frp_transport.stcp_secret_env,
+                    "stcp secret",
+                ),
                 local_bind_port=local_bind_port,
                 remote_api_port=remote_api_port,
                 proxy_name=proxy_name,
@@ -711,6 +766,13 @@ def _echo_lines(lines: list[str]) -> None:
 
 def _require_cluster(cluster: str) -> ClusterDefinition:
     return ClusterRegistry.load(default_registry_path()).require(cluster)
+
+
+def _resolve_env_secret(value: str | None, env_name: str, label: str) -> str:
+    resolved = value or os.getenv(env_name)
+    if resolved:
+        return resolved
+    raise ConfigurationError(f"{label} is required; pass it explicitly or set {env_name}")
 
 
 def _run_or_exit(action: Callable[[], None]) -> None:

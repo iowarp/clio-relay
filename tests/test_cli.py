@@ -70,3 +70,54 @@ def test_cli_creates_and_evaluates_monitor_rule(tmp_path: Path, monkeypatch: Mon
     assert json.loads(add_result.output)["job_id"] == job.job_id
     assert run_result.exit_code == 0
     assert json.loads(run_result.output)[0]["action"] == "emit_event"
+
+
+def test_cli_render_frpc_uses_configured_secret_env(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "env-frp-token")
+    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "env-stcp-secret")
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "relay-host",
+            "render-frpc-config",
+            "--cluster",
+            "ares",
+            "--local-port",
+            "8848",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert 'auth.token = "env-frp-token"' in result.output
+    assert 'secretKey = "env-stcp-secret"' in result.output
+
+
+def test_cli_transport_reports_missing_configured_secret_env(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CLIO_RELAY_FRP_TOKEN", raising=False)
+    monkeypatch.delenv("CLIO_RELAY_STCP_SECRET", raising=False)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "relay-host",
+            "render-frpc-config",
+            "--cluster",
+            "ares",
+            "--local-port",
+            "8848",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "CLIO_RELAY_FRP_TOKEN" in result.output

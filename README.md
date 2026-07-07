@@ -17,9 +17,11 @@ uv sync
 uv run clio-relay init
 uv run clio-relay install-frp
 uv run clio-relay cluster bootstrap --cluster ares
-uv run clio-relay relay-host render-frps-config --token $env:CLIO_RELAY_FRP_TOKEN
-uv run clio-relay relay-host render-frpc-config --cluster ares --token $env:CLIO_RELAY_FRP_TOKEN --local-port 8848 --secret-key $env:CLIO_RELAY_STCP_SECRET
-uv run clio-relay relay-host render-frpc-visitor-config --cluster ares --token $env:CLIO_RELAY_FRP_TOKEN --bind-port 8765 --secret-key $env:CLIO_RELAY_STCP_SECRET
+$env:CLIO_RELAY_FRP_TOKEN = "<shared-frp-token>"
+$env:CLIO_RELAY_STCP_SECRET = "<shared-stcp-secret>"
+uv run clio-relay relay-host render-frps-config
+uv run clio-relay relay-host render-frpc-config --cluster ares --local-port 8848
+uv run clio-relay relay-host render-frpc-visitor-config --cluster ares --bind-port 8765
 uv run clio-relay endpoint status
 ```
 

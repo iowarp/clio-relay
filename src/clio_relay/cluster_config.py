@@ -19,6 +19,7 @@ class FrpTransportConfig(BaseModel):
     server_addr: str = "frps.jcernuda.com"
     server_port: int = 443
     token_env: str = "CLIO_RELAY_FRP_TOKEN"
+    stcp_secret_env: str = "CLIO_RELAY_STCP_SECRET"
 
 
 class LiveTestConfig(BaseModel):
