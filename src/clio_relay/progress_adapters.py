@@ -29,11 +29,30 @@ class LammpsThermoProgressAdapter:
     completed_steps: float = 0.0
     active_run_steps: float | None = None
     active_run_start_step: float | None = None
+    active_package_stdout: bool = False
 
     def observe_stdout(self, text: str) -> list[dict[str, object]]:
         """Extract progress observations from stdout text."""
         records: list[dict[str, object]] = []
         for line in text.splitlines():
+            record = self.observe_line(line)
+            if record is not None:
+                records.append(record)
+        return records
+
+    def observe_jarvis_stdout(self, text: str) -> list[dict[str, object]]:
+        """Extract progress only from this package's JARVIS stdout scope."""
+        records: list[dict[str, object]] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped == f"[{self.package_name}] [START] BEGIN":
+                self.active_package_stdout = True
+                continue
+            if stripped == f"[{self.package_name}] [START] END":
+                self.active_package_stdout = False
+                continue
+            if not self.active_package_stdout:
+                continue
             record = self.observe_line(line)
             if record is not None:
                 records.append(record)
@@ -165,7 +184,7 @@ def package_progress_adapter_from_pipeline(
             continue
         typed_package = cast(dict[str, Any], package)
         package_type = typed_package.get("pkg_type")
-        if package_type not in {"builtin.lammps", "lammps", "jarvis_cd.builtin.lammps"}:
+        if package_type != "builtin.lammps":
             continue
         return LammpsThermoProgressAdapter(
             package_name=str(package_type),

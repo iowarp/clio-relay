@@ -24,9 +24,15 @@ def test_mcp_call_runner_initializes_before_tool_call(
     monkeypatch.chdir(tmp_path)
     captured: dict[str, str] = {}
 
-    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    def fake_run(
+        command: list[str],
+        *,
+        input: str,
+        timeout: int | None,
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout
         captured["command"] = json.dumps(command)
-        captured["input"] = str(kwargs["input"])
+        captured["input"] = input
         stdout = "\n".join(
             [
                 json.dumps({"jsonrpc": "2.0", "id": "clio-relay-mcp-init", "result": {}}),
@@ -41,7 +47,7 @@ def test_mcp_call_runner_initializes_before_tool_call(
         )
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
-    monkeypatch.setattr(cast(Any, runner).subprocess, "run", fake_run)
+    monkeypatch.setattr(cast(Any, runner), "_run_process", fake_run)
 
     return_code = cast(McpCallRunnerModule, runner).run_mcp_call_from_params(
         {"server": "science-mcp", "tool": "inspect", "arguments": {"path": "x"}}
@@ -69,7 +75,13 @@ def test_mcp_call_runner_records_protocol_errors(
     runner = _load_runner()
     monkeypatch.chdir(tmp_path)
 
-    def fake_run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+    def fake_run(
+        command: list[str],
+        *,
+        input: str,
+        timeout: int | None,
+    ) -> subprocess.CompletedProcess[str]:
+        del input, timeout
         stdout = json.dumps(
             {
                 "jsonrpc": "2.0",
@@ -79,7 +91,7 @@ def test_mcp_call_runner_records_protocol_errors(
         )
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
-    monkeypatch.setattr(cast(Any, runner).subprocess, "run", fake_run)
+    monkeypatch.setattr(cast(Any, runner), "_run_process", fake_run)
 
     return_code = cast(McpCallRunnerModule, runner).run_mcp_call_from_params(
         {"server": "science-mcp", "tool": "inspect"}
@@ -98,10 +110,16 @@ def test_mcp_call_runner_writes_result_on_timeout(
     runner = _load_runner()
     monkeypatch.chdir(tmp_path)
 
-    def fake_run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+    def fake_run(
+        command: list[str],
+        *,
+        input: str,
+        timeout: int | None,
+    ) -> subprocess.CompletedProcess[str]:
+        del input
         raise subprocess.TimeoutExpired(command, timeout=1, output="partial", stderr="late")
 
-    monkeypatch.setattr(cast(Any, runner).subprocess, "run", fake_run)
+    monkeypatch.setattr(cast(Any, runner), "_run_process", fake_run)
 
     return_code = cast(McpCallRunnerModule, runner).run_mcp_call_from_params(
         {"server": "science-mcp", "tool": "inspect", "timeout_seconds": 1}
@@ -113,6 +131,19 @@ def test_mcp_call_runner_writes_result_on_timeout(
     assert result["timed_out"] is True
     assert result["stdout"] == "partial"
     assert result["stderr"] == "late"
+
+
+def test_mcp_call_runner_scrubs_progress_env_from_server(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    monkeypatch.setenv("CLIO_RELAY_PROGRESS_FILE", "forbidden")
+    monkeypatch.setenv("CLIO_RELAY_PROGRESS_TOKEN", "forbidden-token")
+
+    scrubbed = cast(Any, runner)._scrubbed_env()
+
+    assert "CLIO_RELAY_PROGRESS_FILE" not in scrubbed
+    assert "CLIO_RELAY_PROGRESS_TOKEN" not in scrubbed
 
 
 def _load_runner() -> ModuleType:

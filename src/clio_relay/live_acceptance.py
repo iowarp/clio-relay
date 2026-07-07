@@ -741,7 +741,7 @@ def _expected_progress_adapter(pipeline_yaml: str) -> str | None:
             continue
         typed_package = cast(dict[str, Any], package)
         package_type = typed_package.get("pkg_type")
-        if package_type in {"builtin.lammps", "lammps", "jarvis_cd.builtin.lammps"}:
+        if package_type == "builtin.lammps":
             return "lammps"
         progress = typed_package.get("progress")
         if not isinstance(progress, dict):
@@ -764,7 +764,7 @@ def _expected_progress_package(pipeline_yaml: str) -> str | None:
             continue
         typed_package = cast(dict[str, Any], package)
         package_type = typed_package.get("pkg_type")
-        if package_type in {"builtin.lammps", "lammps", "jarvis_cd.builtin.lammps"}:
+        if package_type == "builtin.lammps":
             return str(package_type)
     return None
 

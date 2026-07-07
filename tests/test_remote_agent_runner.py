@@ -28,14 +28,20 @@ def test_exec_adapter_runs_configured_agent_with_templates(
     mcp_path = tmp_path / "mcp.toml"
     agent_script.write_text(
         (
-            "import json, sys\n"
+            "import json, os, sys\n"
             "from pathlib import Path\n"
-            f"Path({str(output_path)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+            f"Path({str(output_path)!r}).write_text(json.dumps("
+            "{'args': sys.argv[1:], "
+            "'progress_file': os.environ.get('CLIO_RELAY_PROGRESS_FILE'), "
+            "'progress_token': os.environ.get('CLIO_RELAY_PROGRESS_TOKEN')}))\n"
         ),
         encoding="utf-8",
     )
     prompt_path.write_text("do the work", encoding="utf-8")
     mcp_path.write_text("[mcp_servers.local]\ncommand = 'python'\n", encoding="utf-8")
+
+    monkeypatch.setenv("CLIO_RELAY_PROGRESS_FILE", "forbidden")
+    monkeypatch.setenv("CLIO_RELAY_PROGRESS_TOKEN", "forbidden-token")
 
     return_code = cast(RemoteAgentRunnerModule, runner).run_remote_agent_from_params(
         {
@@ -69,7 +75,8 @@ def test_exec_adapter_runs_configured_agent_with_templates(
         "Relay monitor context:\n"
         '{\n  "match_groups": {\n    "step": "50"\n  },\n  "source_event_seq": 9\n}\n'
     )
-    assert json.loads(output_path.read_text(encoding="utf-8")) == [
+    captured_agent = json.loads(output_path.read_text(encoding="utf-8"))
+    assert captured_agent["args"] == [
         "--prompt",
         expected_prompt,
         "--mcp",
@@ -77,6 +84,8 @@ def test_exec_adapter_runs_configured_agent_with_templates(
         "--model",
         "configured-model",
     ]
+    assert captured_agent["progress_file"] is None
+    assert captured_agent["progress_token"] is None
 
 
 def test_codex_adapter_disables_interactive_approvals(
@@ -89,11 +98,17 @@ def test_codex_adapter_disables_interactive_approvals(
     prompt_path.write_text("use the tool", encoding="utf-8")
     captured: dict[str, list[str]] = {}
 
-    def fake_run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+    def fake_run(
+        command: list[str],
+        *,
+        cwd: Path | None,
+        timeout: int | None,
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, timeout
         captured["command"] = command
         return subprocess.CompletedProcess(command, 0)
 
-    monkeypatch.setattr(cast(Any, runner).subprocess, "run", fake_run)
+    monkeypatch.setattr(cast(Any, runner), "_run_process", fake_run)
 
     return_code = cast(RemoteAgentRunnerModule, runner).run_remote_agent_from_params(
         {
@@ -124,10 +139,16 @@ def test_agent_timeout_writes_structured_result(
     prompt_path = tmp_path / "prompt.md"
     prompt_path.write_text("run too long", encoding="utf-8")
 
-    def fake_run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+    def fake_run(
+        command: list[str],
+        *,
+        cwd: Path | None,
+        timeout: int | None,
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd
         raise subprocess.TimeoutExpired(command, timeout=1)
 
-    monkeypatch.setattr(cast(Any, runner).subprocess, "run", fake_run)
+    monkeypatch.setattr(cast(Any, runner), "_run_process", fake_run)
 
     return_code = cast(RemoteAgentRunnerModule, runner).run_remote_agent_from_params(
         {
@@ -155,10 +176,16 @@ def test_missing_agent_binary_writes_structured_result(
     prompt_path = tmp_path / "prompt.md"
     prompt_path.write_text("run", encoding="utf-8")
 
-    def fake_run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+    def fake_run(
+        command: list[str],
+        *,
+        cwd: Path | None,
+        timeout: int | None,
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, timeout
         raise FileNotFoundError(command[0])
 
-    monkeypatch.setattr(cast(Any, runner).subprocess, "run", fake_run)
+    monkeypatch.setattr(cast(Any, runner), "_run_process", fake_run)
 
     return_code = cast(RemoteAgentRunnerModule, runner).run_remote_agent_from_params(
         {

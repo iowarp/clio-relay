@@ -83,10 +83,28 @@ def test_lammps_parser_handles_reset_timestep() -> None:
 def test_pipeline_adapter_requires_declared_lammps_package() -> None:
     generic = "name: generic\npkgs:\n- pkg_type: clio_relay.bounded_command\n"
     lammps = "name: lammps\npkgs:\n- pkg_type: builtin.lammps\n  progress:\n    total_steps: 250\n"
+    alias = "name: lammps\npkgs:\n- pkg_type: lammps\n"
 
     assert package_progress_adapter_from_pipeline(generic) is None
+    assert package_progress_adapter_from_pipeline(alias) is None
     adapter = package_progress_adapter_from_pipeline(lammps)
 
     assert adapter is not None
     assert adapter.package_name == "builtin.lammps"
     assert adapter.total_steps == 250
+
+
+def test_lammps_parser_only_observes_builtin_jarvis_scope() -> None:
+    adapter = LammpsThermoProgressAdapter(total_steps=100)
+
+    ignored = adapter.observe_jarvis_stdout(
+        "[clio_relay.remote_agent] [START] BEGIN\n"
+        "Step Temp\n0 1.0\n50 1.0\n"
+        "[clio_relay.remote_agent] [START] END\n"
+    )
+    observed = adapter.observe_jarvis_stdout(
+        "[builtin.lammps] [START] BEGIN\nStep Temp\n0 1.0\n50 1.0\n[builtin.lammps] [START] END\n"
+    )
+
+    assert ignored == []
+    assert [record["current"] for record in observed] == [0, 50]

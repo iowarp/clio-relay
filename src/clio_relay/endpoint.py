@@ -351,7 +351,7 @@ class EndpointWorker:
         if package_progress_adapter is not None:
             self._append_package_progress_records(
                 job,
-                package_progress_adapter.observe_stdout(text),
+                package_progress_adapter.observe_jarvis_stdout(text),
                 source_event_seq=event.seq,
             )
 

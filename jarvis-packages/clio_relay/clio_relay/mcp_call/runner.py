@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -18,13 +20,10 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
     started_at = time.time()
     result_path = Path.cwd() / "mcp-result.json"
     try:
-        process = subprocess.run(
+        process = _run_process(
             [server],
             input=_render_session_input(tool=tool, arguments=arguments),
-            text=True,
-            capture_output=True,
             timeout=timeout,
-            check=False,
         )
         returncode = process.returncode
         timed_out = False
@@ -132,6 +131,67 @@ def _write_mcp_result(
         ),
         encoding="utf-8",
     )
+
+
+def _run_process(
+    command: list[str],
+    *,
+    input: str,
+    timeout: int | None,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        command,
+        env=_scrubbed_env(),
+        text=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=os.name != "nt",
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+    )
+    try:
+        stdout, stderr = process.communicate(input=input, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_tree(process)
+        stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(
+            command,
+            timeout if timeout is not None else 0,
+            output=stdout or exc.stdout,
+            stderr=stderr or exc.stderr,
+        ) from exc
+    return subprocess.CompletedProcess(command, process.returncode, stdout=stdout, stderr=stderr)
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        process.send_signal(signal.CTRL_BREAK_EVENT)
+        try:
+            process.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+
+
+def _scrubbed_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("CLIO_RELAY_PROGRESS_FILE", None)
+    env.pop("CLIO_RELAY_PROGRESS_TOKEN", None)
+    return env
 
 
 def _required_str(params: dict[str, Any], key: str) -> str:

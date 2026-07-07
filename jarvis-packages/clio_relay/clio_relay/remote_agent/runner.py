@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -58,7 +59,7 @@ def run_remote_agent_from_params(params: dict[str, Any]) -> int:
             raise ValueError(f"unsupported agent_adapter: {adapter}")
 
         try:
-            result = subprocess.run(command, cwd=workdir, timeout=timeout, check=False)
+            result = _run_process(command, cwd=workdir, timeout=timeout)
             returncode = result.returncode
             timed_out = False
         except subprocess.TimeoutExpired:
@@ -174,6 +175,58 @@ def _exec_command(
     }
     rendered = [replacements.get(arg, arg) for arg in agent_args]
     return [agent_bin, *rendered]
+
+
+def _run_process(
+    command: list[str],
+    *,
+    cwd: Path | None,
+    timeout: int | None,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=_scrubbed_env(),
+        start_new_session=os.name != "nt",
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+    )
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(process)
+        raise
+    return subprocess.CompletedProcess(command, returncode)
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        process.send_signal(signal.CTRL_BREAK_EVENT)
+        try:
+            process.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+
+
+def _scrubbed_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("CLIO_RELAY_PROGRESS_FILE", None)
+    env.pop("CLIO_RELAY_PROGRESS_TOKEN", None)
+    return env
 
 
 def _write_agent_result(
