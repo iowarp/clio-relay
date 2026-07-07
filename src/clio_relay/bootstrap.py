@@ -301,6 +301,28 @@ exit 127
 __CLIO_RELAY_LMP_WRAPPER__
 chmod 0755 "$HOME/.local/bin/lmp"
 
+cat > "$HOME/.local/bin/mpiexec" <<'__CLIO_RELAY_MPIEXEC_WRAPPER__'
+#!/usr/bin/env bash
+set -euo pipefail
+if command -v mpiexec.real >/dev/null 2>&1; then
+  exec mpiexec.real "$@"
+fi
+if [ "${1:-}" = "-n" ] || [ "${1:-}" = "-np" ]; then
+  ranks="${2:-}"
+  shift 2
+  if [ "$ranks" = "1" ]; then
+    exec "$@"
+  fi
+  if command -v srun >/dev/null 2>&1; then
+    exec srun -n "$ranks" "$@"
+  fi
+  echo "mpiexec wrapper only supports single-rank runs without srun" >&2
+  exit 127
+fi
+exec "$@"
+__CLIO_RELAY_MPIEXEC_WRAPPER__
+chmod 0755 "$HOME/.local/bin/mpiexec"
+
 CLIO_RELAY_CORE_DIR="$HOME/.local/share/clio-relay/core" \
 CLIO_RELAY_SPOOL_DIR="$HOME/.local/share/clio-relay/spool" \
 CLIO_RELAY_JARVIS_BIN="$HOME/.local/bin/jarvis" \

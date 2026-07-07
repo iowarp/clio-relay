@@ -28,6 +28,9 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert 'cat > "$HOME/.local/bin/lmp"' in script
     assert "spack install lammps" in script
     assert "spack load lammps" in script
+    assert 'cat > "$HOME/.local/bin/mpiexec"' in script
+    assert 'if [ "$ranks" = "1" ]; then' in script
+    assert 'exec srun -n "$ranks" "$@"' in script
     assert "CLIO_RELAY_CORE_DIR" in script
     assert "clio-relay init" in script
     assert "\r" not in script
