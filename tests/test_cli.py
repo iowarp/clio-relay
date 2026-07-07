@@ -153,6 +153,25 @@ def test_cli_accepts_json_object_from_file(tmp_path: Path, monkeypatch: MonkeyPa
     assert progress[0].current == 25
 
 
+def test_cli_rejects_invalid_json_object() -> None:
+    result = CliRunner().invoke(
+        app,
+        [
+            "monitor",
+            "add-regex",
+            "job_abc",
+            "--pattern",
+            "step",
+            "--action-payload-json",
+            "{bad}",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "value must be valid JSON" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_cli_render_frpc_uses_configured_secret_env(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

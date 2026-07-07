@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from collections.abc import Callable
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Annotated, cast
 
@@ -800,6 +801,33 @@ def live_test(
             ),
         ),
     ] = None,
+    verify_transport: Annotated[
+        bool | None,
+        typer.Option(
+            "--verify-transport/--no-verify-transport",
+            help="Verify desktop-to-cluster HTTP reachability through configured frp transport.",
+        ),
+    ] = None,
+    transport_token: Annotated[
+        str | None,
+        typer.Option(help="frp authentication token. Defaults to cluster token_env."),
+    ] = None,
+    transport_secret_key: Annotated[
+        str | None,
+        typer.Option(help="stcp shared secret. Defaults to cluster stcp_secret_env."),
+    ] = None,
+    transport_local_bind_port: Annotated[
+        int | None,
+        typer.Option(help="Local desktop visitor bind port for transport acceptance."),
+    ] = None,
+    transport_remote_api_port: Annotated[
+        int | None,
+        typer.Option(help="Remote cluster API port for transport acceptance."),
+    ] = None,
+    transport_proxy_name: Annotated[
+        str | None,
+        typer.Option(help="frp proxy/server name for transport acceptance."),
+    ] = None,
     timeout_seconds: Annotated[
         float,
         typer.Option(help="Maximum seconds to wait for acceptance jobs."),
@@ -808,8 +836,12 @@ def live_test(
 ) -> None:
     """Run configurable live acceptance checks for a cluster."""
     definition = _require_cluster(cluster)
+    should_verify_transport = (
+        definition.live_test.verify_transport if verify_transport is None else verify_transport
+    )
 
     def _run() -> None:
+        settings = RelaySettings.from_env()
         _echo_lines(
             run_live_acceptance(
                 LiveAcceptanceOptions(
@@ -822,6 +854,30 @@ def live_test(
                     agent_prompt=agent_prompt,
                     agent_mcp_config=agent_mcp_config,
                     require_agent_child_job=require_agent_child_job,
+                    verify_transport=verify_transport,
+                    transport_token=(
+                        _resolve_env_secret(
+                            transport_token,
+                            definition.frp_transport.token_env,
+                            "frp token",
+                        )
+                        if should_verify_transport
+                        else None
+                    ),
+                    transport_secret_key=(
+                        _resolve_env_secret(
+                            transport_secret_key,
+                            definition.frp_transport.stcp_secret_env,
+                            "stcp secret",
+                        )
+                        if should_verify_transport
+                        else None
+                    ),
+                    transport_frpc_bin=settings.frpc_bin,
+                    transport_local_bind_port=transport_local_bind_port,
+                    transport_remote_api_port=transport_remote_api_port,
+                    transport_proxy_name=transport_proxy_name,
+                    api_token=settings.api_token,
                     timeout_seconds=timeout_seconds,
                     poll_seconds=poll_seconds,
                 )
@@ -838,7 +894,10 @@ def _file_idempotency_key(path: Path, text: str) -> str:
 
 def _json_object(value: str) -> dict[str, object]:
     source = Path(value[1:]).read_text(encoding="utf-8-sig") if value.startswith("@") else value
-    loaded = cast(object, json.loads(source))
+    try:
+        loaded = cast(object, json.loads(source))
+    except JSONDecodeError as exc:
+        raise typer.BadParameter(f"value must be valid JSON: {exc.msg}") from exc
     if not isinstance(loaded, dict):
         raise typer.BadParameter("value must be a JSON object")
     return {str(key): item for key, item in cast(dict[object, object], loaded).items()}

@@ -9,8 +9,12 @@ import pytest
 from pytest import MonkeyPatch
 
 from clio_relay.cluster_config import ClusterDefinition, LiveTestConfig
-from clio_relay.errors import ConfigurationError
-from clio_relay.live_acceptance import LiveAcceptanceOptions, run_live_acceptance
+from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.live_acceptance import (
+    LiveAcceptanceOptions,
+    _find_agent_child_job,  # pyright: ignore[reportPrivateUsage]
+    run_live_acceptance,
+)
 
 
 def test_live_acceptance_requires_configured_workload() -> None:
@@ -19,6 +23,114 @@ def test_live_acceptance_requires_configured_workload() -> None:
             LiveAcceptanceOptions(
                 cluster="test-cluster",
                 definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            )
+        )
+
+
+def test_live_acceptance_verifies_transport_when_enabled(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text("name: generic\npkgs: []\n", encoding="utf-8")
+    transport_calls: list[dict[str, object]] = []
+
+    def fake_cluster_doctor(_definition: ClusterDefinition) -> list[str]:
+        return ["cluster: test-cluster"]
+
+    def fake_transport(**kwargs: object) -> list[str]:
+        transport_calls.append(kwargs)
+        return ["transport.healthz=ok"]
+
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        script = command[-1]
+        if "mkdir -p" in script or "cat >" in " ".join(command):
+            return _completed(command, "")
+        if "job submit" in script:
+            return _completed(command, "job_abc\n")
+        if "job wait" in script:
+            return _completed(command, json.dumps({"job_id": "job_abc", "state": "succeeded"}))
+        if "job monitor" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    {
+                        "events": [
+                            {"event_type": "job.queued"},
+                            {"event_type": "job.running"},
+                            {"event_type": "jarvis.started"},
+                            {"event_type": "job.succeeded"},
+                        ]
+                    }
+                ),
+            )
+        if "job tasks" in script:
+            return _completed(command, json.dumps([{"state": "succeeded"}]))
+        if "read-log" in script and "--stream stdout" in script:
+            return _completed(command, json.dumps({"next_offset": 12}))
+        if "read-log" in script and "--stream stderr" in script:
+            return _completed(command, json.dumps({"next_offset": 0}))
+        if "list-artifacts" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    [
+                        {"artifact_id": "artifact_pipeline", "kind": "jarvis_pipeline"},
+                        {"artifact_id": "artifact_stdout", "kind": "stdout"},
+                        {"artifact_id": "artifact_stderr", "kind": "stderr"},
+                        {"artifact_id": "artifact_provenance", "kind": "provenance"},
+                    ]
+                ),
+            )
+        if "read-artifact" in script:
+            return _completed(command, json.dumps({"encoding": "base64", "data": "aGVsbG8="}))
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
+    monkeypatch.setattr("clio_relay.live_acceptance.run_frp_http_probe", fake_transport)
+
+    lines = run_live_acceptance(
+        LiveAcceptanceOptions(
+            cluster="test-cluster",
+            definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            jarvis_yaml=pipeline,
+            verify_transport=True,
+            transport_token="frp-token",
+            transport_secret_key="stcp-secret",
+            transport_frpc_bin="frpc",
+            transport_local_bind_port=19876,
+            transport_remote_api_port=8766,
+            transport_proxy_name="transport-test",
+            api_token="api-token",
+        ),
+        runner=fake_runner,
+    )
+
+    assert "transport.healthz=ok" in lines
+    assert transport_calls[0]["token"] == "frp-token"
+    assert transport_calls[0]["secret_key"] == "stcp-secret"
+    assert transport_calls[0]["local_bind_port"] == 19876
+    assert transport_calls[0]["remote_api_port"] == 8766
+    assert transport_calls[0]["proxy_name"] == "transport-test"
+    assert transport_calls[0]["api_token"] == "api-token"
+
+
+def test_live_acceptance_transport_requires_secrets(tmp_path: Path) -> None:
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text("name: generic\npkgs: []\n", encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match="frp token"):
+        run_live_acceptance(
+            LiveAcceptanceOptions(
+                cluster="test-cluster",
+                definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+                jarvis_yaml=pipeline,
+                verify_transport=True,
             )
         )
 
@@ -364,19 +476,50 @@ def test_live_acceptance_requires_agent_child_job_when_mcp_configured(
         if f"job wait {primary_job_id}" in script:
             return _completed(
                 command,
-                json.dumps({"job_id": primary_job_id, "state": "succeeded"}),
+                json.dumps(
+                    {
+                        "job_id": primary_job_id,
+                        "state": "succeeded",
+                        "created_at": "2026-07-07T00:00:00Z",
+                    }
+                ),
             )
         if f"job wait {agent_job_id}" in script:
-            return _completed(command, json.dumps({"job_id": agent_job_id, "state": "succeeded"}))
-        if f"job wait {child_job_id}" in script:
-            return _completed(command, json.dumps({"job_id": child_job_id, "state": "succeeded"}))
-        if "job monitor" in script:
-            job_id = child_job_id if child_job_id in script else primary_job_id
             return _completed(
                 command,
                 json.dumps(
                     {
-                        "job": {"job_id": job_id, "state": "succeeded"},
+                        "job_id": agent_job_id,
+                        "state": "succeeded",
+                        "created_at": "2026-07-07T00:01:00Z",
+                    }
+                ),
+            )
+        if f"job wait {child_job_id}" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    {
+                        "job_id": child_job_id,
+                        "state": "succeeded",
+                        "created_at": "2026-07-07T00:02:00Z",
+                    }
+                ),
+            )
+        if "job monitor" in script:
+            job_id = child_job_id if child_job_id in script else primary_job_id
+            created_at = (
+                "2026-07-07T00:02:00Z" if child_job_id in script else "2026-07-07T00:00:00Z"
+            )
+            return _completed(
+                command,
+                json.dumps(
+                    {
+                        "job": {
+                            "job_id": job_id,
+                            "state": "succeeded",
+                            "created_at": created_at,
+                        },
                         "events": [
                             {"event_type": "job.queued"},
                             {"event_type": "job.running"},
@@ -447,6 +590,58 @@ def test_live_acceptance_requires_agent_child_job_when_mcp_configured(
     assert f"acceptance.agent_child_job_id={child_job_id}" in lines
     assert "acceptance.agent_child.provenance=ok" in lines
     assert any(f"job wait {child_job_id}" in command[-1] for command in commands)
+
+
+def test_agent_child_job_must_be_created_by_current_agent_run() -> None:
+    agent_job_id = "job_22222222222222222222222222222222"
+    stale_child_job_id = "job_33333333333333333333333333333333"
+
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        script = command[-1]
+        if "list-artifacts" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    [
+                        {"artifact_id": "artifact_agent_result", "kind": "agent_result"},
+                        {"artifact_id": "artifact_agent_message", "kind": "agent_last_message"},
+                    ]
+                ),
+            )
+        if "read-artifact artifact_agent_result" in script:
+            return _completed(command, _artifact_json('{"returncode": 0}'))
+        if "read-artifact artifact_agent_message" in script:
+            return _completed(command, _artifact_json(f"submitted {stale_child_job_id}\n"))
+        if "read-log" in script:
+            return _completed(command, json.dumps({"text": "", "next_offset": 0}))
+        if "job monitor" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    {
+                        "job": {
+                            "job_id": stale_child_job_id,
+                            "state": "succeeded",
+                            "created_at": "2026-07-07T00:00:00Z",
+                        },
+                        "events": [],
+                    }
+                ),
+            )
+        raise AssertionError(f"unexpected command: {command}")
+
+    with pytest.raises(RelayError, match="stale child"):
+        _find_agent_child_job(
+            ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            agent_job_id,
+            agent_created_at="2026-07-07T00:01:00Z",
+            runner=fake_runner,
+        )
 
 
 def _completed(command: list[str], stdout: str) -> subprocess.CompletedProcess[bytes]:

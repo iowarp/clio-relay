@@ -31,6 +31,10 @@ class LiveTestConfig(BaseModel):
     monitor_pattern: str | None = None
     progress_pattern: str | None = None
     progress_action_payload: dict[str, object] = Field(default_factory=dict)
+    verify_transport: bool = False
+    transport_local_bind_port: int = 18765
+    transport_remote_api_port: int = 8765
+    transport_proxy_name: str = "relay-http-live-test"
     agent_prompt: str | None = None
     agent_mcp_config: str | None = None
 

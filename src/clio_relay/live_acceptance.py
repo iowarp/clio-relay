@@ -10,6 +10,7 @@ import shlex
 import subprocess
 from base64 import b64decode
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
 from uuid import uuid4
@@ -17,6 +18,7 @@ from uuid import uuid4
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.doctor import run_cluster_doctor
 from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.transport_probe import run_frp_http_probe
 
 
 class CommandRunner(Protocol):
@@ -49,6 +51,14 @@ class LiveAcceptanceOptions:
     agent_prompt: str | None = None
     agent_mcp_config: str | None = None
     require_agent_child_job: bool | None = None
+    verify_transport: bool | None = None
+    transport_token: str | None = None
+    transport_secret_key: str | None = None
+    transport_frpc_bin: str = "frpc"
+    transport_local_bind_port: int | None = None
+    transport_remote_api_port: int | None = None
+    transport_proxy_name: str | None = None
+    api_token: str | None = None
     timeout_seconds: float = 600
     poll_seconds: float = 2
 
@@ -75,15 +85,37 @@ def run_live_acceptance(
         if options.require_agent_child_job is None
         else options.require_agent_child_job
     )
+    verify_transport = (
+        options.definition.live_test.verify_transport
+        if options.verify_transport is None
+        else options.verify_transport
+    )
     if jarvis_yaml is None:
         raise ConfigurationError(
             "live-test requires --jarvis-yaml or cluster live_test.jarvis_yaml"
         )
     if not jarvis_yaml.exists():
         raise ConfigurationError(f"live-test JARVIS YAML does not exist: {jarvis_yaml}")
+    transport_token: str | None = None
+    transport_secret_key: str | None = None
+    if verify_transport:
+        transport_token, transport_secret_key = _require_transport_secrets(
+            token=options.transport_token,
+            secret_key=options.transport_secret_key,
+        )
 
     lines: list[str] = []
     lines.extend(run_cluster_doctor(options.definition))
+    if verify_transport:
+        assert transport_token is not None
+        assert transport_secret_key is not None
+        lines.extend(
+            _verify_transport(
+                options,
+                token=transport_token,
+                secret_key=transport_secret_key,
+            )
+        )
     run_id = _acceptance_run_id(jarvis_yaml)
     remote_yaml = f".local/share/clio-relay/live-tests/{run_id}/pipeline.yaml"
     _remote_write_file(
@@ -184,7 +216,7 @@ def run_live_acceptance(
             raw_text=True,
         )
         agent_job_id = agent_submit.strip().splitlines()[-1]
-        _wait_for_success(
+        agent_job = _wait_for_success(
             options.definition,
             agent_job_id,
             timeout_seconds=options.timeout_seconds,
@@ -197,6 +229,7 @@ def run_live_acceptance(
             child_job_id = _find_agent_child_job(
                 options.definition,
                 agent_job_id,
+                agent_created_at=str(agent_job["created_at"]),
                 runner=command_runner,
             )
             _wait_for_success(
@@ -217,6 +250,48 @@ def run_live_acceptance(
 
     lines.append("live acceptance passed")
     return lines
+
+
+def _verify_transport(
+    options: LiveAcceptanceOptions,
+    *,
+    token: str,
+    secret_key: str,
+) -> list[str]:
+    return run_frp_http_probe(
+        cluster=options.cluster,
+        definition=options.definition,
+        frpc_bin=options.transport_frpc_bin,
+        token=token,
+        secret_key=secret_key,
+        local_bind_port=(
+            options.definition.live_test.transport_local_bind_port
+            if options.transport_local_bind_port is None
+            else options.transport_local_bind_port
+        ),
+        remote_api_port=(
+            options.definition.live_test.transport_remote_api_port
+            if options.transport_remote_api_port is None
+            else options.transport_remote_api_port
+        ),
+        proxy_name=(
+            options.transport_proxy_name or options.definition.live_test.transport_proxy_name
+        ),
+        api_token=options.api_token,
+        timeout_seconds=options.timeout_seconds,
+    )
+
+
+def _require_transport_secrets(
+    *,
+    token: str | None,
+    secret_key: str | None,
+) -> tuple[str, str]:
+    if token is None:
+        raise ConfigurationError("live transport acceptance requires a frp token")
+    if secret_key is None:
+        raise ConfigurationError("live transport acceptance requires an stcp secret")
+    return token, secret_key
 
 
 def _wait_for_success(
@@ -377,6 +452,7 @@ def _find_agent_child_job(
     definition: ClusterDefinition,
     agent_job_id: str,
     *,
+    agent_created_at: str,
     runner: CommandRunner,
 ) -> str:
     artifacts = _remote_clio_json(
@@ -424,7 +500,39 @@ def _find_agent_child_job(
     )
     if not child_job_ids:
         raise RelayError("acceptance agent did not report a child relay job id")
-    return child_job_ids[-1]
+    agent_created = _parse_datetime(agent_created_at)
+    stale_child_ids: list[str] = []
+    for child_job_id in reversed(child_job_ids):
+        child_created = _child_job_created_at(
+            definition,
+            child_job_id,
+            runner=runner,
+        )
+        if child_created >= agent_created:
+            return child_job_id
+        stale_child_ids.append(child_job_id)
+    raise RelayError(
+        "acceptance agent only reported stale child relay jobs created before "
+        f"the agent run: {stale_child_ids}"
+    )
+
+
+def _child_job_created_at(
+    definition: ClusterDefinition,
+    child_job_id: str,
+    *,
+    runner: CommandRunner,
+) -> datetime:
+    monitor = _remote_clio_json(
+        definition,
+        ["job", "monitor", child_job_id, "--cursor", "1", "--limit", "1"],
+        runner=runner,
+    )
+    return _parse_datetime(str(monitor["job"]["created_at"]))
+
+
+def _parse_datetime(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def _decode_artifact_text(payload: dict[str, Any]) -> str:
