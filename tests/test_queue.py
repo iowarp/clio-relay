@@ -18,6 +18,7 @@ from clio_relay.models import (
     ProgressRecord,
     RelayJob,
     RelayTask,
+    RemoteAgentTaskSpec,
 )
 from clio_relay.relay_ops import evaluate_monitor_rules
 
@@ -451,3 +452,69 @@ def test_monitor_rule_records_progress_from_regex_groups(tmp_path: Path) -> None
         "progress.updated",
         "monitor.triggered",
     ]
+
+
+def test_monitor_rule_submits_remote_agent_with_event_context(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "hello"]),
+            idempotency_key="monitor-submit-agent-source",
+        )
+    )
+    rule = queue.append_monitor_rule(
+        MonitorRule(
+            job_id=job.job_id,
+            pattern=r"ETA current=(?P<current>\d+) total=(?P<total>\d+)",
+            action=MonitorRuleAction.SUBMIT_AGENT,
+            event_types=["progress.updated"],
+            action_payload={
+                "cluster": "ares",
+                "prompt_path": "/tmp/monitor-prompt.md",
+                "mcp_config_path": "/tmp/monitor-mcp.json",
+                "model": "codex-test",
+                "workdir": "/tmp/work",
+                "timeout_seconds": 30,
+            },
+        )
+    )
+    queue.append_event(
+        job.job_id,
+        "progress.updated",
+        "ETA current=4 total=10",
+        payload={"current": 4, "total": 10},
+    )
+
+    result = evaluate_monitor_rules(queue)
+    second = evaluate_monitor_rules(queue)
+    submitted_job_id = result[0]["submitted_job_id"]
+    agent_job = queue.get_job(str(submitted_job_id))
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id, next_seq=1), limit=20)
+
+    assert second == []
+    assert result == [
+        {
+            "rule_id": rule.rule_id,
+            "action": "submit_agent",
+            "matched_seq": 3,
+            "submitted_job_id": submitted_job_id,
+        }
+    ]
+    assert agent_job.kind == JobKind.REMOTE_AGENT
+    assert agent_job.cluster == "ares"
+    assert agent_job.idempotency_key == f"monitor:{rule.rule_id}:3"
+    assert isinstance(agent_job.spec, RemoteAgentTaskSpec)
+    assert agent_job.spec.prompt_path == Path("/tmp/monitor-prompt.md")
+    assert agent_job.spec.mcp_config_path == Path("/tmp/monitor-mcp.json")
+    assert agent_job.spec.model == "codex-test"
+    assert agent_job.spec.workdir == Path("/tmp/work")
+    assert agent_job.spec.timeout_seconds == 30
+    assert agent_job.spec.context["monitor_rule_id"] == rule.rule_id
+    assert agent_job.spec.context["source_job_id"] == job.job_id
+    assert agent_job.spec.context["source_event_seq"] == 3
+    assert agent_job.spec.context["source_event_type"] == "progress.updated"
+    assert agent_job.spec.context["match_groups"] == {"current": "4", "total": "10"}
+    assert events[-1].event_type == "monitor.triggered"
+    assert events[-1].payload["submitted_job_id"] == submitted_job_id
