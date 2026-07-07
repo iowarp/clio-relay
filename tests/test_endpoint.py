@@ -267,7 +267,7 @@ def test_worker_ingests_package_progress_side_channel(tmp_path: Path) -> None:
     assert len(progress) == 1
     assert progress[0].source == "jarvis_package"
     assert progress[0].metadata["package_name"] == "clio_relay.bounded_command"
-    assert progress[0].metadata["package_version"] == "unknown"
+    assert progress[0].metadata["package_version"] == "builtin"
     assert progress[0].metadata["run_id"] == job.job_id
     assert "relay_progress_token" not in progress[0].metadata
 
@@ -334,6 +334,77 @@ def test_worker_rejects_side_channel_progress_without_token(tmp_path: Path) -> N
 
     assert queue.list_progress(job.job_id) == []
     assert "progress.parse_failed" in [event.event_type for event in events]
+
+
+def test_worker_rewrites_side_channel_package_identity_even_with_valid_token(
+    tmp_path: Path,
+) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+
+    class ForgedIdentitySideChannelProvider(RecordingProvider):
+        def run_pipeline_streaming(
+            self,
+            pipeline_path: Path,
+            *,
+            cwd: Path | None = None,
+            on_stdout: Callable[[str], None] | None = None,
+            on_stderr: Callable[[str], None] | None = None,
+            on_start: Callable[[int], None] | None = None,
+            should_cancel: Callable[[], bool] | None = None,
+            on_poll: Callable[[], None] | None = None,
+            timeout_seconds: int | None = None,
+            on_timeout: Callable[[], None] | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            del pipeline_path, cwd, on_stdout, on_stderr, on_start, should_cancel
+            del on_poll, timeout_seconds, on_timeout
+            progress_path = os.environ["CLIO_RELAY_PROGRESS_FILE"]
+            progress_token = os.environ["CLIO_RELAY_PROGRESS_TOKEN"]
+            Path(progress_path).write_text(
+                json.dumps(
+                    {
+                        "label": "timestep",
+                        "current": 100,
+                        "total": 100,
+                        "metadata": {
+                            "source": "jarvis_package",
+                            "package_name": "builtin.lammps",
+                            "package_version": "builtin",
+                            "adapter": "lammps",
+                            "relay_progress_token": progress_token,
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(args=["jarvis"], returncode=0, stdout="", stderr="")
+
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "hello"]),
+            idempotency_key="worker-forged-side-channel-identity",
+        )
+    )
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=queue,
+        provider=ForgedIdentitySideChannelProvider(),
+    )
+    worker.register()
+
+    worker.run_once()
+    progress = queue.list_progress(job.job_id)
+
+    assert len(progress) == 1
+    assert progress[0].metadata["adapter"] == "regex"
+    assert progress[0].metadata["package_name"] == "clio_relay.bounded_command"
+    assert progress[0].metadata["package_version"] == "builtin"
+    assert progress[0].metadata["run_id"] == job.job_id
 
 
 def test_worker_parses_lammps_progress_only_for_declared_lammps_package(tmp_path: Path) -> None:

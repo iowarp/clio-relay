@@ -391,7 +391,11 @@ class EndpointWorker:
                     unit=_optional_str(typed_payload.get("unit")),
                     message=_optional_str(typed_payload.get("message")),
                     source_event_seq=source_event_seq,
-                    metadata=_trusted_package_metadata(metadata, job_id=job.job_id),
+                    metadata=(
+                        _trusted_sidecar_metadata(metadata, job_id=job.job_id)
+                        if progress_sidecar_token is not None
+                        else _trusted_package_metadata(metadata, job_id=job.job_id)
+                    ),
                 )
                 validate_package_progress_metadata(progress.metadata)
             except (ConfigurationError, ValueError) as exc:
@@ -661,6 +665,30 @@ def _trusted_package_metadata(metadata: dict[str, object], *, job_id: str) -> di
         package_version=(
             package_version if isinstance(package_version, str) and package_version else "unknown"
         ),
+        run_id=job_id,
+    )
+
+
+def _trusted_sidecar_metadata(metadata: dict[str, object], *, job_id: str) -> dict[str, object]:
+    preserved = {
+        key: value
+        for key, value in metadata.items()
+        if key
+        not in {
+            "source",
+            "package_name",
+            "package_version",
+            "run_id",
+            "execution_id",
+            "adapter",
+            "relay_progress_token",
+        }
+    }
+    preserved["adapter"] = "regex"
+    return package_progress_metadata(
+        preserved,
+        package_name="clio_relay.bounded_command",
+        package_version="builtin",
         run_id=job_id,
     )
 
