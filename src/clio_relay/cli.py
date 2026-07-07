@@ -24,6 +24,7 @@ from clio_relay.doctor import run_cluster_doctor, run_doctor
 from clio_relay.endpoint import EndpointWorker
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.frp_check import run_frpc_connection_check
+from clio_relay.live_acceptance import LiveAcceptanceOptions, run_live_acceptance
 from clio_relay.mcp_server import render_codex_mcp_profile, serve_stdio
 from clio_relay.models import (
     Cursor,
@@ -557,7 +558,13 @@ def doctor(
     definition = _require_cluster(cluster)
 
     def _run() -> None:
-        _echo_lines(run_doctor(RelaySettings.from_env(), live=True))
+        _echo_lines(
+            run_doctor(
+                RelaySettings.from_env(),
+                live=True,
+                frps_addr=definition.frp_transport.server_addr,
+            )
+        )
         _echo_lines(run_cluster_doctor(definition))
 
     _run_or_exit(_run)
@@ -566,16 +573,48 @@ def doctor(
 @app.command("live-test")
 def live_test(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    jarvis_yaml: Annotated[
+        Path | None,
+        typer.Option(help="Configured acceptance JARVIS YAML. Overrides cluster config."),
+    ] = None,
+    monitor_pattern: Annotated[
+        str | None,
+        typer.Option(help="Regex expected to match stdout.delta during acceptance."),
+    ] = None,
+    agent_prompt: Annotated[
+        str | None,
+        typer.Option(help="Remote prompt path for optional agent acceptance."),
+    ] = None,
+    agent_mcp_config: Annotated[
+        str | None,
+        typer.Option(help="Remote MCP config path for optional agent acceptance."),
+    ] = None,
+    timeout_seconds: Annotated[
+        float,
+        typer.Option(help="Maximum seconds to wait for acceptance jobs."),
+    ] = 600,
+    poll_seconds: Annotated[float, typer.Option(help="Polling interval.")] = 2,
 ) -> None:
-    """Run live acceptance preflight checks for a configured cluster."""
+    """Run configurable live acceptance checks for a cluster."""
     definition = _require_cluster(cluster)
 
     def _run() -> None:
-        _echo_lines(run_doctor(RelaySettings.from_env(), live=True))
-        _echo_lines(run_cluster_doctor(definition))
+        _echo_lines(
+            run_live_acceptance(
+                LiveAcceptanceOptions(
+                    cluster=cluster,
+                    definition=definition,
+                    jarvis_yaml=jarvis_yaml,
+                    monitor_pattern=monitor_pattern,
+                    agent_prompt=agent_prompt,
+                    agent_mcp_config=agent_mcp_config,
+                    timeout_seconds=timeout_seconds,
+                    poll_seconds=poll_seconds,
+                )
+            )
+        )
 
     _run_or_exit(_run)
-    typer.echo("live preflight passed; submit a full JARVIS acceptance workload")
 
 
 def _file_idempotency_key(path: Path, text: str) -> str:

@@ -21,6 +21,17 @@ class FrpTransportConfig(BaseModel):
     token_env: str = "CLIO_RELAY_FRP_TOKEN"
 
 
+class LiveTestConfig(BaseModel):
+    """Configured live acceptance inputs for a cluster."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    jarvis_yaml: str | None = None
+    monitor_pattern: str | None = None
+    agent_prompt: str | None = None
+    agent_mcp_config: str | None = None
+
+
 class ClusterDefinition(BaseModel):
     """A locally configured cluster target."""
 
@@ -36,6 +47,7 @@ class ClusterDefinition(BaseModel):
     agent_npm_bin: str = "codex"
     agent_args: list[str] = Field(default_factory=list)
     frp_transport: FrpTransportConfig = Field(default_factory=FrpTransportConfig)
+    live_test: LiveTestConfig = Field(default_factory=LiveTestConfig)
 
 
 class ClusterRegistry(BaseModel):

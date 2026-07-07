@@ -27,6 +27,8 @@ Submit a JARVIS pipeline intent:
 ```powershell
 uv run clio-relay job submit --cluster ares --jarvis-yaml .\pipeline.yaml
 uv run clio-relay job watch <job-id>
+uv run clio-relay job read-log <job-id> --stream stdout
+uv run clio-relay job list-artifacts <job-id>
 ```
 
 Expose relay submission tools to an agent process:
@@ -36,13 +38,34 @@ uv run clio-relay agent render-mcp-config --output .\clio-relay-agent.config.tom
 uv run clio-relay agent run --cluster ares --prompt /path/on/cluster/prompt.md --mcp-config /path/on/cluster/clio-relay-agent.config.toml
 ```
 
-The MCP server provides `relay_submit_jarvis_pipeline`, `relay_get_job`, and `relay_watch_job_events`. These tools submit and inspect the same durable `RelayJob` records as the CLI and HTTP surfaces. Workload-specific systems are expressed as JARVIS pipeline YAML supplied by the caller, not as relay-native tools.
+The MCP server provides generic relay tools for JARVIS submission, job state, event cursors, stdout/stderr logs, artifacts, and monitor rules. These tools submit and inspect the same durable `RelayJob` records as the CLI and HTTP surfaces. Workload-specific systems are expressed as JARVIS pipeline YAML supplied by the caller, not as relay-native tools.
 
 Job submission is asynchronous by default: submit returns a `job_id`, initial state, kind, and terminal flag. MCP callers can set `wait_for_terminal` with `timeout_seconds` and `poll_seconds` for synchronous submit-and-wait behavior. Monitoring is cursor-based through `relay_monitor_job` or `relay_watch_job_events`; stdout and stderr are readable by byte offset through `relay_read_job_log`; artifact references are listed with `relay_list_artifacts` and file artifacts are fetched with `relay_read_artifact`.
 
 The worker streams JARVIS stdout/stderr into durable events while the process is running (`stdout.delta` and `stderr.delta`) and also writes complete `stdout.log` and `stderr.log` files into the job spool. The clio-core boundary owns job state, event cursors, and artifact metadata; spool files are backing data for logs and artifacts, not the queue.
 
-Live acceptance requires `CLIO_RELAY_CORE_DIR`, `CLIO_RELAY_FRPS_ADDR`, `CLIO_RELAY_FRP_TOKEN`, `jarvis`, `frpc`, and the target cluster shell environment used interactively.
+Monitor rules are durable observer records over a job event stream. A regex rule can match event messages or streamed `text` payloads, then emit a `monitor.triggered` event or submit a generic remote-agent task. Rules are cursor-based and one-shot by default after a match, so replay does not duplicate actions.
+
+Run a full configured live acceptance:
+
+```powershell
+uv run clio-relay live-test --cluster ares --jarvis-yaml .\.clio-relay\live\ares-lammps.yaml --monitor-pattern "Total.*wall.*time"
+```
+
+`live-test` does not contain workload recipes. It takes acceptance inputs from CLI options or from the cluster registry's `live_test` object:
+
+```json
+{
+  "live_test": {
+    "jarvis_yaml": ".clio-relay/live/ares-lammps.yaml",
+    "monitor_pattern": "Total.*wall.*time",
+    "agent_prompt": "/home/user/.local/share/clio-relay/agent-tests/prompt.md",
+    "agent_mcp_config": "/home/user/.local/share/clio-relay/agent-tests/mcp.toml"
+  }
+}
+```
+
+The acceptance runner submits the configured JARVIS YAML on the target cluster, waits for terminal success, verifies event replay, reads stdout/stderr by offset, lists and reads artifacts, evaluates the configured monitor pattern, and optionally runs a configured remote-agent task. The cluster registry owns what `ares`, `homelab`, or any later target means.
 
 ## Cloudflare-backed frps edge
 

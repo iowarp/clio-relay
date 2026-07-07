@@ -58,6 +58,20 @@ def test_live_doctor_requires_frps_address(tmp_path: Path) -> None:
         run_doctor(settings, live=True)
 
 
+def test_live_doctor_accepts_cluster_frps_address(tmp_path: Path) -> None:
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frp_token="secret",
+        frpc_bin="python",
+    )
+
+    lines = run_doctor(settings, live=True, frps_addr="frps.example.test")
+
+    assert "frps_addr: frps.example.test" in lines
+    assert any(line.startswith("frpc:") for line in lines)
+
+
 def test_live_doctor_does_not_require_cluster_tools_locally(tmp_path: Path) -> None:
     settings = RelaySettings(
         core_dir=tmp_path / "core",

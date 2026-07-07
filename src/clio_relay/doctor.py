@@ -18,18 +18,24 @@ def check_required_binary(name: str, value: str) -> str:
     return f"{name}: {resolved}"
 
 
-def run_doctor(settings: RelaySettings, *, live: bool = False) -> list[str]:
+def run_doctor(
+    settings: RelaySettings,
+    *,
+    live: bool = False,
+    frps_addr: str | None = None,
+) -> list[str]:
     """Run configuration checks and return human-readable status lines."""
     lines = [
         f"core_dir: {settings.core_dir}",
         f"spool_dir: {settings.spool_dir}",
     ]
     if live:
-        if settings.frps_addr is None:
+        resolved_frps_addr = frps_addr or settings.frps_addr
+        if resolved_frps_addr is None:
             raise ConfigurationError("CLIO_RELAY_FRPS_ADDR is required for live checks")
         if settings.frp_token is None:
             raise ConfigurationError("CLIO_RELAY_FRP_TOKEN is required for live checks")
-        lines.append(f"frps_addr: {settings.frps_addr}")
+        lines.append(f"frps_addr: {resolved_frps_addr}")
         lines.append(check_required_binary("frpc", settings.frpc_bin))
     return lines
 
