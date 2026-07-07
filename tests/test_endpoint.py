@@ -747,7 +747,30 @@ def test_worker_preserves_canceled_state_for_running_job(
         scancel_commands.append(command)
         return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
 
+    def fake_scheduler_run(
+        command: list[str],
+        *,
+        text: bool,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        del text, capture_output, check
+        if command[0] == "scancel":
+            scancel_commands.append(command)
+            return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
+        if command[0] == "squeue":
+            return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
+        if command[0] == "sacct":
+            return subprocess.CompletedProcess(
+                command,
+                returncode=0,
+                stdout="12345|CANCELLED|compute|(null)|2026-07-07T18:00:00||0:00|20|20|0\n",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected scheduler command: {command}")
+
     monkeypatch.setattr("clio_relay.endpoint.subprocess.run", fake_run)
+    monkeypatch.setattr("clio_relay.scheduler_status.subprocess.run", fake_scheduler_run)
 
     class CancelingProvider(RecordingProvider):
         def run_pipeline_streaming(
@@ -808,6 +831,7 @@ def test_worker_preserves_canceled_state_for_running_job(
     assert tasks
     assert tasks[0].metadata["scheduler"] == "slurm"
     assert tasks[0].metadata["scheduler_job_ids"] == ["12345"]
+    assert tasks[0].metadata["scheduler_status"]["phase"] == "canceled"
 
 
 def test_worker_timeout_scancels_scheduler_job(
@@ -837,7 +861,30 @@ def test_worker_timeout_scancels_scheduler_job(
         scancel_commands.append(command)
         return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
 
+    def fake_scheduler_run(
+        command: list[str],
+        *,
+        text: bool,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        del text, capture_output, check
+        if command[0] == "scancel":
+            scancel_commands.append(command)
+            return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
+        if command[0] == "squeue":
+            return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
+        if command[0] == "sacct":
+            return subprocess.CompletedProcess(
+                command,
+                returncode=0,
+                stdout="98765|CANCELLED|compute|(null)|2026-07-07T18:00:00||0:00|20|20|0\n",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected scheduler command: {command}")
+
     monkeypatch.setattr("clio_relay.endpoint.subprocess.run", fake_run)
+    monkeypatch.setattr("clio_relay.scheduler_status.subprocess.run", fake_scheduler_run)
 
     class TimeoutProvider(RecordingProvider):
         def run_pipeline_streaming(
@@ -891,6 +938,7 @@ def test_worker_timeout_scancels_scheduler_job(
     assert tasks
     assert tasks[0].metadata["scheduler"] == "slurm"
     assert tasks[0].metadata["scheduler_job_ids"] == ["98765"]
+    assert tasks[0].metadata["scheduler_status"]["phase"] == "canceled"
 
 
 def test_worker_reconciles_canceled_scheduler_job_after_restart(
@@ -930,7 +978,30 @@ def test_worker_reconciles_canceled_scheduler_job_after_restart(
         scancel_commands.append(command)
         return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
 
+    def fake_scheduler_run(
+        command: list[str],
+        *,
+        text: bool,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        del text, capture_output, check
+        if command[0] == "scancel":
+            scancel_commands.append(command)
+            return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
+        if command[0] == "squeue":
+            return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
+        if command[0] == "sacct":
+            return subprocess.CompletedProcess(
+                command,
+                returncode=0,
+                stdout="24680|CANCELLED|compute|(null)|2026-07-07T18:00:00||0:00|20|20|0\n",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected scheduler command: {command}")
+
     monkeypatch.setattr("clio_relay.endpoint.subprocess.run", fake_run)
+    monkeypatch.setattr("clio_relay.scheduler_status.subprocess.run", fake_scheduler_run)
 
     worker = EndpointWorker(
         role=EndpointRole.WORKER,
@@ -944,7 +1015,9 @@ def test_worker_reconciles_canceled_scheduler_job_after_restart(
     assert worker.run_once() is None
     assert scancel_commands == [["scancel", "24680"]]
     events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=50)
-    assert "scheduler.cancel_requested" in [event.event_type for event in events]
+    event_types = [event.event_type for event in events]
+    assert "scheduler.cancel_requested" in event_types
+    assert "scheduler.canceled" in event_types
 
 
 def test_worker_renews_lease_while_pipeline_runs(tmp_path: Path) -> None:

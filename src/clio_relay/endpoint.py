@@ -687,6 +687,11 @@ class EndpointWorker:
                     f"Requested scheduler cancellation: {scheduler_job_id}",
                     payload={"scheduler": "slurm", "scheduler_job_id": scheduler_job_id},
                 )
+                self._refresh_scheduler_status(
+                    job,
+                    [scheduler_job_id],
+                    task_id=None,
+                )
                 continue
             self.queue.append_event(
                 job.job_id,
