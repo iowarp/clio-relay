@@ -12,11 +12,13 @@ from typing import Annotated, cast
 
 import typer
 import uvicorn
+from pydantic import ValidationError
 
 from clio_relay.bootstrap import bootstrap_cluster_over_ssh, install_local_frp
 from clio_relay.cluster_config import (
     ClusterDefinition,
     ClusterRegistry,
+    DirectTransportConfig,
     FrpTransportConfig,
     default_registry_path,
 )
@@ -45,6 +47,7 @@ from clio_relay.models import (
     RelayJob,
     RemoteAgentTaskSpec,
 )
+from clio_relay.progress_provenance import external_progress_metadata
 from clio_relay.relay_host import (
     FrpcConfig,
     FrpcVisitorConfig,
@@ -426,29 +429,52 @@ def cluster_add(
         str,
         typer.Option(help="Environment/local-secret key for the stcp secret."),
     ] = "CLIO_RELAY_STCP_SECRET",
+    direct_transport: Annotated[
+        bool,
+        typer.Option(
+            "--direct-transport/--no-direct-transport",
+            help="Enable optional NAT-punching direct transport optimization.",
+        ),
+    ] = False,
+    direct_transport_mode: Annotated[
+        str,
+        typer.Option(help="Direct transport mode. Currently only xtcp is supported."),
+    ] = "xtcp",
+    direct_transport_fallback: Annotated[
+        str,
+        typer.Option(help="Comma-separated direct transport fallback order ending in queue."),
+    ] = "frp_stcp,queue",
 ) -> None:
     """Add or update a local cluster definition."""
     registry = ClusterRegistry.load(default_registry_path())
-    registry.clusters[name] = ClusterDefinition(
-        name=name,
-        ssh_host=ssh_host,
-        bootstrap_profile=bootstrap_profile,
-        core_dir=core_dir,
-        spool_dir=spool_dir,
-        jarvis_bin=jarvis_bin,
-        frpc_bin=frpc_bin,
-        agent_bin=_none_if_blank(agent_bin),
-        agent_adapter=agent_adapter,
-        agent_npm_package=_none_if_blank(agent_npm_package),
-        agent_npm_bin=_none_if_blank(agent_npm_bin),
-        frp_transport=FrpTransportConfig(
-            protocol=frp_protocol,
-            server_addr=frp_server_addr,
-            server_port=frp_server_port,
-            token_env=frp_token_env,
-            stcp_secret_env=stcp_secret_env,
-        ),
-    )
+    try:
+        registry.clusters[name] = ClusterDefinition(
+            name=name,
+            ssh_host=ssh_host,
+            bootstrap_profile=bootstrap_profile,
+            core_dir=core_dir,
+            spool_dir=spool_dir,
+            jarvis_bin=jarvis_bin,
+            frpc_bin=frpc_bin,
+            agent_bin=_none_if_blank(agent_bin),
+            agent_adapter=agent_adapter,
+            agent_npm_package=_none_if_blank(agent_npm_package),
+            agent_npm_bin=_none_if_blank(agent_npm_bin),
+            frp_transport=FrpTransportConfig(
+                protocol=frp_protocol,
+                server_addr=frp_server_addr,
+                server_port=frp_server_port,
+                token_env=frp_token_env,
+                stcp_secret_env=stcp_secret_env,
+                direct=DirectTransportConfig(
+                    enabled=direct_transport,
+                    mode=direct_transport_mode,
+                    fallback_order=_split_csv(direct_transport_fallback),
+                ),
+            ),
+        )
+    except ValidationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     registry.save(default_registry_path())
     typer.echo(f"{name} ssh={ssh_host} profile={bootstrap_profile}")
 
@@ -664,7 +690,7 @@ def job_record_progress(
     ] = "{}",
 ) -> None:
     """Record a structured progress observation for a job."""
-    metadata = {"source": "external_cli", **_json_object(metadata_json)}
+    metadata = external_progress_metadata("external_cli", _json_object(metadata_json))
     progress = ClioCoreQueue(RelaySettings.from_env().core_dir).append_progress(
         ProgressRecord(
             job_id=job_id,
@@ -998,6 +1024,10 @@ def _none_if_blank(value: str | None) -> str | None:
     if value is None or value.strip() == "":
         return None
     return value
+
+
+def _split_csv(value: str) -> list[str]:
+    return [entry.strip() for entry in value.split(",") if entry.strip()]
 
 
 def _json_object(value: str) -> dict[str, object]:

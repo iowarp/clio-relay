@@ -22,6 +22,7 @@ from clio_relay.models import (
     RelayJob,
     RemoteAgentTaskSpec,
 )
+from clio_relay.progress_provenance import external_progress_metadata
 from clio_relay.relay_ops import (
     cancel_job as request_cancel_job,
 )
@@ -573,7 +574,7 @@ def _record_progress(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     metadata = arguments.get("metadata", {})
     if not isinstance(metadata, dict):
         raise ValueError("metadata must be an object")
-    typed_metadata = {"source": "external_mcp", **cast(dict[str, Any], metadata)}
+    typed_metadata = external_progress_metadata("external_mcp", cast(dict[str, Any], metadata))
     progress = queue.append_progress(
         ProgressRecord(
             job_id=_required_str(arguments, "job_id"),

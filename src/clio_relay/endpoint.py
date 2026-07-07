@@ -38,6 +38,10 @@ from clio_relay.progress_adapters import (
     LammpsThermoProgressAdapter,
     package_progress_adapter_from_pipeline,
 )
+from clio_relay.progress_provenance import (
+    package_progress_metadata,
+    validate_package_progress_metadata,
+)
 from clio_relay.spool import JobSpool
 
 
@@ -133,6 +137,8 @@ class EndpointWorker:
         yaml_text = self._render_job_yaml(job)
         pipeline_path = spool.write_pipeline(yaml_text)
         package_progress_adapter = package_progress_adapter_from_pipeline(yaml_text)
+        if package_progress_adapter is not None:
+            package_progress_adapter.run_id = job.job_id
         progress_sidecar = spool.path / "progress.jsonl"
         progress_sidecar_offset = [0]
         scheduler_job_ids: list[str] = []
@@ -165,6 +171,12 @@ class EndpointWorker:
                 ),
                 on_start=lambda pid: self._append_execution_start(job, pid),
                 should_cancel=lambda: self._should_cancel_job(
+                    job,
+                    scheduler_job_ids=scheduler_job_ids,
+                    scheduler_cancel_attempted=scheduler_cancel_attempted,
+                ),
+                timeout_seconds=_job_timeout_seconds(job),
+                on_timeout=lambda: self._handle_execution_timeout(
                     job,
                     scheduler_job_ids=scheduler_job_ids,
                     scheduler_cancel_attempted=scheduler_cancel_attempted,
@@ -366,9 +378,13 @@ class EndpointWorker:
                     unit=_optional_str(typed_payload.get("unit")),
                     message=_optional_str(typed_payload.get("message")),
                     source_event_seq=source_event_seq,
-                    metadata=_optional_metadata(typed_payload.get("metadata")),
+                    metadata=_trusted_package_metadata(
+                        _optional_metadata(typed_payload.get("metadata")),
+                        job_id=job.job_id,
+                    ),
                 )
-            except ValueError as exc:
+                validate_package_progress_metadata(progress.metadata)
+            except (ConfigurationError, ValueError) as exc:
                 self.queue.append_event(
                     job.job_id,
                     "progress.parse_failed",
@@ -467,6 +483,23 @@ class EndpointWorker:
         scheduler_cancel_attempted[0] = True
         self._cancel_scheduler_jobs(job, scheduler_job_ids)
         return True
+
+    def _handle_execution_timeout(
+        self,
+        job: RelayJob,
+        *,
+        scheduler_job_ids: list[str],
+        scheduler_cancel_attempted: list[bool],
+    ) -> None:
+        self.queue.append_event(
+            job.job_id,
+            "execution.timeout",
+            "JARVIS-CD process exceeded timeout_seconds",
+            payload={"scheduler_job_ids": list(scheduler_job_ids)},
+        )
+        if scheduler_job_ids and not scheduler_cancel_attempted[0]:
+            self._cancel_scheduler_jobs(job, scheduler_job_ids)
+            scheduler_cancel_attempted[0] = True
 
     def _cancel_scheduler_jobs(self, job: RelayJob, scheduler_job_ids: list[str]) -> None:
         if not scheduler_job_ids:
@@ -598,6 +631,23 @@ def _optional_metadata(value: object) -> dict[str, object]:
         raise ValueError("progress metadata must be an object")
     typed = cast(dict[object, object], value)
     return {str(key): item for key, item in typed.items()}
+
+
+def _trusted_package_metadata(metadata: dict[str, object], *, job_id: str) -> dict[str, object]:
+    package_name = metadata.get("package_name")
+    package_version = metadata.get("package_version")
+    return package_progress_metadata(
+        metadata,
+        package_name=package_name if isinstance(package_name, str) and package_name else "unknown",
+        package_version=(
+            package_version if isinstance(package_version, str) and package_version else "unknown"
+        ),
+        run_id=job_id,
+    )
+
+
+def _job_timeout_seconds(job: RelayJob) -> int | None:
+    return job.spec.timeout_seconds
 
 
 @contextmanager

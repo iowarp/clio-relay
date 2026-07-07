@@ -305,6 +305,7 @@ def _verify_transport(
     pipeline_yaml: str,
     expected_progress_adapter: str | None,
 ) -> list[str]:
+    run_suffix = uuid4().hex[:12]
     return run_frp_http_probe(
         cluster=options.cluster,
         definition=options.definition,
@@ -320,9 +321,12 @@ def _verify_transport(
             options.definition.live_test.transport_remote_api_port
             if options.transport_remote_api_port is None
             else options.transport_remote_api_port
-        ),
+        )
+        or _unique_transport_port(run_suffix),
         proxy_name=(
-            options.transport_proxy_name or options.definition.live_test.transport_proxy_name
+            options.transport_proxy_name
+            or options.definition.live_test.transport_proxy_name
+            or f"relay-http-live-test-{run_suffix}"
         ),
         api_token=options.api_token,
         timeout_seconds=options.timeout_seconds,
@@ -336,6 +340,10 @@ def _verify_transport(
             expected_progress_adapter=expected_progress_adapter,
         ),
     )
+
+
+def _unique_transport_port(run_suffix: str) -> int:
+    return 20000 + (int(run_suffix[:6], 16) % 20000)
 
 
 def _verify_transport_http_api(
@@ -453,7 +461,7 @@ def _verify_transport_http_api(
                 timeout_seconds=10,
             ),
         )
-        _assert_progress_adapter(progress, expected_progress_adapter)
+        _assert_progress_adapter(progress, expected_progress_adapter, job_id=job_id)
         lines.append(f"transport.http_progress_adapter={expected_progress_adapter}")
     return lines
 
@@ -700,7 +708,11 @@ def _verify_completed_job(
             ["job", "progress", job_id],
             runner=runner,
         )
-        _assert_progress_adapter(cast(list[dict[str, Any]], progress), expected_progress_adapter)
+        _assert_progress_adapter(
+            cast(list[dict[str, Any]], progress),
+            expected_progress_adapter,
+            job_id=job_id,
+        )
         lines.append(f"{line_prefix}.progress_adapter={expected_progress_adapter}")
 
 
@@ -727,7 +739,12 @@ def _expected_progress_adapter(pipeline_yaml: str) -> str | None:
     return None
 
 
-def _assert_progress_adapter(progress: list[dict[str, Any]], expected_adapter: str) -> None:
+def _assert_progress_adapter(
+    progress: list[dict[str, Any]],
+    expected_adapter: str,
+    *,
+    job_id: str,
+) -> None:
     for item in progress:
         metadata = item.get("metadata")
         if not isinstance(metadata, dict):
@@ -737,6 +754,9 @@ def _assert_progress_adapter(progress: list[dict[str, Any]], expected_adapter: s
             typed_metadata.get("adapter") == expected_adapter
             and typed_metadata.get("source") == "jarvis_package"
             and isinstance(typed_metadata.get("package_name"), str)
+            and isinstance(typed_metadata.get("package_version"), str)
+            and typed_metadata.get("run_id") == job_id
+            and typed_metadata.get("execution_id") == job_id
         ):
             return
     raise RelayError(f"expected package progress adapter was not recorded: {expected_adapter}")

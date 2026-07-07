@@ -6,6 +6,8 @@ The relay host is only `frps` configuration. It has no queue, no job records, an
 
 In the Cloudflare-backed homelab deployment, Cloudflare terminates public HTTPS for `frps.jcernuda.com` and forwards to a local HTTP origin. A small nginx edge container owns that HTTP origin, forwards the frp WebSocket path `/~!frp` to `frps` on loopback, and exposes only a simple health endpoint otherwise. `frps` still remains a dumb byte relay: it has no CLIO queue state, no job state, and no application routing logic.
 
+Direct NAT punching is an optional transport optimization, not the reliability path. Cluster registry entries can enable `frp_transport.direct` with `mode = "xtcp"` and a fallback order such as `["xtcp", "frp_stcp", "queue"]`. A direct probe may try UDP-assisted XTCP for high-volume streams, but any failure must fall back to the configured STCP/WSS relay and then to queue-only observation. The queue remains authoritative in every mode, and no job submission, event cursor, cancellation, progress, artifact, or provenance record can depend on direct transport success.
+
 The desktop endpoint submits configured-cluster work into the durable queue and exposes job, event, artifact, cancellation, remote-agent, and MCP-call surfaces for CLIO consumers.
 
 The worker endpoint leases queued jobs for one configured cluster, materializes relay intents into JARVIS-CD YAML, runs JARVIS-CD, and records progress, stdout, stderr, artifacts, provenance, and terminal state back into the queue.

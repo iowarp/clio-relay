@@ -88,6 +88,7 @@ class JarvisCdProvider:
                     "model": spec.model,
                     "workdir": str(spec.workdir) if spec.workdir is not None else None,
                     "timeout_seconds": spec.timeout_seconds,
+                    "context": spec.context or None,
                 }
             ],
         }
@@ -146,6 +147,8 @@ class JarvisCdProvider:
         on_start: Callable[[int], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
         on_poll: Callable[[], None] | None = None,
+        timeout_seconds: int | None = None,
+        on_timeout: Callable[[], None] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Invoke JARVIS-CD and stream output chunks while retaining final output."""
         self.require_available()
@@ -181,9 +184,18 @@ class JarvisCdProvider:
         stdout_thread.start()
         stderr_thread.start()
         canceled = False
+        timed_out = False
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
         while True:
             return_code = process.poll()
             if return_code is not None:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                timed_out = True
+                if on_timeout is not None:
+                    on_timeout()
+                _terminate_process(process)
+                return_code = process.wait()
                 break
             if should_cancel is not None and should_cancel():
                 canceled = True
@@ -197,7 +209,7 @@ class JarvisCdProvider:
         stderr_thread.join()
         return subprocess.CompletedProcess(
             command,
-            return_code if not canceled else -15,
+            124 if timed_out else return_code if not canceled else -15,
             stdout="".join(stdout_chunks),
             stderr="".join(stderr_chunks),
         )

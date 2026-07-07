@@ -41,6 +41,45 @@ def test_lammps_parser_resets_after_loop_footer() -> None:
     assert adapter.observe_line("20 1.0") is None
 
 
+def test_lammps_parser_tracks_repeated_runs_and_nonzero_start() -> None:
+    adapter = LammpsThermoProgressAdapter(total_steps=300)
+
+    adapter.observe_line("run 150")
+    adapter.observe_line("Step Temp")
+    first = adapter.observe_line("100 1.0")
+    middle = adapter.observe_line("175 1.0")
+    adapter.observe_line("250 1.0")
+    adapter.observe_line("Loop time of 1.0 on 1 procs for 150 steps")
+    adapter.observe_line("run 150")
+    adapter.observe_line("Step Temp")
+    repeated = adapter.observe_line("250 1.0")
+    second_middle = adapter.observe_line("325 1.0")
+
+    assert first is not None
+    assert first["current"] == 0
+    assert middle is not None
+    assert middle["current"] == 75
+    assert repeated is not None
+    assert repeated["current"] == 150
+    assert second_middle is not None
+    assert second_middle["current"] == 225
+
+
+def test_lammps_parser_handles_reset_timestep() -> None:
+    adapter = LammpsThermoProgressAdapter(total_steps=100)
+
+    adapter.observe_line("reset_timestep 0")
+    adapter.observe_line("run 100")
+    adapter.observe_line("Step Temp")
+    first = adapter.observe_line("0 1.0")
+    second = adapter.observe_line("50 1.0")
+
+    assert first is not None
+    assert first["current"] == 0
+    assert second is not None
+    assert second["current"] == 50
+
+
 def test_pipeline_adapter_requires_declared_lammps_package() -> None:
     generic = "name: generic\npkgs:\n- pkg_type: clio_relay.bounded_command\n"
     lammps = "name: lammps\npkgs:\n- pkg_type: builtin.lammps\n  progress:\n    total_steps: 250\n"

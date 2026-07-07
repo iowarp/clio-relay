@@ -111,6 +111,9 @@ def test_live_acceptance_stages_files_and_strips_relay_extension(
                                 "source": "jarvis_package",
                                 "adapter": "lammps",
                                 "package_name": "builtin.lammps",
+                                "package_version": "builtin",
+                                "run_id": "job_abc",
+                                "execution_id": "job_abc",
                             }
                         }
                     ]
@@ -153,6 +156,7 @@ def test_live_acceptance_requires_trusted_package_progress() -> None:
                 }
             ],
             "lammps",
+            job_id="job_test",
         )
     _assert_progress_adapter(
         [
@@ -161,10 +165,14 @@ def test_live_acceptance_requires_trusted_package_progress() -> None:
                     "adapter": "lammps",
                     "source": "jarvis_package",
                     "package_name": "builtin.lammps",
+                    "package_version": "builtin",
+                    "run_id": "job_test",
+                    "execution_id": "job_test",
                 }
             }
         ],
         "lammps",
+        job_id="job_test",
     )
 
 

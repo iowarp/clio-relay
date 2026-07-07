@@ -53,6 +53,7 @@ def test_exec_adapter_runs_configured_agent_with_templates(
             "prompt_path": str(prompt_path),
             "mcp_config_path": str(mcp_path),
             "model": "configured-model",
+            "context": {"source_event_seq": 9, "match_groups": {"step": "50"}},
         }
     )
 
@@ -63,9 +64,14 @@ def test_exec_adapter_runs_configured_agent_with_templates(
     assert result["returncode"] == 0
     assert result["prompt_path"] == str(prompt_path)
     assert result["mcp_config_path"] == str(mcp_path)
+    expected_prompt = (
+        "do the work\n\n"
+        "Relay monitor context:\n"
+        '{\n  "match_groups": {\n    "step": "50"\n  },\n  "source_event_seq": 9\n}\n'
+    )
     assert json.loads(output_path.read_text(encoding="utf-8")) == [
         "--prompt",
-        "do the work",
+        expected_prompt,
         "--mcp",
         str(mcp_path),
         "--model",

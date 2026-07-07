@@ -114,6 +114,7 @@ class RemoteAgentTaskSpec(BaseModel):
     model: str | None = None
     workdir: Path | None = None
     timeout_seconds: int | None = Field(default=None, gt=0)
+    context: dict[str, Any] = Field(default_factory=dict)
 
 
 class McpCallSpec(BaseModel):

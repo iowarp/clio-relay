@@ -26,6 +26,7 @@ from clio_relay.models import (
     RemoteAgentTaskSpec,
     utc_now,
 )
+from clio_relay.progress_provenance import external_progress_metadata
 from clio_relay.spool import JobSpool
 
 
@@ -221,6 +222,7 @@ def _apply_monitor_rule_action(
                     model=_optional_payload_str(rule, "model"),
                     workdir=workdir,
                     timeout_seconds=timeout_seconds,
+                    context=_monitor_agent_context(rule, event, match),
                 ),
                 idempotency_key=f"monitor:{rule.rule_id}:{event_seq}",
             )
@@ -248,12 +250,14 @@ def _apply_monitor_rule_action(
                 unit=_optional_payload_str(rule, "unit"),
                 message=_progress_message(rule, match),
                 source_event_seq=event_seq,
-                metadata={
-                    "source": "monitor_rule",
-                    "rule_id": rule.rule_id,
-                    "event_type": event.event_type,
-                    "match_groups": dict(match.groupdict()),
-                },
+                metadata=external_progress_metadata(
+                    "monitor_rule",
+                    {
+                        "rule_id": rule.rule_id,
+                        "event_type": event.event_type,
+                        "match_groups": dict(match.groupdict()),
+                    },
+                ),
             )
         )
         payload["progress_id"] = progress.progress_id
@@ -277,6 +281,23 @@ def _required_payload_str(rule: MonitorRule, key: str) -> str:
     if not isinstance(value, str) or value == "":
         raise ConfigurationError(f"monitor action requires string payload field: {key}")
     return value
+
+
+def _monitor_agent_context(
+    rule: MonitorRule,
+    event: RelayEvent,
+    match: re.Match[str],
+) -> dict[str, object]:
+    return {
+        "monitor_rule_id": rule.rule_id,
+        "source_job_id": event.job_id,
+        "source_event_seq": event.seq,
+        "source_event_type": event.event_type,
+        "source_event_message": event.message,
+        "source_event_payload": event.payload,
+        "match_text": match.group(0),
+        "match_groups": dict(match.groupdict()),
+    }
 
 
 def _optional_payload_str(rule: MonitorRule, key: str) -> str | None:

@@ -9,12 +9,16 @@ from typing import Any, cast
 
 import yaml
 
+from clio_relay.progress_provenance import package_progress_metadata
+
 
 @dataclass
 class LammpsThermoProgressAdapter:
     """Parse LAMMPS thermo output after a declared JARVIS LAMMPS package starts."""
 
     package_name: str = "builtin.lammps"
+    package_version: str = "unknown"
+    run_id: str = ""
     total_steps: float | None = None
     warmup_samples: int = 2
     sample_window: int = 8
@@ -22,6 +26,9 @@ class LammpsThermoProgressAdapter:
     active_step_column: int | None = None
     samples: list[tuple[float, float]] = field(default_factory=lambda: [])
     last_step: float | None = None
+    completed_steps: float = 0.0
+    active_run_steps: float | None = None
+    active_run_start_step: float | None = None
 
     def observe_stdout(self, text: str) -> list[dict[str, object]]:
         """Extract progress observations from stdout text."""
@@ -37,6 +44,16 @@ class LammpsThermoProgressAdapter:
         stripped = line.strip()
         if stripped == "":
             return None
+        reset_step = _parse_reset_timestep(stripped)
+        if reset_step is not None:
+            self.active_run_start_step = reset_step
+            self.last_step = reset_step
+            return None
+        run_steps = _parse_run_steps(stripped)
+        if run_steps is not None:
+            self.active_run_steps = run_steps
+            self.active_run_start_step = None
+            return None
         if _looks_like_thermo_header(stripped):
             self.active_columns = stripped.split()
             try:
@@ -45,6 +62,12 @@ class LammpsThermoProgressAdapter:
                 self.active_step_column = None
             return None
         if stripped.startswith("Loop time of "):
+            if self.active_run_steps is not None:
+                self.completed_steps += self.active_run_steps
+            elif self.active_run_start_step is not None and self.last_step is not None:
+                self.completed_steps += max(0.0, self.last_step - self.active_run_start_step)
+            self.active_run_steps = None
+            self.active_run_start_step = None
             self.active_columns = []
             self.active_step_column = None
             return None
@@ -59,26 +82,39 @@ class LammpsThermoProgressAdapter:
             return None
         if step < 0:
             return None
+        if self.active_run_start_step is None:
+            self.active_run_start_step = step
         self.last_step = step
+        current = self.completed_steps + max(0.0, step - self.active_run_start_step)
+        if self.active_run_steps is not None:
+            current = min(self.completed_steps + self.active_run_steps, current)
         now = time.monotonic()
-        self.samples.append((step, now))
+        self.samples.append((current, now))
         self.samples = self.samples[-self.sample_window :]
-        prediction = self._prediction(step)
+        prediction = self._prediction(current)
         return _drop_none(
             {
                 "label": "timestep",
-                "current": step,
+                "current": current,
                 "total": self.total_steps,
                 "unit": "step",
-                "message": _lammps_message(step, self.total_steps),
+                "message": _lammps_message(current, self.total_steps),
                 "metadata": {
-                    "source": "jarvis_package",
-                    "package_name": self.package_name,
                     "adapter": "lammps",
                     "columns": self.active_columns,
                     "step_column": "Step",
+                    "absolute_step": step,
+                    "run_start_step": self.active_run_start_step,
+                    "run_steps": self.active_run_steps,
+                    "completed_prior_runs": self.completed_steps,
                     **prediction,
-                },
+                }
+                | package_progress_metadata(
+                    {},
+                    package_name=self.package_name,
+                    package_version=self.package_version,
+                    run_id=self.run_id,
+                ),
             }
         )
 
@@ -133,6 +169,12 @@ def package_progress_adapter_from_pipeline(
             continue
         return LammpsThermoProgressAdapter(
             package_name=str(package_type),
+            package_version=str(
+                typed_package.get("pkg_version")
+                or typed_package.get("version")
+                or typed_package.get("package_version")
+                or "builtin"
+            ),
             total_steps=_optional_float(
                 typed_package.get("total_steps")
                 or typed_package.get("steps")
@@ -165,6 +207,20 @@ def _optional_float(value: object) -> float | None:
 def _looks_like_thermo_header(line: str) -> bool:
     columns = line.split()
     return "Step" in columns and len(columns) >= 2
+
+
+def _parse_run_steps(line: str) -> float | None:
+    parts = line.split()
+    if len(parts) < 2 or parts[0] != "run":
+        return None
+    return _optional_float(parts[1])
+
+
+def _parse_reset_timestep(line: str) -> float | None:
+    parts = line.split()
+    if len(parts) < 2 or parts[0] != "reset_timestep":
+        return None
+    return _optional_float(parts[1])
 
 
 def _lammps_message(step: float, total_steps: float | None) -> str:

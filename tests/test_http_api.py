@@ -183,7 +183,13 @@ def test_http_progress_endpoints_record_and_list_progress(tmp_path: Path) -> Non
             "total": 10,
             "unit": "step",
             "message": "half way",
-            "metadata": {"source": "http"},
+            "metadata": {
+                "source": "jarvis_package",
+                "adapter": "lammps",
+                "package_name": "builtin.lammps",
+                "package_version": "builtin",
+                "run_id": "spoofed",
+            },
         },
     )
     list_response = client.get(f"/jobs/{job.job_id}/progress")
@@ -194,6 +200,9 @@ def test_http_progress_endpoints_record_and_list_progress(tmp_path: Path) -> Non
     listed = list_response.json()
     assert recorded["label"] == "iteration"
     assert recorded["current"] == 5
+    assert recorded["metadata"]["source"] == "external_http"
+    assert "package_name" not in recorded["metadata"]
+    assert "run_id" not in recorded["metadata"]
     assert listed[0]["progress_id"] == recorded["progress_id"]
 
 

@@ -292,7 +292,13 @@ def test_mcp_records_and_lists_progress(tmp_path: Path) -> None:
                     "total": 2,
                     "unit": "step",
                     "message": "running",
-                    "metadata": {"source": "agent"},
+                    "metadata": {
+                        "source": "jarvis_package",
+                        "adapter": "lammps",
+                        "package_name": "builtin.lammps",
+                        "package_version": "builtin",
+                        "run_id": "spoofed",
+                    },
                 },
             },
         },
@@ -317,6 +323,9 @@ def test_mcp_records_and_lists_progress(tmp_path: Path) -> None:
     listed = list_response["result"]["structuredContent"]["progress"]
     assert recorded["label"] == "iteration"
     assert recorded["current"] == 1
+    assert recorded["metadata"]["source"] == "external_mcp"
+    assert "package_name" not in recorded["metadata"]
+    assert "run_id" not in recorded["metadata"]
     assert listed[0]["progress_id"] == recorded["progress_id"]
 
 

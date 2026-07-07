@@ -31,6 +31,7 @@ from clio_relay.models import (
     RelayTask,
     RemoteAgentTaskSpec,
 )
+from clio_relay.progress_provenance import external_progress_metadata
 from clio_relay.relay_ops import (
     cancel_job as request_cancel_job,
 )
@@ -269,7 +270,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     )
     def record_progress(job_id: str, request: ProgressUpdateRequest) -> ProgressRecord:
         try:
-            metadata = {"source": "external_http", **request.metadata}
+            metadata = external_progress_metadata("external_http", dict(request.metadata))
             return queue.append_progress(
                 ProgressRecord(
                     job_id=job_id,

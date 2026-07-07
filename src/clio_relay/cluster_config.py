@@ -5,9 +5,47 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from clio_relay.errors import ConfigurationError
+
+
+class DirectTransportConfig(BaseModel):
+    """Optional NAT-punching transport optimization settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    mode: str = "xtcp"
+    fallback_order: list[str] = Field(default_factory=lambda: ["frp_stcp", "queue"])
+    probe_timeout_seconds: float = 10.0
+
+    @field_validator("mode")
+    @classmethod
+    def _validate_mode(cls, value: str) -> str:
+        if value not in {"xtcp"}:
+            raise ValueError("direct transport mode must be xtcp")
+        return value
+
+    @field_validator("fallback_order")
+    @classmethod
+    def _validate_fallback_order(cls, value: list[str]) -> list[str]:
+        allowed = {"xtcp", "frp_stcp", "queue"}
+        if not value:
+            raise ValueError("direct transport fallback_order must not be empty")
+        invalid = [entry for entry in value if entry not in allowed]
+        if invalid:
+            raise ValueError(f"unsupported direct transport fallback entries: {invalid}")
+        if value[-1] != "queue":
+            raise ValueError("direct transport fallback_order must end with queue")
+        return value
+
+    @field_validator("probe_timeout_seconds")
+    @classmethod
+    def _validate_probe_timeout_seconds(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("direct transport probe_timeout_seconds must be positive")
+        return value
 
 
 class FrpTransportConfig(BaseModel):
@@ -20,6 +58,7 @@ class FrpTransportConfig(BaseModel):
     server_port: int = 443
     token_env: str = "CLIO_RELAY_FRP_TOKEN"
     stcp_secret_env: str = "CLIO_RELAY_STCP_SECRET"
+    direct: DirectTransportConfig = Field(default_factory=DirectTransportConfig)
 
 
 class LiveTestConfig(BaseModel):
@@ -33,8 +72,8 @@ class LiveTestConfig(BaseModel):
     progress_action_payload: dict[str, object] = Field(default_factory=dict)
     verify_transport: bool = False
     transport_local_bind_port: int = 18765
-    transport_remote_api_port: int = 8765
-    transport_proxy_name: str = "relay-http-live-test"
+    transport_remote_api_port: int | None = None
+    transport_proxy_name: str | None = None
     agent_prompt: str | None = None
     agent_child_jarvis_yaml: str | None = None
     agent_mcp_config: str | None = None

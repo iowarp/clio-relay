@@ -32,6 +32,7 @@ def test_remote_agent_task_yaml_generation(tmp_path: Path) -> None:
         RemoteAgentTaskSpec(
             prompt_path=tmp_path / "prompt.md",
             mcp_config_path=tmp_path / "mcp.json",
+            context={"source_event_seq": 7, "match_groups": {"step": "50"}},
         )
     )
     document = yaml.safe_load(rendered)
@@ -42,6 +43,7 @@ def test_remote_agent_task_yaml_generation(tmp_path: Path) -> None:
     assert package["agent_adapter"] == "exec"
     assert package["agent_args"] == ["--prompt", "{prompt_path}"]
     assert package["prompt_path"].endswith("prompt.md")
+    assert package["context"] == {"source_event_seq": 7, "match_groups": {"step": "50"}}
 
 
 def test_mcp_call_yaml_generation() -> None:

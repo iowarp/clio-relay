@@ -27,6 +27,7 @@ def run_remote_agent_from_params(params: dict[str, Any]) -> int:
         agent_bin = _required_str(params, "agent_bin")
         prompt_path = Path(_required_str(params, "prompt_path"))
         prompt_text = prompt_path.read_text(encoding="utf-8")
+        prompt_text = _append_context(prompt_text, params.get("context"))
         mcp_config_path = _optional_path(params.get("mcp_config_path"))
         workdir = _optional_path(params.get("workdir"))
         timeout = _optional_int(params.get("timeout_seconds"))
@@ -242,3 +243,16 @@ def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError("agent_args must be a list of strings")
     return value
+
+
+def _append_context(prompt_text: str, context: Any) -> str:
+    if context is None:
+        return prompt_text
+    if not isinstance(context, dict):
+        raise ValueError("context must be an object")
+    return (
+        prompt_text.rstrip()
+        + "\n\nRelay monitor context:\n"
+        + json.dumps(context, indent=2, sort_keys=True)
+        + "\n"
+    )

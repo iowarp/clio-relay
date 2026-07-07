@@ -49,10 +49,20 @@ class RecordingProvider(JarvisCdProvider):
         on_start: Callable[[int], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
         on_poll: Callable[[], None] | None = None,
+        timeout_seconds: int | None = None,
+        on_timeout: Callable[[], None] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         self.runs.append(pipeline_path)
         if on_start is not None:
             on_start(123)
+        if timeout_seconds is not None and on_timeout is not None:
+            on_timeout()
+            return subprocess.CompletedProcess(
+                args=["jarvis"],
+                returncode=124,
+                stdout="",
+                stderr="",
+            )
         if on_stdout is not None:
             on_stdout("ok\n")
         if on_stderr is not None:
@@ -150,8 +160,11 @@ def test_worker_ignores_forged_stdout_progress_markers(tmp_path: Path) -> None:
             on_start: Callable[[int], None] | None = None,
             should_cancel: Callable[[], bool] | None = None,
             on_poll: Callable[[], None] | None = None,
+            timeout_seconds: int | None = None,
+            on_timeout: Callable[[], None] | None = None,
         ) -> subprocess.CompletedProcess[str]:
             del cwd, on_stderr, on_start, should_cancel, on_poll
+            del timeout_seconds, on_timeout
             self.runs.append(pipeline_path)
             if on_stdout is not None:
                 on_stdout(
@@ -201,8 +214,11 @@ def test_worker_ingests_package_progress_side_channel(tmp_path: Path) -> None:
             on_start: Callable[[int], None] | None = None,
             should_cancel: Callable[[], bool] | None = None,
             on_poll: Callable[[], None] | None = None,
+            timeout_seconds: int | None = None,
+            on_timeout: Callable[[], None] | None = None,
         ) -> subprocess.CompletedProcess[str]:
             del pipeline_path, on_stdout, on_stderr, on_start, should_cancel
+            del timeout_seconds, on_timeout
             self.runs.append(Path("pipeline.yaml"))
             progress_path = os.environ["CLIO_RELAY_PROGRESS_FILE"]
             Path(progress_path).write_text(
@@ -249,6 +265,8 @@ def test_worker_ingests_package_progress_side_channel(tmp_path: Path) -> None:
     assert len(progress) == 1
     assert progress[0].source == "jarvis_package"
     assert progress[0].metadata["package_name"] == "clio_relay.bounded_command"
+    assert progress[0].metadata["package_version"] == "unknown"
+    assert progress[0].metadata["run_id"] == job.job_id
 
 
 def test_worker_parses_lammps_progress_only_for_declared_lammps_package(tmp_path: Path) -> None:
@@ -266,8 +284,11 @@ def test_worker_parses_lammps_progress_only_for_declared_lammps_package(tmp_path
             on_start: Callable[[int], None] | None = None,
             should_cancel: Callable[[], bool] | None = None,
             on_poll: Callable[[], None] | None = None,
+            timeout_seconds: int | None = None,
+            on_timeout: Callable[[], None] | None = None,
         ) -> subprocess.CompletedProcess[str]:
             del cwd, on_stderr, on_start, should_cancel, on_poll
+            del timeout_seconds, on_timeout
             self.runs.append(pipeline_path)
             if on_stdout is not None:
                 on_stdout("Step Temp E_pair\n0 1.44 -6.0\n25 1.40 -5.9\n")
@@ -299,6 +320,9 @@ def test_worker_parses_lammps_progress_only_for_declared_lammps_package(tmp_path
     assert [item.current for item in progress] == [0, 25]
     assert progress[-1].metadata["source"] == "jarvis_package"
     assert progress[-1].metadata["package_name"] == "builtin.lammps"
+    assert progress[-1].metadata["package_version"] == "builtin"
+    assert progress[-1].metadata["run_id"] == job.job_id
+    assert progress[-1].metadata["execution_id"] == job.job_id
 
 
 def test_worker_preserves_canceled_state_for_running_job(
@@ -343,7 +367,10 @@ def test_worker_preserves_canceled_state_for_running_job(
             on_start: Callable[[int], None] | None = None,
             should_cancel: Callable[[], bool] | None = None,
             on_poll: Callable[[], None] | None = None,
+            timeout_seconds: int | None = None,
+            on_timeout: Callable[[], None] | None = None,
         ) -> subprocess.CompletedProcess[str]:
+            del cwd, on_stderr, timeout_seconds, on_timeout
             self.runs.append(pipeline_path)
             if on_start is not None:
                 on_start(456)
@@ -384,6 +411,83 @@ def test_worker_preserves_canceled_state_for_running_job(
     assert scancel_commands == [["scancel", "12345"]]
 
 
+def test_worker_timeout_scancels_scheduler_job(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["sleep", "60"], timeout_seconds=5),
+            idempotency_key="timeout-running",
+        )
+    )
+    scancel_commands: list[list[str]] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        text: bool,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        del text, capture_output, check
+        scancel_commands.append(command)
+        return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("clio_relay.endpoint.subprocess.run", fake_run)
+
+    class TimeoutProvider(RecordingProvider):
+        def run_pipeline_streaming(
+            self,
+            pipeline_path: Path,
+            *,
+            cwd: Path | None = None,
+            on_stdout: Callable[[str], None] | None = None,
+            on_stderr: Callable[[str], None] | None = None,
+            on_start: Callable[[int], None] | None = None,
+            should_cancel: Callable[[], bool] | None = None,
+            on_poll: Callable[[], None] | None = None,
+            timeout_seconds: int | None = None,
+            on_timeout: Callable[[], None] | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            del cwd, on_stderr, should_cancel, on_poll
+            self.runs.append(pipeline_path)
+            if on_start is not None:
+                on_start(789)
+            if on_stdout is not None:
+                on_stdout("Submitted batch job 98765\nstarted\n")
+            assert timeout_seconds == 5
+            assert on_timeout is not None
+            on_timeout()
+            return subprocess.CompletedProcess(
+                args=["jarvis"],
+                returncode=124,
+                stdout="started\n",
+                stderr="",
+            )
+
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=queue,
+        provider=TimeoutProvider(),
+    )
+    worker.register()
+
+    result = worker.run_once()
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=50)
+
+    assert result is not None
+    assert result.state == JobState.FAILED
+    assert "execution.timeout" in [event.event_type for event in events]
+    assert scancel_commands == [["scancel", "98765"]]
+
+
 def test_worker_renews_lease_while_pipeline_runs(tmp_path: Path) -> None:
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
 
@@ -417,7 +521,10 @@ def test_worker_renews_lease_while_pipeline_runs(tmp_path: Path) -> None:
             on_start: Callable[[int], None] | None = None,
             should_cancel: Callable[[], bool] | None = None,
             on_poll: Callable[[], None] | None = None,
+            timeout_seconds: int | None = None,
+            on_timeout: Callable[[], None] | None = None,
         ) -> subprocess.CompletedProcess[str]:
+            del cwd, on_stdout, on_stderr, should_cancel, timeout_seconds, on_timeout
             self.runs.append(pipeline_path)
             if on_start is not None:
                 on_start(789)
@@ -468,7 +575,10 @@ def test_worker_indexes_agent_result_artifacts(tmp_path: Path) -> None:
             on_start: Callable[[int], None] | None = None,
             should_cancel: Callable[[], bool] | None = None,
             on_poll: Callable[[], None] | None = None,
+            timeout_seconds: int | None = None,
+            on_timeout: Callable[[], None] | None = None,
         ) -> subprocess.CompletedProcess[str]:
+            del on_stdout, on_stderr, should_cancel, on_poll, timeout_seconds, on_timeout
             self.runs.append(pipeline_path)
             assert cwd is not None
             (cwd / "agent-result.json").write_text('{"returncode": 0}', encoding="utf-8")

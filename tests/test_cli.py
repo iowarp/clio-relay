@@ -179,6 +179,40 @@ def test_cli_rejects_invalid_json_object() -> None:
     assert "Traceback" not in result.output
 
 
+def test_cli_record_progress_cannot_spoof_package_progress(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="cli-record-progress",
+        )
+    )
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "job",
+            "record-progress",
+            job.job_id,
+            "--metadata-json",
+            '{"source":"jarvis_package","package_name":"builtin.lammps","run_id":"spoofed"}',
+        ],
+    )
+
+    assert result.exit_code == 0
+    progress = ClioCoreQueue(core_dir).list_progress(job.job_id)[0]
+    assert progress.metadata["source"] == "external_cli"
+    assert "package_name" not in progress.metadata
+    assert "run_id" not in progress.metadata
+
+
 def test_cli_render_frpc_uses_configured_secret_env(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -350,6 +384,63 @@ def test_cli_cluster_add_writes_explicit_definition(
     assert definition.frp_transport.server_addr == "relay.example.edu"
     assert definition.frp_transport.protocol == "tcp"
     assert definition.frp_transport.server_port == 7000
+    assert definition.frp_transport.direct.enabled is False
+    assert definition.frp_transport.direct.fallback_order == ["frp_stcp", "queue"]
+
+
+def test_cli_cluster_add_persists_direct_transport_optimization(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "add",
+            "--name",
+            "homelab",
+            "--ssh-host",
+            "homelab",
+            "--direct-transport",
+            "--direct-transport-mode",
+            "xtcp",
+            "--direct-transport-fallback",
+            "xtcp,frp_stcp,queue",
+        ],
+    )
+
+    assert result.exit_code == 0
+    definition = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json").require("homelab")
+    assert definition.frp_transport.direct.enabled is True
+    assert definition.frp_transport.direct.mode == "xtcp"
+    assert definition.frp_transport.direct.fallback_order == ["xtcp", "frp_stcp", "queue"]
+
+
+def test_cli_cluster_add_rejects_direct_transport_without_queue_fallback(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "add",
+            "--name",
+            "homelab",
+            "--ssh-host",
+            "homelab",
+            "--direct-transport",
+            "--direct-transport-fallback",
+            "xtcp,frp_stcp",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "fallback_order must end with queue" in result.output
 
 
 def test_cli_mcp_call_preserves_arguments(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
