@@ -1,0 +1,12 @@
+name: ares-recovery-live
+pkgs:
+  - pkg_type: clio_relay.bounded_command
+    pkg_name: bounded_command
+    command:
+      - bash
+      - -lc
+      - >
+        mkdir -p "$HOME/.local/share/clio-relay/live-tests/recovery" &&
+        date -u +"attempt %Y-%m-%dT%H:%M:%SZ" >>
+        "$HOME/.local/share/clio-relay/live-tests/recovery/attempts.log" &&
+        sleep 300
