@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import TypeVar
@@ -568,16 +569,34 @@ class ClioCoreQueue:
     def _read_optional(path: Path, model: type[Record]) -> Record | None:
         if not path.exists():
             return None
-        return model.model_validate_json(path.read_text(encoding="utf-8"))
+        try:
+            return ClioCoreQueue._read_json_file(path, model)
+        except FileNotFoundError:
+            return None
 
     @classmethod
     def _read_many(cls, directory: Path, model: type[Record]) -> Iterable[Record]:
         if not directory.exists():
             return []
-        return [cls._read_json_file(path, model) for path in directory.glob("*.json")]
+        records: list[Record] = []
+        for path in directory.glob("*.json"):
+            try:
+                records.append(cls._read_json_file(path, model))
+            except FileNotFoundError:
+                continue
+        return records
 
     @staticmethod
     def _read_json_file(path: Path, model: type[Record]) -> Record:
+        last_error: OSError | json.JSONDecodeError | None = None
+        for _ in range(5):
+            try:
+                return model.model_validate_json(path.read_text(encoding="utf-8"))
+            except (PermissionError, json.JSONDecodeError) as exc:
+                last_error = exc
+                time.sleep(0.02)
+        if last_error is not None:
+            raise last_error
         return model.model_validate_json(path.read_text(encoding="utf-8"))
 
 
