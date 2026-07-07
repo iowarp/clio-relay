@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    name: python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - name: check out repository
+        uses: actions/checkout@v4
+
+      - name: install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: set up python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: install dependencies
+        run: uv sync --all-groups
+
+      - name: lint
+        run: uv run ruff check
+
+      - name: format check
+        run: uv run ruff format --check
+
+      - name: type check
+        run: uv run pyright
+
+      - name: test
+        run: uv run pytest
+
+      - name: build package
+        run: uv build
+
+      - name: check package metadata
+        run: uvx twine check dist/*
+
+      - name: upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.python-version }}
+          path: dist/*
+          if-no-files-found: error

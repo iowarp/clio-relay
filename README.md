@@ -1,44 +1,48 @@
 # clio-relay
 
-Private relay for running configured cluster work from CLIO without putting application state in the network relay.
+`clio-relay` lets a desktop tool submit work to a remote cluster, follow it while it runs, and collect logs, artifacts, progress, and provenance without putting job state in the network tunnel.
 
-`frp` is used only as a byte transport. The frpc-to-frps protocol is configurable: use `wss` for Cloudflare-backed homelab routing now, and switch to `tcp` later when a cloud or institutional relay host provides raw TCP. `clio-core` queue records are the durable state source. JARVIS-CD owns deployment, scheduler submission, provenance, and output collection.
+It is a piece of the federation layer for [`clio-agent`](https://github.com/iowarp/clio-agent): a local CLIO experience can delegate work to a remote machine, keep observing it, detach, reconnect, and clean up after itself. The project is also designed for use outside CLIO. Any client that can call the CLI, HTTP API, or MCP tools can use the same relay model.
 
-## Roles
+## what it does
 
-- `desktop`: submits work, exposes HTTP/MCP-facing tools, and drains cursors.
-- `worker`: leases queued work for a configured cluster, materializes JARVIS-CD runs, and streams events/artifacts back.
-- `relay-host`: renders `frps` configuration only. It stores no job state.
+- Submits JARVIS-CD pipelines to configured clusters.
+- Runs remote agent tasks and remote MCP calls through the same queue.
+- Streams stdout, stderr, events, progress, artifacts, and provenance back to the desktop side.
+- Supports reconnect and replay through durable queue records.
+- Keeps network transport separate from application state.
+- Supports frp over WebSocket/TLS, frp over TCP, SSH local port forwarding, and optional frp XTCP probing.
+- Lets a desktop app detach from a remote session or tear down the remote relay processes explicitly.
 
-## Quickstart
+## how it works
+
+`clio-relay` has three roles:
+
+- `desktop`: submits work and exposes CLI, HTTP, and MCP surfaces for local tools.
+- `worker`: runs on a configured cluster, leases work, invokes JARVIS-CD, and records results.
+- `relay-host`: carries bytes for frp deployments. It does not store jobs or queue state.
+
+The durable boundary is `clio-core`. The filesystem queue in this repository is the development backend for that record contract. JARVIS-CD owns scheduler execution, package behavior, output collection, and provenance. frp and SSH forwarding only carry HTTP bytes between endpoints.
+
+## install
 
 ```powershell
 uv sync
 uv run clio-relay init
 uv run clio-relay install-frp
+```
+
+Add a cluster. This example uses Ares and Codex because that is the current test target, but the cluster name and agent executable are local configuration.
+
+```powershell
 uv run clio-relay cluster add --name ares --ssh-host ares --agent-adapter codex --agent-npm-package @openai/codex --agent-npm-bin codex
 uv run clio-relay cluster bootstrap --cluster ares
-$env:CLIO_RELAY_FRP_TOKEN = "<shared-frp-token>"
-$env:CLIO_RELAY_STCP_SECRET = "<shared-stcp-secret>"
-uv run clio-relay relay-host render-frps-config
-uv run clio-relay relay-host render-frpc-config --cluster ares --local-port 8848
-uv run clio-relay relay-host render-frpc-visitor-config --cluster ares --bind-port 8765
-uv run clio-relay relay-host test-ssh-transport --cluster ares --local-bind-port 18766 --remote-api-port 8766 --session-id relay-ssh-test
-uv run clio-relay endpoint status
+uv run clio-relay cluster install-endpoint-service --cluster ares --start --enable
 ```
 
-On Windows, `install-frp` installs into `.tools/frp/bin`; relay commands auto-discover that project-local binary after checking explicit environment configuration, `PATH`, and bootstrap-managed installs.
+## submit work
 
-For unattended local runs, transport secrets can also live in the ignored `.clio-relay/secrets.json` file:
-
-```json
-{
-  "CLIO_RELAY_FRP_TOKEN": "<shared-frp-token>",
-  "CLIO_RELAY_STCP_SECRET": "<shared-stcp-secret>"
-}
-```
-
-Submit a JARVIS pipeline intent:
+Submit a JARVIS pipeline:
 
 ```powershell
 uv run clio-relay job submit --cluster ares --jarvis-yaml .\pipeline.yaml
@@ -47,73 +51,62 @@ uv run clio-relay job read-log <job-id> --cluster ares --stream stdout
 uv run clio-relay job list-artifacts <job-id> --cluster ares
 ```
 
-Cluster-targeted desktop commands execute against the configured cluster over SSH by
-default. Set `CLIO_RELAY_CLI_MODE=local` only when intentionally operating on the
-local file-backed core, such as inside tests or while logged into the cluster.
-
-Expose relay submission tools to an agent process:
+Expose relay tools to an agent:
 
 ```powershell
 uv run clio-relay agent render-mcp-config --output .\clio-relay-agent.config.toml
 uv run clio-relay agent run --cluster ares --prompt /path/on/cluster/prompt.md --mcp-config /path/on/cluster/clio-relay-agent.config.toml
 ```
 
-The MCP server provides generic relay tools for JARVIS submission, remote-agent submission, remote MCP-call submission, job state, event cursors, stdout/stderr logs, artifacts, and monitor rules. These tools submit and inspect the same durable `RelayJob` records as the CLI and HTTP surfaces. Workload-specific systems are expressed as JARVIS pipeline YAML, prompt files, or MCP call arguments supplied by the caller, not as relay-native tools.
-
-Job submission is asynchronous by default: submit returns a `job_id`, initial state, kind, and terminal flag. MCP callers can set `wait_for_terminal` with `timeout_seconds` and `poll_seconds` for synchronous submit-and-wait behavior. Monitoring is cursor-based through `relay_monitor_job` or `relay_watch_job_events`; durable task records are available through `job tasks`, HTTP `/jobs/{job_id}/tasks`, and MCP `relay_list_tasks`; stdout and stderr are readable by byte offset through `relay_read_job_log`; artifact references are listed with `relay_list_artifacts` and file artifacts are fetched with `relay_read_artifact`.
-
-Remote agents running inside a single-worker cluster endpoint should submit child cluster work asynchronously, then return the child `job_id` for an outside monitor or later agent turn. A synchronous wait from that same in-flight worker can block the only worker that could execute the child job. Desktop-side agents and HTTP/MCP clients can use synchronous waiting because they are not occupying the cluster worker.
-
-The worker streams JARVIS stdout/stderr into durable events while the process is running (`stdout.delta` and `stderr.delta`) and also writes complete `stdout.log` and `stderr.log` files into the job spool. The clio-core boundary owns job state, event cursors, and artifact metadata; spool files are backing data for logs and artifacts, not the queue.
-
-Every worker run writes and indexes `provenance.json` as a `provenance` artifact. The manifest records the durable job, endpoint, provider settings, materialized pipeline path, stdout/stderr backing files, return code, terminal state, sizes, and hashes. Relay-owned JARVIS packages also emit structured result files into the same job spool. Remote-agent jobs produce `agent-result.json` and, when the configured adapter writes one, `agent-last-message.txt`; MCP-call jobs produce `mcp-result.json` with return code and captured server output. The worker indexes these as `agent_result`, `agent_last_message`, and `mcp_result` artifacts so desktop, HTTP, and MCP clients can inspect result evidence without scraping logs.
-
-Cancellation is durable and cooperative. `job cancel`, HTTP `/jobs/{job_id}/cancel`, and MCP `relay_cancel_job` all record `job.cancel_requested` and move the job to `canceled`. A running worker polls clio-core while JARVIS executes; when it observes cancellation it terminates the JARVIS process group, records `execution.canceled`, and does not overwrite the terminal canceled state.
-
-Worker leases are short lived and renewed while JARVIS is running. If a worker process dies or loses access to clio-core, the next worker loop recovers expired `leased` or `running` jobs for that cluster: jobs below the retry cap are requeued with a `job.requeued` event, and jobs at the cap become `failed` with an explicit `job.failed` event. This prevents orphaned long-running work from remaining invisible while avoiding duplicate execution from healthy workers. After an actual worker death, retry is at-least-once: package commands and downstream schedulers must use idempotency keys, checkpoints, or scheduler cancellation when duplicate side effects matter.
-
-Monitor rules are durable observer records over a job event stream. A regex rule can match event messages or streamed `text` payloads, then emit a `monitor.triggered` event or submit a generic remote-agent task. Rules are cursor-based and one-shot by default after a match, so replay does not duplicate actions.
-
-JARVIS packages can own application-specific progress extraction without adding workload semantics to the relay core. The bounded-command package only supports generic regex progress and writes trusted package progress to a relay-owned side-channel JSONL file; arbitrary workload stdout markers such as `CLIO_PROGRESS ...` are ignored as package evidence. LAMMPS acceptance uses the upstream JARVIS `builtin.lammps` package directly. The worker enables a LAMMPS thermo parser only for pipelines that declare that package, records package provenance on every progress observation, and stores simple ETA metadata derived from observed per-step timing after warmup.
-
-The HTTP API enforces `CLIO_RELAY_API_TOKEN` when that environment variable is set. Clients can send either `Authorization: Bearer <token>` or `X-Clio-Relay-Token: <token>`. `/healthz` remains unauthenticated for local process checks. When exposing the API through frp or another relay, start it with `clio-relay api start --require-token` so missing API auth fails at startup.
-
-HTTP clients can submit raw `RelayJob` records through `POST /jobs` or use typed submit endpoints: `POST /jobs/jarvis`, `POST /jobs/remote-agent`, and `POST /jobs/mcp-call`. The typed endpoints preserve the same durable queue semantics while keeping provider/workload details in request payloads instead of relay-native hardcoding.
-
-Closed environments can use SSH local port forwarding instead of frp. `relay-host test-ssh-transport` starts an owned cluster-side relay API session, opens `ssh -L 127.0.0.1:<local>:127.0.0.1:<remote>`, verifies `/healthz`, then tears down only the session-owned API process by default. Use `--detach-remote` to leave the remote session alive for a desktop detach/reattach workflow.
-
-Remote sessions are explicit lifecycle objects under `$HOME/.local/share/clio-relay/sessions/<session-id>` on the cluster. `session start`, `session status`, and `session teardown` manage only the PID recorded for that session. `session teardown --stop-worker` additionally stops the persistent user worker service for the configured cluster; this is intended for product shutdown flows such as "close local UI, detach remote", or "close local UI and clean up remote relay processes".
-
-Run a full configured live acceptance:
+Run live acceptance against the builtin JARVIS LAMMPS package:
 
 ```powershell
 uv run clio-relay live-test --cluster ares --jarvis-yaml .\examples\ares-lammps\pipeline.yaml --monitor-pattern "Loop time"
 ```
 
-Cluster names are local configuration. `ares` is an example target created with `cluster add`; a second target such as `homelab`, `delta`, or an institutional relay uses the same commands with a different registry entry.
-Agent providers are local configuration as well. The quickstart uses Codex because that is the current Ares agent, but the relay model, queue, MCP tools, and JARVIS package boundary accept any configured executable/adapter pair.
+## choose transport
 
-`live-test` does not contain workload recipes. It takes acceptance inputs from CLI options or from the cluster registry's `live_test` object:
+For a public relay through Cloudflare or another HTTPS edge, use frp with `transport.protocol = "wss"`:
 
-```json
-{
-  "live_test": {
-    "jarvis_yaml": "examples/ares-lammps/pipeline.yaml",
-    "monitor_pattern": "Loop time",
-    "verify_transport": true,
-    "transport_local_bind_port": 18765,
-    "transport_remote_api_port": 8765,
-    "transport_proxy_name": "relay-http-live-test",
-    "agent_child_jarvis_yaml": ".clio-relay/live/agent-child.yaml",
-    "agent_mcp_config": "/home/user/.local/share/clio-relay/agent-tests/mcp.toml"
-  }
-}
+```powershell
+$env:CLIO_RELAY_FRP_TOKEN = "<shared-frp-token>"
+$env:CLIO_RELAY_STCP_SECRET = "<shared-stcp-secret>"
+uv run clio-relay relay-host render-frpc-config --cluster ares --local-port 8848
+uv run clio-relay relay-host render-frpc-visitor-config --cluster ares --bind-port 8765
+uv run clio-relay relay-host test-http-transport --cluster ares --local-bind-port 18765
 ```
 
-The acceptance runner submits the configured JARVIS YAML on the target cluster, waits for terminal success, verifies event replay, verifies durable task records, reads stdout/stderr by offset, lists and reads artifacts, verifies the provenance artifact, evaluates the configured monitor pattern, and can record structured progress from stdout events through a configured regex/action payload. With `verify_transport` enabled, it also starts a temporary cluster-side relay API and frpc proxy, starts the desktop-side frpc visitor, and verifies HTTP health over the configured frp transport using the cluster's `frp_transport` settings and local secrets. When `agent_child_jarvis_yaml` and an agent MCP config are supplied, acceptance generates a fresh remote prompt that instructs the agent to submit that child pipeline through `relay_submit_jarvis_pipeline`; it then requires the reported child job to have been created by the current agent run and verifies the child with the same event, task, log, artifact, and provenance checks. A prewritten `agent_prompt` can still be supplied for specialized agent acceptance, but it cannot be combined with `agent_child_jarvis_yaml`. The cluster registry owns what `ares`, `homelab`, or any later target means.
+For closed environments where SSH or VPN already exists, use SSH local forwarding:
 
-## Cloudflare-backed frps edge
+```powershell
+uv run clio-relay relay-host test-ssh-transport --cluster ares --local-bind-port 18766 --remote-api-port 8766 --session-id relay-ssh-test
+```
 
-For homelab deployments behind Cloudflare Tunnel, publish `frps.jcernuda.com` to an HTTP origin such as `http://localhost:7000` and run nginx or another HTTP reverse proxy at that origin. The proxy should forward WebSocket requests for frp's default control path `/~!frp` to a loopback-only `frps` listener, for example `127.0.0.1:7001`.
+To leave the remote API alive for a desktop detach and later reattach:
 
-Endpoints then use `frpc` with `transport.protocol = "wss"` and `serverPort = 443`. The cluster-side frpc config exposes a loopback API as an STCP proxy; the desktop-side visitor config binds a local desktop port to that proxy through the same frps. This keeps client setup to normal relay config and leaves the Cloudflare-specific routing in homelab infrastructure. If a later relay host supports raw TCP directly, change the configured transport to `tcp` without changing queue, job, agent, or cluster semantics.
+```powershell
+uv run clio-relay session start --cluster ares --session-id desktop-session --remote-api-port 8766 --replace
+uv run clio-relay session status --cluster ares --session-id desktop-session
+uv run clio-relay session teardown --cluster ares --session-id desktop-session
+```
+
+Use `session teardown --stop-worker` only when the user chooses to clean up the persistent remote worker too.
+
+## documentation
+
+- [architecture](docs/architecture.md)
+- [operations](docs/operations.md)
+- [release](docs/release.md)
+- [brand prompt](docs/brand.md)
+- [ai context](docs/ai/README.md)
+
+## development
+
+```powershell
+uv run ruff check --fix
+uv run ruff format
+uv run pyright
+uv run pytest
+```
+
+The GitHub workflow runs lint, type checks, tests, package builds, and artifact validation. Publishing to PyPI is configured through trusted publishing and can be enabled when the repository moves under the `iowarp` organization.

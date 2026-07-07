@@ -16,6 +16,11 @@ dependencies = [
     "websockets>=16.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/iowarp/clio-relay"
+Repository = "https://github.com/iowarp/clio-relay"
+Issues = "https://github.com/iowarp/clio-relay/issues"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
