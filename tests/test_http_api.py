@@ -13,6 +13,7 @@ from clio_relay.models import (
     Cursor,
     JarvisRunSpec,
     JobKind,
+    JobState,
     McpCallSpec,
     MonitorRule,
     RelayJob,
@@ -51,6 +52,29 @@ def test_http_monitor_logs_and_artifact_content(tmp_path: Path) -> None:
     assert log_response.json()["text"] == "hello"
     assert artifact_response.status_code == 200
     assert artifact_response.json()["artifact"]["artifact_id"] == artifact.artifact_id
+
+
+def test_http_monitor_sse_streams_monitor_and_terminal_events(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-sse",
+        )
+    )
+    queue.update_job_state(job.job_id, JobState.SUCCEEDED)
+    client = cast(Any, TestClient(create_app(settings)))
+
+    with client.stream("GET", f"/jobs/{job.job_id}/monitor/sse") as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert "event: monitor" in body
+    assert "event: terminal" in body
+    assert job.job_id in body
 
 
 def test_http_api_enforces_configured_token(tmp_path: Path) -> None:

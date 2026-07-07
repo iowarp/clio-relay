@@ -4,12 +4,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import secrets
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from clio_relay.config import RelaySettings
@@ -182,6 +185,33 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.get("/jobs/{job_id}/monitor/sse", dependencies=[auth_dependency])
+    def monitor_sse(
+        job_id: str,
+        cursor: int = 1,
+        limit: int = 100,
+        poll_seconds: float = 1.0,
+        stop_on_terminal: bool = True,
+    ) -> StreamingResponse:
+        """Stream job monitor updates as Server-Sent Events."""
+        if poll_seconds <= 0:
+            raise HTTPException(status_code=400, detail="poll_seconds must be positive")
+        try:
+            queue.get_job(job_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return StreamingResponse(
+            _monitor_sse_events(
+                queue,
+                job_id,
+                cursor=cursor,
+                limit=limit,
+                poll_seconds=poll_seconds,
+                stop_on_terminal=stop_on_terminal,
+            ),
+            media_type="text/event-stream",
+        )
+
     @app.post("/jobs/{job_id}/wait", response_model=RelayJob, dependencies=[auth_dependency])
     def wait(job_id: str, timeout_seconds: float = 600, poll_seconds: float = 2) -> RelayJob:
         try:
@@ -239,6 +269,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     )
     def record_progress(job_id: str, request: ProgressUpdateRequest) -> ProgressRecord:
         try:
+            metadata = {"source": "external_http", **request.metadata}
             return queue.append_progress(
                 ProgressRecord(
                     job_id=job_id,
@@ -248,7 +279,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                     unit=request.unit,
                     message=request.message,
                     source_event_seq=request.source_event_seq,
-                    metadata=request.metadata,
+                    metadata=metadata,
                 )
             )
         except NotFoundError as exc:
@@ -281,6 +312,33 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         return evaluate_monitor_rules(queue, limit=limit)
 
     return app
+
+
+async def _monitor_sse_events(
+    queue: ClioCoreQueue,
+    job_id: str,
+    *,
+    cursor: int,
+    limit: int,
+    poll_seconds: float,
+    stop_on_terminal: bool,
+) -> AsyncIterator[str]:
+    next_cursor = cursor
+    while True:
+        payload = monitor_job(queue, job_id, cursor=next_cursor, limit=limit)
+        raw_next_cursor = payload["next_cursor"]
+        if not isinstance(raw_next_cursor, int):
+            raise TypeError("monitor payload next_cursor was not an integer")
+        next_cursor = raw_next_cursor
+        yield f"event: monitor\ndata: {json.dumps(payload, default=str)}\n\n"
+        job = queue.get_job(job_id)
+        if stop_on_terminal and job.state.value in {"succeeded", "failed", "canceled"}:
+            yield (
+                "event: terminal\n"
+                f"data: {json.dumps({'job_id': job_id, 'state': job.state.value})}\n\n"
+            )
+            return
+        await asyncio.sleep(poll_seconds)
 
 
 def _require_api_token(settings: RelaySettings) -> Callable[..., Awaitable[None]]:

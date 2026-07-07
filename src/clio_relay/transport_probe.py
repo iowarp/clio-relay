@@ -163,8 +163,8 @@ def _remote_probe_script(
     agent_bin = _cluster_agent_bin(definition)
     return f"""set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
-export CLIO_RELAY_CORE_DIR="{definition.core_dir}"
-export CLIO_RELAY_SPOOL_DIR="{definition.spool_dir}"
+export CLIO_RELAY_CORE_DIR={_shell_double_quote(definition.core_dir)}
+export CLIO_RELAY_SPOOL_DIR={_shell_double_quote(definition.spool_dir)}
 export CLIO_RELAY_JARVIS_BIN={_shell_double_quote(jarvis_bin)}
 export CLIO_RELAY_FRPC_BIN={_shell_double_quote(frpc_bin)}
 export CLIO_RELAY_AGENT_BIN={_shell_double_quote(agent_bin)}
@@ -184,10 +184,6 @@ cat > "$tmp/frpc.toml" <<'__CLIO_RELAY_FRPC_CONFIG__'
 {frpc_config.rstrip()}
 __CLIO_RELAY_FRPC_CONFIG__
 echo "transport_probe_cluster={cluster}"
-if command -v pkill >/dev/null 2>&1; then
-  api_pattern='clio-relay api start --host 127[.]0[.]0[.]1 --port {api_port}( |$)'
-  pkill -u "$USER" -f "$api_pattern" 2>/dev/null || true
-fi
 clio-relay api start --host 127.0.0.1 --port {api_port}{require_token} >"$tmp/api.log" 2>&1 &
 api_pid="$!"
 sleep 1

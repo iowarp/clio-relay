@@ -45,6 +45,7 @@ def test_frp_http_probe_starts_remote_proxy_and_local_visitor(monkeypatch: Monke
     remote_script = processes[0].stdin.getvalue().decode("utf-8")
     assert "CLIO_RELAY_API_TOKEN='api-token'" in remote_script
     assert "clio-relay api start --host 127.0.0.1 --port 8765 --require-token" in remote_script
+    assert "pkill" not in remote_script
     assert 'name = "relay-http-test"' in remote_script
     assert 'auth.token = "frp-token"' in remote_script
 

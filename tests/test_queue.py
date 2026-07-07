@@ -44,6 +44,28 @@ def test_submit_is_idempotent_and_events_are_ordered(tmp_path: Path) -> None:
     assert cursor.next_seq == 3
 
 
+def test_submit_recovers_reserved_idempotency_record(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    queue.initialize()
+    key_path = tmp_path / "idempotency" / "reserved.json"
+    key_path.write_text(
+        '{"state":"reserved","job_id":"job_reserved","idempotency_key":"reserved"}',
+        encoding="utf-8",
+    )
+
+    saved = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "hello"]),
+            idempotency_key="reserved",
+        )
+    )
+
+    assert saved.job_id == "job_reserved"
+    assert queue.get_job("job_reserved").job_id == "job_reserved"
+
+
 def test_lease_survives_restart_without_duplicate_execution(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path)
     job = queue.submit_job(

@@ -664,7 +664,7 @@ def job_record_progress(
     ] = "{}",
 ) -> None:
     """Record a structured progress observation for a job."""
-    metadata = _json_object(metadata_json)
+    metadata = {"source": "external_cli", **_json_object(metadata_json)}
     progress = ClioCoreQueue(RelaySettings.from_env().core_dir).append_progress(
         ProgressRecord(
             job_id=job_id,

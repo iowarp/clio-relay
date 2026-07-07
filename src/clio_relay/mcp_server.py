@@ -573,6 +573,7 @@ def _record_progress(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     metadata = arguments.get("metadata", {})
     if not isinstance(metadata, dict):
         raise ValueError("metadata must be an object")
+    typed_metadata = {"source": "external_mcp", **cast(dict[str, Any], metadata)}
     progress = queue.append_progress(
         ProgressRecord(
             job_id=_required_str(arguments, "job_id"),
@@ -582,7 +583,7 @@ def _record_progress(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
             unit=_optional_str(arguments, "unit"),
             message=_optional_str(arguments, "message"),
             source_event_seq=_optional_int(arguments, "source_event_seq"),
-            metadata=cast(dict[str, Any], metadata),
+            metadata=typed_metadata,
         )
     )
     return progress.model_dump(mode="json")

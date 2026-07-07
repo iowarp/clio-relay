@@ -249,6 +249,7 @@ def _apply_monitor_rule_action(
                 message=_progress_message(rule, match),
                 source_event_seq=event_seq,
                 metadata={
+                    "source": "monitor_rule",
                     "rule_id": rule.rule_id,
                     "event_type": event.event_type,
                     "match_groups": dict(match.groupdict()),

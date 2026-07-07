@@ -126,7 +126,15 @@ def run_live_acceptance(
             token=options.transport_token,
             secret_key=options.transport_secret_key,
         )
+    run_id = _acceptance_run_id(jarvis_yaml)
     pipeline_yaml_text = jarvis_yaml.read_text(encoding="utf-8")
+    pipeline_yaml_text = _stage_acceptance_files(
+        options.definition,
+        jarvis_yaml=jarvis_yaml,
+        pipeline_yaml_text=pipeline_yaml_text,
+        run_id=run_id,
+        runner=command_runner,
+    )
     expected_progress_adapter = _expected_progress_adapter(pipeline_yaml_text)
 
     lines: list[str] = []
@@ -143,12 +151,11 @@ def run_live_acceptance(
                 expected_progress_adapter=expected_progress_adapter,
             )
         )
-    run_id = _acceptance_run_id(jarvis_yaml)
     remote_yaml = f".local/share/clio-relay/live-tests/{run_id}/pipeline.yaml"
     _remote_write_file(
         options.definition.ssh_host,
         remote_yaml,
-        jarvis_yaml.read_bytes(),
+        pipeline_yaml_text.encode("utf-8"),
         runner=command_runner,
     )
     lines.append(f"acceptance.pipeline={remote_yaml}")
@@ -700,6 +707,9 @@ def _expected_progress_adapter(pipeline_yaml: str) -> str | None:
         if not isinstance(package, dict):
             continue
         typed_package = cast(dict[str, Any], package)
+        package_type = typed_package.get("pkg_type")
+        if package_type in {"builtin.lammps", "lammps", "jarvis_cd.builtin.lammps"}:
+            return "lammps"
         progress = typed_package.get("progress")
         if not isinstance(progress, dict):
             continue
@@ -716,7 +726,11 @@ def _assert_progress_adapter(progress: list[dict[str, Any]], expected_adapter: s
         if not isinstance(metadata, dict):
             continue
         typed_metadata = cast(dict[str, Any], metadata)
-        if typed_metadata.get("adapter") == expected_adapter:
+        if (
+            typed_metadata.get("adapter") == expected_adapter
+            and typed_metadata.get("source") == "jarvis_package"
+            and isinstance(typed_metadata.get("package_name"), str)
+        ):
             return
     raise RelayError(f"expected package progress adapter was not recorded: {expected_adapter}")
 
@@ -874,6 +888,64 @@ def _configured_path(value: str | None) -> Path | None:
 def _acceptance_run_id(path: Path) -> str:
     digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
     return f"{path.stem}-{digest}-{uuid4().hex[:8]}"
+
+
+def _stage_acceptance_files(
+    definition: ClusterDefinition,
+    *,
+    jarvis_yaml: Path,
+    pipeline_yaml_text: str,
+    run_id: str,
+    runner: CommandRunner,
+) -> str:
+    loaded = cast(object, yaml.safe_load(pipeline_yaml_text))
+    if not isinstance(loaded, dict):
+        return pipeline_yaml_text
+    document = cast(dict[str, object], loaded)
+    relay_extension = document.pop("x_clio_relay", None)
+    if relay_extension is None:
+        return yaml.safe_dump(document, sort_keys=False)
+    if not isinstance(relay_extension, dict):
+        raise ConfigurationError("x_clio_relay must be an object")
+    typed_extension = cast(dict[str, object], relay_extension)
+    stage_files = typed_extension.get("stage_files", [])
+    if not isinstance(stage_files, list):
+        raise ConfigurationError("x_clio_relay.stage_files must be a list")
+    for item in cast(list[object], stage_files):
+        if not isinstance(item, dict):
+            raise ConfigurationError("x_clio_relay.stage_files entries must be objects")
+        typed_item = cast(dict[str, object], item)
+        local_path_value = typed_item.get("local_path")
+        remote_path_value = typed_item.get("remote_path")
+        if not isinstance(local_path_value, str) or not isinstance(remote_path_value, str):
+            raise ConfigurationError(
+                "x_clio_relay.stage_files entries require local_path and remote_path strings"
+            )
+        local_path = Path(local_path_value)
+        if not local_path.is_absolute():
+            local_path = jarvis_yaml.parent / local_path
+        if not local_path.exists():
+            raise ConfigurationError(f"staged acceptance file does not exist: {local_path}")
+        remote_path = remote_path_value.format(run_id=run_id)
+        _remote_write_file(
+            definition.ssh_host,
+            remote_path,
+            local_path.read_bytes(),
+            runner=runner,
+        )
+    formatted_document = _format_run_id(document, run_id)
+    return yaml.safe_dump(formatted_document, sort_keys=False)
+
+
+def _format_run_id(value: object, run_id: str) -> object:
+    if isinstance(value, str):
+        return value.format(run_id=run_id)
+    if isinstance(value, list):
+        return [_format_run_id(item, run_id) for item in cast(list[object], value)]
+    if isinstance(value, dict):
+        typed = cast(dict[object, object], value)
+        return {str(key): _format_run_id(item, run_id) for key, item in typed.items()}
+    return value
 
 
 def _remote_write_file(

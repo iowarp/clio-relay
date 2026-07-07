@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -13,7 +14,7 @@ from typing import Any
 
 from jarvis_cd.core.pkg import Application
 
-from clio_relay.bounded_command.progress import adapter_from_config, render_progress_marker
+from clio_relay.bounded_command.progress import adapter_from_config, append_progress_record
 
 
 class BoundedCommand(Application):
@@ -78,6 +79,8 @@ def _run_streaming(
         text=True,
         encoding="utf-8",
         errors="replace",
+        start_new_session=os.name != "nt",
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
     )
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
@@ -118,13 +121,13 @@ def _run_streaming(
                 print(line, end="", flush=True)
                 if adapter is not None:
                     for record in adapter.observe_stdout(line):
-                        print(render_progress_marker(record), flush=True)
+                        append_progress_record(record)
             else:
                 stderr_chunks.append(line)
                 print(line, end="", file=sys.stderr, flush=True)
         returncode = process.wait(timeout=1)
     except subprocess.TimeoutExpired:
-        process.kill()
+        _terminate_process_tree(process)
         stdout, stderr = process.communicate()
         stdout_chunks.append(stdout)
         stderr_chunks.append(stderr)
@@ -135,3 +138,27 @@ def _run_streaming(
         stdout="".join(stdout_chunks),
         stderr="".join(stderr_chunks),
     )
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        process.send_signal(signal.CTRL_BREAK_EVENT)
+        try:
+            process.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return

@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import socket
+import subprocess
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 from filelock import FileLock, Timeout
 
@@ -31,6 +33,10 @@ from clio_relay.models import (
     RelayTask,
     RemoteAgentTaskSpec,
     utc_now,
+)
+from clio_relay.progress_adapters import (
+    LammpsThermoProgressAdapter,
+    package_progress_adapter_from_pipeline,
 )
 from clio_relay.spool import JobSpool
 
@@ -126,6 +132,11 @@ class EndpointWorker:
         spool.initialize()
         yaml_text = self._render_job_yaml(job)
         pipeline_path = spool.write_pipeline(yaml_text)
+        package_progress_adapter = package_progress_adapter_from_pipeline(yaml_text)
+        progress_sidecar = spool.path / "progress.jsonl"
+        progress_sidecar_offset = [0]
+        scheduler_job_ids: list[str] = []
+        scheduler_cancel_attempted = [False]
         self.queue.append_artifact(spool.artifact_for(pipeline_path, kind="jarvis_pipeline"))
         self.queue.append_event(
             job.job_id,
@@ -133,14 +144,43 @@ class EndpointWorker:
             "JARVIS-CD pipeline started",
             payload={"pipeline": str(pipeline_path)},
         )
-        result = self.provider.run_pipeline_streaming(
-            pipeline_path,
-            cwd=spool.path,
-            on_stdout=lambda text: self._append_output(job, spool, "stdout", text),
-            on_stderr=lambda text: self._append_output(job, spool, "stderr", text),
-            on_start=lambda pid: self._append_execution_start(job, pid),
-            should_cancel=lambda: self.queue.get_job(job.job_id).state == JobState.CANCELED,
-            on_poll=lambda: self._renew_lease_if_needed(lease, last_renewed_at),
+        with _temporary_env("CLIO_RELAY_PROGRESS_FILE", str(progress_sidecar)):
+            result = self.provider.run_pipeline_streaming(
+                pipeline_path,
+                cwd=spool.path,
+                on_stdout=lambda text: self._append_output(
+                    job,
+                    spool,
+                    "stdout",
+                    text,
+                    package_progress_adapter=package_progress_adapter,
+                    scheduler_job_ids=scheduler_job_ids,
+                ),
+                on_stderr=lambda text: self._append_output(
+                    job,
+                    spool,
+                    "stderr",
+                    text,
+                    scheduler_job_ids=scheduler_job_ids,
+                ),
+                on_start=lambda pid: self._append_execution_start(job, pid),
+                should_cancel=lambda: self._should_cancel_job(
+                    job,
+                    scheduler_job_ids=scheduler_job_ids,
+                    scheduler_cancel_attempted=scheduler_cancel_attempted,
+                ),
+                on_poll=lambda: self._poll_running_job(
+                    lease,
+                    last_renewed_at,
+                    job=job,
+                    progress_sidecar=progress_sidecar,
+                    progress_sidecar_offset=progress_sidecar_offset,
+                ),
+            )
+        self._ingest_progress_sidecar(
+            job,
+            progress_sidecar,
+            progress_sidecar_offset=progress_sidecar_offset,
         )
         self.queue.append_artifact(spool.artifact_for(spool.path / "stdout.log", kind="stdout"))
         self.queue.append_artifact(spool.artifact_for(spool.path / "stderr.log", kind="stderr"))
@@ -269,6 +309,8 @@ class EndpointWorker:
         spool: JobSpool,
         stream_name: str,
         text: str,
+        package_progress_adapter: LammpsThermoProgressAdapter | None = None,
+        scheduler_job_ids: list[str] | None = None,
     ) -> None:
         if stream_name not in {"stdout", "stderr"}:
             raise ConfigurationError(f"unsupported stream: {stream_name}")
@@ -280,36 +322,41 @@ class EndpointWorker:
             text.rstrip("\n") or f"{stream_name} output",
             payload={"stream": stream_name, "text": text},
         )
-        if typed_stream == "stdout":
-            self._append_progress_markers(job, text, source_event_seq=event.seq)
+        if scheduler_job_ids is not None:
+            self._capture_scheduler_job_ids(job, text, scheduler_job_ids)
+        if typed_stream != "stdout":
+            return
+        self._append_ignored_stdout_markers(job, text)
+        if package_progress_adapter is not None:
+            self._append_package_progress_records(
+                job,
+                package_progress_adapter.observe_stdout(text),
+                source_event_seq=event.seq,
+            )
 
-    def _append_progress_markers(
+    def _append_ignored_stdout_markers(
         self,
         job: RelayJob,
         text: str,
-        *,
-        source_event_seq: int,
     ) -> None:
         for line in text.splitlines():
             if not line.startswith("CLIO_PROGRESS "):
                 continue
-            try:
-                payload = json.loads(line.removeprefix("CLIO_PROGRESS "))
-            except json.JSONDecodeError as exc:
-                self.queue.append_event(
-                    job.job_id,
-                    "progress.parse_failed",
-                    f"Progress marker could not be parsed: {exc}",
-                )
-                continue
-            if not isinstance(payload, dict):
-                self.queue.append_event(
-                    job.job_id,
-                    "progress.parse_failed",
-                    "Progress marker payload was not an object",
-                )
-                continue
-            typed_payload = cast(dict[str, Any], payload)
+            self.queue.append_event(
+                job.job_id,
+                "progress.marker_ignored",
+                "Ignored untrusted stdout progress marker",
+                payload={"reason": "stdout markers are not trusted package progress"},
+            )
+
+    def _append_package_progress_records(
+        self,
+        job: RelayJob,
+        records: list[dict[str, object]],
+        *,
+        source_event_seq: int | None,
+    ) -> None:
+        for typed_payload in records:
             try:
                 progress = ProgressRecord(
                     job_id=job.job_id,
@@ -325,10 +372,61 @@ class EndpointWorker:
                 self.queue.append_event(
                     job.job_id,
                     "progress.parse_failed",
-                    f"Progress marker was invalid: {exc}",
+                    f"Package progress was invalid: {exc}",
                 )
                 continue
             self.queue.append_progress(progress)
+
+    def _ingest_progress_sidecar(
+        self,
+        job: RelayJob,
+        progress_sidecar: Path,
+        *,
+        progress_sidecar_offset: list[int],
+    ) -> None:
+        if not progress_sidecar.exists():
+            return
+        with progress_sidecar.open("r", encoding="utf-8") as handle:
+            handle.seek(progress_sidecar_offset[0])
+            for line in handle:
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    self.queue.append_event(
+                        job.job_id,
+                        "progress.parse_failed",
+                        f"Side-channel package progress could not be parsed: {exc}",
+                    )
+                    continue
+                if not isinstance(payload, dict):
+                    self.queue.append_event(
+                        job.job_id,
+                        "progress.parse_failed",
+                        "Side-channel package progress payload was not an object",
+                    )
+                    continue
+                self._append_package_progress_records(
+                    job,
+                    [cast(dict[str, object], payload)],
+                    source_event_seq=None,
+                )
+            progress_sidecar_offset[0] = handle.tell()
+
+    def _poll_running_job(
+        self,
+        lease: Lease,
+        last_renewed_at: list[float],
+        *,
+        job: RelayJob,
+        progress_sidecar: Path,
+        progress_sidecar_offset: list[int],
+    ) -> None:
+        self._renew_lease_if_needed(lease, last_renewed_at)
+        self._ingest_progress_sidecar(
+            job,
+            progress_sidecar,
+            progress_sidecar_offset=progress_sidecar_offset,
+        )
 
     def _append_execution_start(self, job: RelayJob, pid: int) -> None:
         self.queue.append_event(
@@ -337,6 +435,68 @@ class EndpointWorker:
             f"JARVIS-CD process started: {pid}",
             payload={"pid": pid},
         )
+
+    def _capture_scheduler_job_ids(
+        self,
+        job: RelayJob,
+        text: str,
+        scheduler_job_ids: list[str],
+    ) -> None:
+        for line in text.splitlines():
+            job_id = _extract_scheduler_job_id(line)
+            if job_id is None or job_id in scheduler_job_ids:
+                continue
+            scheduler_job_ids.append(job_id)
+            self.queue.append_event(
+                job.job_id,
+                "scheduler.job_detected",
+                f"Scheduler job detected: {job_id}",
+                payload={"scheduler": "slurm", "scheduler_job_id": job_id},
+            )
+
+    def _should_cancel_job(
+        self,
+        job: RelayJob,
+        *,
+        scheduler_job_ids: list[str],
+        scheduler_cancel_attempted: list[bool],
+    ) -> bool:
+        canceled = self.queue.get_job(job.job_id).state == JobState.CANCELED
+        if not canceled or scheduler_cancel_attempted[0]:
+            return canceled
+        scheduler_cancel_attempted[0] = True
+        self._cancel_scheduler_jobs(job, scheduler_job_ids)
+        return True
+
+    def _cancel_scheduler_jobs(self, job: RelayJob, scheduler_job_ids: list[str]) -> None:
+        if not scheduler_job_ids:
+            return
+        for scheduler_job_id in scheduler_job_ids:
+            result = subprocess.run(
+                ["scancel", scheduler_job_id],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                self.queue.append_event(
+                    job.job_id,
+                    "scheduler.cancel_requested",
+                    f"Requested scheduler cancellation: {scheduler_job_id}",
+                    payload={"scheduler": "slurm", "scheduler_job_id": scheduler_job_id},
+                )
+                continue
+            self.queue.append_event(
+                job.job_id,
+                "scheduler.cancel_failed",
+                f"Scheduler cancellation failed: {scheduler_job_id}",
+                payload={
+                    "scheduler": "slurm",
+                    "scheduler_job_id": scheduler_job_id,
+                    "returncode": result.returncode,
+                    "stderr": result.stderr,
+                },
+            )
 
     def _append_optional_result_artifacts(self, job: RelayJob, spool: JobSpool) -> None:
         candidates = {
@@ -405,6 +565,16 @@ def _file_summary(path: Path) -> dict[str, object]:
     }
 
 
+def _extract_scheduler_job_id(line: str) -> str | None:
+    explicit = re.search(r"\bscheduler_job_id=(?P<job_id>[A-Za-z0-9_.-]+)\b", line)
+    if explicit is not None:
+        return explicit.group("job_id")
+    submitted = re.search(r"\bSubmitted batch job (?P<job_id>[A-Za-z0-9_.-]+)\b", line)
+    if submitted is not None:
+        return submitted.group("job_id")
+    return None
+
+
 def _optional_str(value: object) -> str | None:
     return value if isinstance(value, str) and value != "" else None
 
@@ -428,3 +598,16 @@ def _optional_metadata(value: object) -> dict[str, object]:
         raise ValueError("progress metadata must be an object")
     typed = cast(dict[object, object], value)
     return {str(key): item for key, item in typed.items()}
+
+
+@contextmanager
+def _temporary_env(name: str, value: str) -> Generator[None]:
+    previous = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous

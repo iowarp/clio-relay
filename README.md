@@ -69,7 +69,7 @@ Worker leases are short lived and renewed while JARVIS is running. If a worker p
 
 Monitor rules are durable observer records over a job event stream. A regex rule can match event messages or streamed `text` payloads, then emit a `monitor.triggered` event or submit a generic remote-agent task. Rules are cursor-based and one-shot by default after a match, so replay does not duplicate actions.
 
-JARVIS packages can also own application-specific progress extraction without adding workload semantics to the relay core. The bounded-command package accepts a `progress` object, emits provider-neutral `CLIO_PROGRESS` JSON marker lines, and the worker records those markers as durable `ProgressRecord`s. The current package adapters are `regex` and `lammps`; the LAMMPS adapter parses thermo timestep rows, records current/total step progress, and stores simple ETA metadata derived from observed per-step timing after warmup. Additional application adapters belong in their JARVIS packages, not in relay job scheduling logic.
+JARVIS packages can own application-specific progress extraction without adding workload semantics to the relay core. The bounded-command package only supports generic regex progress and writes trusted package progress to a relay-owned side-channel JSONL file; arbitrary workload stdout markers such as `CLIO_PROGRESS ...` are ignored as package evidence. LAMMPS acceptance uses the upstream JARVIS `builtin.lammps` package directly. The worker enables a LAMMPS thermo parser only for pipelines that declare that package, records package provenance on every progress observation, and stores simple ETA metadata derived from observed per-step timing after warmup.
 
 The HTTP API enforces `CLIO_RELAY_API_TOKEN` when that environment variable is set. Clients can send either `Authorization: Bearer <token>` or `X-Clio-Relay-Token: <token>`. `/healthz` remains unauthenticated for local process checks. When exposing the API through frp or another relay, start it with `clio-relay api start --require-token` so missing API auth fails at startup.
 
@@ -78,7 +78,7 @@ HTTP clients can submit raw `RelayJob` records through `POST /jobs` or use typed
 Run a full configured live acceptance:
 
 ```powershell
-uv run clio-relay live-test --cluster ares --jarvis-yaml .\.clio-relay\live\ares-lammps.yaml --monitor-pattern "Total.*wall.*time"
+uv run clio-relay live-test --cluster ares --jarvis-yaml .\examples\ares-lammps\pipeline.yaml --monitor-pattern "Loop time"
 ```
 
 Cluster names are local configuration. `ares` is an example target created with `cluster add`; a second target such as `homelab`, `delta`, or an institutional relay uses the same commands with a different registry entry.
@@ -89,15 +89,8 @@ Agent providers are local configuration as well. The quickstart uses Codex becau
 ```json
 {
   "live_test": {
-    "jarvis_yaml": ".clio-relay/live/ares-lammps.yaml",
-    "monitor_pattern": "Total.*wall.*time",
-    "progress_pattern": "^\\s*(?P<step>\\d+)\\s+",
-    "progress_action_payload": {
-      "label": "iteration",
-      "current_group": "step",
-      "total": 150,
-      "unit": "step"
-    },
+    "jarvis_yaml": "examples/ares-lammps/pipeline.yaml",
+    "monitor_pattern": "Loop time",
     "verify_transport": true,
     "transport_local_bind_port": 18765,
     "transport_remote_api_port": 8765,

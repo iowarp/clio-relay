@@ -1,14 +1,16 @@
-"""Progress adapters for bounded command JARVIS packages."""
+"""Generic progress adapters for bounded command JARVIS packages."""
 
 from __future__ import annotations
 
 import json
+import os
 import re
-import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol
 
-PROGRESS_PREFIX = "CLIO_PROGRESS "
+PROGRESS_FILE_ENV = "CLIO_RELAY_PROGRESS_FILE"
+PACKAGE_NAME = "clio_relay.bounded_command"
 
 
 class ProgressAdapter(Protocol):
@@ -46,97 +48,16 @@ class GenericRegexProgressAdapter:
                         "total": total,
                         "unit": self.unit,
                         "message": message,
-                        "metadata": {"adapter": "regex", **self.metadata},
+                        "metadata": {
+                            "source": "jarvis_package",
+                            "package_name": PACKAGE_NAME,
+                            "adapter": "regex",
+                            **self.metadata,
+                        },
                     }
                 )
             )
         return records
-
-
-@dataclass
-class LammpsProgressAdapter:
-    """Extract LAMMPS timestep progress and estimate remaining runtime."""
-
-    total_steps: float
-    label: str = "timestep"
-    unit: str = "step"
-    step_column: int = 0
-    warmup_samples: int = 2
-    sample_window: int = 8
-    metadata: dict[str, object] = field(default_factory=dict)
-    samples: list[tuple[float, float]] = field(default_factory=list)
-
-    def observe_stdout(self, line: str) -> list[dict[str, object]]:
-        """Extract a timestep from a LAMMPS thermo row."""
-        step = self._parse_step(line)
-        if step is None:
-            return []
-        now = time.monotonic()
-        self.samples.append((step, now))
-        self.samples = self.samples[-self.sample_window :]
-        prediction = self._prediction(step)
-        return [
-            _drop_none(
-                {
-                    "label": self.label,
-                    "current": step,
-                    "total": self.total_steps,
-                    "unit": self.unit,
-                    "message": f"LAMMPS step {int(step)} of {int(self.total_steps)}",
-                    "metadata": {
-                        "adapter": "lammps",
-                        "prediction_method": "trimmed_step_time_after_warmup",
-                        **prediction,
-                        **self.metadata,
-                    },
-                }
-            )
-        ]
-
-    def _parse_step(self, line: str) -> float | None:
-        stripped = line.strip()
-        if stripped == "" or stripped.startswith("Step "):
-            return None
-        parts = stripped.split()
-        if len(parts) <= self.step_column:
-            return None
-        try:
-            step = float(parts[self.step_column])
-        except ValueError:
-            return None
-        if step < 0 or step > self.total_steps:
-            return None
-        return step
-
-    def _prediction(self, current_step: float) -> dict[str, object]:
-        if len(self.samples) <= self.warmup_samples:
-            return {"confidence": "warming_up", "samples": len(self.samples)}
-        rates: list[float] = []
-        usable = self.samples[-self.sample_window :]
-        for (previous_step, previous_time), (step, timestamp) in zip(
-            usable,
-            usable[1:],
-            strict=False,
-        ):
-            step_delta = step - previous_step
-            time_delta = timestamp - previous_time
-            if step_delta <= 0 or time_delta < 0:
-                continue
-            rates.append(time_delta / step_delta)
-        if not rates:
-            return {"confidence": "warming_up", "samples": len(self.samples)}
-        ordered = sorted(rates)
-        if len(ordered) > 2:
-            ordered = ordered[1:-1]
-        seconds_per_step = sum(ordered) / len(ordered)
-        remaining_steps = max(0.0, self.total_steps - current_step)
-        return {
-            "seconds_per_step": seconds_per_step,
-            "eta_seconds": remaining_steps * seconds_per_step,
-            "remaining_steps": remaining_steps,
-            "samples": len(self.samples),
-            "confidence": "observed" if len(rates) >= 2 else "low_sample",
-        }
 
 
 def adapter_from_config(config: object) -> ProgressAdapter | None:
@@ -161,25 +82,19 @@ def adapter_from_config(config: object) -> ProgressAdapter | None:
             message_group=_optional_str(config.get("message_group")),
             metadata=_metadata(config),
         )
-    if adapter == "lammps":
-        total_steps = config.get("total_steps")
-        if not isinstance(total_steps, int | float) or isinstance(total_steps, bool):
-            raise ValueError("lammps progress adapter requires numeric total_steps")
-        return LammpsProgressAdapter(
-            total_steps=float(total_steps),
-            label=str(config.get("label", "timestep")),
-            unit=str(config.get("unit", "step")),
-            step_column=int(config.get("step_column", 0)),
-            warmup_samples=int(config.get("warmup_samples", 2)),
-            sample_window=int(config.get("sample_window", 8)),
-            metadata=_metadata(config),
-        )
     raise ValueError(f"unsupported progress adapter: {adapter}")
 
 
-def render_progress_marker(record: dict[str, object]) -> str:
-    """Render a relay-readable progress marker line."""
-    return PROGRESS_PREFIX + json.dumps(record, sort_keys=True)
+def append_progress_record(record: dict[str, object]) -> None:
+    """Append a trusted package progress record to the relay side-channel file."""
+    path_value = os.getenv(PROGRESS_FILE_ENV)
+    if path_value is None or path_value == "":
+        return
+    path = Path(path_value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True))
+        handle.write("\n")
 
 
 def _group_text(match: re.Match[str], group: str | None) -> str | None:

@@ -210,6 +210,12 @@ class ProgressRecord(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @property
+    def source(self) -> str:
+        """Return the provenance source for this progress observation."""
+        value = self.metadata.get("source")
+        return value if isinstance(value, str) else "unknown"
+
     @field_validator("label")
     @classmethod
     def label_must_not_be_empty(cls, value: str) -> str:

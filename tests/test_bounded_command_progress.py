@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Protocol, cast
@@ -12,8 +13,8 @@ class ProgressModule(Protocol):
         """Build a progress adapter."""
         ...
 
-    def render_progress_marker(self, record: dict[str, object]) -> str:
-        """Render a progress marker."""
+    def append_progress_record(self, record: dict[str, object]) -> None:
+        """Append a progress record."""
         ...
 
 
@@ -23,36 +24,17 @@ class Adapter(Protocol):
         ...
 
 
-def test_lammps_progress_adapter_emits_eta_metadata() -> None:
+def test_bounded_command_rejects_lammps_progress_adapter() -> None:
     module = _load_progress_module()
-    adapter = cast(
-        Adapter,
-        module.adapter_from_config(
-            {
-                "adapter": "lammps",
-                "total_steps": 150,
-                "warmup_samples": 1,
-                "metadata": {"application": "materio"},
-            }
-        ),
-    )
-
-    assert adapter.observe_stdout("Step Temp E_pair\n") == []
-    first = adapter.observe_stdout("0 1.44 -6.0\n")
-    adapter.observe_stdout("25 1.40 -5.9\n")
-    third = adapter.observe_stdout("50 1.41 -5.8\n")
-
-    assert first[0]["label"] == "timestep"
-    assert first[0]["current"] == 0
-    assert first[0]["total"] == 150
-    metadata = cast(dict[str, object], third[0]["metadata"])
-    assert metadata["adapter"] == "lammps"
-    assert metadata["application"] == "materio"
-    assert "eta_seconds" in metadata
-    assert metadata["remaining_steps"] == 100
+    try:
+        module.adapter_from_config({"adapter": "lammps", "total_steps": 150})
+    except ValueError as exc:
+        assert "unsupported progress adapter: lammps" in str(exc)
+    else:
+        raise AssertionError("bounded_command must not own LAMMPS semantics")
 
 
-def test_regex_progress_adapter_emits_marker() -> None:
+def test_regex_progress_adapter_writes_side_channel(tmp_path: Path) -> None:
     module = _load_progress_module()
     adapter = cast(
         Adapter,
@@ -68,13 +50,23 @@ def test_regex_progress_adapter_emits_marker() -> None:
     )
 
     record = adapter.observe_stdout("iter=4 of 10\n")[0]
-    marker = module.render_progress_marker(record)
+    sidecar = tmp_path / "progress.jsonl"
+    previous = os.environ.get("CLIO_RELAY_PROGRESS_FILE")
+    os.environ["CLIO_RELAY_PROGRESS_FILE"] = str(sidecar)
+    try:
+        module.append_progress_record(record)
+    finally:
+        if previous is None:
+            os.environ.pop("CLIO_RELAY_PROGRESS_FILE", None)
+        else:
+            os.environ["CLIO_RELAY_PROGRESS_FILE"] = previous
 
-    assert marker.startswith("CLIO_PROGRESS ")
-    decoded = json.loads(marker.removeprefix("CLIO_PROGRESS "))
+    decoded = json.loads(sidecar.read_text(encoding="utf-8"))
     assert decoded["label"] == "iteration"
     assert decoded["current"] == 4
     assert decoded["total"] == 10
+    assert decoded["metadata"]["source"] == "jarvis_package"
+    assert decoded["metadata"]["package_name"] == "clio_relay.bounded_command"
 
 
 def _load_progress_module() -> ProgressModule:

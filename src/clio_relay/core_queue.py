@@ -9,6 +9,7 @@ idempotency, leases, and cursor replay rather than a database choice.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterable
 from pathlib import Path
 from typing import TypeVar
@@ -81,10 +82,40 @@ class ClioCoreQueue:
         key_path = self.root / "idempotency" / f"{self._safe_key(job.idempotency_key)}.json"
         with self._lock:
             if key_path.exists():
-                existing_job_id = json.loads(key_path.read_text(encoding="utf-8"))["job_id"]
-                return self.get_job(existing_job_id)
+                existing = json.loads(key_path.read_text(encoding="utf-8"))
+                existing_job_id = existing["job_id"]
+                existing_job = self._read_optional(
+                    self.root / "jobs" / f"{existing_job_id}.json",
+                    RelayJob,
+                )
+                if existing_job is not None:
+                    return existing_job
+                if existing.get("state") != "reserved":
+                    raise QueueConflictError(
+                        f"idempotency key points to missing job: {job.idempotency_key}"
+                    )
+                job = job.model_copy(update={"job_id": existing_job_id})
+            else:
+                self._write_json(
+                    key_path,
+                    {
+                        "state": "reserved",
+                        "job_id": job.job_id,
+                        "idempotency_key": job.idempotency_key,
+                        "created_at": utc_now().isoformat(),
+                    },
+                )
             self._write(self.root / "jobs" / f"{job.job_id}.json", job)
-            self._write_json(key_path, {"job_id": job.job_id})
+            self._write_json(
+                key_path,
+                {
+                    "state": "committed",
+                    "job_id": job.job_id,
+                    "idempotency_key": job.idempotency_key,
+                    "created_at": job.created_at.isoformat(),
+                    "committed_at": utc_now().isoformat(),
+                },
+            )
             self.append_event(job.job_id, "job.queued", "Job queued", locked=True)
         return job
 
@@ -497,8 +528,19 @@ class ClioCoreQueue:
     def _write_text(path: Path, text: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-        temporary.write_text(text, encoding="utf-8")
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
         temporary.replace(path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
     @staticmethod
     def _read_optional(path: Path, model: type[Record]) -> Record | None:

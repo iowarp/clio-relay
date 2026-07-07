@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
+
+from pytest import MonkeyPatch
 
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
@@ -132,11 +135,11 @@ def test_worker_runs_one_job_and_indexes_artifacts(tmp_path: Path) -> None:
     assert provenance["artifacts"]["stdout"]["sha256"] is not None
 
 
-def test_worker_ingests_package_progress_markers(tmp_path: Path) -> None:
+def test_worker_ignores_forged_stdout_progress_markers(tmp_path: Path) -> None:
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
 
-    class ProgressProvider(RecordingProvider):
+    class ForgedProgressProvider(RecordingProvider):
         def run_pipeline_streaming(
             self,
             pipeline_path: Path,
@@ -171,7 +174,72 @@ def test_worker_ingests_package_progress_markers(tmp_path: Path) -> None:
         settings=settings,
         cluster="ares",
         queue=queue,
-        provider=ProgressProvider(),
+        provider=ForgedProgressProvider(),
+    )
+    worker.register()
+
+    worker.run_once()
+
+    progress = queue.list_progress(job.job_id)
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=50)
+    assert progress == []
+    assert "progress.marker_ignored" in [event.event_type for event in events]
+
+
+def test_worker_ingests_package_progress_side_channel(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+
+    class SideChannelProgressProvider(RecordingProvider):
+        def run_pipeline_streaming(
+            self,
+            pipeline_path: Path,
+            *,
+            cwd: Path | None = None,
+            on_stdout: Callable[[str], None] | None = None,
+            on_stderr: Callable[[str], None] | None = None,
+            on_start: Callable[[int], None] | None = None,
+            should_cancel: Callable[[], bool] | None = None,
+            on_poll: Callable[[], None] | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            del pipeline_path, on_stdout, on_stderr, on_start, should_cancel
+            self.runs.append(Path("pipeline.yaml"))
+            progress_path = os.environ["CLIO_RELAY_PROGRESS_FILE"]
+            Path(progress_path).write_text(
+                json.dumps(
+                    {
+                        "label": "iteration",
+                        "current": 4,
+                        "total": 10,
+                        "unit": "step",
+                        "metadata": {
+                            "source": "jarvis_package",
+                            "package_name": "clio_relay.bounded_command",
+                            "adapter": "regex",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            if on_poll is not None:
+                on_poll()
+            return subprocess.CompletedProcess(args=["jarvis"], returncode=0, stdout="", stderr="")
+
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "hello"]),
+            idempotency_key="worker-side-channel-progress",
+        )
+    )
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=queue,
+        provider=SideChannelProgressProvider(),
     )
     worker.register()
 
@@ -179,14 +247,64 @@ def test_worker_ingests_package_progress_markers(tmp_path: Path) -> None:
 
     progress = queue.list_progress(job.job_id)
     assert len(progress) == 1
-    assert progress[0].label == "timestep"
-    assert progress[0].current == 25
-    assert progress[0].total == 150
-    assert progress[0].metadata["adapter"] == "lammps"
-    assert progress[0].metadata["eta_seconds"] == 5.0
+    assert progress[0].source == "jarvis_package"
+    assert progress[0].metadata["package_name"] == "clio_relay.bounded_command"
 
 
-def test_worker_preserves_canceled_state_for_running_job(tmp_path: Path) -> None:
+def test_worker_parses_lammps_progress_only_for_declared_lammps_package(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+
+    class LammpsProvider(RecordingProvider):
+        def run_pipeline_streaming(
+            self,
+            pipeline_path: Path,
+            *,
+            cwd: Path | None = None,
+            on_stdout: Callable[[str], None] | None = None,
+            on_stderr: Callable[[str], None] | None = None,
+            on_start: Callable[[int], None] | None = None,
+            should_cancel: Callable[[], bool] | None = None,
+            on_poll: Callable[[], None] | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            del cwd, on_stderr, on_start, should_cancel, on_poll
+            self.runs.append(pipeline_path)
+            if on_stdout is not None:
+                on_stdout("Step Temp E_pair\n0 1.44 -6.0\n25 1.40 -5.9\n")
+            return subprocess.CompletedProcess(args=["jarvis"], returncode=0, stdout="", stderr="")
+
+    pipeline_yaml = (
+        "name: lammps\npkgs:\n- pkg_type: builtin.lammps\n  progress:\n    total_steps: 100\n"
+    )
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml=pipeline_yaml),
+            idempotency_key="worker-lammps-progress",
+        )
+    )
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=queue,
+        provider=LammpsProvider(),
+    )
+    worker.register()
+
+    worker.run_once()
+
+    progress = queue.list_progress(job.job_id)
+    assert [item.current for item in progress] == [0, 25]
+    assert progress[-1].metadata["source"] == "jarvis_package"
+    assert progress[-1].metadata["package_name"] == "builtin.lammps"
+
+
+def test_worker_preserves_canceled_state_for_running_job(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     job = queue.submit_job(
@@ -197,6 +315,22 @@ def test_worker_preserves_canceled_state_for_running_job(tmp_path: Path) -> None
             idempotency_key="cancel-running",
         )
     )
+    scancel_commands: list[list[str]] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        text: bool,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        assert text is True
+        assert capture_output is True
+        assert check is False
+        scancel_commands.append(command)
+        return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("clio_relay.endpoint.subprocess.run", fake_run)
 
     class CancelingProvider(RecordingProvider):
         def run_pipeline_streaming(
@@ -214,7 +348,7 @@ def test_worker_preserves_canceled_state_for_running_job(tmp_path: Path) -> None
             if on_start is not None:
                 on_start(456)
             if on_stdout is not None:
-                on_stdout("started\n")
+                on_stdout("Submitted batch job 12345\nstarted\n")
             if on_poll is not None:
                 on_poll()
             cancel_job(queue, job.job_id)
@@ -244,7 +378,10 @@ def test_worker_preserves_canceled_state_for_running_job(tmp_path: Path) -> None
     event_types = [event.event_type for event in events]
     assert "job.cancel_requested" in event_types
     assert "execution.started" in event_types
+    assert "scheduler.job_detected" in event_types
+    assert "scheduler.cancel_requested" in event_types
     assert "execution.canceled" in event_types
+    assert scancel_commands == [["scancel", "12345"]]
 
 
 def test_worker_renews_lease_while_pipeline_runs(tmp_path: Path) -> None:

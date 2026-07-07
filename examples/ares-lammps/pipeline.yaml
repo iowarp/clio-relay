@@ -1,0 +1,17 @@
+name: ares-lammps-live-acceptance
+x_clio_relay:
+  stage_files:
+    - local_path: in.lj
+      remote_path: .local/share/clio-relay/live-tests/{run_id}/in.lj
+pkgs:
+  - pkg_type: builtin.lammps
+    pkg_name: lammps
+    deploy_mode: default
+    nprocs: 1
+    ppn: 1
+    script: $HOME/.local/share/clio-relay/live-tests/{run_id}/in.lj
+    lmp_bin: lmp
+    out: $HOME/.local/share/clio-relay/live-tests/{run_id}/lammps-out
+    kokkos_gpu: false
+    progress:
+      total_steps: 150

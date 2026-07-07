@@ -12,6 +12,8 @@ from clio_relay.cluster_config import ClusterDefinition, LiveTestConfig
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.live_acceptance import (
     LiveAcceptanceOptions,
+    _assert_progress_adapter,  # pyright: ignore[reportPrivateUsage]
+    _expected_progress_adapter,  # pyright: ignore[reportPrivateUsage]
     _find_agent_child_job,  # pyright: ignore[reportPrivateUsage]
     run_live_acceptance,
 )
@@ -25,6 +27,145 @@ def test_live_acceptance_requires_configured_workload() -> None:
                 definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
             )
         )
+
+
+def test_live_acceptance_stages_files_and_strips_relay_extension(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    input_script = tmp_path / "in.lj"
+    input_script.write_text("run 10\n", encoding="utf-8")
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text(
+        "name: lammps\n"
+        "x_clio_relay:\n"
+        "  stage_files:\n"
+        "  - local_path: in.lj\n"
+        "    remote_path: .local/share/clio-relay/live-tests/{run_id}/in.lj\n"
+        "pkgs:\n"
+        "- pkg_type: builtin.lammps\n"
+        "  script: .local/share/clio-relay/live-tests/{run_id}/in.lj\n",
+        encoding="utf-8",
+    )
+    uploaded: list[tuple[str, bytes | None]] = []
+
+    def fake_cluster_doctor(_definition: ClusterDefinition) -> list[str]:
+        return ["cluster: test-cluster"]
+
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        script = command[-1]
+        if "cat >" in script:
+            uploaded.append((script, input))
+            return _completed(command, "")
+        if "mkdir -p" in script:
+            return _completed(command, "")
+        if "job submit" in script:
+            return _completed(command, "job_abc\n")
+        if "job wait" in script:
+            return _completed(command, json.dumps({"job_id": "job_abc", "state": "succeeded"}))
+        if "job monitor" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    {
+                        "events": [
+                            {"event_type": "job.queued"},
+                            {"event_type": "job.running"},
+                            {"event_type": "jarvis.started"},
+                            {"event_type": "job.succeeded"},
+                        ]
+                    }
+                ),
+            )
+        if "job tasks" in script:
+            return _completed(command, json.dumps([{"state": "succeeded"}]))
+        if "read-log" in script and "--stream stdout" in script:
+            return _completed(command, json.dumps({"next_offset": 12}))
+        if "read-log" in script and "--stream stderr" in script:
+            return _completed(command, json.dumps({"next_offset": 0}))
+        if "list-artifacts" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    [
+                        {"artifact_id": "artifact_pipeline", "kind": "jarvis_pipeline"},
+                        {"artifact_id": "artifact_stdout", "kind": "stdout"},
+                        {"artifact_id": "artifact_stderr", "kind": "stderr"},
+                        {"artifact_id": "artifact_provenance", "kind": "provenance"},
+                    ]
+                ),
+            )
+        if "read-artifact" in script:
+            return _completed(command, json.dumps({"encoding": "base64", "data": "aGVsbG8="}))
+        if "job progress" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    [
+                        {
+                            "metadata": {
+                                "source": "jarvis_package",
+                                "adapter": "lammps",
+                                "package_name": "builtin.lammps",
+                            }
+                        }
+                    ]
+                ),
+            )
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
+
+    run_live_acceptance(
+        LiveAcceptanceOptions(
+            cluster="test-cluster",
+            definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            jarvis_yaml=pipeline,
+        ),
+        runner=fake_runner,
+    )
+
+    assert any(item[1] is not None and b"run 10" in item[1] for item in uploaded)
+    pipeline_upload = uploaded[-1][1]
+    assert pipeline_upload is not None
+    assert b"x_clio_relay" not in pipeline_upload
+    assert b"pkg_type: builtin.lammps" in pipeline_upload
+    assert b"{run_id}" not in pipeline_upload
+
+
+def test_live_acceptance_requires_trusted_package_progress() -> None:
+    pipeline_yaml = "name: lammps\npkgs:\n- pkg_type: builtin.lammps\n"
+
+    assert _expected_progress_adapter(pipeline_yaml) == "lammps"
+    with pytest.raises(RelayError, match="expected package progress adapter"):
+        _assert_progress_adapter(
+            [
+                {
+                    "metadata": {
+                        "adapter": "lammps",
+                        "source": "external",
+                        "package_name": "builtin.lammps",
+                    }
+                }
+            ],
+            "lammps",
+        )
+    _assert_progress_adapter(
+        [
+            {
+                "metadata": {
+                    "adapter": "lammps",
+                    "source": "jarvis_package",
+                    "package_name": "builtin.lammps",
+                }
+            }
+        ],
+        "lammps",
+    )
 
 
 def test_live_acceptance_verifies_transport_when_enabled(
@@ -265,7 +406,7 @@ def test_live_acceptance_runs_configured_pipeline_and_monitor(
     assert "acceptance.monitor=ok" in lines
     assert "acceptance.progress=1" in lines
     assert "live acceptance passed" in lines
-    assert pipeline.read_bytes() in uploaded
+    assert any(item is not None and b"name: generic" in item for item in uploaded)
     assert any("job submit" in " ".join(command) for command in commands)
     assert any(
         'CLIO_RELAY_JARVIS_BIN="$HOME/.local/bin/jarvis"' in command[-1] for command in commands
