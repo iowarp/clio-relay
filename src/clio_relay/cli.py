@@ -40,9 +40,11 @@ from clio_relay.models import (
 )
 from clio_relay.relay_host import (
     FrpcConfig,
+    FrpcVisitorConfig,
     FrpsConfig,
     FrpTransportProtocol,
     render_frpc_config,
+    render_frpc_visitor_config,
     render_frps_config,
 )
 from clio_relay.relay_ops import (
@@ -52,6 +54,7 @@ from clio_relay.relay_ops import (
     read_job_log,
     wait_for_terminal,
 )
+from clio_relay.transport_probe import run_frp_http_probe
 
 app = typer.Typer(no_args_is_help=True)
 endpoint_app = typer.Typer(no_args_is_help=True)
@@ -166,6 +169,73 @@ def test_frpc(
             run_frpc_connection_check(
                 frpc_bin=settings.frpc_bin,
                 config=config,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+    )
+
+
+@relay_host_app.command("render-frpc-visitor-config")
+def render_frpc_visitor(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    token: Annotated[str, typer.Option(help="frp authentication token.")],
+    bind_port: Annotated[int, typer.Option(help="Local desktop visitor bind port.")],
+    secret_key: Annotated[str, typer.Option(help="stcp shared secret.")],
+    server_name: Annotated[str, typer.Option(help="Cluster-side stcp proxy name.")] = "relay-stcp",
+    visitor_name: Annotated[
+        str,
+        typer.Option(help="Desktop-side stcp visitor name."),
+    ] = "relay-stcp-visitor",
+    bind_addr: Annotated[
+        str,
+        typer.Option(help="Local desktop visitor bind address."),
+    ] = "127.0.0.1",
+) -> None:
+    """Render a desktop-side frpc STCP visitor config."""
+    definition = _require_cluster(cluster)
+    transport = definition.frp_transport
+    config = FrpcVisitorConfig(
+        server_addr=transport.server_addr,
+        server_port=transport.server_port,
+        token=token,
+        transport_protocol=FrpTransportProtocol(transport.protocol),
+        visitor_name=visitor_name,
+        server_name=server_name,
+        bind_addr=bind_addr,
+        bind_port=bind_port,
+        secret_key=secret_key,
+    )
+    typer.echo(render_frpc_visitor_config(config))
+
+
+@relay_host_app.command("test-http-transport")
+def test_http_transport(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    token: Annotated[str, typer.Option(help="frp authentication token.")],
+    secret_key: Annotated[str, typer.Option(help="stcp shared secret.")],
+    local_bind_port: Annotated[int, typer.Option(help="Local desktop visitor bind port.")],
+    remote_api_port: Annotated[int, typer.Option(help="Remote cluster API port.")] = 8765,
+    proxy_name: Annotated[str, typer.Option(help="stcp proxy/server name.")] = "relay-http",
+    timeout_seconds: Annotated[
+        float,
+        typer.Option(help="Seconds to wait for healthz through the transport."),
+    ] = 30.0,
+) -> None:
+    """Run an end-to-end HTTP health check through frp STCP."""
+    settings = RelaySettings.from_env()
+    definition = _require_cluster(cluster)
+    _run_or_exit(
+        lambda: _echo_lines(
+            run_frp_http_probe(
+                cluster=cluster,
+                definition=definition,
+                frpc_bin=settings.frpc_bin,
+                token=token,
+                secret_key=secret_key,
+                local_bind_port=local_bind_port,
+                remote_api_port=remote_api_port,
+                proxy_name=proxy_name,
+                api_token=settings.api_token,
                 timeout_seconds=timeout_seconds,
             )
         )
@@ -528,8 +598,14 @@ def mcp_server() -> None:
 def api_start(
     host: Annotated[str, typer.Option(help="HTTP bind address.")] = "127.0.0.1",
     port: Annotated[int, typer.Option(help="HTTP bind port.")] = 8765,
+    require_token: Annotated[
+        bool,
+        typer.Option(help="Fail if CLIO_RELAY_API_TOKEN is not configured."),
+    ] = False,
 ) -> None:
     """Start the desktop-facing HTTP API."""
+    if require_token and RelaySettings.from_env().api_token is None:
+        raise typer.BadParameter("CLIO_RELAY_API_TOKEN is required with --require-token")
     uvicorn.run("clio_relay.http_api:app", host=host, port=port)
 
 

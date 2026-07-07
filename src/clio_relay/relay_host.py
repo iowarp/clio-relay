@@ -54,6 +54,21 @@ class FrpcConfig:
     secret_key: str = ""
 
 
+@dataclass(frozen=True)
+class FrpcVisitorConfig:
+    """Settings required to render a desktop-side STCP visitor."""
+
+    server_addr: str
+    server_port: int
+    token: str
+    transport_protocol: FrpTransportProtocol = FrpTransportProtocol.WSS
+    visitor_name: str = "relay-stcp-visitor"
+    server_name: str = "relay-stcp"
+    bind_addr: str = "127.0.0.1"
+    bind_port: int = 0
+    secret_key: str = ""
+
+
 def render_frpc_config(config: FrpcConfig) -> str:
     """Render an frpc config for the selected frp transport protocol."""
     if config.local_port <= 0:
@@ -72,6 +87,29 @@ def render_frpc_config(config: FrpcConfig) -> str:
         f"secretKey = {_toml_string(config.secret_key)}",
         f"localIP = {_toml_string(config.local_ip)}",
         f"localPort = {config.local_port}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def render_frpc_visitor_config(config: FrpcVisitorConfig) -> str:
+    """Render an frpc STCP visitor config for desktop access to a relay endpoint."""
+    if config.bind_port <= 0:
+        raise ConfigurationError("frpc visitor bind_port must be configured")
+    lines = [
+        f"serverAddr = {_toml_string(config.server_addr)}",
+        f"serverPort = {config.server_port}",
+        'auth.method = "token"',
+        f"auth.token = {_toml_string(config.token)}",
+        f"transport.protocol = {_toml_string(config.transport_protocol.value)}",
+        "transport.tcpMux = true",
+        "",
+        "[[visitors]]",
+        f"name = {_toml_string(config.visitor_name)}",
+        'type = "stcp"',
+        f"serverName = {_toml_string(config.server_name)}",
+        f"secretKey = {_toml_string(config.secret_key)}",
+        f"bindAddr = {_toml_string(config.bind_addr)}",
+        f"bindPort = {config.bind_port}",
     ]
     return "\n".join(lines) + "\n"
 

@@ -43,6 +43,54 @@ def test_http_monitor_logs_and_artifact_content(tmp_path: Path) -> None:
     assert artifact_response.json()["artifact"]["artifact_id"] == artifact.artifact_id
 
 
+def test_http_api_enforces_configured_token(tmp_path: Path) -> None:
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="secret-token",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-auth",
+        )
+    )
+    client = cast(Any, TestClient(create_app(settings)))
+
+    missing = client.get(f"/jobs/{job.job_id}")
+    wrong = client.get(f"/jobs/{job.job_id}", headers={"Authorization": "Bearer wrong"})
+    bearer = client.get(f"/jobs/{job.job_id}", headers={"Authorization": "Bearer secret-token"})
+    explicit = client.get(f"/jobs/{job.job_id}", headers={"X-Clio-Relay-Token": "secret-token"})
+
+    assert missing.status_code == 401
+    assert wrong.status_code == 401
+    assert bearer.status_code == 200
+    assert explicit.status_code == 200
+
+
+def test_http_healthz_does_not_require_token(tmp_path: Path) -> None:
+    client = cast(
+        Any,
+        TestClient(
+            create_app(
+                RelaySettings(
+                    core_dir=tmp_path / "core",
+                    spool_dir=tmp_path / "spool",
+                    api_token="secret-token",
+                )
+            )
+        ),
+    )
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "auth": True}
+
+
 def test_http_monitor_rules(tmp_path: Path) -> None:
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)

@@ -19,6 +19,7 @@ uv run clio-relay install-frp
 uv run clio-relay cluster bootstrap --cluster ares
 uv run clio-relay relay-host render-frps-config --token $env:CLIO_RELAY_FRP_TOKEN
 uv run clio-relay relay-host render-frpc-config --cluster ares --token $env:CLIO_RELAY_FRP_TOKEN --local-port 8848 --secret-key $env:CLIO_RELAY_STCP_SECRET
+uv run clio-relay relay-host render-frpc-visitor-config --cluster ares --token $env:CLIO_RELAY_FRP_TOKEN --bind-port 8765 --secret-key $env:CLIO_RELAY_STCP_SECRET
 uv run clio-relay endpoint status
 ```
 
@@ -46,6 +47,8 @@ The worker streams JARVIS stdout/stderr into durable events while the process is
 
 Monitor rules are durable observer records over a job event stream. A regex rule can match event messages or streamed `text` payloads, then emit a `monitor.triggered` event or submit a generic remote-agent task. Rules are cursor-based and one-shot by default after a match, so replay does not duplicate actions.
 
+The HTTP API enforces `CLIO_RELAY_API_TOKEN` when that environment variable is set. Clients can send either `Authorization: Bearer <token>` or `X-Clio-Relay-Token: <token>`. `/healthz` remains unauthenticated for local process checks. When exposing the API through frp or another relay, start it with `clio-relay api start --require-token` so missing API auth fails at startup.
+
 Run a full configured live acceptance:
 
 ```powershell
@@ -71,4 +74,4 @@ The acceptance runner submits the configured JARVIS YAML on the target cluster, 
 
 For homelab deployments behind Cloudflare Tunnel, publish `frps.jcernuda.com` to an HTTP origin such as `http://localhost:7000` and run nginx or another HTTP reverse proxy at that origin. The proxy should forward WebSocket requests for frp's default control path `/~!frp` to a loopback-only `frps` listener, for example `127.0.0.1:7001`.
 
-Endpoints then use `frpc` with `transport.protocol = "wss"` and `serverPort = 443`. This keeps client setup to normal relay config and leaves the Cloudflare-specific routing in homelab infrastructure. If a later relay host supports raw TCP directly, change the configured transport to `tcp` without changing queue, job, agent, or cluster semantics.
+Endpoints then use `frpc` with `transport.protocol = "wss"` and `serverPort = 443`. The cluster-side frpc config exposes a loopback API as an STCP proxy; the desktop-side visitor config binds a local desktop port to that proxy through the same frps. This keeps client setup to normal relay config and leaves the Cloudflare-specific routing in homelab infrastructure. If a later relay host supports raw TCP directly, change the configured transport to `tcp` without changing queue, job, agent, or cluster semantics.

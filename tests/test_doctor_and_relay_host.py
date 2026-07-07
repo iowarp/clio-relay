@@ -11,9 +11,11 @@ from clio_relay.doctor import run_doctor
 from clio_relay.errors import ConfigurationError
 from clio_relay.relay_host import (
     FrpcConfig,
+    FrpcVisitorConfig,
     FrpsConfig,
     FrpTransportProtocol,
     render_frpc_config,
+    render_frpc_visitor_config,
     render_frps_config,
 )
 
@@ -49,6 +51,30 @@ def test_render_frpc_config_uses_configured_websocket_transport() -> None:
     assert "serverPort = 443" in rendered
     assert 'transport.protocol = "wss"' in rendered
     assert 'type = "stcp"' in rendered
+
+
+def test_render_frpc_visitor_config_uses_stcp_visitor() -> None:
+    rendered = render_frpc_visitor_config(
+        FrpcVisitorConfig(
+            server_addr="frps.jcernuda.com",
+            server_port=443,
+            token="secret",
+            transport_protocol=FrpTransportProtocol.WSS,
+            server_name="cluster-relay",
+            visitor_name="desktop-relay",
+            bind_port=8765,
+            secret_key="stcp-secret",
+        )
+    )
+
+    assert 'serverAddr = "frps.jcernuda.com"' in rendered
+    assert "serverPort = 443" in rendered
+    assert 'transport.protocol = "wss"' in rendered
+    assert "[[visitors]]" in rendered
+    assert 'type = "stcp"' in rendered
+    assert 'serverName = "cluster-relay"' in rendered
+    assert 'bindAddr = "127.0.0.1"' in rendered
+    assert "bindPort = 8765" in rendered
 
 
 def test_live_doctor_requires_frps_address(tmp_path: Path) -> None:
