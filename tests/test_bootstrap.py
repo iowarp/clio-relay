@@ -32,6 +32,7 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert 'echo "mpich 4.0.0 clio-relay user-space wrapper"' in script
     assert "-p|-f|--host|--hostfile|-host|-hostfile|--hosts|-hosts|-ppn|-npernode)" in script
     assert "-genv|--env)" in script
+    assert "-env)" in script
     assert 'if [ "${ranks:-1}" = "1" ]; then' in script
     assert 'exec srun -n "$ranks" "$@"' in script
     assert "CLIO_RELAY_CORE_DIR" in script

@@ -325,6 +325,9 @@ while [ "$#" -gt 0 ]; do
     -genv|--env)
       shift 3
       ;;
+    -env)
+      shift 2
+      ;;
     -x)
       shift 2
       ;;
