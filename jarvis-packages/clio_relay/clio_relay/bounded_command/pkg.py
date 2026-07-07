@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import os
+import queue
 import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
 from jarvis_cd.core.pkg import Application
+
+from clio_relay.bounded_command.progress import adapter_from_config, render_progress_marker
 
 
 class BoundedCommand(Application):
@@ -37,7 +43,13 @@ class BoundedCommand(Application):
         workdir = Path(workdir_value) if isinstance(workdir_value, str) else None
         timeout_value = self.config.get("timeout_seconds")
         timeout = int(timeout_value) if timeout_value is not None else None
-        result = subprocess.run(command, cwd=workdir, env=env, timeout=timeout, check=False)
+        result = _run_streaming(
+            command,
+            cwd=workdir,
+            env=env,
+            timeout=timeout,
+            progress_config=self.config.get("progress"),
+        )
         if result.returncode != 0:
             raise RuntimeError(f"command failed with exit code {result.returncode}")
 
@@ -46,3 +58,80 @@ class BoundedCommand(Application):
 
     def clean(self) -> None:
         """Clean hook for bounded commands."""
+
+
+def _run_streaming(
+    command: list[str],
+    *,
+    cwd: Path | None,
+    env: dict[str, str],
+    timeout: int | None,
+    progress_config: object,
+) -> subprocess.CompletedProcess[str]:
+    adapter = adapter_from_config(progress_config)
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    output_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
+
+    def read_stream(name: str, stream: Any) -> None:
+        try:
+            for line in stream:
+                output_queue.put((name, line))
+        finally:
+            output_queue.put((name, None))
+
+    assert process.stdout is not None
+    assert process.stderr is not None
+    threads = [
+        threading.Thread(target=read_stream, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=read_stream, args=("stderr", process.stderr), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    deadline = None if timeout is None else time.monotonic() + timeout
+    closed_streams: set[str] = set()
+    try:
+        while len(closed_streams) < 2:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                stream_name, line = output_queue.get(timeout=0.1)
+            except queue.Empty:
+                if process.poll() is not None and all(not thread.is_alive() for thread in threads):
+                    break
+                continue
+            if line is None:
+                closed_streams.add(stream_name)
+                continue
+            if stream_name == "stdout":
+                stdout_chunks.append(line)
+                print(line, end="", flush=True)
+                if adapter is not None:
+                    for record in adapter.observe_stdout(line):
+                        print(render_progress_marker(record), flush=True)
+            else:
+                stderr_chunks.append(line)
+                print(line, end="", file=sys.stderr, flush=True)
+        returncode = process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
+        stdout_chunks.append(stdout)
+        stderr_chunks.append(stderr)
+        raise
+    return subprocess.CompletedProcess(
+        command,
+        returncode,
+        stdout="".join(stdout_chunks),
+        stderr="".join(stderr_chunks),
+    )

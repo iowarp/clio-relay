@@ -171,13 +171,32 @@ export CLIO_RELAY_AGENT_BIN={_shell_double_quote(agent_bin)}
 export CLIO_RELAY_AGENT_ADAPTER={_shell_single_quote(definition.agent_adapter)}
 {token_export}
 tmp="$(mktemp -d)"
-trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$tmp"' EXIT
+api_pid=""
+frpc_pid=""
+cleanup() {{
+  if [ -n "$frpc_pid" ]; then kill "$frpc_pid" 2>/dev/null || true; fi
+  if [ -n "$api_pid" ]; then kill "$api_pid" 2>/dev/null || true; fi
+  wait 2>/dev/null || true
+  rm -rf "$tmp"
+}}
+trap cleanup EXIT
 cat > "$tmp/frpc.toml" <<'__CLIO_RELAY_FRPC_CONFIG__'
 {frpc_config.rstrip()}
 __CLIO_RELAY_FRPC_CONFIG__
 echo "transport_probe_cluster={cluster}"
-clio-relay api start --host 127.0.0.1 --port {api_port}{require_token} &
-"$CLIO_RELAY_FRPC_BIN" -c "$tmp/frpc.toml" &
+if command -v pkill >/dev/null 2>&1; then
+  api_pattern='clio-relay api start --host 127[.]0[.]0[.]1 --port {api_port}( |$)'
+  pkill -u "$USER" -f "$api_pattern" 2>/dev/null || true
+fi
+clio-relay api start --host 127.0.0.1 --port {api_port}{require_token} >"$tmp/api.log" 2>&1 &
+api_pid="$!"
+sleep 1
+if ! kill -0 "$api_pid" 2>/dev/null; then
+  cat "$tmp/api.log" >&2
+  exit 1
+fi
+"$CLIO_RELAY_FRPC_BIN" -c "$tmp/frpc.toml" >"$tmp/frpc.log" 2>&1 &
+frpc_pid="$!"
 wait
 """
 

@@ -69,6 +69,8 @@ Worker leases are short lived and renewed while JARVIS is running. If a worker p
 
 Monitor rules are durable observer records over a job event stream. A regex rule can match event messages or streamed `text` payloads, then emit a `monitor.triggered` event or submit a generic remote-agent task. Rules are cursor-based and one-shot by default after a match, so replay does not duplicate actions.
 
+JARVIS packages can also own application-specific progress extraction without adding workload semantics to the relay core. The bounded-command package accepts a `progress` object, emits provider-neutral `CLIO_PROGRESS` JSON marker lines, and the worker records those markers as durable `ProgressRecord`s. The current package adapters are `regex` and `lammps`; the LAMMPS adapter parses thermo timestep rows, records current/total step progress, and stores simple ETA metadata derived from observed per-step timing after warmup. Additional application adapters belong in their JARVIS packages, not in relay job scheduling logic.
+
 The HTTP API enforces `CLIO_RELAY_API_TOKEN` when that environment variable is set. Clients can send either `Authorization: Bearer <token>` or `X-Clio-Relay-Token: <token>`. `/healthz` remains unauthenticated for local process checks. When exposing the API through frp or another relay, start it with `clio-relay api start --require-token` so missing API auth fails at startup.
 
 HTTP clients can submit raw `RelayJob` records through `POST /jobs` or use typed submit endpoints: `POST /jobs/jarvis`, `POST /jobs/remote-agent`, and `POST /jobs/mcp-call`. The typed endpoints preserve the same durable queue semantics while keeping provider/workload details in request payloads instead of relay-native hardcoding.

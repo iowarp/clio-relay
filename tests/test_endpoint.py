@@ -132,6 +132,60 @@ def test_worker_runs_one_job_and_indexes_artifacts(tmp_path: Path) -> None:
     assert provenance["artifacts"]["stdout"]["sha256"] is not None
 
 
+def test_worker_ingests_package_progress_markers(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+
+    class ProgressProvider(RecordingProvider):
+        def run_pipeline_streaming(
+            self,
+            pipeline_path: Path,
+            *,
+            cwd: Path | None = None,
+            on_stdout: Callable[[str], None] | None = None,
+            on_stderr: Callable[[str], None] | None = None,
+            on_start: Callable[[int], None] | None = None,
+            should_cancel: Callable[[], bool] | None = None,
+            on_poll: Callable[[], None] | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            del cwd, on_stderr, on_start, should_cancel, on_poll
+            self.runs.append(pipeline_path)
+            if on_stdout is not None:
+                on_stdout(
+                    'CLIO_PROGRESS {"label":"timestep","current":25,"total":150,'
+                    '"unit":"step","message":"LAMMPS step 25 of 150",'
+                    '"metadata":{"adapter":"lammps","eta_seconds":5.0}}\n'
+                )
+            return subprocess.CompletedProcess(args=["jarvis"], returncode=0, stdout="", stderr="")
+
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "hello"]),
+            idempotency_key="worker-progress",
+        )
+    )
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=queue,
+        provider=ProgressProvider(),
+    )
+    worker.register()
+
+    worker.run_once()
+
+    progress = queue.list_progress(job.job_id)
+    assert len(progress) == 1
+    assert progress[0].label == "timestep"
+    assert progress[0].current == 25
+    assert progress[0].total == 150
+    assert progress[0].metadata["adapter"] == "lammps"
+    assert progress[0].metadata["eta_seconds"] == 5.0
+
+
 def test_worker_preserves_canceled_state_for_running_job(tmp_path: Path) -> None:
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)

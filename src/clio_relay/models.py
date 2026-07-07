@@ -93,6 +93,7 @@ class JarvisRunSpec(BaseModel):
     workdir: Path | None = None
     env: dict[str, str] = Field(default_factory=dict)
     timeout_seconds: int | None = Field(default=None, gt=0)
+    progress: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("command")
     @classmethod

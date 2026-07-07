@@ -8,6 +8,7 @@ import posixpath
 import re
 import shlex
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,6 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
 from uuid import uuid4
+
+import yaml
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.doctor import run_cluster_doctor
@@ -123,6 +126,8 @@ def run_live_acceptance(
             token=options.transport_token,
             secret_key=options.transport_secret_key,
         )
+    pipeline_yaml_text = jarvis_yaml.read_text(encoding="utf-8")
+    expected_progress_adapter = _expected_progress_adapter(pipeline_yaml_text)
 
     lines: list[str] = []
     lines.extend(run_cluster_doctor(options.definition))
@@ -134,7 +139,8 @@ def run_live_acceptance(
                 options,
                 token=transport_token,
                 secret_key=transport_secret_key,
-                pipeline_yaml=jarvis_yaml.read_text(encoding="utf-8"),
+                pipeline_yaml=pipeline_yaml_text,
+                expected_progress_adapter=expected_progress_adapter,
             )
         )
     run_id = _acceptance_run_id(jarvis_yaml)
@@ -191,6 +197,7 @@ def run_live_acceptance(
         line_prefix="acceptance",
         lines=lines,
         runner=command_runner,
+        expected_progress_adapter=expected_progress_adapter,
     )
 
     if monitor_pattern is not None:
@@ -276,6 +283,7 @@ def run_live_acceptance(
                 line_prefix="acceptance.agent_child",
                 lines=lines,
                 runner=command_runner,
+                expected_progress_adapter=expected_progress_adapter,
             )
 
     lines.append("live acceptance passed")
@@ -288,6 +296,7 @@ def _verify_transport(
     token: str,
     secret_key: str,
     pipeline_yaml: str,
+    expected_progress_adapter: str | None,
 ) -> list[str]:
     return run_frp_http_probe(
         cluster=options.cluster,
@@ -317,6 +326,7 @@ def _verify_transport(
             api_token=options.api_token,
             timeout_seconds=options.timeout_seconds,
             poll_seconds=options.poll_seconds,
+            expected_progress_adapter=expected_progress_adapter,
         ),
     )
 
@@ -329,6 +339,7 @@ def _verify_transport_http_api(
     api_token: str | None,
     timeout_seconds: float,
     poll_seconds: float,
+    expected_progress_adapter: str | None,
 ) -> list[str]:
     run_digest = hashlib.sha256(pipeline_yaml.encode("utf-8")).hexdigest()[:16]
     idempotency_key = f"live-test:http-transport:{cluster}:{run_digest}:{uuid4().hex}"
@@ -348,22 +359,13 @@ def _verify_transport_http_api(
         ),
     )
     job_id = str(submitted["job_id"])
-    waited = cast(
-        dict[str, Any],
-        _http_json(
-            local_url,
-            "POST",
-            f"/jobs/{job_id}/wait",
-            api_token=api_token,
-            query={
-                "timeout_seconds": str(timeout_seconds),
-                "poll_seconds": str(poll_seconds),
-            },
-            timeout_seconds=timeout_seconds + 10,
-        ),
+    _wait_for_transport_http_success(
+        local_url,
+        job_id,
+        api_token=api_token,
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
     )
-    if waited["state"] != "succeeded":
-        raise RelayError(f"transport HTTP job did not succeed: {waited['state']}")
     monitor = cast(
         dict[str, Any],
         _http_json(
@@ -425,7 +427,7 @@ def _verify_transport_http_api(
         raise RelayError("transport HTTP provenance artifact id mismatch")
     if provenance["encoding"] != "base64" or str(provenance["data"]) == "":
         raise RelayError("transport HTTP provenance artifact was empty")
-    return [
+    lines = [
         f"transport.http_job_id={job_id}",
         "transport.http_wait=succeeded",
         "transport.http_events=ok",
@@ -433,6 +435,20 @@ def _verify_transport_http_api(
         "transport.http_artifacts=ok",
         "transport.http_provenance=ok",
     ]
+    if expected_progress_adapter is not None:
+        progress = cast(
+            list[dict[str, Any]],
+            _http_json(
+                local_url,
+                "GET",
+                f"/jobs/{job_id}/progress",
+                api_token=api_token,
+                timeout_seconds=10,
+            ),
+        )
+        _assert_progress_adapter(progress, expected_progress_adapter)
+        lines.append(f"transport.http_progress_adapter={expected_progress_adapter}")
+    return lines
 
 
 def _http_json(
@@ -464,6 +480,35 @@ def _http_json(
     except (OSError, urllib.error.URLError) as exc:
         raise RelayError(f"transport HTTP request failed: {method} {path}: {exc}") from exc
     return cast(dict[str, Any] | list[dict[str, Any]], json.loads(payload))
+
+
+def _wait_for_transport_http_success(
+    local_url: str,
+    job_id: str,
+    *,
+    api_token: str | None,
+    timeout_seconds: float,
+    poll_seconds: float,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        job = cast(
+            dict[str, Any],
+            _http_json(
+                local_url,
+                "GET",
+                f"/jobs/{job_id}",
+                api_token=api_token,
+                timeout_seconds=10,
+            ),
+        )
+        if job["state"] == "succeeded":
+            return job
+        if job["state"] in {"failed", "canceled"}:
+            raise RelayError(f"transport HTTP job did not succeed: {job['state']}")
+        if time.monotonic() >= deadline:
+            raise RelayError(f"transport HTTP job did not reach terminal state: {job_id}")
+        time.sleep(poll_seconds)
 
 
 def _require_transport_secrets(
@@ -564,6 +609,7 @@ def _verify_completed_job(
     line_prefix: str,
     lines: list[str],
     runner: CommandRunner,
+    expected_progress_adapter: str | None = None,
 ) -> None:
     monitor = _remote_clio_json(
         definition,
@@ -634,6 +680,45 @@ def _verify_completed_job(
     if provenance_payload.get("encoding") != "base64":
         raise RelayError("acceptance provenance payload was not base64 encoded")
     lines.append(f"{line_prefix}.provenance=ok")
+    if expected_progress_adapter is not None:
+        progress = _remote_clio_json(
+            definition,
+            ["job", "progress", job_id],
+            runner=runner,
+        )
+        _assert_progress_adapter(cast(list[dict[str, Any]], progress), expected_progress_adapter)
+        lines.append(f"{line_prefix}.progress_adapter={expected_progress_adapter}")
+
+
+def _expected_progress_adapter(pipeline_yaml: str) -> str | None:
+    loaded = yaml.safe_load(pipeline_yaml)
+    typed_document = cast(dict[str, Any], loaded) if isinstance(loaded, dict) else {}
+    packages = typed_document.get("pkgs")
+    if not isinstance(packages, list):
+        return None
+    for package in cast(list[object], packages):
+        if not isinstance(package, dict):
+            continue
+        typed_package = cast(dict[str, Any], package)
+        progress = typed_package.get("progress")
+        if not isinstance(progress, dict):
+            continue
+        typed_progress = cast(dict[str, Any], progress)
+        adapter = typed_progress.get("adapter")
+        if isinstance(adapter, str) and adapter not in {"", "none"}:
+            return adapter
+    return None
+
+
+def _assert_progress_adapter(progress: list[dict[str, Any]], expected_adapter: str) -> None:
+    for item in progress:
+        metadata = item.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        typed_metadata = cast(dict[str, Any], metadata)
+        if typed_metadata.get("adapter") == expected_adapter:
+            return
+    raise RelayError(f"expected package progress adapter was not recorded: {expected_adapter}")
 
 
 def _verify_progress_monitor(

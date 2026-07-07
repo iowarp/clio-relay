@@ -12,6 +12,7 @@ import json
 from collections.abc import Iterable
 from pathlib import Path
 from typing import TypeVar
+from uuid import uuid4
 
 from filelock import FileLock
 from pydantic import BaseModel
@@ -83,7 +84,7 @@ class ClioCoreQueue:
                 existing_job_id = json.loads(key_path.read_text(encoding="utf-8"))["job_id"]
                 return self.get_job(existing_job_id)
             self._write(self.root / "jobs" / f"{job.job_id}.json", job)
-            key_path.write_text(json.dumps({"job_id": job.job_id}), encoding="utf-8")
+            self._write_json(key_path, {"job_id": job.job_id})
             self.append_event(job.job_id, "job.queued", "Job queued", locked=True)
         return job
 
@@ -486,8 +487,18 @@ class ClioCoreQueue:
 
     @staticmethod
     def _write(path: Path, record: BaseModel) -> None:
+        ClioCoreQueue._write_text(path, record.model_dump_json(indent=2))
+
+    @staticmethod
+    def _write_json(path: Path, record: dict[str, object]) -> None:
+        ClioCoreQueue._write_text(path, json.dumps(record))
+
+    @staticmethod
+    def _write_text(path: Path, text: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(record.model_dump_json(indent=2), encoding="utf-8")
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        temporary.write_text(text, encoding="utf-8")
+        temporary.replace(path)
 
     @staticmethod
     def _read_optional(path: Path, model: type[Record]) -> Record | None:

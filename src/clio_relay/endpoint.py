@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import socket
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any, cast
 
 from filelock import FileLock, Timeout
 
@@ -24,6 +26,7 @@ from clio_relay.models import (
     JobState,
     Lease,
     McpCallSpec,
+    ProgressRecord,
     RelayJob,
     RelayTask,
     RemoteAgentTaskSpec,
@@ -271,12 +274,61 @@ class EndpointWorker:
             raise ConfigurationError(f"unsupported stream: {stream_name}")
         typed_stream = "stdout" if stream_name == "stdout" else "stderr"
         spool.append_log(typed_stream, text)
-        self.queue.append_event(
+        event = self.queue.append_event(
             job.job_id,
             f"{stream_name}.delta",
             text.rstrip("\n") or f"{stream_name} output",
             payload={"stream": stream_name, "text": text},
         )
+        if typed_stream == "stdout":
+            self._append_progress_markers(job, text, source_event_seq=event.seq)
+
+    def _append_progress_markers(
+        self,
+        job: RelayJob,
+        text: str,
+        *,
+        source_event_seq: int,
+    ) -> None:
+        for line in text.splitlines():
+            if not line.startswith("CLIO_PROGRESS "):
+                continue
+            try:
+                payload = json.loads(line.removeprefix("CLIO_PROGRESS "))
+            except json.JSONDecodeError as exc:
+                self.queue.append_event(
+                    job.job_id,
+                    "progress.parse_failed",
+                    f"Progress marker could not be parsed: {exc}",
+                )
+                continue
+            if not isinstance(payload, dict):
+                self.queue.append_event(
+                    job.job_id,
+                    "progress.parse_failed",
+                    "Progress marker payload was not an object",
+                )
+                continue
+            typed_payload = cast(dict[str, Any], payload)
+            try:
+                progress = ProgressRecord(
+                    job_id=job.job_id,
+                    label=str(typed_payload.get("label", "progress")),
+                    current=_optional_float(typed_payload.get("current")),
+                    total=_optional_float(typed_payload.get("total")),
+                    unit=_optional_str(typed_payload.get("unit")),
+                    message=_optional_str(typed_payload.get("message")),
+                    source_event_seq=source_event_seq,
+                    metadata=_optional_metadata(typed_payload.get("metadata")),
+                )
+            except ValueError as exc:
+                self.queue.append_event(
+                    job.job_id,
+                    "progress.parse_failed",
+                    f"Progress marker was invalid: {exc}",
+                )
+                continue
+            self.queue.append_progress(progress)
 
     def _append_execution_start(self, job: RelayJob, pid: int) -> None:
         self.queue.append_event(
@@ -351,3 +403,28 @@ def _file_summary(path: Path) -> dict[str, object]:
         "size_bytes": path.stat().st_size,
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
+
+
+def _optional_str(value: object) -> str | None:
+    return value if isinstance(value, str) and value != "" else None
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("numeric progress fields cannot be booleans")
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str) and value != "":
+        return float(value)
+    raise ValueError("progress numeric field must be a number")
+
+
+def _optional_metadata(value: object) -> dict[str, object]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("progress metadata must be an object")
+    typed = cast(dict[object, object], value)
+    return {str(key): item for key, item in typed.items()}
