@@ -58,8 +58,8 @@ class LiveAcceptanceOptions:
     agent_mcp_config: str | None = None
     require_agent_child_job: bool | None = None
     verify_transport: bool | None = None
-    verify_direct_transport: bool = False
-    allow_direct_transport_fallback: bool = False
+    verify_direct_transport: bool | None = None
+    allow_direct_transport_fallback: bool | None = None
     transport_token: str | None = None
     transport_secret_key: str | None = None
     transport_frpc_bin: str = "frpc"
@@ -123,7 +123,17 @@ def run_live_acceptance(
         )
     transport_token: str | None = None
     transport_secret_key: str | None = None
-    if verify_transport or options.verify_direct_transport:
+    verify_direct_transport = (
+        options.definition.live_test.verify_direct_transport
+        if options.verify_direct_transport is None
+        else options.verify_direct_transport
+    )
+    allow_direct_transport_fallback = (
+        options.definition.live_test.allow_direct_transport_fallback
+        if options.allow_direct_transport_fallback is None
+        else options.allow_direct_transport_fallback
+    )
+    if verify_transport or verify_direct_transport:
         transport_token, transport_secret_key = _require_transport_secrets(
             token=options.transport_token,
             secret_key=options.transport_secret_key,
@@ -161,22 +171,20 @@ def run_live_acceptance(
                 expected_progress_package=expected_progress_package,
             )
         )
-    if options.verify_direct_transport:
+    if verify_direct_transport:
         assert transport_token is not None
         assert transport_secret_key is not None
         direct_lines = _verify_direct_transport(
             options,
             token=transport_token,
             secret_key=transport_secret_key,
+            allow_stcp_fallback=allow_direct_transport_fallback,
             pipeline_yaml=pipeline_yaml_text,
             expected_progress_adapter=expected_progress_adapter,
             expected_progress_package=expected_progress_package,
         )
-        if (
-            not options.allow_direct_transport_fallback
-            and "direct_transport.result=xtcp" not in direct_lines
-        ):
-            raise RelayError("direct transport acceptance did not prove XTCP")
+        if not allow_direct_transport_fallback:
+            _assert_direct_xtcp_acceptance(direct_lines)
         lines.extend(direct_lines)
     remote_yaml = f".local/share/clio-relay/live-tests/{run_id}/pipeline.yaml"
     _remote_write_file(
@@ -390,6 +398,7 @@ def _verify_direct_transport(
     *,
     token: str,
     secret_key: str,
+    allow_stcp_fallback: bool,
     pipeline_yaml: str,
     expected_progress_adapter: str | None,
     expected_progress_package: str | None,
@@ -419,7 +428,7 @@ def _verify_direct_transport(
         ),
         api_token=options.api_token,
         timeout_seconds=options.timeout_seconds,
-        allow_stcp_fallback=options.allow_direct_transport_fallback,
+        allow_stcp_fallback=allow_stcp_fallback,
         http_check=lambda local_url: _verify_transport_http_api(
             local_url,
             cluster=options.cluster,
@@ -431,6 +440,18 @@ def _verify_direct_transport(
             expected_progress_package=expected_progress_package,
         ),
     )
+
+
+def _assert_direct_xtcp_acceptance(lines: list[str]) -> None:
+    required = {
+        "direct_transport.result=xtcp",
+        "transport.proxy_type=xtcp",
+        "transport.healthz=ok",
+        "transport.http_wait=succeeded",
+    }
+    missing = required - set(lines)
+    if missing:
+        raise RelayError(f"direct transport acceptance did not prove XTCP: {sorted(missing)}")
 
 
 def _unique_transport_port(run_suffix: str) -> int:

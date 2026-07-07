@@ -405,6 +405,7 @@ def test_live_acceptance_verifies_direct_transport_when_enabled(
             "direct_transport.result=xtcp",
             "transport.proxy_type=xtcp",
             "transport.healthz=ok",
+            "transport.http_wait=succeeded",
         ]
 
     monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
@@ -441,6 +442,54 @@ def test_live_acceptance_verifies_direct_transport_when_enabled(
     assert transport_calls[0]["api_token"] == "api-token"
 
 
+def test_live_acceptance_verifies_configured_direct_transport(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text("name: generic\npkgs: []\n", encoding="utf-8")
+    transport_calls: list[dict[str, object]] = []
+
+    def fake_cluster_doctor(_definition: ClusterDefinition) -> list[str]:
+        return ["cluster: test-cluster"]
+
+    def fake_direct_transport(**kwargs: object) -> list[str]:
+        transport_calls.append(kwargs)
+        return [
+            "direct_transport.result=xtcp",
+            "transport.proxy_type=xtcp",
+            "transport.healthz=ok",
+            "transport.http_wait=succeeded",
+        ]
+
+    monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.run_frp_direct_http_probe",
+        fake_direct_transport,
+    )
+
+    lines = run_live_acceptance(
+        LiveAcceptanceOptions(
+            cluster="test-cluster",
+            definition=ClusterDefinition(
+                name="test-cluster",
+                ssh_host="test-host",
+                live_test=LiveTestConfig(
+                    verify_direct_transport=True,
+                    allow_direct_transport_fallback=False,
+                ),
+            ),
+            jarvis_yaml=pipeline,
+            transport_token="frp-token",
+            transport_secret_key="xtcp-secret",
+        ),
+        runner=_generic_success_runner(),
+    )
+
+    assert "direct_transport.result=xtcp" in lines
+    assert transport_calls[0]["allow_stcp_fallback"] is False
+
+
 def test_live_acceptance_rejects_direct_transport_fallback_unless_allowed(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -465,6 +514,42 @@ def test_live_acceptance_rejects_direct_transport_fallback_unless_allowed(
     )
 
     with pytest.raises(RelayError, match="did not prove XTCP"):
+        run_live_acceptance(
+            LiveAcceptanceOptions(
+                cluster="test-cluster",
+                definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+                jarvis_yaml=pipeline,
+                verify_direct_transport=True,
+                transport_token="frp-token",
+                transport_secret_key="xtcp-secret",
+            ),
+            runner=_generic_success_runner(),
+        )
+
+
+def test_live_acceptance_requires_full_direct_xtcp_evidence(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text("name: generic\npkgs: []\n", encoding="utf-8")
+
+    def fake_cluster_doctor(_definition: ClusterDefinition) -> list[str]:
+        return ["cluster: test-cluster"]
+
+    def fake_direct_transport(**_kwargs: object) -> list[str]:
+        return [
+            "direct_transport.result=xtcp",
+            "transport.healthz=ok",
+        ]
+
+    monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.run_frp_direct_http_probe",
+        fake_direct_transport,
+    )
+
+    with pytest.raises(RelayError, match="transport.http_wait=succeeded"):
         run_live_acceptance(
             LiveAcceptanceOptions(
                 cluster="test-cluster",

@@ -71,6 +71,8 @@ class LiveTestConfig(BaseModel):
     progress_pattern: str | None = None
     progress_action_payload: dict[str, object] = Field(default_factory=dict)
     verify_transport: bool = False
+    verify_direct_transport: bool = False
+    allow_direct_transport_fallback: bool = False
     transport_local_bind_port: int = 18765
     transport_remote_api_port: int | None = None
     transport_proxy_name: str | None = None
