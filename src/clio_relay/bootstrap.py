@@ -283,12 +283,10 @@ if command -v lmp.real >/dev/null 2>&1; then
 fi
 if [ -f "$HOME/spack/share/spack/setup-env.sh" ]; then
   . "$HOME/spack/share/spack/setup-env.sh"
-  if ! spack find --loaded lammps >/dev/null 2>&1; then
-    if ! spack find lammps >/dev/null 2>&1; then
-      spack install lammps
-    fi
-    spack load lammps
+  if ! spack find lammps >/dev/null 2>&1; then
+    spack install lammps
   fi
+  spack load lammps
 fi
 if command -v lmp_mpi >/dev/null 2>&1; then
   exec lmp_mpi "$@"
