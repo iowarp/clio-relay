@@ -1,4 +1,4 @@
-name: ares-lammps-live-acceptance
+name: ares-lammps-long-eta
 x_clio_relay:
   stage_files:
     - local_path: in.lj
@@ -14,4 +14,4 @@ pkgs:
     out: $HOME/.local/share/clio-relay/live-tests/{run_id}/lammps-out
     kokkos_gpu: false
     progress:
-      total_steps: 150
+      total_steps: 10000

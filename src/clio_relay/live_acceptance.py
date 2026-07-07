@@ -137,8 +137,14 @@ def run_live_acceptance(
     )
     expected_progress_adapter = _expected_progress_adapter(pipeline_yaml_text)
     expected_progress_package = _expected_progress_package(pipeline_yaml_text)
-
     lines: list[str] = []
+    if expected_progress_package == "builtin.lammps":
+        package_path = _verify_builtin_lammps_package_load(
+            options.definition,
+            runner=command_runner,
+        )
+        lines.append(f"acceptance.jarvis_package=builtin.lammps:{package_path}")
+
     lines.extend(run_cluster_doctor(options.definition))
     if verify_transport:
         assert transport_token is not None
@@ -190,6 +196,18 @@ def run_live_acceptance(
     if not job_id.startswith("job_"):
         raise RelayError(f"live-test submit did not return a job id: {submit}")
     lines.append(f"acceptance.job_id={job_id}")
+
+    if expected_progress_adapter is not None:
+        _verify_live_package_progress(
+            options.definition,
+            job_id,
+            expected_progress_adapter,
+            package_name=expected_progress_package,
+            timeout_seconds=options.timeout_seconds,
+            poll_seconds=options.poll_seconds,
+            runner=command_runner,
+        )
+        lines.append(f"acceptance.live_progress_adapter={expected_progress_adapter}")
 
     _wait_for_success(
         options.definition,
@@ -636,6 +654,49 @@ def _wait_for_success(
     return typed
 
 
+def _verify_live_package_progress(
+    definition: ClusterDefinition,
+    job_id: str,
+    expected_adapter: str,
+    *,
+    package_name: str | None,
+    timeout_seconds: float,
+    poll_seconds: float,
+    runner: CommandRunner,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    saw_running = False
+    while time.monotonic() < deadline:
+        monitor = _remote_clio_json(
+            definition,
+            ["job", "monitor", job_id, "--cursor", "1", "--limit", "500"],
+            runner=runner,
+        )
+        events = cast(list[dict[str, Any]], monitor["events"])
+        event_types = {str(event.get("event_type")) for event in events}
+        saw_running = saw_running or "job.running" in event_types
+        if event_types & {"job.succeeded", "job.failed", "job.canceled"}:
+            break
+        progress = _remote_clio_json(
+            definition,
+            ["job", "progress", job_id],
+            runner=runner,
+        )
+        if _has_progress_adapter(
+            cast(list[dict[str, Any]], progress),
+            expected_adapter,
+            job_id=job_id,
+            package_name=package_name,
+        ):
+            if not saw_running:
+                raise RelayError("package progress was recorded before job.running")
+            return
+        time.sleep(poll_seconds)
+    raise RelayError(
+        f"expected live package progress before terminal job state: {expected_adapter}"
+    )
+
+
 def _verify_completed_job(
     definition: ClusterDefinition,
     job_id: str,
@@ -721,12 +782,15 @@ def _verify_completed_job(
             ["job", "progress", job_id],
             runner=runner,
         )
-        _assert_progress_adapter(
+        if not _has_progress_adapter(
             cast(list[dict[str, Any]], progress),
             expected_progress_adapter,
             job_id=job_id,
             package_name=expected_progress_package,
-        )
+        ):
+            raise RelayError(
+                f"expected package progress adapter was not recorded: {expected_progress_adapter}"
+            )
         lines.append(f"{line_prefix}.progress_adapter={expected_progress_adapter}")
 
 
@@ -775,6 +839,35 @@ def _expected_progress_package(pipeline_yaml: str) -> str | None:
     return None
 
 
+def _verify_builtin_lammps_package_load(
+    definition: ClusterDefinition,
+    *,
+    runner: CommandRunner,
+) -> str:
+    jarvis_bin_assignment = (
+        shlex.quote(definition.jarvis_bin)
+        if definition.jarvis_bin is not None
+        else '"$HOME/.local/bin/jarvis"'
+    )
+    script = (
+        "set -euo pipefail\n"
+        f"JARVIS_BIN={jarvis_bin_assignment}\n"
+        "PYTHON_BIN=$(head -n 1 \"$JARVIS_BIN\" | sed 's/^#!//')\n"
+        "\"$PYTHON_BIN\" - <<'PY'\n"
+        "import inspect\n"
+        "from builtin.builtin.lammps.pkg import Lammps\n"
+        "path = inspect.getfile(Lammps)\n"
+        "if Lammps.__module__ != 'builtin.builtin.lammps.pkg':\n"
+        "    raise SystemExit(f'unexpected module: {Lammps.__module__}')\n"
+        "print(path)\n"
+        "PY\n"
+    )
+    output = _remote_shell(definition.ssh_host, script, runner=runner).strip()
+    if not output:
+        raise RelayError("remote JARVIS builtin.lammps package path was empty")
+    return output.splitlines()[-1]
+
+
 def _assert_progress_adapter(
     progress: list[dict[str, Any]],
     expected_adapter: str,
@@ -782,6 +875,18 @@ def _assert_progress_adapter(
     job_id: str,
     package_name: str | None = None,
 ) -> None:
+    if _has_progress_adapter(progress, expected_adapter, job_id=job_id, package_name=package_name):
+        return
+    raise RelayError(f"expected package progress adapter was not recorded: {expected_adapter}")
+
+
+def _has_progress_adapter(
+    progress: list[dict[str, Any]],
+    expected_adapter: str,
+    *,
+    job_id: str,
+    package_name: str | None = None,
+) -> bool:
     for item in progress:
         metadata = item.get("metadata")
         if not isinstance(metadata, dict):
@@ -796,8 +901,22 @@ def _assert_progress_adapter(
             and typed_metadata.get("run_id") == job_id
             and typed_metadata.get("execution_id") == job_id
         ):
-            return
-    raise RelayError(f"expected package progress adapter was not recorded: {expected_adapter}")
+            if expected_adapter == "lammps":
+                if _is_lammps_timed_progress(typed_metadata):
+                    return True
+                continue
+            return True
+    return False
+
+
+def _is_lammps_timed_progress(metadata: dict[str, Any]) -> bool:
+    return (
+        metadata.get("timing_source") == "lammps_thermo_cpu"
+        and metadata.get("prediction_status") == "observed_lammps_timing"
+        and metadata.get("prediction_method") == "trimmed_mean_step_time_after_warmup"
+        and isinstance(metadata.get("rate_samples"), int)
+        and isinstance(metadata.get("eta_seconds"), int | float)
+    )
 
 
 def _verify_progress_monitor(

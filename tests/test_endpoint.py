@@ -20,6 +20,7 @@ from clio_relay.models import (
     JobState,
     Lease,
     RelayJob,
+    RelayTask,
     RemoteAgentTaskSpec,
 )
 from clio_relay.relay_ops import cancel_job
@@ -467,6 +468,70 @@ def test_worker_parses_lammps_progress_only_for_declared_lammps_package(tmp_path
     assert progress[-1].metadata["execution_id"] == job.job_id
 
 
+def test_worker_polls_lammps_log_for_live_progress(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    output_dir = tmp_path / "lammps-out"
+
+    class LammpsLogProvider(RecordingProvider):
+        def run_pipeline_streaming(
+            self,
+            pipeline_path: Path,
+            *,
+            cwd: Path | None = None,
+            on_stdout: Callable[[str], None] | None = None,
+            on_stderr: Callable[[str], None] | None = None,
+            on_start: Callable[[int], None] | None = None,
+            should_cancel: Callable[[], bool] | None = None,
+            on_poll: Callable[[], None] | None = None,
+            timeout_seconds: int | None = None,
+            on_timeout: Callable[[], None] | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            del cwd, on_stdout, on_stderr, on_start, should_cancel, timeout_seconds, on_timeout
+            self.runs.append(pipeline_path)
+            output_dir.mkdir(parents=True)
+            (output_dir / "log.lammps").write_text(
+                "Step Temp CPU\n0 1.0 0.0\n50 1.0 5.0\n100 1.0 10.0\n",
+                encoding="utf-8",
+            )
+            if on_poll is not None:
+                on_poll()
+            return subprocess.CompletedProcess(args=["jarvis"], returncode=0, stdout="", stderr="")
+
+    pipeline_yaml = (
+        "name: lammps\n"
+        "pkgs:\n"
+        "- pkg_type: builtin.lammps\n"
+        f"  out: {output_dir.as_posix()}\n"
+        "  progress:\n"
+        "    total_steps: 100\n"
+    )
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml=pipeline_yaml),
+            idempotency_key="worker-lammps-log-progress",
+        )
+    )
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=queue,
+        provider=LammpsLogProvider(),
+    )
+    worker.register()
+
+    worker.run_once()
+
+    progress = queue.list_progress(job.job_id)
+    assert [item.current for item in progress] == [0, 50, 100]
+    assert progress[-1].source_event_seq is None
+    assert progress[-1].metadata["timing_source"] == "lammps_thermo_cpu"
+    assert progress[-1].metadata["prediction_status"] == "observed_lammps_timing"
+
+
 def test_worker_ignores_lammps_shaped_stdout_outside_builtin_scope(tmp_path: Path) -> None:
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
@@ -656,6 +721,10 @@ def test_worker_preserves_canceled_state_for_running_job(
     assert "scheduler.cancel_requested" in event_types
     assert "execution.canceled" in event_types
     assert scancel_commands == [["scancel", "12345"]]
+    tasks = queue.list_tasks(job.job_id)
+    assert tasks
+    assert tasks[0].metadata["scheduler"] == "slurm"
+    assert tasks[0].metadata["scheduler_job_ids"] == ["12345"]
 
 
 def test_worker_timeout_scancels_scheduler_job(
@@ -733,6 +802,64 @@ def test_worker_timeout_scancels_scheduler_job(
     assert result.state == JobState.FAILED
     assert "execution.timeout" in [event.event_type for event in events]
     assert scancel_commands == [["scancel", "98765"]]
+    tasks = queue.list_tasks(job.job_id)
+    assert tasks
+    assert tasks[0].metadata["scheduler"] == "slurm"
+    assert tasks[0].metadata["scheduler_job_ids"] == ["98765"]
+
+
+def test_worker_reconciles_canceled_scheduler_job_after_restart(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["sleep", "60"]),
+            idempotency_key="restart-cancel",
+        )
+    )
+    task = queue.append_task(
+        RelayTask(
+            job_id=job.job_id,
+            name="jarvis.execution",
+            state=JobState.RUNNING,
+            metadata={"scheduler": "slurm", "scheduler_job_ids": ["24680"]},
+        )
+    )
+    del task
+    cancel_job(queue, job.job_id)
+    scancel_commands: list[list[str]] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        text: bool,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        del text, capture_output, check
+        scancel_commands.append(command)
+        return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("clio_relay.endpoint.subprocess.run", fake_run)
+
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=queue,
+        provider=RecordingProvider(),
+    )
+    worker.register()
+
+    assert worker.run_once() is None
+    assert scancel_commands == [["scancel", "24680"]]
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=50)
+    assert "scheduler.cancel_requested" in [event.event_type for event in events]
 
 
 def test_worker_renews_lease_while_pipeline_runs(tmp_path: Path) -> None:

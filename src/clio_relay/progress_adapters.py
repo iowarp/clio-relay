@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import statistics
-import time
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -24,12 +23,17 @@ class LammpsThermoProgressAdapter:
     sample_window: int = 8
     active_columns: list[str] = field(default_factory=lambda: [])
     active_step_column: int | None = None
+    active_time_column: int | None = None
+    active_time_column_name: str | None = None
     samples: list[tuple[float, float]] = field(default_factory=lambda: [])
     last_step: float | None = None
     completed_steps: float = 0.0
     active_run_steps: float | None = None
     active_run_start_step: float | None = None
     active_package_stdout: bool = False
+    emitted_keys: set[tuple[float, float, float, float | None]] = field(
+        default_factory=lambda: set()
+    )
 
     def observe_stdout(self, text: str) -> list[dict[str, object]]:
         """Extract progress observations from stdout text."""
@@ -79,6 +83,13 @@ class LammpsThermoProgressAdapter:
                 self.active_step_column = self.active_columns.index("Step")
             except ValueError:
                 self.active_step_column = None
+            self.active_time_column = None
+            self.active_time_column_name = None
+            for candidate in ("CPU", "Cpu", "cpu"):
+                if candidate in self.active_columns:
+                    self.active_time_column = self.active_columns.index(candidate)
+                    self.active_time_column_name = candidate
+                    break
             return None
         if stripped.startswith("Loop time of "):
             if self.active_run_steps is not None:
@@ -89,8 +100,16 @@ class LammpsThermoProgressAdapter:
             self.active_run_start_step = None
             self.active_columns = []
             self.active_step_column = None
+            self.active_time_column = None
+            self.active_time_column_name = None
             return None
         if self.active_step_column is None:
+            return None
+        if (
+            self.total_steps is not None
+            and self.completed_steps >= self.total_steps
+            and self.active_run_steps is None
+        ):
             return None
         parts = stripped.split()
         if len(parts) != len(self.active_columns):
@@ -101,16 +120,25 @@ class LammpsThermoProgressAdapter:
             return None
         if step < 0:
             return None
+        elapsed_seconds = None
+        if self.active_time_column is not None:
+            elapsed_seconds = _optional_float(parts[self.active_time_column])
+            if elapsed_seconds is not None and elapsed_seconds < 0:
+                elapsed_seconds = None
         if self.active_run_start_step is None:
             self.active_run_start_step = step
         self.last_step = step
         current = self.completed_steps + max(0.0, step - self.active_run_start_step)
         if self.active_run_steps is not None:
             current = min(self.completed_steps + self.active_run_steps, current)
-        now = time.monotonic()
-        self.samples.append((current, now))
-        self.samples = self.samples[-self.sample_window :]
-        prediction = self._prediction(current)
+        progress_key = (self.completed_steps, current, step, elapsed_seconds)
+        if progress_key in self.emitted_keys:
+            return None
+        self.emitted_keys.add(progress_key)
+        if elapsed_seconds is not None:
+            self.samples.append((current, elapsed_seconds))
+            self.samples = self.samples[-self.sample_window :]
+        prediction = self._prediction(current, elapsed_seconds=elapsed_seconds)
         return _drop_none(
             {
                 "label": "timestep",
@@ -126,6 +154,7 @@ class LammpsThermoProgressAdapter:
                     "run_start_step": self.active_run_start_step,
                     "run_steps": self.active_run_steps,
                     "completed_prior_runs": self.completed_steps,
+                    "timing_column": self.active_time_column_name,
                     **prediction,
                 }
                 | package_progress_metadata(
@@ -137,9 +166,25 @@ class LammpsThermoProgressAdapter:
             }
         )
 
-    def _prediction(self, current_step: float) -> dict[str, object]:
+    def _prediction(
+        self,
+        current_step: float,
+        *,
+        elapsed_seconds: float | None,
+    ) -> dict[str, object]:
+        if elapsed_seconds is None:
+            return {
+                "confidence": "timing_unavailable",
+                "samples": len(self.samples),
+                "prediction_status": "no_lammps_timing_column",
+            }
         if self.total_steps is None or len(self.samples) <= self.warmup_samples:
-            return {"confidence": "warming_up", "samples": len(self.samples)}
+            return {
+                "confidence": "warming_up",
+                "samples": len(self.samples),
+                "prediction_status": "warming_up",
+                "elapsed_seconds": elapsed_seconds,
+            }
         rates: list[float] = []
         for (previous_step, previous_time), (step, timestamp) in zip(
             self.samples,
@@ -152,17 +197,29 @@ class LammpsThermoProgressAdapter:
                 continue
             rates.append(time_delta / step_delta)
         if not rates:
-            return {"confidence": "warming_up", "samples": len(self.samples)}
+            return {
+                "confidence": "warming_up",
+                "samples": len(self.samples),
+                "prediction_status": "warming_up",
+                "elapsed_seconds": elapsed_seconds,
+            }
         ordered = sorted(rates)
         trimmed = ordered[1:-1] if len(ordered) > 2 else ordered
         seconds_per_step = statistics.fmean(trimmed)
         remaining_steps = max(0.0, self.total_steps - current_step)
         return {
-            "prediction_method": "trimmed_step_time_after_warmup",
+            "prediction_method": "trimmed_mean_step_time_after_warmup",
+            "rate_samples": len(rates),
+            "trimmed_rate_samples": len(trimmed),
+            "min_seconds_per_step": min(trimmed),
+            "max_seconds_per_step": max(trimmed),
             "seconds_per_step": seconds_per_step,
             "eta_seconds": remaining_steps * seconds_per_step,
+            "elapsed_seconds": elapsed_seconds,
             "remaining_steps": remaining_steps,
             "samples": len(self.samples),
+            "prediction_status": "observed_lammps_timing",
+            "timing_source": "lammps_thermo_cpu",
             "confidence": "observed" if len(rates) >= 2 else "low_sample",
         }
 

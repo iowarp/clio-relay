@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import shutil
 from pathlib import Path
 
+import pytest
+
 from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
     Cursor,
     JarvisRunSpec,
@@ -44,10 +49,55 @@ def test_submit_is_idempotent_and_events_are_ordered(tmp_path: Path) -> None:
     assert cursor.next_seq == 3
 
 
+def test_submit_rejects_reused_idempotency_key_with_different_payload(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "hello"]),
+            idempotency_key="same-submit",
+        )
+    )
+
+    with pytest.raises(QueueConflictError, match="different job payload"):
+        queue.submit_job(
+            RelayJob(
+                cluster="ares",
+                kind=JobKind.JARVIS,
+                spec=JarvisRunSpec(command=["echo", "different"]),
+                idempotency_key="same-submit",
+            )
+        )
+
+
+def test_submit_distinguishes_idempotency_keys_with_same_sanitized_form(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    first = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "hello"]),
+            idempotency_key="a/b",
+        )
+    )
+    second = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "hello"]),
+            idempotency_key="a_b",
+        )
+    )
+
+    assert first.job_id != second.job_id
+    assert len(list((tmp_path / "idempotency").glob("*.json"))) == 2
+
+
 def test_submit_recovers_reserved_idempotency_record(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path)
     queue.initialize()
-    key_path = tmp_path / "idempotency" / "reserved.json"
+    key_path = _idempotency_path(tmp_path, "reserved")
     key_path.write_text(
         '{"state":"reserved","job_id":"job_reserved","idempotency_key":"reserved"}',
         encoding="utf-8",
@@ -64,6 +114,72 @@ def test_submit_recovers_reserved_idempotency_record(tmp_path: Path) -> None:
 
     assert saved.job_id == "job_reserved"
     assert queue.get_job("job_reserved").job_id == "job_reserved"
+
+
+def test_submit_rejects_reserved_idempotency_digest_mismatch(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    queue.initialize()
+    key_path = _idempotency_path(tmp_path, "reserved")
+    key_path.write_text(
+        '{"state":"reserved","job_id":"job_reserved","idempotency_key":"reserved",'
+        '"job_digest":"not-this-payload"}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(QueueConflictError, match="different job payload"):
+        queue.submit_job(
+            RelayJob(
+                cluster="ares",
+                kind=JobKind.JARVIS,
+                spec=JarvisRunSpec(command=["echo", "hello"]),
+                idempotency_key="reserved",
+            )
+        )
+
+
+def test_submit_repairs_existing_job_missing_initial_event(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    job = RelayJob(
+        cluster="ares",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(command=["echo", "hello"]),
+        idempotency_key="repair-event",
+    )
+    saved = queue.submit_job(job)
+    shutil.rmtree(tmp_path / "events" / saved.job_id)
+
+    repeated = queue.submit_job(job)
+    events, _ = queue.drain_events(Cursor(job_id=saved.job_id), limit=10)
+
+    assert repeated.job_id == saved.job_id
+    assert [event.event_type for event in events] == ["job.queued"]
+
+
+def test_submit_promotes_reserved_idempotency_record_with_existing_job(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    job = RelayJob(
+        cluster="ares",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(command=["echo", "hello"]),
+        idempotency_key="reserved-existing",
+    )
+    saved = queue.submit_job(job)
+    key_path = _idempotency_path(tmp_path, "reserved-existing")
+    record = key_path.read_text(encoding="utf-8")
+    key_path.write_text(
+        record.replace('"state": "committed"', '"state": "reserved"'),
+        encoding="utf-8",
+    )
+
+    repeated = queue.submit_job(job)
+    repaired = key_path.read_text(encoding="utf-8")
+
+    assert repeated.job_id == saved.job_id
+    assert '"state": "committed"' in repaired
+
+
+def _idempotency_path(root: Path, key: str) -> Path:
+    return root / "idempotency" / f"key_{hashlib.sha256(key.encode('utf-8')).hexdigest()}.json"
 
 
 def test_lease_survives_restart_without_duplicate_execution(tmp_path: Path) -> None:

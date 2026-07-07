@@ -77,6 +77,64 @@ def test_http_monitor_sse_streams_monitor_and_terminal_events(tmp_path: Path) ->
     assert job.job_id in body
 
 
+def test_http_monitor_websocket_streams_monitor_and_terminal_events(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-websocket",
+        )
+    )
+    queue.update_job_state(job.job_id, JobState.SUCCEEDED)
+    client = cast(Any, TestClient(create_app(settings)))
+
+    with client.websocket_connect(f"/jobs/{job.job_id}/monitor/ws") as websocket:
+        monitor = websocket.receive_json()
+        terminal = websocket.receive_json()
+
+    assert monitor["event"] == "monitor"
+    assert monitor["data"]["job"]["job_id"] == job.job_id
+    assert terminal == {
+        "event": "terminal",
+        "data": {"job_id": job.job_id, "state": "succeeded"},
+    }
+
+
+def test_http_monitor_websocket_streams_running_then_terminal(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-websocket-running",
+        )
+    )
+    queue.update_job_state(job.job_id, JobState.RUNNING)
+    client = cast(Any, TestClient(create_app(settings)))
+
+    with client.websocket_connect(f"/jobs/{job.job_id}/monitor/ws?poll_seconds=0.01") as websocket:
+        running = websocket.receive_json()
+        queue.update_job_state(job.job_id, JobState.SUCCEEDED)
+        messages: list[dict[str, Any]] = []
+        for _ in range(10):
+            message = cast(dict[str, Any], websocket.receive_json())
+            messages.append(message)
+            if message["event"] == "terminal":
+                break
+
+    assert running["event"] == "monitor"
+    assert running["data"]["job"]["state"] == "running"
+    assert {
+        "event": "terminal",
+        "data": {"job_id": job.job_id, "state": "succeeded"},
+    } in messages
+
+
 def test_http_api_enforces_configured_token(tmp_path: Path) -> None:
     settings = RelaySettings(
         core_dir=tmp_path / "core",

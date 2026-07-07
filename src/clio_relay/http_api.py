@@ -11,7 +11,16 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    WebSocket,
+    WebSocketDisconnect,
+    WebSocketException,
+    status,
+)
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -213,6 +222,40 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             media_type="text/event-stream",
         )
 
+    @app.websocket("/jobs/{job_id}/monitor/ws")
+    async def monitor_ws(
+        websocket: WebSocket,
+        job_id: str,
+        cursor: int = 1,
+        limit: int = 100,
+        poll_seconds: float = 1.0,
+        stop_on_terminal: bool = True,
+    ) -> None:
+        """Stream job monitor updates over a WebSocket."""
+        _require_websocket_token(resolved, websocket)
+        if poll_seconds <= 0:
+            raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
+        try:
+            queue.get_job(job_id)
+        except NotFoundError as exc:
+            raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION) from exc
+        await websocket.accept()
+        try:
+            async for payload in _monitor_stream_payloads(
+                queue,
+                job_id,
+                cursor=cursor,
+                limit=limit,
+                poll_seconds=poll_seconds,
+                stop_on_terminal=stop_on_terminal,
+            ):
+                await websocket.send_json(payload)
+                if payload["event"] == "terminal":
+                    await websocket.close()
+                    return
+        except WebSocketDisconnect:
+            return
+
     @app.post("/jobs/{job_id}/wait", response_model=RelayJob, dependencies=[auth_dependency])
     def wait(job_id: str, timeout_seconds: float = 600, poll_seconds: float = 2) -> RelayJob:
         try:
@@ -324,6 +367,26 @@ async def _monitor_sse_events(
     poll_seconds: float,
     stop_on_terminal: bool,
 ) -> AsyncIterator[str]:
+    async for payload in _monitor_stream_payloads(
+        queue,
+        job_id,
+        cursor=cursor,
+        limit=limit,
+        poll_seconds=poll_seconds,
+        stop_on_terminal=stop_on_terminal,
+    ):
+        yield f"event: {payload['event']}\ndata: {json.dumps(payload['data'], default=str)}\n\n"
+
+
+async def _monitor_stream_payloads(
+    queue: ClioCoreQueue,
+    job_id: str,
+    *,
+    cursor: int,
+    limit: int,
+    poll_seconds: float,
+    stop_on_terminal: bool,
+) -> AsyncIterator[dict[str, object]]:
     next_cursor = cursor
     while True:
         payload = monitor_job(queue, job_id, cursor=next_cursor, limit=limit)
@@ -331,13 +394,10 @@ async def _monitor_sse_events(
         if not isinstance(raw_next_cursor, int):
             raise TypeError("monitor payload next_cursor was not an integer")
         next_cursor = raw_next_cursor
-        yield f"event: monitor\ndata: {json.dumps(payload, default=str)}\n\n"
+        yield {"event": "monitor", "data": payload}
         job = queue.get_job(job_id)
         if stop_on_terminal and job.state.value in {"succeeded", "failed", "canceled"}:
-            yield (
-                "event: terminal\n"
-                f"data: {json.dumps({'job_id': job_id, 'state': job.state.value})}\n\n"
-            )
+            yield {"event": "terminal", "data": {"job_id": job_id, "state": job.state.value}}
             return
         await asyncio.sleep(poll_seconds)
 
@@ -357,6 +417,16 @@ def _require_api_token(settings: RelaySettings) -> Callable[..., Awaitable[None]
             )
 
     return dependency
+
+
+def _require_websocket_token(settings: RelaySettings, websocket: WebSocket) -> None:
+    if settings.api_token is None:
+        return
+    supplied = websocket.query_params.get("token")
+    if supplied is None:
+        supplied = _extract_token(websocket.headers.get("authorization"), None)
+    if supplied is None or not secrets.compare_digest(supplied, settings.api_token):
+        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
 
 
 def _extract_token(authorization: str | None, header_token: str | None) -> str | None:

@@ -15,6 +15,7 @@ from clio_relay.live_acceptance import (
     _assert_progress_adapter,  # pyright: ignore[reportPrivateUsage]
     _expected_progress_adapter,  # pyright: ignore[reportPrivateUsage]
     _find_agent_child_job,  # pyright: ignore[reportPrivateUsage]
+    _verify_live_package_progress,  # pyright: ignore[reportPrivateUsage]
     run_live_acceptance,
 )
 
@@ -52,34 +53,38 @@ def test_live_acceptance_stages_files_and_strips_relay_extension(
     def fake_cluster_doctor(_definition: ClusterDefinition) -> list[str]:
         return ["cluster: test-cluster"]
 
+    monitor_calls = 0
+
     def fake_runner(
         command: list[str],
         *,
         input: bytes | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
+        nonlocal monitor_calls
         script = command[-1]
         if "cat >" in script:
             uploaded.append((script, input))
             return _completed(command, "")
         if "mkdir -p" in script:
             return _completed(command, "")
+        if "builtin.builtin.lammps.pkg" in script:
+            return _completed(command, "/opt/jarvis/builtin/builtin/lammps/pkg.py\n")
         if "job submit" in script:
             return _completed(command, "job_abc\n")
         if "job wait" in script:
             return _completed(command, json.dumps({"job_id": "job_abc", "state": "succeeded"}))
         if "job monitor" in script:
+            monitor_calls += 1
+            events = [
+                {"event_type": "job.queued"},
+                {"event_type": "job.running"},
+                {"event_type": "jarvis.started"},
+            ]
+            if monitor_calls > 1:
+                events.append({"event_type": "job.succeeded"})
             return _completed(
                 command,
-                json.dumps(
-                    {
-                        "events": [
-                            {"event_type": "job.queued"},
-                            {"event_type": "job.running"},
-                            {"event_type": "jarvis.started"},
-                            {"event_type": "job.succeeded"},
-                        ]
-                    }
-                ),
+                json.dumps({"events": events}),
             )
         if "job tasks" in script:
             return _completed(command, json.dumps([{"state": "succeeded"}]))
@@ -114,6 +119,11 @@ def test_live_acceptance_stages_files_and_strips_relay_extension(
                                 "package_version": "builtin",
                                 "run_id": "job_abc",
                                 "execution_id": "job_abc",
+                                "timing_source": "lammps_thermo_cpu",
+                                "prediction_status": "observed_lammps_timing",
+                                "prediction_method": "trimmed_mean_step_time_after_warmup",
+                                "rate_samples": 2,
+                                "eta_seconds": 1.0,
                             }
                         }
                     ]
@@ -123,7 +133,7 @@ def test_live_acceptance_stages_files_and_strips_relay_extension(
 
     monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
 
-    run_live_acceptance(
+    lines = run_live_acceptance(
         LiveAcceptanceOptions(
             cluster="test-cluster",
             definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
@@ -132,6 +142,10 @@ def test_live_acceptance_stages_files_and_strips_relay_extension(
         runner=fake_runner,
     )
 
+    assert (
+        "acceptance.jarvis_package=builtin.lammps:/opt/jarvis/builtin/builtin/lammps/pkg.py"
+        in lines
+    )
     assert any(item[1] is not None and b"run 10" in item[1] for item in uploaded)
     pipeline_upload = uploaded[-1][1]
     assert pipeline_upload is not None
@@ -158,6 +172,23 @@ def test_live_acceptance_requires_trusted_package_progress() -> None:
             "lammps",
             job_id="job_test",
         )
+    with pytest.raises(RelayError, match="expected package progress adapter"):
+        _assert_progress_adapter(
+            [
+                {
+                    "metadata": {
+                        "adapter": "lammps",
+                        "source": "jarvis_package",
+                        "package_name": "builtin.lammps",
+                        "package_version": "builtin",
+                        "run_id": "job_test",
+                        "execution_id": "job_test",
+                    }
+                }
+            ],
+            "lammps",
+            job_id="job_test",
+        )
     _assert_progress_adapter(
         [
             {
@@ -168,6 +199,11 @@ def test_live_acceptance_requires_trusted_package_progress() -> None:
                     "package_version": "builtin",
                     "run_id": "job_test",
                     "execution_id": "job_test",
+                    "timing_source": "lammps_thermo_cpu",
+                    "prediction_status": "observed_lammps_timing",
+                    "prediction_method": "trimmed_mean_step_time_after_warmup",
+                    "rate_samples": 2,
+                    "eta_seconds": 10.0,
                 }
             }
         ],
@@ -182,6 +218,65 @@ def test_live_acceptance_requires_single_builtin_lammps_package_for_progress() -
     )
 
     assert _expected_progress_adapter(mixed) is None
+
+
+def test_live_acceptance_rejects_package_progress_only_after_terminal_state() -> None:
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        script = command[-1]
+        if "job monitor" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    {
+                        "events": [
+                            {"event_type": "job.queued"},
+                            {"event_type": "job.running"},
+                            {"event_type": "jarvis.started"},
+                            {"event_type": "job.succeeded"},
+                        ]
+                    }
+                ),
+            )
+        if "job progress" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    [
+                        {
+                            "metadata": {
+                                "adapter": "lammps",
+                                "source": "jarvis_package",
+                                "package_name": "builtin.lammps",
+                                "package_version": "builtin",
+                                "run_id": "job_test",
+                                "execution_id": "job_test",
+                                "timing_source": "lammps_thermo_cpu",
+                                "prediction_status": "observed_lammps_timing",
+                                "prediction_method": "trimmed_mean_step_time_after_warmup",
+                                "rate_samples": 2,
+                                "eta_seconds": 1.0,
+                            }
+                        }
+                    ]
+                ),
+            )
+        raise AssertionError(f"unexpected command: {command}")
+
+    with pytest.raises(RelayError, match="before terminal job state"):
+        _verify_live_package_progress(
+            ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            "job_test",
+            "lammps",
+            package_name="builtin.lammps",
+            timeout_seconds=1,
+            poll_seconds=0.01,
+            runner=fake_runner,
+        )
 
 
 def test_live_acceptance_verifies_transport_when_enabled(

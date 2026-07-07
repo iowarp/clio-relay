@@ -27,8 +27,32 @@ def test_lammps_parser_requires_thermo_header_and_named_step_column() -> None:
     assert metadata["adapter"] == "lammps"
     assert metadata["package_name"] == "builtin.lammps"
     assert metadata["step_column"] == "Step"
+    assert metadata["confidence"] == "timing_unavailable"
+    assert metadata["prediction_status"] == "no_lammps_timing_column"
+    assert "eta_seconds" not in metadata
+
+
+def test_lammps_parser_uses_thermo_cpu_for_eta_not_parse_time() -> None:
+    adapter = LammpsThermoProgressAdapter(total_steps=150, warmup_samples=1)
+
+    adapter.observe_line("Step Temp CPU")
+    first = adapter.observe_line("0 1.44 0.0")
+    second = adapter.observe_line("25 1.40 10.0")
+    third = adapter.observe_line("50 1.41 20.0")
+
+    assert first is not None
+    assert second is not None
+    assert third is not None
+    metadata = cast(dict[str, object], third["metadata"])
+    assert metadata["timing_column"] == "CPU"
+    assert metadata["timing_source"] == "lammps_thermo_cpu"
+    assert metadata["prediction_status"] == "observed_lammps_timing"
+    assert metadata["prediction_method"] == "trimmed_mean_step_time_after_warmup"
+    assert metadata["rate_samples"] == 2
+    assert metadata["trimmed_rate_samples"] == 2
     assert metadata["remaining_steps"] == 100
-    assert "eta_seconds" in metadata
+    assert metadata["eta_seconds"] == 40
+    assert metadata["elapsed_seconds"] == 20
 
 
 def test_lammps_parser_resets_after_loop_footer() -> None:
@@ -78,6 +102,20 @@ def test_lammps_parser_handles_reset_timestep() -> None:
     assert first["current"] == 0
     assert second is not None
     assert second["current"] == 50
+
+
+def test_lammps_parser_ignores_replayed_output_after_declared_total() -> None:
+    adapter = LammpsThermoProgressAdapter(total_steps=100)
+
+    adapter.observe_line("run 100")
+    adapter.observe_line("Step Temp CPU")
+    assert adapter.observe_line("0 1.0 0.0") is not None
+    assert adapter.observe_line("100 1.0 10.0") is not None
+    adapter.observe_line("Loop time of 10.0 on 1 procs for 100 steps")
+    adapter.observe_line("Step Temp CPU")
+
+    assert adapter.observe_line("0 1.0 0.0") is None
+    assert adapter.observe_line("100 1.0 10.0") is None
 
 
 def test_pipeline_adapter_requires_declared_lammps_package() -> None:

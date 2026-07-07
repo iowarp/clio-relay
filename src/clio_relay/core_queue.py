@@ -8,6 +8,7 @@ idempotency, leases, and cursor replay rather than a database choice.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections.abc import Iterable
@@ -79,16 +80,28 @@ class ClioCoreQueue:
     def submit_job(self, job: RelayJob) -> RelayJob:
         """Submit a job, returning the existing record for a repeated idempotency key."""
         self.initialize()
-        key_path = self.root / "idempotency" / f"{self._safe_key(job.idempotency_key)}.json"
+        key_path = (
+            self.root / "idempotency" / f"{_idempotency_key_filename(job.idempotency_key)}.json"
+        )
+        job_digest = _job_idempotency_digest(job)
         with self._lock:
             if key_path.exists():
                 existing = json.loads(key_path.read_text(encoding="utf-8"))
                 existing_job_id = existing["job_id"]
+                existing_digest = existing.get("job_digest")
+                if isinstance(existing_digest, str) and existing_digest != job_digest:
+                    raise QueueConflictError(
+                        f"idempotency key was reused with a different job payload: "
+                        f"{job.idempotency_key}"
+                    )
                 existing_job = self._read_optional(
                     self.root / "jobs" / f"{existing_job_id}.json",
                     RelayJob,
                 )
                 if existing_job is not None:
+                    self._ensure_job_queued_event(existing_job)
+                    if existing.get("state") == "reserved":
+                        self._write_committed_idempotency_record(key_path, existing_job, job_digest)
                     return existing_job
                 if existing.get("state") != "reserved":
                     raise QueueConflictError(
@@ -102,19 +115,14 @@ class ClioCoreQueue:
                         "state": "reserved",
                         "job_id": job.job_id,
                         "idempotency_key": job.idempotency_key,
+                        "job_digest": job_digest,
                         "created_at": utc_now().isoformat(),
                     },
                 )
             self._write(self.root / "jobs" / f"{job.job_id}.json", job)
             self._write_json(
                 key_path,
-                {
-                    "state": "committed",
-                    "job_id": job.job_id,
-                    "idempotency_key": job.idempotency_key,
-                    "created_at": job.created_at.isoformat(),
-                    "committed_at": utc_now().isoformat(),
-                },
+                _committed_idempotency_record(job, job_digest),
             )
             self.append_event(job.job_id, "job.queued", "Job queued", locked=True)
         return job
@@ -510,6 +518,20 @@ class ClioCoreQueue:
             recovered.append(updated)
         return recovered
 
+    def _ensure_job_queued_event(self, job: RelayJob) -> None:
+        event_dir = self.root / "events" / job.job_id
+        if any(event_dir.glob("*.json")):
+            return
+        self.append_event(job.job_id, "job.queued", "Job queued", locked=True)
+
+    def _write_committed_idempotency_record(
+        self,
+        key_path: Path,
+        job: RelayJob,
+        job_digest: str,
+    ) -> None:
+        self._write_json(key_path, _committed_idempotency_record(job, job_digest))
+
     @staticmethod
     def _safe_key(value: str) -> str:
         return "".join(
@@ -557,3 +579,35 @@ class ClioCoreQueue:
     @staticmethod
     def _read_json_file(path: Path, model: type[Record]) -> Record:
         return model.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _job_idempotency_digest(job: RelayJob) -> str:
+    payload = job.model_dump(mode="json")
+    for generated_field in {
+        "job_id",
+        "state",
+        "created_at",
+        "updated_at",
+        "leased_by",
+        "attempts",
+        "last_error",
+    }:
+        payload.pop(generated_field, None)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _idempotency_key_filename(key: str) -> str:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return f"key_{digest}"
+
+
+def _committed_idempotency_record(job: RelayJob, job_digest: str) -> dict[str, object]:
+    return {
+        "state": "committed",
+        "job_id": job.job_id,
+        "idempotency_key": job.idempotency_key,
+        "job_digest": job_digest,
+        "created_at": job.created_at.isoformat(),
+        "committed_at": utc_now().isoformat(),
+    }

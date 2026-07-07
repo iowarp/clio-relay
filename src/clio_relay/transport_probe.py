@@ -126,10 +126,17 @@ def run_frp_http_probe(
             stderr=subprocess.PIPE,
         )
         try:
+            time.sleep(1)
+            if remote.poll() is not None:
+                raise RelayError(_process_output_message(remote, "remote transport probe failed"))
+            if visitor.poll() is not None:
+                raise RelayError(_process_output_message(visitor, "local frpc visitor failed"))
             _wait_for_healthz(
                 f"http://127.0.0.1:{local_bind_port}/healthz",
                 timeout_seconds=timeout_seconds,
             )
+            if visitor.poll() is not None:
+                raise RelayError(_process_output_message(visitor, "local frpc visitor failed"))
             lines = [
                 f"transport.cluster={cluster}",
                 f"transport.server={transport.server_addr}:{transport.server_port}",
@@ -184,6 +191,23 @@ cat > "$tmp/frpc.toml" <<'__CLIO_RELAY_FRPC_CONFIG__'
 {frpc_config.rstrip()}
 __CLIO_RELAY_FRPC_CONFIG__
 echo "transport_probe_cluster={cluster}"
+if python3 - {api_port} <<'__CLIO_RELAY_PORT_CHECK__'
+import socket
+import sys
+port = int(sys.argv[1])
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("127.0.0.1", port))
+    except OSError:
+        raise SystemExit(1)
+__CLIO_RELAY_PORT_CHECK__
+then
+  :
+else
+  echo "remote API port is already occupied: {api_port}" >&2
+  exit 1
+fi
 clio-relay api start --host 127.0.0.1 --port {api_port}{require_token} >"$tmp/api.log" 2>&1 &
 api_pid="$!"
 sleep 1
@@ -224,6 +248,22 @@ def _terminate(process: ManagedProcess) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=5)
+
+
+def _process_output_message(process: ManagedProcess, fallback: str) -> str:
+    parts: list[str] = []
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(process, stream_name, None)
+        if stream is None or not hasattr(stream, "read"):
+            continue
+        output = stream.read()
+        if isinstance(output, bytes):
+            text = output.decode("utf-8", errors="replace").strip()
+        else:
+            text = str(output).strip()
+        if text:
+            parts.append(text)
+    return "\n".join(parts) if parts else fallback
 
 
 def _shell_single_quote(value: str) -> str:
