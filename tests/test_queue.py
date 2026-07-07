@@ -249,27 +249,40 @@ def test_monitor_rule_records_progress_from_regex_groups(tmp_path: Path) -> None
             },
         )
     )
+    progress_text = (
+        "PROGRESS current=4 total=10 running\nPROGRESS current=5 total=10 still-running\n"
+    )
     queue.append_event(
         job.job_id,
         "stdout.delta",
-        "progress",
-        payload={"text": "PROGRESS current=4 total=10 running\n"},
+        progress_text.strip(),
+        payload={"text": progress_text},
     )
 
     result = evaluate_monitor_rules(queue)
+    second = evaluate_monitor_rules(queue)
     progress = queue.list_progress(job.job_id)
+    updated_rule = queue.list_monitor_rules(job.job_id)[0]
     events, _ = queue.drain_events(Cursor(job_id=job.job_id, next_seq=1), limit=20)
 
     assert result[0]["rule_id"] == rule.rule_id
     assert result[0]["action"] == "record_progress"
-    assert len(progress) == 1
+    assert second == []
+    assert len(progress) == 2
     assert progress[0].label == "iteration"
     assert progress[0].current == 4
     assert progress[0].total == 10
     assert progress[0].message == "running"
     assert progress[0].unit == "step"
     assert progress[0].source_event_seq == 3
-    assert [event.event_type for event in events][-2:] == [
+    assert progress[1].current == 5
+    assert progress[1].message == "still-running"
+    assert updated_rule.enabled is True
+    assert updated_rule.triggered_at is None
+    assert updated_rule.next_seq == 8
+    assert [event.event_type for event in events][-4:] == [
+        "progress.updated",
+        "monitor.triggered",
         "progress.updated",
         "monitor.triggered",
     ]

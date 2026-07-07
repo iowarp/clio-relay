@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -29,12 +30,12 @@ class RelaySettings(BaseModel):
     def from_env(cls) -> RelaySettings:
         """Load settings from the current process environment."""
         return cls(
-            core_dir=Path(os.getenv("CLIO_RELAY_CORE_DIR", ".clio-relay/core")),
-            spool_dir=Path(os.getenv("CLIO_RELAY_SPOOL_DIR", ".clio-relay/spool")),
+            core_dir=_env_or_bootstrap_data_dir("CLIO_RELAY_CORE_DIR", "core"),
+            spool_dir=_env_or_bootstrap_data_dir("CLIO_RELAY_SPOOL_DIR", "spool"),
             frps_addr=os.getenv("CLIO_RELAY_FRPS_ADDR"),
             frp_token=os.getenv("CLIO_RELAY_FRP_TOKEN"),
-            jarvis_bin=os.getenv("CLIO_RELAY_JARVIS_BIN", "jarvis"),
-            frpc_bin=os.getenv("CLIO_RELAY_FRPC_BIN", "frpc"),
+            jarvis_bin=_env_or_bootstrap_bin("CLIO_RELAY_JARVIS_BIN", "jarvis"),
+            frpc_bin=_env_or_bootstrap_bin("CLIO_RELAY_FRPC_BIN", "frpc"),
             api_token=os.getenv("CLIO_RELAY_API_TOKEN"),
             agent_bin=os.getenv(
                 "CLIO_RELAY_AGENT_BIN",
@@ -43,6 +44,28 @@ class RelaySettings(BaseModel):
             agent_adapter=os.getenv("CLIO_RELAY_AGENT_ADAPTER", "codex"),
             agent_args=_split_args(os.getenv("CLIO_RELAY_AGENT_ARGS")),
         )
+
+
+def _env_or_bootstrap_data_dir(env_name: str, family: str) -> Path:
+    configured = os.getenv(env_name)
+    if configured:
+        return Path(configured).expanduser().resolve()
+    bootstrap_path = Path.home() / ".local" / "share" / "clio-relay" / family
+    if bootstrap_path.exists():
+        return bootstrap_path.resolve()
+    return Path(".clio-relay") / family
+
+
+def _env_or_bootstrap_bin(env_name: str, executable_name: str) -> str:
+    configured = os.getenv(env_name)
+    if configured:
+        return configured
+    if shutil.which(executable_name) is not None:
+        return executable_name
+    bootstrap_path = Path.home() / ".local" / "bin" / executable_name
+    if bootstrap_path.exists():
+        return str(bootstrap_path)
+    return executable_name
 
 
 def _split_args(value: str | None) -> list[str]:

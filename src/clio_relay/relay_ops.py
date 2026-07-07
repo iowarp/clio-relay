@@ -136,15 +136,23 @@ def evaluate_monitor_rules(queue: ClioCoreQueue, *, limit: int = 100) -> list[di
             Cursor(job_id=rule.job_id, next_seq=rule.next_seq),
             limit=limit,
         )
+        if rule.action == MonitorRuleAction.RECORD_PROGRESS:
+            progress_results: list[dict[str, object]] = []
+            for event in events:
+                if rule.event_types and event.event_type not in rule.event_types:
+                    continue
+                for match in _event_matches(event, pattern):
+                    progress_results.append(_apply_monitor_rule_action(queue, rule, event, match))
+            queue.update_monitor_rule(rule.model_copy(update={"next_seq": cursor.next_seq}))
+            results.extend(progress_results)
+            continue
         matched: tuple[RelayEvent, re.Match[str]] | None = None
         for event in events:
             if rule.event_types and event.event_type not in rule.event_types:
                 continue
-            for candidate in _event_search_text(event):
-                match = pattern.search(candidate)
-                if match is not None:
-                    matched = (event, match)
-                    break
+            for match in _event_matches(event, pattern):
+                matched = (event, match)
+                break
             if matched is not None:
                 break
         updated = rule.model_copy(update={"next_seq": cursor.next_seq})
@@ -159,11 +167,24 @@ def evaluate_monitor_rules(queue: ClioCoreQueue, *, limit: int = 100) -> list[di
 
 
 def _event_search_text(event: RelayEvent) -> list[str]:
-    candidates = [event.message]
-    text = event.payload.get("text")
-    if isinstance(text, str):
-        candidates.append(text)
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for candidate in (event.message, event.payload.get("text")):
+        if not isinstance(candidate, str):
+            continue
+        normalized = candidate.strip()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        candidates.append(candidate)
     return candidates
+
+
+def _event_matches(event: RelayEvent, pattern: re.Pattern[str]) -> list[re.Match[str]]:
+    matches: list[re.Match[str]] = []
+    for candidate in _event_search_text(event):
+        matches.extend(pattern.finditer(candidate))
+    return matches
 
 
 def _apply_monitor_rule_action(
