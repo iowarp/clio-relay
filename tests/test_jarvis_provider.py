@@ -20,6 +20,7 @@ def test_bounded_command_yaml_generation() -> None:
     assert package["command"] == ["python", "-V"]
     assert package["env"] == {"A": "B"}
     assert package["timeout_seconds"] == 30
+    assert "progress" not in package
 
 
 def test_remote_agent_task_yaml_generation(tmp_path: Path) -> None:

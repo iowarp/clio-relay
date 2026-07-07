@@ -855,6 +855,10 @@ def mcp_call(
         str,
         typer.Option(help="JSON object arguments for the remote MCP tool."),
     ] = "{}",
+    arguments_json_file: Annotated[
+        Path | None,
+        typer.Option(help="Path to a JSON object argument file for the remote MCP tool."),
+    ] = None,
     idempotency_key: Annotated[
         str | None,
         typer.Option(help="Submit/retry idempotency key."),
@@ -862,7 +866,13 @@ def mcp_call(
 ) -> None:
     """Submit a remote MCP tool call."""
     _require_cluster(cluster)
-    arguments = _json_object(arguments_json)
+    if arguments_json_file is not None and arguments_json != "{}":
+        raise typer.BadParameter("use either --arguments-json or --arguments-json-file, not both")
+    arguments = _json_object(
+        arguments_json_file.read_text(encoding="utf-8-sig")
+        if arguments_json_file is not None
+        else arguments_json
+    )
     digest = hashlib.sha256(
         json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()

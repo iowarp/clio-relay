@@ -64,7 +64,7 @@ class JarvisCdProvider:
                     "workdir": str(spec.workdir) if spec.workdir is not None else None,
                     "env": spec.env,
                     "timeout_seconds": spec.timeout_seconds,
-                    "progress": spec.progress,
+                    "progress": spec.progress or None,
                 }
             ],
         }

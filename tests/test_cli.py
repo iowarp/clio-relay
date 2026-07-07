@@ -473,3 +473,36 @@ def test_cli_mcp_call_preserves_arguments(tmp_path: Path, monkeypatch: MonkeyPat
     assert job.kind == JobKind.MCP_CALL
     assert isinstance(job.spec, McpCallSpec)
     assert job.spec.arguments == {"steps": 100, "case": "lammps"}
+
+
+def test_cli_mcp_call_reads_arguments_json_file(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    core_dir = tmp_path / "core"
+    arguments_path = tmp_path / "arguments.json"
+    arguments_path.write_text('\ufeff{"steps": 150, "sample": "ares-live"}', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "mcp-call",
+            "--cluster",
+            "ares",
+            "--server",
+            "remote-server",
+            "--tool",
+            "echo",
+            "--arguments-json-file",
+            str(arguments_path),
+            "--idempotency-key",
+            "cli-mcp-call-file-args",
+        ],
+    )
+
+    assert result.exit_code == 0
+    job_id = result.output.strip()
+    job = ClioCoreQueue(core_dir).get_job(job_id)
+    assert isinstance(job.spec, McpCallSpec)
+    assert job.spec.arguments == {"steps": 150, "sample": "ares-live"}

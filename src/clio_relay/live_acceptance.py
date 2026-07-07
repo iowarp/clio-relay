@@ -773,8 +773,6 @@ def _verify_live_package_progress(
         events = cast(list[dict[str, Any]], monitor["events"])
         event_types = {str(event.get("event_type")) for event in events}
         saw_running = saw_running or "job.running" in event_types
-        if event_types & {"job.succeeded", "job.failed", "job.canceled"}:
-            break
         progress = _remote_clio_json(
             definition,
             ["job", "progress", job_id],
@@ -789,6 +787,8 @@ def _verify_live_package_progress(
             if not saw_running:
                 raise RelayError("package progress was recorded before job.running")
             return
+        if event_types & {"job.succeeded", "job.failed", "job.canceled"}:
+            break
         time.sleep(poll_seconds)
     raise RelayError(
         f"expected live package progress before terminal job state: {expected_adapter}"
