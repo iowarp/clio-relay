@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import json
-import subprocess
 import sys
-import time
-from pathlib import Path
 from typing import Any
 
 from jarvis_cd.core.pkg import Application
+
+from clio_relay.mcp_call.runner import run_mcp_call_from_params
 
 
 class McpCall(Application):
@@ -28,51 +26,24 @@ class McpCall(Application):
 
     def start(self) -> None:
         """Run a single MCP tools/call request."""
-        server = str(self.config["server"])
-        tool = str(self.config["tool"])
-        arguments = self.config.get("arguments", {})
-        timeout_value = self.config.get("timeout_seconds")
-        timeout = int(timeout_value) if timeout_value is not None else None
-        started_at = time.time()
-        request = {
-            "jsonrpc": "2.0",
-            "id": "clio-relay-mcp-call",
-            "method": "tools/call",
-            "params": {"name": tool, "arguments": arguments},
-        }
-        result = subprocess.run(
-            [server],
-            input=json.dumps(request) + "\n",
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
-        finished_at = time.time()
-        Path("mcp-result.json").write_text(
-            json.dumps(
-                {
-                    "server": server,
-                    "tool": tool,
-                    "arguments": arguments,
-                    "returncode": result.returncode,
-                    "stdout": result.stdout,
-                    "stderr": result.stderr,
-                    "started_at": started_at,
-                    "finished_at": finished_at,
-                    "duration_seconds": finished_at - started_at,
-                },
-                indent=2,
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
-        if result.stdout:
-            print(result.stdout, end="")
-        if result.stderr:
-            print(result.stderr, end="", file=sys.stderr)
-        if result.returncode != 0:
-            raise RuntimeError(f"MCP call failed with exit code {result.returncode}")
+        return_code = run_mcp_call_from_params(dict(self.config))
+        result_text = ""
+        result_path = "mcp-result.json"
+        try:
+            import json
+            from pathlib import Path
+
+            result = json.loads(Path(result_path).read_text(encoding="utf-8"))
+            result_text = str(result.get("stdout") or "")
+            error_text = str(result.get("stderr") or "")
+        except (OSError, ValueError):
+            error_text = ""
+        if result_text:
+            print(result_text, end="")
+        if error_text:
+            print(error_text, end="", file=sys.stderr)
+        if return_code != 0:
+            raise RuntimeError(f"MCP call failed with exit code {return_code}")
 
     def stop(self) -> None:
         """Stop hook for MCP calls."""
