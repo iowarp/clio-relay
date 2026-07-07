@@ -349,6 +349,12 @@ while [ "$#" -gt 0 ]; do
     *=*)
       shift
       ;;
+    [0-9]*)
+      if [ -z "$ranks" ]; then
+        ranks="$1"
+      fi
+      shift
+      ;;
     *)
       break
       ;;
