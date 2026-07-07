@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -8,7 +9,7 @@ from pytest import MonkeyPatch
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import RelayError
-from clio_relay.transport_probe import run_frp_http_probe
+from clio_relay.transport_probe import run_frp_direct_http_probe, run_frp_http_probe
 
 
 def test_frp_http_probe_starts_remote_proxy_and_local_visitor(monkeypatch: MonkeyPatch) -> None:
@@ -144,6 +145,103 @@ def test_frp_http_probe_rejects_dead_visitor_even_if_local_healthz_passes(
         )
 
     assert len(processes) == 2
+
+
+def test_frp_direct_http_probe_uses_xtcp_proxy_and_visitor(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    processes: list[FakeProcess] = []
+    health_urls: list[str] = []
+    visitor_configs: list[str] = []
+
+    def fake_process_factory(command: list[str], **_kwargs: Any) -> FakeProcess:
+        process = FakeProcess(command)
+        if command and command[0] == "frpc":
+            visitor_configs.append(Path(command[-1]).read_text(encoding="utf-8"))
+        processes.append(process)
+        return process
+
+    def fake_healthz(url: str, *, timeout_seconds: float) -> None:
+        health_urls.append(url)
+        assert timeout_seconds == 4
+
+    monkeypatch.setattr("clio_relay.transport_probe._wait_for_healthz", fake_healthz)
+
+    lines = run_frp_direct_http_probe(
+        cluster="test-cluster",
+        definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+        frpc_bin="frpc",
+        token="frp-token",
+        secret_key="xtcp-secret",
+        local_bind_port=9876,
+        remote_api_port=8765,
+        proxy_name="relay-http-direct-test",
+        api_token="api-token",
+        timeout_seconds=4,
+        process_factory=fake_process_factory,
+        allow_stcp_fallback=False,
+    )
+
+    assert lines[:3] == [
+        "direct_transport.cluster=test-cluster",
+        "direct_transport.mode=xtcp",
+        "direct_transport.result=xtcp",
+    ]
+    assert "transport.proxy_type=xtcp" in lines
+    assert health_urls == ["http://127.0.0.1:9876/healthz"]
+    remote_script = processes[0].stdin.getvalue().decode("utf-8")
+    assert 'type = "xtcp"' in remote_script
+    assert len(visitor_configs) == 1
+    assert 'type = "xtcp"' in visitor_configs[0]
+    assert "keepTunnelOpen = true" in visitor_configs[0]
+
+
+def test_frp_direct_http_probe_reports_stcp_fallback_when_xtcp_fails(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    processes: list[FakeProcess] = []
+
+    def fake_process_factory(command: list[str], **_kwargs: Any) -> FakeProcess:
+        process = FakeProcess(command)
+        if command and command[0] == "frpc":
+            config_text = Path(command[-1]).read_text(encoding="utf-8")
+            if 'type = "xtcp"' in config_text:
+                process.returncode = 1
+                process.stderr = BytesIO(b"xtcp hole punching failed\n")
+        processes.append(process)
+        return process
+
+    def fake_healthz(_url: str, *, timeout_seconds: float) -> None:
+        assert timeout_seconds == 5
+
+    monkeypatch.setattr("clio_relay.transport_probe._wait_for_healthz", fake_healthz)
+
+    lines = run_frp_direct_http_probe(
+        cluster="test-cluster",
+        definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+        frpc_bin="frpc",
+        token="frp-token",
+        secret_key="shared-secret",
+        local_bind_port=9876,
+        remote_api_port=8765,
+        proxy_name="relay-http-direct-test",
+        timeout_seconds=5,
+        process_factory=fake_process_factory,
+        allow_stcp_fallback=True,
+    )
+
+    assert lines[:4] == [
+        "direct_transport.cluster=test-cluster",
+        "direct_transport.mode=xtcp",
+        "direct_transport.result=frp_stcp",
+        "direct_transport.xtcp_error=xtcp hole punching failed",
+    ]
+    assert "transport.healthz=ok" in lines
+    assert any(
+        "relay-http-direct-test-fallback" in process.stdin.getvalue().decode("utf-8")
+        for process in processes
+        if process.stdin is not None
+    )
 
 
 class FakeProcess:

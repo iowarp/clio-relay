@@ -49,6 +49,7 @@ class FrpcConfig:
     token: str
     transport_protocol: FrpTransportProtocol = FrpTransportProtocol.WSS
     proxy_name: str = "relay-stcp"
+    proxy_type: str = "stcp"
     local_ip: str = "127.0.0.1"
     local_port: int = 0
     secret_key: str = ""
@@ -63,14 +64,18 @@ class FrpcVisitorConfig:
     token: str
     transport_protocol: FrpTransportProtocol = FrpTransportProtocol.WSS
     visitor_name: str = "relay-stcp-visitor"
+    visitor_type: str = "stcp"
     server_name: str = "relay-stcp"
     bind_addr: str = "127.0.0.1"
     bind_port: int = 0
     secret_key: str = ""
+    keep_tunnel_open: bool = False
 
 
 def render_frpc_config(config: FrpcConfig) -> str:
     """Render an frpc config for the selected frp transport protocol."""
+    if config.proxy_type not in {"stcp", "xtcp"}:
+        raise ConfigurationError(f"unsupported frpc proxy type: {config.proxy_type}")
     if config.local_port <= 0:
         raise ConfigurationError("frpc local_port must be configured")
     lines = [
@@ -83,7 +88,7 @@ def render_frpc_config(config: FrpcConfig) -> str:
         "",
         "[[proxies]]",
         f"name = {_toml_string(config.proxy_name)}",
-        'type = "stcp"',
+        f"type = {_toml_string(config.proxy_type)}",
         f"secretKey = {_toml_string(config.secret_key)}",
         f"localIP = {_toml_string(config.local_ip)}",
         f"localPort = {config.local_port}",
@@ -93,6 +98,8 @@ def render_frpc_config(config: FrpcConfig) -> str:
 
 def render_frpc_visitor_config(config: FrpcVisitorConfig) -> str:
     """Render an frpc STCP visitor config for desktop access to a relay endpoint."""
+    if config.visitor_type not in {"stcp", "xtcp"}:
+        raise ConfigurationError(f"unsupported frpc visitor type: {config.visitor_type}")
     if config.bind_port <= 0:
         raise ConfigurationError("frpc visitor bind_port must be configured")
     lines = [
@@ -105,15 +112,21 @@ def render_frpc_visitor_config(config: FrpcVisitorConfig) -> str:
         "",
         "[[visitors]]",
         f"name = {_toml_string(config.visitor_name)}",
-        'type = "stcp"',
+        f"type = {_toml_string(config.visitor_type)}",
         f"serverName = {_toml_string(config.server_name)}",
         f"secretKey = {_toml_string(config.secret_key)}",
         f"bindAddr = {_toml_string(config.bind_addr)}",
         f"bindPort = {config.bind_port}",
     ]
+    if config.visitor_type == "xtcp":
+        lines.append(f"keepTunnelOpen = {_toml_bool(config.keep_tunnel_open)}")
     return "\n".join(lines) + "\n"
 
 
 def _toml_string(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+
+def _toml_bool(value: bool) -> str:
+    return "true" if value else "false"

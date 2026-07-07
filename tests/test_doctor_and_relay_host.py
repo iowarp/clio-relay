@@ -77,6 +77,41 @@ def test_render_frpc_visitor_config_uses_stcp_visitor() -> None:
     assert "bindPort = 8765" in rendered
 
 
+def test_render_frpc_config_supports_xtcp_proxy_and_visitor() -> None:
+    proxy = render_frpc_config(
+        FrpcConfig(
+            server_addr="frps.jcernuda.com",
+            server_port=443,
+            token="secret",
+            transport_protocol=FrpTransportProtocol.WSS,
+            proxy_name="cluster-direct",
+            proxy_type="xtcp",
+            local_port=8848,
+            secret_key="xtcp-secret",
+        )
+    )
+    visitor = render_frpc_visitor_config(
+        FrpcVisitorConfig(
+            server_addr="frps.jcernuda.com",
+            server_port=443,
+            token="secret",
+            transport_protocol=FrpTransportProtocol.WSS,
+            visitor_name="desktop-direct",
+            visitor_type="xtcp",
+            server_name="cluster-direct",
+            bind_port=8765,
+            secret_key="xtcp-secret",
+            keep_tunnel_open=True,
+        )
+    )
+
+    assert 'type = "xtcp"' in proxy
+    assert 'name = "cluster-direct"' in proxy
+    assert 'type = "xtcp"' in visitor
+    assert 'serverName = "cluster-direct"' in visitor
+    assert "keepTunnelOpen = true" in visitor
+
+
 def test_live_doctor_requires_frps_address(tmp_path: Path) -> None:
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
 

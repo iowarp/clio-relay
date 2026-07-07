@@ -131,16 +131,210 @@ def run_frp_http_probe(
                 raise RelayError(_process_output_message(remote, "remote transport probe failed"))
             if visitor.poll() is not None:
                 raise RelayError(_process_output_message(visitor, "local frpc visitor failed"))
-            _wait_for_healthz(
-                f"http://127.0.0.1:{local_bind_port}/healthz",
-                timeout_seconds=timeout_seconds,
-            )
+            try:
+                _wait_for_healthz(
+                    f"http://127.0.0.1:{local_bind_port}/healthz",
+                    timeout_seconds=timeout_seconds,
+                )
+            except RelayError as exc:
+                _terminate(visitor)
+                _terminate(remote)
+                details = [
+                    str(exc),
+                    _process_output_message(remote, "remote transport probe still running"),
+                    _process_output_message(visitor, "local frpc visitor still running"),
+                ]
+                raise RelayError("\n".join(details)) from exc
             if visitor.poll() is not None:
                 raise RelayError(_process_output_message(visitor, "local frpc visitor failed"))
             lines = [
                 f"transport.cluster={cluster}",
                 f"transport.server={transport.server_addr}:{transport.server_port}",
                 f"transport.protocol={transport.protocol}",
+                f"transport.local_url=http://127.0.0.1:{local_bind_port}",
+                "transport.healthz=ok",
+            ]
+            if http_check is not None:
+                lines.extend(http_check(f"http://127.0.0.1:{local_bind_port}"))
+            return lines
+        finally:
+            _terminate(visitor)
+            _terminate(remote)
+
+
+def run_frp_direct_http_probe(
+    *,
+    cluster: str,
+    definition: ClusterDefinition,
+    frpc_bin: str,
+    token: str,
+    secret_key: str,
+    local_bind_port: int,
+    remote_api_port: int = 8765,
+    proxy_name: str = "relay-http-direct",
+    api_token: str | None = None,
+    timeout_seconds: float = 30.0,
+    process_factory: ProcessFactory | None = None,
+    http_check: HttpCheck | None = None,
+    allow_stcp_fallback: bool = True,
+) -> list[str]:
+    """Probe direct XTCP HTTP reachability, optionally falling back to STCP."""
+    try:
+        lines = _run_frp_http_probe_with_proxy_type(
+            cluster=cluster,
+            definition=definition,
+            frpc_bin=frpc_bin,
+            token=token,
+            secret_key=secret_key,
+            local_bind_port=local_bind_port,
+            remote_api_port=remote_api_port,
+            proxy_name=proxy_name,
+            api_token=api_token,
+            timeout_seconds=timeout_seconds,
+            process_factory=process_factory,
+            http_check=http_check,
+            proxy_type="xtcp",
+        )
+    except RelayError as exc:
+        if not allow_stcp_fallback:
+            raise
+        fallback_lines = run_frp_http_probe(
+            cluster=cluster,
+            definition=definition,
+            frpc_bin=frpc_bin,
+            token=token,
+            secret_key=secret_key,
+            local_bind_port=local_bind_port,
+            remote_api_port=remote_api_port,
+            proxy_name=f"{proxy_name}-fallback",
+            api_token=api_token,
+            timeout_seconds=timeout_seconds,
+            process_factory=process_factory,
+            http_check=http_check,
+        )
+        return [
+            f"direct_transport.cluster={cluster}",
+            "direct_transport.mode=xtcp",
+            "direct_transport.result=frp_stcp",
+            f"direct_transport.xtcp_error={str(exc).splitlines()[0]}",
+            *fallback_lines,
+        ]
+    return [
+        f"direct_transport.cluster={cluster}",
+        "direct_transport.mode=xtcp",
+        "direct_transport.result=xtcp",
+        *lines,
+    ]
+
+
+def _run_frp_http_probe_with_proxy_type(
+    *,
+    cluster: str,
+    definition: ClusterDefinition,
+    frpc_bin: str,
+    token: str,
+    secret_key: str,
+    local_bind_port: int,
+    remote_api_port: int,
+    proxy_name: str,
+    api_token: str | None,
+    timeout_seconds: float,
+    process_factory: ProcessFactory | None,
+    http_check: HttpCheck | None,
+    proxy_type: str,
+) -> list[str]:
+    if local_bind_port <= 0:
+        raise ConfigurationError("local_bind_port must be positive")
+    if remote_api_port <= 0:
+        raise ConfigurationError("remote_api_port must be positive")
+    if timeout_seconds <= 0:
+        raise ConfigurationError("timeout_seconds must be positive")
+    if proxy_type not in {"stcp", "xtcp"}:
+        raise ConfigurationError(f"unsupported transport proxy type: {proxy_type}")
+    factory = process_factory or _popen
+    transport = definition.frp_transport
+    protocol = FrpTransportProtocol(transport.protocol)
+    with tempfile.TemporaryDirectory(prefix="clio-relay-transport-") as temp_dir:
+        temp_path = Path(temp_dir)
+        remote_frpc_config = render_frpc_config(
+            FrpcConfig(
+                server_addr=transport.server_addr,
+                server_port=transport.server_port,
+                token=token,
+                transport_protocol=protocol,
+                proxy_name=proxy_name,
+                proxy_type=proxy_type,
+                local_port=remote_api_port,
+                secret_key=secret_key,
+            )
+        )
+        visitor_config_path = temp_path / "frpc-visitor.toml"
+        visitor_config_path.write_text(
+            render_frpc_visitor_config(
+                FrpcVisitorConfig(
+                    server_addr=transport.server_addr,
+                    server_port=transport.server_port,
+                    token=token,
+                    transport_protocol=protocol,
+                    visitor_name=f"{proxy_name}-visitor",
+                    visitor_type=proxy_type,
+                    server_name=proxy_name,
+                    bind_port=local_bind_port,
+                    secret_key=secret_key,
+                    keep_tunnel_open=proxy_type == "xtcp",
+                )
+            ),
+            encoding="utf-8",
+        )
+        remote = factory(
+            ["ssh", definition.ssh_host, "bash", "-s"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert remote.stdin is not None
+        remote.stdin.write(
+            _remote_probe_script(
+                cluster=cluster,
+                definition=definition,
+                api_token=api_token,
+                api_port=remote_api_port,
+                frpc_config=remote_frpc_config,
+            ).encode("utf-8")
+        )
+        remote.stdin.close()
+        visitor = factory(
+            [frpc_bin, "-c", str(visitor_config_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            time.sleep(1)
+            if remote.poll() is not None:
+                raise RelayError(_process_output_message(remote, "remote transport probe failed"))
+            if visitor.poll() is not None:
+                raise RelayError(_process_output_message(visitor, "local frpc visitor failed"))
+            try:
+                _wait_for_healthz(
+                    f"http://127.0.0.1:{local_bind_port}/healthz",
+                    timeout_seconds=timeout_seconds,
+                )
+            except RelayError as exc:
+                _terminate(visitor)
+                _terminate(remote)
+                details = [
+                    str(exc),
+                    _process_output_message(remote, "remote transport probe still running"),
+                    _process_output_message(visitor, "local frpc visitor still running"),
+                ]
+                raise RelayError("\n".join(details)) from exc
+            if visitor.poll() is not None:
+                raise RelayError(_process_output_message(visitor, "local frpc visitor failed"))
+            lines = [
+                f"transport.cluster={cluster}",
+                f"transport.server={transport.server_addr}:{transport.server_port}",
+                f"transport.protocol={transport.protocol}",
+                f"transport.proxy_type={proxy_type}",
                 f"transport.local_url=http://127.0.0.1:{local_bind_port}",
                 "transport.healthz=ok",
             ]

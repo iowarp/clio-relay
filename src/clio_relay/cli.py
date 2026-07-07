@@ -67,7 +67,7 @@ from clio_relay.relay_ops import (
     read_job_log,
     wait_for_terminal,
 )
-from clio_relay.transport_probe import run_frp_http_probe
+from clio_relay.transport_probe import run_frp_direct_http_probe, run_frp_http_probe
 
 app = typer.Typer(no_args_is_help=True)
 endpoint_app = typer.Typer(no_args_is_help=True)
@@ -304,6 +304,61 @@ def test_http_transport(
                 proxy_name=proxy_name,
                 api_token=settings.api_token,
                 timeout_seconds=timeout_seconds,
+            )
+        )
+    )
+
+
+@relay_host_app.command("test-direct-transport")
+def test_direct_transport(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    local_bind_port: Annotated[int, typer.Option(help="Local desktop visitor bind port.")],
+    token: Annotated[
+        str | None,
+        typer.Option(help="frp authentication token. Defaults to cluster token_env."),
+    ] = None,
+    secret_key: Annotated[
+        str | None,
+        typer.Option(help="stcp/xtcp shared secret. Defaults to cluster stcp_secret_env."),
+    ] = None,
+    remote_api_port: Annotated[int, typer.Option(help="Remote cluster API port.")] = 8765,
+    proxy_name: Annotated[
+        str,
+        typer.Option(help="xtcp proxy/server name."),
+    ] = "relay-http-direct",
+    timeout_seconds: Annotated[
+        float,
+        typer.Option(help="Seconds to wait for healthz through direct transport."),
+    ] = 30.0,
+    allow_stcp_fallback: Annotated[
+        bool,
+        typer.Option(
+            "--allow-stcp-fallback/--no-allow-stcp-fallback",
+            help="Allow fallback to STCP if XTCP fails.",
+        ),
+    ] = True,
+) -> None:
+    """Run an end-to-end HTTP health check through frp XTCP direct transport."""
+    settings = RelaySettings.from_env()
+    definition = _require_cluster(cluster)
+    _run_or_exit(
+        lambda: _echo_lines(
+            run_frp_direct_http_probe(
+                cluster=cluster,
+                definition=definition,
+                frpc_bin=settings.frpc_bin,
+                token=_resolve_env_secret(token, definition.frp_transport.token_env, "frp token"),
+                secret_key=_resolve_env_secret(
+                    secret_key,
+                    definition.frp_transport.stcp_secret_env,
+                    "stcp/xtcp secret",
+                ),
+                local_bind_port=local_bind_port,
+                remote_api_port=remote_api_port,
+                proxy_name=proxy_name,
+                api_token=settings.api_token,
+                timeout_seconds=timeout_seconds,
+                allow_stcp_fallback=allow_stcp_fallback,
             )
         )
     )
