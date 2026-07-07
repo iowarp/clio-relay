@@ -179,6 +179,66 @@ def test_cli_render_frpc_uses_configured_secret_env(
     assert 'secretKey = "env-stcp-secret"' in result.output
 
 
+def test_cli_render_frpc_uses_local_secret_file(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    secret_dir = tmp_path / ".clio-relay"
+    secret_dir.mkdir()
+    (secret_dir / "secrets.json").write_text(
+        json.dumps(
+            {
+                "CLIO_RELAY_FRP_TOKEN": "file-frp-token",
+                "CLIO_RELAY_STCP_SECRET": "file-stcp-secret",
+            }
+        ),
+        encoding="utf-8-sig",
+    )
+    monkeypatch.delenv("CLIO_RELAY_FRP_TOKEN", raising=False)
+    monkeypatch.delenv("CLIO_RELAY_STCP_SECRET", raising=False)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "relay-host",
+            "render-frpc-config",
+            "--cluster",
+            "ares",
+            "--local-port",
+            "8848",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert 'auth.token = "file-frp-token"' in result.output
+    assert 'secretKey = "file-stcp-secret"' in result.output
+
+
+def test_cli_secret_file_rejects_non_string_secret(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    secret_dir = tmp_path / ".clio-relay"
+    secret_dir.mkdir()
+    (secret_dir / "secrets.json").write_text(
+        json.dumps({"CLIO_RELAY_FRP_TOKEN": 123}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("CLIO_RELAY_FRP_TOKEN", raising=False)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        ["relay-host", "render-frps-config"],
+    )
+
+    assert result.exit_code == 1
+    assert "non-empty string" in result.output
+
+
 def test_cli_transport_reports_missing_configured_secret_env(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

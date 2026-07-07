@@ -27,6 +27,15 @@ uv run clio-relay endpoint status
 
 On Windows, `install-frp` installs into `.tools/frp/bin`; relay commands auto-discover that project-local binary after checking explicit environment configuration, `PATH`, and bootstrap-managed installs.
 
+For unattended local runs, transport secrets can also live in the ignored `.clio-relay/secrets.json` file:
+
+```json
+{
+  "CLIO_RELAY_FRP_TOKEN": "<shared-frp-token>",
+  "CLIO_RELAY_STCP_SECRET": "<shared-stcp-secret>"
+}
+```
+
 Submit a JARVIS pipeline intent:
 
 ```powershell

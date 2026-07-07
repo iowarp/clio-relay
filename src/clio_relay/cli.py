@@ -854,10 +854,31 @@ def _require_cluster(cluster: str) -> ClusterDefinition:
 
 
 def _resolve_env_secret(value: str | None, env_name: str, label: str) -> str:
-    resolved = value or os.getenv(env_name)
+    resolved = value or os.getenv(env_name) or _local_secret(env_name)
     if resolved:
         return resolved
-    raise ConfigurationError(f"{label} is required; pass it explicitly or set {env_name}")
+    raise ConfigurationError(
+        f"{label} is required; pass it explicitly, set {env_name}, "
+        f"or add {env_name} to .clio-relay/secrets.json"
+    )
+
+
+def _local_secret(env_name: str) -> str | None:
+    path = Path(".clio-relay/secrets.json")
+    if not path.exists():
+        return None
+    loaded = cast(object, json.loads(path.read_text(encoding="utf-8-sig")))
+    if not isinstance(loaded, dict):
+        raise ConfigurationError(".clio-relay/secrets.json must contain a JSON object")
+    secrets = cast(dict[object, object], loaded)
+    value = secrets.get(env_name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or value == "":
+        raise ConfigurationError(
+            f".clio-relay/secrets.json field must be a non-empty string: {env_name}"
+        )
+    return value
 
 
 def _run_or_exit(action: Callable[[], None]) -> None:
