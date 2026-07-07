@@ -155,7 +155,7 @@ def _remote_probe_script(
         require_token = " --require-token"
     jarvis_bin = definition.jarvis_bin or "$HOME/.local/bin/jarvis"
     frpc_bin = definition.frpc_bin or "$HOME/.local/bin/frpc"
-    agent_bin = definition.agent_bin or f"$HOME/.local/bin/{definition.agent_npm_bin}"
+    agent_bin = _cluster_agent_bin(definition)
     return f"""set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 export CLIO_RELAY_CORE_DIR="{definition.core_dir}"
@@ -212,6 +212,14 @@ def _shell_single_quote(value: str) -> str:
 
 def _shell_double_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _cluster_agent_bin(definition: ClusterDefinition) -> str:
+    if definition.agent_bin is not None:
+        return definition.agent_bin
+    if definition.agent_npm_bin is not None:
+        return f"$HOME/.local/bin/{definition.agent_npm_bin}"
+    return "agent"
 
 
 def _popen(*args: Any, **kwargs: Any) -> ManagedProcess:

@@ -83,6 +83,26 @@ def test_settings_env_bins_override_bootstrap_managed_bins(
     assert settings.frpc_bin == "/opt/frpc"
 
 
+def test_settings_agent_defaults_are_provider_neutral(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.delenv("CLIO_RELAY_AGENT_BIN", raising=False)
+    monkeypatch.delenv("CLIO_RELAY_AGENT_ADAPTER", raising=False)
+
+    settings = RelaySettings.from_env()
+
+    assert settings.agent_bin == "agent"
+    assert settings.agent_adapter == "exec"
+
+
+def test_settings_agent_env_overrides(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("CLIO_RELAY_AGENT_BIN", "/opt/agents/codex")
+    monkeypatch.setenv("CLIO_RELAY_AGENT_ADAPTER", "codex")
+
+    settings = RelaySettings.from_env()
+
+    assert settings.agent_bin == "/opt/agents/codex"
+    assert settings.agent_adapter == "codex"
+
+
 def test_settings_discovers_project_local_frp_bins(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

@@ -53,9 +53,9 @@ class ClusterDefinition(BaseModel):
     jarvis_bin: str | None = None
     frpc_bin: str | None = None
     agent_bin: str | None = None
-    agent_adapter: str = "codex"
-    agent_npm_package: str = "@openai/codex"
-    agent_npm_bin: str = "codex"
+    agent_adapter: str = "exec"
+    agent_npm_package: str | None = None
+    agent_npm_bin: str | None = None
     agent_args: list[str] = Field(default_factory=list)
     frp_transport: FrpTransportConfig = Field(default_factory=FrpTransportConfig)
     live_test: LiveTestConfig = Field(default_factory=LiveTestConfig)

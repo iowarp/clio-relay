@@ -30,8 +30,8 @@ class JarvisCdProvider:
         self,
         *,
         jarvis_bin: str = "jarvis",
-        agent_bin: str = "codex",
-        agent_adapter: str = "codex",
+        agent_bin: str = "agent",
+        agent_adapter: str = "exec",
         agent_args: list[str] | None = None,
     ) -> None:
         self.jarvis_bin = jarvis_bin

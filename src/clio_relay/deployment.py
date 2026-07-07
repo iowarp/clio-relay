@@ -21,9 +21,7 @@ def render_endpoint_user_service(
     spool_dir = _systemd_home_path(definition.spool_dir)
     jarvis_bin = _systemd_home_path(definition.jarvis_bin or "$HOME/.local/bin/jarvis")
     frpc_bin = _systemd_home_path(definition.frpc_bin or "$HOME/.local/bin/frpc")
-    agent_bin = _systemd_home_path(
-        definition.agent_bin or f"$HOME/.local/bin/{definition.agent_npm_bin}"
-    )
+    agent_bin = _systemd_home_path(_configured_agent_bin(definition))
     agent_args = " ".join(definition.agent_args)
     return f"""[Unit]
 Description=clio-relay worker endpoint for {cluster}
@@ -114,3 +112,11 @@ def write_endpoint_user_service(path: Path, service_text: str) -> Path:
 
 def _systemd_home_path(value: str) -> str:
     return value.replace("$HOME", "%h")
+
+
+def _configured_agent_bin(definition: ClusterDefinition) -> str:
+    if definition.agent_bin is not None:
+        return definition.agent_bin
+    if definition.agent_npm_bin is not None:
+        return f"$HOME/.local/bin/{definition.agent_npm_bin}"
+    return "agent"

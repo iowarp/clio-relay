@@ -19,13 +19,30 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert "CLIO_RELAY_AGENT_NPM_BIN" in script
     assert 'npm install -g "$AGENT_NPM_PACKAGE"' in script
     assert "CLIO_RELAY_AGENT_BIN" in script
-    assert "CLIO_RELAY_AGENT_ADAPTER=codex" in script
+    assert "AGENT_NPM_PACKAGE=${CLIO_RELAY_AGENT_NPM_PACKAGE:-''}" in script
+    assert "AGENT_NPM_BIN=${CLIO_RELAY_AGENT_NPM_BIN:-''}" in script
+    assert "CLIO_RELAY_AGENT_ADAPTER=exec" in script
     assert "CLIO_RELAY_AGENT_ARGS=''" in script
     assert "github.com/grc-iit/jarvis-cd.git" in script
     assert 'jarvis repo add "$DEST/jarvis-packages/clio_relay" --force true' in script
     assert "CLIO_RELAY_CORE_DIR" in script
     assert "clio-relay init" in script
     assert "\r" not in script
+
+
+def test_linux_user_bootstrap_script_accepts_explicit_npm_agent() -> None:
+    script = render_linux_user_bootstrap_script(
+        agent_adapter="codex",
+        agent_npm_package="@openai/codex",
+        agent_npm_bin="codex",
+        agent_args=["--model", "gpt-5-codex"],
+    )
+
+    assert "AGENT_NPM_PACKAGE=${CLIO_RELAY_AGENT_NPM_PACKAGE:-@openai/codex}" in script
+    assert "AGENT_NPM_BIN=${CLIO_RELAY_AGENT_NPM_BIN:-codex}" in script
+    assert 'AGENT_BIN="$HOME/.local/bin/$AGENT_NPM_BIN"' in script
+    assert "CLIO_RELAY_AGENT_ADAPTER=codex" in script
+    assert "CLIO_RELAY_AGENT_ARGS='--model gpt-5-codex'" in script
 
 
 def test_bootstrap_refuses_dirty_git_checkout(tmp_path: Path) -> None:

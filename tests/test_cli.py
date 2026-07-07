@@ -345,7 +345,7 @@ def test_cli_cluster_add_writes_explicit_definition(
     definition = registry.require("delta")
     assert definition.ssh_host == "delta-login"
     assert definition.agent_adapter == "exec"
-    assert definition.agent_npm_package == ""
+    assert definition.agent_npm_package is None
     assert definition.agent_npm_bin == "clio"
     assert definition.frp_transport.server_addr == "relay.example.edu"
     assert definition.frp_transport.protocol == "tcp"

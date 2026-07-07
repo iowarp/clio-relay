@@ -23,8 +23,8 @@ class RelaySettings(BaseModel):
     jarvis_bin: str = "jarvis"
     frpc_bin: str = "frpc"
     api_token: str | None = None
-    agent_bin: str = "codex"
-    agent_adapter: str = "codex"
+    agent_bin: str = "agent"
+    agent_adapter: str = "exec"
     agent_args: list[str] = Field(default_factory=list)
 
     @classmethod
@@ -40,9 +40,9 @@ class RelaySettings(BaseModel):
             api_token=os.getenv("CLIO_RELAY_API_TOKEN"),
             agent_bin=os.getenv(
                 "CLIO_RELAY_AGENT_BIN",
-                "codex",
+                "agent",
             ),
-            agent_adapter=os.getenv("CLIO_RELAY_AGENT_ADAPTER", "codex"),
+            agent_adapter=os.getenv("CLIO_RELAY_AGENT_ADAPTER", "exec"),
             agent_args=_split_args(os.getenv("CLIO_RELAY_AGENT_ARGS")),
         )
 

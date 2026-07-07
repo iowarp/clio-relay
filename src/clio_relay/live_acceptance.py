@@ -675,7 +675,7 @@ def _remote_shell(ssh_host: str, script: str, *, runner: CommandRunner) -> str:
 def _remote_env(definition: ClusterDefinition) -> str:
     jarvis_bin = definition.jarvis_bin or "$HOME/.local/bin/jarvis"
     frpc_bin = definition.frpc_bin or "$HOME/.local/bin/frpc"
-    agent_bin = definition.agent_bin or f"$HOME/.local/bin/{definition.agent_npm_bin}"
+    agent_bin = _cluster_agent_bin(definition)
     return " ".join(
         [
             'export PATH="$HOME/.local/bin:$PATH";',
@@ -691,6 +691,14 @@ def _remote_env(definition: ClusterDefinition) -> str:
 
 def _shell_double_quoted(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _cluster_agent_bin(definition: ClusterDefinition) -> str:
+    if definition.agent_bin is not None:
+        return definition.agent_bin
+    if definition.agent_npm_bin is not None:
+        return f"$HOME/.local/bin/{definition.agent_npm_bin}"
+    return "agent"
 
 
 def _run_command(

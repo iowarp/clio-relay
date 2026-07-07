@@ -397,15 +397,15 @@ def cluster_add(
     agent_adapter: Annotated[
         str,
         typer.Option(help="Remote agent adapter name."),
-    ] = "codex",
+    ] = "exec",
     agent_npm_package: Annotated[
-        str,
+        str | None,
         typer.Option(help="Optional npm package used to install the agent."),
-    ] = "@openai/codex",
+    ] = None,
     agent_npm_bin: Annotated[
-        str,
+        str | None,
         typer.Option(help="Agent binary name provided by npm or PATH."),
-    ] = "codex",
+    ] = None,
     frp_server_addr: Annotated[
         str,
         typer.Option(help="frps server address for this cluster transport."),
@@ -437,10 +437,10 @@ def cluster_add(
         spool_dir=spool_dir,
         jarvis_bin=jarvis_bin,
         frpc_bin=frpc_bin,
-        agent_bin=agent_bin,
+        agent_bin=_none_if_blank(agent_bin),
         agent_adapter=agent_adapter,
-        agent_npm_package=agent_npm_package,
-        agent_npm_bin=agent_npm_bin,
+        agent_npm_package=_none_if_blank(agent_npm_package),
+        agent_npm_bin=_none_if_blank(agent_npm_bin),
         frp_transport=FrpTransportConfig(
             protocol=frp_protocol,
             server_addr=frp_server_addr,
@@ -992,6 +992,12 @@ def live_test(
 def _file_idempotency_key(path: Path, text: str) -> str:
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return f"jarvis:{path.resolve()}:{digest}"
+
+
+def _none_if_blank(value: str | None) -> str | None:
+    if value is None or value.strip() == "":
+        return None
+    return value
 
 
 def _json_object(value: str) -> dict[str, object]:

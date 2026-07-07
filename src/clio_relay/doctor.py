@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 import shutil
 import subprocess
 
@@ -43,9 +44,8 @@ def run_cluster_doctor(definition: ClusterDefinition) -> list[str]:
     """Run live cluster-side checks over SSH and return status lines."""
     jarvis_bin = _shell_double_quote(definition.jarvis_bin or "$HOME/.local/bin/jarvis")
     frpc_bin = _shell_double_quote(definition.frpc_bin or "$HOME/.local/bin/frpc")
-    agent_bin = _shell_double_quote(
-        definition.agent_bin or f"$HOME/.local/bin/{definition.agent_npm_bin}"
-    )
+    agent_bin = _shell_double_quote(definition.agent_bin or "")
+    agent_npm_bin = shlex.quote(definition.agent_npm_bin or "")
     script = f"""set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 echo "cluster: {definition.name}"
@@ -56,13 +56,21 @@ AGENT_BIN="${{CLIO_RELAY_AGENT_BIN:-}}"
 if [ -z "$AGENT_BIN" ]; then
   AGENT_BIN={agent_bin}
 fi
+AGENT_NPM_BIN={agent_npm_bin}
+if [ -z "$AGENT_BIN" ] && [ -n "$AGENT_NPM_BIN" ]; then
+  AGENT_BIN="$HOME/.local/bin/$AGENT_NPM_BIN"
+fi
 echo "frpc=$("$FRPC_BIN" --version)"
 echo "frps=$(frps --version)"
 echo "jarvis=$("$JARVIS_BIN" --help | head -n 1)"
-if [ ! -x "$AGENT_BIN" ]; then
-  AGENT_BIN="$(command -v {definition.agent_npm_bin})"
+if [ -z "$AGENT_BIN" ]; then
+  echo "agent=not_configured"
+elif [ ! -x "$AGENT_BIN" ] && [ -n "$AGENT_NPM_BIN" ]; then
+  AGENT_BIN="$(command -v "$AGENT_NPM_BIN" || true)"
 fi
-echo "agent=$("$AGENT_BIN" --version)"
+if [ -n "$AGENT_BIN" ]; then
+  echo "agent=$("$AGENT_BIN" --version)"
+fi
 echo "clio_relay=$(clio-relay --help | head -n 1)"
 """
     result = subprocess.run(

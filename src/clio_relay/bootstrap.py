@@ -159,9 +159,9 @@ def bootstrap_cluster_over_ssh(
     bootstrap_profile: str,
     ssh_host: str,
     source_root: Path,
-    agent_adapter: str = "codex",
-    agent_npm_package: str = "@openai/codex",
-    agent_npm_bin: str = "codex",
+    agent_adapter: str = "exec",
+    agent_npm_package: str | None = None,
+    agent_npm_bin: str | None = None,
     agent_args: list[str] | None = None,
     frp_version: str = FRP_VERSION,
 ) -> list[str]:
@@ -196,14 +196,16 @@ def bootstrap_cluster_over_ssh(
 def render_linux_user_bootstrap_script(
     *,
     frp_version: str = FRP_VERSION,
-    agent_adapter: str = "codex",
-    agent_npm_package: str = "@openai/codex",
-    agent_npm_bin: str = "codex",
+    agent_adapter: str = "exec",
+    agent_npm_package: str | None = None,
+    agent_npm_bin: str | None = None,
     agent_args: list[str] | None = None,
 ) -> str:
     """Render the idempotent shell script used for the current Linux cluster bootstrap."""
     rendered_agent_adapter = shlex.quote(agent_adapter)
     rendered_agent_args = shlex.quote(" ".join(agent_args or []))
+    rendered_agent_npm_package = shlex.quote(agent_npm_package or "")
+    rendered_agent_npm_bin = shlex.quote(agent_npm_bin or "")
     script = f"""set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$HOME/.local/bin" "$HOME/.local/src" "$HOME/.local/share/clio-relay"
@@ -224,9 +226,12 @@ if [ ! -x "$HOME/.local/bin/uv" ]; then
 fi
 uv python install 3.12
 
-AGENT_NPM_PACKAGE="${{CLIO_RELAY_AGENT_NPM_PACKAGE:-{agent_npm_package}}}"
-AGENT_NPM_BIN="${{CLIO_RELAY_AGENT_NPM_BIN:-{agent_npm_bin}}}"
-AGENT_BIN="${{CLIO_RELAY_AGENT_BIN:-$HOME/.local/bin/$AGENT_NPM_BIN}}"
+AGENT_NPM_PACKAGE=${{CLIO_RELAY_AGENT_NPM_PACKAGE:-{rendered_agent_npm_package}}}
+AGENT_NPM_BIN=${{CLIO_RELAY_AGENT_NPM_BIN:-{rendered_agent_npm_bin}}}
+AGENT_BIN="${{CLIO_RELAY_AGENT_BIN:-}}"
+if [ -z "$AGENT_BIN" ] && [ -n "$AGENT_NPM_BIN" ]; then
+  AGENT_BIN="$HOME/.local/bin/$AGENT_NPM_BIN"
+fi
 if [ ! -x "$AGENT_BIN" ] && [ -n "$AGENT_NPM_PACKAGE" ] && command -v npm >/dev/null 2>&1; then
   npm install -g "$AGENT_NPM_PACKAGE"
 fi
@@ -274,7 +279,7 @@ CLIO_RELAY_CORE_DIR="$HOME/.local/share/clio-relay/core" \
 CLIO_RELAY_SPOOL_DIR="$HOME/.local/share/clio-relay/spool" \
 CLIO_RELAY_JARVIS_BIN="$HOME/.local/bin/jarvis" \
 CLIO_RELAY_FRPC_BIN="$HOME/.local/bin/frpc" \
-CLIO_RELAY_AGENT_BIN="$AGENT_BIN" \
+CLIO_RELAY_AGENT_BIN="${{AGENT_BIN:-agent}}" \
 CLIO_RELAY_AGENT_ADAPTER={rendered_agent_adapter} \
 CLIO_RELAY_AGENT_ARGS={rendered_agent_args} \
 clio-relay init
