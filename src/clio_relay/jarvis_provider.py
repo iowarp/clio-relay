@@ -319,11 +319,35 @@ def _document_uses_scheduler(document: object) -> bool:
 def _jarvis_python(jarvis_bin: str) -> str:
     jarvis_path = Path(jarvis_bin)
     if jarvis_path.parent.name == "bin":
-        return str(jarvis_path.parent / "python")
+        candidate = jarvis_path.parent / "python"
+        if candidate.exists():
+            return str(candidate)
+        shebang_python = _python_from_shebang(jarvis_path)
+        if shebang_python is not None:
+            return shebang_python
     resolved = shutil.which(jarvis_bin)
     if resolved is not None:
         resolved_path = Path(resolved)
         candidate = resolved_path.parent / "python"
         if candidate.exists():
             return str(candidate)
+        shebang_python = _python_from_shebang(resolved_path)
+        if shebang_python is not None:
+            return shebang_python
     return "python"
+
+
+def _python_from_shebang(path: Path) -> str | None:
+    try:
+        first_line = path.read_text(encoding="utf-8").splitlines()[0]
+    except (IndexError, OSError, UnicodeDecodeError):
+        return None
+    if not first_line.startswith("#!"):
+        return None
+    command = first_line[2:].strip()
+    if not command:
+        return None
+    executable = command.split(maxsplit=1)[0]
+    if Path(executable).name.startswith("python"):
+        return executable
+    return None

@@ -90,11 +90,14 @@ def test_scheduled_pipeline_uses_waiting_scheduler_runner(tmp_path: Path) -> Non
         ),
         encoding="utf-8",
     )
-    provider = JarvisCdProvider(jarvis_bin="/opt/jarvis/bin/jarvis")
+    bin_dir = tmp_path / "opt" / "jarvis" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "python").write_text("", encoding="utf-8")
+    provider = JarvisCdProvider(jarvis_bin=str(bin_dir / "jarvis"))
 
     command = provider.pipeline_command(pipeline)
 
-    assert command[0].replace("\\", "/") == "/opt/jarvis/bin/python"
+    assert command[0] == str(bin_dir / "python")
     assert command[1] == "-c"
     assert "wait=True" in command[2]
     assert command[3] == str(pipeline)
@@ -122,3 +125,31 @@ def test_scheduled_pipeline_test_config_uses_scheduler_runner(tmp_path: Path) ->
     assert command[1] == "-c"
     assert "load_yaml_auto" in command[2]
     assert command[3] == str(pipeline)
+
+
+def test_scheduled_pipeline_uses_wrapper_shebang_when_sibling_python_is_missing(
+    tmp_path: Path,
+) -> None:
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text(
+        yaml.safe_dump(
+            {
+                "name": "scheduled",
+                "scheduler": {"name": "slurm"},
+                "pkgs": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    jarvis = bin_dir / "jarvis"
+    jarvis.write_text(
+        "#!/opt/clio-relay/jarvis-venv/bin/python\nprint('jarvis')\n",
+        encoding="utf-8",
+    )
+    provider = JarvisCdProvider(jarvis_bin=str(jarvis))
+
+    command = provider.pipeline_command(pipeline)
+
+    assert command[0] == "/opt/clio-relay/jarvis-venv/bin/python"
