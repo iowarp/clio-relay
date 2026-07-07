@@ -74,13 +74,20 @@ uv run clio-relay live-test --cluster ares --jarvis-yaml .\.clio-relay\live\ares
   "live_test": {
     "jarvis_yaml": ".clio-relay/live/ares-lammps.yaml",
     "monitor_pattern": "Total.*wall.*time",
+    "progress_pattern": "^\\s*(?P<step>\\d+)\\s+",
+    "progress_action_payload": {
+      "label": "iteration",
+      "current_group": "step",
+      "total": 150,
+      "unit": "step"
+    },
     "agent_prompt": "/home/user/.local/share/clio-relay/agent-tests/prompt.md",
     "agent_mcp_config": "/home/user/.local/share/clio-relay/agent-tests/mcp.toml"
   }
 }
 ```
 
-The acceptance runner submits the configured JARVIS YAML on the target cluster, waits for terminal success, verifies event replay, verifies durable task records, reads stdout/stderr by offset, lists and reads artifacts, verifies the provenance artifact, evaluates the configured monitor pattern, and optionally runs a configured remote-agent task. When an agent MCP config is supplied, acceptance also requires the agent to report a child relay job id and verifies that child job with the same event, task, log, artifact, and provenance checks. The cluster registry owns what `ares`, `homelab`, or any later target means.
+The acceptance runner submits the configured JARVIS YAML on the target cluster, waits for terminal success, verifies event replay, verifies durable task records, reads stdout/stderr by offset, lists and reads artifacts, verifies the provenance artifact, evaluates the configured monitor pattern, and can record structured progress from stdout events through a configured regex/action payload. When an agent MCP config is supplied, acceptance also requires the agent to report a child relay job id and verifies that child job with the same event, task, log, artifact, and provenance checks. The cluster registry owns what `ares`, `homelab`, or any later target means.
 
 ## Cloudflare-backed frps edge
 

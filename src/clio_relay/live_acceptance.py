@@ -9,7 +9,7 @@ import re
 import shlex
 import subprocess
 from base64 import b64decode
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, cast
 from uuid import uuid4
@@ -32,6 +32,10 @@ class CommandRunner(Protocol):
         ...
 
 
+def _empty_progress_payload() -> dict[str, object]:
+    return {}
+
+
 @dataclass(frozen=True)
 class LiveAcceptanceOptions:
     """Inputs for a full live acceptance run."""
@@ -40,6 +44,8 @@ class LiveAcceptanceOptions:
     definition: ClusterDefinition
     jarvis_yaml: Path | None = None
     monitor_pattern: str | None = None
+    progress_pattern: str | None = None
+    progress_action_payload: dict[str, object] = field(default_factory=_empty_progress_payload)
     agent_prompt: str | None = None
     agent_mcp_config: str | None = None
     require_agent_child_job: bool | None = None
@@ -56,6 +62,12 @@ def run_live_acceptance(
     command_runner = runner or _run_command
     jarvis_yaml = options.jarvis_yaml or _configured_path(options.definition.live_test.jarvis_yaml)
     monitor_pattern = options.monitor_pattern or options.definition.live_test.monitor_pattern
+    progress_pattern = options.progress_pattern or options.definition.live_test.progress_pattern
+    progress_action_payload = (
+        options.progress_action_payload
+        if options.progress_action_payload
+        else options.definition.live_test.progress_action_payload
+    )
     agent_prompt = options.agent_prompt or options.definition.live_test.agent_prompt
     agent_mcp_config = options.agent_mcp_config or options.definition.live_test.agent_mcp_config
     require_agent_child_job = (
@@ -141,6 +153,16 @@ def run_live_acceptance(
         if not actions:
             raise RelayError(f"acceptance monitor pattern did not match: {monitor_pattern}")
         lines.append("acceptance.monitor=ok")
+
+    if progress_pattern is not None:
+        _verify_progress_monitor(
+            options.definition,
+            job_id,
+            pattern=progress_pattern,
+            action_payload=progress_action_payload,
+            lines=lines,
+            runner=command_runner,
+        )
 
     if agent_prompt is not None:
         agent_args = [
@@ -301,6 +323,54 @@ def _verify_completed_job(
     if provenance_payload.get("encoding") != "base64":
         raise RelayError("acceptance provenance payload was not base64 encoded")
     lines.append(f"{line_prefix}.provenance=ok")
+
+
+def _verify_progress_monitor(
+    definition: ClusterDefinition,
+    job_id: str,
+    *,
+    pattern: str,
+    action_payload: dict[str, object],
+    lines: list[str],
+    runner: CommandRunner,
+) -> None:
+    _remote_clio_json(
+        definition,
+        [
+            "monitor",
+            "add-regex",
+            job_id,
+            "--pattern",
+            pattern,
+            "--action",
+            "record_progress",
+            "--event-type",
+            "stdout.delta",
+            "--action-payload-json",
+            json.dumps(action_payload, sort_keys=True, separators=(",", ":")),
+        ],
+        runner=runner,
+    )
+    actions = _remote_clio_json(
+        definition,
+        ["monitor", "run-once", "--limit", "250"],
+        runner=runner,
+    )
+    action_items = cast(list[dict[str, Any]], actions)
+    progress_actions = [
+        action for action in action_items if action.get("action") == "record_progress"
+    ]
+    if not progress_actions:
+        raise RelayError(f"acceptance progress pattern did not record progress: {pattern}")
+    progress = _remote_clio_json(
+        definition,
+        ["job", "progress", job_id],
+        runner=runner,
+    )
+    progress_items = cast(list[dict[str, Any]], progress)
+    if not progress_items:
+        raise RelayError("acceptance progress records missing after monitor evaluation")
+    lines.append(f"acceptance.progress={len(progress_items)}")
 
 
 def _find_agent_child_job(

@@ -99,7 +99,29 @@ def test_live_acceptance_runs_configured_pipeline_and_monitor(
         if "monitor add-regex" in script:
             return _completed(command, json.dumps({"rule_id": "rule_abc"}))
         if "monitor run-once" in script:
-            return _completed(command, json.dumps([{"action": "emit_event"}]))
+            return _completed(
+                command,
+                json.dumps(
+                    [
+                        {"action": "emit_event"},
+                        {"action": "record_progress", "progress_id": "progress_abc"},
+                    ]
+                ),
+            )
+        if "job progress" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    [
+                        {
+                            "progress_id": "progress_abc",
+                            "label": "iteration",
+                            "current": 5,
+                            "total": 10,
+                        }
+                    ]
+                ),
+            )
         raise AssertionError(f"unexpected command: {command}")
 
     monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
@@ -113,6 +135,13 @@ def test_live_acceptance_runs_configured_pipeline_and_monitor(
                 live_test=LiveTestConfig(monitor_pattern="done"),
             ),
             jarvis_yaml=pipeline,
+            progress_pattern=r"step=(?P<step>\d+)",
+            progress_action_payload={
+                "label": "iteration",
+                "current_group": "step",
+                "total": 10,
+                "unit": "step",
+            },
         ),
         runner=fake_runner,
     )
@@ -122,6 +151,7 @@ def test_live_acceptance_runs_configured_pipeline_and_monitor(
     assert "acceptance.artifact_read=ok" in lines
     assert "acceptance.provenance=ok" in lines
     assert "acceptance.monitor=ok" in lines
+    assert "acceptance.progress=1" in lines
     assert "live acceptance passed" in lines
     assert pipeline.read_bytes() in uploaded
     assert any("job submit" in " ".join(command) for command in commands)

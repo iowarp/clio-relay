@@ -101,6 +101,58 @@ def test_cli_creates_and_evaluates_monitor_rule(tmp_path: Path, monkeypatch: Mon
     assert json.loads(run_result.output)[0]["action"] == "emit_event"
 
 
+def test_cli_accepts_json_object_from_file(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    core_dir = tmp_path / "core"
+    payload_path = tmp_path / "progress-payload.json"
+    payload_path.write_text(
+        json.dumps(
+            {
+                "label": "iteration",
+                "current_group": "step",
+                "total": 100,
+                "unit": "step",
+            }
+        ),
+        encoding="utf-8-sig",
+    )
+    queue = ClioCoreQueue(core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="cli-json-file",
+        )
+    )
+    queue.append_event(job.job_id, "stdout.delta", "step 25", payload={"text": "step 25\n"})
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    runner = CliRunner()
+
+    add_result = runner.invoke(
+        app,
+        [
+            "monitor",
+            "add-regex",
+            job.job_id,
+            "--pattern",
+            r"step (?P<step>\d+)",
+            "--action",
+            "record_progress",
+            "--event-type",
+            "stdout.delta",
+            "--action-payload-json",
+            f"@{payload_path}",
+        ],
+    )
+    run_result = runner.invoke(app, ["monitor", "run-once"])
+
+    assert add_result.exit_code == 0
+    assert run_result.exit_code == 0
+    progress = ClioCoreQueue(core_dir).list_progress(job.job_id)
+    assert progress[0].label == "iteration"
+    assert progress[0].current == 25
+
+
 def test_cli_render_frpc_uses_configured_secret_env(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

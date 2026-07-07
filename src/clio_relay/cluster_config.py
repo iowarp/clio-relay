@@ -29,6 +29,8 @@ class LiveTestConfig(BaseModel):
 
     jarvis_yaml: str | None = None
     monitor_pattern: str | None = None
+    progress_pattern: str | None = None
+    progress_action_payload: dict[str, object] = Field(default_factory=dict)
     agent_prompt: str | None = None
     agent_mcp_config: str | None = None
 

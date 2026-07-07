@@ -772,6 +772,16 @@ def live_test(
         str | None,
         typer.Option(help="Regex expected to match stdout.delta during acceptance."),
     ] = None,
+    progress_pattern: Annotated[
+        str | None,
+        typer.Option(help="Regex used to record structured progress from stdout.delta."),
+    ] = None,
+    progress_action_payload_json: Annotated[
+        str,
+        typer.Option(
+            help="JSON object payload for progress monitor extraction, such as groups and units.",
+        ),
+    ] = "{}",
     agent_prompt: Annotated[
         str | None,
         typer.Option(help="Remote prompt path for optional agent acceptance."),
@@ -807,6 +817,8 @@ def live_test(
                     definition=definition,
                     jarvis_yaml=jarvis_yaml,
                     monitor_pattern=monitor_pattern,
+                    progress_pattern=progress_pattern,
+                    progress_action_payload=_json_object(progress_action_payload_json),
                     agent_prompt=agent_prompt,
                     agent_mcp_config=agent_mcp_config,
                     require_agent_child_job=require_agent_child_job,
@@ -825,7 +837,8 @@ def _file_idempotency_key(path: Path, text: str) -> str:
 
 
 def _json_object(value: str) -> dict[str, object]:
-    loaded = cast(object, json.loads(value))
+    source = Path(value[1:]).read_text(encoding="utf-8-sig") if value.startswith("@") else value
+    loaded = cast(object, json.loads(source))
     if not isinstance(loaded, dict):
         raise typer.BadParameter("value must be a JSON object")
     return {str(key): item for key, item in cast(dict[object, object], loaded).items()}
