@@ -137,6 +137,59 @@ def test_agent_timeout_writes_structured_result(
     assert return_code == 124
     assert result["returncode"] == 124
     assert result["timed_out"] is True
+    assert result["error_type"] == "TimeoutExpired"
+
+
+def test_missing_agent_binary_writes_structured_result(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("run", encoding="utf-8")
+
+    def fake_run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError(command[0])
+
+    monkeypatch.setattr(cast(Any, runner).subprocess, "run", fake_run)
+
+    return_code = cast(RemoteAgentRunnerModule, runner).run_remote_agent_from_params(
+        {
+            "agent_bin": "missing-agent",
+            "agent_adapter": "exec",
+            "prompt_path": str(prompt_path),
+        }
+    )
+
+    result = json.loads((tmp_path / "agent-result.json").read_text(encoding="utf-8"))
+
+    assert return_code == 127
+    assert result["returncode"] == 127
+    assert result["error_type"] == "FileNotFoundError"
+    assert result["agent_bin"] == "missing-agent"
+
+
+def test_invalid_agent_setup_writes_structured_result(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+
+    return_code = cast(RemoteAgentRunnerModule, runner).run_remote_agent_from_params(
+        {
+            "agent_bin": "agent",
+            "agent_adapter": "missing-adapter",
+            "prompt_path": str(tmp_path / "missing-prompt.md"),
+        }
+    )
+
+    result = json.loads((tmp_path / "agent-result.json").read_text(encoding="utf-8"))
+
+    assert return_code == 2
+    assert result["returncode"] == 2
+    assert result["error_type"] == "FileNotFoundError"
+    assert result["prompt_path"].endswith("missing-prompt.md")
 
 
 def _load_runner() -> ModuleType:
