@@ -293,6 +293,10 @@ fi
 if command -v lmp_mpi >/dev/null 2>&1; then
   exec lmp_mpi "$@"
 fi
+real_lmp="$(command -v lmp || true)"
+if [ -n "$real_lmp" ] && [ "$real_lmp" != "$HOME/.local/bin/lmp" ]; then
+  exec "$real_lmp" "$@"
+fi
 if command -v lammps >/dev/null 2>&1; then
   exec lammps "$@"
 fi
@@ -319,7 +323,7 @@ while [ "$#" -gt 0 ]; do
       ranks="${{2:-}}"
       shift 2
       ;;
-    -p|-f|--host|--hostfile|-host|-hostfile|--hosts|-hosts|-ppn|-npernode)
+    -p|-f|--host|--hostfile|-host|-hostfile|--hosts|-hosts|--ppn|-ppn|-npernode)
       shift 2
       ;;
     -genv|--env)

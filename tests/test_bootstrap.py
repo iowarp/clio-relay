@@ -28,9 +28,10 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert 'cat > "$HOME/.local/bin/lmp"' in script
     assert "spack install lammps" in script
     assert "spack load lammps" in script
+    assert 'real_lmp="$(command -v lmp || true)"' in script
     assert 'cat > "$HOME/.local/bin/mpiexec"' in script
     assert 'echo "mpich 4.0.0 clio-relay user-space wrapper"' in script
-    assert "-p|-f|--host|--hostfile|-host|-hostfile|--hosts|-hosts|-ppn|-npernode)" in script
+    assert "-p|-f|--host|--hostfile|-host|-hostfile|--hosts|-hosts|--ppn|-ppn|-npernode)" in script
     assert "-genv|--env)" in script
     assert "-env)" in script
     assert "*=*)" in script
