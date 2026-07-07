@@ -25,6 +25,7 @@ from clio_relay.models import (
     JobState,
     Lease,
     MonitorRule,
+    ProgressRecord,
     RelayEvent,
     RelayJob,
     RelayTask,
@@ -51,6 +52,7 @@ class ClioCoreQueue:
             "events",
             "cursors",
             "artifacts",
+            "progress",
             "checkpoints",
             "idempotency",
             "monitor_rules",
@@ -265,6 +267,41 @@ class ClioCoreQueue:
         if artifact is None:
             raise NotFoundError(f"artifact not found: {artifact_id}")
         return artifact
+
+    def append_progress(self, progress: ProgressRecord) -> ProgressRecord:
+        """Record a structured job progress observation."""
+        self.initialize()
+        with self._lock:
+            self.get_job(progress.job_id)
+            self._write(self.root / "progress" / f"{progress.progress_id}.json", progress)
+            self.append_event(
+                progress.job_id,
+                "progress.updated",
+                progress.message or f"Progress updated: {progress.label}",
+                locked=True,
+                payload={
+                    "progress_id": progress.progress_id,
+                    "label": progress.label,
+                    "current": progress.current,
+                    "total": progress.total,
+                    "unit": progress.unit,
+                    "message": progress.message,
+                    "source_event_seq": progress.source_event_seq,
+                },
+            )
+        return progress
+
+    def list_progress(self, job_id: str) -> list[ProgressRecord]:
+        """Return structured progress observations for a job."""
+        self.initialize()
+        return sorted(
+            [
+                progress
+                for progress in self._read_many(self.root / "progress", ProgressRecord)
+                if progress.job_id == job_id
+            ],
+            key=lambda progress: progress.created_at,
+        )
 
     def append_monitor_rule(self, rule: MonitorRule) -> MonitorRule:
         """Create a durable monitor rule."""

@@ -20,6 +20,7 @@ from clio_relay.models import (
     JobState,
     MonitorRule,
     MonitorRuleAction,
+    ProgressRecord,
     RelayEvent,
     RelayJob,
     RemoteAgentTaskSpec,
@@ -135,18 +136,22 @@ def evaluate_monitor_rules(queue: ClioCoreQueue, *, limit: int = 100) -> list[di
             Cursor(job_id=rule.job_id, next_seq=rule.next_seq),
             limit=limit,
         )
-        matched = None
+        matched: tuple[RelayEvent, re.Match[str]] | None = None
         for event in events:
             if rule.event_types and event.event_type not in rule.event_types:
                 continue
-            if any(pattern.search(candidate) for candidate in _event_search_text(event)):
-                matched = event
+            for candidate in _event_search_text(event):
+                match = pattern.search(candidate)
+                if match is not None:
+                    matched = (event, match)
+                    break
+            if matched is not None:
                 break
         updated = rule.model_copy(update={"next_seq": cursor.next_seq})
         if matched is None:
             queue.update_monitor_rule(updated)
             continue
-        action_result = _apply_monitor_rule_action(queue, updated, matched.seq)
+        action_result = _apply_monitor_rule_action(queue, updated, matched[0], matched[1])
         triggered = updated.model_copy(update={"triggered_at": utc_now(), "enabled": False})
         queue.update_monitor_rule(triggered)
         results.append(action_result)
@@ -164,8 +169,10 @@ def _event_search_text(event: RelayEvent) -> list[str]:
 def _apply_monitor_rule_action(
     queue: ClioCoreQueue,
     rule: MonitorRule,
-    event_seq: int,
+    event: RelayEvent,
+    match: re.Match[str],
 ) -> dict[str, object]:
+    event_seq = event.seq
     payload: dict[str, object] = {"rule_id": rule.rule_id, "matched_seq": event_seq}
     if rule.action == MonitorRuleAction.EMIT_EVENT:
         queue.append_event(
@@ -210,6 +217,36 @@ def _apply_monitor_rule_action(
             "matched_seq": event_seq,
             "submitted_job_id": agent_job.job_id,
         }
+    if rule.action == MonitorRuleAction.RECORD_PROGRESS:
+        progress = queue.append_progress(
+            ProgressRecord(
+                job_id=rule.job_id,
+                label=_progress_label(rule),
+                current=_progress_float(rule, "current", match),
+                total=_progress_float(rule, "total", match),
+                unit=_optional_payload_str(rule, "unit"),
+                message=_progress_message(rule, match),
+                source_event_seq=event_seq,
+                metadata={
+                    "rule_id": rule.rule_id,
+                    "event_type": event.event_type,
+                    "match_groups": dict(match.groupdict()),
+                },
+            )
+        )
+        payload["progress_id"] = progress.progress_id
+        queue.append_event(
+            rule.job_id,
+            "monitor.triggered",
+            f"Monitor rule triggered and recorded progress: {progress.progress_id}",
+            payload=payload,
+        )
+        return {
+            "rule_id": rule.rule_id,
+            "action": rule.action.value,
+            "matched_seq": event_seq,
+            "progress_id": progress.progress_id,
+        }
     raise ConfigurationError(f"unsupported monitor action: {rule.action}")
 
 
@@ -234,6 +271,57 @@ def _optional_payload_path(rule: MonitorRule, key: str) -> Path | None:
     if value is None:
         return None
     return Path(value)
+
+
+def _progress_label(rule: MonitorRule) -> str:
+    value = rule.action_payload.get("label", "progress")
+    if not isinstance(value, str) or value == "":
+        raise ConfigurationError("monitor progress label must be a non-empty string")
+    return value
+
+
+def _progress_message(rule: MonitorRule, match: re.Match[str]) -> str | None:
+    static = _optional_payload_str(rule, "message")
+    if static is not None:
+        return static
+    group_name = _optional_payload_str(rule, "message_group")
+    if group_name is None:
+        return None
+    return _progress_group_text(match, group_name)
+
+
+def _progress_float(rule: MonitorRule, key: str, match: re.Match[str]) -> float | None:
+    static_value = rule.action_payload.get(key)
+    if static_value is not None:
+        return _coerce_progress_float(static_value, key)
+    group_name = _optional_payload_str(rule, f"{key}_group")
+    if group_name is None:
+        return None
+    text = _progress_group_text(match, group_name)
+    if text is None:
+        return None
+    return _coerce_progress_float(text, key)
+
+
+def _progress_group_text(match: re.Match[str], group_name: str) -> str | None:
+    try:
+        value = match.group(int(group_name)) if group_name.isdigit() else match.group(group_name)
+    except (IndexError, KeyError) as exc:
+        raise ConfigurationError(f"monitor regex did not define group: {group_name}") from exc
+    return value
+
+
+def _coerce_progress_float(value: object, key: str) -> float:
+    if isinstance(value, bool):
+        raise ConfigurationError(f"monitor progress {key} must be numeric")
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError as exc:
+            raise ConfigurationError(f"monitor progress {key} must be numeric") from exc
+    raise ConfigurationError(f"monitor progress {key} must be numeric")
 
 
 def _artifact_file_path(uri: str) -> Path:

@@ -22,6 +22,7 @@ from clio_relay.models import (
     JobKind,
     McpCallSpec,
     MonitorRule,
+    ProgressRecord,
     RelayEvent,
     RelayJob,
     RemoteAgentTaskSpec,
@@ -73,6 +74,20 @@ class McpCallSubmitRequest(BaseModel):
     arguments: dict[str, object] = Field(default_factory=dict)
     timeout_seconds: int | None = Field(default=None, gt=0)
     idempotency_key: str
+
+
+class ProgressUpdateRequest(BaseModel):
+    """HTTP request to record a job progress observation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = "progress"
+    current: float | None = None
+    total: float | None = Field(default=None, gt=0)
+    unit: str | None = None
+    message: str | None = None
+    source_event_seq: int | None = Field(default=None, ge=1)
+    metadata: dict[str, object] = Field(default_factory=dict)
 
 
 def create_app(settings: RelaySettings | None = None) -> FastAPI:
@@ -199,6 +214,36 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     )
     def get_artifacts(job_id: str) -> list[ArtifactRef]:
         return queue.list_artifacts(job_id)
+
+    @app.get(
+        "/jobs/{job_id}/progress",
+        response_model=list[ProgressRecord],
+        dependencies=[auth_dependency],
+    )
+    def get_progress(job_id: str) -> list[ProgressRecord]:
+        return queue.list_progress(job_id)
+
+    @app.post(
+        "/jobs/{job_id}/progress",
+        response_model=ProgressRecord,
+        dependencies=[auth_dependency],
+    )
+    def record_progress(job_id: str, request: ProgressUpdateRequest) -> ProgressRecord:
+        try:
+            return queue.append_progress(
+                ProgressRecord(
+                    job_id=job_id,
+                    label=request.label,
+                    current=request.current,
+                    total=request.total,
+                    unit=request.unit,
+                    message=request.message,
+                    source_event_seq=request.source_event_seq,
+                    metadata=request.metadata,
+                )
+            )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/artifacts/{artifact_id}/content", dependencies=[auth_dependency])
     def get_artifact_content(artifact_id: str) -> dict[str, object]:

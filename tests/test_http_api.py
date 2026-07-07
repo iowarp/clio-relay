@@ -137,6 +137,41 @@ def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
     assert mcp.spec.arguments == {"case": "lammps", "steps": 100}
 
 
+def test_http_progress_endpoints_record_and_list_progress(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-progress",
+        )
+    )
+    client = cast(Any, TestClient(create_app(settings)))
+
+    record_response = client.post(
+        f"/jobs/{job.job_id}/progress",
+        json={
+            "label": "iteration",
+            "current": 5,
+            "total": 10,
+            "unit": "step",
+            "message": "half way",
+            "metadata": {"source": "http"},
+        },
+    )
+    list_response = client.get(f"/jobs/{job.job_id}/progress")
+
+    assert record_response.status_code == 200
+    assert list_response.status_code == 200
+    recorded = record_response.json()
+    listed = list_response.json()
+    assert recorded["label"] == "iteration"
+    assert recorded["current"] == 5
+    assert listed[0]["progress_id"] == recorded["progress_id"]
+
+
 def test_http_healthz_does_not_require_token(tmp_path: Path) -> None:
     client = cast(
         Any,

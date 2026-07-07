@@ -55,6 +55,7 @@ class MonitorRuleAction(StrEnum):
 
     EMIT_EVENT = "emit_event"
     SUBMIT_AGENT = "submit_agent"
+    RECORD_PROGRESS = "record_progress"
 
 
 class EventLevel(StrEnum):
@@ -190,6 +191,31 @@ class ArtifactRef(BaseModel):
     sha256: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProgressRecord(BaseModel):
+    """A durable job progress observation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    progress_id: str = Field(default_factory=lambda: new_id("progress"))
+    job_id: str
+    label: str = "progress"
+    current: float | None = None
+    total: float | None = Field(default=None, gt=0)
+    unit: str | None = None
+    message: str | None = None
+    source_event_seq: int | None = Field(default=None, ge=1)
+    created_at: datetime = Field(default_factory=utc_now)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("label")
+    @classmethod
+    def label_must_not_be_empty(cls, value: str) -> str:
+        """Reject empty progress labels."""
+        if value == "":
+            raise ValueError("label must not be empty")
+        return value
 
 
 class MonitorRule(BaseModel):

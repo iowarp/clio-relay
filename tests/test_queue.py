@@ -3,7 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.models import Cursor, JarvisRunSpec, JobKind, JobState, MonitorRule, RelayJob
+from clio_relay.models import (
+    Cursor,
+    JarvisRunSpec,
+    JobKind,
+    JobState,
+    MonitorRule,
+    MonitorRuleAction,
+    ProgressRecord,
+    RelayJob,
+)
 from clio_relay.relay_ops import evaluate_monitor_rules
 
 
@@ -149,6 +158,37 @@ def test_cursor_replay_after_restart(tmp_path: Path) -> None:
     assert cursor.next_seq == 3
 
 
+def test_progress_records_are_durable_and_emit_events(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "hello"]),
+            idempotency_key="progress",
+        )
+    )
+
+    progress = queue.append_progress(
+        ProgressRecord(
+            job_id=job.job_id,
+            label="steps",
+            current=10,
+            total=20,
+            unit="step",
+            message="half way",
+        )
+    )
+    listed = ClioCoreQueue(tmp_path).list_progress(job.job_id)
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=20)
+
+    assert [item.progress_id for item in listed] == [progress.progress_id]
+    assert listed[0].current == 10
+    assert listed[0].total == 20
+    assert [event.event_type for event in events][-1] == "progress.updated"
+    assert events[-1].payload["progress_id"] == progress.progress_id
+
+
 def test_monitor_rule_triggers_once_from_event_text(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path)
     job = queue.submit_job(
@@ -182,3 +222,54 @@ def test_monitor_rule_triggers_once_from_event_text(tmp_path: Path) -> None:
     ]
     assert second == []
     assert [event.event_type for event in events].count("monitor.triggered") == 1
+
+
+def test_monitor_rule_records_progress_from_regex_groups(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "hello"]),
+            idempotency_key="monitor-progress",
+        )
+    )
+    rule = queue.append_monitor_rule(
+        MonitorRule(
+            job_id=job.job_id,
+            pattern=r"PROGRESS current=(?P<current>\d+) total=(?P<total>\d+) (?P<message>.+)",
+            action=MonitorRuleAction.RECORD_PROGRESS,
+            event_types=["stdout.delta"],
+            action_payload={
+                "label": "iteration",
+                "current_group": "current",
+                "total_group": "total",
+                "message_group": "message",
+                "unit": "step",
+            },
+        )
+    )
+    queue.append_event(
+        job.job_id,
+        "stdout.delta",
+        "progress",
+        payload={"text": "PROGRESS current=4 total=10 running\n"},
+    )
+
+    result = evaluate_monitor_rules(queue)
+    progress = queue.list_progress(job.job_id)
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id, next_seq=1), limit=20)
+
+    assert result[0]["rule_id"] == rule.rule_id
+    assert result[0]["action"] == "record_progress"
+    assert len(progress) == 1
+    assert progress[0].label == "iteration"
+    assert progress[0].current == 4
+    assert progress[0].total == 10
+    assert progress[0].message == "running"
+    assert progress[0].unit == "step"
+    assert progress[0].source_event_seq == 3
+    assert [event.event_type for event in events][-2:] == [
+        "progress.updated",
+        "monitor.triggered",
+    ]

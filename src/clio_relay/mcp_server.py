@@ -18,6 +18,7 @@ from clio_relay.models import (
     McpCallSpec,
     MonitorRule,
     MonitorRuleAction,
+    ProgressRecord,
     RelayJob,
     RemoteAgentTaskSpec,
 )
@@ -242,6 +243,35 @@ def _tool_definitions() -> list[JSON]:
             },
         },
         {
+            "name": "relay_record_progress",
+            "description": "Record a structured progress observation for a relay job.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"},
+                    "label": {"type": "string", "default": "progress"},
+                    "current": {"type": "number"},
+                    "total": {"type": "number", "exclusiveMinimum": 0},
+                    "unit": {"type": "string"},
+                    "message": {"type": "string"},
+                    "source_event_seq": {"type": "integer", "minimum": 1},
+                    "metadata": {"type": "object", "default": {}},
+                },
+                "required": ["job_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_list_progress",
+            "description": "List structured progress observations for a relay job.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "relay_read_artifact",
             "description": "Read a file artifact payload as base64.",
             "inputSchema": {
@@ -271,7 +301,7 @@ def _tool_definitions() -> list[JSON]:
                     "pattern": {"type": "string"},
                     "action": {
                         "type": "string",
-                        "enum": ["emit_event", "submit_agent"],
+                        "enum": ["emit_event", "submit_agent", "record_progress"],
                         "default": "emit_event",
                     },
                     "event_types": {
@@ -357,6 +387,15 @@ def _call_tool(params: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -
         }
     elif name == "relay_read_artifact":
         result = read_artifact_bytes(queue, _required_str(arguments, "artifact_id"))
+    elif name == "relay_record_progress":
+        result = _record_progress(arguments, queue=queue)
+    elif name == "relay_list_progress":
+        result = {
+            "progress": [
+                progress.model_dump(mode="json")
+                for progress in queue.list_progress(_required_str(arguments, "job_id"))
+            ]
+        }
     elif name == "relay_cancel_job":
         result = request_cancel_job(queue, _required_str(arguments, "job_id")).model_dump(
             mode="json"
@@ -505,6 +544,25 @@ def _monitor_rule_from_arguments(arguments: JSON) -> MonitorRule:
     )
 
 
+def _record_progress(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+    metadata = arguments.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata must be an object")
+    progress = queue.append_progress(
+        ProgressRecord(
+            job_id=_required_str(arguments, "job_id"),
+            label=str(arguments.get("label", "progress")),
+            current=_optional_float(arguments, "current"),
+            total=_optional_float(arguments, "total"),
+            unit=_optional_str(arguments, "unit"),
+            message=_optional_str(arguments, "message"),
+            source_event_seq=_optional_int(arguments, "source_event_seq"),
+            metadata=cast(dict[str, Any], metadata),
+        )
+    )
+    return progress.model_dump(mode="json")
+
+
 def _object(value: Any) -> JSON:
     if not isinstance(value, dict):
         raise ValueError("expected object")
@@ -532,6 +590,15 @@ def _optional_int(value: JSON, key: str) -> int | None:
     if item is None:
         return None
     return int(item)
+
+
+def _optional_float(value: JSON, key: str) -> float | None:
+    item = value.get(key)
+    if item is None:
+        return None
+    if isinstance(item, bool):
+        raise ValueError(f"{key} must be a number")
+    return float(item)
 
 
 def _error(request_id: Any, code: int, message: str) -> JSON:

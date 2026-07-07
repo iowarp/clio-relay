@@ -35,6 +35,7 @@ from clio_relay.models import (
     McpCallSpec,
     MonitorRule,
     MonitorRuleAction,
+    ProgressRecord,
     RelayJob,
     RemoteAgentTaskSpec,
 )
@@ -532,6 +533,49 @@ def job_list_artifacts(
     """List artifact references indexed for a job as JSON."""
     artifacts = ClioCoreQueue(RelaySettings.from_env().core_dir).list_artifacts(job_id)
     typer.echo(json.dumps([artifact.model_dump(mode="json") for artifact in artifacts], indent=2))
+
+
+@job_app.command("progress")
+def job_progress(
+    job_id: str,
+) -> None:
+    """List structured progress observations for a job as JSON."""
+    progress = ClioCoreQueue(RelaySettings.from_env().core_dir).list_progress(job_id)
+    typer.echo(json.dumps([item.model_dump(mode="json") for item in progress], indent=2))
+
+
+@job_app.command("record-progress")
+def job_record_progress(
+    job_id: str,
+    label: Annotated[str, typer.Option(help="Progress label.")] = "progress",
+    current: Annotated[float | None, typer.Option(help="Current progress value.")] = None,
+    total: Annotated[float | None, typer.Option(help="Total progress value.")] = None,
+    unit: Annotated[str | None, typer.Option(help="Progress unit.")] = None,
+    message: Annotated[str | None, typer.Option(help="Human-readable progress message.")] = None,
+    source_event_seq: Annotated[
+        int | None,
+        typer.Option(help="Source event sequence for this progress observation."),
+    ] = None,
+    metadata_json: Annotated[
+        str,
+        typer.Option(help="JSON object metadata for this observation."),
+    ] = "{}",
+) -> None:
+    """Record a structured progress observation for a job."""
+    metadata = _json_object(metadata_json)
+    progress = ClioCoreQueue(RelaySettings.from_env().core_dir).append_progress(
+        ProgressRecord(
+            job_id=job_id,
+            label=label,
+            current=current,
+            total=total,
+            unit=unit,
+            message=message,
+            source_event_seq=source_event_seq,
+            metadata=metadata,
+        )
+    )
+    typer.echo(progress.model_dump_json(indent=2))
 
 
 @job_app.command("cancel")

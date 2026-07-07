@@ -37,6 +37,8 @@ def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
     assert "relay_read_job_log" in tool_names
     assert "relay_list_artifacts" in tool_names
     assert "relay_read_artifact" in tool_names
+    assert "relay_record_progress" in tool_names
+    assert "relay_list_progress" in tool_names
     assert "relay_cancel_job" in tool_names
     assert "relay_create_monitor_rule" in tool_names
     assert "relay_list_monitor_rules" in tool_names
@@ -247,6 +249,68 @@ def test_mcp_monitor_returns_job_and_events(tmp_path: Path) -> None:
     assert structured["job"]["job_id"] == job_id
     assert structured["events"][0]["event_type"] == "job.queued"
     assert structured["terminal"] is False
+
+
+def test_mcp_records_and_lists_progress(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    submit_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 23,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_submit_jarvis_pipeline",
+                "arguments": {
+                    "cluster": "test-cluster",
+                    "pipeline_yaml": "name: generic\npkgs: []\n",
+                },
+            },
+        },
+        queue=queue,
+    )
+    assert submit_response is not None
+    job_id = submit_response["result"]["structuredContent"]["job_id"]
+
+    record_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 24,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_record_progress",
+                "arguments": {
+                    "job_id": job_id,
+                    "label": "iteration",
+                    "current": 1,
+                    "total": 2,
+                    "unit": "step",
+                    "message": "running",
+                    "metadata": {"source": "agent"},
+                },
+            },
+        },
+        queue=queue,
+    )
+    list_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 25,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_list_progress",
+                "arguments": {"job_id": job_id},
+            },
+        },
+        queue=queue,
+    )
+
+    assert record_response is not None
+    assert list_response is not None
+    recorded = record_response["result"]["structuredContent"]
+    listed = list_response["result"]["structuredContent"]["progress"]
+    assert recorded["label"] == "iteration"
+    assert recorded["current"] == 1
+    assert listed[0]["progress_id"] == recorded["progress_id"]
 
 
 def test_codex_mcp_profile_points_to_clio_relay_server() -> None:
