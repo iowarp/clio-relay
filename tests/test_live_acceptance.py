@@ -11,6 +11,7 @@ from pytest import MonkeyPatch
 from clio_relay.cluster_config import ClusterDefinition, LiveTestConfig
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.live_acceptance import (
+    CommandRunner,
     LiveAcceptanceOptions,
     _assert_progress_adapter,  # pyright: ignore[reportPrivateUsage]
     _expected_progress_adapter,  # pyright: ignore[reportPrivateUsage]
@@ -384,6 +385,96 @@ def test_live_acceptance_transport_requires_secrets(tmp_path: Path) -> None:
                 jarvis_yaml=pipeline,
                 verify_transport=True,
             )
+        )
+
+
+def test_live_acceptance_verifies_direct_transport_when_enabled(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text("name: generic\npkgs: []\n", encoding="utf-8")
+    transport_calls: list[dict[str, object]] = []
+
+    def fake_cluster_doctor(_definition: ClusterDefinition) -> list[str]:
+        return ["cluster: test-cluster"]
+
+    def fake_direct_transport(**kwargs: object) -> list[str]:
+        transport_calls.append(kwargs)
+        return [
+            "direct_transport.result=xtcp",
+            "transport.proxy_type=xtcp",
+            "transport.healthz=ok",
+        ]
+
+    monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.run_frp_direct_http_probe",
+        fake_direct_transport,
+    )
+
+    lines = run_live_acceptance(
+        LiveAcceptanceOptions(
+            cluster="test-cluster",
+            definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            jarvis_yaml=pipeline,
+            verify_direct_transport=True,
+            transport_token="frp-token",
+            transport_secret_key="xtcp-secret",
+            transport_frpc_bin="frpc",
+            transport_local_bind_port=19876,
+            transport_remote_api_port=8766,
+            transport_proxy_name="direct-test",
+            api_token="api-token",
+        ),
+        runner=_generic_success_runner(),
+    )
+
+    assert "direct_transport.result=xtcp" in lines
+    assert "transport.proxy_type=xtcp" in lines
+    assert transport_calls[0]["token"] == "frp-token"
+    assert transport_calls[0]["secret_key"] == "xtcp-secret"
+    assert transport_calls[0]["allow_stcp_fallback"] is False
+    assert transport_calls[0]["local_bind_port"] == 19876
+    assert transport_calls[0]["remote_api_port"] == 8766
+    assert transport_calls[0]["proxy_name"] == "direct-test"
+    assert transport_calls[0]["api_token"] == "api-token"
+
+
+def test_live_acceptance_rejects_direct_transport_fallback_unless_allowed(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text("name: generic\npkgs: []\n", encoding="utf-8")
+
+    def fake_cluster_doctor(_definition: ClusterDefinition) -> list[str]:
+        return ["cluster: test-cluster"]
+
+    def fake_direct_transport(**_kwargs: object) -> list[str]:
+        return [
+            "direct_transport.result=frp_stcp",
+            "transport.proxy_type=stcp",
+            "transport.healthz=ok",
+        ]
+
+    monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.run_frp_direct_http_probe",
+        fake_direct_transport,
+    )
+
+    with pytest.raises(RelayError, match="did not prove XTCP"):
+        run_live_acceptance(
+            LiveAcceptanceOptions(
+                cluster="test-cluster",
+                definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+                jarvis_yaml=pipeline,
+                verify_direct_transport=True,
+                transport_token="frp-token",
+                transport_secret_key="xtcp-secret",
+            ),
+            runner=_generic_success_runner(),
         )
 
 
@@ -1078,6 +1169,59 @@ def test_agent_child_job_must_be_created_by_current_agent_run() -> None:
 
 def _completed(command: list[str], stdout: str) -> subprocess.CompletedProcess[bytes]:
     return subprocess.CompletedProcess(command, 0, stdout=stdout.encode(), stderr=b"")
+
+
+def _generic_success_runner() -> CommandRunner:
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        script = command[-1]
+        if "mkdir -p" in script or "cat >" in " ".join(command):
+            return _completed(command, "")
+        if "job submit" in script:
+            return _completed(command, "job_abc\n")
+        if "job wait" in script:
+            return _completed(command, json.dumps({"job_id": "job_abc", "state": "succeeded"}))
+        if "job monitor" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    {
+                        "events": [
+                            {"event_type": "job.queued"},
+                            {"event_type": "job.running"},
+                            {"event_type": "jarvis.started"},
+                            {"event_type": "job.succeeded"},
+                        ]
+                    }
+                ),
+            )
+        if "job tasks" in script:
+            return _completed(command, json.dumps([{"state": "succeeded"}]))
+        if "read-log" in script and "--stream stdout" in script:
+            return _completed(command, json.dumps({"next_offset": 12}))
+        if "read-log" in script and "--stream stderr" in script:
+            return _completed(command, json.dumps({"next_offset": 0}))
+        if "list-artifacts" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    [
+                        {"artifact_id": "artifact_pipeline", "kind": "jarvis_pipeline"},
+                        {"artifact_id": "artifact_stdout", "kind": "stdout"},
+                        {"artifact_id": "artifact_stderr", "kind": "stderr"},
+                        {"artifact_id": "artifact_provenance", "kind": "provenance"},
+                    ]
+                ),
+            )
+        if "read-artifact" in script:
+            return _completed(command, json.dumps({"encoding": "base64", "data": "aGVsbG8="}))
+        raise AssertionError(f"unexpected command: {command}")
+
+    return fake_runner
 
 
 def _artifact_json(text: str) -> str:

@@ -24,7 +24,7 @@ import yaml
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.doctor import run_cluster_doctor
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.transport_probe import run_frp_http_probe
+from clio_relay.transport_probe import run_frp_direct_http_probe, run_frp_http_probe
 
 
 class CommandRunner(Protocol):
@@ -58,6 +58,8 @@ class LiveAcceptanceOptions:
     agent_mcp_config: str | None = None
     require_agent_child_job: bool | None = None
     verify_transport: bool | None = None
+    verify_direct_transport: bool = False
+    allow_direct_transport_fallback: bool = False
     transport_token: str | None = None
     transport_secret_key: str | None = None
     transport_frpc_bin: str = "frpc"
@@ -121,7 +123,7 @@ def run_live_acceptance(
         )
     transport_token: str | None = None
     transport_secret_key: str | None = None
-    if verify_transport:
+    if verify_transport or options.verify_direct_transport:
         transport_token, transport_secret_key = _require_transport_secrets(
             token=options.transport_token,
             secret_key=options.transport_secret_key,
@@ -159,6 +161,23 @@ def run_live_acceptance(
                 expected_progress_package=expected_progress_package,
             )
         )
+    if options.verify_direct_transport:
+        assert transport_token is not None
+        assert transport_secret_key is not None
+        direct_lines = _verify_direct_transport(
+            options,
+            token=transport_token,
+            secret_key=transport_secret_key,
+            pipeline_yaml=pipeline_yaml_text,
+            expected_progress_adapter=expected_progress_adapter,
+            expected_progress_package=expected_progress_package,
+        )
+        if (
+            not options.allow_direct_transport_fallback
+            and "direct_transport.result=xtcp" not in direct_lines
+        ):
+            raise RelayError("direct transport acceptance did not prove XTCP")
+        lines.extend(direct_lines)
     remote_yaml = f".local/share/clio-relay/live-tests/{run_id}/pipeline.yaml"
     _remote_write_file(
         options.definition.ssh_host,
@@ -366,6 +385,54 @@ def _verify_transport(
     )
 
 
+def _verify_direct_transport(
+    options: LiveAcceptanceOptions,
+    *,
+    token: str,
+    secret_key: str,
+    pipeline_yaml: str,
+    expected_progress_adapter: str | None,
+    expected_progress_package: str | None,
+) -> list[str]:
+    run_suffix = uuid4().hex[:12]
+    return run_frp_direct_http_probe(
+        cluster=options.cluster,
+        definition=options.definition,
+        frpc_bin=options.transport_frpc_bin,
+        token=token,
+        secret_key=secret_key,
+        local_bind_port=(
+            options.definition.live_test.transport_local_bind_port
+            if options.transport_local_bind_port is None
+            else options.transport_local_bind_port
+        ),
+        remote_api_port=(
+            options.definition.live_test.transport_remote_api_port
+            if options.transport_remote_api_port is None
+            else options.transport_remote_api_port
+        )
+        or _unique_transport_port(run_suffix),
+        proxy_name=(
+            options.transport_proxy_name
+            or options.definition.live_test.transport_proxy_name
+            or f"relay-http-direct-live-test-{run_suffix}"
+        ),
+        api_token=options.api_token,
+        timeout_seconds=options.timeout_seconds,
+        allow_stcp_fallback=options.allow_direct_transport_fallback,
+        http_check=lambda local_url: _verify_transport_http_api(
+            local_url,
+            cluster=options.cluster,
+            pipeline_yaml=pipeline_yaml,
+            api_token=options.api_token,
+            timeout_seconds=options.timeout_seconds,
+            poll_seconds=options.poll_seconds,
+            expected_progress_adapter=expected_progress_adapter,
+            expected_progress_package=expected_progress_package,
+        ),
+    )
+
+
 def _unique_transport_port(run_suffix: str) -> int:
     return 20000 + (int(run_suffix[:6], 16) % 20000)
 
@@ -516,15 +583,25 @@ def _http_json(
     )
     if api_token is not None:
         request.add_header("Authorization", f"Bearer {api_token}")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            payload = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RelayError(f"transport HTTP request failed: {method} {path}: {detail}") from exc
-    except (OSError, urllib.error.URLError) as exc:
-        raise RelayError(f"transport HTTP request failed: {method} {path}: {exc}") from exc
-    return cast(dict[str, Any] | list[dict[str, Any]], json.loads(payload))
+    attempts = 3
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                payload = response.read().decode("utf-8")
+            return cast(dict[str, Any] | list[dict[str, Any]], json.loads(payload))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RelayError(f"transport HTTP request failed: {method} {path}: {detail}") from exc
+        except (OSError, urllib.error.URLError) as exc:
+            last_error = exc
+            if attempt == attempts:
+                break
+            time.sleep(min(2.0, 0.5 * attempt))
+    assert last_error is not None
+    raise RelayError(
+        f"transport HTTP request failed: {method} {path}: {last_error}"
+    ) from last_error
 
 
 def _wait_for_transport_http_success(

@@ -990,6 +990,20 @@ def live_test(
             help="Verify desktop-to-cluster HTTP reachability through configured frp transport.",
         ),
     ] = None,
+    verify_direct_transport: Annotated[
+        bool,
+        typer.Option(
+            "--verify-direct-transport/--no-verify-direct-transport",
+            help="Verify desktop-to-cluster HTTP reachability through frp XTCP.",
+        ),
+    ] = False,
+    allow_direct_transport_fallback: Annotated[
+        bool,
+        typer.Option(
+            "--allow-direct-transport-fallback/--no-allow-direct-transport-fallback",
+            help="Allow live direct transport acceptance to fall back to STCP.",
+        ),
+    ] = False,
     transport_token: Annotated[
         str | None,
         typer.Option(help="frp authentication token. Defaults to cluster token_env."),
@@ -1021,6 +1035,7 @@ def live_test(
     should_verify_transport = (
         definition.live_test.verify_transport if verify_transport is None else verify_transport
     )
+    needs_transport_secrets = should_verify_transport or verify_direct_transport
 
     def _run() -> None:
         settings = RelaySettings.from_env()
@@ -1038,13 +1053,15 @@ def live_test(
                     require_agent_child_job=require_agent_child_job,
                     agent_child_jarvis_yaml=agent_child_jarvis_yaml,
                     verify_transport=verify_transport,
+                    verify_direct_transport=verify_direct_transport,
+                    allow_direct_transport_fallback=allow_direct_transport_fallback,
                     transport_token=(
                         _resolve_env_secret(
                             transport_token,
                             definition.frp_transport.token_env,
                             "frp token",
                         )
-                        if should_verify_transport
+                        if needs_transport_secrets
                         else None
                     ),
                     transport_secret_key=(
@@ -1053,7 +1070,7 @@ def live_test(
                             definition.frp_transport.stcp_secret_env,
                             "stcp secret",
                         )
-                        if should_verify_transport
+                        if needs_transport_secrets
                         else None
                     ),
                     transport_frpc_bin=settings.frpc_bin,
