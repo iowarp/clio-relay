@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
+import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
@@ -17,6 +19,11 @@ from clio_relay.models import (
     RelayJob,
     RelayTask,
 )
+
+
+@pytest.fixture(autouse=True)
+def _default_cli_mode(monkeypatch: MonkeyPatch) -> None:  # pyright: ignore[reportUnusedFunction]
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
 
 
 def _write_test_cluster(root: Path, name: str = "ares") -> None:
@@ -506,3 +513,127 @@ def test_cli_mcp_call_reads_arguments_json_file(tmp_path: Path, monkeypatch: Mon
     job = ClioCoreQueue(core_dir).get_job(job_id)
     assert isinstance(job.spec, McpCallSpec)
     assert job.spec.arguments == {"steps": 150, "sample": "ares-live"}
+
+
+def test_cli_remote_job_submit_stages_yaml_and_uses_cluster_core(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+    ClusterRegistry(
+        clusters={
+            "ares": ClusterDefinition(
+                name="ares",
+                ssh_host="test-host",
+                core_dir="/remote/core",
+                spool_dir="/remote/spool",
+            )
+        }
+    ).save(tmp_path / ".clio-relay" / "clusters.json")
+    (tmp_path / "input.in").write_text("run 150\n", encoding="utf-8")
+    yaml_path = tmp_path / "pipeline.yaml"
+    yaml_path.write_text(
+        """
+name: remote-submit
+x_clio_relay:
+  stage_files:
+    - local_path: input.in
+      remote_path: .local/share/clio-relay/live-tests/{run_id}/input.in
+pkgs:
+  - pkg_type: builtin.lammps
+    script: $HOME/.local/share/clio-relay/live-tests/{run_id}/input.in
+""".lstrip(),
+        encoding="utf-8",
+    )
+    writes: dict[str, bytes] = {}
+    commands: list[list[str]] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[bytes]:
+        commands.append(command)
+        assert capture_output is True
+        assert check is False
+        if command[2].startswith("cat > "):
+            writes[command[2].removeprefix("cat > ").strip("'")] = input or b""
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+        if "clio-relay job submit" in command[2]:
+            assert "CLIO_RELAY_CLI_MODE=local" in command[2]
+            assert 'CLIO_RELAY_CORE_DIR="/remote/core"' in command[2]
+            return subprocess.CompletedProcess(command, 0, b"job_remote\n", b"")
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "job",
+            "submit",
+            "--cluster",
+            "ares",
+            "--jarvis-yaml",
+            str(yaml_path),
+            "--idempotency-key",
+            "desktop-submit",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.output.strip() == "job_remote"
+    assert ClioCoreQueue(tmp_path / ".clio-relay" / "core").list_jobs() == []
+    assert any(path.endswith("/input.in") for path in writes)
+    staged_yaml = next(
+        data.decode("utf-8") for path, data in writes.items() if path.endswith("/pipeline.yaml")
+    )
+    assert "x_clio_relay" not in staged_yaml
+    assert ".local/share/clio-relay/live-tests/pipeline-" in staged_yaml
+    assert any("clio-relay job submit" in command[2] for command in commands)
+
+
+def test_cli_remote_wait_passthrough_uses_cluster_core(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+    _write_test_cluster(tmp_path)
+    commands: list[list[str]] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[bytes]:
+        commands.append(command)
+        assert capture_output is True
+        assert check is False
+        return subprocess.CompletedProcess(command, 0, b'{"job_id":"job_remote"}\n', b"")
+
+    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "job",
+            "wait",
+            "job_remote",
+            "--cluster",
+            "ares",
+            "--timeout-seconds",
+            "1",
+            "--poll-seconds",
+            "0.1",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output)["job_id"] == "job_remote"
+    assert len(commands) == 1
+    assert "clio-relay job wait job_remote" in commands[0][2]

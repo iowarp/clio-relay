@@ -67,6 +67,12 @@ from clio_relay.relay_ops import (
     read_job_log,
     wait_for_terminal,
 )
+from clio_relay.remote_cli import (
+    run_remote_clio,
+    should_execute_on_cluster,
+    stage_jarvis_yaml,
+    write_remote_file,
+)
 from clio_relay.transport_probe import run_frp_direct_http_probe, run_frp_http_probe
 
 app = typer.Typer(no_args_is_help=True)
@@ -606,9 +612,30 @@ def job_submit(
     ] = None,
 ) -> None:
     """Submit a JARVIS pipeline job."""
-    _require_cluster(cluster)
+    definition = _require_cluster(cluster)
     yaml_text = jarvis_yaml.read_text(encoding="utf-8")
     key = idempotency_key or _file_idempotency_key(jarvis_yaml, yaml_text)
+    if should_execute_on_cluster(definition):
+        remote_yaml = stage_jarvis_yaml(
+            definition,
+            jarvis_yaml=jarvis_yaml,
+            pipeline_yaml_text=yaml_text,
+            idempotency_key=key,
+        )
+        _run_remote_or_exit(
+            definition,
+            [
+                "job",
+                "submit",
+                "--cluster",
+                cluster,
+                "--jarvis-yaml",
+                remote_yaml,
+                "--idempotency-key",
+                key,
+            ],
+        )
+        return
     job = RelayJob(
         cluster=cluster,
         kind=JobKind.JARVIS,
@@ -622,10 +649,19 @@ def job_submit(
 @job_app.command("watch")
 def job_watch(
     job_id: str,
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH."),
+    ] = None,
     cursor: Annotated[int, typer.Option(help="First event sequence to read.")] = 1,
     limit: Annotated[int, typer.Option(help="Maximum events to read.")] = 100,
 ) -> None:
     """Read job events from a cursor."""
+    if _try_remote_cluster_passthrough(
+        cluster,
+        ["job", "watch", job_id, "--cursor", str(cursor), "--limit", str(limit)],
+    ):
+        return
     queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
     events, next_cursor = queue.drain_events(Cursor(job_id=job_id, next_seq=cursor), limit=limit)
     for event in events:
@@ -636,10 +672,19 @@ def job_watch(
 @job_app.command("monitor")
 def job_monitor(
     job_id: str,
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH."),
+    ] = None,
     cursor: Annotated[int, typer.Option(help="First event sequence to read.")] = 1,
     limit: Annotated[int, typer.Option(help="Maximum events to read.")] = 100,
 ) -> None:
     """Read job state and event stream data from a cursor as JSON."""
+    if _try_remote_cluster_passthrough(
+        cluster,
+        ["job", "monitor", job_id, "--cursor", str(cursor), "--limit", str(limit)],
+    ):
+        return
     result = monitor_job(
         ClioCoreQueue(RelaySettings.from_env().core_dir),
         job_id,
@@ -652,8 +697,14 @@ def job_monitor(
 @job_app.command("tasks")
 def job_tasks(
     job_id: str,
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH."),
+    ] = None,
 ) -> None:
     """List durable task records for a job as JSON."""
+    if _try_remote_cluster_passthrough(cluster, ["job", "tasks", job_id]):
+        return
     tasks = ClioCoreQueue(RelaySettings.from_env().core_dir).list_tasks(job_id)
     typer.echo(json.dumps([task.model_dump(mode="json") for task in tasks], indent=2))
 
@@ -661,6 +712,10 @@ def job_tasks(
 @job_app.command("wait")
 def job_wait(
     job_id: str,
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH."),
+    ] = None,
     timeout_seconds: Annotated[
         float,
         typer.Option(help="Maximum seconds to wait for terminal state."),
@@ -668,6 +723,19 @@ def job_wait(
     poll_seconds: Annotated[float, typer.Option(help="Polling interval.")] = 2,
 ) -> None:
     """Wait until a job reaches terminal state."""
+    if _try_remote_cluster_passthrough(
+        cluster,
+        [
+            "job",
+            "wait",
+            job_id,
+            "--timeout-seconds",
+            str(timeout_seconds),
+            "--poll-seconds",
+            str(poll_seconds),
+        ],
+    ):
+        return
     queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
     job = wait_for_terminal(
         queue,
@@ -682,10 +750,29 @@ def job_wait(
 def job_read_log(
     job_id: str,
     stream: Annotated[str, typer.Option(help="stdout or stderr.")],
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH."),
+    ] = None,
     offset: Annotated[int, typer.Option(help="Byte offset.")] = 0,
     limit: Annotated[int, typer.Option(help="Maximum bytes.")] = 65536,
 ) -> None:
     """Read stdout or stderr from a job log by byte offset."""
+    if _try_remote_cluster_passthrough(
+        cluster,
+        [
+            "job",
+            "read-log",
+            job_id,
+            "--stream",
+            stream,
+            "--offset",
+            str(offset),
+            "--limit",
+            str(limit),
+        ],
+    ):
+        return
     settings = RelaySettings.from_env()
     queue = ClioCoreQueue(settings.core_dir)
     if stream not in {"stdout", "stderr"}:
@@ -703,8 +790,14 @@ def job_read_log(
 @job_app.command("read-artifact")
 def job_read_artifact(
     artifact_id: str,
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH."),
+    ] = None,
 ) -> None:
     """Read an artifact payload as base64 JSON."""
+    if _try_remote_cluster_passthrough(cluster, ["job", "read-artifact", artifact_id]):
+        return
     result = read_artifact_bytes(ClioCoreQueue(RelaySettings.from_env().core_dir), artifact_id)
     typer.echo(json.dumps(result, indent=2))
 
@@ -712,8 +805,14 @@ def job_read_artifact(
 @job_app.command("list-artifacts")
 def job_list_artifacts(
     job_id: str,
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH."),
+    ] = None,
 ) -> None:
     """List artifact references indexed for a job as JSON."""
+    if _try_remote_cluster_passthrough(cluster, ["job", "list-artifacts", job_id]):
+        return
     artifacts = ClioCoreQueue(RelaySettings.from_env().core_dir).list_artifacts(job_id)
     typer.echo(json.dumps([artifact.model_dump(mode="json") for artifact in artifacts], indent=2))
 
@@ -721,8 +820,14 @@ def job_list_artifacts(
 @job_app.command("progress")
 def job_progress(
     job_id: str,
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH."),
+    ] = None,
 ) -> None:
     """List structured progress observations for a job as JSON."""
+    if _try_remote_cluster_passthrough(cluster, ["job", "progress", job_id]):
+        return
     progress = ClioCoreQueue(RelaySettings.from_env().core_dir).list_progress(job_id)
     typer.echo(json.dumps([item.model_dump(mode="json") for item in progress], indent=2))
 
@@ -762,8 +867,16 @@ def job_record_progress(
 
 
 @job_app.command("cancel")
-def job_cancel(job_id: str) -> None:
+def job_cancel(
+    job_id: str,
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH."),
+    ] = None,
+) -> None:
     """Cancel a queued or running job."""
+    if _try_remote_cluster_passthrough(cluster, ["job", "cancel", job_id]):
+        return
     job = request_cancel_job(ClioCoreQueue(RelaySettings.from_env().core_dir), job_id)
     typer.echo(f"{job.job_id} {job.state.value}")
 
@@ -834,8 +947,23 @@ def agent_run(
     ] = None,
 ) -> None:
     """Submit a remote agent task on a configured cluster."""
-    _require_cluster(cluster)
+    definition = _require_cluster(cluster)
     key = idempotency_key or f"agent:{cluster}:{prompt}:{mcp_config}"
+    if should_execute_on_cluster(definition):
+        args = [
+            "agent",
+            "run",
+            "--cluster",
+            cluster,
+            "--prompt",
+            str(prompt),
+            "--idempotency-key",
+            key,
+        ]
+        if mcp_config is not None:
+            args.extend(["--mcp-config", str(mcp_config)])
+        _run_remote_or_exit(definition, args)
+        return
     job = RelayJob(
         cluster=cluster,
         kind=JobKind.REMOTE_AGENT,
@@ -865,7 +993,7 @@ def mcp_call(
     ] = None,
 ) -> None:
     """Submit a remote MCP tool call."""
-    _require_cluster(cluster)
+    definition = _require_cluster(cluster)
     if arguments_json_file is not None and arguments_json != "{}":
         raise typer.BadParameter("use either --arguments-json or --arguments-json-file, not both")
     arguments = _json_object(
@@ -877,6 +1005,32 @@ def mcp_call(
         json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     key = idempotency_key or f"mcp:{cluster}:{server}:{tool}:{digest}"
+    if should_execute_on_cluster(definition):
+        remote_args = (
+            f".local/share/clio-relay/desktop-submissions/mcp-{digest[:16]}/arguments.json"
+        )
+        write_remote_file(
+            definition,
+            remote_args,
+            json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        )
+        _run_remote_or_exit(
+            definition,
+            [
+                "mcp-call",
+                "--cluster",
+                cluster,
+                "--server",
+                server,
+                "--tool",
+                tool,
+                "--arguments-json-file",
+                remote_args,
+                "--idempotency-key",
+                key,
+            ],
+        )
+        return
     job = RelayJob(
         cluster=cluster,
         kind=JobKind.MCP_CALL,
@@ -1136,6 +1290,20 @@ def _json_object(value: str) -> dict[str, object]:
 def _echo_lines(lines: list[str]) -> None:
     for line in lines:
         typer.echo(line)
+
+
+def _try_remote_cluster_passthrough(cluster: str | None, args: list[str]) -> bool:
+    if cluster is None:
+        return False
+    definition = _require_cluster(cluster)
+    if not should_execute_on_cluster(definition):
+        return False
+    _run_remote_or_exit(definition, args)
+    return True
+
+
+def _run_remote_or_exit(definition: ClusterDefinition, args: list[str]) -> None:
+    _run_or_exit(lambda: typer.echo(run_remote_clio(definition, args), nl=False))
 
 
 def _require_cluster(cluster: str) -> ClusterDefinition:

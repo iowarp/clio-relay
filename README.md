@@ -41,10 +41,14 @@ Submit a JARVIS pipeline intent:
 
 ```powershell
 uv run clio-relay job submit --cluster ares --jarvis-yaml .\pipeline.yaml
-uv run clio-relay job watch <job-id>
-uv run clio-relay job read-log <job-id> --stream stdout
-uv run clio-relay job list-artifacts <job-id>
+uv run clio-relay job watch <job-id> --cluster ares
+uv run clio-relay job read-log <job-id> --cluster ares --stream stdout
+uv run clio-relay job list-artifacts <job-id> --cluster ares
 ```
+
+Cluster-targeted desktop commands execute against the configured cluster over SSH by
+default. Set `CLIO_RELAY_CLI_MODE=local` only when intentionally operating on the
+local file-backed core, such as inside tests or while logged into the cluster.
 
 Expose relay submission tools to an agent process:
 
