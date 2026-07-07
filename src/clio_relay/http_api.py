@@ -25,6 +25,7 @@ from clio_relay.models import (
     ProgressRecord,
     RelayEvent,
     RelayJob,
+    RelayTask,
     RemoteAgentTaskSpec,
 )
 from clio_relay.relay_ops import (
@@ -165,6 +166,14 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     def get_events(job_id: str, cursor: int = 1, limit: int = 100) -> list[RelayEvent]:
         events, _ = queue.drain_events(Cursor(job_id=job_id, next_seq=cursor), limit=limit)
         return events
+
+    @app.get(
+        "/jobs/{job_id}/tasks",
+        response_model=list[RelayTask],
+        dependencies=[auth_dependency],
+    )
+    def get_tasks(job_id: str) -> list[RelayTask]:
+        return queue.list_tasks(job_id)
 
     @app.get("/jobs/{job_id}/monitor", dependencies=[auth_dependency])
     def monitor(job_id: str, cursor: int = 1, limit: int = 100) -> dict[str, object]:

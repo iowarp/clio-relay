@@ -475,6 +475,15 @@ def job_monitor(
     typer.echo(json.dumps(result, indent=2))
 
 
+@job_app.command("tasks")
+def job_tasks(
+    job_id: str,
+) -> None:
+    """List durable task records for a job as JSON."""
+    tasks = ClioCoreQueue(RelaySettings.from_env().core_dir).list_tasks(job_id)
+    typer.echo(json.dumps([task.model_dump(mode="json") for task in tasks], indent=2))
+
+
 @job_app.command("wait")
 def job_wait(
     job_id: str,

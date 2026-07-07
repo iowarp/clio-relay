@@ -16,6 +16,7 @@ from clio_relay.models import (
     McpCallSpec,
     MonitorRule,
     RelayJob,
+    RelayTask,
     RemoteAgentTaskSpec,
 )
 
@@ -170,6 +171,27 @@ def test_http_progress_endpoints_record_and_list_progress(tmp_path: Path) -> Non
     assert recorded["label"] == "iteration"
     assert recorded["current"] == 5
     assert listed[0]["progress_id"] == recorded["progress_id"]
+
+
+def test_http_lists_job_tasks(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-tasks",
+        )
+    )
+    task = queue.append_task(RelayTask(job_id=job.job_id, name="jarvis.execution"))
+    client = cast(Any, TestClient(create_app(settings)))
+
+    response = client.get(f"/jobs/{job.job_id}/tasks")
+
+    assert response.status_code == 200
+    assert response.json()[0]["task_id"] == task.task_id
+    assert response.json()[0]["name"] == "jarvis.execution"
 
 
 def test_http_healthz_does_not_require_token(tmp_path: Path) -> None:

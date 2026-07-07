@@ -99,6 +99,7 @@ def test_worker_runs_one_job_and_indexes_artifacts(tmp_path: Path) -> None:
     assert result.state == JobState.SUCCEEDED
     assert len(provider.runs) == 1
     artifacts = queue.list_artifacts(job.job_id)
+    tasks = queue.list_tasks(job.job_id)
     assert {artifact.kind for artifact in artifacts} == {
         "jarvis_pipeline",
         "stdout",
@@ -110,6 +111,9 @@ def test_worker_runs_one_job_and_indexes_artifacts(tmp_path: Path) -> None:
     assert "jarvis.started" in event_types
     assert "stdout.delta" in event_types
     assert "stderr.delta" in event_types
+    assert "task.queued" in event_types
+    assert "task.running" in event_types
+    assert "task.succeeded" in event_types
     assert "provenance.available" in event_types
     stdout_text = (settings.spool_dir / job.job_id / "stdout.log").read_text(encoding="utf-8")
     stderr_text = (settings.spool_dir / job.job_id / "stderr.log").read_text(encoding="utf-8")
@@ -118,6 +122,9 @@ def test_worker_runs_one_job_and_indexes_artifacts(tmp_path: Path) -> None:
     )
     assert stdout_text == "ok\n"
     assert stderr_text == "warn\n"
+    assert len(tasks) == 1
+    assert tasks[0].name == "jarvis.execution"
+    assert tasks[0].state == JobState.SUCCEEDED
     assert provenance["job"]["job_id"] == job.job_id
     assert provenance["execution"]["terminal_state"] == "succeeded"
     assert provenance["execution"]["returncode"] == 0

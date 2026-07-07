@@ -12,6 +12,7 @@ from clio_relay.models import (
     MonitorRuleAction,
     ProgressRecord,
     RelayJob,
+    RelayTask,
 )
 from clio_relay.relay_ops import evaluate_monitor_rules
 
@@ -156,6 +157,32 @@ def test_cursor_replay_after_restart(tmp_path: Path) -> None:
 
     assert [event.event_type for event in events] == ["one"]
     assert cursor.next_seq == 3
+
+
+def test_task_records_have_state_events(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "hello"]),
+            idempotency_key="task",
+        )
+    )
+    task = queue.append_task(RelayTask(job_id=job.job_id, name="jarvis.execution"))
+
+    updated = queue.update_task_state(
+        task.task_id,
+        JobState.RUNNING,
+        metadata={"pid": 123},
+    )
+    listed = ClioCoreQueue(tmp_path).list_tasks(job.job_id)
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=20)
+
+    assert updated.state == JobState.RUNNING
+    assert updated.metadata["pid"] == 123
+    assert [item.task_id for item in listed] == [task.task_id]
+    assert [event.event_type for event in events][-2:] == ["task.queued", "task.running"]
 
 
 def test_progress_records_are_durable_and_emit_events(tmp_path: Path) -> None:

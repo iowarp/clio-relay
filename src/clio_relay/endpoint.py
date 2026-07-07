@@ -25,6 +25,7 @@ from clio_relay.models import (
     Lease,
     McpCallSpec,
     RelayJob,
+    RelayTask,
     RemoteAgentTaskSpec,
     utc_now,
 )
@@ -106,6 +107,18 @@ class EndpointWorker:
         started_at = utc_now()
         last_renewed_at = [time.monotonic()]
         self.queue.update_job_state(job.job_id, JobState.RUNNING)
+        task = self.queue.append_task(
+            RelayTask(
+                job_id=job.job_id,
+                name=f"{job.kind.value}.execution",
+                metadata={"cluster": self.cluster, "attempt": job.attempts},
+            )
+        )
+        self.queue.update_task_state(
+            task.task_id,
+            JobState.RUNNING,
+            message=f"Task running: {task.name}",
+        )
         spool = JobSpool(self.settings.spool_dir, job)
         spool.initialize()
         yaml_text = self._render_job_yaml(job)
@@ -146,6 +159,12 @@ class EndpointWorker:
             terminal_state=terminal_state,
         )
         if self.queue.get_job(job.job_id).state == JobState.CANCELED:
+            self.queue.update_task_state(
+                task.task_id,
+                JobState.CANCELED,
+                message=f"Task canceled: {task.name}",
+                metadata={"returncode": result.returncode},
+            )
             self.queue.append_event(
                 job.job_id,
                 "execution.canceled",
@@ -154,12 +173,24 @@ class EndpointWorker:
             )
             return
         if result.returncode == 0:
+            self.queue.update_task_state(
+                task.task_id,
+                JobState.SUCCEEDED,
+                message=f"Task succeeded: {task.name}",
+                metadata={"returncode": result.returncode},
+            )
             self.queue.update_job_state(
                 job.job_id,
                 JobState.SUCCEEDED,
                 message="JARVIS-CD run succeeded",
             )
             return
+        self.queue.update_task_state(
+            task.task_id,
+            JobState.FAILED,
+            message=f"Task failed: {task.name}",
+            metadata={"returncode": result.returncode},
+        )
         self.queue.update_job_state(
             job.job_id,
             JobState.FAILED,

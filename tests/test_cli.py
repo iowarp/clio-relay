@@ -8,7 +8,14 @@ from typer.testing import CliRunner
 
 from clio_relay.cli import app
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.models import ArtifactRef, JarvisRunSpec, JobKind, McpCallSpec, RelayJob
+from clio_relay.models import (
+    ArtifactRef,
+    JarvisRunSpec,
+    JobKind,
+    McpCallSpec,
+    RelayJob,
+    RelayTask,
+)
 
 
 def test_cli_lists_artifacts(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -35,6 +42,28 @@ def test_cli_lists_artifacts(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     artifacts = json.loads(result.output)
     assert artifacts[0]["artifact_id"] == artifact.artifact_id
     assert artifacts[0]["kind"] == "stdout"
+
+
+def test_cli_lists_tasks(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="cli-tasks",
+        )
+    )
+    task = queue.append_task(RelayTask(job_id=job.job_id, name="jarvis.execution"))
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+
+    result = CliRunner().invoke(app, ["job", "tasks", job.job_id])
+
+    assert result.exit_code == 0
+    tasks = json.loads(result.output)
+    assert tasks[0]["task_id"] == task.task_id
+    assert tasks[0]["name"] == "jarvis.execution"
 
 
 def test_cli_creates_and_evaluates_monitor_rule(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

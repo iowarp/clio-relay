@@ -14,6 +14,7 @@ from clio_relay.models import (
     JobKind,
     McpCallSpec,
     RelayJob,
+    RelayTask,
     RemoteAgentTaskSpec,
 )
 
@@ -34,6 +35,7 @@ def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
     assert "relay_get_job" in tool_names
     assert "relay_monitor_job" in tool_names
     assert "relay_watch_job_events" in tool_names
+    assert "relay_list_tasks" in tool_names
     assert "relay_read_job_log" in tool_names
     assert "relay_list_artifacts" in tool_names
     assert "relay_read_artifact" in tool_names
@@ -311,6 +313,37 @@ def test_mcp_records_and_lists_progress(tmp_path: Path) -> None:
     assert recorded["label"] == "iteration"
     assert recorded["current"] == 1
     assert listed[0]["progress_id"] == recorded["progress_id"]
+
+
+def test_mcp_lists_job_tasks(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="mcp-tasks",
+        )
+    )
+    task = queue.append_task(RelayTask(job_id=job.job_id, name="jarvis.execution"))
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 26,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_list_tasks",
+                "arguments": {"job_id": job.job_id},
+            },
+        },
+        queue=queue,
+    )
+
+    assert response is not None
+    tasks = response["result"]["structuredContent"]["tasks"]
+    assert tasks[0]["task_id"] == task.task_id
+    assert tasks[0]["name"] == "jarvis.execution"
 
 
 def test_codex_mcp_profile_points_to_clio_relay_server() -> None:

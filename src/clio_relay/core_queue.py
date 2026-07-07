@@ -204,8 +204,63 @@ class ClioCoreQueue:
         """Create a task record."""
         self.initialize()
         with self._lock:
+            self.get_job(task.job_id)
             self._write(self.root / "tasks" / f"{task.task_id}.json", task)
+            self.append_event(
+                task.job_id,
+                "task.queued",
+                f"Task queued: {task.name}",
+                locked=True,
+                payload={"task_id": task.task_id, "name": task.name},
+            )
         return task
+
+    def update_task_state(
+        self,
+        task_id: str,
+        state: JobState,
+        *,
+        message: str | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> RelayTask:
+        """Update a task state and append a task event."""
+        self.initialize()
+        with self._lock:
+            path = self.root / "tasks" / f"{task_id}.json"
+            task = self._read_optional(path, RelayTask)
+            if task is None:
+                raise NotFoundError(f"task not found: {task_id}")
+            update_metadata = dict(task.metadata)
+            if metadata:
+                update_metadata.update(metadata)
+            updated = task.model_copy(
+                update={
+                    "state": state,
+                    "updated_at": utc_now(),
+                    "metadata": update_metadata,
+                }
+            )
+            self._write(path, updated)
+            self.append_event(
+                updated.job_id,
+                f"task.{state.value}",
+                message or f"Task {updated.name} {state.value}",
+                locked=True,
+                payload={
+                    "task_id": updated.task_id,
+                    "name": updated.name,
+                    "state": state.value,
+                },
+            )
+            return updated
+
+    def list_tasks(self, job_id: str | None = None) -> list[RelayTask]:
+        """Return durable task records, optionally filtered by job id."""
+        self.initialize()
+        tasks = list(self._read_many(self.root / "tasks", RelayTask))
+        if job_id is not None:
+            tasks = [task for task in tasks if task.job_id == job_id]
+        return sorted(tasks, key=lambda task: task.created_at)
 
     def append_event(
         self,

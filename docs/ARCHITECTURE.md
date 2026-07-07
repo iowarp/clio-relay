@@ -12,6 +12,8 @@ The worker endpoint leases queued jobs for one configured cluster, materializes 
 
 The queue boundary is `ClioCoreQueue`. It owns endpoint, job, task, lease, event, cursor, artifact, progress, checkpoint, and idempotency record families. The filesystem implementation in this repository is a development backend for the same record contract; production deployment can bind the same API to clio-core CTE storage.
 
+Each leased job gets a durable execution task record. Task records move through queued, running, and terminal states independently of the parent job and emit `task.*` events so clients can distinguish job-level state from execution-step state during replay.
+
 Per-job spool directories live on cluster-accessible storage and are backing files only:
 
 - `metadata.json`

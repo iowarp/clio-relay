@@ -64,6 +64,19 @@ def test_live_acceptance_runs_configured_pipeline_and_monitor(
                     }
                 ),
             )
+        if "job tasks" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    [
+                        {
+                            "task_id": "task_abc",
+                            "name": "jarvis.execution",
+                            "state": "succeeded",
+                        }
+                    ]
+                ),
+            )
         if "read-log" in script and "--stream stdout" in script:
             return _completed(command, json.dumps({"next_offset": 12}))
         if "read-log" in script and "--stream stderr" in script:
@@ -104,6 +117,7 @@ def test_live_acceptance_runs_configured_pipeline_and_monitor(
     )
 
     assert "acceptance.job_state=succeeded" in lines
+    assert "acceptance.tasks=1" in lines
     assert "acceptance.artifact_read=ok" in lines
     assert "acceptance.provenance=ok" in lines
     assert "acceptance.monitor=ok" in lines
@@ -147,6 +161,19 @@ def test_live_acceptance_uses_fresh_idempotency_key_per_run(
                             {"event_type": "job.succeeded"},
                         ]
                     }
+                ),
+            )
+        if "job tasks" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    [
+                        {
+                            "task_id": "task_abc",
+                            "name": "jarvis.execution",
+                            "state": "succeeded",
+                        }
+                    ]
                 ),
             )
         if "read-log" in script and "--stream stdout" in script:

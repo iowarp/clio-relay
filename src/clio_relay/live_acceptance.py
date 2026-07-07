@@ -123,6 +123,16 @@ def run_live_acceptance(
         raise RelayError(f"acceptance job missing events: {sorted(missing_events)}")
     lines.append("acceptance.events=ok")
 
+    tasks = _remote_clio_json(
+        options.definition,
+        ["job", "tasks", job_id],
+        runner=command_runner,
+    )
+    task_items = cast(list[dict[str, Any]], tasks)
+    if not task_items or not any(task["state"] == "succeeded" for task in task_items):
+        raise RelayError("acceptance job missing succeeded task record")
+    lines.append(f"acceptance.tasks={len(task_items)}")
+
     stdout = _remote_clio_json(
         options.definition,
         ["job", "read-log", job_id, "--stream", "stdout", "--offset", "0", "--limit", "200000"],

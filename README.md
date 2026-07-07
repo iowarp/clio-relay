@@ -43,7 +43,7 @@ uv run clio-relay agent run --cluster ares --prompt /path/on/cluster/prompt.md -
 
 The MCP server provides generic relay tools for JARVIS submission, remote-agent submission, remote MCP-call submission, job state, event cursors, stdout/stderr logs, artifacts, and monitor rules. These tools submit and inspect the same durable `RelayJob` records as the CLI and HTTP surfaces. Workload-specific systems are expressed as JARVIS pipeline YAML, prompt files, or MCP call arguments supplied by the caller, not as relay-native tools.
 
-Job submission is asynchronous by default: submit returns a `job_id`, initial state, kind, and terminal flag. MCP callers can set `wait_for_terminal` with `timeout_seconds` and `poll_seconds` for synchronous submit-and-wait behavior. Monitoring is cursor-based through `relay_monitor_job` or `relay_watch_job_events`; stdout and stderr are readable by byte offset through `relay_read_job_log`; artifact references are listed with `relay_list_artifacts` and file artifacts are fetched with `relay_read_artifact`.
+Job submission is asynchronous by default: submit returns a `job_id`, initial state, kind, and terminal flag. MCP callers can set `wait_for_terminal` with `timeout_seconds` and `poll_seconds` for synchronous submit-and-wait behavior. Monitoring is cursor-based through `relay_monitor_job` or `relay_watch_job_events`; durable task records are available through `job tasks`, HTTP `/jobs/{job_id}/tasks`, and MCP `relay_list_tasks`; stdout and stderr are readable by byte offset through `relay_read_job_log`; artifact references are listed with `relay_list_artifacts` and file artifacts are fetched with `relay_read_artifact`.
 
 Remote agents running inside a single-worker cluster endpoint should submit child cluster work asynchronously, then return the child `job_id` for an outside monitor or later agent turn. A synchronous wait from that same in-flight worker can block the only worker that could execute the child job. Desktop-side agents and HTTP/MCP clients can use synchronous waiting because they are not occupying the cluster worker.
 
@@ -80,7 +80,7 @@ uv run clio-relay live-test --cluster ares --jarvis-yaml .\.clio-relay\live\ares
 }
 ```
 
-The acceptance runner submits the configured JARVIS YAML on the target cluster, waits for terminal success, verifies event replay, reads stdout/stderr by offset, lists and reads artifacts, verifies the provenance artifact, evaluates the configured monitor pattern, and optionally runs a configured remote-agent task. The cluster registry owns what `ares`, `homelab`, or any later target means.
+The acceptance runner submits the configured JARVIS YAML on the target cluster, waits for terminal success, verifies event replay, verifies durable task records, reads stdout/stderr by offset, lists and reads artifacts, verifies the provenance artifact, evaluates the configured monitor pattern, and optionally runs a configured remote-agent task. The cluster registry owns what `ares`, `homelab`, or any later target means.
 
 ## Cloudflare-backed frps edge
 

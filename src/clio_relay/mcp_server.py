@@ -218,6 +218,16 @@ def _tool_definitions() -> list[JSON]:
             },
         },
         {
+            "name": "relay_list_tasks",
+            "description": "List durable task records for a relay job.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "relay_read_job_log",
             "description": "Read stdout or stderr text from a job log by byte offset.",
             "inputSchema": {
@@ -365,6 +375,13 @@ def _call_tool(params: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -
         result = {
             "events": [event.model_dump(mode="json") for event in events],
             "next_cursor": cursor.next_seq,
+        }
+    elif name == "relay_list_tasks":
+        result = {
+            "tasks": [
+                task.model_dump(mode="json")
+                for task in queue.list_tasks(_required_str(arguments, "job_id"))
+            ]
         }
     elif name == "relay_read_job_log":
         job = queue.get_job(_required_str(arguments, "job_id"))
