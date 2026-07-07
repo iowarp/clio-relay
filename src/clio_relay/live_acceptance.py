@@ -736,7 +736,10 @@ def _expected_progress_adapter(pipeline_yaml: str) -> str | None:
     packages = typed_document.get("pkgs")
     if not isinstance(packages, list):
         return None
-    for package in cast(list[object], packages):
+    typed_packages = cast(list[object], packages)
+    if len(typed_packages) != 1:
+        return None
+    for package in typed_packages:
         if not isinstance(package, dict):
             continue
         typed_package = cast(dict[str, Any], package)
@@ -759,7 +762,10 @@ def _expected_progress_package(pipeline_yaml: str) -> str | None:
     packages = typed_document.get("pkgs")
     if not isinstance(packages, list):
         return None
-    for package in cast(list[object], packages):
+    typed_packages = cast(list[object], packages)
+    if len(typed_packages) != 1:
+        return None
+    for package in typed_packages:
         if not isinstance(package, dict):
             continue
         typed_package = cast(dict[str, Any], package)

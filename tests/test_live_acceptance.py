@@ -176,6 +176,14 @@ def test_live_acceptance_requires_trusted_package_progress() -> None:
     )
 
 
+def test_live_acceptance_requires_single_builtin_lammps_package_for_progress() -> None:
+    mixed = (
+        "name: mixed\npkgs:\n- pkg_type: builtin.lammps\n- pkg_type: clio_relay.bounded_command\n"
+    )
+
+    assert _expected_progress_adapter(mixed) is None
+
+
 def test_live_acceptance_verifies_transport_when_enabled(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

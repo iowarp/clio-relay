@@ -179,6 +179,8 @@ def package_progress_adapter_from_pipeline(
     if not isinstance(packages, list):
         return None
     typed_packages = cast(list[object], packages)
+    if len(typed_packages) != 1:
+        return None
     for package in typed_packages:
         if not isinstance(package, dict):
             continue

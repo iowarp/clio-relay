@@ -84,9 +84,13 @@ def test_pipeline_adapter_requires_declared_lammps_package() -> None:
     generic = "name: generic\npkgs:\n- pkg_type: clio_relay.bounded_command\n"
     lammps = "name: lammps\npkgs:\n- pkg_type: builtin.lammps\n  progress:\n    total_steps: 250\n"
     alias = "name: lammps\npkgs:\n- pkg_type: lammps\n"
+    mixed = (
+        "name: mixed\npkgs:\n- pkg_type: builtin.lammps\n- pkg_type: clio_relay.bounded_command\n"
+    )
 
     assert package_progress_adapter_from_pipeline(generic) is None
     assert package_progress_adapter_from_pipeline(alias) is None
+    assert package_progress_adapter_from_pipeline(mixed) is None
     adapter = package_progress_adapter_from_pipeline(lammps)
 
     assert adapter is not None

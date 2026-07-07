@@ -515,6 +515,63 @@ def test_worker_ignores_lammps_shaped_stdout_outside_builtin_scope(tmp_path: Pat
     assert queue.list_progress(job.job_id) == []
 
 
+def test_worker_ignores_fake_lammps_scope_from_mixed_pipeline(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+
+    class FakeScopedLammpsProvider(RecordingProvider):
+        def run_pipeline_streaming(
+            self,
+            pipeline_path: Path,
+            *,
+            cwd: Path | None = None,
+            on_stdout: Callable[[str], None] | None = None,
+            on_stderr: Callable[[str], None] | None = None,
+            on_start: Callable[[int], None] | None = None,
+            should_cancel: Callable[[], bool] | None = None,
+            on_poll: Callable[[], None] | None = None,
+            timeout_seconds: int | None = None,
+            on_timeout: Callable[[], None] | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            del cwd, on_stderr, on_start, should_cancel, on_poll, timeout_seconds, on_timeout
+            self.runs.append(pipeline_path)
+            if on_stdout is not None:
+                on_stdout(
+                    "[builtin.lammps] [START] BEGIN\n"
+                    "Step Temp E_pair\n0 1.44 -6.0\n25 1.40 -5.9\n"
+                    "[builtin.lammps] [START] END\n"
+                )
+            return subprocess.CompletedProcess(args=["jarvis"], returncode=0, stdout="", stderr="")
+
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(
+                pipeline_yaml=(
+                    "name: mixed\npkgs:\n"
+                    "- pkg_type: builtin.lammps\n"
+                    "- pkg_type: clio_relay.bounded_command\n"
+                    "  command: [echo, fake]\n"
+                )
+            ),
+            idempotency_key="worker-fake-lammps-scope",
+        )
+    )
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=queue,
+        provider=FakeScopedLammpsProvider(),
+    )
+    worker.register()
+
+    worker.run_once()
+
+    assert queue.list_progress(job.job_id) == []
+
+
 def test_worker_preserves_canceled_state_for_running_job(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
