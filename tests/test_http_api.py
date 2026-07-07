@@ -8,7 +8,16 @@ from fastapi.testclient import TestClient
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.http_api import create_app
-from clio_relay.models import ArtifactRef, Cursor, JarvisRunSpec, JobKind, MonitorRule, RelayJob
+from clio_relay.models import (
+    ArtifactRef,
+    Cursor,
+    JarvisRunSpec,
+    JobKind,
+    McpCallSpec,
+    MonitorRule,
+    RelayJob,
+    RemoteAgentTaskSpec,
+)
 
 
 def test_http_monitor_logs_and_artifact_content(tmp_path: Path) -> None:
@@ -69,6 +78,63 @@ def test_http_api_enforces_configured_token(tmp_path: Path) -> None:
     assert wrong.status_code == 401
     assert bearer.status_code == 200
     assert explicit.status_code == 200
+
+
+def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    client = cast(Any, TestClient(create_app(settings)))
+    prompt_path = tmp_path / "prompt.md"
+    mcp_config_path = tmp_path / "mcp.toml"
+
+    jarvis_response = client.post(
+        "/jobs/jarvis",
+        json={
+            "cluster": "test-cluster",
+            "pipeline_yaml": "name: generic\npkgs: []\n",
+            "idempotency_key": "http-typed-jarvis",
+        },
+    )
+    agent_response = client.post(
+        "/jobs/remote-agent",
+        json={
+            "cluster": "test-cluster",
+            "prompt_path": str(prompt_path),
+            "mcp_config_path": str(mcp_config_path),
+            "model": "configured-model",
+            "workdir": str(tmp_path),
+            "timeout_seconds": 60,
+            "idempotency_key": "http-typed-agent",
+        },
+    )
+    mcp_response = client.post(
+        "/jobs/mcp-call",
+        json={
+            "cluster": "test-cluster",
+            "server": "remote-server",
+            "tool": "simulate",
+            "arguments": {"case": "lammps", "steps": 100},
+            "timeout_seconds": 30,
+            "idempotency_key": "http-typed-mcp",
+        },
+    )
+
+    assert jarvis_response.status_code == 200
+    assert agent_response.status_code == 200
+    assert mcp_response.status_code == 200
+    jarvis = queue.get_job(jarvis_response.json()["job_id"])
+    agent = queue.get_job(agent_response.json()["job_id"])
+    mcp = queue.get_job(mcp_response.json()["job_id"])
+    assert jarvis.kind == JobKind.JARVIS
+    assert isinstance(jarvis.spec, JarvisRunSpec)
+    assert agent.kind == JobKind.REMOTE_AGENT
+    assert isinstance(agent.spec, RemoteAgentTaskSpec)
+    assert agent.spec.prompt_path == prompt_path
+    assert agent.spec.mcp_config_path == mcp_config_path
+    assert agent.spec.model == "configured-model"
+    assert mcp.kind == JobKind.MCP_CALL
+    assert isinstance(mcp.spec, McpCallSpec)
+    assert mcp.spec.arguments == {"case": "lammps", "steps": 100}
 
 
 def test_http_healthz_does_not_require_token(tmp_path: Path) -> None:

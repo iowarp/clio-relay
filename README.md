@@ -59,6 +59,8 @@ Monitor rules are durable observer records over a job event stream. A regex rule
 
 The HTTP API enforces `CLIO_RELAY_API_TOKEN` when that environment variable is set. Clients can send either `Authorization: Bearer <token>` or `X-Clio-Relay-Token: <token>`. `/healthz` remains unauthenticated for local process checks. When exposing the API through frp or another relay, start it with `clio-relay api start --require-token` so missing API auth fails at startup.
 
+HTTP clients can submit raw `RelayJob` records through `POST /jobs` or use typed submit endpoints: `POST /jobs/jarvis`, `POST /jobs/remote-agent`, and `POST /jobs/mcp-call`. The typed endpoints preserve the same durable queue semantics while keeping provider/workload details in request payloads instead of relay-native hardcoding.
+
 Run a full configured live acceptance:
 
 ```powershell

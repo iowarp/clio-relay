@@ -6,14 +6,26 @@ from __future__ import annotations
 
 import secrets
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
+from pydantic import BaseModel, ConfigDict, Field
 
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import NotFoundError
-from clio_relay.models import ArtifactRef, Cursor, MonitorRule, RelayEvent, RelayJob
+from clio_relay.models import (
+    ArtifactRef,
+    Cursor,
+    JarvisRunSpec,
+    JobKind,
+    McpCallSpec,
+    MonitorRule,
+    RelayEvent,
+    RelayJob,
+    RemoteAgentTaskSpec,
+)
 from clio_relay.relay_ops import (
     cancel_job as request_cancel_job,
 )
@@ -24,6 +36,43 @@ from clio_relay.relay_ops import (
     read_job_log,
     wait_for_terminal,
 )
+
+
+class JarvisSubmitRequest(BaseModel):
+    """HTTP request to submit a JARVIS pipeline YAML document."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cluster: str
+    pipeline_yaml: str
+    idempotency_key: str
+
+
+class RemoteAgentSubmitRequest(BaseModel):
+    """HTTP request to submit a remote-agent task."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cluster: str
+    prompt_path: Path
+    mcp_config_path: Path | None = None
+    model: str | None = None
+    workdir: Path | None = None
+    timeout_seconds: int | None = Field(default=None, gt=0)
+    idempotency_key: str
+
+
+class McpCallSubmitRequest(BaseModel):
+    """HTTP request to submit a remote MCP tool call."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cluster: str
+    server: str
+    tool: str
+    arguments: dict[str, object] = Field(default_factory=dict)
+    timeout_seconds: int | None = Field(default=None, gt=0)
+    idempotency_key: str
 
 
 def create_app(settings: RelaySettings | None = None) -> FastAPI:
@@ -41,6 +90,50 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     @app.post("/jobs", response_model=RelayJob, dependencies=[auth_dependency])
     def submit_job(job: RelayJob) -> RelayJob:
         return queue.submit_job(job)
+
+    @app.post("/jobs/jarvis", response_model=RelayJob, dependencies=[auth_dependency])
+    def submit_jarvis(request: JarvisSubmitRequest) -> RelayJob:
+        return queue.submit_job(
+            RelayJob(
+                cluster=request.cluster,
+                kind=JobKind.JARVIS,
+                spec=JarvisRunSpec(pipeline_yaml=request.pipeline_yaml),
+                idempotency_key=request.idempotency_key,
+            )
+        )
+
+    @app.post("/jobs/remote-agent", response_model=RelayJob, dependencies=[auth_dependency])
+    def submit_remote_agent(request: RemoteAgentSubmitRequest) -> RelayJob:
+        return queue.submit_job(
+            RelayJob(
+                cluster=request.cluster,
+                kind=JobKind.REMOTE_AGENT,
+                spec=RemoteAgentTaskSpec(
+                    prompt_path=request.prompt_path,
+                    mcp_config_path=request.mcp_config_path,
+                    model=request.model,
+                    workdir=request.workdir,
+                    timeout_seconds=request.timeout_seconds,
+                ),
+                idempotency_key=request.idempotency_key,
+            )
+        )
+
+    @app.post("/jobs/mcp-call", response_model=RelayJob, dependencies=[auth_dependency])
+    def submit_mcp_call(request: McpCallSubmitRequest) -> RelayJob:
+        return queue.submit_job(
+            RelayJob(
+                cluster=request.cluster,
+                kind=JobKind.MCP_CALL,
+                spec=McpCallSpec(
+                    server=request.server,
+                    tool=request.tool,
+                    arguments=request.arguments,
+                    timeout_seconds=request.timeout_seconds,
+                ),
+                idempotency_key=request.idempotency_key,
+            )
+        )
 
     @app.get("/jobs/{job_id}", response_model=RelayJob, dependencies=[auth_dependency])
     def get_job(job_id: str) -> RelayJob:
