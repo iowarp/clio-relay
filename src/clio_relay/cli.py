@@ -342,7 +342,7 @@ def test_direct_transport(
             "--allow-stcp-fallback/--no-allow-stcp-fallback",
             help="Allow fallback to STCP if XTCP fails.",
         ),
-    ] = True,
+    ] = False,
 ) -> None:
     """Run an end-to-end HTTP health check through frp XTCP direct transport."""
     settings = RelaySettings.from_env()

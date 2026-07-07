@@ -334,6 +334,38 @@ def test_cli_transport_reports_missing_configured_secret_env(
     assert "CLIO_RELAY_FRP_TOKEN" in result.output
 
 
+def test_cli_direct_transport_is_strict_xtcp_by_default(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "frp-token")
+    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "secret-key")
+    calls: list[dict[str, object]] = []
+
+    def fake_direct_probe(**kwargs: object) -> list[str]:
+        calls.append(kwargs)
+        return ["direct_transport.result=xtcp"]
+
+    monkeypatch.setattr("clio_relay.cli.run_frp_direct_http_probe", fake_direct_probe)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "relay-host",
+            "test-direct-transport",
+            "--cluster",
+            "ares",
+            "--local-bind-port",
+            "19000",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls[0]["allow_stcp_fallback"] is False
+
+
 def test_cli_init_creates_empty_cluster_registry(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
