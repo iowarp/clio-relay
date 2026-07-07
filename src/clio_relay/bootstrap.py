@@ -319,7 +319,7 @@ while [ "$#" -gt 0 ]; do
       ranks="${{2:-}}"
       shift 2
       ;;
-    -p|-f|--hostfile|-hostfile|--hosts|-hosts|-ppn|-npernode)
+    -p|-f|--host|--hostfile|-host|-hostfile|--hosts|-hosts|-ppn|-npernode)
       shift 2
       ;;
     -genv|--env)
