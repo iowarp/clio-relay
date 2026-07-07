@@ -10,6 +10,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
+from uuid import uuid4
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.doctor import run_cluster_doctor
@@ -231,7 +232,7 @@ def _configured_path(value: str | None) -> Path | None:
 
 def _acceptance_run_id(path: Path) -> str:
     digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-    return f"{path.stem}-{digest}"
+    return f"{path.stem}-{digest}-{uuid4().hex[:8]}"
 
 
 def _remote_write_file(
