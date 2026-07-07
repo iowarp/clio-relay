@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.http_api import create_app
-from clio_relay.models import ArtifactRef, JarvisRunSpec, JobKind, MonitorRule, RelayJob
+from clio_relay.models import ArtifactRef, Cursor, JarvisRunSpec, JobKind, MonitorRule, RelayJob
 
 
 def test_http_monitor_logs_and_artifact_content(tmp_path: Path) -> None:
@@ -89,6 +89,30 @@ def test_http_healthz_does_not_require_token(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"ok": True, "auth": True}
+
+
+def test_http_cancel_job_records_cancel_request(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-cancel",
+        )
+    )
+    client = cast(Any, TestClient(create_app(settings)))
+
+    response = client.post(f"/jobs/{job.job_id}/cancel")
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=20)
+
+    assert response.status_code == 200
+    assert response.json()["state"] == "canceled"
+    assert [event.event_type for event in events][-2:] == [
+        "job.cancel_requested",
+        "job.canceled",
+    ]
 
 
 def test_http_monitor_rules(tmp_path: Path) -> None:

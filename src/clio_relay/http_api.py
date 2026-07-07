@@ -13,7 +13,10 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import NotFoundError
-from clio_relay.models import ArtifactRef, Cursor, JobState, MonitorRule, RelayEvent, RelayJob
+from clio_relay.models import ArtifactRef, Cursor, MonitorRule, RelayEvent, RelayJob
+from clio_relay.relay_ops import (
+    cancel_job as request_cancel_job,
+)
 from clio_relay.relay_ops import (
     evaluate_monitor_rules,
     monitor_job,
@@ -113,7 +116,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
 
     @app.post("/jobs/{job_id}/cancel", response_model=RelayJob, dependencies=[auth_dependency])
     def cancel_job(job_id: str) -> RelayJob:
-        return queue.update_job_state(job_id, state=JobState.CANCELED)
+        return request_cancel_job(queue, job_id)
 
     @app.post("/monitor/rules", response_model=MonitorRule, dependencies=[auth_dependency])
     def create_monitor_rule(rule: MonitorRule) -> MonitorRule:

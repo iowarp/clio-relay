@@ -31,7 +31,6 @@ from clio_relay.models import (
     EndpointRole,
     JarvisRunSpec,
     JobKind,
-    JobState,
     McpCallSpec,
     MonitorRule,
     MonitorRuleAction,
@@ -46,6 +45,9 @@ from clio_relay.relay_host import (
     render_frpc_config,
     render_frpc_visitor_config,
     render_frps_config,
+)
+from clio_relay.relay_ops import (
+    cancel_job as request_cancel_job,
 )
 from clio_relay.relay_ops import (
     evaluate_monitor_rules,
@@ -480,10 +482,7 @@ def job_list_artifacts(
 @job_app.command("cancel")
 def job_cancel(job_id: str) -> None:
     """Cancel a queued or running job."""
-    job = ClioCoreQueue(RelaySettings.from_env().core_dir).update_job_state(
-        job_id,
-        JobState.CANCELED,
-    )
+    job = request_cancel_job(ClioCoreQueue(RelaySettings.from_env().core_dir), job_id)
     typer.echo(f"{job.job_id} {job.state.value}")
 
 

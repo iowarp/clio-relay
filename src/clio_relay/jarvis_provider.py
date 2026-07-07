@@ -7,9 +7,12 @@ environment capture, output collection, and provenance.
 
 from __future__ import annotations
 
+import os
 import shutil
+import signal
 import subprocess
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -139,6 +142,8 @@ class JarvisCdProvider:
         cwd: Path | None = None,
         on_stdout: Callable[[str], None] | None = None,
         on_stderr: Callable[[str], None] | None = None,
+        on_start: Callable[[int], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Invoke JARVIS-CD and stream output chunks while retaining final output."""
         self.require_available()
@@ -151,9 +156,13 @@ class JarvisCdProvider:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=1,
+                start_new_session=os.name != "nt",
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
             )
         except OSError as exc:
             raise RelayError(f"failed to execute JARVIS-CD: {exc}") from exc
+        if on_start is not None:
+            on_start(process.pid)
 
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
@@ -169,12 +178,22 @@ class JarvisCdProvider:
         )
         stdout_thread.start()
         stderr_thread.start()
-        return_code = process.wait()
+        canceled = False
+        while True:
+            return_code = process.poll()
+            if return_code is not None:
+                break
+            if should_cancel is not None and should_cancel():
+                canceled = True
+                _terminate_process(process)
+                return_code = process.wait()
+                break
+            time.sleep(0.25)
         stdout_thread.join()
         stderr_thread.join()
         return subprocess.CompletedProcess(
             command,
-            return_code,
+            return_code if not canceled else -15,
             stdout="".join(stdout_chunks),
             stderr="".join(stderr_chunks),
         )
@@ -201,3 +220,27 @@ def _drain_stream(
         chunks.append(chunk)
         if callback is not None:
             callback(chunk)
+
+
+def _terminate_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        process.send_signal(signal.CTRL_BREAK_EVENT)
+        try:
+            process.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return

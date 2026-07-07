@@ -17,6 +17,7 @@ from clio_relay.models import (
     TERMINAL_STATES,
     Cursor,
     JobKind,
+    JobState,
     MonitorRule,
     MonitorRuleAction,
     RelayEvent,
@@ -101,6 +102,24 @@ def read_artifact_bytes(queue: ClioCoreQueue, artifact_id: str) -> dict[str, obj
         "encoding": "base64",
         "data": base64.b64encode(data).decode("ascii"),
     }
+
+
+def cancel_job(queue: ClioCoreQueue, job_id: str) -> RelayJob:
+    """Request cancellation for a queued, leased, or running job."""
+    job = queue.get_job(job_id)
+    if job.state in TERMINAL_STATES:
+        return job
+    queue.append_event(
+        job_id,
+        "job.cancel_requested",
+        "Cancellation requested",
+        payload={"previous_state": job.state.value},
+    )
+    return queue.update_job_state(
+        job_id,
+        JobState.CANCELED,
+        message="Job canceled",
+    )
 
 
 def evaluate_monitor_rules(queue: ClioCoreQueue, *, limit: int = 100) -> list[dict[str, object]]:

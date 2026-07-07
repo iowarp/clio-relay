@@ -89,6 +89,9 @@ class EndpointWorker:
                 time.sleep(poll_seconds)
 
     def _run_job(self, job: RelayJob) -> None:
+        if self.queue.get_job(job.job_id).state == JobState.CANCELED:
+            self.queue.append_event(job.job_id, "job.cancel_acknowledged", "Canceled before start")
+            return
         self.queue.update_job_state(job.job_id, JobState.RUNNING)
         spool = JobSpool(self.settings.spool_dir, job)
         spool.initialize()
@@ -106,9 +109,19 @@ class EndpointWorker:
             cwd=spool.path,
             on_stdout=lambda text: self._append_output(job, spool, "stdout", text),
             on_stderr=lambda text: self._append_output(job, spool, "stderr", text),
+            on_start=lambda pid: self._append_execution_start(job, pid),
+            should_cancel=lambda: self.queue.get_job(job.job_id).state == JobState.CANCELED,
         )
         self.queue.append_artifact(spool.artifact_for(spool.path / "stdout.log", kind="stdout"))
         self.queue.append_artifact(spool.artifact_for(spool.path / "stderr.log", kind="stderr"))
+        if self.queue.get_job(job.job_id).state == JobState.CANCELED:
+            self.queue.append_event(
+                job.job_id,
+                "execution.canceled",
+                "JARVIS-CD process terminated after cancellation",
+                payload={"returncode": result.returncode},
+            )
+            return
         if result.returncode == 0:
             self.queue.update_job_state(
                 job.job_id,
@@ -148,6 +161,14 @@ class EndpointWorker:
             f"{stream_name}.delta",
             text.rstrip("\n") or f"{stream_name} output",
             payload={"stream": stream_name, "text": text},
+        )
+
+    def _append_execution_start(self, job: RelayJob, pid: int) -> None:
+        self.queue.append_event(
+            job.job_id,
+            "execution.started",
+            f"JARVIS-CD process started: {pid}",
+            payload={"pid": pid},
         )
 
     @contextmanager

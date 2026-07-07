@@ -19,6 +19,9 @@ from clio_relay.models import (
     RelayJob,
 )
 from clio_relay.relay_ops import (
+    cancel_job as request_cancel_job,
+)
+from clio_relay.relay_ops import (
     evaluate_monitor_rules,
     monitor_job,
     read_artifact_bytes,
@@ -201,6 +204,16 @@ def _tool_definitions() -> list[JSON]:
             },
         },
         {
+            "name": "relay_cancel_job",
+            "description": "Request cancellation for a queued, leased, or running relay job.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "relay_create_monitor_rule",
             "description": "Create a regex monitor rule over a job event stream.",
             "inputSchema": {
@@ -292,6 +305,10 @@ def _call_tool(params: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -
         }
     elif name == "relay_read_artifact":
         result = read_artifact_bytes(queue, _required_str(arguments, "artifact_id"))
+    elif name == "relay_cancel_job":
+        result = request_cancel_job(queue, _required_str(arguments, "job_id")).model_dump(
+            mode="json"
+        )
     elif name == "relay_create_monitor_rule":
         result = queue.append_monitor_rule(_monitor_rule_from_arguments(arguments)).model_dump(
             mode="json"

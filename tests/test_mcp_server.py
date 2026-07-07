@@ -7,7 +7,7 @@ from pathlib import Path
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.mcp_server import handle_request, render_codex_mcp_profile, serve_stdio
-from clio_relay.models import ArtifactRef, JarvisRunSpec, JobKind, RelayJob
+from clio_relay.models import ArtifactRef, Cursor, JarvisRunSpec, JobKind, RelayJob
 
 
 def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
@@ -27,6 +27,7 @@ def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
     assert "relay_read_job_log" in tool_names
     assert "relay_list_artifacts" in tool_names
     assert "relay_read_artifact" in tool_names
+    assert "relay_cancel_job" in tool_names
     assert "relay_create_monitor_rule" in tool_names
     assert "relay_list_monitor_rules" in tool_names
     assert "relay_evaluate_monitor_rules" in tool_names
@@ -274,6 +275,39 @@ def test_mcp_reads_logs_and_artifacts(tmp_path: Path) -> None:
     )
     assert content_response is not None
     assert content_response["result"]["structuredContent"]["encoding"] == "base64"
+
+
+def test_mcp_cancels_job(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="mcp-cancel",
+        )
+    )
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_cancel_job",
+                "arguments": {"job_id": job.job_id},
+            },
+        },
+        queue=queue,
+    )
+
+    assert response is not None
+    assert response["result"]["structuredContent"]["state"] == "canceled"
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=20)
+    assert [event.event_type for event in events][-2:] == [
+        "job.cancel_requested",
+        "job.canceled",
+    ]
 
 
 def test_mcp_creates_and_evaluates_monitor_rule(tmp_path: Path) -> None:
