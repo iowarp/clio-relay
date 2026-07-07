@@ -59,3 +59,66 @@ def test_mcp_call_yaml_generation() -> None:
     assert package["server"] == "science"
     assert package["tool"] == "inspect"
     assert package["arguments"] == {"path": "x"}
+
+
+def test_unscheduled_pipeline_uses_direct_run_command(tmp_path: Path) -> None:
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text(
+        yaml.safe_dump({"name": "direct", "pkgs": []}),
+        encoding="utf-8",
+    )
+    provider = JarvisCdProvider(jarvis_bin="/opt/jarvis/bin/jarvis")
+
+    assert provider.pipeline_command(pipeline) == [
+        "/opt/jarvis/bin/jarvis",
+        "ppl",
+        "run",
+        "yaml",
+        str(pipeline),
+    ]
+
+
+def test_scheduled_pipeline_uses_waiting_scheduler_runner(tmp_path: Path) -> None:
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text(
+        yaml.safe_dump(
+            {
+                "name": "scheduled",
+                "scheduler": {"name": "slurm", "exclusive": True},
+                "pkgs": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    provider = JarvisCdProvider(jarvis_bin="/opt/jarvis/bin/jarvis")
+
+    command = provider.pipeline_command(pipeline)
+
+    assert command[0].replace("\\", "/") == "/opt/jarvis/bin/python"
+    assert command[1] == "-c"
+    assert "wait=True" in command[2]
+    assert command[3] == str(pipeline)
+
+
+def test_scheduled_pipeline_test_config_uses_scheduler_runner(tmp_path: Path) -> None:
+    pipeline = tmp_path / "pipeline-test.yaml"
+    pipeline.write_text(
+        yaml.safe_dump(
+            {
+                "config": {
+                    "name": "scheduled-test",
+                    "scheduler": {"name": "slurm", "nodes": 2},
+                    "pkgs": [],
+                },
+                "vars": {"case": [1]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    provider = JarvisCdProvider(jarvis_bin="jarvis")
+
+    command = provider.pipeline_command(pipeline)
+
+    assert command[1] == "-c"
+    assert "load_yaml_auto" in command[2]
+    assert command[3] == str(pipeline)

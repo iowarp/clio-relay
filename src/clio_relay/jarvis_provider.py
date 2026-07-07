@@ -22,6 +22,22 @@ import yaml
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.models import JarvisRunSpec, McpCallSpec, RemoteAgentTaskSpec
 
+_SCHEDULED_PIPELINE_RUNNER = """
+from __future__ import annotations
+
+import inspect
+import sys
+
+from jarvis_cd.core.pipeline_test import load_yaml_auto
+
+_, obj = load_yaml_auto(sys.argv[1])
+submit = getattr(obj, "submit")
+if "wait" in inspect.signature(submit).parameters:
+    submit(submit=True, wait=True)
+else:
+    submit(submit=True)
+"""
+
 
 class JarvisCdProvider:
     """Materialize and invoke relay jobs through JARVIS-CD."""
@@ -125,7 +141,7 @@ class JarvisCdProvider:
     ) -> subprocess.CompletedProcess[str]:
         """Invoke JARVIS-CD for an already materialized pipeline."""
         self.require_available()
-        command = [self.jarvis_bin, "ppl", "run", "yaml", str(pipeline_path)]
+        command = self.pipeline_command(pipeline_path)
         try:
             return subprocess.run(
                 command,
@@ -152,7 +168,7 @@ class JarvisCdProvider:
     ) -> subprocess.CompletedProcess[str]:
         """Invoke JARVIS-CD and stream output chunks while retaining final output."""
         self.require_available()
-        command = [self.jarvis_bin, "ppl", "run", "yaml", str(pipeline_path)]
+        command = self.pipeline_command(pipeline_path)
         try:
             process = subprocess.Popen(
                 command,
@@ -214,6 +230,17 @@ class JarvisCdProvider:
             stderr="".join(stderr_chunks),
         )
 
+    def pipeline_command(self, pipeline_path: Path) -> list[str]:
+        """Return the command used to execute a materialized JARVIS pipeline."""
+        if _uses_scheduler(pipeline_path):
+            return [
+                _jarvis_python(self.jarvis_bin),
+                "-c",
+                _SCHEDULED_PIPELINE_RUNNER,
+                str(pipeline_path),
+            ]
+        return [self.jarvis_bin, "ppl", "run", "yaml", str(pipeline_path)]
+
 
 def _drop_none(value: Any) -> Any:
     if isinstance(value, dict):
@@ -260,3 +287,43 @@ def _terminate_process(process: subprocess.Popen[str]) -> None:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             return
+
+
+def _uses_scheduler(pipeline_path: Path) -> bool:
+    try:
+        document = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ConfigurationError(f"failed to read JARVIS pipeline: {pipeline_path}") from exc
+    return _document_uses_scheduler(document)
+
+
+def _document_uses_scheduler(document: object) -> bool:
+    if not isinstance(document, dict):
+        return False
+    typed = cast(dict[str, object], document)
+    scheduler = typed.get("scheduler")
+    if isinstance(scheduler, dict) and scheduler:
+        return True
+    config = typed.get("config")
+    if isinstance(config, dict):
+        typed_config = cast(dict[str, object], config)
+        if _document_uses_scheduler(typed_config):
+            return True
+    experiments = typed.get("experiments")
+    if isinstance(experiments, list):
+        typed_experiments = cast(list[object], experiments)
+        return any(_document_uses_scheduler(experiment) for experiment in typed_experiments)
+    return False
+
+
+def _jarvis_python(jarvis_bin: str) -> str:
+    jarvis_path = Path(jarvis_bin)
+    if jarvis_path.parent.name == "bin":
+        return str(jarvis_path.parent / "python")
+    resolved = shutil.which(jarvis_bin)
+    if resolved is not None:
+        resolved_path = Path(resolved)
+        candidate = resolved_path.parent / "python"
+        if candidate.exists():
+            return str(candidate)
+    return "python"
