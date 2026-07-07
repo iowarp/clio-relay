@@ -24,6 +24,7 @@ from clio_relay.models import (
     EndpointRegistration,
     JobState,
     Lease,
+    MonitorRule,
     RelayEvent,
     RelayJob,
     RelayTask,
@@ -52,6 +53,7 @@ class ClioCoreQueue:
             "artifacts",
             "checkpoints",
             "idempotency",
+            "monitor_rules",
         ):
             (self.root / family).mkdir(parents=True, exist_ok=True)
 
@@ -236,6 +238,36 @@ class ClioCoreQueue:
         if artifact is None:
             raise NotFoundError(f"artifact not found: {artifact_id}")
         return artifact
+
+    def append_monitor_rule(self, rule: MonitorRule) -> MonitorRule:
+        """Create a durable monitor rule."""
+        self.initialize()
+        with self._lock:
+            self.get_job(rule.job_id)
+            self._write(self.root / "monitor_rules" / f"{rule.rule_id}.json", rule)
+            self.append_event(
+                rule.job_id,
+                "monitor.rule.created",
+                f"Monitor rule created: {rule.rule_id}",
+                locked=True,
+                payload={"rule_id": rule.rule_id, "pattern": rule.pattern},
+            )
+        return rule
+
+    def list_monitor_rules(self, job_id: str | None = None) -> list[MonitorRule]:
+        """Return monitor rules, optionally filtered by job id."""
+        self.initialize()
+        rules = list(self._read_many(self.root / "monitor_rules", MonitorRule))
+        if job_id is not None:
+            rules = [rule for rule in rules if rule.job_id == job_id]
+        return sorted(rules, key=lambda rule: rule.created_at)
+
+    def update_monitor_rule(self, rule: MonitorRule) -> MonitorRule:
+        """Persist a monitor rule update."""
+        self.initialize()
+        with self._lock:
+            self._write(self.root / "monitor_rules" / f"{rule.rule_id}.json", rule)
+        return rule
 
     def _append_event_unlocked(
         self,

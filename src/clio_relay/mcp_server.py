@@ -10,8 +10,16 @@ from typing import Any, TextIO, cast
 
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.models import Cursor, JarvisRunSpec, JobKind, RelayJob
+from clio_relay.models import (
+    Cursor,
+    JarvisRunSpec,
+    JobKind,
+    MonitorRule,
+    MonitorRuleAction,
+    RelayJob,
+)
 from clio_relay.relay_ops import (
+    evaluate_monitor_rules,
     monitor_job,
     read_artifact_bytes,
     read_job_log,
@@ -192,6 +200,48 @@ def _tool_definitions() -> list[JSON]:
                 "additionalProperties": False,
             },
         },
+        {
+            "name": "relay_create_monitor_rule",
+            "description": "Create a regex monitor rule over a job event stream.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"},
+                    "pattern": {"type": "string"},
+                    "action": {
+                        "type": "string",
+                        "enum": ["emit_event", "submit_agent"],
+                        "default": "emit_event",
+                    },
+                    "event_types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": [],
+                    },
+                    "action_payload": {"type": "object", "default": {}},
+                },
+                "required": ["job_id", "pattern"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_list_monitor_rules",
+            "description": "List monitor rules, optionally filtered by job id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"job_id": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_evaluate_monitor_rules",
+            "description": "Evaluate enabled monitor rules once.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer", "default": 100, "minimum": 1}},
+                "additionalProperties": False,
+            },
+        },
     ]
 
 
@@ -242,6 +292,21 @@ def _call_tool(params: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -
         }
     elif name == "relay_read_artifact":
         result = read_artifact_bytes(queue, _required_str(arguments, "artifact_id"))
+    elif name == "relay_create_monitor_rule":
+        result = queue.append_monitor_rule(_monitor_rule_from_arguments(arguments)).model_dump(
+            mode="json"
+        )
+    elif name == "relay_list_monitor_rules":
+        job_id = arguments.get("job_id")
+        if job_id is not None and not isinstance(job_id, str):
+            raise ValueError("job_id must be a string")
+        result = {
+            "rules": [
+                rule.model_dump(mode="json") for rule in queue.list_monitor_rules(job_id=job_id)
+            ]
+        }
+    elif name == "relay_evaluate_monitor_rules":
+        result = {"actions": evaluate_monitor_rules(queue, limit=int(arguments.get("limit", 100)))}
     else:
         raise ValueError(f"unknown tool: {name}")
     return {
@@ -277,6 +342,26 @@ def _submit_jarvis_pipeline(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
         "kind": job.kind.value,
         "terminal": job.state.value in {"succeeded", "failed", "canceled"},
     }
+
+
+def _monitor_rule_from_arguments(arguments: JSON) -> MonitorRule:
+    action_payload = arguments.get("action_payload", {})
+    if not isinstance(action_payload, dict):
+        raise ValueError("action_payload must be an object")
+    event_types_value = arguments.get("event_types", [])
+    if not isinstance(event_types_value, list):
+        raise ValueError("event_types must be a string array")
+    event_type_items = cast(list[object], event_types_value)
+    if not all(isinstance(item, str) for item in event_type_items):
+        raise ValueError("event_types must be a string array")
+    event_types = cast(list[str], event_type_items)
+    return MonitorRule(
+        job_id=_required_str(arguments, "job_id"),
+        pattern=_required_str(arguments, "pattern"),
+        action=MonitorRuleAction(str(arguments.get("action", "emit_event"))),
+        event_types=event_types,
+        action_payload=cast(dict[str, Any], action_payload),
+    )
 
 
 def _object(value: Any) -> JSON:

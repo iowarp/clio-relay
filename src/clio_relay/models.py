@@ -50,6 +50,13 @@ class JobState(StrEnum):
 TERMINAL_STATES = {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELED}
 
 
+class MonitorRuleAction(StrEnum):
+    """Actions a monitor rule can take when it matches an event."""
+
+    EMIT_EVENT = "emit_event"
+    SUBMIT_AGENT = "submit_agent"
+
+
 class EventLevel(StrEnum):
     """Event severity levels."""
 
@@ -183,6 +190,24 @@ class ArtifactRef(BaseModel):
     sha256: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MonitorRule(BaseModel):
+    """A durable observer rule over a job event stream."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rule_id: str = Field(default_factory=lambda: new_id("rule"))
+    job_id: str
+    pattern: str
+    action: MonitorRuleAction = MonitorRuleAction.EMIT_EVENT
+    event_types: list[str] = Field(default_factory=list)
+    next_seq: int = Field(default=1, ge=1)
+    enabled: bool = True
+    triggered_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    action_payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class Cursor(BaseModel):

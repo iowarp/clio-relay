@@ -6,9 +6,10 @@ import hashlib
 import json
 from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, cast
 
 import typer
+import uvicorn
 
 from clio_relay.bootstrap import bootstrap_cluster_over_ssh, install_local_frp
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, default_registry_path
@@ -31,6 +32,8 @@ from clio_relay.models import (
     JobKind,
     JobState,
     McpCallSpec,
+    MonitorRule,
+    MonitorRuleAction,
     RelayJob,
     RemoteAgentTaskSpec,
 )
@@ -41,7 +44,13 @@ from clio_relay.relay_host import (
     render_frpc_config,
     render_frps_config,
 )
-from clio_relay.relay_ops import monitor_job, read_artifact_bytes, read_job_log, wait_for_terminal
+from clio_relay.relay_ops import (
+    evaluate_monitor_rules,
+    monitor_job,
+    read_artifact_bytes,
+    read_job_log,
+    wait_for_terminal,
+)
 
 app = typer.Typer(no_args_is_help=True)
 endpoint_app = typer.Typer(no_args_is_help=True)
@@ -49,12 +58,16 @@ relay_host_app = typer.Typer(no_args_is_help=True)
 job_app = typer.Typer(no_args_is_help=True)
 cluster_app = typer.Typer(no_args_is_help=True)
 agent_app = typer.Typer(no_args_is_help=True)
+monitor_app = typer.Typer(no_args_is_help=True)
+api_app = typer.Typer(no_args_is_help=True)
 
 app.add_typer(endpoint_app, name="endpoint")
 app.add_typer(relay_host_app, name="relay-host")
 app.add_typer(job_app, name="job")
 app.add_typer(cluster_app, name="cluster")
 app.add_typer(agent_app, name="agent")
+app.add_typer(monitor_app, name="monitor")
+app.add_typer(api_app, name="api")
 
 
 @app.callback()
@@ -403,6 +416,58 @@ def job_cancel(job_id: str) -> None:
     typer.echo(f"{job.job_id} {job.state.value}")
 
 
+@monitor_app.command("add-regex")
+def monitor_add_regex(
+    job_id: str,
+    pattern: Annotated[str, typer.Option(help="Python regular expression to match.")],
+    action: Annotated[
+        MonitorRuleAction,
+        typer.Option(help="Action to take when the rule matches."),
+    ] = MonitorRuleAction.EMIT_EVENT,
+    event_type: Annotated[
+        list[str] | None,
+        typer.Option(help="Event type to inspect; repeat for multiple types."),
+    ] = None,
+    action_payload_json: Annotated[
+        str,
+        typer.Option(help="JSON object used by actions such as submit_agent."),
+    ] = "{}",
+) -> None:
+    """Create a generic regex monitor rule over a job event stream."""
+    action_payload = _json_object(action_payload_json)
+    rule = ClioCoreQueue(RelaySettings.from_env().core_dir).append_monitor_rule(
+        MonitorRule(
+            job_id=job_id,
+            pattern=pattern,
+            action=action,
+            event_types=event_type or [],
+            action_payload=action_payload,
+        )
+    )
+    typer.echo(rule.model_dump_json(indent=2))
+
+
+@monitor_app.command("list")
+def monitor_list(
+    job_id: Annotated[
+        str | None,
+        typer.Option(help="Optional job id filter."),
+    ] = None,
+) -> None:
+    """List durable monitor rules as JSON."""
+    rules = ClioCoreQueue(RelaySettings.from_env().core_dir).list_monitor_rules(job_id)
+    typer.echo(json.dumps([rule.model_dump(mode="json") for rule in rules], indent=2))
+
+
+@monitor_app.command("run-once")
+def monitor_run_once(
+    limit: Annotated[int, typer.Option(help="Maximum events read per rule.")] = 100,
+) -> None:
+    """Evaluate enabled monitor rules once."""
+    result = evaluate_monitor_rules(ClioCoreQueue(RelaySettings.from_env().core_dir), limit=limit)
+    typer.echo(json.dumps(result, indent=2))
+
+
 @agent_app.command("run")
 def agent_run(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
@@ -458,6 +523,15 @@ def mcp_server() -> None:
     serve_stdio()
 
 
+@api_app.command("start")
+def api_start(
+    host: Annotated[str, typer.Option(help="HTTP bind address.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option(help="HTTP bind port.")] = 8765,
+) -> None:
+    """Start the desktop-facing HTTP API."""
+    uvicorn.run("clio_relay.http_api:app", host=host, port=port)
+
+
 @agent_app.command("render-mcp-config")
 def agent_render_mcp_config(
     output: Annotated[
@@ -507,6 +581,13 @@ def live_test(
 def _file_idempotency_key(path: Path, text: str) -> str:
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return f"jarvis:{path.resolve()}:{digest}"
+
+
+def _json_object(value: str) -> dict[str, object]:
+    loaded = cast(object, json.loads(value))
+    if not isinstance(loaded, dict):
+        raise typer.BadParameter("value must be a JSON object")
+    return {str(key): item for key, item in cast(dict[object, object], loaded).items()}
 
 
 def _echo_lines(lines: list[str]) -> None:

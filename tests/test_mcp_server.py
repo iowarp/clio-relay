@@ -27,6 +27,9 @@ def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
     assert "relay_read_job_log" in tool_names
     assert "relay_list_artifacts" in tool_names
     assert "relay_read_artifact" in tool_names
+    assert "relay_create_monitor_rule" in tool_names
+    assert "relay_list_monitor_rules" in tool_names
+    assert "relay_evaluate_monitor_rules" in tool_names
 
 
 def test_mcp_submit_jarvis_pipeline_creates_real_job(tmp_path: Path) -> None:
@@ -271,6 +274,64 @@ def test_mcp_reads_logs_and_artifacts(tmp_path: Path) -> None:
     )
     assert content_response is not None
     assert content_response["result"]["structuredContent"]["encoding"] == "base64"
+
+
+def test_mcp_creates_and_evaluates_monitor_rule(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="mcp-monitor",
+        )
+    )
+    queue.append_event(job.job_id, "stdout.delta", "step 75", payload={"text": "step 75\n"})
+
+    create_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_create_monitor_rule",
+                "arguments": {
+                    "job_id": job.job_id,
+                    "pattern": "step 75",
+                    "event_types": ["stdout.delta"],
+                },
+            },
+        },
+        queue=queue,
+    )
+    list_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 13,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_list_monitor_rules",
+                "arguments": {"job_id": job.job_id},
+            },
+        },
+        queue=queue,
+    )
+    run_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 14,
+            "method": "tools/call",
+            "params": {"name": "relay_evaluate_monitor_rules", "arguments": {}},
+        },
+        queue=queue,
+    )
+
+    assert create_response is not None
+    assert create_response["result"]["structuredContent"]["job_id"] == job.job_id
+    assert list_response is not None
+    assert list_response["result"]["structuredContent"]["rules"][0]["job_id"] == job.job_id
+    assert run_response is not None
+    assert run_response["result"]["structuredContent"]["actions"][0]["action"] == "emit_event"
 
 
 def test_stdio_server_reports_parse_errors(tmp_path: Path) -> None:

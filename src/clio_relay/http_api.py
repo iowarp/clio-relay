@@ -9,8 +9,14 @@ from fastapi import FastAPI, HTTPException
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import NotFoundError
-from clio_relay.models import ArtifactRef, Cursor, JobState, RelayEvent, RelayJob
-from clio_relay.relay_ops import monitor_job, read_artifact_bytes, read_job_log, wait_for_terminal
+from clio_relay.models import ArtifactRef, Cursor, JobState, MonitorRule, RelayEvent, RelayJob
+from clio_relay.relay_ops import (
+    evaluate_monitor_rules,
+    monitor_job,
+    read_artifact_bytes,
+    read_job_log,
+    wait_for_terminal,
+)
 
 
 def create_app(settings: RelaySettings | None = None) -> FastAPI:
@@ -91,6 +97,21 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     @app.post("/jobs/{job_id}/cancel", response_model=RelayJob)
     def cancel_job(job_id: str) -> RelayJob:
         return queue.update_job_state(job_id, state=JobState.CANCELED)
+
+    @app.post("/monitor/rules", response_model=MonitorRule)
+    def create_monitor_rule(rule: MonitorRule) -> MonitorRule:
+        try:
+            return queue.append_monitor_rule(rule)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/monitor/rules", response_model=list[MonitorRule])
+    def list_monitor_rules(job_id: str | None = None) -> list[MonitorRule]:
+        return queue.list_monitor_rules(job_id)
+
+    @app.post("/monitor/run-once")
+    def run_monitor_once(limit: int = 100) -> list[dict[str, object]]:
+        return evaluate_monitor_rules(queue, limit=limit)
 
     return app
 
