@@ -33,9 +33,8 @@ def run_doctor(
         resolved_frps_addr = frps_addr or settings.frps_addr
         if resolved_frps_addr is None:
             raise ConfigurationError("CLIO_RELAY_FRPS_ADDR is required for live checks")
-        if settings.frp_token is None:
-            raise ConfigurationError("CLIO_RELAY_FRP_TOKEN is required for live checks")
         lines.append(f"frps_addr: {resolved_frps_addr}")
+        lines.append(f"frp_token: {'configured' if settings.frp_token is not None else 'missing'}")
         lines.append(check_required_binary("frpc", settings.frpc_bin))
     return lines
 

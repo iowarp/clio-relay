@@ -69,7 +69,20 @@ def test_live_doctor_accepts_cluster_frps_address(tmp_path: Path) -> None:
     lines = run_doctor(settings, live=True, frps_addr="frps.example.test")
 
     assert "frps_addr: frps.example.test" in lines
+    assert "frp_token: configured" in lines
     assert any(line.startswith("frpc:") for line in lines)
+
+
+def test_live_doctor_reports_missing_frp_token(tmp_path: Path) -> None:
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="python",
+    )
+
+    lines = run_doctor(settings, live=True, frps_addr="frps.example.test")
+
+    assert "frp_token: missing" in lines
 
 
 def test_live_doctor_does_not_require_cluster_tools_locally(tmp_path: Path) -> None:
@@ -86,6 +99,7 @@ def test_live_doctor_does_not_require_cluster_tools_locally(tmp_path: Path) -> N
     lines = run_doctor(settings, live=True)
 
     assert "frps_addr: frps.example.test" in lines
+    assert "frp_token: configured" in lines
     assert any(line.startswith("frpc:") for line in lines)
 
 
