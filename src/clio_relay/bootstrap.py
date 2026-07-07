@@ -342,6 +342,9 @@ while [ "$#" -gt 0 ]; do
       passthrough+=("$1")
       shift
       ;;
+    *=*)
+      shift
+      ;;
     *)
       break
       ;;
