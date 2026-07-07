@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import socket
+from collections.abc import Generator
+from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -147,6 +150,23 @@ def test_frp_http_probe_rejects_dead_visitor_even_if_local_healthz_passes(
     assert len(processes) == 2
 
 
+def test_frp_http_probe_rejects_occupied_local_visitor_port() -> None:
+    with (
+        _occupied_loopback_port() as port,
+        pytest.raises(RelayError, match=f"local visitor port is already occupied: {port}"),
+    ):
+        run_frp_http_probe(
+            cluster="test-cluster",
+            definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            frpc_bin="frpc",
+            token="frp-token",
+            secret_key="stcp-secret",
+            local_bind_port=port,
+            remote_api_port=8765,
+            process_factory=_unexpected_process_factory,
+        )
+
+
 def test_frp_direct_http_probe_uses_xtcp_proxy_and_visitor(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -196,6 +216,24 @@ def test_frp_direct_http_probe_uses_xtcp_proxy_and_visitor(
     assert "keepTunnelOpen = true" in visitor_configs[0]
 
 
+def test_frp_direct_http_probe_rejects_occupied_local_visitor_port() -> None:
+    with (
+        _occupied_loopback_port() as port,
+        pytest.raises(RelayError, match=f"local visitor port is already occupied: {port}"),
+    ):
+        run_frp_direct_http_probe(
+            cluster="test-cluster",
+            definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            frpc_bin="frpc",
+            token="frp-token",
+            secret_key="xtcp-secret",
+            local_bind_port=port,
+            remote_api_port=8765,
+            proxy_name="relay-http-direct-test",
+            process_factory=_unexpected_process_factory,
+        )
+
+
 def test_frp_direct_http_probe_reports_stcp_fallback_when_xtcp_fails(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -242,6 +280,21 @@ def test_frp_direct_http_probe_reports_stcp_fallback_when_xtcp_fails(
         for process in processes
         if process.stdin is not None
     )
+
+
+@contextmanager
+def _occupied_loopback_port() -> Generator[int]:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        yield int(sock.getsockname()[1])
+    finally:
+        sock.close()
+
+
+def _unexpected_process_factory(command: list[str], **_kwargs: Any) -> FakeProcess:
+    raise AssertionError(f"process should not start with occupied local port: {command}")
 
 
 class FakeProcess:

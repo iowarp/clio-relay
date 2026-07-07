@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import tempfile
 import time
@@ -71,6 +72,7 @@ def run_frp_http_probe(
         raise ConfigurationError("remote_api_port must be positive")
     if timeout_seconds <= 0:
         raise ConfigurationError("timeout_seconds must be positive")
+    _assert_local_bind_port_available(local_bind_port)
     factory = process_factory or _popen
     transport = definition.frp_transport
     protocol = FrpTransportProtocol(transport.protocol)
@@ -251,6 +253,7 @@ def _run_frp_http_probe_with_proxy_type(
         raise ConfigurationError("timeout_seconds must be positive")
     if proxy_type not in {"stcp", "xtcp"}:
         raise ConfigurationError(f"unsupported transport proxy type: {proxy_type}")
+    _assert_local_bind_port_available(local_bind_port)
     factory = process_factory or _popen
     transport = definition.frp_transport
     protocol = FrpTransportProtocol(transport.protocol)
@@ -428,6 +431,15 @@ def _wait_for_healthz(url: str, *, timeout_seconds: float) -> None:
             last_error = str(exc)
         time.sleep(0.5)
     raise RelayError(f"transport health check failed for {url}: {last_error}")
+
+
+def _assert_local_bind_port_available(port: int) -> None:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("127.0.0.1", port))
+    except OSError as exc:
+        raise ConfigurationError(f"local visitor port is already occupied: {port}") from exc
 
 
 def _terminate(process: ManagedProcess) -> None:
