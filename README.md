@@ -47,6 +47,8 @@ The worker streams JARVIS stdout/stderr into durable events while the process is
 
 Cancellation is durable and cooperative. `job cancel`, HTTP `/jobs/{job_id}/cancel`, and MCP `relay_cancel_job` all record `job.cancel_requested` and move the job to `canceled`. A running worker polls clio-core while JARVIS executes; when it observes cancellation it terminates the JARVIS process group, records `execution.canceled`, and does not overwrite the terminal canceled state.
 
+Worker leases are short lived and renewed while JARVIS is running. If a worker process dies or loses access to clio-core, the next worker loop recovers expired `leased` or `running` jobs for that cluster: jobs below the retry cap are requeued with a `job.requeued` event, and jobs at the cap become `failed` with an explicit `job.failed` event. This prevents orphaned long-running work from remaining invisible while avoiding duplicate execution from healthy workers.
+
 Monitor rules are durable observer records over a job event stream. A regex rule can match event messages or streamed `text` payloads, then emit a `monitor.triggered` event or submit a generic remote-agent task. Rules are cursor-based and one-shot by default after a match, so replay does not duplicate actions.
 
 The HTTP API enforces `CLIO_RELAY_API_TOKEN` when that environment variable is set. Clients can send either `Authorization: Bearer <token>` or `X-Clio-Relay-Token: <token>`. `/healthz` remains unauthenticated for local process checks. When exposing the API through frp or another relay, start it with `clio-relay api start --require-token` so missing API auth fails at startup.

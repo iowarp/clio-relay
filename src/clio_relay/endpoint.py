@@ -20,6 +20,7 @@ from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
     JobState,
+    Lease,
     McpCallSpec,
     RelayJob,
     RemoteAgentTaskSpec,
@@ -29,6 +30,9 @@ from clio_relay.spool import JobSpool
 
 class EndpointWorker:
     """Endpoint worker for desktop or cluster roles."""
+
+    lease_ttl_seconds = 120
+    lease_renew_seconds = 30
 
     def __init__(
         self,
@@ -67,12 +71,16 @@ class EndpointWorker:
         if self.role != EndpointRole.WORKER:
             return None
         endpoint = self.endpoint or self.register()
-        lease = self.queue.acquire_next_job(endpoint.endpoint_id, cluster=self.cluster)
+        lease = self.queue.acquire_next_job(
+            endpoint.endpoint_id,
+            cluster=self.cluster,
+            ttl_seconds=self.lease_ttl_seconds,
+        )
         if lease is None:
             return None
         job = self.queue.get_job(lease.job_id)
         try:
-            self._run_job(job)
+            self._run_job(job, lease)
         finally:
             self.queue.release_lease(lease.lease_id)
         return self.queue.get_job(job.job_id)
@@ -88,10 +96,11 @@ class EndpointWorker:
                 self.run_once()
                 time.sleep(poll_seconds)
 
-    def _run_job(self, job: RelayJob) -> None:
+    def _run_job(self, job: RelayJob, lease: Lease) -> None:
         if self.queue.get_job(job.job_id).state == JobState.CANCELED:
             self.queue.append_event(job.job_id, "job.cancel_acknowledged", "Canceled before start")
             return
+        last_renewed_at = [time.monotonic()]
         self.queue.update_job_state(job.job_id, JobState.RUNNING)
         spool = JobSpool(self.settings.spool_dir, job)
         spool.initialize()
@@ -111,6 +120,7 @@ class EndpointWorker:
             on_stderr=lambda text: self._append_output(job, spool, "stderr", text),
             on_start=lambda pid: self._append_execution_start(job, pid),
             should_cancel=lambda: self.queue.get_job(job.job_id).state == JobState.CANCELED,
+            on_poll=lambda: self._renew_lease_if_needed(lease, last_renewed_at),
         )
         self.queue.append_artifact(spool.artifact_for(spool.path / "stdout.log", kind="stdout"))
         self.queue.append_artifact(spool.artifact_for(spool.path / "stderr.log", kind="stderr"))
@@ -170,6 +180,13 @@ class EndpointWorker:
             f"JARVIS-CD process started: {pid}",
             payload={"pid": pid},
         )
+
+    def _renew_lease_if_needed(self, lease: Lease, last_renewed_at: list[float]) -> None:
+        now = time.monotonic()
+        if now - last_renewed_at[0] < self.lease_renew_seconds:
+            return
+        self.queue.renew_lease(lease.lease_id, ttl_seconds=self.lease_ttl_seconds)
+        last_renewed_at[0] = now
 
     @contextmanager
     def _single_cluster_worker_lock(self) -> Generator[None]:

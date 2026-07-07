@@ -133,10 +133,15 @@ class ClioCoreQueue:
         *,
         cluster: str,
         ttl_seconds: int = 300,
+        max_attempts: int = 3,
     ) -> Lease | None:
         """Lease the next queued job for a cluster worker."""
         self.initialize()
         with self._lock:
+            self._recover_stale_jobs_unlocked(
+                cluster=cluster,
+                max_attempts=max_attempts,
+            )
             active = self._active_lease_for_endpoint(endpoint_id)
             if active is not None:
                 return active
@@ -163,6 +168,28 @@ class ClioCoreQueue:
                 )
                 return lease
         return None
+
+    def renew_lease(self, lease_id: str, *, ttl_seconds: int = 300) -> Lease | None:
+        """Extend an active lease TTL."""
+        self.initialize()
+        with self._lock:
+            path = self.root / "leases" / f"{lease_id}.json"
+            lease = self._read_optional(path, Lease)
+            if lease is None:
+                return None
+            renewed = Lease.new(lease.job_id, lease.endpoint_id, ttl_seconds)
+            renewed = renewed.model_copy(update={"lease_id": lease.lease_id})
+            self._write(path, renewed)
+            return renewed
+
+    def recover_stale_jobs(self, *, cluster: str, max_attempts: int = 3) -> list[RelayJob]:
+        """Requeue or fail jobs whose worker lease expired."""
+        self.initialize()
+        with self._lock:
+            return self._recover_stale_jobs_unlocked(
+                cluster=cluster,
+                max_attempts=max_attempts,
+            )
 
     def release_lease(self, lease_id: str) -> None:
         """Remove a lease record."""
@@ -298,6 +325,66 @@ class ClioCoreQueue:
             if lease.endpoint_id == endpoint_id and not lease.is_expired():
                 return lease
         return None
+
+    def _recover_stale_jobs_unlocked(self, *, cluster: str, max_attempts: int) -> list[RelayJob]:
+        recovered: list[RelayJob] = []
+        for lease in self._read_many(self.root / "leases", Lease):
+            if not lease.is_expired():
+                continue
+            lease_path = self.root / "leases" / f"{lease.lease_id}.json"
+            job = self._read_optional(self.root / "jobs" / f"{lease.job_id}.json", RelayJob)
+            if job is None or job.cluster != cluster or job.state in TERMINAL_STATES:
+                lease_path.unlink(missing_ok=True)
+                continue
+            if job.state not in {JobState.LEASED, JobState.RUNNING}:
+                lease_path.unlink(missing_ok=True)
+                continue
+            previous_state = job.state
+            if job.attempts >= max_attempts:
+                updated = job.model_copy(
+                    update={
+                        "state": JobState.FAILED,
+                        "leased_by": None,
+                        "updated_at": utc_now(),
+                        "last_error": "expired lease exceeded retry limit",
+                    }
+                )
+                self._write(self.root / "jobs" / f"{job.job_id}.json", updated)
+                self.append_event(
+                    job.job_id,
+                    "job.failed",
+                    "Job failed after expired lease retry limit",
+                    locked=True,
+                    payload={
+                        "state": JobState.FAILED.value,
+                        "error": "expired lease exceeded retry limit",
+                        "expired_lease_id": lease.lease_id,
+                        "previous_state": previous_state.value,
+                    },
+                )
+            else:
+                updated = job.model_copy(
+                    update={
+                        "state": JobState.QUEUED,
+                        "leased_by": None,
+                        "updated_at": utc_now(),
+                    }
+                )
+                self._write(self.root / "jobs" / f"{job.job_id}.json", updated)
+                self.append_event(
+                    job.job_id,
+                    "job.requeued",
+                    "Job requeued after expired worker lease",
+                    locked=True,
+                    payload={
+                        "state": JobState.QUEUED.value,
+                        "expired_lease_id": lease.lease_id,
+                        "previous_state": previous_state.value,
+                    },
+                )
+            lease_path.unlink(missing_ok=True)
+            recovered.append(updated)
+        return recovered
 
     @staticmethod
     def _safe_key(value: str) -> str:

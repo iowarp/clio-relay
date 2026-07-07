@@ -144,6 +144,7 @@ class JarvisCdProvider:
         on_stderr: Callable[[str], None] | None = None,
         on_start: Callable[[int], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        on_poll: Callable[[], None] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Invoke JARVIS-CD and stream output chunks while retaining final output."""
         self.require_available()
@@ -188,6 +189,8 @@ class JarvisCdProvider:
                 _terminate_process(process)
                 return_code = process.wait()
                 break
+            if on_poll is not None:
+                on_poll()
             time.sleep(0.25)
         stdout_thread.join()
         stderr_thread.join()

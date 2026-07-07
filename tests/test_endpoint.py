@@ -8,7 +8,15 @@ from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.endpoint import EndpointWorker
 from clio_relay.jarvis_provider import JarvisCdProvider
-from clio_relay.models import Cursor, EndpointRole, JarvisRunSpec, JobKind, JobState, RelayJob
+from clio_relay.models import (
+    Cursor,
+    EndpointRole,
+    JarvisRunSpec,
+    JobKind,
+    JobState,
+    Lease,
+    RelayJob,
+)
 from clio_relay.relay_ops import cancel_job
 
 
@@ -35,6 +43,7 @@ class RecordingProvider(JarvisCdProvider):
         on_stderr: Callable[[str], None] | None = None,
         on_start: Callable[[int], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        on_poll: Callable[[], None] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         self.runs.append(pipeline_path)
         if on_start is not None:
@@ -43,6 +52,8 @@ class RecordingProvider(JarvisCdProvider):
             on_stdout("ok\n")
         if on_stderr is not None:
             on_stderr("warn\n")
+        if on_poll is not None:
+            on_poll()
         if should_cancel is not None and should_cancel():
             return subprocess.CompletedProcess(
                 args=["jarvis"],
@@ -120,12 +131,15 @@ def test_worker_preserves_canceled_state_for_running_job(tmp_path: Path) -> None
             on_stderr: Callable[[str], None] | None = None,
             on_start: Callable[[int], None] | None = None,
             should_cancel: Callable[[], bool] | None = None,
+            on_poll: Callable[[], None] | None = None,
         ) -> subprocess.CompletedProcess[str]:
             self.runs.append(pipeline_path)
             if on_start is not None:
                 on_start(456)
             if on_stdout is not None:
                 on_stdout("started\n")
+            if on_poll is not None:
+                on_poll()
             cancel_job(queue, job.job_id)
             assert should_cancel is not None
             assert should_cancel() is True
@@ -154,3 +168,62 @@ def test_worker_preserves_canceled_state_for_running_job(tmp_path: Path) -> None
     assert "job.cancel_requested" in event_types
     assert "execution.started" in event_types
     assert "execution.canceled" in event_types
+
+
+def test_worker_renews_lease_while_pipeline_runs(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+
+    class RecordingQueue(ClioCoreQueue):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.renew_count = 0
+
+        def renew_lease(self, lease_id: str, *, ttl_seconds: int = 300) -> Lease | None:
+            self.renew_count += 1
+            return super().renew_lease(lease_id, ttl_seconds=ttl_seconds)
+
+    queue = RecordingQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "hello"]),
+            idempotency_key="renew-from-worker",
+        )
+    )
+
+    class PollingProvider(RecordingProvider):
+        def run_pipeline_streaming(
+            self,
+            pipeline_path: Path,
+            *,
+            cwd: Path | None = None,
+            on_stdout: Callable[[str], None] | None = None,
+            on_stderr: Callable[[str], None] | None = None,
+            on_start: Callable[[int], None] | None = None,
+            should_cancel: Callable[[], bool] | None = None,
+            on_poll: Callable[[], None] | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            self.runs.append(pipeline_path)
+            if on_start is not None:
+                on_start(789)
+            if on_poll is not None:
+                on_poll()
+            return subprocess.CompletedProcess(args=["jarvis"], returncode=0, stdout="", stderr="")
+
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=queue,
+        provider=PollingProvider(),
+    )
+    worker.lease_renew_seconds = 0
+    worker.register()
+
+    result = worker.run_once()
+
+    assert result is not None
+    assert result.job_id == job.job_id
+    assert result.state == JobState.SUCCEEDED
+    assert queue.renew_count == 1

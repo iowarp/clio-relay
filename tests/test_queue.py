@@ -57,6 +57,81 @@ def test_lease_survives_restart_without_duplicate_execution(tmp_path: Path) -> N
     assert queue.get_job(job.job_id).state == JobState.LEASED
 
 
+def test_expired_lease_requeues_job_for_retry(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "hello"]),
+            idempotency_key="retry-expired",
+        )
+    )
+
+    lease = queue.acquire_next_job("endpoint-1", cluster="ares", ttl_seconds=-1)
+    recovered = queue.recover_stale_jobs(cluster="ares", max_attempts=3)
+    next_lease = queue.acquire_next_job("endpoint-2", cluster="ares", ttl_seconds=60)
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=20)
+
+    assert lease is not None
+    assert [item.job_id for item in recovered] == [job.job_id]
+    assert recovered[0].state == JobState.QUEUED
+    assert recovered[0].leased_by is None
+    assert next_lease is not None
+    assert next_lease.job_id == job.job_id
+    assert queue.get_job(job.job_id).attempts == 2
+    assert "job.requeued" in [event.event_type for event in events]
+
+
+def test_expired_lease_fails_job_after_retry_limit(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "hello"]),
+            idempotency_key="retry-exhausted",
+        )
+    )
+
+    lease = queue.acquire_next_job("endpoint-1", cluster="ares", ttl_seconds=-1)
+    recovered = queue.recover_stale_jobs(cluster="ares", max_attempts=1)
+    next_lease = queue.acquire_next_job("endpoint-2", cluster="ares", ttl_seconds=60)
+    failed = queue.get_job(job.job_id)
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=20)
+
+    assert lease is not None
+    assert [item.job_id for item in recovered] == [job.job_id]
+    assert recovered[0].state == JobState.FAILED
+    assert next_lease is None
+    assert failed.state == JobState.FAILED
+    assert failed.leased_by is None
+    assert failed.last_error == "expired lease exceeded retry limit"
+    assert "job.failed" in [event.event_type for event in events]
+
+
+def test_renewed_lease_prevents_stale_recovery(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "hello"]),
+            idempotency_key="renewed-lease",
+        )
+    )
+
+    lease = queue.acquire_next_job("endpoint-1", cluster="ares", ttl_seconds=-1)
+    assert lease is not None
+    renewed = queue.renew_lease(lease.lease_id, ttl_seconds=60)
+    recovered = queue.recover_stale_jobs(cluster="ares", max_attempts=3)
+
+    assert renewed is not None
+    assert recovered == []
+    assert queue.get_job(job.job_id).state == JobState.LEASED
+    assert queue.get_job(job.job_id).leased_by == "endpoint-1"
+
+
 def test_cursor_replay_after_restart(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path)
     job = queue.submit_job(
