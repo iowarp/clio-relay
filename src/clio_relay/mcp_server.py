@@ -6,6 +6,7 @@ import hashlib
 import json
 import sys
 from json import JSONDecodeError
+from pathlib import Path
 from typing import Any, TextIO, cast
 
 from clio_relay.config import RelaySettings
@@ -14,9 +15,11 @@ from clio_relay.models import (
     Cursor,
     JarvisRunSpec,
     JobKind,
+    McpCallSpec,
     MonitorRule,
     MonitorRuleAction,
     RelayJob,
+    RemoteAgentTaskSpec,
 )
 from clio_relay.relay_ops import (
     cancel_job as request_cancel_job,
@@ -127,6 +130,47 @@ def _tool_definitions() -> list[JSON]:
                     "poll_seconds": {"type": "number", "default": 2},
                 },
                 "required": ["cluster", "pipeline_yaml"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_submit_remote_agent",
+            "description": "Submit a generic remote-agent task to a configured relay cluster.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cluster": {"type": "string"},
+                    "prompt_path": {"type": "string"},
+                    "mcp_config_path": {"type": "string"},
+                    "model": {"type": "string"},
+                    "workdir": {"type": "string"},
+                    "timeout_seconds": {"type": "integer", "minimum": 1},
+                    "idempotency_key": {"type": "string"},
+                    "wait_for_terminal": {"type": "boolean", "default": False},
+                    "wait_timeout_seconds": {"type": "number", "default": 600},
+                    "poll_seconds": {"type": "number", "default": 2},
+                },
+                "required": ["cluster", "prompt_path"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_submit_mcp_call",
+            "description": "Submit a remote MCP tools/call task through a configured cluster.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cluster": {"type": "string"},
+                    "server": {"type": "string"},
+                    "tool": {"type": "string"},
+                    "arguments": {"type": "object", "default": {}},
+                    "timeout_seconds": {"type": "integer", "minimum": 1},
+                    "idempotency_key": {"type": "string"},
+                    "wait_for_terminal": {"type": "boolean", "default": False},
+                    "wait_timeout_seconds": {"type": "number", "default": 600},
+                    "poll_seconds": {"type": "number", "default": 2},
+                },
+                "required": ["cluster", "server", "tool"],
                 "additionalProperties": False,
             },
         },
@@ -263,6 +307,10 @@ def _call_tool(params: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -
     arguments = _object(params.get("arguments", {}))
     if name == "relay_submit_jarvis_pipeline":
         result = _submit_jarvis_pipeline(arguments, queue=queue)
+    elif name == "relay_submit_remote_agent":
+        result = _submit_remote_agent(arguments, queue=queue)
+    elif name == "relay_submit_mcp_call":
+        result = _submit_mcp_call(arguments, queue=queue)
     elif name == "relay_get_job":
         result = queue.get_job(_required_str(arguments, "job_id")).model_dump(mode="json")
     elif name == "relay_monitor_job":
@@ -361,6 +409,78 @@ def _submit_jarvis_pipeline(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     }
 
 
+def _submit_remote_agent(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+    cluster = _required_str(arguments, "cluster")
+    prompt_path = _required_str(arguments, "prompt_path")
+    mcp_config_path = _optional_str(arguments, "mcp_config_path")
+    model = _optional_str(arguments, "model")
+    workdir = _optional_str(arguments, "workdir")
+    timeout_seconds = _optional_int(arguments, "timeout_seconds")
+    idempotency_key = str(
+        arguments.get("idempotency_key")
+        or f"mcp:remote-agent:{cluster}:{prompt_path}:{mcp_config_path}:{model}:{workdir}"
+    )
+    job = queue.submit_job(
+        RelayJob(
+            cluster=cluster,
+            kind=JobKind.REMOTE_AGENT,
+            spec=RemoteAgentTaskSpec(
+                prompt_path=Path(prompt_path),
+                mcp_config_path=None if mcp_config_path is None else Path(mcp_config_path),
+                model=model,
+                workdir=None if workdir is None else Path(workdir),
+                timeout_seconds=timeout_seconds,
+            ),
+            idempotency_key=idempotency_key,
+        )
+    )
+    return _submission_result(job, arguments, queue=queue)
+
+
+def _submit_mcp_call(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+    cluster = _required_str(arguments, "cluster")
+    server = _required_str(arguments, "server")
+    tool = _required_str(arguments, "tool")
+    tool_arguments = _object(arguments.get("arguments", {}))
+    timeout_seconds = _optional_int(arguments, "timeout_seconds")
+    digest = hashlib.sha256(
+        json.dumps(tool_arguments, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    idempotency_key = str(
+        arguments.get("idempotency_key") or f"mcp:mcp-call:{cluster}:{server}:{tool}:{digest}"
+    )
+    job = queue.submit_job(
+        RelayJob(
+            cluster=cluster,
+            kind=JobKind.MCP_CALL,
+            spec=McpCallSpec(
+                server=server,
+                tool=tool,
+                arguments=tool_arguments,
+                timeout_seconds=timeout_seconds,
+            ),
+            idempotency_key=idempotency_key,
+        )
+    )
+    return _submission_result(job, arguments, queue=queue)
+
+
+def _submission_result(job: RelayJob, arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+    if bool(arguments.get("wait_for_terminal", False)):
+        job = wait_for_terminal(
+            queue,
+            job.job_id,
+            timeout_seconds=float(arguments.get("wait_timeout_seconds", 600)),
+            poll_seconds=float(arguments.get("poll_seconds", 2)),
+        )
+    return {
+        "job_id": job.job_id,
+        "state": job.state.value,
+        "kind": job.kind.value,
+        "terminal": job.state.value in {"succeeded", "failed", "canceled"},
+    }
+
+
 def _monitor_rule_from_arguments(arguments: JSON) -> MonitorRule:
     action_payload = arguments.get("action_payload", {})
     if not isinstance(action_payload, dict):
@@ -392,6 +512,22 @@ def _required_str(value: JSON, key: str) -> str:
     if not isinstance(item, str) or not item:
         raise ValueError(f"{key} is required")
     return item
+
+
+def _optional_str(value: JSON, key: str) -> str | None:
+    item = value.get(key)
+    if item is None:
+        return None
+    if not isinstance(item, str) or not item:
+        raise ValueError(f"{key} must be a non-empty string")
+    return item
+
+
+def _optional_int(value: JSON, key: str) -> int | None:
+    item = value.get(key)
+    if item is None:
+        return None
+    return int(item)
 
 
 def _error(request_id: Any, code: int, message: str) -> JSON:

@@ -7,7 +7,15 @@ from pathlib import Path
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.mcp_server import handle_request, render_codex_mcp_profile, serve_stdio
-from clio_relay.models import ArtifactRef, Cursor, JarvisRunSpec, JobKind, RelayJob
+from clio_relay.models import (
+    ArtifactRef,
+    Cursor,
+    JarvisRunSpec,
+    JobKind,
+    McpCallSpec,
+    RelayJob,
+    RemoteAgentTaskSpec,
+)
 
 
 def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
@@ -21,6 +29,8 @@ def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
     assert response is not None
     tool_names = {tool["name"] for tool in response["result"]["tools"]}
     assert "relay_submit_jarvis_pipeline" in tool_names
+    assert "relay_submit_remote_agent" in tool_names
+    assert "relay_submit_mcp_call" in tool_names
     assert "relay_get_job" in tool_names
     assert "relay_monitor_job" in tool_names
     assert "relay_watch_job_events" in tool_names
@@ -60,6 +70,77 @@ def test_mcp_submit_jarvis_pipeline_creates_real_job(tmp_path: Path) -> None:
     assert job.kind == JobKind.JARVIS
     assert isinstance(job.spec, JarvisRunSpec)
     assert job.spec.pipeline_yaml == pipeline_yaml
+
+
+def test_mcp_submit_remote_agent_creates_real_job(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    prompt_path = tmp_path / "prompt.md"
+    mcp_config_path = tmp_path / "mcp.toml"
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_submit_remote_agent",
+                "arguments": {
+                    "cluster": "test-cluster",
+                    "prompt_path": str(prompt_path),
+                    "mcp_config_path": str(mcp_config_path),
+                    "model": "configured-model",
+                    "workdir": str(tmp_path),
+                    "timeout_seconds": 30,
+                    "idempotency_key": "remote-agent-tool",
+                },
+            },
+        },
+        queue=queue,
+    )
+
+    assert response is not None
+    result = response["result"]["structuredContent"]
+    job = queue.get_job(result["job_id"])
+    assert job.kind == JobKind.REMOTE_AGENT
+    assert isinstance(job.spec, RemoteAgentTaskSpec)
+    assert job.spec.prompt_path == prompt_path
+    assert job.spec.mcp_config_path == mcp_config_path
+    assert job.spec.model == "configured-model"
+    assert job.spec.timeout_seconds == 30
+
+
+def test_mcp_submit_mcp_call_creates_real_job_with_arguments(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_submit_mcp_call",
+                "arguments": {
+                    "cluster": "test-cluster",
+                    "server": "remote-tool-server",
+                    "tool": "run",
+                    "arguments": {"case": "lammps", "steps": 100},
+                    "timeout_seconds": 60,
+                    "idempotency_key": "mcp-call-tool",
+                },
+            },
+        },
+        queue=queue,
+    )
+
+    assert response is not None
+    result = response["result"]["structuredContent"]
+    job = queue.get_job(result["job_id"])
+    assert job.kind == JobKind.MCP_CALL
+    assert isinstance(job.spec, McpCallSpec)
+    assert job.spec.server == "remote-tool-server"
+    assert job.spec.tool == "run"
+    assert job.spec.arguments == {"case": "lammps", "steps": 100}
+    assert job.spec.timeout_seconds == 60
 
 
 def test_mcp_submit_is_idempotent(tmp_path: Path) -> None:

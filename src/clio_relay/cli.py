@@ -624,6 +624,10 @@ def mcp_call(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     server: Annotated[str, typer.Option(help="Remote MCP server name.")],
     tool: Annotated[str, typer.Option(help="Remote MCP tool name.")],
+    arguments_json: Annotated[
+        str,
+        typer.Option(help="JSON object arguments for the remote MCP tool."),
+    ] = "{}",
     idempotency_key: Annotated[
         str | None,
         typer.Option(help="Submit/retry idempotency key."),
@@ -631,11 +635,15 @@ def mcp_call(
 ) -> None:
     """Submit a remote MCP tool call."""
     _require_cluster(cluster)
-    key = idempotency_key or f"mcp:{cluster}:{server}:{tool}"
+    arguments = _json_object(arguments_json)
+    digest = hashlib.sha256(
+        json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    key = idempotency_key or f"mcp:{cluster}:{server}:{tool}:{digest}"
     job = RelayJob(
         cluster=cluster,
         kind=JobKind.MCP_CALL,
-        spec=McpCallSpec(server=server, tool=tool),
+        spec=McpCallSpec(server=server, tool=tool, arguments=arguments),
         idempotency_key=key,
     )
     saved = ClioCoreQueue(RelaySettings.from_env().core_dir).submit_job(job)

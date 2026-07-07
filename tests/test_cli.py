@@ -8,7 +8,7 @@ from typer.testing import CliRunner
 
 from clio_relay.cli import app
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.models import ArtifactRef, JarvisRunSpec, JobKind, RelayJob
+from clio_relay.models import ArtifactRef, JarvisRunSpec, JobKind, McpCallSpec, RelayJob
 
 
 def test_cli_lists_artifacts(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -121,3 +121,34 @@ def test_cli_transport_reports_missing_configured_secret_env(
 
     assert result.exit_code == 1
     assert "CLIO_RELAY_FRP_TOKEN" in result.output
+
+
+def test_cli_mcp_call_preserves_arguments(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    core_dir = tmp_path / "core"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "mcp-call",
+            "--cluster",
+            "ares",
+            "--server",
+            "remote-server",
+            "--tool",
+            "simulate",
+            "--arguments-json",
+            '{"steps": 100, "case": "lammps"}',
+            "--idempotency-key",
+            "cli-mcp-call-args",
+        ],
+    )
+
+    assert result.exit_code == 0
+    job_id = result.output.strip()
+    job = ClioCoreQueue(core_dir).get_job(job_id)
+    assert job.kind == JobKind.MCP_CALL
+    assert isinstance(job.spec, McpCallSpec)
+    assert job.spec.arguments == {"steps": 100, "case": "lammps"}
