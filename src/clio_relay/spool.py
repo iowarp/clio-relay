@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from clio_relay.models import ArtifactRef, RelayJob
 
@@ -33,6 +34,12 @@ class JobSpool:
         """Write the materialized JARVIS pipeline for this job."""
         target = self.path / "pipeline.yaml"
         target.write_text(yaml_text, encoding="utf-8")
+        return target
+
+    def write_provenance(self, provenance: dict[str, Any]) -> Path:
+        """Write a relay execution provenance manifest."""
+        target = self.path / "provenance.json"
+        target.write_text(json.dumps(provenance, indent=2, sort_keys=True), encoding="utf-8")
         return target
 
     def append_stdout(self, text: str) -> None:

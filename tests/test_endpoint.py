@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -98,16 +99,30 @@ def test_worker_runs_one_job_and_indexes_artifacts(tmp_path: Path) -> None:
     assert result.state == JobState.SUCCEEDED
     assert len(provider.runs) == 1
     artifacts = queue.list_artifacts(job.job_id)
-    assert {artifact.kind for artifact in artifacts} == {"jarvis_pipeline", "stdout", "stderr"}
+    assert {artifact.kind for artifact in artifacts} == {
+        "jarvis_pipeline",
+        "stdout",
+        "stderr",
+        "provenance",
+    }
     events, _ = queue.drain_events(Cursor(job_id=job.job_id))
     event_types = [event.event_type for event in events]
     assert "jarvis.started" in event_types
     assert "stdout.delta" in event_types
     assert "stderr.delta" in event_types
+    assert "provenance.available" in event_types
     stdout_text = (settings.spool_dir / job.job_id / "stdout.log").read_text(encoding="utf-8")
     stderr_text = (settings.spool_dir / job.job_id / "stderr.log").read_text(encoding="utf-8")
+    provenance = json.loads(
+        (settings.spool_dir / job.job_id / "provenance.json").read_text(encoding="utf-8")
+    )
     assert stdout_text == "ok\n"
     assert stderr_text == "warn\n"
+    assert provenance["job"]["job_id"] == job.job_id
+    assert provenance["execution"]["terminal_state"] == "succeeded"
+    assert provenance["execution"]["returncode"] == 0
+    assert provenance["provider"]["name"] == "jarvis-cd"
+    assert provenance["artifacts"]["stdout"]["sha256"] is not None
 
 
 def test_worker_preserves_canceled_state_for_running_job(tmp_path: Path) -> None:

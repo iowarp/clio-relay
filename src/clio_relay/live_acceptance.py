@@ -145,7 +145,7 @@ def run_live_acceptance(
     )
     artifact_items = cast(list[dict[str, Any]], artifacts)
     artifact_kinds = {str(artifact["kind"]) for artifact in artifact_items}
-    if not {"jarvis_pipeline", "stdout", "stderr"}.issubset(artifact_kinds):
+    if not {"jarvis_pipeline", "stdout", "stderr", "provenance"}.issubset(artifact_kinds):
         raise RelayError(f"acceptance artifacts incomplete: {sorted(artifact_kinds)}")
     lines.append(f"acceptance.artifacts={','.join(sorted(artifact_kinds))}")
 
@@ -158,6 +158,18 @@ def run_live_acceptance(
     if artifact_payload.get("encoding") != "base64":
         raise RelayError("acceptance artifact payload was not base64 encoded")
     lines.append("acceptance.artifact_read=ok")
+
+    provenance_artifact = next(
+        artifact for artifact in artifact_items if artifact["kind"] == "provenance"
+    )
+    provenance_payload = _remote_clio_json(
+        options.definition,
+        ["job", "read-artifact", str(provenance_artifact["artifact_id"])],
+        runner=command_runner,
+    )
+    if provenance_payload.get("encoding") != "base64":
+        raise RelayError("acceptance provenance payload was not base64 encoded")
+    lines.append("acceptance.provenance=ok")
 
     if monitor_pattern is not None:
         _remote_clio_json(

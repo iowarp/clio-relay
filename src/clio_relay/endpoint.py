@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import socket
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
+from pathlib import Path
 
 from filelock import FileLock, Timeout
 
@@ -24,6 +26,7 @@ from clio_relay.models import (
     McpCallSpec,
     RelayJob,
     RemoteAgentTaskSpec,
+    utc_now,
 )
 from clio_relay.spool import JobSpool
 
@@ -100,6 +103,7 @@ class EndpointWorker:
         if self.queue.get_job(job.job_id).state == JobState.CANCELED:
             self.queue.append_event(job.job_id, "job.cancel_acknowledged", "Canceled before start")
             return
+        started_at = utc_now()
         last_renewed_at = [time.monotonic()]
         self.queue.update_job_state(job.job_id, JobState.RUNNING)
         spool = JobSpool(self.settings.spool_dir, job)
@@ -125,6 +129,22 @@ class EndpointWorker:
         self.queue.append_artifact(spool.artifact_for(spool.path / "stdout.log", kind="stdout"))
         self.queue.append_artifact(spool.artifact_for(spool.path / "stderr.log", kind="stderr"))
         self._append_optional_result_artifacts(job, spool)
+        terminal_state = (
+            JobState.CANCELED
+            if self.queue.get_job(job.job_id).state == JobState.CANCELED
+            else JobState.SUCCEEDED
+            if result.returncode == 0
+            else JobState.FAILED
+        )
+        self._append_provenance_artifact(
+            job,
+            spool,
+            pipeline_path=pipeline_path,
+            started_at=started_at.isoformat(),
+            finished_at=utc_now().isoformat(),
+            returncode=result.returncode,
+            terminal_state=terminal_state,
+        )
         if self.queue.get_job(job.job_id).state == JobState.CANCELED:
             self.queue.append_event(
                 job.job_id,
@@ -145,6 +165,59 @@ class EndpointWorker:
             JobState.FAILED,
             message="JARVIS-CD run failed",
             error=f"exit code {result.returncode}",
+        )
+
+    def _append_provenance_artifact(
+        self,
+        job: RelayJob,
+        spool: JobSpool,
+        *,
+        pipeline_path: Path,
+        started_at: str,
+        finished_at: str,
+        returncode: int,
+        terminal_state: JobState,
+    ) -> None:
+        provenance_path = spool.write_provenance(
+            {
+                "job": job.model_dump(mode="json"),
+                "endpoint": None
+                if self.endpoint is None
+                else self.endpoint.model_dump(mode="json"),
+                "execution": {
+                    "cluster": self.cluster,
+                    "role": self.role.value,
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                    "returncode": returncode,
+                    "terminal_state": terminal_state.value,
+                },
+                "provider": {
+                    "name": "jarvis-cd",
+                    "jarvis_bin": self.settings.jarvis_bin,
+                    "agent_bin": self.settings.agent_bin,
+                    "agent_adapter": self.settings.agent_adapter,
+                    "agent_args": self.settings.agent_args,
+                },
+                "spool": {
+                    "path": str(spool.path),
+                    "pipeline": str(pipeline_path),
+                    "stdout": str(spool.path / "stdout.log"),
+                    "stderr": str(spool.path / "stderr.log"),
+                },
+                "artifacts": {
+                    "pipeline": _file_summary(pipeline_path),
+                    "stdout": _file_summary(spool.path / "stdout.log"),
+                    "stderr": _file_summary(spool.path / "stderr.log"),
+                },
+            }
+        )
+        self.queue.append_artifact(spool.artifact_for(provenance_path, kind="provenance"))
+        self.queue.append_event(
+            job.job_id,
+            "provenance.available",
+            "Execution provenance available",
+            payload={"path": str(provenance_path)},
         )
 
     def _render_job_yaml(self, job: RelayJob) -> str:
@@ -236,3 +309,14 @@ def bootstrap_cluster_environment(settings: RelaySettings) -> None:
     provider.require_available()
     if settings.frps_addr is None or settings.frp_token is None:
         raise ConfigurationError("CLIO_RELAY_FRPS_ADDR and CLIO_RELAY_FRP_TOKEN are required")
+
+
+def _file_summary(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {"path": str(path), "exists": False}
+    return {
+        "path": str(path),
+        "exists": True,
+        "size_bytes": path.stat().st_size,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }

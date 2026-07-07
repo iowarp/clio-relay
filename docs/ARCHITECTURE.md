@@ -8,9 +8,9 @@ In the Cloudflare-backed homelab deployment, Cloudflare terminates public HTTPS 
 
 The desktop endpoint submits configured-cluster work into the durable queue and exposes job, event, artifact, cancellation, remote-agent, and MCP-call surfaces for CLIO consumers.
 
-The worker endpoint leases queued jobs for one configured cluster, materializes relay intents into JARVIS-CD YAML, runs JARVIS-CD, and records progress, stdout, stderr, artifacts, and terminal state back into the queue.
+The worker endpoint leases queued jobs for one configured cluster, materializes relay intents into JARVIS-CD YAML, runs JARVIS-CD, and records progress, stdout, stderr, artifacts, provenance, and terminal state back into the queue.
 
-The queue boundary is `ClioCoreQueue`. It owns endpoint, job, task, lease, event, cursor, artifact, checkpoint, and idempotency record families. The filesystem implementation in this repository is a development backend for the same record contract; production deployment can bind the same API to clio-core CTE storage.
+The queue boundary is `ClioCoreQueue`. It owns endpoint, job, task, lease, event, cursor, artifact, progress, checkpoint, and idempotency record families. The filesystem implementation in this repository is a development backend for the same record contract; production deployment can bind the same API to clio-core CTE storage.
 
 Per-job spool directories live on cluster-accessible storage and are backing files only:
 
@@ -20,5 +20,6 @@ Per-job spool directories live on cluster-accessible storage and are backing fil
 - `stderr.log`
 - `artifacts.jsonl`
 - `pipeline.yaml`
+- `provenance.json`
 
 Spool files are never the authoritative queue. Reconnects and cursor replay come from clio-core records.

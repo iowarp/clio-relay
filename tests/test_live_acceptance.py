@@ -76,6 +76,7 @@ def test_live_acceptance_runs_configured_pipeline_and_monitor(
                         {"artifact_id": "artifact_pipeline", "kind": "jarvis_pipeline"},
                         {"artifact_id": "artifact_stdout", "kind": "stdout"},
                         {"artifact_id": "artifact_stderr", "kind": "stderr"},
+                        {"artifact_id": "artifact_provenance", "kind": "provenance"},
                     ]
                 ),
             )
@@ -104,6 +105,7 @@ def test_live_acceptance_runs_configured_pipeline_and_monitor(
 
     assert "acceptance.job_state=succeeded" in lines
     assert "acceptance.artifact_read=ok" in lines
+    assert "acceptance.provenance=ok" in lines
     assert "acceptance.monitor=ok" in lines
     assert "live acceptance passed" in lines
     assert pipeline.read_bytes() in uploaded
@@ -159,6 +161,7 @@ def test_live_acceptance_uses_fresh_idempotency_key_per_run(
                         {"artifact_id": "artifact_pipeline", "kind": "jarvis_pipeline"},
                         {"artifact_id": "artifact_stdout", "kind": "stdout"},
                         {"artifact_id": "artifact_stderr", "kind": "stderr"},
+                        {"artifact_id": "artifact_provenance", "kind": "provenance"},
                     ]
                 ),
             )

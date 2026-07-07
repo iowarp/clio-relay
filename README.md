@@ -49,7 +49,7 @@ Remote agents running inside a single-worker cluster endpoint should submit chil
 
 The worker streams JARVIS stdout/stderr into durable events while the process is running (`stdout.delta` and `stderr.delta`) and also writes complete `stdout.log` and `stderr.log` files into the job spool. The clio-core boundary owns job state, event cursors, and artifact metadata; spool files are backing data for logs and artifacts, not the queue.
 
-Relay-owned JARVIS packages emit structured result files into the same job spool. Remote-agent jobs produce `agent-result.json` and, when the configured adapter writes one, `agent-last-message.txt`; MCP-call jobs produce `mcp-result.json` with return code and captured server output. The worker indexes these as `agent_result`, `agent_last_message`, and `mcp_result` artifacts so desktop, HTTP, and MCP clients can inspect result evidence without scraping logs.
+Every worker run writes and indexes `provenance.json` as a `provenance` artifact. The manifest records the durable job, endpoint, provider settings, materialized pipeline path, stdout/stderr backing files, return code, terminal state, sizes, and hashes. Relay-owned JARVIS packages also emit structured result files into the same job spool. Remote-agent jobs produce `agent-result.json` and, when the configured adapter writes one, `agent-last-message.txt`; MCP-call jobs produce `mcp-result.json` with return code and captured server output. The worker indexes these as `agent_result`, `agent_last_message`, and `mcp_result` artifacts so desktop, HTTP, and MCP clients can inspect result evidence without scraping logs.
 
 Cancellation is durable and cooperative. `job cancel`, HTTP `/jobs/{job_id}/cancel`, and MCP `relay_cancel_job` all record `job.cancel_requested` and move the job to `canceled`. A running worker polls clio-core while JARVIS executes; when it observes cancellation it terminates the JARVIS process group, records `execution.canceled`, and does not overwrite the terminal canceled state.
 
@@ -80,7 +80,7 @@ uv run clio-relay live-test --cluster ares --jarvis-yaml .\.clio-relay\live\ares
 }
 ```
 
-The acceptance runner submits the configured JARVIS YAML on the target cluster, waits for terminal success, verifies event replay, reads stdout/stderr by offset, lists and reads artifacts, evaluates the configured monitor pattern, and optionally runs a configured remote-agent task. The cluster registry owns what `ares`, `homelab`, or any later target means.
+The acceptance runner submits the configured JARVIS YAML on the target cluster, waits for terminal success, verifies event replay, reads stdout/stderr by offset, lists and reads artifacts, verifies the provenance artifact, evaluates the configured monitor pattern, and optionally runs a configured remote-agent task. The cluster registry owns what `ares`, `homelab`, or any later target means.
 
 ## Cloudflare-backed frps edge
 
