@@ -307,18 +307,38 @@ set -euo pipefail
 if command -v mpiexec.real >/dev/null 2>&1; then
   exec mpiexec.real "$@"
 fi
-if [ "${1:-}" = "-n" ] || [ "${1:-}" = "-np" ]; then
-  ranks="${2:-}"
-  shift 2
-  if [ "$ranks" = "1" ]; then
-    exec "$@"
-  fi
-  if command -v srun >/dev/null 2>&1; then
-    exec srun -n "$ranks" "$@"
-  fi
-  echo "mpiexec wrapper only supports single-rank runs without srun" >&2
-  exit 127
+ranks=""
+passthrough=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -n|-np)
+      ranks="${{2:-}}"
+      shift 2
+      ;;
+    -p|-f|--hostfile|-hostfile|--hosts|-hosts)
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      passthrough+=("$1")
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+if [ "${{ranks:-1}}" = "1" ]; then
+  exec "$@" "${{passthrough[@]}}"
 fi
+if command -v srun >/dev/null 2>&1; then
+  exec srun -n "$ranks" "$@" "${{passthrough[@]}}"
+fi
+echo "mpiexec wrapper only supports single-rank runs without srun" >&2
+exit 127
 exec "$@"
 __CLIO_RELAY_MPIEXEC_WRAPPER__
 chmod 0755 "$HOME/.local/bin/mpiexec"
