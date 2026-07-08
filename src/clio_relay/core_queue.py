@@ -26,6 +26,8 @@ from clio_relay.models import (
     ArtifactRef,
     Cursor,
     EndpointRegistration,
+    GatewaySession,
+    GatewaySessionState,
     JobState,
     Lease,
     MonitorRule,
@@ -33,6 +35,7 @@ from clio_relay.models import (
     RelayEvent,
     RelayJob,
     RelayTask,
+    TaskTimelineEvent,
     utc_now,
 )
 
@@ -57,6 +60,8 @@ class ClioCoreQueue:
             "cursors",
             "artifacts",
             "progress",
+            "task_events",
+            "gateway_sessions",
             "checkpoints",
             "idempotency",
             "monitor_rules",
@@ -323,6 +328,58 @@ class ClioCoreQueue:
             tasks = [task for task in tasks if task.job_id == job_id]
         return sorted(tasks, key=lambda task: task.created_at)
 
+    def append_task_event(self, event: TaskTimelineEvent) -> TaskTimelineEvent:
+        """Append a structured task timeline event with a per-task sequence."""
+        self.initialize()
+        with self._lock:
+            task = self.get_task(event.task_id)
+            event_dir = self.root / "task_events" / event.task_id
+            event_dir.mkdir(parents=True, exist_ok=True)
+            seq = self._next_event_seq(event_dir)
+            saved = event.model_copy(update={"seq": seq})
+            self._write(event_dir / f"{seq:020d}.json", saved)
+            self.append_event(
+                task.job_id,
+                f"task.timeline.{event.event_type}",
+                event.summary,
+                locked=True,
+                payload={
+                    "task_id": event.task_id,
+                    "task_event_seq": seq,
+                    "event_type": event.event_type,
+                    "label": event.label,
+                    "status": event.status.value,
+                },
+            )
+            return saved
+
+    def drain_task_events(
+        self,
+        task_id: str,
+        *,
+        cursor: int = 1,
+        limit: int = 100,
+    ) -> tuple[list[TaskTimelineEvent], int]:
+        """Drain structured task timeline events from a task cursor."""
+        self.initialize()
+        self.get_task(task_id)
+        events = [
+            event
+            for event in self._read_many(self.root / "task_events" / task_id, TaskTimelineEvent)
+            if event.seq >= cursor
+        ]
+        events.sort(key=lambda event: event.seq)
+        drained = events[:limit]
+        next_cursor = cursor if not drained else drained[-1].seq + 1
+        return drained, next_cursor
+
+    def get_task(self, task_id: str) -> RelayTask:
+        """Return a task by id."""
+        task = self._read_optional(self.root / "tasks" / f"{task_id}.json", RelayTask)
+        if task is None:
+            raise NotFoundError(f"task not found: {task_id}")
+        return task
+
     def append_event(
         self,
         job_id: str,
@@ -418,6 +475,65 @@ class ClioCoreQueue:
             ],
             key=lambda progress: progress.created_at,
         )
+
+    def create_gateway_session(self, session: GatewaySession) -> GatewaySession:
+        """Create a durable scheduler-backed gateway session record."""
+        self.initialize()
+        with self._lock:
+            self._write(
+                self.root / "gateway_sessions" / f"{session.session_id}.json",
+                session,
+            )
+        return session
+
+    def get_gateway_session(self, session_id: str) -> GatewaySession:
+        """Return a gateway session by id."""
+        session = self._read_optional(
+            self.root / "gateway_sessions" / f"{session_id}.json",
+            GatewaySession,
+        )
+        if session is None:
+            raise NotFoundError(f"gateway session not found: {session_id}")
+        return session
+
+    def list_gateway_sessions(self, cluster: str | None = None) -> list[GatewaySession]:
+        """Return durable gateway sessions, optionally filtered by cluster."""
+        self.initialize()
+        sessions = list(self._read_many(self.root / "gateway_sessions", GatewaySession))
+        if cluster is not None:
+            sessions = [session for session in sessions if session.cluster == cluster]
+        return sorted(sessions, key=lambda session: session.created_at)
+
+    def update_gateway_session(
+        self,
+        session_id: str,
+        *,
+        state: GatewaySessionState | None = None,
+        metadata: dict[str, object] | None = None,
+        **updates: object,
+    ) -> GatewaySession:
+        """Merge gateway session state and metadata updates."""
+        self.initialize()
+        with self._lock:
+            session = self.get_gateway_session(session_id)
+            merged_metadata = dict(session.metadata)
+            if metadata:
+                merged_metadata.update(metadata)
+            payload = dict(updates)
+            if state is not None:
+                payload["state"] = state
+            payload["metadata"] = merged_metadata
+            payload["updated_at"] = utc_now()
+            updated = session.model_copy(update=payload)
+            self._write(
+                self.root / "gateway_sessions" / f"{session_id}.json",
+                updated,
+            )
+            return updated
+
+    def close_gateway_session(self, session_id: str) -> GatewaySession:
+        """Mark a gateway session closed."""
+        return self.update_gateway_session(session_id, state=GatewaySessionState.CLOSED)
 
     def append_monitor_rule(self, rule: MonitorRule) -> MonitorRule:
         """Create a durable monitor rule."""

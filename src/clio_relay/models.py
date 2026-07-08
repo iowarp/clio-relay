@@ -79,6 +79,31 @@ class EventLevel(StrEnum):
     ERROR = "error"
 
 
+class TaskEventStatus(StrEnum):
+    """Structured status for task timeline events."""
+
+    PLANNED = "planned"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    WARNING = "warning"
+    ERROR = "error"
+    CANCELED = "canceled"
+
+
+class GatewaySessionState(StrEnum):
+    """Durable lifecycle state for a scheduler-backed service session."""
+
+    CREATED = "created"
+    SUBMITTED = "submitted"
+    PENDING = "pending"
+    STARTING = "starting"
+    READY = "ready"
+    DEGRADED = "degraded"
+    FAILED = "failed"
+    CLOSED = "closed"
+    UNKNOWN = "unknown"
+
+
 class EndpointRegistration(BaseModel):
     """A registered relay endpoint."""
 
@@ -221,6 +246,32 @@ class RelayEvent(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class TaskTimelineEvent(BaseModel):
+    """A resumable structured timeline event for one relay task."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str
+    seq: int = Field(default=0, ge=0)
+    event_type: str
+    label: str
+    status: TaskEventStatus = TaskEventStatus.RUNNING
+    summary: str
+    detail: str | None = None
+    artifact_refs: list[str] = Field(default_factory=list)
+    path_refs: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("event_type", "label", "summary")
+    @classmethod
+    def timeline_text_must_not_be_empty(cls, value: str) -> str:
+        """Reject empty timeline fields used by UI labels."""
+        if value == "":
+            raise ValueError("timeline text fields must not be empty")
+        return value
+
+
 class ArtifactRef(BaseModel):
     """A durable artifact index entry."""
 
@@ -283,6 +334,41 @@ class MonitorRule(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
     metadata: dict[str, Any] = Field(default_factory=dict)
     action_payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class GatewaySession(BaseModel):
+    """Durable state for a scheduler-backed gateway or visualization service."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(default_factory=lambda: new_id("gateway"))
+    cluster: str
+    name: str
+    state: GatewaySessionState = GatewaySessionState.CREATED
+    scheduler: str = "slurm"
+    scheduler_job_id: str | None = None
+    queue_state: str | None = None
+    node: str | None = None
+    requested_resources: dict[str, Any] = Field(default_factory=dict)
+    submit_time: datetime | None = None
+    start_time: datetime | None = None
+    expected_expiry: datetime | None = None
+    stdout_uri: str | None = None
+    stderr_uri: str | None = None
+    log_uris: list[str] = Field(default_factory=list)
+    gateway: dict[str, Any] = Field(default_factory=dict)
+    artifacts: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("cluster", "name")
+    @classmethod
+    def gateway_text_must_not_be_empty(cls, value: str) -> str:
+        """Reject empty session labels."""
+        if value == "":
+            raise ValueError("cluster and name must not be empty")
+        return value
 
 
 class Cursor(BaseModel):

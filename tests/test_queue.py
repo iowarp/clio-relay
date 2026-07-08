@@ -10,6 +10,8 @@ from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
     Cursor,
+    GatewaySession,
+    GatewaySessionState,
     JarvisRunSpec,
     JobKind,
     JobState,
@@ -19,6 +21,8 @@ from clio_relay.models import (
     RelayJob,
     RelayTask,
     RemoteAgentTaskSpec,
+    TaskEventStatus,
+    TaskTimelineEvent,
 )
 from clio_relay.relay_ops import evaluate_monitor_rules
 
@@ -48,6 +52,83 @@ def test_submit_is_idempotent_and_events_are_ordered(tmp_path: Path) -> None:
     assert [event.seq for event in events] == [1, 2]
     assert [event.event_type for event in events] == ["job.queued", "custom"]
     assert cursor.next_seq == 3
+
+
+def test_task_timeline_events_are_durable_and_resumable(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.REMOTE_AGENT,
+            spec=RemoteAgentTaskSpec(prompt_path="/tmp/prompt.md"),
+            idempotency_key="task-events",
+        )
+    )
+    task = queue.append_task(RelayTask(job_id=job.job_id, name="remote-agent.discovery"))
+
+    first = queue.append_task_event(
+        TaskTimelineEvent(
+            task_id=task.task_id,
+            event_type="dataset_found",
+            label="dataset",
+            status=TaskEventStatus.SUCCEEDED,
+            summary="Found staged dataset",
+            path_refs=["/mnt/common/datasets/red_sea_001"],
+        )
+    )
+    second = queue.append_task_event(
+        TaskTimelineEvent(
+            task_id=task.task_id,
+            event_type="script_found",
+            label="script",
+            summary="Found ParaView launch script",
+            path_refs=["scripts/red_sea.py"],
+        )
+    )
+
+    events, next_cursor = ClioCoreQueue(tmp_path).drain_task_events(
+        task.task_id,
+        cursor=2,
+        limit=10,
+    )
+    job_events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=20)
+
+    assert first.seq == 1
+    assert second.seq == 2
+    assert [event.seq for event in events] == [2]
+    assert events[0].event_type == "script_found"
+    assert next_cursor == 3
+    assert "task.timeline.dataset_found" in [event.event_type for event in job_events]
+
+
+def test_gateway_sessions_are_durable_and_updateable(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    session = queue.create_gateway_session(
+        GatewaySession(
+            cluster="test-cluster",
+            name="paraview-red-sea",
+            requested_resources={"nodes": 1, "exclusive": True},
+            gateway={"strategy": "ssh_forward", "remote_port": 11111},
+        )
+    )
+
+    updated = queue.update_gateway_session(
+        session.session_id,
+        state=GatewaySessionState.READY,
+        scheduler_job_id="12345",
+        node="ares-comp-01",
+        gateway={"strategy": "ssh_forward", "remote_port": 11111, "local_port": 5900},
+        metadata={"dataset": "red_sea_001"},
+    )
+    listed = ClioCoreQueue(tmp_path).list_gateway_sessions(cluster="test-cluster")
+    closed = queue.close_gateway_session(session.session_id)
+
+    assert listed[0].session_id == session.session_id
+    assert updated.state == GatewaySessionState.READY
+    assert updated.scheduler_job_id == "12345"
+    assert updated.gateway["local_port"] == 5900
+    assert updated.metadata["dataset"] == "red_sea_001"
+    assert closed.state == GatewaySessionState.CLOSED
 
 
 def test_submit_rejects_reused_idempotency_key_with_different_payload(tmp_path: Path) -> None:

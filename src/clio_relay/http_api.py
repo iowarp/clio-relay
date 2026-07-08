@@ -29,6 +29,8 @@ from clio_relay.errors import NotFoundError
 from clio_relay.models import (
     ArtifactRef,
     Cursor,
+    GatewaySession,
+    GatewaySessionState,
     JarvisRunSpec,
     JobKind,
     McpCallSpec,
@@ -38,6 +40,8 @@ from clio_relay.models import (
     RelayJob,
     RelayTask,
     RemoteAgentTaskSpec,
+    TaskEventStatus,
+    TaskTimelineEvent,
 )
 from clio_relay.progress_provenance import external_progress_metadata
 from clio_relay.relay_ops import (
@@ -103,6 +107,59 @@ class ProgressUpdateRequest(BaseModel):
     unit: str | None = None
     message: str | None = None
     source_event_seq: int | None = Field(default=None, ge=1)
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+
+class TaskTimelineEventRequest(BaseModel):
+    """HTTP request to append a structured task timeline event."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_type: str
+    label: str
+    status: TaskEventStatus = TaskEventStatus.RUNNING
+    summary: str
+    detail: str | None = None
+    artifact_refs: list[str] = Field(default_factory=list)
+    path_refs: list[str] = Field(default_factory=list)
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+
+class GatewaySessionCreateRequest(BaseModel):
+    """HTTP request to create a scheduler-backed gateway session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cluster: str
+    name: str
+    state: GatewaySessionState = GatewaySessionState.CREATED
+    scheduler: str = "slurm"
+    scheduler_job_id: str | None = None
+    queue_state: str | None = None
+    node: str | None = None
+    requested_resources: dict[str, object] = Field(default_factory=dict)
+    stdout_uri: str | None = None
+    stderr_uri: str | None = None
+    log_uris: list[str] = Field(default_factory=list)
+    gateway: dict[str, object] = Field(default_factory=dict)
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+
+class GatewaySessionUpdateRequest(BaseModel):
+    """HTTP request to update scheduler-backed gateway session state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    state: GatewaySessionState | None = None
+    scheduler_job_id: str | None = None
+    queue_state: str | None = None
+    node: str | None = None
+    requested_resources: dict[str, object] | None = None
+    stdout_uri: str | None = None
+    stderr_uri: str | None = None
+    log_uris: list[str] | None = None
+    gateway: dict[str, object] | None = None
+    artifacts: list[str] | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
 
 
@@ -196,6 +253,100 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     )
     def get_tasks(job_id: str) -> list[RelayTask]:
         return queue.list_tasks(job_id)
+
+    @app.get(
+        "/tasks/{task_id}/events",
+        response_model=list[TaskTimelineEvent],
+        dependencies=[auth_dependency],
+    )
+    def get_task_events(task_id: str, cursor: int = 1, limit: int = 100) -> list[TaskTimelineEvent]:
+        try:
+            events, _ = queue.drain_task_events(task_id, cursor=cursor, limit=limit)
+            return events
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post(
+        "/tasks/{task_id}/events",
+        response_model=TaskTimelineEvent,
+        dependencies=[auth_dependency],
+    )
+    def append_task_event(
+        task_id: str,
+        request: TaskTimelineEventRequest,
+    ) -> TaskTimelineEvent:
+        try:
+            return queue.append_task_event(
+                TaskTimelineEvent(
+                    task_id=task_id,
+                    event_type=request.event_type,
+                    label=request.label,
+                    status=request.status,
+                    summary=request.summary,
+                    detail=request.detail,
+                    artifact_refs=request.artifact_refs,
+                    path_refs=request.path_refs,
+                    metadata=request.metadata,
+                )
+            )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/tasks/{task_id}/events/sse", dependencies=[auth_dependency])
+    def task_events_sse(
+        task_id: str,
+        cursor: int = 1,
+        limit: int = 100,
+        poll_seconds: float = 1.0,
+        stop_after_replay: bool = False,
+    ) -> StreamingResponse:
+        """Stream task timeline events as Server-Sent Events."""
+        if poll_seconds <= 0:
+            raise HTTPException(status_code=400, detail="poll_seconds must be positive")
+        try:
+            queue.get_task(task_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return StreamingResponse(
+            _task_sse_events(
+                queue,
+                task_id,
+                cursor=cursor,
+                limit=limit,
+                poll_seconds=poll_seconds,
+                stop_after_replay=stop_after_replay,
+            ),
+            media_type="text/event-stream",
+        )
+
+    @app.websocket("/tasks/{task_id}/events/ws")
+    async def task_events_ws(
+        websocket: WebSocket,
+        task_id: str,
+        cursor: int = 1,
+        limit: int = 100,
+        poll_seconds: float = 1.0,
+    ) -> None:
+        """Stream task timeline events over a WebSocket."""
+        _require_websocket_token(resolved, websocket)
+        if poll_seconds <= 0:
+            raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
+        try:
+            queue.get_task(task_id)
+        except NotFoundError as exc:
+            raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION) from exc
+        await websocket.accept()
+        try:
+            async for payload in _task_stream_payloads(
+                queue,
+                task_id,
+                cursor=cursor,
+                limit=limit,
+                poll_seconds=poll_seconds,
+            ):
+                await websocket.send_json(payload)
+        except WebSocketDisconnect:
+            return
 
     @app.get("/jobs/{job_id}/monitor", dependencies=[auth_dependency])
     def monitor(job_id: str, cursor: int = 1, limit: int = 100) -> dict[str, object]:
@@ -316,6 +467,80 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         return queue.list_progress(job_id)
 
     @app.post(
+        "/gateway-sessions",
+        response_model=GatewaySession,
+        dependencies=[auth_dependency],
+    )
+    def create_gateway_session(request: GatewaySessionCreateRequest) -> GatewaySession:
+        return queue.create_gateway_session(
+            GatewaySession(
+                cluster=request.cluster,
+                name=request.name,
+                state=request.state,
+                scheduler=request.scheduler,
+                scheduler_job_id=request.scheduler_job_id,
+                queue_state=request.queue_state,
+                node=request.node,
+                requested_resources=request.requested_resources,
+                stdout_uri=request.stdout_uri,
+                stderr_uri=request.stderr_uri,
+                log_uris=request.log_uris,
+                gateway=request.gateway,
+                metadata=request.metadata,
+            )
+        )
+
+    @app.get(
+        "/gateway-sessions",
+        response_model=list[GatewaySession],
+        dependencies=[auth_dependency],
+    )
+    def list_gateway_sessions(cluster: str | None = None) -> list[GatewaySession]:
+        return queue.list_gateway_sessions(cluster=cluster)
+
+    @app.get(
+        "/gateway-sessions/{session_id}",
+        response_model=GatewaySession,
+        dependencies=[auth_dependency],
+    )
+    def get_gateway_session(session_id: str) -> GatewaySession:
+        try:
+            return queue.get_gateway_session(session_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.patch(
+        "/gateway-sessions/{session_id}",
+        response_model=GatewaySession,
+        dependencies=[auth_dependency],
+    )
+    def update_gateway_session(
+        session_id: str,
+        request: GatewaySessionUpdateRequest,
+    ) -> GatewaySession:
+        updates = request.model_dump(exclude={"state", "metadata"}, exclude_none=True)
+        try:
+            return queue.update_gateway_session(
+                session_id,
+                state=request.state,
+                metadata=request.metadata,
+                **updates,
+            )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post(
+        "/gateway-sessions/{session_id}/close",
+        response_model=GatewaySession,
+        dependencies=[auth_dependency],
+    )
+    def close_gateway_session(session_id: str) -> GatewaySession:
+        try:
+            return queue.close_gateway_session(session_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post(
         "/jobs/{job_id}/progress",
         response_model=ProgressRecord,
         dependencies=[auth_dependency],
@@ -385,6 +610,58 @@ async def _monitor_sse_events(
         stop_on_terminal=stop_on_terminal,
     ):
         yield f"event: {payload['event']}\ndata: {json.dumps(payload['data'], default=str)}\n\n"
+
+
+async def _task_sse_events(
+    queue: ClioCoreQueue,
+    task_id: str,
+    *,
+    cursor: int,
+    limit: int,
+    poll_seconds: float,
+    stop_after_replay: bool,
+) -> AsyncIterator[str]:
+    async for payload in _task_stream_payloads(
+        queue,
+        task_id,
+        cursor=cursor,
+        limit=limit,
+        poll_seconds=poll_seconds,
+        stop_after_replay=stop_after_replay,
+    ):
+        yield f"event: {payload['event']}\ndata: {json.dumps(payload['data'], default=str)}\n\n"
+
+
+async def _task_stream_payloads(
+    queue: ClioCoreQueue,
+    task_id: str,
+    *,
+    cursor: int,
+    limit: int,
+    poll_seconds: float,
+    stop_after_replay: bool = False,
+) -> AsyncIterator[dict[str, object]]:
+    next_cursor = cursor
+    while True:
+        events, next_cursor = queue.drain_task_events(
+            task_id,
+            cursor=next_cursor,
+            limit=limit,
+        )
+        if events:
+            yield {
+                "event": "task_events",
+                "data": {
+                    "task_id": task_id,
+                    "events": [event.model_dump(mode="json") for event in events],
+                    "next_cursor": next_cursor,
+                },
+            }
+            if stop_after_replay:
+                return
+        elif stop_after_replay:
+            return
+        await asyncio.sleep(poll_seconds)
 
 
 async def _monitor_stream_payloads(

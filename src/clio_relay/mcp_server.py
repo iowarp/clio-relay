@@ -12,6 +12,8 @@ from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.models import (
     Cursor,
+    GatewaySession,
+    GatewaySessionState,
     JarvisRunSpec,
     JobKind,
     McpCallSpec,
@@ -20,6 +22,8 @@ from clio_relay.models import (
     ProgressRecord,
     RelayJob,
     RemoteAgentTaskSpec,
+    TaskEventStatus,
+    TaskTimelineEvent,
 )
 from clio_relay.progress_provenance import external_progress_metadata
 from clio_relay.relay_ops import (
@@ -247,6 +251,52 @@ def _tool_definitions() -> list[JSON]:
             },
         },
         {
+            "name": "relay_record_task_event",
+            "description": "Record a structured, resumable timeline event for one relay task.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "event_type": {"type": "string"},
+                    "label": {"type": "string"},
+                    "status": {
+                        "type": "string",
+                        "enum": ["planned", "running", "succeeded", "warning", "error", "canceled"],
+                        "default": "running",
+                    },
+                    "summary": {"type": "string"},
+                    "detail": {"type": "string"},
+                    "artifact_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": [],
+                    },
+                    "path_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": [],
+                    },
+                    "metadata": {"type": "object", "default": {}},
+                },
+                "required": ["task_id", "event_type", "label", "summary"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_watch_task_events",
+            "description": "Read task timeline events from a task cursor.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "cursor": {"type": "integer", "default": 1, "minimum": 1},
+                    "limit": {"type": "integer", "default": 100, "minimum": 1},
+                },
+                "required": ["task_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "relay_read_job_log",
             "description": "Read stdout or stderr text from a job log by byte offset.",
             "inputSchema": {
@@ -362,6 +412,87 @@ def _tool_definitions() -> list[JSON]:
                 "additionalProperties": False,
             },
         },
+        {
+            "name": "relay_create_gateway_session",
+            "description": "Create a durable scheduler-backed gateway service session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cluster": {"type": "string"},
+                    "name": {"type": "string"},
+                    "state": {
+                        "type": "string",
+                        "enum": [
+                            "created",
+                            "submitted",
+                            "pending",
+                            "starting",
+                            "ready",
+                            "degraded",
+                            "failed",
+                            "closed",
+                            "unknown",
+                        ],
+                        "default": "created",
+                    },
+                    "scheduler": {"type": "string", "default": "slurm"},
+                    "scheduler_job_id": {"type": "string"},
+                    "queue_state": {"type": "string"},
+                    "node": {"type": "string"},
+                    "requested_resources": {"type": "object", "default": {}},
+                    "stdout_uri": {"type": "string"},
+                    "stderr_uri": {"type": "string"},
+                    "log_uris": {"type": "array", "items": {"type": "string"}, "default": []},
+                    "gateway": {"type": "object", "default": {}},
+                    "metadata": {"type": "object", "default": {}},
+                },
+                "required": ["cluster", "name"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_get_gateway_session",
+            "description": "Read a durable gateway service session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"session_id": {"type": "string"}},
+                "required": ["session_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_update_gateway_session",
+            "description": "Update a gateway service session with scheduler or gateway state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "state": {"type": "string"},
+                    "scheduler_job_id": {"type": "string"},
+                    "queue_state": {"type": "string"},
+                    "node": {"type": "string"},
+                    "requested_resources": {"type": "object"},
+                    "stdout_uri": {"type": "string"},
+                    "stderr_uri": {"type": "string"},
+                    "log_uris": {"type": "array", "items": {"type": "string"}},
+                    "gateway": {"type": "object"},
+                    "artifacts": {"type": "array", "items": {"type": "string"}},
+                    "metadata": {"type": "object", "default": {}},
+                },
+                "required": ["session_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_close_gateway_session",
+            "description": "Mark a gateway service session closed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"session_id": {"type": "string"}},
+                "required": ["session_id"],
+                "additionalProperties": False,
+            },
+        },
     ]
 
 
@@ -403,6 +534,18 @@ def _call_tool(params: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -
                 task.model_dump(mode="json")
                 for task in queue.list_tasks(_required_str(arguments, "job_id"))
             ]
+        }
+    elif name == "relay_record_task_event":
+        result = _record_task_event(arguments, queue=queue)
+    elif name == "relay_watch_task_events":
+        events, cursor = queue.drain_task_events(
+            _required_str(arguments, "task_id"),
+            cursor=int(arguments.get("cursor", 1)),
+            limit=int(arguments.get("limit", 100)),
+        )
+        result = {
+            "events": [event.model_dump(mode="json") for event in events],
+            "next_cursor": cursor,
         }
     elif name == "relay_read_job_log":
         job = queue.get_job(_required_str(arguments, "job_id"))
@@ -453,6 +596,18 @@ def _call_tool(params: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -
         }
     elif name == "relay_evaluate_monitor_rules":
         result = {"actions": evaluate_monitor_rules(queue, limit=int(arguments.get("limit", 100)))}
+    elif name == "relay_create_gateway_session":
+        result = _create_gateway_session(arguments, queue=queue)
+    elif name == "relay_get_gateway_session":
+        result = queue.get_gateway_session(_required_str(arguments, "session_id")).model_dump(
+            mode="json"
+        )
+    elif name == "relay_update_gateway_session":
+        result = _update_gateway_session(arguments, queue=queue)
+    elif name == "relay_close_gateway_session":
+        result = queue.close_gateway_session(_required_str(arguments, "session_id")).model_dump(
+            mode="json"
+        )
     else:
         raise ValueError(f"unknown tool: {name}")
     return {
@@ -622,6 +777,74 @@ def _record_progress(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     return progress.model_dump(mode="json")
 
 
+def _record_task_event(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+    metadata = _object(arguments.get("metadata", {}))
+    event = queue.append_task_event(
+        TaskTimelineEvent(
+            task_id=_required_str(arguments, "task_id"),
+            event_type=_required_str(arguments, "event_type"),
+            label=_required_str(arguments, "label"),
+            status=TaskEventStatus(str(arguments.get("status", "running"))),
+            summary=_required_str(arguments, "summary"),
+            detail=_optional_str(arguments, "detail"),
+            artifact_refs=_string_list(arguments.get("artifact_refs", []), "artifact_refs"),
+            path_refs=_string_list(arguments.get("path_refs", []), "path_refs"),
+            metadata=metadata,
+        )
+    )
+    return event.model_dump(mode="json")
+
+
+def _create_gateway_session(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+    session = queue.create_gateway_session(
+        GatewaySession(
+            cluster=_required_str(arguments, "cluster"),
+            name=_required_str(arguments, "name"),
+            state=GatewaySessionState(str(arguments.get("state", "created"))),
+            scheduler=str(arguments.get("scheduler", "slurm")),
+            scheduler_job_id=_optional_str(arguments, "scheduler_job_id"),
+            queue_state=_optional_str(arguments, "queue_state"),
+            node=_optional_str(arguments, "node"),
+            requested_resources=_object(arguments.get("requested_resources", {})),
+            stdout_uri=_optional_str(arguments, "stdout_uri"),
+            stderr_uri=_optional_str(arguments, "stderr_uri"),
+            log_uris=_string_list(arguments.get("log_uris", []), "log_uris"),
+            gateway=_object(arguments.get("gateway", {})),
+            metadata=_object(arguments.get("metadata", {})),
+        )
+    )
+    return session.model_dump(mode="json")
+
+
+def _update_gateway_session(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+    updates: dict[str, object] = {}
+    for key in {
+        "scheduler_job_id",
+        "queue_state",
+        "node",
+        "stdout_uri",
+        "stderr_uri",
+    }:
+        value = arguments.get(key)
+        if isinstance(value, str):
+            updates[key] = value
+    for key in {"requested_resources", "gateway"}:
+        if key in arguments:
+            updates[key] = _object(arguments.get(key))
+    for key in {"log_uris", "artifacts"}:
+        if key in arguments:
+            updates[key] = _string_list(arguments.get(key), key)
+    state_value = arguments.get("state")
+    state = GatewaySessionState(str(state_value)) if state_value is not None else None
+    session = queue.update_gateway_session(
+        _required_str(arguments, "session_id"),
+        state=state,
+        metadata=_object(arguments.get("metadata", {})),
+        **updates,
+    )
+    return session.model_dump(mode="json")
+
+
 def _object(value: Any) -> JSON:
     if not isinstance(value, dict):
         raise ValueError("expected object")
@@ -642,6 +865,15 @@ def _optional_str(value: JSON, key: str) -> str | None:
     if not isinstance(item, str) or not item:
         raise ValueError(f"{key} must be a non-empty string")
     return item
+
+
+def _string_list(value: Any, name: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError(f"{name} must be a string array")
+    items = cast(list[object], value)
+    if not all(isinstance(item, str) for item in items):
+        raise ValueError(f"{name} must be a string array")
+    return cast(list[str], items)
 
 
 def _optional_int(value: JSON, key: str) -> int | None:

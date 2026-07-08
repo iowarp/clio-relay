@@ -32,6 +32,28 @@ uv run clio-relay agent run --cluster ares --prompt /path/on/cluster/prompt.md -
 
 Agents should submit child cluster work asynchronously and return the child `job_id`. A single cluster worker cannot execute a child job while it is blocked inside a parent agent job waiting for that child to finish.
 
+Agents can also record structured task timeline events:
+
+```powershell
+uv run clio-relay job record-task-event <task-id> --event-type dataset_found --label dataset --summary "found staged dataset" --path-ref /mnt/common/datasets/red_sea_001
+uv run clio-relay job task-events <task-id> --cursor 1
+```
+
+Use timeline events for UI-visible agent work such as repository scans, dataset discovery, generated scripts, planned commands, scheduler submissions, warnings, and completion. Use normal job logs for stdout and stderr.
+
+## manage visualization gateways
+
+Use gateway sessions for scheduler-backed services that need to survive long enough for a desktop to connect, such as ParaView or another cluster-side visualizer.
+
+```powershell
+uv run clio-relay gateway create --cluster ares --name paraview-red-sea --gateway-json '{"strategy":"ssh_forward","remote_port":11111}'
+uv run clio-relay gateway update <session-id> --state ready --scheduler-job-id 12345 --node ares-comp-01 --gateway-json '{"strategy":"ssh_forward","local_port":5900}'
+uv run clio-relay gateway get <session-id>
+uv run clio-relay gateway close <session-id>
+```
+
+`close` marks the durable session closed. The scheduler or package path should still clean up the actual service process or scheduler job it owns.
+
 ## use frp transport
 
 Use frp when the desktop and cluster cannot directly SSH to each other but can both reach a relay host.

@@ -13,6 +13,7 @@ from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.models import (
     ArtifactRef,
+    GatewaySessionState,
     JarvisRunSpec,
     JobKind,
     McpCallSpec,
@@ -78,6 +79,94 @@ def test_cli_lists_tasks(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     tasks = json.loads(result.output)
     assert tasks[0]["task_id"] == task.task_id
     assert tasks[0]["name"] == "jarvis.execution"
+
+
+def test_cli_records_and_reads_task_events(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="cli-task-events",
+        )
+    )
+    task = queue.append_task(RelayTask(job_id=job.job_id, name="remote-agent.discovery"))
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+
+    record = CliRunner().invoke(
+        app,
+        [
+            "job",
+            "record-task-event",
+            task.task_id,
+            "--event-type",
+            "dataset_found",
+            "--label",
+            "dataset",
+            "--summary",
+            "Found staged dataset",
+            "--status",
+            "succeeded",
+            "--path-ref",
+            "/mnt/common/datasets/red_sea_001",
+        ],
+    )
+    read = CliRunner().invoke(app, ["job", "task-events", task.task_id])
+
+    assert record.exit_code == 0
+    assert read.exit_code == 0
+    payload = json.loads(read.output)
+    assert payload["events"][0]["event_type"] == "dataset_found"
+    assert payload["events"][0]["path_refs"] == ["/mnt/common/datasets/red_sea_001"]
+
+
+def test_cli_gateway_session_lifecycle(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    core_dir = tmp_path / "core"
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+
+    created = CliRunner().invoke(
+        app,
+        [
+            "gateway",
+            "create",
+            "--cluster",
+            "test-cluster",
+            "--name",
+            "paraview-red-sea",
+            "--gateway-json",
+            '{"strategy":"ssh_forward","remote_port":11111}',
+        ],
+    )
+    assert created.exit_code == 0
+    session_id = json.loads(created.output)["session_id"]
+
+    updated = CliRunner().invoke(
+        app,
+        [
+            "gateway",
+            "update",
+            session_id,
+            "--state",
+            "ready",
+            "--scheduler-job-id",
+            "12345",
+            "--node",
+            "ares-comp-01",
+            "--gateway-json",
+            '{"strategy":"ssh_forward","local_port":5900}',
+        ],
+    )
+    listed = CliRunner().invoke(app, ["gateway", "list", "--cluster", "test-cluster"])
+    closed = CliRunner().invoke(app, ["gateway", "close", session_id])
+
+    assert updated.exit_code == 0
+    assert listed.exit_code == 0
+    assert closed.exit_code == 0
+    assert json.loads(updated.output)["state"] == GatewaySessionState.READY.value
+    assert json.loads(listed.output)[0]["session_id"] == session_id
+    assert json.loads(closed.output)["state"] == GatewaySessionState.CLOSED.value
 
 
 def test_cli_job_status_includes_relay_queue(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

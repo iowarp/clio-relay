@@ -42,6 +42,8 @@ def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
     assert "relay_monitor_job" in tool_names
     assert "relay_watch_job_events" in tool_names
     assert "relay_list_tasks" in tool_names
+    assert "relay_record_task_event" in tool_names
+    assert "relay_watch_task_events" in tool_names
     assert "relay_read_job_log" in tool_names
     assert "relay_list_artifacts" in tool_names
     assert "relay_read_artifact" in tool_names
@@ -51,6 +53,10 @@ def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
     assert "relay_create_monitor_rule" in tool_names
     assert "relay_list_monitor_rules" in tool_names
     assert "relay_evaluate_monitor_rules" in tool_names
+    assert "relay_create_gateway_session" in tool_names
+    assert "relay_get_gateway_session" in tool_names
+    assert "relay_update_gateway_session" in tool_names
+    assert "relay_close_gateway_session" in tool_names
 
 
 def test_mcp_submit_jarvis_pipeline_creates_real_job(tmp_path: Path) -> None:
@@ -117,6 +123,119 @@ def test_mcp_submit_remote_agent_creates_real_job(tmp_path: Path) -> None:
     assert job.spec.mcp_config_path == str(mcp_config_path)
     assert job.spec.model == "configured-model"
     assert job.spec.timeout_seconds == 30
+
+
+def test_mcp_records_and_watches_task_events(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.REMOTE_AGENT,
+            spec=RemoteAgentTaskSpec(prompt_path="/tmp/prompt.md"),
+            idempotency_key="mcp-task-events",
+        )
+    )
+    task = queue.append_task(RelayTask(job_id=job.job_id, name="remote-agent.discovery"))
+
+    record_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_record_task_event",
+                "arguments": {
+                    "task_id": task.task_id,
+                    "event_type": "dataset_found",
+                    "label": "dataset",
+                    "status": "succeeded",
+                    "summary": "Found staged dataset",
+                    "path_refs": ["/mnt/common/datasets/red_sea_001"],
+                },
+            },
+        },
+        queue=queue,
+    )
+    watch_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 23,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_watch_task_events",
+                "arguments": {"task_id": task.task_id, "cursor": 1},
+            },
+        },
+        queue=queue,
+    )
+
+    assert record_response is not None
+    assert watch_response is not None
+    recorded = record_response["result"]["structuredContent"]
+    watched = watch_response["result"]["structuredContent"]
+    assert recorded["seq"] == 1
+    assert watched["events"][0]["event_type"] == "dataset_found"
+    assert watched["next_cursor"] == 2
+
+
+def test_mcp_gateway_session_lifecycle(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+
+    create_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 24,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_create_gateway_session",
+                "arguments": {
+                    "cluster": "test-cluster",
+                    "name": "paraview-red-sea",
+                    "gateway": {"strategy": "ssh_forward", "remote_port": 11111},
+                },
+            },
+        },
+        queue=queue,
+    )
+    assert create_response is not None
+    session_id = create_response["result"]["structuredContent"]["session_id"]
+
+    update_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 25,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_update_gateway_session",
+                "arguments": {
+                    "session_id": session_id,
+                    "state": "ready",
+                    "scheduler_job_id": "12345",
+                    "node": "ares-comp-01",
+                    "gateway": {"strategy": "ssh_forward", "local_port": 5900},
+                },
+            },
+        },
+        queue=queue,
+    )
+    close_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 26,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_close_gateway_session",
+                "arguments": {"session_id": session_id},
+            },
+        },
+        queue=queue,
+    )
+
+    assert update_response is not None
+    assert close_response is not None
+    assert update_response["result"]["structuredContent"]["state"] == "ready"
+    assert update_response["result"]["structuredContent"]["gateway"]["local_port"] == 5900
+    assert close_response["result"]["structuredContent"]["state"] == "closed"
 
 
 def test_mcp_submit_mcp_call_creates_real_job_with_arguments(tmp_path: Path) -> None:

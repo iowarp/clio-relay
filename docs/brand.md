@@ -1,5 +1,10 @@
 # brand prompt
 
+Current project assets live in:
+
+- `docs/assets/clio-relay-logo.png`
+- `docs/assets/clio-relay-banner.png`
+
 Use this prompt with a stronger image model to create a logo and banner.
 
 ```text

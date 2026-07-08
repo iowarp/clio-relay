@@ -14,11 +14,17 @@ The queue boundary is `clio-core`. The file-backed queue in this repository is a
 
 The durable records are jobs, tasks, leases, events, cursors, artifacts, progress, checkpoints, endpoint registrations, and idempotency records. Per-job spool directories hold backing files such as `stdout.log`, `stderr.log`, `pipeline.yaml`, and `provenance.json`, but those files are not the queue.
 
+Tasks can also have structured timeline events. A remote agent can record discovery, planning, warnings, commands, scheduler decisions, and completion as resumable task-scoped records. These events are separate from raw stdout so a UI can show meaningful work before the final answer exists.
+
+Gateway sessions are durable records for scheduler-backed services such as ParaView servers or other cluster-side visual services. A session records the scheduler job, queue state, allocated node, logs, forwarded endpoint metadata, health hints, and close state. This lets the desktop detach, reconnect, or explicitly close the remote service without treating it as an anonymous process.
+
 ## execution
 
 JARVIS-CD owns cluster execution. A relay job describes the desired work. The worker materializes that intent into JARVIS inputs, runs JARVIS, streams output while the job is active, and writes provenance when the run ends.
 
 Application behavior belongs in JARVIS packages. For example, LAMMPS progress comes from the upstream JARVIS `builtin.lammps` package and the relay-side parser that is enabled only for that package. The generic bounded-command package stays generic.
+
+Interactive visualization services should be launched through scheduler-backed package or pipeline behavior as well. The relay records the gateway session and transport metadata, while the package or operator script owns how the service starts on the allocated node.
 
 ## transport
 

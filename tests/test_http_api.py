@@ -11,6 +11,7 @@ from clio_relay.http_api import create_app
 from clio_relay.models import (
     ArtifactRef,
     Cursor,
+    GatewaySessionState,
     JarvisRunSpec,
     JobKind,
     JobState,
@@ -19,6 +20,7 @@ from clio_relay.models import (
     RelayJob,
     RelayTask,
     RemoteAgentTaskSpec,
+    TaskTimelineEvent,
 )
 
 
@@ -283,6 +285,111 @@ def test_http_lists_job_tasks(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert response.json()[0]["task_id"] == task.task_id
     assert response.json()[0]["name"] == "jarvis.execution"
+
+
+def test_http_task_timeline_events_are_replayable(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.REMOTE_AGENT,
+            spec=RemoteAgentTaskSpec(prompt_path="/tmp/prompt.md"),
+            idempotency_key="http-task-events",
+        )
+    )
+    task = queue.append_task(RelayTask(job_id=job.job_id, name="remote-agent.discovery"))
+    client = cast(Any, TestClient(create_app(settings)))
+
+    created = client.post(
+        f"/tasks/{task.task_id}/events",
+        json={
+            "event_type": "dataset_found",
+            "label": "dataset",
+            "status": "succeeded",
+            "summary": "Found staged dataset",
+            "path_refs": ["/mnt/common/datasets/red_sea_001"],
+            "metadata": {"dataset": "red_sea_001"},
+        },
+    )
+    replay = client.get(f"/tasks/{task.task_id}/events", params={"cursor": 1})
+
+    assert created.status_code == 200
+    assert replay.status_code == 200
+    assert created.json()["seq"] == 1
+    assert replay.json()[0]["event_type"] == "dataset_found"
+    assert replay.json()[0]["metadata"]["dataset"] == "red_sea_001"
+
+
+def test_http_task_timeline_sse_replays_existing_events(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.REMOTE_AGENT,
+            spec=RemoteAgentTaskSpec(prompt_path="/tmp/prompt.md"),
+            idempotency_key="http-task-events-sse",
+        )
+    )
+    task = queue.append_task(RelayTask(job_id=job.job_id, name="remote-agent.discovery"))
+    queue.append_task_event(
+        TaskTimelineEvent(
+            task_id=task.task_id,
+            event_type="repo_scan",
+            label="repo",
+            summary="Scanned visualization repository",
+        )
+    )
+    client = cast(Any, TestClient(create_app(settings)))
+
+    with client.stream(
+        "GET",
+        f"/tasks/{task.task_id}/events/sse",
+        params={"poll_seconds": 0.01, "stop_after_replay": True},
+    ) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert "event: task_events" in body
+    assert "repo_scan" in body
+
+
+def test_http_gateway_session_lifecycle(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    client = cast(Any, TestClient(create_app(settings)))
+
+    created = client.post(
+        "/gateway-sessions",
+        json={
+            "cluster": "test-cluster",
+            "name": "paraview-red-sea",
+            "requested_resources": {"nodes": 1, "exclusive": True},
+            "gateway": {"strategy": "ssh_forward", "remote_port": 11111},
+        },
+    )
+    session_id = created.json()["session_id"]
+    updated = client.patch(
+        f"/gateway-sessions/{session_id}",
+        json={
+            "state": "ready",
+            "scheduler_job_id": "12345",
+            "node": "ares-comp-01",
+            "gateway": {"strategy": "ssh_forward", "local_port": 5900},
+            "metadata": {"dataset": "red_sea_001"},
+        },
+    )
+    listed = client.get("/gateway-sessions", params={"cluster": "test-cluster"})
+    closed = client.post(f"/gateway-sessions/{session_id}/close")
+
+    assert created.status_code == 200
+    assert updated.status_code == 200
+    assert listed.status_code == 200
+    assert closed.status_code == 200
+    assert updated.json()["state"] == GatewaySessionState.READY.value
+    assert updated.json()["scheduler_job_id"] == "12345"
+    assert listed.json()[0]["session_id"] == session_id
+    assert closed.json()["state"] == GatewaySessionState.CLOSED.value
 
 
 def test_http_job_status_includes_relay_queue_and_scheduler(tmp_path: Path) -> None:

@@ -1,5 +1,7 @@
 # clio-relay
 
+![clio-relay banner](docs/assets/clio-relay-banner.png)
+
 `clio-relay` lets a desktop tool submit work to a remote cluster, follow it while it runs, and collect logs, artifacts, progress, and provenance without putting job state in the network tunnel.
 
 It is a piece of the federation layer for [`clio-agent`](https://github.com/iowarp/clio-agent): a local CLIO experience can delegate work to a remote machine, keep observing it, detach, reconnect, and clean up after itself. The project is also designed for use outside CLIO. Any client that can call the CLI, HTTP API, or MCP tools can use the same relay model.
@@ -9,6 +11,8 @@ It is a piece of the federation layer for [`clio-agent`](https://github.com/iowa
 - Submits JARVIS-CD pipelines to configured clusters.
 - Runs remote agent tasks and remote MCP calls through the same queue.
 - Streams stdout, stderr, events, progress, artifacts, and provenance back to the desktop side.
+- Records structured task timelines for remote agent workflows, with cursor replay for reconnecting UIs.
+- Tracks durable scheduler-backed gateway sessions for services such as cluster-side visualization servers.
 - Supports reconnect and replay through durable queue records.
 - Keeps network transport separate from application state.
 - Supports frp over WebSocket/TLS, frp over TCP, SSH local port forwarding, and optional frp XTCP probing.
@@ -63,6 +67,31 @@ Run live acceptance against the builtin JARVIS LAMMPS package:
 ```powershell
 uv run clio-relay live-test --cluster ares --jarvis-yaml .\examples\ares-lammps\pipeline.yaml --monitor-pattern "Loop time"
 ```
+
+## observe remote agent work
+
+Remote agents can emit structured task timeline events while they work. This is useful when a UI needs to show discovery and planning before the final answer exists.
+
+```powershell
+uv run clio-relay job tasks <job-id> --cluster ares
+uv run clio-relay job record-task-event <task-id> --event-type dataset_found --label dataset --summary "found staged dataset" --path-ref /mnt/common/datasets/red_sea_001
+uv run clio-relay job task-events <task-id> --cursor 1
+```
+
+The same contract is available over HTTP at `/tasks/{task_id}/events`, `/tasks/{task_id}/events/sse`, and `/tasks/{task_id}/events/ws`, and through MCP tools `relay_record_task_event` and `relay_watch_task_events`.
+
+## manage gateway sessions
+
+Long-running visualization services should be tracked as durable gateway sessions. A session records the scheduler job, node, logs, published or forwarded endpoint, health metadata, and reconnect hints.
+
+```powershell
+uv run clio-relay gateway create --cluster ares --name paraview-red-sea --gateway-json '{"strategy":"ssh_forward","remote_port":11111}'
+uv run clio-relay gateway update <session-id> --state ready --scheduler-job-id 12345 --node ares-comp-01 --gateway-json '{"strategy":"ssh_forward","local_port":5900}'
+uv run clio-relay gateway get <session-id>
+uv run clio-relay gateway close <session-id>
+```
+
+The HTTP API exposes `/gateway-sessions`, `/gateway-sessions/{session_id}`, and `/gateway-sessions/{session_id}/close`. MCP tools expose the same create, read, update, and close operations.
 
 ## choose transport
 

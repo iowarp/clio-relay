@@ -39,6 +39,8 @@ from clio_relay.mcp_server import render_agent_mcp_profile, serve_stdio
 from clio_relay.models import (
     Cursor,
     EndpointRole,
+    GatewaySession,
+    GatewaySessionState,
     JarvisRunSpec,
     JobKind,
     McpCallSpec,
@@ -47,6 +49,8 @@ from clio_relay.models import (
     ProgressRecord,
     RelayJob,
     RemoteAgentTaskSpec,
+    TaskEventStatus,
+    TaskTimelineEvent,
 )
 from clio_relay.progress_provenance import external_progress_metadata
 from clio_relay.relay_host import (
@@ -97,6 +101,7 @@ agent_app = typer.Typer(no_args_is_help=True)
 monitor_app = typer.Typer(no_args_is_help=True)
 api_app = typer.Typer(no_args_is_help=True)
 session_app = typer.Typer(no_args_is_help=True)
+gateway_app = typer.Typer(no_args_is_help=True)
 
 app.add_typer(endpoint_app, name="endpoint")
 app.add_typer(relay_host_app, name="relay-host")
@@ -106,6 +111,7 @@ app.add_typer(agent_app, name="agent")
 app.add_typer(monitor_app, name="monitor")
 app.add_typer(api_app, name="api")
 app.add_typer(session_app, name="session")
+app.add_typer(gateway_app, name="gateway")
 
 
 @app.callback()
@@ -856,6 +862,79 @@ def job_tasks(
     typer.echo(json.dumps([task.model_dump(mode="json") for task in tasks], indent=2))
 
 
+@job_app.command("task-events")
+def job_task_events(
+    task_id: str,
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH."),
+    ] = None,
+    cursor: Annotated[int, typer.Option(help="First task event sequence to read.")] = 1,
+    limit: Annotated[int, typer.Option(help="Maximum task events to read.")] = 100,
+) -> None:
+    """Read structured task timeline events from a cursor as JSON."""
+    if _try_remote_cluster_passthrough(
+        cluster,
+        ["job", "task-events", task_id, "--cursor", str(cursor), "--limit", str(limit)],
+    ):
+        return
+    events, next_cursor = ClioCoreQueue(RelaySettings.from_env().core_dir).drain_task_events(
+        task_id,
+        cursor=cursor,
+        limit=limit,
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "events": [event.model_dump(mode="json") for event in events],
+                "next_cursor": next_cursor,
+            },
+            indent=2,
+        )
+    )
+
+
+@job_app.command("record-task-event")
+def job_record_task_event(
+    task_id: str,
+    event_type: Annotated[str, typer.Option(help="Structured task event type.")],
+    label: Annotated[str, typer.Option(help="Short UI step label.")],
+    summary: Annotated[str, typer.Option(help="Short event summary.")],
+    status: Annotated[
+        TaskEventStatus,
+        typer.Option(help="Task step status."),
+    ] = TaskEventStatus.RUNNING,
+    detail: Annotated[str | None, typer.Option(help="Optional detail text.")] = None,
+    path_ref: Annotated[
+        list[str] | None,
+        typer.Option(help="Path reference; repeat for multiple paths."),
+    ] = None,
+    artifact_ref: Annotated[
+        list[str] | None,
+        typer.Option(help="Artifact reference; repeat for multiple artifacts."),
+    ] = None,
+    metadata_json: Annotated[
+        str,
+        typer.Option(help="JSON object metadata for this task event."),
+    ] = "{}",
+) -> None:
+    """Record a structured task timeline event."""
+    event = ClioCoreQueue(RelaySettings.from_env().core_dir).append_task_event(
+        TaskTimelineEvent(
+            task_id=task_id,
+            event_type=event_type,
+            label=label,
+            status=status,
+            summary=summary,
+            detail=detail,
+            path_refs=path_ref or [],
+            artifact_refs=artifact_ref or [],
+            metadata=_json_object(metadata_json),
+        )
+    )
+    typer.echo(event.model_dump_json(indent=2))
+
+
 @job_app.command("wait")
 def job_wait(
     job_id: str,
@@ -1026,6 +1105,119 @@ def job_cancel(
         return
     job = request_cancel_job(ClioCoreQueue(RelaySettings.from_env().core_dir), job_id)
     typer.echo(f"{job.job_id} {job.state.value}")
+
+
+@gateway_app.command("create")
+def gateway_create(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    name: Annotated[str, typer.Option(help="Human-readable session name.")],
+    state: Annotated[
+        GatewaySessionState,
+        typer.Option(help="Initial gateway session state."),
+    ] = GatewaySessionState.CREATED,
+    scheduler: Annotated[str, typer.Option(help="Scheduler name.")] = "slurm",
+    scheduler_job_id: Annotated[
+        str | None,
+        typer.Option(help="Scheduler job id if already known."),
+    ] = None,
+    node: Annotated[str | None, typer.Option(help="Allocated node or host.")] = None,
+    gateway_json: Annotated[
+        str,
+        typer.Option(help="JSON object with gateway endpoint metadata."),
+    ] = "{}",
+    resources_json: Annotated[
+        str,
+        typer.Option(help="JSON object with requested resource metadata."),
+    ] = "{}",
+    metadata_json: Annotated[
+        str,
+        typer.Option(help="JSON object metadata for this gateway session."),
+    ] = "{}",
+) -> None:
+    """Create a durable scheduler-backed gateway service session."""
+    session = ClioCoreQueue(RelaySettings.from_env().core_dir).create_gateway_session(
+        GatewaySession(
+            cluster=cluster,
+            name=name,
+            state=state,
+            scheduler=scheduler,
+            scheduler_job_id=scheduler_job_id,
+            node=node,
+            gateway=_json_object(gateway_json),
+            requested_resources=_json_object(resources_json),
+            metadata=_json_object(metadata_json),
+        )
+    )
+    typer.echo(session.model_dump_json(indent=2))
+
+
+@gateway_app.command("list")
+def gateway_list(
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Optional configured cluster filter."),
+    ] = None,
+) -> None:
+    """List durable gateway service sessions."""
+    sessions = ClioCoreQueue(RelaySettings.from_env().core_dir).list_gateway_sessions(
+        cluster=cluster
+    )
+    typer.echo(json.dumps([session.model_dump(mode="json") for session in sessions], indent=2))
+
+
+@gateway_app.command("get")
+def gateway_get(session_id: str) -> None:
+    """Read a gateway service session."""
+    session = ClioCoreQueue(RelaySettings.from_env().core_dir).get_gateway_session(session_id)
+    typer.echo(session.model_dump_json(indent=2))
+
+
+@gateway_app.command("update")
+def gateway_update(
+    session_id: str,
+    state: Annotated[
+        GatewaySessionState | None,
+        typer.Option(help="Updated gateway session state."),
+    ] = None,
+    scheduler_job_id: Annotated[
+        str | None,
+        typer.Option(help="Scheduler job id."),
+    ] = None,
+    queue_state: Annotated[str | None, typer.Option(help="Scheduler queue state.")] = None,
+    node: Annotated[str | None, typer.Option(help="Allocated node or host.")] = None,
+    gateway_json: Annotated[
+        str | None,
+        typer.Option(help="JSON object with gateway endpoint metadata."),
+    ] = None,
+    metadata_json: Annotated[
+        str,
+        typer.Option(help="JSON object metadata to merge into this session."),
+    ] = "{}",
+) -> None:
+    """Update a gateway service session."""
+    updates: dict[str, object] = {}
+    if scheduler_job_id is not None:
+        updates["scheduler_job_id"] = scheduler_job_id
+    if queue_state is not None:
+        updates["queue_state"] = queue_state
+    if node is not None:
+        updates["node"] = node
+    if gateway_json is not None:
+        updates["gateway"] = _json_object(gateway_json)
+    session = ClioCoreQueue(RelaySettings.from_env().core_dir).update_gateway_session(
+        session_id,
+        state=state,
+        metadata=_json_object(metadata_json),
+        **updates,
+    )
+    typer.echo(session.model_dump_json(indent=2))
+
+
+@gateway_app.command("close")
+def gateway_close(session_id: str) -> None:
+    """Mark a gateway service session closed."""
+    session = ClioCoreQueue(RelaySettings.from_env().core_dir).close_gateway_session(session_id)
+    typer.echo(session.model_dump_json(indent=2))
 
 
 @monitor_app.command("add-regex")
