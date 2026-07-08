@@ -921,8 +921,13 @@ def job_record_task_event(
         str,
         typer.Option(help="JSON object metadata for this task event."),
     ] = "{}",
+    metadata_json_file: Annotated[
+        Path | None,
+        typer.Option(help="Path to a JSON object metadata file."),
+    ] = None,
 ) -> None:
     """Record a structured task timeline event."""
+    metadata_source = _json_text_from_option(metadata_json, metadata_json_file)
     remote_args = [
         "job",
         "record-task-event",
@@ -936,7 +941,7 @@ def job_record_task_event(
         "--status",
         status.value,
         "--metadata-json",
-        metadata_json,
+        metadata_source,
     ]
     if detail is not None:
         remote_args.extend(["--detail", detail])
@@ -956,7 +961,7 @@ def job_record_task_event(
             detail=detail,
             path_refs=path_ref or [],
             artifact_refs=artifact_ref or [],
-            metadata=_json_object(metadata_json),
+            metadata=_json_object(metadata_source),
         )
     )
     typer.echo(event.model_dump_json(indent=2))
@@ -1152,16 +1157,31 @@ def gateway_create(
         str,
         typer.Option(help="JSON object with gateway endpoint metadata."),
     ] = "{}",
+    gateway_json_file: Annotated[
+        Path | None,
+        typer.Option(help="Path to a JSON object with gateway endpoint metadata."),
+    ] = None,
     resources_json: Annotated[
         str,
         typer.Option(help="JSON object with requested resource metadata."),
     ] = "{}",
+    resources_json_file: Annotated[
+        Path | None,
+        typer.Option(help="Path to a JSON object with requested resource metadata."),
+    ] = None,
     metadata_json: Annotated[
         str,
         typer.Option(help="JSON object metadata for this gateway session."),
     ] = "{}",
+    metadata_json_file: Annotated[
+        Path | None,
+        typer.Option(help="Path to a JSON object metadata file."),
+    ] = None,
 ) -> None:
     """Create a durable scheduler-backed gateway service session."""
+    gateway_source = _json_text_from_option(gateway_json, gateway_json_file)
+    resources_source = _json_text_from_option(resources_json, resources_json_file)
+    metadata_source = _json_text_from_option(metadata_json, metadata_json_file)
     remote_args = [
         "gateway",
         "create",
@@ -1174,11 +1194,11 @@ def gateway_create(
         "--scheduler",
         scheduler,
         "--gateway-json",
-        gateway_json,
+        gateway_source,
         "--resources-json",
-        resources_json,
+        resources_source,
         "--metadata-json",
-        metadata_json,
+        metadata_source,
     ]
     if scheduler_job_id is not None:
         remote_args.extend(["--scheduler-job-id", scheduler_job_id])
@@ -1194,9 +1214,9 @@ def gateway_create(
             scheduler=scheduler,
             scheduler_job_id=scheduler_job_id,
             node=node,
-            gateway=_json_object(gateway_json),
-            requested_resources=_json_object(resources_json),
-            metadata=_json_object(metadata_json),
+            gateway=_json_object(gateway_source),
+            requested_resources=_json_object(resources_source),
+            metadata=_json_object(metadata_source),
         )
     )
     typer.echo(session.model_dump_json(indent=2))
@@ -1258,12 +1278,26 @@ def gateway_update(
         str | None,
         typer.Option(help="JSON object with gateway endpoint metadata."),
     ] = None,
+    gateway_json_file: Annotated[
+        Path | None,
+        typer.Option(help="Path to a JSON object with gateway endpoint metadata."),
+    ] = None,
     metadata_json: Annotated[
         str,
         typer.Option(help="JSON object metadata to merge into this session."),
     ] = "{}",
+    metadata_json_file: Annotated[
+        Path | None,
+        typer.Option(help="Path to a JSON object metadata file."),
+    ] = None,
 ) -> None:
     """Update a gateway service session."""
+    if gateway_json is not None and gateway_json_file is not None:
+        raise typer.BadParameter("use either --gateway-json or --gateway-json-file, not both")
+    gateway_source = None
+    if gateway_json is not None or gateway_json_file is not None:
+        gateway_source = _json_text_from_option(gateway_json or "{}", gateway_json_file)
+    metadata_source = _json_text_from_option(metadata_json, metadata_json_file)
     remote_args = ["gateway", "update", session_id]
     if state is not None:
         remote_args.extend(["--state", state.value])
@@ -1273,9 +1307,9 @@ def gateway_update(
         remote_args.extend(["--queue-state", queue_state])
     if node is not None:
         remote_args.extend(["--node", node])
-    if gateway_json is not None:
-        remote_args.extend(["--gateway-json", gateway_json])
-    remote_args.extend(["--metadata-json", metadata_json])
+    if gateway_source is not None:
+        remote_args.extend(["--gateway-json", gateway_source])
+    remote_args.extend(["--metadata-json", metadata_source])
     if _try_remote_cluster_passthrough(cluster, remote_args):
         return
     updates: dict[str, object] = {}
@@ -1285,12 +1319,12 @@ def gateway_update(
         updates["queue_state"] = queue_state
     if node is not None:
         updates["node"] = node
-    if gateway_json is not None:
-        updates["gateway"] = _json_object(gateway_json)
+    if gateway_source is not None:
+        updates["gateway"] = _json_object(gateway_source)
     session = ClioCoreQueue(RelaySettings.from_env().core_dir).update_gateway_session(
         session_id,
         state=state,
-        metadata=_json_object(metadata_json),
+        metadata=_json_object(metadata_source),
         **updates,
     )
     typer.echo(session.model_dump_json(indent=2))
@@ -1715,6 +1749,16 @@ def _json_object(value: str) -> dict[str, object]:
     if not isinstance(loaded, dict):
         raise typer.BadParameter("value must be a JSON object")
     return {str(key): item for key, item in cast(dict[object, object], loaded).items()}
+
+
+def _json_text_from_option(source: str, source_file: Path | None) -> str:
+    if source_file is None:
+        return source
+    if source != "{}":
+        raise typer.BadParameter("use either the JSON value option or the JSON file option")
+    if not source_file.exists():
+        raise typer.BadParameter(f"JSON file does not exist: {source_file}")
+    return source_file.read_text(encoding="utf-8-sig")
 
 
 def _with_exclusive_scheduler(pipeline_yaml: str) -> str:

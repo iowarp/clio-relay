@@ -125,6 +125,10 @@ def test_cli_records_and_reads_task_events(tmp_path: Path, monkeypatch: MonkeyPa
 def test_cli_gateway_session_lifecycle(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     core_dir = tmp_path / "core"
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    gateway_json = tmp_path / "gateway.json"
+    gateway_json.write_text('{"strategy":"ssh_forward","remote_port":11111}', encoding="utf-8")
+    resources_json = tmp_path / "resources.json"
+    resources_json.write_text('{"nodes":1,"exclusive":true}', encoding="utf-8")
 
     created = CliRunner().invoke(
         app,
@@ -135,8 +139,10 @@ def test_cli_gateway_session_lifecycle(tmp_path: Path, monkeypatch: MonkeyPatch)
             "test-cluster",
             "--name",
             "paraview-red-sea",
-            "--gateway-json",
-            '{"strategy":"ssh_forward","remote_port":11111}',
+            "--gateway-json-file",
+            str(gateway_json),
+            "--resources-json-file",
+            str(resources_json),
         ],
     )
     assert created.exit_code == 0
@@ -165,6 +171,8 @@ def test_cli_gateway_session_lifecycle(tmp_path: Path, monkeypatch: MonkeyPatch)
     assert listed.exit_code == 0
     assert closed.exit_code == 0
     assert json.loads(updated.output)["state"] == GatewaySessionState.READY.value
+    assert json.loads(created.output)["gateway"]["remote_port"] == 11111
+    assert json.loads(created.output)["requested_resources"]["exclusive"] is True
     assert json.loads(listed.output)[0]["session_id"] == session_id
     assert json.loads(closed.output)["state"] == GatewaySessionState.CLOSED.value
 
@@ -915,6 +923,8 @@ def test_cli_remote_task_event_passthrough_uses_cluster_core(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
     _write_test_cluster(tmp_path)
+    metadata_json = tmp_path / "metadata.json"
+    metadata_json.write_text('{"surface":"cli-file"}', encoding="utf-8")
     commands: list[list[str]] = []
 
     def fake_run(
@@ -948,6 +958,8 @@ def test_cli_remote_task_event_passthrough_uses_cluster_core(
             "succeeded",
             "--path-ref",
             "/mnt/common/datasets/red_sea_001",
+            "--metadata-json-file",
+            str(metadata_json),
         ],
     )
 
@@ -957,6 +969,7 @@ def test_cli_remote_task_event_passthrough_uses_cluster_core(
     assert "CLIO_RELAY_CLI_MODE=local" in commands[0][2]
     assert "clio-relay job record-task-event task_remote" in commands[0][2]
     assert "--path-ref /mnt/common/datasets/red_sea_001" in commands[0][2]
+    assert "cli-file" in commands[0][2]
 
 
 def test_cli_remote_gateway_passthrough_uses_cluster_core(
@@ -966,6 +979,8 @@ def test_cli_remote_gateway_passthrough_uses_cluster_core(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
     _write_test_cluster(tmp_path)
+    gateway_json = tmp_path / "gateway.json"
+    gateway_json.write_text('{"strategy":"ssh_forward","remote_port":11111}', encoding="utf-8")
     commands: list[list[str]] = []
 
     def fake_run(
@@ -990,8 +1005,8 @@ def test_cli_remote_gateway_passthrough_uses_cluster_core(
             "ares",
             "--name",
             "paraview-red-sea",
-            "--gateway-json",
-            '{"strategy":"ssh_forward","remote_port":11111}',
+            "--gateway-json-file",
+            str(gateway_json),
         ],
     )
     updated = CliRunner().invoke(
@@ -1019,6 +1034,7 @@ def test_cli_remote_gateway_passthrough_uses_cluster_core(
         "gateway_remote",
     ]
     assert "clio-relay gateway create" in commands[0][2]
+    assert "remote_port" in commands[0][2]
     assert "clio-relay gateway update gateway_remote" in commands[1][2]
     assert "clio-relay gateway close gateway_remote" in commands[2][2]
 
