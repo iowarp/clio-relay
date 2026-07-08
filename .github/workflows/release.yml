@@ -54,7 +54,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dist
-          path: dist/*
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
           if-no-files-found: error
 
   attach-release-assets:
@@ -79,9 +81,9 @@ jobs:
           REPOSITORY: ${{ github.repository }}
         run: |
           if gh release view "$TAG_NAME" --repo "$REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG_NAME" dist/* --repo "$REPOSITORY" --clobber
+            gh release upload "$TAG_NAME" dist/*.whl dist/*.tar.gz --repo "$REPOSITORY" --clobber
           else
-            gh release create "$TAG_NAME" dist/* --repo "$REPOSITORY" --title "$TAG_NAME" --notes "Automated release for $TAG_NAME"
+            gh release create "$TAG_NAME" dist/*.whl dist/*.tar.gz --repo "$REPOSITORY" --title "$TAG_NAME" --notes "Automated release for $TAG_NAME"
           fi
 
   publish-pypi:
