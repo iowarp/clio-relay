@@ -33,7 +33,7 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert "CLIO_RELAY_AGENT_ADAPTER=exec" in script
     assert "CLIO_RELAY_AGENT_ARGS=''" in script
     assert "github.com/grc-iit/jarvis-cd.git" in script
-    assert 'uv pip install "$DEST"' in script
+    assert 'uv pip install --refresh-package clio-relay "$DEST"' in script
     assert 'jarvis repo add "$DEST/jarvis-packages/clio_relay" --force true' in script
     assert 'cat > "$HOME/.local/bin/lmp"' in script
     assert "spack install lammps" in script

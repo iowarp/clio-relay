@@ -277,7 +277,7 @@ mkdir -p "$DEST"
 tar -xf /tmp/clio-relay-head.tar -C "$DEST"
 uv venv --python 3.12 --clear "$HOME/.local/share/clio-relay/relay-venv312"
 . "$HOME/.local/share/clio-relay/relay-venv312/bin/activate"
-uv pip install {rendered_relay_install_spec}
+uv pip install --refresh-package clio-relay {rendered_relay_install_spec}
 ln -sf "$HOME/.local/share/clio-relay/relay-venv312/bin/clio-relay" "$HOME/.local/bin/clio-relay"
 deactivate
 
