@@ -19,6 +19,7 @@ from clio_relay.models import (
     GatewaySessionState,
     JarvisRunSpec,
     JobKind,
+    JobState,
     McpCallSpec,
     RelayJob,
     RelayTask,
@@ -496,7 +497,16 @@ def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch
     )
     teardown_result = runner.invoke(
         app,
-        ["session", "teardown", "--cluster", "ares", "--session-id", "session-1", "--stop-worker"],
+        [
+            "session",
+            "teardown",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--stop-worker",
+            "--keep-jobs",
+        ],
     )
 
     assert start_result.exit_code == 0
@@ -508,6 +518,95 @@ def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch
     assert teardown_result.exit_code == 0
     assert torn_down[0]["stop_worker"] is True
     assert torn_down[0]["cluster"] == "ares"
+
+
+def test_cli_session_teardown_defaults_to_keep_jobs(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    queue = ClioCoreQueue(tmp_path / "core")
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["sleep", "60"]),
+            idempotency_key="keep-job",
+        )
+    )
+    torn_down: list[dict[str, object]] = []
+
+    def fake_teardown(**kwargs: object) -> list[str]:
+        torn_down.append(kwargs)
+        return ["session_teardown=session-1"]
+
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    monkeypatch.setattr("clio_relay.cli.teardown_remote_session", fake_teardown)
+
+    result = CliRunner().invoke(
+        app,
+        ["session", "teardown", "--cluster", "ares", "--session-id", "session-1"],
+        input="\n",
+    )
+
+    assert result.exit_code == 0
+    assert "Cancel queued or running jobs for cluster ares? [y/N]:" in result.output
+    assert ClioCoreQueue(tmp_path / "core").get_job(job.job_id).state == JobState.QUEUED
+    assert torn_down[0]["stop_worker"] is False
+
+
+def test_cli_session_teardown_can_cancel_active_jobs(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    queue = ClioCoreQueue(tmp_path / "core")
+    active = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["sleep", "60"]),
+            idempotency_key="cancel-active-job",
+        )
+    )
+    other_cluster = queue.submit_job(
+        RelayJob(
+            cluster="other",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["sleep", "60"]),
+            idempotency_key="keep-other-cluster-job",
+        )
+    )
+    torn_down: list[dict[str, object]] = []
+
+    def fake_teardown(**kwargs: object) -> list[str]:
+        torn_down.append(kwargs)
+        return ["session_teardown=session-1"]
+
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    monkeypatch.setattr("clio_relay.cli.teardown_remote_session", fake_teardown)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "teardown",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--cancel-jobs",
+        ],
+    )
+
+    refreshed = ClioCoreQueue(tmp_path / "core")
+    assert result.exit_code == 0
+    assert f"job_canceled={active.job_id}" in result.output
+    assert refreshed.get_job(active.job_id).state == JobState.CANCELED
+    assert refreshed.get_job(other_cluster.job_id).state == JobState.QUEUED
+    assert torn_down[0]["stop_worker"] is False
 
 
 def test_cli_render_frpc_uses_configured_secret_env(

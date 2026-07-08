@@ -48,6 +48,7 @@ from clio_relay.models import (
     GatewaySessionState,
     JarvisRunSpec,
     JobKind,
+    JobState,
     McpCallSpec,
     MonitorRule,
     MonitorRuleAction,
@@ -745,11 +746,39 @@ def session_teardown(
         bool,
         typer.Option(help="Also stop the persistent cluster worker service for this cluster."),
     ] = False,
+    cancel_jobs: Annotated[
+        bool | None,
+        typer.Option(
+            "--cancel-jobs/--keep-jobs",
+            help="Cancel queued, leased, and running jobs for this cluster. Defaults to asking.",
+        ),
+    ] = None,
 ) -> None:
     """Stop owned remote relay session processes, optionally stopping the worker service."""
     definition = _require_cluster(cluster)
-    _run_or_exit(
-        lambda: _echo_lines(
+    if should_execute_on_cluster(definition):
+        remote_args = [
+            "session",
+            "teardown",
+            "--cluster",
+            cluster,
+            "--session-id",
+            session_id,
+            "--stop-worker" if stop_worker else "--no-stop-worker",
+            "--cancel-jobs" if _resolve_cancel_jobs(cancel_jobs, cluster) else "--keep-jobs",
+        ]
+        _run_remote_or_exit(definition, remote_args)
+        return
+
+    def action() -> None:
+        if _resolve_cancel_jobs(cancel_jobs, cluster):
+            canceled = _cancel_active_cluster_jobs(
+                ClioCoreQueue(RelaySettings.from_env().core_dir),
+                cluster,
+            )
+            for job_id in canceled:
+                typer.echo(f"job_canceled={job_id}")
+        _echo_lines(
             teardown_remote_session(
                 definition=definition,
                 session_id=session_id,
@@ -757,7 +786,8 @@ def session_teardown(
                 cluster=cluster,
             )
         )
-    )
+
+    _run_or_exit(action)
 
 
 @app.command("install-frp")
@@ -1899,6 +1929,28 @@ def _with_exclusive_scheduler(pipeline_yaml: str) -> str:
     typed_scheduler["exclusive"] = True
     document["scheduler"] = typed_scheduler
     return yaml.safe_dump(document, sort_keys=False)
+
+
+def _resolve_cancel_jobs(cancel_jobs: bool | None, cluster: str) -> bool:
+    if cancel_jobs is not None:
+        return cancel_jobs
+    return typer.confirm(
+        f"Cancel queued or running jobs for cluster {cluster}?",
+        default=False,
+    )
+
+
+def _cancel_active_cluster_jobs(queue: ClioCoreQueue, cluster: str) -> list[str]:
+    canceled: list[str] = []
+    for job in queue.list_jobs():
+        if job.cluster != cluster or job.state not in {
+            JobState.QUEUED,
+            JobState.LEASED,
+            JobState.RUNNING,
+        }:
+            continue
+        canceled.append(request_cancel_job(queue, job.job_id).job_id)
+    return canceled
 
 
 def _echo_lines(lines: list[str]) -> None:

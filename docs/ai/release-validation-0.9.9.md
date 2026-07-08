@@ -124,8 +124,6 @@ queue_position_note=scheduler cancellation was requested by relay; the scheduler
 Events included `scheduler.pending`, `scheduler.cancel_requested`, and
 `scheduler.canceled`.
 
-## Remaining before release
-
 ## Homelab transport
 
 STCP over WSS:

@@ -8,7 +8,7 @@
 
 It is a piece of the federation layer for [`clio-agent`](https://github.com/iowarp/clio-agent): a local CLIO experience can delegate work to a remote machine, keep observing it, detach, reconnect, and clean up after itself. The project is also designed for use outside CLIO. Any client that can call the CLI, HTTP API, or MCP tools can use the same relay model.
 
-> 0.9.5 is a prerelease validation build, not an internal rollout release. Ares/Homelab paths have been exercised, but pre-rollout blockers remain around workload-specific bootstrap, scheduler provider boundaries, and package-owned progress semantics. See issue #3.
+> The current release candidate is `0.9.11`. Ares and Homelab validation evidence is tracked under `docs/ai/`; release notes should be read with the matching version tag.
 
 ## How It Works
 
@@ -115,7 +115,7 @@ uvx --python 3.12 --from clio-relay clio-relay session status --cluster my-clust
 uvx --python 3.12 --from clio-relay clio-relay session teardown --cluster my-cluster --session-id desktop-session
 ```
 
-Use `session teardown --stop-worker` only when the user chooses to clean up the persistent remote worker too.
+Use `session teardown --stop-worker` only when the user chooses to clean up the persistent remote worker too. Teardown asks before canceling queued or running jobs, and the default is to keep jobs running. Use `--cancel-jobs` only for an explicit user choice; use `--keep-jobs` in noninteractive cleanup paths.
 
 ## Documentation
 
