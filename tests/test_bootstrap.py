@@ -75,6 +75,7 @@ def test_lammps_install_is_explicit_cluster_app_setup() -> None:
     assert "spack load lammps" in script
     assert 'cat > "$HOME/.local/bin/lmp"' in script
     assert 'CLIO_RELAY_LAMMPS_BIN="$LAMMPS_BIN"' in script
+    assert "\r" not in script
 
 
 def test_cluster_app_install_rejects_unknown_app() -> None:

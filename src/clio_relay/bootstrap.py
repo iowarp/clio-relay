@@ -236,7 +236,7 @@ def render_cluster_app_install_script(*, app_name: str) -> str:
 
 def render_lammps_app_install_script() -> str:
     """Render the sudo-less LAMMPS installer used by explicit app setup."""
-    return """set -euo pipefail
+    script = """set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$HOME/.local/bin" "$HOME/.local/src" "$HOME/.local/share/clio-relay/apps/lammps"
 
@@ -287,6 +287,7 @@ echo "lammps_prefix=$LAMMPS_PREFIX"
 echo "lammps_bin=$LAMMPS_BIN"
 echo "lmp=$HOME/.local/bin/lmp"
 """
+    return script.replace("\r\n", "\n")
 
 
 def render_linux_user_bootstrap_script(

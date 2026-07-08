@@ -1,6 +1,6 @@
 # Correction Tasks
 
-Current status: the 0.9.7 working tree implements the local code corrections for
+Current status: the 0.9.8 working tree implements the local code corrections for
 workload-specific bootstrap removal, scheduler provider isolation, and
 package-owned LAMMPS progress parsing. Full rollout is still blocked until these
 corrections pass installed-package `uvx` validation on homelab and Ares.
