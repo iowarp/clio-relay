@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import subprocess
+import tarfile
 from pathlib import Path
 
 import pytest
 
-from clio_relay.bootstrap import assert_clean_git_checkout, render_linux_user_bootstrap_script
+from clio_relay import __version__
+from clio_relay.bootstrap import (
+    assert_clean_git_checkout,
+    create_bootstrap_archive,
+    render_linux_user_bootstrap_script,
+)
 from clio_relay.errors import ConfigurationError
 
 
@@ -24,6 +30,7 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert "CLIO_RELAY_AGENT_ADAPTER=exec" in script
     assert "CLIO_RELAY_AGENT_ARGS=''" in script
     assert "github.com/grc-iit/jarvis-cd.git" in script
+    assert 'uv pip install "$DEST"' in script
     assert 'jarvis repo add "$DEST/jarvis-packages/clio_relay" --force true' in script
     assert 'cat > "$HOME/.local/bin/lmp"' in script
     assert "spack install lammps" in script
@@ -81,3 +88,53 @@ def test_bootstrap_refuses_dirty_git_checkout(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigurationError, match="deploys git HEAD"):
         assert_clean_git_checkout(tmp_path)
+
+
+def test_bootstrap_archive_uses_clean_git_checkout(tmp_path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "tracked.txt").write_text("clean\n", encoding="utf-8")
+    (tmp_path / "jarvis-packages" / "clio_relay").mkdir(parents=True)
+    (tmp_path / "jarvis-packages" / "clio_relay" / "README.md").write_text(
+        "package\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    deployment = create_bootstrap_archive(
+        source_root=tmp_path,
+        archive=tmp_path / "bootstrap.tar",
+    )
+
+    assert deployment.install_spec == "$DEST"
+    with tarfile.open(deployment.archive) as archive:
+        names = archive.getnames()
+    assert "tracked.txt" in names
+    assert "jarvis-packages/clio_relay/README.md" in names
+
+
+def test_bootstrap_archive_uses_packaged_assets_without_git_checkout(tmp_path: Path) -> None:
+    deployment = create_bootstrap_archive(
+        source_root=tmp_path / "not-a-repo",
+        archive=tmp_path / "bootstrap.tar",
+    )
+
+    assert deployment.install_spec == f"clio-relay=={__version__}"
+    with tarfile.open(deployment.archive) as archive:
+        names = archive.getnames()
+    assert any(name.startswith("jarvis-packages/clio_relay/") for name in names)
+    assert not any("__pycache__" in name or name.endswith(".pyc") for name in names)

@@ -7,14 +7,26 @@ import platform
 import shlex
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import zipfile
+from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
 from urllib.request import urlretrieve
 
+from clio_relay import __version__
 from clio_relay.errors import ConfigurationError, RelayError
 
 FRP_VERSION = "0.69.1"
+
+
+@dataclass(frozen=True)
+class BootstrapArchive:
+    """Remote bootstrap archive and relay install source."""
+
+    archive: Path
+    install_spec: str
 
 
 def install_local_frp(destination: Path) -> Path:
@@ -168,15 +180,14 @@ def bootstrap_cluster_over_ssh(
     """Install relay dependencies and the current source tree on a cluster over SSH."""
     if bootstrap_profile != "linux-user":
         raise ConfigurationError(f"unsupported bootstrap profile: {bootstrap_profile}")
-    if shutil.which("ssh") is None or shutil.which("scp") is None or shutil.which("git") is None:
-        raise ConfigurationError("ssh, scp, and git are required for remote bootstrap")
-    assert_clean_git_checkout(source_root)
+    if shutil.which("ssh") is None or shutil.which("scp") is None:
+        raise ConfigurationError("ssh and scp are required for remote bootstrap")
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
         archive = temp_path / "clio-relay-head.tar"
         script_path = temp_path / "clio-relay-bootstrap.sh"
-        _run(["git", "archive", "--format=tar", "-o", str(archive), "HEAD"], cwd=source_root)
-        _run(["scp", str(archive), f"{ssh_host}:/tmp/clio-relay-head.tar"])
+        deployment = create_bootstrap_archive(source_root=source_root, archive=archive)
+        _run(["scp", str(deployment.archive), f"{ssh_host}:/tmp/clio-relay-head.tar"])
         script_path.write_text(
             render_linux_user_bootstrap_script(
                 frp_version=frp_version,
@@ -184,6 +195,7 @@ def bootstrap_cluster_over_ssh(
                 agent_npm_package=agent_npm_package,
                 agent_npm_bin=agent_npm_bin,
                 agent_args=agent_args or [],
+                relay_install_spec=deployment.install_spec,
             ),
             encoding="utf-8",
             newline="\n",
@@ -200,12 +212,16 @@ def render_linux_user_bootstrap_script(
     agent_npm_package: str | None = None,
     agent_npm_bin: str | None = None,
     agent_args: list[str] | None = None,
+    relay_install_spec: str = "$DEST",
 ) -> str:
     """Render the idempotent shell script used for the current Linux cluster bootstrap."""
     rendered_agent_adapter = shlex.quote(agent_adapter)
     rendered_agent_args = shlex.quote(" ".join(agent_args or []))
     rendered_agent_npm_package = shlex.quote(agent_npm_package or "")
     rendered_agent_npm_bin = shlex.quote(agent_npm_bin or "")
+    rendered_relay_install_spec = (
+        '"$DEST"' if relay_install_spec == "$DEST" else shlex.quote(relay_install_spec)
+    )
     script = f"""set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$HOME/.local/bin" "$HOME/.local/src" "$HOME/.local/share/clio-relay"
@@ -261,7 +277,7 @@ mkdir -p "$DEST"
 tar -xf /tmp/clio-relay-head.tar -C "$DEST"
 uv venv --python 3.12 --clear "$HOME/.local/share/clio-relay/relay-venv312"
 . "$HOME/.local/share/clio-relay/relay-venv312/bin/activate"
-uv pip install "$DEST"
+uv pip install {rendered_relay_install_spec}
 ln -sf "$HOME/.local/share/clio-relay/relay-venv312/bin/clio-relay" "$HOME/.local/bin/clio-relay"
 deactivate
 
@@ -388,6 +404,47 @@ echo "jarvis=$("$HOME/.local/bin/jarvis" --help | head -n 1)"
 echo "relay=$(clio-relay --help | head -n 1)"
 """
     return script.replace("\r\n", "\n")
+
+
+def create_bootstrap_archive(*, source_root: Path, archive: Path) -> BootstrapArchive:
+    """Create the archive used by remote bootstrap.
+
+    A clean git checkout deploys that exact committed tree. Installed-package
+    runs deploy packaged JARVIS assets and install clio-relay from PyPI by
+    version, so bootstrap does not require a checkout.
+    """
+    if (source_root / ".git").exists():
+        assert_clean_git_checkout(source_root)
+        _run(["git", "archive", "--format=tar", "-o", str(archive), "HEAD"], cwd=source_root)
+        return BootstrapArchive(archive=archive, install_spec="$DEST")
+    _write_packaged_bootstrap_archive(archive)
+    return BootstrapArchive(archive=archive, install_spec=f"clio-relay=={__version__}")
+
+
+def _write_packaged_bootstrap_archive(archive: Path) -> None:
+    assets = resources.files("clio_relay").joinpath("assets", "jarvis-packages")
+    source_assets = Path(__file__).resolve().parents[2] / "jarvis-packages"
+    with tarfile.open(archive, "w") as tar:
+        if assets.is_dir():
+            with resources.as_file(assets) as asset_path:
+                _add_jarvis_assets_to_archive(tar=tar, asset_path=asset_path)
+            return
+        if source_assets.is_dir():
+            _add_jarvis_assets_to_archive(tar=tar, asset_path=source_assets)
+            return
+    raise ConfigurationError("installed clio-relay package does not include jarvis package assets")
+
+
+def _add_jarvis_assets_to_archive(*, tar: tarfile.TarFile, asset_path: Path) -> None:
+    for item in asset_path.rglob("*"):
+        relative_parts = item.relative_to(asset_path).parts
+        if "__pycache__" in relative_parts or item.name.endswith(".pyc"):
+            continue
+        tar.add(
+            item,
+            arcname=str(Path("jarvis-packages", *relative_parts)),
+            recursive=False,
+        )
 
 
 def assert_clean_git_checkout(source_root: Path) -> None:

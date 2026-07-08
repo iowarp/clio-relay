@@ -16,9 +16,12 @@ uv build
 
 ## bootstrap source
 
-The current `cluster bootstrap` command deploys the repository source from a clean local git checkout. For the initial repository release, run bootstrap commands from the checkout, not from an arbitrary directory after installing only the wheel.
+`cluster bootstrap` supports two deployment sources:
 
-PyPI packages are still built and checked by CI, but a future release should make the JARVIS package repository discoverable from the installed package before documenting PyPI-only cluster bootstrap.
+- From a repository checkout, it deploys the committed git `HEAD`. The checkout must be clean so the remote cluster receives the same tree that was reviewed and committed.
+- From an installed wheel or PyPI package, it deploys the packaged JARVIS assets and installs `clio-relay==<version>` on the remote cluster.
+
+Before publishing, verify that the wheel contains `clio_relay/assets/jarvis-packages/clio_relay/`. That packaged asset path is what makes bootstrap work without a local checkout.
 
 ## version
 

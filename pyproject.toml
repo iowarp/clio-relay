@@ -25,6 +25,29 @@ Issues = "https://github.com/JaimeCernuda/clio-relay/issues"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+exclude = [
+    "**/__pycache__",
+    "**/*.pyc",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/clio_relay"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"jarvis-packages" = "clio_relay/assets/jarvis-packages"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src",
+    "jarvis-packages",
+    "tests",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+    "uv.lock",
+]
+
 [project.scripts]
 clio-relay = "clio_relay.cli:app"
 
