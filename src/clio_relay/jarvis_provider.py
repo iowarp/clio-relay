@@ -21,84 +21,7 @@ import yaml
 
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.models import JarvisRunSpec, McpCallSpec, RemoteAgentTaskSpec
-
-_SCHEDULED_PIPELINE_RUNNER = """
-from __future__ import annotations
-
-import subprocess
-import sys
-import time
-
-from jarvis_cd.core.pipeline_test import load_yaml_auto
-
-_, obj = load_yaml_auto(sys.argv[1])
-submit = getattr(obj, "submit")
-script_path = submit(submit=False)
-if script_path is None:
-    raise RuntimeError("Scheduled JARVIS object did not return a scheduler script path")
-
-submission = subprocess.run(
-    ["sbatch", "--parsable", str(script_path)],
-    capture_output=True,
-    text=True,
-    check=False,
-)
-if submission.stderr:
-    print(submission.stderr, file=sys.stderr, end="", flush=True)
-if submission.stdout:
-    print(submission.stdout, end="", flush=True)
-if submission.returncode != 0:
-    raise SystemExit(submission.returncode)
-
-job_id = submission.stdout.strip().splitlines()[-1].split(";", 1)[0].strip()
-if not job_id:
-    raise RuntimeError("sbatch did not return a scheduler job id")
-print(f"scheduler_job_id={job_id}", flush=True)
-
-terminal_success = {"COMPLETED"}
-terminal_cancel = {"CANCELLED", "CANCELLED+"}
-terminal_failure = {
-    "BOOT_FAIL",
-    "DEADLINE",
-    "FAILED",
-    "NODE_FAIL",
-    "OUT_OF_MEMORY",
-    "PREEMPTED",
-    "REVOKED",
-    "SPECIAL_EXIT",
-    "TIMEOUT",
-}
-
-while True:
-    queued = subprocess.run(
-        ["squeue", "-h", "-j", job_id, "-o", "%T"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if queued.stdout.strip():
-        time.sleep(5)
-        continue
-
-    accounting = subprocess.run(
-        ["sacct", "-n", "-P", "-j", job_id, "-o", "State"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    states = [
-        line.split("|", 1)[0].split()[0]
-        for line in accounting.stdout.splitlines()
-        if line.strip()
-    ]
-    if any(state in terminal_success for state in states):
-        raise SystemExit(0)
-    if any(state in terminal_cancel for state in states):
-        raise SystemExit(130)
-    if any(state in terminal_failure for state in states):
-        raise SystemExit(1)
-    time.sleep(5)
-"""
+from clio_relay.scheduler_providers import provider_for_scheduler
 
 
 class JarvisCdProvider:
@@ -294,13 +217,13 @@ class JarvisCdProvider:
 
     def pipeline_command(self, pipeline_path: Path) -> list[str]:
         """Return the command used to execute a materialized JARVIS pipeline."""
-        if _uses_scheduler(pipeline_path):
-            return [
+        scheduler_name = _scheduler_name(pipeline_path)
+        if scheduler_name is not None:
+            scheduler_provider = provider_for_scheduler(scheduler_name)
+            return scheduler_provider.pipeline_command(
                 _jarvis_python(self.jarvis_bin),
-                "-c",
-                _SCHEDULED_PIPELINE_RUNNER,
-                str(pipeline_path),
-            ]
+                pipeline_path,
+            )
         return [self.jarvis_bin, "ppl", "run", "yaml", str(pipeline_path)]
 
 
@@ -351,31 +274,37 @@ def _terminate_process(process: subprocess.Popen[str]) -> None:
             return
 
 
-def _uses_scheduler(pipeline_path: Path) -> bool:
+def _scheduler_name(pipeline_path: Path) -> str | None:
     try:
         document = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
     except OSError as exc:
         raise ConfigurationError(f"failed to read JARVIS pipeline: {pipeline_path}") from exc
-    return _document_uses_scheduler(document)
+    return _document_scheduler_name(document)
 
 
-def _document_uses_scheduler(document: object) -> bool:
+def _document_scheduler_name(document: object) -> str | None:
     if not isinstance(document, dict):
-        return False
+        return None
     typed = cast(dict[str, object], document)
     scheduler = typed.get("scheduler")
     if isinstance(scheduler, dict) and scheduler:
-        return True
+        typed_scheduler = cast(dict[str, object], scheduler)
+        name = typed_scheduler.get("name")
+        return str(name) if isinstance(name, str) and name.strip() else "slurm"
     config = typed.get("config")
     if isinstance(config, dict):
         typed_config = cast(dict[str, object], config)
-        if _document_uses_scheduler(typed_config):
-            return True
+        config_scheduler = _document_scheduler_name(typed_config)
+        if config_scheduler is not None:
+            return config_scheduler
     experiments = typed.get("experiments")
     if isinstance(experiments, list):
         typed_experiments = cast(list[object], experiments)
-        return any(_document_uses_scheduler(experiment) for experiment in typed_experiments)
-    return False
+        for experiment in typed_experiments:
+            experiment_scheduler = _document_scheduler_name(experiment)
+            if experiment_scheduler is not None:
+                return experiment_scheduler
+    return None
 
 
 def _jarvis_python(jarvis_bin: str) -> str:

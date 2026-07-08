@@ -291,34 +291,6 @@ jarvis init \
   "$HOME/.local/share/clio-relay/jarvis-shared" || true
 jarvis repo add "$DEST/jarvis-packages/clio_relay" --force true
 
-cat > "$HOME/.local/bin/lmp" <<'__CLIO_RELAY_LMP_WRAPPER__'
-#!/usr/bin/env bash
-set -euo pipefail
-if command -v lmp.real >/dev/null 2>&1; then
-  exec lmp.real "$@"
-fi
-if [ -f "$HOME/spack/share/spack/setup-env.sh" ]; then
-  . "$HOME/spack/share/spack/setup-env.sh"
-  if ! spack find lammps >/dev/null 2>&1; then
-    spack install lammps
-  fi
-  spack load lammps
-fi
-if command -v lmp_mpi >/dev/null 2>&1; then
-  exec lmp_mpi "$@"
-fi
-real_lmp="$(command -v lmp || true)"
-if [ -n "$real_lmp" ] && [ "$real_lmp" != "$HOME/.local/bin/lmp" ]; then
-  exec "$real_lmp" "$@"
-fi
-if command -v lammps >/dev/null 2>&1; then
-  exec lammps "$@"
-fi
-echo "LAMMPS executable not found; install it or make lmp/lmp_mpi/lammps available in PATH" >&2
-exit 127
-__CLIO_RELAY_LMP_WRAPPER__
-chmod 0755 "$HOME/.local/bin/lmp"
-
 cat > "$HOME/.local/bin/mpiexec" <<'__CLIO_RELAY_MPIEXEC_WRAPPER__'
 #!/usr/bin/env bash
 set -euo pipefail

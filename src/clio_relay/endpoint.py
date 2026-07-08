@@ -8,7 +8,6 @@ import os
 import re
 import secrets
 import socket
-import subprocess
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -40,14 +39,14 @@ from clio_relay.models import (
     utc_now,
 )
 from clio_relay.progress_adapters import (
-    LammpsThermoProgressAdapter,
+    PackageProgressAdapter,
     package_progress_adapter_from_pipeline,
 )
 from clio_relay.progress_provenance import (
     package_progress_metadata,
     validate_package_progress_metadata,
 )
-from clio_relay.scheduler_status import poll_slurm_status
+from clio_relay.scheduler_providers import SchedulerProvider, provider_for_scheduler
 from clio_relay.spool import JobSpool
 
 
@@ -65,6 +64,7 @@ class EndpointWorker:
         cluster: str = "local",
         queue: ClioCoreQueue | None = None,
         provider: JarvisCdProvider | None = None,
+        scheduler_provider: SchedulerProvider | None = None,
     ) -> None:
         self.role = role
         self.cluster = cluster
@@ -76,6 +76,7 @@ class EndpointWorker:
             agent_adapter=settings.agent_adapter,
             agent_args=settings.agent_args,
         )
+        self.scheduler_provider = scheduler_provider or provider_for_scheduler("slurm")
         self.endpoint: EndpointRegistration | None = None
 
     def register(self) -> EndpointRegistration:
@@ -352,7 +353,7 @@ class EndpointWorker:
         spool: JobSpool,
         stream_name: str,
         text: str,
-        package_progress_adapter: LammpsThermoProgressAdapter | None = None,
+        package_progress_adapter: PackageProgressAdapter | None = None,
         scheduler_job_ids: list[str] | None = None,
         scheduler_task_id: str | None = None,
     ) -> None:
@@ -483,7 +484,7 @@ class EndpointWorker:
         progress_sidecar_offset: list[int],
         progress_sidecar_token: str,
         scheduler_job_ids: list[str],
-        package_progress_adapter: LammpsThermoProgressAdapter | None = None,
+        package_progress_adapter: PackageProgressAdapter | None = None,
         package_progress_log_offsets: dict[Path, int] | None = None,
     ) -> None:
         self._renew_lease_if_needed(lease, last_renewed_at)
@@ -505,7 +506,7 @@ class EndpointWorker:
     def _ingest_package_progress_logs(
         self,
         job: RelayJob,
-        package_progress_adapter: LammpsThermoProgressAdapter,
+        package_progress_adapter: PackageProgressAdapter,
         log_offsets: dict[Path, int],
     ) -> None:
         for path, offset in list(log_offsets.items()):
@@ -610,7 +611,7 @@ class EndpointWorker:
             JobState.RUNNING,
             message="Scheduler job id detected",
             metadata={
-                "scheduler": "slurm",
+                "scheduler": self.scheduler_provider.name,
                 "scheduler_job_ids": list(scheduler_job_ids),
             },
         )
@@ -623,7 +624,7 @@ class EndpointWorker:
         task_id: str | None,
     ) -> None:
         for scheduler_job_id in scheduler_job_ids:
-            status = poll_slurm_status(scheduler_job_id)
+            status = self.scheduler_provider.poll(scheduler_job_id)
             self._record_scheduler_status(
                 job,
                 scheduler_job_ids,
@@ -656,7 +657,7 @@ class EndpointWorker:
         self.queue.update_task_metadata(
             target_task_id,
             {
-                "scheduler": "slurm",
+                "scheduler": status.scheduler,
                 "scheduler_job_ids": list(scheduler_job_ids),
                 "scheduler_status": status_payload,
             },
@@ -693,20 +694,18 @@ class EndpointWorker:
         if not scheduler_job_ids:
             return
         for scheduler_job_id in scheduler_job_ids:
-            result = subprocess.run(
-                ["scancel", scheduler_job_id],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
+            result = self.scheduler_provider.cancel(scheduler_job_id)
             if result.returncode == 0:
                 self.queue.append_event(
                     job.job_id,
                     "scheduler.cancel_requested",
                     f"Requested scheduler cancellation: {scheduler_job_id}",
-                    payload={"scheduler": "slurm", "scheduler_job_id": scheduler_job_id},
+                    payload={
+                        "scheduler": self.scheduler_provider.name,
+                        "scheduler_job_id": scheduler_job_id,
+                    },
                 )
-                status = poll_slurm_status(scheduler_job_id)
+                status = self.scheduler_provider.poll(scheduler_job_id)
                 if status.phase == SchedulerPhase.UNKNOWN:
                     status = status.model_copy(
                         update={
@@ -715,7 +714,7 @@ class EndpointWorker:
                             "reason": "relay cancellation requested",
                             "queue_position_note": (
                                 "scheduler cancellation was requested by relay; "
-                                "sacct did not have a terminal record yet"
+                                "the scheduler provider did not return a terminal record yet"
                             ),
                         }
                     )
@@ -732,7 +731,7 @@ class EndpointWorker:
                 "scheduler.cancel_failed",
                 f"Scheduler cancellation failed: {scheduler_job_id}",
                 payload={
-                    "scheduler": "slurm",
+                    "scheduler": self.scheduler_provider.name,
                     "scheduler_job_id": scheduler_job_id,
                     "returncode": result.returncode,
                     "stderr": result.stderr,

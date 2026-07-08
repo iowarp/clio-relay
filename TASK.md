@@ -1,5 +1,10 @@
 # Correction Tasks
 
+Current status: the 0.9.6 working tree implements the local code corrections for
+workload-specific bootstrap removal, scheduler provider isolation, and
+package-owned LAMMPS progress parsing. Full rollout is still blocked until these
+corrections pass installed-package `uvx` validation on homelab and Ares.
+
 1. **Use the builtin JARVIS LAMMPS package as the acceptance application**
    - LAMMPS is already a builtin JARVIS-CD package under `builtin.lammps`; do not duplicate it as `clio_relay.lammps` unless upstream extension proves impossible.
    - Move LAMMPS-specific execution/progress out of `clio_relay.bounded_command`.

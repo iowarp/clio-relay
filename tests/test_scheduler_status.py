@@ -16,7 +16,8 @@ from clio_relay.models import (
     SchedulerPhase,
 )
 from clio_relay.relay_ops import job_status
-from clio_relay.scheduler_status import poll_slurm_status, relay_queue_status
+from clio_relay.scheduler_providers import SlurmSchedulerProvider
+from clio_relay.scheduler_status import relay_queue_status
 
 
 def test_relay_queue_status_counts_older_cluster_jobs(tmp_path: Path) -> None:
@@ -98,9 +99,9 @@ def test_poll_slurm_status_reports_pending_queue_position(monkeypatch: MonkeyPat
             )
         raise AssertionError(command)
 
-    monkeypatch.setattr("clio_relay.scheduler_status.subprocess.run", fake_run)
+    monkeypatch.setattr("clio_relay.scheduler_providers.subprocess.run", fake_run)
 
-    status = poll_slurm_status("100")
+    status = SlurmSchedulerProvider().poll("100")
 
     assert status.phase == SchedulerPhase.PENDING
     assert status.reason == "Resources"
@@ -130,9 +131,9 @@ def test_poll_slurm_status_uses_sacct_when_squeue_is_empty(monkeypatch: MonkeyPa
             )
         raise AssertionError(command)
 
-    monkeypatch.setattr("clio_relay.scheduler_status.subprocess.run", fake_run)
+    monkeypatch.setattr("clio_relay.scheduler_providers.subprocess.run", fake_run)
 
-    status = poll_slurm_status("100")
+    status = SlurmSchedulerProvider().poll("100")
 
     assert status.phase == SchedulerPhase.COMPLETED
     assert status.raw_state == "COMPLETED"

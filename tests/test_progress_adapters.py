@@ -2,10 +2,8 @@ from __future__ import annotations
 
 from typing import cast
 
-from clio_relay.progress_adapters import (
-    LammpsThermoProgressAdapter,
-    package_progress_adapter_from_pipeline,
-)
+from clio_relay.package_adapters.lammps import LammpsThermoProgressAdapter
+from clio_relay.progress_adapters import package_progress_adapter_from_pipeline
 
 
 def test_lammps_parser_requires_thermo_header_and_named_step_column() -> None:
@@ -132,6 +130,7 @@ def test_pipeline_adapter_requires_declared_lammps_package() -> None:
     adapter = package_progress_adapter_from_pipeline(lammps)
 
     assert adapter is not None
+    assert isinstance(adapter, LammpsThermoProgressAdapter)
     assert adapter.package_name == "builtin.lammps"
     assert adapter.total_steps == 250
 

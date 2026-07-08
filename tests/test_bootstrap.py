@@ -35,10 +35,8 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert "github.com/grc-iit/jarvis-cd.git" in script
     assert 'uv pip install --refresh-package clio-relay "$DEST"' in script
     assert 'jarvis repo add "$DEST/jarvis-packages/clio_relay" --force true' in script
-    assert 'cat > "$HOME/.local/bin/lmp"' in script
-    assert "spack install lammps" in script
-    assert "spack load lammps" in script
-    assert 'real_lmp="$(command -v lmp || true)"' in script
+    assert "spack install lammps" not in script
+    assert 'cat > "$HOME/.local/bin/lmp"' not in script
     assert 'cat > "$HOME/.local/bin/mpiexec"' in script
     assert 'echo "mpich 4.0.0 clio-relay user-space wrapper"' in script
     assert "-p|-f|--host|--hostfile|-host|-hostfile|--hosts|-hosts|--ppn|-ppn|-npernode)" in script
