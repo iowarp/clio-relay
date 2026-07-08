@@ -1,12 +1,18 @@
-# clio-relay
+<p align="center">
+  <img src="docs/assets/clio-relay-banner.png" alt="clio-relay banner">
+</p>
 
-![clio-relay banner](https://raw.githubusercontent.com/JaimeCernuda/clio-relay/main/docs/assets/clio-relay-banner.png)
+<h1 align="center">clio-relay</h1>
+
+<p align="center">
+  <img src="docs/assets/clio-relay-logo.png" alt="clio-relay logo" width="96">
+</p>
 
 `clio-relay` lets a desktop tool submit work to a remote cluster, follow it while it runs, and collect logs, artifacts, progress, and provenance without putting job state in the network tunnel.
 
 It is a piece of the federation layer for [`clio-agent`](https://github.com/iowarp/clio-agent): a local CLIO experience can delegate work to a remote machine, keep observing it, detach, reconnect, and clean up after itself. The project is also designed for use outside CLIO. Any client that can call the CLI, HTTP API, or MCP tools can use the same relay model.
 
-## what it does
+## What It Does
 
 - Submits JARVIS-CD pipelines to configured clusters.
 - Runs remote agent tasks and remote MCP calls through the same queue.
@@ -18,7 +24,7 @@ It is a piece of the federation layer for [`clio-agent`](https://github.com/iowa
 - Supports frp over WebSocket/TLS, frp over TCP, SSH local port forwarding, and optional frp XTCP probing.
 - Lets a desktop app detach from a remote session or tear down the remote relay processes explicitly.
 
-## how it works
+## How It Works
 
 `clio-relay` has three roles:
 
@@ -28,7 +34,7 @@ It is a piece of the federation layer for [`clio-agent`](https://github.com/iowa
 
 The durable boundary is `clio-core`. The filesystem queue in this repository is the development backend for that record contract. JARVIS-CD owns scheduler execution, package behavior, output collection, and provenance. frp and SSH forwarding only carry HTTP bytes between endpoints.
 
-## install
+## Install
 
 ```powershell
 uv sync
@@ -44,7 +50,7 @@ uv run clio-relay cluster bootstrap --cluster my-cluster
 uv run clio-relay cluster install-endpoint-service --cluster my-cluster --start --enable
 ```
 
-## submit work
+## Submit Work
 
 Submit a JARVIS pipeline:
 
@@ -68,7 +74,7 @@ Run live acceptance against the builtin JARVIS LAMMPS package:
 uv run clio-relay live-test --cluster ares --jarvis-yaml .\examples\ares-lammps\pipeline.yaml --monitor-pattern "Loop time"
 ```
 
-## observe remote agent work
+## Observe Remote Agent Work
 
 Remote agents can emit structured task timeline events while they work. This is useful when a UI needs to show discovery and planning before the final answer exists.
 
@@ -80,7 +86,7 @@ uv run clio-relay job task-events <task-id> --cluster my-cluster --cursor 1
 
 The same contract is available over HTTP at `/tasks/{task_id}/events`, `/tasks/{task_id}/events/sse`, and `/tasks/{task_id}/events/ws`, and through MCP tools `relay_record_task_event` and `relay_watch_task_events`.
 
-## manage gateway sessions
+## Manage Gateway Sessions
 
 Long-running visualization services should be tracked as durable gateway sessions. A session records the scheduler job, node, logs, published or forwarded endpoint, health metadata, and reconnect hints.
 
@@ -93,7 +99,7 @@ uv run clio-relay gateway close <session-id> --cluster my-cluster
 
 The HTTP API exposes `/gateway-sessions`, `/gateway-sessions/{session_id}`, and `/gateway-sessions/{session_id}/close`. MCP tools expose the same create, read, update, and close operations.
 
-## choose transport
+## Choose Transport
 
 For a public relay through Cloudflare or another HTTPS edge, use frp with `transport.protocol = "wss"`:
 
@@ -122,7 +128,7 @@ uv run clio-relay session teardown --cluster my-cluster --session-id desktop-ses
 
 Use `session teardown --stop-worker` only when the user chooses to clean up the persistent remote worker too.
 
-## documentation
+## Documentation
 
 - [architecture](docs/architecture.md)
 - [operations](docs/operations.md)
@@ -130,7 +136,7 @@ Use `session teardown --stop-worker` only when the user chooses to clean up the 
 - [brand prompt](docs/brand.md)
 - [ai context](docs/ai/README.md)
 
-## development
+## Development
 
 ```powershell
 uv run ruff check --fix
