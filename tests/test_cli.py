@@ -908,6 +908,121 @@ def test_cli_remote_wait_passthrough_uses_cluster_core(
     assert "clio-relay job wait job_remote" in commands[0][2]
 
 
+def test_cli_remote_task_event_passthrough_uses_cluster_core(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+    _write_test_cluster(tmp_path)
+    commands: list[list[str]] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[bytes]:
+        commands.append(command)
+        assert capture_output is True
+        assert check is False
+        return subprocess.CompletedProcess(command, 0, b'{"seq":1}\n', b"")
+
+    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "job",
+            "record-task-event",
+            "task_remote",
+            "--cluster",
+            "ares",
+            "--event-type",
+            "dataset_found",
+            "--label",
+            "dataset",
+            "--summary",
+            "Found staged dataset",
+            "--status",
+            "succeeded",
+            "--path-ref",
+            "/mnt/common/datasets/red_sea_001",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output)["seq"] == 1
+    assert len(commands) == 1
+    assert "CLIO_RELAY_CLI_MODE=local" in commands[0][2]
+    assert "clio-relay job record-task-event task_remote" in commands[0][2]
+    assert "--path-ref /mnt/common/datasets/red_sea_001" in commands[0][2]
+
+
+def test_cli_remote_gateway_passthrough_uses_cluster_core(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+    _write_test_cluster(tmp_path)
+    commands: list[list[str]] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[bytes]:
+        commands.append(command)
+        assert capture_output is True
+        assert check is False
+        return subprocess.CompletedProcess(command, 0, b'{"session_id":"gateway_remote"}\n', b"")
+
+    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
+
+    created = CliRunner().invoke(
+        app,
+        [
+            "gateway",
+            "create",
+            "--cluster",
+            "ares",
+            "--name",
+            "paraview-red-sea",
+            "--gateway-json",
+            '{"strategy":"ssh_forward","remote_port":11111}',
+        ],
+    )
+    updated = CliRunner().invoke(
+        app,
+        [
+            "gateway",
+            "update",
+            "gateway_remote",
+            "--cluster",
+            "ares",
+            "--state",
+            "ready",
+            "--node",
+            "ares-comp-01",
+        ],
+    )
+    closed = CliRunner().invoke(app, ["gateway", "close", "gateway_remote", "--cluster", "ares"])
+
+    assert created.exit_code == 0
+    assert updated.exit_code == 0
+    assert closed.exit_code == 0
+    assert [json.loads(item.output)["session_id"] for item in [created, updated, closed]] == [
+        "gateway_remote",
+        "gateway_remote",
+        "gateway_remote",
+    ]
+    assert "clio-relay gateway create" in commands[0][2]
+    assert "clio-relay gateway update gateway_remote" in commands[1][2]
+    assert "clio-relay gateway close gateway_remote" in commands[2][2]
+
+
 def test_cli_remote_agent_run_preserves_posix_prompt_path(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

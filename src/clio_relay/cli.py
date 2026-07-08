@@ -900,6 +900,10 @@ def job_record_task_event(
     event_type: Annotated[str, typer.Option(help="Structured task event type.")],
     label: Annotated[str, typer.Option(help="Short UI step label.")],
     summary: Annotated[str, typer.Option(help="Short event summary.")],
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to record the event over SSH."),
+    ] = None,
     status: Annotated[
         TaskEventStatus,
         typer.Option(help="Task step status."),
@@ -919,6 +923,29 @@ def job_record_task_event(
     ] = "{}",
 ) -> None:
     """Record a structured task timeline event."""
+    remote_args = [
+        "job",
+        "record-task-event",
+        task_id,
+        "--event-type",
+        event_type,
+        "--label",
+        label,
+        "--summary",
+        summary,
+        "--status",
+        status.value,
+        "--metadata-json",
+        metadata_json,
+    ]
+    if detail is not None:
+        remote_args.extend(["--detail", detail])
+    for value in path_ref or []:
+        remote_args.extend(["--path-ref", value])
+    for value in artifact_ref or []:
+        remote_args.extend(["--artifact-ref", value])
+    if _try_remote_cluster_passthrough(cluster, remote_args):
+        return
     event = ClioCoreQueue(RelaySettings.from_env().core_dir).append_task_event(
         TaskTimelineEvent(
             task_id=task_id,
@@ -1135,6 +1162,30 @@ def gateway_create(
     ] = "{}",
 ) -> None:
     """Create a durable scheduler-backed gateway service session."""
+    remote_args = [
+        "gateway",
+        "create",
+        "--cluster",
+        cluster,
+        "--name",
+        name,
+        "--state",
+        state.value,
+        "--scheduler",
+        scheduler,
+        "--gateway-json",
+        gateway_json,
+        "--resources-json",
+        resources_json,
+        "--metadata-json",
+        metadata_json,
+    ]
+    if scheduler_job_id is not None:
+        remote_args.extend(["--scheduler-job-id", scheduler_job_id])
+    if node is not None:
+        remote_args.extend(["--node", node])
+    if _try_remote_cluster_passthrough(cluster, remote_args):
+        return
     session = ClioCoreQueue(RelaySettings.from_env().core_dir).create_gateway_session(
         GatewaySession(
             cluster=cluster,
@@ -1159,6 +1210,11 @@ def gateway_list(
     ] = None,
 ) -> None:
     """List durable gateway service sessions."""
+    remote_args = ["gateway", "list"]
+    if cluster is not None:
+        remote_args.extend(["--cluster", cluster])
+    if _try_remote_cluster_passthrough(cluster, remote_args):
+        return
     sessions = ClioCoreQueue(RelaySettings.from_env().core_dir).list_gateway_sessions(
         cluster=cluster
     )
@@ -1166,8 +1222,17 @@ def gateway_list(
 
 
 @gateway_app.command("get")
-def gateway_get(session_id: str) -> None:
+def gateway_get(
+    session_id: str,
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH."),
+    ] = None,
+) -> None:
     """Read a gateway service session."""
+    remote_args = ["gateway", "get", session_id]
+    if _try_remote_cluster_passthrough(cluster, remote_args):
+        return
     session = ClioCoreQueue(RelaySettings.from_env().core_dir).get_gateway_session(session_id)
     typer.echo(session.model_dump_json(indent=2))
 
@@ -1175,6 +1240,10 @@ def gateway_get(session_id: str) -> None:
 @gateway_app.command("update")
 def gateway_update(
     session_id: str,
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to update over SSH."),
+    ] = None,
     state: Annotated[
         GatewaySessionState | None,
         typer.Option(help="Updated gateway session state."),
@@ -1195,6 +1264,20 @@ def gateway_update(
     ] = "{}",
 ) -> None:
     """Update a gateway service session."""
+    remote_args = ["gateway", "update", session_id]
+    if state is not None:
+        remote_args.extend(["--state", state.value])
+    if scheduler_job_id is not None:
+        remote_args.extend(["--scheduler-job-id", scheduler_job_id])
+    if queue_state is not None:
+        remote_args.extend(["--queue-state", queue_state])
+    if node is not None:
+        remote_args.extend(["--node", node])
+    if gateway_json is not None:
+        remote_args.extend(["--gateway-json", gateway_json])
+    remote_args.extend(["--metadata-json", metadata_json])
+    if _try_remote_cluster_passthrough(cluster, remote_args):
+        return
     updates: dict[str, object] = {}
     if scheduler_job_id is not None:
         updates["scheduler_job_id"] = scheduler_job_id
@@ -1214,8 +1297,16 @@ def gateway_update(
 
 
 @gateway_app.command("close")
-def gateway_close(session_id: str) -> None:
+def gateway_close(
+    session_id: str,
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to update over SSH."),
+    ] = None,
+) -> None:
     """Mark a gateway service session closed."""
+    if _try_remote_cluster_passthrough(cluster, ["gateway", "close", session_id]):
+        return
     session = ClioCoreQueue(RelaySettings.from_env().core_dir).close_gateway_session(session_id)
     typer.echo(session.model_dump_json(indent=2))
 
@@ -1650,6 +1741,8 @@ def _echo_lines(lines: list[str]) -> None:
 
 def _try_remote_cluster_passthrough(cluster: str | None, args: list[str]) -> bool:
     if cluster is None:
+        return False
+    if os.getenv("CLIO_RELAY_CLI_MODE", "auto").strip().lower() == "local":
         return False
     definition = _require_cluster(cluster)
     if not should_execute_on_cluster(definition):
