@@ -35,6 +35,8 @@ from clio_relay.models import (
     RelayJob,
     RelayTask,
     RemoteAgentTaskSpec,
+    SchedulerPhase,
+    SchedulerStatus,
     utc_now,
 )
 from clio_relay.progress_adapters import (
@@ -622,35 +624,52 @@ class EndpointWorker:
     ) -> None:
         for scheduler_job_id in scheduler_job_ids:
             status = poll_slurm_status(scheduler_job_id)
-            target_task_id = task_id or _task_id_for_scheduler_job(
-                self.queue.list_tasks(job.job_id),
+            self._record_scheduler_status(
+                job,
+                scheduler_job_ids,
                 scheduler_job_id,
+                status,
+                task_id=task_id,
             )
-            if target_task_id is None:
-                continue
-            previous = _task_scheduler_status(
-                self.queue.list_tasks(job.job_id),
-                target_task_id,
-                scheduler_job_id,
-            )
-            status_payload = status.model_dump(mode="json")
-            self.queue.update_task_metadata(
-                target_task_id,
-                {
-                    "scheduler": "slurm",
-                    "scheduler_job_ids": list(scheduler_job_ids),
-                    "scheduler_status": status_payload,
-                },
-            )
-            previous_phase = previous.get("phase") if previous is not None else None
-            if previous_phase == status.phase.value:
-                continue
-            self.queue.append_event(
-                job.job_id,
-                f"scheduler.{status.phase.value}",
-                f"Scheduler job {scheduler_job_id} is {status.phase.value}",
-                payload=status_payload,
-            )
+
+    def _record_scheduler_status(
+        self,
+        job: RelayJob,
+        scheduler_job_ids: list[str],
+        scheduler_job_id: str,
+        status: SchedulerStatus,
+        *,
+        task_id: str | None,
+    ) -> None:
+        target_task_id = task_id or _task_id_for_scheduler_job(
+            self.queue.list_tasks(job.job_id),
+            scheduler_job_id,
+        )
+        if target_task_id is None:
+            return
+        previous = _task_scheduler_status(
+            self.queue.list_tasks(job.job_id),
+            target_task_id,
+            scheduler_job_id,
+        )
+        status_payload = status.model_dump(mode="json")
+        self.queue.update_task_metadata(
+            target_task_id,
+            {
+                "scheduler": "slurm",
+                "scheduler_job_ids": list(scheduler_job_ids),
+                "scheduler_status": status_payload,
+            },
+        )
+        previous_phase = previous.get("phase") if previous is not None else None
+        if previous_phase == status.phase.value:
+            return
+        self.queue.append_event(
+            job.job_id,
+            f"scheduler.{status.phase.value}",
+            f"Scheduler job {scheduler_job_id} is {status.phase.value}",
+            payload=status_payload,
+        )
 
     def _durable_scheduler_job_ids(
         self,
@@ -687,9 +706,24 @@ class EndpointWorker:
                     f"Requested scheduler cancellation: {scheduler_job_id}",
                     payload={"scheduler": "slurm", "scheduler_job_id": scheduler_job_id},
                 )
-                self._refresh_scheduler_status(
+                status = poll_slurm_status(scheduler_job_id)
+                if status.phase == SchedulerPhase.UNKNOWN:
+                    status = status.model_copy(
+                        update={
+                            "phase": SchedulerPhase.CANCELED,
+                            "raw_state": "CANCELLED",
+                            "reason": "relay cancellation requested",
+                            "queue_position_note": (
+                                "scheduler cancellation was requested by relay; "
+                                "sacct did not have a terminal record yet"
+                            ),
+                        }
+                    )
+                self._record_scheduler_status(
                     job,
                     [scheduler_job_id],
+                    scheduler_job_id,
+                    status,
                     task_id=None,
                 )
                 continue

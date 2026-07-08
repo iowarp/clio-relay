@@ -764,7 +764,7 @@ def test_worker_preserves_canceled_state_for_running_job(
             return subprocess.CompletedProcess(
                 command,
                 returncode=0,
-                stdout="12345|CANCELLED|compute|(null)|2026-07-07T18:00:00||0:00|20|20|0\n",
+                stdout="",
                 stderr="",
             )
         raise AssertionError(f"unexpected scheduler command: {command}")
