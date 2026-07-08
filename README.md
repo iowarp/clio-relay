@@ -8,6 +8,8 @@
 
 It is a piece of the federation layer for [`clio-agent`](https://github.com/iowarp/clio-agent): a local CLIO experience can delegate work to a remote machine, keep observing it, detach, reconnect, and clean up after itself. The project is also designed for use outside CLIO. Any client that can call the CLI, HTTP API, or MCP tools can use the same relay model.
 
+> 0.9.5 is a prerelease validation build, not an internal rollout release. Ares/Homelab paths have been exercised, but pre-rollout blockers remain around workload-specific bootstrap, scheduler provider boundaries, and package-owned progress semantics. See issue #3.
+
 ## How It Works
 
 `clio-relay` has three long-running roles:

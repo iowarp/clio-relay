@@ -4,6 +4,8 @@ Date: 2026-07-08
 
 Package under test: `clio-relay==0.9.5` from PyPI, invoked with `uvx --python 3.12 --from clio-relay==0.9.5 clio-relay ...`.
 
+Status: prerelease validation build. This version passed the live checks below, but it is not ready for internal rollout because generic bootstrap still includes workload-specific LAMMPS setup, scheduler control is SLURM-specific in core paths, and LAMMPS progress parsing is not package-owned. These are tracked in issue #3.
+
 Validation root: `C:\Users\jaime\AppData\Local\Temp\clio-relay-uvx-live-20260708110057`
 
 Release state:
