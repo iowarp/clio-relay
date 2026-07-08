@@ -312,9 +312,7 @@ def render_linux_user_bootstrap_script(
     rendered_agent_args = shlex.quote(" ".join(agent_args or []))
     rendered_agent_npm_package = shlex.quote(agent_npm_package or "")
     rendered_agent_npm_bin = shlex.quote(agent_npm_bin or "")
-    rendered_relay_install_spec = (
-        '"$DEST"' if relay_install_spec == "$DEST" else shlex.quote(relay_install_spec)
-    )
+    rendered_relay_install_spec = _render_relay_install_spec(relay_install_spec)
     script = f"""set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$HOME/.local/bin" "$HOME/.local/src" "$HOME/.local/share/clio-relay"
@@ -469,6 +467,14 @@ echo "jarvis=$("$HOME/.local/bin/jarvis" --help | head -n 1)"
 echo "relay=$(clio-relay --help | head -n 1)"
 """
     return script.replace("\r\n", "\n")
+
+
+def _render_relay_install_spec(relay_install_spec: str) -> str:
+    if relay_install_spec == "$DEST":
+        return '"$DEST"'
+    if relay_install_spec.startswith("$DEST/"):
+        return '"$DEST"/' + shlex.quote(relay_install_spec.removeprefix("$DEST/"))
+    return shlex.quote(relay_install_spec)
 
 
 def create_bootstrap_archive(

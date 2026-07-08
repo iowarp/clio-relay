@@ -53,6 +53,18 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert "\r" not in script
 
 
+def test_linux_user_bootstrap_script_expands_dest_wheel_install_spec() -> None:
+    script = render_linux_user_bootstrap_script(
+        relay_install_spec="$DEST/wheels/clio_relay-0.9.16-py3-none-any.whl"
+    )
+    expected = (
+        "uv pip install --refresh-package clio-relay "
+        '"$DEST"/wheels/clio_relay-0.9.16-py3-none-any.whl'
+    )
+
+    assert expected in script
+
+
 def test_linux_user_bootstrap_script_accepts_explicit_npm_agent() -> None:
     script = render_linux_user_bootstrap_script(
         agent_adapter="codex",

@@ -626,7 +626,10 @@ def cluster_bootstrap(
     ] = None,
     relay_wheel: Annotated[
         Path | None,
-        typer.Option(help="Local clio-relay wheel to include in the bootstrap archive."),
+        typer.Option(
+            "--relay-wheel",
+            help="Local clio-relay wheel to include in the bootstrap archive.",
+        ),
     ] = None,
 ) -> None:
     """Bootstrap a configured cluster's tools, relay package, and endpoint directories."""

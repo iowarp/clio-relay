@@ -1,6 +1,6 @@
 # Correction Tasks
 
-Current status: the 0.9.15 working tree implements the local code corrections for
+Current status: the 0.9.17 working tree implements the local code corrections for
 workload-specific bootstrap removal, scheduler provider isolation, and
 package-owned LAMMPS progress parsing. Ares installed-package `uvx` validation
 passed for explicit LAMMPS app installation, builtin JARVIS LAMMPS acceptance,
