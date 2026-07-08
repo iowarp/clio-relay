@@ -11,6 +11,7 @@ from clio_relay import __version__
 from clio_relay.bootstrap import (
     assert_clean_git_checkout,
     create_bootstrap_archive,
+    install_cluster_app_over_ssh,
     render_cluster_app_install_script,
     render_linux_user_bootstrap_script,
 )
@@ -81,6 +82,30 @@ def test_lammps_install_is_explicit_cluster_app_setup() -> None:
 def test_cluster_app_install_rejects_unknown_app() -> None:
     with pytest.raises(ConfigurationError, match="unsupported cluster app"):
         render_cluster_app_install_script(app_name="vasp")
+
+
+def test_cluster_app_install_sends_lf_script_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        del args
+        calls.append(kwargs)
+        return subprocess.CompletedProcess(
+            ["ssh", "host", "bash", "-s"],
+            0,
+            stdout=b"ok\n",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = install_cluster_app_over_ssh(ssh_host="host", app_name="lammps")
+
+    assert result == ["ok"]
+    script = calls[0]["input"]
+    assert isinstance(script, bytes)
+    assert b"\r" not in script
+    assert calls[0]["capture_output"] is True
 
 
 def test_bootstrap_runner_decodes_remote_output_as_utf8(

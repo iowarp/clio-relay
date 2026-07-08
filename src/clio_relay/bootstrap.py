@@ -212,19 +212,17 @@ def install_cluster_app_over_ssh(*, ssh_host: str, app_name: str) -> list[str]:
     script = render_cluster_app_install_script(app_name=app_name)
     result = subprocess.run(
         ["ssh", ssh_host, "bash", "-s"],
-        input=script,
-        text=True,
+        input=script.encode("utf-8"),
         capture_output=True,
-        encoding="utf-8",
-        errors="replace",
         check=False,
     )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
     if result.returncode != 0:
         raise RelayError(
-            f"cluster app installation failed on {ssh_host}: "
-            f"{result.stderr.strip() or result.stdout.strip()}"
+            f"cluster app installation failed on {ssh_host}: {stderr.strip() or stdout.strip()}"
         )
-    return result.stdout.splitlines()
+    return stdout.splitlines()
 
 
 def render_cluster_app_install_script(*, app_name: str) -> str:
