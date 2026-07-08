@@ -166,8 +166,8 @@ def run_frp_http_probe(
             return lines
         finally:
             _terminate(visitor)
-            _terminate(remote)
             _cleanup_remote_probe(definition=definition, probe_id=probe_id)
+            _terminate(remote)
 
 
 def run_frp_direct_http_probe(
@@ -434,8 +434,8 @@ def _run_frp_http_probe_with_proxy_type(
             return lines
         finally:
             _terminate(visitor)
-            _terminate(remote)
             _cleanup_remote_probe(definition=definition, probe_id=probe_id)
+            _terminate(remote)
 
 
 def _remote_probe_script(
@@ -546,9 +546,11 @@ def _cleanup_remote_probe(*, definition: ClusterDefinition, probe_id: str) -> No
 probe_id={_shell_single_quote(probe_id)}
 probe_dir="$HOME/.local/share/clio-relay/transport-probes/$probe_id"
 metadata_file="$probe_dir/metadata.json"
-if [ ! -f "$metadata_file" ]; then
-  exit 0
-fi
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ -f "$metadata_file" ] && break
+  sleep 0.5
+done
+[ -f "$metadata_file" ] || exit 0
 python3 - "$metadata_file" <<'__CLIO_RELAY_CLEANUP_PROBE__'
 import json
 import os
