@@ -487,6 +487,8 @@ def _run(
         command,
         cwd=cwd,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         check=False,
         env=env,

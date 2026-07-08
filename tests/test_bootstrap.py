@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import tarfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -65,6 +66,27 @@ def test_linux_user_bootstrap_script_accepts_explicit_npm_agent() -> None:
     assert 'AGENT_BIN="$HOME/.local/bin/$AGENT_NPM_BIN"' in script
     assert "CLIO_RELAY_AGENT_ADAPTER=codex" in script
     assert "CLIO_RELAY_AGENT_ARGS='--model gpt-5-codex'" in script
+
+
+def test_bootstrap_runner_decodes_remote_output_as_utf8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del args
+        calls.append(kwargs)
+        return subprocess.CompletedProcess(["ssh", "host"], 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    from clio_relay import bootstrap
+
+    result = bootstrap._run(["ssh", "host"])  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    assert result.stdout == "ok"
+    assert calls[0]["encoding"] == "utf-8"
+    assert calls[0]["errors"] == "replace"
 
 
 def test_bootstrap_refuses_dirty_git_checkout(tmp_path: Path) -> None:
