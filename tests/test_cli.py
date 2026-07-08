@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
+from clio_relay import cli
 from clio_relay.cli import app
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, FrpTransportConfig
 from clio_relay.core_queue import ClioCoreQueue
@@ -42,6 +45,14 @@ def _write_test_cluster(
             )
         }
     ).save(root / ".clio-relay" / "clusters.json")
+
+
+def test_console_safe_text_replaces_non_console_characters(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "stdout", SimpleNamespace(encoding="cp1252"))
+
+    assert cli._console_safe_text("× ╰─▶") == "× ???"  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def test_cli_lists_artifacts(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

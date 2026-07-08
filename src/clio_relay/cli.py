@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 from collections.abc import Callable
 from json import JSONDecodeError
 from pathlib import Path
@@ -1874,7 +1875,12 @@ def _with_exclusive_scheduler(pipeline_yaml: str) -> str:
 
 def _echo_lines(lines: list[str]) -> None:
     for line in lines:
-        typer.echo(line)
+        typer.echo(_console_safe_text(line))
+
+
+def _console_safe_text(value: str) -> str:
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    return value.encode(encoding, errors="replace").decode(encoding, errors="replace")
 
 
 def _try_remote_cluster_passthrough(cluster: str | None, args: list[str]) -> bool:
