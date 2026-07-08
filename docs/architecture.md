@@ -1,4 +1,4 @@
-# architecture
+# Architecture
 
 `clio-relay` connects a local tool to a remote execution environment without making the network tunnel responsible for job state.
 
@@ -8,7 +8,7 @@ The system has three roles:
 - `worker`: runs near the cluster, leases work, calls JARVIS-CD, and records events, logs, artifacts, progress, and provenance.
 - `relay-host`: carries bytes for frp deployments. It has no queue and no application state.
 
-## state
+## State
 
 The queue boundary is `clio-core`. The file-backed queue in this repository is a development backend for the same record model.
 
@@ -18,7 +18,7 @@ Tasks can also have structured timeline events. A remote agent can record discov
 
 Gateway sessions are durable records for scheduler-backed services such as ParaView servers or other cluster-side visual services. A session records the scheduler job, queue state, allocated node, logs, forwarded endpoint metadata, health hints, and close state. This lets the desktop detach, reconnect, and mark the session closed without treating it as an anonymous process. The package or scheduler integration remains responsible for stopping the actual remote service.
 
-## execution
+## Execution
 
 JARVIS-CD owns cluster execution. A relay job describes the desired work. The worker materializes that intent into JARVIS inputs, runs JARVIS, streams output while the job is active, and writes provenance when the run ends.
 
@@ -26,7 +26,7 @@ Application behavior belongs in JARVIS packages. For example, LAMMPS progress co
 
 Interactive visualization services should be launched through scheduler-backed package or pipeline behavior as well. The relay records the gateway session and transport metadata, while the package or operator script owns how the service starts on the allocated node.
 
-## transport
+## Transport
 
 Transport is replaceable:
 
@@ -37,7 +37,7 @@ Transport is replaceable:
 
 Every transport carries local HTTP between endpoints. No job submission, cursor, artifact, cancellation, progress, or provenance record depends on a particular tunnel.
 
-## detach and teardown
+## Detach and Teardown
 
 Remote sessions are owned by a session id. The cluster stores session metadata and a PID file under `$HOME/.local/share/clio-relay/sessions/<session-id>`.
 

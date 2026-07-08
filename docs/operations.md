@@ -1,8 +1,8 @@
-# operations
+# Operations
 
 This page covers the common operator paths. Use the README for the short overview and `docs/ai/` for the full implementation context.
 
-## add a cluster
+## Add a Cluster
 
 ```powershell
 uv run clio-relay cluster add --name my-cluster --ssh-host my-cluster-login --agent-adapter exec --agent-bin agent
@@ -12,7 +12,7 @@ uv run clio-relay cluster install-endpoint-service --cluster my-cluster --start 
 
 Cluster names are local labels. `ares`, `homelab`, or a later institutional target are registry entries, not hardcoded behavior.
 
-## run a job
+## Run a Job
 
 ```powershell
 uv run clio-relay job submit --cluster my-cluster --jarvis-yaml .\pipeline.yaml
@@ -23,7 +23,7 @@ uv run clio-relay job list-artifacts <job-id> --cluster my-cluster
 
 Submissions are asynchronous by default. CLI, HTTP, and MCP callers get a `job_id` and can monitor events and logs by cursor or byte offset.
 
-## expose tools to an agent
+## Expose Tools to an Agent
 
 ```powershell
 uv run clio-relay agent render-mcp-config --output .\clio-relay-agent.config.toml
@@ -41,7 +41,7 @@ uv run clio-relay job task-events <task-id> --cluster my-cluster --cursor 1
 
 Use timeline events for UI-visible agent work such as repository scans, dataset discovery, generated scripts, planned commands, scheduler submissions, warnings, and completion. Use normal job logs for stdout and stderr.
 
-## manage visualization gateways
+## Manage Visualization Gateways
 
 Use gateway sessions for scheduler-backed services that need to survive long enough for a desktop to connect, such as ParaView or another cluster-side visualizer.
 
@@ -54,7 +54,7 @@ uv run clio-relay gateway close <session-id> --cluster my-cluster
 
 `close` marks the durable session closed. The scheduler or package path should still clean up the actual service process or scheduler job it owns.
 
-## use frp transport
+## Use FRP Transport
 
 Use frp when the desktop and cluster cannot directly SSH to each other but can both reach a relay host.
 
@@ -69,7 +69,7 @@ uv run clio-relay relay-host test-http-transport --cluster my-cluster --local-bi
 
 For Cloudflare-backed homelab deployments, configure the cluster transport as `wss` over port `443`. For a raw public relay host, configure `tcp`.
 
-## use ssh forwarding
+## Use SSH Forwarding
 
 Use SSH forwarding when the desktop already has SSH or VPN access to the cluster.
 
@@ -91,7 +91,7 @@ To clean up the persistent worker too:
 uv run clio-relay session teardown --cluster my-cluster --session-id desktop-session --stop-worker
 ```
 
-## live acceptance
+## Live Acceptance
 
 ```powershell
 uv run clio-relay live-test --cluster ares --jarvis-yaml .\examples\ares-lammps\pipeline.yaml --monitor-pattern "Loop time"

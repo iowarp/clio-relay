@@ -1,8 +1,8 @@
-# agent instructions
+# Agent Instructions
 
 Read this file before changing the repository.
 
-## start here
+## Start Here
 
 - Use `uv` for dependency management and execution.
 - Run commands with `uv run`.
@@ -11,7 +11,7 @@ Read this file before changing the repository.
 - Keep cluster names, agent binaries, and transport choices configurable.
 - Do not hardcode `ares`, `codex`, `frps.jcernuda.com`, or any specific workload into core logic.
 
-## detailed context
+## Detailed Context
 
 Agent-oriented context lives in `docs/ai/`:
 
@@ -21,7 +21,7 @@ Agent-oriented context lives in `docs/ai/`:
 
 Read those files before making non-trivial implementation changes.
 
-## local checks
+## Local Checks
 
 ```powershell
 uv run ruff check --fix

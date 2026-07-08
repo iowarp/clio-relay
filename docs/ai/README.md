@@ -1,4 +1,4 @@
-# ai context
+# AI Context
 
 These files are for coding agents and review agents. Human-facing docs should stay short and readable.
 

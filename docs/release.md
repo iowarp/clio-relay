@@ -1,8 +1,8 @@
-# release
+# Release
 
 `clio-relay` uses `uv`, hatchling, and GitHub Actions.
 
-## local checks
+## Local Checks
 
 Run these before cutting a release:
 
@@ -14,7 +14,7 @@ uv run pytest
 uv build
 ```
 
-## bootstrap source
+## Bootstrap Source
 
 `cluster bootstrap` supports two deployment sources:
 
@@ -23,7 +23,7 @@ uv build
 
 Before publishing, verify that the wheel contains `clio_relay/assets/jarvis-packages/clio_relay/`. That packaged asset path is what makes bootstrap work without a local checkout.
 
-## version
+## Version
 
 Update both version declarations:
 
@@ -36,7 +36,7 @@ Use a conventional commit for the version change, for example:
 chore: release 0.1.0
 ```
 
-## github release
+## GitHub Release
 
 Create a tag that matches the package version:
 
@@ -47,7 +47,7 @@ git push origin v0.1.0
 
 Then create a GitHub release for that tag. The release workflow builds the source distribution and wheel, verifies the metadata, uploads the files as release artifacts, and publishes to PyPI when trusted publishing is configured.
 
-## pypi publishing
+## PyPI Publishing
 
 Publishing is wired for GitHub trusted publishing. After the repository moves to the `iowarp` organization, configure PyPI with:
 

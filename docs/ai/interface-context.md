@@ -1,8 +1,8 @@
-# interface context
+# Interface Context
 
 This file is a dense map for coding agents. Keep the README shorter than this file.
 
-## cli surfaces
+## CLI Surfaces
 
 Core setup:
 
@@ -54,7 +54,7 @@ Agent and monitor work:
 - `clio-relay monitor add-regex`
 - `clio-relay monitor run-once`
 
-## http surfaces
+## HTTP Surfaces
 
 The HTTP API exposes:
 
@@ -76,7 +76,7 @@ The HTTP API exposes:
 
 When `CLIO_RELAY_API_TOKEN` is set and the API is started with `--require-token`, clients must send either `Authorization: Bearer <token>` or `X-Clio-Relay-Token: <token>`. `/healthz` stays open for local process checks.
 
-## mcp surfaces
+## MCP Surfaces
 
 The MCP server exposes relay tools for:
 
@@ -96,7 +96,7 @@ The MCP server exposes relay tools for:
 
 MCP tools operate on the same durable records as CLI and HTTP calls.
 
-## environment and config
+## Environment and Config
 
 Important environment variables:
 
@@ -114,6 +114,6 @@ Important environment variables:
 
 Local cluster registry data lives under `.clio-relay/clusters.json` by default. Secrets for unattended local runs can live in ignored `.clio-relay/secrets.json`.
 
-## live examples are not product defaults
+## Live Examples Are Not Product Defaults
 
 The current live target uses Ares, Codex, Cloudflare-backed frp, and JARVIS builtin LAMMPS examples. Treat those as tested configurations, not fixed product semantics.

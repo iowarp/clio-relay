@@ -1,8 +1,8 @@
-# testing context
+# Testing Context
 
 Local tests are necessary but not sufficient for transport or cluster behavior.
 
-## local gates
+## Local Gates
 
 Run:
 
@@ -20,7 +20,7 @@ For CI parity, also verify the built artifacts:
 uvx twine check dist/*
 ```
 
-## live acceptance
+## Live Acceptance
 
 A feature that depends on a cluster, transport, scheduler, agent process, or MCP call is not done until that path has been live-tested.
 
@@ -35,7 +35,7 @@ The expected Ares acceptance includes:
 - verify transport through the configured path when transport behavior is in scope.
 - verify detach and teardown behavior when lifecycle behavior is in scope.
 
-## recent live evidence
+## Recent Live Evidence
 
 The SSH lifecycle implementation was live-tested on Ares after deployment:
 

@@ -1,4 +1,4 @@
-# brand prompt
+# Brand Prompt
 
 Current project assets live in:
 
