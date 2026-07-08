@@ -1117,6 +1117,8 @@ def test_cli_cluster_bootstrap_uses_package_source_root(
     monkeypatch.chdir(tmp_path)
     _write_test_cluster(tmp_path)
     package_root = tmp_path / "package-root"
+    wheel = tmp_path / "clio_relay-0.0.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
     captured: dict[str, object] = {}
 
     def fake_package_source_root() -> Path:
@@ -1129,13 +1131,24 @@ def test_cli_cluster_bootstrap_uses_package_source_root(
     monkeypatch.setattr(cli, "package_source_root", fake_package_source_root)
     monkeypatch.setattr(cli, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
 
-    result = CliRunner().invoke(app, ["cluster", "bootstrap", "--cluster", "ares"])
+    result = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "bootstrap",
+            "--cluster",
+            "ares",
+            "--relay-wheel",
+            str(wheel),
+        ],
+    )
 
     assert result.exit_code == 0
     assert result.output.strip() == "bootstrapped"
     assert captured["ssh_host"] == "ares"
     assert captured["source_root"] == package_root
     assert captured["source_root"] != tmp_path
+    assert captured["relay_wheel"] == wheel
 
 
 def test_cli_remote_task_event_passthrough_uses_cluster_core(

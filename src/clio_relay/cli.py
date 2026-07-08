@@ -624,6 +624,10 @@ def cluster_bootstrap(
         str | None,
         typer.Option(help="Override SSH host alias for this run."),
     ] = None,
+    relay_wheel: Annotated[
+        Path | None,
+        typer.Option(help="Local clio-relay wheel to include in the bootstrap archive."),
+    ] = None,
 ) -> None:
     """Bootstrap a configured cluster's tools, relay package, and endpoint directories."""
     definition = _require_cluster(cluster)
@@ -633,6 +637,7 @@ def cluster_bootstrap(
                 bootstrap_profile=definition.bootstrap_profile,
                 ssh_host=ssh_host or definition.ssh_host,
                 source_root=package_source_root(),
+                relay_wheel=relay_wheel,
                 agent_adapter=definition.agent_adapter,
                 agent_npm_package=definition.agent_npm_package,
                 agent_npm_bin=definition.agent_npm_bin,

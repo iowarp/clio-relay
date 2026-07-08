@@ -212,6 +212,23 @@ def test_bootstrap_archive_uses_packaged_assets_without_git_checkout(tmp_path: P
     assert not any("__pycache__" in name or name.endswith(".pyc") for name in names)
 
 
+def test_bootstrap_archive_can_include_local_relay_wheel(tmp_path: Path) -> None:
+    wheel = tmp_path / "clio_relay-0.0.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+
+    deployment = create_bootstrap_archive(
+        source_root=tmp_path / "not-a-repo",
+        archive=tmp_path / "bootstrap.tar",
+        relay_wheel=wheel,
+    )
+
+    assert deployment.install_spec == f"$DEST/wheels/{wheel.name}"
+    with tarfile.open(deployment.archive) as archive:
+        names = archive.getnames()
+    assert f"wheels/{wheel.name}" in names
+    assert any(name.startswith("jarvis-packages/clio_relay/") for name in names)
+
+
 def test_bootstrap_archive_ignores_unrelated_git_checkout(tmp_path: Path) -> None:
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     (tmp_path / "pyproject.toml").write_text(

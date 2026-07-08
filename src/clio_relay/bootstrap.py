@@ -171,6 +171,7 @@ def bootstrap_cluster_over_ssh(
     bootstrap_profile: str,
     ssh_host: str,
     source_root: Path,
+    relay_wheel: Path | None = None,
     agent_adapter: str = "exec",
     agent_npm_package: str | None = None,
     agent_npm_bin: str | None = None,
@@ -186,7 +187,11 @@ def bootstrap_cluster_over_ssh(
         temp_path = Path(temp_dir)
         archive = temp_path / "clio-relay-head.tar"
         script_path = temp_path / "clio-relay-bootstrap.sh"
-        deployment = create_bootstrap_archive(source_root=source_root, archive=archive)
+        deployment = create_bootstrap_archive(
+            source_root=source_root,
+            archive=archive,
+            relay_wheel=relay_wheel,
+        )
         _run(["scp", str(deployment.archive), f"{ssh_host}:/tmp/clio-relay-head.tar"])
         script_path.write_text(
             render_linux_user_bootstrap_script(
@@ -466,25 +471,40 @@ echo "relay=$(clio-relay --help | head -n 1)"
     return script.replace("\r\n", "\n")
 
 
-def create_bootstrap_archive(*, source_root: Path, archive: Path) -> BootstrapArchive:
+def create_bootstrap_archive(
+    *,
+    source_root: Path,
+    archive: Path,
+    relay_wheel: Path | None = None,
+) -> BootstrapArchive:
     """Create the archive used by remote bootstrap.
 
     A clean git checkout deploys that exact committed tree. Installed-package
     runs deploy packaged JARVIS assets and install clio-relay from PyPI by
     version, so bootstrap does not require a checkout.
     """
+    if relay_wheel is not None:
+        _write_packaged_bootstrap_archive(archive, relay_wheel=relay_wheel)
+        return BootstrapArchive(
+            archive=archive,
+            install_spec=f"$DEST/wheels/{relay_wheel.name}",
+        )
     if _is_clio_relay_git_checkout(source_root):
         assert_clean_git_checkout(source_root)
         _run(["git", "archive", "--format=tar", "-o", str(archive), "HEAD"], cwd=source_root)
         return BootstrapArchive(archive=archive, install_spec="$DEST")
-    _write_packaged_bootstrap_archive(archive)
+    _write_packaged_bootstrap_archive(archive, relay_wheel=None)
     return BootstrapArchive(archive=archive, install_spec=f"clio-relay=={__version__}")
 
 
-def _write_packaged_bootstrap_archive(archive: Path) -> None:
+def _write_packaged_bootstrap_archive(archive: Path, *, relay_wheel: Path | None) -> None:
+    if relay_wheel is not None and not relay_wheel.is_file():
+        raise ConfigurationError(f"relay wheel does not exist: {relay_wheel}")
     assets = resources.files("clio_relay").joinpath("assets", "jarvis-packages")
     source_assets = Path(__file__).resolve().parents[2] / "jarvis-packages"
     with tarfile.open(archive, "w") as tar:
+        if relay_wheel is not None:
+            tar.add(relay_wheel, arcname=str(Path("wheels", relay_wheel.name)))
         if assets.is_dir():
             with resources.as_file(assets) as asset_path:
                 _add_jarvis_assets_to_archive(tar=tar, asset_path=asset_path)
