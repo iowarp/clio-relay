@@ -7,8 +7,9 @@ Read in this order:
 1. `system-context.md`
 2. `testing-context.md`
 3. `interface-context.md`
-4. `../../README.md`
-5. `../architecture.md`
-6. `../operations.md`
+4. `release-validation-0.9.5.md`
+5. `../../README.md`
+6. `../architecture.md`
+7. `../operations.md`
 
 Do not treat examples as hardcoded product semantics. Examples show one configured target or workload.
