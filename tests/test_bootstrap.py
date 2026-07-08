@@ -21,6 +21,8 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert 'FRP_VERSION="0.69.1"' in script
     assert 'ARCHIVE="frp_${FRP_VERSION}_linux_amd64.tar.gz"' in script
     assert "uv python install 3.12" in script
+    assert 'uv venv --python 3.12 --clear "$JARVIS_VENV"' in script
+    assert "python3 -m venv" not in script
     assert "CLIO_RELAY_AGENT_NPM_PACKAGE" in script
     assert "CLIO_RELAY_AGENT_NPM_BIN" in script
     assert 'npm install -g "$AGENT_NPM_PACKAGE"' in script

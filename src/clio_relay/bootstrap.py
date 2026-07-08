@@ -253,7 +253,7 @@ if [ ! -x "$AGENT_BIN" ] && [ -n "$AGENT_NPM_PACKAGE" ] && command -v npm >/dev/
 fi
 
 JARVIS_VENV="$HOME/.local/share/clio-relay/jarvis-venv"
-python3 -m venv "$JARVIS_VENV"
+uv venv --python 3.12 --clear "$JARVIS_VENV"
 . "$JARVIS_VENV/bin/activate"
 python -m pip install --upgrade pip setuptools wheel
 if [ ! -d "$HOME/.local/src/jarvis-util/.git" ]; then
