@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import time
+from importlib import metadata
 from pathlib import Path
 from typing import Any
 
@@ -63,7 +64,7 @@ def _render_session_input(*, tool: str, arguments: dict[str, Any]) -> str:
         "params": {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": {"name": "clio-relay", "version": "0.1.0"},
+            "clientInfo": {"name": "clio-relay", "version": _package_version()},
         },
     }
     initialized = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
@@ -75,6 +76,13 @@ def _render_session_input(*, tool: str, arguments: dict[str, Any]) -> str:
     }
     messages = (initialize, initialized, call)
     return "\n".join(json.dumps(item, separators=(",", ":")) for item in messages) + "\n"
+
+
+def _package_version() -> str:
+    try:
+        return metadata.version("clio-relay")
+    except metadata.PackageNotFoundError:
+        return "0+unknown"
 
 
 def _protocol_error(stdout: str) -> str | None:

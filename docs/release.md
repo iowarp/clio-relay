@@ -33,7 +33,7 @@ Update both version declarations:
 Use a conventional commit for the version change, for example:
 
 ```text
-chore: release 0.1.0
+chore: release 0.9.0
 ```
 
 ## GitHub Release
@@ -41,15 +41,15 @@ chore: release 0.1.0
 Create a tag that matches the package version:
 
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.9.0
+git push origin v0.9.0
 ```
 
 Then create a GitHub release for that tag. The release workflow builds the source distribution and wheel, verifies the metadata, uploads the files as release artifacts, and publishes to PyPI when trusted publishing is configured.
 
 ## PyPI Publishing
 
-Publishing is wired for GitHub trusted publishing. After the repository moves to the `iowarp` organization, configure PyPI with:
+Publishing is wired for GitHub trusted publishing from `iowarp/clio-relay`. Configure PyPI with:
 
 - project name: `clio-relay`
 - owner: `iowarp`

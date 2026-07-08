@@ -131,4 +131,4 @@ uv run pyright
 uv run pytest
 ```
 
-The GitHub workflow runs lint, type checks, tests, package builds, and artifact validation. Publishing to PyPI is configured through trusted publishing and can be enabled when the repository moves under the `iowarp` organization.
+The GitHub workflow runs lint, type checks, tests, package builds, and artifact validation. Publishing to PyPI is configured through trusted publishing for the `iowarp/clio-relay` repository.

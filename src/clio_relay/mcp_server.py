@@ -8,6 +8,7 @@ import sys
 from json import JSONDecodeError
 from typing import Any, TextIO, cast
 
+from clio_relay import __version__
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.models import (
@@ -128,7 +129,7 @@ def _initialize_result() -> JSON:
     return {
         "protocolVersion": "2024-11-05",
         "capabilities": {"tools": {}},
-        "serverInfo": {"name": "clio-relay", "version": "0.1.0"},
+        "serverInfo": {"name": "clio-relay", "version": __version__},
     }
 
 

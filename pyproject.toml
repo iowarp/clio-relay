@@ -17,9 +17,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/JaimeCernuda/clio-relay"
-Repository = "https://github.com/JaimeCernuda/clio-relay"
-Issues = "https://github.com/JaimeCernuda/clio-relay/issues"
+Homepage = "https://github.com/iowarp/clio-relay"
+Repository = "https://github.com/iowarp/clio-relay"
+Issues = "https://github.com/iowarp/clio-relay/issues"
 
 [build-system]
 requires = ["hatchling"]
