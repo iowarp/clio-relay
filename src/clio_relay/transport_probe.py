@@ -567,7 +567,7 @@ except (OSError, json.JSONDecodeError):
 if metadata.get("owner") != "clio-relay":
     raise SystemExit(0)
 
-def owned(pid: object, expected: str) -> int | None:
+def owned(pid, expected):
     if not isinstance(pid, int) or pid <= 0:
         return None
     try:

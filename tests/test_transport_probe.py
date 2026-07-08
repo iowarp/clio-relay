@@ -186,6 +186,7 @@ def test_remote_probe_cleanup_script_targets_real_proc_paths(monkeypatch: Monkey
     assert scripts
     assert 'Path("/proc") / str(pid) / "cmdline"' in scripts[0]
     assert 'Path("/proc") / str(pid)' in scripts[0]
+    assert "int | None" not in scripts[0]
     assert "/proc/{{pid}}" not in scripts[0]
     assert "transport-probes/$probe_id" in scripts[0]
 
