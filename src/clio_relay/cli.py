@@ -20,6 +20,7 @@ from clio_relay.bootstrap import (
     bootstrap_cluster_over_ssh,
     install_cluster_app_over_ssh,
     install_local_frp,
+    package_source_root,
 )
 from clio_relay.cluster_config import (
     ClusterDefinition,
@@ -631,7 +632,7 @@ def cluster_bootstrap(
             bootstrap_cluster_over_ssh(
                 bootstrap_profile=definition.bootstrap_profile,
                 ssh_host=ssh_host or definition.ssh_host,
-                source_root=Path.cwd(),
+                source_root=package_source_root(),
                 agent_adapter=definition.agent_adapter,
                 agent_npm_package=definition.agent_npm_package,
                 agent_npm_bin=definition.agent_npm_bin,

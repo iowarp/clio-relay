@@ -205,6 +205,11 @@ def bootstrap_cluster_over_ssh(
     return result.stdout.splitlines()
 
 
+def package_source_root() -> Path:
+    """Return the project root for editable installs, or the package root for wheels."""
+    return Path(__file__).resolve().parents[2]
+
+
 def install_cluster_app_over_ssh(*, ssh_host: str, app_name: str) -> list[str]:
     """Install an application-specific runtime on a cluster over SSH."""
     if shutil.which("ssh") is None:
@@ -468,7 +473,7 @@ def create_bootstrap_archive(*, source_root: Path, archive: Path) -> BootstrapAr
     runs deploy packaged JARVIS assets and install clio-relay from PyPI by
     version, so bootstrap does not require a checkout.
     """
-    if (source_root / ".git").exists():
+    if _is_clio_relay_git_checkout(source_root):
         assert_clean_git_checkout(source_root)
         _run(["git", "archive", "--format=tar", "-o", str(archive), "HEAD"], cwd=source_root)
         return BootstrapArchive(archive=archive, install_spec="$DEST")
@@ -488,6 +493,17 @@ def _write_packaged_bootstrap_archive(archive: Path) -> None:
             _add_jarvis_assets_to_archive(tar=tar, asset_path=source_assets)
             return
     raise ConfigurationError("installed clio-relay package does not include jarvis package assets")
+
+
+def _is_clio_relay_git_checkout(source_root: Path) -> bool:
+    pyproject = source_root / "pyproject.toml"
+    if not (source_root / ".git").exists() or not pyproject.exists():
+        return False
+    try:
+        text = pyproject.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return 'name = "clio-relay"' in text
 
 
 def _add_jarvis_assets_to_archive(*, tar: tarfile.TarFile, asset_path: Path) -> None:

@@ -131,6 +131,10 @@ def test_bootstrap_runner_decodes_remote_output_as_utf8(
 
 def test_bootstrap_refuses_dirty_git_checkout(tmp_path: Path) -> None:
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "clio-relay"\n',
+        encoding="utf-8",
+    )
     (tmp_path / "tracked.txt").write_text("clean\n", encoding="utf-8")
     subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(
@@ -156,6 +160,10 @@ def test_bootstrap_refuses_dirty_git_checkout(tmp_path: Path) -> None:
 
 def test_bootstrap_archive_uses_clean_git_checkout(tmp_path: Path) -> None:
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "clio-relay"\n',
+        encoding="utf-8",
+    )
     (tmp_path / "tracked.txt").write_text("clean\n", encoding="utf-8")
     (tmp_path / "jarvis-packages" / "clio_relay").mkdir(parents=True)
     (tmp_path / "jarvis-packages" / "clio_relay" / "README.md").write_text(
@@ -202,3 +210,39 @@ def test_bootstrap_archive_uses_packaged_assets_without_git_checkout(tmp_path: P
         names = archive.getnames()
     assert any(name.startswith("jarvis-packages/clio_relay/") for name in names)
     assert not any("__pycache__" in name or name.endswith(".pyc") for name in names)
+
+
+def test_bootstrap_archive_ignores_unrelated_git_checkout(tmp_path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "other-project"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "unrelated.txt").write_text("do not deploy\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    deployment = create_bootstrap_archive(
+        source_root=tmp_path,
+        archive=tmp_path / "bootstrap.tar",
+    )
+
+    assert deployment.install_spec == f"clio-relay=={__version__}"
+    with tarfile.open(deployment.archive) as archive:
+        names = archive.getnames()
+    assert "unrelated.txt" not in names
+    assert any(name.startswith("jarvis-packages/clio_relay/") for name in names)

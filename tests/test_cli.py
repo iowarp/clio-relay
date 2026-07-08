@@ -1110,6 +1110,34 @@ def test_cli_remote_wait_passthrough_uses_cluster_core(
     assert "clio-relay job wait job_remote" in commands[0][2]
 
 
+def test_cli_cluster_bootstrap_uses_package_source_root(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    package_root = tmp_path / "package-root"
+    captured: dict[str, object] = {}
+
+    def fake_package_source_root() -> Path:
+        return package_root
+
+    def fake_bootstrap_cluster_over_ssh(**kwargs: object) -> list[str]:
+        captured.update(kwargs)
+        return ["bootstrapped"]
+
+    monkeypatch.setattr(cli, "package_source_root", fake_package_source_root)
+    monkeypatch.setattr(cli, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
+
+    result = CliRunner().invoke(app, ["cluster", "bootstrap", "--cluster", "ares"])
+
+    assert result.exit_code == 0
+    assert result.output.strip() == "bootstrapped"
+    assert captured["ssh_host"] == "ares"
+    assert captured["source_root"] == package_root
+    assert captured["source_root"] != tmp_path
+
+
 def test_cli_remote_task_event_passthrough_uses_cluster_core(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
