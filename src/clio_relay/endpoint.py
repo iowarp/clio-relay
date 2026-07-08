@@ -76,7 +76,7 @@ class EndpointWorker:
             agent_adapter=settings.agent_adapter,
             agent_args=settings.agent_args,
         )
-        self.scheduler_provider = scheduler_provider or provider_for_scheduler("slurm")
+        self.scheduler_provider = scheduler_provider
         self.endpoint: EndpointRegistration | None = None
 
     def register(self) -> EndpointRegistration:
@@ -555,7 +555,10 @@ class EndpointWorker:
                 job.job_id,
                 "scheduler.job_detected",
                 f"Scheduler job detected: {job_id}",
-                payload={"scheduler": "slurm", "scheduler_job_id": job_id},
+                payload={
+                    "scheduler": self._scheduler_provider_for_job(job).name,
+                    "scheduler_job_id": job_id,
+                },
             )
             self._refresh_scheduler_status(job, [job_id], task_id=scheduler_task_id)
 
@@ -611,7 +614,7 @@ class EndpointWorker:
             JobState.RUNNING,
             message="Scheduler job id detected",
             metadata={
-                "scheduler": self.scheduler_provider.name,
+                "scheduler": self._scheduler_provider_for_job(job).name,
                 "scheduler_job_ids": list(scheduler_job_ids),
             },
         )
@@ -623,8 +626,9 @@ class EndpointWorker:
         *,
         task_id: str | None,
     ) -> None:
+        provider = self._scheduler_provider_for_job(job)
         for scheduler_job_id in scheduler_job_ids:
-            status = self.scheduler_provider.poll(scheduler_job_id)
+            status = provider.poll(scheduler_job_id)
             self._record_scheduler_status(
                 job,
                 scheduler_job_ids,
@@ -693,19 +697,20 @@ class EndpointWorker:
     def _cancel_scheduler_jobs(self, job: RelayJob, scheduler_job_ids: list[str]) -> None:
         if not scheduler_job_ids:
             return
+        provider = self._scheduler_provider_for_job(job)
         for scheduler_job_id in scheduler_job_ids:
-            result = self.scheduler_provider.cancel(scheduler_job_id)
+            result = provider.cancel(scheduler_job_id)
             if result.returncode == 0:
                 self.queue.append_event(
                     job.job_id,
                     "scheduler.cancel_requested",
                     f"Requested scheduler cancellation: {scheduler_job_id}",
                     payload={
-                        "scheduler": self.scheduler_provider.name,
+                        "scheduler": provider.name,
                         "scheduler_job_id": scheduler_job_id,
                     },
                 )
-                status = self.scheduler_provider.poll(scheduler_job_id)
+                status = provider.poll(scheduler_job_id)
                 if status.phase == SchedulerPhase.UNKNOWN:
                     status = status.model_copy(
                         update={
@@ -731,7 +736,7 @@ class EndpointWorker:
                 "scheduler.cancel_failed",
                 f"Scheduler cancellation failed: {scheduler_job_id}",
                 payload={
-                    "scheduler": self.scheduler_provider.name,
+                    "scheduler": provider.name,
                     "scheduler_job_id": scheduler_job_id,
                     "returncode": result.returncode,
                     "stderr": result.stderr,
@@ -753,6 +758,11 @@ class EndpointWorker:
                 ]
                 if pending:
                     self._cancel_scheduler_jobs(job, pending)
+
+    def _scheduler_provider_for_job(self, job: RelayJob) -> SchedulerProvider:
+        if self.scheduler_provider is not None:
+            return self.scheduler_provider
+        return provider_for_scheduler(_scheduler_name_from_job(job))
 
     def _scheduler_cancel_already_recorded(
         self,
@@ -841,6 +851,52 @@ def _extract_scheduler_job_id(line: str) -> str | None:
     submitted = re.search(r"\bSubmitted batch job (?P<job_id>[A-Za-z0-9_.-]+)\b", line)
     if submitted is not None:
         return submitted.group("job_id")
+    return None
+
+
+def _scheduler_name_from_job(job: RelayJob) -> str | None:
+    if not isinstance(job.spec, JarvisRunSpec):
+        return None
+    if job.spec.pipeline_yaml is not None:
+        return _scheduler_name_from_yaml(job.spec.pipeline_yaml)
+    if job.spec.pipeline_path is not None:
+        try:
+            pipeline_yaml = Path(job.spec.pipeline_path).read_text(encoding="utf-8")
+        except OSError:
+            return None
+        return _scheduler_name_from_yaml(pipeline_yaml)
+    return None
+
+
+def _scheduler_name_from_yaml(pipeline_yaml: str) -> str | None:
+    try:
+        loaded = yaml.safe_load(pipeline_yaml)
+    except yaml.YAMLError:
+        return None
+    return _scheduler_name_from_document(loaded)
+
+
+def _scheduler_name_from_document(document: object) -> str | None:
+    if not isinstance(document, dict):
+        return None
+    typed = cast(dict[str, object], document)
+    scheduler = typed.get("scheduler")
+    if isinstance(scheduler, dict):
+        typed_scheduler = cast(dict[str, object], scheduler)
+        name = typed_scheduler.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    config = typed.get("config")
+    if isinstance(config, dict):
+        config_scheduler = _scheduler_name_from_document(cast(dict[str, object], config))
+        if config_scheduler is not None:
+            return config_scheduler
+    experiments = typed.get("experiments")
+    if isinstance(experiments, list):
+        for experiment in cast(list[object], experiments):
+            experiment_scheduler = _scheduler_name_from_document(experiment)
+            if experiment_scheduler is not None:
+                return experiment_scheduler
     return None
 
 

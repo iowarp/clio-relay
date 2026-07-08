@@ -30,6 +30,7 @@ def _frp_cluster_definition() -> ClusterDefinition:
 def test_frp_http_probe_starts_remote_proxy_and_local_visitor(monkeypatch: MonkeyPatch) -> None:
     processes: list[FakeProcess] = []
     health_urls: list[str] = []
+    cleanup_probe_ids: list[str] = []
 
     def fake_process_factory(command: list[str], **_kwargs: Any) -> FakeProcess:
         process = FakeProcess(command)
@@ -40,7 +41,11 @@ def test_frp_http_probe_starts_remote_proxy_and_local_visitor(monkeypatch: Monke
         health_urls.append(url)
         assert timeout_seconds == 3
 
+    def fake_cleanup(**kwargs: object) -> None:
+        cleanup_probe_ids.append(str(kwargs["probe_id"]))
+
     monkeypatch.setattr("clio_relay.transport_probe._wait_for_healthz", fake_healthz)
+    monkeypatch.setattr("clio_relay.transport_probe._cleanup_remote_probe", fake_cleanup)
 
     lines = run_frp_http_probe(
         cluster="test-cluster",
@@ -61,6 +66,10 @@ def test_frp_http_probe_starts_remote_proxy_and_local_visitor(monkeypatch: Monke
     assert processes[0].command == ["ssh", "test-host", "bash", "-s"]
     assert processes[1].command[0] == "frpc"
     remote_script = processes[0].stdin.getvalue().decode("utf-8")
+    assert cleanup_probe_ids
+    assert f"probe_id='{cleanup_probe_ids[0]}'" in remote_script
+    assert "transport-probes/$probe_id" in remote_script
+    assert '"owner": "clio-relay"' in remote_script
     assert "CLIO_RELAY_API_TOKEN='api-token'" in remote_script
     assert "clio-relay api start --host 127.0.0.1 --port 8765 --require-token" in remote_script
     assert "remote API port is already occupied: 8765" in remote_script
@@ -111,6 +120,7 @@ def test_frp_http_probe_runs_optional_http_check(monkeypatch: MonkeyPatch) -> No
 
 def test_frp_http_probe_surfaces_remote_port_conflict(monkeypatch: MonkeyPatch) -> None:
     processes: list[FakeProcess] = []
+    cleanup_calls: list[str] = []
 
     def fake_process_factory(command: list[str], **_kwargs: Any) -> FakeProcess:
         process = FakeProcess(command)
@@ -124,7 +134,11 @@ def test_frp_http_probe_surfaces_remote_port_conflict(monkeypatch: MonkeyPatch) 
         del timeout_seconds
         raise AssertionError("health check should not run after remote probe exits")
 
+    def fake_cleanup(**kwargs: object) -> None:
+        cleanup_calls.append(str(kwargs["probe_id"]))
+
     monkeypatch.setattr("clio_relay.transport_probe._wait_for_healthz", fake_healthz)
+    monkeypatch.setattr("clio_relay.transport_probe._cleanup_remote_probe", fake_cleanup)
 
     with pytest.raises(RelayError, match="remote API port is already occupied: 8765"):
         run_frp_http_probe(
@@ -139,6 +153,7 @@ def test_frp_http_probe_surfaces_remote_port_conflict(monkeypatch: MonkeyPatch) 
         )
 
     assert len(processes) == 2
+    assert cleanup_calls
 
 
 def test_frp_http_probe_rejects_dead_visitor_even_if_local_healthz_passes(
@@ -197,6 +212,7 @@ def test_frp_direct_http_probe_uses_xtcp_proxy_and_visitor(
     processes: list[FakeProcess] = []
     health_urls: list[str] = []
     visitor_configs: list[str] = []
+    cleanup_calls: list[str] = []
 
     def fake_process_factory(command: list[str], **_kwargs: Any) -> FakeProcess:
         process = FakeProcess(command)
@@ -209,7 +225,11 @@ def test_frp_direct_http_probe_uses_xtcp_proxy_and_visitor(
         health_urls.append(url)
         assert timeout_seconds == 4
 
+    def fake_cleanup(**kwargs: object) -> None:
+        cleanup_calls.append(str(kwargs["probe_id"]))
+
     monkeypatch.setattr("clio_relay.transport_probe._wait_for_healthz", fake_healthz)
+    monkeypatch.setattr("clio_relay.transport_probe._cleanup_remote_probe", fake_cleanup)
 
     lines = run_frp_direct_http_probe(
         cluster="test-cluster",
@@ -234,6 +254,7 @@ def test_frp_direct_http_probe_uses_xtcp_proxy_and_visitor(
     assert "transport.proxy_type=xtcp" in lines
     assert health_urls == ["http://127.0.0.1:9876/healthz"]
     remote_script = processes[0].stdin.getvalue().decode("utf-8")
+    assert cleanup_calls
     assert 'type = "xtcp"' in remote_script
     assert len(visitor_configs) == 1
     assert 'type = "xtcp"' in visitor_configs[0]

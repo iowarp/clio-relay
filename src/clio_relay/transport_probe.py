@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import socket
 import subprocess
 import tempfile
@@ -80,6 +81,7 @@ def run_frp_http_probe(
     protocol = FrpTransportProtocol(transport.protocol)
     with tempfile.TemporaryDirectory(prefix="clio-relay-transport-") as temp_dir:
         temp_path = Path(temp_dir)
+        probe_id = _probe_id(cluster=cluster, proxy_name=proxy_name)
         remote_frpc_config = render_frpc_config(
             FrpcConfig(
                 server_addr=server_addr,
@@ -118,6 +120,7 @@ def run_frp_http_probe(
             _remote_probe_script(
                 cluster=cluster,
                 definition=definition,
+                probe_id=probe_id,
                 api_token=api_token,
                 api_port=remote_api_port,
                 frpc_config=remote_frpc_config,
@@ -164,6 +167,7 @@ def run_frp_http_probe(
         finally:
             _terminate(visitor)
             _terminate(remote)
+            _cleanup_remote_probe(definition=definition, probe_id=probe_id)
 
 
 def run_frp_direct_http_probe(
@@ -341,6 +345,7 @@ def _run_frp_http_probe_with_proxy_type(
     protocol = FrpTransportProtocol(transport.protocol)
     with tempfile.TemporaryDirectory(prefix="clio-relay-transport-") as temp_dir:
         temp_path = Path(temp_dir)
+        probe_id = _probe_id(cluster=cluster, proxy_name=proxy_name)
         remote_frpc_config = render_frpc_config(
             FrpcConfig(
                 server_addr=server_addr,
@@ -382,6 +387,7 @@ def _run_frp_http_probe_with_proxy_type(
             _remote_probe_script(
                 cluster=cluster,
                 definition=definition,
+                probe_id=probe_id,
                 api_token=api_token,
                 api_port=remote_api_port,
                 frpc_config=remote_frpc_config,
@@ -429,12 +435,14 @@ def _run_frp_http_probe_with_proxy_type(
         finally:
             _terminate(visitor)
             _terminate(remote)
+            _cleanup_remote_probe(definition=definition, probe_id=probe_id)
 
 
 def _remote_probe_script(
     *,
     cluster: str,
     definition: ClusterDefinition,
+    probe_id: str,
     api_token: str | None,
     api_port: int,
     frpc_config: str,
@@ -457,6 +465,10 @@ export CLIO_RELAY_AGENT_BIN={_shell_double_quote(agent_bin)}
 export CLIO_RELAY_AGENT_ADAPTER={_shell_single_quote(definition.agent_adapter)}
 {token_export}
 tmp="$(mktemp -d)"
+probe_id={_shell_single_quote(probe_id)}
+probe_dir="$HOME/.local/share/clio-relay/transport-probes/$probe_id"
+metadata_file="$probe_dir/metadata.json"
+mkdir -p "$probe_dir"
 api_pid=""
 frpc_pid=""
 cleanup() {{
@@ -464,6 +476,7 @@ cleanup() {{
   if [ -n "$api_pid" ]; then kill "$api_pid" 2>/dev/null || true; fi
   wait 2>/dev/null || true
   rm -rf "$tmp"
+  rm -rf "$probe_dir"
 }}
 trap cleanup EXIT
 cat > "$tmp/frpc.toml" <<'__CLIO_RELAY_FRPC_CONFIG__'
@@ -489,6 +502,24 @@ else
 fi
 clio-relay api start --host 127.0.0.1 --port {api_port}{require_token} >"$tmp/api.log" 2>&1 &
 api_pid="$!"
+python3 - "$metadata_file" "$probe_id" "$api_pid" "$tmp" <<'__CLIO_RELAY_PROBE_METADATA__'
+import json
+import sys
+path, probe_id, api_pid, tmp = sys.argv[1:]
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(
+        {{
+            "owner": "clio-relay",
+            "probe_id": probe_id,
+            "cluster": {cluster!r},
+            "api_pid": int(api_pid),
+            "frpc_pid": None,
+            "tmp": tmp,
+        }},
+        handle,
+        indent=2,
+    )
+__CLIO_RELAY_PROBE_METADATA__
 sleep 1
 if ! kill -0 "$api_pid" 2>/dev/null; then
   cat "$tmp/api.log" >&2
@@ -496,8 +527,88 @@ if ! kill -0 "$api_pid" 2>/dev/null; then
 fi
 "$CLIO_RELAY_FRPC_BIN" -c "$tmp/frpc.toml" >"$tmp/frpc.log" 2>&1 &
 frpc_pid="$!"
+python3 - "$metadata_file" "$frpc_pid" <<'__CLIO_RELAY_PROBE_FRPC_PID__'
+import json
+import sys
+path, frpc_pid = sys.argv[1:]
+with open(path, encoding="utf-8") as handle:
+    metadata = json.load(handle)
+metadata["frpc_pid"] = int(frpc_pid)
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(metadata, handle, indent=2)
+__CLIO_RELAY_PROBE_FRPC_PID__
 wait
 """
+
+
+def _cleanup_remote_probe(*, definition: ClusterDefinition, probe_id: str) -> None:
+    script = f"""set -euo pipefail
+probe_id={_shell_single_quote(probe_id)}
+probe_dir="$HOME/.local/share/clio-relay/transport-probes/$probe_id"
+metadata_file="$probe_dir/metadata.json"
+if [ ! -f "$metadata_file" ]; then
+  exit 0
+fi
+python3 - "$metadata_file" <<'__CLIO_RELAY_CLEANUP_PROBE__'
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+metadata_path = Path(sys.argv[1])
+try:
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(0)
+if metadata.get("owner") != "clio-relay":
+    raise SystemExit(0)
+
+def owned(pid: object, expected: str) -> int | None:
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        command = Path(f"/proc/{{pid}}/cmdline").read_bytes().replace(b"\\0", b" ")
+    except OSError:
+        return None
+    if expected.encode() not in command:
+        return None
+    return pid
+
+targets = [
+    owned(metadata.get("frpc_pid"), b"frpc".decode()),
+    owned(metadata.get("api_pid"), b"clio-relay api start".decode()),
+]
+for pid in [item for item in targets if item is not None]:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    if all(not Path(f"/proc/{{pid}}").exists() for pid in targets if pid is not None):
+        break
+    time.sleep(0.2)
+for pid in [item for item in targets if item is not None]:
+    if Path(f"/proc/{{pid}}").exists():
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+tmp = metadata.get("tmp")
+if isinstance(tmp, str) and tmp.startswith("/tmp/"):
+    subprocess = __import__("subprocess")
+    subprocess.run(["rm", "-rf", tmp], check=False)
+__CLIO_RELAY_CLEANUP_PROBE__
+rm -rf "$probe_dir"
+"""
+    subprocess.run(
+        ["ssh", definition.ssh_host, "bash", "-s"],
+        input=script.encode("utf-8"),
+        capture_output=True,
+        check=False,
+    )
 
 
 def _wait_for_healthz(url: str, *, timeout_seconds: float) -> None:
@@ -581,3 +692,9 @@ def _cluster_agent_bin(definition: ClusterDefinition) -> str:
 
 def _popen(*args: Any, **kwargs: Any) -> ManagedProcess:
     return subprocess.Popen(*args, **kwargs)
+
+
+def _probe_id(*, cluster: str, proxy_name: str) -> str:
+    safe_cluster = "".join(item if item.isalnum() else "-" for item in cluster).strip("-")
+    safe_proxy = "".join(item if item.isalnum() else "-" for item in proxy_name).strip("-")
+    return f"{safe_cluster}-{safe_proxy}-{secrets.token_hex(8)}"

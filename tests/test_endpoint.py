@@ -6,6 +6,8 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
+from pytest import MonkeyPatch
+
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.endpoint import EndpointWorker
@@ -246,6 +248,90 @@ def test_worker_records_scheduler_status_from_polling(tmp_path: Path) -> None:
     assert status["jobs_ahead"] == 3
     events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=50)
     assert "scheduler.pending" in [event.event_type for event in events]
+
+
+def test_worker_uses_scheduler_provider_from_pipeline_metadata(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    class SchedulerProvider(RecordingProvider):
+        def run_pipeline_streaming(
+            self,
+            pipeline_path: Path,
+            *,
+            cwd: Path | None = None,
+            on_stdout: Callable[[str], None] | None = None,
+            on_stderr: Callable[[str], None] | None = None,
+            on_start: Callable[[int], None] | None = None,
+            should_cancel: Callable[[], bool] | None = None,
+            on_poll: Callable[[], None] | None = None,
+            timeout_seconds: int | None = None,
+            on_timeout: Callable[[], None] | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            del cwd, on_stderr, on_start, should_cancel, on_poll
+            del timeout_seconds, on_timeout
+            self.runs.append(pipeline_path)
+            if on_stdout is not None:
+                on_stdout("scheduler_job_id=abc123\n")
+            return subprocess.CompletedProcess(
+                args=["jarvis"],
+                returncode=0,
+                stdout="scheduler_job_id=abc123\n",
+                stderr="",
+            )
+
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    provider = SchedulerProvider()
+    scheduler_provider = FakeSchedulerProvider(
+        SchedulerStatus(
+            scheduler="test-scheduler",
+            scheduler_job_id="abc123",
+            phase=SchedulerPhase.PENDING,
+        )
+    )
+    requested_scheduler_names: list[str | None] = []
+
+    def fake_provider_for_scheduler(name: str | None) -> FakeSchedulerProvider:
+        requested_scheduler_names.append(name)
+        return scheduler_provider
+
+    monkeypatch.setattr("clio_relay.endpoint.provider_for_scheduler", fake_provider_for_scheduler)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(
+                pipeline_yaml="""
+name: scheduled
+scheduler:
+  name: test-scheduler
+pkgs: []
+"""
+            ),
+            idempotency_key="worker-scheduler-provider-from-yaml",
+        )
+    )
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=queue,
+        provider=provider,
+    )
+    worker.register()
+
+    result = worker.run_once()
+
+    assert result is not None
+    assert result.job_id == job.job_id
+    assert requested_scheduler_names == ["test-scheduler", "test-scheduler", "test-scheduler"]
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=50)
+    detected = [event for event in events if event.event_type == "scheduler.job_detected"]
+    assert detected
+    assert detected[0].payload["scheduler"] == "test-scheduler"
+    task = queue.list_tasks(job.job_id)[0]
+    assert task.metadata["scheduler"] == "test-scheduler"
 
 
 def test_worker_ignores_forged_stdout_progress_markers(tmp_path: Path) -> None:
