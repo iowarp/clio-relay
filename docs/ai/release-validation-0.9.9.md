@@ -126,5 +126,62 @@ Events included `scheduler.pending`, `scheduler.cancel_requested`, and
 
 ## Remaining before release
 
-- Refresh homelab installed-package transport validation from 0.9.9.
+## Homelab transport
+
+STCP over WSS:
+
+```powershell
+uvx --python 3.12 --from .\dist\clio_relay-0.9.9-py3-none-any.whl clio-relay relay-host test-http-transport --cluster homelab --local-bind-port 19168 --remote-api-port 8868 --proxy-name uvx-homelab-stcp-099b --timeout-seconds 45
+```
+
+Observed:
+
+```text
+transport.cluster=homelab
+transport.server=frps.jcernuda.com:443
+transport.protocol=wss
+transport.local_url=http://127.0.0.1:19168
+transport.healthz=ok
+```
+
+XTCP direct transport:
+
+```powershell
+uvx --python 3.12 --from .\dist\clio_relay-0.9.9-py3-none-any.whl clio-relay relay-host test-direct-transport --cluster homelab --local-bind-port 19169 --remote-api-port 8869 --proxy-name uvx-homelab-xtcp-099 --timeout-seconds 45 --no-allow-stcp-fallback
+```
+
+Observed:
+
+```text
+direct_transport.cluster=homelab
+direct_transport.mode=xtcp
+direct_transport.result=xtcp
+transport.cluster=homelab
+transport.server=frps.jcernuda.com:443
+transport.protocol=wss
+transport.proxy_type=xtcp
+transport.local_url=http://127.0.0.1:19169
+transport.healthz=ok
+```
+
+SSH forwarding:
+
+```powershell
+uvx --python 3.12 --from .\dist\clio_relay-0.9.9-py3-none-any.whl clio-relay relay-host test-ssh-transport --cluster homelab --local-bind-port 19170 --remote-api-port 8870 --session-id uvx-homelab-ssh-099 --timeout-seconds 45 --teardown-remote
+```
+
+Observed:
+
+```text
+transport.cluster=homelab
+transport.protocol=ssh_forward
+transport.ssh_host=homelab
+transport.session_id=uvx-homelab-ssh-099
+transport.remote_api_port=8870
+transport.local_url=http://127.0.0.1:19170
+transport.healthz=ok
+```
+
+## Remaining before release
+
 - Publish only after tagging a corrected version, not from 0.9.5.
