@@ -569,7 +569,7 @@ def owned(pid: object, expected: str) -> int | None:
     if not isinstance(pid, int) or pid <= 0:
         return None
     try:
-        command = Path(f"/proc/{{pid}}/cmdline").read_bytes().replace(b"\\0", b" ")
+        command = (Path("/proc") / str(pid) / "cmdline").read_bytes().replace(b"\\0", b" ")
     except OSError:
         return None
     if expected.encode() not in command:
@@ -587,11 +587,11 @@ for pid in [item for item in targets if item is not None]:
         pass
 deadline = time.monotonic() + 5
 while time.monotonic() < deadline:
-    if all(not Path(f"/proc/{{pid}}").exists() for pid in targets if pid is not None):
+    if all(not (Path("/proc") / str(pid)).exists() for pid in targets if pid is not None):
         break
     time.sleep(0.2)
 for pid in [item for item in targets if item is not None]:
-    if Path(f"/proc/{{pid}}").exists():
+    if (Path("/proc") / str(pid)).exists():
         try:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:

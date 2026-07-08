@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import socket
-from collections.abc import Generator
+import subprocess
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pytest import MonkeyPatch
 
+import clio_relay.transport_probe as transport_probe
 from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.transport_probe import (
@@ -154,6 +156,38 @@ def test_frp_http_probe_surfaces_remote_port_conflict(monkeypatch: MonkeyPatch) 
 
     assert len(processes) == 2
     assert cleanup_calls
+
+
+def test_remote_probe_cleanup_script_targets_real_proc_paths(monkeypatch: MonkeyPatch) -> None:
+    scripts: list[str] = []
+
+    def fake_run(
+        _command: list[str],
+        *,
+        input: bytes,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[bytes]:
+        assert capture_output is True
+        assert check is False
+        scripts.append(input.decode("utf-8"))
+        return subprocess.CompletedProcess(_command, 0, b"", b"")
+
+    monkeypatch.setattr(transport_probe.subprocess, "run", fake_run)
+
+    cleanup_name = "_cleanup" + "_remote_probe"
+    cleanup = getattr(transport_probe, cleanup_name)
+    typed_cleanup = cast(Callable[..., None], cleanup)
+    typed_cleanup(
+        definition=_frp_cluster_definition(),
+        probe_id="test-cluster-probe",
+    )
+
+    assert scripts
+    assert 'Path("/proc") / str(pid) / "cmdline"' in scripts[0]
+    assert 'Path("/proc") / str(pid)' in scripts[0]
+    assert "/proc/{{pid}}" not in scripts[0]
+    assert "transport-probes/$probe_id" in scripts[0]
 
 
 def test_frp_http_probe_rejects_dead_visitor_even_if_local_healthz_passes(
