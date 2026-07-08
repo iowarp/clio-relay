@@ -98,13 +98,40 @@ mkdir -p "$session_dir"
 pid_file="$session_dir/api.pid"
 log_file="$session_dir/api.log"
 metadata_file="$session_dir/metadata.json"
-if [ -s "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+is_owned_api_pid() {{
+  python3 - "$metadata_file" "$1" "$session_id" <<'__CLIO_RELAY_PID_OWNER__'
+import json
+import sys
+metadata_path, pid, session_id = sys.argv[1:]
+try:
+    with open(metadata_path, encoding="utf-8") as handle:
+        metadata = json.load(handle)
+except (FileNotFoundError, json.JSONDecodeError):
+    raise SystemExit(1)
+if str(metadata.get("api_pid")) != pid:
+    raise SystemExit(1)
+if metadata.get("session_id") != session_id or metadata.get("owner") != "clio-relay":
+    raise SystemExit(1)
+try:
+    with open(f"/proc/{{pid}}/cmdline", "rb") as handle:
+        command = handle.read().replace(b"\\0", b" ").decode("utf-8", errors="replace")
+except OSError:
+    raise SystemExit(1)
+if "clio-relay" not in command or " api " not in f" {{command}} " or " start" not in command:
+    raise SystemExit(1)
+__CLIO_RELAY_PID_OWNER__
+}}
+if [ -s "$pid_file" ] \
+  && kill -0 "$(cat "$pid_file")" 2>/dev/null \
+  && is_owned_api_pid "$(cat "$pid_file")"; then
   if [ "{replace_flag}" != "1" ]; then
     echo "session_already_running=$session_id"
     echo "api_pid=$(cat "$pid_file")"
     exit 0
   fi
   kill "$(cat "$pid_file")" 2>/dev/null || true
+elif [ -s "$pid_file" ]; then
+  rm -f "$pid_file"
 fi
 if python3 - {remote_api_port} <<'__CLIO_RELAY_PORT_CHECK__'
 import socket
@@ -164,9 +191,32 @@ pid_file="$session_dir/api.pid"
 metadata_file="$session_dir/metadata.json"
 running=false
 api_pid=null
+is_owned_api_pid() {{
+  python3 - "$metadata_file" "$1" "$session_id" <<'__CLIO_RELAY_PID_OWNER__'
+import json
+import sys
+metadata_path, pid, session_id = sys.argv[1:]
+try:
+    with open(metadata_path, encoding="utf-8") as handle:
+        metadata = json.load(handle)
+except (FileNotFoundError, json.JSONDecodeError):
+    raise SystemExit(1)
+if str(metadata.get("api_pid")) != pid:
+    raise SystemExit(1)
+if metadata.get("session_id") != session_id or metadata.get("owner") != "clio-relay":
+    raise SystemExit(1)
+try:
+    with open(f"/proc/{{pid}}/cmdline", "rb") as handle:
+        command = handle.read().replace(b"\\0", b" ").decode("utf-8", errors="replace")
+except OSError:
+    raise SystemExit(1)
+if "clio-relay" not in command or " api " not in f" {{command}} " or " start" not in command:
+    raise SystemExit(1)
+__CLIO_RELAY_PID_OWNER__
+}}
 if [ -s "$pid_file" ]; then
   api_pid="$(cat "$pid_file")"
-  if kill -0 "$api_pid" 2>/dev/null; then running=true; fi
+  if kill -0 "$api_pid" 2>/dev/null && is_owned_api_pid "$api_pid"; then running=true; fi
 fi
 python3 - "$metadata_file" "$running" "$api_pid" <<'__CLIO_RELAY_STATUS__'
 import json
@@ -196,9 +246,33 @@ def _teardown_script(*, session_id: str, stop_worker: bool, cluster: str | None)
 session_id={shlex.quote(session_id)}
 session_dir="$HOME/.local/share/clio-relay/sessions/$session_id"
 pid_file="$session_dir/api.pid"
+metadata_file="$session_dir/metadata.json"
+is_owned_api_pid() {{
+  python3 - "$metadata_file" "$1" "$session_id" <<'__CLIO_RELAY_PID_OWNER__'
+import json
+import sys
+metadata_path, pid, session_id = sys.argv[1:]
+try:
+    with open(metadata_path, encoding="utf-8") as handle:
+        metadata = json.load(handle)
+except (FileNotFoundError, json.JSONDecodeError):
+    raise SystemExit(1)
+if str(metadata.get("api_pid")) != pid:
+    raise SystemExit(1)
+if metadata.get("session_id") != session_id or metadata.get("owner") != "clio-relay":
+    raise SystemExit(1)
+try:
+    with open(f"/proc/{{pid}}/cmdline", "rb") as handle:
+        command = handle.read().replace(b"\\0", b" ").decode("utf-8", errors="replace")
+except OSError:
+    raise SystemExit(1)
+if "clio-relay" not in command or " api " not in f" {{command}} " or " start" not in command:
+    raise SystemExit(1)
+__CLIO_RELAY_PID_OWNER__
+}}
 if [ -s "$pid_file" ]; then
   api_pid="$(cat "$pid_file")"
-  if kill -0 "$api_pid" 2>/dev/null; then
+  if kill -0 "$api_pid" 2>/dev/null && is_owned_api_pid "$api_pid"; then
     kill "$api_pid" 2>/dev/null || true
     for _ in 1 2 3 4 5; do
       if ! kill -0 "$api_pid" 2>/dev/null; then break; fi
@@ -206,6 +280,8 @@ if [ -s "$pid_file" ]; then
     done
     if kill -0 "$api_pid" 2>/dev/null; then kill -9 "$api_pid" 2>/dev/null || true; fi
     echo "api_stopped=$api_pid"
+  elif kill -0 "$api_pid" 2>/dev/null; then
+    echo "api_pid_not_owned=$api_pid"
   else
     echo "api_not_running=$api_pid"
   fi

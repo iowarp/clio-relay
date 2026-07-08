@@ -14,6 +14,12 @@ uv run pytest
 uv build
 ```
 
+## bootstrap source
+
+The current `cluster bootstrap` command deploys the repository source from a clean local git checkout. For the initial repository release, run bootstrap commands from the checkout, not from an arbitrary directory after installing only the wheel.
+
+PyPI packages are still built and checked by CI, but a future release should make the JARVIS package repository discoverable from the installed package before documenting PyPI-only cluster bootstrap.
+
 ## version
 
 Update both version declarations:

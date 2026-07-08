@@ -76,12 +76,13 @@ def run_frp_http_probe(
     _assert_local_bind_port_available(local_bind_port)
     factory = process_factory or _popen
     transport = definition.frp_transport
+    server_addr = _require_frp_server_addr(transport.server_addr, cluster)
     protocol = FrpTransportProtocol(transport.protocol)
     with tempfile.TemporaryDirectory(prefix="clio-relay-transport-") as temp_dir:
         temp_path = Path(temp_dir)
         remote_frpc_config = render_frpc_config(
             FrpcConfig(
-                server_addr=transport.server_addr,
+                server_addr=server_addr,
                 server_port=transport.server_port,
                 token=token,
                 transport_protocol=protocol,
@@ -94,7 +95,7 @@ def run_frp_http_probe(
         visitor_config_path.write_text(
             render_frpc_visitor_config(
                 FrpcVisitorConfig(
-                    server_addr=transport.server_addr,
+                    server_addr=server_addr,
                     server_port=transport.server_port,
                     token=token,
                     transport_protocol=protocol,
@@ -152,7 +153,7 @@ def run_frp_http_probe(
                 raise RelayError(_process_output_message(visitor, "local frpc visitor failed"))
             lines = [
                 f"transport.cluster={cluster}",
-                f"transport.server={transport.server_addr}:{transport.server_port}",
+                f"transport.server={server_addr}:{transport.server_port}",
                 f"transport.protocol={transport.protocol}",
                 f"transport.local_url=http://127.0.0.1:{local_bind_port}",
                 "transport.healthz=ok",
@@ -336,12 +337,13 @@ def _run_frp_http_probe_with_proxy_type(
     _assert_local_bind_port_available(local_bind_port)
     factory = process_factory or _popen
     transport = definition.frp_transport
+    server_addr = _require_frp_server_addr(transport.server_addr, cluster)
     protocol = FrpTransportProtocol(transport.protocol)
     with tempfile.TemporaryDirectory(prefix="clio-relay-transport-") as temp_dir:
         temp_path = Path(temp_dir)
         remote_frpc_config = render_frpc_config(
             FrpcConfig(
-                server_addr=transport.server_addr,
+                server_addr=server_addr,
                 server_port=transport.server_port,
                 token=token,
                 transport_protocol=protocol,
@@ -355,7 +357,7 @@ def _run_frp_http_probe_with_proxy_type(
         visitor_config_path.write_text(
             render_frpc_visitor_config(
                 FrpcVisitorConfig(
-                    server_addr=transport.server_addr,
+                    server_addr=server_addr,
                     server_port=transport.server_port,
                     token=token,
                     transport_protocol=protocol,
@@ -415,7 +417,7 @@ def _run_frp_http_probe_with_proxy_type(
                 raise RelayError(_process_output_message(visitor, "local frpc visitor failed"))
             lines = [
                 f"transport.cluster={cluster}",
-                f"transport.server={transport.server_addr}:{transport.server_port}",
+                f"transport.server={server_addr}:{transport.server_port}",
                 f"transport.protocol={transport.protocol}",
                 f"transport.proxy_type={proxy_type}",
                 f"transport.local_url=http://127.0.0.1:{local_bind_port}",
@@ -520,6 +522,15 @@ def _assert_local_bind_port_available(port: int) -> None:
             probe.bind(("127.0.0.1", port))
     except OSError as exc:
         raise ConfigurationError(f"local visitor port is already occupied: {port}") from exc
+
+
+def _require_frp_server_addr(server_addr: str, cluster: str) -> str:
+    if server_addr.strip():
+        return server_addr
+    raise ConfigurationError(
+        f"frp server address is not configured for cluster {cluster}; "
+        "set it with `clio-relay cluster add --frp-server-addr ...`"
+    )
 
 
 def _terminate(process: ManagedProcess) -> None:

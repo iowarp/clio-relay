@@ -101,6 +101,24 @@ def test_task_timeline_events_are_durable_and_resumable(tmp_path: Path) -> None:
     assert "task.timeline.dataset_found" in [event.event_type for event in job_events]
 
 
+def test_task_timeline_cursor_and_limit_must_be_positive(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.REMOTE_AGENT,
+            spec=RemoteAgentTaskSpec(prompt_path="/tmp/prompt.md"),
+            idempotency_key="task-events-invalid-cursor",
+        )
+    )
+    task = queue.append_task(RelayTask(job_id=job.job_id, name="remote-agent.discovery"))
+
+    with pytest.raises(ValueError, match="cursor"):
+        queue.drain_task_events(task.task_id, cursor=0)
+    with pytest.raises(ValueError, match="limit"):
+        queue.drain_task_events(task.task_id, limit=0)
+
+
 def test_gateway_sessions_are_durable_and_updateable(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path)
     session = queue.create_gateway_session(
@@ -128,6 +146,22 @@ def test_gateway_sessions_are_durable_and_updateable(tmp_path: Path) -> None:
     assert updated.scheduler_job_id == "12345"
     assert updated.gateway["local_port"] == 5900
     assert updated.metadata["dataset"] == "red_sea_001"
+    assert closed.state == GatewaySessionState.CLOSED
+
+
+def test_closed_gateway_session_cannot_be_reopened_or_updated(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    session = queue.create_gateway_session(
+        GatewaySession(cluster="test-cluster", name="paraview-red-sea")
+    )
+    queue.close_gateway_session(session.session_id)
+
+    with pytest.raises(QueueConflictError, match="cannot reopen"):
+        queue.update_gateway_session(session.session_id, state=GatewaySessionState.READY)
+    with pytest.raises(QueueConflictError, match="cannot update"):
+        queue.update_gateway_session(session.session_id, node="compute-01")
+
+    closed = queue.close_gateway_session(session.session_id)
     assert closed.state == GatewaySessionState.CLOSED
 
 

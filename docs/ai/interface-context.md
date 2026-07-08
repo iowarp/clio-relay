@@ -35,10 +35,17 @@ Endpoint and job work:
 - `clio-relay job watch`
 - `clio-relay job cancel`
 - `clio-relay job tasks`
+- `clio-relay job task-events`
+- `clio-relay job record-task-event`
 - `clio-relay job read-log`
 - `clio-relay job list-artifacts`
 - `clio-relay job read-artifact`
 - `clio-relay job progress`
+- `clio-relay gateway create`
+- `clio-relay gateway list`
+- `clio-relay gateway get`
+- `clio-relay gateway update`
+- `clio-relay gateway close`
 
 Agent and monitor work:
 
@@ -59,9 +66,12 @@ The HTTP API exposes:
 - job state
 - job events
 - task records
+- task timeline event reads and writes
+- task timeline SSE and WebSocket streams
 - stdout and stderr reads by offset
 - artifact listing and reads
 - progress reads
+- gateway session create, list, read, update, and close
 - cancellation
 
 When `CLIO_RELAY_API_TOKEN` is set and the API is started with `--require-token`, clients must send either `Authorization: Bearer <token>` or `X-Clio-Relay-Token: <token>`. `/healthz` stays open for local process checks.
@@ -76,9 +86,11 @@ The MCP server exposes relay tools for:
 - monitor job
 - watch event cursors
 - list task records
+- record and watch task timeline events
 - read logs
 - list and read artifacts
 - record and list progress
+- create, read, update, and close gateway sessions
 - create monitor rules
 - cancel jobs
 

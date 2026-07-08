@@ -38,7 +38,7 @@ def test_render_frps_config_has_no_application_state() -> None:
 def test_render_frpc_config_uses_configured_websocket_transport() -> None:
     rendered = render_frpc_config(
         FrpcConfig(
-            server_addr="frps.jcernuda.com",
+            server_addr="relay.example.test",
             server_port=443,
             token="secret",
             transport_protocol=FrpTransportProtocol.WSS,
@@ -47,7 +47,7 @@ def test_render_frpc_config_uses_configured_websocket_transport() -> None:
         )
     )
 
-    assert 'serverAddr = "frps.jcernuda.com"' in rendered
+    assert 'serverAddr = "relay.example.test"' in rendered
     assert "serverPort = 443" in rendered
     assert 'transport.protocol = "wss"' in rendered
     assert 'type = "stcp"' in rendered
@@ -56,7 +56,7 @@ def test_render_frpc_config_uses_configured_websocket_transport() -> None:
 def test_render_frpc_visitor_config_uses_stcp_visitor() -> None:
     rendered = render_frpc_visitor_config(
         FrpcVisitorConfig(
-            server_addr="frps.jcernuda.com",
+            server_addr="relay.example.test",
             server_port=443,
             token="secret",
             transport_protocol=FrpTransportProtocol.WSS,
@@ -67,7 +67,7 @@ def test_render_frpc_visitor_config_uses_stcp_visitor() -> None:
         )
     )
 
-    assert 'serverAddr = "frps.jcernuda.com"' in rendered
+    assert 'serverAddr = "relay.example.test"' in rendered
     assert "serverPort = 443" in rendered
     assert 'transport.protocol = "wss"' in rendered
     assert "[[visitors]]" in rendered
@@ -80,7 +80,7 @@ def test_render_frpc_visitor_config_uses_stcp_visitor() -> None:
 def test_render_frpc_config_supports_xtcp_proxy_and_visitor() -> None:
     proxy = render_frpc_config(
         FrpcConfig(
-            server_addr="frps.jcernuda.com",
+            server_addr="relay.example.test",
             server_port=443,
             token="secret",
             transport_protocol=FrpTransportProtocol.WSS,
@@ -92,7 +92,7 @@ def test_render_frpc_config_supports_xtcp_proxy_and_visitor() -> None:
     )
     visitor = render_frpc_visitor_config(
         FrpcVisitorConfig(
-            server_addr="frps.jcernuda.com",
+            server_addr="relay.example.test",
             server_port=443,
             token="secret",
             transport_protocol=FrpTransportProtocol.WSS,

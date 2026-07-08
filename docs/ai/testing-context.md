@@ -45,4 +45,18 @@ The SSH lifecycle implementation was live-tested on Ares after deployment:
 - `session teardown --stop-worker` stopped the Ares user worker service, and the worker was restarted successfully.
 - builtin JARVIS LAMMPS live acceptance passed with stdout, stderr, artifacts, provenance, progress, and monitor checks.
 
+Task timeline and gateway session surfaces were live-tested on Ares after deployment:
+
+- task `task_0b2bec1345e041dc965322a0c9c5eccf` recorded and replayed three events:
+  - `seq=1 paraview_dataset_found` through desktop CLI passthrough.
+  - `seq=2 paraview_script_planned` through HTTP over an SSH-forwarded Ares API.
+  - `seq=3 paraview_command_planned` through MCP stdio on Ares.
+- the same task events were read through CLI, HTTP JSON, SSE, WebSocket, and MCP.
+- gateway sessions were created, updated, read, and closed through CLI, HTTP, and MCP:
+  - `gateway_f0292af89638476eae8c82cbed575242` through CLI.
+  - `gateway_bfbe7f5bd15841fcbcbfc772ddb20298` through HTTP.
+  - `gateway_e406b8c309eb47b7856e47b015239e60` through MCP.
+  - `gateway_3418bce505ed4d4e81255266e509df99` through CLI JSON-file metadata.
+- `gateway close` was validated as durable record closure. It does not yet scancel or terminate the underlying scheduler-backed service by itself.
+
 Refresh this evidence when changing the relevant code. Do not present old live evidence as current proof after transport, lifecycle, worker, or acceptance code changes.

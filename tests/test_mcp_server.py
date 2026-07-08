@@ -230,12 +230,26 @@ def test_mcp_gateway_session_lifecycle(tmp_path: Path) -> None:
         },
         queue=queue,
     )
+    reopen_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 27,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_update_gateway_session",
+                "arguments": {"session_id": session_id, "state": "ready"},
+            },
+        },
+        queue=queue,
+    )
 
     assert update_response is not None
     assert close_response is not None
+    assert reopen_response is not None
     assert update_response["result"]["structuredContent"]["state"] == "ready"
     assert update_response["result"]["structuredContent"]["gateway"]["local_port"] == 5900
     assert close_response["result"]["structuredContent"]["state"] == "closed"
+    assert "cannot reopen closed gateway session" in reopen_response["error"]["message"]
 
 
 def test_mcp_submit_mcp_call_creates_real_job_with_arguments(tmp_path: Path) -> None:

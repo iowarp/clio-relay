@@ -355,6 +355,25 @@ def test_http_task_timeline_sse_replays_existing_events(tmp_path: Path) -> None:
     assert "repo_scan" in body
 
 
+def test_http_task_timeline_rejects_invalid_cursor(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.REMOTE_AGENT,
+            spec=RemoteAgentTaskSpec(prompt_path="/tmp/prompt.md"),
+            idempotency_key="http-task-events-invalid-cursor",
+        )
+    )
+    task = queue.append_task(RelayTask(job_id=job.job_id, name="remote-agent.discovery"))
+    client = cast(Any, TestClient(create_app(settings)))
+
+    response = client.get(f"/tasks/{task.task_id}/events", params={"cursor": 0})
+
+    assert response.status_code == 422
+
+
 def test_http_gateway_session_lifecycle(tmp_path: Path) -> None:
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     client = cast(Any, TestClient(create_app(settings)))
@@ -381,6 +400,7 @@ def test_http_gateway_session_lifecycle(tmp_path: Path) -> None:
     )
     listed = client.get("/gateway-sessions", params={"cluster": "test-cluster"})
     closed = client.post(f"/gateway-sessions/{session_id}/close")
+    reopen = client.patch(f"/gateway-sessions/{session_id}", json={"state": "ready"})
 
     assert created.status_code == 200
     assert updated.status_code == 200
@@ -390,6 +410,7 @@ def test_http_gateway_session_lifecycle(tmp_path: Path) -> None:
     assert updated.json()["scheduler_job_id"] == "12345"
     assert listed.json()[0]["session_id"] == session_id
     assert closed.json()["state"] == GatewaySessionState.CLOSED.value
+    assert reopen.status_code == 409
 
 
 def test_http_job_status_includes_relay_queue_and_scheduler(tmp_path: Path) -> None:

@@ -179,13 +179,15 @@ def render_frpc(
     proxy_name: Annotated[str, typer.Option(help="stcp proxy name.")] = "relay-stcp",
 ) -> None:
     """Render an frpc config using the cluster's configured frp transport."""
-    definition = _require_cluster(cluster)
-    transport = definition.frp_transport
-    _run_or_exit(
-        lambda: typer.echo(
+
+    def action() -> None:
+        definition = _require_cluster(cluster)
+        transport = definition.frp_transport
+        server_addr = _require_frp_server_addr(transport.server_addr, cluster)
+        typer.echo(
             render_frpc_config(
                 FrpcConfig(
-                    server_addr=transport.server_addr,
+                    server_addr=server_addr,
                     server_port=transport.server_port,
                     token=_resolve_env_secret(token, transport.token_env, "frp token"),
                     transport_protocol=FrpTransportProtocol(transport.protocol),
@@ -199,7 +201,8 @@ def render_frpc(
                 )
             )
         )
-    )
+
+    _run_or_exit(action)
 
 
 @relay_host_app.command("test-frpc-connection")
@@ -221,27 +224,30 @@ def test_frpc(
     ] = 10.0,
 ) -> None:
     """Run a live frpc login check for the cluster transport."""
-    settings = RelaySettings.from_env()
-    definition = _require_cluster(cluster)
-    transport = definition.frp_transport
-    config = FrpcConfig(
-        server_addr=transport.server_addr,
-        server_port=transport.server_port,
-        token=_resolve_env_secret(token, transport.token_env, "frp token"),
-        transport_protocol=FrpTransportProtocol(transport.protocol),
-        proxy_name=proxy_name,
-        local_port=local_port,
-        secret_key=_resolve_env_secret(secret_key, transport.stcp_secret_env, "stcp secret"),
-    )
-    _run_or_exit(
-        lambda: _echo_lines(
+
+    def action() -> None:
+        settings = RelaySettings.from_env()
+        definition = _require_cluster(cluster)
+        transport = definition.frp_transport
+        server_addr = _require_frp_server_addr(transport.server_addr, cluster)
+        config = FrpcConfig(
+            server_addr=server_addr,
+            server_port=transport.server_port,
+            token=_resolve_env_secret(token, transport.token_env, "frp token"),
+            transport_protocol=FrpTransportProtocol(transport.protocol),
+            proxy_name=proxy_name,
+            local_port=local_port,
+            secret_key=_resolve_env_secret(secret_key, transport.stcp_secret_env, "stcp secret"),
+        )
+        _echo_lines(
             run_frpc_connection_check(
                 frpc_bin=settings.frpc_bin,
                 config=config,
                 timeout_seconds=timeout_seconds,
             )
         )
-    )
+
+    _run_or_exit(action)
 
 
 @relay_host_app.command("render-frpc-visitor-config")
@@ -267,13 +273,15 @@ def render_frpc_visitor(
     ] = "127.0.0.1",
 ) -> None:
     """Render a desktop-side frpc STCP visitor config."""
-    definition = _require_cluster(cluster)
-    transport = definition.frp_transport
-    _run_or_exit(
-        lambda: typer.echo(
+
+    def action() -> None:
+        definition = _require_cluster(cluster)
+        transport = definition.frp_transport
+        server_addr = _require_frp_server_addr(transport.server_addr, cluster)
+        typer.echo(
             render_frpc_visitor_config(
                 FrpcVisitorConfig(
-                    server_addr=transport.server_addr,
+                    server_addr=server_addr,
                     server_port=transport.server_port,
                     token=_resolve_env_secret(token, transport.token_env, "frp token"),
                     transport_protocol=FrpTransportProtocol(transport.protocol),
@@ -289,7 +297,8 @@ def render_frpc_visitor(
                 )
             )
         )
-    )
+
+    _run_or_exit(action)
 
 
 @relay_host_app.command("test-http-transport")
@@ -534,7 +543,7 @@ def cluster_add(
     frp_server_addr: Annotated[
         str,
         typer.Option(help="frps server address for this cluster transport."),
-    ] = "frps.jcernuda.com",
+    ] = "",
     frp_server_port: Annotated[
         int,
         typer.Option(help="frps server port for this cluster transport."),
@@ -869,8 +878,14 @@ def job_task_events(
         str | None,
         typer.Option(help="Configured cluster to inspect over SSH."),
     ] = None,
-    cursor: Annotated[int, typer.Option(help="First task event sequence to read.")] = 1,
-    limit: Annotated[int, typer.Option(help="Maximum task events to read.")] = 100,
+    cursor: Annotated[
+        int,
+        typer.Option(help="First task event sequence to read.", min=1),
+    ] = 1,
+    limit: Annotated[
+        int,
+        typer.Option(help="Maximum task events to read.", min=1),
+    ] = 100,
 ) -> None:
     """Read structured task timeline events from a cursor as JSON."""
     if _try_remote_cluster_passthrough(
@@ -1152,7 +1167,18 @@ def gateway_create(
         str | None,
         typer.Option(help="Scheduler job id if already known."),
     ] = None,
+    queue_state: Annotated[str | None, typer.Option(help="Scheduler queue state.")] = None,
     node: Annotated[str | None, typer.Option(help="Allocated node or host.")] = None,
+    stdout_uri: Annotated[str | None, typer.Option(help="Gateway stdout log URI.")] = None,
+    stderr_uri: Annotated[str | None, typer.Option(help="Gateway stderr log URI.")] = None,
+    log_uri: Annotated[
+        list[str] | None,
+        typer.Option(help="Additional log URI; repeat for multiple logs."),
+    ] = None,
+    artifact: Annotated[
+        list[str] | None,
+        typer.Option(help="Artifact URI or id; repeat for multiple artifacts."),
+    ] = None,
     gateway_json: Annotated[
         str,
         typer.Option(help="JSON object with gateway endpoint metadata."),
@@ -1202,8 +1228,18 @@ def gateway_create(
     ]
     if scheduler_job_id is not None:
         remote_args.extend(["--scheduler-job-id", scheduler_job_id])
+    if queue_state is not None:
+        remote_args.extend(["--queue-state", queue_state])
     if node is not None:
         remote_args.extend(["--node", node])
+    if stdout_uri is not None:
+        remote_args.extend(["--stdout-uri", stdout_uri])
+    if stderr_uri is not None:
+        remote_args.extend(["--stderr-uri", stderr_uri])
+    for value in log_uri or []:
+        remote_args.extend(["--log-uri", value])
+    for value in artifact or []:
+        remote_args.extend(["--artifact", value])
     if _try_remote_cluster_passthrough(cluster, remote_args):
         return
     session = ClioCoreQueue(RelaySettings.from_env().core_dir).create_gateway_session(
@@ -1213,8 +1249,13 @@ def gateway_create(
             state=state,
             scheduler=scheduler,
             scheduler_job_id=scheduler_job_id,
+            queue_state=queue_state,
             node=node,
+            stdout_uri=stdout_uri,
+            stderr_uri=stderr_uri,
+            log_uris=log_uri or [],
             gateway=_json_object(gateway_source),
+            artifacts=artifact or [],
             requested_resources=_json_object(resources_source),
             metadata=_json_object(metadata_source),
         )
@@ -1274,6 +1315,24 @@ def gateway_update(
     ] = None,
     queue_state: Annotated[str | None, typer.Option(help="Scheduler queue state.")] = None,
     node: Annotated[str | None, typer.Option(help="Allocated node or host.")] = None,
+    stdout_uri: Annotated[str | None, typer.Option(help="Gateway stdout log URI.")] = None,
+    stderr_uri: Annotated[str | None, typer.Option(help="Gateway stderr log URI.")] = None,
+    log_uri: Annotated[
+        list[str] | None,
+        typer.Option(help="Additional log URI; repeat for multiple logs."),
+    ] = None,
+    artifact: Annotated[
+        list[str] | None,
+        typer.Option(help="Artifact URI or id; repeat for multiple artifacts."),
+    ] = None,
+    resources_json: Annotated[
+        str | None,
+        typer.Option(help="JSON object with requested resource metadata."),
+    ] = None,
+    resources_json_file: Annotated[
+        Path | None,
+        typer.Option(help="Path to a JSON object with requested resource metadata."),
+    ] = None,
     gateway_json: Annotated[
         str | None,
         typer.Option(help="JSON object with gateway endpoint metadata."),
@@ -1294,9 +1353,14 @@ def gateway_update(
     """Update a gateway service session."""
     if gateway_json is not None and gateway_json_file is not None:
         raise typer.BadParameter("use either --gateway-json or --gateway-json-file, not both")
+    if resources_json is not None and resources_json_file is not None:
+        raise typer.BadParameter("use either --resources-json or --resources-json-file, not both")
     gateway_source = None
     if gateway_json is not None or gateway_json_file is not None:
         gateway_source = _json_text_from_option(gateway_json or "{}", gateway_json_file)
+    resources_source = None
+    if resources_json is not None or resources_json_file is not None:
+        resources_source = _json_text_from_option(resources_json or "{}", resources_json_file)
     metadata_source = _json_text_from_option(metadata_json, metadata_json_file)
     remote_args = ["gateway", "update", session_id]
     if state is not None:
@@ -1307,6 +1371,16 @@ def gateway_update(
         remote_args.extend(["--queue-state", queue_state])
     if node is not None:
         remote_args.extend(["--node", node])
+    if stdout_uri is not None:
+        remote_args.extend(["--stdout-uri", stdout_uri])
+    if stderr_uri is not None:
+        remote_args.extend(["--stderr-uri", stderr_uri])
+    for value in log_uri or []:
+        remote_args.extend(["--log-uri", value])
+    for value in artifact or []:
+        remote_args.extend(["--artifact", value])
+    if resources_source is not None:
+        remote_args.extend(["--resources-json", resources_source])
     if gateway_source is not None:
         remote_args.extend(["--gateway-json", gateway_source])
     remote_args.extend(["--metadata-json", metadata_source])
@@ -1319,6 +1393,16 @@ def gateway_update(
         updates["queue_state"] = queue_state
     if node is not None:
         updates["node"] = node
+    if stdout_uri is not None:
+        updates["stdout_uri"] = stdout_uri
+    if stderr_uri is not None:
+        updates["stderr_uri"] = stderr_uri
+    if log_uri is not None:
+        updates["log_uris"] = log_uri
+    if artifact is not None:
+        updates["artifacts"] = artifact
+    if resources_source is not None:
+        updates["requested_resources"] = _json_object(resources_source)
     if gateway_source is not None:
         updates["gateway"] = _json_object(gateway_source)
     session = ClioCoreQueue(RelaySettings.from_env().core_dir).update_gateway_session(
@@ -1801,6 +1885,15 @@ def _run_remote_or_exit(definition: ClusterDefinition, args: list[str]) -> None:
 
 def _require_cluster(cluster: str) -> ClusterDefinition:
     return ClusterRegistry.load(default_registry_path()).require(cluster)
+
+
+def _require_frp_server_addr(server_addr: str, cluster: str) -> str:
+    if server_addr.strip():
+        return server_addr
+    raise ConfigurationError(
+        f"frp server address is not configured for cluster {cluster}; "
+        "set it with `clio-relay cluster add --frp-server-addr ...`"
+    )
 
 
 def _resolve_env_secret(value: str | None, env_name: str, label: str) -> str:

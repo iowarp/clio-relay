@@ -15,6 +15,7 @@ from fastapi import (
     FastAPI,
     Header,
     HTTPException,
+    Query,
     WebSocket,
     WebSocketDisconnect,
     WebSocketException,
@@ -25,7 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import NotFoundError
+from clio_relay.errors import NotFoundError, QueueConflictError
 from clio_relay.models import (
     ArtifactRef,
     Cursor,
@@ -259,7 +260,11 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         response_model=list[TaskTimelineEvent],
         dependencies=[auth_dependency],
     )
-    def get_task_events(task_id: str, cursor: int = 1, limit: int = 100) -> list[TaskTimelineEvent]:
+    def get_task_events(
+        task_id: str,
+        cursor: Annotated[int, Query(ge=1)] = 1,
+        limit: Annotated[int, Query(ge=1)] = 100,
+    ) -> list[TaskTimelineEvent]:
         try:
             events, _ = queue.drain_task_events(task_id, cursor=cursor, limit=limit)
             return events
@@ -295,8 +300,8 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     @app.get("/tasks/{task_id}/events/sse", dependencies=[auth_dependency])
     def task_events_sse(
         task_id: str,
-        cursor: int = 1,
-        limit: int = 100,
+        cursor: Annotated[int, Query(ge=1)] = 1,
+        limit: Annotated[int, Query(ge=1)] = 100,
         poll_seconds: float = 1.0,
         stop_after_replay: bool = False,
     ) -> StreamingResponse:
@@ -329,7 +334,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     ) -> None:
         """Stream task timeline events over a WebSocket."""
         _require_websocket_token(resolved, websocket)
-        if poll_seconds <= 0:
+        if poll_seconds <= 0 or cursor < 1 or limit < 1:
             raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
         try:
             queue.get_task(task_id)
@@ -526,6 +531,8 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 metadata=request.metadata,
                 **updates,
             )
+        except QueueConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 

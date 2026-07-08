@@ -54,7 +54,7 @@ class FrpTransportConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     protocol: str = "wss"
-    server_addr: str = "frps.jcernuda.com"
+    server_addr: str = ""
     server_port: int = 443
     token_env: str = "CLIO_RELAY_FRP_TOKEN"
     stcp_secret_env: str = "CLIO_RELAY_STCP_SECRET"

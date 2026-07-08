@@ -10,13 +10,21 @@ from typing import Any
 import pytest
 from pytest import MonkeyPatch
 
-from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.errors import RelayError
+from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
+from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.transport_probe import (
     run_frp_direct_http_probe,
     run_frp_http_probe,
     run_ssh_forward_http_probe,
 )
+
+
+def _frp_cluster_definition() -> ClusterDefinition:
+    return ClusterDefinition(
+        name="test-cluster",
+        ssh_host="test-host",
+        frp_transport=FrpTransportConfig(server_addr="relay.example.test"),
+    )
 
 
 def test_frp_http_probe_starts_remote_proxy_and_local_visitor(monkeypatch: MonkeyPatch) -> None:
@@ -36,7 +44,7 @@ def test_frp_http_probe_starts_remote_proxy_and_local_visitor(monkeypatch: Monke
 
     lines = run_frp_http_probe(
         cluster="test-cluster",
-        definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+        definition=_frp_cluster_definition(),
         frpc_bin="frpc",
         token="frp-token",
         secret_key="stcp-secret",
@@ -66,6 +74,18 @@ def test_frp_http_probe_starts_remote_proxy_and_local_visitor(monkeypatch: Monke
     assert 'auth.token = "frp-token"' in remote_script
 
 
+def test_frp_http_probe_requires_configured_relay_host() -> None:
+    with pytest.raises(ConfigurationError, match="frp server address is not configured"):
+        run_frp_http_probe(
+            cluster="test-cluster",
+            definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            frpc_bin="frpc",
+            token="frp-token",
+            secret_key="stcp-secret",
+            local_bind_port=9876,
+        )
+
+
 def test_frp_http_probe_runs_optional_http_check(monkeypatch: MonkeyPatch) -> None:
     def fake_process_factory(command: list[str], **_kwargs: Any) -> FakeProcess:
         return FakeProcess(command)
@@ -77,7 +97,7 @@ def test_frp_http_probe_runs_optional_http_check(monkeypatch: MonkeyPatch) -> No
 
     lines = run_frp_http_probe(
         cluster="test-cluster",
-        definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+        definition=_frp_cluster_definition(),
         frpc_bin="frpc",
         token="frp-token",
         secret_key="stcp-secret",
@@ -109,7 +129,7 @@ def test_frp_http_probe_surfaces_remote_port_conflict(monkeypatch: MonkeyPatch) 
     with pytest.raises(RelayError, match="remote API port is already occupied: 8765"):
         run_frp_http_probe(
             cluster="test-cluster",
-            definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            definition=_frp_cluster_definition(),
             frpc_bin="frpc",
             token="frp-token",
             secret_key="stcp-secret",
@@ -142,7 +162,7 @@ def test_frp_http_probe_rejects_dead_visitor_even_if_local_healthz_passes(
     with pytest.raises(RelayError, match="address already in use"):
         run_frp_http_probe(
             cluster="test-cluster",
-            definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            definition=_frp_cluster_definition(),
             frpc_bin="frpc",
             token="frp-token",
             secret_key="stcp-secret",
@@ -161,7 +181,7 @@ def test_frp_http_probe_rejects_occupied_local_visitor_port() -> None:
     ):
         run_frp_http_probe(
             cluster="test-cluster",
-            definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            definition=_frp_cluster_definition(),
             frpc_bin="frpc",
             token="frp-token",
             secret_key="stcp-secret",
@@ -193,7 +213,7 @@ def test_frp_direct_http_probe_uses_xtcp_proxy_and_visitor(
 
     lines = run_frp_direct_http_probe(
         cluster="test-cluster",
-        definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+        definition=_frp_cluster_definition(),
         frpc_bin="frpc",
         token="frp-token",
         secret_key="xtcp-secret",
@@ -227,7 +247,7 @@ def test_frp_direct_http_probe_rejects_occupied_local_visitor_port() -> None:
     ):
         run_frp_direct_http_probe(
             cluster="test-cluster",
-            definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            definition=_frp_cluster_definition(),
             frpc_bin="frpc",
             token="frp-token",
             secret_key="xtcp-secret",
@@ -260,7 +280,7 @@ def test_frp_direct_http_probe_reports_stcp_fallback_when_xtcp_fails(
 
     lines = run_frp_direct_http_probe(
         cluster="test-cluster",
-        definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+        definition=_frp_cluster_definition(),
         frpc_bin="frpc",
         token="frp-token",
         secret_key="shared-secret",

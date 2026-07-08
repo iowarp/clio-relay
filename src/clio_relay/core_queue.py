@@ -361,6 +361,10 @@ class ClioCoreQueue:
         limit: int = 100,
     ) -> tuple[list[TaskTimelineEvent], int]:
         """Drain structured task timeline events from a task cursor."""
+        if cursor < 1:
+            raise ValueError("task event cursor must be greater than or equal to 1")
+        if limit < 1:
+            raise ValueError("task event limit must be greater than or equal to 1")
         self.initialize()
         self.get_task(task_id)
         events = [
@@ -516,6 +520,11 @@ class ClioCoreQueue:
         self.initialize()
         with self._lock:
             session = self.get_gateway_session(session_id)
+            if session.state == GatewaySessionState.CLOSED:
+                if state is not None and state != GatewaySessionState.CLOSED:
+                    raise QueueConflictError(f"cannot reopen closed gateway session: {session_id}")
+                if updates:
+                    raise QueueConflictError(f"cannot update closed gateway session: {session_id}")
             merged_metadata = dict(session.metadata)
             if metadata:
                 merged_metadata.update(metadata)

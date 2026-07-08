@@ -16,7 +16,7 @@ The durable records are jobs, tasks, leases, events, cursors, artifacts, progres
 
 Tasks can also have structured timeline events. A remote agent can record discovery, planning, warnings, commands, scheduler decisions, and completion as resumable task-scoped records. These events are separate from raw stdout so a UI can show meaningful work before the final answer exists.
 
-Gateway sessions are durable records for scheduler-backed services such as ParaView servers or other cluster-side visual services. A session records the scheduler job, queue state, allocated node, logs, forwarded endpoint metadata, health hints, and close state. This lets the desktop detach, reconnect, or explicitly close the remote service without treating it as an anonymous process.
+Gateway sessions are durable records for scheduler-backed services such as ParaView servers or other cluster-side visual services. A session records the scheduler job, queue state, allocated node, logs, forwarded endpoint metadata, health hints, and close state. This lets the desktop detach, reconnect, and mark the session closed without treating it as an anonymous process. The package or scheduler integration remains responsible for stopping the actual remote service.
 
 ## execution
 

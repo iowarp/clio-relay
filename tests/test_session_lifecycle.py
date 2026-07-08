@@ -50,6 +50,8 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
     assert "clio-relay api start --host 127.0.0.1 --port 9001 --require-token" in script
     assert "api.pid" in script
     assert "metadata.json" in script
+    assert "is_owned_api_pid" in script
+    assert "/proc/{pid}/cmdline" in script
     assert "pkill" not in script
 
 
@@ -112,4 +114,6 @@ def test_teardown_remote_session_kills_owned_pid_and_optional_worker(
     assert "api_stopped=123" in lines
     assert "worker_stopped=clio-relay-worker-ares.service" in lines
     assert 'kill "$api_pid"' in scripts[0]
+    assert "is_owned_api_pid" in scripts[0]
+    assert "api_pid_not_owned" in scripts[0]
     assert "systemctl --user stop clio-relay-worker-ares.service" in scripts[0]

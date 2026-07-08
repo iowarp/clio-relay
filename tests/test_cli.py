@@ -9,7 +9,7 @@ from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
 from clio_relay.cli import app
-from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
+from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, FrpTransportConfig
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.models import (
     ArtifactRef,
@@ -27,10 +27,21 @@ def _default_cli_mode(monkeypatch: MonkeyPatch) -> None:  # pyright: ignore[repo
     monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
 
 
-def _write_test_cluster(root: Path, name: str = "ares") -> None:
-    ClusterRegistry(clusters={name: ClusterDefinition(name=name, ssh_host=name)}).save(
-        root / ".clio-relay" / "clusters.json"
-    )
+def _write_test_cluster(
+    root: Path,
+    name: str = "ares",
+    *,
+    frp_server_addr: str = "relay.example.test",
+) -> None:
+    ClusterRegistry(
+        clusters={
+            name: ClusterDefinition(
+                name=name,
+                ssh_host=name,
+                frp_transport=FrpTransportConfig(server_addr=frp_server_addr),
+            )
+        }
+    ).save(root / ".clio-relay" / "clusters.json")
 
 
 def test_cli_lists_artifacts(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -143,6 +154,14 @@ def test_cli_gateway_session_lifecycle(tmp_path: Path, monkeypatch: MonkeyPatch)
             str(gateway_json),
             "--resources-json-file",
             str(resources_json),
+            "--stdout-uri",
+            "file:///tmp/stdout.log",
+            "--stderr-uri",
+            "file:///tmp/stderr.log",
+            "--log-uri",
+            "file:///tmp/pvserver.log",
+            "--artifact",
+            "artifact://session/startup",
         ],
     )
     assert created.exit_code == 0
@@ -162,6 +181,14 @@ def test_cli_gateway_session_lifecycle(tmp_path: Path, monkeypatch: MonkeyPatch)
             "ares-comp-01",
             "--gateway-json",
             '{"strategy":"ssh_forward","local_port":5900}',
+            "--resources-json",
+            '{"nodes":2}',
+            "--stdout-uri",
+            "file:///tmp/updated-stdout.log",
+            "--log-uri",
+            "file:///tmp/updated.log",
+            "--artifact",
+            "artifact://session/updated",
         ],
     )
     listed = CliRunner().invoke(app, ["gateway", "list", "--cluster", "test-cluster"])
@@ -173,6 +200,13 @@ def test_cli_gateway_session_lifecycle(tmp_path: Path, monkeypatch: MonkeyPatch)
     assert json.loads(updated.output)["state"] == GatewaySessionState.READY.value
     assert json.loads(created.output)["gateway"]["remote_port"] == 11111
     assert json.loads(created.output)["requested_resources"]["exclusive"] is True
+    assert json.loads(created.output)["stdout_uri"] == "file:///tmp/stdout.log"
+    assert json.loads(created.output)["log_uris"] == ["file:///tmp/pvserver.log"]
+    assert json.loads(created.output)["artifacts"] == ["artifact://session/startup"]
+    assert json.loads(updated.output)["requested_resources"] == {"nodes": 2}
+    assert json.loads(updated.output)["stdout_uri"] == "file:///tmp/updated-stdout.log"
+    assert json.loads(updated.output)["log_uris"] == ["file:///tmp/updated.log"]
+    assert json.loads(updated.output)["artifacts"] == ["artifact://session/updated"]
     assert json.loads(listed.output)[0]["session_id"] == session_id
     assert json.loads(closed.output)["state"] == GatewaySessionState.CLOSED.value
 
@@ -579,6 +613,31 @@ def test_cli_transport_reports_missing_configured_secret_env(
     assert "CLIO_RELAY_FRP_TOKEN" in result.output
 
 
+def test_cli_transport_reports_missing_frp_server_addr(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path, frp_server_addr="")
+    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "frp-token")
+    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "secret-key")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "relay-host",
+            "render-frpc-config",
+            "--cluster",
+            "ares",
+            "--local-port",
+            "8848",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "frp server address is not configured" in result.output
+
+
 def test_cli_direct_transport_is_strict_xtcp_by_default(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -700,6 +759,7 @@ def test_cli_cluster_add_persists_direct_transport_optimization(
     assert definition.frp_transport.direct.enabled is True
     assert definition.frp_transport.direct.mode == "xtcp"
     assert definition.frp_transport.direct.fallback_order == ["xtcp", "frp_stcp", "queue"]
+    assert definition.frp_transport.server_addr == ""
 
 
 def test_cli_cluster_add_rejects_direct_transport_without_queue_fallback(
