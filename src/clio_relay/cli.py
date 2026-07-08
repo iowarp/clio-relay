@@ -16,7 +16,11 @@ import uvicorn
 import yaml
 from pydantic import ValidationError
 
-from clio_relay.bootstrap import bootstrap_cluster_over_ssh, install_local_frp
+from clio_relay.bootstrap import (
+    bootstrap_cluster_over_ssh,
+    install_cluster_app_over_ssh,
+    install_local_frp,
+)
 from clio_relay.cluster_config import (
     ClusterDefinition,
     ClusterRegistry,
@@ -631,6 +635,30 @@ def cluster_bootstrap(
                 agent_npm_package=definition.agent_npm_package,
                 agent_npm_bin=definition.agent_npm_bin,
                 agent_args=definition.agent_args,
+            )
+        )
+    )
+
+
+@cluster_app.command("install-app")
+def cluster_install_app(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    app_name: Annotated[
+        str,
+        typer.Option("--app", help="Application runtime to install on the cluster."),
+    ],
+    ssh_host: Annotated[
+        str | None,
+        typer.Option(help="Override SSH host alias for this run."),
+    ] = None,
+) -> None:
+    """Install an explicit application runtime on a configured cluster."""
+    definition = _require_cluster(cluster)
+    _run_or_exit(
+        lambda: _echo_lines(
+            install_cluster_app_over_ssh(
+                ssh_host=ssh_host or definition.ssh_host,
+                app_name=app_name,
             )
         )
     )

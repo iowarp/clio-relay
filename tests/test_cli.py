@@ -798,6 +798,30 @@ def test_cli_cluster_add_rejects_direct_transport_without_queue_fallback(
     assert "fallback_order must end with queue" in result.output
 
 
+def test_cli_cluster_install_app_uses_explicit_app_installer(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path, name="delta")
+    calls: list[tuple[str, str]] = []
+
+    def fake_install_cluster_app_over_ssh(*, ssh_host: str, app_name: str) -> list[str]:
+        calls.append((ssh_host, app_name))
+        return ["lammps_bin=/opt/lammps/bin/lmp"]
+
+    monkeypatch.setattr(cli, "install_cluster_app_over_ssh", fake_install_cluster_app_over_ssh)
+
+    result = CliRunner().invoke(
+        app,
+        ["cluster", "install-app", "--cluster", "delta", "--app", "lammps"],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [("delta", "lammps")]
+    assert "lammps_bin=/opt/lammps/bin/lmp" in result.output
+
+
 def test_cli_mcp_call_preserves_arguments(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     core_dir = tmp_path / "core"
     monkeypatch.chdir(tmp_path)

@@ -11,6 +11,7 @@ from clio_relay import __version__
 from clio_relay.bootstrap import (
     assert_clean_git_checkout,
     create_bootstrap_archive,
+    render_cluster_app_install_script,
     render_linux_user_bootstrap_script,
 )
 from clio_relay.errors import ConfigurationError
@@ -64,6 +65,21 @@ def test_linux_user_bootstrap_script_accepts_explicit_npm_agent() -> None:
     assert 'AGENT_BIN="$HOME/.local/bin/$AGENT_NPM_BIN"' in script
     assert "CLIO_RELAY_AGENT_ADAPTER=codex" in script
     assert "CLIO_RELAY_AGENT_ARGS='--model gpt-5-codex'" in script
+
+
+def test_lammps_install_is_explicit_cluster_app_setup() -> None:
+    script = render_cluster_app_install_script(app_name="lammps")
+
+    assert "github.com/spack/spack.git" in script
+    assert "spack install lammps" in script
+    assert "spack load lammps" in script
+    assert 'cat > "$HOME/.local/bin/lmp"' in script
+    assert 'CLIO_RELAY_LAMMPS_BIN="$LAMMPS_BIN"' in script
+
+
+def test_cluster_app_install_rejects_unknown_app() -> None:
+    with pytest.raises(ConfigurationError, match="unsupported cluster app"):
+        render_cluster_app_install_script(app_name="vasp")
 
 
 def test_bootstrap_runner_decodes_remote_output_as_utf8(

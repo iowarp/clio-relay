@@ -205,6 +205,90 @@ def bootstrap_cluster_over_ssh(
     return result.stdout.splitlines()
 
 
+def install_cluster_app_over_ssh(*, ssh_host: str, app_name: str) -> list[str]:
+    """Install an application-specific runtime on a cluster over SSH."""
+    if shutil.which("ssh") is None:
+        raise ConfigurationError("ssh is required for remote app installation")
+    script = render_cluster_app_install_script(app_name=app_name)
+    result = subprocess.run(
+        ["ssh", ssh_host, "bash", "-s"],
+        input=script,
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RelayError(
+            f"cluster app installation failed on {ssh_host}: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    return result.stdout.splitlines()
+
+
+def render_cluster_app_install_script(*, app_name: str) -> str:
+    """Render an app-specific remote install script."""
+    if app_name != "lammps":
+        raise ConfigurationError(f"unsupported cluster app: {app_name}")
+    return render_lammps_app_install_script()
+
+
+def render_lammps_app_install_script() -> str:
+    """Render the sudo-less LAMMPS installer used by explicit app setup."""
+    return """set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+mkdir -p "$HOME/.local/bin" "$HOME/.local/src" "$HOME/.local/share/clio-relay/apps/lammps"
+
+if [ ! -d "$HOME/spack/.git" ]; then
+  git clone --depth 1 --branch releases/v1.1 https://github.com/spack/spack.git "$HOME/spack"
+fi
+. "$HOME/spack/share/spack/setup-env.sh"
+spack compiler find || true
+if ! spack find -p lammps >/dev/null 2>&1; then
+  spack install lammps
+fi
+LAMMPS_PREFIX="$(spack location -i lammps)"
+if [ -z "$LAMMPS_PREFIX" ] || [ ! -d "$LAMMPS_PREFIX" ]; then
+  echo "failed to locate installed LAMMPS prefix through Spack" >&2
+  exit 1
+fi
+LAMMPS_BIN=""
+for candidate in \
+  "$LAMMPS_PREFIX/bin/lmp" \
+  "$LAMMPS_PREFIX/bin/lmp_mpi" \
+  "$LAMMPS_PREFIX/bin/lammps"; do
+  if [ -x "$candidate" ]; then
+    LAMMPS_BIN="$candidate"
+    break
+  fi
+done
+if [ -z "$LAMMPS_BIN" ]; then
+  echo "LAMMPS installed at $LAMMPS_PREFIX but no lmp/lmp_mpi/lammps binary was found" >&2
+  exit 1
+fi
+
+cat > "$HOME/.local/share/clio-relay/apps/lammps/env.sh" <<__CLIO_RELAY_LAMMPS_ENV__
+export SPACK_ROOT="$HOME/spack"
+. "$HOME/spack/share/spack/setup-env.sh"
+spack load lammps
+export CLIO_RELAY_LAMMPS_BIN="$LAMMPS_BIN"
+__CLIO_RELAY_LAMMPS_ENV__
+
+cat > "$HOME/.local/bin/lmp" <<'__CLIO_RELAY_LAMMPS_ENTRYPOINT__'
+#!/usr/bin/env bash
+set -euo pipefail
+. "$HOME/.local/share/clio-relay/apps/lammps/env.sh"
+exec "$CLIO_RELAY_LAMMPS_BIN" "$@"
+__CLIO_RELAY_LAMMPS_ENTRYPOINT__
+chmod 0755 "$HOME/.local/bin/lmp"
+
+echo "lammps_prefix=$LAMMPS_PREFIX"
+echo "lammps_bin=$LAMMPS_BIN"
+echo "lmp=$HOME/.local/bin/lmp"
+"""
+
+
 def render_linux_user_bootstrap_script(
     *,
     frp_version: str = FRP_VERSION,
