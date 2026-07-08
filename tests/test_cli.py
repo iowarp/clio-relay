@@ -1099,6 +1099,28 @@ def test_cli_remote_gateway_passthrough_uses_cluster_core(
     assert "clio-relay gateway close gateway_remote" in commands[2][2]
 
 
+def test_cli_gateway_update_closed_session_reports_clean_error(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    created = CliRunner().invoke(
+        app,
+        ["gateway", "create", "--cluster", "ares", "--name", "paraview-red-sea"],
+    )
+    assert created.exit_code == 0
+    session_id = json.loads(created.output)["session_id"]
+
+    closed = CliRunner().invoke(app, ["gateway", "close", session_id])
+    updated = CliRunner().invoke(app, ["gateway", "update", session_id, "--state", "ready"])
+
+    assert closed.exit_code == 0
+    assert updated.exit_code == 1
+    assert "error: cannot reopen closed gateway session" in updated.stderr
+    assert "Traceback" not in updated.output
+    assert "Traceback" not in updated.stderr
+
+
 def test_cli_remote_agent_run_preserves_posix_prompt_path(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

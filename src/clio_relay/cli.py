@@ -1405,13 +1405,18 @@ def gateway_update(
         updates["requested_resources"] = _json_object(resources_source)
     if gateway_source is not None:
         updates["gateway"] = _json_object(gateway_source)
-    session = ClioCoreQueue(RelaySettings.from_env().core_dir).update_gateway_session(
-        session_id,
-        state=state,
-        metadata=_json_object(metadata_source),
-        **updates,
+    _run_or_exit(
+        lambda: typer.echo(
+            ClioCoreQueue(RelaySettings.from_env().core_dir)
+            .update_gateway_session(
+                session_id,
+                state=state,
+                metadata=_json_object(metadata_source),
+                **updates,
+            )
+            .model_dump_json(indent=2)
+        )
     )
-    typer.echo(session.model_dump_json(indent=2))
 
 
 @gateway_app.command("close")
@@ -1425,8 +1430,13 @@ def gateway_close(
     """Mark a gateway service session closed."""
     if _try_remote_cluster_passthrough(cluster, ["gateway", "close", session_id]):
         return
-    session = ClioCoreQueue(RelaySettings.from_env().core_dir).close_gateway_session(session_id)
-    typer.echo(session.model_dump_json(indent=2))
+    _run_or_exit(
+        lambda: typer.echo(
+            ClioCoreQueue(RelaySettings.from_env().core_dir)
+            .close_gateway_session(session_id)
+            .model_dump_json(indent=2)
+        )
+    )
 
 
 @monitor_app.command("add-regex")
