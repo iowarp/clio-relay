@@ -16,7 +16,7 @@ The durable records are jobs, tasks, leases, events, cursors, artifacts, progres
 
 Tasks can also have structured timeline events. A remote agent can record discovery, planning, warnings, commands, scheduler decisions, and completion as resumable task-scoped records. These events are separate from raw stdout so a UI can show meaningful work before the final answer exists.
 
-Gateway sessions are durable records for scheduler-backed services such as ParaView servers or other cluster-side visual services. A session records the scheduler job, queue state, allocated node, logs, forwarded endpoint metadata, health hints, and close state. This lets the desktop detach, reconnect, and mark the session closed without treating it as an anonymous process. The package or scheduler integration remains responsible for stopping the actual remote service.
+Gateway sessions are durable records for scheduler-backed services such as interactive visualization servers, data streams, remote MCP servers, or long-running agent services. A session records the scheduler job, queue state, allocated node, logs, forwarded endpoint metadata, health hints, and close state. This lets the desktop detach, reconnect, and mark the session closed without treating it as an anonymous process. The package or scheduler integration remains responsible for stopping the actual remote service.
 
 ## Execution
 
@@ -24,7 +24,7 @@ JARVIS-CD owns cluster execution. A relay job describes the desired work. The wo
 
 Application behavior belongs in JARVIS packages. For example, LAMMPS progress comes from the upstream JARVIS `builtin.lammps` package and the relay-side parser that is enabled only for that package. The generic bounded-command package stays generic.
 
-Interactive visualization services should be launched through scheduler-backed package or pipeline behavior as well. The relay records the gateway session and transport metadata, while the package or operator script owns how the service starts on the allocated node.
+Interactive services should be launched through scheduler-backed package or pipeline behavior as well. The relay records the gateway session and transport metadata, while the package owns how the service starts on the allocated node, how stdout and stderr are interpreted, and which structured progress or runtime events are reported.
 
 ## Transport
 

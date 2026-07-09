@@ -133,7 +133,7 @@ def test_cli_records_and_reads_task_events(tmp_path: Path, monkeypatch: MonkeyPa
             "--status",
             "succeeded",
             "--path-ref",
-            "/mnt/common/datasets/red_sea_001",
+            "/mnt/common/datasets/example_001",
         ],
     )
     read = CliRunner().invoke(app, ["job", "task-events", task.task_id])
@@ -142,7 +142,7 @@ def test_cli_records_and_reads_task_events(tmp_path: Path, monkeypatch: MonkeyPa
     assert read.exit_code == 0
     payload = json.loads(read.output)
     assert payload["events"][0]["event_type"] == "dataset_found"
-    assert payload["events"][0]["path_refs"] == ["/mnt/common/datasets/red_sea_001"]
+    assert payload["events"][0]["path_refs"] == ["/mnt/common/datasets/example_001"]
 
 
 def test_cli_gateway_session_lifecycle(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -161,7 +161,7 @@ def test_cli_gateway_session_lifecycle(tmp_path: Path, monkeypatch: MonkeyPatch)
             "--cluster",
             "test-cluster",
             "--name",
-            "paraview-red-sea",
+            "live-service-example",
             "--gateway-json-file",
             str(gateway_json),
             "--resources-json-file",
@@ -171,7 +171,7 @@ def test_cli_gateway_session_lifecycle(tmp_path: Path, monkeypatch: MonkeyPatch)
             "--stderr-uri",
             "file:///tmp/stderr.log",
             "--log-uri",
-            "file:///tmp/pvserver.log",
+            "file:///tmp/service.log",
             "--artifact",
             "artifact://session/startup",
         ],
@@ -213,7 +213,7 @@ def test_cli_gateway_session_lifecycle(tmp_path: Path, monkeypatch: MonkeyPatch)
     assert json.loads(created.output)["gateway"]["remote_port"] == 11111
     assert json.loads(created.output)["requested_resources"]["exclusive"] is True
     assert json.loads(created.output)["stdout_uri"] == "file:///tmp/stdout.log"
-    assert json.loads(created.output)["log_uris"] == ["file:///tmp/pvserver.log"]
+    assert json.loads(created.output)["log_uris"] == ["file:///tmp/service.log"]
     assert json.loads(created.output)["artifacts"] == ["artifact://session/startup"]
     assert json.loads(updated.output)["requested_resources"] == {"nodes": 2}
     assert json.loads(updated.output)["stdout_uri"] == "file:///tmp/updated-stdout.log"
@@ -1192,7 +1192,7 @@ def test_cli_remote_task_event_passthrough_uses_cluster_core(
             "--status",
             "succeeded",
             "--path-ref",
-            "/mnt/common/datasets/red_sea_001",
+            "/mnt/common/datasets/example_001",
             "--metadata-json-file",
             str(metadata_json),
         ],
@@ -1203,7 +1203,7 @@ def test_cli_remote_task_event_passthrough_uses_cluster_core(
     assert len(commands) == 1
     assert "CLIO_RELAY_CLI_MODE=local" in commands[0][2]
     assert "clio-relay job record-task-event task_remote" in commands[0][2]
-    assert "--path-ref /mnt/common/datasets/red_sea_001" in commands[0][2]
+    assert "--path-ref /mnt/common/datasets/example_001" in commands[0][2]
     assert "cli-file" in commands[0][2]
 
 
@@ -1239,7 +1239,7 @@ def test_cli_remote_gateway_passthrough_uses_cluster_core(
             "--cluster",
             "ares",
             "--name",
-            "paraview-red-sea",
+            "live-service-example",
             "--gateway-json-file",
             str(gateway_json),
         ],
@@ -1281,7 +1281,7 @@ def test_cli_gateway_update_closed_session_reports_clean_error(
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
     created = CliRunner().invoke(
         app,
-        ["gateway", "create", "--cluster", "ares", "--name", "paraview-red-sea"],
+        ["gateway", "create", "--cluster", "ares", "--name", "live-service-example"],
     )
     assert created.exit_code == 0
     session_id = json.loads(created.output)["session_id"]

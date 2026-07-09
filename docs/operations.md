@@ -35,24 +35,97 @@ Agents should submit child cluster work asynchronously and return the child `job
 Agents can also record structured task timeline events:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay job record-task-event <task-id> --cluster my-cluster --event-type dataset_found --label dataset --summary "found staged dataset" --path-ref /mnt/common/datasets/red_sea_001
+uvx --python 3.12 --from clio-relay clio-relay job record-task-event <task-id> --cluster my-cluster --event-type dataset_found --label dataset --summary "found staged dataset" --path-ref /mnt/common/datasets/example_001
 uvx --python 3.12 --from clio-relay clio-relay job task-events <task-id> --cluster my-cluster --cursor 1
 ```
 
 Use timeline events for UI-visible agent work such as repository scans, dataset discovery, generated scripts, planned commands, scheduler submissions, warnings, and completion. Use normal job logs for stdout and stderr.
 
-## Manage Visualization Gateways
+## Manage Streaming Service Runtimes
 
-Use gateway sessions for scheduler-backed services that need to survive long enough for a desktop to connect, such as ParaView or another cluster-side visualizer.
+Use gateway sessions for scheduler-backed services that need to survive long enough for a desktop to connect, such as a visualization service, Jupyter-like service, remote MCP server, or long-running agent service.
+
+For a managed runtime, describe the application generically with `ServiceRuntimeSpec`. In production, `submit_command` should invoke a JARVIS package or pipeline. That package owns the application launch, scheduler script, readiness behavior, logs, provenance, and any application-specific stream protocol. The relay waits for the allocated node and service health, starts the cluster-side frp connector, starts the desktop visitor, records both owned PIDs/configs/logs, and returns desktop-local URLs.
+
+```json
+{
+  "kind": "streaming-http-service",
+  "deployment_driver": "jarvis",
+  "submit_command": [
+    "jarvis",
+    "run",
+    "/remote/service-runtime.yaml",
+    "--set",
+    "RELAY_APPLICATION_PORT=18777"
+  ],
+  "status_command": [
+    "jarvis",
+    "runtime",
+    "status",
+    "{scheduler_job_id}"
+  ],
+  "cancel_command": [
+    "jarvis",
+    "runtime",
+    "cancel",
+    "{scheduler_job_id}"
+  ],
+  "service_port": 18777,
+  "health_path": "/healthz",
+  "stream_mode": "push",
+  "stream_path": "/live-data",
+  "event_stream_path": "/events",
+  "state_path": "/state",
+  "compatibility_paths": {
+    "snapshot": "/debug/snapshot"
+  },
+  "desktop_bind_addr": "127.0.0.1",
+  "desktop_bind_port": 28777,
+  "proxy_name": "my-service-session",
+  "transport_mode": "frp-stcp-wss",
+  "readiness_timeout_seconds": 900,
+  "poll_seconds": 5,
+  "scheduler": "external",
+  "connect_url_template": "http://{bind_addr}:{bind_port}"
+}
+```
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay gateway create --cluster my-cluster --name paraview-red-sea --gateway-json-file .\gateway.json
+uvx --python 3.12 --from clio-relay clio-relay gateway start-runtime --cluster my-cluster --name my-live-service --runtime-json-file .\runtime.json
+uvx --python 3.12 --from clio-relay clio-relay gateway get <session-id>
+uvx --python 3.12 --from clio-relay clio-relay gateway stop-runtime <session-id> --cluster my-cluster --keep-scheduler-job
+```
+
+Use `transport_mode: "frp-stcp-wss"` for the relay path and `transport_mode: "frp-xtcp-wss"` for direct NAT-bypass attempts. The application stream still flows through the relay/bypass transport to the desktop-local bind port, not through an SSH port forward.
+
+The default service contract is push-based. A desktop client subscribes once to `stream_url`, and the remote application pushes data, images, frames, or domain records as they are emitted. The relay does not assume any application-specific endpoint shape. Pull-style endpoints are represented only as named `compatibility_paths`, such as `snapshot`, `render_once`, or `state_dump`.
+
+The JARVIS package must emit structured JSON records for the runtime supervisor. The submit command must eventually print a JSON object with `scheduler_job_id` and may include `service_host` when allocation is already known:
+
+```json
+{"scheduler_job_id":"12345","service_host":"compute-01"}
+```
+
+If `service_host` is not known at submission time, provide `status_command`. The status command must print JSON such as:
+
+```json
+{"state":"allocated","service_host":"compute-01","reason":null,"events":[{"type":"progress","source":"jarvis_package","package":"example_stream","message":"runtime allocated"}]}
+```
+
+The JARVIS package is the source of application monitoring. It can watch stdout, stderr, scheduler logs, readiness files, or application-specific control channels, then report generic structured events through its status output or through the service's push stream. Scheduler-specific and application-specific parsing belongs in the JARVIS package or scheduler adapter. The service runtime supervisor does not parse scheduler command output, scheduler environment variables, or application logs.
+
+`stop-runtime` stops owned relay connector processes. It keeps the scheduler job by default; pass `--cancel-scheduler-job` only when the user explicitly wants to stop the remote application.
+
+Manual gateway record updates are still available for package integrations and external supervisors:
+
+```powershell
+uvx --python 3.12 --from clio-relay clio-relay gateway create --cluster my-cluster --name live-service-example --gateway-json-file .\gateway.json
 uvx --python 3.12 --from clio-relay clio-relay gateway update <session-id> --cluster my-cluster --state ready --scheduler-job-id 12345 --node compute-01 --gateway-json-file .\gateway-ready.json
 uvx --python 3.12 --from clio-relay clio-relay gateway get <session-id> --cluster my-cluster
 uvx --python 3.12 --from clio-relay clio-relay gateway close <session-id> --cluster my-cluster
 ```
 
-`close` marks the durable session closed. The scheduler or package path should still clean up the actual service process or scheduler job it owns.
+`close` only marks the durable record closed. Use `stop-runtime` when clio-relay owns the connector lifecycle.
 
 ## Use FRP Transport
 

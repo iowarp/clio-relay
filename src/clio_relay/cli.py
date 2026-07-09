@@ -56,6 +56,7 @@ from clio_relay.models import (
     ProgressRecord,
     RelayJob,
     RemoteAgentTaskSpec,
+    ServiceRuntimeSpec,
     TaskEventStatus,
     TaskTimelineEvent,
 )
@@ -88,6 +89,7 @@ from clio_relay.remote_cli import (
     stage_jarvis_yaml,
     write_remote_file,
 )
+from clio_relay.service_runtime import ServiceRuntimeSupervisor
 from clio_relay.session_lifecycle import (
     start_remote_session,
     status_remote_session,
@@ -1505,6 +1507,85 @@ def gateway_close(
             .model_dump_json(indent=2)
         )
     )
+
+
+@gateway_app.command("start-runtime")
+def gateway_start_runtime(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    name: Annotated[str, typer.Option(help="Human-readable runtime session name.")],
+    runtime_json_file: Annotated[
+        Path,
+        typer.Option(help="Path to a generic ServiceRuntimeSpec JSON document."),
+    ],
+    token: Annotated[
+        str | None,
+        typer.Option(help="frp authentication token. Defaults to cluster token_env."),
+    ] = None,
+    secret_key: Annotated[
+        str | None,
+        typer.Option(help="stcp shared secret. Defaults to cluster stcp_secret_env."),
+    ] = None,
+) -> None:
+    """Start and bind a scheduler-backed streaming service runtime."""
+
+    def action() -> None:
+        definition = _require_cluster(cluster)
+        if not runtime_json_file.exists():
+            raise ConfigurationError(f"runtime spec does not exist: {runtime_json_file}")
+        spec = ServiceRuntimeSpec.model_validate_json(
+            runtime_json_file.read_text(encoding="utf-8-sig")
+        )
+        settings = RelaySettings.from_env()
+        supervisor = ServiceRuntimeSupervisor(
+            settings=settings,
+            queue=ClioCoreQueue(settings.core_dir),
+            cluster=cluster,
+            definition=definition,
+            token=_resolve_env_secret(token, definition.frp_transport.token_env, "frp token"),
+            secret_key=_resolve_env_secret(
+                secret_key,
+                definition.frp_transport.stcp_secret_env,
+                "stcp secret",
+            ),
+        )
+        result = supervisor.start(name=name, spec=spec)
+        typer.echo(result.session.model_dump_json(indent=2))
+
+    _run_or_exit(action)
+
+
+@gateway_app.command("stop-runtime")
+def gateway_stop_runtime(
+    session_id: str,
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    cancel_scheduler_job: Annotated[
+        bool,
+        typer.Option(
+            "--cancel-scheduler-job/--keep-scheduler-job",
+            help="Cancel the scheduler job after closing relay connectors.",
+        ),
+    ] = False,
+) -> None:
+    """Stop owned runtime relay connectors and optionally cancel scheduler work."""
+
+    def action() -> None:
+        definition = _require_cluster(cluster)
+        settings = RelaySettings.from_env()
+        supervisor = ServiceRuntimeSupervisor(
+            settings=settings,
+            queue=ClioCoreQueue(settings.core_dir),
+            cluster=cluster,
+            definition=definition,
+            token="",
+            secret_key="",
+        )
+        result = supervisor.stop(
+            session_id=session_id,
+            cancel_scheduler_job=cancel_scheduler_job,
+        )
+        typer.echo(result.session.model_dump_json(indent=2))
+
+    _run_or_exit(action)
 
 
 @monitor_app.command("add-regex")

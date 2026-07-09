@@ -73,7 +73,7 @@ def test_task_timeline_events_are_durable_and_resumable(tmp_path: Path) -> None:
             label="dataset",
             status=TaskEventStatus.SUCCEEDED,
             summary="Found staged dataset",
-            path_refs=["/mnt/common/datasets/red_sea_001"],
+            path_refs=["/mnt/common/datasets/example_001"],
         )
     )
     second = queue.append_task_event(
@@ -81,7 +81,7 @@ def test_task_timeline_events_are_durable_and_resumable(tmp_path: Path) -> None:
             task_id=task.task_id,
             event_type="script_found",
             label="script",
-            summary="Found ParaView launch script",
+            summary="Found service launch descriptor",
             path_refs=["scripts/red_sea.py"],
         )
     )
@@ -124,7 +124,7 @@ def test_gateway_sessions_are_durable_and_updateable(tmp_path: Path) -> None:
     session = queue.create_gateway_session(
         GatewaySession(
             cluster="test-cluster",
-            name="paraview-red-sea",
+            name="live-service-example",
             requested_resources={"nodes": 1, "exclusive": True},
             gateway={"strategy": "ssh_forward", "remote_port": 11111},
         )
@@ -136,7 +136,7 @@ def test_gateway_sessions_are_durable_and_updateable(tmp_path: Path) -> None:
         scheduler_job_id="12345",
         node="ares-comp-01",
         gateway={"strategy": "ssh_forward", "remote_port": 11111, "local_port": 5900},
-        metadata={"dataset": "red_sea_001"},
+        metadata={"dataset": "example_001"},
     )
     listed = ClioCoreQueue(tmp_path).list_gateway_sessions(cluster="test-cluster")
     closed = queue.close_gateway_session(session.session_id)
@@ -145,14 +145,14 @@ def test_gateway_sessions_are_durable_and_updateable(tmp_path: Path) -> None:
     assert updated.state == GatewaySessionState.READY
     assert updated.scheduler_job_id == "12345"
     assert updated.gateway["local_port"] == 5900
-    assert updated.metadata["dataset"] == "red_sea_001"
+    assert updated.metadata["dataset"] == "example_001"
     assert closed.state == GatewaySessionState.CLOSED
 
 
 def test_closed_gateway_session_cannot_be_reopened_or_updated(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path)
     session = queue.create_gateway_session(
-        GatewaySession(cluster="test-cluster", name="paraview-red-sea")
+        GatewaySession(cluster="test-cluster", name="live-service-example")
     )
     queue.close_gateway_session(session.session_id)
 

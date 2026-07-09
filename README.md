@@ -69,7 +69,7 @@ Remote agents can emit structured task timeline events while they work. This is 
 
 ```powershell
 uvx --python 3.12 --from clio-relay clio-relay job tasks <job-id> --cluster my-cluster
-uvx --python 3.12 --from clio-relay clio-relay job record-task-event <task-id> --cluster my-cluster --event-type dataset_found --label dataset --summary "found staged dataset" --path-ref /mnt/common/datasets/red_sea_001
+uvx --python 3.12 --from clio-relay clio-relay job record-task-event <task-id> --cluster my-cluster --event-type dataset_found --label dataset --summary "found staged dataset" --path-ref /mnt/common/datasets/example_001
 uvx --python 3.12 --from clio-relay clio-relay job task-events <task-id> --cluster my-cluster --cursor 1
 ```
 
@@ -77,10 +77,10 @@ The same contract is available over HTTP at `/tasks/{task_id}/events`, `/tasks/{
 
 ## Manage Gateway Sessions
 
-Long-running visualization services should be tracked as durable gateway sessions. A session records the scheduler job, node, logs, published or forwarded endpoint, health metadata, and reconnect hints.
+Long-running remote services should be tracked as durable gateway sessions. A session records the scheduler job, node, logs, published or forwarded endpoint, health metadata, and reconnect hints. Production service runtimes should be launched by a JARVIS package or pipeline, which owns application-specific monitoring and emits structured status/events back to the relay.
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay gateway create --cluster my-cluster --name paraview-red-sea --gateway-json-file .\gateway.json
+uvx --python 3.12 --from clio-relay clio-relay gateway create --cluster my-cluster --name live-service-example --gateway-json-file .\gateway.json
 uvx --python 3.12 --from clio-relay clio-relay gateway update <session-id> --cluster my-cluster --state ready --scheduler-job-id 12345 --node compute-01 --gateway-json-file .\gateway-ready.json
 uvx --python 3.12 --from clio-relay clio-relay gateway get <session-id> --cluster my-cluster
 uvx --python 3.12 --from clio-relay clio-relay gateway close <session-id> --cluster my-cluster

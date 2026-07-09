@@ -308,8 +308,8 @@ def test_http_task_timeline_events_are_replayable(tmp_path: Path) -> None:
             "label": "dataset",
             "status": "succeeded",
             "summary": "Found staged dataset",
-            "path_refs": ["/mnt/common/datasets/red_sea_001"],
-            "metadata": {"dataset": "red_sea_001"},
+            "path_refs": ["/mnt/common/datasets/example_001"],
+            "metadata": {"dataset": "example_001"},
         },
     )
     replay = client.get(f"/tasks/{task.task_id}/events", params={"cursor": 1})
@@ -318,7 +318,7 @@ def test_http_task_timeline_events_are_replayable(tmp_path: Path) -> None:
     assert replay.status_code == 200
     assert created.json()["seq"] == 1
     assert replay.json()[0]["event_type"] == "dataset_found"
-    assert replay.json()[0]["metadata"]["dataset"] == "red_sea_001"
+    assert replay.json()[0]["metadata"]["dataset"] == "example_001"
 
 
 def test_http_task_timeline_sse_replays_existing_events(tmp_path: Path) -> None:
@@ -382,7 +382,7 @@ def test_http_gateway_session_lifecycle(tmp_path: Path) -> None:
         "/gateway-sessions",
         json={
             "cluster": "test-cluster",
-            "name": "paraview-red-sea",
+            "name": "live-service-example",
             "requested_resources": {"nodes": 1, "exclusive": True},
             "gateway": {"strategy": "ssh_forward", "remote_port": 11111},
         },
@@ -395,7 +395,7 @@ def test_http_gateway_session_lifecycle(tmp_path: Path) -> None:
             "scheduler_job_id": "12345",
             "node": "ares-comp-01",
             "gateway": {"strategy": "ssh_forward", "local_port": 5900},
-            "metadata": {"dataset": "red_sea_001"},
+            "metadata": {"dataset": "example_001"},
         },
     )
     listed = client.get("/gateway-sessions", params={"cluster": "test-cluster"})

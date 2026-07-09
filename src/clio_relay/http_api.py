@@ -134,7 +134,7 @@ class GatewaySessionCreateRequest(BaseModel):
     cluster: str
     name: str
     state: GatewaySessionState = GatewaySessionState.CREATED
-    scheduler: str = "slurm"
+    scheduler: str = "external"
     scheduler_job_id: str | None = None
     queue_state: str | None = None
     node: str | None = None

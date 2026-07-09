@@ -57,6 +57,13 @@ def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
     assert "relay_get_gateway_session" in tool_names
     assert "relay_update_gateway_session" in tool_names
     assert "relay_close_gateway_session" in tool_names
+    create_gateway_tool = next(
+        tool
+        for tool in response["result"]["tools"]
+        if tool["name"] == "relay_create_gateway_session"
+    )
+    state_enum = create_gateway_tool["inputSchema"]["properties"]["state"]["enum"]
+    assert "allocated" in state_enum
 
 
 def test_mcp_submit_jarvis_pipeline_creates_real_job(tmp_path: Path) -> None:
@@ -150,7 +157,7 @@ def test_mcp_records_and_watches_task_events(tmp_path: Path) -> None:
                     "label": "dataset",
                     "status": "succeeded",
                     "summary": "Found staged dataset",
-                    "path_refs": ["/mnt/common/datasets/red_sea_001"],
+                    "path_refs": ["/mnt/common/datasets/example_001"],
                 },
             },
         },
@@ -190,7 +197,7 @@ def test_mcp_gateway_session_lifecycle(tmp_path: Path) -> None:
                 "name": "relay_create_gateway_session",
                 "arguments": {
                     "cluster": "test-cluster",
-                    "name": "paraview-red-sea",
+                    "name": "live-service-example",
                     "gateway": {"strategy": "ssh_forward", "remote_port": 11111},
                 },
             },
