@@ -950,6 +950,7 @@ def job_watch(
     limit: Annotated[int, typer.Option(help="Maximum events to read.")] = 100,
 ) -> None:
     """Read job events from a cursor."""
+    cursor = _job_event_cursor(cursor)
     if _try_remote_cluster_passthrough(
         cluster,
         ["job", "watch", job_id, "--cursor", str(cursor), "--limit", str(limit)],
@@ -973,6 +974,7 @@ def job_monitor(
     limit: Annotated[int, typer.Option(help="Maximum events to read.")] = 100,
 ) -> None:
     """Read job state and event stream data from a cursor as JSON."""
+    cursor = _job_event_cursor(cursor)
     if _try_remote_cluster_passthrough(
         cluster,
         ["job", "monitor", job_id, "--cursor", str(cursor), "--limit", str(limit)],
@@ -2378,6 +2380,13 @@ def _cancel_active_cluster_jobs(queue: ClioCoreQueue, cluster: str) -> list[str]
 def _echo_lines(lines: list[str]) -> None:
     for line in lines:
         typer.echo(_console_safe_text(line))
+
+
+def _job_event_cursor(cursor: int) -> int:
+    """Normalize CLI event cursors while preserving the durable cursor contract."""
+    if cursor < 0:
+        raise typer.BadParameter("cursor must be greater than or equal to 0")
+    return 1 if cursor == 0 else cursor
 
 
 def _console_safe_text(value: str) -> str:

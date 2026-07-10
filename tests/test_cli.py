@@ -147,6 +147,47 @@ def test_cli_records_and_reads_task_events(tmp_path: Path, monkeypatch: MonkeyPa
     assert payload["events"][0]["path_refs"] == ["/mnt/common/datasets/example_001"]
 
 
+def test_cli_job_watch_accepts_zero_cursor(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="cli-watch-zero-cursor",
+        )
+    )
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+
+    result = CliRunner().invoke(app, ["job", "watch", job.job_id, "--cursor", "0"])
+
+    assert result.exit_code == 0
+    assert "job.queued" in result.output
+    assert "next_cursor=2" in result.output
+
+
+def test_cli_job_monitor_accepts_zero_cursor(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="cli-monitor-zero-cursor",
+        )
+    )
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+
+    result = CliRunner().invoke(app, ["job", "monitor", job.job_id, "--cursor", "0"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["events"][0]["event_type"] == "job.queued"
+    assert payload["next_cursor"] == 2
+
+
 def test_cli_gateway_session_lifecycle(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     core_dir = tmp_path / "core"
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
