@@ -15,14 +15,16 @@ from typing import Any
 def run_mcp_call_from_params(params: dict[str, Any]) -> int:
     """Run a single MCP tools/call request and write mcp-result.json."""
     server = _required_str(params, "server")
+    server_args = _str_list(params.get("server_args", []), key="server_args")
     tool = _required_str(params, "tool")
     arguments = _object(params.get("arguments", {}))
     timeout = _optional_int(params.get("timeout_seconds"))
     started_at = time.time()
     result_path = Path.cwd() / "mcp-result.json"
     try:
+        command = [server, *server_args]
         process = _run_process(
-            [server],
+            command,
             input=_render_session_input(tool=tool, arguments=arguments),
             timeout=timeout,
         )
@@ -33,7 +35,7 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
             returncode = 1
     except subprocess.TimeoutExpired as exc:
         process = subprocess.CompletedProcess(
-            args=[server],
+            args=[server, *server_args],
             returncode=124,
             stdout=exc.stdout or "",
             stderr=exc.stderr or "",
@@ -44,6 +46,7 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
     _write_mcp_result(
         result_path=result_path,
         server=server,
+        server_args=server_args,
         tool=tool,
         arguments=arguments,
         returncode=returncode,
@@ -109,6 +112,7 @@ def _write_mcp_result(
     *,
     result_path: Path,
     server: str,
+    server_args: list[str],
     tool: str,
     arguments: dict[str, Any],
     returncode: int,
@@ -123,6 +127,7 @@ def _write_mcp_result(
         json.dumps(
             {
                 "server": server,
+                "server_args": server_args,
                 "tool": tool,
                 "arguments": arguments,
                 "returncode": returncode,
@@ -212,6 +217,12 @@ def _required_str(params: dict[str, Any], key: str) -> str:
 def _object(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("arguments must be an object")
+    return value
+
+
+def _str_list(value: Any, *, key: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{key} must be a string array")
     return value
 
 

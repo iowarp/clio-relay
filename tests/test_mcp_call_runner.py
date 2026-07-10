@@ -68,6 +68,47 @@ def test_mcp_call_runner_initializes_before_tool_call(
     assert result["protocol_error"] is None
 
 
+def test_mcp_call_runner_supports_server_arguments(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(
+        command: list[str],
+        *,
+        input: str,
+        timeout: int | None,
+    ) -> subprocess.CompletedProcess[str]:
+        del input, timeout
+        captured["command"] = command
+        stdout = "\n".join(
+            [
+                json.dumps({"jsonrpc": "2.0", "id": "clio-relay-mcp-init", "result": {}}),
+                json.dumps({"jsonrpc": "2.0", "id": "clio-relay-mcp-call", "result": {}}),
+            ]
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(cast(Any, runner), "_run_process", fake_run)
+
+    return_code = cast(McpCallRunnerModule, runner).run_mcp_call_from_params(
+        {
+            "server": "uvx",
+            "server_args": ["clio-kit", "mcp-server", "jarvis", "--profile", "user"],
+            "tool": "jm_list_repos",
+        }
+    )
+    result = json.loads((tmp_path / "mcp-result.json").read_text(encoding="utf-8"))
+
+    assert return_code == 0
+    assert captured["command"] == ["uvx", "clio-kit", "mcp-server", "jarvis", "--profile", "user"]
+    assert result["server"] == "uvx"
+    assert result["server_args"] == ["clio-kit", "mcp-server", "jarvis", "--profile", "user"]
+
+
 def test_mcp_call_runner_records_protocol_errors(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

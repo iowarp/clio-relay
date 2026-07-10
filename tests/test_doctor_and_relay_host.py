@@ -200,3 +200,22 @@ def test_endpoint_user_service_uses_cluster_executable_overrides() -> None:
     assert 'Environment="CLIO_RELAY_JARVIS_BIN=/opt/jarvis/current"' in rendered
     assert 'Environment="CLIO_RELAY_FRPC_BIN=/opt/frp/frpc"' in rendered
     assert 'Environment="CLIO_RELAY_AGENT_BIN=/opt/agents/clio"' in rendered
+
+
+def test_endpoint_user_service_passes_optional_jarvis_mcp_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "CLIO_RELAY_JARVIS_MCP_COMMAND",
+        '["uvx","--from","git+https://github.com/iowarp/clio-kit.git@branch","clio-kit"]',
+    )
+
+    rendered = render_endpoint_user_service(
+        cluster="test-cluster",
+        definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+    )
+
+    assert (
+        'Environment="CLIO_RELAY_JARVIS_MCP_COMMAND=[\\"uvx\\",\\"--from\\",'
+        '\\"git+https://github.com/iowarp/clio-kit.git@branch\\",\\"clio-kit\\"]"'
+    ) in rendered

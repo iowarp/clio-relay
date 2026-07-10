@@ -40,6 +40,7 @@ from clio_relay.doctor import run_cluster_doctor, run_doctor
 from clio_relay.endpoint import EndpointWorker
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.frp_check import run_frpc_connection_check
+from clio_relay.jarvis_mcp import jarvis_mcp_server, jarvis_mcp_server_args
 from clio_relay.live_acceptance import LiveAcceptanceOptions, run_live_acceptance
 from clio_relay.mcp_server import render_agent_mcp_profile, serve_stdio
 from clio_relay.models import (
@@ -895,6 +896,43 @@ def job_submit(
         cluster=cluster,
         kind=JobKind.JARVIS,
         spec=JarvisRunSpec(pipeline_yaml=yaml_text),
+        idempotency_key=key,
+    )
+    saved = ClioCoreQueue(RelaySettings.from_env().core_dir).submit_job(job)
+    typer.echo(saved.job_id)
+
+
+@job_app.command("submit-pipeline")
+def job_submit_pipeline(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    pipeline_name: Annotated[str, typer.Option(help="Existing JARVIS pipeline name.")],
+    idempotency_key: Annotated[
+        str | None,
+        typer.Option(help="Submit/retry idempotency key."),
+    ] = None,
+) -> None:
+    """Submit an existing JARVIS pipeline by name on the target cluster."""
+    definition = _require_cluster(cluster)
+    key = idempotency_key or f"jarvis-pipeline:{cluster}:{pipeline_name}"
+    if should_execute_on_cluster(definition):
+        _run_remote_or_exit(
+            definition,
+            [
+                "job",
+                "submit-pipeline",
+                "--cluster",
+                cluster,
+                "--pipeline-name",
+                pipeline_name,
+                "--idempotency-key",
+                key,
+            ],
+        )
+        return
+    job = RelayJob(
+        cluster=cluster,
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(pipeline_name=pipeline_name),
         idempotency_key=key,
     )
     saved = ClioCoreQueue(RelaySettings.from_env().core_dir).submit_job(job)
@@ -1880,6 +1918,10 @@ def mcp_call(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     server: Annotated[str, typer.Option(help="Remote MCP server name.")],
     tool: Annotated[str, typer.Option(help="Remote MCP tool name.")],
+    server_arg: Annotated[
+        list[str] | None,
+        typer.Option(help="Additional remote MCP server argument. Repeatable."),
+    ] = None,
     arguments_json: Annotated[
         str,
         typer.Option(help="JSON object arguments for the remote MCP tool."),
@@ -1891,6 +1933,10 @@ def mcp_call(
     idempotency_key: Annotated[
         str | None,
         typer.Option(help="Submit/retry idempotency key."),
+    ] = None,
+    timeout_seconds: Annotated[
+        int | None,
+        typer.Option(help="Optional timeout for the remote MCP call."),
     ] = None,
 ) -> None:
     """Submit a remote MCP tool call."""
@@ -1905,7 +1951,11 @@ def mcp_call(
     digest = hashlib.sha256(
         json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-    key = idempotency_key or f"mcp:{cluster}:{server}:{tool}:{digest}"
+    server_args = server_arg or []
+    server_digest = hashlib.sha256(
+        json.dumps([server, *server_args], separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    key = idempotency_key or f"mcp:{cluster}:{server_digest}:{tool}:{digest}"
     if should_execute_on_cluster(definition):
         remote_args = (
             f".local/share/clio-relay/desktop-submissions/mcp-{digest[:16]}/arguments.json"
@@ -1929,13 +1979,101 @@ def mcp_call(
                 remote_args,
                 "--idempotency-key",
                 key,
-            ],
+            ]
+            + (["--timeout-seconds", str(timeout_seconds)] if timeout_seconds is not None else [])
+            + [item for value in server_args for item in ("--server-arg", value)],
         )
         return
     job = RelayJob(
         cluster=cluster,
         kind=JobKind.MCP_CALL,
-        spec=McpCallSpec(server=server, tool=tool, arguments=arguments),
+        spec=McpCallSpec(
+            server=server,
+            server_args=server_args,
+            tool=tool,
+            arguments=arguments,
+            timeout_seconds=timeout_seconds,
+        ),
+        idempotency_key=key,
+    )
+    saved = ClioCoreQueue(RelaySettings.from_env().core_dir).submit_job(job)
+    typer.echo(saved.job_id)
+
+
+@app.command("jarvis-mcp-call")
+def jarvis_mcp_call(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    tool: Annotated[str, typer.Option(help="JARVIS MCP tool name.")],
+    arguments_json: Annotated[
+        str,
+        typer.Option(help="JSON object arguments for the JARVIS MCP tool."),
+    ] = "{}",
+    arguments_json_file: Annotated[
+        Path | None,
+        typer.Option(help="Path to a JSON object argument file for the JARVIS MCP tool."),
+    ] = None,
+    idempotency_key: Annotated[
+        str | None,
+        typer.Option(help="Submit/retry idempotency key."),
+    ] = None,
+    timeout_seconds: Annotated[
+        int | None,
+        typer.Option(help="Optional timeout for the remote JARVIS MCP call."),
+    ] = None,
+) -> None:
+    """Submit a JARVIS MCP tool call that runs on the target cluster."""
+    definition = _require_cluster(cluster)
+    if arguments_json_file is not None and arguments_json != "{}":
+        raise typer.BadParameter("use either --arguments-json or --arguments-json-file, not both")
+    arguments = _json_object(
+        arguments_json_file.read_text(encoding="utf-8-sig")
+        if arguments_json_file is not None
+        else arguments_json
+    )
+    digest = hashlib.sha256(
+        json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    key = idempotency_key or f"mcp:{cluster}:jarvis:{tool}:{digest}"
+    server = jarvis_mcp_server()
+    server_args = jarvis_mcp_server_args()
+    if should_execute_on_cluster(definition):
+        remote_args = (
+            f".local/share/clio-relay/desktop-submissions/jarvis-mcp-{digest[:16]}/arguments.json"
+        )
+        write_remote_file(
+            definition,
+            remote_args,
+            json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        )
+        _run_remote_or_exit(
+            definition,
+            [
+                "mcp-call",
+                "--cluster",
+                cluster,
+                "--server",
+                server,
+                "--tool",
+                tool,
+                "--arguments-json-file",
+                remote_args,
+                "--idempotency-key",
+                key,
+            ]
+            + (["--timeout-seconds", str(timeout_seconds)] if timeout_seconds is not None else [])
+            + [item for value in server_args for item in ("--server-arg", value)],
+        )
+        return
+    job = RelayJob(
+        cluster=cluster,
+        kind=JobKind.MCP_CALL,
+        spec=McpCallSpec(
+            server=server,
+            server_args=server_args,
+            tool=tool,
+            arguments=arguments,
+            timeout_seconds=timeout_seconds,
+        ),
         idempotency_key=key,
     )
     saved = ClioCoreQueue(RelaySettings.from_env().core_dir).submit_job(job)
@@ -2260,7 +2398,9 @@ def _try_remote_cluster_passthrough(cluster: str | None, args: list[str]) -> boo
 
 
 def _run_remote_or_exit(definition: ClusterDefinition, args: list[str]) -> None:
-    _run_or_exit(lambda: typer.echo(run_remote_clio(definition, args), nl=False))
+    _run_or_exit(
+        lambda: typer.echo(_console_safe_text(run_remote_clio(definition, args)), nl=False)
+    )
 
 
 def _require_cluster(cluster: str) -> ClusterDefinition:

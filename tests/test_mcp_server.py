@@ -4,6 +4,8 @@ import json
 from io import StringIO
 from pathlib import Path
 
+import pytest
+
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.mcp_server import (
@@ -37,6 +39,11 @@ def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
     assert response is not None
     tool_names = {tool["name"] for tool in response["result"]["tools"]}
     assert "relay_submit_jarvis_pipeline" in tool_names
+    assert "relay_remote_mcp_context" in tool_names
+    assert "jarvis_create_pipeline" in tool_names
+    assert "jarvis_append_pkg" in tool_names
+    assert "jarvis_configure_pkg" in tool_names
+    assert "jarvis_export_pipeline" in tool_names
     assert "relay_submit_remote_agent" in tool_names
     assert "relay_submit_mcp_call" in tool_names
     assert "relay_get_job" in tool_names
@@ -70,6 +77,30 @@ def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
     )
     state_enum = create_gateway_tool["inputSchema"]["properties"]["state"]["enum"]
     assert "allocated" in state_enum
+    create_pipeline_tool = next(
+        tool for tool in response["result"]["tools"] if tool["name"] == "jarvis_create_pipeline"
+    )
+    assert create_pipeline_tool["inputSchema"]["required"] == ["cluster", "pipeline_id"]
+    assert "pipeline_id" in create_pipeline_tool["inputSchema"]["properties"]
+
+
+def test_mcp_remote_mcp_context_describes_virtual_tools(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {"name": "relay_remote_mcp_context", "arguments": {}},
+        },
+        queue=queue,
+    )
+
+    assert response is not None
+    context = response["result"]["structuredContent"]["context"]
+    assert "jarvis_create_pipeline" in context
+    assert "cluster argument" in context
 
 
 def test_mcp_submit_jarvis_pipeline_creates_real_job(tmp_path: Path) -> None:
@@ -99,6 +130,33 @@ def test_mcp_submit_jarvis_pipeline_creates_real_job(tmp_path: Path) -> None:
     assert job.kind == JobKind.JARVIS
     assert isinstance(job.spec, JarvisRunSpec)
     assert job.spec.pipeline_yaml == pipeline_yaml
+
+
+def test_mcp_submit_jarvis_job_creates_named_pipeline_job(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_submit_jarvis_job",
+                "arguments": {
+                    "cluster": "test-cluster",
+                    "pipeline_name": "lammps_4node",
+                    "idempotency_key": "mcp-named-pipeline",
+                },
+            },
+        },
+        queue=queue,
+    )
+
+    assert response is not None
+    result = response["result"]["structuredContent"]
+    job = queue.get_job(result["job_id"])
+    assert isinstance(job.spec, JarvisRunSpec)
+    assert job.spec.pipeline_name == "lammps_4node"
 
 
 def test_mcp_submit_remote_agent_creates_real_job(tmp_path: Path) -> None:
@@ -278,6 +336,7 @@ def test_mcp_submit_mcp_call_creates_real_job_with_arguments(tmp_path: Path) -> 
                 "arguments": {
                     "cluster": "test-cluster",
                     "server": "remote-tool-server",
+                    "server_args": ["--stdio"],
                     "tool": "run",
                     "arguments": {"case": "lammps", "steps": 100},
                     "timeout_seconds": 60,
@@ -294,9 +353,75 @@ def test_mcp_submit_mcp_call_creates_real_job_with_arguments(tmp_path: Path) -> 
     assert job.kind == JobKind.MCP_CALL
     assert isinstance(job.spec, McpCallSpec)
     assert job.spec.server == "remote-tool-server"
+    assert job.spec.server_args == ["--stdio"]
     assert job.spec.tool == "run"
     assert job.spec.arguments == {"case": "lammps", "steps": 100}
     assert job.spec.timeout_seconds == 60
+
+
+def test_mcp_call_jarvis_mcp_uses_builtin_cluster_command(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 23,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_call_jarvis_mcp",
+                "arguments": {
+                    "cluster": "test-cluster",
+                    "tool": "jm_list_repos",
+                    "arguments": {},
+                    "idempotency_key": "jarvis-mcp-tool",
+                },
+            },
+        },
+        queue=queue,
+    )
+
+    assert response is not None
+    result = response["result"]["structuredContent"]
+    job = queue.get_job(result["job_id"])
+    assert isinstance(job.spec, McpCallSpec)
+    assert job.spec.server == "jarvis-mcp"
+    assert job.spec.server_args == ["--profile", "user"]
+    assert job.spec.tool == "jm_list_repos"
+
+
+def test_mcp_virtual_jarvis_tool_routes_to_cluster_mcp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
+    queue = ClioCoreQueue(tmp_path / "core")
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 24,
+            "method": "tools/call",
+            "params": {
+                "name": "jarvis_create_pipeline",
+                "arguments": {
+                    "cluster": "ares",
+                    "pipeline_id": "lammps_4node",
+                    "idempotency_key": "virtual-jarvis-create",
+                },
+            },
+        },
+        queue=queue,
+    )
+
+    assert response is not None
+    result = response["result"]["structuredContent"]
+    job = queue.get_job(result["job_id"])
+    assert isinstance(job.spec, McpCallSpec)
+    assert job.cluster == "ares"
+    assert job.spec.server == "jarvis-mcp"
+    assert job.spec.server_args == ["--profile", "user"]
+    assert job.spec.tool == "create_pipeline"
+    assert job.spec.arguments == {"pipeline_id": "lammps_4node"}
 
 
 def test_mcp_remote_agent_default_idempotency_includes_timeout(tmp_path: Path) -> None:

@@ -306,6 +306,7 @@ def render_linux_user_bootstrap_script(
     agent_npm_bin: str | None = None,
     agent_args: list[str] | None = None,
     relay_install_spec: str = "$DEST",
+    jarvis_mcp_install_spec: str | None = None,
 ) -> str:
     """Render the idempotent shell script used for the current Linux cluster bootstrap."""
     rendered_agent_adapter = shlex.quote(agent_adapter)
@@ -313,6 +314,13 @@ def render_linux_user_bootstrap_script(
     rendered_agent_npm_package = shlex.quote(agent_npm_package or "")
     rendered_agent_npm_bin = shlex.quote(agent_npm_bin or "")
     rendered_relay_install_spec = _render_relay_install_spec(relay_install_spec)
+    rendered_jarvis_mcp_install_spec = shlex.quote(
+        jarvis_mcp_install_spec
+        or os.environ.get(
+            "CLIO_RELAY_JARVIS_MCP_INSTALL_SPEC",
+            "git+https://github.com/iowarp/clio-kit.git@main#subdirectory=clio-kit-mcp-servers/jarvis",
+        )
+    )
     script = f"""set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$HOME/.local/bin" "$HOME/.local/src" "$HOME/.local/share/clio-relay"
@@ -359,7 +367,10 @@ fi
 git -C "$HOME/.local/src/jarvis-cd" pull --ff-only
 python -m pip install -r "$HOME/.local/src/jarvis-cd/requirements.txt"
 python -m pip install -e "$HOME/.local/src/jarvis-cd"
+python -m pip install "fastmcp>=3.0.1" fastapi "starlette>=0.49.1" "python-dotenv>=1.0.0"
+python -m pip install --no-deps --upgrade {rendered_jarvis_mcp_install_spec}
 ln -sf "$JARVIS_VENV/bin/jarvis" "$HOME/.local/bin/jarvis"
+ln -sf "$JARVIS_VENV/bin/jarvis-mcp" "$HOME/.local/bin/jarvis-mcp"
 deactivate
 
 DEST="$HOME/.local/src/clio-relay"

@@ -182,6 +182,14 @@ def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
             "idempotency_key": "http-typed-jarvis",
         },
     )
+    jarvis_pipeline_response = client.post(
+        "/jobs/jarvis-pipeline",
+        json={
+            "cluster": "test-cluster",
+            "pipeline_name": "lammps_4node",
+            "idempotency_key": "http-typed-jarvis-pipeline",
+        },
+    )
     agent_response = client.post(
         "/jobs/remote-agent",
         json={
@@ -199,21 +207,36 @@ def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
         json={
             "cluster": "test-cluster",
             "server": "remote-server",
+            "server_args": ["--stdio"],
             "tool": "simulate",
             "arguments": {"case": "lammps", "steps": 100},
             "timeout_seconds": 30,
             "idempotency_key": "http-typed-mcp",
         },
     )
+    jarvis_mcp_response = client.post(
+        "/jobs/jarvis-mcp-call",
+        json={
+            "cluster": "test-cluster",
+            "tool": "jm_list_repos",
+            "idempotency_key": "http-typed-jarvis-mcp",
+        },
+    )
 
     assert jarvis_response.status_code == 200
+    assert jarvis_pipeline_response.status_code == 200
     assert agent_response.status_code == 200
     assert mcp_response.status_code == 200
+    assert jarvis_mcp_response.status_code == 200
     jarvis = queue.get_job(jarvis_response.json()["job_id"])
+    jarvis_pipeline = queue.get_job(jarvis_pipeline_response.json()["job_id"])
     agent = queue.get_job(agent_response.json()["job_id"])
     mcp = queue.get_job(mcp_response.json()["job_id"])
+    jarvis_mcp = queue.get_job(jarvis_mcp_response.json()["job_id"])
     assert jarvis.kind == JobKind.JARVIS
     assert isinstance(jarvis.spec, JarvisRunSpec)
+    assert isinstance(jarvis_pipeline.spec, JarvisRunSpec)
+    assert jarvis_pipeline.spec.pipeline_name == "lammps_4node"
     assert agent.kind == JobKind.REMOTE_AGENT
     assert isinstance(agent.spec, RemoteAgentTaskSpec)
     assert agent.spec.prompt_path == str(prompt_path)
@@ -221,7 +244,12 @@ def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
     assert agent.spec.model == "configured-model"
     assert mcp.kind == JobKind.MCP_CALL
     assert isinstance(mcp.spec, McpCallSpec)
+    assert mcp.spec.server_args == ["--stdio"]
     assert mcp.spec.arguments == {"case": "lammps", "steps": 100}
+    assert isinstance(jarvis_mcp.spec, McpCallSpec)
+    assert jarvis_mcp.spec.server == "jarvis-mcp"
+    assert jarvis_mcp.spec.server_args == ["--profile", "user"]
+    assert jarvis_mcp.spec.tool == "jm_list_repos"
 
 
 def test_http_progress_endpoints_record_and_list_progress(tmp_path: Path) -> None:

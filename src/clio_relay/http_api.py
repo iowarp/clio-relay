@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import NotFoundError, QueueConflictError
+from clio_relay.jarvis_mcp import jarvis_mcp_server, jarvis_mcp_server_args
 from clio_relay.models import (
     ArtifactRef,
     Cursor,
@@ -78,6 +79,16 @@ class JarvisSubmitRequest(BaseModel):
     idempotency_key: str
 
 
+class JarvisPipelineSubmitRequest(BaseModel):
+    """HTTP request to submit an existing JARVIS pipeline by name."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cluster: str
+    pipeline_name: str
+    idempotency_key: str
+
+
 class RemoteAgentSubmitRequest(BaseModel):
     """HTTP request to submit a remote-agent task."""
 
@@ -99,6 +110,19 @@ class McpCallSubmitRequest(BaseModel):
 
     cluster: str
     server: str
+    server_args: list[str] = Field(default_factory=list)
+    tool: str
+    arguments: dict[str, object] = Field(default_factory=dict)
+    timeout_seconds: int | None = Field(default=None, gt=0)
+    idempotency_key: str
+
+
+class JarvisMcpCallSubmitRequest(BaseModel):
+    """HTTP request to submit a remote JARVIS MCP tool call."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cluster: str
     tool: str
     arguments: dict[str, object] = Field(default_factory=dict)
     timeout_seconds: int | None = Field(default=None, gt=0)
@@ -207,6 +231,17 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             )
         )
 
+    @app.post("/jobs/jarvis-pipeline", response_model=RelayJob, dependencies=[auth_dependency])
+    def submit_jarvis_pipeline(request: JarvisPipelineSubmitRequest) -> RelayJob:
+        return queue.submit_job(
+            RelayJob(
+                cluster=request.cluster,
+                kind=JobKind.JARVIS,
+                spec=JarvisRunSpec(pipeline_name=request.pipeline_name),
+                idempotency_key=request.idempotency_key,
+            )
+        )
+
     @app.post("/jobs/remote-agent", response_model=RelayJob, dependencies=[auth_dependency])
     def submit_remote_agent(request: RemoteAgentSubmitRequest) -> RelayJob:
         return queue.submit_job(
@@ -232,6 +267,24 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 kind=JobKind.MCP_CALL,
                 spec=McpCallSpec(
                     server=request.server,
+                    server_args=request.server_args,
+                    tool=request.tool,
+                    arguments=request.arguments,
+                    timeout_seconds=request.timeout_seconds,
+                ),
+                idempotency_key=request.idempotency_key,
+            )
+        )
+
+    @app.post("/jobs/jarvis-mcp-call", response_model=RelayJob, dependencies=[auth_dependency])
+    def submit_jarvis_mcp_call(request: JarvisMcpCallSubmitRequest) -> RelayJob:
+        return queue.submit_job(
+            RelayJob(
+                cluster=request.cluster,
+                kind=JobKind.MCP_CALL,
+                spec=McpCallSpec(
+                    server=jarvis_mcp_server(),
+                    server_args=jarvis_mcp_server_args(),
                     tool=request.tool,
                     arguments=request.arguments,
                     timeout_seconds=request.timeout_seconds,

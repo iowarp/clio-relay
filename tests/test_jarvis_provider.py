@@ -50,15 +50,31 @@ def test_remote_agent_task_yaml_generation(tmp_path: Path) -> None:
 def test_mcp_call_yaml_generation() -> None:
     provider = JarvisCdProvider()
     rendered = provider.render_mcp_call_yaml(
-        McpCallSpec(server="science", tool="inspect", arguments={"path": "x"})
+        McpCallSpec(
+            server="uvx",
+            server_args=["clio-kit", "mcp-server", "jarvis", "--profile", "user"],
+            tool="inspect",
+            arguments={"path": "x"},
+        )
     )
     document = yaml.safe_load(rendered)
 
     package = document["pkgs"][0]
     assert package["pkg_type"] == "clio_relay.mcp_call"
-    assert package["server"] == "science"
+    assert package["server"] == "uvx"
+    assert package["server_args"] == ["clio-kit", "mcp-server", "jarvis", "--profile", "user"]
     assert package["tool"] == "inspect"
     assert package["arguments"] == {"path": "x"}
+
+
+def test_named_pipeline_command_uses_configured_jarvis_binary() -> None:
+    provider = JarvisCdProvider(jarvis_bin="/opt/jarvis/bin/jarvis")
+
+    assert provider.named_pipeline_command("my_pipeline") == [
+        "bash",
+        "-lc",
+        "/opt/jarvis/bin/jarvis cd my_pipeline && exec /opt/jarvis/bin/jarvis ppl run",
+    ]
 
 
 def test_unscheduled_pipeline_uses_direct_run_command(tmp_path: Path) -> None:

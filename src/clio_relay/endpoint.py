@@ -9,8 +9,9 @@ import os
 import re
 import secrets
 import socket
+import subprocess
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -189,33 +190,59 @@ class EndpointWorker:
         )
         spool = JobSpool(self.settings.spool_dir, job)
         spool.initialize()
-        yaml_text = self._render_job_yaml(job)
-        pipeline_path = spool.write_pipeline(yaml_text)
-        package_progress_adapter = package_progress_adapter_from_pipeline(yaml_text)
+        pipeline_name = _jarvis_pipeline_name(job)
+        if pipeline_name is None:
+            yaml_text = self._render_job_yaml(job)
+            pipeline_path = spool.write_pipeline(yaml_text)
+            package_progress_adapter = package_progress_adapter_from_pipeline(yaml_text)
+            package_progress_logs = _package_progress_log_paths(yaml_text)
+            self.queue.append_artifact(spool.artifact_for(pipeline_path, kind="jarvis_pipeline"))
+            self.queue.append_event(
+                job.job_id,
+                "jarvis.started",
+                "JARVIS-CD pipeline started",
+                payload={"pipeline": str(pipeline_path)},
+            )
+        else:
+            yaml_text = None
+            pipeline_path = spool.path / "pipeline-reference.json"
+            pipeline_path.write_text(
+                json.dumps(
+                    {"pipeline_name": pipeline_name, "execution": "jarvis_named_pipeline"},
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            package_progress_adapter = None
+            package_progress_logs = []
+            self.queue.append_artifact(
+                spool.artifact_for(pipeline_path, kind="jarvis_pipeline_reference")
+            )
+            self.queue.append_event(
+                job.job_id,
+                "jarvis.named_pipeline",
+                f"JARVIS-CD named pipeline started: {pipeline_name}",
+                payload={"pipeline_name": pipeline_name},
+            )
         if package_progress_adapter is not None:
             package_progress_adapter.run_id = job.job_id
-        package_progress_logs = _package_progress_log_paths(yaml_text)
         package_progress_log_offsets = {path: 0 for path in package_progress_logs}
         progress_sidecar_token = secrets.token_urlsafe(32)
         progress_sidecar = spool.path / f".progress-{secrets.token_hex(16)}.jsonl"
         progress_sidecar_offset = [0]
         scheduler_job_ids: list[str] = []
         scheduler_cancel_attempted = [False]
-        self.queue.append_artifact(spool.artifact_for(pipeline_path, kind="jarvis_pipeline"))
-        self.queue.append_event(
-            job.job_id,
-            "jarvis.started",
-            "JARVIS-CD pipeline started",
-            payload={"pipeline": str(pipeline_path)},
-        )
         with _temporary_env_vars(
             {
                 "CLIO_RELAY_PROGRESS_FILE": str(progress_sidecar),
                 "CLIO_RELAY_PROGRESS_TOKEN": progress_sidecar_token,
             }
         ):
-            result = self.provider.run_pipeline_streaming(
-                pipeline_path,
+            result = self._run_jarvis_streaming(
+                job,
+                pipeline_path=pipeline_path,
+                pipeline_name=pipeline_name,
                 cwd=spool.path,
                 on_stdout=lambda text: self._append_output(
                     job,
@@ -393,6 +420,45 @@ class EndpointWorker:
         if job.kind == JobKind.MCP_CALL and isinstance(job.spec, McpCallSpec):
             return self.provider.render_mcp_call_yaml(job.spec)
         raise ConfigurationError(f"job kind/spec mismatch for {job.job_id}")
+
+    def _run_jarvis_streaming(
+        self,
+        job: RelayJob,
+        *,
+        pipeline_path: Path,
+        pipeline_name: str | None,
+        cwd: Path | None,
+        on_stdout: Callable[[str], None],
+        on_stderr: Callable[[str], None],
+        on_start: Callable[[int], None],
+        should_cancel: Callable[[], bool],
+        timeout_seconds: int | None,
+        on_timeout: Callable[[], None],
+        on_poll: Callable[[], None],
+    ) -> subprocess.CompletedProcess[str]:
+        if pipeline_name is not None:
+            return self.provider.run_named_pipeline_streaming(
+                pipeline_name,
+                cwd=cwd,
+                on_stdout=on_stdout,
+                on_stderr=on_stderr,
+                on_start=on_start,
+                should_cancel=should_cancel,
+                timeout_seconds=timeout_seconds,
+                on_timeout=on_timeout,
+                on_poll=on_poll,
+            )
+        return self.provider.run_pipeline_streaming(
+            pipeline_path,
+            cwd=cwd,
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+            on_start=on_start,
+            should_cancel=should_cancel,
+            timeout_seconds=timeout_seconds,
+            on_timeout=on_timeout,
+            on_poll=on_poll,
+        )
 
     def _append_output(
         self,
@@ -924,6 +990,12 @@ def _scheduler_name_from_job(job: RelayJob) -> str | None:
         except OSError:
             return None
         return _scheduler_name_from_yaml(pipeline_yaml)
+    return None
+
+
+def _jarvis_pipeline_name(job: RelayJob) -> str | None:
+    if job.kind == JobKind.JARVIS and isinstance(job.spec, JarvisRunSpec):
+        return job.spec.pipeline_name
     return None
 
 

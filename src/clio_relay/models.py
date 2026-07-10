@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Annotated, Any
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def utc_now() -> datetime:
@@ -127,6 +127,7 @@ class JarvisRunSpec(BaseModel):
 
     pipeline_yaml: str | None = None
     pipeline_path: Path | None = None
+    pipeline_name: str | None = None
     package: str | None = None
     command: list[str] | None = None
     workdir: Path | None = None
@@ -141,6 +142,21 @@ class JarvisRunSpec(BaseModel):
         if value == []:
             raise ValueError("command must not be empty")
         return value
+
+    @model_validator(mode="after")
+    def exactly_one_pipeline_source(self) -> JarvisRunSpec:
+        """Require a single source for a JARVIS run."""
+        sources = [
+            self.pipeline_yaml is not None,
+            self.pipeline_path is not None,
+            self.pipeline_name is not None,
+            self.command is not None,
+        ]
+        if sum(1 for item in sources if item) != 1:
+            raise ValueError(
+                "exactly one of pipeline_yaml, pipeline_path, pipeline_name, or command is required"
+            )
+        return self
 
 
 class RemoteAgentTaskSpec(BaseModel):
@@ -162,6 +178,7 @@ class McpCallSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     server: str
+    server_args: list[str] = Field(default_factory=list)
     tool: str
     arguments: dict[str, Any] = Field(default_factory=dict)
     timeout_seconds: int | None = Field(default=None, gt=0)

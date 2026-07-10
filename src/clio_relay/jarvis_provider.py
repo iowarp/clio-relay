@@ -8,6 +8,7 @@ environment capture, output collection, and provenance.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -51,6 +52,10 @@ class JarvisCdProvider:
             return spec.pipeline_yaml
         if spec.pipeline_path is not None:
             return spec.pipeline_path.read_text(encoding="utf-8")
+        if spec.pipeline_name is not None:
+            raise ConfigurationError(
+                "pipeline_name jobs must be executed directly, not rendered to YAML"
+            )
         if spec.command is None:
             raise ConfigurationError(
                 "JarvisRunSpec requires pipeline_yaml, pipeline_path, or command"
@@ -104,6 +109,7 @@ class JarvisCdProvider:
                     "pkg_type": "clio_relay.mcp_call",
                     "pkg_name": "mcp_call",
                     "server": spec.server,
+                    "server_args": spec.server_args or None,
                     "tool": spec.tool,
                     "arguments": spec.arguments,
                     "timeout_seconds": spec.timeout_seconds,
@@ -154,6 +160,59 @@ class JarvisCdProvider:
         """Invoke JARVIS-CD and stream output chunks while retaining final output."""
         self.require_available()
         command = self.pipeline_command(pipeline_path)
+        return self.run_command_streaming(
+            command,
+            cwd=cwd,
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+            on_start=on_start,
+            should_cancel=should_cancel,
+            on_poll=on_poll,
+            timeout_seconds=timeout_seconds,
+            on_timeout=on_timeout,
+        )
+
+    def run_named_pipeline_streaming(
+        self,
+        pipeline_name: str,
+        *,
+        cwd: Path | None = None,
+        on_stdout: Callable[[str], None] | None = None,
+        on_stderr: Callable[[str], None] | None = None,
+        on_start: Callable[[int], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        on_poll: Callable[[], None] | None = None,
+        timeout_seconds: int | None = None,
+        on_timeout: Callable[[], None] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Invoke JARVIS-CD for an existing named pipeline and stream output."""
+        self.require_available()
+        return self.run_command_streaming(
+            self.named_pipeline_command(pipeline_name),
+            cwd=cwd,
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+            on_start=on_start,
+            should_cancel=should_cancel,
+            on_poll=on_poll,
+            timeout_seconds=timeout_seconds,
+            on_timeout=on_timeout,
+        )
+
+    def run_command_streaming(
+        self,
+        command: list[str],
+        *,
+        cwd: Path | None = None,
+        on_stdout: Callable[[str], None] | None = None,
+        on_stderr: Callable[[str], None] | None = None,
+        on_start: Callable[[int], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        on_poll: Callable[[], None] | None = None,
+        timeout_seconds: int | None = None,
+        on_timeout: Callable[[], None] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a command and stream output chunks while retaining final output."""
         try:
             process = subprocess.Popen(
                 command,
@@ -214,6 +273,16 @@ class JarvisCdProvider:
             stdout="".join(stdout_chunks),
             stderr="".join(stderr_chunks),
         )
+
+    def named_pipeline_command(self, pipeline_name: str) -> list[str]:
+        """Return the command used to execute a named JARVIS pipeline."""
+        if not pipeline_name.strip():
+            raise ConfigurationError("pipeline_name must be non-empty")
+        script = (
+            f"{shlex.quote(self.jarvis_bin)} cd {shlex.quote(pipeline_name)} "
+            f"&& exec {shlex.quote(self.jarvis_bin)} ppl run"
+        )
+        return ["bash", "-lc", script]
 
     def pipeline_command(self, pipeline_path: Path) -> list[str]:
         """Return the command used to execute a materialized JARVIS pipeline."""

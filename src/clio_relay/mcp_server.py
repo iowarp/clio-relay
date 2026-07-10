@@ -9,8 +9,17 @@ from json import JSONDecodeError
 from typing import Any, TextIO, cast
 
 from clio_relay import __version__
+from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, default_registry_path
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.jarvis_mcp import (
+    is_virtual_jarvis_tool,
+    jarvis_mcp_server,
+    jarvis_mcp_server_args,
+    render_virtual_jarvis_agent_context,
+    virtual_jarvis_call_arguments,
+    virtual_jarvis_tool_definitions,
+)
 from clio_relay.models import (
     Cursor,
     GatewaySession,
@@ -43,6 +52,7 @@ from clio_relay.relay_ops import (
     read_job_log,
     wait_for_terminal,
 )
+from clio_relay.remote_cli import run_remote_clio, should_execute_on_cluster, write_remote_file
 
 JSON = dict[str, Any]
 
@@ -141,6 +151,15 @@ def _initialize_result() -> JSON:
 def _tool_definitions() -> list[JSON]:
     return [
         {
+            "name": "relay_remote_mcp_context",
+            "description": "Return agent instructions for clio-relay virtual remote MCP tools.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "relay_submit_jarvis_pipeline",
             "description": "Submit a JARVIS pipeline YAML document to a configured relay cluster.",
             "inputSchema": {
@@ -154,6 +173,25 @@ def _tool_definitions() -> list[JSON]:
                     "poll_seconds": {"type": "number", "default": 2},
                 },
                 "required": ["cluster", "pipeline_yaml"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_submit_jarvis_job",
+            "description": (
+                "Submit an existing JARVIS pipeline by name on a configured relay cluster."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cluster": {"type": "string"},
+                    "pipeline_name": {"type": "string"},
+                    "idempotency_key": {"type": "string"},
+                    "wait_for_terminal": {"type": "boolean", "default": False},
+                    "timeout_seconds": {"type": "number", "default": 600},
+                    "poll_seconds": {"type": "number", "default": 2},
+                },
+                "required": ["cluster", "pipeline_name"],
                 "additionalProperties": False,
             },
         },
@@ -186,6 +224,11 @@ def _tool_definitions() -> list[JSON]:
                 "properties": {
                     "cluster": {"type": "string"},
                     "server": {"type": "string"},
+                    "server_args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": [],
+                    },
                     "tool": {"type": "string"},
                     "arguments": {"type": "object", "default": {}},
                     "timeout_seconds": {"type": "integer", "minimum": 1},
@@ -195,6 +238,28 @@ def _tool_definitions() -> list[JSON]:
                     "poll_seconds": {"type": "number", "default": 2},
                 },
                 "required": ["cluster", "server", "tool"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_call_jarvis_mcp",
+            "description": (
+                "Submit a tool call to the target cluster's built-in JARVIS MCP server. "
+                "The server is launched on the cluster with the clio-kit PyPI command."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cluster": {"type": "string"},
+                    "tool": {"type": "string"},
+                    "arguments": {"type": "object", "default": {}},
+                    "timeout_seconds": {"type": "integer", "minimum": 1},
+                    "idempotency_key": {"type": "string"},
+                    "wait_for_terminal": {"type": "boolean", "default": False},
+                    "wait_timeout_seconds": {"type": "number", "default": 600},
+                    "poll_seconds": {"type": "number", "default": 2},
+                },
+                "required": ["cluster", "tool"],
                 "additionalProperties": False,
             },
         },
@@ -551,6 +616,7 @@ def _tool_definitions() -> list[JSON]:
                 "additionalProperties": False,
             },
         },
+        *virtual_jarvis_tool_definitions(),
     ]
 
 
@@ -559,10 +625,21 @@ def _call_tool(params: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -
     arguments = _object(params.get("arguments", {}))
     if name == "relay_submit_jarvis_pipeline":
         result = _submit_jarvis_pipeline(arguments, queue=queue)
+    elif name == "relay_remote_mcp_context":
+        result = {"context": render_virtual_jarvis_agent_context()}
+    elif name == "relay_submit_jarvis_job":
+        result = _submit_jarvis_job(arguments, queue=queue)
     elif name == "relay_submit_remote_agent":
         result = _submit_remote_agent(arguments, queue=queue)
     elif name == "relay_submit_mcp_call":
         result = _submit_mcp_call(arguments, queue=queue)
+    elif name == "relay_call_jarvis_mcp":
+        result = _submit_jarvis_mcp_call(arguments, queue=queue)
+    elif is_virtual_jarvis_tool(name):
+        result = _submit_jarvis_mcp_call(
+            virtual_jarvis_call_arguments(name, arguments),
+            queue=queue,
+        )
     elif name == "relay_get_job":
         result = queue.get_job(_required_str(arguments, "job_id")).model_dump(mode="json")
     elif name == "relay_get_job_status":
@@ -729,6 +806,39 @@ def _submit_jarvis_pipeline(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     }
 
 
+def _submit_jarvis_job(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+    cluster = _required_str(arguments, "cluster")
+    if (definition := _remote_cluster_definition(cluster)) is not None:
+        remote_args = [
+            "job",
+            "submit-pipeline",
+            "--cluster",
+            cluster,
+            "--pipeline-name",
+            _required_str(arguments, "pipeline_name"),
+            "--idempotency-key",
+            str(
+                arguments.get("idempotency_key")
+                or f"mcp:jarvis-job:{cluster}:{_required_str(arguments, 'pipeline_name')}"
+            ),
+        ]
+        output = run_remote_clio(definition, remote_args)
+        return _remote_submission_result(output, kind=JobKind.JARVIS)
+    pipeline_name = _required_str(arguments, "pipeline_name")
+    idempotency_key = str(
+        arguments.get("idempotency_key") or f"mcp:jarvis-job:{cluster}:{pipeline_name}"
+    )
+    job = queue.submit_job(
+        RelayJob(
+            cluster=cluster,
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_name=pipeline_name),
+            idempotency_key=idempotency_key,
+        )
+    )
+    return _submission_result(job, arguments, queue=queue)
+
+
 def _submit_remote_agent(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     cluster = _required_str(arguments, "cluster")
     prompt_path = _required_str(arguments, "prompt_path")
@@ -770,6 +880,7 @@ def _submit_remote_agent(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
 def _submit_mcp_call(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     cluster = _required_str(arguments, "cluster")
     server = _required_str(arguments, "server")
+    server_args = _string_list(arguments.get("server_args", []), "server_args")
     tool = _required_str(arguments, "tool")
     tool_arguments = _object(arguments.get("arguments", {}))
     timeout_seconds = _optional_int(arguments, "timeout_seconds")
@@ -783,18 +894,50 @@ def _submit_mcp_call(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
             {
                 "cluster": cluster,
                 "server": server,
+                "server_args": server_args,
                 "tool": tool,
                 "arguments_digest": digest,
                 "timeout_seconds": timeout_seconds,
             }
         )
     )
+    if (definition := _remote_cluster_definition(cluster)) is not None:
+        remote_args_path = (
+            ".local/share/clio-relay/desktop-submissions/"
+            f"mcp-{_stable_digest({'cluster': cluster, 'tool': tool, 'arguments': tool_arguments})}"
+            "/arguments.json"
+        )
+        write_remote_file(
+            definition,
+            remote_args_path,
+            json.dumps(tool_arguments, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        )
+        remote_args = [
+            "mcp-call",
+            "--cluster",
+            cluster,
+            "--server",
+            server,
+            "--tool",
+            tool,
+            "--arguments-json-file",
+            remote_args_path,
+            "--idempotency-key",
+            idempotency_key,
+        ]
+        if timeout_seconds is not None:
+            remote_args.extend(["--timeout-seconds", str(timeout_seconds)])
+        for item in server_args:
+            remote_args.extend(["--server-arg", item])
+        output = run_remote_clio(definition, remote_args)
+        return _remote_submission_result(output, kind=JobKind.MCP_CALL)
     job = queue.submit_job(
         RelayJob(
             cluster=cluster,
             kind=JobKind.MCP_CALL,
             spec=McpCallSpec(
                 server=server,
+                server_args=server_args,
                 tool=tool,
                 arguments=tool_arguments,
                 timeout_seconds=timeout_seconds,
@@ -803,6 +946,45 @@ def _submit_mcp_call(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
         )
     )
     return _submission_result(job, arguments, queue=queue)
+
+
+def _remote_cluster_definition(cluster: str) -> ClusterDefinition | None:
+    registry_path = default_registry_path()
+    if not registry_path.exists():
+        return None
+    registry = ClusterRegistry.load(registry_path)
+    definition = registry.clusters.get(cluster)
+    if definition is None or not should_execute_on_cluster(definition):
+        return None
+    return definition
+
+
+def _remote_submission_result(output: str, *, kind: JobKind) -> JSON:
+    job_id = output.strip().splitlines()[-1].strip()
+    return {
+        "job_id": job_id,
+        "state": JobState.QUEUED.value,
+        "kind": kind.value,
+        "terminal": False,
+        "remote": True,
+    }
+
+
+def _submit_jarvis_mcp_call(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+    server = jarvis_mcp_server()
+    server_args = jarvis_mcp_server_args()
+    forwarded = dict(arguments)
+    forwarded["server"] = server
+    forwarded["server_args"] = server_args
+    if "idempotency_key" not in forwarded:
+        cluster = _required_str(arguments, "cluster")
+        tool = _required_str(arguments, "tool")
+        tool_arguments = _object(arguments.get("arguments", {}))
+        digest = hashlib.sha256(
+            json.dumps(tool_arguments, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        forwarded["idempotency_key"] = f"mcp:{cluster}:jarvis:{tool}:{digest}"
+    return _submit_mcp_call(forwarded, queue=queue)
 
 
 def _submission_result(job: RelayJob, arguments: JSON, *, queue: ClioCoreQueue) -> JSON:

@@ -84,6 +84,16 @@ uvx --python 3.12 --from clio-relay clio-relay job task-events <task-id> --clust
 
 Use timeline events for UI-visible agent work such as repository scans, dataset discovery, generated scripts, planned commands, scheduler submissions, warnings, and completion. Use normal job logs for stdout and stderr.
 
+## Use Remote JARVIS MCP
+
+The relay can run the JARVIS MCP server inside the target cluster environment through `jarvis-mcp --profile user`. Bootstrap installs this entry point into the cluster-local JARVIS environment. Use this when an agent needs to create or configure a JARVIS pipeline on the cluster before submitting it.
+
+The expected workflow is to call remote JARVIS MCP tools through `relay_call_jarvis_mcp`, inspect the pipeline with `export_pipeline`, then submit the existing cluster-local pipeline with `relay_submit_jarvis_job` or `clio-relay job submit-pipeline`.
+
+For prerelease testing, set `CLIO_RELAY_JARVIS_MCP_COMMAND` to a JSON string array on the worker environment. The command is interpreted on the cluster, so it can point at a PyPI release, a Git branch, or a site-local executable.
+
+See `docs/remote-mcp-federation.md` for the full agent-facing model.
+
 ## Manage Streaming Service Runtimes
 
 Use gateway sessions for scheduler-backed services that need to survive long enough for a desktop to connect, such as a visualization service, Jupyter-like service, remote MCP server, or long-running agent service.

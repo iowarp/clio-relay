@@ -59,6 +59,7 @@ class RecordingProvider(JarvisCdProvider):
     def __init__(self) -> None:
         super().__init__(jarvis_bin="jarvis")
         self.runs: list[Path] = []
+        self.named_runs: list[str] = []
 
     def run_pipeline(
         self,
@@ -111,6 +112,36 @@ class RecordingProvider(JarvisCdProvider):
             returncode=0,
             stdout="ok\n",
             stderr="warn\n",
+        )
+
+    def run_named_pipeline_streaming(
+        self,
+        pipeline_name: str,
+        *,
+        cwd: Path | None = None,
+        on_stdout: Callable[[str], None] | None = None,
+        on_stderr: Callable[[str], None] | None = None,
+        on_start: Callable[[int], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        on_poll: Callable[[], None] | None = None,
+        timeout_seconds: int | None = None,
+        on_timeout: Callable[[], None] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, should_cancel, timeout_seconds, on_timeout
+        self.named_runs.append(pipeline_name)
+        if on_start is not None:
+            on_start(456)
+        if on_stdout is not None:
+            on_stdout("named ok\n")
+        if on_stderr is not None:
+            on_stderr("named warn\n")
+        if on_poll is not None:
+            on_poll()
+        return subprocess.CompletedProcess(
+            args=["jarvis", "ppl", "run"],
+            returncode=0,
+            stdout="named ok\n",
+            stderr="named warn\n",
         )
 
 
@@ -173,6 +204,43 @@ def test_worker_runs_one_job_and_indexes_artifacts(tmp_path: Path) -> None:
     assert provenance["execution"]["returncode"] == 0
     assert provenance["provider"]["name"] == "jarvis-cd"
     assert provenance["artifacts"]["stdout"]["sha256"] is not None
+
+
+def test_worker_runs_named_jarvis_pipeline(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    provider = RecordingProvider()
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_name="lammps_4node"),
+            idempotency_key="named-pipeline-worker",
+        )
+    )
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=queue,
+        provider=provider,
+    )
+    worker.register()
+
+    result = worker.run_once()
+
+    assert result is not None
+    assert result.state == JobState.SUCCEEDED
+    assert provider.named_runs == ["lammps_4node"]
+    artifacts = queue.list_artifacts(job.job_id)
+    assert {artifact.kind for artifact in artifacts} == {
+        "jarvis_pipeline_reference",
+        "stdout",
+        "stderr",
+        "provenance",
+    }
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=50)
+    assert "jarvis.named_pipeline" in [event.event_type for event in events]
 
 
 def test_worker_records_scheduler_status_from_polling(tmp_path: Path) -> None:

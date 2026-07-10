@@ -341,6 +341,36 @@ def test_cli_job_submit_can_request_exclusive_scheduler(
     assert "exclusive: true" in str(job.spec.pipeline_yaml)
 
 
+def test_cli_job_submit_pipeline_creates_named_jarvis_job(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    core_dir = tmp_path / "core"
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "job",
+            "submit-pipeline",
+            "--cluster",
+            "ares",
+            "--pipeline-name",
+            "lammps_4node",
+            "--idempotency-key",
+            "named-pipeline",
+        ],
+    )
+
+    assert result.exit_code == 0
+    job = ClioCoreQueue(core_dir).get_job(result.output.strip())
+    assert isinstance(job.spec, JarvisRunSpec)
+    assert job.spec.pipeline_name == "lammps_4node"
+    assert job.spec.pipeline_yaml is None
+
+
 def test_cli_creates_and_evaluates_monitor_rule(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     core_dir = tmp_path / "core"
     queue = ClioCoreQueue(core_dir)
@@ -1002,10 +1032,14 @@ def test_cli_mcp_call_preserves_arguments(tmp_path: Path, monkeypatch: MonkeyPat
             "ares",
             "--server",
             "remote-server",
+            "--server-arg",
+            "--stdio",
             "--tool",
             "simulate",
             "--arguments-json",
             '{"steps": 100, "case": "lammps"}',
+            "--timeout-seconds",
+            "90",
             "--idempotency-key",
             "cli-mcp-call-args",
         ],
@@ -1016,7 +1050,40 @@ def test_cli_mcp_call_preserves_arguments(tmp_path: Path, monkeypatch: MonkeyPat
     job = ClioCoreQueue(core_dir).get_job(job_id)
     assert job.kind == JobKind.MCP_CALL
     assert isinstance(job.spec, McpCallSpec)
+    assert job.spec.server == "remote-server"
+    assert job.spec.server_args == ["--stdio"]
     assert job.spec.arguments == {"steps": 100, "case": "lammps"}
+    assert job.spec.timeout_seconds == 90
+
+
+def test_cli_jarvis_mcp_call_uses_builtin_cluster_command(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    core_dir = tmp_path / "core"
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "jarvis-mcp-call",
+            "--cluster",
+            "ares",
+            "--tool",
+            "jm_list_repos",
+            "--idempotency-key",
+            "cli-jarvis-mcp",
+        ],
+    )
+
+    assert result.exit_code == 0
+    job = ClioCoreQueue(core_dir).get_job(result.output.strip())
+    assert isinstance(job.spec, McpCallSpec)
+    assert job.spec.server == "jarvis-mcp"
+    assert job.spec.server_args == ["--profile", "user"]
+    assert job.spec.tool == "jm_list_repos"
 
 
 def test_cli_mcp_call_reads_arguments_json_file(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

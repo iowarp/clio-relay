@@ -35,6 +35,10 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert "CLIO_RELAY_AGENT_ADAPTER=exec" in script
     assert "CLIO_RELAY_AGENT_ARGS=''" in script
     assert "github.com/grc-iit/jarvis-cd.git" in script
+    assert 'python -m pip install "fastmcp>=3.0.1" fastapi' in script
+    assert "python -m pip install --no-deps --upgrade" in script
+    assert "clio-kit.git@main#subdirectory=clio-kit-mcp-servers/jarvis" in script
+    assert 'ln -sf "$JARVIS_VENV/bin/jarvis-mcp" "$HOME/.local/bin/jarvis-mcp"' in script
     assert 'uv pip install --refresh-package clio-relay "$DEST"' in script
     assert 'jarvis repo add "$DEST/jarvis-packages/clio_relay" --force true' in script
     assert "spack install lammps" not in script
