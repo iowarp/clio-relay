@@ -40,6 +40,7 @@ from clio_relay.models import (
 )
 
 Record = TypeVar("Record", bound=BaseModel)
+_UNSET = object()
 
 
 class ClioCoreQueue:
@@ -149,6 +150,27 @@ class ClioCoreQueue:
             key=lambda job: job.created_at,
         )
 
+    def list_endpoints(self, cluster: str | None = None) -> list[EndpointRegistration]:
+        """Return registered endpoints, optionally filtered by cluster."""
+        self.initialize()
+        endpoints = list(self._read_many(self.root / "endpoints", EndpointRegistration))
+        if cluster is not None:
+            endpoints = [endpoint for endpoint in endpoints if endpoint.cluster == cluster]
+        return sorted(endpoints, key=lambda endpoint: endpoint.registered_at)
+
+    def list_leases(self, cluster: str | None = None) -> list[Lease]:
+        """Return active and expired leases, optionally filtered by job cluster."""
+        self.initialize()
+        leases = list(self._read_many(self.root / "leases", Lease))
+        if cluster is not None:
+            jobs_by_id = {job.job_id: job for job in self.list_jobs()}
+            leases = [
+                lease
+                for lease in leases
+                if (job := jobs_by_id.get(lease.job_id)) is not None and job.cluster == cluster
+            ]
+        return sorted(leases, key=lambda lease: lease.acquired_at)
+
     def update_job_state(
         self,
         job_id: str,
@@ -156,15 +178,21 @@ class ClioCoreQueue:
         *,
         message: str | None = None,
         error: str | None = None,
+        leased_by: str | None | object = _UNSET,
     ) -> RelayJob:
         """Update a job state and append a state event."""
         with self._lock:
             job = self.get_job(job_id)
             if job.state in TERMINAL_STATES and state not in TERMINAL_STATES:
                 raise QueueConflictError(f"cannot move terminal job {job_id} back to {state}")
-            job = job.model_copy(
-                update={"state": state, "updated_at": utc_now(), "last_error": error}
-            )
+            updates: dict[str, object] = {
+                "state": state,
+                "updated_at": utc_now(),
+                "last_error": error,
+            }
+            if leased_by is not _UNSET:
+                updates["leased_by"] = leased_by
+            job = job.model_copy(update=updates)
             self._write(self.root / "jobs" / f"{job_id}.json", job)
             self.append_event(
                 job_id,

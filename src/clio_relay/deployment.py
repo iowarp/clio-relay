@@ -15,8 +15,11 @@ def render_endpoint_user_service(
     cluster: str,
     definition: ClusterDefinition,
     relay_bin: str = "%h/.local/bin/clio-relay",
+    concurrency: int = 1,
 ) -> str:
     """Render a user-level systemd service for a configured worker endpoint."""
+    if concurrency < 1:
+        raise RelayError("worker concurrency must be at least 1")
     core_dir = _systemd_home_path(definition.core_dir)
     spool_dir = _systemd_home_path(definition.spool_dir)
     jarvis_bin = _systemd_home_path(definition.jarvis_bin or "$HOME/.local/bin/jarvis")
@@ -37,7 +40,7 @@ Environment="CLIO_RELAY_FRPC_BIN={frpc_bin}"
 Environment="CLIO_RELAY_AGENT_BIN={agent_bin}"
 Environment="CLIO_RELAY_AGENT_ADAPTER={definition.agent_adapter}"
 Environment="CLIO_RELAY_AGENT_ARGS={agent_args}"
-ExecStart={relay_bin} endpoint start --role worker --cluster {cluster}
+ExecStart={relay_bin} endpoint start --role worker --cluster {cluster} --concurrency {concurrency}
 Restart=on-failure
 RestartSec=5
 

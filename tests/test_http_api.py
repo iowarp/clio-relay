@@ -11,6 +11,8 @@ from clio_relay.http_api import create_app
 from clio_relay.models import (
     ArtifactRef,
     Cursor,
+    EndpointRegistration,
+    EndpointRole,
     GatewaySessionState,
     JarvisRunSpec,
     JobKind,
@@ -443,6 +445,50 @@ def test_http_job_status_includes_relay_queue_and_scheduler(tmp_path: Path) -> N
     payload = response.json()
     assert payload["relay_queue"]["position"] == 1
     assert payload["scheduler"][0]["status"]["phase"] == "pending"
+
+
+def test_http_queue_management_routes(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    queue.register_endpoint(
+        EndpointRegistration(
+            role=EndpointRole.WORKER,
+            cluster="test-cluster",
+            hostname="node",
+            pid=123,
+            metadata={"concurrency": 2},
+        )
+    )
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-queue-management",
+        )
+    )
+    queue.acquire_next_job("endpoint-1", cluster="test-cluster", ttl_seconds=-1)
+    client = cast(Any, TestClient(create_app(settings)))
+
+    listed = client.get("/queue", params={"cluster": "test-cluster"})
+    diagnosed = client.get("/queue/diagnostics", params={"cluster": "test-cluster"})
+    workers = client.get("/workers", params={"cluster": "test-cluster"})
+    cleanup = client.post(
+        "/queue/cleanup-stale",
+        params={"cluster": "test-cluster", "dry_run": False},
+    )
+    canceled = client.post(f"/queue/jobs/{job.job_id}/cancel")
+
+    assert listed.status_code == 200
+    assert diagnosed.status_code == 200
+    assert workers.status_code == 200
+    assert cleanup.status_code == 200
+    assert canceled.status_code == 200
+    assert listed.json()["count"] == 1
+    assert diagnosed.json()["issues"][0]["code"] == "expired_lease"
+    assert workers.json()["configured_concurrency"] == 2
+    assert cleanup.json()["recovered_count"] == 1
+    assert canceled.json()["scheduler_policy"] == "relay-only"
 
 
 def test_http_healthz_does_not_require_token(tmp_path: Path) -> None:

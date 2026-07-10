@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 from collections.abc import Callable
+from datetime import timedelta
 from pathlib import Path
 
 from pytest import MonkeyPatch
@@ -14,6 +15,7 @@ from clio_relay.endpoint import EndpointWorker
 from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.models import (
     Cursor,
+    EndpointRegistration,
     EndpointRole,
     JarvisRunSpec,
     JobKind,
@@ -24,6 +26,7 @@ from clio_relay.models import (
     RemoteAgentTaskSpec,
     SchedulerPhase,
     SchedulerStatus,
+    utc_now,
 )
 from clio_relay.relay_ops import cancel_job
 
@@ -825,7 +828,7 @@ def test_worker_ignores_fake_lammps_scope_from_mixed_pipeline(tmp_path: Path) ->
     assert queue.list_progress(job.job_id) == []
 
 
-def test_worker_preserves_canceled_state_for_running_job(
+def test_worker_preserves_canceled_state_and_scancels_when_requested(
     tmp_path: Path,
 ) -> None:
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
@@ -862,7 +865,7 @@ def test_worker_preserves_canceled_state_for_running_job(
                 on_stdout("Submitted batch job 12345\nstarted\n")
             if on_poll is not None:
                 on_poll()
-            cancel_job(queue, job.job_id)
+            cancel_job(queue, job.job_id, cancel_scheduler=True)
             assert should_cancel is not None
             assert should_cancel() is True
             return subprocess.CompletedProcess(
@@ -977,7 +980,7 @@ def test_worker_timeout_scancels_scheduler_job(
     assert tasks[0].metadata["scheduler_status"]["phase"] == "canceled"
 
 
-def test_worker_reconciles_canceled_scheduler_job_after_restart(
+def test_worker_reconciles_scheduler_cancel_request_after_restart(
     tmp_path: Path,
 ) -> None:
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
@@ -999,7 +1002,7 @@ def test_worker_reconciles_canceled_scheduler_job_after_restart(
         )
     )
     del task
-    cancel_job(queue, job.job_id)
+    cancel_job(queue, job.job_id, cancel_scheduler=True)
     scheduler_provider = FakeSchedulerProvider(
         SchedulerStatus(
             scheduler="test-scheduler",
@@ -1025,6 +1028,80 @@ def test_worker_reconciles_canceled_scheduler_job_after_restart(
     event_types = [event.event_type for event in events]
     assert "scheduler.cancel_requested" in event_types
     assert "scheduler.canceled" in event_types
+
+
+def test_worker_does_not_scancel_relay_only_canceled_job_after_restart(
+    tmp_path: Path,
+) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["sleep", "60"]),
+            idempotency_key="restart-relay-only-cancel",
+        )
+    )
+    task = queue.append_task(
+        RelayTask(
+            job_id=job.job_id,
+            name="jarvis.execution",
+            state=JobState.RUNNING,
+            metadata={"scheduler": "slurm", "scheduler_job_ids": ["13579"]},
+        )
+    )
+    del task
+    cancel_job(queue, job.job_id)
+    scheduler_provider = FakeSchedulerProvider()
+
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=queue,
+        provider=RecordingProvider(),
+        scheduler_provider=scheduler_provider,
+    )
+    worker.register()
+
+    assert worker.run_once() is None
+    assert scheduler_provider.canceled == []
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=50)
+    event_types = [event.event_type for event in events]
+    assert "job.cancel_requested" in event_types
+    assert "scheduler.cancel_requested" not in event_types
+
+
+def test_worker_run_once_heartbeats_existing_endpoint(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=queue,
+        provider=RecordingProvider(),
+    )
+    endpoint = worker.register()
+    stale_endpoint = EndpointRegistration(
+        endpoint_id=endpoint.endpoint_id,
+        role=endpoint.role,
+        cluster=endpoint.cluster,
+        hostname=endpoint.hostname,
+        pid=endpoint.pid,
+        registered_at=endpoint.registered_at,
+        last_seen_at=utc_now() - timedelta(seconds=120),
+        metadata=endpoint.metadata,
+    )
+    endpoint_path = queue.root / "endpoints" / f"{endpoint.endpoint_id}.json"
+    endpoint_path.write_text(stale_endpoint.model_dump_json(indent=2), encoding="utf-8")
+
+    assert worker.run_once() is None
+
+    refreshed = queue.list_endpoints(cluster="ares")[0]
+    assert refreshed.endpoint_id == endpoint.endpoint_id
+    assert utc_now() - refreshed.last_seen_at < timedelta(seconds=5)
 
 
 def test_worker_renews_lease_while_pipeline_runs(tmp_path: Path) -> None:

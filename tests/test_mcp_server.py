@@ -15,6 +15,8 @@ from clio_relay.mcp_server import (
 from clio_relay.models import (
     ArtifactRef,
     Cursor,
+    EndpointRegistration,
+    EndpointRole,
     JarvisRunSpec,
     JobKind,
     McpCallSpec,
@@ -50,6 +52,10 @@ def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
     assert "relay_record_progress" in tool_names
     assert "relay_list_progress" in tool_names
     assert "relay_cancel_job" in tool_names
+    assert "relay_queue_list" in tool_names
+    assert "relay_queue_diagnose" in tool_names
+    assert "relay_queue_cleanup_stale" in tool_names
+    assert "relay_worker_status" in tool_names
     assert "relay_create_monitor_rule" in tool_names
     assert "relay_list_monitor_rules" in tool_names
     assert "relay_evaluate_monitor_rules" in tool_names
@@ -757,12 +763,93 @@ def test_mcp_cancels_job(tmp_path: Path) -> None:
     )
 
     assert response is not None
-    assert response["result"]["structuredContent"]["state"] == "canceled"
+    assert response["result"]["structuredContent"]["job"]["state"] == "canceled"
+    assert response["result"]["structuredContent"]["scheduler_policy"] == "relay-only"
     events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=20)
     assert [event.event_type for event in events][-2:] == [
         "job.cancel_requested",
         "job.canceled",
     ]
+
+
+def test_mcp_queue_management_tools(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    queue.register_endpoint(
+        EndpointRegistration(
+            role=EndpointRole.WORKER,
+            cluster="test-cluster",
+            hostname="node",
+            pid=123,
+            metadata={"concurrency": 5},
+        )
+    )
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="mcp-queue-management",
+        )
+    )
+    queue.acquire_next_job("endpoint-1", cluster="test-cluster", ttl_seconds=-1)
+
+    listed = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_queue_list",
+                "arguments": {"cluster": "test-cluster"},
+            },
+        },
+        queue=queue,
+    )
+    diagnosed = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_queue_diagnose",
+                "arguments": {"cluster": "test-cluster"},
+            },
+        },
+        queue=queue,
+    )
+    workers = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 43,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_worker_status",
+                "arguments": {"cluster": "test-cluster"},
+            },
+        },
+        queue=queue,
+    )
+    cleanup = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 44,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_queue_cleanup_stale",
+                "arguments": {"cluster": "test-cluster", "dry_run": False},
+            },
+        },
+        queue=queue,
+    )
+
+    assert listed is not None
+    assert diagnosed is not None
+    assert workers is not None
+    assert cleanup is not None
+    assert listed["result"]["structuredContent"]["jobs"][0]["job"]["job_id"] == job.job_id
+    assert diagnosed["result"]["structuredContent"]["issues"][0]["code"] == "expired_lease"
+    assert workers["result"]["structuredContent"]["configured_concurrency"] == 5
+    assert cleanup["result"]["structuredContent"]["recovered_count"] == 1
 
 
 def test_mcp_creates_and_evaluates_monitor_rule(tmp_path: Path) -> None:

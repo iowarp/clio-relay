@@ -61,6 +61,13 @@ from clio_relay.models import (
     TaskTimelineEvent,
 )
 from clio_relay.progress_provenance import external_progress_metadata
+from clio_relay.queue_management import (
+    cancel_queue_job,
+    cleanup_stale_jobs,
+    diagnose_queue,
+    list_queue_jobs,
+    worker_status,
+)
 from clio_relay.relay_host import (
     FrpcConfig,
     FrpcVisitorConfig,
@@ -111,6 +118,8 @@ monitor_app = typer.Typer(no_args_is_help=True)
 api_app = typer.Typer(no_args_is_help=True)
 session_app = typer.Typer(no_args_is_help=True)
 gateway_app = typer.Typer(no_args_is_help=True)
+queue_app = typer.Typer(no_args_is_help=True)
+worker_app = typer.Typer(no_args_is_help=True)
 
 app.add_typer(endpoint_app, name="endpoint")
 app.add_typer(relay_host_app, name="relay-host")
@@ -121,6 +130,8 @@ app.add_typer(monitor_app, name="monitor")
 app.add_typer(api_app, name="api")
 app.add_typer(session_app, name="session")
 app.add_typer(gateway_app, name="gateway")
+app.add_typer(queue_app, name="queue")
+app.add_typer(worker_app, name="worker")
 
 
 @app.callback()
@@ -457,14 +468,25 @@ def endpoint_start(
         typer.Option(help="Configured cluster name for worker endpoints."),
     ] = None,
     once: Annotated[bool, typer.Option(help="Run one worker iteration and exit.")] = False,
+    concurrency: Annotated[
+        int,
+        typer.Option(help="Number of in-process worker slots for worker endpoints."),
+    ] = 1,
 ) -> None:
     """Start a desktop or worker endpoint."""
+    if concurrency < 1:
+        raise typer.BadParameter("--concurrency must be at least 1")
     settings = RelaySettings.from_env()
     if role == EndpointRole.WORKER:
         if cluster is None:
             raise typer.BadParameter("--cluster is required for worker endpoints")
         _require_cluster(cluster)
-    worker = EndpointWorker(role=role, settings=settings, cluster=cluster or "local")
+    worker = EndpointWorker(
+        role=role,
+        settings=settings,
+        cluster=cluster or "local",
+        concurrency=concurrency,
+    )
     worker.register()
     if once:
         worker.run_once()
@@ -491,10 +513,18 @@ def endpoint_render_user_service(
         Path | None,
         typer.Option(help="Optional path to write the systemd user service."),
     ] = None,
+    concurrency: Annotated[
+        int,
+        typer.Option(help="Number of in-process worker slots for the user service."),
+    ] = 1,
 ) -> None:
     """Render a sudo-less systemd user service for a worker endpoint."""
     definition = _require_cluster(cluster)
-    service_text = render_endpoint_user_service(cluster=cluster, definition=definition)
+    service_text = render_endpoint_user_service(
+        cluster=cluster,
+        definition=definition,
+        concurrency=concurrency,
+    )
     if output is None:
         typer.echo(service_text)
         return
@@ -685,10 +715,18 @@ def cluster_install_endpoint_service(
     ] = None,
     start: Annotated[bool, typer.Option(help="Restart the service after installing.")] = True,
     enable: Annotated[bool, typer.Option(help="Enable the user service.")] = True,
+    concurrency: Annotated[
+        int,
+        typer.Option(help="Number of in-process worker slots for the user service."),
+    ] = 1,
 ) -> None:
     """Install and optionally start a sudo-less worker endpoint service over SSH."""
     definition = _require_cluster(cluster)
-    service_text = render_endpoint_user_service(cluster=cluster, definition=definition)
+    service_text = render_endpoint_user_service(
+        cluster=cluster,
+        definition=definition,
+        concurrency=concurrency,
+    )
     _run_or_exit(
         lambda: _echo_lines(
             install_endpoint_user_service_over_ssh(
@@ -1209,6 +1247,148 @@ def job_record_progress(
     typer.echo(progress.model_dump_json(indent=2))
 
 
+@queue_app.command("list")
+def queue_list(
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH, or local filter in local mode."),
+    ] = None,
+    state: Annotated[
+        JobState | None,
+        typer.Option(help="Optional job state filter."),
+    ] = None,
+    include_terminal: Annotated[
+        bool,
+        typer.Option(help="Include succeeded, failed, and canceled jobs."),
+    ] = False,
+) -> None:
+    """List relay queue jobs."""
+    args = ["queue", "list"]
+    if cluster is not None:
+        args.extend(["--cluster", cluster])
+    if state is not None:
+        args.extend(["--state", state.value])
+    if include_terminal:
+        args.append("--include-terminal")
+    if _try_remote_cluster_passthrough(cluster, args):
+        return
+    queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+    typer.echo(
+        json.dumps(
+            list_queue_jobs(
+                queue,
+                cluster=cluster,
+                state=state,
+                include_terminal=include_terminal,
+            ),
+            indent=2,
+        )
+    )
+
+
+@queue_app.command("diagnose")
+def queue_diagnose(
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH, or local filter in local mode."),
+    ] = None,
+) -> None:
+    """Diagnose stuck relay queue state."""
+    args = ["queue", "diagnose"]
+    if cluster is not None:
+        args.extend(["--cluster", cluster])
+    if _try_remote_cluster_passthrough(cluster, args):
+        return
+    queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+    typer.echo(json.dumps(diagnose_queue(queue, cluster=cluster), indent=2))
+
+
+@queue_app.command("cancel")
+def queue_cancel(
+    job_id: str,
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH."),
+    ] = None,
+    cancel_scheduler_job: Annotated[
+        bool,
+        typer.Option(
+            "--cancel-scheduler-job/--keep-scheduler-job",
+            help="Request scheduler cancellation for already-submitted remote work.",
+        ),
+    ] = False,
+) -> None:
+    """Cancel a relay job with explicit scheduler policy."""
+    args = ["queue", "cancel", job_id]
+    if cluster is not None:
+        args.extend(["--cluster", cluster])
+    args.append("--cancel-scheduler-job" if cancel_scheduler_job else "--keep-scheduler-job")
+    if _try_remote_cluster_passthrough(cluster, args):
+        return
+    queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+    result = cancel_queue_job(
+        queue,
+        job_id,
+        scheduler_policy="request-scheduler" if cancel_scheduler_job else "relay-only",
+    )
+    typer.echo(json.dumps(result, indent=2))
+
+
+@queue_app.command("cleanup-stale")
+def queue_cleanup_stale(
+    cluster: Annotated[str, typer.Option(help="Cluster whose stale leases should be recovered.")],
+    max_attempts: Annotated[
+        int,
+        typer.Option(help="Maximum attempts before expired leased jobs fail instead of requeue."),
+    ] = 3,
+    dry_run: Annotated[
+        bool,
+        typer.Option(help="Preview recoverable jobs without changing state."),
+    ] = True,
+) -> None:
+    """Recover jobs with expired worker leases."""
+    args = [
+        "queue",
+        "cleanup-stale",
+        "--cluster",
+        cluster,
+        "--max-attempts",
+        str(max_attempts),
+    ]
+    args.append("--dry-run" if dry_run else "--no-dry-run")
+    if _try_remote_cluster_passthrough(cluster, args):
+        return
+    queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+    typer.echo(
+        json.dumps(
+            cleanup_stale_jobs(
+                queue,
+                cluster=cluster,
+                max_attempts=max_attempts,
+                dry_run=dry_run,
+            ),
+            indent=2,
+        )
+    )
+
+
+@worker_app.command("status")
+def worker_status_command(
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH, or local filter in local mode."),
+    ] = None,
+) -> None:
+    """Show registered worker capacity and leases."""
+    args = ["worker", "status"]
+    if cluster is not None:
+        args.extend(["--cluster", cluster])
+    if _try_remote_cluster_passthrough(cluster, args):
+        return
+    queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+    typer.echo(json.dumps(worker_status(queue, cluster=cluster), indent=2))
+
+
 @job_app.command("cancel")
 def job_cancel(
     job_id: str,
@@ -1216,11 +1396,25 @@ def job_cancel(
         str | None,
         typer.Option(help="Configured cluster to inspect over SSH."),
     ] = None,
+    cancel_scheduler_job: Annotated[
+        bool,
+        typer.Option(
+            "--cancel-scheduler-job/--keep-scheduler-job",
+            help="Request scheduler cancellation for already-submitted remote work.",
+        ),
+    ] = False,
 ) -> None:
     """Cancel a queued or running job."""
-    if _try_remote_cluster_passthrough(cluster, ["job", "cancel", job_id]):
+    args = ["job", "cancel", job_id]
+    if cancel_scheduler_job:
+        args.append("--cancel-scheduler-job")
+    if _try_remote_cluster_passthrough(cluster, args):
         return
-    job = request_cancel_job(ClioCoreQueue(RelaySettings.from_env().core_dir), job_id)
+    job = request_cancel_job(
+        ClioCoreQueue(RelaySettings.from_env().core_dir),
+        job_id,
+        cancel_scheduler=cancel_scheduler_job,
+    )
     typer.echo(f"{job.job_id} {job.state.value}")
 
 

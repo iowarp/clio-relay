@@ -16,6 +16,8 @@ from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, FrpTra
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.models import (
     ArtifactRef,
+    EndpointRegistration,
+    EndpointRole,
     GatewaySessionState,
     JarvisRunSpec,
     JobKind,
@@ -242,6 +244,70 @@ def test_cli_job_status_includes_relay_queue(tmp_path: Path, monkeypatch: Monkey
     status = json.loads(result.output)
     assert status["job"]["job_id"] == job.job_id
     assert status["relay_queue"] == {"state": "queued", "jobs_ahead": 0, "position": 1}
+
+
+def test_cli_queue_management_commands(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="cli-queue-management",
+        )
+    )
+    queue.acquire_next_job("endpoint-1", cluster="test-cluster", ttl_seconds=-1)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    runner = CliRunner()
+
+    listed = runner.invoke(app, ["queue", "list", "--cluster", "test-cluster"])
+    diagnosed = runner.invoke(app, ["queue", "diagnose", "--cluster", "test-cluster"])
+    cleanup = runner.invoke(
+        app,
+        [
+            "queue",
+            "cleanup-stale",
+            "--cluster",
+            "test-cluster",
+            "--no-dry-run",
+        ],
+    )
+    canceled = runner.invoke(app, ["queue", "cancel", job.job_id])
+
+    assert listed.exit_code == 0
+    assert diagnosed.exit_code == 0
+    assert cleanup.exit_code == 0
+    assert canceled.exit_code == 0
+    assert json.loads(listed.output)["count"] == 1
+    assert json.loads(diagnosed.output)["issues"][0]["code"] == "expired_lease"
+    assert json.loads(cleanup.output)["recovered_count"] == 1
+    assert json.loads(canceled.output)["scheduler_policy"] == "relay-only"
+
+
+def test_cli_worker_status_reports_registered_capacity(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    queue.register_endpoint(
+        EndpointRegistration(
+            role=EndpointRole.WORKER,
+            cluster="test-cluster",
+            hostname="node",
+            pid=123,
+            metadata={"concurrency": 3},
+        )
+    )
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+
+    result = CliRunner().invoke(app, ["worker", "status", "--cluster", "test-cluster"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["worker_count"] == 1
+    assert payload["configured_concurrency"] == 3
 
 
 def test_cli_job_submit_can_request_exclusive_scheduler(

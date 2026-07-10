@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -62,12 +63,16 @@ class EndpointWorker:
         role: EndpointRole,
         settings: RelaySettings,
         cluster: str = "local",
+        concurrency: int = 1,
         queue: ClioCoreQueue | None = None,
         provider: JarvisCdProvider | None = None,
         scheduler_provider: SchedulerProvider | None = None,
     ) -> None:
+        if concurrency < 1:
+            raise ConfigurationError("worker concurrency must be at least 1")
         self.role = role
         self.cluster = cluster
+        self.concurrency = concurrency
         self.settings = settings
         self.queue = queue or ClioCoreQueue(settings.core_dir)
         self.provider = provider or JarvisCdProvider(
@@ -81,11 +86,15 @@ class EndpointWorker:
 
     def register(self) -> EndpointRegistration:
         """Register this endpoint in the durable queue."""
+        metadata: dict[str, object] = {"concurrency": self.concurrency}
+        if self.role == EndpointRole.WORKER and self.concurrency > 1:
+            metadata["worker_supervisor"] = True
         endpoint = EndpointRegistration(
             role=self.role,
             cluster=self.cluster if self.role == EndpointRole.WORKER else None,
             hostname=socket.gethostname(),
             pid=os.getpid(),
+            metadata=metadata,
         )
         self.endpoint = self.queue.register_endpoint(endpoint)
         return self.endpoint
@@ -95,6 +104,7 @@ class EndpointWorker:
         if self.role != EndpointRole.WORKER:
             return None
         endpoint = self.endpoint or self.register()
+        self.endpoint = self.queue.register_endpoint(endpoint)
         self._reconcile_canceled_scheduler_jobs()
         lease = self.queue.acquire_next_job(
             endpoint.endpoint_id,
@@ -117,9 +127,46 @@ class EndpointWorker:
             while True:
                 time.sleep(poll_seconds)
         with self._single_cluster_worker_lock():
+            if self.concurrency > 1:
+                self._serve_worker_slots(poll_seconds=poll_seconds)
+                return
             while True:
                 self.run_once()
                 time.sleep(poll_seconds)
+
+    def _serve_worker_slots(self, *, poll_seconds: float) -> None:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+            futures = [
+                executor.submit(self._serve_worker_slot, index, poll_seconds)
+                for index in range(self.concurrency)
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+
+    def _serve_worker_slot(self, index: int, poll_seconds: float) -> None:
+        worker = EndpointWorker(
+            role=self.role,
+            settings=self.settings,
+            cluster=self.cluster,
+            concurrency=1,
+            queue=self.queue,
+            scheduler_provider=self.scheduler_provider,
+        )
+        endpoint = EndpointRegistration(
+            role=self.role,
+            cluster=self.cluster,
+            hostname=socket.gethostname(),
+            pid=os.getpid(),
+            metadata={
+                "worker_slot": index,
+                "parent_endpoint_id": None if self.endpoint is None else self.endpoint.endpoint_id,
+                "concurrency": 1,
+            },
+        )
+        worker.endpoint = self.queue.register_endpoint(endpoint)
+        while True:
+            worker.run_once()
+            time.sleep(poll_seconds)
 
     def _run_job(self, job: RelayJob, lease: Lease) -> None:
         if self.queue.get_job(job.job_id).state == JobState.CANCELED:
@@ -574,10 +621,11 @@ class EndpointWorker:
         if not canceled or scheduler_cancel_attempted[0]:
             return canceled
         scheduler_cancel_attempted[0] = True
-        self._cancel_scheduler_jobs(
-            job,
-            self._durable_scheduler_job_ids(job, task_id, scheduler_job_ids),
-        )
+        if self._scheduler_cancel_was_requested(job.job_id):
+            self._cancel_scheduler_jobs(
+                job,
+                self._durable_scheduler_job_ids(job, task_id, scheduler_job_ids),
+            )
         return True
 
     def _handle_execution_timeout(
@@ -747,6 +795,8 @@ class EndpointWorker:
         for job in self.queue.list_jobs():
             if job.cluster != self.cluster or job.state != JobState.CANCELED:
                 continue
+            if not self._scheduler_cancel_was_requested(job.job_id):
+                continue
             for task in self.queue.list_tasks(job.job_id):
                 scheduler_job_ids = _scheduler_job_ids_from_metadata(task.metadata)
                 if not scheduler_job_ids:
@@ -758,6 +808,15 @@ class EndpointWorker:
                 ]
                 if pending:
                     self._cancel_scheduler_jobs(job, pending)
+
+    def _scheduler_cancel_was_requested(self, job_id: str) -> bool:
+        events, _ = self.queue.drain_events(Cursor(job_id=job_id, next_seq=1), limit=10000)
+        for event in events:
+            if event.event_type != "job.cancel_requested":
+                continue
+            if event.payload.get("cancel_scheduler") is True:
+                return True
+        return False
 
     def _scheduler_provider_for_job(self, job: RelayJob) -> SchedulerProvider:
         if self.scheduler_provider is not None:

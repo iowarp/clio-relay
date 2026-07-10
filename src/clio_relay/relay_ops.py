@@ -147,7 +147,12 @@ def read_artifact_bytes(queue: ClioCoreQueue, artifact_id: str) -> dict[str, obj
     }
 
 
-def cancel_job(queue: ClioCoreQueue, job_id: str) -> RelayJob:
+def cancel_job(
+    queue: ClioCoreQueue,
+    job_id: str,
+    *,
+    cancel_scheduler: bool = False,
+) -> RelayJob:
     """Request cancellation for a queued, leased, or running job."""
     job = queue.get_job(job_id)
     if job.state in TERMINAL_STATES:
@@ -156,12 +161,16 @@ def cancel_job(queue: ClioCoreQueue, job_id: str) -> RelayJob:
         job_id,
         "job.cancel_requested",
         "Cancellation requested",
-        payload={"previous_state": job.state.value},
+        payload={
+            "previous_state": job.state.value,
+            "cancel_scheduler": cancel_scheduler,
+        },
     )
     return queue.update_job_state(
         job_id,
         JobState.CANCELED,
         message="Job canceled",
+        leased_by=None,
     )
 
 

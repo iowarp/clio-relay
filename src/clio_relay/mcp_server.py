@@ -17,6 +17,7 @@ from clio_relay.models import (
     GatewaySessionState,
     JarvisRunSpec,
     JobKind,
+    JobState,
     McpCallSpec,
     MonitorRule,
     MonitorRuleAction,
@@ -27,8 +28,12 @@ from clio_relay.models import (
     TaskTimelineEvent,
 )
 from clio_relay.progress_provenance import external_progress_metadata
-from clio_relay.relay_ops import (
-    cancel_job as request_cancel_job,
+from clio_relay.queue_management import (
+    cancel_queue_job,
+    cleanup_stale_jobs,
+    diagnose_queue,
+    list_queue_jobs,
+    worker_status,
 )
 from clio_relay.relay_ops import (
     evaluate_monitor_rules,
@@ -366,8 +371,59 @@ def _tool_definitions() -> list[JSON]:
             "description": "Request cancellation for a queued, leased, or running relay job.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"job_id": {"type": "string"}},
+                "properties": {
+                    "job_id": {"type": "string"},
+                    "cancel_scheduler_job": {"type": "boolean", "default": False},
+                },
                 "required": ["job_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_queue_list",
+            "description": "List relay queue jobs with queue-position metadata.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cluster": {"type": "string"},
+                    "state": {
+                        "type": "string",
+                        "enum": ["queued", "leased", "running", "succeeded", "failed", "canceled"],
+                    },
+                    "include_terminal": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_queue_diagnose",
+            "description": "Diagnose stuck relay queue state such as expired leases.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"cluster": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_queue_cleanup_stale",
+            "description": "Recover jobs with expired worker leases.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cluster": {"type": "string"},
+                    "max_attempts": {"type": "integer", "minimum": 1, "default": 3},
+                    "dry_run": {"type": "boolean", "default": True},
+                },
+                "required": ["cluster"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_worker_status",
+            "description": "Show registered worker capacity and leases.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"cluster": {"type": "string"}},
                 "additionalProperties": False,
             },
         },
@@ -580,9 +636,35 @@ def _call_tool(params: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -
             ]
         }
     elif name == "relay_cancel_job":
-        result = request_cancel_job(queue, _required_str(arguments, "job_id")).model_dump(
-            mode="json"
+        result = cancel_queue_job(
+            queue,
+            _required_str(arguments, "job_id"),
+            scheduler_policy=(
+                "request-scheduler"
+                if arguments.get("cancel_scheduler_job") is True
+                else "relay-only"
+            ),
         )
+    elif name == "relay_queue_list":
+        raw_state = arguments.get("state")
+        state = JobState(raw_state) if isinstance(raw_state, str) else None
+        result = list_queue_jobs(
+            queue,
+            cluster=_optional_str(arguments, "cluster"),
+            state=state,
+            include_terminal=arguments.get("include_terminal") is True,
+        )
+    elif name == "relay_queue_diagnose":
+        result = diagnose_queue(queue, cluster=_optional_str(arguments, "cluster"))
+    elif name == "relay_queue_cleanup_stale":
+        result = cleanup_stale_jobs(
+            queue,
+            cluster=_required_str(arguments, "cluster"),
+            max_attempts=int(arguments.get("max_attempts", 3)),
+            dry_run=arguments.get("dry_run", True) is not False,
+        )
+    elif name == "relay_worker_status":
+        result = worker_status(queue, cluster=_optional_str(arguments, "cluster"))
     elif name == "relay_create_monitor_rule":
         result = queue.append_monitor_rule(_monitor_rule_from_arguments(arguments)).model_dump(
             mode="json"

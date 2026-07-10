@@ -2,6 +2,10 @@
 
 This page covers the common operator paths. Use the README for the short overview and `docs/ai/` for the full implementation context.
 
+For a complete first-connection walkthrough from a local desktop through a
+homelab relay to a cluster worker and remote agent, see
+`docs/connect-desktop-homelab-cluster.md`.
+
 ## Add a Cluster
 
 ```powershell
@@ -22,6 +26,45 @@ uvx --python 3.12 --from clio-relay clio-relay job list-artifacts <job-id> --clu
 ```
 
 Submissions are asynchronous by default. CLI, HTTP, and MCP callers get a `job_id` and can monitor events and logs by cursor or byte offset.
+
+## Manage the Relay Queue
+
+Relay queue state is separate from cluster scheduler state. A queued relay job
+has not been leased by a worker yet. A running relay job may already have
+submitted scheduler work through its JARVIS package.
+
+```powershell
+uvx --python 3.12 --from clio-relay clio-relay queue list --cluster my-cluster
+uvx --python 3.12 --from clio-relay clio-relay queue diagnose --cluster my-cluster
+uvx --python 3.12 --from clio-relay clio-relay queue cleanup-stale --cluster my-cluster --dry-run
+uvx --python 3.12 --from clio-relay clio-relay worker status --cluster my-cluster
+```
+
+Cancel queued jobs without touching any scheduler:
+
+```powershell
+uvx --python 3.12 --from clio-relay clio-relay queue cancel <job-id> --cluster my-cluster
+```
+
+For leased or running jobs, scheduler cancellation is explicit:
+
+```powershell
+uvx --python 3.12 --from clio-relay clio-relay queue cancel <job-id> --cluster my-cluster --cancel-scheduler-job
+```
+
+Use `--keep-scheduler-job` or omit the flag when the user only wants the relay
+job/session to stop observing or driving the work. Use `--cancel-scheduler-job`
+only when the user explicitly wants the package or scheduler adapter to stop the
+remote scheduler job too.
+
+Worker capacity is configured when the user-level worker service is installed:
+
+```powershell
+uvx --python 3.12 --from clio-relay clio-relay cluster install-endpoint-service --cluster my-cluster --concurrency 4 --start --enable
+```
+
+This keeps one sudo-less user service per cluster and runs multiple in-process
+worker slots inside that service.
 
 ## Expose Tools to an Agent
 

@@ -34,6 +34,7 @@ from clio_relay.models import (
     GatewaySessionState,
     JarvisRunSpec,
     JobKind,
+    JobState,
     McpCallSpec,
     MonitorRule,
     ProgressRecord,
@@ -45,6 +46,13 @@ from clio_relay.models import (
     TaskTimelineEvent,
 )
 from clio_relay.progress_provenance import external_progress_metadata
+from clio_relay.queue_management import (
+    cancel_queue_job,
+    cleanup_stale_jobs,
+    diagnose_queue,
+    list_queue_jobs,
+    worker_status,
+)
 from clio_relay.relay_ops import (
     cancel_job as request_cancel_job,
 )
@@ -95,6 +103,14 @@ class McpCallSubmitRequest(BaseModel):
     arguments: dict[str, object] = Field(default_factory=dict)
     timeout_seconds: int | None = Field(default=None, gt=0)
     idempotency_key: str
+
+
+class QueueCancelRequest(BaseModel):
+    """HTTP request to cancel a relay job with explicit scheduler policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cancel_scheduler_job: bool = False
 
 
 class ProgressUpdateRequest(BaseModel):
@@ -578,8 +594,64 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/jobs/{job_id}/cancel", response_model=RelayJob, dependencies=[auth_dependency])
-    def cancel_job(job_id: str) -> RelayJob:
-        return request_cancel_job(queue, job_id)
+    def cancel_job(job_id: str, request: QueueCancelRequest | None = None) -> RelayJob:
+        cancel_scheduler = False if request is None else request.cancel_scheduler_job
+        return request_cancel_job(queue, job_id, cancel_scheduler=cancel_scheduler)
+
+    @app.post("/queue/jobs/{job_id}/cancel", dependencies=[auth_dependency])
+    def cancel_queue_job_route(
+        job_id: str,
+        request: QueueCancelRequest | None = None,
+    ) -> dict[str, object]:
+        cancel_scheduler = False if request is None else request.cancel_scheduler_job
+        try:
+            return cancel_queue_job(
+                queue,
+                job_id,
+                scheduler_policy="request-scheduler" if cancel_scheduler else "relay-only",
+            )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/queue", dependencies=[auth_dependency])
+    def list_queue(
+        cluster: str | None = None,
+        state: str | None = None,
+        include_terminal: bool = False,
+    ) -> dict[str, object]:
+        job_state = None
+        if state is not None:
+            try:
+                job_state = JobState(state)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=f"unknown job state: {state}") from exc
+        return list_queue_jobs(
+            queue,
+            cluster=cluster,
+            state=job_state,
+            include_terminal=include_terminal,
+        )
+
+    @app.get("/queue/diagnostics", dependencies=[auth_dependency])
+    def diagnose_queue_route(cluster: str | None = None) -> dict[str, object]:
+        return diagnose_queue(queue, cluster=cluster)
+
+    @app.post("/queue/cleanup-stale", dependencies=[auth_dependency])
+    def cleanup_stale_queue_route(
+        cluster: str,
+        max_attempts: int = 3,
+        dry_run: bool = True,
+    ) -> dict[str, object]:
+        return cleanup_stale_jobs(
+            queue,
+            cluster=cluster,
+            max_attempts=max_attempts,
+            dry_run=dry_run,
+        )
+
+    @app.get("/workers", dependencies=[auth_dependency])
+    def worker_status_route(cluster: str | None = None) -> dict[str, object]:
+        return worker_status(queue, cluster=cluster)
 
     @app.post("/monitor/rules", response_model=MonitorRule, dependencies=[auth_dependency])
     def create_monitor_rule(rule: MonitorRule) -> MonitorRule:
