@@ -56,7 +56,7 @@ wheels = [
 
 [[package]]
 name = "clio-relay"
-version = "0.9.21"
+version = "0.9.22"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
