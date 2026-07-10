@@ -19,18 +19,40 @@ This keeps machine selection in data, not in duplicated server registrations. A 
 The built-in JARVIS MCP command is:
 
 ```bash
-jarvis-mcp --profile user
+uvx --from clio-kit==2.2.6 clio-kit mcp-server jarvis
 ```
 
-That command runs on the remote cluster, not on the desktop. During cluster bootstrap, clio-relay installs `jarvis-mcp` into the same user virtualenv that contains JARVIS-CD, then links it into `~/.local/bin`. The `user` profile is meant for normal pipeline construction and inspection. Admin operations such as repository management are separated in `clio-kit` so a normal agent does not receive unnecessary privileged tools.
+That command runs on the remote cluster, not on the desktop. During cluster bootstrap, clio-relay installs JARVIS-CD for execution and warms the released clio-kit MCP entry point through `uvx`. The user JARVIS MCP is intentionally compact: create a pipeline, describe packages or pipelines, add/edit/remove a step, and run.
 
 The bootstrap install source can be overridden for prerelease or site-local deployments:
 
 ```bash
-export CLIO_RELAY_JARVIS_MCP_INSTALL_SPEC='git+https://github.com/iowarp/clio-kit.git@develop/jarvis-mcp-user-surface#subdirectory=clio-kit-mcp-servers/jarvis'
+export CLIO_RELAY_JARVIS_MCP_INSTALL_SPEC='clio-kit==2.2.6'
 ```
 
 Use `CLIO_RELAY_JARVIS_MCP_COMMAND` only when a site intentionally wants to replace the launched command.
+
+## Relay MCP profiles
+
+The default local MCP profile is the user profile. It exposes:
+
+- `relay_submit_agent`
+- `relay_status`
+- `relay_cancel`
+- `relay_observe`
+- `relay_wait`
+- `jarvis_create_pipeline`
+- `jarvis_describe`
+- `jarvis_add_step`
+- `jarvis_edit_step`
+- `jarvis_remove_step`
+- `jarvis_run`
+
+Operational tools for queues, gateway sessions, low-level log reads, monitor rules, and raw MCP calls remain available through the admin/operator profile:
+
+```bash
+clio-relay mcp-server --profile admin
+```
 
 ## Agent workflow
 
@@ -40,19 +62,18 @@ Typical flow:
 
 ```text
 jarvis_create_pipeline(cluster="ares", pipeline_id="demo_lammps")
-jarvis_append_pkg(cluster="ares", pipeline_id="demo_lammps", pkg_type="builtin.lammps", ...)
-jarvis_configure_pkg(cluster="ares", pipeline_id="demo_lammps", pkg_id="lammps", extra_args={...})
-jarvis_export_pipeline(cluster="ares", pipeline_id="demo_lammps")
-relay_submit_jarvis_job(cluster="ares", pipeline_name="demo_lammps")
+jarvis_describe(cluster="ares", target="package", package_name="builtin.lammps")
+jarvis_add_step(cluster="ares", pipeline_id="demo_lammps", package_name="builtin.lammps", step_id="lammps", config={...})
+jarvis_run(cluster="ares", pipeline_id="demo_lammps", execution={"mode":"cluster"}, submit=true, wait=false)
+relay_observe(job_id="<jarvis-run-relay-job>", pattern="Loop time")
+relay_wait(job_id="<jarvis-run-relay-job>")
 ```
 
-The relay submission does not require the agent to copy YAML back to the desktop. The named pipeline already lives in the cluster-local JARVIS state.
-
-`relay_call_jarvis_mcp` remains available as a lower-level escape hatch for tools that have not yet been virtualized.
+The relay submission does not require the agent to copy YAML back to the desktop. The named pipeline lives in cluster-local JARVIS state, and `jarvis_run` is itself routed as a durable relay job.
 
 ## Generic remote MCP calls
 
-For MCP servers other than JARVIS, use `relay_submit_mcp_call` with:
+For MCP servers other than JARVIS, the admin profile exposes the lower-level raw call contract:
 
 - `cluster`: target cluster name.
 - `server`: executable to launch on the cluster.
@@ -60,13 +81,13 @@ For MCP servers other than JARVIS, use `relay_submit_mcp_call` with:
 - `tool`: remote MCP tool name.
 - `arguments`: tool arguments.
 
-The virtual JARVIS tools and the JARVIS helper are typed conveniences over this generic mechanism. They are not Ares-specific paths.
+The virtual JARVIS tools are typed conveniences over this generic mechanism. They are not Ares-specific paths.
 
 ## Discovery model
 
 The local relay MCP should stay small and stable while still exposing concrete agent-facing tools for common remote capabilities. Remote discovery is cluster-scoped:
 
-- JARVIS pipeline inspection uses `relay_call_jarvis_mcp(..., tool="export_pipeline", ...)`.
+- JARVIS pipeline inspection uses `jarvis_describe(cluster=..., target="pipeline", pipeline_id=...)`.
 - Generic remote MCP discovery should be exposed as a relay-level remote `tools/list` operation before adding more built-in remote servers.
 - Site-specific MCP servers should be registered in cluster configuration, then called through the same `cluster`, `server`, `server_args`, `tool`, `arguments` shape.
 - Virtualized tools can be generated from a remote MCP catalog and exposed locally with a `cluster` parameter when a tool family becomes common enough for agent-facing use.

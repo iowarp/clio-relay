@@ -21,11 +21,13 @@ from clio_relay.models import (
     EndpointRole,
     JarvisRunSpec,
     JobKind,
+    JobState,
     McpCallSpec,
     RelayJob,
     RelayTask,
     RemoteAgentTaskSpec,
 )
+from clio_relay.spool import JobSpool
 
 
 def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
@@ -38,38 +40,47 @@ def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
 
     assert response is not None
     tool_names = {tool["name"] for tool in response["result"]["tools"]}
-    assert "relay_submit_jarvis_pipeline" in tool_names
-    assert "relay_remote_mcp_context" in tool_names
+    assert tool_names == {
+        "relay_remote_mcp_context",
+        "relay_submit_agent",
+        "relay_status",
+        "relay_cancel",
+        "relay_observe",
+        "relay_wait",
+        "jarvis_create_pipeline",
+        "jarvis_describe",
+        "jarvis_add_step",
+        "jarvis_edit_step",
+        "jarvis_remove_step",
+        "jarvis_run",
+    }
     assert "jarvis_create_pipeline" in tool_names
-    assert "jarvis_append_pkg" in tool_names
-    assert "jarvis_configure_pkg" in tool_names
-    assert "jarvis_export_pipeline" in tool_names
+    create_pipeline_tool = next(
+        tool for tool in response["result"]["tools"] if tool["name"] == "jarvis_create_pipeline"
+    )
+    assert create_pipeline_tool["inputSchema"]["required"] == ["cluster", "pipeline_id"]
+    assert "pipeline_id" in create_pipeline_tool["inputSchema"]["properties"]
+
+
+def test_mcp_admin_profile_lists_operational_tools(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+
+    response = handle_request(
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        queue=queue,
+        profile="admin",
+    )
+
+    assert response is not None
+    tool_names = {tool["name"] for tool in response["result"]["tools"]}
+    assert "relay_submit_jarvis_pipeline" in tool_names
     assert "relay_submit_remote_agent" in tool_names
     assert "relay_submit_mcp_call" in tool_names
     assert "relay_get_job" in tool_names
     assert "relay_get_job_status" in tool_names
     assert "relay_monitor_job" in tool_names
-    assert "relay_watch_job_events" in tool_names
-    assert "relay_list_tasks" in tool_names
-    assert "relay_record_task_event" in tool_names
-    assert "relay_watch_task_events" in tool_names
-    assert "relay_read_job_log" in tool_names
-    assert "relay_list_artifacts" in tool_names
-    assert "relay_read_artifact" in tool_names
-    assert "relay_record_progress" in tool_names
-    assert "relay_list_progress" in tool_names
-    assert "relay_cancel_job" in tool_names
     assert "relay_queue_list" in tool_names
-    assert "relay_queue_diagnose" in tool_names
-    assert "relay_queue_cleanup_stale" in tool_names
-    assert "relay_worker_status" in tool_names
-    assert "relay_create_monitor_rule" in tool_names
-    assert "relay_list_monitor_rules" in tool_names
-    assert "relay_evaluate_monitor_rules" in tool_names
     assert "relay_create_gateway_session" in tool_names
-    assert "relay_get_gateway_session" in tool_names
-    assert "relay_update_gateway_session" in tool_names
-    assert "relay_close_gateway_session" in tool_names
     create_gateway_tool = next(
         tool
         for tool in response["result"]["tools"]
@@ -77,11 +88,6 @@ def test_mcp_lists_relay_tools(tmp_path: Path) -> None:
     )
     state_enum = create_gateway_tool["inputSchema"]["properties"]["state"]["enum"]
     assert "allocated" in state_enum
-    create_pipeline_tool = next(
-        tool for tool in response["result"]["tools"] if tool["name"] == "jarvis_create_pipeline"
-    )
-    assert create_pipeline_tool["inputSchema"]["required"] == ["cluster", "pipeline_id"]
-    assert "pipeline_id" in create_pipeline_tool["inputSchema"]["properties"]
 
 
 def test_mcp_remote_mcp_context_describes_virtual_tools(tmp_path: Path) -> None:
@@ -194,6 +200,118 @@ def test_mcp_submit_remote_agent_creates_real_job(tmp_path: Path) -> None:
     assert job.spec.mcp_config_path == str(mcp_config_path)
     assert job.spec.model == "configured-model"
     assert job.spec.timeout_seconds == 30
+
+
+def test_mcp_compact_submit_agent_creates_real_job(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    prompt_path = tmp_path / "prompt.md"
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 28,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_submit_agent",
+                "arguments": {
+                    "cluster": "test-cluster",
+                    "prompt_path": str(prompt_path),
+                    "timeout_seconds": 45,
+                    "idempotency_key": "compact-agent-tool",
+                },
+            },
+        },
+        queue=queue,
+    )
+
+    assert response is not None
+    result = response["result"]["structuredContent"]
+    job = queue.get_job(result["job_id"])
+    assert job.kind == JobKind.REMOTE_AGENT
+    assert isinstance(job.spec, RemoteAgentTaskSpec)
+    assert job.spec.prompt_path == str(prompt_path)
+    assert job.spec.timeout_seconds == 45
+
+
+def test_mcp_compact_status_observe_wait_and_cancel(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="compact-observe",
+        )
+    )
+    spool = JobSpool(settings.spool_dir, job)
+    spool.initialize()
+    spool.append_stdout("step 25\nfinished\n")
+    spool.append_stderr("warning: none\n")
+    queue.append_event(job.job_id, "stdout.delta", "progress event", payload={"text": "progress\n"})
+
+    status_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 29,
+            "method": "tools/call",
+            "params": {"name": "relay_status", "arguments": {"job_id": job.job_id}},
+        },
+        queue=queue,
+        settings=settings,
+    )
+    observe_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_observe",
+                "arguments": {"job_id": job.job_id, "pattern": r"step\s+(?P<step>\d+)"},
+            },
+        },
+        queue=queue,
+        settings=settings,
+    )
+    queue.update_job_state(job.job_id, JobState.SUCCEEDED, message="done")
+    wait_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_wait",
+                "arguments": {"job_id": job.job_id, "timeout_seconds": 1},
+            },
+        },
+        queue=queue,
+        settings=settings,
+    )
+    cancel_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 32,
+            "method": "tools/call",
+            "params": {"name": "relay_cancel", "arguments": {"job_id": job.job_id}},
+        },
+        queue=queue,
+        settings=settings,
+    )
+
+    assert status_response is not None
+    assert status_response["result"]["structuredContent"]["job"]["job_id"] == job.job_id
+    assert observe_response is not None
+    observed = observe_response["result"]["structuredContent"]
+    assert observed["matched"] is True
+    assert observed["matches"][0]["source"] == "stdout"
+    assert observed["matches"][0]["groupdict"] == {"step": "25"}
+    assert "step 25" in observed["logs"]["stdout"]["text"]
+    assert wait_response is not None
+    waited = wait_response["result"]["structuredContent"]
+    assert waited["terminal"] is True
+    assert "finished" in waited["logs"]["stdout"]["text"]
+    assert cancel_response is not None
+    assert cancel_response["result"]["structuredContent"]["job_id"] == job.job_id
 
 
 def test_mcp_records_and_watches_task_events(tmp_path: Path) -> None:
@@ -371,8 +489,8 @@ def test_mcp_call_jarvis_mcp_uses_builtin_cluster_command(tmp_path: Path) -> Non
                 "name": "relay_call_jarvis_mcp",
                 "arguments": {
                     "cluster": "test-cluster",
-                    "tool": "jm_list_repos",
-                    "arguments": {},
+                    "tool": "jarvis_describe",
+                    "arguments": {"target": "packages"},
                     "idempotency_key": "jarvis-mcp-tool",
                 },
             },
@@ -384,9 +502,16 @@ def test_mcp_call_jarvis_mcp_uses_builtin_cluster_command(tmp_path: Path) -> Non
     result = response["result"]["structuredContent"]
     job = queue.get_job(result["job_id"])
     assert isinstance(job.spec, McpCallSpec)
-    assert job.spec.server == "jarvis-mcp"
-    assert job.spec.server_args == ["--profile", "user"]
-    assert job.spec.tool == "jm_list_repos"
+    assert job.spec.server == "uvx"
+    assert job.spec.server_args == [
+        "--from",
+        "clio-kit==2.2.6",
+        "clio-kit",
+        "mcp-server",
+        "jarvis",
+    ]
+    assert job.spec.tool == "jarvis_describe"
+    assert job.spec.arguments == {"target": "packages"}
 
 
 def test_mcp_virtual_jarvis_tool_routes_to_cluster_mcp(
@@ -418,9 +543,15 @@ def test_mcp_virtual_jarvis_tool_routes_to_cluster_mcp(
     job = queue.get_job(result["job_id"])
     assert isinstance(job.spec, McpCallSpec)
     assert job.cluster == "ares"
-    assert job.spec.server == "jarvis-mcp"
-    assert job.spec.server_args == ["--profile", "user"]
-    assert job.spec.tool == "create_pipeline"
+    assert job.spec.server == "uvx"
+    assert job.spec.server_args == [
+        "--from",
+        "clio-kit==2.2.6",
+        "clio-kit",
+        "mcp-server",
+        "jarvis",
+    ]
+    assert job.spec.tool == "jarvis_create_pipeline"
     assert job.spec.arguments == {"pipeline_id": "lammps_4node"}
 
 
@@ -1059,4 +1190,5 @@ def test_stdio_server_accepts_utf8_bom(tmp_path: Path) -> None:
 
     response = json.loads(stdout.getvalue())
     tool_names = {tool["name"] for tool in response["result"]["tools"]}
-    assert "relay_submit_remote_agent" in tool_names
+    assert "relay_submit_agent" in tool_names
+    assert "relay_submit_remote_agent" not in tool_names

@@ -1113,7 +1113,9 @@ def test_cli_jarvis_mcp_call_uses_builtin_cluster_command(
             "--cluster",
             "ares",
             "--tool",
-            "jm_list_repos",
+            "jarvis_describe",
+            "--arguments-json",
+            '{"target":"packages"}',
             "--idempotency-key",
             "cli-jarvis-mcp",
         ],
@@ -1122,9 +1124,16 @@ def test_cli_jarvis_mcp_call_uses_builtin_cluster_command(
     assert result.exit_code == 0
     job = ClioCoreQueue(core_dir).get_job(result.output.strip())
     assert isinstance(job.spec, McpCallSpec)
-    assert job.spec.server == "jarvis-mcp"
-    assert job.spec.server_args == ["--profile", "user"]
-    assert job.spec.tool == "jm_list_repos"
+    assert job.spec.server == "uvx"
+    assert job.spec.server_args == [
+        "--from",
+        "clio-kit==2.2.6",
+        "clio-kit",
+        "mcp-server",
+        "jarvis",
+    ]
+    assert job.spec.tool == "jarvis_describe"
+    assert job.spec.arguments == {"target": "packages"}
 
 
 def test_cli_mcp_call_reads_arguments_json_file(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

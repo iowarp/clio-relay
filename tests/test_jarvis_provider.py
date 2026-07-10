@@ -52,7 +52,13 @@ def test_mcp_call_yaml_generation() -> None:
     rendered = provider.render_mcp_call_yaml(
         McpCallSpec(
             server="uvx",
-            server_args=["clio-kit", "mcp-server", "jarvis", "--profile", "user"],
+            server_args=[
+                "--from",
+                "clio-kit==2.2.6",
+                "clio-kit",
+                "mcp-server",
+                "jarvis",
+            ],
             tool="inspect",
             arguments={"path": "x"},
         )
@@ -62,7 +68,13 @@ def test_mcp_call_yaml_generation() -> None:
     package = document["pkgs"][0]
     assert package["pkg_type"] == "clio_relay.mcp_call"
     assert package["server"] == "uvx"
-    assert package["server_args"] == ["clio-kit", "mcp-server", "jarvis", "--profile", "user"]
+    assert package["server_args"] == [
+        "--from",
+        "clio-kit==2.2.6",
+        "clio-kit",
+        "mcp-server",
+        "jarvis",
+    ]
     assert package["tool"] == "inspect"
     assert package["arguments"] == {"path": "x"}
 

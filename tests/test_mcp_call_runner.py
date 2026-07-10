@@ -27,12 +27,14 @@ def test_mcp_call_runner_initializes_before_tool_call(
     def fake_run(
         command: list[str],
         *,
-        input: str,
+        tool: str,
+        arguments: dict[str, object],
         timeout: int | None,
     ) -> subprocess.CompletedProcess[str]:
         del timeout
         captured["command"] = json.dumps(command)
-        captured["input"] = input
+        captured["tool"] = tool
+        captured["arguments"] = json.dumps(arguments)
         stdout = "\n".join(
             [
                 json.dumps({"jsonrpc": "2.0", "id": "clio-relay-mcp-init", "result": {}}),
@@ -47,16 +49,23 @@ def test_mcp_call_runner_initializes_before_tool_call(
         )
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
-    monkeypatch.setattr(cast(Any, runner), "_run_process", fake_run)
+    monkeypatch.setattr(cast(Any, runner), "_run_mcp_session", fake_run)
 
     return_code = cast(McpCallRunnerModule, runner).run_mcp_call_from_params(
         {"server": "science-mcp", "tool": "inspect", "arguments": {"path": "x"}}
     )
-    messages = [json.loads(line) for line in captured["input"].splitlines()]
+    messages = [
+        json.loads(line)
+        for line in cast(Any, runner)
+        ._render_session_input(tool="inspect", arguments={"path": "x"})
+        .splitlines()
+    ]
     result = json.loads((tmp_path / "mcp-result.json").read_text(encoding="utf-8"))
 
     assert return_code == 0
     assert json.loads(captured["command"]) == ["science-mcp"]
+    assert captured["tool"] == "inspect"
+    assert json.loads(captured["arguments"]) == {"path": "x"}
     assert [message.get("method") for message in messages] == [
         "initialize",
         "notifications/initialized",
@@ -79,10 +88,11 @@ def test_mcp_call_runner_supports_server_arguments(
     def fake_run(
         command: list[str],
         *,
-        input: str,
+        tool: str,
+        arguments: dict[str, object],
         timeout: int | None,
     ) -> subprocess.CompletedProcess[str]:
-        del input, timeout
+        del tool, arguments, timeout
         captured["command"] = command
         stdout = "\n".join(
             [
@@ -92,21 +102,39 @@ def test_mcp_call_runner_supports_server_arguments(
         )
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
-    monkeypatch.setattr(cast(Any, runner), "_run_process", fake_run)
+    monkeypatch.setattr(cast(Any, runner), "_run_mcp_session", fake_run)
 
     return_code = cast(McpCallRunnerModule, runner).run_mcp_call_from_params(
         {
             "server": "uvx",
-            "server_args": ["clio-kit", "mcp-server", "jarvis", "--profile", "user"],
-            "tool": "jm_list_repos",
+            "server_args": [
+                "--from",
+                "clio-kit==2.2.6",
+                "clio-kit",
+                "mcp-server",
+                "jarvis",
+            ],
+            "tool": "jarvis_describe",
         }
     )
     result = json.loads((tmp_path / "mcp-result.json").read_text(encoding="utf-8"))
 
     assert return_code == 0
-    assert captured["command"] == ["uvx", "clio-kit", "mcp-server", "jarvis", "--profile", "user"]
+    assert captured["command"][-5:] == [
+        "--from",
+        "clio-kit==2.2.6",
+        "clio-kit",
+        "mcp-server",
+        "jarvis",
+    ]
     assert result["server"] == "uvx"
-    assert result["server_args"] == ["clio-kit", "mcp-server", "jarvis", "--profile", "user"]
+    assert result["server_args"] == [
+        "--from",
+        "clio-kit==2.2.6",
+        "clio-kit",
+        "mcp-server",
+        "jarvis",
+    ]
 
 
 def test_mcp_call_runner_records_protocol_errors(
@@ -119,10 +147,11 @@ def test_mcp_call_runner_records_protocol_errors(
     def fake_run(
         command: list[str],
         *,
-        input: str,
+        tool: str,
+        arguments: dict[str, object],
         timeout: int | None,
     ) -> subprocess.CompletedProcess[str]:
-        del input, timeout
+        del tool, arguments, timeout
         stdout = json.dumps(
             {
                 "jsonrpc": "2.0",
@@ -132,7 +161,7 @@ def test_mcp_call_runner_records_protocol_errors(
         )
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
-    monkeypatch.setattr(cast(Any, runner), "_run_process", fake_run)
+    monkeypatch.setattr(cast(Any, runner), "_run_mcp_session", fake_run)
 
     return_code = cast(McpCallRunnerModule, runner).run_mcp_call_from_params(
         {"server": "science-mcp", "tool": "inspect"}
@@ -154,13 +183,14 @@ def test_mcp_call_runner_writes_result_on_timeout(
     def fake_run(
         command: list[str],
         *,
-        input: str,
+        tool: str,
+        arguments: dict[str, object],
         timeout: int | None,
     ) -> subprocess.CompletedProcess[str]:
-        del input
+        del tool, arguments
         raise subprocess.TimeoutExpired(command, timeout=1, output="partial", stderr="late")
 
-    monkeypatch.setattr(cast(Any, runner), "_run_process", fake_run)
+    monkeypatch.setattr(cast(Any, runner), "_run_mcp_session", fake_run)
 
     return_code = cast(McpCallRunnerModule, runner).run_mcp_call_from_params(
         {"server": "science-mcp", "tool": "inspect", "timeout_seconds": 1}

@@ -7,10 +7,14 @@ import os
 from copy import deepcopy
 from typing import Any, cast
 
+CLIO_KIT_JARVIS_MCP_VERSION = "2.2.6"
 DEFAULT_JARVIS_MCP_COMMAND = [
-    "jarvis-mcp",
-    "--profile",
-    "user",
+    "uvx",
+    "--from",
+    f"clio-kit=={CLIO_KIT_JARVIS_MCP_VERSION}",
+    "clio-kit",
+    "mcp-server",
+    "jarvis",
 ]
 JARVIS_MCP_COMMAND_ENV = "CLIO_RELAY_JARVIS_MCP_COMMAND"
 VIRTUAL_JARVIS_PREFIX = "jarvis_"
@@ -23,91 +27,62 @@ _BOOL_SCHEMA: JSON = {"type": "boolean"}
 _OBJECT_SCHEMA: JSON = {"type": "object", "default": {}}
 
 _VIRTUAL_JARVIS_TOOLS: dict[str, JSON] = {
-    "create_pipeline": {
+    "jarvis_create_pipeline": {
         "description": "Create a JARVIS pipeline on the selected cluster.",
-        "properties": {"pipeline_id": _STRING_SCHEMA},
+        "properties": {"pipeline_id": _STRING_SCHEMA, "execution": _OBJECT_SCHEMA},
         "required": ["pipeline_id"],
     },
-    "load_pipeline": {
-        "description": "Load a JARVIS pipeline on the selected cluster.",
-        "properties": {"pipeline_id": _OPTIONAL_STRING_SCHEMA},
-        "required": [],
+    "jarvis_describe": {
+        "description": (
+            "Describe JARVIS packages, one package, a pipeline, or one pipeline step "
+            "on the selected cluster."
+        ),
+        "properties": {
+            "target": {
+                "type": "string",
+                "enum": ["packages", "package", "pipeline", "step"],
+            },
+            "pipeline_id": _STRING_SCHEMA,
+            "step_id": _OPTIONAL_STRING_SCHEMA,
+            "package_name": _OPTIONAL_STRING_SCHEMA,
+            "include_yaml": _BOOL_SCHEMA,
+        },
+        "required": ["target"],
     },
-    "export_pipeline": {
-        "description": "Export a structured JARVIS pipeline snapshot from the selected cluster.",
-        "properties": {"pipeline_id": _STRING_SCHEMA, "include_yaml": _BOOL_SCHEMA},
-        "required": ["pipeline_id"],
-    },
-    "append_pkg": {
-        "description": "Append a package to a JARVIS pipeline on the selected cluster.",
+    "jarvis_add_step": {
+        "description": ("Add a package-backed step to a JARVIS pipeline on the selected cluster."),
         "properties": {
             "pipeline_id": _STRING_SCHEMA,
-            "pkg_type": _STRING_SCHEMA,
-            "pkg_id": _OPTIONAL_STRING_SCHEMA,
+            "package_name": _STRING_SCHEMA,
+            "step_id": _OPTIONAL_STRING_SCHEMA,
+            "config": _OBJECT_SCHEMA,
             "do_configure": _BOOL_SCHEMA,
-            "extra_args": _OBJECT_SCHEMA,
         },
-        "required": ["pipeline_id", "pkg_type"],
+        "required": ["pipeline_id", "package_name"],
     },
-    "configure_pkg": {
-        "description": "Configure a package in a JARVIS pipeline on the selected cluster.",
+    "jarvis_edit_step": {
+        "description": "Edit the configuration of a JARVIS pipeline step.",
         "properties": {
             "pipeline_id": _STRING_SCHEMA,
-            "pkg_id": _STRING_SCHEMA,
-            "extra_args": _OBJECT_SCHEMA,
+            "step_id": _STRING_SCHEMA,
+            "config": _OBJECT_SCHEMA,
         },
-        "required": ["pipeline_id", "pkg_id"],
+        "required": ["pipeline_id", "step_id", "config"],
     },
-    "get_pkg_config": {
-        "description": (
-            "Read a package configuration from a JARVIS pipeline on the selected cluster."
-        ),
-        "properties": {"pipeline_id": _STRING_SCHEMA, "pkg_id": _STRING_SCHEMA},
-        "required": ["pipeline_id", "pkg_id"],
+    "jarvis_remove_step": {
+        "description": "Remove a step from a JARVIS pipeline without deleting package files.",
+        "properties": {"pipeline_id": _STRING_SCHEMA, "step_id": _STRING_SCHEMA},
+        "required": ["pipeline_id", "step_id"],
     },
-    "update_pipeline": {
-        "description": (
-            "Re-apply package configuration for a JARVIS pipeline on the selected cluster."
-        ),
-        "properties": {"pipeline_id": _STRING_SCHEMA},
+    "jarvis_run": {
+        "description": ("Run a configured JARVIS pipeline through the cluster-local JARVIS MCP."),
+        "properties": {
+            "pipeline_id": _STRING_SCHEMA,
+            "execution": _OBJECT_SCHEMA,
+            "submit": _BOOL_SCHEMA,
+            "wait": _BOOL_SCHEMA,
+        },
         "required": ["pipeline_id"],
-    },
-    "build_pipeline_env": {
-        "description": "Rebuild a JARVIS pipeline execution environment on the selected cluster.",
-        "properties": {"pipeline_id": _STRING_SCHEMA},
-        "required": ["pipeline_id"],
-    },
-    "unlink_pkg": {
-        "description": "Unlink a package from a JARVIS pipeline on the selected cluster.",
-        "properties": {"pipeline_id": _STRING_SCHEMA, "pkg_id": _STRING_SCHEMA},
-        "required": ["pipeline_id", "pkg_id"],
-    },
-    "remove_pkg": {
-        "description": "Remove a package from a JARVIS pipeline on the selected cluster.",
-        "properties": {"pipeline_id": _STRING_SCHEMA, "pkg_id": _STRING_SCHEMA},
-        "required": ["pipeline_id", "pkg_id"],
-    },
-    "run_pipeline": {
-        "description": (
-            "Run a JARVIS pipeline through the remote JARVIS MCP on the selected cluster."
-        ),
-        "properties": {"pipeline_id": _STRING_SCHEMA},
-        "required": ["pipeline_id"],
-    },
-    "jm_list_pipelines": {
-        "description": "List JARVIS pipelines on the selected cluster.",
-        "properties": {},
-        "required": [],
-    },
-    "jm_list_repos": {
-        "description": "List JARVIS repositories on the selected cluster.",
-        "properties": {},
-        "required": [],
-    },
-    "jm_get_repo": {
-        "description": "Read one JARVIS repository record on the selected cluster.",
-        "properties": {"path": _STRING_SCHEMA},
-        "required": ["path"],
     },
 }
 
@@ -172,23 +147,21 @@ def virtual_jarvis_tool_definitions() -> list[JSON]:
 
 def virtual_jarvis_tool_name(remote_tool: str) -> str:
     """Return the local virtual tool name for a remote JARVIS MCP tool."""
+    if remote_tool.startswith(VIRTUAL_JARVIS_PREFIX):
+        return remote_tool
     return f"{VIRTUAL_JARVIS_PREFIX}{remote_tool}"
 
 
 def is_virtual_jarvis_tool(tool_name: str) -> bool:
     """Return true when a local MCP tool name represents a virtual JARVIS tool."""
-    return (
-        tool_name.startswith(VIRTUAL_JARVIS_PREFIX)
-        and tool_name.removeprefix(VIRTUAL_JARVIS_PREFIX) in _VIRTUAL_JARVIS_TOOLS
-    )
+    return tool_name in _VIRTUAL_JARVIS_TOOLS
 
 
 def virtual_jarvis_remote_tool(tool_name: str) -> str:
     """Return the remote JARVIS MCP tool name for a local virtual tool."""
-    remote_tool = tool_name.removeprefix(VIRTUAL_JARVIS_PREFIX)
-    if remote_tool not in _VIRTUAL_JARVIS_TOOLS:
+    if tool_name not in _VIRTUAL_JARVIS_TOOLS:
         raise ValueError(f"unknown virtual JARVIS tool: {tool_name}")
-    return remote_tool
+    return tool_name
 
 
 def virtual_jarvis_call_arguments(tool_name: str, arguments: JSON) -> JSON:
@@ -218,10 +191,10 @@ def render_virtual_jarvis_agent_context() -> str:
     tool_names = ", ".join(sorted(virtual_jarvis_tool_name(name) for name in _VIRTUAL_JARVIS_TOOLS))
     return (
         "clio-relay virtualizes the cluster-local JARVIS MCP as concrete tools. "
-        "Call tools such as jarvis_create_pipeline, jarvis_append_pkg, "
-        "jarvis_configure_pkg, jarvis_export_pipeline, and jarvis_run_pipeline with "
-        "a cluster argument. clio-relay routes each call to the JARVIS MCP server "
-        "running on that cluster and returns a durable relay job_id. Available "
+        "Call jarvis_create_pipeline, jarvis_describe, jarvis_add_step, "
+        "jarvis_edit_step, jarvis_remove_step, and jarvis_run with a cluster "
+        "argument. clio-relay routes each call to the JARVIS MCP server running "
+        "on that cluster and returns a durable relay job_id. Available "
         f"virtual JARVIS tools: {tool_names}."
     )
 

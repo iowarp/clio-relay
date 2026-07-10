@@ -218,7 +218,8 @@ def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
         "/jobs/jarvis-mcp-call",
         json={
             "cluster": "test-cluster",
-            "tool": "jm_list_repos",
+            "tool": "jarvis_describe",
+            "arguments": {"target": "packages"},
             "idempotency_key": "http-typed-jarvis-mcp",
         },
     )
@@ -247,9 +248,16 @@ def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
     assert mcp.spec.server_args == ["--stdio"]
     assert mcp.spec.arguments == {"case": "lammps", "steps": 100}
     assert isinstance(jarvis_mcp.spec, McpCallSpec)
-    assert jarvis_mcp.spec.server == "jarvis-mcp"
-    assert jarvis_mcp.spec.server_args == ["--profile", "user"]
-    assert jarvis_mcp.spec.tool == "jm_list_repos"
+    assert jarvis_mcp.spec.server == "uvx"
+    assert jarvis_mcp.spec.server_args == [
+        "--from",
+        "clio-kit==2.2.6",
+        "clio-kit",
+        "mcp-server",
+        "jarvis",
+    ]
+    assert jarvis_mcp.spec.tool == "jarvis_describe"
+    assert jarvis_mcp.spec.arguments == {"target": "packages"}
 
 
 def test_http_progress_endpoints_record_and_list_progress(tmp_path: Path) -> None:

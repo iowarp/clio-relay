@@ -86,11 +86,35 @@ Use timeline events for UI-visible agent work such as repository scans, dataset 
 
 ## Use Remote JARVIS MCP
 
-The relay can run the JARVIS MCP server inside the target cluster environment through `jarvis-mcp --profile user`. Bootstrap installs this entry point into the cluster-local JARVIS environment. Use this when an agent needs to create or configure a JARVIS pipeline on the cluster before submitting it.
+The relay can run the JARVIS MCP server inside the target cluster environment through:
 
-The expected workflow is to call remote JARVIS MCP tools through `relay_call_jarvis_mcp`, inspect the pipeline with `export_pipeline`, then submit the existing cluster-local pipeline with `relay_submit_jarvis_job` or `clio-relay job submit-pipeline`.
+```bash
+uvx --from clio-kit==2.2.6 clio-kit mcp-server jarvis
+```
+
+The default agent MCP profile exposes compact relay tools and the compact JARVIS tools:
+
+- `relay_submit_agent`
+- `relay_status`
+- `relay_cancel`
+- `relay_observe`
+- `relay_wait`
+- `jarvis_create_pipeline`
+- `jarvis_describe`
+- `jarvis_add_step`
+- `jarvis_edit_step`
+- `jarvis_remove_step`
+- `jarvis_run`
+
+The expected workflow is to create or load a pipeline through those JARVIS tools, use `jarvis_describe` for package and pipeline inspection, and call `jarvis_run` to submit the configured pipeline through the cluster-local JARVIS environment. `relay_observe` and `relay_wait` are the agent-facing monitor loop for progress, stdout, stderr, and terminal output.
 
 For prerelease testing, set `CLIO_RELAY_JARVIS_MCP_COMMAND` to a JSON string array on the worker environment. The command is interpreted on the cluster, so it can point at a PyPI release, a Git branch, or a site-local executable.
+
+Operational queue, gateway-session, raw MCP-call, and low-level log tools are available through:
+
+```bash
+clio-relay mcp-server --profile admin
+```
 
 See `docs/remote-mcp-federation.md` for the full agent-facing model.
 

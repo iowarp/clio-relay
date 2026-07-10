@@ -17,6 +17,7 @@ from urllib.request import urlretrieve
 
 from clio_relay import __version__
 from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.jarvis_mcp import CLIO_KIT_JARVIS_MCP_VERSION
 
 FRP_VERSION = "0.69.1"
 
@@ -318,7 +319,7 @@ def render_linux_user_bootstrap_script(
         jarvis_mcp_install_spec
         or os.environ.get(
             "CLIO_RELAY_JARVIS_MCP_INSTALL_SPEC",
-            "git+https://github.com/iowarp/clio-kit.git@main#subdirectory=clio-kit-mcp-servers/jarvis",
+            f"clio-kit=={CLIO_KIT_JARVIS_MCP_VERSION}",
         )
     )
     script = f"""set -euo pipefail
@@ -367,11 +368,9 @@ fi
 git -C "$HOME/.local/src/jarvis-cd" pull --ff-only
 python -m pip install -r "$HOME/.local/src/jarvis-cd/requirements.txt"
 python -m pip install -e "$HOME/.local/src/jarvis-cd"
-python -m pip install "fastmcp>=3.0.1" fastapi "starlette>=0.49.1" "python-dotenv>=1.0.0"
-python -m pip install --no-deps --upgrade {rendered_jarvis_mcp_install_spec}
 ln -sf "$JARVIS_VENV/bin/jarvis" "$HOME/.local/bin/jarvis"
-ln -sf "$JARVIS_VENV/bin/jarvis-mcp" "$HOME/.local/bin/jarvis-mcp"
 deactivate
+uvx --from {rendered_jarvis_mcp_install_spec} clio-kit --help >/dev/null
 
 DEST="$HOME/.local/src/clio-relay"
 rm -rf "$DEST"

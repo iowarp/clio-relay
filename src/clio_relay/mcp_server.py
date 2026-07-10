@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 import sys
 from json import JSONDecodeError
 from typing import Any, TextIO, cast
@@ -55,6 +57,15 @@ from clio_relay.relay_ops import (
 from clio_relay.remote_cli import run_remote_clio, should_execute_on_cluster, write_remote_file
 
 JSON = dict[str, Any]
+MCP_PROFILE_ENV = "CLIO_RELAY_MCP_PROFILE"
+USER_MCP_TOOL_NAMES = {
+    "relay_remote_mcp_context",
+    "relay_submit_agent",
+    "relay_status",
+    "relay_cancel",
+    "relay_observe",
+    "relay_wait",
+}
 
 
 def serve_stdio(
@@ -62,9 +73,11 @@ def serve_stdio(
     stdin: TextIO = sys.stdin,
     stdout: TextIO = sys.stdout,
     settings: RelaySettings | None = None,
+    profile: str | None = None,
 ) -> None:
     """Serve a minimal MCP JSON-RPC server over newline-delimited stdio."""
     resolved = settings or RelaySettings.from_env()
+    resolved_profile = _normalize_profile(profile or _mcp_profile_from_env())
     queue = ClioCoreQueue(resolved.core_dir)
     queue.initialize()
     first_line = True
@@ -79,7 +92,12 @@ def serve_stdio(
         except JSONDecodeError as exc:
             response = _error(None, -32700, f"parse error: {exc.msg}")
         else:
-            response = handle_request(request, queue=queue, settings=resolved)
+            response = handle_request(
+                request,
+                queue=queue,
+                settings=resolved,
+                profile=resolved_profile,
+            )
         if response is None:
             continue
         stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
@@ -91,6 +109,7 @@ def handle_request(
     *,
     queue: ClioCoreQueue,
     settings: RelaySettings | None = None,
+    profile: str | None = None,
 ) -> JSON | None:
     """Handle one JSON-RPC MCP request."""
     request_id = request.get("id")
@@ -101,7 +120,7 @@ def handle_request(
         if method == "initialize":
             result = _initialize_result()
         elif method == "tools/list":
-            result = {"tools": _tool_definitions()}
+            result = {"tools": _tool_definitions(profile=profile)}
         elif method == "tools/call":
             params = _object(request.get("params"))
             result = _call_tool(params, queue=queue, settings=settings or RelaySettings.from_env())
@@ -148,7 +167,19 @@ def _initialize_result() -> JSON:
     }
 
 
-def _tool_definitions() -> list[JSON]:
+def _tool_definitions(*, profile: str | None = None) -> list[JSON]:
+    tools = _all_tool_definitions()
+    normalized = _normalize_profile(profile or _mcp_profile_from_env())
+    if normalized in {"admin", "operator", "all"}:
+        return tools
+    return [
+        tool
+        for tool in tools
+        if tool["name"] in USER_MCP_TOOL_NAMES or is_virtual_jarvis_tool(str(tool["name"]))
+    ]
+
+
+def _all_tool_definitions() -> list[JSON]:
     return [
         {
             "name": "relay_remote_mcp_context",
@@ -156,6 +187,86 @@ def _tool_definitions() -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_submit_agent",
+            "description": "Submit a remote agent task to a configured relay cluster.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cluster": {"type": "string"},
+                    "prompt_path": {"type": "string"},
+                    "mcp_config_path": {"type": "string"},
+                    "model": {"type": "string"},
+                    "workdir": {"type": "string"},
+                    "timeout_seconds": {"type": "integer", "minimum": 1},
+                    "idempotency_key": {"type": "string"},
+                    "wait_for_terminal": {"type": "boolean", "default": False},
+                    "wait_timeout_seconds": {"type": "number", "default": 600},
+                    "poll_seconds": {"type": "number", "default": 2},
+                },
+                "required": ["cluster", "prompt_path"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_status",
+            "description": "Read relay job state, relay queue position, and scheduler status.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_cancel",
+            "description": "Request cancellation for a relay job.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"},
+                    "cancel_scheduler_job": {"type": "boolean", "default": False},
+                },
+                "required": ["job_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_observe",
+            "description": (
+                "Read job events from a cursor and optionally return when a regex pattern "
+                "matches stdout, stderr, or event text."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"},
+                    "cursor": {"type": "integer", "default": 1, "minimum": 1},
+                    "limit": {"type": "integer", "default": 100, "minimum": 1},
+                    "pattern": {"type": "string"},
+                    "include_logs": {"type": "boolean", "default": True},
+                    "log_limit": {"type": "integer", "default": 65536, "minimum": 1},
+                },
+                "required": ["job_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_wait",
+            "description": "Wait for a relay job to finish and return final status and logs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"},
+                    "timeout_seconds": {"type": "number", "default": 600},
+                    "poll_seconds": {"type": "number", "default": 2},
+                    "include_logs": {"type": "boolean", "default": True},
+                    "log_limit": {"type": "integer", "default": 65536, "minimum": 1},
+                },
+                "required": ["job_id"],
                 "additionalProperties": False,
             },
         },
@@ -620,6 +731,19 @@ def _tool_definitions() -> list[JSON]:
     ]
 
 
+def _mcp_profile_from_env() -> str:
+    return os.environ.get(MCP_PROFILE_ENV, "user")
+
+
+def _normalize_profile(profile: str) -> str:
+    normalized = profile.strip().lower()
+    if normalized in {"", "user", "agent"}:
+        return "user"
+    if normalized in {"admin", "operator", "all"}:
+        return normalized
+    raise ValueError("MCP profile must be user, admin, operator, or all")
+
+
 def _call_tool(params: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -> JSON:
     name = _required_str(params, "name")
     arguments = _object(params.get("arguments", {}))
@@ -627,6 +751,16 @@ def _call_tool(params: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -
         result = _submit_jarvis_pipeline(arguments, queue=queue)
     elif name == "relay_remote_mcp_context":
         result = {"context": render_virtual_jarvis_agent_context()}
+    elif name == "relay_submit_agent":
+        result = _submit_remote_agent(arguments, queue=queue)
+    elif name == "relay_status":
+        result = job_status(queue, _required_str(arguments, "job_id"))
+    elif name == "relay_cancel":
+        result = _cancel_job(arguments, queue=queue)
+    elif name == "relay_observe":
+        result = _observe_job(arguments, queue=queue, settings=settings)
+    elif name == "relay_wait":
+        result = _wait_job(arguments, queue=queue, settings=settings)
     elif name == "relay_submit_jarvis_job":
         result = _submit_jarvis_job(arguments, queue=queue)
     elif name == "relay_submit_remote_agent":
@@ -776,6 +910,126 @@ def _call_tool(params: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -
         "structuredContent": result,
         "isError": False,
     }
+
+
+def _cancel_job(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+    result = cancel_queue_job(
+        queue,
+        _required_str(arguments, "job_id"),
+        scheduler_policy=(
+            "request-scheduler" if arguments.get("cancel_scheduler_job") is True else "relay-only"
+        ),
+    )
+    job = _object(result["job"])
+    return {
+        **result,
+        "job_id": job["job_id"],
+        "state": job["state"],
+    }
+
+
+def _observe_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -> JSON:
+    job_id = _required_str(arguments, "job_id")
+    cursor = int(arguments.get("cursor", 1))
+    limit = int(arguments.get("limit", 100))
+    observed = monitor_job(queue, job_id, cursor=cursor, limit=limit)
+    pattern = _optional_str(arguments, "pattern")
+    matches: list[JSON] = []
+    logs: JSON | None = None
+    if arguments.get("include_logs", True) is not False:
+        logs = _job_logs(
+            queue,
+            settings,
+            job_id,
+            limit=int(arguments.get("log_limit", 65536)),
+        )
+    if pattern is not None:
+        compiled = re.compile(pattern)
+        for event in cast(list[JSON], observed.get("events", [])):
+            for text in _event_match_candidates(event):
+                for match in compiled.finditer(text):
+                    matches.append(
+                        {
+                            "event_seq": event.get("seq"),
+                            "event_type": event.get("event_type"),
+                            "text": text,
+                            "match": match.group(0),
+                            "groups": list(match.groups()),
+                            "groupdict": match.groupdict(),
+                        }
+                    )
+        if logs is not None:
+            for stream_name in ("stdout", "stderr"):
+                stream = _object(logs[stream_name])
+                text = stream.get("text")
+                if not isinstance(text, str):
+                    continue
+                for match in compiled.finditer(text):
+                    matches.append(
+                        {
+                            "source": stream_name,
+                            "text": text,
+                            "match": match.group(0),
+                            "groups": list(match.groups()),
+                            "groupdict": match.groupdict(),
+                        }
+                    )
+    result: JSON = {**observed, "matched": bool(matches), "matches": matches}
+    if logs is not None:
+        result["logs"] = logs
+    return result
+
+
+def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -> JSON:
+    job_id = _required_str(arguments, "job_id")
+    job = wait_for_terminal(
+        queue,
+        job_id,
+        timeout_seconds=float(arguments.get("timeout_seconds", 600)),
+        poll_seconds=float(arguments.get("poll_seconds", 2)),
+    )
+    result = job_status(queue, job.job_id)
+    if arguments.get("include_logs", True) is not False:
+        result["logs"] = _job_logs(
+            queue,
+            settings,
+            job.job_id,
+            limit=int(arguments.get("log_limit", 65536)),
+        )
+    result["artifacts"] = [
+        artifact.model_dump(mode="json") for artifact in queue.list_artifacts(job.job_id)
+    ]
+    return result
+
+
+def _job_logs(
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+    job_id: str,
+    *,
+    limit: int,
+) -> JSON:
+    job = queue.get_job(job_id)
+    return {
+        "stdout": read_job_log(settings, job, stream_name="stdout", offset=0, limit=limit),
+        "stderr": read_job_log(settings, job, stream_name="stderr", offset=0, limit=limit),
+    }
+
+
+def _event_match_candidates(event: JSON) -> list[str]:
+    candidates: list[str] = []
+    for key in ("message", "event_type"):
+        value = event.get(key)
+        if isinstance(value, str):
+            candidates.append(value)
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        typed_payload = cast(JSON, payload)
+        for key in ("text", "stdout", "stderr", "message"):
+            value = typed_payload.get(key)
+            if isinstance(value, str):
+                candidates.append(value)
+    return candidates
 
 
 def _submit_jarvis_pipeline(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:

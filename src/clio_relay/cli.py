@@ -2083,9 +2083,14 @@ def jarvis_mcp_call(
 
 
 @app.command("mcp-server")
-def mcp_server() -> None:
+def mcp_server(
+    profile: Annotated[
+        str,
+        typer.Option(help="MCP tool profile: user, admin, operator, or all."),
+    ] = "user",
+) -> None:
     """Serve relay job tools over stdio MCP."""
-    serve_stdio()
+    serve_stdio(profile=profile)
 
 
 @api_app.command("start")

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
+import threading
 import time
 from importlib import metadata
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Any
 
 
@@ -22,10 +25,11 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
     started_at = time.time()
     result_path = Path.cwd() / "mcp-result.json"
     try:
-        command = [server, *server_args]
-        process = _run_process(
+        command = [_resolve_executable(server), *server_args]
+        process = _run_mcp_session(
             command,
-            input=_render_session_input(tool=tool, arguments=arguments),
+            tool=tool,
+            arguments=arguments,
             timeout=timeout,
         )
         returncode = process.returncode
@@ -35,7 +39,7 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
             returncode = 1
     except subprocess.TimeoutExpired as exc:
         process = subprocess.CompletedProcess(
-            args=[server, *server_args],
+            args=[_resolve_executable(server), *server_args],
             returncode=124,
             stdout=exc.stdout or "",
             stderr=exc.stderr or "",
@@ -59,8 +63,8 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
     return returncode
 
 
-def _render_session_input(*, tool: str, arguments: dict[str, Any]) -> str:
-    initialize = {
+def _initialize_message() -> dict[str, Any]:
+    return {
         "jsonrpc": "2.0",
         "id": "clio-relay-mcp-init",
         "method": "initialize",
@@ -70,14 +74,27 @@ def _render_session_input(*, tool: str, arguments: dict[str, Any]) -> str:
             "clientInfo": {"name": "clio-relay", "version": _package_version()},
         },
     }
-    initialized = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
-    call = {
+
+
+def _initialized_message() -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
+
+
+def _call_message(*, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    return {
         "jsonrpc": "2.0",
         "id": "clio-relay-mcp-call",
         "method": "tools/call",
         "params": {"name": tool, "arguments": arguments},
     }
-    messages = (initialize, initialized, call)
+
+
+def _render_session_input(*, tool: str, arguments: dict[str, Any]) -> str:
+    messages = (
+        _initialize_message(),
+        _initialized_message(),
+        _call_message(tool=tool, arguments=arguments),
+    )
     return "\n".join(json.dumps(item, separators=(",", ":")) for item in messages) + "\n"
 
 
@@ -146,22 +163,139 @@ def _write_mcp_result(
     )
 
 
+def _run_mcp_session(
+    command: list[str],
+    *,
+    tool: str,
+    arguments: dict[str, Any],
+    timeout: int | None,
+) -> subprocess.CompletedProcess[str]:
+    process = _open_process(command)
+    stdout_queue: Queue[str | None] = Queue()
+    stderr_queue: Queue[str | None] = Queue()
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    stdout_thread = _start_reader(process.stdout, stdout_queue)
+    stderr_thread = _start_reader(process.stderr, stderr_queue)
+    started_at = time.monotonic()
+    deadline = None if timeout is None else started_at + timeout
+    try:
+        _write_message(process, _initialize_message())
+        _wait_for_response(
+            stdout_queue,
+            "clio-relay-mcp-init",
+            stdout_lines,
+            deadline=deadline,
+            command=command,
+        )
+        _write_message(process, _initialized_message())
+        _write_message(process, _call_message(tool=tool, arguments=arguments))
+        _wait_for_response(
+            stdout_queue,
+            "clio-relay-mcp-call",
+            stdout_lines,
+            deadline=deadline,
+            command=command,
+        )
+        if process.stdin is not None:
+            process.stdin.close()
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        process.wait(timeout=remaining)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_tree(process)
+        _drain_available(stdout_queue, stdout_lines)
+        _drain_available(stderr_queue, stderr_lines)
+        raise subprocess.TimeoutExpired(
+            command,
+            timeout if timeout is not None else 0,
+            output="".join(stdout_lines) or exc.output,
+            stderr="".join(stderr_lines) or exc.stderr,
+        ) from exc
+    finally:
+        _join_reader(stdout_thread, stdout_queue, stdout_lines)
+        _join_reader(stderr_thread, stderr_queue, stderr_lines)
+    return subprocess.CompletedProcess(
+        command,
+        process.returncode if process.returncode is not None else 0,
+        stdout="".join(stdout_lines),
+        stderr="".join(stderr_lines),
+    )
+
+
+def _write_message(process: subprocess.Popen[str], message: dict[str, Any]) -> None:
+    if process.stdin is None:
+        raise RuntimeError("MCP server stdin is not available")
+    process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+    process.stdin.flush()
+
+
+def _wait_for_response(
+    queue: Queue[str | None],
+    response_id: str,
+    lines: list[str],
+    *,
+    deadline: float | None,
+    command: list[str],
+) -> None:
+    while True:
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise subprocess.TimeoutExpired(command, timeout=0, output="".join(lines))
+        try:
+            line = queue.get(timeout=0.2 if remaining is None else min(0.2, remaining))
+        except Empty:
+            continue
+        if line is None:
+            raise subprocess.TimeoutExpired(command, timeout=0, output="".join(lines))
+        lines.append(line)
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if message.get("id") == response_id:
+            return
+
+
+def _start_reader(stream: Any, queue: Queue[str | None]) -> threading.Thread:
+    def read_stream() -> None:
+        try:
+            if stream is not None:
+                for line in stream:
+                    queue.put(line)
+        finally:
+            queue.put(None)
+
+    thread = threading.Thread(target=read_stream, daemon=True)
+    thread.start()
+    return thread
+
+
+def _join_reader(
+    thread: threading.Thread,
+    queue: Queue[str | None],
+    lines: list[str],
+) -> None:
+    thread.join(timeout=1)
+    _drain_available(queue, lines)
+
+
+def _drain_available(queue: Queue[str | None], lines: list[str]) -> None:
+    while True:
+        try:
+            line = queue.get_nowait()
+        except Empty:
+            return
+        if line is not None:
+            lines.append(line)
+
+
 def _run_process(
     command: list[str],
     *,
     input: str,
     timeout: int | None,
 ) -> subprocess.CompletedProcess[str]:
-    process = subprocess.Popen(
-        command,
-        env=_scrubbed_env(),
-        text=True,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=os.name != "nt",
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-    )
+    process = _open_process(command)
     try:
         stdout, stderr = process.communicate(input=input, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
@@ -174,6 +308,31 @@ def _run_process(
             stderr=stderr or exc.stderr,
         ) from exc
     return subprocess.CompletedProcess(command, process.returncode, stdout=stdout, stderr=stderr)
+
+
+def _open_process(command: list[str]) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        command,
+        env=_scrubbed_env(),
+        text=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=os.name != "nt",
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+    )
+
+
+def _resolve_executable(executable: str) -> str:
+    """Resolve executables commonly installed into user-local cluster paths."""
+    resolved = shutil.which(executable)
+    if resolved is not None:
+        return resolved
+    if executable == "uvx":
+        user_local_uvx = Path.home() / ".local" / "bin" / "uvx"
+        if user_local_uvx.exists():
+            return str(user_local_uvx)
+    return executable
 
 
 def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
