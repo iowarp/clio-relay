@@ -67,7 +67,10 @@ from clio_relay.worker_concurrency import KindConcurrencyInput, normalize_kind_c
 Record = TypeVar("Record", bound=BaseModel)
 _LeaseExpiryReference = tuple[int, str, JobKind, str, str, str, str]
 _UNSET = object()
-DEFAULT_CORE_LOCK_TIMEOUT_SECONDS = 2.0
+# Queue mutations can legitimately serialize behind several durable writes on
+# slower filesystems (notably Windows endpoint storage).  Keep the wait bounded,
+# but allow enough time for a healthy owner to finish its critical section.
+DEFAULT_CORE_LOCK_TIMEOUT_SECONDS = 30.0
 ATOMIC_REPLACE_ATTEMPTS = 25
 ATOMIC_REPLACE_RETRY_SECONDS = 0.02
 JOB_INDEX_SCHEMA = "clio-relay.job-index.v1"

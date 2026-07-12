@@ -31,11 +31,21 @@ The registry and schema cache are executable-control state. Relay accepts only
 bounded regular files and rejects links/reparse points and unstable reads. On
 POSIX, the files must be owned by the current user and not writable by group or
 other users; atomic replacements are created with mode `0600`. On Windows,
-relay protects the state directory and files from inherited access, granting
-full control only to Owner Rights, Local System, and built-in Administrators.
-If that ACL cannot be applied, registry/cache access fails closed. Do not place
-the state directory on a filesystem that cannot preserve these ownership and
-ACL guarantees.
+relay creates new state directories and atomic files with a protected ACL before
+exposing them, granting full control only to Owner Rights, Local System, and
+built-in Administrators. Existing state is accepted only for the current owner,
+while no data writer is open, and only after exact native ACL readback. Legacy
+inherited ACLs are repaired in place; perform that migration with other local
+accounts logged out, and inspect/trust the legacy registry and cache contents or
+delete them for recreation before starting relay. The first registry/cache access
+performs the repair, and Windows cannot revoke security-control handles that were
+opened before hardening. If the ACL cannot be applied, registry/cache access fails
+closed. Do not place the state directory on a filesystem or parent path that cannot
+preserve these ownership, replacement, and ACL guarantees. The existing parent
+and its ancestors are a trust boundary: they must not be reparse points and must
+prevent other principals from replacing descendants. Relay retains no-delete-share
+handles for every directory it creates until the complete new directory chain is
+hardened and verified.
 
 The package and executable names in this example are placeholders for a
 site-approved server:

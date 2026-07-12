@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import json
+import ctypes
 import os
-import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from pytest import MonkeyPatch
@@ -19,6 +20,7 @@ from clio_relay.cluster_config import (
     ClusterTargetIdentity,
     RemoteMcpServerConfig,
     default_registry_path,
+    ensure_private_configuration_directory,
     ensure_private_configuration_path,
     open_private_atomic_file,
     read_bounded_configuration_bytes,
@@ -140,8 +142,145 @@ def test_private_atomic_file_requests_owner_only_posix_mode(
 
     with open_private_atomic_file(path) as stream:
         stream.write(b"{}")
+        stream.flush()
+        if os.name == "nt":
+            with pytest.raises(PermissionError):
+                path.read_bytes()
 
-    assert modes == [0o600]
+    assert modes == ([] if os.name == "nt" else [0o600])
+    assert path.read_bytes() == b"{}"
+
+
+def test_windows_atomic_create_captures_error_before_freeing_descriptor(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FailingCreateFile:
+        argtypes: list[object]
+        restype: object
+
+        def __call__(self, *_args: object) -> int:
+            events.append("create")
+            return int(ctypes.c_void_p(-1).value or -1)
+
+    kernel32 = SimpleNamespace(CreateFileW=FailingCreateFile())
+
+    def load_library(name: str) -> object:
+        return kernel32 if name == "kernel32" else object()
+
+    def last_error() -> int:
+        events.append("last-error")
+        return 5
+
+    def free_descriptor(_pointer: ctypes.c_void_p, *, kernel32: object) -> None:
+        assert kernel32 is not None
+        events.append("free")
+
+    def windows_error(error: int) -> OSError:
+        events.append("error")
+        return PermissionError(error, "simulated access denial")
+
+    def build_descriptor(**_kwargs: object) -> ctypes.c_void_p:
+        return ctypes.c_void_p(1)
+
+    monkeypatch.setattr(cluster_config.os, "name", "nt")
+    monkeypatch.setattr(cluster_config, "_load_windows_library", load_library)
+    monkeypatch.setattr(
+        cluster_config,
+        "_build_private_windows_security_descriptor",
+        build_descriptor,
+    )
+    monkeypatch.setattr(cluster_config, "_windows_last_error", last_error)
+    monkeypatch.setattr(cluster_config, "_free_windows_local", free_descriptor)
+    monkeypatch.setattr(cluster_config, "_windows_error", windows_error)
+
+    with pytest.raises(PermissionError, match="simulated access denial"):
+        open_private_atomic_file(tmp_path / "private.tmp")
+
+    assert events == ["create", "last-error", "free", "error"]
+
+
+def test_configuration_directory_is_created_with_private_protection(tmp_path: Path) -> None:
+    path = tmp_path / "new-state" / "private"
+
+    ensure_private_configuration_directory(path)
+
+    assert path.is_dir()
+    ensure_private_configuration_path(path, directory=True)
+
+
+def test_windows_nested_configuration_creation_retains_hardened_handles(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    path = tmp_path / "new-state" / "private"
+    events: list[tuple[str, Path | int]] = []
+    open_handles: set[int] = set()
+    next_handle = 100
+    kernel32 = object()
+
+    def create(directory: Path) -> None:
+        directory.mkdir()
+        events.append(("create", directory))
+
+    def open_handle(
+        target: Path,
+        *,
+        directory: bool,
+        kernel32: object,
+    ) -> Any:
+        nonlocal next_handle
+        assert directory
+        assert kernel32 is not None
+        next_handle += 1
+        handle = SimpleNamespace(value=next_handle)
+        open_handles.add(next_handle)
+        events.append(("open", target))
+        return handle
+
+    def harden(
+        directory_path: Path,
+        *,
+        directory: bool,
+        existing_handle: Any,
+    ) -> None:
+        assert directory
+        assert existing_handle.value in open_handles
+        events.append(("harden", directory_path))
+
+    def close(handle: Any, *, kernel32: object) -> None:
+        assert kernel32 is not None
+        assert handle.value in open_handles
+        open_handles.remove(handle.value)
+        events.append(("close", handle.value))
+
+    def load_kernel32(_name: str) -> object:
+        return kernel32
+
+    monkeypatch.setattr(cluster_config.os, "name", "nt")
+    monkeypatch.setattr(cluster_config, "_load_windows_library", load_kernel32)
+    monkeypatch.setattr(cluster_config, "_create_private_windows_directory", create)
+    monkeypatch.setattr(cluster_config, "_open_windows_configuration_handle", open_handle)
+    monkeypatch.setattr(cluster_config, "_set_private_windows_acl", harden)
+    monkeypatch.setattr(cluster_config, "_close_windows_handle", close)
+
+    ensure_private_configuration_directory(path)
+
+    assert events[:6] == [
+        ("create", path.parent),
+        ("open", path.parent),
+        ("harden", path.parent),
+        ("create", path),
+        ("open", path),
+        ("harden", path),
+    ]
+    assert [event for event in events if event[0] == "close"] == [
+        ("close", 102),
+        ("close", 101),
+    ]
+    assert open_handles == set()
 
 
 def test_configuration_read_rejects_foreign_or_group_writable_posix_file(
@@ -178,36 +317,41 @@ def test_windows_configuration_directory_removes_broad_inherited_acl(tmp_path: P
     path.mkdir()
 
     ensure_private_configuration_path(path, directory=True)
+    # The implementation reads the ACL back through Win32, verifies that
+    # inheritance is protected, and rejects any SID/mask/flag outside its exact
+    # private ACE set before returning.  Reapplying also verifies idempotence.
+    ensure_private_configuration_path(path, directory=True)
 
-    powershell = (
-        Path(os.environ["SYSTEMROOT"])
-        / "System32"
-        / "WindowsPowerShell"
-        / "v1.0"
-        / "powershell.exe"
-    )
-    script = (
-        "$acl=Get-Acl -LiteralPath $env:CLIO_RELAY_ACL_TEST_PATH;"
-        "$broad=@('S-1-1-0','S-1-5-11','S-1-5-32-545');"
-        "$bad=@($acl.Access | ForEach-Object {"
-        "try {$sid=$_.IdentityReference.Translate("
-        "[System.Security.Principal.SecurityIdentifier]).Value} catch {$sid='unresolved'};"
-        "if ($broad -contains $sid -and $_.AccessControlType -eq 'Allow') {$sid}});"
-        "[pscustomobject]@{protected=$acl.AreAccessRulesProtected;bad=$bad.Count}"
-        "| ConvertTo-Json -Compress"
-    )
-    result = subprocess.run(
-        [str(powershell), "-NoProfile", "-NonInteractive", "-Command", script],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=15,
-        env={**os.environ, "CLIO_RELAY_ACL_TEST_PATH": str(path)},
-    )
 
-    assert result.returncode == 0, result.stderr
-    acl = json.loads(result.stdout)
-    assert acl == {"protected": True, "bad": 0}
+def test_windows_configuration_hardening_rejects_an_existing_writer(tmp_path: Path) -> None:
+    if os.name != "nt":
+        return
+    path = tmp_path / "configuration.json"
+    path.write_text("original", encoding="utf-8")
+
+    with (
+        path.open("r+b"),
+        pytest.raises(ConfigurationError, match="could not open Windows configuration path"),
+    ):
+        ensure_private_configuration_path(path, directory=False)
+
+    ensure_private_configuration_path(path, directory=False)
+
+
+def test_windows_configuration_owner_must_match_current_user(tmp_path: Path) -> None:
+    path = tmp_path / "configuration.json"
+
+    cluster_config._require_current_windows_owner(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        owner_sid="S-1-5-21-current",
+        user_sid="S-1-5-21-current",
+        path=path,
+    )
+    with pytest.raises(ConfigurationError, match="not owned by this user"):
+        cluster_config._require_current_windows_owner(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            owner_sid="S-1-5-21-foreign",
+            user_sid="S-1-5-21-current",
+            path=path,
+        )
 
 
 def test_cluster_registry_save_preserves_previous_file_when_replace_fails(

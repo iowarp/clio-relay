@@ -8,6 +8,7 @@ import os
 import stat
 import time
 from collections.abc import Callable
+from importlib import import_module
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, cast
 from uuid import uuid4
@@ -31,6 +32,124 @@ MAX_REMOTE_MCP_ALLOW_TOOLS = 2_048
 MAX_REMOTE_MCP_ARGUMENT_BYTES = 4_096
 MAX_REMOTE_MCP_SCHEMA_CACHE_TTL_SECONDS = 31_536_000
 CONFIG_REPLACE_ATTEMPTS = 25
+
+_WINDOWS_READ_CONTROL = 0x00020000
+_WINDOWS_WRITE_DAC = 0x00040000
+_WINDOWS_GENERIC_READ = 0x80000000
+_WINDOWS_GENERIC_WRITE = 0x40000000
+_WINDOWS_FILE_SHARE_READ = 0x00000001
+_WINDOWS_CREATE_NEW = 1
+_WINDOWS_OPEN_EXISTING = 3
+_WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080
+_WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+_WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+_WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_WINDOWS_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_WINDOWS_SE_FILE_OBJECT = 1
+_WINDOWS_OWNER_SECURITY_INFORMATION = 0x00000001
+_WINDOWS_DACL_SECURITY_INFORMATION = 0x00000004
+_WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+_WINDOWS_SE_DACL_PROTECTED = 0x1000
+_WINDOWS_ACL_SIZE_INFORMATION = 2
+_WINDOWS_ACCESS_ALLOWED_ACE_TYPE = 0
+_WINDOWS_FILE_ALL_ACCESS = 0x001F01FF
+_WINDOWS_OBJECT_INHERIT_ACE = 0x01
+_WINDOWS_CONTAINER_INHERIT_ACE = 0x02
+_WINDOWS_PRIVATE_SIDS = {"S-1-3-4", "S-1-5-18", "S-1-5-32-544"}
+_WINDOWS_TOKEN_QUERY = 0x0008
+_WINDOWS_TOKEN_USER = 1
+_WINDOWS_ERROR_ALREADY_EXISTS = 183
+
+
+class _WindowsFileTime(ctypes.Structure):
+    _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+
+class _WindowsFileInformation(ctypes.Structure):
+    _fields_ = [
+        ("attributes", ctypes.c_uint32),
+        ("creation_time", _WindowsFileTime),
+        ("last_access_time", _WindowsFileTime),
+        ("last_write_time", _WindowsFileTime),
+        ("volume_serial_number", ctypes.c_uint32),
+        ("file_size_high", ctypes.c_uint32),
+        ("file_size_low", ctypes.c_uint32),
+        ("number_of_links", ctypes.c_uint32),
+        ("file_index_high", ctypes.c_uint32),
+        ("file_index_low", ctypes.c_uint32),
+    ]
+
+
+class _WindowsAclSizeInformation(ctypes.Structure):
+    _fields_ = [
+        ("ace_count", ctypes.c_uint32),
+        ("acl_bytes_in_use", ctypes.c_uint32),
+        ("acl_bytes_free", ctypes.c_uint32),
+    ]
+
+
+class _WindowsAceHeader(ctypes.Structure):
+    _fields_ = [
+        ("ace_type", ctypes.c_ubyte),
+        ("ace_flags", ctypes.c_ubyte),
+        ("ace_size", ctypes.c_uint16),
+    ]
+
+
+class _WindowsAccessAllowedAce(ctypes.Structure):
+    _fields_ = [
+        ("header", _WindowsAceHeader),
+        ("mask", ctypes.c_uint32),
+        ("sid_start", ctypes.c_uint32),
+    ]
+
+
+class _WindowsSidAndAttributes(ctypes.Structure):
+    _fields_ = [("sid", ctypes.c_void_p), ("attributes", ctypes.c_uint32)]
+
+
+class _WindowsTokenUser(ctypes.Structure):
+    _fields_ = [("user", _WindowsSidAndAttributes)]
+
+
+class _WindowsSecurityAttributes(ctypes.Structure):
+    _fields_ = [
+        ("length", ctypes.c_uint32),
+        ("security_descriptor", ctypes.c_void_p),
+        ("inherit_handle", ctypes.c_int),
+    ]
+
+
+def _load_windows_library(name: str) -> Any:
+    """Load a Win32 library without exposing platform-specific ctypes stubs."""
+    factory = cast(Callable[..., Any], vars(ctypes)["WinDLL"])
+    return factory(name, use_last_error=True)
+
+
+def _windows_last_error() -> int:
+    """Return the calling thread's Win32 last-error value."""
+    get_last_error = cast(Callable[[], int], vars(ctypes)["get_last_error"])
+    return get_last_error()
+
+
+def _windows_error(error: int) -> OSError:
+    """Build the native Python exception for a Win32 error code."""
+    factory = cast(Callable[[int], OSError], vars(ctypes)["WinError"])
+    return factory(error)
+
+
+def _windows_os_file_handle(descriptor: int) -> int:
+    """Return the Win32 handle owned by a CRT file descriptor."""
+    module = import_module("msvcrt")
+    get_osfhandle = cast(Callable[[int], int], vars(module)["get_osfhandle"])
+    return get_osfhandle(descriptor)
+
+
+def _open_windows_os_file_handle(handle: int, flags: int) -> int:
+    """Transfer ownership of a Win32 handle to a CRT file descriptor."""
+    module = import_module("msvcrt")
+    open_osfhandle = cast(Callable[[int, int], int], vars(module)["open_osfhandle"])
+    return open_osfhandle(handle, flags)
 
 
 class _ConfigurationChangedError(ConfigurationError):
@@ -344,8 +463,7 @@ class ClusterRegistry(BaseModel):
     @classmethod
     def load(cls, path: Path) -> ClusterRegistry:
         """Load a registry from disk, creating defaults if the file is absent."""
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        ensure_private_configuration_path(path.parent, directory=True)
+        ensure_private_configuration_directory(path.parent)
         if not path.exists():
             with FileLock(f"{path}.lock"):
                 if not path.exists():
@@ -356,8 +474,7 @@ class ClusterRegistry(BaseModel):
 
     def save(self, path: Path) -> None:
         """Persist the registry with locking, atomic replacement, and fsync."""
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        ensure_private_configuration_path(path.parent, directory=True)
+        ensure_private_configuration_directory(path.parent)
         with FileLock(f"{path}.lock"):
             validated = type(self).model_validate(self.model_dump(mode="python"))
             validated._write_atomic_unlocked(path)
@@ -369,8 +486,7 @@ class ClusterRegistry(BaseModel):
         mutation: Callable[[ClusterRegistry], None],
     ) -> ClusterRegistry:
         """Apply a read-modify-write operation under one registry lock."""
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        ensure_private_configuration_path(path.parent, directory=True)
+        ensure_private_configuration_directory(path.parent)
         with FileLock(f"{path}.lock"):
             registry = (
                 cls.model_validate_json(
@@ -517,13 +633,647 @@ def open_private_atomic_file(path: Path) -> BinaryIO:
     """Create a new private regular file for an eventual atomic replacement."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_CLOEXEC", 0)
-    descriptor = os.open(path, flags, 0o600)
+    descriptor = (
+        _create_private_windows_atomic_descriptor(path)
+        if os.name == "nt"
+        else os.open(path, flags, 0o600)
+    )
     try:
-        ensure_private_configuration_path(path, directory=False)
+        if os.name == "nt":
+            _set_private_windows_acl(
+                path,
+                directory=False,
+                existing_handle=ctypes.c_void_p(_windows_os_file_handle(descriptor)),
+            )
+        else:
+            ensure_private_configuration_path(path, directory=False)
         return os.fdopen(descriptor, "wb")
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _create_private_windows_atomic_descriptor(path: Path) -> int:
+    kernel32 = _load_windows_library("kernel32")
+    advapi32 = _load_windows_library("advapi32")
+    security_descriptor = _build_private_windows_security_descriptor(
+        directory=False,
+        advapi32=advapi32,
+        path=path,
+    )
+    security_attributes = _WindowsSecurityAttributes(
+        length=ctypes.sizeof(_WindowsSecurityAttributes),
+        security_descriptor=security_descriptor,
+        inherit_handle=0,
+    )
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(_WindowsSecurityAttributes),
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    create_error = 0
+    try:
+        raw_handle = create_file(
+            str(path),
+            _WINDOWS_GENERIC_WRITE | _WINDOWS_READ_CONTROL | _WINDOWS_WRITE_DAC,
+            0,
+            ctypes.byref(security_attributes),
+            _WINDOWS_CREATE_NEW,
+            _WINDOWS_FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        if raw_handle in (None, ctypes.c_void_p(-1).value):
+            create_error = _windows_last_error()
+    finally:
+        _free_windows_local(security_descriptor, kernel32=kernel32)
+    if raw_handle in (None, ctypes.c_void_p(-1).value):
+        raise _windows_error(create_error)
+    try:
+        descriptor_flags = os.O_WRONLY | getattr(os, "O_BINARY", 0)
+        return _open_windows_os_file_handle(cast(int, raw_handle), descriptor_flags)
+    except BaseException:
+        _close_windows_handle(ctypes.c_void_p(raw_handle), kernel32=kernel32)
+        raise
+
+
+def _build_private_windows_security_descriptor(
+    *,
+    directory: bool,
+    advapi32: Any,
+    path: Path,
+) -> ctypes.c_void_p:
+    sddl = (
+        "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+        if directory
+        else "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"
+    )
+    descriptor = ctypes.c_void_p()
+    convert = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    convert.restype = ctypes.c_int
+    if not convert(sddl, 1, ctypes.byref(descriptor), None):
+        error = _windows_last_error()
+        raise ConfigurationError(f"could not build private Windows ACL ({error}): {path}")
+    return descriptor
+
+
+def _free_windows_local(pointer: ctypes.c_void_p, *, kernel32: Any) -> None:
+    local_free = kernel32.LocalFree
+    local_free.argtypes = [ctypes.c_void_p]
+    local_free.restype = ctypes.c_void_p
+    local_free(pointer)
+
+
+def ensure_private_configuration_directory(path: Path) -> None:
+    """Create a configuration directory privately, then verify its exact protections."""
+    if os.name != "nt":
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        ensure_private_configuration_path(path, directory=True)
+        return
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            raise ConfigurationError(f"configuration directory has no existing parent: {path}")
+        current = parent
+    if not missing:
+        ensure_private_configuration_path(path, directory=True)
+        return
+
+    kernel32 = _load_windows_library("kernel32")
+    held_handles: list[ctypes.c_void_p] = []
+    try:
+        for directory in reversed(missing):
+            _create_private_windows_directory(directory)
+            handle = _open_windows_configuration_handle(
+                directory,
+                directory=True,
+                kernel32=kernel32,
+            )
+            try:
+                _set_private_windows_acl(
+                    directory,
+                    directory=True,
+                    existing_handle=handle,
+                )
+            except BaseException:
+                _close_windows_handle(handle, kernel32=kernel32)
+                raise
+            held_handles.append(handle)
+    finally:
+        for handle in reversed(held_handles):
+            _close_windows_handle(handle, kernel32=kernel32)
+
+
+def _create_private_windows_directory(path: Path) -> None:
+    kernel32 = _load_windows_library("kernel32")
+    advapi32 = _load_windows_library("advapi32")
+    security_descriptor = _build_private_windows_security_descriptor(
+        directory=True,
+        advapi32=advapi32,
+        path=path,
+    )
+    security_attributes = _WindowsSecurityAttributes(
+        length=ctypes.sizeof(_WindowsSecurityAttributes),
+        security_descriptor=security_descriptor,
+        inherit_handle=0,
+    )
+    create_directory = kernel32.CreateDirectoryW
+    create_directory.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.POINTER(_WindowsSecurityAttributes),
+    ]
+    create_directory.restype = ctypes.c_int
+    try:
+        created = create_directory(str(path), ctypes.byref(security_attributes))
+        if not created:
+            error = _windows_last_error()
+            if error != _WINDOWS_ERROR_ALREADY_EXISTS:
+                raise ConfigurationError(
+                    f"could not create private Windows configuration directory ({error}): {path}"
+                )
+    finally:
+        _free_windows_local(security_descriptor, kernel32=kernel32)
+
+
+def _open_windows_configuration_handle(
+    path: Path,
+    *,
+    directory: bool,
+    kernel32: Any,
+) -> ctypes.c_void_p:
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    flags = _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT
+    if directory:
+        flags |= _WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
+    raw_handle = create_file(
+        str(path),
+        _WINDOWS_GENERIC_READ | _WINDOWS_READ_CONTROL | _WINDOWS_WRITE_DAC,
+        _WINDOWS_FILE_SHARE_READ,
+        None,
+        _WINDOWS_OPEN_EXISTING,
+        flags,
+        None,
+    )
+    if raw_handle in (None, ctypes.c_void_p(-1).value):
+        error = _windows_last_error()
+        raise ConfigurationError(f"could not open Windows configuration path ({error}): {path}")
+    handle = ctypes.c_void_p(raw_handle)
+    try:
+        _validate_windows_configuration_handle(
+            handle,
+            directory=directory,
+            kernel32=kernel32,
+            path=path,
+        )
+    except BaseException:
+        _close_windows_handle(handle, kernel32=kernel32)
+        raise
+    return handle
+
+
+def _validate_windows_configuration_handle(
+    handle: ctypes.c_void_p,
+    *,
+    directory: bool,
+    kernel32: Any,
+    path: Path,
+) -> None:
+    get_information = kernel32.GetFileInformationByHandle
+    get_information.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WindowsFileInformation)]
+    get_information.restype = ctypes.c_int
+    information = _WindowsFileInformation()
+    if not get_information(handle, ctypes.byref(information)):
+        error = _windows_last_error()
+        raise ConfigurationError(f"could not inspect Windows configuration path ({error}): {path}")
+    is_directory = bool(information.attributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY)
+    is_reparse_point = bool(information.attributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT)
+    if is_directory != directory or is_reparse_point:
+        kind = "directory" if directory else "file"
+        raise ConfigurationError(f"configuration path is not a regular {kind}: {path}")
+
+
+def _close_windows_handle(handle: ctypes.c_void_p, *, kernel32: Any) -> None:
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    close_handle.restype = ctypes.c_int
+    close_handle(handle)
+
+
+def _windows_sid_text(
+    sid_pointer: ctypes.c_void_p,
+    *,
+    advapi32: Any,
+    kernel32: Any,
+    path: Path,
+    context: str,
+) -> str:
+    sid_to_text = advapi32.ConvertSidToStringSidW
+    sid_to_text.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    sid_to_text.restype = ctypes.c_int
+    sid_text_pointer = ctypes.c_void_p()
+    if not sid_to_text(sid_pointer, ctypes.byref(sid_text_pointer)):
+        error = _windows_last_error()
+        raise ConfigurationError(f"could not inspect Windows {context} SID ({error}): {path}")
+    try:
+        return ctypes.wstring_at(sid_text_pointer)
+    finally:
+        local_free = kernel32.LocalFree
+        local_free.argtypes = [ctypes.c_void_p]
+        local_free.restype = ctypes.c_void_p
+        local_free(sid_text_pointer)
+
+
+def _current_windows_user_sid(*, advapi32: Any, kernel32: Any, path: Path) -> str:
+    get_current_process = kernel32.GetCurrentProcess
+    get_current_process.argtypes = []
+    get_current_process.restype = ctypes.c_void_p
+    open_process_token = advapi32.OpenProcessToken
+    open_process_token.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    open_process_token.restype = ctypes.c_int
+    token = ctypes.c_void_p()
+    if not open_process_token(
+        get_current_process(),
+        _WINDOWS_TOKEN_QUERY,
+        ctypes.byref(token),
+    ):
+        error = _windows_last_error()
+        raise ConfigurationError(f"could not inspect current Windows user ({error}): {path}")
+    try:
+        get_token_information = advapi32.GetTokenInformation
+        get_token_information.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        get_token_information.restype = ctypes.c_int
+        required = ctypes.c_uint32()
+        get_token_information(
+            token,
+            _WINDOWS_TOKEN_USER,
+            None,
+            0,
+            ctypes.byref(required),
+        )
+        if required.value < ctypes.sizeof(_WindowsTokenUser):
+            error = _windows_last_error()
+            raise ConfigurationError(
+                f"could not size current Windows user identity ({error}): {path}"
+            )
+        buffer = ctypes.create_string_buffer(required.value)
+        if not get_token_information(
+            token,
+            _WINDOWS_TOKEN_USER,
+            buffer,
+            required.value,
+            ctypes.byref(required),
+        ):
+            error = _windows_last_error()
+            raise ConfigurationError(f"could not read current Windows user ({error}): {path}")
+        token_user = ctypes.cast(buffer, ctypes.POINTER(_WindowsTokenUser)).contents
+        return _windows_sid_text(
+            token_user.user.sid,
+            advapi32=advapi32,
+            kernel32=kernel32,
+            path=path,
+            context="current user",
+        )
+    finally:
+        _close_windows_handle(token, kernel32=kernel32)
+
+
+def _windows_object_owner_sid(
+    handle: ctypes.c_void_p,
+    *,
+    advapi32: Any,
+    kernel32: Any,
+    path: Path,
+) -> str:
+    get_security = advapi32.GetSecurityInfo
+    get_security.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    get_security.restype = ctypes.c_uint32
+    owner = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    result = get_security(
+        handle,
+        _WINDOWS_SE_FILE_OBJECT,
+        _WINDOWS_OWNER_SECURITY_INFORMATION,
+        ctypes.byref(owner),
+        None,
+        None,
+        None,
+        ctypes.byref(descriptor),
+    )
+    if result != 0:
+        raise ConfigurationError(
+            f"could not inspect Windows configuration owner ({result}): {path}"
+        )
+    try:
+        if owner.value is None:
+            raise ConfigurationError(f"Windows configuration path has no owner: {path}")
+        return _windows_sid_text(
+            owner,
+            advapi32=advapi32,
+            kernel32=kernel32,
+            path=path,
+            context="configuration owner",
+        )
+    finally:
+        local_free = kernel32.LocalFree
+        local_free.argtypes = [ctypes.c_void_p]
+        local_free.restype = ctypes.c_void_p
+        local_free(descriptor)
+
+
+def _require_current_windows_owner(*, owner_sid: str, user_sid: str, path: Path) -> None:
+    if owner_sid != user_sid:
+        raise ConfigurationError(f"configuration path is not owned by this user: {path}")
+
+
+def _windows_acl_entries(
+    dacl: ctypes.c_void_p,
+    *,
+    advapi32: Any,
+    kernel32: Any,
+    path: Path,
+) -> list[tuple[str, int, int]]:
+    get_acl_information = advapi32.GetAclInformation
+    get_acl_information.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_WindowsAclSizeInformation),
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+    ]
+    get_acl_information.restype = ctypes.c_int
+    information = _WindowsAclSizeInformation()
+    if not get_acl_information(
+        dacl,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+        _WINDOWS_ACL_SIZE_INFORMATION,
+    ):
+        error = _windows_last_error()
+        raise ConfigurationError(f"could not inspect Windows configuration ACL ({error}): {path}")
+    get_ace = advapi32.GetAce
+    get_ace.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+    get_ace.restype = ctypes.c_int
+    entries: list[tuple[str, int, int]] = []
+    for index in range(information.ace_count):
+        ace_pointer = ctypes.c_void_p()
+        if not get_ace(dacl, index, ctypes.byref(ace_pointer)):
+            error = _windows_last_error()
+            raise ConfigurationError(
+                f"could not inspect Windows configuration ACE ({error}): {path}"
+            )
+        ace = ctypes.cast(ace_pointer, ctypes.POINTER(_WindowsAccessAllowedAce)).contents
+        if (
+            ace.header.ace_type != _WINDOWS_ACCESS_ALLOWED_ACE_TYPE
+            or ace.header.ace_size < ctypes.sizeof(_WindowsAccessAllowedAce)
+        ):
+            raise ConfigurationError(f"Windows configuration ACL has an unexpected ACE: {path}")
+        sid_address = cast(int, ace_pointer.value) + _WindowsAccessAllowedAce.sid_start.offset
+        sid = _windows_sid_text(
+            ctypes.c_void_p(sid_address),
+            advapi32=advapi32,
+            kernel32=kernel32,
+            path=path,
+            context="configuration ACE",
+        )
+        entries.append((sid, ace.mask, ace.header.ace_flags))
+    return entries
+
+
+def _verify_private_windows_acl(
+    handle: ctypes.c_void_p,
+    *,
+    directory: bool,
+    expected_owner_sid: str,
+    advapi32: Any,
+    kernel32: Any,
+    path: Path,
+) -> None:
+    get_security = advapi32.GetSecurityInfo
+    get_security.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    get_security.restype = ctypes.c_uint32
+    owner = ctypes.c_void_p()
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    result = get_security(
+        handle,
+        _WINDOWS_SE_FILE_OBJECT,
+        _WINDOWS_OWNER_SECURITY_INFORMATION | _WINDOWS_DACL_SECURITY_INFORMATION,
+        ctypes.byref(owner),
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if result != 0:
+        raise ConfigurationError(f"could not read back private Windows ACL ({result}): {path}")
+    try:
+        if owner.value is None:
+            raise ConfigurationError(f"Windows configuration path has no owner: {path}")
+        owner_sid = _windows_sid_text(
+            owner,
+            advapi32=advapi32,
+            kernel32=kernel32,
+            path=path,
+            context="configuration owner",
+        )
+        _require_current_windows_owner(
+            owner_sid=owner_sid,
+            user_sid=expected_owner_sid,
+            path=path,
+        )
+        if dacl.value is None:
+            raise ConfigurationError(f"Windows configuration path has no private DACL: {path}")
+        get_control = advapi32.GetSecurityDescriptorControl
+        get_control.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint16),
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        get_control.restype = ctypes.c_int
+        control = ctypes.c_uint16()
+        revision = ctypes.c_uint32()
+        if not get_control(descriptor, ctypes.byref(control), ctypes.byref(revision)):
+            error = _windows_last_error()
+            raise ConfigurationError(
+                f"could not verify Windows configuration ACL control ({error}): {path}"
+            )
+        if not control.value & _WINDOWS_SE_DACL_PROTECTED:
+            raise ConfigurationError(f"Windows configuration ACL remains inherited: {path}")
+        expected_flags = (
+            _WINDOWS_OBJECT_INHERIT_ACE | _WINDOWS_CONTAINER_INHERIT_ACE if directory else 0
+        )
+        entries = _windows_acl_entries(
+            dacl,
+            advapi32=advapi32,
+            kernel32=kernel32,
+            path=path,
+        )
+        if (
+            len(entries) != len(_WINDOWS_PRIVATE_SIDS)
+            or {sid for sid, _mask, _flags in entries} != _WINDOWS_PRIVATE_SIDS
+        ):
+            raise ConfigurationError(f"Windows configuration ACL is not owner-private: {path}")
+        if any(
+            mask != _WINDOWS_FILE_ALL_ACCESS or flags != expected_flags
+            for _sid, mask, flags in entries
+        ):
+            raise ConfigurationError(f"Windows configuration ACL grants unexpected access: {path}")
+    finally:
+        local_free = kernel32.LocalFree
+        local_free.argtypes = [ctypes.c_void_p]
+        local_free.restype = ctypes.c_void_p
+        local_free(descriptor)
+
+
+def _set_private_windows_acl(
+    path: Path,
+    *,
+    directory: bool,
+    existing_handle: ctypes.c_void_p | None = None,
+) -> None:
+    advapi32 = _load_windows_library("advapi32")
+    kernel32 = _load_windows_library("kernel32")
+    descriptor = _build_private_windows_security_descriptor(
+        directory=directory,
+        advapi32=advapi32,
+        path=path,
+    )
+    handle = existing_handle
+    owns_handle = existing_handle is None
+    try:
+        dacl = ctypes.c_void_p()
+        dacl_present = ctypes.c_int()
+        dacl_defaulted = ctypes.c_int()
+        get_dacl = advapi32.GetSecurityDescriptorDacl
+        get_dacl.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        get_dacl.restype = ctypes.c_int
+        if not get_dacl(
+            descriptor,
+            ctypes.byref(dacl_present),
+            ctypes.byref(dacl),
+            ctypes.byref(dacl_defaulted),
+        ):
+            error = _windows_last_error()
+            raise ConfigurationError(f"could not read private Windows ACL ({error}): {path}")
+        if not dacl_present.value or dacl.value is None:
+            raise ConfigurationError(f"private Windows ACL has no DACL: {path}")
+        if handle is None:
+            handle = _open_windows_configuration_handle(
+                path,
+                directory=directory,
+                kernel32=kernel32,
+            )
+        else:
+            _validate_windows_configuration_handle(
+                handle,
+                directory=directory,
+                kernel32=kernel32,
+                path=path,
+            )
+        user_sid = _current_windows_user_sid(
+            advapi32=advapi32,
+            kernel32=kernel32,
+            path=path,
+        )
+        owner_sid = _windows_object_owner_sid(
+            handle,
+            advapi32=advapi32,
+            kernel32=kernel32,
+            path=path,
+        )
+        _require_current_windows_owner(owner_sid=owner_sid, user_sid=user_sid, path=path)
+        set_security = advapi32.SetSecurityInfo
+        set_security.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        set_security.restype = ctypes.c_uint32
+        result = set_security(
+            handle,
+            _WINDOWS_SE_FILE_OBJECT,
+            _WINDOWS_DACL_SECURITY_INFORMATION | _WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            dacl,
+            None,
+        )
+        if result != 0:
+            raise ConfigurationError(
+                f"could not protect Windows configuration ACL ({result}): {path}"
+            )
+        _verify_private_windows_acl(
+            handle,
+            directory=directory,
+            expected_owner_sid=user_sid,
+            advapi32=advapi32,
+            kernel32=kernel32,
+            path=path,
+        )
+    finally:
+        if owns_handle and handle is not None:
+            _close_windows_handle(handle, kernel32=kernel32)
+        _free_windows_local(descriptor, kernel32=kernel32)
 
 
 def ensure_private_configuration_path(path: Path, *, directory: bool) -> None:
@@ -541,41 +1291,7 @@ def ensure_private_configuration_path(path: Path, *, directory: bool) -> None:
                 f"configuration path is writable by group or other users: {path}"
             )
         return
-    sddl = (
-        "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
-        if directory
-        else "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"
-    )
-    win_dll = cast(Any, ctypes.WinDLL)
-    advapi32 = win_dll("advapi32", use_last_error=True)
-    kernel32 = win_dll("kernel32", use_last_error=True)
-    descriptor = ctypes.c_void_p()
-    convert = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
-    convert.argtypes = [
-        ctypes.c_wchar_p,
-        ctypes.c_uint32,
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(ctypes.c_uint32),
-    ]
-    convert.restype = ctypes.c_int
-    if not convert(sddl, 1, ctypes.byref(descriptor), None):
-        error = ctypes.get_last_error()
-        raise ConfigurationError(f"could not build private Windows ACL ({error}): {path}")
-    try:
-        set_security = advapi32.SetFileSecurityW
-        set_security.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_void_p]
-        set_security.restype = ctypes.c_int
-        security_information = 0x00000004 | 0x80000000
-        if not set_security(str(path), security_information, descriptor):
-            error = ctypes.get_last_error()
-            raise ConfigurationError(
-                f"could not protect Windows configuration ACL ({error}): {path}"
-            )
-    finally:
-        local_free = kernel32.LocalFree
-        local_free.argtypes = [ctypes.c_void_p]
-        local_free.restype = ctypes.c_void_p
-        local_free(descriptor)
+    _set_private_windows_acl(path, directory=directory)
 
 
 def default_registry_path() -> Path:

@@ -101,6 +101,66 @@ def test_status_is_bounded_machine_readable_and_target_agnostic(tmp_path: Path) 
     assert "target" not in json.dumps(payload).lower()
 
 
+def test_storage_snapshot_retries_transient_tree_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = _policy(tmp_path)
+    real_scan_tree = storage_module.scan_tree
+    calls = 0
+    sleeps: list[float] = []
+
+    def transient_scan(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            raise StoragePolicyError(
+                StorageReason.SCAN_CHANGED,
+                "storage tree changed while it was being accounted",
+            )
+        return real_scan_tree(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(storage_module, "scan_tree", transient_scan)
+    monkeypatch.setattr(storage_module.time, "sleep", sleeps.append)
+
+    decision = policy.status()
+
+    assert decision.allowed is True
+    assert calls == 4
+    assert sleeps == [
+        storage_module.STORAGE_SNAPSHOT_SCAN_RETRY_SECONDS,
+        storage_module.STORAGE_SNAPSHOT_SCAN_RETRY_SECONDS,
+    ]
+
+
+def test_storage_snapshot_persistent_churn_fails_closed_after_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = _policy(tmp_path)
+    calls = 0
+
+    def changing_scan(*_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise StoragePolicyError(
+            StorageReason.SCAN_CHANGED,
+            "storage tree changed while it was being accounted",
+        )
+
+    def no_sleep(_seconds: float) -> None:
+        return
+
+    monkeypatch.setattr(storage_module, "scan_tree", changing_scan)
+    monkeypatch.setattr(storage_module.time, "sleep", no_sleep)
+
+    decision = policy.status()
+
+    assert decision.allowed is False
+    assert decision.reason is StorageReason.SCAN_CHANGED
+    assert calls == storage_module.STORAGE_SNAPSHOT_SCAN_ATTEMPTS
+
+
 def test_limits_require_runtime_scan_to_cover_every_legal_job_reservation() -> None:
     with pytest.raises(
         ValueError,

@@ -656,7 +656,12 @@ def test_cli_queue_validation_writes_canonical_report(
     finally:
         fleet.close()
 
-    assert result.exit_code == 0
+    failure_report = (
+        report_path.read_text(encoding="utf-8") if report_path.exists() else "<report not written>"
+    )
+    assert result.exit_code == 0, (
+        f"output={result.output!r}\nexception={result.exception!r}\nreport={failure_report}"
+    )
     assert "validation.status=passed" in result.output
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["scenario"] == "queue-management"
@@ -4018,6 +4023,7 @@ def test_cli_remote_jarvis_call_defers_artifact_selection_to_target(
     monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
     _write_test_cluster(tmp_path)
     writes: list[tuple[str, bytes]] = []
+    removals: list[tuple[str, bool]] = []
     commands: list[list[str]] = []
 
     def write_remote(_definition: ClusterDefinition, path: str, data: bytes) -> None:
@@ -4030,6 +4036,16 @@ def test_cli_remote_jarvis_call_defers_artifact_selection_to_target(
         "clio_relay.cli.write_remote_file",
         write_remote,
     )
+
+    def remove_remote(
+        _definition: ClusterDefinition,
+        path: str,
+        *,
+        remove_empty_parent: bool,
+    ) -> None:
+        removals.append((path, remove_empty_parent))
+
+    monkeypatch.setattr("clio_relay.cli.remove_remote_file", remove_remote)
 
     def run_remote(_definition: ClusterDefinition, args: list[str]) -> str:
         commands.append(args)
@@ -4057,6 +4073,7 @@ def test_cli_remote_jarvis_call_defers_artifact_selection_to_target(
     assert result.exit_code == 0
     assert result.output.strip() == "job_remote_jarvis"
     assert writes and json.loads(writes[0][1]) == {"target": "packages"}
+    assert removals == [(writes[0][0], True)]
     assert commands[0][0] == "jarvis-mcp-call"
     assert "--server" not in commands[0]
 

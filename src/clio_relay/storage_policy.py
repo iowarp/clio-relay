@@ -42,6 +42,8 @@ _FILE_ATTRIBUTE_REPARSE_POINT: Final = 0x400
 DEFAULT_JOB_CORE_ALLOWANCE_BYTES: Final = 64 * _MIB
 DEFAULT_JOB_RESULT_ALLOWANCE_BYTES: Final = 256 * _MIB
 DEFAULT_RUNTIME_CHECK_INTERVAL_SECONDS: Final = 5.0
+STORAGE_SNAPSHOT_SCAN_ATTEMPTS: Final = 25
+STORAGE_SNAPSHOT_SCAN_RETRY_SECONDS: Final = 0.01
 
 
 class StorageReason(StrEnum):
@@ -1133,19 +1135,7 @@ class StoragePolicy:
     def _snapshot(
         self, reservations: tuple[ReservationRecord, ...], ledger_generation: int
     ) -> StorageStatus:
-        core = scan_tree(
-            self.core_root,
-            max_entries=self.limits.max_scan_entries,
-            max_depth=self.limits.max_scan_depth,
-            max_accounted_bytes=self.limits.max_scan_accounted_bytes,
-        )
-        spool = scan_tree(
-            self.spool_root,
-            max_entries=self.limits.max_scan_entries,
-            max_depth=self.limits.max_scan_depth,
-            max_accounted_bytes=self.limits.max_scan_accounted_bytes,
-            link_policy="count",
-        )
+        core, spool = self._stable_tree_snapshot()
         reserved_core = sum(record.core_bytes for record in reservations)
         reserved_spool = sum(record.spool_bytes for record in reservations)
         volumes = self._volume_status(reserved_core, reserved_spool)
@@ -1173,6 +1163,31 @@ class StoragePolicy:
             volumes=volumes,
             limits=self.limits,
         )
+
+    def _stable_tree_snapshot(self) -> tuple[TreeUsage, TreeUsage]:
+        """Retry only transient tree changes while preserving bounded fail-closed scans."""
+        for attempt in range(STORAGE_SNAPSHOT_SCAN_ATTEMPTS):
+            try:
+                core = scan_tree(
+                    self.core_root,
+                    max_entries=self.limits.max_scan_entries,
+                    max_depth=self.limits.max_scan_depth,
+                    max_accounted_bytes=self.limits.max_scan_accounted_bytes,
+                )
+                spool = scan_tree(
+                    self.spool_root,
+                    max_entries=self.limits.max_scan_entries,
+                    max_depth=self.limits.max_scan_depth,
+                    max_accounted_bytes=self.limits.max_scan_accounted_bytes,
+                    link_policy="count",
+                )
+                return core, spool
+            except StoragePolicyError as exc:
+                final_attempt = attempt + 1 == STORAGE_SNAPSHOT_SCAN_ATTEMPTS
+                if exc.reason is not StorageReason.SCAN_CHANGED or final_attempt:
+                    raise
+                time.sleep(STORAGE_SNAPSHOT_SCAN_RETRY_SECONDS)
+        raise AssertionError("bounded storage snapshot loop did not return or raise")
 
     def _volume_status(self, reserved_core: int, reserved_spool: int) -> tuple[VolumeStatus, ...]:
         roots = (

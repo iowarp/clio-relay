@@ -10,7 +10,7 @@ import pytest
 from filelock import Timeout
 
 import clio_relay.core_queue as core_queue_module
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.core_queue import DEFAULT_CORE_LOCK_TIMEOUT_SECONDS, ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
     Cursor,
@@ -79,6 +79,14 @@ def test_core_lock_admits_same_process_waiters_in_ticket_order(tmp_path: Path) -
         assert not thread.is_alive()
     assert errors == []
     assert acquired == [0, 1, 2, 3]
+
+
+def test_core_lock_default_is_bounded_for_production_contention(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    lock = queue._lock  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    assert DEFAULT_CORE_LOCK_TIMEOUT_SECONDS == 30.0
+    assert lock.timeout == DEFAULT_CORE_LOCK_TIMEOUT_SECONDS
 
 
 def test_core_lock_local_wait_is_bounded_and_abandoned_ticket_is_skipped(

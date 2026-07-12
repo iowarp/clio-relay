@@ -39,7 +39,7 @@ from clio_relay.cluster_config import (
     RemoteMcpProfile,
     RemoteMcpServerConfig,
     default_registry_path,
-    ensure_private_configuration_path,
+    ensure_private_configuration_directory,
     open_private_atomic_file,
     read_bounded_configuration_bytes,
 )
@@ -331,8 +331,7 @@ class RemoteMcpSchemaCache(BaseModel):
         entry: RemoteMcpSchemaCacheEntry,
     ) -> RemoteMcpSchemaCache:
         """Atomically replace one cache entry while serializing concurrent refreshes."""
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        ensure_private_configuration_path(path.parent, directory=True)
+        ensure_private_configuration_directory(path.parent)
         with FileLock(f"{path}.lock"):
             cache = cls.load(path)
             entries = [
@@ -350,8 +349,7 @@ class RemoteMcpSchemaCache(BaseModel):
     @classmethod
     def remove_entry(cls, path: Path, cluster: str, server_name: str) -> RemoteMcpSchemaCache:
         """Atomically remove a cache entry after an operator unregisters a server."""
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        ensure_private_configuration_path(path.parent, directory=True)
+        ensure_private_configuration_directory(path.parent)
         with FileLock(f"{path}.lock"):
             cache = cls.load(path)
             updated = cls(
