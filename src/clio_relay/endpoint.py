@@ -4597,6 +4597,8 @@ def _open_windows_cleanup_handle(
     missing_ok: bool,
 ) -> int | None:
     """Open a Windows path without allowing delete sharing or reparse traversal."""
+    if os.name != "nt":
+        raise RuntimeError("Windows cleanup handles require Windows")
     from ctypes import wintypes
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -4635,6 +4637,8 @@ def _open_windows_cleanup_handle(
 
 def _windows_handle_information(handle: int, path: Path) -> tuple[int, int]:
     """Return attributes and stable file identity for an already-open Windows handle."""
+    if os.name != "nt":
+        raise RuntimeError("Windows cleanup handle inspection requires Windows")
     from ctypes import wintypes
 
     class _ByHandleFileInformation(ctypes.Structure):
@@ -4673,6 +4677,8 @@ def _mark_windows_handle_for_rename(
     quarantine: Path,
 ) -> None:
     """Apply no-replace FileRenameInfo to an exact open sidecar handle."""
+    if os.name != "nt":
+        raise RuntimeError("Windows handle rename requires Windows")
     from ctypes import wintypes
 
     quarantine_text = str(quarantine)
@@ -4745,6 +4751,8 @@ def _mark_windows_handle_for_rename(
 
 def _close_windows_cleanup_handle(handle: int) -> None:
     """Close a Windows cleanup handle without masking an earlier cleanup failure."""
+    if os.name != "nt":
+        raise RuntimeError("Windows handle cleanup requires Windows")
     from ctypes import wintypes
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)

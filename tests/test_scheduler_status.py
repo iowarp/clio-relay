@@ -758,7 +758,11 @@ def test_slurm_execution_adapter_coalesces_more_than_4096_elapsed_only_polls(
             exec(compile(command[4], "<jarvis-long-running>", "exec"), {"__name__": "__main__"})
         os.close(ready_read_fd)
         return
-    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(time, "sleep", no_sleep)
 
     exec(compile(command[4], "<jarvis-long-running>", "exec"), {"__name__": "__main__"})
 
@@ -980,7 +984,9 @@ def test_isolated_named_wrapper_loads_plain_module_roots_without_python_hooks(
         bounded_package / "__init__.py",
     ):
         package_init.write_text("", encoding="utf-8")
-    containment_source = Path(cast(str, process_containment.__file__))
+    containment_filename = process_containment.__file__
+    assert containment_filename is not None
+    containment_source = Path(containment_filename)
     (relay_package / "process_containment.py").write_bytes(containment_source.read_bytes())
     progress_source = (
         Path(__file__).parents[1]

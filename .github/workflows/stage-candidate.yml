@@ -102,10 +102,12 @@ jobs:
           run_attempt="$(jq -r '.[0].run_attempt' <<<"$matches")"
           [[ "$run_id" =~ ^[1-9][0-9]*$ ]]
           [[ "$run_attempt" =~ ^[1-9][0-9]*$ ]]
-          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
-          echo "run_attempt=$run_attempt" >> "$GITHUB_OUTPUT"
-          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "run_id=$run_id"
+            echo "run_attempt=$run_attempt"
+            echo "source_commit=$source_commit"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
 
       - name: preflight the exact Actions artifact before download
         id: artifact

@@ -1182,6 +1182,8 @@ def _wait_for_linux_cgroup_empty(
 
 
 def _create_windows_job() -> int:
+    if os.name != "nt":
+        raise RuntimeError("Windows job objects require Windows")
     import ctypes
     from ctypes import wintypes
 
@@ -1241,6 +1243,8 @@ def _create_windows_job() -> int:
 
 
 def _windows_process_start_identity(process_id: int) -> str | None:
+    if os.name != "nt":
+        raise RuntimeError("Windows process identity inspection requires Windows")
     import ctypes
     from ctypes import wintypes
 
@@ -1281,6 +1285,8 @@ def _windows_process_start_identity(process_id: int) -> str | None:
 
 
 def _assign_windows_job(job_handle: int, process: subprocess.Popen[str]) -> None:
+    if os.name != "nt":
+        raise RuntimeError("Windows job assignment requires Windows")
     import ctypes
     from ctypes import wintypes
 
@@ -1294,6 +1300,8 @@ def _assign_windows_job(job_handle: int, process: subprocess.Popen[str]) -> None
 
 
 def _terminate_windows_job(job_handle: int) -> None:
+    if os.name != "nt":
+        raise RuntimeError("Windows job termination requires Windows")
     import ctypes
     from ctypes import wintypes
 
@@ -1304,6 +1312,8 @@ def _terminate_windows_job(job_handle: int) -> None:
 
 
 def _windows_job_active_processes(job_handle: int) -> int:
+    if os.name != "nt":
+        raise RuntimeError("Windows job inspection requires Windows")
     import ctypes
     from ctypes import wintypes
 
@@ -1333,6 +1343,8 @@ def _windows_job_active_processes(job_handle: int) -> int:
 
 
 def _close_windows_handle(job_handle: int) -> None:
+    if os.name != "nt":
+        raise RuntimeError("Windows handle cleanup requires Windows")
     import ctypes
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)

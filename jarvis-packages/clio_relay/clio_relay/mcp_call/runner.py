@@ -1272,6 +1272,8 @@ def _open_windows_snapshot_cleanup_handle(
     directory: bool,
 ) -> int:
     """Open one exact Windows cleanup entry without permitting substitution."""
+    if os.name != "nt":
+        raise RuntimeError("Windows snapshot cleanup handles require Windows")
     import ctypes
     from ctypes import wintypes
 
@@ -1328,6 +1330,8 @@ def _windows_snapshot_handle_information(
     path: Path,
 ) -> tuple[int, int, int]:
     """Return attributes, stable identity, and links for a Windows handle."""
+    if os.name != "nt":
+        raise RuntimeError("Windows snapshot handle inspection requires Windows")
     import ctypes
     from ctypes import wintypes
 
@@ -1365,6 +1369,8 @@ def _windows_snapshot_handle_information(
 
 def _mark_windows_snapshot_handle_for_delete(handle: int, path: Path) -> None:
     """Mark one exact Windows cleanup handle for deletion on close."""
+    if os.name != "nt":
+        raise RuntimeError("Windows snapshot handle deletion requires Windows")
     import ctypes
     from ctypes import wintypes
 
@@ -1392,6 +1398,8 @@ def _mark_windows_snapshot_handle_for_delete(handle: int, path: Path) -> None:
 
 def _close_windows_snapshot_cleanup_handle(handle: int) -> None:
     """Close a Windows cleanup handle."""
+    if os.name != "nt":
+        raise RuntimeError("Windows snapshot handle cleanup requires Windows")
     import ctypes
     from ctypes import wintypes
 

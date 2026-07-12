@@ -540,6 +540,8 @@ def _open_windows_owned_handle(
     expect_directory: bool,
     delete_access: bool = False,
 ) -> Generator[int]:
+    if os.name != "nt":
+        raise RuntimeError("Windows owned handles require Windows")
     kernel32: Any = ctypes.WinDLL("kernel32", use_last_error=True)
     create_file = kernel32.CreateFileW
     create_file.argtypes = [
@@ -582,6 +584,8 @@ def _open_windows_owned_handle(
 
 
 def _windows_file_information(kernel32: Any, handle: int) -> _WindowsFileInformation:
+    if os.name != "nt":
+        raise RuntimeError("Windows file information requires Windows")
     get_information = kernel32.GetFileInformationByHandle
     get_information.argtypes = [wintypes.HANDLE, ctypes.POINTER(_WindowsFileInformation)]
     get_information.restype = wintypes.BOOL
@@ -593,12 +597,16 @@ def _windows_file_information(kernel32: Any, handle: int) -> _WindowsFileInforma
 
 
 def _windows_handle_identity(kernel32: Any, handle: int) -> tuple[int, int]:
+    if os.name != "nt":
+        raise RuntimeError("Windows handle identity requires Windows")
     information = _windows_file_information(kernel32, handle)
     inode = (int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow)
     return int(information.dwVolumeSerialNumber), inode
 
 
 def _windows_final_path(kernel32: Any, handle: int) -> Path:
+    if os.name != "nt":
+        raise RuntimeError("Windows final-path inspection requires Windows")
     get_final_path = kernel32.GetFinalPathNameByHandleW
     get_final_path.argtypes = [
         wintypes.HANDLE,
@@ -632,6 +640,8 @@ def _windows_rename_handle(
     *,
     replace: bool,
 ) -> None:
+    if os.name != "nt":
+        raise RuntimeError("Windows handle rename requires Windows")
     kernel32: Any = ctypes.WinDLL("kernel32", use_last_error=True)
     destination_parent_before = _windows_final_path(kernel32, destination_parent_handle)
     configured_parent = Path(os.path.abspath(destination_parent))

@@ -109,9 +109,11 @@ jobs:
           policy_version="$(sed -nE 's/^release_version:[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' docs/release-gate-1.0.yaml)"
           test -n "$policy_version"
           test "$version" = "$policy_version"
-          echo "source_commit=$DISPATCH_SHA" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "is_draft=$is_draft" >> "$GITHUB_OUTPUT"
+          {
+            echo "source_commit=$DISPATCH_SHA"
+            echo "version=$version"
+            echo "is_draft=$is_draft"
+          } >> "$GITHUB_OUTPUT"
 
       - name: preflight bounded final report asset sets
         env:

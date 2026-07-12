@@ -174,14 +174,16 @@ jobs:
             [[ "$uploader_id" =~ ^[1-9][0-9]*$ ]]
             test "$dispatcher_id" != "$uploader_id"
           done
-          echo "login=$DISPATCH_ACTOR" >> "$GITHUB_OUTPUT"
-          echo "id=$dispatcher_id" >> "$GITHUB_OUTPUT"
-          echo "source_author=$source_author" >> "$GITHUB_OUTPUT"
-          echo "source_author_id=$source_author_id" >> "$GITHUB_OUTPUT"
-          echo "source_committer=$source_committer" >> "$GITHUB_OUTPUT"
-          echo "source_committer_id=$source_committer_id" >> "$GITHUB_OUTPUT"
-          echo "source_pr_authors=$(jq -c . <<<"$source_pr_authors")" >> "$GITHUB_OUTPUT"
-          echo "source_contributor_ids=$(jq -c . <<<"$source_contributor_ids")" >> "$GITHUB_OUTPUT"
+          {
+            echo "login=$DISPATCH_ACTOR"
+            echo "id=$dispatcher_id"
+            echo "source_author=$source_author"
+            echo "source_author_id=$source_author_id"
+            echo "source_committer=$source_committer"
+            echo "source_committer_id=$source_committer_id"
+            echo "source_pr_authors=$(jq -c . <<<"$source_pr_authors")"
+            echo "source_contributor_ids=$(jq -c . <<<"$source_contributor_ids")"
+          } >> "$GITHUB_OUTPUT"
 
       - name: download exact candidate and submitted reports
         env:

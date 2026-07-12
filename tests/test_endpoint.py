@@ -1098,30 +1098,57 @@ def test_windows_sidecar_cleanup_anchors_parent_and_rejects_reparse_points(
 
     if os.name != "nt":
         calls: list[tuple[str, int]] = []
+
+        def fake_open_windows_cleanup_handle(
+            path: Path,
+            *,
+            desired_access: int,
+            share_mode: int,
+            flags: int,
+            missing_ok: bool,
+        ) -> int:
+            del path, desired_access, share_mode, flags, missing_ok
+            return 41
+
+        def fake_windows_handle_information(handle: int, path: Path) -> tuple[int, int]:
+            del handle, path
+            return (
+                cast(Any, endpoint_module)._WINDOWS_FILE_ATTRIBUTE_DIRECTORY,
+                os.stat(spool).st_ino,
+            )
+
+        def fake_quarantine_windows_sidecar_by_handle(
+            path: Path,
+            *,
+            quarantine: Path,
+            anchored_directory_handle: int,
+            expected_anchor: object,
+        ) -> None:
+            del quarantine, expected_anchor
+            calls.append((path.name, anchored_directory_handle))
+
+        def fake_close_windows_cleanup_handle(handle: int) -> None:
+            calls.append(("closed", handle))
+
         monkeypatch.setattr(
             endpoint_module,
             "_open_windows_cleanup_handle",
-            lambda *args, **kwargs: 41,
+            fake_open_windows_cleanup_handle,
         )
         monkeypatch.setattr(
             endpoint_module,
             "_windows_handle_information",
-            lambda handle, path: (
-                cast(Any, endpoint_module)._WINDOWS_FILE_ATTRIBUTE_DIRECTORY,
-                os.stat(spool).st_ino,
-            ),
+            fake_windows_handle_information,
         )
         monkeypatch.setattr(
             endpoint_module,
             "_quarantine_windows_sidecar_by_handle",
-            lambda path, *, quarantine, anchored_directory_handle, expected_anchor: calls.append(
-                (path.name, anchored_directory_handle)
-            ),
+            fake_quarantine_windows_sidecar_by_handle,
         )
         monkeypatch.setattr(
             endpoint_module,
             "_close_windows_cleanup_handle",
-            lambda handle: calls.append(("closed", handle)),
+            fake_close_windows_cleanup_handle,
         )
         cast(Any, endpoint_module)._remove_execution_sidecars_windows(
             [progress],
