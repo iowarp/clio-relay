@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import base64
+import hmac
 import os
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Literal, cast
 from urllib.parse import unquote, urlparse
 
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import ConfigurationError
+from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.models import (
     TERMINAL_STATES,
     Cursor,
@@ -26,9 +28,18 @@ from clio_relay.models import (
     RemoteAgentTaskSpec,
     utc_now,
 )
+from clio_relay.pagination import validate_response_page_limit
 from clio_relay.progress_provenance import external_progress_metadata
 from clio_relay.scheduler_status import relay_queue_status
-from clio_relay.spool import JobSpool
+from clio_relay.spool import (
+    ARTIFACT_OWNERSHIP_SCHEMA,
+    JobSpool,
+    OwnedFileSizeLimitError,
+    read_owned_regular_file_bytes,
+)
+
+MAX_ARTIFACT_CONTENT_BYTES = 16 * 1_048_576
+MAX_MONITOR_RULE_RECORDS = 10_000
 
 
 def wait_for_terminal(
@@ -61,6 +72,7 @@ def monitor_job(
     limit: int = 100,
 ) -> dict[str, object]:
     """Return job state plus event drain data from a cursor."""
+    limit = _response_page_limit(limit)
     events, next_cursor = queue.drain_events(Cursor(job_id=job_id, next_seq=cursor), limit=limit)
     status = job_status(queue, job_id)
     return {
@@ -81,10 +93,18 @@ def job_status(queue: ClioCoreQueue, job_id: str) -> dict[str, object]:
     }
 
 
-def scheduler_status_for_job(queue: ClioCoreQueue, job_id: str) -> list[dict[str, object]]:
-    """Return scheduler status metadata recorded for job tasks."""
+def scheduler_status_for_job(
+    queue: ClioCoreQueue,
+    job_id: str,
+    *,
+    limit: int = 100,
+) -> list[dict[str, object]]:
+    """Return a bounded scheduler-status snapshot from exact job task indexes."""
+    if limit < 1:
+        raise ValueError("scheduler status limit must be positive")
     statuses: list[dict[str, object]] = []
-    for task in queue.list_tasks(job_id):
+    tasks, _truncated = queue.scan_job_tasks(job_id, limit=limit)
+    for task in tasks:
         stored = task.metadata.get("scheduler_status")
         if isinstance(stored, dict):
             statuses.append(
@@ -94,20 +114,24 @@ def scheduler_status_for_job(queue: ClioCoreQueue, job_id: str) -> list[dict[str
                     "status": stored,
                 }
             )
+            if len(statuses) >= limit:
+                return statuses
             continue
         stored_items = task.metadata.get("scheduler_statuses")
         if not isinstance(stored_items, list):
             continue
         for item in cast(list[object], stored_items):
-            if isinstance(item, dict):
-                typed_item = cast(dict[str, object], item)
-                statuses.append(
-                    {
-                        "task_id": task.task_id,
-                        "task_name": task.name,
-                        "status": typed_item,
-                    }
-                )
+            if not isinstance(item, dict):
+                continue
+            statuses.append(
+                {
+                    "task_id": task.task_id,
+                    "task_name": task.name,
+                    "status": cast(dict[str, object], item),
+                }
+            )
+            if len(statuses) >= limit:
+                return statuses
     return statuses
 
 
@@ -139,7 +163,45 @@ def read_artifact_bytes(queue: ClioCoreQueue, artifact_id: str) -> dict[str, obj
     """Read an artifact payload referenced by clio-core artifact metadata."""
     artifact = queue.get_artifact(artifact_id)
     path = _artifact_file_path(artifact.uri)
-    data = path.read_bytes()
+    owned_root_uri = artifact.metadata.get("owned_root_uri")
+    ownership_schema = artifact.metadata.get("ownership_schema")
+    if owned_root_uri is None and ownership_schema is None:
+        owned_root = queue.root.parent / "spool" / artifact.job_id
+    elif (
+        ownership_schema == ARTIFACT_OWNERSHIP_SCHEMA
+        and isinstance(owned_root_uri, str)
+        and owned_root_uri
+    ):
+        owned_root = _artifact_file_path(owned_root_uri)
+    else:
+        raise RelayError(f"artifact has invalid owned-root metadata: {artifact_id}")
+    if owned_root.name != artifact.job_id:
+        raise RelayError(
+            f"artifact owned-root metadata does not name its durable job: {artifact_id}"
+        )
+    try:
+        snapshot = read_owned_regular_file_bytes(
+            path,
+            owned_root=owned_root,
+            max_bytes=MAX_ARTIFACT_CONTENT_BYTES,
+        )
+    except OwnedFileSizeLimitError as exc:
+        raise RelayError(
+            f"artifact content exceeds the {MAX_ARTIFACT_CONTENT_BYTES}-byte transfer limit: "
+            f"{artifact_id}; use the cursor-based log endpoint for job logs"
+        ) from exc
+    except RuntimeError as exc:
+        raise RelayError(f"artifact backing file is unsafe: {artifact_id}: {exc}") from exc
+    data = snapshot.data
+    if data is None:
+        raise RelayError(f"artifact content capture failed: {artifact_id}")
+    if artifact.size_bytes is not None and snapshot.size_bytes != artifact.size_bytes:
+        raise RelayError(
+            f"artifact size does not match durable metadata: {artifact_id} "
+            f"({snapshot.size_bytes} != {artifact.size_bytes})"
+        )
+    if artifact.sha256 is not None and not hmac.compare_digest(snapshot.sha256, artifact.sha256):
+        raise RelayError(f"artifact SHA-256 does not match durable metadata: {artifact_id}")
     return {
         "artifact": artifact.model_dump(mode="json"),
         "encoding": "base64",
@@ -152,35 +214,34 @@ def cancel_job(
     job_id: str,
     *,
     cancel_scheduler: bool = False,
+    expected_state: JobState | None = None,
+    expected_updated_at: datetime | None = None,
 ) -> RelayJob:
     """Request cancellation for a queued, leased, or running job."""
-    job = queue.get_job(job_id)
-    if job.state in TERMINAL_STATES:
-        return job
-    queue.append_event(
+    job, _transitioned = queue.cancel_job_if_active(
         job_id,
-        "job.cancel_requested",
-        "Cancellation requested",
-        payload={
-            "previous_state": job.state.value,
-            "cancel_scheduler": cancel_scheduler,
-        },
+        cancel_scheduler=cancel_scheduler,
+        expected_state=expected_state,
+        expected_updated_at=expected_updated_at,
     )
-    return queue.update_job_state(
-        job_id,
-        JobState.CANCELED,
-        message="Job canceled",
-        leased_by=None,
-    )
+    return job
 
 
 def evaluate_monitor_rules(queue: ClioCoreQueue, *, limit: int = 100) -> list[dict[str, object]]:
     """Evaluate enabled monitor rules and return triggered actions."""
-    if limit <= 0:
-        raise ConfigurationError("limit must be positive")
+    limit = _response_page_limit(limit)
+    rules, truncated = queue.scan_monitor_rules(
+        limit=MAX_MONITOR_RULE_RECORDS,
+        enabled=True,
+    )
+    if truncated:
+        raise ConfigurationError(
+            "monitor rule evaluation exceeds the bounded source limit "
+            f"{MAX_MONITOR_RULE_RECORDS}; no rules were evaluated"
+        )
     results: list[dict[str, object]] = []
-    for rule in queue.list_monitor_rules():
-        if not rule.enabled or rule.triggered_at is not None:
+    for rule in rules:
+        if rule.triggered_at is not None:
             continue
         pattern = re.compile(rule.pattern)
         events, cursor = queue.drain_events(
@@ -215,6 +276,13 @@ def evaluate_monitor_rules(queue: ClioCoreQueue, *, limit: int = 100) -> list[di
         queue.update_monitor_rule(triggered)
         results.append(action_result)
     return results
+
+
+def _response_page_limit(limit: object) -> int:
+    try:
+        return validate_response_page_limit(limit)
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
 
 
 def _event_search_text(event: RelayEvent) -> list[str]:
@@ -414,6 +482,10 @@ def _artifact_file_path(uri: str) -> Path:
     parsed = urlparse(uri)
     if parsed.scheme != "file":
         raise ConfigurationError(f"unsupported artifact URI scheme: {parsed.scheme}")
+    if parsed.netloc not in {"", "localhost"}:
+        raise ConfigurationError("artifact file URIs with remote authorities are not supported")
+    if parsed.query or parsed.fragment:
+        raise ConfigurationError("artifact file URIs must not contain query or fragment data")
     path = unquote(parsed.path)
     if os.name == "nt" and len(path) >= 3 and path[0] == "/" and path[2] == ":":
         path = path[1:]

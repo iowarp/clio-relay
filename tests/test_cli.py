@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
@@ -12,12 +16,20 @@ from typer.testing import CliRunner
 
 from clio_relay import cli
 from clio_relay.cli import app
-from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, FrpTransportConfig
+from clio_relay.cluster_config import (
+    ClusterDefinition,
+    ClusterRegistry,
+    ClusterTargetIdentity,
+    FrpTransportConfig,
+)
 from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.models import (
     ArtifactRef,
+    Cursor,
     EndpointRegistration,
     EndpointRole,
+    GatewaySession,
     GatewaySessionState,
     JarvisRunSpec,
     JobKind,
@@ -25,6 +37,24 @@ from clio_relay.models import (
     McpCallSpec,
     RelayJob,
     RelayTask,
+    SchedulerPhase,
+    SchedulerStatus,
+)
+from clio_relay.scheduler_providers import SchedulerProvider
+from clio_relay.session_lifecycle import (
+    CleanupResource,
+    RemoteSessionStateEvidence,
+    SessionLifecycleReport,
+)
+from clio_relay.validation_report import (
+    EvidenceReference,
+    LiveValidationReport,
+    ValidationRecorder,
+    ValidationResource,
+)
+from tests.queue_validation_fixtures import (
+    DeterministicQueueValidationProvider,
+    LiveWorkerFleet,
 )
 
 
@@ -38,16 +68,109 @@ def _write_test_cluster(
     name: str = "ares",
     *,
     frp_server_addr: str = "relay.example.test",
+    scheduler_provider: str = "external",
 ) -> None:
     ClusterRegistry(
         clusters={
             name: ClusterDefinition(
                 name=name,
                 ssh_host=name,
+                scheduler_provider=scheduler_provider,
                 frp_transport=FrpTransportConfig(server_addr=frp_server_addr),
             )
         }
     ).save(root / ".clio-relay" / "clusters.json")
+
+
+def _owned_session_status(
+    *,
+    session_id: str = "session-1",
+    generation_id: str = "generation-1",
+    running: bool = True,
+) -> dict[str, object]:
+    return {
+        "owner": "clio-relay",
+        "session_id": session_id,
+        "session_generation_id": generation_id,
+        "running": running,
+        "ownership_verified": running,
+    }
+
+
+def _verified_teardown_report(
+    *,
+    cluster: str = "ares",
+    session_id: str = "session-1",
+    generation_id: str = "generation-1",
+    resources: list[CleanupResource] | None = None,
+) -> SessionLifecycleReport:
+    observed_at = datetime.now(UTC)
+    return SessionLifecycleReport(
+        cluster=cluster,
+        session_id=session_id,
+        session_generation_id=generation_id,
+        mode="teardown",
+        prior_session_status=RemoteSessionStateEvidence(
+            api_pid=123,
+            session_generation_id=generation_id,
+            process_start_marker="start-123",
+            running=True,
+            ownership_verified=True,
+            observed_at=observed_at,
+            started_at=observed_at,
+        ),
+        post_session_status=RemoteSessionStateEvidence(
+            api_pid=123,
+            session_generation_id=generation_id,
+            process_start_marker="start-123",
+            running=False,
+            ownership_verified=True,
+            observed_at=observed_at,
+            started_at=observed_at,
+        ),
+        resources=resources
+        or [
+            CleanupResource(
+                kind="remote_relay_api",
+                resource_id="123",
+                location=cluster,
+                action="stop",
+                ownership_verified=True,
+                outcome="stopped",
+                verified_after_operation=True,
+            )
+        ],
+    )
+
+
+def _fake_owned_session_status(**_kwargs: object) -> dict[str, object]:
+    return _owned_session_status()
+
+
+def _fake_verified_teardown(**_kwargs: object) -> SessionLifecycleReport:
+    return _verified_teardown_report()
+
+
+def _fake_empty_runtime_cleanup(**_kwargs: object) -> list[dict[str, object]]:
+    return []
+
+
+def _fake_empty_owned_jobs(*_args: object, **_kwargs: object) -> list[object]:
+    return []
+
+
+def _activate_owner_session(
+    queue: ClioCoreQueue,
+    *,
+    session_id: str = "session-1",
+    generation_id: str = "generation-1",
+) -> None:
+    selected = queue.prepare_owner_session_start(
+        session_id,
+        recorded_generation_id=None,
+        candidate_generation_id=generation_id,
+    )
+    assert selected == generation_id
 
 
 def test_console_safe_text_replaces_non_console_characters(
@@ -56,6 +179,100 @@ def test_console_safe_text_replaces_non_console_characters(
     monkeypatch.setattr(sys, "stdout", SimpleNamespace(encoding="cp1252"))
 
     assert cli._console_safe_text("× ╰─▶") == "× ???"  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+
+def test_endpoint_worker_with_explicit_provider_does_not_require_remote_registry(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeWorker:
+        def register(self) -> None:
+            captured["registered"] = True
+
+        def run_once(self) -> None:
+            captured["ran_once"] = True
+
+    def make_worker(**kwargs: object) -> FakeWorker:
+        captured.update(kwargs)
+        return FakeWorker()
+
+    def fail_registry_lookup(cluster: str) -> ClusterDefinition:
+        raise AssertionError(f"unexpected registry lookup for {cluster}")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "EndpointWorker", make_worker)
+    monkeypatch.setattr(cli, "_require_cluster", fail_registry_lookup)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "endpoint",
+            "start",
+            "--role",
+            "worker",
+            "--cluster",
+            "homelab",
+            "--scheduler-provider",
+            "external",
+            "--once",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["cluster"] == "homelab"
+    assert captured["registered"] is True
+    assert captured["ran_once"] is True
+    provider = cast(SchedulerProvider, captured["scheduler_provider"])
+    assert provider.name == "external"
+
+
+def test_endpoint_worker_without_explicit_provider_uses_cluster_registry(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    definition = ClusterDefinition(
+        name="configured-cluster",
+        ssh_host="configured-cluster",
+        scheduler_provider="slurm",
+    )
+
+    class FakeWorker:
+        def register(self) -> None:
+            captured["registered"] = True
+
+        def run_once(self) -> None:
+            captured["ran_once"] = True
+
+    def make_worker(**kwargs: object) -> FakeWorker:
+        captured.update(kwargs)
+        return FakeWorker()
+
+    def load_cluster(cluster: str) -> ClusterDefinition:
+        captured["registry_cluster"] = cluster
+        return definition
+
+    monkeypatch.setattr(cli, "EndpointWorker", make_worker)
+    monkeypatch.setattr(cli, "_require_cluster", load_cluster)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "endpoint",
+            "start",
+            "--role",
+            "worker",
+            "--cluster",
+            "configured-cluster",
+            "--once",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["registry_cluster"] == "configured-cluster"
+    provider = cast(SchedulerProvider, captured["scheduler_provider"])
+    assert provider.name == "slurm"
 
 
 def test_cli_lists_artifacts(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -79,9 +296,13 @@ def test_cli_lists_artifacts(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     result = CliRunner().invoke(app, ["job", "list-artifacts", job.job_id])
 
     assert result.exit_code == 0
-    artifacts = json.loads(result.output)
-    assert artifacts[0]["artifact_id"] == artifact.artifact_id
-    assert artifacts[0]["kind"] == "stdout"
+    page = json.loads(result.output)
+    assert page["artifacts"][0]["artifact_id"] == artifact.artifact_id
+    assert page["artifacts"][0]["kind"] == "stdout"
+    assert page["cursor"] == 1
+    assert page["limit"] == 100
+    assert page["next_cursor"] is None
+    assert page["total"] == 1
 
 
 def test_cli_lists_tasks(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -101,9 +322,46 @@ def test_cli_lists_tasks(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     result = CliRunner().invoke(app, ["job", "tasks", job.job_id])
 
     assert result.exit_code == 0
-    tasks = json.loads(result.output)
-    assert tasks[0]["task_id"] == task.task_id
-    assert tasks[0]["name"] == "jarvis.execution"
+    page = json.loads(result.output)
+    assert page["tasks"][0]["task_id"] == task.task_id
+    assert page["tasks"][0]["name"] == "jarvis.execution"
+    assert page["cursor"] == 1
+    assert page["limit"] == 100
+    assert page["next_cursor"] is None
+    assert page["total"] == 1
+
+
+def test_cli_repairs_lease_operational_indexes(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="cli-repair-lease-indexes",
+        )
+    )
+    lease = queue.acquire_job(job.job_id, "worker", cluster=job.cluster)
+    assert lease is not None
+    identity = queue._lease_index_identity(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        lease,
+        job=queue.get_job(job.job_id),
+    )
+    endpoint_ref = queue._lease_endpoint_ref_path(identity)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    endpoint_ref.unlink()
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+
+    result = CliRunner().invoke(app, ["queue", "repair-lease-indexes"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["complete"] is True
+    assert payload["record_count"] == 1
+    assert endpoint_ref.is_file()
 
 
 def test_cli_records_and_reads_task_events(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -262,7 +520,12 @@ def test_cli_gateway_session_lifecycle(tmp_path: Path, monkeypatch: MonkeyPatch)
     assert json.loads(updated.output)["stdout_uri"] == "file:///tmp/updated-stdout.log"
     assert json.loads(updated.output)["log_uris"] == ["file:///tmp/updated.log"]
     assert json.loads(updated.output)["artifacts"] == ["artifact://session/updated"]
-    assert json.loads(listed.output)[0]["session_id"] == session_id
+    listed_page = json.loads(listed.output)
+    assert listed_page["gateway_sessions"][0]["session_id"] == session_id
+    assert listed_page["source_cursor"] == 1
+    assert listed_page["source_limit"] == 100
+    assert listed_page["source_next_cursor"] is None
+    assert listed_page["source_total"] == 1
     assert json.loads(closed.output)["state"] == GatewaySessionState.CLOSED.value
 
 
@@ -302,8 +565,34 @@ def test_cli_queue_management_commands(tmp_path: Path, monkeypatch: MonkeyPatch)
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
     runner = CliRunner()
 
-    listed = runner.invoke(app, ["queue", "list", "--cluster", "test-cluster"])
-    diagnosed = runner.invoke(app, ["queue", "diagnose", "--cluster", "test-cluster"])
+    listed = runner.invoke(
+        app,
+        [
+            "queue",
+            "list",
+            "--cluster",
+            "test-cluster",
+            "--kind",
+            "jarvis",
+            "--limit",
+            "1",
+        ],
+    )
+    diagnosed = runner.invoke(
+        app,
+        ["queue", "diagnose", job.job_id, "--cluster", "test-cluster"],
+    )
+    stale = runner.invoke(
+        app,
+        [
+            "queue",
+            "stale",
+            "--cluster",
+            "test-cluster",
+            "--older-than",
+            "1h",
+        ],
+    )
     cleanup = runner.invoke(
         app,
         [
@@ -314,16 +603,75 @@ def test_cli_queue_management_commands(tmp_path: Path, monkeypatch: MonkeyPatch)
             "--no-dry-run",
         ],
     )
-    canceled = runner.invoke(app, ["queue", "cancel", job.job_id])
+    canceled = runner.invoke(
+        app,
+        ["queue", "cancel", job.job_id, "--cluster", "test-cluster"],
+    )
 
     assert listed.exit_code == 0
     assert diagnosed.exit_code == 0
+    assert stale.exit_code == 0
     assert cleanup.exit_code == 0
     assert canceled.exit_code == 0
     assert json.loads(listed.output)["count"] == 1
-    assert json.loads(diagnosed.output)["issues"][0]["code"] == "expired_lease"
+    assert json.loads(listed.output)["jobs"][0]["job"]["kind"] == "jarvis"
+    assert json.loads(diagnosed.output)["reason"] == "stale_lease"
+    assert json.loads(stale.output)["jobs"][0]["job"]["job_id"] == job.job_id
     assert json.loads(cleanup.output)["recovered_count"] == 1
     assert json.loads(canceled.output)["scheduler_policy"] == "relay-only"
+
+
+def test_cli_queue_validation_writes_canonical_report(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path, "test-cluster", scheduler_provider="slurm")
+    fleet = LiveWorkerFleet(tmp_path).start()
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(fleet.settings.core_dir))
+    report_path = tmp_path / "queue-validation.json"
+
+    def queue_validation_provider(_name: str | None) -> DeterministicQueueValidationProvider:
+        return fleet.scheduler
+
+    monkeypatch.setattr(cli, "validation_provider_for_scheduler", queue_validation_provider)
+    try:
+        result = CliRunner().invoke(
+            app,
+            [
+                "queue",
+                "validate",
+                "--cluster",
+                "test-cluster",
+                "--older-than",
+                "1s",
+                "--scheduler-timeout-seconds",
+                "30",
+                "--scheduler-poll-seconds",
+                "0.02",
+                "--report",
+                str(report_path),
+            ],
+        )
+    finally:
+        fleet.close()
+
+    assert result.exit_code == 0
+    assert "validation.status=passed" in result.output
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["scenario"] == "queue-management"
+    assert {check["check_id"] for check in report["checks"]} == {
+        "queue.kind-concurrency-parallel",
+        "queue.kind-concurrency-worker-enforced",
+        "queue.list-bounded",
+        "queue.diagnose-specific-reason",
+        "queue.stale-dry-run",
+        "queue.stale-cleanup-executed",
+        "queue.cancel-running-worker-process",
+        "queue.scheduler-preserved-default",
+        "queue.worker-containment-enforced",
+    }
+    assert report["cleanup"]["cancel_scheduler_jobs"] is False
 
 
 def test_cli_worker_status_reports_registered_capacity(
@@ -360,7 +708,7 @@ def test_cli_job_submit_can_request_exclusive_scheduler(
     yaml_path.write_text("name: generic\npkgs: []\n", encoding="utf-8")
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
     monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
-    _write_test_cluster(tmp_path, name="test-cluster")
+    _write_test_cluster(tmp_path, name="test-cluster", scheduler_provider="slurm")
     monkeypatch.chdir(tmp_path)
 
     result = CliRunner().invoke(
@@ -399,7 +747,7 @@ def test_cli_job_submit_pipeline_creates_named_jarvis_job(
             "--cluster",
             "ares",
             "--pipeline-name",
-            "lammps_4node",
+            "site_simulation_4node",
             "--idempotency-key",
             "named-pipeline",
         ],
@@ -408,7 +756,7 @@ def test_cli_job_submit_pipeline_creates_named_jarvis_job(
     assert result.exit_code == 0
     job = ClioCoreQueue(core_dir).get_job(result.output.strip())
     assert isinstance(job.spec, JarvisRunSpec)
-    assert job.spec.pipeline_name == "lammps_4node"
+    assert job.spec.pipeline_name == "site_simulation_4node"
     assert job.spec.pipeline_yaml is None
 
 
@@ -541,7 +889,7 @@ def test_cli_record_progress_cannot_spoof_package_progress(
             "record-progress",
             job.job_id,
             "--metadata-json",
-            '{"source":"jarvis_package","package_name":"builtin.lammps","run_id":"spoofed"}',
+            '{"source":"jarvis_package","package_name":"site.simulation","run_id":"spoofed"}',
         ],
     )
 
@@ -559,10 +907,15 @@ def test_cli_tests_ssh_transport(tmp_path: Path, monkeypatch: MonkeyPatch) -> No
 
     def fake_probe(**kwargs: object) -> list[str]:
         calls.append(kwargs)
-        return ["transport.protocol=ssh_forward", "transport.healthz=ok"]
+        return [
+            "transport.protocol=ssh_forward",
+            "transport.healthz=ok",
+            "transport.cleanup=passed",
+        ]
 
     monkeypatch.setattr("clio_relay.cli.run_ssh_forward_http_probe", fake_probe)
     monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
+    report_path = tmp_path / "ssh-transport.json"
 
     result = CliRunner().invoke(
         app,
@@ -577,7 +930,12 @@ def test_cli_tests_ssh_transport(tmp_path: Path, monkeypatch: MonkeyPatch) -> No
             "9001",
             "--session-id",
             "session-1",
-            "--detach-remote",
+            "--validation-report",
+            str(report_path),
+            "--validation-launcher",
+            "uvx",
+            "--validation-install-source",
+            "wheel:clio_relay-0.9.23-py3-none-any.whl",
         ],
     )
 
@@ -588,7 +946,297 @@ def test_cli_tests_ssh_transport(tmp_path: Path, monkeypatch: MonkeyPatch) -> No
     assert calls[0]["remote_api_port"] == 9001
     assert calls[0]["session_id"] == "session-1"
     assert calls[0]["api_token"] == "api-token"
-    assert calls[0]["detach_remote"] is True
+    assert calls[0]["detach_remote"] is False
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "passed"
+    assert report["scenario"] == "transport"
+    assert report["install_source"]["launcher"] == "uvx"
+    assert {check["check_id"] for check in report["checks"]} >= {
+        "transport.ssh",
+        "transport.cleanup",
+    }
+    assert report["resources"] == [
+        {
+            "cluster": "ares",
+            "kind": "connector",
+            "metadata": {
+                "cleanup_verified": True,
+                "remote_session_retained": False,
+                "transport_mode": "ssh-forward",
+            },
+            "provider": None,
+            "references": [],
+            "resource_id": "session-1",
+            "role": "ssh_forward_probe",
+            "state": "stopped",
+        }
+    ]
+    assert report["cleanup"]["remaining_resources"] == []
+
+
+def test_cli_ssh_transport_detach_report_models_retention_without_residual(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+
+    def fake_probe(**kwargs: object) -> list[str]:
+        assert kwargs["detach_remote"] is True
+        return [
+            "transport.protocol=ssh_forward",
+            "transport.healthz=ok",
+            "transport.remote_session=retained",
+            "transport.remote_session_ownership=verified",
+            "transport.cleanup=detached",
+        ]
+
+    monkeypatch.setattr("clio_relay.cli.run_ssh_forward_http_probe", fake_probe)
+    monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
+    report_path = tmp_path / "ssh-detach.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "relay-host",
+            "test-ssh-transport",
+            "--cluster",
+            "ares",
+            "--local-bind-port",
+            "19011",
+            "--session-id",
+            "session-detach-1",
+            "--detach-remote",
+            "--validation-report",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "passed"
+    assert report["cleanup"]["mode"] == "transport_probe_detach"
+    assert report["cleanup"]["remaining_resources"] == []
+    resources = {item["kind"]: item for item in report["resources"]}
+    assert resources["connector"]["state"] == "stopped"
+    assert resources["connector"]["metadata"]["remote_session_retained"] is True
+    assert resources["relay_session"]["state"] == "retained"
+    assert resources["relay_session"]["metadata"]["verified_after_operation"] is True
+    retained_actions = [
+        action for action in report["cleanup"]["actions"] if action["action"] == "retain"
+    ]
+    assert retained_actions[0]["outcome"] == "retained"
+
+
+def test_cli_tests_http_transport_and_writes_canonical_report(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    calls: list[dict[str, object]] = []
+
+    def fake_probe(**kwargs: object) -> list[str]:
+        calls.append(kwargs)
+        return [
+            "transport.protocol=wss",
+            "transport.healthz=ok",
+            "transport.cleanup=passed",
+        ]
+
+    def fake_worker_identity(
+        report: LiveValidationReport,
+        definition: ClusterDefinition,
+    ) -> None:
+        assert definition.name == "ares"
+        recorder = ValidationRecorder(report)
+        with recorder.check("worker.artifact-version", "verified remote worker") as evidence:
+            evidence.append(EvidenceReference(kind="test", excerpt="worker verified"))
+        recorder.add_resource(
+            ValidationResource(
+                kind="relay_worker",
+                resource_id="worker:ares",
+                cluster="ares",
+                state="running",
+            )
+        )
+
+    monkeypatch.setattr("clio_relay.cli.run_frp_http_probe", fake_probe)
+    monkeypatch.setattr(cli, "_attach_verified_remote_worker", fake_worker_identity)
+    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "frp-token")
+    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "stcp-secret")
+    report_path = tmp_path / "relay-transport.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "relay-host",
+            "test-http-transport",
+            "--cluster",
+            "ares",
+            "--local-bind-port",
+            "19002",
+            "--remote-api-port",
+            "9002",
+            "--proxy-name",
+            "relay-probe-1",
+            "--validation-report",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls[0]["token"] == "frp-token"
+    assert calls[0]["secret_key"] == "stcp-secret"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "passed"
+    assert {check["check_id"] for check in report["checks"]} >= {
+        "transport.relay",
+        "transport.cleanup",
+        "worker.artifact-version",
+    }
+    assert {resource["kind"] for resource in report["resources"]} == {
+        "connector",
+        "relay_worker",
+    }
+
+
+def test_cli_tests_direct_transport_and_writes_canonical_report(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+
+    def fake_probe(**_kwargs: object) -> list[str]:
+        return [
+            "direct_transport.result=xtcp",
+            "transport.protocol=wss",
+            "transport.proxy_type=xtcp",
+            "transport.healthz=ok",
+            "transport.cleanup=passed",
+        ]
+
+    monkeypatch.setattr("clio_relay.cli.run_frp_direct_http_probe", fake_probe)
+    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "frp-token")
+    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "xtcp-secret")
+    report_path = tmp_path / "direct-transport.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "relay-host",
+            "test-direct-transport",
+            "--cluster",
+            "ares",
+            "--local-bind-port",
+            "19004",
+            "--proxy-name",
+            "direct-probe-1",
+            "--no-allow-stcp-fallback",
+            "--validation-report",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "passed"
+    assert {check["check_id"] for check in report["checks"]} >= {
+        "transport.direct",
+        "transport.cleanup",
+    }
+    assert report["resources"][0]["role"] == "frp_xtcp_probe"
+
+
+def test_cli_transport_failure_writes_partial_canonical_report(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+
+    def failing_probe(**kwargs: object) -> list[str]:
+        del kwargs
+        raise RelayError("live transport failed")
+
+    monkeypatch.setattr("clio_relay.cli.run_frp_http_probe", failing_probe)
+    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "frp-token")
+    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "stcp-secret")
+    report_path = tmp_path / "failed-transport.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "relay-host",
+            "test-http-transport",
+            "--cluster",
+            "ares",
+            "--local-bind-port",
+            "19003",
+            "--proxy-name",
+            "relay-probe-failed",
+            "--validation-report",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert report["checks"][-1]["check_id"] == "transport.completed"
+    assert report["checks"][-1]["status"] == "failed"
+    assert report["resources"][0]["state"] == "unknown"
+    assert report["cleanup"]["remaining_resources"][0]["resource_id"] == ("relay-probe-failed")
+
+
+def test_cli_transport_worker_identity_failure_fails_canonical_report(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+
+    def fake_probe(**_kwargs: object) -> list[str]:
+        return [
+            "transport.protocol=wss",
+            "transport.healthz=ok",
+            "transport.cleanup=passed",
+        ]
+
+    def fail_worker_identity(
+        _report: LiveValidationReport,
+        _definition: ClusterDefinition,
+    ) -> None:
+        raise ConfigurationError("remote wheel hash does not match")
+
+    monkeypatch.setattr(cli, "run_frp_http_probe", fake_probe)
+    monkeypatch.setattr(cli, "_attach_verified_remote_worker", fail_worker_identity)
+    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "frp-token")
+    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "stcp-secret")
+    report_path = tmp_path / "worker-mismatch.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "relay-host",
+            "test-http-transport",
+            "--cluster",
+            "ares",
+            "--local-bind-port",
+            "19005",
+            "--validation-report",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    worker_checks = [
+        check for check in report["checks"] if check["check_id"] == "worker.installation-info"
+    ]
+    assert worker_checks[0]["status"] == "failed"
 
 
 def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -596,22 +1244,44 @@ def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch
     _write_test_cluster(tmp_path)
     started: list[dict[str, object]] = []
     torn_down: list[dict[str, object]] = []
+    remote_calls: list[list[str]] = []
 
     def fake_start(**kwargs: object) -> list[str]:
         started.append(kwargs)
-        return ["session_started=session-1"]
+        return ["session_started=session-1", "session_generation_id=generation-1"]
 
     def fake_status(**kwargs: object) -> dict[str, object]:
-        return {"session_id": kwargs["session_id"], "running": True}
+        return _owned_session_status(session_id=cast(str, kwargs["session_id"]))
 
-    def fake_teardown(**kwargs: object) -> list[str]:
+    def fake_teardown(**kwargs: object) -> SessionLifecycleReport:
         torn_down.append(kwargs)
-        return ["api_stopped=123", "worker_stopped=clio-relay-worker-ares.service"]
+        report = _verified_teardown_report()
+        if kwargs.get("stop_worker") is True:
+            report.resources.append(
+                CleanupResource(
+                    kind="worker_service",
+                    resource_id="clio-relay-worker-ares.service",
+                    location="ares",
+                    action="stop",
+                    ownership_verified=True,
+                    outcome="stopped",
+                    verified_after_operation=True,
+                    observed_state="inactive",
+                )
+            )
+        return report
+
+    def fake_run_remote_clio(_definition: ClusterDefinition, arguments: list[str]) -> str:
+        remote_calls.append(arguments)
+        return "{}"
 
     monkeypatch.setattr("clio_relay.cli.start_remote_session", fake_start)
     monkeypatch.setattr("clio_relay.cli.status_remote_session", fake_status)
     monkeypatch.setattr("clio_relay.cli.teardown_remote_session", fake_teardown)
+    monkeypatch.setattr("clio_relay.cli.run_remote_clio", fake_run_remote_clio)
     monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    _activate_owner_session(ClioCoreQueue(tmp_path / "core"))
     runner = CliRunner()
 
     start_result = runner.invoke(
@@ -650,11 +1320,836 @@ def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch
     assert "session_started=session-1" in start_result.output
     assert started[0]["api_token"] == "api-token"
     assert started[0]["replace"] is True
+    assert remote_calls == []
+    assert (tmp_path / ".clio-relay" / "session-transitions").is_dir()
     assert status_result.exit_code == 0
     assert json.loads(status_result.output)["running"] is True
     assert teardown_result.exit_code == 0
     assert torn_down[0]["stop_worker"] is True
     assert torn_down[0]["cluster"] == "ares"
+    assert torn_down[0]["expected_session_generation_id"] == "generation-1"
+
+
+def test_cli_session_start_does_not_reopen_intake_when_process_start_fails(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
+    remote_calls: list[list[str]] = []
+
+    def fail_start(**_kwargs: object) -> list[str]:
+        raise RelayError("remote process start failed")
+
+    def record_remote(_definition: ClusterDefinition, arguments: list[str]) -> str:
+        remote_calls.append(arguments)
+        return "{}"
+
+    monkeypatch.setattr(cli, "start_remote_session", fail_start)
+    monkeypatch.setattr(cli, "run_remote_clio", record_remote)
+
+    result = CliRunner().invoke(
+        app,
+        ["session", "start", "--cluster", "ares", "--session-id", "session-1"],
+    )
+
+    assert result.exit_code == 1
+    assert remote_calls == []
+
+
+def test_cli_session_detach_never_records_owner_session_closure(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    core_dir = tmp_path / "core"
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    _activate_owner_session(ClioCoreQueue(core_dir))
+
+    def fake_detach(**_kwargs: object) -> SessionLifecycleReport:
+        return SessionLifecycleReport(
+            cluster="ares",
+            session_id="session-1",
+            session_generation_id="generation-1",
+            mode="detach",
+            resources=[
+                CleanupResource(
+                    kind="remote_relay_api",
+                    resource_id="123",
+                    location="ares",
+                    action="retain",
+                    ownership_verified=True,
+                    outcome="retained",
+                    verified_after_operation=True,
+                )
+            ],
+        )
+
+    monkeypatch.setattr(cli, "detach_remote_session", fake_detach)
+
+    result = CliRunner().invoke(
+        app,
+        ["session", "detach", "--cluster", "ares", "--session-id", "session-1"],
+    )
+
+    queue = ClioCoreQueue(core_dir)
+    assert result.exit_code == 0, result.output
+    assert queue.owner_session_is_closing("session-1") is False
+    assert queue.get_owner_session_closed("session-1") is None
+
+
+def test_cli_session_detach_default_report_failure_controls_exit(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+
+    def incomplete_detach(**_kwargs: object) -> SessionLifecycleReport:
+        return SessionLifecycleReport(
+            cluster="ares",
+            session_id="session-1",
+            session_generation_id=None,
+            mode="detach",
+            resources=[
+                CleanupResource(
+                    kind="remote_relay_api",
+                    resource_id="123",
+                    location="ares",
+                    action="retain",
+                    ownership_verified=True,
+                    outcome="retained",
+                    verified_after_operation=True,
+                )
+            ],
+        )
+
+    monkeypatch.setattr(cli, "detach_remote_session", incomplete_detach)
+
+    result = CliRunner().invoke(
+        app,
+        ["session", "detach", "--cluster", "ares", "--session-id", "session-1"],
+    )
+
+    assert result.exit_code == 1
+    reports = list((tmp_path / ".clio-relay" / "validation-reports").glob("*.json"))
+    assert len(reports) == 1
+    canonical = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert canonical["status"] == "failed"
+    detach_check = next(
+        check for check in canonical["checks"] if check["check_id"] == "cleanup.detach"
+    )
+    assert detach_check["status"] == "failed"
+
+
+def test_cli_session_reopen_preserves_prior_generation_closure_history(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    core_dir = tmp_path / "core"
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    runner = CliRunner()
+
+    prepared = runner.invoke(
+        app,
+        [
+            "session",
+            "prepare-start",
+            "--session-id",
+            "session-1",
+            "--candidate-generation-id",
+            "generation-1",
+        ],
+    )
+    quiesced = runner.invoke(
+        app,
+        [
+            "session",
+            "quiesce-intake",
+            "--session-id",
+            "session-1",
+            "--session-generation-id",
+            "generation-1",
+        ],
+    )
+    closed = runner.invoke(
+        app,
+        [
+            "session",
+            "mark-closed",
+            "--session-id",
+            "session-1",
+            "--session-generation-id",
+            "generation-1",
+        ],
+    )
+    reopened = runner.invoke(
+        app,
+        [
+            "session",
+            "prepare-start",
+            "--session-id",
+            "session-1",
+            "--recorded-generation-id",
+            "generation-1",
+            "--candidate-generation-id",
+            "generation-2",
+        ],
+    )
+    resumed = runner.invoke(
+        app,
+        [
+            "session",
+            "resume-intake",
+            "--session-id",
+            "session-1",
+            "--session-generation-id",
+            "generation-2",
+        ],
+    )
+
+    queue = ClioCoreQueue(core_dir)
+    assert prepared.exit_code == 0, prepared.output
+    assert quiesced.exit_code == 0, quiesced.output
+    assert closed.exit_code == 0, closed.output
+    assert reopened.exit_code == 0, reopened.output
+    assert resumed.exit_code == 0, resumed.output
+    assert queue.owner_session_is_closing("session-1") is False
+    assert (
+        queue.get_owner_session_closed(
+            "session-1",
+            session_generation_id="generation-1",
+        )
+        is not None
+    )
+    assert (
+        queue.get_owner_session_closed(
+            "session-1",
+            session_generation_id="generation-2",
+        )
+        is None
+    )
+
+
+def test_cli_session_prepare_start_preserves_active_generation_and_resources(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    core_dir = tmp_path / "core"
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    runner = CliRunner()
+    first = runner.invoke(
+        app,
+        [
+            "session",
+            "prepare-start",
+            "--session-id",
+            "session-1",
+            "--candidate-generation-id",
+            "generation-1",
+        ],
+    )
+    queue = ClioCoreQueue(core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="preserve-generation-job",
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": "session-1",
+                "owner_session_generation_id": "generation-1",
+            },
+        )
+    )
+    gateway = queue.create_gateway_session(
+        GatewaySession(
+            cluster="ares",
+            name="preserve-generation-gateway",
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": "session-1",
+                "owner_session_generation_id": "generation-1",
+            },
+        )
+    )
+
+    replacement = runner.invoke(
+        app,
+        [
+            "session",
+            "prepare-start",
+            "--session-id",
+            "session-1",
+            "--recorded-generation-id",
+            "generation-1",
+            "--candidate-generation-id",
+            "generation-2",
+        ],
+    )
+    dead_api_recovery = runner.invoke(
+        app,
+        [
+            "session",
+            "prepare-start",
+            "--session-id",
+            "session-1",
+            "--candidate-generation-id",
+            "generation-3",
+        ],
+    )
+
+    assert first.exit_code == 0, first.output
+    assert replacement.exit_code == 0, replacement.output
+    assert dead_api_recovery.exit_code == 0, dead_api_recovery.output
+    assert json.loads(replacement.output)["session_generation_id"] == "generation-1"
+    assert json.loads(dead_api_recovery.output)["session_generation_id"] == "generation-1"
+    assert queue.get_job(job.job_id).metadata["owner_session_generation_id"] == "generation-1"
+    assert (
+        queue.get_gateway_session(gateway.session_id).metadata["owner_session_generation_id"]
+        == "generation-1"
+    )
+
+
+def test_cli_session_prepare_start_refuses_new_generation_before_closure(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    core_dir = tmp_path / "core"
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    queue = ClioCoreQueue(core_dir)
+    _activate_owner_session(queue)
+    queue.set_owner_session_closing(
+        "session-1",
+        session_generation_id="generation-1",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "prepare-start",
+            "--session-id",
+            "session-1",
+            "--recorded-generation-id",
+            "generation-1",
+            "--candidate-generation-id",
+            "generation-2",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "unfinished generation transition" in result.output
+    assert queue.owner_session_is_closing("session-1") is True
+    assert (
+        queue.get_owner_session_closed(
+            "session-1",
+            session_generation_id="generation-1",
+        )
+        is None
+    )
+
+
+def test_cli_session_teardown_failure_leaves_generation_quiesced_not_closed(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    core_dir = tmp_path / "core"
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    _activate_owner_session(ClioCoreQueue(core_dir))
+    monkeypatch.setattr(
+        cli,
+        "status_remote_session",
+        _fake_owned_session_status,
+    )
+    failed_report = _verified_teardown_report()
+    failed_report.resources.append(
+        CleanupResource(
+            kind="remote_connector",
+            resource_id="connector-123",
+            location="ares",
+            action="stop",
+            ownership_verified=True,
+            outcome="failed",
+            residual=True,
+            detail="connector still running",
+        )
+    )
+
+    def fake_failed_teardown(**_kwargs: object) -> SessionLifecycleReport:
+        return failed_report
+
+    monkeypatch.setattr(
+        cli,
+        "teardown_remote_session",
+        fake_failed_teardown,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["session", "teardown", "--cluster", "ares", "--session-id", "session-1"],
+    )
+
+    queue = ClioCoreQueue(core_dir)
+    assert result.exit_code == 1
+    assert queue.owner_session_is_closing("session-1") is True
+    assert queue.get_owner_session_closed("session-1") is None
+
+
+def test_cli_session_teardown_failure_preserves_stopped_api_evidence(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    core_dir = tmp_path / "core"
+    report_path = tmp_path / "teardown-partial.json"
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    queue = ClioCoreQueue(core_dir)
+    _activate_owner_session(queue)
+    list_calls = [0]
+    gateway_cleanup_calls: list[str] = []
+
+    def fail_after_api_stop(*_args: object, **_kwargs: object) -> list[object]:
+        list_calls[0] += 1
+        if list_calls[0] == 1:
+            return []
+        raise RelayError("post-API owner-session rescan failed")
+
+    def forbidden_gateway_cleanup(**_kwargs: object) -> list[dict[str, object]]:
+        gateway_cleanup_calls.append("gateway")
+        return []
+
+    monkeypatch.setattr(cli, "status_remote_session", _fake_owned_session_status)
+    monkeypatch.setattr(cli, "teardown_remote_session", _fake_verified_teardown)
+    monkeypatch.setattr(cli, "_list_owned_active_cluster_jobs", fail_after_api_stop)
+    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", forbidden_gateway_cleanup)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "teardown",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--validation-report",
+            str(report_path),
+        ],
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    session_resource = next(
+        resource for resource in report["resources"] if resource["kind"] == "relay_session"
+    )
+    process_resource = next(
+        resource for resource in report["resources"] if resource["kind"] == "relay_process"
+    )
+    assert result.exit_code == 1
+    assert "post-API owner-session rescan failed" in result.output
+    assert report["status"] == "failed"
+    assert session_resource["resource_id"] == "session-1:generation-1"
+    assert session_resource["state"] == "stopped"
+    assert process_resource["resource_id"] == "123"
+    assert process_resource["state"] == "stopped"
+    assert report["cleanup"]["actions"][0]["kind"] == "remote_relay_api"
+    assert gateway_cleanup_calls == []
+    assert queue.owner_session_is_closing("session-1") is True
+    assert queue.get_owner_session_closed("session-1") is None
+
+
+def test_cli_session_teardown_rejects_generation_change_before_closure(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    core_dir = tmp_path / "core"
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    _activate_owner_session(ClioCoreQueue(core_dir))
+
+    def fake_generation_one_status(**_kwargs: object) -> dict[str, object]:
+        return _owned_session_status(generation_id="generation-1")
+
+    def fake_generation_two_teardown(**_kwargs: object) -> SessionLifecycleReport:
+        return _verified_teardown_report(generation_id="generation-2")
+
+    monkeypatch.setattr(cli, "status_remote_session", fake_generation_one_status)
+    monkeypatch.setattr(cli, "teardown_remote_session", fake_generation_two_teardown)
+
+    result = CliRunner().invoke(
+        app,
+        ["session", "teardown", "--cluster", "ares", "--session-id", "session-1"],
+    )
+
+    queue = ClioCoreQueue(core_dir)
+    assert result.exit_code == 1
+    assert "generation did not match" in result.output
+    assert queue.owner_session_is_closing("session-1") is True
+    assert queue.get_owner_session_closed("session-1") is None
+
+
+def test_cli_remote_teardown_writes_closure_only_in_remote_authoritative_core(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    local_core_dir = tmp_path / "desktop-core"
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(local_core_dir))
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+    remote_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        cli,
+        "status_remote_session",
+        _fake_owned_session_status,
+    )
+    monkeypatch.setattr(
+        cli,
+        "teardown_remote_session",
+        _fake_verified_teardown,
+    )
+    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
+    monkeypatch.setattr(
+        cli,
+        "_list_remote_owned_active_cluster_jobs",
+        _fake_empty_owned_jobs,
+    )
+
+    def fake_remote(_definition: ClusterDefinition, args: list[str]) -> str:
+        remote_calls.append(args)
+        if args[:2] == ["session", "quiesce-intake"]:
+            return json.dumps(
+                {
+                    "session_id": "session-1",
+                    "session_generation_id": "generation-1",
+                    "intake": "quiesced",
+                }
+            )
+        return json.dumps(
+            {
+                "owner_session_id": "session-1",
+                "session_generation_id": "generation-1",
+                "residual_resource_ids": [],
+            }
+        )
+
+    monkeypatch.setattr(cli, "run_remote_clio", fake_remote)
+
+    def skip_worker_verification(
+        _report: LiveValidationReport,
+        _definition: ClusterDefinition,
+    ) -> None:
+        return
+
+    monkeypatch.setattr(cli, "_attach_verified_remote_worker", skip_worker_verification)
+
+    result = CliRunner().invoke(
+        app,
+        ["session", "teardown", "--cluster", "ares", "--session-id", "session-1"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert remote_calls == [
+        [
+            "session",
+            "quiesce-intake",
+            "--session-id",
+            "session-1",
+            "--session-generation-id",
+            "generation-1",
+        ],
+        [
+            "session",
+            "mark-closed",
+            "--session-id",
+            "session-1",
+            "--session-generation-id",
+            "generation-1",
+        ],
+    ]
+    local_queue = ClioCoreQueue(local_core_dir)
+    assert local_queue.owner_session_is_closing("session-1") is False
+    assert local_queue.get_owner_session_closed("session-1") is None
+
+
+def test_cli_session_start_requires_token_by_default(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    monkeypatch.delenv("CLIO_RELAY_API_TOKEN", raising=False)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "start",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-without-token",
+        ],
+    )
+
+    assert result.exit_code == 2
+
+
+def test_cli_jarvis_mcp_preflight_failure_writes_canonical_report(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    report_path = tmp_path / "jarvis-preflight-failed.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "jarvis-mcp-validate",
+            "--cluster",
+            "ares",
+            "--arguments-json",
+            "{}",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert report["checks"][-1]["check_id"] == "jarvis-mcp.preflight"
+
+
+def test_jarvis_live_progress_observation_requires_running_warming_record() -> None:
+    progress = [
+        {
+            "progress_id": "progress-live",
+            "metadata": {
+                "source": "jarvis_package",
+                "provider_source_authority": "mcp_progress_notification",
+                "provider_validated": True,
+                "acceptance_validated": False,
+                "provider_execution_validated": False,
+                "provider_notification_sequence": 1,
+            },
+        }
+    ]
+    running: dict[str, object] = {
+        "job": {"state": "running", "updated_at": "2026-07-11T10:00:00Z"},
+        "terminal": False,
+    }
+
+    observation = cli._live_jarvis_progress_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        progress,
+        running,
+    )
+
+    assert observation == {
+        "progress_id": "progress-live",
+        "job_state": "running",
+        "job_updated_at": "2026-07-11T10:00:00Z",
+        "terminal": False,
+        "provider_notification_sequence": 1,
+    }
+    assert (
+        cli._live_jarvis_progress_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            progress,
+            {"job": {"state": "succeeded"}, "terminal": True},
+        )
+        is None
+    )
+
+
+def test_cli_scheduler_preflight_failure_writes_canonical_report(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    ClusterRegistry.default().save(tmp_path / ".clio-relay" / "clusters.json")
+    report_path = tmp_path / "scheduler-preflight-failed.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "scheduler",
+            "validate-lifecycle",
+            "--cluster",
+            "missing",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert report["checks"][-1]["check_id"] == "scheduler.preflight"
+
+
+@pytest.mark.parametrize(
+    ("command", "report_option", "check_id"),
+    [
+        (
+            [
+                "relay-host",
+                "test-http-transport",
+                "--cluster",
+                "missing",
+                "--local-bind-port",
+                "19101",
+            ],
+            "--validation-report",
+            "transport.preflight",
+        ),
+        (
+            [
+                "relay-host",
+                "test-direct-transport",
+                "--cluster",
+                "missing",
+                "--local-bind-port",
+                "19102",
+            ],
+            "--validation-report",
+            "transport.preflight",
+        ),
+        (
+            [
+                "relay-host",
+                "test-ssh-transport",
+                "--cluster",
+                "missing",
+                "--local-bind-port",
+                "19103",
+            ],
+            "--validation-report",
+            "transport.preflight",
+        ),
+        (
+            ["live-test", "--cluster", "missing"],
+            "--report",
+            "live.preflight",
+        ),
+        (
+            [
+                "session",
+                "detach",
+                "--cluster",
+                "missing",
+                "--session-id",
+                "owned-session",
+            ],
+            "--validation-report",
+            "session.detach.preflight",
+        ),
+        (
+            [
+                "session",
+                "teardown",
+                "--cluster",
+                "missing",
+                "--session-id",
+                "owned-session",
+            ],
+            "--validation-report",
+            "session.teardown.preflight",
+        ),
+    ],
+)
+def test_cli_acceptance_preflight_failure_always_writes_canonical_report(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    command: list[str],
+    report_option: str,
+    check_id: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    ClusterRegistry.default().save(tmp_path / ".clio-relay" / "clusters.json")
+    report_path = tmp_path / f"{check_id.replace('.', '-')}.json"
+
+    result = CliRunner().invoke(app, [*command, report_option, str(report_path)])
+
+    assert result.exit_code != 0
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert report["checks"][-1]["check_id"] == check_id
+
+
+def test_cli_session_detach_failure_writes_canonical_report(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+
+    def fail_detach(**_kwargs: object) -> SessionLifecycleReport:
+        raise RelayError("remote session ownership check failed")
+
+    monkeypatch.setattr(cli, "detach_remote_session", fail_detach)
+    report_path = tmp_path / "detach-failed.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "detach",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--validation-report",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["scenario"] == "cleanup"
+    assert report["status"] == "failed"
+    assert report["checks"][-1]["check_id"] == "session.detach"
+
+
+def test_cli_session_teardown_failure_writes_canonical_report(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+
+    def fail_teardown(**_kwargs: object) -> SessionLifecycleReport:
+        raise RelayError("remote process identity changed")
+
+    monkeypatch.setattr(cli, "teardown_remote_session", fail_teardown)
+    report_path = tmp_path / "teardown-failed.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "teardown",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--validation-report",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["scenario"] == "cleanup"
+    assert report["status"] == "failed"
+    assert report["checks"][-1]["check_id"] == "session.teardown"
 
 
 def test_cli_session_teardown_defaults_to_keep_jobs(
@@ -670,15 +2165,25 @@ def test_cli_session_teardown_defaults_to_keep_jobs(
             kind=JobKind.JARVIS,
             spec=JarvisRunSpec(command=["sleep", "60"]),
             idempotency_key="keep-job",
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": "session-1",
+                "owner_session_generation_id": "generation-1",
+            },
         )
     )
     torn_down: list[dict[str, object]] = []
 
-    def fake_teardown(**kwargs: object) -> list[str]:
+    def fake_teardown(**kwargs: object) -> SessionLifecycleReport:
         torn_down.append(kwargs)
-        return ["session_teardown=session-1"]
+        return _verified_teardown_report()
 
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    _activate_owner_session(queue)
+    monkeypatch.setattr(
+        "clio_relay.cli.status_remote_session",
+        _fake_owned_session_status,
+    )
     monkeypatch.setattr("clio_relay.cli.teardown_remote_session", fake_teardown)
 
     result = CliRunner().invoke(
@@ -688,9 +2193,83 @@ def test_cli_session_teardown_defaults_to_keep_jobs(
     )
 
     assert result.exit_code == 0
-    assert "Cancel queued or running jobs for cluster ares? [y/N]:" in result.output
-    assert ClioCoreQueue(tmp_path / "core").get_job(job.job_id).state == JobState.QUEUED
+    assert "Cancel queued or running jobs" not in result.output
+    payload = json.loads(result.output)
+    assert payload["relay_jobs"]["cancel_requested"] is False
+    retained = [resource for resource in payload["resources"] if resource["kind"] == "relay_job"]
+    assert retained[0]["resource_id"] == job.job_id
+    assert retained[0]["outcome"] == "retained"
+    assert retained[0]["verified_after_operation"] is True
+    refreshed_queue = ClioCoreQueue(tmp_path / "core")
+    assert refreshed_queue.get_job(job.job_id).state == JobState.QUEUED
+    closure = refreshed_queue.get_owner_session_closed(
+        "session-1",
+        session_generation_id="generation-1",
+    )
+    assert closure is not None
+    assert closure.residual_resource_ids == []
+    assert any(resource["kind"] == "owner_session" for resource in payload["resources"])
     assert torn_down[0]["stop_worker"] is False
+
+
+def test_cli_first_upgraded_teardown_covers_exact_legacy_job_for_retention(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    submitted = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="legacy-owner-session-job",
+        )
+    )
+    legacy = submitted.model_copy(
+        update={
+            "metadata": {
+                "owner": "clio-relay",
+                "owner_session_id": "session-1",
+            }
+        }
+    )
+    for family in ("jobs", "jobs_active", "jobs_queued"):
+        (core_dir / family / f"{legacy.job_id}.json").write_text(
+            legacy.model_dump_json(),
+            encoding="utf-8",
+        )
+    queue.update_job_state(legacy.job_id, JobState.SUCCEEDED)
+    _activate_owner_session(queue)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    monkeypatch.setattr(cli, "status_remote_session", _fake_owned_session_status)
+    monkeypatch.setattr(cli, "teardown_remote_session", _fake_verified_teardown)
+
+    result = CliRunner().invoke(
+        app,
+        ["session", "teardown", "--cluster", "ares", "--session-id", "session-1"],
+    )
+
+    assert result.exit_code == 0, result.output
+    legacy_closure = queue.get_owner_session_closed(
+        "session-1",
+        session_generation_id=None,
+    )
+    assert legacy_closure is not None
+    assert legacy_closure.covered_legacy_job_ids == [legacy.job_id]
+    assert legacy_closure.covered_by_session_generation_id == "generation-1"
+    assert queue.plan_terminal_job_gc(legacy.job_id).eligible is True
+    assert (
+        queue.prepare_owner_session_start(
+            "session-1",
+            recorded_generation_id="generation-1",
+            candidate_generation_id="generation-2",
+        )
+        == "generation-2"
+    )
+    assert queue.plan_terminal_job_gc(legacy.job_id).eligible is True
 
 
 def test_cli_session_teardown_can_cancel_active_jobs(
@@ -706,6 +2285,24 @@ def test_cli_session_teardown_can_cancel_active_jobs(
             kind=JobKind.JARVIS,
             spec=JarvisRunSpec(command=["sleep", "60"]),
             idempotency_key="cancel-active-job",
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": "session-1",
+                "owner_session_generation_id": "generation-1",
+            },
+        )
+    )
+    unrelated_same_cluster = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["sleep", "60"]),
+            idempotency_key="keep-unrelated-ares-job",
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": "another-session",
+                "owner_session_generation_id": "another-generation",
+            },
         )
     )
     other_cluster = queue.submit_job(
@@ -718,11 +2315,16 @@ def test_cli_session_teardown_can_cancel_active_jobs(
     )
     torn_down: list[dict[str, object]] = []
 
-    def fake_teardown(**kwargs: object) -> list[str]:
+    def fake_teardown(**kwargs: object) -> SessionLifecycleReport:
         torn_down.append(kwargs)
-        return ["session_teardown=session-1"]
+        return _verified_teardown_report()
 
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    _activate_owner_session(queue)
+    monkeypatch.setattr(
+        "clio_relay.cli.status_remote_session",
+        _fake_owned_session_status,
+    )
     monkeypatch.setattr("clio_relay.cli.teardown_remote_session", fake_teardown)
 
     result = CliRunner().invoke(
@@ -740,10 +2342,828 @@ def test_cli_session_teardown_can_cancel_active_jobs(
 
     refreshed = ClioCoreQueue(tmp_path / "core")
     assert result.exit_code == 0
-    assert f"job_canceled={active.job_id}" in result.output
+    assert json.loads(result.output)["relay_jobs"]["canceled_job_ids"] == [active.job_id]
     assert refreshed.get_job(active.job_id).state == JobState.CANCELED
+    assert refreshed.get_job(unrelated_same_cluster.job_id).state == JobState.QUEUED
     assert refreshed.get_job(other_cluster.job_id).state == JobState.QUEUED
     assert torn_down[0]["stop_worker"] is False
+
+
+@pytest.mark.parametrize("active_state", [JobState.LEASED, JobState.RUNNING])
+def test_cli_session_teardown_waits_for_worker_acknowledged_cancellation(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    active_state: JobState,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["sleep", "60"]),
+            idempotency_key=f"async-cancel-{active_state.value}",
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": "session-1",
+                "owner_session_generation_id": "generation-1",
+            },
+        )
+    )
+    endpoint = queue.register_endpoint(
+        EndpointRegistration(
+            role=EndpointRole.WORKER,
+            cluster="ares",
+            hostname="worker",
+            pid=123,
+        )
+    )
+    lease = queue.acquire_next_job(
+        endpoint.endpoint_id,
+        cluster="ares",
+        ttl_seconds=60,
+    )
+    assert lease is not None
+    if active_state is JobState.RUNNING:
+        queue.update_job_state(job.job_id, JobState.RUNNING)
+    cleanup_observations: list[JobState] = []
+    sleep_calls: list[float] = []
+
+    def acknowledge_after_poll(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        queue.acknowledge_job_cancellation(job.job_id)
+        queue.release_lease(lease.lease_id)
+
+    def verified_runtime_cleanup(**_kwargs: object) -> list[dict[str, object]]:
+        cleanup_observations.append(queue.get_job(job.job_id).state)
+        return []
+
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    _activate_owner_session(queue)
+    monkeypatch.setattr(cli, "status_remote_session", _fake_owned_session_status)
+    monkeypatch.setattr(cli, "teardown_remote_session", _fake_verified_teardown)
+    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", verified_runtime_cleanup)
+    monkeypatch.setattr(cli, "sleep", acknowledge_after_poll)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "teardown",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--cancel-jobs",
+            "--relay-cancel-timeout-seconds",
+            "1",
+            "--relay-cancel-poll-seconds",
+            "0.01",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["relay_jobs"]["canceled_job_ids"] == [job.job_id]
+    assert sleep_calls
+    assert cleanup_observations
+    assert set(cleanup_observations) == {JobState.CANCELED}
+    canceled = queue.get_job(job.job_id)
+    request = cast(dict[str, object], canceled.metadata["cancellation_request"])
+    assert canceled.state is JobState.CANCELED
+    assert request["cleanup_acknowledged"] is True
+    relay_resource = next(
+        resource for resource in payload["resources"] if resource["kind"] == "relay_job"
+    )
+    assert relay_resource["outcome"] == "canceled"
+    assert relay_resource["verified_after_operation"] is True
+
+
+def test_cli_session_teardown_does_not_stop_runtime_before_cancel_acknowledgment(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["sleep", "60"]),
+            idempotency_key="cancel-ack-timeout",
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": "session-1",
+                "owner_session_generation_id": "generation-1",
+            },
+        )
+    )
+    endpoint = queue.register_endpoint(
+        EndpointRegistration(
+            role=EndpointRole.WORKER,
+            cluster="ares",
+            hostname="worker",
+            pid=123,
+        )
+    )
+    assert (
+        queue.acquire_next_job(
+            endpoint.endpoint_id,
+            cluster="ares",
+            ttl_seconds=60,
+        )
+        is not None
+    )
+    destructive_calls: list[str] = []
+    clock = [0.0]
+
+    def advance_clock(seconds: float) -> None:
+        clock[0] += seconds
+
+    def forbidden_runtime_cleanup(**_kwargs: object) -> list[dict[str, object]]:
+        destructive_calls.append("gateway")
+        return []
+
+    def forbidden_teardown(**_kwargs: object) -> SessionLifecycleReport:
+        destructive_calls.append("api")
+        return _verified_teardown_report()
+
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    _activate_owner_session(queue)
+    monkeypatch.setattr(cli, "status_remote_session", _fake_owned_session_status)
+    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", forbidden_runtime_cleanup)
+    monkeypatch.setattr(cli, "teardown_remote_session", forbidden_teardown)
+    monkeypatch.setattr(cli, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(cli, "sleep", advance_clock)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "teardown",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--cancel-jobs",
+            "--relay-cancel-timeout-seconds",
+            "0.02",
+            "--relay-cancel-poll-seconds",
+            "0.01",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "worker-acknowledged relay cancellation" in result.output
+    assert destructive_calls == []
+    pending = queue.get_job(job.job_id)
+    assert pending.state is JobState.LEASED
+    assert isinstance(pending.metadata.get("cancellation_request"), dict)
+    assert queue.owner_session_is_closing("session-1") is True
+    assert queue.get_owner_session_closed("session-1") is None
+
+
+def test_cli_session_scheduler_cancellation_requires_explicit_flag(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["sleep", "60"]),
+            idempotency_key="cancel-scheduler-explicit",
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": "session-1",
+                "owner_session_generation_id": "generation-1",
+            },
+        )
+    )
+
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    _activate_owner_session(queue)
+
+    def fake_teardown(**_kwargs: object) -> SessionLifecycleReport:
+        return _verified_teardown_report()
+
+    monkeypatch.setattr(
+        "clio_relay.cli.status_remote_session",
+        _fake_owned_session_status,
+    )
+    monkeypatch.setattr("clio_relay.cli.teardown_remote_session", fake_teardown)
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "teardown",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--cancel-jobs",
+            "--cancel-scheduler-jobs",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output)["relay_jobs"]["scheduler_cancel_requested"] is True
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=100)
+    cancel_events = [event for event in events if event.event_type == "job.cancel_requested"]
+    # Session cleanup has one scheduler cancellation path below; relay queue
+    # cancellation never races it with a worker-side provider call.
+    assert cancel_events[-1].payload["cancel_scheduler"] is False
+
+
+def test_cli_session_scheduler_cancellation_is_owned_and_canonical(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path, scheduler_provider="slurm")
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    owned = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["sleep", "60"]),
+            idempotency_key="owned-scheduler-cancel",
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": "session-1",
+                "owner_session_generation_id": "generation-1",
+            },
+        )
+    )
+    task = queue.append_task(RelayTask(job_id=owned.job_id, name="jarvis.execution"))
+    queue.update_task_metadata(
+        task.task_id,
+        {
+            "scheduler": "slurm",
+            "runtime_metadata_source": "jarvis_sidecar",
+            "scheduler_job_ids": ["validation-123"],
+            "scheduler_job_ownership": [
+                {
+                    "scheduler_job_id": "validation-123",
+                    "scheduler_provider": "slurm",
+                    "relay_job_id": owned.job_id,
+                    "task_id": task.task_id,
+                    "execution_id": "execution-validation-123",
+                    "runtime_metadata_source": "jarvis_sidecar",
+                    "ownership_verified": True,
+                    "proof": "authenticated_runtime_sidecar",
+                }
+            ],
+            "scheduler_status": {
+                "scheduler": "slurm",
+                "scheduler_job_id": "validation-123",
+                "phase": "running",
+            },
+        },
+    )
+    unrelated = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["sleep", "60"]),
+            idempotency_key="unrelated-scheduler-job",
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": "session-2",
+                "owner_session_generation_id": "generation-2",
+            },
+        )
+    )
+    canceled_scheduler_ids: list[str] = []
+
+    class ConfirmingScheduler:
+        name = "slurm"
+
+        def cancel(self, scheduler_job_id: str) -> subprocess.CompletedProcess[str]:
+            canceled_scheduler_ids.append(scheduler_job_id)
+            return subprocess.CompletedProcess(["scancel", scheduler_job_id], 0, "", "")
+
+        def poll(self, scheduler_job_id: str) -> SchedulerStatus:
+            return SchedulerStatus(
+                scheduler="slurm",
+                scheduler_job_id=scheduler_job_id,
+                phase=SchedulerPhase.CANCELED,
+            )
+
+    def fake_teardown(**_kwargs: object) -> SessionLifecycleReport:
+        return SessionLifecycleReport(
+            cluster="ares",
+            session_id="session-1",
+            session_generation_id="generation-1",
+            mode="teardown",
+            prior_session_status=RemoteSessionStateEvidence(
+                api_pid=123,
+                session_generation_id="generation-1",
+                process_start_marker="start-123",
+                running=True,
+                ownership_verified=True,
+                observed_at=datetime.now(UTC),
+                started_at=datetime.now(UTC),
+            ),
+            post_session_status=RemoteSessionStateEvidence(
+                api_pid=123,
+                session_generation_id="generation-1",
+                process_start_marker="start-123",
+                running=False,
+                ownership_verified=True,
+                observed_at=datetime.now(UTC),
+                started_at=datetime.now(UTC),
+            ),
+            resources=[
+                CleanupResource(
+                    kind="remote_relay_api",
+                    resource_id="123",
+                    location="ares",
+                    action="stop",
+                    ownership_verified=True,
+                    outcome="stopped",
+                    verified_after_operation=True,
+                )
+            ],
+        )
+
+    report_path = tmp_path / "owned-cancel-report.json"
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    _activate_owner_session(queue)
+    monkeypatch.setattr(
+        "clio_relay.cli.status_remote_session",
+        _fake_owned_session_status,
+    )
+    monkeypatch.setattr("clio_relay.cli.teardown_remote_session", fake_teardown)
+
+    def confirming_provider(_provider: str) -> ConfirmingScheduler:
+        return ConfirmingScheduler()
+
+    monkeypatch.setattr(
+        "clio_relay.cli.provider_for_scheduler",
+        confirming_provider,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "teardown",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--cancel-jobs",
+            "--cancel-scheduler-jobs",
+            "--validation-report",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert canceled_scheduler_ids == ["validation-123"]
+    refreshed = ClioCoreQueue(core_dir)
+    assert refreshed.get_job(owned.job_id).state is JobState.CANCELED
+    assert refreshed.get_job(unrelated.job_id).state is JobState.QUEUED
+    canonical = json.loads(report_path.read_text(encoding="utf-8"))
+    checks = {check["check_id"]: check["status"] for check in canonical["checks"]}
+    assert checks["cleanup.explicit-job-cancel"] == "passed"
+    scheduler_resources = [
+        resource for resource in canonical["resources"] if resource["kind"] == "scheduler_job"
+    ]
+    assert scheduler_resources[0]["resource_id"] == "validation-123"
+    assert scheduler_resources[0]["provider"] == "slurm"
+    assert scheduler_resources[0]["state"] == "canceled"
+
+
+def test_cli_session_cancels_owned_scheduler_after_relay_job_is_terminal(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path, scheduler_provider="slurm")
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.MCP_CALL,
+            spec=McpCallSpec(server="jarvis-mcp", tool="jarvis_run"),
+            idempotency_key="terminal-relay-owned-scheduler",
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": "session-1",
+                "owner_session_generation_id": "generation-1",
+            },
+        )
+    )
+    task = queue.append_task(RelayTask(job_id=job.job_id, name="mcp.execution"))
+    queue.update_task_metadata(
+        task.task_id,
+        {
+            "scheduler": "slurm",
+            "runtime_metadata_source": "jarvis_mcp",
+            "scheduler_job_ids": ["validation-789"],
+            "scheduler_job_ownership": [
+                {
+                    "scheduler_job_id": "validation-789",
+                    "scheduler_provider": "slurm",
+                    "relay_job_id": job.job_id,
+                    "task_id": task.task_id,
+                    "execution_id": "execution-validation-789",
+                    "runtime_metadata_source": "jarvis_mcp",
+                    "ownership_verified": True,
+                    "proof": "owned_jarvis_run_mcp_result",
+                }
+            ],
+        },
+    )
+    queue.update_job_state(job.job_id, JobState.SUCCEEDED)
+    canceled_scheduler_ids: list[str] = []
+
+    class ConfirmingScheduler:
+        name = "slurm"
+
+        def cancel(self, scheduler_job_id: str) -> subprocess.CompletedProcess[str]:
+            canceled_scheduler_ids.append(scheduler_job_id)
+            return subprocess.CompletedProcess(["scancel", scheduler_job_id], 0, "", "")
+
+        def poll(self, scheduler_job_id: str) -> SchedulerStatus:
+            return SchedulerStatus(
+                scheduler="slurm",
+                scheduler_job_id=scheduler_job_id,
+                phase=SchedulerPhase.CANCELED,
+            )
+
+    def fake_teardown(**_kwargs: object) -> SessionLifecycleReport:
+        return _verified_teardown_report()
+
+    def fake_provider_for_scheduler(_provider: str | None) -> ConfirmingScheduler:
+        return ConfirmingScheduler()
+
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    _activate_owner_session(queue)
+    monkeypatch.setattr(
+        "clio_relay.cli.status_remote_session",
+        _fake_owned_session_status,
+    )
+    monkeypatch.setattr(
+        "clio_relay.cli.teardown_remote_session",
+        fake_teardown,
+    )
+    monkeypatch.setattr(
+        "clio_relay.cli.provider_for_scheduler",
+        fake_provider_for_scheduler,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "teardown",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--cancel-jobs",
+            "--cancel-scheduler-jobs",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["relay_jobs"]["canceled_job_ids"] == []
+    assert ClioCoreQueue(core_dir).get_job(job.job_id).state is JobState.SUCCEEDED
+    assert canceled_scheduler_ids == ["validation-789"]
+    relay_resource = next(
+        resource for resource in payload["resources"] if resource["kind"] == "relay_job"
+    )
+    assert relay_resource["outcome"] == "terminal"
+    scheduler_resource = next(
+        resource for resource in payload["resources"] if resource["kind"] == "scheduler_job"
+    )
+    assert scheduler_resource["outcome"] == "canceled"
+
+
+def test_owned_relay_job_refuses_scheduler_identity_without_bound_proof() -> None:
+    job: dict[str, object] = {
+        "job_id": "relay-job",
+        "state": "succeeded",
+        "metadata": {},
+    }
+    task: dict[str, object] = {
+        "task_id": "relay-task",
+        "metadata": {
+            "scheduler": "slurm",
+            "scheduler_job_ids": ["untrusted-123"],
+            "runtime_metadata": {
+                "scheduler_provider": "slurm",
+                "scheduler_job_id": "untrusted-123",
+            },
+        },
+    }
+
+    owned = cli._owned_relay_job(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        job,
+        [task],
+        scheduler_provider="slurm",
+    )
+
+    assert owned.scheduler_job_ids == ()
+    assert owned.unowned_scheduler_job_ids == ("untrusted-123",)
+    resources = cli._owned_job_cleanup_resources(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        [owned],
+        definition=ClusterDefinition(
+            name="ares",
+            ssh_host="ares",
+            scheduler_provider="slurm",
+        ),
+        location="ares",
+        cancel_jobs=True,
+        cancel_scheduler_jobs=True,
+    )
+    refused = next(resource for resource in resources if resource.kind == "scheduler_job")
+    assert refused.ownership_verified is False
+    assert refused.outcome == "refused"
+    assert refused.residual is True
+
+
+def test_cli_session_rejects_scheduler_cancel_without_relay_cancel(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path, scheduler_provider="slurm")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "teardown",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--keep-jobs",
+            "--cancel-scheduler-jobs",
+        ],
+    )
+
+    assert result.exit_code == 2
+
+
+def test_remote_owned_job_discovery_never_cancels_unrelated_session(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    definition = ClusterDefinition(name="ares", ssh_host="ares", scheduler_provider="slurm")
+    calls: list[list[str]] = []
+
+    def fake_remote(_definition: ClusterDefinition, args: list[str]) -> str:
+        calls.append(args)
+        if args[:2] == ["queue", "owner-jobs"]:
+            generation_selected = "--owner-session-generation-id" in args
+            return json.dumps(
+                {
+                    "jobs": (
+                        [
+                            {
+                                "job_id": "owned-job",
+                                "state": "queued",
+                                "metadata": {
+                                    "owner": "clio-relay",
+                                    "owner_session_id": "session-1",
+                                    "owner_session_generation_id": "generation-1",
+                                },
+                            }
+                        ]
+                        if generation_selected
+                        else []
+                    ),
+                    "source_cursor": None,
+                    "source_limit": 500,
+                    "source_next_cursor": None,
+                    "source_total": 1 if generation_selected else 0,
+                    "source_window_count": 1 if generation_selected else 0,
+                }
+            )
+        if args == [
+            "job",
+            "tasks",
+            "owned-job",
+            "--cursor",
+            "1",
+            "--limit",
+            "500",
+        ]:
+            return json.dumps(
+                {
+                    "tasks": [
+                        {
+                            "task_id": "owned-task",
+                            "metadata": {
+                                "scheduler": "slurm",
+                                "runtime_metadata_source": "jarvis_mcp",
+                                "scheduler_job_ids": ["validation-456"],
+                                "scheduler_job_ownership": [
+                                    {
+                                        "scheduler_job_id": "validation-456",
+                                        "scheduler_provider": "slurm",
+                                        "relay_job_id": "owned-job",
+                                        "task_id": "owned-task",
+                                        "execution_id": "execution-validation-456",
+                                        "runtime_metadata_source": "jarvis_mcp",
+                                        "ownership_verified": True,
+                                        "proof": "owned_jarvis_run_mcp_result",
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                    "cursor": 1,
+                    "limit": 500,
+                    "next_cursor": None,
+                    "total": 1,
+                }
+            )
+        if args[:3] == ["queue", "cancel", "owned-job"]:
+            acknowledged_at = datetime.now(UTC).isoformat()
+            return json.dumps(
+                {
+                    "cancellation_requested": True,
+                    "job": {
+                        "job_id": "owned-job",
+                        "state": "canceled",
+                        "metadata": {
+                            "owner": "clio-relay",
+                            "owner_session_id": "session-1",
+                            "owner_session_generation_id": "generation-1",
+                            "cancellation_request": {
+                                "schema_version": "clio-relay.cancellation-request.v1",
+                                "requested_at": acknowledged_at,
+                                "previous_state": "queued",
+                                "cancel_scheduler": False,
+                                "acknowledged_at": acknowledged_at,
+                                "cleanup_acknowledged": True,
+                            },
+                        },
+                    },
+                }
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("clio_relay.cli.run_remote_clio", fake_remote)
+
+    jobs = cli._list_remote_owned_active_cluster_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        definition,
+        "ares",
+        owner_session_id="session-1",
+        owner_session_generation_id="generation-1",
+    )
+    canceled = cli._cancel_remote_owned_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        definition,
+        "ares",
+        jobs,
+    )
+
+    assert canceled == ["owned-job"]
+    assert jobs[0].scheduler_job_ids == ("validation-456",)
+    assert [
+        "queue",
+        "owner-jobs",
+        "--cluster",
+        "ares",
+        "--owner-session-id",
+        "session-1",
+        "--limit",
+        "500",
+        "--owner-session-generation-id",
+        "generation-1",
+    ] in calls
+    assert not any("unrelated-job" in command for command in calls)
+    assert not any("newer-generation-job" in command for command in calls)
+
+
+def test_remote_owner_session_discovery_refuses_truncated_legacy_coverage(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    def fake_remote(_definition: ClusterDefinition, _args: list[str]) -> str:
+        return json.dumps(
+            {
+                "jobs": [],
+                "source_cursor": 1,
+                "source_limit": 500,
+                "source_next_cursor": 501,
+                "source_total": 10_001,
+            }
+        )
+
+    monkeypatch.setattr(cli, "run_remote_clio", fake_remote)
+
+    with pytest.raises(RelayError, match="bounded source limit"):
+        cli._list_remote_owned_active_cluster_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            ClusterDefinition(name="ares", ssh_host="ares"),
+            "ares",
+            owner_session_id="session-1",
+            owner_session_generation_id="generation-1",
+            include_terminal=True,
+        )
+
+
+def test_owned_runtime_cleanup_scans_remote_gateway_core(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "desktop-core"))
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+    definition = ClusterDefinition(name="ares", ssh_host="ares")
+    calls: list[list[str]] = []
+
+    def fake_remote(_definition: ClusterDefinition, args: list[str]) -> str:
+        calls.append(args)
+        if args[:2] == ["gateway", "list"]:
+            return json.dumps(
+                {
+                    "gateway_sessions": [
+                        {
+                            "session_id": "owned-gateway",
+                            "state": "ready",
+                            "metadata": {
+                                "owner": "clio-relay",
+                                "owner_session_id": "session-1",
+                                "owner_session_generation_id": "generation-1",
+                            },
+                        },
+                        {
+                            "session_id": "newer-generation-gateway",
+                            "state": "ready",
+                            "metadata": {
+                                "owner": "clio-relay",
+                                "owner_session_id": "session-1",
+                                "owner_session_generation_id": "generation-2",
+                            },
+                        },
+                        {
+                            "session_id": "unrelated-gateway",
+                            "state": "ready",
+                            "metadata": {
+                                "owner": "clio-relay",
+                                "owner_session_id": "session-2",
+                            },
+                        },
+                    ],
+                    "source_cursor": 1,
+                    "source_limit": 500,
+                    "source_next_cursor": None,
+                    "source_total": 3,
+                }
+            )
+        if args[:3] == ["gateway", "stop-runtime", "owned-gateway"]:
+            return json.dumps(
+                {
+                    "resources": [
+                        {
+                            "kind": "gateway_record",
+                            "resource_id": "owned-gateway",
+                            "location": "ares",
+                            "action": "close",
+                            "ownership_verified": True,
+                            "outcome": "closed",
+                            "residual": False,
+                        }
+                    ],
+                    "errors": [],
+                }
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("clio_relay.cli.run_remote_clio", fake_remote)
+
+    reports = cli._cleanup_owned_runtime_sessions(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster="ares",
+        definition=definition,
+        owner_session_id="session-1",
+        owner_session_generation_id="generation-1",
+        mode="teardown",
+        cancel_scheduler_jobs=False,
+    )
+
+    assert len(reports) == 1
+    resources = reports[0]["resources"]
+    assert isinstance(resources, list)
+    first_resource = cast(object, resources[0])
+    assert isinstance(first_resource, dict)
+    assert first_resource["resource_id"] == "owned-gateway"
+    assert not any("unrelated-gateway" in command for command in calls)
+    assert not any("newer-generation-gateway" in command for command in calls)
 
 
 def test_cli_render_frpc_uses_configured_secret_env(
@@ -897,7 +3317,7 @@ def test_cli_direct_transport_is_strict_xtcp_by_default(
 
     def fake_direct_probe(**kwargs: object) -> list[str]:
         calls.append(kwargs)
-        return ["direct_transport.result=xtcp"]
+        return ["direct_transport.result=xtcp", "transport.cleanup=passed"]
 
     monkeypatch.setattr("clio_relay.cli.run_frp_direct_http_probe", fake_direct_probe)
 
@@ -949,6 +3369,18 @@ def test_cli_cluster_add_writes_explicit_definition(
             "delta",
             "--ssh-host",
             "delta-login",
+            "--scheduler-provider",
+            "slurm",
+            "--target-hostname",
+            "delta-login-1",
+            "--target-hostname",
+            "delta-login-1.example.edu",
+            "--ssh-host-key-sha256",
+            "SHA256:operator-pinned-fingerprint",
+            "--scheduler-cluster-name",
+            "delta",
+            "--site-marker-sha256",
+            "a" * 64,
             "--agent-adapter",
             "exec",
             "--agent-npm-package",
@@ -968,6 +3400,13 @@ def test_cli_cluster_add_writes_explicit_definition(
     registry = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json")
     definition = registry.require("delta")
     assert definition.ssh_host == "delta-login"
+    assert definition.scheduler_provider == "slurm"
+    assert definition.target_identity == ClusterTargetIdentity(
+        hostnames=["delta-login-1", "delta-login-1.example.edu"],
+        ssh_host_key_sha256=["SHA256:operator-pinned-fingerprint"],
+        scheduler_cluster_name="delta",
+        site_marker_sha256="a" * 64,
+    )
     assert definition.agent_adapter == "exec"
     assert definition.agent_npm_package is None
     assert definition.agent_npm_bin == "clio"
@@ -976,6 +3415,438 @@ def test_cli_cluster_add_writes_explicit_definition(
     assert definition.frp_transport.server_port == 7000
     assert definition.frp_transport.direct.enabled is False
     assert definition.frp_transport.direct.fallback_order == ["frp_stcp", "queue"]
+
+
+def test_cli_cluster_add_requires_hostname_and_host_key_pins_together(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "add",
+            "--name",
+            "delta",
+            "--ssh-host",
+            "delta-login",
+            "--target-hostname",
+            "delta-login-1",
+        ],
+        terminal_width=200,
+    )
+
+    assert result.exit_code == 2
+    assert not (tmp_path / ".clio-relay" / "clusters.json").exists()
+
+
+def test_cli_cluster_pin_target_preserves_every_unrelated_cluster_setting(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    registry_path = tmp_path / ".clio-relay" / "clusters.json"
+    definition = ClusterDefinition.model_validate(
+        {
+            "name": "delta",
+            "ssh_host": "delta-login",
+            "bootstrap_profile": "site-profile",
+            "core_dir": "/srv/clio/core",
+            "spool_dir": "/scratch/clio/spool",
+            "jarvis_bin": "/opt/jarvis/bin/jarvis",
+            "frpc_bin": "/opt/frp/frpc",
+            "agent_bin": "/opt/agent/bin/agent",
+            "agent_adapter": "exec",
+            "agent_npm_package": "@example/agent",
+            "agent_npm_bin": "example-agent",
+            "agent_args": ["--profile", "science"],
+            "scheduler_provider": "slurm",
+            "remote_mcp_servers": {
+                "spack": {
+                    "command": "uvx",
+                    "args": [
+                        "--from",
+                        "/opt/clio/clio_kit-3.0.0-py3-none-any.whl",
+                        "clio-kit",
+                        "mcp-server",
+                        "spack",
+                    ],
+                    "namespace": "software",
+                    "allow_tools": ["spack_find", "spack_install"],
+                    "profiles": ["user"],
+                }
+            },
+            "frp_transport": {
+                "protocol": "tcp",
+                "server_addr": "relay.example.edu",
+                "server_port": 7000,
+                "token_env": "SITE_FRP_TOKEN",
+                "stcp_secret_env": "SITE_STCP_SECRET",
+                "direct": {
+                    "enabled": True,
+                    "mode": "xtcp",
+                    "fallback_order": ["xtcp", "frp_stcp", "queue"],
+                    "probe_timeout_seconds": 14,
+                },
+            },
+            "live_test": {
+                "jarvis_yaml": "site/pipeline.yaml",
+                "monitor_pattern": "iteration",
+                "progress_pattern": "progress",
+                "verify_transport": True,
+                "transport_local_bind_port": 19001,
+                "agent_prompt": "validate the site",
+            },
+            "target_identity": {
+                "hostnames": ["old-login.example.edu"],
+                "ssh_host_key_sha256": ["SHA256:old-key"],
+            },
+        }
+    )
+    ClusterRegistry(clusters={"delta": definition}).save(registry_path)
+    expected_unrelated = definition.model_dump(mode="json")
+    expected_unrelated.pop("target_identity")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "pin-target",
+            "--cluster",
+            "delta",
+            "--target-hostname",
+            "delta-login-1",
+            "--target-hostname",
+            "delta-login-1.example.edu",
+            "--ssh-host-key-sha256",
+            "SHA256:new-key-a",
+            "--ssh-host-key-sha256",
+            "SHA256:new-key-b",
+            "--scheduler-cluster-name",
+            "delta-production",
+            "--site-marker-sha256",
+            "b" * 64,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    updated = ClusterRegistry.load(registry_path).require("delta")
+    actual_unrelated = updated.model_dump(mode="json")
+    actual_unrelated.pop("target_identity")
+    assert actual_unrelated == expected_unrelated
+    assert updated.target_identity == ClusterTargetIdentity(
+        hostnames=["delta-login-1", "delta-login-1.example.edu"],
+        ssh_host_key_sha256=["SHA256:new-key-a", "SHA256:new-key-b"],
+        scheduler_cluster_name="delta-production",
+        site_marker_sha256="b" * 64,
+    )
+
+
+def test_cli_cluster_pin_target_clear_is_exclusive_and_preserves_cluster_config(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    registry_path = tmp_path / ".clio-relay" / "clusters.json"
+    definition = ClusterDefinition(
+        name="frontier",
+        ssh_host="frontier-login",
+        agent_args=["--keep-this"],
+        target_identity=ClusterTargetIdentity(
+            hostnames=["frontier-login.example.edu"],
+            ssh_host_key_sha256=["SHA256:old-key"],
+        ),
+    )
+    ClusterRegistry(clusters={"frontier": definition}).save(registry_path)
+
+    rejected = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "pin-target",
+            "--cluster",
+            "frontier",
+            "--clear",
+            "--target-hostname",
+            "unexpected.example.edu",
+        ],
+    )
+    assert rejected.exit_code == 2
+    assert ClusterRegistry.load(registry_path).require("frontier") == definition
+
+    cleared = CliRunner().invoke(
+        app,
+        ["cluster", "pin-target", "--cluster", "frontier", "--clear"],
+    )
+    assert cleared.exit_code == 0, cleared.output
+    updated = ClusterRegistry.load(registry_path).require("frontier")
+    assert updated.target_identity is None
+    assert updated.model_copy(update={"target_identity": definition.target_identity}) == definition
+
+
+def test_ssh_host_key_fingerprints_prefers_all_configured_known_hosts_files(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    first_key_bytes = b"operator-pinned-host-key-a"
+    second_key_bytes = b"operator-pinned-host-key-b"
+    first_encoded = base64.b64encode(first_key_bytes).decode()
+    second_encoded = base64.b64encode(second_key_bytes).decode()
+    commands: list[list[str]] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        capture_output: bool,
+        text: bool,
+        check: bool,
+        timeout: int,
+    ) -> subprocess.CompletedProcess[str]:
+        assert capture_output is True
+        assert text is True
+        assert check is False
+        assert timeout == 10
+        commands.append(command)
+        if command[:2] == ["ssh", "-G"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "\n".join(
+                    [
+                        "hostname login.example.edu",
+                        "port 2222",
+                        "hostkeyalias physical-target",
+                        (
+                            'userknownhostsfile "C:\\Operator Files\\known hosts" '
+                            "D:\\site\\known_hosts"
+                        ),
+                    ]
+                ),
+                "",
+            )
+        if command[-1] == "C:\\Operator Files\\known hosts":
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                f"|1|salt|hashed ssh-ed25519 {first_encoded}\n",
+                "",
+            )
+        if command[-1] == "D:\\site\\known_hosts":
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                f"@cert-authority *.example.edu ssh-ed25519 {second_encoded}\n",
+                "",
+            )
+        raise AssertionError(f"ssh-keyscan must not run when configured keys exist: {command}")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    fingerprints = cli._ssh_host_key_fingerprints(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "operator-alias"
+    )
+
+    expected = {
+        "SHA256:" + base64.b64encode(hashlib.sha256(key).digest()).decode().rstrip("=")
+        for key in (first_key_bytes, second_key_bytes)
+    }
+    assert set(fingerprints) == expected
+    assert commands == [
+        ["ssh", "-G", "operator-alias"],
+        [
+            "ssh-keygen",
+            "-F",
+            "[physical-target]:2222",
+            "-f",
+            "C:\\Operator Files\\known hosts",
+        ],
+        [
+            "ssh-keygen",
+            "-F",
+            "[physical-target]:2222",
+            "-f",
+            "D:\\site\\known_hosts",
+        ],
+    ]
+
+
+def test_ssh_host_key_fingerprints_resolves_alias_and_falls_back_to_keyscan(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    key_bytes = b"operator-pinned-host-key"
+    encoded_key = base64.b64encode(key_bytes).decode()
+    commands: list[list[str]] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        capture_output: bool,
+        text: bool,
+        check: bool,
+        timeout: int,
+    ) -> subprocess.CompletedProcess[str]:
+        assert capture_output is True
+        assert text is True
+        assert check is False
+        assert timeout in {10, 15}
+        commands.append(command)
+        if command[:2] == ["ssh", "-G"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "hostname ares.example.edu\nport 2222\n",
+                "",
+            )
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            f"ares.example.edu ssh-ed25519 {encoded_key}\n",
+            "",
+        )
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    fingerprints = cli._ssh_host_key_fingerprints("ares")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    digest = base64.b64encode(hashlib.sha256(key_bytes).digest()).decode().rstrip("=")
+    assert fingerprints == [f"SHA256:{digest}"]
+    assert commands == [
+        ["ssh", "-G", "ares"],
+        ["ssh-keyscan", "-T", "10", "-p", "2222", "ares.example.edu"],
+    ]
+
+
+def test_ssh_host_key_fingerprints_bounds_known_hosts_and_scan_timeouts(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        capture_output: bool,
+        text: bool,
+        check: bool,
+        timeout: int,
+    ) -> subprocess.CompletedProcess[str]:
+        del capture_output, text, check
+        commands.append(command)
+        if command[:2] == ["ssh", "-G"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "hostname generic.example.edu\nuserknownhostsfile /operator/known_hosts\n",
+                "",
+            )
+        if command[0] == "ssh-keygen":
+            raise subprocess.TimeoutExpired(command, timeout)
+        raise subprocess.TimeoutExpired(command, timeout)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    with pytest.raises(ConfigurationError, match="ssh-keygen timed out") as captured:
+        cli._ssh_host_key_fingerprints(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            "generic-target"
+        )
+
+    assert "ssh-keyscan timed out" in str(captured.value)
+    assert commands == [
+        ["ssh", "-G", "generic-target"],
+        [
+            "ssh-keygen",
+            "-F",
+            "generic.example.edu",
+            "-f",
+            str(Path("/operator/known_hosts")),
+        ],
+        ["ssh-keyscan", "-T", "10", "-p", "22", "generic.example.edu"],
+    ]
+
+
+def test_ssh_host_key_fingerprint_parser_rejects_revoked_and_malformed_records() -> None:
+    revoked = base64.b64encode(b"revoked-key").decode()
+    trusted_key = b"trusted-ca-key"
+    trusted = base64.b64encode(trusted_key).decode()
+
+    fingerprints = cli._ssh_fingerprints_from_key_lines(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "\n".join(
+            [
+                f"@revoked host.example ssh-ed25519 {revoked}",
+                "host.example ssh-ed25519 !!!not-base64!!!",
+                f"@cert-authority *.example ssh-ed25519 {trusted}",
+            ]
+        )
+    )
+
+    expected = base64.b64encode(hashlib.sha256(trusted_key).digest()).decode().rstrip("=")
+    assert fingerprints == {f"SHA256:{expected}"}
+
+
+def test_remote_worker_info_binds_worker_to_operator_pinned_physical_target(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    definition = ClusterDefinition(
+        name="ares",
+        ssh_host="ares",
+        scheduler_provider="slurm",
+        target_identity=ClusterTargetIdentity(
+            hostnames=["ares-login-1.example.edu"],
+            ssh_host_key_sha256=["SHA256:operator-pinned-fingerprint"],
+            scheduler_cluster_name="ares",
+            site_marker_sha256="a" * 64,
+        ),
+    )
+    target_scheduler_provider = ["slurm"]
+
+    def fake_run_remote_clio(
+        configured: ClusterDefinition,
+        arguments: list[str],
+    ) -> str:
+        assert configured is definition
+        if arguments[1] == "worker-info":
+            return json.dumps(
+                {
+                    "schema_version": "clio-relay.worker-runtime-info.v1",
+                    "cluster": "ares",
+                    "scheduler_provider": "slurm",
+                }
+            )
+        assert arguments == [
+            "endpoint",
+            "target-info",
+            "--scheduler-provider",
+            "slurm",
+        ]
+        return json.dumps(
+            {
+                "schema_version": "clio-relay.cluster-target-info.v1",
+                "hostname": "ares-login-1",
+                "fqdn": "ares-login-1.example.edu",
+                "site_marker_sha256": "a" * 64,
+                "scheduler_provider": target_scheduler_provider[0],
+                "scheduler_cluster_name": "ares",
+            }
+        )
+
+    monkeypatch.setattr(cli, "run_remote_clio", fake_run_remote_clio)
+
+    def fake_host_key_fingerprints(_host: str) -> list[str]:
+        return ["SHA256:operator-pinned-fingerprint"]
+
+    monkeypatch.setattr(cli, "_ssh_host_key_fingerprints", fake_host_key_fingerprints)
+
+    info = cli._remote_worker_info(definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    target = cast(dict[str, object], info["target_identity"])
+    assert target["verified"] is True
+    assert target["scheduler_provider"] == "slurm"
+    assert target["scheduler_cluster_name"] == "ares"
+    assert target["ssh_host_key_sha256"] == ["SHA256:operator-pinned-fingerprint"]
+
+    target_scheduler_provider[0] = "external"
+    with pytest.raises(ConfigurationError, match="physical target scheduler provider"):
+        cli._remote_worker_info(definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def test_cli_cluster_add_persists_direct_transport_optimization(
@@ -1044,18 +3915,18 @@ def test_cli_cluster_install_app_uses_explicit_app_installer(
 
     def fake_install_cluster_app_over_ssh(*, ssh_host: str, app_name: str) -> list[str]:
         calls.append((ssh_host, app_name))
-        return ["lammps_bin=/opt/lammps/bin/lmp"]
+        return ["site_stack=ready"]
 
     monkeypatch.setattr(cli, "install_cluster_app_over_ssh", fake_install_cluster_app_over_ssh)
 
     result = CliRunner().invoke(
         app,
-        ["cluster", "install-app", "--cluster", "delta", "--app", "lammps"],
+        ["cluster", "install-app", "--cluster", "delta", "--app", "site-stack"],
     )
 
     assert result.exit_code == 0
-    assert calls == [("delta", "lammps")]
-    assert "lammps_bin=/opt/lammps/bin/lmp" in result.output
+    assert calls == [("delta", "site-stack")]
+    assert "site_stack=ready" in result.output
 
 
 def test_cli_mcp_call_preserves_arguments(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -1075,10 +3946,12 @@ def test_cli_mcp_call_preserves_arguments(tmp_path: Path, monkeypatch: MonkeyPat
             "remote-server",
             "--server-arg",
             "--stdio",
+            "--env-from",
+            "SCIENCE_TOKEN=SITE_SCIENCE_TOKEN",
             "--tool",
             "simulate",
             "--arguments-json",
-            '{"steps": 100, "case": "lammps"}',
+            '{"steps": 100, "case": "site-simulation"}',
             "--timeout-seconds",
             "90",
             "--idempotency-key",
@@ -1093,7 +3966,8 @@ def test_cli_mcp_call_preserves_arguments(tmp_path: Path, monkeypatch: MonkeyPat
     assert isinstance(job.spec, McpCallSpec)
     assert job.spec.server == "remote-server"
     assert job.spec.server_args == ["--stdio"]
-    assert job.spec.arguments == {"steps": 100, "case": "lammps"}
+    assert job.spec.env_from == {"SCIENCE_TOKEN": "SITE_SCIENCE_TOKEN"}
+    assert job.spec.arguments == {"steps": 100, "case": "site-simulation"}
     assert job.spec.timeout_seconds == 90
 
 
@@ -1127,13 +4001,92 @@ def test_cli_jarvis_mcp_call_uses_builtin_cluster_command(
     assert job.spec.server == "uvx"
     assert job.spec.server_args == [
         "--from",
-        "clio-kit==2.2.6",
+        "clio-kit==3.0.0",
         "clio-kit",
         "mcp-server",
         "jarvis",
     ]
     assert job.spec.tool == "jarvis_describe"
     assert job.spec.arguments == {"target": "packages"}
+
+
+def test_cli_remote_jarvis_call_defers_artifact_selection_to_target(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+    _write_test_cluster(tmp_path)
+    writes: list[tuple[str, bytes]] = []
+    commands: list[list[str]] = []
+
+    def write_remote(_definition: ClusterDefinition, path: str, data: bytes) -> None:
+        writes.append((path, data))
+
+    def fail_local_resolution() -> str:
+        raise AssertionError("desktop resolved JARVIS artifact")
+
+    monkeypatch.setattr(
+        "clio_relay.cli.write_remote_file",
+        write_remote,
+    )
+
+    def run_remote(_definition: ClusterDefinition, args: list[str]) -> str:
+        commands.append(args)
+        return "job_remote_jarvis\n"
+
+    monkeypatch.setattr("clio_relay.cli.run_remote_clio", run_remote)
+    monkeypatch.setattr(
+        "clio_relay.cli.jarvis_mcp_server",
+        fail_local_resolution,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "jarvis-mcp-call",
+            "--cluster",
+            "ares",
+            "--tool",
+            "jarvis_describe",
+            "--arguments-json",
+            '{"target":"packages"}',
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.output.strip() == "job_remote_jarvis"
+    assert writes and json.loads(writes[0][1]) == {"target": "packages"}
+    assert commands[0][0] == "jarvis-mcp-call"
+    assert "--server" not in commands[0]
+
+
+def test_target_side_jarvis_discovery_uses_receipt_without_cluster_registry(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    core_dir = tmp_path / "core"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
+    monkeypatch.setenv("CLIO_RELAY_REMOTE_CLUSTER", "ares")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "jarvis-mcp-call",
+            "--cluster",
+            "ares",
+            "--operation",
+            "tools/list",
+        ],
+    )
+
+    assert result.exit_code == 0
+    job = ClioCoreQueue(core_dir).get_job(result.output.strip())
+    assert isinstance(job.spec, McpCallSpec)
+    assert job.spec.operation.value == "tools/list"
+    assert job.spec.tool is None
 
 
 def test_cli_mcp_call_reads_arguments_json_file(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -1195,8 +4148,8 @@ x_clio_relay:
     - local_path: input.in
       remote_path: .local/share/clio-relay/live-tests/{run_id}/input.in
 pkgs:
-  - pkg_type: builtin.lammps
-    script: $HOME/.local/share/clio-relay/live-tests/{run_id}/input.in
+  - pkg_type: site.simulation
+    input: $HOME/.local/share/clio-relay/live-tests/{run_id}/input.in
 """.lstrip(),
         encoding="utf-8",
     )
@@ -1213,8 +4166,9 @@ pkgs:
         commands.append(command)
         assert capture_output is True
         assert check is False
-        if command[2].startswith("cat > "):
-            writes[command[2].removeprefix("cat > ").strip("'")] = input or b""
+        if "cat > " in command[2]:
+            remote_path = command[2].split("cat > ", maxsplit=1)[1].split(" &&", maxsplit=1)[0]
+            writes[remote_path.strip("'")] = input or b""
             return subprocess.CompletedProcess(command, 0, b"", b"")
         if "clio-relay job submit" in command[2]:
             assert "CLIO_RELAY_CLI_MODE=local" in command[2]
@@ -1309,7 +4263,21 @@ def test_cli_cluster_bootstrap_uses_package_source_root(
 
     def fake_bootstrap_cluster_over_ssh(**kwargs: object) -> list[str]:
         captured.update(kwargs)
-        return ["bootstrapped"]
+        receipt = {
+            "schema_version": "clio-relay.bootstrap-receipt.v1",
+            "invocation_id": "bootstrap_test",
+            "bootstrap_profile": "linux-user",
+            "relay_install_spec": "clio-relay==1.0.0",
+            "install_receipt_sha256": "a" * 64,
+            "completed_at": "2026-07-11T00:00:00Z",
+        }
+        return [
+            "bootstrapped",
+            "bootstrap_receipt=/home/test/.local/share/clio-relay/bootstrap-receipt.json",
+            "bootstrap_invocation_id=bootstrap_test",
+            "bootstrap_install_receipt_sha256=" + "a" * 64,
+            "bootstrap_receipt_json=" + json.dumps(receipt, sort_keys=True),
+        ]
 
     monkeypatch.setattr(cli, "package_source_root", fake_package_source_root)
     monkeypatch.setattr(cli, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
@@ -1327,7 +4295,30 @@ def test_cli_cluster_bootstrap_uses_package_source_root(
     )
 
     assert result.exit_code == 0
-    assert result.output.strip() == "bootstrapped"
+    output_lines = result.output.splitlines()
+    assert output_lines[:-1] == [
+        "bootstrapped",
+        "bootstrap_receipt=/home/test/.local/share/clio-relay/bootstrap-receipt.json",
+        "bootstrap_invocation_id=bootstrap_test",
+        "bootstrap_install_receipt_sha256=" + "a" * 64,
+        "bootstrap_receipt_json="
+        + json.dumps(
+            {
+                "schema_version": "clio-relay.bootstrap-receipt.v1",
+                "invocation_id": "bootstrap_test",
+                "bootstrap_profile": "linux-user",
+                "relay_install_spec": "clio-relay==1.0.0",
+                "install_receipt_sha256": "a" * 64,
+                "completed_at": "2026-07-11T00:00:00Z",
+            },
+            sort_keys=True,
+        ),
+    ]
+    assert output_lines[-1].startswith("validation.report=")
+    report_path = Path(output_lines[-1].partition("=")[2])
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "passed"
+    assert report["checks"][0]["check_id"] == "cluster.bootstrap"
     assert captured["ssh_host"] == "ares"
     assert captured["source_root"] == package_root
     assert captured["source_root"] != tmp_path

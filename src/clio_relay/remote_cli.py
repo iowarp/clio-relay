@@ -49,18 +49,42 @@ def run_remote_shell(definition: ClusterDefinition, script: str) -> str:
 
 
 def write_remote_file(definition: ClusterDefinition, remote_path: str, data: bytes) -> None:
-    """Write bytes to a remote path, creating the parent directory first."""
+    """Write private bytes to a remote path, creating the parent directory first."""
     parent = posixpath.dirname(remote_path)
     if parent:
-        run_remote_shell(definition, f"mkdir -p {shlex.quote(parent)}")
+        rendered_parent = shlex.quote(parent)
+        run_remote_shell(
+            definition,
+            f"umask 077; mkdir -p {rendered_parent}; chmod 700 {rendered_parent}",
+        )
+    rendered_path = shlex.quote(remote_path)
     result = subprocess.run(
-        ["ssh", definition.ssh_host, f"cat > {shlex.quote(remote_path)}"],
+        [
+            "ssh",
+            definition.ssh_host,
+            f"umask 077; cat > {rendered_path} && chmod 600 {rendered_path}",
+        ],
         input=data,
         capture_output=True,
         check=False,
     )
     if result.returncode != 0:
         raise RelayError(_command_error("remote file write failed", result))
+
+
+def remove_remote_file(
+    definition: ClusterDefinition,
+    remote_path: str,
+    *,
+    remove_empty_parent: bool = False,
+) -> None:
+    """Remove one explicitly owned staged file and optionally its empty parent."""
+    rendered_path = shlex.quote(remote_path)
+    script = f"rm -f -- {rendered_path}"
+    parent = posixpath.dirname(remote_path)
+    if remove_empty_parent and parent:
+        script += f" && {{ rmdir -- {shlex.quote(parent)} 2>/dev/null || true; }}"
+    run_remote_shell(definition, script)
 
 
 def stage_jarvis_yaml(

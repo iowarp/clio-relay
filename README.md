@@ -8,7 +8,16 @@
 
 It is a piece of the federation layer for [`clio-agent`](https://github.com/iowarp/clio-agent): a local CLIO experience can delegate work to a remote machine, keep observing it, detach, reconnect, and clean up after itself. The project is also designed for use outside CLIO. Any client that can call the CLI, HTTP API, or MCP tools can use the same relay model.
 
-> The current release candidate is `0.9.17`. Ares and Homelab validation evidence is tracked under `docs/ai/`; release notes should be read with the matching version tag.
+> The current development candidate is `0.9.23`. The latest released live
+> evidence is `0.9.22`; 0.9.23 is not release-complete until its local-wheel
+> reports pass and the immutable-candidate 1.0 policy remains intentionally
+> closed until every report for its currently selected target labels (`ares`
+> and `homelab`) exists. Those labels are policy configuration, not hardcoded
+> product targets; operators can select additional or different clusters. The
+> policy also
+> declares the coordinated JARVIS-CD structured-submission and clio-kit
+> JARVIS/Spack releases as explicit blockers; old component pins cannot satisfy
+> the 1.0 gate.
 
 ## How It Works
 
@@ -42,7 +51,7 @@ Add a cluster. The cluster name and agent executable are local configuration.
 ```powershell
 uvx --python 3.12 --from clio-relay clio-relay cluster add --name my-cluster --ssh-host my-cluster-login --agent-adapter exec --agent-bin agent
 uvx --python 3.12 --from clio-relay clio-relay cluster bootstrap --cluster my-cluster
-uvx --python 3.12 --from clio-relay clio-relay cluster install-endpoint-service --cluster my-cluster --start --enable
+uvx --python 3.12 --from clio-relay clio-relay cluster install-endpoint-service --cluster my-cluster --concurrency 4 --kind-concurrency remote_agent=2 --kind-concurrency mcp_call=1 --start --enable
 ```
 
 ## Submit Work
@@ -62,6 +71,23 @@ Expose relay tools to an agent:
 uvx --python 3.12 --from clio-relay clio-relay agent render-mcp-config --output .\clio-relay-agent.config.toml
 uvx --python 3.12 --from clio-relay clio-relay agent run --cluster my-cluster --prompt /path/on/cluster/prompt.md --mcp-config /path/on/cluster/clio-relay-agent.config.toml
 ```
+
+Operators can expose selected tools from any cluster-side stdio MCP server
+through the same local relay MCP. Registration is allowlisted, and schema
+discovery is an explicit durable job:
+
+```powershell
+uvx --python 3.12 --from clio-relay clio-relay remote-mcp register --cluster my-cluster --name science --command uvx --arg=--from --arg C:\artifacts\science_mcp_kit-1.4.0-py3-none-any.whl --arg science-mcp --allow-tool inspect_dataset --profile user
+uvx --python 3.12 --from clio-relay clio-relay remote-mcp refresh --cluster my-cluster --name science
+```
+
+User-profile federation requires an exact immutable wheel path (or a unique,
+non-editable console installation whose complete `RECORD` closure verifies).
+A mutable install or a package-index spec such as `science-mcp-kit==1.4.0`
+fails closed and is not exposed to agents.
+
+See [remote MCP federation](docs/remote-mcp-federation.md) for cache,
+freshness, alias, collision, profile, and live-acceptance semantics.
 
 ## Observe Remote Agent Work
 
@@ -112,10 +138,11 @@ To leave the remote API alive for a desktop detach and later reattach:
 ```powershell
 uvx --python 3.12 --from clio-relay clio-relay session start --cluster my-cluster --session-id desktop-session --remote-api-port 8766 --replace
 uvx --python 3.12 --from clio-relay clio-relay session status --cluster my-cluster --session-id desktop-session
+uvx --python 3.12 --from clio-relay clio-relay session detach --cluster my-cluster --session-id desktop-session
 uvx --python 3.12 --from clio-relay clio-relay session teardown --cluster my-cluster --session-id desktop-session
 ```
 
-Use `session teardown --stop-worker` only when the user chooses to clean up the persistent remote worker too. Teardown asks before canceling queued or running jobs, and the default is to keep jobs running. Use `--cancel-jobs` only for an explicit user choice; use `--keep-jobs` in noninteractive cleanup paths.
+Use `session teardown --stop-worker` only when the user chooses to clean up the persistent remote worker too. Teardown keeps relay and scheduler jobs running without prompting. Use `--cancel-jobs` only for an explicit user choice, and add `--cancel-scheduler-jobs` only when the scheduler allocation should also be canceled. The JSON result identifies verified ownership and any residual resources.
 
 ## Documentation
 
@@ -135,4 +162,7 @@ uv run pyright
 uv run pytest
 ```
 
-The GitHub workflow runs lint, type checks, tests, package builds, and artifact validation. Publishing to PyPI is configured through trusted publishing for the `iowarp/clio-relay` repository.
+The tag workflow builds and attests an immutable draft candidate. Independent
+maintainer sealing verifies its digest and live reports before promotion
+publishes those exact bytes to PyPI. Published-artifact evidence and PyPI
+digests must then pass before final verification publishes the GitHub release.

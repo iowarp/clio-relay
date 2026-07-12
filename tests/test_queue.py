@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+import threading
+import time
 from pathlib import Path
 
 import pytest
+from filelock import Timeout
 
+import clio_relay.core_queue as core_queue_module
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
@@ -18,6 +22,7 @@ from clio_relay.models import (
     MonitorRule,
     MonitorRuleAction,
     ProgressRecord,
+    RelayEvent,
     RelayJob,
     RelayTask,
     RemoteAgentTaskSpec,
@@ -25,6 +30,124 @@ from clio_relay.models import (
     TaskTimelineEvent,
 )
 from clio_relay.relay_ops import evaluate_monitor_rules
+
+
+def test_core_lock_admits_same_process_waiters_in_ticket_order(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path, lock_timeout_seconds=2)
+    lock = queue._lock  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    acquired: list[int] = []
+    errors: list[BaseException] = []
+    threads: list[threading.Thread] = []
+
+    def acquire_after_signal(index: int, started: threading.Event) -> None:
+        started.set()
+        try:
+            with lock:
+                assert lock.is_locked is True
+                acquired.append(index)
+        except Exception as exc:
+            errors.append(exc)
+
+    assert lock.is_locked is False
+    with lock:
+        assert lock.is_locked is True
+        with lock:
+            assert lock.is_locked is True
+        for index in range(4):
+            started = threading.Event()
+            thread = threading.Thread(
+                target=acquire_after_signal,
+                args=(index, started),
+                name=f"core-lock-waiter-{index}",
+            )
+            thread.start()
+            threads.append(thread)
+            assert started.wait(timeout=1)
+            expected_next_ticket = index + 2
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                with lock._condition:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                    if lock._next_ticket >= expected_next_ticket:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                        break
+                time.sleep(0.001)
+            else:
+                pytest.fail(f"waiter {index} did not enter core-lock admission")
+
+    assert lock.is_locked is False
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+    assert errors == []
+    assert acquired == [0, 1, 2, 3]
+
+
+def test_core_lock_local_wait_is_bounded_and_abandoned_ticket_is_skipped(
+    tmp_path: Path,
+) -> None:
+    queue = ClioCoreQueue(tmp_path, lock_timeout_seconds=0.1)
+    lock = queue._lock  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    outcomes: list[BaseException] = []
+    elapsed: list[float] = []
+    started = threading.Event()
+
+    def bounded_waiter() -> None:
+        started.set()
+        began = time.monotonic()
+        try:
+            with lock:
+                pytest.fail("waiter acquired a lock that remained locally owned")
+        except Exception as exc:
+            outcomes.append(exc)
+        finally:
+            elapsed.append(time.monotonic() - began)
+
+    with lock:
+        thread = threading.Thread(target=bounded_waiter, name="bounded-core-lock-waiter")
+        thread.start()
+        assert started.wait(timeout=1)
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], Timeout)
+    assert len(elapsed) == 1
+    assert 0.05 <= elapsed[0] < 1
+    with lock:
+        pass
+
+
+def test_durable_record_read_retries_wrapped_windows_sharing_denial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="configured-target",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="transient-read-sharing",
+        )
+    )
+    task = queue.append_task(RelayTask(job_id=job.job_id, name="sharing-race"))
+    task_path = queue.root / "tasks" / f"{task.task_id}.json"
+    original = core_queue_module._read_bounded_record_bytes  # pyright: ignore[reportPrivateUsage]
+    attempts = 0
+
+    def transient_read(path: Path) -> bytes:
+        nonlocal attempts
+        if path == task_path and attempts < 2:
+            attempts += 1
+            try:
+                raise PermissionError(13, "Permission denied", str(path))
+            except PermissionError as exc:
+                raise QueueConflictError(f"cannot read durable record {path}: {exc}") from exc
+        return original(path)
+
+    monkeypatch.setattr(core_queue_module, "_read_bounded_record_bytes", transient_read)
+
+    assert queue.get_task(task.task_id) == task
+    assert attempts == 2
 
 
 def test_submit_is_idempotent_and_events_are_ordered(tmp_path: Path) -> None:
@@ -52,6 +175,28 @@ def test_submit_is_idempotent_and_events_are_ordered(tmp_path: Path) -> None:
     assert [event.seq for event in events] == [1, 2]
     assert [event.event_type for event in events] == ["job.queued", "custom"]
     assert cursor.next_seq == 3
+
+
+def test_event_pages_are_bounded_contiguous_and_do_not_advance_cursor(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "hello"]),
+            idempotency_key="bounded-event-pages",
+        )
+    )
+    queue.append_event(job.job_id, "second", "second")
+    queue.append_event(job.job_id, "third", "third")
+
+    first, next_seq = queue.read_event_page(job.job_id, next_seq=1, limit=2)
+    second, completed_seq = queue.read_event_page(job.job_id, next_seq=next_seq, limit=2)
+
+    assert [event.seq for event in first] == [1, 2]
+    assert [event.seq for event in second] == [3]
+    assert completed_seq == 4
+    assert not (queue.root / "cursors" / f"{job.job_id}.json").exists()
 
 
 def test_task_timeline_events_are_durable_and_resumable(tmp_path: Path) -> None:
@@ -269,6 +414,136 @@ def test_submit_repairs_existing_job_missing_initial_event(tmp_path: Path) -> No
 
     assert repeated.job_id == saved.job_id
     assert [event.event_type for event in events] == ["job.queued"]
+
+
+def test_legacy_queue_requires_and_completes_crash_safe_bounded_index_migration(
+    tmp_path: Path,
+) -> None:
+    for family in ("jobs", "tasks", "leases", "artifacts", "progress", "events"):
+        (tmp_path / family).mkdir(parents=True, exist_ok=True)
+    job = RelayJob(
+        cluster="ares",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(command=["echo", "legacy"]),
+        idempotency_key="legacy-index-migration",
+    )
+    task = RelayTask(job_id=job.job_id, name="legacy-task")
+    progress = ProgressRecord(job_id=job.job_id, label="legacy", current=1, total=2)
+    (tmp_path / "jobs" / f"{job.job_id}.json").write_text(
+        job.model_dump_json(indent=2), encoding="utf-8"
+    )
+    (tmp_path / "tasks" / f"{task.task_id}.json").write_text(
+        task.model_dump_json(indent=2), encoding="utf-8"
+    )
+    (tmp_path / "progress" / f"{progress.progress_id}.json").write_text(
+        progress.model_dump_json(indent=2), encoding="utf-8"
+    )
+    event_dir = tmp_path / "events" / job.job_id
+    event_dir.mkdir(parents=True)
+    for seq, event_type in ((1, "job.queued"), (2, "legacy.observed")):
+        event = RelayEvent(
+            job_id=job.job_id,
+            seq=seq,
+            event_type=event_type,
+            message=event_type,
+        )
+        (event_dir / f"{seq:020d}.json").write_text(
+            event.model_dump_json(indent=2), encoding="utf-8"
+        )
+
+    queue = ClioCoreQueue(tmp_path)
+    assert queue.index_migration_status()["complete"] is False
+    with pytest.raises(QueueConflictError, match="migrate-indexes"):
+        queue.acquire_next_job("worker-before-migration", cluster="ares")
+
+    batches = 0
+    state = queue.index_migration_status()
+    while state["complete"] is not True:
+        state = queue.migrate_indexes_batch(batch_size=1)
+        batches += 1
+        assert batches < 20
+
+    assert (tmp_path / "jobs_queued" / f"{job.job_id}.json").is_file()
+    assert (tmp_path / "tasks_by_job" / job.job_id / f"{task.task_id}.json").is_file()
+    latest, truncated = queue.latest_job_event(job.job_id)
+    assert truncated is False
+    assert latest is not None and latest.seq == 2
+    latest_progress, progress_count, progress_truncated = queue.latest_job_progress(job.job_id)
+    assert progress_truncated is False
+    assert progress_count == 1
+    assert latest_progress is not None and latest_progress.progress_id == progress.progress_id
+    migrated_tasks, next_task_cursor, task_count = queue.list_tasks_page(job.job_id)
+    migrated_progress, next_progress_cursor, migrated_progress_count = queue.list_progress_page(
+        job.job_id
+    )
+    assert task_count == migrated_progress_count == 1
+    assert next_task_cursor is next_progress_cursor is None
+    assert migrated_tasks[0].task_id == task.task_id
+    assert migrated_tasks[0].sequence == 1
+    assert migrated_progress[0].progress_id == progress.progress_id
+    assert migrated_progress[0].sequence == 1
+    lease = queue.acquire_next_job("worker-after-migration", cluster="ares")
+    assert lease is not None and lease.job_id == job.job_id
+
+
+def test_leasing_reads_active_index_not_terminal_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    queued = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "queued"]),
+            idempotency_key="active-index-target",
+        )
+    )
+    for index in range(2_000):
+        terminal = RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            state=JobState.SUCCEEDED,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key=f"terminal-history-{index}",
+        )
+        (tmp_path / "jobs" / f"{terminal.job_id}.json").write_text(
+            terminal.model_dump_json(), encoding="utf-8"
+        )
+
+    def fail_global_history_read() -> list[RelayJob]:
+        raise AssertionError("lease admission read terminal history")
+
+    monkeypatch.setattr(queue, "list_jobs", fail_global_history_read)
+    lease = queue.acquire_next_job("indexed-worker", cluster="ares")
+
+    assert lease is not None and lease.job_id == queued.job_id
+
+
+def test_task_event_head_advances_without_linear_history_probe(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="task-event-head",
+        )
+    )
+    task = queue.append_task(RelayTask(job_id=job.job_id, name="head-test"))
+    head_path = tmp_path / "task_event_heads" / f"{task.task_id}.json"
+    head_path.write_text(f'{{"task_id":"{task.task_id}","latest_seq":100000}}', encoding="utf-8")
+
+    saved = queue.append_task_event(
+        TaskTimelineEvent(
+            task_id=task.task_id,
+            event_type="checkpoint",
+            label="checkpoint",
+            summary="checkpoint",
+        )
+    )
+
+    assert saved.seq == 100001
 
 
 def test_submit_promotes_reserved_idempotency_record_with_existing_job(tmp_path: Path) -> None:

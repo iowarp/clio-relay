@@ -1,0 +1,507 @@
+name: attest live validation evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing immutable-candidate draft tag, such as v1.0.0
+        required: true
+        type: string
+
+concurrency:
+  group: live-validation-attestation-${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  authorize:
+    name: reject non-main dispatch before protected environment
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      workflow_sha: ${{ steps.dispatch.outputs.workflow_sha }}
+    steps:
+      - name: require protected-main workflow identity
+        id: dispatch
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          TAG_NAME: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          test "$DISPATCH_REF" = "refs/heads/main"
+          [[ "$DISPATCH_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          echo "workflow_sha=$DISPATCH_SHA" >> "$GITHUB_OUTPUT"
+
+  seal:
+    name: verify and attest candidate-bound live reports
+    runs-on: ubuntu-latest
+    needs: authorize
+    environment:
+      name: live-validation
+    permissions:
+      actions: read  # Read protected environment and effective governance metadata.
+      contents: write  # Attach the sealed candidate binding to the draft.
+      id-token: write  # Mint the identity used to sign candidate live evidence.
+      attestations: write  # Persist candidate live-evidence attestations.
+      artifact-metadata: write  # Link evidence to GitHub's artifact record.
+      pull-requests: read  # Bind review independence to associated source PR authors.
+
+    steps:
+      - name: check out the protected-main verifier commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.authorize.outputs.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: false
+          version: "0.11.28"
+
+      - name: set up protected-main python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: install protected-main locked dependencies
+        run: uv sync --locked --all-groups
+
+      - name: require protected-main dispatch for the exact candidate tag
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG_NAME: ${{ inputs.tag }}
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          git fetch --force --no-tags origin \
+            refs/heads/main:refs/remotes/origin/main \
+            "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
+          test "$DISPATCH_REF" = "refs/heads/main"
+          test "$DISPATCH_SHA" = "$(git rev-parse refs/remotes/origin/main)"
+          test "$DISPATCH_SHA" = "$(git rev-parse HEAD)"
+          source_commit="$(gh api "repos/$REPOSITORY/commits/$TAG_NAME" --jq .sha)"
+          [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-list -n 1 "$TAG_NAME")" = "$source_commit"
+          test "$source_commit" = "$DISPATCH_SHA"
+          python src/clio_relay/ci_validation.py verify-live-release \
+            --repository "$REPOSITORY" \
+            --tag "$TAG_NAME" \
+            --source-commit "$source_commit" \
+            --draft true \
+            --prerelease false
+          version="${TAG_NAME#v}"
+          test "$TAG_NAME" = "v$version"
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: preflight bounded candidate report assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ steps.candidate.outputs.source_commit }}
+          TAG_NAME: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          mkdir -p candidate/evidence
+          gh api "repos/$REPOSITORY/releases/tags/$TAG_NAME" \
+            > candidate/evidence/release-metadata-before.json
+          release_id="$(jq -r .id candidate/evidence/release-metadata-before.json)"
+          [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/$REPOSITORY/releases/$release_id/assets?per_page=100" \
+            > candidate/evidence/release-asset-list-before.json
+          jq --slurpfile assets candidate/evidence/release-asset-list-before.json \
+            '.assets = $assets[0]' candidate/evidence/release-metadata-before.json \
+            > candidate/evidence/release-assets-before.json
+          python src/clio_relay/ci_validation.py report-assets \
+            --release candidate/evidence/release-assets-before.json \
+            --kind candidate \
+            --output candidate/evidence/report-assets-before.json
+
+      - name: require an independent maintainer to review and dispatch sealing
+        id: reviewer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG_NAME: ${{ inputs.tag }}
+          DISPATCH_ACTOR: ${{ github.actor }}
+          SOURCE_COMMIT: ${{ steps.candidate.outputs.source_commit }}
+        shell: bash
+        run: |
+          permission="$(gh api "repos/$REPOSITORY/collaborators/$DISPATCH_ACTOR/permission" --jq .permission)"
+          case "$permission" in
+            admin|maintain|write) ;;
+            *) echo "sealing dispatcher is not a write-capable maintainer" >&2; exit 1 ;;
+          esac
+          dispatcher_id="$(gh api "users/$DISPATCH_ACTOR" --jq .id)"
+          [[ "$dispatcher_id" =~ ^[1-9][0-9]*$ ]]
+          exclusions="$RUNNER_TEMP/live-reviewer-exclusions.json"
+          python src/clio_relay/ci_validation.py reviewer-exclusions \
+            --repository "$REPOSITORY" \
+            --source-commit "$SOURCE_COMMIT" \
+            --dispatcher-login "$DISPATCH_ACTOR" \
+            --dispatcher-id "$dispatcher_id" \
+            --output "$exclusions"
+          test "$(jq -r .reviewer_login "$exclusions")" = "$DISPATCH_ACTOR"
+          test "$(jq -r .reviewer_id "$exclusions")" = "$dispatcher_id"
+          source_author="$(jq -r .source_author.login "$exclusions")"
+          source_author_id="$(jq -r .source_author.id "$exclusions")"
+          source_committer="$(jq -r .source_committer.login "$exclusions")"
+          source_committer_id="$(jq -r .source_committer.id "$exclusions")"
+          source_pr_authors="$(jq -c .source_pr_authors "$exclusions")"
+          source_contributor_ids="$(jq -c .source_contributor_ids "$exclusions")"
+          mapfile -t report_uploader_ids < <(
+            jq -r '.assets[] | select(.name != "validation-local.json") | .uploader.id' \
+              candidate/evidence/report-assets-before.json | sort -n --unique
+          )
+          test "${#report_uploader_ids[@]}" -gt 0
+          mapfile -t report_uploaders < <(
+            jq -r '.assets[] | select(.name != "validation-local.json") | .uploader.login' \
+              candidate/evidence/report-assets-before.json | sort --unique
+          )
+          for uploader in "${report_uploaders[@]}"; do
+            test "$DISPATCH_ACTOR" != "$uploader"
+          done
+          for uploader_id in "${report_uploader_ids[@]}"; do
+            [[ "$uploader_id" =~ ^[1-9][0-9]*$ ]]
+            test "$dispatcher_id" != "$uploader_id"
+          done
+          echo "login=$DISPATCH_ACTOR" >> "$GITHUB_OUTPUT"
+          echo "id=$dispatcher_id" >> "$GITHUB_OUTPUT"
+          echo "source_author=$source_author" >> "$GITHUB_OUTPUT"
+          echo "source_author_id=$source_author_id" >> "$GITHUB_OUTPUT"
+          echo "source_committer=$source_committer" >> "$GITHUB_OUTPUT"
+          echo "source_committer_id=$source_committer_id" >> "$GITHUB_OUTPUT"
+          echo "source_pr_authors=$(jq -c . <<<"$source_pr_authors")" >> "$GITHUB_OUTPUT"
+          echo "source_contributor_ids=$(jq -c . <<<"$source_contributor_ids")" >> "$GITHUB_OUTPUT"
+
+      - name: download exact candidate and submitted reports
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG_NAME: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          mkdir -p candidate/packages candidate/evidence/reports
+          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern '*.whl' --dir candidate/packages
+          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern '*.tar.gz' --dir candidate/packages
+          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'SHA256SUMS' --dir candidate/evidence
+          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'CI-STATUS.json' --dir candidate/evidence
+          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'REPOSITORY-GOVERNANCE.json' --dir candidate/evidence
+          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'validation-*.json' --dir candidate/evidence/reports
+          gh api "repos/$REPOSITORY/releases/tags/$TAG_NAME" \
+            > candidate/evidence/release-metadata-after.json
+          release_id="$(jq -r .id candidate/evidence/release-metadata-after.json)"
+          [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/$REPOSITORY/releases/$release_id/assets?per_page=100" \
+            > candidate/evidence/release-asset-list-after.json
+          jq --slurpfile assets candidate/evidence/release-asset-list-after.json \
+            '.assets = $assets[0]' candidate/evidence/release-metadata-after.json \
+            > candidate/evidence/release-assets.json
+          python src/clio_relay/ci_validation.py report-assets \
+            --release candidate/evidence/release-assets.json \
+            --kind candidate \
+            --report-dir candidate/evidence/reports \
+            --output candidate/evidence/report-assets-after.json
+          cmp --silent candidate/evidence/report-assets-before.json \
+            candidate/evidence/report-assets-after.json
+
+      - name: verify build provenance and bind every report to the candidate
+        id: binding
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ steps.candidate.outputs.source_commit }}
+          TAG_NAME: ${{ inputs.tag }}
+          VERSION: ${{ steps.candidate.outputs.version }}
+          REVIEWER_LOGIN: ${{ steps.reviewer.outputs.login }}
+          REVIEWER_ID: ${{ steps.reviewer.outputs.id }}
+          SOURCE_AUTHOR_LOGIN: ${{ steps.reviewer.outputs.source_author }}
+          SOURCE_AUTHOR_ID: ${{ steps.reviewer.outputs.source_author_id }}
+          SOURCE_COMMITTER_LOGIN: ${{ steps.reviewer.outputs.source_committer }}
+          SOURCE_COMMITTER_ID: ${{ steps.reviewer.outputs.source_committer_id }}
+          SOURCE_PR_AUTHORS_JSON: ${{ steps.reviewer.outputs.source_pr_authors }}
+          SOURCE_CONTRIBUTOR_IDS_JSON: ${{ steps.reviewer.outputs.source_contributor_ids }}
+          EXPECTED_UV_VERSION: "0.11.28"
+        shell: bash
+        run: |
+          mapfile -t wheels < <(find candidate/packages -maxdepth 1 -type f -name '*.whl' | sort)
+          mapfile -t sdists < <(find candidate/packages -maxdepth 1 -type f -name '*.tar.gz' | sort)
+          test "${#wheels[@]}" -eq 1
+          test "${#sdists[@]}" -eq 1
+          wheel="${wheels[0]}"
+          sdist="${sdists[0]}"
+          wheel_name="$(basename "$wheel")"
+          sdist_name="$(basename "$sdist")"
+          wheel_sha256="$(sha256sum "$wheel" | cut -d ' ' -f 1)"
+          sdist_sha256="$(sha256sum "$sdist" | cut -d ' ' -f 1)"
+          test "$wheel_sha256" = "$(awk -v name="$wheel_name" '$2 == "*" name || $2 == name {print $1}' candidate/evidence/SHA256SUMS)"
+          test "$sdist_sha256" = "$(awk -v name="$sdist_name" '$2 == "*" name || $2 == name {print $1}' candidate/evidence/SHA256SUMS)"
+          for subject in "$wheel" "$sdist" candidate/evidence/CI-STATUS.json \
+            candidate/evidence/REPOSITORY-GOVERNANCE.json; do
+            name="$(basename "$subject")"
+            declared="$(awk -v name="$name" '$2 == "*" name || $2 == name {print $1}' candidate/evidence/SHA256SUMS)"
+            test -n "$declared"
+            test "$declared" = "$(sha256sum "$subject" | cut -d ' ' -f 1)"
+            gh attestation verify "$subject" \
+              --repo "$REPOSITORY" \
+              --signer-workflow "$REPOSITORY/.github/workflows/stage-candidate.yml" \
+              --source-ref "refs/heads/main" \
+              --source-digest "$SOURCE_COMMIT" \
+              --deny-self-hosted-runners
+          done
+          python src/clio_relay/ci_validation.py verify-ci-status \
+            --receipt candidate/evidence/CI-STATUS.json \
+            --repository "$REPOSITORY" \
+            --source-commit "$SOURCE_COMMIT"
+          python src/clio_relay/ci_validation.py verify-live-governance \
+            --receipt candidate/evidence/REPOSITORY-GOVERNANCE.json \
+            --repository "$REPOSITORY" \
+            --source-commit "$SOURCE_COMMIT" \
+            --tag "$TAG_NAME"
+          python - candidate/evidence/reports candidate/evidence/LIVE-VALIDATION-BINDING.json \
+            candidate/evidence/release-assets.json candidate/evidence/CI-STATUS.json \
+            candidate/evidence/REPOSITORY-GOVERNANCE.json \
+            "$TAG_NAME" "$SOURCE_COMMIT" "$VERSION" "$wheel_name" "$wheel_sha256" <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          report_dir = Path(sys.argv[1])
+          destination = Path(sys.argv[2])
+          assets_path = Path(sys.argv[3])
+          ci_status_path = Path(sys.argv[4])
+          governance_path = Path(sys.argv[5])
+          (
+              tag,
+              commit,
+              version,
+              wheel_name,
+              wheel_sha256,
+          ) = sys.argv[6:]
+          reviewer_login = os.environ["REVIEWER_LOGIN"]
+          reviewer_id = int(os.environ["REVIEWER_ID"])
+          source_author_login = os.environ["SOURCE_AUTHOR_LOGIN"]
+          source_author_id = int(os.environ["SOURCE_AUTHOR_ID"])
+          source_committer_login = os.environ["SOURCE_COMMITTER_LOGIN"]
+          source_committer_id = int(os.environ["SOURCE_COMMITTER_ID"])
+          source_pr_authors = json.loads(os.environ["SOURCE_PR_AUTHORS_JSON"])
+          source_contributor_ids = json.loads(os.environ["SOURCE_CONTRIBUTOR_IDS_JSON"])
+          expected_uv_version = os.environ["EXPECTED_UV_VERSION"]
+          release = json.loads(assets_path.read_text(encoding="utf-8"))
+          assets = {
+              item["name"]: item
+              for item in release.get("assets", [])
+              if isinstance(item, dict) and isinstance(item.get("name"), str)
+          }
+          reports = []
+          report_ids = set()
+          invocation_ids = set()
+          for path in sorted(report_dir.glob("validation-*.json")):
+              document = json.loads(path.read_text(encoding="utf-8"))
+              if document.get("cluster") == "local":
+                  if path.name != "validation-local.json":
+                      raise SystemExit(f"unexpected additional local report: {path.name}")
+                  continue
+              report_id = document.get("report_id")
+              if not isinstance(report_id, str) or not report_id or report_id in report_ids:
+                  raise SystemExit(f"invalid or duplicate report id in {path.name}")
+              report_ids.add(report_id)
+              software = document.get("software", {})
+              source = document.get("install_source", {})
+              trust = document.get("evidence_trust", {})
+              launcher_receipt = source.get("launcher_receipt", {})
+              asset = assets.get(path.name, {})
+              uploader = asset.get("uploader", {}) if isinstance(asset, dict) else {}
+              producer_login = trust.get("producer_github_login")
+              producer_id = trust.get("producer_github_id")
+              invocation_id = trust.get("invocation_id")
+              valid_invocation = (
+                  isinstance(invocation_id, str)
+                  and 16 <= len(invocation_id) <= 256
+                  and invocation_id not in invocation_ids
+              )
+              expected = {
+                  "status": document.get("status") == "passed",
+                  "version": software.get("version") == version,
+                  "tag": software.get("tag") == tag,
+                  "commit": software.get("commit") == commit,
+                  "clean": software.get("dirty") is False,
+                  "distribution_version": source.get("distribution_version") == version,
+                  "artifact_sha256": source.get("artifact_sha256") == wheel_sha256,
+                  "artifact_identity": source.get("artifact_identity_verified") is True,
+                  "source_kind": source.get("kind") == "wheel",
+                  "detected_source_kind": source.get("detected_kind") == "wheel",
+                  "launcher": source.get("launcher") == "uvx",
+                  "launcher_verified": source.get("launcher_verified") is True,
+                  "launcher_receipt": source.get("launcher_receipt", {}).get("verified") is True,
+                  "candidate_claim": source.get("released_artifact") is False,
+                  "operator_origin": trust.get("origin") == "operator_generated",
+                  "no_producer_overclaim": trust.get("producer_execution_verified") is False,
+                  "producer_login": isinstance(producer_login, str)
+                      and producer_login == uploader.get("login"),
+                  "producer_id": isinstance(producer_id, int)
+                      and not isinstance(producer_id, bool)
+                      and producer_id > 0
+                      and producer_id == uploader.get("id"),
+                  "reviewer_not_producer": producer_id != reviewer_id,
+                  "invocation_id": valid_invocation,
+                  "launcher_invocation": launcher_receipt.get("invocation_id")
+                      == invocation_id,
+                  "uv_version": launcher_receipt.get("uv_version")
+                      == expected_uv_version,
+                  "uv_executable_sha256": isinstance(
+                      launcher_receipt.get("uv_executable_sha256"), str
+                  ) and re.fullmatch(
+                      r"[0-9a-f]{64}", launcher_receipt["uv_executable_sha256"]
+                  ) is not None,
+              }
+              failed = sorted(name for name, passed in expected.items() if not passed)
+              if failed:
+                  raise SystemExit(f"candidate binding failed for {path.name}: {failed}")
+              invocation_ids.add(invocation_id)
+              reports.append({
+                  "filename": path.name,
+                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                  "report_id": report_id,
+                  "scenario": document.get("scenario"),
+                  "cluster": document.get("cluster"),
+                  "producer_github_login": producer_login,
+                  "producer_github_id": producer_id,
+                  "uploader_github_login": uploader.get("login"),
+                  "uploader_github_id": uploader.get("id"),
+                  "invocation_id": invocation_id,
+                  "uv_version": launcher_receipt.get("uv_version"),
+                  "uv_executable_sha256": launcher_receipt.get(
+                      "uv_executable_sha256"
+                  ),
+              })
+          if not reports:
+              raise SystemExit("no non-local live validation reports were submitted")
+          binding = {
+              "schema_version": "1.0",
+              "artifact_stage": "immutable_candidate",
+              "tag": tag,
+              "source_commit": commit,
+              "version": version,
+              "wheel": {"filename": wheel_name, "sha256": wheel_sha256},
+              "ci_status_sha256": hashlib.sha256(ci_status_path.read_bytes()).hexdigest(),
+              "repository_governance_sha256": hashlib.sha256(
+                  governance_path.read_bytes()
+              ).hexdigest(),
+              "authorized_workflow": ".github/workflows/live-validation-attest.yml",
+              "trust_model": "reviewer_sealed_operator_evidence",
+              "producer_execution_verified": False,
+              "review_environment": "live-validation",
+              "review_method": "independent_maintainer_workflow_dispatch",
+              "reviewer_login": reviewer_login,
+              "reviewer_id": reviewer_id,
+              "source_commit_author_login": source_author_login,
+              "source_commit_author_id": source_author_id,
+              "source_commit_committer_login": source_committer_login,
+              "source_commit_committer_id": source_committer_id,
+              "source_pr_authors": source_pr_authors,
+              "source_contributor_ids": source_contributor_ids,
+              "environment_reviewers_available": False,
+              "reports": reports,
+          }
+          destination.write_text(
+              json.dumps(binding, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          python - docs/release-gate-1.0.yaml candidate/evidence/candidate-policy.yaml <<'PY'
+          import sys
+          from pathlib import Path
+
+          source = Path(sys.argv[1])
+          destination = Path(sys.argv[2])
+          policy = source.read_text(encoding="utf-8")
+          replacements = {
+              "artifact_stage: published": "artifact_stage: immutable_candidate",
+              "require_released_artifact: true": "require_released_artifact: false",
+              "allowed_install_sources:\n  - pypi": "allowed_install_sources:\n  - wheel",
+          }
+          for published, candidate in replacements.items():
+              if policy.count(published) != 1:
+                  raise SystemExit(f"cannot derive candidate policy: {published!r}")
+              policy = policy.replace(published, candidate, 1)
+          destination.write_text(policy, encoding="utf-8")
+          PY
+          uv run --no-sync clio-relay release gate \
+            --policy candidate/evidence/candidate-policy.yaml \
+            --report-dir candidate/evidence/reports \
+            --expected-artifact-sha256 "$wheel_sha256" \
+            --output candidate/evidence/preseal-release-gate.json
+          rm -f candidate/evidence/reports/validation-local.json
+          echo "wheel_sha256=$wheel_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: revalidate protected main immediately before live-evidence attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ steps.candidate.outputs.source_commit }}
+          TAG_NAME: ${{ inputs.tag }}
+        shell: bash
+        run: >-
+          python src/clio_relay/ci_validation.py mutation-authority
+          --governance-receipt candidate/evidence/REPOSITORY-GOVERNANCE.json
+          --repository "$REPOSITORY"
+          --source-commit "$SOURCE_COMMIT"
+          --tag "$TAG_NAME"
+          --workflow-ref "$GITHUB_REF"
+          --workflow-sha "$GITHUB_SHA"
+          --release-state present
+          --draft true
+
+      - name: attest every live report and its deterministic candidate binding
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: |
+            candidate/evidence/reports/*.json
+            candidate/evidence/LIVE-VALIDATION-BINDING.json
+
+      - name: publish binding without replacing evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ steps.candidate.outputs.source_commit }}
+          TAG_NAME: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          python src/clio_relay/ci_validation.py mutation-authority \
+            --governance-receipt candidate/evidence/REPOSITORY-GOVERNANCE.json \
+            --repository "$REPOSITORY" \
+            --source-commit "$SOURCE_COMMIT" \
+            --tag "$TAG_NAME" \
+            --workflow-ref "$GITHUB_REF" \
+            --workflow-sha "$GITHUB_SHA" \
+            --release-state present \
+            --draft true
+          binding=candidate/evidence/LIVE-VALIDATION-BINDING.json
+          if gh release download "$TAG_NAME" --repo "$REPOSITORY" \
+            --pattern 'LIVE-VALIDATION-BINDING.json' --dir existing-binding >/dev/null 2>&1; then
+            cmp --silent "$binding" existing-binding/LIVE-VALIDATION-BINDING.json
+          else
+            python src/clio_relay/ci_validation.py mutation-authority \
+              --governance-receipt candidate/evidence/REPOSITORY-GOVERNANCE.json \
+              --repository "$REPOSITORY" \
+              --source-commit "$SOURCE_COMMIT" \
+              --tag "$TAG_NAME" \
+              --workflow-ref "$GITHUB_REF" \
+              --workflow-sha "$GITHUB_SHA" \
+              --release-state present \
+              --draft true
+            gh release upload "$TAG_NAME" "$binding" --repo "$REPOSITORY"
+          fi

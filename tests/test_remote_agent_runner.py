@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import stat
 import subprocess
 from pathlib import Path
 from types import ModuleType
@@ -33,7 +35,13 @@ def test_exec_adapter_runs_configured_agent_with_templates(
             f"Path({str(output_path)!r}).write_text(json.dumps("
             "{'args': sys.argv[1:], "
             "'progress_file': os.environ.get('CLIO_RELAY_PROGRESS_FILE'), "
-            "'progress_token': os.environ.get('CLIO_RELAY_PROGRESS_TOKEN')}))\n"
+            "'progress_token': os.environ.get('CLIO_RELAY_PROGRESS_TOKEN'), "
+            "'runtime_file': os.environ.get('CLIO_RELAY_RUNTIME_METADATA_FILE'), "
+            "'runtime_token': os.environ.get('CLIO_RELAY_RUNTIME_METADATA_TOKEN'), "
+            "'api_token': os.environ.get('CLIO_RELAY_API_TOKEN'), "
+            "'frp_token': os.environ.get('CLIO_RELAY_FRP_TOKEN'), "
+            "'stcp_secret': os.environ.get('CLIO_RELAY_STCP_SECRET'), "
+            "'owner_token': os.environ.get('CLIO_RELAY_SESSION_OWNER_TOKEN')}))\n"
         ),
         encoding="utf-8",
     )
@@ -42,6 +50,12 @@ def test_exec_adapter_runs_configured_agent_with_templates(
 
     monkeypatch.setenv("CLIO_RELAY_PROGRESS_FILE", "forbidden")
     monkeypatch.setenv("CLIO_RELAY_PROGRESS_TOKEN", "forbidden-token")
+    monkeypatch.setenv("CLIO_RELAY_RUNTIME_METADATA_FILE", "forbidden-runtime")
+    monkeypatch.setenv("CLIO_RELAY_RUNTIME_METADATA_TOKEN", "forbidden-runtime-token")
+    monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "forbidden-api-token")
+    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "forbidden-frp-token")
+    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "forbidden-stcp-secret")
+    monkeypatch.setenv("CLIO_RELAY_SESSION_OWNER_TOKEN", "forbidden-owner-token")
 
     return_code = cast(RemoteAgentRunnerModule, runner).run_remote_agent_from_params(
         {
@@ -86,6 +100,12 @@ def test_exec_adapter_runs_configured_agent_with_templates(
     ]
     assert captured_agent["progress_file"] is None
     assert captured_agent["progress_token"] is None
+    assert captured_agent["runtime_file"] is None
+    assert captured_agent["runtime_token"] is None
+    assert captured_agent["api_token"] is None
+    assert captured_agent["frp_token"] is None
+    assert captured_agent["stcp_secret"] is None
+    assert captured_agent["owner_token"] is None
 
 
 def test_codex_adapter_disables_interactive_approvals(
@@ -128,6 +148,52 @@ def test_codex_adapter_disables_interactive_approvals(
         "exec",
         "--json",
     ]
+
+
+def test_codex_adapter_uses_private_ephemeral_mcp_profile(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+    codex_home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("use the private tool", encoding="utf-8")
+    mcp_path = tmp_path / "mcp.toml"
+    mcp_document = "[mcp_servers.private]\ncommand = 'private-server'\n"
+    mcp_path.write_text(mcp_document, encoding="utf-8")
+    observed_profile: Path | None = None
+
+    def fake_run(
+        command: list[str],
+        *,
+        cwd: Path | None,
+        timeout: int | None,
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, timeout
+        nonlocal observed_profile
+        profile_name = command[command.index("--profile") + 1]
+        observed_profile = codex_home / f"{profile_name}.config.toml"
+        assert observed_profile.read_text(encoding="utf-8") == mcp_document
+        if os.name != "nt":
+            assert stat.S_IMODE(observed_profile.stat().st_mode) == 0o600
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(cast(Any, runner), "_run_process", fake_run)
+
+    return_code = cast(RemoteAgentRunnerModule, runner).run_remote_agent_from_params(
+        {
+            "agent_bin": "codex",
+            "agent_adapter": "codex",
+            "prompt_path": str(prompt_path),
+            "mcp_config_path": str(mcp_path),
+        }
+    )
+
+    assert return_code == 0
+    assert observed_profile is not None
+    assert not observed_profile.exists()
 
 
 def test_agent_timeout_writes_structured_result(
@@ -223,6 +289,71 @@ def test_invalid_agent_setup_writes_structured_result(
     assert result["returncode"] == 2
     assert result["error_type"] == "FileNotFoundError"
     assert result["prompt_path"].endswith("missing-prompt.md")
+
+
+def test_agent_rejects_oversized_prompt_without_launching(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+    prompt_path = tmp_path / "prompt.md"
+    with prompt_path.open("wb") as stream:
+        stream.truncate(4 * 1_048_576 + 1)
+
+    def forbidden_run(
+        command: list[str],
+        *,
+        cwd: Path | None,
+        timeout: int | None,
+    ) -> subprocess.CompletedProcess[str]:
+        del command, cwd, timeout
+        raise AssertionError("oversized prompt must fail before agent launch")
+
+    monkeypatch.setattr(cast(Any, runner), "_run_process", forbidden_run)
+
+    return_code = cast(RemoteAgentRunnerModule, runner).run_remote_agent_from_params(
+        {
+            "agent_bin": "agent",
+            "agent_adapter": "exec",
+            "prompt_path": str(prompt_path),
+        }
+    )
+
+    result = json.loads((tmp_path / "agent-result.json").read_text(encoding="utf-8"))
+    assert return_code == 2
+    assert result["error_type"] == "ValueError"
+    assert "byte limit" in result["error_message"]
+
+
+def test_codex_adapter_rejects_oversized_profile_without_leaving_secrets(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+    codex_home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("use the tool", encoding="utf-8")
+    mcp_path = tmp_path / "mcp.toml"
+    with mcp_path.open("wb") as stream:
+        stream.truncate(1_048_576 + 1)
+
+    return_code = cast(RemoteAgentRunnerModule, runner).run_remote_agent_from_params(
+        {
+            "agent_bin": "codex",
+            "agent_adapter": "codex",
+            "prompt_path": str(prompt_path),
+            "mcp_config_path": str(mcp_path),
+        }
+    )
+
+    result = json.loads((tmp_path / "agent-result.json").read_text(encoding="utf-8"))
+    assert return_code == 2
+    assert result["error_type"] == "ValueError"
+    assert "byte limit" in result["error_message"]
+    assert not list(codex_home.glob("clio-relay-agent-*.config.toml"))
 
 
 def _load_runner() -> ModuleType:

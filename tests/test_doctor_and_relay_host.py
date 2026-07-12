@@ -177,11 +177,17 @@ def test_endpoint_user_service_is_sudo_less_and_configured() -> None:
     )
 
     assert (
+        "ExecStartPre=%h/.local/bin/clio-relay queue migrate-indexes --all --batch-size 500"
+    ) in rendered
+    assert (
         "ExecStart=%h/.local/bin/clio-relay endpoint start --role worker --cluster test-cluster"
     ) in rendered
     assert 'Environment="CLIO_RELAY_CORE_DIR=%h/.local/share/clio-relay/core"' in rendered
     assert 'Environment="CLIO_RELAY_AGENT_BIN=%h/.local/bin/current-agent"' in rendered
     assert 'Environment="CLIO_RELAY_AGENT_ADAPTER=exec"' in rendered
+    assert (
+        'Environment="CLIO_RELAY_INSTALL_RECEIPT=%h/.local/share/clio-relay/install-receipt.json"'
+    ) in rendered
     assert "sudo" not in rendered
 
 

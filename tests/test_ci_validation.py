@@ -1,0 +1,1352 @@
+"""Tests for exact-SHA CI and live repository-governance receipts."""
+
+from __future__ import annotations
+
+import gzip
+import hashlib
+import io
+import stat
+import tarfile
+import zipfile
+from copy import deepcopy
+from pathlib import Path
+from typing import cast
+
+import pytest
+
+from clio_relay import ci_validation
+from clio_relay.ci_validation import (
+    GITHUB_ACTIONS_APP_ID,
+    MAX_ACTIONS_ARTIFACT_ARCHIVE_BYTES,
+    MAX_DISTRIBUTION_BYTES,
+    MAX_DISTRIBUTION_MEMBERS,
+    MAX_FIXED_JSON_BYTES,
+    MAX_JSON_DOCUMENT_BYTES,
+    MAX_MANIFEST_BYTES,
+    MAX_RELEASE_ASSET_AGGREGATE_BYTES,
+    MAX_RELEASE_ASSET_BYTES,
+    MAX_RELEASE_ASSET_METADATA_RECORDS,
+    MAX_VALIDATION_REPORT_AGGREGATE_BYTES,
+    MAX_VALIDATION_REPORT_ASSETS,
+    MAX_VALIDATION_REPORT_BYTES,
+    REQUIRED_CI_JOBS,
+    REQUIRED_ENVIRONMENTS,
+    GitHubNotFound,
+    ProvenanceError,
+    build_actions_artifact_manifest,
+    build_ci_status,
+    build_distribution_archive_receipt,
+    build_exact_release_asset_inventory,
+    build_repository_governance,
+    build_reviewer_exclusions,
+    build_staged_release_asset_plan,
+    build_validation_report_asset_manifest,
+    fetch_live_repository_governance,
+    fetch_reviewer_exclusions,
+    select_ci_run,
+    verify_actions_artifact_archive,
+    verify_ci_status,
+    verify_downloaded_validation_report_assets,
+    verify_exact_release_asset_inventory,
+    verify_live_mutation_authority,
+    verify_live_release_identity,
+    verify_live_repository_governance,
+    verify_release_identity,
+    verify_repository_governance,
+    write_candidate_checksum_manifest,
+)
+
+REPOSITORY = "iowarp/clio-relay"
+COMMIT = "a" * 40
+TAG = "v1.0.0"
+
+
+def _runs() -> dict[str, object]:
+    return {
+        "total_count": 1,
+        "workflow_runs": [
+            {
+                "id": 1001,
+                "run_attempt": 2,
+                "run_number": 75,
+                "workflow_id": 99,
+                "html_url": "https://github.com/iowarp/clio-relay/actions/runs/1001",
+                "head_sha": COMMIT,
+                "head_branch": "main",
+                "event": "push",
+                "status": "completed",
+                "conclusion": "success",
+                "path": ".github/workflows/ci.yml",
+            }
+        ],
+    }
+
+
+def _jobs() -> dict[str, object]:
+    return {
+        "total_count": len(REQUIRED_CI_JOBS),
+        "jobs": [
+            {
+                "id": 2000 + index,
+                "name": name,
+                "status": "completed",
+                "conclusion": "success",
+                "html_url": f"https://github.com/iowarp/clio-relay/actions/jobs/{2000 + index}",
+            }
+            for index, name in enumerate(REQUIRED_CI_JOBS, start=1)
+        ],
+    }
+
+
+MAIN_RULESET_ID = 18816105
+TAG_RULESET_ID = 18813108
+
+
+def _main_effective_rules() -> list[dict[str, object]]:
+    return [
+        {"type": "deletion", "ruleset_id": MAIN_RULESET_ID},
+        {"type": "non_fast_forward", "ruleset_id": MAIN_RULESET_ID},
+        {
+            "type": "pull_request",
+            "ruleset_id": MAIN_RULESET_ID,
+            "parameters": {
+                "dismiss_stale_reviews_on_push": True,
+                "require_last_push_approval": True,
+                "required_approving_review_count": 1,
+                "required_review_thread_resolution": True,
+            },
+        },
+        {
+            "type": "required_status_checks",
+            "ruleset_id": MAIN_RULESET_ID,
+            "parameters": {
+                "strict_required_status_checks_policy": True,
+                "required_status_checks": [
+                    {"context": name, "integration_id": GITHUB_ACTIONS_APP_ID}
+                    for name in REQUIRED_CI_JOBS
+                ],
+            },
+        },
+    ]
+
+
+def _branch_rulesets() -> list[dict[str, object]]:
+    return [
+        {
+            "id": MAIN_RULESET_ID,
+            "name": "protect-main-release-source",
+            "target": "branch",
+            "enforcement": "active",
+            "conditions": {
+                "ref_name": {"include": ["refs/heads/main"], "exclude": []},
+            },
+            # A visible global actor is recorded, not misrepresented as absent. The
+            # release decision rests on the current workflow token being unable to bypass.
+            "bypass_actors": [{"actor_id": 1, "actor_type": "OrganizationAdmin"}],
+            "current_user_can_bypass": "never",
+        }
+    ]
+
+
+def _tag_rulesets() -> list[dict[str, object]]:
+    return [
+        {
+            "id": TAG_RULESET_ID,
+            "name": "protect-release-tags",
+            "target": "tag",
+            "enforcement": "active",
+            "conditions": {
+                "ref_name": {"include": ["refs/tags/v*"], "exclude": []},
+            },
+            "rules": [{"type": "update"}, {"type": "deletion"}],
+            "bypass_actors": [{"actor_id": 1, "actor_type": "OrganizationAdmin"}],
+            "current_user_can_bypass": "never",
+        }
+    ]
+
+
+def _protected_branches() -> list[dict[str, object]]:
+    return [{"name": "main", "protected": True}]
+
+
+def _environments() -> dict[str, object]:
+    return {
+        name: {
+            "name": name,
+            "can_admins_bypass": False,
+            "protection_rules": [{"id": index, "type": "branch_policy"}],
+            "deployment_branch_policy": {
+                "protected_branches": True,
+                "custom_branch_policies": False,
+            },
+        }
+        for index, name in enumerate(REQUIRED_ENVIRONMENTS, start=1)
+    }
+
+
+def _governance_routes() -> dict[str, object]:
+    routes: dict[str, object] = {
+        f"repos/{REPOSITORY}/rules/branches/main?per_page=100": _main_effective_rules(),
+        f"repos/{REPOSITORY}/branches?protected=true&per_page=100": _protected_branches(),
+        f"repos/{REPOSITORY}/rulesets?includes_parents=true&per_page=100": [
+            {"id": MAIN_RULESET_ID, "target": "branch"},
+            {"id": TAG_RULESET_ID, "target": "tag"},
+        ],
+        f"repos/{REPOSITORY}/rulesets/{MAIN_RULESET_ID}": _branch_rulesets()[0],
+        f"repos/{REPOSITORY}/rulesets/{TAG_RULESET_ID}": _tag_rulesets()[0],
+    }
+    for name, environment in _environments().items():
+        routes[f"repos/{REPOSITORY}/environments/{name}"] = environment
+    return routes
+
+
+def _release_assets(names_and_sizes: list[tuple[str, int]]) -> dict[str, object]:
+    return {
+        "assets": [
+            {
+                "id": 1000 + index,
+                "name": name,
+                "size": size,
+                "digest": f"sha256:{hashlib.sha256(b'x' * size).hexdigest()}",
+                "uploader": {"login": "release-operator", "id": 123456},
+            }
+            for index, (name, size) in enumerate(names_and_sizes)
+        ]
+    }
+
+
+def test_ci_status_requires_exact_successful_push_run_and_job_set() -> None:
+    selected = select_ci_run(_runs(), repository=REPOSITORY, source_commit=COMMIT)
+    receipt = build_ci_status(
+        _runs(),
+        _jobs(),
+        repository=REPOSITORY,
+        source_commit=COMMIT,
+    )
+
+    assert selected == {
+        "run_id": 1001,
+        "run_attempt": 2,
+        "run_number": 75,
+        "workflow_id": 99,
+        "url": "https://github.com/iowarp/clio-relay/actions/runs/1001",
+    }
+    assert receipt["required_jobs"] == list(REQUIRED_CI_JOBS)
+    assert [job["name"] for job in cast(list[dict[str, object]], receipt["jobs"])] == list(
+        REQUIRED_CI_JOBS
+    )
+    verify_ci_status(receipt, repository=REPOSITORY, source_commit=COMMIT)
+
+
+@pytest.mark.parametrize("mutation", ["failed", "missing", "duplicate", "truncated"])
+def test_ci_status_rejects_incomplete_or_nonpassing_jobs(mutation: str) -> None:
+    jobs = deepcopy(_jobs())
+    typed_jobs = cast(list[dict[str, object]], jobs["jobs"])
+    if mutation == "failed":
+        typed_jobs[-1]["conclusion"] = "failure"
+    elif mutation == "missing":
+        typed_jobs.pop()
+        jobs["total_count"] = len(typed_jobs)
+    elif mutation == "duplicate":
+        typed_jobs[-1]["name"] = typed_jobs[0]["name"]
+    else:
+        jobs["total_count"] = len(typed_jobs) + 1
+
+    with pytest.raises(ProvenanceError):
+        build_ci_status(_runs(), jobs, repository=REPOSITORY, source_commit=COMMIT)
+
+
+def test_ci_status_rejects_a_caller_supplied_non_push_or_wrong_sha_run() -> None:
+    runs = _runs()
+    run = cast(list[dict[str, object]], runs["workflow_runs"])[0]
+    run["event"] = "workflow_dispatch"
+
+    with pytest.raises(ProvenanceError, match="exactly one"):
+        select_ci_run(runs, repository=REPOSITORY, source_commit=COMMIT)
+
+    run["event"] = "push"
+    run["head_sha"] = "b" * 40
+    with pytest.raises(ProvenanceError, match="exactly one"):
+        select_ci_run(runs, repository=REPOSITORY, source_commit=COMMIT)
+
+
+def _artifact_run(*, kind: str = "tag-payload") -> dict[str, object]:
+    is_tag = kind == "tag-payload"
+    return {
+        "id": 5001,
+        "run_attempt": 3,
+        "head_branch": TAG if is_tag else "main",
+        "head_sha": COMMIT,
+        "event": "push" if is_tag else "workflow_dispatch",
+        "status": "completed" if is_tag else "in_progress",
+        "conclusion": "success" if is_tag else None,
+        "run_started_at": "2026-07-11T10:00:00Z",
+        "path": (
+            ".github/workflows/release.yml" if is_tag else ".github/workflows/release-gate.yml"
+        ),
+        "repository": {"id": 100},
+        "head_repository": {"id": 100},
+    }
+
+
+def _artifact_listing(*, size: int, digest: str, kind: str = "tag-payload") -> dict[str, object]:
+    name = f"release-candidate-{TAG}" if kind == "tag-payload" else f"verified-release-{TAG}"
+    return {
+        "total_count": 1,
+        "artifacts": [
+            {
+                "id": 6001,
+                "name": name,
+                "size_in_bytes": size,
+                "digest": f"sha256:{digest}",
+                "expired": False,
+                "created_at": "2026-07-11T10:05:00Z",
+                "archive_download_url": (
+                    f"https://api.github.com/repos/{REPOSITORY}/actions/artifacts/6001/zip"
+                ),
+                "workflow_run": {
+                    "id": 5001,
+                    "head_sha": COMMIT,
+                    "head_branch": TAG if kind == "tag-payload" else "main",
+                    "repository_id": 100,
+                    "head_repository_id": 100,
+                },
+            }
+        ],
+    }
+
+
+def _write_tag_payload_zip(path: Path, *, extra_name: str | None = None) -> None:
+    files = {
+        "clio_relay-1.0.0-py3-none-any.whl": b"wheel",
+        "clio_relay-1.0.0.tar.gz": b"sdist",
+        "validation-local.json": b"{}",
+    }
+    checksum = "".join(
+        f"{hashlib.sha256(payload).hexdigest()} *{name}\n"
+        for name, payload in sorted(files.items())
+    ).encode()
+    files["SHA256SUMS"] = checksum
+    if extra_name is not None:
+        files[extra_name] = b"extra"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in files.items():
+            archive.writestr(name, payload)
+
+
+def _write_promotion_zip(path: Path) -> None:
+    files = {
+        "packages/clio_relay-1.0.0-py3-none-any.whl": b"wheel",
+        "packages/clio_relay-1.0.0.tar.gz": b"sdist",
+        "evidence/SHA256SUMS": b"manifest",
+        "evidence/validation-local.json": b"{}",
+        "evidence/CI-STATUS.json": b"{}",
+        "evidence/REPOSITORY-GOVERNANCE.json": b"{}",
+        "evidence/DISTRIBUTION-ARCHIVES.json": b"{}",
+        "evidence/LIVE-VALIDATION-BINDING.json": b"{}",
+        "evidence/candidate-release-gate-1.0.json": b"{}",
+        "evidence/VALIDATION-SHA256SUMS": b"manifest",
+        "evidence/live/validation-ares.json": b"{}",
+        "evidence/recovery/candidate-release-gate-1.0.json": b"{}",
+    }
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in files.items():
+            archive.writestr(name, payload)
+
+
+def _write_distribution_archives(
+    directory: Path,
+    *,
+    metadata_version: str = "1.0.0",
+    sdist_extra: tuple[tarfile.TarInfo, bytes | None] | None = None,
+) -> tuple[Path, Path]:
+    wheel = directory / "clio_relay-1.0.0-py3-none-any.whl"
+    sdist = directory / "clio_relay-1.0.0.tar.gz"
+    metadata = (
+        f"Metadata-Version: 2.4\nName: clio-relay\nVersion: {metadata_version}\n\n"
+    ).encode()
+    with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("clio_relay/__init__.py", b"__version__ = '1.0.0'\n")
+        archive.writestr("clio_relay-1.0.0.dist-info/METADATA", metadata)
+        archive.writestr(
+            "clio_relay-1.0.0.dist-info/WHEEL",
+            b"Wheel-Version: 1.0\nGenerator: tests\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+        archive.writestr("clio_relay-1.0.0.dist-info/RECORD", b"")
+    with tarfile.open(sdist, "w:gz") as archive:
+        root = tarfile.TarInfo("clio_relay-1.0.0")
+        root.type = tarfile.DIRTYPE
+        archive.addfile(root)
+        entries = {
+            "clio_relay-1.0.0/PKG-INFO": metadata,
+            "clio_relay-1.0.0/pyproject.toml": b"[build-system]\nrequires=[]\n",
+            "clio_relay-1.0.0/src/clio_relay/__init__.py": b"__version__='1.0.0'\n",
+        }
+        for name, content in entries.items():
+            member = tarfile.TarInfo(name)
+            member.size = len(content)
+            archive.addfile(member, io.BytesIO(content))
+        if sdist_extra is not None:
+            member, content = sdist_extra
+            if content is not None:
+                member.size = len(content)
+                archive.addfile(member, io.BytesIO(content))
+            else:
+                archive.addfile(member)
+    return wheel, sdist
+
+
+def test_actions_artifact_manifest_and_archive_bind_exact_api_identity(tmp_path: Path) -> None:
+    archive = tmp_path / "candidate.zip"
+    _write_tag_payload_zip(archive)
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    manifest = build_actions_artifact_manifest(
+        _artifact_run(),
+        _artifact_listing(size=archive.stat().st_size, digest=digest),
+        repository=REPOSITORY,
+        source_commit=COMMIT,
+        tag=TAG,
+        run_id=5001,
+        run_attempt=3,
+        artifact_name=f"release-candidate-{TAG}",
+        artifact_kind="tag-payload",
+    )
+    output = tmp_path / "candidate"
+
+    verify_actions_artifact_archive(manifest, archive, output)
+
+    assert {item.name for item in output.iterdir()} == {
+        "clio_relay-1.0.0-py3-none-any.whl",
+        "clio_relay-1.0.0.tar.gz",
+        "validation-local.json",
+        "SHA256SUMS",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "attempt",
+        "head",
+        "name",
+        "count",
+        "expired",
+        "digest",
+        "size",
+        "foreign_repo",
+        "prior_attempt",
+    ],
+)
+def test_actions_artifact_manifest_rejects_replay_or_unbounded_metadata(
+    mutation: str,
+) -> None:
+    run = _artifact_run()
+    artifacts = _artifact_listing(size=100, digest="1" * 64)
+    artifact = cast(list[dict[str, object]], artifacts["artifacts"])[0]
+    if mutation == "attempt":
+        run["run_attempt"] = 2
+    elif mutation == "head":
+        run["head_sha"] = "b" * 40
+    elif mutation == "name":
+        artifact["name"] = "release-candidate-v1.0.1"
+    elif mutation == "count":
+        artifacts["total_count"] = 2
+    elif mutation == "expired":
+        artifact["expired"] = True
+    elif mutation == "digest":
+        artifact["digest"] = "sha256:not-a-digest"
+    elif mutation == "size":
+        artifact["size_in_bytes"] = MAX_ACTIONS_ARTIFACT_ARCHIVE_BYTES + 1
+    elif mutation == "foreign_repo":
+        cast(dict[str, object], run["head_repository"])["id"] = 101
+    else:
+        artifact["created_at"] = "2026-07-11T09:59:59Z"
+
+    with pytest.raises(ProvenanceError):
+        build_actions_artifact_manifest(
+            run,
+            artifacts,
+            repository=REPOSITORY,
+            source_commit=COMMIT,
+            tag=TAG,
+            run_id=5001,
+            run_attempt=3,
+            artifact_name=f"release-candidate-{TAG}",
+            artifact_kind="tag-payload",
+        )
+
+
+@pytest.mark.parametrize("mutation", ["digest", "size", "extra", "traversal"])
+def test_actions_artifact_archive_rejects_tampering_and_extra_paths(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    archive = tmp_path / "candidate.zip"
+    _write_tag_payload_zip(
+        archive,
+        extra_name="../escape"
+        if mutation == "traversal"
+        else "extra.txt"
+        if mutation == "extra"
+        else None,
+    )
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    manifest = build_actions_artifact_manifest(
+        _artifact_run(),
+        _artifact_listing(size=archive.stat().st_size, digest=digest),
+        repository=REPOSITORY,
+        source_commit=COMMIT,
+        tag=TAG,
+        run_id=5001,
+        run_attempt=3,
+        artifact_name=f"release-candidate-{TAG}",
+        artifact_kind="tag-payload",
+    )
+    artifact = cast(dict[str, object], manifest["artifact"])
+    if mutation == "digest":
+        artifact["digest"] = f"sha256:{'2' * 64}"
+    elif mutation == "size":
+        artifact["size_in_bytes"] = cast(int, artifact["size_in_bytes"]) + 1
+
+    with pytest.raises(ProvenanceError):
+        verify_actions_artifact_archive(manifest, archive, tmp_path / "output")
+
+
+def test_in_progress_promotion_artifact_is_bound_to_the_same_dispatch_run() -> None:
+    manifest = build_actions_artifact_manifest(
+        _artifact_run(kind="promotion"),
+        _artifact_listing(size=100, digest="1" * 64, kind="promotion"),
+        repository=REPOSITORY,
+        source_commit=COMMIT,
+        tag=TAG,
+        run_id=5001,
+        run_attempt=3,
+        artifact_name=f"verified-release-{TAG}",
+        artifact_kind="promotion",
+    )
+
+    assert manifest["artifact_kind"] == "promotion"
+
+
+def test_promotion_artifact_extracts_only_the_bounded_canonical_tree(tmp_path: Path) -> None:
+    archive = tmp_path / "promotion.zip"
+    _write_promotion_zip(archive)
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    manifest = build_actions_artifact_manifest(
+        _artifact_run(kind="promotion"),
+        _artifact_listing(
+            size=archive.stat().st_size,
+            digest=digest,
+            kind="promotion",
+        ),
+        repository=REPOSITORY,
+        source_commit=COMMIT,
+        tag=TAG,
+        run_id=5001,
+        run_attempt=3,
+        artifact_name=f"verified-release-{TAG}",
+        artifact_kind="promotion",
+    )
+
+    verify_actions_artifact_archive(manifest, archive, tmp_path / "promotion")
+
+    assert (tmp_path / "promotion/evidence/recovery/candidate-release-gate-1.0.json").is_file()
+
+
+def test_distribution_archives_are_fully_bounded_and_identity_checked(tmp_path: Path) -> None:
+    wheel, sdist = _write_distribution_archives(tmp_path)
+
+    receipt = build_distribution_archive_receipt(
+        wheel,
+        sdist,
+        project="clio-relay",
+        version="1.0.0",
+    )
+
+    assert receipt["schema_version"] == "clio-relay.distribution-archives.v1"
+    assert cast(dict[str, object], receipt["wheel"])["member_count"] == 4
+    assert cast(dict[str, object], receipt["sdist"])["top_level_directory"] == ("clio_relay-1.0.0")
+    assert cast(dict[str, object], receipt["limits"])["maximum_members"] == (
+        MAX_DISTRIBUTION_MEMBERS
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["traversal", "sdist_traversal", "symlink", "metadata", "member_limit", "member_size"],
+)
+def test_distribution_archive_preflight_rejects_adversarial_members(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    if mutation == "metadata":
+        wheel, sdist = _write_distribution_archives(tmp_path, metadata_version="9.9.9")
+    elif mutation in {"sdist_traversal", "symlink"}:
+        link = tarfile.TarInfo("clio_relay-1.0.0/escape")
+        content: bytes | None = None
+        if mutation == "symlink":
+            link.type = tarfile.SYMTYPE
+            link.linkname = "../../escape"
+        else:
+            link.name = "../escape"
+            content = b"escape"
+        wheel, sdist = _write_distribution_archives(
+            tmp_path,
+            sdist_extra=(link, content),
+        )
+    else:
+        wheel, sdist = _write_distribution_archives(tmp_path)
+    if mutation == "traversal":
+        with zipfile.ZipFile(wheel, "a", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("../escape", b"escape")
+    elif mutation == "member_limit":
+        monkeypatch.setattr(ci_validation, "MAX_DISTRIBUTION_MEMBERS", 2)
+    elif mutation == "member_size":
+        monkeypatch.setattr(ci_validation, "MAX_DISTRIBUTION_MEMBER_BYTES", 8)
+
+    with pytest.raises(ProvenanceError):
+        build_distribution_archive_receipt(
+            wheel,
+            sdist,
+            project="clio-relay",
+            version="1.0.0",
+        )
+
+
+def test_distribution_archive_preflight_rejects_zip_symlinks_and_expansion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel, sdist = _write_distribution_archives(tmp_path)
+    link = zipfile.ZipInfo("clio_relay/link")
+    link.external_attr = (stat.S_IFLNK | 0o777) << 16
+    with zipfile.ZipFile(wheel, "a") as archive:
+        archive.writestr(link, b"../../escape")
+    with pytest.raises(ProvenanceError, match="not regular"):
+        build_distribution_archive_receipt(
+            wheel,
+            sdist,
+            project="clio-relay",
+            version="1.0.0",
+        )
+
+
+def test_distribution_archive_rejects_raw_gzip_expansion_before_tar_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel, sdist = _write_distribution_archives(tmp_path)
+    monkeypatch.setattr(ci_validation, "MAX_DISTRIBUTION_TAR_BYTES", 1024)
+    sdist.write_bytes(gzip.compress(b"x" * 1025))
+
+    with pytest.raises(ProvenanceError, match="tar stream exceeds"):
+        build_distribution_archive_receipt(
+            wheel,
+            sdist,
+            project="clio-relay",
+            version="1.0.0",
+        )
+
+    wheel, sdist = _write_distribution_archives(tmp_path)
+    monkeypatch.setattr(ci_validation, "MAX_DISTRIBUTION_UNCOMPRESSED_BYTES", 32)
+    with pytest.raises(ProvenanceError, match="aggregate"):
+        build_distribution_archive_receipt(
+            wheel,
+            sdist,
+            project="clio-relay",
+            version="1.0.0",
+        )
+
+
+def test_exact_release_assets_bind_ids_names_sizes_and_digests(tmp_path: Path) -> None:
+    wheel = tmp_path / "clio_relay-1.0.0-py3-none-any.whl"
+    claims = tmp_path / "RELEASE-CLAIMS.json"
+    wheel.write_bytes(b"xxx")
+    claims.write_bytes(b"xx")
+    release = _release_assets([(wheel.name, 3), (claims.name, 2)])
+
+    receipt = build_exact_release_asset_inventory(
+        release,
+        [wheel, claims],
+        next_page_document=[],
+        page_size=100,
+    )
+    verify_exact_release_asset_inventory(
+        receipt,
+        release,
+        [wheel, claims],
+        next_page_document=[],
+        page_size=100,
+    )
+
+    assert receipt["release_asset_count"] == 2
+    assert receipt["release_asset_aggregate_bytes"] == 5
+    assert receipt["api_pagination"] == {
+        "page_size": 100,
+        "pages_requested": [1, 2],
+        "first_page_count": 2,
+        "next_page_count": 0,
+        "maximum_asset_count": MAX_RELEASE_ASSET_METADATA_RECORDS,
+    }
+    assert [
+        item["name"] for item in cast(list[dict[str, object]], receipt["release_assets"])
+    ] == sorted([wheel.name, claims.name])
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "digest", "size", "unsafe"])
+def test_exact_release_assets_reject_any_live_inventory_difference(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_bytes(b"xx")
+    second.write_bytes(b"xxx")
+    release = _release_assets([(first.name, 2), (second.name, 3)])
+    assets = cast(list[dict[str, object]], release["assets"])
+    if mutation == "missing":
+        assets.pop()
+    elif mutation == "extra":
+        assets.append(
+            {
+                "id": 9999,
+                "name": "extra.json",
+                "size": 1,
+                "digest": f"sha256:{hashlib.sha256(b'x').hexdigest()}",
+            }
+        )
+    elif mutation == "digest":
+        assets[0]["digest"] = f"sha256:{'f' * 64}"
+    elif mutation == "size":
+        assets[0]["size"] = 1
+    else:
+        assets[0]["name"] = "../escape"
+
+    with pytest.raises(ProvenanceError):
+        build_exact_release_asset_inventory(
+            release,
+            [first, second],
+            next_page_document=[],
+            page_size=100,
+        )
+
+
+def test_exact_release_assets_require_empty_bounded_next_page(tmp_path: Path) -> None:
+    subject = tmp_path / "RELEASE-CLAIMS.json"
+    subject.write_bytes(b"xx")
+    release = _release_assets([(subject.name, 2)])
+
+    with pytest.raises(ProvenanceError, match="non-empty next page"):
+        build_exact_release_asset_inventory(
+            release,
+            [subject],
+            next_page_document=[{"id": 9999}],
+            page_size=100,
+        )
+
+    oversized = deepcopy(release)
+    assets = cast(list[dict[str, object]], oversized["assets"])
+    assets.extend(deepcopy(assets[0]) for _ in range(MAX_RELEASE_ASSET_METADATA_RECORDS))
+    with pytest.raises(ProvenanceError, match="count must be"):
+        build_exact_release_asset_inventory(
+            oversized,
+            [subject],
+            next_page_document=[],
+            page_size=100,
+        )
+
+
+def test_exact_release_assets_reject_postpublication_id_replacement(tmp_path: Path) -> None:
+    subject = tmp_path / "RELEASE-CLAIMS.json"
+    subject.write_bytes(b"xx")
+    release = _release_assets([(subject.name, 2)])
+    receipt = build_exact_release_asset_inventory(
+        release,
+        [subject],
+        next_page_document=[],
+        page_size=100,
+    )
+    replaced = deepcopy(release)
+    cast(list[dict[str, object]], replaced["assets"])[0]["id"] = 9999
+
+    with pytest.raises(ProvenanceError, match="differs from the prepublication receipt"):
+        verify_exact_release_asset_inventory(
+            receipt,
+            replaced,
+            [subject],
+            next_page_document=[],
+            page_size=100,
+        )
+
+
+def test_protected_main_rewrites_checksums_and_plans_idempotent_staging(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    subjects = {
+        "clio_relay-1.0.0-py3-none-any.whl": b"wheel",
+        "clio_relay-1.0.0.tar.gz": b"sdist",
+        "validation-local.json": b"{}",
+        "CI-STATUS.json": b"{}",
+        "REPOSITORY-GOVERNANCE.json": b"{}",
+        "SHA256SUMS": b"untrusted tag manifest",
+    }
+    for name, payload in subjects.items():
+        (candidate / name).write_bytes(payload)
+
+    write_candidate_checksum_manifest(candidate)
+    missing_plan = build_staged_release_asset_plan({"assets": []}, candidate)
+    missing = cast(list[dict[str, object]], missing_plan["missing"])
+    assert {cast(str, item["name"]) for item in missing} == set(subjects)
+
+    one = missing[0]
+    existing_plan = build_staged_release_asset_plan(
+        {
+            "assets": [
+                {
+                    "name": one["name"],
+                    "size": one["size"],
+                    "digest": one["digest"],
+                }
+            ]
+        },
+        candidate,
+    )
+    assert cast(list[dict[str, object]], existing_plan["existing"]) == [one]
+    assert len(cast(list[object], existing_plan["missing"])) == 5
+
+
+def test_repository_governance_receipt_requires_effective_current_token_controls() -> None:
+    receipt = build_repository_governance(
+        _main_effective_rules(),
+        _protected_branches(),
+        _branch_rulesets(),
+        _tag_rulesets(),
+        _environments(),
+        repository=REPOSITORY,
+        source_commit=COMMIT,
+        tag=TAG,
+    )
+
+    assert receipt["environment_reviewers_available"] is False
+    main = cast(dict[str, object], receipt["main_protection"])
+    assert main["source"] == "effective_rulesets"
+    assert main["ruleset_ids"] == [MAIN_RULESET_ID]
+    assert main["current_workflow_token_can_bypass"] is False
+    main_ruleset = cast(list[dict[str, object]], main["rulesets"])[0]
+    assert main_ruleset["global_bypass_actors_visible"] is True
+    assert main_ruleset["configured_bypass_actor_count"] == 1
+    tag_protection = cast(list[dict[str, object]], receipt["tag_protections"])[0]
+    assert tag_protection["current_workflow_token_can_bypass"] is False
+    assert tag_protection["configured_bypass_actor_count"] == 1
+    verify_repository_governance(
+        receipt,
+        repository=REPOSITORY,
+        source_commit=COMMIT,
+        tag=TAG,
+    )
+
+
+def test_live_governance_requery_must_equal_the_carried_receipt() -> None:
+    routes = _governance_routes()
+
+    def fetch(path: str) -> object:
+        return deepcopy(routes[path])
+
+    receipt = fetch_live_repository_governance(
+        repository=REPOSITORY,
+        source_commit=COMMIT,
+        tag=TAG,
+        fetch_json=fetch,
+    )
+    verify_live_repository_governance(
+        receipt,
+        repository=REPOSITORY,
+        source_commit=COMMIT,
+        tag=TAG,
+        fetch_json=fetch,
+    )
+
+    branch = cast(dict[str, object], routes[f"repos/{REPOSITORY}/rulesets/{MAIN_RULESET_ID}"])
+    branch["current_user_can_bypass"] = "always"
+    with pytest.raises(ProvenanceError):
+        verify_live_repository_governance(
+            receipt,
+            repository=REPOSITORY,
+            source_commit=COMMIT,
+            tag=TAG,
+            fetch_json=fetch,
+        )
+
+
+@pytest.mark.parametrize(
+    ("surface", "expected_message"),
+    [
+        ("status_app", "integration id"),
+        ("main_bypass", "current workflow token can bypass"),
+        ("missing_main_rule", "effective main branch rules are incomplete"),
+        ("tag_bypass", "current_workflow_token_cannot_bypass"),
+        ("tag_update", "no active workflow-token-protected tag ruleset"),
+        ("environment", "protected-branch deployment policy"),
+        ("environment_policy", "protected-branch deployment policy"),
+        ("environment_admin_bypass", "administrator bypass"),
+    ],
+)
+def test_repository_governance_rejects_weakened_controls(
+    surface: str,
+    expected_message: str,
+) -> None:
+    effective = deepcopy(_main_effective_rules())
+    branch_rulesets = deepcopy(_branch_rulesets())
+    tag_rulesets = deepcopy(_tag_rulesets())
+    environments = deepcopy(_environments())
+    if surface == "status_app":
+        status = cast(dict[str, object], effective[-1]["parameters"])
+        cast(list[dict[str, object]], status["required_status_checks"])[0]["integration_id"] = None
+    elif surface == "main_bypass":
+        branch_rulesets[0]["current_user_can_bypass"] = "always"
+    elif surface == "missing_main_rule":
+        effective.pop(0)
+    elif surface == "tag_bypass":
+        tag_rulesets[0]["current_user_can_bypass"] = "always"
+    elif surface == "tag_update":
+        tag_rulesets[0]["rules"] = [{"type": "deletion"}]
+    elif surface == "environment":
+        environment = cast(dict[str, object], environments["live-validation"])
+        environment["protection_rules"] = []
+    elif surface == "environment_policy":
+        environment = cast(dict[str, object], environments["live-validation"])
+        environment["deployment_branch_policy"] = {
+            "protected_branches": False,
+            "custom_branch_policies": True,
+        }
+    else:
+        environment = cast(dict[str, object], environments["live-validation"])
+        environment["can_admins_bypass"] = True
+
+    with pytest.raises(ProvenanceError, match=expected_message):
+        build_repository_governance(
+            effective,
+            _protected_branches(),
+            branch_rulesets,
+            tag_rulesets,
+            environments,
+            repository=REPOSITORY,
+            source_commit=COMMIT,
+            tag=TAG,
+        )
+
+
+def test_repository_governance_rejects_another_protected_branch() -> None:
+    protected_branches = [*_protected_branches(), {"name": "release-work", "protected": True}]
+
+    with pytest.raises(ProvenanceError, match="sole protected branch"):
+        build_repository_governance(
+            _main_effective_rules(),
+            protected_branches,
+            _branch_rulesets(),
+            _tag_rulesets(),
+            _environments(),
+            repository=REPOSITORY,
+            source_commit=COMMIT,
+            tag=TAG,
+        )
+
+
+def _release_identity() -> dict[str, object]:
+    return {
+        "id": 8001,
+        "tag_name": TAG,
+        "target_commitish": COMMIT,
+        "draft": True,
+        "prerelease": False,
+    }
+
+
+def test_release_identity_binds_tag_target_and_state_to_source_commit() -> None:
+    verify_release_identity(
+        _release_identity(),
+        tag=TAG,
+        source_commit=COMMIT,
+        resolved_tag_commit=COMMIT,
+        resolved_target_commit=COMMIT,
+        expect_draft=True,
+        expect_prerelease=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["tag_name", "target_commitish", "tag_resolution", "target_resolution", "draft"],
+)
+def test_release_identity_rejects_mutable_or_mismatched_identity(mutation: str) -> None:
+    release = _release_identity()
+    tag_commit = COMMIT
+    target_commit = COMMIT
+    if mutation == "tag_name":
+        release["tag_name"] = "v1.0.1"
+    elif mutation == "target_commitish":
+        release["target_commitish"] = "main"
+    elif mutation == "tag_resolution":
+        tag_commit = "b" * 40
+    elif mutation == "target_resolution":
+        target_commit = "b" * 40
+    else:
+        release["draft"] = False
+
+    with pytest.raises(ProvenanceError):
+        verify_release_identity(
+            release,
+            tag=TAG,
+            source_commit=COMMIT,
+            resolved_tag_commit=tag_commit,
+            resolved_target_commit=target_commit,
+            expect_draft=True,
+            expect_prerelease=False,
+        )
+
+
+def test_live_release_identity_resolves_both_tag_and_explicit_target() -> None:
+    routes: dict[str, object] = {
+        f"repos/{REPOSITORY}/releases/tags/{TAG}": _release_identity(),
+        f"repos/{REPOSITORY}/commits/{TAG}": {"sha": COMMIT},
+        f"repos/{REPOSITORY}/commits/{COMMIT}": {"sha": COMMIT},
+    }
+
+    verify_live_release_identity(
+        repository=REPOSITORY,
+        tag=TAG,
+        source_commit=COMMIT,
+        expect_draft=True,
+        expect_prerelease=False,
+        fetch_json=lambda path: routes[path],
+    )
+
+
+def _governance_receipt() -> dict[str, object]:
+    return build_repository_governance(
+        _main_effective_rules(),
+        _protected_branches(),
+        _branch_rulesets(),
+        _tag_rulesets(),
+        _environments(),
+        repository=REPOSITORY,
+        source_commit=COMMIT,
+        tag=TAG,
+    )
+
+
+def _mutation_routes() -> dict[str, object]:
+    return {
+        **_governance_routes(),
+        f"repos/{REPOSITORY}/commits/main": {"sha": COMMIT},
+        f"repos/{REPOSITORY}/commits/{TAG}": {"sha": COMMIT},
+        f"repos/{REPOSITORY}/commits/{COMMIT}": {"sha": COMMIT},
+        f"repos/{REPOSITORY}/releases/tags/{TAG}": _release_identity(),
+    }
+
+
+def test_mutation_authority_revalidates_exact_main_tag_governance_and_draft() -> None:
+    routes = _mutation_routes()
+
+    verify_live_mutation_authority(
+        _governance_receipt(),
+        repository=REPOSITORY,
+        source_commit=COMMIT,
+        tag=TAG,
+        workflow_ref="refs/heads/main",
+        workflow_sha=COMMIT,
+        release_state="present",
+        expect_draft=True,
+        fetch_json=lambda path: deepcopy(routes[path]),
+    )
+
+
+def test_mutation_authority_proves_release_absence_before_create() -> None:
+    routes = _mutation_routes()
+    del routes[f"repos/{REPOSITORY}/releases/tags/{TAG}"]
+
+    def fetch(path: str) -> object:
+        if path == f"repos/{REPOSITORY}/releases/tags/{TAG}":
+            raise GitHubNotFound("not found")
+        return deepcopy(routes[path])
+
+    verify_live_mutation_authority(
+        _governance_receipt(),
+        repository=REPOSITORY,
+        source_commit=COMMIT,
+        tag=TAG,
+        workflow_ref="refs/heads/main",
+        workflow_sha=COMMIT,
+        release_state="absent",
+        expect_draft=True,
+        fetch_json=fetch,
+    )
+
+
+def test_mutation_authority_rejects_an_unspecified_present_draft_state() -> None:
+    with pytest.raises(ProvenanceError, match="exact draft state"):
+        verify_live_mutation_authority(
+            _governance_receipt(),
+            repository=REPOSITORY,
+            source_commit=COMMIT,
+            tag=TAG,
+            workflow_ref="refs/heads/main",
+            workflow_sha=COMMIT,
+            release_state="present",
+            expect_draft=None,
+            fetch_json=lambda path: deepcopy(_mutation_routes()[path]),
+        )
+
+
+@pytest.mark.parametrize("mutation", ["workflow", "main", "tag", "draft", "governance"])
+def test_mutation_authority_rejects_stale_or_bypassable_live_state(mutation: str) -> None:
+    routes = _mutation_routes()
+    workflow_ref = "refs/heads/main"
+    if mutation == "workflow":
+        workflow_ref = f"refs/tags/{TAG}"
+    elif mutation == "main":
+        routes[f"repos/{REPOSITORY}/commits/main"] = {"sha": "b" * 40}
+    elif mutation == "tag":
+        routes[f"repos/{REPOSITORY}/commits/{TAG}"] = {"sha": "b" * 40}
+    elif mutation == "draft":
+        cast(dict[str, object], routes[f"repos/{REPOSITORY}/releases/tags/{TAG}"])["draft"] = False
+    else:
+        cast(dict[str, object], routes[f"repos/{REPOSITORY}/rulesets/{MAIN_RULESET_ID}"])[
+            "current_user_can_bypass"
+        ] = "always"
+
+    with pytest.raises(ProvenanceError):
+        verify_live_mutation_authority(
+            _governance_receipt(),
+            repository=REPOSITORY,
+            source_commit=COMMIT,
+            tag=TAG,
+            workflow_ref=workflow_ref,
+            workflow_sha=COMMIT,
+            release_state="present",
+            expect_draft=True,
+            fetch_json=lambda path: deepcopy(routes[path]),
+        )
+
+
+def _reviewer_identity_documents() -> tuple[
+    dict[str, object], list[dict[str, object]], dict[int, object]
+]:
+    source: dict[str, object] = {
+        "author": {"login": "source-author", "id": 1},
+        "committer": {"login": "source-committer", "id": 2},
+    }
+    prs: list[dict[str, object]] = [
+        {
+            "number": 10,
+            "commits": 1,
+            "merged_at": "2026-07-10T00:00:00Z",
+            "base": {"ref": "main"},
+            "user": {"login": "pr-opener", "id": 3},
+        }
+    ]
+    commits: dict[int, object] = {
+        10: [
+            {
+                "author": {"login": "commit-author", "id": 4},
+                "committer": {"login": "commit-committer", "id": 5},
+            }
+        ]
+    }
+    return source, prs, commits
+
+
+def test_reviewer_exclusions_cover_every_source_and_pr_commit_identity() -> None:
+    source, prs, commits = _reviewer_identity_documents()
+
+    result = build_reviewer_exclusions(
+        source,
+        prs,
+        commits,
+        dispatcher_login="independent-reviewer",
+        dispatcher_id=99,
+    )
+
+    assert result["source_contributor_ids"] == [1, 2, 3, 4, 5]
+    assert result["source_author"] == {"login": "source-author", "id": 1}
+    assert result["source_committer"] == {"login": "source-committer", "id": 2}
+
+
+@pytest.mark.parametrize("dispatcher_id", [1, 2, 3, 4, 5])
+def test_reviewer_exclusions_reject_every_contributor_role(dispatcher_id: int) -> None:
+    source, prs, commits = _reviewer_identity_documents()
+
+    with pytest.raises(ProvenanceError, match="contributed"):
+        build_reviewer_exclusions(
+            source,
+            prs,
+            commits,
+            dispatcher_login="independent-reviewer",
+            dispatcher_id=dispatcher_id,
+        )
+
+
+@pytest.mark.parametrize(
+    ("surface", "role"),
+    [
+        ("source", "author"),
+        ("source", "committer"),
+        ("commit", "author"),
+        ("commit", "committer"),
+    ],
+)
+def test_reviewer_exclusions_fail_closed_on_unlinked_identity(
+    surface: str,
+    role: str,
+) -> None:
+    source, prs, commits = _reviewer_identity_documents()
+    if surface == "source":
+        source[role] = None
+    else:
+        cast(list[dict[str, object]], commits[10])[0][role] = None
+
+    with pytest.raises(ProvenanceError):
+        build_reviewer_exclusions(
+            source,
+            prs,
+            commits,
+            dispatcher_login="independent-reviewer",
+            dispatcher_id=99,
+        )
+
+
+def test_fetch_reviewer_exclusions_fetches_every_associated_pr_commit() -> None:
+    source, prs, commits = _reviewer_identity_documents()
+    routes: dict[str, object] = {
+        f"repos/{REPOSITORY}/commits/{COMMIT}": source,
+        f"repos/{REPOSITORY}/commits/{COMMIT}/pulls?per_page=100": [{"number": 10}],
+        f"repos/{REPOSITORY}/pulls/10": prs[0],
+        f"repos/{REPOSITORY}/pulls/10/commits?per_page=100": commits[10],
+    }
+
+    result = fetch_reviewer_exclusions(
+        repository=REPOSITORY,
+        source_commit=COMMIT,
+        dispatcher_login="independent-reviewer",
+        dispatcher_id=99,
+        fetch_json=lambda path: routes[path],
+    )
+
+    assert result["source_contributor_ids"] == [1, 2, 3, 4, 5]
+
+
+def test_validation_report_asset_manifest_is_bounded_and_matches_downloads(
+    tmp_path: Path,
+) -> None:
+    release = _release_assets([("validation-local.json", 2), ("validation-ares-cleanup.json", 3)])
+    manifest = build_validation_report_asset_manifest(release, kind="candidate")
+    report_dir = tmp_path / "reports"
+    report_dir.mkdir()
+    (report_dir / "validation-local.json").write_bytes(b"xx")
+    (report_dir / "validation-ares-cleanup.json").write_bytes(b"xxx")
+
+    verify_downloaded_validation_report_assets(manifest, report_dir)
+    assert manifest["aggregate_bytes"] == 5
+    assert manifest["report_count"] == 2
+    assert cast(dict[str, int], manifest["limits"]) == {
+        "maximum_release_asset_metadata_records": MAX_RELEASE_ASSET_METADATA_RECORDS,
+        "maximum_release_asset_bytes": MAX_RELEASE_ASSET_BYTES,
+        "maximum_release_asset_aggregate_bytes": MAX_RELEASE_ASSET_AGGREGATE_BYTES,
+        "maximum_distribution_bytes": MAX_DISTRIBUTION_BYTES,
+        "maximum_fixed_json_bytes": MAX_FIXED_JSON_BYTES,
+        "maximum_manifest_bytes": MAX_MANIFEST_BYTES,
+        "maximum_assets": MAX_VALIDATION_REPORT_ASSETS,
+        "maximum_asset_bytes": MAX_VALIDATION_REPORT_BYTES,
+        "maximum_aggregate_bytes": MAX_VALIDATION_REPORT_AGGREGATE_BYTES,
+    }
+
+
+@pytest.mark.parametrize("mutation", ["count", "single_size", "aggregate", "unsafe", "missing"])
+def test_validation_report_asset_manifest_rejects_unbounded_or_ambiguous_inputs(
+    mutation: str,
+) -> None:
+    assets = [("validation-local.json", 2), ("validation-ares.json", 3)]
+    if mutation == "count":
+        assets = [
+            ("validation-local.json", 1),
+            *[
+                (f"validation-site-{index}.json", 1)
+                for index in range(MAX_VALIDATION_REPORT_ASSETS)
+            ],
+        ]
+    elif mutation == "single_size":
+        assets[-1] = (assets[-1][0], MAX_VALIDATION_REPORT_BYTES + 1)
+    elif mutation == "aggregate":
+        assets = [
+            ("validation-local.json", 1),
+            *[(f"validation-site-{index}.json", MAX_VALIDATION_REPORT_BYTES) for index in range(9)],
+        ]
+    elif mutation == "unsafe":
+        assets[-1] = ("validation-site name.json", 3)
+    else:
+        assets = [("validation-local.json", 2)]
+
+    with pytest.raises(ProvenanceError):
+        build_validation_report_asset_manifest(_release_assets(assets), kind="candidate")
+
+
+def test_downloaded_validation_report_manifest_rejects_size_or_file_set_changes(
+    tmp_path: Path,
+) -> None:
+    manifest = build_validation_report_asset_manifest(
+        _release_assets(
+            [("released-validation-ares.json", 2), ("released-validation-homelab.json", 2)]
+        ),
+        kind="released",
+    )
+    report_dir = tmp_path / "reports"
+    report_dir.mkdir()
+    (report_dir / "released-validation-ares.json").write_bytes(b"xx")
+    (report_dir / "released-validation-homelab.json").write_bytes(b"bad")
+
+    with pytest.raises(ProvenanceError, match="differ from the preflight manifest"):
+        verify_downloaded_validation_report_assets(manifest, report_dir)
+
+
+def test_validation_report_preflight_rejects_an_unbounded_release_asset_listing() -> None:
+    assets = _release_assets(
+        [(f"unrelated-{index}.txt", 1) for index in range(MAX_RELEASE_ASSET_METADATA_RECORDS + 1)]
+    )["assets"]
+
+    with pytest.raises(ProvenanceError, match="metadata count exceeds"):
+        build_validation_report_asset_manifest(assets, kind="candidate")
+
+
+@pytest.mark.parametrize("field", ["report_count", "aggregate_bytes", "limits"])
+def test_downloaded_report_verification_rejects_tampered_preflight_manifest(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    manifest = build_validation_report_asset_manifest(
+        _release_assets([("released-validation-ares.json", 2)]),
+        kind="released",
+    )
+    if field == "report_count":
+        manifest[field] = 2
+    elif field == "aggregate_bytes":
+        manifest[field] = 3
+    else:
+        cast(dict[str, int], manifest[field])["maximum_assets"] += 1
+    report_dir = tmp_path / "reports"
+    report_dir.mkdir()
+    (report_dir / "released-validation-ares.json").write_bytes(b"xx")
+
+    with pytest.raises(ProvenanceError):
+        verify_downloaded_validation_report_assets(manifest, report_dir)
+
+
+def test_json_loader_rejects_oversized_input_before_decoding(tmp_path: Path) -> None:
+    document = tmp_path / "oversized.json"
+    with document.open("wb") as stream:
+        stream.truncate(MAX_JSON_DOCUMENT_BYTES + 1)
+
+    with pytest.raises(ProvenanceError, match="exceeds"):
+        ci_validation._load_json(document)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001

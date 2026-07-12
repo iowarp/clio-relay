@@ -9,7 +9,9 @@ from pathlib import Path
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import RelayError
+from clio_relay.installation import INSTALL_RECEIPT_PATH_ENV
 from clio_relay.jarvis_mcp import JARVIS_MCP_COMMAND_ENV
+from clio_relay.worker_concurrency import KindConcurrencyInput, kind_concurrency_metadata
 
 
 def render_endpoint_user_service(
@@ -18,6 +20,7 @@ def render_endpoint_user_service(
     definition: ClusterDefinition,
     relay_bin: str = "%h/.local/bin/clio-relay",
     concurrency: int = 1,
+    kind_concurrency: KindConcurrencyInput | None = None,
 ) -> str:
     """Render a user-level systemd service for a configured worker endpoint."""
     if concurrency < 1:
@@ -28,10 +31,20 @@ def render_endpoint_user_service(
     frpc_bin = _systemd_home_path(definition.frpc_bin or "$HOME/.local/bin/frpc")
     agent_bin = _systemd_home_path(_configured_agent_bin(definition))
     agent_args = " ".join(definition.agent_args)
+    kind_limits = kind_concurrency_metadata(kind_concurrency)
+    kind_limit_args = "".join(
+        f" --kind-concurrency {kind}={limit}" for kind, limit in kind_limits.items()
+    )
     jarvis_mcp_line = _optional_environment_line(
         JARVIS_MCP_COMMAND_ENV,
         os.environ.get(JARVIS_MCP_COMMAND_ENV),
     )
+    exec_start = (
+        f"{relay_bin} endpoint start --role worker --cluster {cluster} "
+        f"--concurrency {concurrency}{kind_limit_args} "
+        f"--scheduler-provider {definition.scheduler_provider}"
+    )
+    exec_start_pre = f"{relay_bin} queue migrate-indexes --all --batch-size 500"
     return f"""[Unit]
 Description=clio-relay worker endpoint for {cluster}
 After=network-online.target
@@ -46,8 +59,10 @@ Environment="CLIO_RELAY_FRPC_BIN={frpc_bin}"
 Environment="CLIO_RELAY_AGENT_BIN={agent_bin}"
 Environment="CLIO_RELAY_AGENT_ADAPTER={definition.agent_adapter}"
 Environment="CLIO_RELAY_AGENT_ARGS={agent_args}"
+Environment="{INSTALL_RECEIPT_PATH_ENV}=%h/.local/share/clio-relay/install-receipt.json"
 {jarvis_mcp_line}
-ExecStart={relay_bin} endpoint start --role worker --cluster {cluster} --concurrency {concurrency}
+ExecStartPre={exec_start_pre}
+ExecStart={exec_start}
 Restart=on-failure
 RestartSec=5
 

@@ -2,19 +2,29 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
-from collections.abc import Sequence
-from pathlib import Path
-from typing import Protocol
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime, timedelta
+from typing import Protocol, runtime_checkable
 
+from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.models import SchedulerPhase, SchedulerStatus
 
 SQUEUE_FIELDS = "%i|%T|%R|%P|%q|%u|%D|%C|%m|%V|%S|%M|%l"
 SACCT_FIELDS = "JobIDRaw,State,Partition,QOS,Submit,Start,Elapsed,NNodes,NCPUS,ReqMem"
+SCHEDULER_PENDING_CHECK_ID = "scheduler.pending"
+SCHEDULER_ALLOCATED_CHECK_ID = "scheduler.allocated"
+SCHEDULER_RUNNING_CHECK_ID = "scheduler.running"
+SCHEDULER_COMPLETED_CHECK_ID = "scheduler.completed"
+SCHEDULER_RUNTIME_METADATA_CHECK_ID = "scheduler.structured-metadata"
+SCHEDULER_COMMAND_TIMEOUT_SECONDS = 15.0
+SCHEDULER_RECONCILIATION_MAX_AGE = timedelta(days=7)
+SCHEDULER_RECONCILIATION_TIME_TOLERANCE = timedelta(seconds=5)
 
 
 class SchedulerProvider(Protocol):
-    """Provider interface for scheduler status and cancellation."""
+    """Provider interface for scheduler status, cancellation, and target identity."""
 
     name: str
 
@@ -26,56 +36,266 @@ class SchedulerProvider(Protocol):
         """Request scheduler cancellation for a scheduler job id."""
         ...
 
-    def pipeline_command(self, python_bin: str, pipeline_path: Path) -> list[str]:
-        """Return the command that submits and waits for a scheduled JARVIS pipeline."""
+    def scheduler_cluster_name(self) -> str | None:
+        """Return the scheduler-native cluster name when one exists."""
         ...
 
 
-class SlurmSchedulerProvider:
-    """SLURM provider backed by squeue, sacct, and scancel."""
+@runtime_checkable
+class SchedulerValidationProvider(SchedulerProvider, Protocol):
+    """Optional provider operations used by deterministic live acceptance."""
 
-    name = "slurm"
+    name: str
+
+    def submit_held_validation_job(self, *, job_name: str, run_seconds: int) -> str:
+        """Submit bounded held work and return its scheduler job id."""
+        ...
+
+    def release_validation_job(self, scheduler_job_id: str) -> subprocess.CompletedProcess[str]:
+        """Release a held validation job without changing any other job."""
+        ...
+
+
+@runtime_checkable
+class SchedulerReconciliationProvider(SchedulerProvider, Protocol):
+    """Optional exact-marker lookup for interrupted scheduler submissions."""
+
+    def find_job_ids_by_marker(
+        self,
+        marker: str,
+        *,
+        submitted_after: datetime,
+        scheduler_user: str,
+    ) -> list[str]:
+        """Return scheduler ids whose provider-native job name exactly matches marker."""
+        ...
+
+
+class ExternalSchedulerProvider:
+    """Provider for runtimes whose scheduler lifecycle is owned externally."""
+
+    name = "external"
 
     def poll(self, scheduler_job_id: str) -> SchedulerStatus:
-        """Poll SLURM for a job status, using sacct after squeue no longer sees the job."""
-        current = self._squeue_one(scheduler_job_id)
-        if current is not None:
-            status = _status_from_squeue_row(current)
-            if status.phase == SchedulerPhase.PENDING:
-                return _with_queue_position(status, self._squeue_pending_jobs())
-            return status
-        historical = self._sacct_one(scheduler_job_id)
-        if historical is not None:
-            return _status_from_sacct_row(scheduler_job_id, historical)
+        """Report that no relay-owned scheduler observation is configured."""
+        _validate_scheduler_job_id(scheduler_job_id)
         return SchedulerStatus(
             scheduler=self.name,
             scheduler_job_id=scheduler_job_id,
             phase=SchedulerPhase.UNKNOWN,
-            queue_position_note="scheduler job was not found by squeue or sacct",
+            queue_position_note="scheduler observation is owned by the deployment driver",
+        )
+
+    def cancel(self, scheduler_job_id: str) -> subprocess.CompletedProcess[str]:
+        """Reject scheduler cancellation when no relay-owned provider is configured."""
+        _validate_scheduler_job_id(scheduler_job_id)
+        return subprocess.CompletedProcess(
+            ["external-scheduler", scheduler_job_id],
+            2,
+            "",
+            "scheduler cancellation is owned by the deployment driver",
+        )
+
+    def scheduler_cluster_name(self) -> str | None:
+        """Return no scheduler-native identity for externally owned runtimes."""
+        return None
+
+    def submit_held_validation_job(self, *, job_name: str, run_seconds: int) -> str:
+        """Reject live submission when scheduling is externally managed."""
+        del job_name, run_seconds
+        raise ConfigurationError("external scheduler providers cannot submit held validation jobs")
+
+    def release_validation_job(self, scheduler_job_id: str) -> subprocess.CompletedProcess[str]:
+        """Reject release when scheduling is externally managed."""
+        _validate_scheduler_job_id(scheduler_job_id)
+        return subprocess.CompletedProcess(
+            ["external-scheduler", "release", scheduler_job_id],
+            2,
+            "",
+            "scheduler release is owned by the deployment driver",
+        )
+
+
+class SlurmSchedulerProvider:
+    """SLURM provider backed by squeue, controller/accounting history, and scancel."""
+
+    name = "slurm"
+
+    def poll(self, scheduler_job_id: str) -> SchedulerStatus:
+        """Poll SLURM, including clusters where accounting storage is disabled."""
+        _validate_scheduler_job_id(scheduler_job_id)
+        current = self._squeue_one(scheduler_job_id)
+        if current is not None:
+            status = _status_from_squeue_row(current).model_copy(update={"record_found": True})
+            if status.phase == SchedulerPhase.PENDING:
+                return _with_queue_position(status, self._squeue_pending_jobs())
+            return status
+        history_errors: list[str] = []
+        try:
+            historical = self._sacct_one(scheduler_job_id)
+        except RelayError as exc:
+            historical = None
+            history_errors.append(str(exc))
+        if historical is not None:
+            return _status_from_sacct_row(scheduler_job_id, historical).model_copy(
+                update={"record_found": True}
+            )
+        try:
+            controller_record = self._scontrol_one(scheduler_job_id)
+        except RelayError as exc:
+            controller_record = None
+            history_errors.append(str(exc))
+        if controller_record is not None:
+            return _status_from_scontrol_record(
+                scheduler_job_id,
+                controller_record,
+            ).model_copy(update={"record_found": True})
+        diagnostic = "; ".join(history_errors)
+        note = "scheduler job was not found by squeue, sacct, or scontrol"
+        if diagnostic:
+            note = f"{note}; {diagnostic}"
+        return SchedulerStatus(
+            scheduler=self.name,
+            scheduler_job_id=scheduler_job_id,
+            phase=SchedulerPhase.UNKNOWN,
+            record_found=False if not history_errors else None,
+            queue_position_note=note,
         )
 
     def cancel(self, scheduler_job_id: str) -> subprocess.CompletedProcess[str]:
         """Cancel a SLURM job with scancel."""
-        return subprocess.run(
+        _validate_scheduler_job_id(scheduler_job_id)
+        return _run_scheduler_command(
             ["scancel", scheduler_job_id],
-            text=True,
-            capture_output=True,
-            check=False,
         )
 
-    def pipeline_command(self, python_bin: str, pipeline_path: Path) -> list[str]:
-        """Return the SLURM-backed JARVIS pipeline command."""
-        return [python_bin, "-c", _SLURM_SCHEDULED_PIPELINE_RUNNER, str(pipeline_path)]
+    def scheduler_cluster_name(self) -> str:
+        """Read the configured SLURM ClusterName through the provider boundary."""
+        result = _run_scheduler_command(["scontrol", "show", "config"])
+        if result.returncode != 0:
+            raise _scheduler_command_error("scontrol", result)
+        for line in result.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key.strip() == "ClusterName":
+                cluster_name = value.strip().split()[0]
+                if cluster_name:
+                    return cluster_name
+        raise RelayError("scheduler provider output omitted SLURM ClusterName")
 
-    def _squeue_one(self, scheduler_job_id: str) -> list[str] | None:
-        result = subprocess.run(
-            ["squeue", "-h", "-j", scheduler_job_id, "-o", SQUEUE_FIELDS],
-            text=True,
-            capture_output=True,
-            check=False,
+    def submit_held_validation_job(self, *, job_name: str, run_seconds: int) -> str:
+        """Submit one bounded held SLURM job for deterministic lifecycle validation."""
+        _validate_validation_job_name(job_name)
+        if run_seconds < 1 or run_seconds > 300:
+            raise ConfigurationError("validation run_seconds must be between 1 and 300")
+        result = _run_scheduler_command(
+            [
+                "sbatch",
+                "--parsable",
+                "--hold",
+                "--job-name",
+                job_name,
+                "--time",
+                "00:05:00",
+                "--wrap",
+                f"sleep {run_seconds}",
+            ]
         )
         if result.returncode != 0:
-            return None
+            raise _scheduler_command_error("sbatch", result)
+        scheduler_job_id = result.stdout.strip().splitlines()[-1].split(";", 1)[0].strip()
+        _validate_scheduler_job_id(scheduler_job_id)
+        return scheduler_job_id
+
+    def release_validation_job(self, scheduler_job_id: str) -> subprocess.CompletedProcess[str]:
+        """Release one exact held SLURM validation job."""
+        _validate_scheduler_job_id(scheduler_job_id)
+        return _run_scheduler_command(["scontrol", "release", scheduler_job_id])
+
+    def find_job_ids_by_marker(
+        self,
+        marker: str,
+        *,
+        submitted_after: datetime,
+        scheduler_user: str,
+    ) -> list[str]:
+        """Find current or recent SLURM jobs by exact name, user, and time window."""
+        _validate_reconciliation_marker(marker)
+        _validate_scheduler_user(scheduler_user)
+        submitted_after = _validate_reconciliation_time(submitted_after)
+        earliest_submit = submitted_after - SCHEDULER_RECONCILIATION_TIME_TOLERANCE
+        latest_submit = datetime.now(UTC) + SCHEDULER_RECONCILIATION_TIME_TOLERANCE
+        result = _run_scheduler_command(
+            [
+                "squeue",
+                "-h",
+                "--name",
+                marker,
+                "--user",
+                scheduler_user,
+                "-o",
+                "%A|%j|%u|%V",
+            ],
+        )
+        if result.returncode != 0:
+            raise _scheduler_command_error("squeue", result)
+        matches: list[str] = []
+        for line in result.stdout.splitlines():
+            row = _split_row(line, 4)
+            if row is None or row[1] != marker or row[2] != scheduler_user:
+                continue
+            submit_time = _parse_slurm_reconciliation_time(row[3])
+            if submit_time is None or submit_time < earliest_submit or submit_time > latest_submit:
+                continue
+            _validate_scheduler_job_id(row[0])
+            if row[0] not in matches:
+                matches.append(row[0])
+            if len(matches) > 1:
+                break
+        local_start = earliest_submit.astimezone().strftime("%Y-%m-%dT%H:%M:%S")
+        history = _run_scheduler_command(
+            [
+                "sacct",
+                "-n",
+                "-P",
+                "-X",
+                "--name",
+                marker,
+                "--user",
+                scheduler_user,
+                "--starttime",
+                local_start,
+                "-o",
+                "JobIDRaw,JobName,User,Submit",
+            ],
+        )
+        if history.returncode != 0:
+            error = _scheduler_command_error("sacct", history)
+            raise RelayError(
+                "SLURM accounting history is required to prove scheduler marker uniqueness: "
+                f"{error}"
+            ) from error
+        for line in history.stdout.splitlines():
+            row = _split_row(line, 4)
+            if row is None or row[1] != marker or row[2] != scheduler_user:
+                continue
+            submit_time = _parse_slurm_reconciliation_time(row[3])
+            if submit_time is None or submit_time < earliest_submit or submit_time > latest_submit:
+                continue
+            if not row[0].isdecimal():
+                continue
+            _validate_scheduler_job_id(row[0])
+            if row[0] not in matches:
+                matches.append(row[0])
+            if len(matches) > 1:
+                break
+        return matches
+
+    def _squeue_one(self, scheduler_job_id: str) -> list[str] | None:
+        result = _run_scheduler_command(
+            ["squeue", "-h", "-j", scheduler_job_id, "-o", SQUEUE_FIELDS],
+        )
+        if result.returncode != 0:
+            raise _scheduler_command_error("squeue", result)
         for line in result.stdout.splitlines():
             row = _split_row(line, 13)
             if row and row[0] == scheduler_job_id:
@@ -83,18 +303,15 @@ class SlurmSchedulerProvider:
         return None
 
     def _squeue_pending_jobs(self) -> list[list[str]]:
-        result = subprocess.run(
+        result = _run_scheduler_command(
             ["squeue", "-h", "-t", "PD", "-o", SQUEUE_FIELDS],
-            text=True,
-            capture_output=True,
-            check=False,
         )
         if result.returncode != 0:
-            return []
+            raise _scheduler_command_error("squeue", result)
         return [row for line in result.stdout.splitlines() if (row := _split_row(line, 13))]
 
     def _sacct_one(self, scheduler_job_id: str) -> list[str] | None:
-        result = subprocess.run(
+        result = _run_scheduler_command(
             [
                 "sacct",
                 "-n",
@@ -104,25 +321,88 @@ class SlurmSchedulerProvider:
                 "-o",
                 SACCT_FIELDS,
             ],
-            text=True,
-            capture_output=True,
-            check=False,
         )
         if result.returncode != 0:
-            return None
+            raise _scheduler_command_error("sacct", result)
         for line in result.stdout.splitlines():
             row = _split_row(line, 10)
             if row and row[0] == scheduler_job_id:
                 return row
         return None
 
+    def _scontrol_one(self, scheduler_job_id: str) -> dict[str, str] | None:
+        result = _run_scheduler_command(
+            ["scontrol", "show", "job", scheduler_job_id, "-o"],
+        )
+        if result.returncode != 0:
+            raise _scheduler_command_error("scontrol", result)
+        for line in result.stdout.splitlines():
+            record = _parse_scontrol_record(line)
+            if record.get("JobId") == scheduler_job_id:
+                return record
+        return None
+
+
+SchedulerProviderFactory = Callable[[], SchedulerProvider]
+_PROVIDER_FACTORIES: dict[str, SchedulerProviderFactory] = {
+    "external": ExternalSchedulerProvider,
+    "slurm": SlurmSchedulerProvider,
+}
+
+
+def register_scheduler_provider(
+    name: str,
+    factory: SchedulerProviderFactory,
+    *,
+    replace: bool = False,
+) -> None:
+    """Register an additional scheduler provider factory."""
+    normalized = _normalize_provider_name(name)
+    if normalized in _PROVIDER_FACTORIES and not replace:
+        raise ConfigurationError(f"scheduler provider is already registered: {normalized}")
+    _PROVIDER_FACTORIES[normalized] = factory
+
 
 def provider_for_scheduler(name: str | None) -> SchedulerProvider:
-    """Return the configured scheduler provider."""
-    normalized = (name or "slurm").strip().lower()
-    if normalized == "slurm":
-        return SlurmSchedulerProvider()
-    raise ValueError(f"unsupported scheduler provider: {name}")
+    """Return an explicitly selected scheduler provider."""
+    if name is None or name.strip() == "":
+        raise ConfigurationError(
+            "scheduler provider must be explicit; configure external or a scheduler provider"
+        )
+    normalized = _normalize_provider_name(name)
+    if normalized in {"external", "none", "unmanaged"}:
+        normalized = "external"
+    factory = _PROVIDER_FACTORIES.get(normalized)
+    if factory is None:
+        raise ConfigurationError(f"unsupported scheduler provider: {name}")
+    provider = factory()
+    if _normalize_provider_name(provider.name) != normalized:
+        raise ConfigurationError(
+            f"scheduler provider factory {normalized} returned provider {provider.name}"
+        )
+    return provider
+
+
+def validation_provider_for_scheduler(name: str | None) -> SchedulerValidationProvider:
+    """Return a provider that implements deterministic lifecycle validation operations."""
+    provider = provider_for_scheduler(name)
+    if not isinstance(provider, SchedulerValidationProvider):
+        raise ConfigurationError(
+            f"scheduler provider does not support lifecycle validation: {provider.name}"
+        )
+    return provider
+
+
+def reconciliation_provider_for_scheduler(
+    name: str | None,
+) -> SchedulerReconciliationProvider:
+    """Return a provider that can prove one interrupted submission by exact marker."""
+    provider = provider_for_scheduler(name)
+    if not isinstance(provider, SchedulerReconciliationProvider):
+        raise ConfigurationError(
+            f"scheduler provider does not support exact submission reconciliation: {provider.name}"
+        )
+    return provider
 
 
 def _status_from_squeue_row(row: Sequence[str]) -> SchedulerStatus:
@@ -165,6 +445,37 @@ def _status_from_sacct_row(scheduler_job_id: str, row: Sequence[str]) -> Schedul
     )
 
 
+def _status_from_scontrol_record(
+    scheduler_job_id: str,
+    record: dict[str, str],
+) -> SchedulerStatus:
+    raw_state = record.get("JobState")
+    user_id = _empty_to_none(record.get("UserId"))
+    exit_code = _empty_to_none(record.get("ExitCode"))
+    note = "historical scheduler status from scontrol"
+    if exit_code is not None:
+        note = f"{note}; ExitCode={exit_code}"
+    return SchedulerStatus(
+        scheduler=SlurmSchedulerProvider.name,
+        scheduler_job_id=scheduler_job_id,
+        phase=_phase_from_slurm_state(raw_state),
+        raw_state=raw_state,
+        reason=_empty_to_none(record.get("Reason")),
+        partition=_empty_to_none(record.get("Partition")),
+        qos=_empty_to_none(record.get("QOS")),
+        user=user_id.split("(", 1)[0] if user_id is not None else None,
+        nodes=_optional_int(record.get("NumNodes", "")),
+        cpus=_optional_int(record.get("NumCPUs", "")),
+        memory=_empty_to_none(record.get("MinMemoryNode")),
+        submit_time=_empty_to_none(record.get("SubmitTime")),
+        eligible_time=_empty_to_none(record.get("EligibleTime")),
+        start_time=_empty_to_none(record.get("StartTime")),
+        elapsed=_empty_to_none(record.get("RunTime")),
+        time_limit=_empty_to_none(record.get("TimeLimit")),
+        queue_position_note=note,
+    )
+
+
 def _with_queue_position(
     status: SchedulerStatus,
     pending_jobs: Sequence[Sequence[str]],
@@ -193,18 +504,35 @@ def _with_queue_position(
 def _phase_from_slurm_state(raw_state: str | None) -> SchedulerPhase:
     if raw_state is None:
         return SchedulerPhase.UNKNOWN
-    normalized = raw_state.strip().upper()
-    if normalized in {"PENDING", "PD"}:
+    normalized = raw_state.strip().upper().split()[0].rstrip("+")
+    if normalized in {"PENDING", "PD", "REQUEUED", "RQ", "REQUEUE_HOLD", "RH"}:
         return SchedulerPhase.PENDING
     if normalized in {"CONFIGURING", "CF", "COMPLETING", "CG", "RESIZING", "RS"}:
         return SchedulerPhase.ALLOCATED
-    if normalized in {"RUNNING", "R"}:
+    if normalized in {"RUNNING", "R", "SUSPENDED", "S"}:
         return SchedulerPhase.RUNNING
     if normalized in {"COMPLETED", "CD"}:
         return SchedulerPhase.COMPLETED
-    if normalized in {"CANCELLED", "CA"}:
+    if normalized in {"CANCELLED", "CANCELED", "CA"}:
         return SchedulerPhase.CANCELED
-    if normalized in {"FAILED", "F", "TIMEOUT", "TO", "NODE_FAIL", "NF", "OUT_OF_MEMORY", "OOM"}:
+    if normalized in {
+        "BOOT_FAIL",
+        "BF",
+        "DEADLINE",
+        "DL",
+        "FAILED",
+        "F",
+        "NODE_FAIL",
+        "NF",
+        "OUT_OF_MEMORY",
+        "OOM",
+        "PREEMPTED",
+        "PR",
+        "REVOKED",
+        "RV",
+        "TIMEOUT",
+        "TO",
+    }:
         return SchedulerPhase.FAILED
     return SchedulerPhase.UNKNOWN
 
@@ -214,6 +542,16 @@ def _split_row(line: str, expected_fields: int) -> list[str] | None:
     if len(row) != expected_fields:
         return None
     return row
+
+
+def _parse_scontrol_record(line: str) -> dict[str, str]:
+    normalized = line.strip()
+    matches = list(re.finditer(r"(?<!\S)([A-Za-z][A-Za-z0-9_:]*)=", normalized))
+    record: dict[str, str] = {}
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
+        record[match.group(1)] = normalized[match.end() : end].strip()
+    return record
 
 
 def _empty_to_none(value: str | None) -> str | None:
@@ -238,80 +576,81 @@ def _sort_time(value: str | None) -> str:
     return value or ""
 
 
-_SLURM_SCHEDULED_PIPELINE_RUNNER = """
-from __future__ import annotations
+_SCHEDULER_JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:+-]*$")
+_VALIDATION_JOB_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
-import subprocess
-import sys
-import time
 
-from jarvis_cd.core.pipeline_test import load_yaml_auto
+def _validate_scheduler_job_id(value: str) -> None:
+    if not _SCHEDULER_JOB_ID.fullmatch(value):
+        raise ConfigurationError(f"invalid scheduler job id: {value!r}")
 
-_, obj = load_yaml_auto(sys.argv[1])
-submit = getattr(obj, "submit")
-script_path = submit(submit=False)
-if script_path is None:
-    raise RuntimeError("Scheduled JARVIS object did not return a scheduler script path")
 
-submission = subprocess.run(
-    ["sbatch", "--parsable", str(script_path)],
-    capture_output=True,
-    text=True,
-    check=False,
-)
-if submission.stderr:
-    print(submission.stderr, file=sys.stderr, end="", flush=True)
-if submission.stdout:
-    print(submission.stdout, end="", flush=True)
-if submission.returncode != 0:
-    raise SystemExit(submission.returncode)
+def _validate_validation_job_name(value: str) -> None:
+    if not _VALIDATION_JOB_NAME.fullmatch(value):
+        raise ConfigurationError(f"invalid scheduler validation job name: {value!r}")
 
-job_id = submission.stdout.strip().splitlines()[-1].split(";", 1)[0].strip()
-if not job_id:
-    raise RuntimeError("sbatch did not return a scheduler job id")
-print(f"scheduler_job_id={job_id}", flush=True)
 
-terminal_success = {"COMPLETED"}
-terminal_cancel = {"CANCELLED", "CANCELLED+"}
-terminal_failure = {
-    "BOOT_FAIL",
-    "DEADLINE",
-    "FAILED",
-    "NODE_FAIL",
-    "OUT_OF_MEMORY",
-    "PREEMPTED",
-    "REVOKED",
-    "SPECIAL_EXIT",
-    "TIMEOUT",
-}
+def _validate_reconciliation_marker(value: str) -> None:
+    if not value.startswith("clio-relay-") or not _VALIDATION_JOB_NAME.fullmatch(value):
+        raise ConfigurationError(f"invalid scheduler reconciliation marker: {value!r}")
 
-while True:
-    queued = subprocess.run(
-        ["squeue", "-h", "-j", job_id, "-o", "%T"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if queued.stdout.strip():
-        time.sleep(5)
-        continue
 
-    accounting = subprocess.run(
-        ["sacct", "-n", "-P", "-j", job_id, "-o", "State"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    states = [
-        line.split("|", 1)[0].split()[0]
-        for line in accounting.stdout.splitlines()
-        if line.strip()
-    ]
-    if any(state in terminal_success for state in states):
-        raise SystemExit(0)
-    if any(state in terminal_cancel for state in states):
-        raise SystemExit(130)
-    if any(state in terminal_failure for state in states):
-        raise SystemExit(1)
-    time.sleep(5)
-"""
+def _validate_scheduler_user(value: str) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", value):
+        raise ConfigurationError(f"invalid scheduler reconciliation user: {value!r}")
+
+
+def _validate_reconciliation_time(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ConfigurationError("scheduler reconciliation time must include a timezone")
+    normalized = value.astimezone(UTC)
+    now = datetime.now(UTC)
+    if normalized > now + timedelta(minutes=5):
+        raise ConfigurationError("scheduler reconciliation time is in the future")
+    if normalized < now - SCHEDULER_RECONCILIATION_MAX_AGE:
+        raise ConfigurationError("scheduler reconciliation intent exceeded its history window")
+    return normalized
+
+
+def _parse_slurm_reconciliation_time(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        local_timezone = datetime.now().astimezone().tzinfo
+        parsed = parsed.replace(tzinfo=local_timezone)
+    return parsed.astimezone(UTC)
+
+
+def _normalize_provider_name(value: str) -> str:
+    normalized = value.strip().lower().replace("_", "-")
+    if not re.fullmatch(r"[a-z][a-z0-9-]*", normalized):
+        raise ConfigurationError(f"invalid scheduler provider name: {value!r}")
+    return normalized
+
+
+def _run_scheduler_command(command: list[str]) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=SCHEDULER_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RelayError(
+            f"scheduler provider command timed out after "
+            f"{SCHEDULER_COMMAND_TIMEOUT_SECONDS:g}s: {command[0]}"
+        ) from exc
+    except OSError as exc:
+        raise RelayError(f"scheduler provider command failed: {command[0]}: {exc}") from exc
+
+
+def _scheduler_command_error(
+    executable: str,
+    result: subprocess.CompletedProcess[str],
+) -> RelayError:
+    detail = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+    return RelayError(f"scheduler provider command failed: {executable}: {detail}")

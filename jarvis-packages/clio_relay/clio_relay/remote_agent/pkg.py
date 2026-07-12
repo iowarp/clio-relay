@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from jarvis_cd.core.pkg import Application
-
+from clio_relay._jarvis_api import Application
 from clio_relay.remote_agent.runner import run_remote_agent_from_params
 
 

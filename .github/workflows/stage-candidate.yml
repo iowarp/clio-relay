@@ -1,0 +1,379 @@
+name: attest and stage immutable release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Reviewed release tag whose unprivileged payload should be staged
+        required: true
+        type: string
+      reviewed_main_sha:
+        description: Exact reviewed origin/main commit that the tag must identify
+        required: true
+        type: string
+
+concurrency:
+  group: release-candidate-staging-${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  authorize:
+    name: reject non-main dispatch before protected environment
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      workflow_sha: ${{ steps.dispatch.outputs.workflow_sha }}
+    steps:
+      - name: require protected-main workflow identity
+        id: dispatch
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          REVIEWED_MAIN_SHA: ${{ inputs.reviewed_main_sha }}
+          TAG_NAME: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          test "$DISPATCH_REF" = "refs/heads/main"
+          [[ "$DISPATCH_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$REVIEWED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          echo "workflow_sha=$DISPATCH_SHA" >> "$GITHUB_OUTPUT"
+
+  stage:
+    name: verify, attest, and create immutable-identity draft
+    runs-on: ubuntu-latest
+    needs: authorize
+    environment:
+      name: live-validation
+    permissions:
+      actions: read  # Download the exact successful tag-build payload.
+      contents: write  # Create the draft and attach the verified candidate bytes.
+      id-token: write  # Mint the protected-main candidate attestation identity.
+      attestations: write  # Persist attestations for the exact candidate payload.
+      artifact-metadata: write  # Link the attested subjects to GitHub metadata.
+
+    steps:
+      - name: check out the protected-main verifier commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.authorize.outputs.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: set up python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: bind the tag and unprivileged payload run to reviewed main
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REVIEWED_MAIN_SHA: ${{ inputs.reviewed_main_sha }}
+          TAG_NAME: ${{ inputs.tag }}
+          WORKFLOW_SHA: ${{ needs.authorize.outputs.workflow_sha }}
+        shell: bash
+        run: |
+          git fetch --force --no-tags origin \
+            refs/heads/main:refs/remotes/origin/main \
+            "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
+          source_commit="$(gh api "repos/$REPOSITORY/commits/$TAG_NAME" --jq .sha)"
+          [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
+          test "$source_commit" = "$REVIEWED_MAIN_SHA"
+          test "$source_commit" = "$WORKFLOW_SHA"
+          test "$source_commit" = "$(git rev-parse HEAD)"
+          test "$source_commit" = "$(git rev-parse refs/remotes/origin/main)"
+          test "$source_commit" = "$(git rev-list -n 1 "$TAG_NAME")"
+          version="${TAG_NAME#v}"
+          policy_version="$(sed -nE 's/^release_version:[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' docs/release-gate-1.0.yaml)"
+          test -n "$policy_version"
+          test "$version" = "$policy_version"
+          gh api "repos/$REPOSITORY/actions/workflows/release.yml/runs?head_sha=$source_commit&event=push&status=completed&per_page=100" \
+            > "$RUNNER_TEMP/tag-build-runs.json"
+          test "$(jq -r .total_count "$RUNNER_TEMP/tag-build-runs.json")" -lt 100
+          matches="$(jq -c --arg tag "$TAG_NAME" --arg commit "$source_commit" \
+            '[.workflow_runs[] | select(.head_branch == $tag and .head_sha == $commit and .event == "push" and .status == "completed" and .conclusion == "success" and .path == ".github/workflows/release.yml")]' \
+            "$RUNNER_TEMP/tag-build-runs.json")"
+          test "$(jq length <<<"$matches")" -eq 1
+          run_id="$(jq -r '.[0].id' <<<"$matches")"
+          run_attempt="$(jq -r '.[0].run_attempt' <<<"$matches")"
+          [[ "$run_id" =~ ^[1-9][0-9]*$ ]]
+          [[ "$run_attempt" =~ ^[1-9][0-9]*$ ]]
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "run_attempt=$run_attempt" >> "$GITHUB_OUTPUT"
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: preflight the exact Actions artifact before download
+        id: artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ steps.candidate.outputs.run_id }}
+          RUN_ATTEMPT: ${{ steps.candidate.outputs.run_attempt }}
+          SOURCE_COMMIT: ${{ steps.candidate.outputs.source_commit }}
+          TAG_NAME: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          preflight="$RUNNER_TEMP/tag-payload-preflight"
+          rm -rf "$preflight"
+          mkdir "$preflight"
+          gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT" \
+            > "$preflight/run.json"
+          gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
+            > "$preflight/artifacts.json"
+          python src/clio_relay/ci_validation.py actions-artifact-manifest \
+            --run "$preflight/run.json" \
+            --artifacts "$preflight/artifacts.json" \
+            --repository "$REPOSITORY" \
+            --source-commit "$SOURCE_COMMIT" \
+            --tag "$TAG_NAME" \
+            --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT" \
+            --artifact-name "release-candidate-$TAG_NAME" \
+            --artifact-kind tag-payload \
+            --output "$preflight/ARTIFACT.json"
+          artifact_id="$(jq -r .artifact.id "$preflight/ARTIFACT.json")"
+          [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
+          echo "artifact_id=$artifact_id" >> "$GITHUB_OUTPUT"
+          echo "manifest=$preflight/ARTIFACT.json" >> "$GITHUB_OUTPUT"
+
+      - name: download by artifact id and verify API digest before extraction
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          ARTIFACT_ID: ${{ steps.artifact.outputs.artifact_id }}
+          ARTIFACT_MANIFEST: ${{ steps.artifact.outputs.manifest }}
+        shell: bash
+        run: |
+          rm -rf dist "$RUNNER_TEMP/tag-payload.zip"
+          gh api "repos/$REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" \
+            > "$RUNNER_TEMP/tag-payload.zip"
+          python src/clio_relay/ci_validation.py extract-actions-artifact \
+            --manifest "$ARTIFACT_MANIFEST" \
+            --archive "$RUNNER_TEMP/tag-payload.zip" \
+            --output-dir dist
+
+      - name: build trusted CI and live-governance receipts from protected main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ steps.candidate.outputs.source_commit }}
+          TAG_NAME: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          inputs="$RUNNER_TEMP/release-prerequisites"
+          rm -rf "$inputs"
+          mkdir -p "$inputs/branch-rulesets" "$inputs/tag-rulesets" "$inputs/environments"
+          gh api "repos/$REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SOURCE_COMMIT&event=push&status=completed&per_page=100" \
+            > "$inputs/ci-runs.json"
+          python src/clio_relay/ci_validation.py select-ci-run \
+            --runs "$inputs/ci-runs.json" \
+            --repository "$REPOSITORY" \
+            --source-commit "$SOURCE_COMMIT" \
+            --output "$inputs/selected-ci-run.json"
+          ci_run_id="$(jq -r .run_id "$inputs/selected-ci-run.json")"
+          ci_run_attempt="$(jq -r .run_attempt "$inputs/selected-ci-run.json")"
+          gh api "repos/$REPOSITORY/actions/runs/$ci_run_id/attempts/$ci_run_attempt/jobs?per_page=100" \
+            > "$inputs/ci-jobs.json"
+          python src/clio_relay/ci_validation.py build-ci-status \
+            --runs "$inputs/ci-runs.json" \
+            --jobs "$inputs/ci-jobs.json" \
+            --repository "$REPOSITORY" \
+            --source-commit "$SOURCE_COMMIT" \
+            --output dist/CI-STATUS.json
+
+          gh api "repos/$REPOSITORY/rules/branches/main?per_page=100" \
+            > "$inputs/main-effective-rules.json"
+          mapfile -t branch_ruleset_ids < <(
+            jq -r '.[].ruleset_id' "$inputs/main-effective-rules.json" | sort -n -u
+          )
+          test "${#branch_ruleset_ids[@]}" -gt 0
+          for ruleset_id in "${branch_ruleset_ids[@]}"; do
+            [[ "$ruleset_id" =~ ^[1-9][0-9]*$ ]]
+            gh api "repos/$REPOSITORY/rulesets/$ruleset_id" \
+              > "$inputs/branch-rulesets/$ruleset_id.json"
+          done
+          jq --slurp '.' "$inputs"/branch-rulesets/*.json > "$inputs/branch-rulesets.json"
+          gh api "repos/$REPOSITORY/branches?protected=true&per_page=100" \
+            > "$inputs/protected-branches.json"
+          gh api "repos/$REPOSITORY/rulesets?includes_parents=true&per_page=100" \
+            > "$inputs/ruleset-summaries.json"
+          test "$(jq length "$inputs/ruleset-summaries.json")" -lt 100
+          mapfile -t tag_ruleset_ids < <(
+            jq -r '.[] | select(.target == "tag") | .id' \
+              "$inputs/ruleset-summaries.json" | sort -n -u
+          )
+          test "${#tag_ruleset_ids[@]}" -gt 0
+          for ruleset_id in "${tag_ruleset_ids[@]}"; do
+            [[ "$ruleset_id" =~ ^[1-9][0-9]*$ ]]
+            gh api "repos/$REPOSITORY/rulesets/$ruleset_id" \
+              > "$inputs/tag-rulesets/$ruleset_id.json"
+          done
+          jq --slurp '.' "$inputs"/tag-rulesets/*.json > "$inputs/tag-rulesets.json"
+          for environment in live-validation pypi release-finalization released-validation; do
+            gh api "repos/$REPOSITORY/environments/$environment" \
+              > "$inputs/environments/$environment.json"
+          done
+          python src/clio_relay/ci_validation.py build-governance \
+            --main-effective-rules "$inputs/main-effective-rules.json" \
+            --protected-branches "$inputs/protected-branches.json" \
+            --branch-rulesets "$inputs/branch-rulesets.json" \
+            --tag-rulesets "$inputs/tag-rulesets.json" \
+            --environments-dir "$inputs/environments" \
+            --repository "$REPOSITORY" \
+            --source-commit "$SOURCE_COMMIT" \
+            --tag "$TAG_NAME" \
+            --output dist/REPOSITORY-GOVERNANCE.json
+
+      - name: normalize and verify the complete candidate payload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ steps.candidate.outputs.source_commit }}
+          TAG_NAME: ${{ inputs.tag }}
+          VERSION: ${{ steps.candidate.outputs.version }}
+        shell: bash
+        run: |
+          python src/clio_relay/ci_validation.py verify-ci-status \
+            --receipt dist/CI-STATUS.json \
+            --repository "$REPOSITORY" \
+            --source-commit "$SOURCE_COMMIT"
+          python src/clio_relay/ci_validation.py verify-live-governance \
+            --receipt dist/REPOSITORY-GOVERNANCE.json \
+            --repository "$REPOSITORY" \
+            --source-commit "$SOURCE_COMMIT" \
+            --tag "$TAG_NAME"
+          python - dist/validation-local.json "$SOURCE_COMMIT" "$TAG_NAME" "$VERSION" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          commit, tag, version = sys.argv[2:]
+          software = report.get("software", {})
+          source = report.get("install_source", {})
+          checks = {
+              "status": report.get("status") == "passed",
+              "cluster": report.get("cluster") == "local",
+              "commit": software.get("commit") == commit,
+              "tag": software.get("tag") == tag,
+              "clean": software.get("dirty") is False,
+              "version": source.get("distribution_version") == version,
+          }
+          failed = sorted(name for name, passed in checks.items() if not passed)
+          if failed:
+              raise SystemExit(f"local release report identity failed: {failed}")
+          PY
+          python src/clio_relay/ci_validation.py candidate-manifest --candidate-dir dist
+
+      - name: create or verify the empty exact-target draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ steps.candidate.outputs.source_commit }}
+          TAG_NAME: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          authority=(python src/clio_relay/ci_validation.py mutation-authority
+            --governance-receipt dist/REPOSITORY-GOVERNANCE.json
+            --repository "$REPOSITORY"
+            --source-commit "$SOURCE_COMMIT"
+            --tag "$TAG_NAME"
+            --workflow-ref "$GITHUB_REF"
+            --workflow-sha "$GITHUB_SHA")
+          if gh release view "$TAG_NAME" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            "${authority[@]}" --release-state present --draft true
+          else
+            "${authority[@]}" --release-state absent --draft any
+            wheel="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+            wheel_sha="$(sha256sum "$wheel" | cut -d ' ' -f 1)"
+            gh release create "$TAG_NAME" \
+              --repo "$REPOSITORY" \
+              --verify-tag \
+              --target "$SOURCE_COMMIT" \
+              --draft \
+              --title "$TAG_NAME" \
+              --notes "Immutable candidate wheel SHA-256: $wheel_sha. Live validation and PyPI promotion are pending."
+          fi
+          "${authority[@]}" --release-state present --draft true
+
+      - name: revalidate protected main immediately before candidate attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ steps.candidate.outputs.source_commit }}
+          TAG_NAME: ${{ inputs.tag }}
+        shell: bash
+        run: >-
+          python src/clio_relay/ci_validation.py mutation-authority
+          --governance-receipt dist/REPOSITORY-GOVERNANCE.json
+          --repository "$REPOSITORY"
+          --source-commit "$SOURCE_COMMIT"
+          --tag "$TAG_NAME"
+          --workflow-ref "$GITHUB_REF"
+          --workflow-sha "$GITHUB_SHA"
+          --release-state present
+          --draft true
+
+      - name: attest candidate artifacts and local evidence from protected main
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - name: attach only missing candidate assets and verify API digests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ steps.candidate.outputs.source_commit }}
+          TAG_NAME: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          inspect_assets() {
+            local suffix="$1"
+            gh api "repos/$REPOSITORY/releases/tags/$TAG_NAME" \
+              > "$RUNNER_TEMP/release-$suffix.json"
+            release_id="$(jq -r .id "$RUNNER_TEMP/release-$suffix.json")"
+            [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
+            gh api "repos/$REPOSITORY/releases/$release_id/assets?per_page=100" \
+              > "$RUNNER_TEMP/release-assets-$suffix.json"
+            jq --slurpfile assets "$RUNNER_TEMP/release-assets-$suffix.json" \
+              '.assets = $assets[0]' "$RUNNER_TEMP/release-$suffix.json" \
+              > "$RUNNER_TEMP/release-complete-$suffix.json"
+            python src/clio_relay/ci_validation.py staged-assets \
+              --release "$RUNNER_TEMP/release-complete-$suffix.json" \
+              --candidate-dir dist \
+              --output "$RUNNER_TEMP/release-plan-$suffix.json"
+          }
+          inspect_assets before
+          mapfile -t missing < <(jq -r '.missing[].name' "$RUNNER_TEMP/release-plan-before.json")
+          if test "${#missing[@]}" -gt 0; then
+            upload=()
+            for name in "${missing[@]}"; do
+              upload+=("dist/$name")
+            done
+            python src/clio_relay/ci_validation.py mutation-authority \
+              --governance-receipt dist/REPOSITORY-GOVERNANCE.json \
+              --repository "$REPOSITORY" \
+              --source-commit "$SOURCE_COMMIT" \
+              --tag "$TAG_NAME" \
+              --workflow-ref "$GITHUB_REF" \
+              --workflow-sha "$GITHUB_SHA" \
+              --release-state present \
+              --draft true
+            gh release upload "$TAG_NAME" "${upload[@]}" --repo "$REPOSITORY"
+          fi
+          inspect_assets after
+          test "$(jq '.missing | length' "$RUNNER_TEMP/release-plan-after.json")" -eq 0
+          for subject in dist/*.whl dist/*.tar.gz dist/validation-local.json \
+            dist/CI-STATUS.json dist/REPOSITORY-GOVERNANCE.json; do
+            gh attestation verify "$subject" \
+              --repo "$REPOSITORY" \
+              --signer-workflow "$REPOSITORY/.github/workflows/stage-candidate.yml" \
+              --source-ref "refs/heads/main" \
+              --source-digest "$SOURCE_COMMIT" \
+              --deny-self-hosted-runners
+          done

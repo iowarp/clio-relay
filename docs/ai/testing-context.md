@@ -47,9 +47,9 @@ The 0.9.17 validation includes:
 - Ares worker restart with `clio_relay.__version__ == 0.9.17`.
 - Homelab WSS/STCP, XTCP, and SSH-forward transport checks, followed by clean
   probe-process and metadata cleanup scans.
-- Ares builtin JARVIS LAMMPS acceptance with WSS relay, XTCP direct transport,
-  stdout, stderr, artifacts, provenance, and LAMMPS progress.
-- Ares remote-agent MCP child LAMMPS submission.
+- Ares application-package acceptance with WSS relay, XTCP direct transport,
+  stdout, stderr, artifacts, provenance, and package-owned progress.
+- Ares remote-agent MCP child application submission.
 - forced SLURM pending state and relay cancel propagation.
 - ParaView-style gateway create, update, get, and close record lifecycle.
 - task timeline CLI record/read and HTTP, SSE, and WebSocket replay over an
@@ -59,3 +59,24 @@ Historical validation files remain useful for debugging regressions, but they
 are not current proof for a release candidate.
 
 Refresh this evidence when changing the relevant code. Do not present old live evidence as current proof after transport, lifecycle, worker, or acceptance code changes.
+
+## Machine-readable evidence
+
+`clio-relay live-test` writes a versioned JSON report by default under
+`.clio-relay/validation-reports`. The report is canonical; an optional Markdown
+file is only a view. Reports contain package/build/install identity, checks,
+relay and scheduler jobs, sessions/connectors, artifact and log references,
+cleanup policy, residual resources, and partial failure evidence.
+
+Use `clio-relay release validate-local` for the local quality report. Candidate
+wheel reports are sealed before PyPI publication and remain valuable regression
+evidence, but the final
+`clio-relay release gate --policy docs/release-gate-1.0.yaml` matrix accepts
+only reports produced through the published `uvx --from clio-relay==<version>`
+path. A checkout or local wheel report is diagnostic evidence, not proof of a
+released `uvx` path.
+
+The pending lifecycle and scheduler-provider procedure is
+`lifecycle-scheduler-live-validation.md`. Candidate-wheel evidence can gate
+artifact publication, but only a repeated released-`uvx` run satisfies the
+final release gate. A checkout run satisfies neither gate.

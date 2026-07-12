@@ -40,12 +40,19 @@ Job submission is asynchronous by default. Submit returns a `job_id`, state, kin
 Remote agent jobs should usually submit child cluster work asynchronously and return the child `job_id`. A cluster worker running a parent agent job cannot also execute a child job if it is waiting synchronously inside the parent.
 
 Cancellation is durable and cooperative. A cancel request records queue events and the worker terminates the running process group. For scheduler-backed packages, package code should capture scheduler job ids and cancel through the scheduler when needed.
+Session teardown quiesces the exact owner-session generation before discovery. With
+`--cancel-jobs`, it waits boundedly for worker cleanup acknowledgment of leased and
+running jobs before gateway or API cleanup. It stops the API to seal intake, rescans
+for pre-quiescence in-flight submissions, and acknowledges those before gateway
+cleanup. A timeout leaves intake quiesced and the remaining resources explicit.
+
+JARVIS runtime metadata uses the normalized `clio-relay.jarvis-runtime.v1` contract. Structured results from an owned `jarvis_run` call (`structuredContent` first, JSON text content as compatibility) and authenticated runtime sidecar records are authoritative. The normalized record is merged into job and task metadata, emitted as monotonic runtime events, indexed as `runtime-metadata.json`, and embedded in execution provenance. Stdout scheduler-id patterns are a compatibility fallback only, must be labeled `legacy_stdout`, and cannot authorize polling or cancellation.
 
 ## Progress
 
-Progress can come from generic regex rules or package-aware adapters.
+Progress can come from generic regex rules or package-aware adapters. Application installers and progress adapters are discovered through the `clio_relay.application_profiles` and `clio_relay.package_progress_adapters` entry-point groups. Application adapters own log paths, parsers, package probes, and application-specific acceptance predicates; generic bootstrap and worker code do not.
 
-Trusted package progress must be distinguishable from raw workload stdout. Raw stdout text is not proof that a package adapter ran. LAMMPS acceptance uses the upstream JARVIS `builtin.lammps` package and package-aware relay parsing enabled for that package.
+Trusted package progress must be distinguishable from raw workload stdout. Raw stdout text is not proof that a package adapter ran.
 
 ETA is based on observed iterative progress after warmup. It should include confidence or sample metadata when exposed to clients.
 
@@ -66,11 +73,23 @@ Remote sessions are owned by a session id. Session metadata and PID files live u
 
 The desktop shutdown choices are separate:
 
-- close local UI and detach from remote session.
-- close local UI and tear down the owned remote session.
+- close local UI, stop owned desktop connectors, and detach from the remote session.
+- close local UI, stop verified owned local/remote connectors and relay API processes,
+  and close gateway records owned by the session.
 - close local UI and also stop the persistent worker service.
 
 Only the last option should call `session teardown --stop-worker`.
+Relay jobs are retained unless `--cancel-jobs` is explicit. Scheduler work is
+retained unless `--cancel-scheduler-jobs` is also explicit. Cleanup reports must
+include ownership verification, action, outcome, and residual-resource fields.
+
+## Scheduler provider boundary
+
+Every cluster has an explicit `scheduler_provider`. `external` is the generic
+default for package-owned or nonscheduler runtimes; a SLURM site selects `slurm`
+in its cluster definition. Missing provider metadata must never silently become
+SLURM. Structured JARVIS runtime metadata is preferred for provider and job ids,
+and must agree with the worker's configured provider before polling or canceling.
 
 ## Configurability
 
@@ -79,7 +98,7 @@ Do not hardcode:
 - `ares`
 - `codex`
 - `frps.jcernuda.com`
-- LAMMPS
+- application names, package log formats, or installer commands
 - Cloudflare
 - local filesystem roots
 

@@ -6,55 +6,76 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
 jobs:
-  test:
-    name: python ${{ matrix.python-version }}
+  workflow-lint:
+    name: GitHub Actions syntax and semantics
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.12", "3.13"]
 
     steps:
       - name: check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: install checksum-pinned actionlint
+        shell: bash
+        run: |
+          archive=actionlint_1.7.12_linux_amd64.tar.gz
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/$archive"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $archive" \
+            | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" actionlint
+
+      - name: lint workflows
+        run: ./actionlint
+
+  test:
+    name: ${{ matrix.os }} / python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13", "3.14"]
+
+    steps:
+      - name: check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
+          version: "0.11.28"
 
       - name: set up python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: install dependencies
         run: uv sync --locked --all-groups
 
-      - name: lint
-        run: uv run ruff check
-
-      - name: format check
-        run: uv run ruff format --check
-
-      - name: type check
-        run: uv run pyright
-
-      - name: test
-        run: uv run pytest
-
-      - name: build package
-        run: uv build
-
-      - name: check package metadata
-        run: uvx twine check dist/*
+      - name: run evidence-producing local release gate
+        run: >-
+          uv run clio-relay release validate-local
+          --project-root .
+          --report dist/validation-local-${{ runner.os }}-${{ matrix.python-version }}.json
+          --artifact-dir dist
 
       - name: upload package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: dist-${{ matrix.python-version }}
+          name: dist-${{ runner.os }}-${{ matrix.python-version }}
           path: |
             dist/*.whl
             dist/*.tar.gz
+            dist/validation-*.json
           if-no-files-found: error
