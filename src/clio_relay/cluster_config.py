@@ -35,6 +35,7 @@ CONFIG_REPLACE_ATTEMPTS = 25
 
 _WINDOWS_READ_CONTROL = 0x00020000
 _WINDOWS_WRITE_DAC = 0x00040000
+_WINDOWS_WRITE_OWNER = 0x00080000
 _WINDOWS_GENERIC_READ = 0x80000000
 _WINDOWS_GENERIC_WRITE = 0x40000000
 _WINDOWS_FILE_SHARE_READ = 0x00000001
@@ -58,6 +59,7 @@ _WINDOWS_CONTAINER_INHERIT_ACE = 0x02
 _WINDOWS_PRIVATE_SIDS = {"S-1-3-4", "S-1-5-18", "S-1-5-32-544"}
 _WINDOWS_TOKEN_QUERY = 0x0008
 _WINDOWS_TOKEN_USER = 1
+_WINDOWS_TOKEN_OWNER = 4
 _WINDOWS_ERROR_ALREADY_EXISTS = 183
 
 
@@ -110,6 +112,10 @@ class _WindowsSidAndAttributes(ctypes.Structure):
 
 class _WindowsTokenUser(ctypes.Structure):
     _fields_ = [("user", _WindowsSidAndAttributes)]
+
+
+class _WindowsTokenOwner(ctypes.Structure):
+    _fields_ = [("owner", ctypes.c_void_p)]
 
 
 class _WindowsSecurityAttributes(ctypes.Structure):
@@ -687,7 +693,10 @@ def _create_private_windows_atomic_descriptor(path: Path) -> int:
     try:
         raw_handle = create_file(
             str(path),
-            _WINDOWS_GENERIC_WRITE | _WINDOWS_READ_CONTROL | _WINDOWS_WRITE_DAC,
+            _WINDOWS_GENERIC_WRITE
+            | _WINDOWS_READ_CONTROL
+            | _WINDOWS_WRITE_DAC
+            | _WINDOWS_WRITE_OWNER,
             0,
             ctypes.byref(security_attributes),
             _WINDOWS_CREATE_NEW,
@@ -844,7 +853,7 @@ def _open_windows_configuration_handle(
         flags |= _WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
     raw_handle = create_file(
         str(path),
-        _WINDOWS_GENERIC_READ | _WINDOWS_READ_CONTROL | _WINDOWS_WRITE_DAC,
+        _WINDOWS_GENERIC_READ | _WINDOWS_READ_CONTROL | _WINDOWS_WRITE_DAC | _WINDOWS_WRITE_OWNER,
         _WINDOWS_FILE_SHARE_READ,
         None,
         _WINDOWS_OPEN_EXISTING,
@@ -920,7 +929,15 @@ def _windows_sid_text(
         local_free(sid_text_pointer)
 
 
-def _current_windows_user_sid(*, advapi32: Any, kernel32: Any, path: Path) -> str:
+def _current_windows_token_sid(
+    *,
+    information_class: int,
+    minimum_size: int,
+    context: str,
+    advapi32: Any,
+    kernel32: Any,
+    path: Path,
+) -> str:
     get_current_process = kernel32.GetCurrentProcess
     get_current_process.argtypes = []
     get_current_process.restype = ctypes.c_void_p
@@ -952,36 +969,60 @@ def _current_windows_user_sid(*, advapi32: Any, kernel32: Any, path: Path) -> st
         required = ctypes.c_uint32()
         get_token_information(
             token,
-            _WINDOWS_TOKEN_USER,
+            information_class,
             None,
             0,
             ctypes.byref(required),
         )
-        if required.value < ctypes.sizeof(_WindowsTokenUser):
+        if required.value < minimum_size:
             error = _windows_last_error()
             raise ConfigurationError(
-                f"could not size current Windows user identity ({error}): {path}"
+                f"could not size current Windows {context} identity ({error}): {path}"
             )
         buffer = ctypes.create_string_buffer(required.value)
         if not get_token_information(
             token,
-            _WINDOWS_TOKEN_USER,
+            information_class,
             buffer,
             required.value,
             ctypes.byref(required),
         ):
             error = _windows_last_error()
-            raise ConfigurationError(f"could not read current Windows user ({error}): {path}")
-        token_user = ctypes.cast(buffer, ctypes.POINTER(_WindowsTokenUser)).contents
+            raise ConfigurationError(f"could not read current Windows {context} ({error}): {path}")
+        sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p)).contents
+        if sid.value is None:
+            raise ConfigurationError(f"current Windows {context} has no SID: {path}")
         return _windows_sid_text(
-            token_user.user.sid,
+            sid,
             advapi32=advapi32,
             kernel32=kernel32,
             path=path,
-            context="current user",
+            context=f"current {context}",
         )
     finally:
         _close_windows_handle(token, kernel32=kernel32)
+
+
+def _current_windows_user_sid(*, advapi32: Any, kernel32: Any, path: Path) -> str:
+    return _current_windows_token_sid(
+        information_class=_WINDOWS_TOKEN_USER,
+        minimum_size=ctypes.sizeof(_WindowsTokenUser),
+        context="user",
+        advapi32=advapi32,
+        kernel32=kernel32,
+        path=path,
+    )
+
+
+def _current_windows_default_owner_sid(*, advapi32: Any, kernel32: Any, path: Path) -> str:
+    return _current_windows_token_sid(
+        information_class=_WINDOWS_TOKEN_OWNER,
+        minimum_size=ctypes.sizeof(_WindowsTokenOwner),
+        context="default owner",
+        advapi32=advapi32,
+        kernel32=kernel32,
+        path=path,
+    )
 
 
 def _windows_object_owner_sid(
@@ -1036,8 +1077,17 @@ def _windows_object_owner_sid(
         local_free(descriptor)
 
 
-def _require_current_windows_owner(*, owner_sid: str, user_sid: str, path: Path) -> None:
-    if owner_sid != user_sid:
+def _require_current_windows_owner(
+    *,
+    owner_sid: str,
+    user_sid: str,
+    default_owner_sid: str | None = None,
+    path: Path,
+) -> None:
+    permitted_owner_sids = {user_sid}
+    if default_owner_sid is not None:
+        permitted_owner_sids.add(default_owner_sid)
+    if owner_sid not in permitted_owner_sids:
         raise ConfigurationError(f"configuration path is not owned by this user: {path}")
 
 
@@ -1202,6 +1252,11 @@ def _set_private_windows_acl(
         kernel32=kernel32,
         path=path,
     )
+    default_owner_sid = _current_windows_default_owner_sid(
+        advapi32=advapi32,
+        kernel32=kernel32,
+        path=path,
+    )
     descriptor = _build_private_windows_security_descriptor(
         directory=directory,
         advapi32=advapi32,
@@ -1251,7 +1306,36 @@ def _set_private_windows_acl(
             kernel32=kernel32,
             path=path,
         )
-        _require_current_windows_owner(owner_sid=owner_sid, user_sid=user_sid, path=path)
+        _require_current_windows_owner(
+            owner_sid=owner_sid,
+            user_sid=user_sid,
+            default_owner_sid=default_owner_sid,
+            path=path,
+        )
+        # Elevated tokens can assign their TokenOwner SID (commonly the local
+        # Administrators group) to objects this process creates.  Accept only
+        # that token-proven default, then normalize it to TokenUser below.
+        descriptor_owner = ctypes.c_void_p()
+        owner_defaulted = ctypes.c_int()
+        get_owner = advapi32.GetSecurityDescriptorOwner
+        get_owner.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        get_owner.restype = ctypes.c_int
+        if not get_owner(
+            descriptor,
+            ctypes.byref(descriptor_owner),
+            ctypes.byref(owner_defaulted),
+        ):
+            error = _windows_last_error()
+            raise ConfigurationError(
+                f"could not read private Windows configuration owner ({error}): {path}"
+            )
+        if descriptor_owner.value is None:
+            raise ConfigurationError(f"private Windows configuration owner has no SID: {path}")
+        normalize_owner = owner_sid != user_sid
         set_security = advapi32.SetSecurityInfo
         set_security.argtypes = [
             ctypes.c_void_p,
@@ -1266,8 +1350,10 @@ def _set_private_windows_acl(
         result = set_security(
             handle,
             _WINDOWS_SE_FILE_OBJECT,
-            _WINDOWS_DACL_SECURITY_INFORMATION | _WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION,
-            None,
+            _WINDOWS_DACL_SECURITY_INFORMATION
+            | _WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION
+            | (_WINDOWS_OWNER_SECURITY_INFORMATION if normalize_owner else 0),
+            descriptor_owner if normalize_owner else None,
             None,
             dacl,
             None,

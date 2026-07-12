@@ -353,10 +353,17 @@ def test_windows_configuration_owner_must_match_current_user(tmp_path: Path) -> 
         user_sid="S-1-5-21-current",
         path=path,
     )
+    cluster_config._require_current_windows_owner(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        owner_sid="S-1-5-32-544",
+        user_sid="S-1-5-21-current",
+        default_owner_sid="S-1-5-32-544",
+        path=path,
+    )
     with pytest.raises(ConfigurationError, match="not owned by this user"):
         cluster_config._require_current_windows_owner(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             owner_sid="S-1-5-21-foreign",
             user_sid="S-1-5-21-current",
+            default_owner_sid="S-1-5-32-544",
             path=path,
         )
 
