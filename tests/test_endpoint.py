@@ -2040,6 +2040,7 @@ def test_runtime_sidecar_failure_latches_until_exact_scheduler_reconciliation(
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     scheduler = FakeSchedulerProvider()
+    owned_processes: list[subprocess.Popen[str]] = []
 
     class InvalidThenSignedDirectProvider(RecordingProvider):
         def run_named_pipeline_streaming(
@@ -2063,8 +2064,16 @@ def test_runtime_sidecar_failure_latches_until_exact_scheduler_reconciliation(
             _write_direct_runtime_sidecar(env)
             signed_direct = runtime_path.read_text(encoding="utf-8")
             runtime_path.write_text("{}\n" + signed_direct, encoding="utf-8")
+            process = process_containment.spawn_owned_process(
+                [sys.executable, "-c", "import time;time.sleep(60)"],
+                env=process_containment.owner_environment(None),
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            owned_processes.append(process)
             if on_start is not None:
-                on_start(919)
+                on_start(process.pid)
             if on_poll is not None:
                 on_poll()
             return subprocess.CompletedProcess(["jarvis", "ppl", "run"], 0, "", "")
@@ -2087,40 +2096,48 @@ def test_runtime_sidecar_failure_latches_until_exact_scheduler_reconciliation(
     )
     worker.register()
 
-    result = worker.run_once()
+    try:
+        result = worker.run_once()
 
-    assert result is not None
-    assert result.state is JobState.FAILED
-    task = queue.list_tasks(job.job_id)[0]
-    channel = cast(dict[str, object], task.metadata["runtime_sidecar_channel"])
-    assert channel["state"] == "failed_closed"
-    assert channel["resolution_requirement"] == "exact_scheduler_marker_reconciliation"
-    sidecars = cast(dict[str, object], task.metadata["execution_sidecars"])
-    assert "scheduler_expected_resolved" not in sidecars
-    assert task.metadata["scheduler_job_ids"] == []
-    assert task.metadata["scheduler_job_ownership"] == []
-    runtime_path = settings.spool_dir / job.job_id / cast(str, sidecars["runtime"])
-    assert runtime_path.read_text(encoding="utf-8").count("\n") == 2
-    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=100)
-    event_types = {event.event_type for event in events}
-    assert "runtime.metadata_channel_failed_closed" in event_types
-    assert "scheduler.direct_execution_confirmed" not in event_types
+        assert result is not None
+        assert result.state is JobState.FAILED
+        task = queue.list_tasks(job.job_id)[0]
+        channel = cast(dict[str, object], task.metadata["runtime_sidecar_channel"])
+        assert channel["state"] == "failed_closed"
+        assert channel["resolution_requirement"] == "exact_scheduler_marker_reconciliation"
+        sidecars = cast(dict[str, object], task.metadata["execution_sidecars"])
+        assert "scheduler_expected_resolved" not in sidecars
+        assert task.metadata["scheduler_job_ids"] == []
+        assert task.metadata["scheduler_job_ownership"] == []
+        runtime_path = settings.spool_dir / job.job_id / cast(str, sidecars["runtime"])
+        assert runtime_path.read_text(encoding="utf-8").count("\n") == 2
+        events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=100)
+        event_types = {event.event_type for event in events}
+        assert "runtime.metadata_channel_failed_closed" in event_types
+        assert "scheduler.direct_execution_confirmed" not in event_types
 
-    scheduler.reconciliation_matches = ["exact-42"]
-    cast(Any, worker)._reconcile_pending_execution_cleanup()
+        scheduler.reconciliation_matches = ["exact-42"]
+        cast(Any, worker)._reconcile_pending_execution_cleanup()
 
-    recovered = queue.get_task(task.task_id)
-    recovered_channel = cast(
-        dict[str, object],
-        recovered.metadata["runtime_sidecar_channel"],
-    )
-    assert recovered_channel["state"] == "resolved_by_exact_scheduler_reconciliation"
-    assert recovered.metadata["scheduler_job_ids"] == ["exact-42"]
-    ownership = cast(list[dict[str, object]], recovered.metadata["scheduler_job_ownership"])
-    assert ownership[0]["proof"] == "exact_scheduler_marker_reconciliation"
-    pending, truncated = queue.scan_execution_cleanup(cluster="ares", limit=10)
-    assert pending == []
-    assert truncated is False
+        recovered = queue.get_task(task.task_id)
+        recovered_channel = cast(
+            dict[str, object],
+            recovered.metadata["runtime_sidecar_channel"],
+        )
+        assert recovered_channel["state"] == "resolved_by_exact_scheduler_reconciliation"
+        assert recovered.metadata["scheduler_job_ids"] == ["exact-42"]
+        ownership = cast(list[dict[str, object]], recovered.metadata["scheduler_job_ownership"])
+        assert ownership[0]["proof"] == "exact_scheduler_marker_reconciliation"
+        pending, truncated = queue.scan_execution_cleanup(cluster="ares", limit=10)
+        assert pending == []
+        assert truncated is False
+        assert len(owned_processes) == 1
+        owned_processes[0].wait(timeout=5)
+    finally:
+        for process in owned_processes:
+            if process.poll() is None:
+                process_containment.terminate_owned_process(process)
+            process_containment.release_owned_process(process)
 
 
 def test_authenticated_direct_mode_pin_rejects_later_scheduler_identity(

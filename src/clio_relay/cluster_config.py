@@ -656,9 +656,15 @@ def open_private_atomic_file(path: Path) -> BinaryIO:
 def _create_private_windows_atomic_descriptor(path: Path) -> int:
     kernel32 = _load_windows_library("kernel32")
     advapi32 = _load_windows_library("advapi32")
+    owner_sid = _current_windows_user_sid(
+        advapi32=advapi32,
+        kernel32=kernel32,
+        path=path,
+    )
     security_descriptor = _build_private_windows_security_descriptor(
         directory=False,
         advapi32=advapi32,
+        owner_sid=owner_sid,
         path=path,
     )
     security_attributes = _WindowsSecurityAttributes(
@@ -706,12 +712,13 @@ def _build_private_windows_security_descriptor(
     *,
     directory: bool,
     advapi32: Any,
+    owner_sid: str,
     path: Path,
 ) -> ctypes.c_void_p:
     sddl = (
-        "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+        f"O:{owner_sid}D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
         if directory
-        else "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"
+        else f"O:{owner_sid}D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"
     )
     descriptor = ctypes.c_void_p()
     convert = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
@@ -781,9 +788,15 @@ def ensure_private_configuration_directory(path: Path) -> None:
 def _create_private_windows_directory(path: Path) -> None:
     kernel32 = _load_windows_library("kernel32")
     advapi32 = _load_windows_library("advapi32")
+    owner_sid = _current_windows_user_sid(
+        advapi32=advapi32,
+        kernel32=kernel32,
+        path=path,
+    )
     security_descriptor = _build_private_windows_security_descriptor(
         directory=True,
         advapi32=advapi32,
+        owner_sid=owner_sid,
         path=path,
     )
     security_attributes = _WindowsSecurityAttributes(
@@ -1184,9 +1197,15 @@ def _set_private_windows_acl(
 ) -> None:
     advapi32 = _load_windows_library("advapi32")
     kernel32 = _load_windows_library("kernel32")
+    user_sid = _current_windows_user_sid(
+        advapi32=advapi32,
+        kernel32=kernel32,
+        path=path,
+    )
     descriptor = _build_private_windows_security_descriptor(
         directory=directory,
         advapi32=advapi32,
+        owner_sid=user_sid,
         path=path,
     )
     handle = existing_handle
@@ -1226,11 +1245,6 @@ def _set_private_windows_acl(
                 kernel32=kernel32,
                 path=path,
             )
-        user_sid = _current_windows_user_sid(
-            advapi32=advapi32,
-            kernel32=kernel32,
-            path=path,
-        )
         owner_sid = _windows_object_owner_sid(
             handle,
             advapi32=advapi32,

@@ -185,6 +185,12 @@ def test_windows_atomic_create_captures_error_before_freeing_descriptor(
     def build_descriptor(**_kwargs: object) -> ctypes.c_void_p:
         return ctypes.c_void_p(1)
 
+    def current_user_sid(*, advapi32: object, kernel32: object, path: Path) -> str:
+        assert advapi32 is not None
+        assert kernel32 is not None
+        assert path.name == "private.tmp"
+        return "S-1-5-21-current"
+
     monkeypatch.setattr(cluster_config.os, "name", "nt")
     monkeypatch.setattr(cluster_config, "_load_windows_library", load_library)
     monkeypatch.setattr(
@@ -192,6 +198,7 @@ def test_windows_atomic_create_captures_error_before_freeing_descriptor(
         "_build_private_windows_security_descriptor",
         build_descriptor,
     )
+    monkeypatch.setattr(cluster_config, "_current_windows_user_sid", current_user_sid)
     monkeypatch.setattr(cluster_config, "_windows_last_error", last_error)
     monkeypatch.setattr(cluster_config, "_free_windows_local", free_descriptor)
     monkeypatch.setattr(cluster_config, "_windows_error", windows_error)
