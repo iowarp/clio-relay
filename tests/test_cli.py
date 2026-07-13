@@ -3806,6 +3806,8 @@ def test_cli_session_rejects_scheduler_sentinel_without_both_cancel_flags(
                 "--validation-report",
                 str(tmp_path / f"sentinel-preflight-{len(flags)}.json"),
             ],
+            color=False,
+            terminal_width=200,
         )
 
         assert result.exit_code == 2

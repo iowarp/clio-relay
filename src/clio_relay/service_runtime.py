@@ -3991,6 +3991,24 @@ def _local_connector_group_members(connector: dict[str, object]) -> list[int]:
         if fields[0] == "Z":
             continue
         try:
+            command_line = (
+                (proc / "cmdline")
+                .read_bytes()
+                .replace(bytes([0]), b" ")
+                .decode("utf-8", errors="replace")
+            )
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError as exc:
+            raise RelayError(
+                f"cannot inspect local connector group member {member_pid}: {exc}"
+            ) from exc
+        if "frpc" not in command_line.casefold() or not _command_contains_path(
+            command_line,
+            config_path,
+        ):
+            continue
+        try:
             environment = (proc / "environ").read_bytes().split(bytes([0]))
         except (FileNotFoundError, ProcessLookupError):
             continue

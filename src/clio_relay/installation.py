@@ -270,8 +270,12 @@ def probe_persistent_uv_tool_identity(
     uv_path = _required_regular_file(uv_executable, label="uv executable")
     executable_location = _absolute_path(tool_executable, label="tool executable")
     executable_path = _required_regular_file(executable_location, label="tool executable")
-    provider_path = _required_regular_file(
+    provider_location = _absolute_path(
         provider_interpreter,
+        label="tool provider interpreter",
+    )
+    provider_path = _required_regular_file(
+        provider_location,
         label="tool provider interpreter",
     )
     source_path = _required_regular_file(source_artifact, label="tool source artifact")
@@ -389,7 +393,7 @@ entry_points = sorted(
 )
 metadata_path = Path(installed._path).resolve(strict=True)
 print(json.dumps({
-    "provider_interpreter": str(Path(sys.executable).resolve(strict=True)),
+    "provider_interpreter": str(Path(sys.executable).absolute()),
     "environment_prefix": str(Path(sys.prefix).resolve(strict=True)),
     "distribution": installed.metadata.get("Name"),
     "distribution_version": installed.version,
@@ -407,7 +411,7 @@ print(json.dumps({
 """
     raw_probe = _bounded_identity_command(
         [
-            str(provider_path),
+            str(provider_location),
             "-I",
             "-c",
             probe_source,
@@ -426,7 +430,11 @@ print(json.dumps({
         raise ConfigurationError("persistent uv tool probe returned no identity object")
     evidence = cast(dict[str, Any], decoded)
     try:
-        observed_provider = Path(str(evidence["provider_interpreter"])).resolve(strict=True)
+        observed_provider = _absolute_path(
+            str(evidence["provider_interpreter"]),
+            label="observed tool provider interpreter",
+        )
+        observed_provider_target = observed_provider.resolve(strict=True)
         environment_prefix = Path(str(evidence["environment_prefix"])).resolve(strict=True)
         metadata_path = Path(str(evidence["distribution_metadata_path"])).resolve(strict=True)
         record_path = Path(str(evidence["record_path"])).resolve(strict=True)
@@ -439,9 +447,12 @@ print(json.dumps({
         raise ConfigurationError("persistent uv tool probe returned invalid paths") from exc
     except (TypeError, ValueError) as exc:
         raise ConfigurationError("persistent uv tool probe returned invalid paths") from exc
-    if observed_provider != provider_path:
+    if (
+        _lexical_path_key(observed_provider) != _lexical_path_key(provider_location)
+        or observed_provider_target != provider_path
+    ):
         raise ConfigurationError("persistent uv tool probe used the wrong interpreter")
-    if not _path_within(provider_path, environment_prefix):
+    if not _path_within(provider_location, environment_prefix):
         raise ConfigurationError("persistent uv tool provider is outside its environment")
     if not _path_within(environment_prefix, tool_directory):
         raise ConfigurationError("persistent tool environment is outside uv's tool directory")
@@ -495,7 +506,7 @@ print(json.dumps({
             tool_directory=str(tool_directory),
             tool_bin_directory=str(tool_bin_directory),
             environment_prefix=str(environment_prefix),
-            provider_interpreter=str(provider_path),
+            provider_interpreter=str(provider_location),
             provider_interpreter_sha256=sha256_file(provider_path),
             tool_executable=str(executable_location),
             tool_executable_resolved=str(executable_path),

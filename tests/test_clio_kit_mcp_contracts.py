@@ -277,6 +277,7 @@ def test_real_uv_tool_install_binds_external_launcher_to_receipt_and_record(
 
     assert Path(identity.tool_executable) == executable.absolute()
     assert Path(identity.tool_executable).parent == tool_bin_directory.absolute()
+    assert Path(identity.provider_interpreter) == provider.absolute()
     assert Path(identity.distribution_console_script_path).is_relative_to(environment.resolve())
     assert identity.tool_executable_sha256 == identity.distribution_console_script_sha256
     assert Path(identity.uv_receipt_path) == (environment / "uv-receipt.toml").resolve()
