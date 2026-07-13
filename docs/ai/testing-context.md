@@ -37,9 +37,9 @@ The expected Ares acceptance includes:
 
 ## Recent Live Evidence
 
-The current release-candidate evidence is `release-validation-0.9.17.md`.
-Use that file as the authoritative live evidence record for the 0.9.17
-candidate.
+Historical release-candidate evidence is retained in
+`release-validation-0.9.17.md`. Use that file only as the authoritative record
+for the 0.9.17 candidate; it is not evidence for the current 1.0 gate.
 
 The 0.9.17 validation includes:
 
@@ -68,15 +68,26 @@ file is only a view. Reports contain package/build/install identity, checks,
 relay and scheduler jobs, sessions/connectors, artifact and log references,
 cleanup policy, residual resources, and partial failure evidence.
 
+The complete report-producing acceptance CLI inventory is `release validate-local`;
+`relay-host test-frpc-connection`, `test-http-transport`, `test-direct-transport`, and
+`test-ssh-transport`; `remote-mcp validate`; `cluster bootstrap`; `session detach`
+and `session teardown`; `queue validate`; `scheduler validate-lifecycle`; `gateway
+start-runtime`, `detach-runtime`, and `stop-runtime`; `jarvis-mcp-validate`; and
+`live-test`. Every invocation writes a collision-resistant default JSON report on
+success and after preflight or runtime failure unless the operator supplies an
+explicit path. `release gate` consumes those reports; it is not an acceptance-report
+producer.
+
 Use `clio-relay release validate-local` for the local quality report. Candidate
 wheel reports are sealed before PyPI publication and remain valuable regression
 evidence, but the final
 `clio-relay release gate --policy docs/release-gate-1.0.yaml` matrix accepts
-only reports produced through the published `uvx --from clio-relay==<version>`
-path. A checkout or local wheel report is diagnostic evidence, not proof of a
-released `uvx` path.
+only reports produced through a persistent, exact
+`uv tool install --python 3.12 --no-config clio-relay==<version>` installation.
+A checkout, local wheel, or temporary `uvx` report is diagnostic evidence, not
+proof of the released persistent-tool path.
 
 The pending lifecycle and scheduler-provider procedure is
 `lifecycle-scheduler-live-validation.md`. Candidate-wheel evidence can gate
-artifact publication, but only a repeated released-`uvx` run satisfies the
-final release gate. A checkout run satisfies neither gate.
+artifact publication, but only a repeated released persistent-tool run
+satisfies the final release gate. A checkout run satisfies neither gate.

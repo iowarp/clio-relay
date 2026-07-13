@@ -51,13 +51,12 @@ The package and executable names in this example are placeholders for a
 site-approved server:
 
 ```powershell
+uv tool install --python 3.12 --no-config `
+  /absolute/path/to/science_mcp_kit-1.4.0-py3-none-any.whl
 clio-relay remote-mcp register `
   --cluster my-cluster `
   --name science `
-  --command uvx `
-  --arg=--from `
-  --arg /absolute/path/to/science_mcp_kit-1.4.0-py3-none-any.whl `
-  --arg science-mcp `
+  --command science-mcp `
   --env-from SCIENCE_API_TOKEN=SITE_SCIENCE_API_TOKEN `
   --allow-tool inspect_dataset `
   --allow-tool summarize_run `
@@ -65,11 +64,11 @@ clio-relay remote-mcp register `
   --call-timeout-seconds 300
 ```
 
-For a user profile, `--from` must identify the exact immutable wheel file.
-Index requirements such as `science-mcp-kit==1.4.0` remain resolver-mutable and
-therefore cannot produce released-artifact evidence. A direct console script
-is valid only for a unique non-editable distribution with a complete,
-hash-valid `RECORD` closure.
+For a user profile, install from the exact immutable wheel file and retain its
+digest. Index requirements such as `science-mcp-kit==1.4.0` remain
+resolver-mutable and therefore cannot produce released-artifact evidence. A
+direct console script is valid only for a unique non-editable distribution with
+a complete, hash-valid `RECORD` closure.
 
 Remote registrations are deny-by-default:
 
@@ -182,10 +181,21 @@ semantic contract are equivalent. Each cluster route retains its own
 operator-chosen registration name; that name is not cross-cluster identity.
 The local `cluster` schema is an enum of the eligible targets.
 
+Each MCP stdio connection binds virtual calls to the profile-specific catalog
+revision rendered by its most recent `tools/list`. The revision is returned in
+the list result's `_meta`, without adding relay bookkeeping fields to any tool's
+input schema. If a refresh, registration edit, profile change, or alias
+collision changes that catalog, the server rejects the stale call before route
+resolution; the client must run `tools/list` again. Successful virtual
+submissions return the bound `catalog_revision` alongside the durable job
+handle.
+
 Names are normalized deterministically. If normalized names collide, schemas
 differ between clusters, or a name conflicts with a built-in relay tool, the
-relay appends a stable digest. Alias generation is independent of registry and
-cache file ordering.
+relay appends a stable digest. Generated aliases are capped at 64 characters,
+with a digest-preserving suffix when an operator namespace or remote tool name
+is longer, so the local surface remains interoperable with MCP clients. Alias
+generation is independent of registry and cache file ordering.
 
 The generated input schema preserves the discovered contract. Simple object
 schemas stay flat and receive a local-only `cluster` property. Composed,
@@ -222,6 +232,7 @@ The compact built-in JARVIS aliases remain compatible:
 - `jarvis_describe`
 - `jarvis_add_step`
 - `jarvis_edit_step`
+- `jarvis_get_execution`
 - `jarvis_run`
 
 `jarvis_edit_step` uses an explicit `edit` or `remove` operation. The remove
@@ -229,23 +240,30 @@ operation unlinks pipeline membership without deleting package files. There is
 no `jarvis_remove_step` alias, including in admin/all profiles; admin retains the
 lower-level `unlink_pkg` compatibility tool. `jarvis_run` can accept `spack_specs`, whose environment is resolved
 and persisted by JARVIS immediately before execution.
+`jarvis_get_execution` is the unified durable query for the JARVIS handle,
+lifecycle record, runtime metadata, optional progress, and an optional bounded
+artifact page. It takes `cluster`, `pipeline_id`, and `execution_id`, plus
+`include_progress` and an `artifacts` filter object when needed. The relay
+removes only local routing controls before submitting the durable remote call;
+all JARVIS query and cursor fields pass through unchanged.
 
 Virtual JARVIS mutations and runs receive a fresh relay job by default. Supply
 an explicit `idempotency_key` only when retry de-duplication is intentional; an
 identical second `jarvis_run` is otherwise a new execution.
 
-The released clio-kit 2.2.6 command remains historical compatibility evidence,
-not proof of this revised contract. Bootstrap now persists the exact coordinated
-clio-kit wheel and JARVIS command in the worker installation receipt; an
-environment override is diagnostic only unless it matches that receipt. The 1.0
-artifact check opens the exact clio-kit wheel, verifies the embedded server's
-source and `uv.lock`, and records their digests together with the actual `uv`
-executable. clio-kit's locked launcher uses those same bytes with `uv run
---frozen --no-editable`; the live MCP response therefore binds the child server
-process to the outer wheel instead of trusting an unobserved nested resolution.
-The gate remains closed until that revised clio-kit contract is released and
-rerun on Ares and the homelab. Other servers use the operator registry and
-generated `remote_...` aliases.
+The released clio-kit 2.3.2 artifact is the pinned six-tool contract. Bootstrap
+downloads and hashes the exact coordinated wheel, installs it once with
+`uv tool install`, and persists the wheel plus the direct JARVIS command in the
+worker receipt. The receipt also binds the exact uv executable/version and
+tool directories, provider `sys.prefix`, `pyvenv.cfg` uv marker, console-script
+ownership, and complete installed RECORD closure. At call time the worker uses
+that persistent executable directly. clio-kit's child launcher still uses its
+wheel-owned server source and lock with `uv run --frozen --no-editable`, so the
+live MCP response binds both the installed outer tool and the locked child
+server rather than trusting an unobserved nested resolution. The release gate
+requires that exact 2.3.2 artifact to be rerun on every target selected by the
+release policy. Other servers use the operator registry and generated
+`remote_...` aliases.
 
 ## Register the Spack MCP
 
@@ -255,7 +273,7 @@ cluster registry. `spack_load` is intentionally absent because environment
 changes in an MCP child process would not affect a later JARVIS run. Runtime
 environment application belongs to `jarvis_run(spack_specs=[...])`.
 The semantic check is enabled explicitly with the
-`clio-kit-spack-user-v3` contract identifier; registration names remain
+`clio-kit-spack-user-v2` contract identifier; registration names remain
 operator-defined and do not select behavior.
 
 For an unreleased candidate, use an exact wheel path for the remote command and
@@ -266,13 +284,10 @@ building the coordinated clio-kit artifact:
 clio-relay remote-mcp register `
   --cluster my-cluster `
   --name spack `
-  --command uvx `
-  --arg=--from `
-  --arg=/absolute/path/to/clio_kit-3.0.0-py3-none-any.whl `
-  --arg=clio-kit `
+  --command /home/operator/.local/bin/clio-kit `
   --arg=mcp-server `
   --arg=spack `
-  --contract clio-kit-spack-user-v3 `
+  --contract clio-kit-spack-user-v2 `
   --allow-tool spack_find `
   --allow-tool spack_locate `
   --allow-tool spack_install `
@@ -284,8 +299,8 @@ clio-relay remote-mcp register `
 
 Before claiming a registered server path as released:
 
-1. install the candidate wheel or released `uvx` artifact on the desktop and
-   target cluster;
+1. install the exact candidate or released wheel once with `uv tool install`
+   on the desktop and target cluster, retaining its digest;
 2. register a non-JARVIS MCP server with an exact user-profile allowlist;
 3. run `remote-mcp refresh` and retain its JSON output;
 4. request `tools/list` from `clio-relay mcp-server` and record the generated

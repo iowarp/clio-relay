@@ -2,8 +2,9 @@
 
 Status: pending for the next release candidate. Local tests are not live evidence.
 
-Run every command through the exact wheel or released `uvx` artifact being evaluated.
-Set `$relay` to that artifact, for example:
+Install the exact wheel once with `uv tool install`, then run every command
+through that persistent executable. Set `$relay` to the retained artifact, for
+example:
 
 ```powershell
 $relay = (Resolve-Path .\dist\clio_relay-1.0.0rc1-py3-none-any.whl).Path
@@ -11,7 +12,12 @@ $runId = [guid]::NewGuid().ToString("N")
 $reportRoot = Join-Path ".clio-relay\validation-reports" $runId
 $installSource = "wheel:$([Uri]::new($relay).AbsoluteUri)"
 New-Item -ItemType Directory -Force $reportRoot | Out-Null
-uvx --python 3.12 --from $relay clio-relay --help
+$env:UV = (Get-Command uv).Source
+uv tool install --force --python 3.12 --no-config $relay
+$relayCommand = (Get-Command clio-relay).Source
+$env:CLIO_RELAY_VALIDATION_LAUNCHER = "uv-tool"
+$env:CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE = $relayCommand
+& $relayCommand --help
 ```
 
 The run directory and each command's canonical report id prevent concurrent or
@@ -27,11 +33,11 @@ releases only that id, requires a node-backed allocation and a fresh running
 observation, then waits for completion:
 
 ```powershell
-uvx --python 3.12 --from $relay clio-relay scheduler validate-lifecycle `
+& $relayCommand scheduler validate-lifecycle `
   --cluster ares `
   --run-seconds 30 `
   --report "$reportRoot\ares-scheduler-lifecycle.json" `
-  --validation-launcher uvx `
+  --validation-launcher uv-tool `
   --validation-install-source $installSource `
   --validation-artifact $relay
 ```
@@ -50,11 +56,11 @@ structured contract. Run it through `live-test` so success and partial failure a
 both recorded canonically:
 
 ```powershell
-uvx --python 3.12 --from $relay clio-relay live-test `
+& $relayCommand live-test `
   --cluster ares `
   --jarvis-yaml .\path\to\site-scheduler-acceptance.yaml `
   --report "$reportRoot\ares-jarvis-scheduler.json" `
-  --validation-launcher uvx `
+  --validation-launcher uv-tool `
   --validation-install-source $installSource `
   --validation-artifact $relay `
   --require-structured-runtime-metadata
@@ -70,32 +76,32 @@ generation returned by `session status`.
 ```powershell
 $cluster = "ares"
 $sessionId = "lifecycle-$cluster-$runId"
-uvx --python 3.12 --from $relay clio-relay session start `
+& $relayCommand session start `
   --cluster $cluster --session-id $sessionId --remote-api-port 18921
-$sessionStatus = uvx --python 3.12 --from $relay clio-relay session status `
+$sessionStatus = & $relayCommand session status `
   --cluster $cluster --session-id $sessionId | ConvertFrom-Json
 $generationId = $sessionStatus.session_generation_id
 
 # Use a site-owned generic ServiceRuntimeSpec; application behavior is not relay core.
 $runtimeSpec = ".\path\to\site-gateway-runtime.json"
-$gateway = uvx --python 3.12 --from $relay clio-relay gateway start-runtime `
+$gateway = & $relayCommand gateway start-runtime `
   --cluster $cluster --name "lifecycle-$runId" --runtime-json-file $runtimeSpec `
   --owner-session-id $sessionId --owner-session-generation-id $generationId `
   --validation-report "$reportRoot\$cluster-gateway-start.json" `
-  --validation-launcher uvx --validation-install-source $installSource `
+  --validation-launcher uv-tool --validation-install-source $installSource `
   --validation-artifact $relay | ConvertFrom-Json
 
-uvx --python 3.12 --from $relay clio-relay session detach `
+& $relayCommand session detach `
   --cluster $cluster --session-id $sessionId `
   --validation-report "$reportRoot\$cluster-detach.json" `
-  --validation-launcher uvx --validation-install-source $installSource `
+  --validation-launcher uv-tool --validation-install-source $installSource `
   --validation-artifact $relay
-uvx --python 3.12 --from $relay clio-relay session status `
+& $relayCommand session status `
   --cluster $cluster --session-id $sessionId
-uvx --python 3.12 --from $relay clio-relay session teardown `
+& $relayCommand session teardown `
   --cluster $cluster --session-id $sessionId --keep-jobs --keep-scheduler-jobs `
   --validation-report "$reportRoot\$cluster-teardown.json" `
-  --validation-launcher uvx --validation-install-source $installSource `
+  --validation-launcher uv-tool --validation-install-source $installSource `
   --validation-artifact $relay
 ```
 
@@ -115,10 +121,15 @@ Acceptance requires:
 
 Run a second dedicated session with `--cancel-jobs --cancel-scheduler-jobs`, and
 submit its bounded validation job through that owned session API so the server
-stamps the durable job ownership. Verify that an unrelated same-cluster sentinel
-job remains untouched and that only the owned scheduler id reaches the provider.
-The canonical report must contain the exact owned relay and scheduler ids and a
-confirmed canceled scheduler phase. Run a third teardown with `--stop-worker`, then
+stamps the durable job ownership. Submit an unrelated same-cluster scheduler job,
+then pass its native id with repeatable `--preserve-scheduler-job-id` options. The
+command fails before cancellation unless every sentinel is active and absent from
+all owned and unowned scheduler identities for that session generation. It re-polls
+afterward and accepts only an active or naturally completed sentinel. The canonical
+report must contain the exact owned relay and scheduler ids, a confirmed canceled
+scheduler phase, and a `scheduler_job` resource with role
+`scheduler_sentinel:retain`, state `retained`, and pre/post phases proving that only
+the owned id reached the provider. Run a third teardown with `--stop-worker`, then
 restart the worker before subsequent tests. Give every teardown its own path under
 `$reportRoot` and pass the same four provenance options shown above; do not capture
 the operational JSON with `Tee-Object` as a substitute for a canonical report.
@@ -130,10 +141,10 @@ by default. For a release run, supply a named path and artifact provenance so th
 report can be archived with the rest of the run:
 
 ```powershell
-uvx --python 3.12 --from $relay clio-relay cluster bootstrap `
+& $relayCommand cluster bootstrap `
   --cluster $cluster --relay-wheel $relay `
   --report "$reportRoot\$cluster-bootstrap.json" `
-  --validation-launcher uvx --validation-install-source $installSource
+  --validation-launcher uv-tool --validation-install-source $installSource
 ```
 
 Run a separate bounded gateway lifecycle when the `gateway-runtime` release-policy
@@ -141,15 +152,15 @@ scenario is required. `start-runtime` and `stop-runtime` each write a canonical
 report by default; explicit paths keep the paired evidence easy to review:
 
 ```powershell
-$dedicatedGateway = uvx --python 3.12 --from $relay clio-relay gateway start-runtime `
+$dedicatedGateway = & $relayCommand gateway start-runtime `
   --cluster $cluster --name "gateway-$runId" --runtime-json-file $runtimeSpec `
   --validation-report "$reportRoot\$cluster-gateway-dedicated-start.json" `
-  --validation-launcher uvx --validation-install-source $installSource `
+  --validation-launcher uv-tool --validation-install-source $installSource `
   --validation-artifact $relay | ConvertFrom-Json
-uvx --python 3.12 --from $relay clio-relay gateway stop-runtime `
+& $relayCommand gateway stop-runtime `
   $dedicatedGateway.session_id --cluster $cluster --keep-scheduler-job `
   --validation-report "$reportRoot\$cluster-gateway-dedicated-stop.json" `
-  --validation-launcher uvx --validation-install-source $installSource `
+  --validation-launcher uv-tool --validation-install-source $installSource `
   --validation-artifact $relay
 ```
 

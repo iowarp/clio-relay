@@ -41,36 +41,43 @@ process is absent.
 
 JARVIS-CD owns cluster execution. A relay job describes the desired work. The worker materializes that intent into JARVIS inputs, runs JARVIS, streams output while the job is active, and writes provenance when the run ends.
 
-Application behavior belongs in JARVIS packages or operator-selected application profiles. Package progress adapters and application installers are plugins; generic bootstrap and worker code do not import application modules or infer application log paths. The generic bounded-command package stays generic.
+Application behavior belongs in JARVIS packages or operator-selected application profiles. JARVIS core owns execution identity, durable progress events, and aggregate progress snapshots; an individual package owns only the application-specific interpretation used to produce those events. Generic bootstrap and worker code do not import application modules or infer application log paths. The generic bounded-command package stays generic.
 
-The worker binds each package progress adapter to its Python entry point and
-owning distribution before execution. It stamps that immutable provider
-identity and stores structurally valid provider observations, including warm-up
-records. Provider validation and the stricter release-acceptance predicate are
-separate durable flags. Agent-side validation consumes the acceptance-qualified
-attestation and the package's explicit `progress.adapter` declaration; it never
-imports the application provider locally.
+The production boundary is the native JARVIS contract. Every run returns exact
+`jarvis.execution.handle.v1`, `jarvis.execution.record.v1`, and
+`jarvis.execution.progress.v1` documents. The query API returns the same
+identity-bound documents after submission, and MCP progress notifications carry
+native progress snapshots rather than relay-defined application payloads. The
+installation receipt and live worker evidence independently probe the JARVIS-CD
+API in its execution interpreter and clio-kit's locked MCP schemas through its
+receipt-bound runtime command.
 
-Provider inputs have one authority per execution. Host-visible package logs
-take precedence; scoped JARVIS stdout is a fallback only when no provider log
-is exposed. The worker baselines logs before launching JARVIS, never replays
-preexisting bytes, and resets its tail checkpoint and provider parser when a
-selected log is truncated, rewritten, or replaced. Version 1.0 permits one
-regular, nonsymlink provider log per execution and reads it through an
-open-then-identify bounded tail.
+`clio_relay.package_progress_adapters` remains a compatibility mechanism for
+older deployments. Compatibility observations are labeled as such and may help
+diagnose an older package, but an adapter entry point, parsed log, or stdout
+pattern cannot satisfy a 1.0 release claim.
 Providers treat logs as host-visible only when the pipeline explicitly marks
 them shared; a non-container path is not sufficient evidence because it may be
 node-local.
 
-The virtual JARVIS MCP path preserves the same provider boundary across the
-stdio hop. The packaged client uses a per-call MCP progress token unrelated to
-relay credentials, validates schema, sequence, execution, provider, and artifact
-bindings, and persists early provider-valid records as non-acceptance warm-up
-observations. Acceptance is unlocked only by the final structured JARVIS result
-and is revalidated by the worker's locally installed provider before becoming a
-durable acceptance record.
+The virtual JARVIS MCP path preserves that boundary across the stdio hop. The
+packaged client uses a per-call MCP progress token unrelated to relay
+credentials, validates each exact `jarvis.execution.progress.v1` snapshot and
+its transport sequence, and binds it to the discovered server artifact. Live
+records may be persisted before the final execution identity is confirmed, but
+only the final native handle, record, and progress envelope can complete that
+binding. MCP transport sequence is never treated as workload percentage.
 
-When JARVIS owns execution, its structured runtime metadata is the primary record of scheduler identity, scheduler type, scripts, hostfiles, output paths, allocated nodes, package provenance, and terminal state. Producer schema `jarvis.runtime.v1` is required before MCP or authenticated-sidecar data receives authoritative source labels. A scheduler identity also requires matching `jarvis.scheduler.submission.v1` proof from the scheduler submit API. The worker normalizes that metadata into the durable `clio-relay.jarvis-runtime.v1` job/task record and indexes `runtime-metadata.json` as an artifact. Flexible, missing-schema, and log-derived identities remain visible as `untrusted_compatibility` or `legacy_stdout`; neither can establish ownership, polling, or cancellation eligibility.
+When JARVIS owns execution, the exact native handle and record are the primary
+source of execution and scheduler identity, and the exact progress snapshot is
+the primary source of package progress. A scheduler-native ID also requires
+matching `jarvis.scheduler.submission.v1` proof inside the native record. The
+worker projects these documents into the durable
+`clio-relay.jarvis-runtime.v1` job/task view and indexes
+`runtime-metadata.json` as an artifact without discarding the originals. The
+older `jarvis.runtime.v1`, flexible missing-schema payloads, and log-derived
+identities remain visible only as compatibility evidence; none can establish a
+1.0 claim, ownership, polling, or cancellation eligibility.
 
 Interactive services should be launched through scheduler-backed package or pipeline behavior as well. The relay records the gateway session and transport metadata, while the package owns how the service starts on the allocated node, how stdout and stderr are interpreted, and which structured progress or runtime events are reported.
 
@@ -133,6 +140,16 @@ the scheduler ids durably attached to that owned set, and is rejected without
 worker service. Every detach and teardown returns a JSON ownership and
 residual-resource report with exact relay and scheduler resource ids.
 
+Before destructive work, teardown atomically persists an operation id and the
+exact `stop_worker`, relay-cancel, and scheduler-cancel policy. Retries must use
+that same policy; attach and detach are refused once teardown is committed. Each
+cleanup report binds exactly one desktop-connector and one remote-connector
+disposition to every owned gateway record. A retry after closure re-observes the
+closed records and emits fresh evidence instead of treating their absence from an
+active-session scan as proof. If a scheduler job completes naturally during a
+cancel race, teardown may close after recording the terminal disposition, but the
+validation report does not claim that the job was canceled.
+
 ## Scheduler providers
 
 Scheduler observation and cancellation use an explicit provider selected in each
@@ -151,8 +168,7 @@ readiness, and the allocated service host. Only the `external` provider delegate
 scheduler observation and cancellation to those driver commands.
 
 Scheduler providers do not submit JARVIS application work. JARVIS materializes the
-pipeline execution plan; a separately registered JARVIS scheduled-execution adapter
-bridges any runtime contract that JARVIS does not yet emit natively. The SLURM
+pipeline execution plan and emits its native execution documents. The SLURM
 provider remains limited to queue/status normalization, deterministic provider
 validation, and exact-job cancellation.
 

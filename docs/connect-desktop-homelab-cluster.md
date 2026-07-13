@@ -11,6 +11,18 @@ This guide starts from three machines that are not already connected through
 The homelab relay does not store job state. It only joins outbound `frp`
 connections from the desktop and the cluster.
 
+Install the released relay as a persistent tool on each operator host that runs
+`clio-relay`. Replace `<released-version>` with the exact version being deployed:
+
+```bash
+uv tool install --python 3.12 --no-config "clio-relay==<released-version>"
+```
+
+The commands below use that persistent executable. `uvx` is intentionally not
+used for a long-lived relay deployment because it creates a temporary execution
+environment rather than the independently managed tool installation recorded by
+the release evidence.
+
 ## Start the relay host
 
 On the relay host, run `frps` behind a public endpoint. For Cloudflare-backed
@@ -18,7 +30,7 @@ deployments, use WebSocket transport on port `443`. For a raw public host, use
 the configured TCP port.
 
 ```bash
-uvx --python 3.12 --from clio-relay clio-relay relay-host render-frps-config \
+clio-relay relay-host render-frps-config \
   --bind-port 7000 \
   --vhost-http-port 8080 \
   --auth-token "$CLIO_RELAY_FRP_TOKEN" \
@@ -43,7 +55,7 @@ Add the cluster. The cluster name, relay endpoint, and agent binary are local
 configuration values.
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay cluster add `
+clio-relay cluster add `
   --name my-cluster `
   --ssh-host my-cluster-login `
   --frp-server-addr relay.example.org `
@@ -62,13 +74,13 @@ agent name into prompts, packages, or workflow code.
 From the desktop:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay cluster bootstrap --cluster my-cluster
+clio-relay cluster bootstrap --cluster my-cluster
 ```
 
 Install and start the cluster worker as a user-level service:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay cluster install-endpoint-service `
+clio-relay cluster install-endpoint-service `
   --cluster my-cluster `
   --start `
   --enable
@@ -82,7 +94,7 @@ It does not require sudo.
 Render an MCP config that exposes the relay tools:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay agent render-mcp-config `
+clio-relay agent render-mcp-config `
   --output .\clio-relay-agent.config.toml
 ```
 
@@ -107,7 +119,7 @@ the workload directly outside clio-relay.
 From the desktop:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay agent run `
+clio-relay agent run `
   --cluster my-cluster `
   --prompt /home/<user>/relay/prompt.md `
   --mcp-config /home/<user>/relay/clio-relay-agent.config.toml `
@@ -121,13 +133,13 @@ relay MCP tools available.
 Monitor the parent agent job:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay job watch <agent-job-id> --cluster my-cluster
+clio-relay job watch <agent-job-id> --cluster my-cluster
 
-uvx --python 3.12 --from clio-relay clio-relay job read-log <agent-job-id> `
+clio-relay job read-log <agent-job-id> `
   --cluster my-cluster `
   --stream stdout
 
-uvx --python 3.12 --from clio-relay clio-relay job list-artifacts <agent-job-id> --cluster my-cluster
+clio-relay job list-artifacts <agent-job-id> --cluster my-cluster
 ```
 
 If the agent submits child work, it should return the child `job_id` or gateway
@@ -158,7 +170,7 @@ as artifacts.
 To close only the relay connectors while keeping the remote scheduler job alive:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay gateway stop-runtime <session-id> `
+clio-relay gateway stop-runtime <session-id> `
   --cluster my-cluster `
   --keep-scheduler-job
 ```
@@ -166,7 +178,7 @@ uvx --python 3.12 --from clio-relay clio-relay gateway stop-runtime <session-id>
 To explicitly stop the remote scheduler job:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay gateway stop-runtime <session-id> `
+clio-relay gateway stop-runtime <session-id> `
   --cluster my-cluster `
   --cancel-scheduler-job
 ```

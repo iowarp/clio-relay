@@ -9,9 +9,10 @@ homelab relay to a cluster worker and remote agent, see
 ## Add a Cluster
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay cluster add --name my-cluster --ssh-host my-cluster-login --scheduler-provider slurm --agent-adapter exec --agent-bin agent
-uvx --python 3.12 --from clio-relay clio-relay cluster bootstrap --cluster my-cluster
-uvx --python 3.12 --from clio-relay clio-relay cluster install-endpoint-service --cluster my-cluster --start --enable
+uv tool install --python 3.12 --no-config clio-relay
+clio-relay cluster add --name my-cluster --ssh-host my-cluster-login --scheduler-provider slurm --agent-adapter exec --agent-bin agent
+clio-relay cluster bootstrap --cluster my-cluster
+clio-relay cluster install-endpoint-service --cluster my-cluster --start --enable
 ```
 
 ### Upgrade durable queue indexes
@@ -19,13 +20,13 @@ uvx --python 3.12 --from clio-relay clio-relay cluster install-endpoint-service 
 The worker service runs this preflight before it accepts work:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay queue migrate-indexes --all --batch-size 500
+clio-relay queue migrate-indexes --all --batch-size 500
 ```
 
 Inspect the durable checkpoint without advancing it:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay queue migration-status
+clio-relay queue migration-status
 ```
 
 Migration holds the queue lock for one bounded batch at a time and resumes from
@@ -47,7 +48,7 @@ Pin the physical identity of an existing entry without replacing its transport,
 remote MCP registrations, paths, live-test inputs, or agent settings:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay cluster pin-target --cluster my-cluster --target-hostname login-1.example.edu --ssh-host-key-sha256 SHA256:REPLACE_WITH_PIN --scheduler-cluster-name my-cluster
+clio-relay cluster pin-target --cluster my-cluster --target-hostname login-1.example.edu --ssh-host-key-sha256 SHA256:REPLACE_WITH_PIN --scheduler-cluster-name my-cluster
 ```
 
 Repeat either identity option during hostname aliases or SSH host-key rotations.
@@ -70,7 +71,7 @@ Spack MCP server through the normal `remote_mcp_servers` cluster configuration.
 The audited clio-kit user contract is `spack_find`, `spack_locate`, and
 `spack_install`. There is deliberately no stateful `spack_load` tool: an MCP
 child's process environment cannot survive into a later JARVIS process.
-Declare `contract: clio-kit-spack-user-v3` on that registration so the live
+Declare `contract: clio-kit-spack-user-v2` on that registration so the live
 gate checks the exact upstream schemas; the operator's server name has no
 semantic effect.
 `jarvis_run(spack_specs=[...])` resolves the requested specs immediately before
@@ -83,10 +84,12 @@ Sites that require a non-agent installation workflow can install an external
 Python distribution that contributes a profile through the
 `clio_relay.application_profiles` Python entry-point group without changing
 generic bootstrap code. After that distribution is installed, operators may
-invoke `cluster install-app --app <external-profile-name>`. Package progress
-adapters use the separate
-`clio_relay.package_progress_adapters` entry-point group and own application log
-locations, parsing, package probes, and application-specific acceptance rules.
+invoke `cluster install-app --app <external-profile-name>`. The separate
+`clio_relay.package_progress_adapters` entry-point group remains a compatibility
+surface for older packages that only expose application log parsers. Those
+adapters are inspectable, but they cannot satisfy the 1.0 execution/progress
+gate. Production acceptance requires the JARVIS-owned execution handle, durable
+record, and application-independent progress snapshot described below.
 The cluster bootstrap downloads one exact JARVIS-CD GitHub release wheel,
 verifies its pinned SHA-256, and installs those same bytes normally in the
 JARVIS execution environment and with `--no-deps` in the relay provider
@@ -97,10 +100,10 @@ JARVIS executable, and exported entry points. The running worker verifies that
 both environments still resolve to the receipt-bound wheel before release
 acceptance.
 
-An acceptance pipeline must declare its provider explicitly under the package,
-for example `progress.adapter: lammps`. The worker replaces all plugin-supplied
-provenance with the bound entry-point and distribution identity. Every
-provider-produced, structurally valid observation is persisted with
+An older compatibility pipeline may declare its provider explicitly under the
+package, for example `progress.adapter: lammps`. The worker replaces all
+plugin-supplied provenance with the bound entry-point and distribution identity.
+Every provider-produced, structurally valid observation is persisted with
 `provider_validated=true`; warm-up observations remain visible with
 `acceptance_validated=false`, while observations satisfying the package's live
 acceptance predicate carry `acceptance_validated=true`. Desktop acceptance
@@ -128,17 +131,30 @@ are consumed.
 ## Run a Job
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay job submit --cluster my-cluster --jarvis-yaml .\pipeline.yaml
-uvx --python 3.12 --from clio-relay clio-relay job watch <job-id> --cluster my-cluster
-uvx --python 3.12 --from clio-relay clio-relay job read-log <job-id> --cluster my-cluster --stream stdout
-uvx --python 3.12 --from clio-relay clio-relay job list-artifacts <job-id> --cluster my-cluster
+clio-relay job submit --cluster my-cluster --jarvis-yaml .\pipeline.yaml
+clio-relay job watch <job-id> --cluster my-cluster
+clio-relay job read-log <job-id> --cluster my-cluster --stream stdout
+clio-relay job list-artifacts <job-id> --cluster my-cluster
 ```
 
 Submissions are asynchronous by default. CLI, HTTP, and MCP callers get a `job_id` and can monitor events and logs by cursor or byte offset.
 
 ### inspect structured runtime metadata
 
-For JARVIS-owned execution, structured MCP results or authenticated JARVIS sidecar records take precedence over log parsing. The normalized `clio-relay.jarvis-runtime.v1` record can include:
+For JARVIS-owned execution, the authoritative source is the exact native
+document set returned by JARVIS and polled by the relay-owned broker:
+
+- `jarvis.execution.handle.v1` is the stable execution identity and contains
+  the JARVIS execution id, pipeline id, execution mode, and native scheduler
+  identity when applicable;
+- `jarvis.execution.record.v1` is the durable lifecycle record;
+- `jarvis.execution.progress.v1` is the queryable, package-independent progress
+  snapshot whose latest events use `jarvis.progress.v1`.
+
+The broker requires all three documents to agree on execution, pipeline,
+provider, native scheduler identity, lifecycle, and reconciliation marker. It
+then writes the bounded document set to the authenticated relay sidecar. The
+normalized `clio-relay.jarvis-runtime.v1` record can include:
 
 - execution and pipeline ids;
 - scheduler provider, type, job id, and phase;
@@ -147,7 +163,17 @@ For JARVIS-owned execution, structured MCP results or authenticated JARVIS sidec
 - package names, versions, ids, sources, and paths;
 - terminal state, return code, reason, and timestamps.
 
-The current record is stored in both job and task `metadata.runtime_metadata`, and `runtime-metadata.json` is indexed as a job artifact. The relay assigns `source=jarvis_mcp` or `source=jarvis_sidecar` only after the producer record declares exact schema `jarvis.runtime.v1`. A claimed scheduler id additionally requires nested `jarvis.scheduler.submission.v1` proof whose provider and job id match, whose `identity_source` is `scheduler_submit_api`, and whose `submitted` flag is true. Missing, wrong, or internally inconsistent producer contracts are normalized as `untrusted_compatibility`; they remain inspectable but cannot create scheduler ownership, polling, or cancellation eligibility. `field_sources` preserves that field-level trust decision. Older log-only JARVIS paths are marked `legacy_stdout` and are likewise never polled or canceled. Scheduler cancellation requires a `scheduler_job_ownership` record bound to the relay job and task by a schema-valid owned `jarvis_run` result or authenticated runtime sidecar.
+The current record is stored in both job and task `metadata.runtime_metadata`,
+and `runtime-metadata.json` is indexed as a job artifact. A claimed scheduler id
+is authoritative only when the mutually bound native documents prove the
+scheduler provider and native id and the authenticated sidecar belongs to the
+durable relay job and task. Missing, wrong, stale, or internally inconsistent
+documents fail closed: they cannot create scheduler ownership, polling, or
+cancellation eligibility. `field_sources` preserves that field-level trust
+decision. Older `jarvis.runtime.v1`, package-adapter, and log-only paths remain
+visible as compatibility evidence but cannot satisfy the 1.0 gate. Scheduler
+cancellation additionally requires an exact `scheduler_job_ownership` record;
+it is opt-in, and detach/exit does not cancel scheduler jobs by default.
 
 An MCP result is treated as owned JARVIS metadata only when its command matches
 the operator-configured JARVIS MCP command and its successful result envelope
@@ -155,19 +181,20 @@ matches the durable relay job's server, arguments, operation, and tool. A
 different server cannot gain scheduler ownership merely by naming a tool
 `jarvis_run`.
 
-For the released clio-kit 2.2.6 compatibility path, a successful synchronous
+For the legacy clio-kit 2.2.6 compatibility path, a successful synchronous
 `jarvis_run` MCP return is normalized to a terminal `completed` record even
 though that release labels the result `status=running`; the original status and
 completion basis remain in `details.completion_normalization` for auditability.
-The pre-1.0 candidate removes that ambiguity upstream and returns a structured
-completed result directly. Scheduler submissions remain non-terminal unless
-JARVIS was asked to wait.
+The pinned clio-kit 2.3.2 production path removes that ambiguity upstream and
+returns a structured completed result directly. The legacy normalization is
+diagnostic compatibility evidence and cannot satisfy the 1.0 gate. Scheduler
+submissions remain non-terminal unless JARVIS was asked to wait.
 
 Exercise the agent-facing virtual `jarvis_run` tool, its cluster routing, durable
 result, and non-legacy runtime artifact in one canonical acceptance run:
 
 ```powershell
-uvx --from clio-relay clio-relay jarvis-mcp-validate `
+clio-relay jarvis-mcp-validate `
   --cluster my-cluster `
   --arguments-json-file .\jarvis-run.json `
   --report .\validation\jarvis-mcp.json
@@ -178,10 +205,10 @@ uvx --from clio-relay clio-relay jarvis-mcp-validate `
 `cluster` selector is injected by clio-relay and is never forwarded to JARVIS.
 
 Runtime observations are emitted only by the relay-owned JARVIS execution
-adapter or returned through an owned `jarvis_run` MCP result. Application and
+broker or returned through an owned `jarvis_run` MCP result. Application and
 package code does not receive the runtime sidecar path or HMAC key and must not
-write the sidecar directly. A producer supplies the non-secret
-`jarvis.runtime.v1` payload:
+write the sidecar directly. The following older `jarvis.runtime.v1` payload is
+accepted for compatibility inspection only; it is not native 1.0 evidence:
 
 ```json
 {
@@ -222,19 +249,24 @@ has not been leased by a worker yet. A running relay job may already have
 submitted scheduler work through its JARVIS package.
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay queue list --cluster my-cluster --kind remote_agent
-uvx --python 3.12 --from clio-relay clio-relay queue diagnose <job-id> --cluster my-cluster
-uvx --python 3.12 --from clio-relay clio-relay queue stale --cluster my-cluster --older-than 2h
-uvx --python 3.12 --from clio-relay clio-relay queue cleanup-stale --cluster my-cluster --older-than 2h
-uvx --python 3.12 --from clio-relay clio-relay worker status --cluster my-cluster
+clio-relay queue list --cluster my-cluster --kind remote_agent
+clio-relay queue diagnose <job-id> --cluster my-cluster
+clio-relay queue stale --cluster my-cluster --older-than 2h
+clio-relay queue cleanup-stale --cluster my-cluster --older-than 2h
+clio-relay worker status --cluster my-cluster
 ```
 
 Queue reads and cleanup scans are bounded. Their JSON includes
 `scan_truncated` and `result_truncated`; increase `--scan-limit` or `--limit`
 explicitly when an operator needs a larger window. Diagnosis is job-specific
-and reports queue blockers, the durable lease and owner heartbeat, worker
-capacity, scheduler observations, current tasks, and the most recent event and
-progress record. Every job-specific mutation verifies the requested cluster.
+and reports raw submission order separately from effective admission blockers,
+plus the durable lease and owner heartbeat, worker capacity, scheduler
+observations, current tasks, and the most recent event and progress record. The
+admission snapshot applies the same fresh worker slots, per-kind limits, active
+leases, pending-cleanup exclusions, and global lease bound as worker admission.
+If any bounded input is truncated or inconsistent, diagnosis returns
+`admission_analysis_incomplete` instead of presenting a raw earlier job as a
+proven blocker. Every job-specific mutation verifies the requested cluster.
 The same payloads expose `active_job_capacity` with `limit`, `used`,
 `remaining`, and `over_capacity`. Admission rejects the next job with the
 stable `active_job_capacity_reached` error before the durable active population
@@ -254,19 +286,19 @@ stale and explicit cleanup cancels only the relay side; this prevents an
 unattended lease recovery from submitting duplicate scheduler work.
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay queue cleanup-stale --cluster my-cluster --older-than 2h --cancel-queued --no-dry-run
+clio-relay queue cleanup-stale --cluster my-cluster --older-than 2h --cancel-queued --no-dry-run
 ```
 
 Cancel queued jobs without touching any scheduler:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay queue cancel <job-id> --cluster my-cluster
+clio-relay queue cancel <job-id> --cluster my-cluster
 ```
 
 For leased or running jobs, scheduler cancellation is explicit:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay queue cancel <job-id> --cluster my-cluster --cancel-scheduler-job
+clio-relay queue cancel <job-id> --cluster my-cluster --cancel-scheduler-job
 ```
 
 Use `--keep-scheduler-job` or omit the flag when the user only wants the relay
@@ -292,6 +324,10 @@ that membership through verified generation closure.
 The user MCP profile exposes the read-only `relay_queue_list`,
 `relay_queue_diagnose`, and `relay_queue_stale` tools. The admin profile also
 exposes `relay_queue_cleanup_stale`, `relay_cancel_job`, and worker status.
+When `cluster` names a configured SSH target, these tools operate on that
+cluster's queue and return a `route_revision`; exact follow-up operations can
+echo that revision so a changed cluster route is rejected instead of silently
+acting on a different queue.
 
 For release evidence, configure at least three live worker slots and the exact
 per-kind cap `jarvis=2`, then run during a quiet window with an otherwise empty
@@ -299,7 +335,7 @@ relay queue. The validator creates only bounded harmless commands and runs the
 canonical acceptance command from the exact artifact under test:
 
 ```powershell
-uvx --from clio-relay clio-relay queue validate --cluster my-cluster --older-than 1m --report .\validation\queue-management.json --validation-launcher uvx --validation-install-source pypi
+clio-relay queue validate --cluster my-cluster --older-than 1m --report .\validation\queue-management.json --validation-launcher uv-tool --validation-install-source pypi
 ```
 
 The validator requires two generated commands to be concurrently running with
@@ -324,7 +360,7 @@ but it cannot recover or cancel a neighboring stale record.
 Worker capacity is configured when the user-level worker service is installed:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay cluster install-endpoint-service --cluster my-cluster --concurrency 4 --kind-concurrency jarvis=2 --kind-concurrency remote_agent=2 --kind-concurrency mcp_call=1 --start --enable
+clio-relay cluster install-endpoint-service --cluster my-cluster --concurrency 4 --kind-concurrency jarvis=2 --kind-concurrency remote_agent=2 --kind-concurrency mcp_call=1 --start --enable
 ```
 
 This keeps one sudo-less user service per cluster and runs multiple in-process
@@ -340,8 +376,8 @@ whether fresh worker registrations agree, and active leases by kind.
 ## Expose Tools to an Agent
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay agent render-mcp-config --output .\clio-relay-agent.config.toml
-uvx --python 3.12 --from clio-relay clio-relay agent run --cluster my-cluster --prompt /path/on/cluster/prompt.md --mcp-config /path/on/cluster/clio-relay-agent.config.toml
+clio-relay agent render-mcp-config --output .\clio-relay-agent.config.toml
+clio-relay agent run --cluster my-cluster --prompt /path/on/cluster/prompt.md --mcp-config /path/on/cluster/clio-relay-agent.config.toml
 ```
 
 Agents should submit child cluster work asynchronously and return the child `job_id`. A single cluster worker cannot execute a child job while it is blocked inside a parent agent job waiting for that child to finish.
@@ -349,19 +385,27 @@ Agents should submit child cluster work asynchronously and return the child `job
 Agents can also record structured task timeline events:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay job record-task-event <task-id> --cluster my-cluster --event-type dataset_found --label dataset --summary "found staged dataset" --path-ref /mnt/common/datasets/example_001
-uvx --python 3.12 --from clio-relay clio-relay job task-events <task-id> --cluster my-cluster --cursor 1
+clio-relay job record-task-event <task-id> --cluster my-cluster --event-type dataset_found --label dataset --summary "found staged dataset" --path-ref /mnt/common/datasets/example_001
+clio-relay job task-events <task-id> --cluster my-cluster --cursor 1
 ```
 
 Use timeline events for UI-visible agent work such as repository scans, dataset discovery, generated scripts, planned commands, scheduler submissions, warnings, and completion. Use normal job logs for stdout and stderr.
 
 ## Use Remote JARVIS MCP
 
-The released compatibility command is:
+Install the cluster-side server once, then launch its persistent executable:
 
 ```bash
-uvx --from clio-kit==2.2.6 clio-kit mcp-server jarvis
+uv tool install --python 3.12 --no-config clio-kit==2.3.2
+clio-kit mcp-server jarvis
 ```
+
+Release bootstrap is stricter: it downloads and hashes the exact released
+wheel first, installs that wheel with `uv tool install`, and records the uv
+binary/version, tool and environment directories, provider interpreter,
+`pyvenv.cfg` uv marker, installed RECORD closure, and retained wheel digest.
+Repeated worker calls execute that receipt-bound tool directly; they do not
+create a new `uvx` environment per call.
 
 The default agent MCP profile exposes compact relay tools and the compact JARVIS tools:
 
@@ -374,6 +418,7 @@ The default agent MCP profile exposes compact relay tools and the compact JARVIS
 - `jarvis_describe`
 - `jarvis_add_step`
 - `jarvis_edit_step`
+- `jarvis_get_execution`
 - `jarvis_run`
 
 The pre-1.0 user contract merges removal into
@@ -389,25 +434,36 @@ tools, use `jarvis_describe` for package and pipeline inspection, and call
 `jarvis_run` to submit the configured pipeline through the cluster-local JARVIS
 environment. `relay_observe` and `relay_wait` are the agent-facing monitor loop
 for progress, stdout, stderr, and terminal output.
+After submission, `jarvis_get_execution` is the single durable query. It always
+returns the execution handle, lifecycle record, and runtime metadata; progress
+is included by default and can be disabled with `include_progress=false`.
+Artifacts remain opt-in: pass `artifacts={}` or bounded filters for one page,
+then pass the returned opaque cursor with the same filters for the next page.
+The call requires the local `cluster` selector plus the returned `pipeline_id`
+and `execution_id`. The relay forwards the query as a durable remote MCP job and
+validates the returned identities, lifecycle, progress, artifact filters,
+counts, and cursor bounds before marking its result valid.
 
 For virtual `jarvis_run`, the packaged runner creates a distinct one-call MCP
 progress token; the remote JARVIS server never receives the outer relay sidecar
-credential. It validates bounded `clio-kit.jarvis-package-progress.v1`
-notifications and immediately persists provider-valid warm-up records with
-`acceptance_validated=false`. Only after the final structured result binds the
-same execution id, pipeline id, package provenance, and discovery-time server
-artifact does it replay an acceptance candidate with
-`provider_execution_validated=true`. The worker independently resolves the
-provider entry point and reruns its acceptance predicate before stamping the
-durable record. `jarvis-mcp-validate` polls `job progress` before job completion,
-and the machine-readable `remote-mcp.jarvis-live-progress` check requires both
-the record observed while the outer job was running and its later
-execution-bound replay.
+credential. It accepts only bounded `notifications/progress` messages whose
+`params.message` is an exact `jarvis.execution.progress.v1` snapshot and whose
+`params.progress` sequence is monotonic for that call. The final structured
+result must bind the same native execution handle, durable record, progress
+snapshot, pipeline identity, and discovery-time server artifact. The
+relay-owned broker continues querying JARVIS by execution id and persists each
+coherent snapshot through its HMAC-authenticated sidecar. Package progress
+adapters and `clio-kit.jarvis-package-progress.v1` notifications remain legacy
+compatibility paths and are invalid as 1.0 acceptance evidence.
+`jarvis-mcp-validate` polls job progress before job completion, and the
+machine-readable live-progress check requires an in-flight native snapshot and
+its coherently bound terminal snapshot.
 
-Cluster bootstrap stores the exact clio-kit wheel path, digest, and JARVIS MCP
-command in the installation receipt. The worker service reads that receipt and
-uses the stored wheel by default; it does not resolve a package version again at
-call time. Desktop CLI and MCP submissions defer JARVIS command selection to the
+Cluster bootstrap stores the exact clio-kit wheel path, digest, persistent-tool
+environment, and JARVIS MCP command in the installation receipt. The worker
+service reads that receipt and invokes the installed executable directly; it
+does not resolve a package version or create another cache environment at call
+time. Desktop CLI and MCP submissions defer JARVIS command selection to the
 target, so a desktop package default cannot replace the cluster receipt. For
 prerelease diagnostics, `CLIO_RELAY_JARVIS_MCP_COMMAND` can still
 override the command with a JSON string array. The override is interpreted on
@@ -448,11 +504,22 @@ Register only the tools an agent should see, then refresh their schemas through
 a durable cluster-side `tools/list` job:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay remote-mcp register --cluster my-cluster --name science --command uvx --arg=--from --arg C:\artifacts\science_mcp_kit-1.4.0-py3-none-any.whl --arg science-mcp --env-from SCIENCE_API_TOKEN=SITE_SCIENCE_API_TOKEN --allow-tool inspect_dataset --profile user --call-timeout-seconds 300
-uvx --python 3.12 --from clio-relay clio-relay remote-mcp refresh --cluster my-cluster --name science
-uvx --python 3.12 --from clio-relay clio-relay remote-mcp reload --profile user
-uvx --python 3.12 --from clio-relay clio-relay remote-mcp validate --cluster my-cluster --name science --tool inspect_dataset --arguments-json-file .\inspect-arguments.json --output-json .\validation\remote-mcp.json
+uv tool install --python 3.12 --no-config C:\artifacts\science_mcp_kit-1.4.0-py3-none-any.whl
+clio-relay remote-mcp register --cluster my-cluster --name science --command science-mcp --env-from SCIENCE_API_TOKEN=SITE_SCIENCE_API_TOKEN --allow-tool inspect_dataset --profile user --call-timeout-seconds 300
+clio-relay remote-mcp refresh --cluster my-cluster --name science
+clio-relay remote-mcp reload --profile user
+clio-relay remote-mcp validate --cluster my-cluster --name science --tool inspect_dataset --arguments-json-file .\inspect-arguments.json --output-json .\validation\remote-mcp.json
 ```
+
+Release validation can additionally require contract-specific
+`structuredContent` semantics with `--result-expectation-json` or
+`--result-expectation-json-file`. The expectation is validated against the
+registered semantic contract and selected tool before relay dispatch. For the
+Spack user contract, it can bind an exact package name and DAG hash, the unique
+locate prefix and canonical `/hash` load spec, or installed status with the
+requested reuse setting. The resulting `remote-mcp.structured-result` check and
+`structured_result_assertion` job metadata are suitable for release-policy
+constraints; successful text content cannot substitute for structured data.
 
 The wheel path is an operator-supplied immutable artifact. A PyPI requirement
 string is insufficient for user-profile evidence. A direct console script is
@@ -528,11 +595,11 @@ For a managed runtime, describe the application generically with `ServiceRuntime
 ```
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay gateway start-runtime --cluster my-cluster --name my-live-service --runtime-json-file .\runtime.json --owner-session-id desktop-session
-uvx --python 3.12 --from clio-relay clio-relay gateway get <session-id>
-uvx --python 3.12 --from clio-relay clio-relay gateway detach-runtime <session-id> --cluster my-cluster
-uvx --python 3.12 --from clio-relay clio-relay gateway attach-runtime <session-id> --cluster my-cluster
-uvx --python 3.12 --from clio-relay clio-relay gateway stop-runtime <session-id> --cluster my-cluster --keep-scheduler-job
+clio-relay gateway start-runtime --cluster my-cluster --name my-live-service --runtime-json-file .\runtime.json --owner-session-id desktop-session --owner-session-generation-id <generation-id>
+clio-relay gateway get <session-id>
+clio-relay gateway detach-runtime <session-id> --cluster my-cluster
+clio-relay gateway attach-runtime <session-id> --cluster my-cluster
+clio-relay gateway stop-runtime <session-id> --cluster my-cluster --keep-scheduler-job
 ```
 
 Use `transport_mode: "frp-stcp-wss"` for the relay path and `transport_mode: "frp-xtcp-wss"` for direct NAT-bypass attempts. The application stream still flows through the relay/bypass transport to the desktop-local bind port, not through an SSH port forward.
@@ -571,16 +638,21 @@ submission id, scheduler provider, marker, size, and digest all match. Missing
 or unreadable connector process evidence is likewise unresolved: cleanup stays
 retryable and never treats an observation error as verified absence.
 
-Manual gateway record updates are still available for package integrations and external supervisors:
+Manual gateway record updates remain available for ordinary endpoint metadata:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay gateway create --cluster my-cluster --name live-service-example --gateway-json-file .\gateway.json
-uvx --python 3.12 --from clio-relay clio-relay gateway update <session-id> --cluster my-cluster --state ready --scheduler-job-id 12345 --node compute-01 --gateway-json-file .\gateway-ready.json
-uvx --python 3.12 --from clio-relay clio-relay gateway get <session-id> --cluster my-cluster
-uvx --python 3.12 --from clio-relay clio-relay gateway close <session-id> --cluster my-cluster
+clio-relay gateway create --cluster my-cluster --name live-service-example --gateway-json-file .\gateway.json
+clio-relay gateway update <session-id> --cluster my-cluster --state ready --node compute-01 --gateway-json-file .\gateway-ready.json
+clio-relay gateway get <session-id> --cluster my-cluster
+clio-relay gateway close <session-id> --cluster my-cluster
 ```
 
-`close` only marks the durable record closed. Use `stop-runtime` when clio-relay owns the connector lifecycle.
+Generic CLI, HTTP, and MCP gateway writes reject scheduler provider/native ids,
+relay runtime specifications and ownership intents, connector ownership, and
+relay owner metadata. Use `start-runtime` for a relay-owned scheduler-backed
+service and `detach-runtime` or `stop-runtime` for its lifecycle. `close` only
+marks an ordinary durable record closed; the core refuses it for an owned
+runtime until `stop-runtime` has proven connector cleanup.
 
 ## Use FRP Transport
 
@@ -589,10 +661,10 @@ Use frp when the desktop and cluster cannot directly SSH to each other but can b
 ```powershell
 $env:CLIO_RELAY_FRP_TOKEN = "<shared-frp-token>"
 $env:CLIO_RELAY_STCP_SECRET = "<shared-stcp-secret>"
-uvx --python 3.12 --from clio-relay clio-relay cluster add --name my-cluster --ssh-host my-cluster-login --frp-server-addr relay.example.edu
-uvx --python 3.12 --from clio-relay clio-relay relay-host render-frpc-config --cluster my-cluster --local-port 8848
-uvx --python 3.12 --from clio-relay clio-relay relay-host render-frpc-visitor-config --cluster my-cluster --bind-port 8765
-uvx --python 3.12 --from clio-relay clio-relay relay-host test-http-transport --cluster my-cluster --local-bind-port 18765
+clio-relay cluster add --name my-cluster --ssh-host my-cluster-login --frp-server-addr relay.example.edu
+clio-relay relay-host render-frpc-config --cluster my-cluster --local-port 8848
+clio-relay relay-host render-frpc-visitor-config --cluster my-cluster --bind-port 8765
+clio-relay relay-host test-http-transport --cluster my-cluster --local-bind-port 18765
 ```
 
 For Cloudflare-backed homelab deployments, configure the cluster transport as `wss` over port `443`. For a raw public relay host, configure `tcp`.
@@ -602,16 +674,16 @@ For Cloudflare-backed homelab deployments, configure the cluster transport as `w
 Use SSH forwarding when the desktop already has SSH or VPN access to the cluster.
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay relay-host test-ssh-transport --cluster my-cluster --local-bind-port 18766 --remote-api-port 8766 --session-id relay-ssh-test
+clio-relay relay-host test-ssh-transport --cluster my-cluster --local-bind-port 18766 --remote-api-port 8766 --session-id relay-ssh-test
 ```
 
 For detach and reattach workflows:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay session start --cluster my-cluster --session-id desktop-session --remote-api-port 8766 --replace
-uvx --python 3.12 --from clio-relay clio-relay session status --cluster my-cluster --session-id desktop-session
-uvx --python 3.12 --from clio-relay clio-relay session detach --cluster my-cluster --session-id desktop-session
-uvx --python 3.12 --from clio-relay clio-relay session teardown --cluster my-cluster --session-id desktop-session
+clio-relay session start --cluster my-cluster --session-id desktop-session --remote-api-port 8766 --replace
+clio-relay session status --cluster my-cluster --session-id desktop-session
+clio-relay session detach --cluster my-cluster --session-id desktop-session
+clio-relay session teardown --cluster my-cluster --session-id desktop-session
 ```
 
 Detach succeeds only after the exact owned remote API generation is observed
@@ -621,6 +693,18 @@ dispositions, and any requested worker service stop are verified. Worker stop
 evidence must report the exact service as `inactive` or `not-found`; transitional
 or unknown systemd states remain retryable. The default canonical report has the
 same checks and remote installation provenance as an explicitly named report.
+Gateway records must carry that same owner-session generation. A legacy or damaged
+record with only the session id is reported as an ambiguous residual and is not
+stopped or closed automatically.
+
+Teardown writes a durable cleanup intent before its first side effect. Its
+operation id and job/worker policy are returned in `cleanup_evidence`; retry with
+the same flags only. A different policy is rejected, and a committed teardown
+cannot be changed into attach or detach. Evidence must contain exactly one local
+and remote connector result for each owned gateway record. Closed-gateway retries
+recreate that evidence idempotently. Remote session commands are wall-clock
+bounded, so an unavailable host produces an explicit failed report instead of an
+unbounded shutdown.
 
 `session start` requires `CLIO_RELAY_API_TOKEN` by default and fails before opening
 the remote API when it is absent. An unauthenticated API requires the explicit
@@ -629,14 +713,14 @@ the remote API when it is absent. An unauthenticated API requires the explicit
 To clean up the persistent worker too:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay session teardown --cluster my-cluster --session-id desktop-session --stop-worker
+clio-relay session teardown --cluster my-cluster --session-id desktop-session --stop-worker
 ```
 
 The safe teardown default is `--keep-jobs --keep-scheduler-jobs`. Canceling both
 relay and scheduler work requires both explicit flags:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay session teardown --cluster my-cluster --session-id desktop-session --cancel-jobs --cancel-scheduler-jobs
+clio-relay session teardown --cluster my-cluster --session-id desktop-session --cancel-jobs --cancel-scheduler-jobs --preserve-scheduler-job-id unrelated-validation-job
 ```
 
 Jobs submitted through the owned session API are stamped with the server-side
@@ -648,7 +732,18 @@ exact relay job and task and agrees with the cluster's configured provider. Raw
 runtime fields and legacy stdout ids are reported as refused residuals. The
 scheduler flag is rejected unless `--cancel-jobs` is also present; relay jobs are
 canceled relay-only, followed by one exact scheduler cancellation and verification
-path so duplicate `scancel` requests cannot race.
+path so duplicate provider cancellation requests cannot race. Release acceptance
+also supplies one or more repeatable `--preserve-scheduler-job-id` values. Each
+sentinel must be active and absent from both owned and unowned scheduler identities
+for the target session generation before cancellation. After owned cancellation it
+must still be active or have completed naturally; canceled, failed, unknown, or
+unqueryable sentinels fail the cleanup report. The option is rejected unless both
+cancellation flags are explicit.
+
+If the scheduler reports `completed` or `failed` while cancellation is being
+requested, cleanup records a verified terminal outcome and can close the owned
+session. The explicit scheduler-canceled validation check still fails, because a
+natural terminal race is not cancellation evidence.
 
 Queued relay cancellation is acknowledged immediately. Leased and running jobs are
 cooperative: teardown waits for the worker to terminate its owned execution and
@@ -663,14 +758,14 @@ cleanup.
 Inspect provider-normalized scheduler state independently:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay scheduler status 12345 --cluster my-cluster
+clio-relay scheduler status 12345 --cluster my-cluster
 ```
 
 For release acceptance, use the deterministic held-job orchestrator instead of
 hoping a normal job remains pending long enough to sample:
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay scheduler validate-lifecycle --cluster my-cluster --report .clio-relay/validation-reports/scheduler-lifecycle.json
+clio-relay scheduler validate-lifecycle --cluster my-cluster --report .clio-relay/validation-reports/scheduler-lifecycle.json
 ```
 
 It owns one bounded validation job, observes pending before release, proves allocation
@@ -680,7 +775,7 @@ run cancels only the exact job id it submitted and records cleanup in the JSON r
 ## Live Acceptance
 
 ```powershell
-uvx --python 3.12 --from clio-relay clio-relay live-test --cluster my-cluster --jarvis-yaml .\path\to\site-acceptance.yaml --report .clio-relay\validation-reports\validation-my-cluster-live-test.json
+clio-relay live-test --cluster my-cluster --jarvis-yaml .\path\to\site-acceptance.yaml --report .clio-relay\validation-reports\validation-my-cluster-live-test.json
 ```
 
 A complete live acceptance should verify the cluster bootstrap, worker service, transport, JARVIS package execution, logs, artifacts, provenance, progress, and agent tool submission path.

@@ -46,13 +46,13 @@ running jobs before gateway or API cleanup. It stops the API to seal intake, res
 for pre-quiescence in-flight submissions, and acknowledges those before gateway
 cleanup. A timeout leaves intake quiesced and the remaining resources explicit.
 
-JARVIS runtime metadata uses the normalized `clio-relay.jarvis-runtime.v1` contract. Structured results from an owned `jarvis_run` call (`structuredContent` first, JSON text content as compatibility) and authenticated runtime sidecar records are authoritative. The normalized record is merged into job and task metadata, emitted as monotonic runtime events, indexed as `runtime-metadata.json`, and embedded in execution provenance. Stdout scheduler-id patterns are a compatibility fallback only, must be labeled `legacy_stdout`, and cannot authorize polling or cancellation.
+JARVIS-owned execution is authoritative only when it supplies the exact `jarvis.execution.handle.v1`, `jarvis.execution.record.v1`, and `jarvis.execution.progress.v1` documents. The relay preserves those documents and projects them into `clio-relay.jarvis-runtime.v1` for job/task metadata, events, artifacts, and provenance. The older `jarvis.runtime.v1`, flexible structured payloads, and stdout scheduler patterns are compatibility evidence only and cannot authorize polling or cancellation or satisfy the 1.0 gate.
 
 ## Progress
 
-Progress can come from generic regex rules or package-aware adapters. Application installers and progress adapters are discovered through the `clio_relay.application_profiles` and `clio_relay.package_progress_adapters` entry-point groups. Application adapters own log paths, parsers, package probes, and application-specific acceptance predicates; generic bootstrap and worker code do not.
+JARVIS core owns execution IDs, durable `jarvis.progress.v1` events, and aggregate execution progress. Package-local code owns only application-specific interpretation. Native MCP notifications carry exact execution progress snapshots and remain distinct from MCP transport sequence numbers.
 
-Trusted package progress must be distinguishable from raw workload stdout. Raw stdout text is not proof that a package adapter ran.
+`clio_relay.package_progress_adapters` and generic regex progress remain explicitly labeled compatibility paths. They cannot satisfy a 1.0 release claim, even when their provider entry point or parsed output is otherwise valid.
 
 ETA is based on observed iterative progress after warmup. It should include confidence or sample metadata when exposed to clients.
 
@@ -82,6 +82,14 @@ Only the last option should call `session teardown --stop-worker`.
 Relay jobs are retained unless `--cancel-jobs` is explicit. Scheduler work is
 retained unless `--cancel-scheduler-jobs` is also explicit. Cleanup reports must
 include ownership verification, action, outcome, and residual-resource fields.
+Teardown persists one immutable cleanup operation and policy before side effects;
+same-policy retries are idempotent, policy drift is rejected, and attach/detach is
+forbidden after that intent exists. Connector evidence must map one desktop and
+one remote disposition to each owned gateway. A natural scheduler terminal state
+during a cancel race permits safe closure but must not be reported as canceled.
+An owner-session gateway without the exact active generation is ambiguous: detach
+or teardown reports it as a residual resource and does not use the session id alone
+to authorize connector or gateway cleanup.
 
 ## Scheduler provider boundary
 

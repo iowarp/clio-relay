@@ -2,9 +2,9 @@
 
 `clio-relay` uses `uv`, hatchling, and a staged GitHub Actions release. A tag
 creates an inert candidate payload in an unprivileged job. Protected-main code
-normalizes and attests that payload, reviewer-sealed operator live evidence
+normalizes and attests that payload, maintainer-sealed operator live evidence
 gates publication to PyPI, released-artifact evidence then exercises the
-published `uvx` path, and only the final evidence-verifying workflow publishes
+published persistent `uv tool` path, and only the final evidence-verifying workflow publishes
 the GitHub release.
 
 ## Local checks
@@ -38,13 +38,13 @@ then parse the bounded tar and wheel topology without invoking either archive.
 
 The 1.0 policy has an explicit `release_blockers` list. The evaluator fails
 closed even when all acceptance reports pass while any declared blocker
-remains. The policy currently tracks the missing immutable JARVIS-CD artifact,
-the dependent clio-kit release, adversarial cross-platform process containment,
-bounded indexed storage and retention, and the not-yet-passed Windows/Python
-3.14 matrix. Remove an entry only after its
-implementation and acceptance evidence are present on the reviewed release
-commit; remove the upstream entries only when the exact component pins and
-immutable artifacts are also recorded.
+remains. The reviewed 1.0 candidate has no declared implementation blockers:
+the exact JARVIS-CD and clio-kit releases are pinned, while containment,
+retention, cross-platform CI, and live Gray-Scott proof are enforced by named
+checks and target requirements. Missing evidence still fails the gate. Add a
+new blocker immediately if review discovers work that cannot be represented by
+an existing acceptance requirement, and remove it only after implementation
+and evidence are present on the reviewed release commit.
 
 ## Bootstrap source
 
@@ -80,6 +80,23 @@ git tag $Tag $ReviewedMainSha
 git push origin $Tag
 ```
 
+From the tag push until `finalize-release.yml` succeeds, keep `main` frozen at
+`$ReviewedMainSha`. Every privileged stage fetches live `origin/main` again and
+requires it, the protected workflow checkout, and the release tag to identify
+that exact commit. If `main` advances before PyPI publication, abandon the
+candidate and cut a new version from the newly reviewed commit; never move or
+replace the protected tag. Do not merge unrelated work during this window. In
+particular, advancing `main` after PyPI publication would prevent the immutable
+evidence chain from being finalized, because published package versions cannot
+be replaced.
+
+All six same-tag release workflows use the shared
+`clio-relay-release-<tag>` concurrency group with cancellation disabled. This
+serializes tag build, staging, both evidence seals, PyPI promotion, and final
+publication. It does not replace the freeze: every privileged stage still
+fetches live `origin/main` and fails unless main, the reviewed SHA, the tag, and
+the protected workflow checkout are identical.
+
 The tag-push workflow rejects a tag that does not match the package version,
 checked-out commit, and freshly fetched `origin/main` commit. It runs the
 complete local gate, builds exactly one wheel and one source distribution, and
@@ -111,11 +128,14 @@ identical and its complete asset-name set equals the six staged candidate
 assets. The workflow never replaces a candidate distribution.
 
 Enable GitHub immutable releases for the repository before the 1.0 release.
-The default workflow token cannot read the repository administration endpoint
-that owns this setting, so workflows do not claim to prove it. A repository
-administrator must audit and record the setting out of band. Finalization still
-checks the published release's `isImmutable` state and verifies the individual
-release, but that is not a substitute for the repository-setting audit.
+The default workflow token cannot read the repository administration endpoint,
+so configure an `IMMUTABLE_RELEASES_READ_TOKEN` secret on the protected
+`release-finalization` environment. Use a fine-grained token restricted to this
+repository with repository Administration read permission. Finalization calls
+`GET /repos/{owner}/{repo}/immutable-releases`, requires `enabled: true`, and
+records the deterministic result in `RELEASE-CLAIMS.json`. It repeats the same
+admin-read check immediately before changing the draft to public and refuses
+publication if the endpoint is unavailable, disabled, or has changed.
 
 ## Live validation of the candidate
 
@@ -155,37 +175,52 @@ not a checkout or an already published PyPI package. Record its independently
 computed digest in each report:
 
 ```powershell
-$env:CLIO_RELAY_VALIDATION_LAUNCHER = "uvx"
+$env:CLIO_RELAY_VALIDATION_LAUNCHER = "uv-tool"
 $env:CLIO_RELAY_VALIDATION_ARTIFACT_SHA256 = $Expected
 $Source = "wheel:$([Uri]::new($Wheel).AbsoluteUri)"
+$env:UV = (Get-Command uv).Source
+uv tool install --force --python 3.12 --no-config $Wheel
+$Relay = (Get-Command clio-relay).Source
+$env:CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE = $Relay
 
-uvx --python 3.12 --from $Wheel clio-relay cluster bootstrap `
+& $Relay cluster bootstrap `
   --cluster ares `
   --relay-wheel $Wheel `
-  --validation-launcher uvx `
+  --validation-launcher uv-tool `
   --validation-install-source $Source `
   --report .clio-relay\validation-reports\validation-ares-bootstrap.json
 
-uvx --python 3.12 --from $Wheel clio-relay live-test `
+& $Relay live-test `
   --cluster ares `
   --validation-install-source $Source `
   --jarvis-yaml .\pipeline.yaml `
   --report .clio-relay\validation-reports\validation-ares-live-test.json
 
-uvx --python 3.12 --from $Wheel clio-relay jarvis-mcp-validate `
+& $Relay jarvis-mcp-validate `
   --cluster ares `
   --arguments-json-file .\jarvis-run.json `
-  --validation-launcher uvx `
+  --validation-launcher uv-tool `
   --validation-install-source $Source `
   --report .clio-relay\validation-reports\validation-ares-jarvis-mcp.json
 ```
 
 Run every scenario required by the candidate-mode derivation of
 [`release-gate-1.0.yaml`](release-gate-1.0.yaml), including Ares bootstrap,
-JARVIS and non-JARVIS MCP, all three Spack user operations, explicit SLURM
-phases, the Ares LAMMPS package-progress application boundary, safe cleanup and
-explicit owned-job cancellation, homelab transport and cleanup, and the gateway
-runtime.
+JARVIS and non-JARVIS MCP, existing LAMMPS Spack discovery/location plus one
+separate absent-to-fresh-install-to-location transition, explicit SLURM
+phases, a bounded 20-step JARVIS-native Gray-Scott progress and artifact query,
+safe cleanup and explicit owned-job cancellation, homelab transport and
+cleanup, and the gateway runtime.
+Use the executable [1.0 live acceptance runbook](release-acceptance-1.0.md) and
+its tracked 17-report matrix. The matrix carries a canonical semantic SHA-256,
+the candidate and released filename prefixes, and the ordered logical report
+identities. Candidate and released preflight reject any missing, extra, renamed,
+or reordered logical entry; the policy evaluator then requires every one of the
+17 report documents to participate in a satisfied requirement. Both seals,
+both decisions, and final claims bind the same matrix digest and order. The
+runbook assigns fresh candidate or released pipeline, session, gateway,
+invocation, report, and output identities and keeps the two evidence stages
+disjoint.
 Upload each unique machine-readable report to the draft without replacing an
 earlier report:
 
@@ -205,21 +240,20 @@ gh workflow run live-validation-attest.yml --ref main -f tag=$Tag
 ```
 
 The repository's current GitHub plan does not support environment required-
-reviewer rules. The workflow therefore enforces the review boundary itself: a
-write-capable maintainer must manually dispatch sealing, and that maintainer
-must differ from both the candidate commit author and every non-local report
-asset uploader, every associated PR opener, and every numeric author or
-committer in the associated PR commits. The binding records those identities so
-finalization rechecks that independence. Sealing fails closed if either the
-author or committer of the source commit or any associated PR commit lacks a
-linked positive GitHub identity. All privileged environments admit only
-protected-branch dispatches and disable administrator bypass. This is a trust
-boundary, not defense in depth: a tag dispatch would let the tag supply the code
-that validates itself. The workflow requires protected `main`, the tag commit,
-and the checked-out source to be identical, then checks every non-local report's passing
-status, exact tag and commit, clean source identity, detected wheel install
-source, uvx launcher, distribution version, and candidate wheel digest. It then
-runs the candidate-mode gate with protected-main code and locked dependencies;
+reviewer rules. A write-capable repository maintainer must manually dispatch
+sealing from protected `main`; the workflow resolves that actor to a positive
+GitHub identity and requires `write`, `maintain`, or `admin` permission. The
+maintainer may also be the source author, report producer, or report uploader.
+The seal is therefore maintainer authorization and integrity binding, not an
+independent review claim. All privileged environments admit only protected-
+branch dispatches and disable administrator bypass. This is a trust boundary,
+not defense in depth: a tag dispatch would let the tag supply the code that
+validates itself. The workflow requires protected `main`, the tag commit, and
+the checked-out source to be identical, then checks every non-local report's
+passing status, exact tag and commit, clean source identity, detected wheel
+install source, persistent uv-tool launcher and RECORD closure, distribution
+version, and candidate wheel digest.
+It then runs the candidate-mode gate with protected-main code and locked dependencies;
 the candidate wheel remains inert in every write-, OIDC-, and attestation-
 capable job. The operator-produced reports, not execution inside the privileged
 job, prove that the exact wheel ran on each selected target. The workflow signs
@@ -228,7 +262,8 @@ every live JSON report and a deterministic
 ids, scenarios, clusters, and SHA-256 digests. Re-uploaded, added, or modified
 reports invalidate promotion unless the authorized workflow seals the exact new
 set. The binding labels this trust boundary as
-`reviewer_sealed_operator_evidence` and explicitly records
+`maintainer_sealed_operator_evidence`, records the sealer's numeric GitHub
+identity and write-capable permission, and explicitly records
 `producer_execution_verified=false`; neither the GitHub attestation nor the
 release notes may be described as independent target-produced proof.
 
@@ -238,7 +273,17 @@ hostname, SSH host key, scheduler provider, and optional scheduler/site markers
 against the operator pins. It records a canonical target-identity SHA-256 for
 each cluster label and fails if any report reuses a label for a different
 physical identity. These labels are evidence keys for this release, not a
-runtime target allowlist.
+runtime target allowlist. Operators can register arbitrary cluster targets, and
+a later release can add any of them to `policy.targets` and `requirements`
+without changing relay code.
+
+The 1.0 worker and JARVIS requirements also verify two receipt-bound native
+capabilities: JARVIS-CD must expose its execution handle, record, progress, and
+query APIs in its execution interpreter, and the released clio-kit wheel must
+expose the locked JARVIS MCP contract with those exact schemas. Legacy
+`clio_relay.package_progress_adapters` entry points remain compatibility
+diagnostics, but they are neither required nor accepted as native release
+evidence.
 
 These are immutable-candidate reports, not released-artifact reports. Their
 `released_artifact` field remains false because PyPI publication has not yet
@@ -314,39 +359,38 @@ New-Item -ItemType Directory -Force .clio-relay\published | Out-Null
 gh release download $Tag --pattern "PYPI-PROMOTION.json" `
   --dir .clio-relay\published
 $Promotion = Get-Content .clio-relay\published\PYPI-PROMOTION.json | ConvertFrom-Json
-$env:CLIO_RELAY_VALIDATION_LAUNCHER = "uvx"
+$env:CLIO_RELAY_VALIDATION_LAUNCHER = "uv-tool"
 $env:CLIO_RELAY_VALIDATION_ARTIFACT_SHA256 = $Promotion.wheel_sha256
+$env:UV = (Get-Command uv).Source
 Remove-Item Env:UV_INDEX, Env:UV_EXTRA_INDEX_URL, Env:UV_INDEX_URL `
   -ErrorAction SilentlyContinue
 
-uvx --refresh --no-config `
+uv tool install --force --refresh --no-config `
   --default-index https://pypi.org/simple `
-  --python 3.12 --from "clio-relay==$Version" `
-  clio-relay cluster bootstrap --cluster ares `
-  --validation-launcher uvx `
+  --python 3.12 "clio-relay==$Version"
+$Relay = (Get-Command clio-relay).Source
+$env:CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE = $Relay
+
+& $Relay cluster bootstrap --cluster ares `
+  --validation-launcher uv-tool `
   --validation-install-source "pypi:clio-relay==$Version" `
   --report .clio-relay\validation-reports\released-validation-ares-bootstrap.json
 
-uvx --refresh --no-config `
-  --default-index https://pypi.org/simple `
-  --python 3.12 --from "clio-relay==$Version" `
-  clio-relay live-test --cluster ares --jarvis-yaml .\pipeline.yaml `
+& $Relay live-test --cluster ares --jarvis-yaml .\pipeline.yaml `
   --report .clio-relay\validation-reports\released-validation-ares-live-test.json
 
-uvx --refresh --no-config `
-  --default-index https://pypi.org/simple `
-  --python 3.12 --from "clio-relay==$Version" `
-  clio-relay jarvis-mcp-validate `
+& $Relay jarvis-mcp-validate `
   --cluster ares `
   --arguments-json-file .\jarvis-run.json `
-  --validation-launcher uvx `
+  --validation-launcher uv-tool `
   --report .clio-relay\validation-reports\released-validation-ares-jarvis-mcp.json
 ```
 
 The report must detect `pypi` itself as both its effective and detected install
-source, record launcher `uvx`, set `released_artifact` true, and match the
-published wheel digest. Renaming a candidate report does not satisfy this
-contract. Upload the distinct released reports without replacing assets, then
+source, record launcher `uv-tool`, verify its persistent environment and
+installed RECORD closure, set `released_artifact` true, and match the published
+wheel digest. Renaming a candidate report does not satisfy this contract.
+Upload the distinct released reports without replacing assets, then
 seal them from protected `main`:
 
 ```powershell
@@ -355,17 +399,17 @@ gh release upload $Tag `
 gh workflow run released-validation-attest.yml --ref main -f tag=$Tag
 ```
 
-Released-evidence sealing applies the same independent-maintainer dispatch
-rule: the dispatcher must be write-capable and must differ from the release
-commit author, every associated PR contributor with a numeric GitHub identity,
-and every released-report asset uploader. The workflow verifies
+Released-evidence sealing applies the same write-capable maintainer dispatch
+rule and permits that maintainer to seal evidence they produced or uploaded.
+The workflow verifies
 the signed PyPI promotion record, current PyPI filenames and
 digests, every released report's exact source identity, and the final published
 policy. It evaluates that policy with protected-main code and locked
 dependencies; it does not execute either the draft wheel or the PyPI package in
 the privileged sealing job. Instead, every accepted report must prove that its
-operator ran `uvx --from clio-relay==<version>` against the public PyPI index
-and must bind the exact published digest. The workflow signs every released
+operator installed `clio-relay==<version>` once with `uv tool install` against
+the public PyPI index, reused that persistent executable, and bound the exact
+published digest. The workflow signs every released
 report, `RELEASED-VALIDATION-BINDING.json`, and
 `released-release-gate-1.0.json`.
 
