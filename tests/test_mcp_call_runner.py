@@ -13,6 +13,7 @@ import sys
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Protocol, cast
@@ -286,6 +287,67 @@ def test_direct_console_launcher_binds_real_distribution_record_and_detects_muta
     )._server_artifact_digest(after)
 
 
+def test_persistent_uv_tool_clio_kit_runtime_is_receipt_bindable(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    tool = tmp_path / ("clio-kit.exe" if os.name == "nt" else "clio-kit")
+    uv = tmp_path / ("uv.exe" if os.name == "nt" else "uv")
+    wheel = tmp_path / "clio_kit-2.3.1-py3-none-any.whl"
+    source = tmp_path / "clio_kit" / "__init__.py"
+    lock = tmp_path / "share" / "clio-kit-mcp-servers" / "jarvis" / "uv.lock"
+    source.parent.mkdir(parents=True)
+    lock.parent.mkdir(parents=True)
+    tool.write_bytes(b"persistent-clio-kit-tool")
+    uv.write_bytes(b"pinned-uv")
+    wheel.write_bytes(b"released-clio-kit-wheel")
+    source.write_text(_locked_clio_kit_v4_launcher_source(), encoding="utf-8")
+    lock.write_text("version = 1\n", encoding="utf-8")
+
+    def console_distribution_identity(_path: Path) -> dict[str, object]:
+        return {
+            "schema_version": "clio-relay.python-distribution-runtime.v1",
+            "distribution": "clio-kit",
+            "distribution_version": "2.3.1",
+            "entry_point": "clio-kit",
+            "entry_point_value": "clio_kit:main",
+            "record_sha256": "b" * 64,
+            "runtime_closure_sha256": "c" * 64,
+            "runtime_file_count": 100,
+            "runtime_bytes": 4096,
+            "runtime_closure_verified": True,
+            "direct_url": {"url": wheel.resolve().as_uri()},
+            "provider_interpreter": str(tmp_path / "tool-python"),
+            "contract_source_path": str(source),
+            "server_lock_paths": {"jarvis": str(lock)},
+            "error": None,
+        }
+
+    monkeypatch.setattr(
+        runner,
+        "_python_console_distribution_identity",
+        console_distribution_identity,
+    )
+
+    identity = cast(Any, runner)._server_artifact_identity(
+        str(tool),
+        ["mcp-server", "jarvis"],
+    )
+
+    assert identity["install_source"] == "uv-tool"
+    assert identity["install_spec"] == str(wheel.resolve())
+    assert (
+        identity["install_artifact_sha256"]
+        == hashlib.sha256(b"released-clio-kit-wheel").hexdigest()
+    )
+    assert identity["nested_launcher"] is True
+    assert identity["nested_runtime"]["persistent_tool"] is True
+    assert identity["nested_runtime"]["locked_runtime_verified"] is True
+    assert identity["server_process_artifact_verified"] is True
+    assert identity["verified"] is True
+
+
 def test_mcp_call_runner_supports_server_arguments(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -361,8 +423,8 @@ def test_mcp_call_runner_verifies_locked_clio_kit_child_runtime(
     uv = tmp_path / ("uv.exe" if os.name == "nt" else "uv")
     uvx.write_bytes(b"pinned-uv-launcher")
     uv.write_bytes(b"pinned-uv-runtime")
-    wheel = tmp_path / "clio_kit-3.0.0-py3-none-any.whl"
-    prefix = "clio_kit-3.0.0.data/data/clio-kit-mcp-servers/spack/"
+    wheel = tmp_path / "clio_kit-2.3.1-py3-none-any.whl"
+    prefix = "clio_kit-2.3.1.data/data/clio-kit-mcp-servers/spack/"
     launcher_source = _locked_clio_kit_v4_launcher_source()
     project = {
         "README.md": b"Spack MCP\n",
@@ -421,8 +483,8 @@ def test_mcp_call_runner_v4_identity_resists_structural_collision(tmp_path: Path
         "src.py": payload,
         "uv.lock": b"version = 1\n",
     }
-    collapsed_wheel = tmp_path / "clio_kit-3.0.0-collapsed.whl"
-    separated_wheel = tmp_path / "clio_kit-3.0.0-separated.whl"
+    collapsed_wheel = tmp_path / "clio_kit-2.3.1-collapsed.whl"
+    separated_wheel = tmp_path / "clio_kit-2.3.1-separated.whl"
     _write_synthetic_clio_kit_wheel(collapsed_wheel, project=collapsed)
     _write_synthetic_clio_kit_wheel(separated_wheel, project=separated)
 
@@ -455,10 +517,10 @@ def test_mcp_call_runner_v4_identity_ignores_only_launcher_exclusions(
         "src/spack_mcp/server.py": b"VALUE = 1\n",
         "uv.lock": b"version = 1\n",
     }
-    baseline = tmp_path / "clio_kit-3.0.0-baseline.whl"
-    excluded_mutation = tmp_path / "clio_kit-3.0.0-excluded.whl"
-    included_mutation = tmp_path / "clio_kit-3.0.0-included.whl"
-    lock_mutation = tmp_path / "clio_kit-3.0.0-lock.whl"
+    baseline = tmp_path / "clio_kit-2.3.1-baseline.whl"
+    excluded_mutation = tmp_path / "clio_kit-2.3.1-excluded.whl"
+    included_mutation = tmp_path / "clio_kit-2.3.1-included.whl"
+    lock_mutation = tmp_path / "clio_kit-2.3.1-lock.whl"
     _write_synthetic_clio_kit_wheel(baseline, project=project)
     _write_synthetic_clio_kit_wheel(
         excluded_mutation,
@@ -499,7 +561,7 @@ def test_mcp_call_runner_rejects_unsafe_clio_kit_wheel_paths(tmp_path: Path) -> 
     uv = tmp_path / ("uv.exe" if os.name == "nt" else "uv")
     uvx.write_bytes(b"pinned-uv-launcher")
     uv.write_bytes(b"pinned-uv-runtime")
-    wheel = tmp_path / "clio_kit-3.0.0-unsafe.whl"
+    wheel = tmp_path / "clio_kit-2.3.1-unsafe.whl"
     project = {
         "pyproject.toml": b"[project]\nname='spack-mcp'\n",
         "uv.lock": b"version = 1\n",
@@ -526,14 +588,14 @@ def test_mcp_call_runner_rejects_linked_clio_kit_runtime_member(tmp_path: Path) 
     uv = tmp_path / ("uv.exe" if os.name == "nt" else "uv")
     uvx.write_bytes(b"pinned-uv-launcher")
     uv.write_bytes(b"pinned-uv-runtime")
-    wheel = tmp_path / "clio_kit-3.0.0-linked.whl"
+    wheel = tmp_path / "clio_kit-2.3.1-linked.whl"
     project = {
         "pyproject.toml": b"[project]\nname='spack-mcp'\n",
         "uv.lock": b"version = 1\n",
     }
     _write_synthetic_clio_kit_wheel(wheel, project=project)
     link = zipfile.ZipInfo(
-        "clio_kit-3.0.0.data/data/clio-kit-mcp-servers/spack/src/spack_mcp/link.py"
+        "clio_kit-2.3.1.data/data/clio-kit-mcp-servers/spack/src/spack_mcp/link.py"
     )
     link.create_system = 3
     link.external_attr = (stat.S_IFLNK | 0o777) << 16
@@ -559,7 +621,7 @@ def test_mcp_call_runner_rejects_clio_kit_wheel_replacement(
     uv = tmp_path / ("uv.exe" if os.name == "nt" else "uv")
     uvx.write_bytes(b"pinned-uv-launcher")
     uv.write_bytes(b"pinned-uv-runtime")
-    wheel = tmp_path / "clio_kit-3.0.0-replaced.whl"
+    wheel = tmp_path / "clio_kit-2.3.1-replaced.whl"
     _write_synthetic_clio_kit_wheel(
         wheel,
         project={
@@ -601,7 +663,7 @@ def test_mcp_call_runner_executes_private_snapshot_during_swap_and_restore(
     uv = tmp_path / ("uv.exe" if os.name == "nt" else "uv")
     uvx.write_bytes(b"pinned-uv-launcher")
     uv.write_bytes(b"pinned-uv-runtime")
-    wheel = tmp_path / "clio_kit-3.0.0-swap.whl"
+    wheel = tmp_path / "clio_kit-2.3.1-swap.whl"
     _write_synthetic_clio_kit_wheel(
         wheel,
         project={
@@ -722,7 +784,7 @@ def test_mcp_call_runner_private_launch_fails_closed_on_artifact_mutation(
     uv = tmp_path / ("uv.exe" if os.name == "nt" else "uv")
     uvx.write_bytes(b"pinned-uv-launcher")
     uv.write_bytes(b"pinned-uv-runtime")
-    wheel = tmp_path / f"clio_kit-3.0.0-{mutation_target}.whl"
+    wheel = tmp_path / f"clio_kit-2.3.1-{mutation_target}.whl"
     _write_synthetic_clio_kit_wheel(
         wheel,
         project={
@@ -783,7 +845,7 @@ def test_mcp_call_runner_instance_bound_cleanup_preserves_substitute(
     uv = tmp_path / ("uv.exe" if os.name == "nt" else "uv")
     uvx.write_bytes(b"pinned-uv-launcher")
     uv.write_bytes(b"pinned-uv-runtime")
-    wheel = tmp_path / "clio_kit-3.0.0-cleanup-race.whl"
+    wheel = tmp_path / "clio_kit-2.3.1-cleanup-race.whl"
     _write_synthetic_clio_kit_wheel(
         wheel,
         project={
@@ -873,7 +935,7 @@ def test_mcp_call_runner_held_file_proof_rejects_intercepted_unlink(
     uv = tmp_path / ("uv.exe" if os.name == "nt" else "uv")
     uvx.write_bytes(b"pinned-uv-launcher")
     uv.write_bytes(b"pinned-uv-runtime")
-    wheel = tmp_path / "clio_kit-3.0.0-unlink-race.whl"
+    wheel = tmp_path / "clio_kit-2.3.1-unlink-race.whl"
     _write_synthetic_clio_kit_wheel(
         wheel,
         project={
@@ -1415,10 +1477,10 @@ def envelope(sequence, current, accepted):
         "entry_point": "lammps",
         "entry_point_value": "jarvis_cd.progress.lammps:adapter_from_package",
         "distribution": "jarvis_cd",
-        "distribution_version": "2.0.0",
+        "distribution_version": "1.2.2",
         "adapter": "lammps",
         "package_name": "builtin.lammps",
-        "package_version": "2.0.0",
+        "package_version": "1.2.2",
         "application_profile": "jarvis-cd.builtin.lammps",
     }
     record = {
@@ -1430,7 +1492,7 @@ def envelope(sequence, current, accepted):
         "metadata": {
             "adapter": "lammps",
             "package_name": "builtin.lammps",
-            "package_version": "2.0.0",
+            "package_version": "1.2.2",
             "run_id": execution_id,
             "execution_id": execution_id,
             "prediction_status": (
@@ -1634,6 +1696,458 @@ def test_mcp_call_runner_rejects_final_execution_mismatch(tmp_path: Path) -> Non
     assert bridge.result_metadata()["execution_validated"] is False
 
 
+def test_mcp_call_runner_bridges_indeterminate_native_progress_by_transport_sequence(
+    tmp_path: Path,
+) -> None:
+    runner = _load_runner()
+    sidecar = tmp_path / "progress.jsonl"
+    _precreate_progress_sidecar(sidecar)
+    bridge = cast(Any, runner)._McpProgressBridge(
+        path=sidecar,
+        relay_token="outer",
+        expected_server_artifact_digest="c" * 64,
+        observed_server_artifact_digest="c" * 64,
+        expected_pipeline_id="pipeline-a",
+    )
+    snapshot = _native_progress_snapshot(state="running", terminal=False)
+
+    bridge.observe(
+        {
+            "params": {
+                "progressToken": bridge.progress_token,
+                "progress": 1,
+                "total": 999,
+                "message": json.dumps(snapshot, separators=(",", ":"), sort_keys=True),
+            }
+        }
+    )
+    early = [json.loads(line) for line in sidecar.read_text(encoding="utf-8").splitlines()]
+
+    assert len(early) == 1
+    assert "current" not in early[0]["progress"]
+    assert "total" not in early[0]["progress"]
+    bridge_metadata = early[0]["progress"]["metadata"]["mcp_native_progress_bridge"]
+    assert bridge_metadata["transport_sequence"] == 1
+    assert bridge_metadata["determinate"] is False
+    assert bridge_metadata["execution_validated"] is False
+
+    documents = _native_execution_documents(state="completed", terminal=True)
+    bridge.finalize(documents)
+    records = [json.loads(line) for line in sidecar.read_text(encoding="utf-8").splitlines()]
+
+    assert len(records) == 2
+    final_bridge = records[-1]["progress"]["metadata"]["mcp_native_progress_bridge"]
+    assert final_bridge["execution_validated"] is True
+    assert bridge.result_metadata()["schema_version"] == (
+        "clio-relay.mcp-jarvis-progress-bridge.v1"
+    )
+    assert bridge.result_metadata()["execution_id"] == "native-execution"
+
+
+def test_mcp_call_runner_does_not_compare_native_transport_sequence_to_workload_current(
+    tmp_path: Path,
+) -> None:
+    runner = _load_runner()
+    sidecar = tmp_path / "progress.jsonl"
+    _precreate_progress_sidecar(sidecar)
+    bridge = cast(Any, runner)._McpProgressBridge(
+        path=sidecar,
+        relay_token="outer",
+        expected_server_artifact_digest="d" * 64,
+        observed_server_artifact_digest="d" * 64,
+        expected_pipeline_id="pipeline-a",
+    )
+    snapshot = _native_progress_snapshot(state="running", terminal=False)
+    latest = cast(dict[str, Any], cast(list[dict[str, Any]], snapshot["packages"])[0]["latest"])
+    latest.update({"current": 5.0, "total": 10.0, "determinate": True})
+
+    bridge.observe(
+        {
+            "params": {
+                "progressToken": bridge.progress_token,
+                "progress": 1,
+                "message": json.dumps(snapshot, separators=(",", ":"), sort_keys=True),
+            }
+        }
+    )
+    record = json.loads(sidecar.read_text(encoding="utf-8"))
+
+    assert record["progress"]["current"] == 5.0
+    assert record["progress"]["total"] == 10.0
+    assert record["progress"]["metadata"]["mcp_native_progress_bridge"]["transport_sequence"] == 1
+
+
+def test_mcp_call_runner_accepts_explicitly_null_native_optional_progress_fields(
+    tmp_path: Path,
+) -> None:
+    runner = _load_runner()
+    sidecar = tmp_path / "progress.jsonl"
+    _precreate_progress_sidecar(sidecar)
+    bridge = cast(Any, runner)._McpProgressBridge(
+        path=sidecar,
+        relay_token="outer",
+        expected_server_artifact_digest="d" * 64,
+        observed_server_artifact_digest="d" * 64,
+        expected_pipeline_id="pipeline-a",
+    )
+    snapshot = _native_progress_snapshot(state="running", terminal=False)
+    latest = cast(dict[str, Any], cast(list[dict[str, Any]], snapshot["packages"])[0]["latest"])
+    latest.update({"current": None, "total": None, "unit": None, "message": None})
+
+    bridge.observe(
+        {
+            "params": {
+                "progressToken": bridge.progress_token,
+                "progress": 1,
+                "message": json.dumps(snapshot, separators=(",", ":"), sort_keys=True),
+            }
+        }
+    )
+    record = json.loads(sidecar.read_text(encoding="utf-8"))["progress"]
+
+    assert record["current"] is None
+    assert record["total"] is None
+    assert record["unit"] is None
+    assert record["metadata"]["mcp_native_progress_bridge"]["determinate"] is False
+
+
+def test_mcp_call_runner_rejects_native_package_identity_drift(tmp_path: Path) -> None:
+    runner = _load_runner()
+    sidecar = tmp_path / "progress.jsonl"
+    _precreate_progress_sidecar(sidecar)
+    bridge = cast(Any, runner)._McpProgressBridge(
+        path=sidecar,
+        relay_token="outer",
+        expected_server_artifact_digest="d" * 64,
+        observed_server_artifact_digest="d" * 64,
+        expected_pipeline_id="pipeline-a",
+    )
+    first = _native_progress_snapshot(state="running", terminal=False)
+    bridge.observe(
+        {
+            "params": {
+                "progressToken": bridge.progress_token,
+                "progress": 1,
+                "message": json.dumps(first),
+            }
+        }
+    )
+    second = _native_progress_snapshot(state="running", terminal=False)
+    package = cast(list[dict[str, Any]], second["packages"])[0]
+    latest = cast(dict[str, Any], package["latest"])
+    package.update({"package_name": "different.package", "event_count": 2})
+    latest.update({"package_name": "different.package", "sequence": 1})
+
+    with raises(RuntimeError, match="package progress name changed"):
+        bridge.observe(
+            {
+                "params": {
+                    "progressToken": bridge.progress_token,
+                    "progress": 2,
+                    "message": json.dumps(second),
+                }
+            }
+        )
+
+
+def test_mcp_call_runner_persists_final_native_snapshot_without_notifications(
+    tmp_path: Path,
+) -> None:
+    runner = _load_runner()
+    sidecar = tmp_path / "progress.jsonl"
+    _precreate_progress_sidecar(sidecar)
+    bridge = cast(Any, runner)._McpProgressBridge(
+        path=sidecar,
+        relay_token="outer",
+        expected_server_artifact_digest="e" * 64,
+        observed_server_artifact_digest="e" * 64,
+        expected_pipeline_id="pipeline-a",
+    )
+
+    bridge.finalize(_native_execution_documents(state="completed", terminal=True))
+    records = [json.loads(line) for line in sidecar.read_text(encoding="utf-8").splitlines()]
+
+    assert len(records) == 1
+    assert (
+        records[0]["progress"]["metadata"]["mcp_native_progress_bridge"]["execution_validated"]
+        is True
+    )
+    assert bridge.result_metadata()["notification_count"] == 0
+
+
+def test_mcp_call_runner_rejects_native_final_identity_mismatch(tmp_path: Path) -> None:
+    runner = _load_runner()
+    sidecar = tmp_path / "progress.jsonl"
+    _precreate_progress_sidecar(sidecar)
+    bridge = cast(Any, runner)._McpProgressBridge(
+        path=sidecar,
+        relay_token="outer",
+        expected_server_artifact_digest="f" * 64,
+        observed_server_artifact_digest="f" * 64,
+        expected_pipeline_id="pipeline-a",
+    )
+    snapshot = _native_progress_snapshot(state="running", terminal=False)
+    bridge.observe(
+        {
+            "params": {
+                "progressToken": bridge.progress_token,
+                "progress": 1,
+                "message": json.dumps(snapshot),
+            }
+        }
+    )
+    documents = _native_execution_documents(state="completed", terminal=True)
+    handle = cast(dict[str, Any], documents["execution_handle"])
+    handle["execution_id"] = "different-execution"
+
+    with raises(RuntimeError, match="handle and record identities did not match"):
+        bridge.finalize(documents)
+
+
+def test_mcp_call_runner_rejects_compatibility_progress_with_native_final_result(
+    tmp_path: Path,
+) -> None:
+    runner = _load_runner()
+    sidecar = tmp_path / "progress.jsonl"
+    _precreate_progress_sidecar(sidecar)
+    bridge = cast(Any, runner)._McpProgressBridge(
+        path=sidecar,
+        relay_token="outer",
+        expected_server_artifact_digest="f" * 64,
+        observed_server_artifact_digest="f" * 64,
+        expected_pipeline_id="pipeline-a",
+    )
+    compatibility = _package_progress_envelope(sequence=1, accepted=True)
+    bridge.observe(
+        {
+            "params": {
+                "progressToken": bridge.progress_token,
+                "progress": 5,
+                "total": 10,
+                "message": json.dumps(compatibility),
+            }
+        }
+    )
+
+    with raises(RuntimeError, match="changed to native execution documents"):
+        bridge.finalize(_native_execution_documents(state="completed", terminal=True))
+
+
+def test_mcp_call_runner_rejects_rewritten_native_event_in_final_result(
+    tmp_path: Path,
+) -> None:
+    runner = _load_runner()
+    sidecar = tmp_path / "progress.jsonl"
+    _precreate_progress_sidecar(sidecar)
+    bridge = cast(Any, runner)._McpProgressBridge(
+        path=sidecar,
+        relay_token="outer",
+        expected_server_artifact_digest="f" * 64,
+        observed_server_artifact_digest="f" * 64,
+        expected_pipeline_id="pipeline-a",
+    )
+    snapshot = _native_progress_snapshot(state="running", terminal=False)
+    bridge.observe(
+        {
+            "params": {
+                "progressToken": bridge.progress_token,
+                "progress": 1,
+                "message": json.dumps(snapshot),
+            }
+        }
+    )
+    documents = _native_execution_documents(state="completed", terminal=True)
+    progress = cast(dict[str, Any], documents["progress"])
+    package = cast(list[dict[str, Any]], progress["packages"])[0]
+    cast(dict[str, Any], package["latest"])["message"] = "rewritten"
+
+    with raises(RuntimeError, match="changed an existing package event"):
+        bridge.finalize(documents)
+
+
+def test_mcp_call_runner_validates_unified_execution_progress_and_artifact_page() -> None:
+    runner = _load_runner()
+    result = _jarvis_execution_query_result(include_progress=True, include_artifacts=True)
+    arguments = {
+        "pipeline_id": "pipeline-a",
+        "execution_id": "native-execution",
+        "include_progress": True,
+        "artifacts": {
+            "package_id": "gray-scott",
+            "role": "output",
+            "state": "finalized",
+            "page_size": 50,
+            "cursor": "opaque_cursor_1",
+        },
+    }
+
+    validation = cast(Any, runner)._validated_jarvis_execution_query_result(
+        result,
+        arguments=arguments,
+    )
+
+    assert validation == {
+        "schema_version": "clio-relay.jarvis-execution-query-validation.v1",
+        "pipeline_id": "pipeline-a",
+        "execution_id": "native-execution",
+        "include_progress": True,
+        "progress_included": True,
+        "artifacts_requested": True,
+        "artifact_filters": {
+            "package_id": "gray-scott",
+            "role": "output",
+            "state": "finalized",
+            "artifact_id": None,
+            "page_size": 50,
+            "cursor": "opaque_cursor_1",
+        },
+        "returned_artifact_count": 1,
+        "next_cursor_present": False,
+    }
+
+
+def test_mcp_call_runner_persists_query_validation_in_durable_result(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+    server = _write_structured_tools_call_server(
+        tmp_path,
+        _jarvis_execution_query_result(include_progress=True, include_artifacts=True),
+    )
+    artifact = {
+        "verified": True,
+        "nested_runtime": {
+            "server_name": "jarvis",
+            "locked_runtime_verified": True,
+        },
+    }
+
+    def server_identity(_server: str, _args: list[str]) -> dict[str, Any]:
+        return artifact
+
+    def server_digest(_artifact: dict[str, Any]) -> str:
+        return "a" * 64
+
+    monkeypatch.setattr(runner, "_server_artifact_identity", server_identity)
+    monkeypatch.setattr(runner, "_server_artifact_digest", server_digest)
+
+    returncode = cast(Any, runner).run_mcp_call_from_params(
+        {
+            "server": sys.executable,
+            "server_args": [str(server)],
+            "operation": "tools/call",
+            "tool": "jarvis_get_execution",
+            "arguments": {
+                "pipeline_id": "pipeline-a",
+                "execution_id": "native-execution",
+                "artifacts": {"role": "output"},
+            },
+            "expected_server_artifact_digest": "a" * 64,
+        }
+    )
+
+    result = json.loads((tmp_path / "mcp-result.json").read_text(encoding="utf-8"))
+    assert returncode == 0
+    assert result["returncode"] == 0
+    assert result["protocol_error"] is None
+    assert result["result_validation"]["schema_version"] == (
+        "clio-relay.jarvis-execution-query-validation.v1"
+    )
+    assert result["result_validation"]["returned_artifact_count"] == 1
+
+
+def test_mcp_call_runner_accepts_explicit_execution_query_opt_outs() -> None:
+    runner = _load_runner()
+    result = _jarvis_execution_query_result(include_progress=False, include_artifacts=False)
+
+    validation = cast(Any, runner)._validated_jarvis_execution_query_result(
+        result,
+        arguments={
+            "pipeline_id": "pipeline-a",
+            "execution_id": "native-execution",
+            "include_progress": False,
+        },
+    )
+
+    assert validation["progress_included"] is False
+    assert validation["artifacts_requested"] is False
+    assert validation["returned_artifact_count"] == 0
+
+
+@mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("progress_lifecycle", "progress lifecycle did not match"),
+        ("artifact_lifecycle", "artifact page lifecycle did not match"),
+        ("artifact_execution", "artifact entry schema or identity was invalid"),
+        ("artifact_filter", "did not satisfy the role filter"),
+        ("artifact_count", "artifact page counts did not match"),
+        ("artifact_cursor", "artifact next_cursor was invalid"),
+    ],
+)
+def test_mcp_call_runner_rejects_incoherent_execution_query_results(
+    mutation: str,
+    message: str,
+) -> None:
+    runner = _load_runner()
+    result = _jarvis_execution_query_result(include_progress=True, include_artifacts=True)
+    progress = cast(dict[str, Any], result["progress"])
+    page = cast(dict[str, Any], result["artifact_page"])
+    artifact = cast(list[dict[str, Any]], page["artifacts"])[0]
+    if mutation == "progress_lifecycle":
+        progress["execution_state"] = "running"
+        progress["terminal"] = False
+    elif mutation == "artifact_lifecycle":
+        page["terminal"] = False
+    elif mutation == "artifact_execution":
+        artifact["execution_id"] = "different-execution"
+    elif mutation == "artifact_filter":
+        artifact["role"] = "log"
+    elif mutation == "artifact_count":
+        page["returned_artifact_count"] = 2
+    else:
+        page["next_cursor"] = "not a valid cursor"
+
+    with raises(RuntimeError, match=message):
+        cast(Any, runner)._validated_jarvis_execution_query_result(
+            result,
+            arguments={
+                "pipeline_id": "pipeline-a",
+                "execution_id": "native-execution",
+                "artifacts": {"role": "output"},
+            },
+        )
+
+
+def test_mcp_call_runner_rejects_unrequested_execution_query_payloads() -> None:
+    runner = _load_runner()
+    result = _jarvis_execution_query_result(include_progress=False, include_artifacts=False)
+    result["progress"] = _native_progress_snapshot(state="completed", terminal=True)
+
+    with raises(RuntimeError, match="returned progress after it was omitted"):
+        cast(Any, runner)._validated_jarvis_execution_query_result(
+            result,
+            arguments={
+                "pipeline_id": "pipeline-a",
+                "execution_id": "native-execution",
+                "include_progress": False,
+            },
+        )
+
+    result = _jarvis_execution_query_result(include_progress=False, include_artifacts=True)
+    with raises(RuntimeError, match="returned artifacts without an artifact request"):
+        cast(Any, runner)._validated_jarvis_execution_query_result(
+            result,
+            arguments={
+                "pipeline_id": "pipeline-a",
+                "execution_id": "native-execution",
+                "include_progress": False,
+            },
+        )
+
+
 def _precreate_progress_sidecar(path: Path) -> None:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -1655,10 +2169,10 @@ def _package_progress_envelope(*, sequence: int, accepted: bool) -> dict[str, ob
             "entry_point": "lammps",
             "entry_point_value": "jarvis_cd.progress.lammps:adapter_from_package",
             "distribution": "jarvis_cd",
-            "distribution_version": "2.0.0",
+            "distribution_version": "1.2.2",
             "adapter": "lammps",
             "package_name": "builtin.lammps",
-            "package_version": "2.0.0",
+            "package_version": "1.2.2",
             "application_profile": "jarvis-cd.builtin.lammps",
         },
         "provider_acceptance_validated": accepted,
@@ -1671,7 +2185,7 @@ def _package_progress_envelope(*, sequence: int, accepted: bool) -> dict[str, ob
             "metadata": {
                 "adapter": "lammps",
                 "package_name": "builtin.lammps",
-                "package_version": "2.0.0",
+                "package_version": "1.2.2",
                 "run_id": execution_id,
                 "execution_id": execution_id,
                 "prediction_status": "observed_lammps_timing",
@@ -1680,6 +2194,127 @@ def _package_progress_envelope(*, sequence: int, accepted: bool) -> dict[str, ob
                 "eta_seconds": 1.0,
             },
         },
+    }
+
+
+def _native_progress_snapshot(*, state: str, terminal: bool) -> dict[str, object]:
+    return {
+        "schema_version": "jarvis.execution.progress.v1",
+        "execution_id": "native-execution",
+        "pipeline_id": "pipeline-a",
+        "execution_state": state,
+        "terminal": terminal,
+        "packages": [
+            {
+                "package_id": "render",
+                "package_name": "builtin.paraview",
+                "event_count": 1,
+                "latest": {
+                    "schema_version": "jarvis.progress.v1",
+                    "package_name": "builtin.paraview",
+                    "package_id": "render",
+                    "execution_id": "native-execution",
+                    "label": "server readiness",
+                    "state": "ready",
+                    "sequence": 0,
+                    "observed_at_epoch": 1_789_000_000.0,
+                    "determinate": False,
+                    "metadata": {"mode": "server"},
+                },
+            }
+        ],
+    }
+
+
+def _native_execution_documents(*, state: str, terminal: bool) -> dict[str, object]:
+    handle: dict[str, object] = {
+        "schema_version": "jarvis.execution.handle.v1",
+        "execution_id": "native-execution",
+        "pipeline_id": "pipeline-a",
+        "mode": "direct",
+        "scheduler_provider": None,
+        "scheduler_native_id": None,
+        "cluster": None,
+    }
+    record: dict[str, object] = {
+        "schema_version": "jarvis.execution.record.v1",
+        "execution_id": "native-execution",
+        "pipeline_id": "pipeline-a",
+        "pipeline_name": "pipeline-a",
+        "mode": "direct",
+        "scheduler_provider": None,
+        "scheduler_native_id": None,
+        "cluster": None,
+        "state": state,
+        "submitted": False,
+        "terminal": terminal,
+        "created_at": "2026-07-12T10:00:00Z",
+        "updated_at": "2026-07-12T10:00:01Z",
+        "return_code": 0 if state == "completed" else None,
+        "error": None,
+        "metadata": {},
+    }
+    return {
+        "execution_handle": handle,
+        "execution_record": record,
+        "progress": _native_progress_snapshot(state=state, terminal=terminal),
+    }
+
+
+def _jarvis_execution_query_result(
+    *,
+    include_progress: bool,
+    include_artifacts: bool,
+) -> dict[str, Any]:
+    documents = deepcopy(_native_execution_documents(state="completed", terminal=True))
+    progress = documents.pop("progress") if include_progress else None
+    artifact_page: dict[str, Any] | None = None
+    if include_artifacts:
+        artifact_page = {
+            "producer_schema_version": "jarvis.execution.artifacts.v1",
+            "pipeline_id": "pipeline-a",
+            "execution_id": "native-execution",
+            "execution_state": "completed",
+            "terminal": True,
+            "artifacts": [
+                {
+                    "schema_version": "jarvis.artifact.v1",
+                    "package_name": "builtin.gray_scott",
+                    "package_id": "gray-scott",
+                    "execution_id": "native-execution",
+                    "artifact_id": "art_0000000000000000000001",
+                    "logical_name": "gray-scott-timesteps",
+                    "kind": "timestep-collection",
+                    "role": "output",
+                    "structure": "collection",
+                    "ownership": "execution",
+                    "state": "finalized",
+                    "revision": 1,
+                    "sequence": 1,
+                    "observed_at_epoch": 1_789_000_100.0,
+                    "location": {
+                        "kind": "execution_path",
+                        "value": "outputs/gray-scott.bp",
+                    },
+                    "media_type": "application/octet-stream",
+                    "format": "adios2",
+                    "size_bytes": 4096,
+                    "checksum": "sha256:0123456789abcdef",
+                    "metadata": {"member_count": 10, "latest_timestep": 9},
+                }
+            ],
+            "matching_artifact_count": 1,
+            "returned_artifact_count": 1,
+            "next_cursor": None,
+        }
+    return {
+        "schema_version": "clio-kit.jarvis-execution.v1",
+        "pipeline_id": "pipeline-a",
+        "execution_id": "native-execution",
+        **documents,
+        "runtime_metadata": {"package_provenance": [{"pkg_id": "gray-scott"}]},
+        "progress": progress,
+        "artifact_page": artifact_page,
     }
 
 
@@ -1697,6 +2332,33 @@ for line in sys.stdin:
         print(json.dumps({{"jsonrpc": "2.0", "id": message["id"], "result": result}}), flush=True)
     elif method == "tools/call":
         result = {{"content": [{{"type": "text", "text": "x" * {padding_bytes}}}]}}
+        print(json.dumps({{"jsonrpc": "2.0", "id": message["id"], "result": result}}), flush=True)
+        break
+""",
+        encoding="utf-8",
+    )
+    return server_path
+
+
+def _write_structured_tools_call_server(
+    tmp_path: Path,
+    structured: dict[str, Any],
+) -> Path:
+    server_path = tmp_path / "structured_stdio_server.py"
+    encoded = json.dumps(structured, separators=(",", ":"), sort_keys=True)
+    server_path.write_text(
+        f"""import json
+import sys
+
+structured = json.loads({encoded!r})
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        result = {{"protocolVersion": "2024-11-05", "capabilities": {{"tools": {{}}}}}}
+        print(json.dumps({{"jsonrpc": "2.0", "id": message["id"], "result": result}}), flush=True)
+    elif method == "tools/call":
+        result = {{"structuredContent": structured, "content": []}}
         print(json.dumps({{"jsonrpc": "2.0", "id": message["id"], "result": result}}), flush=True)
         break
 """,
@@ -1756,7 +2418,7 @@ def _write_synthetic_clio_kit_wheel(
     excluded: dict[str, bytes] | None = None,
     outer_members: dict[str, bytes] | None = None,
 ) -> None:
-    prefix = "clio_kit-3.0.0.data/data/clio-kit-mcp-servers/spack/"
+    prefix = "clio_kit-2.3.1.data/data/clio-kit-mcp-servers/spack/"
     with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr("clio_kit/__init__.py", _locked_clio_kit_v4_launcher_source())
         for relative, content in project.items():

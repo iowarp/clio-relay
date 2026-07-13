@@ -19,7 +19,7 @@ from filelock import Timeout
 
 from clio_relay import jarvis_provider
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import RelayError
+from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.jarvis_execution import sanitized_jarvis_environment
 from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.models import JarvisRunSpec, JobKind, McpCallSpec, RelayJob, RemoteAgentTaskSpec
@@ -47,6 +47,7 @@ def _private_sidecar_environment(*, scheduler_expected: bool | str) -> dict[str,
             }
         ),
         "CLIO_RELAY_RUNTIME_DIRECT_PROOF": direct_proof,
+        "CLIO_RELAY_RUNTIME_SCHEDULER_PROVIDER": "slurm",
         "CLIO_RELAY_BROKER_CREDENTIAL_FD": "999",
         "CLIO_RELAY_BROKER_READY_FD": "998",
     }
@@ -534,12 +535,74 @@ def test_scheduled_pipeline_uses_structured_submit_and_observe_runner(tmp_path: 
 
     assert command[0] == str(bin_dir / "python")
     assert command[1:4] == ["-I", "-S", "-c"]
-    assert "submit(submit=True, wait=False)" in command[4]
-    assert '"jarvis.scheduler.submission.v1"' in command[4]
-    assert "provider.poll(scheduler_job_id)" in command[4]
-    assert '"scheduler_job_id": scheduler_job_id' in command[4]
-    assert '"execution_owner": "jarvis_cd.pipeline.submit"' in command[4]
+    assert "from clio_relay.jarvis_execution import run_native_jarvis_broker" in command[4]
+    assert "run_native_jarvis_broker(" in command[4]
+    assert "runtime_intent=runtime_intent" in command[4]
+    assert "runtime_direct_proof=runtime_direct_proof" in command[4]
+    assert "append_runtime_record=append_runtime_record" in command[4]
     assert command[5:] == ["yaml", str(pipeline)]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_unsupported_scheduled_pipeline_fails_before_credentials_or_process_spawn(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    streaming: bool,
+) -> None:
+    pipeline = tmp_path / "unsupported-scheduler.yaml"
+    pipeline.write_text(
+        yaml.safe_dump(
+            {
+                "name": "unsupported-scheduler",
+                "scheduler": {"name": "site-batch"},
+                "pkgs": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    provider = JarvisCdProvider(jarvis_bin="jarvis")
+    observation_lookups: list[str | None] = []
+    credential_calls: list[object] = []
+    process_calls: list[object] = []
+
+    def record_observation_lookup(name: str | None) -> object:
+        observation_lookups.append(name)
+        return object()
+
+    def reject_credential_extraction(environment: object) -> None:
+        credential_calls.append(environment)
+        raise AssertionError("credential extraction must not be reached")
+
+    def reject_process_spawn(*args: object, **kwargs: object) -> None:
+        process_calls.append((args, kwargs))
+        raise AssertionError("process spawn must not be reached")
+
+    monkeypatch.setattr(provider, "require_available", lambda: None)
+    monkeypatch.setattr(
+        jarvis_provider,
+        "provider_for_scheduler",
+        record_observation_lookup,
+    )
+    monkeypatch.setattr(
+        jarvis_provider,
+        "jarvis_private_credential_channel",
+        reject_credential_extraction,
+    )
+    monkeypatch.setattr(
+        provider,
+        "run_command_streaming",
+        reject_process_spawn,
+    )
+
+    with pytest.raises(ConfigurationError, match="only through slurm"):
+        if streaming:
+            provider.run_pipeline_streaming(pipeline, env={})
+        else:
+            provider.run_pipeline(pipeline)
+
+    assert observation_lookups == ["site-batch"]
+    assert credential_calls == []
+    assert process_calls == []
 
 
 def test_scheduled_launch_initial_argv_and_environment_hide_all_sidecar_secrets(
@@ -615,6 +678,7 @@ def test_scheduled_launch_initial_argv_and_environment_hide_all_sidecar_secrets(
             "direct_proof_sha256": hashlib.sha256(b"test-direct-execution-proof").hexdigest(),
         },
         "runtime_direct_proof": "test-direct-execution-proof",
+        "scheduler_provider": "slurm",
     }
 
 

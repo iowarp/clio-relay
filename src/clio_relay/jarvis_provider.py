@@ -184,9 +184,10 @@ class JarvisCdProvider:
     ) -> subprocess.CompletedProcess[str]:
         """Invoke JARVIS-CD for an already materialized pipeline."""
         self.require_available()
+        command = self.pipeline_command(pipeline_path)
         launch_env, credential_payload = jarvis_private_credential_channel(os.environ)
         return self.run_command_streaming(
-            self.pipeline_command(pipeline_path),
+            command,
             cwd=cwd,
             env=launch_env,
             credential_payload=credential_payload,

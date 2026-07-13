@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from typing import cast
 
 import pytest
 
@@ -135,6 +136,223 @@ def test_direct_jarvis_mcp_return_records_synchronous_completion() -> None:
         "wait": True,
         "reported_status": "running",
     }
+
+
+def test_mcp_runtime_metadata_prefers_exact_native_execution_documents() -> None:
+    structured = _native_execution_envelope(mode="direct", state="completed")
+    runtime_projection = cast(dict[str, object], structured["runtime_metadata"])
+    runtime_projection["output_path"] = "/runs/pipeline-a/stdout.log"
+    runtime_projection["error_path"] = "/runs/pipeline-a/stderr.log"
+    runtime_projection["package_provenance"] = [
+        {
+            "pkg_id": "render",
+            "pkg_type": "builtin.paraview",
+            "global_id": "builtin.paraview.render",
+            "config_path": "/runs/pipeline-a/render.yaml",
+        },
+        {
+            "pkg_id": "analysis",
+            "pkg_type": "builtin.gray_scott",
+            "config_path": "/runs/pipeline-a/analysis.yaml",
+        },
+    ]
+    document = {
+        "tool": "jarvis_run",
+        "structured_result": structured,
+    }
+
+    metadata = runtime_metadata_from_mcp_result_document(document)
+
+    assert metadata is not None
+    assert metadata.source is RuntimeMetadataSource.JARVIS_MCP
+    assert metadata.execution_id == "native-execution"
+    assert metadata.pipeline_id == "pipeline-a"
+    assert metadata.scheduler_provider is None
+    assert metadata.scheduler_job_id is None
+    assert metadata.terminal.state == "completed"
+    assert metadata.terminal.terminal is True
+    assert metadata.terminal.returncode == 0
+    assert metadata.output_path == "/runs/pipeline-a/stdout.log"
+    assert metadata.error_path == "/runs/pipeline-a/stderr.log"
+    assert metadata.packages[0].name == "builtin.paraview"
+    assert metadata.packages[0].package_id == "render"
+    assert metadata.packages[0].path == "/runs/pipeline-a/render.yaml"
+    assert metadata.packages[0].metadata == {
+        "global_id": "builtin.paraview.render",
+        "progress_event_count": 1,
+    }
+    assert metadata.packages[1].name == "builtin.gray_scott"
+    assert metadata.packages[1].package_id == "analysis"
+    assert metadata.details["environment"] == {
+        "schema_version": "jarvis.environment.v1",
+        "spack_specs": ["paraview"],
+    }
+    assert metadata.details["producer_contract"]["contract_kind"] == "native_execution"
+    assert metadata.details["producer_contract"]["trusted"] is True
+    assert metadata.details["producer_contract"]["runtime_projection_merged"] is True
+    native_progress = metadata.details["native_execution"]["progress"]
+    assert native_progress["packages"][0]["latest"]["current"] is None
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        ("execution_id", "different-execution", "execution_id did not match"),
+        ("pipeline_id", "different-pipeline", "pipeline_id did not match"),
+        ("scheduler_phase", "running", "scheduler_phase did not match"),
+    ],
+)
+def test_native_runtime_projection_rejects_authoritative_identity_or_lifecycle_drift(
+    field_name: str,
+    value: object,
+    message: str,
+) -> None:
+    structured = _native_execution_envelope(mode="direct", state="completed")
+    runtime_projection = cast(dict[str, object], structured["runtime_metadata"])
+    runtime_projection[field_name] = value
+
+    with pytest.raises(ValueError, match=message):
+        runtime_metadata_from_mcp_result_document(
+            {"tool": "jarvis_run", "structured_result": structured}
+        )
+
+
+def test_native_runtime_projection_rejects_terminal_and_detail_document_drift() -> None:
+    structured = _native_execution_envelope(mode="direct", state="completed")
+    runtime_projection = cast(dict[str, object], structured["runtime_metadata"])
+    terminal = cast(dict[str, object], runtime_projection["terminal"])
+    terminal["terminal"] = False
+
+    with pytest.raises(ValueError, match=r"terminal\.terminal did not match"):
+        runtime_metadata_from_mcp_result_document(
+            {"tool": "jarvis_run", "structured_result": structured}
+        )
+
+    structured = _native_execution_envelope(mode="direct", state="completed")
+    runtime_projection = cast(dict[str, object], structured["runtime_metadata"])
+    details = cast(dict[str, object], runtime_projection["details"])
+    details["execution_handle"] = {"forged": True}
+
+    with pytest.raises(ValueError, match=r"details\.execution_handle did not match"):
+        runtime_metadata_from_mcp_result_document(
+            {"tool": "jarvis_run", "structured_result": structured}
+        )
+
+
+def test_native_runtime_projection_is_required_and_structurally_validated() -> None:
+    structured = _native_execution_envelope(mode="direct", state="completed")
+    structured.pop("runtime_metadata")
+
+    with pytest.raises(ValueError, match="omitted structured runtime_metadata"):
+        runtime_metadata_from_mcp_result_document(
+            {"tool": "jarvis_run", "structured_result": structured}
+        )
+
+    structured = _native_execution_envelope(mode="direct", state="completed")
+    runtime_projection = cast(dict[str, object], structured["runtime_metadata"])
+    runtime_projection["package_provenance"] = [{"pkg_id": "missing-package-type"}]
+
+    with pytest.raises(ValueError, match="package provenance contained an invalid entry"):
+        runtime_metadata_from_mcp_result_document(
+            {"tool": "jarvis_run", "structured_result": structured}
+        )
+
+
+def test_native_scheduler_documents_bind_provider_native_id_without_stdout() -> None:
+    document = {
+        "tool": "jarvis_run",
+        "structured_result": _native_execution_envelope(
+            mode="scheduler",
+            state="submitted",
+        ),
+    }
+
+    metadata = runtime_metadata_from_mcp_result_document(document)
+
+    assert metadata is not None
+    assert metadata.scheduler_provider == "slurm"
+    assert metadata.scheduler_job_id == "24680"
+    assert metadata.scheduler_phase == "submitted"
+    assert metadata.terminal.terminal is False
+    assert metadata.field_sources["scheduler_job_id"] is RuntimeMetadataSource.JARVIS_MCP
+
+
+def test_native_execution_documents_reject_cross_document_identity_drift() -> None:
+    structured = _native_execution_envelope(mode="direct", state="completed")
+    progress = structured["progress"]
+    assert isinstance(progress, dict)
+    progress["execution_id"] = "different-execution"
+
+    with pytest.raises(ValueError, match="execution identity did not match"):
+        runtime_metadata_from_mcp_result_document(
+            {"tool": "jarvis_run", "structured_result": structured}
+        )
+
+
+def test_native_execution_documents_reject_partial_envelope() -> None:
+    structured = _native_execution_envelope(mode="direct", state="completed")
+    structured.pop("execution_record")
+
+    with pytest.raises(ValueError, match="omitted documents"):
+        runtime_metadata_from_mcp_result_document(
+            {"tool": "jarvis_run", "structured_result": structured}
+        )
+
+
+def test_native_scheduler_documents_reject_submission_cluster_drift() -> None:
+    structured = _native_execution_envelope(mode="scheduler", state="submitted")
+    record = cast(dict[str, object], structured["execution_record"])
+    metadata = cast(dict[str, object], record["metadata"])
+    submission = cast(dict[str, object], metadata["submission"])
+    submission["scheduler_cluster"] = "different-cluster"
+
+    with pytest.raises(ValueError, match="submission cluster did not match"):
+        runtime_metadata_from_mcp_result_document(
+            {"tool": "jarvis_run", "structured_result": structured}
+        )
+
+
+def test_native_execution_documents_reject_nonportable_identity() -> None:
+    structured = _native_execution_envelope(mode="direct", state="completed")
+    for key in ("execution_handle", "execution_record", "progress"):
+        document = cast(dict[str, object], structured[key])
+        document["execution_id"] = "CON"
+    package = cast(
+        list[dict[str, object]],
+        cast(dict[str, object], structured["progress"])["packages"],
+    )[0]
+    cast(dict[str, object], package["latest"])["execution_id"] = "CON"
+
+    with pytest.raises(ValueError, match="portable ASCII identity"):
+        runtime_metadata_from_mcp_result_document(
+            {"tool": "jarvis_run", "structured_result": structured}
+        )
+
+
+def test_native_runtime_merge_rejects_lifecycle_regression() -> None:
+    completed = runtime_metadata_from_mcp_result_document(
+        {
+            "tool": "jarvis_run",
+            "structured_result": _native_execution_envelope(
+                mode="direct",
+                state="completed",
+            ),
+        }
+    )
+    running = runtime_metadata_from_mcp_result_document(
+        {
+            "tool": "jarvis_run",
+            "structured_result": _native_execution_envelope(
+                mode="direct",
+                state="running",
+            ),
+        }
+    )
+    assert completed is not None
+    assert running is not None
+
+    with pytest.raises(RuntimeMetadataIdentityConflictError, match="lifecycle regressed"):
+        merge_runtime_metadata(completed, running)
 
 
 def test_non_jarvis_mcp_result_cannot_claim_runtime_identity() -> None:
@@ -410,3 +628,128 @@ def _scheduler_submission(
         "identity_source": "scheduler_submit_api",
         "submitted": True,
     }
+
+
+def _native_execution_envelope(*, mode: str, state: str) -> dict[str, object]:
+    execution_id = "native-execution"
+    pipeline_id = "pipeline-a"
+    scheduler = mode == "scheduler"
+    terminal = state in {"scripted", "completed", "failed", "canceled"}
+    native_id = "24680" if scheduler else None
+    provider = "slurm" if scheduler else None
+    cluster = "linux" if scheduler else None
+    submission = {
+        "schema_version": JARVIS_SCHEDULER_SUBMISSION_SCHEMA,
+        "execution_id": execution_id,
+        "provider": provider,
+        "scheduler_job_id": native_id,
+        "scheduler_cluster": cluster,
+        "identity_source": "scheduler_submit_api",
+        "submitted": True,
+        "script_path": "/tmp/submit.sh",
+        "hostfile_path": "/tmp/hosts",
+    }
+    metadata = {"submission": submission, "script_path": "/tmp/submit.sh"} if scheduler else {}
+    handle = {
+        "schema_version": "jarvis.execution.handle.v1",
+        "execution_id": execution_id,
+        "pipeline_id": pipeline_id,
+        "mode": mode,
+        "scheduler_provider": provider,
+        "scheduler_native_id": native_id,
+        "cluster": cluster,
+    }
+    record = {
+        "schema_version": "jarvis.execution.record.v1",
+        "execution_id": execution_id,
+        "pipeline_id": pipeline_id,
+        "pipeline_name": pipeline_id,
+        "mode": mode,
+        "scheduler_provider": provider,
+        "scheduler_native_id": native_id,
+        "cluster": cluster,
+        "state": state,
+        "submitted": scheduler,
+        "terminal": terminal,
+        "created_at": "2026-07-12T10:00:00Z",
+        "updated_at": "2026-07-12T10:00:01Z",
+        "return_code": 0 if state == "completed" else None,
+        "error": None,
+        "metadata": metadata,
+    }
+    latest = {
+        "schema_version": "jarvis.progress.v1",
+        "package_name": "builtin.paraview",
+        "package_id": "render",
+        "execution_id": execution_id,
+        "label": "server readiness",
+        "state": "ready",
+        "sequence": 0,
+        "observed_at_epoch": 1_789_000_000.0,
+        "determinate": False,
+        "metadata": {"mode": "server"},
+    }
+    progress = {
+        "schema_version": "jarvis.execution.progress.v1",
+        "execution_id": execution_id,
+        "pipeline_id": pipeline_id,
+        "execution_state": state,
+        "terminal": terminal,
+        "packages": [
+            {
+                "package_id": "render",
+                "package_name": "builtin.paraview",
+                "event_count": 1,
+                "latest": latest,
+            }
+        ],
+    }
+    documents: dict[str, object] = {
+        "execution_handle": handle,
+        "execution_record": record,
+        "progress": progress,
+    }
+    documents["runtime_metadata"] = {
+        "schema_version": JARVIS_RUNTIME_METADATA_SCHEMA,
+        "source": "jarvis_mcp",
+        "execution_id": execution_id,
+        "pipeline_id": pipeline_id,
+        "mode": mode,
+        "scheduler_provider": provider,
+        "scheduler_native_id": native_id,
+        "cluster": cluster,
+        "scheduler_type": provider,
+        "scheduler_job_id": native_id,
+        "scheduler_phase": state,
+        "script_path": "/tmp/submit.sh" if scheduler else None,
+        "hostfile_path": "/tmp/hosts" if scheduler else None,
+        "output_path": None,
+        "error_path": None,
+        "package_provenance": [
+            {
+                "pkg_id": "render",
+                "pkg_type": "builtin.paraview",
+            }
+        ],
+        "terminal": {
+            "state": state,
+            "terminal": terminal,
+            "returncode": 0 if state == "completed" else None,
+            "reason": None,
+            "started_at": "2026-07-12T10:00:00Z",
+            "finished_at": "2026-07-12T10:00:01Z" if terminal else None,
+        },
+        "details": {
+            "execution_owner": "jarvis_cd.execution_record",
+            "submit": True if scheduler else None,
+            "wait": None if scheduler else True,
+            "environment": {
+                "schema_version": "jarvis.environment.v1",
+                "spack_specs": ["paraview"],
+            },
+            "execution_handle": deepcopy(handle),
+            "execution_record": deepcopy(record),
+            "scheduler_submission": deepcopy(submission) if scheduler else None,
+        },
+    }
+    return documents

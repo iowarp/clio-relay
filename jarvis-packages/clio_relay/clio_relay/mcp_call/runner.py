@@ -8,11 +8,13 @@ import hmac
 import json
 import math
 import os
+import re
 import secrets
 import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -23,6 +25,7 @@ from importlib import metadata
 from pathlib import Path, PurePosixPath
 from queue import Empty, Queue
 from typing import Any, cast
+from urllib.parse import unquote, urlsplit
 
 from clio_relay.process_containment import (
     CONTAINMENT_ENV,
@@ -34,6 +37,7 @@ TOOLS_LIST_MAX_PAGES = 64
 TOOLS_LIST_MAX_TOOLS = 10_000
 TOOLS_LIST_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MCP_CALL_DEFAULT_TIMEOUT_SECONDS = 300
+MCP_SERVER_TERMINATION_TIMEOUT_SECONDS = 2.0
 MCP_INITIALIZE_MAX_RESPONSE_BYTES = 1024 * 1024
 MCP_CALL_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MCP_SESSION_MAX_STDOUT_BYTES = 32 * 1024 * 1024
@@ -41,10 +45,99 @@ MCP_SESSION_MAX_STDERR_BYTES = 4 * 1024 * 1024
 MCP_PACKAGE_PROGRESS_SCHEMA = "clio-kit.jarvis-package-progress.v1"
 MCP_PACKAGE_PROGRESS_BRIDGE_SCHEMA = "clio-relay.mcp-package-progress-bridge.v1"
 MCP_JARVIS_RUNTIME_SCHEMA = "jarvis.runtime.v1"
+MCP_JARVIS_EXECUTION_HANDLE_SCHEMA = "jarvis.execution.handle.v1"
+MCP_JARVIS_EXECUTION_RECORD_SCHEMA = "jarvis.execution.record.v1"
+MCP_JARVIS_EXECUTION_PROGRESS_SCHEMA = "jarvis.execution.progress.v1"
+MCP_JARVIS_PROGRESS_EVENT_SCHEMA = "jarvis.progress.v1"
+MCP_JARVIS_EXECUTION_QUERY_SCHEMA = "clio-kit.jarvis-execution.v1"
+MCP_JARVIS_EXECUTION_ARTIFACTS_SCHEMA = "jarvis.execution.artifacts.v1"
+MCP_JARVIS_ARTIFACT_SCHEMA = "jarvis.artifact.v1"
+MCP_JARVIS_NATIVE_PROGRESS_BRIDGE_SCHEMA = "clio-relay.mcp-jarvis-progress-bridge.v1"
 MCP_PACKAGE_PROGRESS_MAX_NOTIFICATION_BYTES = 64 * 1024
 MCP_PACKAGE_PROGRESS_MAX_NOTIFICATIONS = 10_000
 MCP_PACKAGE_PROGRESS_MAX_TOTAL_BYTES = 4 * 1024 * 1024
 PROGRESS_SIDECAR_RECORD_SCHEMA = "clio-relay.progress-sidecar-record.v1"
+_JARVIS_EXECUTION_STATES = frozenset(
+    {
+        "preparing",
+        "scripted",
+        "submitting",
+        "submitted",
+        "running",
+        "completed",
+        "failed",
+        "canceled",
+        "unknown",
+    }
+)
+_JARVIS_TERMINAL_STATES = frozenset({"scripted", "completed", "failed", "canceled"})
+_JARVIS_PROGRESS_STATES = frozenset(
+    {"pending", "starting", "running", "ready", "completed", "failed", "canceled"}
+)
+_JARVIS_ARTIFACT_ROLES = frozenset(
+    {"intermediate", "output", "log", "checkpoint", "provenance", "validation"}
+)
+_JARVIS_ARTIFACT_STATES = frozenset({"producing", "available", "finalized", "incomplete", "failed"})
+_JARVIS_ARTIFACT_STRUCTURES = frozenset({"file", "directory", "collection", "stream"})
+_JARVIS_ARTIFACT_OWNERSHIP = frozenset({"execution", "external", "shared"})
+_JARVIS_ARTIFACT_LOCATION_KINDS = frozenset({"execution_path", "cluster_path", "external_uri"})
+_JARVIS_ARTIFACT_REQUIRED_FIELDS = frozenset(
+    {
+        "schema_version",
+        "package_name",
+        "package_id",
+        "execution_id",
+        "artifact_id",
+        "logical_name",
+        "kind",
+        "role",
+        "structure",
+        "ownership",
+        "state",
+        "revision",
+        "sequence",
+        "observed_at_epoch",
+        "metadata",
+    }
+)
+_JARVIS_ARTIFACT_OPTIONAL_FIELDS = frozenset(
+    {"location", "media_type", "format", "size_bytes", "checksum", "message"}
+)
+_JARVIS_ARTIFACT_ID = re.compile(r"^art_[A-Za-z0-9_-]{22,86}$")
+_JARVIS_ARTIFACT_CHECKSUM = re.compile(r"^[a-z0-9][a-z0-9_-]*:[A-Fa-f0-9]{16,256}$")
+_JARVIS_ARTIFACT_MEDIA_TYPE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$"
+)
+_JARVIS_ARTIFACT_CURSOR = re.compile(r"^[A-Za-z0-9_-]+$")
+_JARVIS_ARTIFACT_URI_SCHEME = re.compile(r"^[a-z][a-z0-9+.-]*$")
+_JARVIS_ARTIFACT_UNSAFE_URI_SCHEMES = frozenset({"data", "file", "javascript"})
+_JARVIS_ARTIFACT_MAX_PAGE_SIZE = 100
+_JARVIS_ARTIFACT_DEFAULT_PAGE_SIZE = 50
+_JARVIS_ARTIFACT_MAX_CURSOR_LENGTH = 1024
+_JARVIS_ARTIFACT_MAX_EVENT_BYTES = 64 * 1024
+_JARVIS_ARTIFACT_MAX_METADATA_BYTES = 64 * 1024
+_WINDOWS_RESERVED_COMPONENTS = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CLOCK$",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+    }
+)
+_JARVIS_REACHABLE_STATES: dict[str, frozenset[str]] = {
+    "preparing": _JARVIS_EXECUTION_STATES - {"preparing"},
+    "scripted": frozenset({"running", "completed", "failed", "canceled", "unknown"}),
+    "submitting": frozenset({"submitted", "running", "completed", "failed", "canceled", "unknown"}),
+    "submitted": frozenset({"running", "completed", "failed", "canceled", "unknown"}),
+    "running": frozenset({"completed", "failed", "canceled", "unknown"}),
+    "completed": frozenset(),
+    "failed": frozenset(),
+    "canceled": frozenset(),
+    "unknown": frozenset({"submitted", "running", "completed", "failed", "canceled"}),
+}
 FILE_HASH_CHUNK_BYTES = 1024 * 1024
 CLIO_KIT_WHEEL_MAX_FILES = 10_000
 CLIO_KIT_WHEEL_MAX_LAUNCHER_BYTES = 1024 * 1024
@@ -54,6 +147,8 @@ PYTHON_DISTRIBUTION_MAX_DISTRIBUTIONS = 10_000
 PYTHON_DISTRIBUTION_MAX_ENTRY_POINTS = 100_000
 PYTHON_DISTRIBUTION_MAX_FILES = 100_000
 PYTHON_DISTRIBUTION_MAX_BYTES = 4 * 1024 * 1024 * 1024
+PYTHON_TOOL_IDENTITY_MAX_BYTES = 8 * 1024 * 1024
+PYTHON_TOOL_IDENTITY_TIMEOUT_SECONDS = 30
 _STREAM_READ_CHARS = 64 * 1024
 _TOOLS_LIST_PAGINATION_KEY = "_clioRelayPagination"
 _CLIO_KIT_LOCKED_SERVER_SCHEMA = "clio-kit.locked-server.v4"
@@ -157,6 +252,15 @@ class _McpProgressBridge:
         self.bound_execution_id: str | None = None
         self.bound_provider: dict[str, Any] | None = None
         self.acceptance_candidates: list[dict[str, Any]] = []
+        self.native_mode: bool | None = None
+        self.native_transport_sequence = 0
+        self.native_execution_state: str | None = None
+        self.native_execution_terminal: bool | None = None
+        self.native_scripted_activation_observed = False
+        self.native_package_names: dict[str, str] = {}
+        self.native_package_sequences: dict[str, int] = {}
+        self.native_package_event_counts: dict[str, int] = {}
+        self.native_latest_candidates: dict[str, dict[str, Any]] = {}
         self.execution_validated = False
 
     def observe(self, message: dict[str, Any]) -> None:
@@ -181,22 +285,46 @@ class _McpProgressBridge:
         if self.notification_bytes > MCP_PACKAGE_PROGRESS_MAX_TOTAL_BYTES:
             raise _McpProtocolFailure("MCP package progress exceeded its total byte limit")
         try:
-            envelope = json.loads(raw_message)
-        except json.JSONDecodeError as exc:
+            envelope = json.loads(raw_message, object_pairs_hook=_reject_duplicate_json_keys)
+        except (json.JSONDecodeError, ValueError) as exc:
             raise _McpProtocolFailure(f"MCP package progress JSON was invalid: {exc}") from exc
-        validated = self._validated_envelope(envelope, params=params)
+        typed_envelope = cast(dict[str, Any], envelope) if isinstance(envelope, dict) else None
+        if (
+            typed_envelope is not None
+            and typed_envelope.get("schema_version") == MCP_JARVIS_EXECUTION_PROGRESS_SCHEMA
+        ):
+            self._observe_native_progress(typed_envelope, params=params)
+            return
+        if self.native_mode is True:
+            raise _McpProtocolFailure("MCP progress producer changed from native to compatibility")
+        self.native_mode = False
+        validated = self._validated_envelope(typed_envelope, params=params)
         self._append_record(validated, execution_validated=False)
         if validated["provider_acceptance_validated"] is True:
             self.acceptance_candidates.append(validated)
 
     def finalize(self, structured_result: dict[str, Any] | None) -> None:
         """Bind accepted observations to the final JARVIS execution result."""
-        if self.notification_count == 0:
-            return
         if structured_result is None:
+            if self.notification_count == 0:
+                return
             raise _McpProtocolFailure(
                 "MCP package progress had no structured JARVIS result for execution binding"
             )
+        native_documents = _validated_native_execution_documents(structured_result)
+        if native_documents is not None:
+            if self.native_mode is False:
+                raise _McpProtocolFailure(
+                    "MCP compatibility progress result changed to native execution documents"
+                )
+            self._finalize_native_progress(native_documents)
+            return
+        if self.native_mode is True:
+            raise _McpProtocolFailure(
+                "MCP native progress result omitted native JARVIS execution documents"
+            )
+        if self.notification_count == 0:
+            return
         raw_runtime = structured_result.get("runtime_metadata")
         if not isinstance(raw_runtime, dict):
             raise _McpProtocolFailure(
@@ -228,6 +356,18 @@ class _McpProgressBridge:
 
     def result_metadata(self) -> dict[str, Any]:
         """Return non-secret progress-bridge provenance for ``mcp-result.json``."""
+        if self.native_mode is True:
+            return {
+                "schema_version": MCP_JARVIS_NATIVE_PROGRESS_BRIDGE_SCHEMA,
+                "notification_count": self.notification_count,
+                "notification_bytes": self.notification_bytes,
+                "execution_id": self.bound_execution_id,
+                "pipeline_id": self.expected_pipeline_id,
+                "package_sequences": dict(sorted(self.native_package_sequences.items())),
+                "expected_server_artifact_digest": self.expected_server_artifact_digest,
+                "observed_server_artifact_digest": self.observed_server_artifact_digest,
+                "execution_validated": self.execution_validated,
+            }
         return {
             "schema_version": MCP_PACKAGE_PROGRESS_BRIDGE_SCHEMA,
             "notification_count": self.notification_count,
@@ -239,6 +379,247 @@ class _McpProgressBridge:
             "observed_server_artifact_digest": self.observed_server_artifact_digest,
             "execution_validated": self.execution_validated,
         }
+
+    def _observe_native_progress(
+        self,
+        snapshot_value: dict[str, Any],
+        *,
+        params: dict[str, Any],
+    ) -> None:
+        """Validate one native snapshot without treating MCP progress as workload percent."""
+        if self.native_mode is False:
+            raise _McpProtocolFailure("MCP progress producer changed from compatibility to native")
+        self.native_mode = True
+        transport_value = _finite_progress_number(params.get("progress"))
+        if (
+            transport_value is None
+            or not transport_value.is_integer()
+            or int(transport_value) != self.native_transport_sequence + 1
+        ):
+            raise _McpProtocolFailure("MCP native progress transport sequence was not monotonic")
+        self.native_transport_sequence = int(transport_value)
+        snapshot = _validated_native_progress_snapshot(snapshot_value)
+        if snapshot["pipeline_id"] != self.expected_pipeline_id:
+            raise _McpProtocolFailure("MCP native progress pipeline id did not match the request")
+        execution_id = cast(str, snapshot["execution_id"])
+        if self.bound_execution_id is None:
+            self.bound_execution_id = execution_id
+        elif self.bound_execution_id != execution_id:
+            raise _McpProtocolFailure("MCP native progress execution id changed")
+        self._observe_native_execution_lifecycle(snapshot)
+        packages = cast(list[dict[str, Any]], snapshot["packages"])
+        package_ids = {cast(str, package["package_id"]) for package in packages}
+        if not set(self.native_package_names).issubset(package_ids):
+            raise _McpProtocolFailure("MCP native progress dropped a package identity")
+        for package in packages:
+            self._observe_native_package(
+                snapshot,
+                package,
+                transport_sequence=self.native_transport_sequence,
+            )
+
+    def _observe_native_package(
+        self,
+        snapshot: dict[str, Any],
+        package: dict[str, Any],
+        *,
+        transport_sequence: int,
+    ) -> None:
+        """Append a package's new latest event while recording skipped snapshot events."""
+        package_id = cast(str, package["package_id"])
+        package_name = cast(str, package["package_name"])
+        prior_name = self.native_package_names.get(package_id)
+        if prior_name is not None and prior_name != package_name:
+            raise _McpProtocolFailure("MCP native package progress name changed")
+        self.native_package_names[package_id] = package_name
+        event_count = cast(int, package["event_count"])
+        prior_count = self.native_package_event_counts.get(package_id, 0)
+        if event_count < prior_count:
+            raise _McpProtocolFailure("MCP native progress event count regressed")
+        self.native_package_event_counts[package_id] = event_count
+        latest = cast(dict[str, Any] | None, package["latest"])
+        if latest is None:
+            return
+        event_sequence = cast(int, latest["sequence"])
+        prior_sequence = self.native_package_sequences.get(package_id, -1)
+        if event_sequence < prior_sequence:
+            raise _McpProtocolFailure("MCP native package progress sequence regressed")
+        if event_sequence == prior_sequence:
+            if event_count != prior_count:
+                raise _McpProtocolFailure(
+                    "MCP native package progress count changed without a new event"
+                )
+            return
+        if prior_sequence >= 0 and event_count == prior_count:
+            raise _McpProtocolFailure(
+                "MCP native package progress event changed without increasing its count"
+            )
+        candidate = {
+            "snapshot": snapshot,
+            "package": package,
+            "event": latest,
+            "transport_sequence": transport_sequence,
+            "skipped_event_count": max(0, event_count - prior_count - 1),
+        }
+        self.native_package_sequences[package_id] = event_sequence
+        self.native_latest_candidates[package_id] = candidate
+        self._append_native_record(candidate, execution_validated=False)
+
+    def _observe_native_execution_lifecycle(self, snapshot: dict[str, Any]) -> None:
+        """Require each sampled execution state to be reachable without regression."""
+        state = cast(str, snapshot["execution_state"])
+        terminal = cast(bool, snapshot["terminal"])
+        previous_state = self.native_execution_state
+        previous_terminal = self.native_execution_terminal
+        if previous_state is None:
+            self.native_execution_state = state
+            self.native_execution_terminal = terminal
+            return
+        if state == previous_state:
+            if terminal is not previous_terminal:
+                raise _McpProtocolFailure("MCP native progress terminal flag changed in place")
+            return
+        if state not in _JARVIS_REACHABLE_STATES[previous_state]:
+            raise _McpProtocolFailure("MCP native progress execution state regressed")
+        if previous_terminal is True and previous_state != "scripted":
+            raise _McpProtocolFailure("MCP native terminal execution changed state")
+        if previous_state == "scripted" and state != "failed":
+            self.native_scripted_activation_observed = True
+        self.native_execution_state = state
+        self.native_execution_terminal = terminal
+
+    def _finalize_native_progress(self, documents: dict[str, dict[str, Any]]) -> None:
+        """Bind native observations to exact matching final execution documents."""
+        self.native_mode = True
+        handle = documents["execution_handle"]
+        progress = documents["progress"]
+        record = documents["execution_record"]
+        execution_id = cast(str, handle["execution_id"])
+        if cast(str, handle["pipeline_id"]) != self.expected_pipeline_id:
+            raise _McpProtocolFailure("MCP native execution pipeline id did not match the request")
+        if self.bound_execution_id is not None and self.bound_execution_id != execution_id:
+            raise _McpProtocolFailure("MCP native progress execution id did not match the result")
+        self.bound_execution_id = execution_id
+        self._observe_native_execution_lifecycle(progress)
+        if self.native_scripted_activation_observed and (
+            handle["mode"] != "scheduler"
+            or handle["scheduler_native_id"] is None
+            or record["submitted"] is not True
+        ):
+            raise _McpProtocolFailure(
+                "MCP native scripted execution activation lacked scheduler identity"
+            )
+        final_packages = {
+            cast(str, package["package_id"]): package
+            for package in cast(list[dict[str, Any]], progress["packages"])
+        }
+        if not set(self.native_package_names).issubset(final_packages):
+            raise _McpProtocolFailure("MCP native final progress dropped a package identity")
+        for package_id, candidate in self.native_latest_candidates.items():
+            final_package = final_packages.get(package_id)
+            if final_package is None:
+                raise _McpProtocolFailure(
+                    "MCP native progress package was absent from final result"
+                )
+            candidate_event = cast(dict[str, Any], candidate["event"])
+            final_event = cast(dict[str, Any] | None, final_package["latest"])
+            if final_event is None or cast(int, final_event["sequence"]) < cast(
+                int, candidate_event["sequence"]
+            ):
+                raise _McpProtocolFailure("MCP native progress result regressed a package event")
+            if (
+                cast(int, final_event["sequence"]) == cast(int, candidate_event["sequence"])
+                and final_event != candidate_event
+            ):
+                raise _McpProtocolFailure("MCP native progress changed an existing package event")
+        final_candidates: list[tuple[str, str, int, int, dict[str, Any] | None]] = []
+        for package in final_packages.values():
+            package_id = cast(str, package["package_id"])
+            package_name = cast(str, package["package_name"])
+            previous_name = self.native_package_names.get(package_id)
+            if previous_name is not None and previous_name != package_name:
+                raise _McpProtocolFailure("MCP native final package progress name changed")
+            latest = cast(dict[str, Any] | None, package["latest"])
+            if latest is None:
+                final_candidates.append((package_id, package_name, 0, -1, None))
+                continue
+            event_count = cast(int, package["event_count"])
+            previous_count = self.native_package_event_counts.get(package_id, 0)
+            if event_count < previous_count:
+                raise _McpProtocolFailure("MCP native final progress event count regressed")
+            previous_sequence = self.native_package_sequences.get(package_id, -1)
+            final_sequence = cast(int, latest["sequence"])
+            if final_sequence == previous_sequence and event_count != previous_count:
+                raise _McpProtocolFailure(
+                    "MCP native final progress count changed without a new event"
+                )
+            if (
+                previous_sequence >= 0
+                and final_sequence > previous_sequence
+                and (event_count == previous_count)
+            ):
+                raise _McpProtocolFailure(
+                    "MCP native final progress event changed without increasing its count"
+                )
+            candidate = {
+                "snapshot": progress,
+                "package": package,
+                "event": latest,
+                "transport_sequence": self.native_transport_sequence,
+                "skipped_event_count": max(0, event_count - previous_count - 1),
+            }
+            final_candidates.append(
+                (package_id, package_name, event_count, final_sequence, candidate)
+            )
+        self.execution_validated = True
+        for package_id, package_name, event_count, final_sequence, candidate in final_candidates:
+            self.native_package_names[package_id] = package_name
+            self.native_package_event_counts[package_id] = event_count
+            if candidate is None:
+                continue
+            self.native_package_sequences[package_id] = final_sequence
+            self._append_native_record(candidate, execution_validated=True)
+
+    def _append_native_record(
+        self,
+        candidate: dict[str, Any],
+        *,
+        execution_validated: bool,
+    ) -> None:
+        """Project one exact native event into the relay progress record transport."""
+        snapshot = cast(dict[str, Any], candidate["snapshot"])
+        package = cast(dict[str, Any], candidate["package"])
+        event = cast(dict[str, Any], candidate["event"])
+        metadata = dict(cast(dict[str, Any], event["metadata"]))
+        metadata["mcp_native_progress_bridge"] = {
+            "schema_version": MCP_JARVIS_NATIVE_PROGRESS_BRIDGE_SCHEMA,
+            "execution_id": snapshot["execution_id"],
+            "pipeline_id": snapshot["pipeline_id"],
+            "execution_state": snapshot["execution_state"],
+            "terminal": snapshot["terminal"],
+            "transport_sequence": candidate["transport_sequence"],
+            "package_name": package["package_name"],
+            "package_id": package["package_id"],
+            "event_count": package["event_count"],
+            "event_schema_version": event["schema_version"],
+            "event_sequence": event["sequence"],
+            "event_state": event["state"],
+            "observed_at_epoch": event["observed_at_epoch"],
+            "determinate": event["determinate"],
+            "skipped_event_count": candidate["skipped_event_count"],
+            "expected_server_artifact_digest": self.expected_server_artifact_digest,
+            "observed_server_artifact_digest": self.observed_server_artifact_digest,
+            "execution_validated": execution_validated,
+        }
+        record: dict[str, Any] = {
+            "label": event["label"],
+            "message": event.get("message") or event["label"],
+            "metadata": metadata,
+        }
+        for field_name in ("current", "total", "unit"):
+            if field_name in event:
+                record[field_name] = event[field_name]
+        self._append_progress_payload(record)
 
     def _validated_envelope(
         self,
@@ -340,6 +721,10 @@ class _McpProgressBridge:
             "execution_validated": execution_validated,
         }
         record["metadata"] = metadata
+        self._append_progress_payload(record)
+
+    def _append_progress_payload(self, record: dict[str, Any]) -> None:
+        """Sign and append one relay-shaped progress payload."""
         sequence = self.sidecar_sequence + 1
         signed = {
             "schema_version": PROGRESS_SIDECAR_RECORD_SCHEMA,
@@ -450,6 +835,824 @@ def _finite_progress_number(value: object) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Reject duplicate producer keys before schema validation."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _is_locked_jarvis_execution_query(
+    *,
+    operation: str,
+    tool: str | None,
+    expected_server_artifact_digest: str | None,
+    observed_server_artifact_digest: str | None,
+    server_artifact: dict[str, Any] | None,
+) -> bool:
+    """Return whether this call is the artifact-bound built-in JARVIS query."""
+    if (
+        operation != "tools/call"
+        or tool != "jarvis_get_execution"
+        or expected_server_artifact_digest is None
+        or observed_server_artifact_digest != expected_server_artifact_digest
+        or server_artifact is None
+        or server_artifact.get("verified") is not True
+    ):
+        return False
+    nested_runtime = server_artifact.get("nested_runtime")
+    return (
+        isinstance(nested_runtime, dict)
+        and cast(dict[str, Any], nested_runtime).get("server_name") == "jarvis"
+        and cast(dict[str, Any], nested_runtime).get("locked_runtime_verified") is True
+    )
+
+
+def _validated_jarvis_execution_query_result(
+    value: dict[str, Any] | None,
+    *,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate one unified JARVIS execution, progress, and artifact result."""
+    allowed_arguments = {"pipeline_id", "execution_id", "include_progress", "artifacts"}
+    if not set(arguments).issubset(allowed_arguments):
+        raise _McpProtocolFailure("MCP JARVIS execution query contained unknown arguments")
+    pipeline_id = _native_identity(arguments.get("pipeline_id"), "pipeline_id")
+    execution_id = _native_identity(arguments.get("execution_id"), "execution_id")
+    include_progress = arguments.get("include_progress", True)
+    if not isinstance(include_progress, bool):
+        raise _McpProtocolFailure("MCP JARVIS include_progress must be boolean")
+    artifact_query = _validated_jarvis_artifact_query(arguments.get("artifacts"))
+    if value is None:
+        raise _McpProtocolFailure("MCP JARVIS execution query omitted its structured result")
+    expected_fields = {
+        "schema_version",
+        "pipeline_id",
+        "execution_id",
+        "execution_handle",
+        "execution_record",
+        "runtime_metadata",
+        "progress",
+        "artifact_page",
+    }
+    if set(value) != expected_fields or value.get("schema_version") != (
+        MCP_JARVIS_EXECUTION_QUERY_SCHEMA
+    ):
+        raise _McpProtocolFailure("MCP JARVIS execution query envelope was invalid")
+    if value.get("pipeline_id") != pipeline_id or value.get("execution_id") != execution_id:
+        raise _McpProtocolFailure("MCP JARVIS execution query identity did not match its request")
+    handle = _validated_native_execution_handle(value.get("execution_handle"))
+    record = _validated_native_execution_record(value.get("execution_record"))
+    identity_fields = (
+        "execution_id",
+        "pipeline_id",
+        "mode",
+        "scheduler_provider",
+        "scheduler_native_id",
+        "cluster",
+    )
+    if any(handle[field] != record[field] for field in identity_fields):
+        raise _McpProtocolFailure("MCP native JARVIS handle and record identities did not match")
+    if record["pipeline_id"] != pipeline_id or record["execution_id"] != execution_id:
+        raise _McpProtocolFailure("MCP JARVIS execution documents did not match the query")
+    runtime_metadata = value.get("runtime_metadata")
+    if not isinstance(runtime_metadata, dict):
+        raise _McpProtocolFailure("MCP JARVIS execution runtime_metadata must be an object")
+    _bounded_finite_json(
+        cast(dict[str, Any], runtime_metadata),
+        "JARVIS execution runtime_metadata",
+        4 * 1024 * 1024,
+    )
+
+    raw_progress = value.get("progress")
+    progress: dict[str, Any] | None = None
+    if include_progress:
+        progress = _validated_native_progress_snapshot(raw_progress)
+        if (
+            progress["execution_id"] != execution_id
+            or progress["pipeline_id"] != pipeline_id
+            or progress["execution_state"] != record["state"]
+            or progress["terminal"] is not record["terminal"]
+        ):
+            raise _McpProtocolFailure("MCP JARVIS query progress lifecycle did not match")
+    elif raw_progress is not None:
+        raise _McpProtocolFailure("MCP JARVIS query returned progress after it was omitted")
+
+    raw_artifact_page = value.get("artifact_page")
+    artifact_page: dict[str, Any] | None = None
+    if artifact_query is None:
+        if raw_artifact_page is not None:
+            raise _McpProtocolFailure(
+                "MCP JARVIS query returned artifacts without an artifact request"
+            )
+    else:
+        artifact_page = _validated_jarvis_artifact_page(
+            raw_artifact_page,
+            query=artifact_query,
+            pipeline_id=pipeline_id,
+            execution_id=execution_id,
+            execution_state=cast(str, record["state"]),
+            terminal=cast(bool, record["terminal"]),
+        )
+    return {
+        "schema_version": "clio-relay.jarvis-execution-query-validation.v1",
+        "pipeline_id": pipeline_id,
+        "execution_id": execution_id,
+        "include_progress": include_progress,
+        "progress_included": progress is not None,
+        "artifacts_requested": artifact_query is not None,
+        "artifact_filters": artifact_query or {},
+        "returned_artifact_count": (
+            artifact_page["returned_artifact_count"] if artifact_page is not None else 0
+        ),
+        "next_cursor_present": (
+            artifact_page is not None and artifact_page["next_cursor"] is not None
+        ),
+    }
+
+
+def _validated_jarvis_artifact_query(value: object) -> dict[str, Any] | None:
+    """Validate the bounded artifact selector before trusting its response page."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise _McpProtocolFailure("MCP JARVIS artifacts query must be an object or null")
+    typed = dict(cast(dict[str, Any], value))
+    allowed = {"package_id", "role", "state", "artifact_id", "page_size", "cursor"}
+    if not set(typed).issubset(allowed):
+        raise _McpProtocolFailure("MCP JARVIS artifact query contained unknown filters")
+    for field_name, maximum in (("package_id", 256), ("artifact_id", 90)):
+        field_value = typed.get(field_name)
+        if field_value is not None:
+            _jarvis_artifact_text(field_value, field_name, maximum=maximum)
+    artifact_id = typed.get("artifact_id")
+    if artifact_id is not None and _JARVIS_ARTIFACT_ID.fullmatch(cast(str, artifact_id)) is None:
+        raise _McpProtocolFailure("MCP JARVIS artifact_id filter was invalid")
+    role = typed.get("role")
+    if role is not None and role not in _JARVIS_ARTIFACT_ROLES:
+        raise _McpProtocolFailure("MCP JARVIS artifact role filter was invalid")
+    state = typed.get("state")
+    if state is not None and state not in _JARVIS_ARTIFACT_STATES:
+        raise _McpProtocolFailure("MCP JARVIS artifact state filter was invalid")
+    page_size = typed.get("page_size", _JARVIS_ARTIFACT_DEFAULT_PAGE_SIZE)
+    if (
+        isinstance(page_size, bool)
+        or not isinstance(page_size, int)
+        or not 1 <= page_size <= _JARVIS_ARTIFACT_MAX_PAGE_SIZE
+    ):
+        raise _McpProtocolFailure("MCP JARVIS artifact page_size was invalid")
+    cursor = typed.get("cursor")
+    if cursor is not None and (
+        not isinstance(cursor, str)
+        or not cursor
+        or len(cursor) > _JARVIS_ARTIFACT_MAX_CURSOR_LENGTH
+        or _JARVIS_ARTIFACT_CURSOR.fullmatch(cursor) is None
+    ):
+        raise _McpProtocolFailure("MCP JARVIS artifact cursor was invalid")
+    return {
+        "package_id": typed.get("package_id"),
+        "role": role,
+        "state": state,
+        "artifact_id": artifact_id,
+        "page_size": page_size,
+        "cursor": cursor,
+    }
+
+
+def _validated_jarvis_artifact_page(
+    value: object,
+    *,
+    query: dict[str, Any],
+    pipeline_id: str,
+    execution_id: str,
+    execution_state: str,
+    terminal: bool,
+) -> dict[str, Any]:
+    """Validate identity, lifecycle, counts, filters, and cursor bounds for one page."""
+    if not isinstance(value, dict):
+        raise _McpProtocolFailure("MCP JARVIS artifact_page must be an object")
+    typed = dict(cast(dict[str, Any], value))
+    expected = {
+        "producer_schema_version",
+        "pipeline_id",
+        "execution_id",
+        "execution_state",
+        "terminal",
+        "artifacts",
+        "matching_artifact_count",
+        "returned_artifact_count",
+        "next_cursor",
+    }
+    if set(typed) != expected or typed.get("producer_schema_version") != (
+        MCP_JARVIS_EXECUTION_ARTIFACTS_SCHEMA
+    ):
+        raise _McpProtocolFailure("MCP JARVIS artifact page schema was invalid")
+    if typed.get("pipeline_id") != pipeline_id or typed.get("execution_id") != execution_id:
+        raise _McpProtocolFailure("MCP JARVIS artifact page identity did not match")
+    if typed.get("execution_state") != execution_state or typed.get("terminal") is not terminal:
+        raise _McpProtocolFailure("MCP JARVIS artifact page lifecycle did not match")
+    raw_artifacts = typed.get("artifacts")
+    if not isinstance(raw_artifacts, list):
+        raise _McpProtocolFailure("MCP JARVIS artifact page entries must be an array")
+    artifact_items = cast(list[object], raw_artifacts)
+    page_size = cast(int, query["page_size"])
+    if len(artifact_items) > page_size:
+        raise _McpProtocolFailure("MCP JARVIS artifact page exceeded the requested page_size")
+    seen_ids: set[str] = set()
+    artifacts = [
+        _validated_jarvis_artifact_event(
+            item,
+            execution_id=execution_id,
+            query=query,
+            seen_ids=seen_ids,
+        )
+        for item in artifact_items
+    ]
+    returned = typed.get("returned_artifact_count")
+    matching = typed.get("matching_artifact_count")
+    if (
+        isinstance(returned, bool)
+        or not isinstance(returned, int)
+        or returned != len(artifacts)
+        or isinstance(matching, bool)
+        or not isinstance(matching, int)
+        or matching < returned
+    ):
+        raise _McpProtocolFailure("MCP JARVIS artifact page counts did not match")
+    if query.get("artifact_id") is not None and (matching > 1 or returned > 1):
+        raise _McpProtocolFailure("MCP JARVIS exact artifact filter returned multiple matches")
+    next_cursor = typed.get("next_cursor")
+    if next_cursor is not None and (
+        not artifacts
+        or not isinstance(next_cursor, str)
+        or not next_cursor
+        or len(next_cursor) > _JARVIS_ARTIFACT_MAX_CURSOR_LENGTH
+        or _JARVIS_ARTIFACT_CURSOR.fullmatch(next_cursor) is None
+    ):
+        raise _McpProtocolFailure("MCP JARVIS artifact next_cursor was invalid")
+    if query.get("artifact_id") is not None and next_cursor is not None:
+        raise _McpProtocolFailure("MCP JARVIS exact artifact filter unexpectedly paginated")
+    typed["artifacts"] = artifacts
+    return typed
+
+
+def _validated_jarvis_artifact_event(
+    value: object,
+    *,
+    execution_id: str,
+    query: dict[str, Any],
+    seen_ids: set[str],
+) -> dict[str, Any]:
+    """Validate one generated artifact and require it to satisfy the request filters."""
+    if not isinstance(value, dict):
+        raise _McpProtocolFailure("MCP JARVIS artifact entry must be an object")
+    typed = dict(cast(dict[str, Any], value))
+    if (
+        not _JARVIS_ARTIFACT_REQUIRED_FIELDS.issubset(typed)
+        or not set(typed).issubset(
+            _JARVIS_ARTIFACT_REQUIRED_FIELDS | _JARVIS_ARTIFACT_OPTIONAL_FIELDS
+        )
+        or typed.get("schema_version") != MCP_JARVIS_ARTIFACT_SCHEMA
+        or typed.get("execution_id") != execution_id
+    ):
+        raise _McpProtocolFailure("MCP JARVIS artifact entry schema or identity was invalid")
+    for field_name in ("package_name", "package_id", "logical_name", "kind"):
+        _jarvis_artifact_text(typed.get(field_name), field_name, maximum=256)
+    artifact_id = typed.get("artifact_id")
+    if (
+        not isinstance(artifact_id, str)
+        or _JARVIS_ARTIFACT_ID.fullmatch(artifact_id) is None
+        or artifact_id in seen_ids
+    ):
+        raise _McpProtocolFailure("MCP JARVIS artifact identity was invalid")
+    seen_ids.add(artifact_id)
+    allowed_fields = {
+        "role": _JARVIS_ARTIFACT_ROLES,
+        "state": _JARVIS_ARTIFACT_STATES,
+        "structure": _JARVIS_ARTIFACT_STRUCTURES,
+        "ownership": _JARVIS_ARTIFACT_OWNERSHIP,
+    }
+    for field_name, allowed in allowed_fields.items():
+        if typed.get(field_name) not in allowed:
+            raise _McpProtocolFailure(f"MCP JARVIS artifact {field_name} was invalid")
+    for field_name in ("revision", "sequence"):
+        item = typed.get(field_name)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 1:
+            raise _McpProtocolFailure(f"MCP JARVIS artifact {field_name} was invalid")
+    observed = _finite_progress_number(typed.get("observed_at_epoch"))
+    if observed is None or observed < 0:
+        raise _McpProtocolFailure("MCP JARVIS artifact observation time was invalid")
+    metadata_value = typed.get("metadata")
+    if not isinstance(metadata_value, dict):
+        raise _McpProtocolFailure("MCP JARVIS artifact metadata was invalid")
+    _bounded_finite_json(
+        cast(dict[str, Any], metadata_value),
+        "JARVIS artifact metadata",
+        _JARVIS_ARTIFACT_MAX_METADATA_BYTES,
+    )
+    _validate_jarvis_artifact_location(typed)
+    _validate_jarvis_artifact_optional_fields(typed)
+    _bounded_finite_json(typed, "JARVIS artifact entry", _JARVIS_ARTIFACT_MAX_EVENT_BYTES)
+    for field_name in ("package_id", "role", "state", "artifact_id"):
+        expected = query.get(field_name)
+        if expected is not None and typed.get(field_name) != expected:
+            raise _McpProtocolFailure(
+                f"MCP JARVIS artifact did not satisfy the {field_name} filter"
+            )
+    return typed
+
+
+def _validate_jarvis_artifact_location(value: dict[str, Any]) -> None:
+    """Validate transport-neutral location and ownership semantics."""
+    location = value.get("location")
+    if location is None:
+        if value["state"] in {"available", "finalized"}:
+            raise _McpProtocolFailure("MCP JARVIS available artifact omitted its location")
+        return
+    if not isinstance(location, dict) or set(cast(dict[object, object], location)) != {
+        "kind",
+        "value",
+    }:
+        raise _McpProtocolFailure("MCP JARVIS artifact location was invalid")
+    typed_location = cast(dict[str, Any], location)
+    kind = typed_location.get("kind")
+    if kind not in _JARVIS_ARTIFACT_LOCATION_KINDS:
+        raise _McpProtocolFailure("MCP JARVIS artifact location kind was invalid")
+    rendered = _jarvis_artifact_text(
+        typed_location.get("value"),
+        "location",
+        maximum=4096,
+    )
+    if kind == "execution_path":
+        path = PurePosixPath(rendered)
+        if (
+            "\\" in rendered
+            or path.is_absolute()
+            or rendered.startswith("/")
+            or rendered.endswith("/")
+            or "//" in rendered
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or (bool(path.parts) and ":" in path.parts[0])
+            or path.as_posix() != rendered
+        ):
+            raise _McpProtocolFailure("MCP JARVIS execution artifact path was invalid")
+    elif kind == "cluster_path":
+        path = PurePosixPath(rendered)
+        if (
+            "\\" in rendered
+            or not path.is_absolute()
+            or not rendered.startswith("/")
+            or rendered == "/"
+            or rendered.endswith("/")
+            or "//" in rendered
+            or any(part in {"", ".", ".."} for part in path.parts[1:])
+            or path.as_posix() != rendered
+        ):
+            raise _McpProtocolFailure("MCP JARVIS cluster artifact path was invalid")
+    else:
+        try:
+            parsed = urlsplit(rendered)
+            has_user_info = parsed.username is not None or parsed.password is not None
+        except ValueError as exc:
+            raise _McpProtocolFailure("MCP JARVIS external artifact URI was invalid") from exc
+        scheme = parsed.scheme.lower()
+        if (
+            not scheme
+            or _JARVIS_ARTIFACT_URI_SCHEME.fullmatch(scheme) is None
+            or len(scheme) == 1
+            or scheme in _JARVIS_ARTIFACT_UNSAFE_URI_SCHEMES
+            or has_user_info
+            or (scheme in {"gs", "http", "https", "s3"} and not parsed.netloc)
+        ):
+            raise _McpProtocolFailure("MCP JARVIS external artifact URI was invalid")
+    if (kind == "execution_path") is not (value["ownership"] == "execution"):
+        raise _McpProtocolFailure("MCP JARVIS artifact location ownership was invalid")
+
+
+def _validate_jarvis_artifact_optional_fields(value: dict[str, Any]) -> None:
+    """Validate optional generated-artifact metadata fields."""
+    for field_name, maximum in (("format", 256), ("message", 4096)):
+        if field_name in value:
+            _jarvis_artifact_text(value[field_name], field_name, maximum=maximum)
+    media_type = value.get("media_type")
+    if media_type is not None and (
+        not isinstance(media_type, str) or _JARVIS_ARTIFACT_MEDIA_TYPE.fullmatch(media_type) is None
+    ):
+        raise _McpProtocolFailure("MCP JARVIS artifact media_type was invalid")
+    if "size_bytes" in value:
+        size = value["size_bytes"]
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise _McpProtocolFailure("MCP JARVIS artifact size_bytes was invalid")
+    checksum = value.get("checksum")
+    if checksum is not None and (
+        not isinstance(checksum, str) or _JARVIS_ARTIFACT_CHECKSUM.fullmatch(checksum) is None
+    ):
+        raise _McpProtocolFailure("MCP JARVIS artifact checksum was invalid")
+
+
+def _jarvis_artifact_text(value: object, field_name: str, *, maximum: int) -> str:
+    """Return one bounded nonblank artifact field without control characters."""
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > maximum
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise _McpProtocolFailure(f"MCP JARVIS artifact {field_name} was invalid")
+    return value
+
+
+def _validated_native_execution_documents(
+    value: dict[str, Any],
+) -> dict[str, dict[str, Any]] | None:
+    """Validate an exact native JARVIS handle/record/progress result envelope."""
+    keys = {"execution_handle", "execution_record", "progress"}
+    present = keys & set(value)
+    if not present:
+        return None
+    if present != keys:
+        raise _McpProtocolFailure("MCP native JARVIS result omitted execution documents")
+    handle = _validated_native_execution_handle(value["execution_handle"])
+    record = _validated_native_execution_record(value["execution_record"])
+    progress = _validated_native_progress_snapshot(value["progress"])
+    identity_fields = (
+        "execution_id",
+        "pipeline_id",
+        "mode",
+        "scheduler_provider",
+        "scheduler_native_id",
+        "cluster",
+    )
+    if any(handle[field] != record[field] for field in identity_fields):
+        raise _McpProtocolFailure("MCP native JARVIS handle and record identities did not match")
+    if (
+        progress["execution_id"] != record["execution_id"]
+        or progress["pipeline_id"] != record["pipeline_id"]
+        or progress["execution_state"] != record["state"]
+        or progress["terminal"] is not record["terminal"]
+    ):
+        raise _McpProtocolFailure("MCP native JARVIS record and progress did not match")
+    return {
+        "execution_handle": handle,
+        "execution_record": record,
+        "progress": progress,
+    }
+
+
+def _validated_native_execution_handle(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise _McpProtocolFailure("MCP native JARVIS execution_handle must be an object")
+    typed = dict(cast(dict[str, Any], value))
+    expected = {
+        "schema_version",
+        "execution_id",
+        "pipeline_id",
+        "mode",
+        "scheduler_provider",
+        "scheduler_native_id",
+        "cluster",
+    }
+    if set(typed) != expected or typed.get("schema_version") != MCP_JARVIS_EXECUTION_HANDLE_SCHEMA:
+        raise _McpProtocolFailure("MCP native JARVIS execution_handle schema was invalid")
+    _native_identity(typed.get("execution_id"), "execution_id")
+    _native_identity(typed.get("pipeline_id"), "pipeline_id")
+    mode = typed.get("mode")
+    if mode not in {"direct", "scheduler"}:
+        raise _McpProtocolFailure("MCP native JARVIS execution mode was invalid")
+    for field_name in ("scheduler_provider", "scheduler_native_id", "cluster"):
+        field_value = typed.get(field_name)
+        if field_value is not None:
+            _native_text(field_value, field_name)
+    if mode == "direct" and any(
+        typed.get(field_name) is not None
+        for field_name in ("scheduler_provider", "scheduler_native_id", "cluster")
+    ):
+        raise _McpProtocolFailure("MCP native direct execution claimed scheduler identity")
+    if mode == "scheduler" and typed.get("scheduler_provider") is None:
+        raise _McpProtocolFailure("MCP native scheduler execution omitted its provider")
+    if typed.get("scheduler_provider") == "slurm":
+        native_id = typed.get("scheduler_native_id")
+        cluster = typed.get("cluster")
+        if native_id is not None and (
+            len(cast(str, native_id)) > 64
+            or not cast(str, native_id).isascii()
+            or not cast(str, native_id).isdigit()
+        ):
+            raise _McpProtocolFailure("MCP native SLURM identity was invalid")
+        if cluster is not None and (
+            len(cast(str, cluster)) > 255
+            or any(
+                not (character.isascii() and (character.isalnum() or character in "._-"))
+                for character in cast(str, cluster)
+            )
+        ):
+            raise _McpProtocolFailure("MCP native SLURM cluster was invalid")
+    return typed
+
+
+def _validated_native_execution_record(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise _McpProtocolFailure("MCP native JARVIS execution_record must be an object")
+    typed = dict(cast(dict[str, Any], value))
+    expected = {
+        "schema_version",
+        "execution_id",
+        "pipeline_id",
+        "pipeline_name",
+        "mode",
+        "scheduler_provider",
+        "scheduler_native_id",
+        "cluster",
+        "state",
+        "submitted",
+        "terminal",
+        "created_at",
+        "updated_at",
+        "return_code",
+        "error",
+        "metadata",
+    }
+    if set(typed) != expected or typed.get("schema_version") != MCP_JARVIS_EXECUTION_RECORD_SCHEMA:
+        raise _McpProtocolFailure("MCP native JARVIS execution_record schema was invalid")
+    handle_projection = {
+        "schema_version": MCP_JARVIS_EXECUTION_HANDLE_SCHEMA,
+        **{
+            key: typed[key]
+            for key in (
+                "execution_id",
+                "pipeline_id",
+                "mode",
+                "scheduler_provider",
+                "scheduler_native_id",
+                "cluster",
+            )
+        },
+    }
+    _validated_native_execution_handle(handle_projection)
+    if typed.get("pipeline_name") != typed.get("pipeline_id"):
+        raise _McpProtocolFailure("MCP native JARVIS pipeline identity did not match")
+    state = typed.get("state")
+    if state not in _JARVIS_EXECUTION_STATES:
+        raise _McpProtocolFailure("MCP native JARVIS execution state was invalid")
+    submitted = typed.get("submitted")
+    terminal = typed.get("terminal")
+    if not isinstance(submitted, bool) or not isinstance(terminal, bool):
+        raise _McpProtocolFailure("MCP native JARVIS lifecycle flags must be boolean")
+    if terminal and state not in _JARVIS_TERMINAL_STATES:
+        raise _McpProtocolFailure("MCP native terminal execution state was invalid")
+    if state in {"completed", "failed", "canceled"} and terminal is not True:
+        raise _McpProtocolFailure("MCP native terminal state omitted terminal=true")
+    return_code = typed.get("return_code")
+    if return_code is not None and (
+        isinstance(return_code, bool) or not isinstance(return_code, int)
+    ):
+        raise _McpProtocolFailure("MCP native JARVIS return_code was invalid")
+    if state == "completed" and return_code != 0:
+        raise _McpProtocolFailure("MCP native completed execution requires return_code=0")
+    if state == "failed" and (return_code is None or return_code == 0):
+        raise _McpProtocolFailure("MCP native failed execution requires a nonzero return_code")
+    _native_timestamp(typed.get("created_at"), "created_at")
+    _native_timestamp(typed.get("updated_at"), "updated_at")
+    error = typed.get("error")
+    if error is not None:
+        _native_text(error, "error", maximum=16_384, allow_newlines=True)
+    metadata_value = typed.get("metadata")
+    if not isinstance(metadata_value, dict):
+        raise _McpProtocolFailure("MCP native JARVIS execution metadata must be an object")
+    metadata_document = cast(dict[str, Any], metadata_value)
+    _bounded_finite_json(metadata_document, "native JARVIS execution metadata", 48_000)
+    native_id = typed.get("scheduler_native_id")
+    raw_submission = metadata_document.get("submission")
+    if raw_submission is None:
+        if native_id is not None or submitted is True:
+            raise _McpProtocolFailure("MCP native scheduler identity omitted submission proof")
+        return typed
+    if not isinstance(raw_submission, dict):
+        raise _McpProtocolFailure("MCP native scheduler submission proof must be an object")
+    if typed["mode"] != "scheduler":
+        raise _McpProtocolFailure("MCP native direct execution carried scheduler submission proof")
+    submission_document = cast(dict[str, Any], raw_submission)
+    submission_submitted = submission_document.get("submitted")
+    if (
+        submission_document.get("schema_version") != "jarvis.scheduler.submission.v1"
+        or submission_document.get("execution_id") != typed.get("execution_id")
+        or submission_document.get("provider") != typed.get("scheduler_provider")
+        or submission_document.get("scheduler_job_id") != native_id
+        or submission_document.get("scheduler_cluster") != typed.get("cluster")
+        or not isinstance(submission_submitted, bool)
+        or submission_submitted is not submitted
+    ):
+        raise _McpProtocolFailure("MCP native scheduler submission proof did not match")
+    identity_source = submission_document.get("identity_source")
+    if native_id is not None and (
+        identity_source != "scheduler_submit_api" or submission_submitted is not True
+    ):
+        raise _McpProtocolFailure("MCP native scheduler submission identity was not authoritative")
+    if native_id is None and identity_source is not None:
+        raise _McpProtocolFailure("MCP native scheduler submission source claimed no identity")
+    for field_name in (
+        "script_path",
+        "hostfile_path",
+        "pipeline_snapshot_path",
+        "pipeline_input_path",
+        "execution_root_path",
+        "output_path",
+        "error_path",
+    ):
+        field_value = submission_document.get(field_name)
+        if field_value is not None:
+            _native_text(field_value, field_name, maximum=16_384)
+    return typed
+
+
+def _validated_native_progress_snapshot(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise _McpProtocolFailure("MCP native JARVIS progress must be an object")
+    typed = dict(cast(dict[str, Any], value))
+    expected = {
+        "schema_version",
+        "execution_id",
+        "pipeline_id",
+        "execution_state",
+        "terminal",
+        "packages",
+    }
+    if (
+        set(typed) != expected
+        or typed.get("schema_version") != MCP_JARVIS_EXECUTION_PROGRESS_SCHEMA
+    ):
+        raise _McpProtocolFailure("MCP native JARVIS progress snapshot schema was invalid")
+    execution_id = _native_identity(typed.get("execution_id"), "execution_id")
+    _native_identity(typed.get("pipeline_id"), "pipeline_id")
+    if typed.get("execution_state") not in _JARVIS_EXECUTION_STATES:
+        raise _McpProtocolFailure("MCP native JARVIS progress state was invalid")
+    terminal = typed.get("terminal")
+    if not isinstance(terminal, bool):
+        raise _McpProtocolFailure("MCP native JARVIS progress terminal flag was invalid")
+    if terminal and typed["execution_state"] not in _JARVIS_TERMINAL_STATES:
+        raise _McpProtocolFailure("MCP native JARVIS terminal progress state was invalid")
+    if typed["execution_state"] in {"completed", "failed", "canceled"} and not terminal:
+        raise _McpProtocolFailure("MCP native JARVIS terminal progress omitted terminal=true")
+    raw_packages = typed.get("packages")
+    if not isinstance(raw_packages, list):
+        raise _McpProtocolFailure("MCP native JARVIS progress packages must be an array")
+    packages: list[dict[str, Any]] = []
+    package_ids: set[str] = set()
+    for raw_package in cast(list[object], raw_packages):
+        if not isinstance(raw_package, dict):
+            raise _McpProtocolFailure("MCP native JARVIS package progress must be an object")
+        package = dict(cast(dict[str, Any], raw_package))
+        if set(package) != {"package_id", "package_name", "event_count", "latest"}:
+            raise _McpProtocolFailure("MCP native JARVIS package progress fields were invalid")
+        package_id = _native_text(package.get("package_id"), "package_id", maximum=256)
+        package_name = _native_text(package.get("package_name"), "package_name", maximum=256)
+        event_count = package.get("event_count")
+        if isinstance(event_count, bool) or not isinstance(event_count, int) or event_count < 0:
+            raise _McpProtocolFailure("MCP native JARVIS event_count was invalid")
+        if package_id in package_ids:
+            raise _McpProtocolFailure("MCP native JARVIS progress repeated a package_id")
+        package_ids.add(package_id)
+        latest_value = package.get("latest")
+        latest = None if latest_value is None else _validated_native_progress_event(latest_value)
+        if (event_count == 0) is not (latest is None):
+            raise _McpProtocolFailure("MCP native JARVIS event_count did not match latest")
+        if latest is not None and (
+            latest["package_id"] != package_id
+            or latest["package_name"] != package_name
+            or latest["execution_id"] != execution_id
+        ):
+            raise _McpProtocolFailure("MCP native JARVIS package event identity did not match")
+        package["latest"] = latest
+        packages.append(package)
+    typed["packages"] = packages
+    return typed
+
+
+def _validated_native_progress_event(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise _McpProtocolFailure("MCP native JARVIS progress event must be an object")
+    typed = dict(cast(dict[str, Any], value))
+    required = {
+        "schema_version",
+        "package_name",
+        "package_id",
+        "execution_id",
+        "label",
+        "state",
+        "sequence",
+        "observed_at_epoch",
+        "determinate",
+        "metadata",
+    }
+    optional = {"current", "total", "unit", "message"}
+    if (
+        not required.issubset(typed)
+        or not set(typed).issubset(required | optional)
+        or typed.get("schema_version") != MCP_JARVIS_PROGRESS_EVENT_SCHEMA
+    ):
+        raise _McpProtocolFailure("MCP native JARVIS progress event schema was invalid")
+    for field_name in ("package_name", "package_id", "execution_id", "label"):
+        _native_text(typed.get(field_name), field_name, maximum=256)
+    if typed.get("state") not in _JARVIS_PROGRESS_STATES:
+        raise _McpProtocolFailure("MCP native JARVIS progress event state was invalid")
+    sequence = typed.get("sequence")
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+        raise _McpProtocolFailure("MCP native JARVIS progress event sequence was invalid")
+    observed = _finite_progress_number(typed.get("observed_at_epoch"))
+    if observed is None or observed < 0:
+        raise _McpProtocolFailure("MCP native JARVIS progress timestamp was invalid")
+    raw_current = typed.get("current")
+    raw_total = typed.get("total")
+    current = None if raw_current is None else _finite_progress_number(raw_current)
+    total = None if raw_total is None else _finite_progress_number(raw_total)
+    if raw_current is not None and (current is None or current < 0):
+        raise _McpProtocolFailure("MCP native JARVIS progress current was invalid")
+    if raw_total is not None and (
+        total is None or total <= 0 or current is None or current > total
+    ):
+        raise _McpProtocolFailure("MCP native JARVIS progress total was invalid")
+    if typed.get("determinate") is not (current is not None and total is not None):
+        raise _McpProtocolFailure("MCP native JARVIS determinate flag was invalid")
+    if typed.get("unit") is not None:
+        _native_text(typed.get("unit"), "unit", maximum=256)
+    if typed.get("message") is not None:
+        _native_text(typed.get("message"), "message")
+    metadata_value = typed.get("metadata")
+    if not isinstance(metadata_value, dict):
+        raise _McpProtocolFailure("MCP native JARVIS progress metadata must be an object")
+    _bounded_finite_json(
+        cast(dict[str, Any], metadata_value),
+        "native JARVIS progress metadata",
+        48_000,
+    )
+    return typed
+
+
+def _native_identity(value: object, field_name: str) -> str:
+    rendered = _native_text(value, field_name, maximum=128)
+    reserved_stem = rendered.split(".", 1)[0].upper()
+    if (
+        not rendered[0].isalnum()
+        or rendered.endswith(".")
+        or reserved_stem in _WINDOWS_RESERVED_COMPONENTS
+        or any(
+            not (character.isascii() and (character.isalnum() or character in "._-"))
+            for character in rendered
+        )
+    ):
+        raise _McpProtocolFailure(f"MCP native JARVIS {field_name} was not portable")
+    return rendered
+
+
+def _native_text(
+    value: object,
+    field_name: str,
+    *,
+    maximum: int = 4096,
+    allow_newlines: bool = False,
+) -> str:
+    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > maximum:
+        raise _McpProtocolFailure(f"MCP native JARVIS {field_name} was invalid")
+    allowed_controls: set[str] = {"\n", "\r", "\t"} if allow_newlines else set()
+    if any(
+        (ord(character) < 32 and character not in allowed_controls) or ord(character) == 127
+        for character in value
+    ):
+        raise _McpProtocolFailure(f"MCP native JARVIS {field_name} contained controls")
+    return value
+
+
+def _native_timestamp(value: object, field_name: str) -> str:
+    rendered = _native_text(value, field_name, maximum=64)
+    try:
+        from datetime import datetime
+
+        parsed = datetime.fromisoformat(rendered.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise _McpProtocolFailure(f"MCP native JARVIS {field_name} was invalid") from exc
+    if parsed.tzinfo is None:
+        raise _McpProtocolFailure(f"MCP native JARVIS {field_name} omitted timezone")
+    return rendered
+
+
+def _bounded_finite_json(value: object, label: str, maximum: int) -> None:
+    try:
+        payload = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise _McpProtocolFailure(f"MCP {label} was not finite JSON") from exc
+    if len(payload) > maximum:
+        raise _McpProtocolFailure(f"MCP {label} exceeded its byte limit")
+
+
 def _append_progress_sidecar(path: Path, payload: str) -> None:
     encoded = payload.encode("utf-8")
     flags = (
@@ -512,6 +1715,7 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
     server_artifact: dict[str, Any] | None = None
     observed_server_artifact_digest: str | None = None
     execution_artifact: dict[str, Any] | None = None
+    result_validation: dict[str, Any] | None = None
     try:
         command = [_resolve_executable(server), *server_args]
         server_artifact = _server_artifact_identity(server, server_args)
@@ -568,13 +1772,26 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
         protocol_error = _protocol_error(process.stdout, operation=operation)
         if protocol_error is not None:
             returncode = 1
-        elif progress_bridge is not None:
+        else:
             protocol_result = _response_result(
                 str(process.stdout or ""),
                 response_id=_response_id(operation),
             )
+            structured_result = _structured_result(protocol_result, operation=operation)
             try:
-                progress_bridge.finalize(_structured_result(protocol_result, operation=operation))
+                if _is_locked_jarvis_execution_query(
+                    operation=operation,
+                    tool=tool,
+                    expected_server_artifact_digest=expected_server_artifact_digest,
+                    observed_server_artifact_digest=observed_server_artifact_digest,
+                    server_artifact=server_artifact,
+                ):
+                    result_validation = _validated_jarvis_execution_query_result(
+                        structured_result,
+                        arguments=arguments,
+                    )
+                if progress_bridge is not None:
+                    progress_bridge.finalize(structured_result)
             except _McpProtocolFailure as exc:
                 returncode = 1
                 protocol_error = str(exc)
@@ -619,6 +1836,7 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
         progress_bridge=(
             progress_bridge.result_metadata() if progress_bridge is not None else None
         ),
+        result_validation=result_validation,
     )
     return returncode
 
@@ -841,6 +2059,7 @@ def _write_mcp_result(
     timed_out: bool,
     protocol_error: str | None,
     progress_bridge: dict[str, Any] | None,
+    result_validation: dict[str, Any] | None,
 ) -> None:
     finished_at = time.time()
     protocol_result = _response_result(stdout, response_id=_response_id(operation))
@@ -885,6 +2104,7 @@ def _write_mcp_result(
                 "timed_out": timed_out,
                 "protocol_error": protocol_error,
                 "package_progress_bridge": progress_bridge,
+                "result_validation": result_validation,
                 "started_at": started_at,
                 "finished_at": finished_at,
                 "duration_seconds": finished_at - started_at,
@@ -1632,17 +2852,42 @@ def _server_artifact_identity(server: str, server_args: list[str]) -> dict[str, 
         python_distribution_runtime is not None
         and python_distribution_runtime.get("runtime_closure_verified") is True
     )
+    direct_install_artifact = _direct_distribution_source_identity(python_distribution_runtime)
+    if direct_install_artifact is not None and direct_install_artifact not in input_files:
+        input_files.append(direct_install_artifact)
+    recorded_install_spec = (
+        install_spec
+        if install_spec is not None
+        else (str(direct_install_artifact["path"]) if direct_install_artifact is not None else None)
+    )
+    recorded_install_source = (
+        install_source
+        if install_spec is not None
+        else ("uv-tool" if direct_install_artifact is not None else None)
+    )
+    recorded_install_artifact = install_artifact or direct_install_artifact
     launcher_artifact_verified = executable is not None and (
         (install_spec is None and direct_runtime_verified)
         or (install_spec is not None and install_artifact is not None)
     )
-    nested_server_name = _nested_clio_kit_server_name(server_args)
+    nested_server_name = _nested_clio_kit_server_name(
+        server_args,
+        python_distribution_runtime=python_distribution_runtime,
+    )
     nested_launcher = nested_server_name is not None
     nested_runtime = (
-        _locked_clio_kit_runtime_identity(
-            install_artifact,
-            server_name=nested_server_name,
-            resolved_executable=resolved_executable,
+        (
+            _locked_clio_kit_runtime_identity(
+                install_artifact,
+                server_name=nested_server_name,
+                resolved_executable=resolved_executable,
+            )
+            if install_artifact is not None
+            else _installed_clio_kit_runtime_identity(
+                python_distribution_runtime,
+                server_name=nested_server_name,
+                resolved_executable=resolved_executable,
+            )
         )
         if nested_server_name is not None
         else None
@@ -1657,10 +2902,12 @@ def _server_artifact_identity(server: str, server_args: list[str]) -> dict[str, 
         "requested_command": server,
         "resolved_executable": str(resolved_executable),
         "executable": executable,
-        "install_spec": install_spec,
-        "install_source": install_source,
+        "install_spec": recorded_install_spec,
+        "install_source": recorded_install_source,
         "install_artifact_sha256": (
-            install_artifact.get("sha256") if install_artifact is not None else None
+            recorded_install_artifact.get("sha256")
+            if recorded_install_artifact is not None
+            else None
         ),
         "input_files": input_files,
         "launcher_artifact_verified": launcher_artifact_verified,
@@ -1669,8 +2916,8 @@ def _server_artifact_identity(server: str, server_args: list[str]) -> dict[str, 
         "nested_runtime": nested_runtime,
         "server_process_artifact_verified": server_process_artifact_verified,
         "identity_error": (
-            "clio-kit mcp-server child source, lock, or uv runtime is not bound to the "
-            "outer clio-kit wheel"
+            "clio-kit mcp-server child source, lock, or uv runtime is not bound to its "
+            "persistent tool distribution"
             if nested_launcher and not nested_runtime_verified
             else (
                 "direct server executable is not bound to a verified Python entry-point "
@@ -1696,6 +2943,10 @@ def _python_console_distribution_identity(executable: Path) -> dict[str, Any]:
         "runtime_file_count": 0,
         "runtime_bytes": 0,
         "runtime_closure_verified": False,
+        "direct_url": None,
+        "provider_interpreter": None,
+        "contract_source_path": None,
+        "server_lock_paths": {},
         "error": None,
     }
     try:
@@ -1736,10 +2987,10 @@ def _python_console_distribution_identity(executable: Path) -> dict[str, Any]:
         evidence["error"] = f"could not inspect installed Python distributions: {exc}"
         return evidence
     if len(matches) != 1:
-        evidence["error"] = (
-            "direct server executable has no unique installed console-script distribution"
+        return _external_python_console_distribution_identity(
+            resolved_executable,
+            command_name=command_name,
         )
-        return evidence
     distribution, entry_point = matches[0]
     evidence.update(
         {
@@ -1747,9 +2998,20 @@ def _python_console_distribution_identity(executable: Path) -> dict[str, Any]:
             "distribution_version": distribution.version,
             "entry_point": entry_point.name,
             "entry_point_value": entry_point.value,
+            "provider_interpreter": sys.executable,
         }
     )
+    files = distribution.files or []
+    for member in files:
+        normalized = str(member).replace("\\", "/")
+        path = str(Path(str(distribution.locate_file(member))).resolve())
+        if normalized.endswith("clio_kit/__init__.py"):
+            evidence["contract_source_path"] = path
+        match = re.search(r"clio-kit-mcp-servers/([^/]+)/uv\.lock$", normalized)
+        if match is not None:
+            cast(dict[str, str], evidence["server_lock_paths"])[match.group(1)] = path
     direct_url = _distribution_direct_url(distribution)
+    evidence["direct_url"] = direct_url
     if direct_url is not None:
         directory = direct_url.get("dir_info")
         typed_directory = cast(dict[str, Any], directory) if isinstance(directory, dict) else {}
@@ -1759,6 +3021,276 @@ def _python_console_distribution_identity(executable: Path) -> dict[str, Any]:
     closure = _verify_distribution_record_closure(distribution)
     evidence.update(closure)
     return evidence
+
+
+def _direct_distribution_source_identity(
+    runtime: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return the retained wheel behind one verified persistent tool install."""
+    direct_url = runtime.get("direct_url") if runtime is not None else None
+    if not isinstance(direct_url, dict):
+        return None
+    url = cast(dict[str, Any], direct_url).get("url")
+    if not isinstance(url, str):
+        return None
+    parsed = urlsplit(url)
+    if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+        return None
+    source_value = unquote(parsed.path)
+    if os.name == "nt" and re.fullmatch(r"/[A-Za-z]:/.*", source_value):
+        source_value = source_value[1:]
+    source = Path(source_value)
+    if source.suffix.lower() != ".whl":
+        return None
+    return _file_identity(source)
+
+
+def _external_python_console_distribution_identity(
+    executable: Path,
+    *,
+    command_name: str,
+) -> dict[str, Any]:
+    """Verify a console script installed in an isolated persistent tool environment."""
+    evidence: dict[str, Any] = {
+        "schema_version": "clio-relay.python-distribution-runtime.v1",
+        "distribution": None,
+        "distribution_version": None,
+        "entry_point": None,
+        "entry_point_value": None,
+        "record_sha256": None,
+        "runtime_closure_sha256": None,
+        "runtime_file_count": 0,
+        "runtime_bytes": 0,
+        "runtime_closure_verified": False,
+        "direct_url": None,
+        "provider_interpreter": None,
+        "provider_interpreter_identity": None,
+        "contract_source_path": None,
+        "server_lock_paths": {},
+        "error": None,
+    }
+    try:
+        with executable.open("rb") as stream:
+            first_line = stream.readline(4096)
+        shebang = first_line.decode("utf-8", errors="strict").strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        evidence["error"] = f"could not read persistent tool launcher: {exc}"
+        return evidence
+    if not shebang.startswith("#!") or not shebang[2:]:
+        evidence["error"] = "persistent tool launcher has no direct Python interpreter shebang"
+        return evidence
+    try:
+        provider = Path(shebang[2:]).expanduser().resolve(strict=True)
+    except OSError as exc:
+        evidence["error"] = f"persistent tool provider interpreter is unavailable: {exc}"
+        return evidence
+    provider_identity = _file_identity(provider)
+    if provider_identity is None:
+        evidence["error"] = "persistent tool provider interpreter has no file identity"
+        return evidence
+    probe = r"""
+import json
+import sys
+from importlib import metadata
+from pathlib import Path
+
+command_name = sys.argv[1]
+launcher = Path(sys.argv[2]).resolve()
+matches = []
+for distribution in metadata.distributions():
+    files = distribution.files or []
+    owns_launcher = any(
+        Path(str(distribution.locate_file(member))).resolve() == launcher
+        for member in files
+    )
+    if not owns_launcher:
+        continue
+    for entry_point in distribution.entry_points:
+        if entry_point.group != "console_scripts" or entry_point.name != command_name:
+            continue
+        direct_url_text = distribution.read_text("direct_url.json")
+        direct_url = json.loads(direct_url_text) if direct_url_text else None
+        serialized_files = []
+        contract_source_path = None
+        server_lock_paths = {}
+        for member in files:
+            normalized = str(member).replace("\\", "/")
+            located = str(Path(str(distribution.locate_file(member))).resolve())
+            member_hash = member.hash
+            serialized_files.append({
+                "name": normalized,
+                "path": located,
+                "hash_mode": member_hash.mode if member_hash is not None else None,
+                "hash_value": member_hash.value if member_hash is not None else None,
+                "size": member.size,
+            })
+            if normalized.endswith("clio_kit/__init__.py"):
+                contract_source_path = located
+            marker = "clio-kit-mcp-servers/"
+            if marker in normalized and normalized.endswith("/uv.lock"):
+                server_name = normalized.split(marker, 1)[1].split("/", 1)[0]
+                server_lock_paths[server_name] = located
+        matches.append({
+            "executable": sys.executable,
+            "distribution": distribution.metadata.get("Name"),
+            "distribution_version": distribution.version,
+            "entry_point": entry_point.name,
+            "entry_point_value": entry_point.value,
+            "direct_url": direct_url,
+            "files": serialized_files,
+            "contract_source_path": contract_source_path,
+            "server_lock_paths": server_lock_paths,
+        })
+print(json.dumps({"matches": matches}, sort_keys=True))
+"""
+    try:
+        completed = subprocess.run(
+            [str(provider), "-I", "-c", probe, command_name, str(executable)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=PYTHON_TOOL_IDENTITY_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+        evidence["error"] = f"persistent tool distribution probe failed: {exc}"
+        return evidence
+    stdout_bytes = completed.stdout.encode("utf-8")
+    if (
+        completed.returncode != 0
+        or not stdout_bytes
+        or len(stdout_bytes) > PYTHON_TOOL_IDENTITY_MAX_BYTES
+    ):
+        evidence["error"] = "persistent tool distribution probe returned no bounded evidence"
+        return evidence
+    try:
+        decoded = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        evidence["error"] = f"persistent tool distribution probe returned invalid JSON: {exc}"
+        return evidence
+    decoded_mapping = cast(dict[str, object], decoded) if isinstance(decoded, dict) else {}
+    raw_matches: object = decoded_mapping.get("matches")
+    if not isinstance(raw_matches, list):
+        evidence["error"] = (
+            "persistent tool launcher has no unique installed console-script distribution"
+        )
+        return evidence
+    matches = cast(list[object], raw_matches)
+    if len(matches) != 1 or not isinstance(matches[0], dict):
+        evidence["error"] = (
+            "persistent tool launcher has no unique installed console-script distribution"
+        )
+        return evidence
+    identity = cast(dict[str, Any], matches[0])
+    raw_files = identity.get("files")
+    if not isinstance(raw_files, list):
+        evidence["error"] = "persistent tool distribution omitted its RECORD closure"
+        return evidence
+    try:
+        observed_provider = Path(str(identity.get("executable"))).resolve(strict=True)
+    except OSError:
+        observed_provider = Path("__unverified_provider__")
+    if observed_provider != provider:
+        evidence["error"] = "persistent tool probe executed under the wrong interpreter"
+        return evidence
+    closure = _verify_external_distribution_record_closure(cast(list[object], raw_files))
+    evidence.update(
+        {
+            "distribution": identity.get("distribution"),
+            "distribution_version": identity.get("distribution_version"),
+            "entry_point": identity.get("entry_point"),
+            "entry_point_value": identity.get("entry_point_value"),
+            "direct_url": identity.get("direct_url"),
+            "provider_interpreter": str(provider),
+            "provider_interpreter_identity": provider_identity,
+            "contract_source_path": identity.get("contract_source_path"),
+            "server_lock_paths": identity.get("server_lock_paths", {}),
+            **closure,
+        }
+    )
+    return evidence
+
+
+def _verify_external_distribution_record_closure(
+    raw_files: list[object],
+) -> dict[str, Any]:
+    """Verify the RECORD closure described by an isolated tool interpreter."""
+    failure: dict[str, Any] = {
+        "record_sha256": None,
+        "runtime_closure_sha256": None,
+        "runtime_file_count": 0,
+        "runtime_bytes": 0,
+        "runtime_closure_verified": False,
+        "error": None,
+    }
+    if not raw_files or len(raw_files) > PYTHON_DISTRIBUTION_MAX_FILES:
+        failure["error"] = "persistent tool RECORD file list was missing or exceeded its limit"
+        return failure
+    names: set[str] = set()
+    record_paths: list[Path] = []
+    closure_inputs: list[tuple[str, int, str]] = []
+    total_bytes = 0
+    for item in raw_files:
+        if not isinstance(item, dict):
+            failure["error"] = "persistent tool RECORD entry was not an object"
+            return failure
+        member = cast(dict[str, Any], item)
+        name = member.get("name")
+        path = member.get("path")
+        if not isinstance(name, str) or not name or name in names or not isinstance(path, str):
+            failure["error"] = "persistent tool RECORD contained an invalid or duplicate path"
+            return failure
+        names.add(name)
+        member_path = Path(path)
+        if name.endswith(".dist-info/RECORD"):
+            record_paths.append(member_path)
+            continue
+        size = member.get("size")
+        if (
+            member.get("hash_mode") != "sha256"
+            or not isinstance(member.get("hash_value"), str)
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+        ):
+            failure["error"] = f"persistent tool RECORD entry was not SHA-256 bound: {name}"
+            return failure
+        total_bytes += size
+        if total_bytes > PYTHON_DISTRIBUTION_MAX_BYTES:
+            failure["error"] = "persistent tool RECORD byte total exceeded its limit"
+            return failure
+        actual = _record_bound_sha256(member_path, expected_size=size)
+        expected = _urlsafe_sha256_digest(cast(str, member["hash_value"]))
+        if actual is None or expected is None or not hmac.compare_digest(actual, expected):
+            failure["error"] = f"persistent tool distribution file hash mismatch: {name}"
+            return failure
+        closure_inputs.append((name, size, actual))
+    if len(record_paths) != 1:
+        failure["error"] = "persistent tool distribution had no unique RECORD file"
+        return failure
+    try:
+        record_size = record_paths[0].lstat().st_size
+    except OSError:
+        record_size = -1
+    record_sha256 = _record_bound_sha256(record_paths[0], expected_size=record_size)
+    if record_sha256 is None:
+        failure["error"] = "persistent tool RECORD file was missing"
+        return failure
+    closure_hash = hashlib.sha256()
+    for name, size, digest in sorted(closure_inputs):
+        encoded = name.encode("utf-8")
+        closure_hash.update(len(encoded).to_bytes(8, "big"))
+        closure_hash.update(encoded)
+        closure_hash.update(size.to_bytes(8, "big"))
+        closure_hash.update(bytes.fromhex(digest))
+    closure_hash.update(bytes.fromhex(record_sha256))
+    return {
+        "record_sha256": record_sha256,
+        "runtime_closure_sha256": closure_hash.hexdigest(),
+        "runtime_file_count": len(closure_inputs),
+        "runtime_bytes": total_bytes,
+        "runtime_closure_verified": True,
+        "error": None,
+    }
 
 
 def _distribution_contains_executable(
@@ -1937,7 +3469,11 @@ def _server_artifact_digest(server_artifact: dict[str, Any]) -> str:
     ).hexdigest()
 
 
-def _nested_clio_kit_server_name(server_args: list[str]) -> str | None:
+def _nested_clio_kit_server_name(
+    server_args: list[str],
+    *,
+    python_distribution_runtime: dict[str, Any] | None,
+) -> str | None:
     """Return the embedded server selected through clio-kit's child launcher."""
     for index, argument in enumerate(server_args[:-1]):
         if argument != "--from":
@@ -1951,7 +3487,166 @@ def _nested_clio_kit_server_name(server_args: list[str]) -> str | None:
         ):
             return command[2]
         return None
+    if (
+        len(server_args) >= 2
+        and server_args[0] == "mcp-server"
+        and bool(server_args[1])
+        and python_distribution_runtime is not None
+        and str(python_distribution_runtime.get("distribution", "")).lower().replace("_", "-")
+        == "clio-kit"
+        and python_distribution_runtime.get("entry_point") == "clio-kit"
+        and python_distribution_runtime.get("runtime_closure_verified") is True
+    ):
+        return server_args[1]
     return None
+
+
+def _installed_clio_kit_runtime_identity(
+    distribution_runtime: dict[str, Any] | None,
+    *,
+    server_name: str,
+    resolved_executable: Path,
+) -> dict[str, Any]:
+    """Verify clio-kit's locked child launcher from a persistent tool environment."""
+    uv_name = "uv.exe" if resolved_executable.suffix.lower() == ".exe" else "uv"
+    uv_identity = _file_identity(resolved_executable.with_name(uv_name))
+    evidence: dict[str, Any] = {
+        "schema_version": _CLIO_KIT_LOCKED_SERVER_SCHEMA,
+        "server_name": server_name,
+        "runtime_policy": _CLIO_KIT_LOCKED_SERVER_RUNTIME_POLICY,
+        "project_sha256": None,
+        "lock_sha256": None,
+        "runtime_file_count": 0,
+        "runtime_bytes": 0,
+        "contract_source_verified": False,
+        "uv_executable": uv_identity,
+        "persistent_tool": True,
+        "locked_runtime_verified": False,
+        "error": None,
+    }
+    if (
+        distribution_runtime is None
+        or str(distribution_runtime.get("distribution", "")).lower().replace("_", "-") != "clio-kit"
+        or distribution_runtime.get("entry_point") != "clio-kit"
+        or distribution_runtime.get("runtime_closure_verified") is not True
+    ):
+        evidence["error"] = "persistent clio-kit distribution closure is unverified"
+        return evidence
+    source_value = distribution_runtime.get("contract_source_path")
+    lock_paths = distribution_runtime.get("server_lock_paths")
+    lock_value = (
+        cast(dict[str, Any], lock_paths).get(server_name) if isinstance(lock_paths, dict) else None
+    )
+    if not isinstance(source_value, str) or not isinstance(lock_value, str):
+        evidence["error"] = "persistent clio-kit tool omitted launcher or server lock files"
+        return evidence
+    source_path = Path(source_value)
+    lock_path = Path(lock_value)
+    source = _bounded_regular_file_bytes(
+        source_path,
+        max_bytes=CLIO_KIT_WHEEL_MAX_LAUNCHER_BYTES,
+    )
+    lock_identity = _file_identity(lock_path)
+    if source is None or lock_identity is None:
+        evidence["error"] = "persistent clio-kit launcher or lock file is unavailable"
+        return evidence
+    try:
+        launcher_source = source.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        evidence["error"] = "persistent clio-kit launcher source is not UTF-8"
+        return evidence
+    contract_source_verified = all(
+        marker in launcher_source
+        for marker in (
+            f'LOCKED_SERVER_LAUNCH_SCHEMA = "{_CLIO_KIT_LOCKED_SERVER_SCHEMA}"',
+            f'_LOCKED_SERVER_RUNTIME_POLICY = "{_CLIO_KIT_LOCKED_SERVER_RUNTIME_POLICY}"',
+            '"--no-dev"',
+            '"--no-editable"',
+            '"--frozen"',
+            "locked_server_project_identity",
+            "materialize_locked_server_project",
+            "UV_PROJECT_ENVIRONMENT",
+        )
+    )
+    project_sha256 = distribution_runtime.get("runtime_closure_sha256")
+    runtime_file_count = distribution_runtime.get("runtime_file_count")
+    runtime_bytes = distribution_runtime.get("runtime_bytes")
+    locked = (
+        contract_source_verified
+        and uv_identity is not None
+        and isinstance(project_sha256, str)
+        and _is_sha256_text(project_sha256)
+        and isinstance(runtime_file_count, int)
+        and not isinstance(runtime_file_count, bool)
+        and runtime_file_count > 0
+        and isinstance(runtime_bytes, int)
+        and not isinstance(runtime_bytes, bool)
+        and runtime_bytes > 0
+    )
+    evidence.update(
+        {
+            "project_sha256": project_sha256,
+            "lock_sha256": lock_identity.get("sha256"),
+            "runtime_file_count": runtime_file_count,
+            "runtime_bytes": runtime_bytes,
+            "contract_source_verified": contract_source_verified,
+            "locked_runtime_verified": locked,
+            "error": (
+                None
+                if locked
+                else "persistent clio-kit launcher contract, lock, or uv executable is unverified"
+            ),
+        }
+    )
+    return evidence
+
+
+def _is_sha256_text(value: object) -> bool:
+    """Return whether a value is one lowercase hexadecimal SHA-256 digest."""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value == value.lower()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _bounded_regular_file_bytes(path: Path, *, max_bytes: int) -> bytes | None:
+    """Read one stable non-link regular file under an explicit byte limit."""
+    try:
+        before = path.lstat()
+    except OSError:
+        return None
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_size < 0
+        or before.st_size > max_bytes
+    ):
+        return None
+    identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    try:
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+                opened.st_mtime_ns,
+            ) != identity:
+                return None
+            payload = stream.read(max_bytes + 1)
+    except OSError:
+        return None
+    if len(payload) != before.st_size:
+        return None
+    try:
+        after = path.lstat()
+    except OSError:
+        return None
+    if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != identity:
+        return None
+    return payload
 
 
 def _locked_clio_kit_runtime_identity(
@@ -2638,7 +4333,10 @@ def _resolve_executable(executable: str) -> str:
 
 
 def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
-    terminate_nested_process(process)
+    terminate_nested_process(
+        process,
+        timeout_seconds=MCP_SERVER_TERMINATION_TIMEOUT_SECONDS,
+    )
 
 
 def _install_parent_termination_handlers(

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
@@ -27,8 +29,299 @@ RUNTIME_METADATA_TOKEN_ENV = "CLIO_RELAY_RUNTIME_METADATA_TOKEN"
 RUNTIME_METADATA_ANCHOR_ENV = "CLIO_RELAY_RUNTIME_METADATA_ANCHOR"
 RUNTIME_SUBMISSION_INTENT_ENV = "CLIO_RELAY_RUNTIME_SUBMISSION_INTENT"
 RUNTIME_DIRECT_PROOF_ENV = "CLIO_RELAY_RUNTIME_DIRECT_PROOF"
+RUNTIME_SCHEDULER_PROVIDER_ENV = "CLIO_RELAY_RUNTIME_SCHEDULER_PROVIDER"
 JARVIS_CREDENTIAL_SCHEMA = "clio-relay.jarvis-private-credential.v1"
 RUNTIME_CREDENTIAL_MAX_BYTES = 8 * 1024
+
+
+def _read_native_execution(
+    obj: Any,
+    *,
+    execution_id: str,
+    pipeline_id: str,
+    direct_execution: bool,
+    scheduler_name: str | None,
+    submission_marker: str,
+    sleep: Callable[[float], None],
+) -> tuple[dict[str, Any], Any]:
+    """Read one coherent, validated JARVIS handle/record/progress snapshot."""
+    from clio_relay.runtime_metadata import native_execution_documents
+
+    for _attempt in range(8):
+        record = obj.get_execution(execution_id)
+        progress = obj.get_execution_progress(execution_id)
+        record_document = cast(dict[str, Any], record.to_dict())
+        progress_document = cast(dict[str, Any], progress.to_dict())
+        if progress_document.get("execution_state") != record_document.get(
+            "state"
+        ) or progress_document.get("terminal") is not record_document.get("terminal"):
+            sleep(0.01)
+            continue
+        envelope: dict[str, Any] = {
+            "execution_handle": record.handle.to_dict(),
+            "execution_record": record_document,
+            "progress": progress_document,
+        }
+        documents = native_execution_documents(envelope)
+        if documents is None:
+            raise RuntimeError("JARVIS native execution documents were unavailable")
+        handle = documents.execution_handle
+        if (
+            handle.execution_id != execution_id
+            or handle.pipeline_id != pipeline_id
+            or handle.mode != ("direct" if direct_execution else "scheduler")
+        ):
+            raise RuntimeError("JARVIS native execution identity did not match relay intent")
+        if not direct_execution:
+            assert scheduler_name is not None
+            assert handle.scheduler_provider is not None
+            normalized_provider = handle.scheduler_provider.strip().lower().replace("_", "-")
+            if normalized_provider != scheduler_name:
+                raise RuntimeError("JARVIS native scheduler provider did not match")
+            submission = documents.execution_record.metadata.get("submission")
+            if submission is not None:
+                if not isinstance(submission, dict):
+                    raise RuntimeError("JARVIS scheduler submission proof was invalid")
+                typed_submission = cast(dict[str, Any], submission)
+                if typed_submission.get("reconciliation_marker") != submission_marker:
+                    raise RuntimeError("JARVIS scheduler reconciliation marker did not match")
+        return envelope, record
+    raise RuntimeError("JARVIS execution changed during every bounded snapshot read")
+
+
+def _validate_operation_handle(
+    handle: object,
+    *,
+    execution_id: str,
+    pipeline_id: str,
+    direct_execution: bool,
+) -> None:
+    """Require a top-level JARVIS operation to return its exact native handle."""
+    from clio_relay.runtime_metadata import JarvisExecutionHandleDocument
+
+    to_dict = getattr(handle, "to_dict", None)
+    if not callable(to_dict):
+        raise RuntimeError("JARVIS execution did not return an ExecutionHandle")
+    document = JarvisExecutionHandleDocument.model_validate(to_dict())
+    if (
+        document.execution_id != execution_id
+        or document.pipeline_id != pipeline_id
+        or document.mode != ("direct" if direct_execution else "scheduler")
+    ):
+        raise RuntimeError("JARVIS returned an execution handle for another operation")
+
+
+def run_native_jarvis_broker(
+    obj: Any,
+    *,
+    runtime_intent: Mapping[str, Any],
+    runtime_direct_proof: str,
+    configured_scheduler_provider: str,
+    append_runtime_record: Callable[[dict[str, Any]], None],
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Run one contained JARVIS operation and relay only authoritative lifecycle documents."""
+    scheduler = getattr(obj, "scheduler", None)
+    direct_execution = not scheduler
+    scheduler_expected = runtime_intent["scheduler_expected"]
+    if direct_execution and scheduler_expected is True:
+        raise RuntimeError("JARVIS object lost its expected scheduler contract")
+    if not direct_execution and scheduler_expected is False:
+        raise RuntimeError("JARVIS object acquired an unexpected scheduler contract")
+    if not direct_execution and not isinstance(scheduler, dict):
+        raise RuntimeError("Scheduled JARVIS object did not retain its scheduler contract")
+    pipeline_id = getattr(obj, "name", None)
+    if not isinstance(pipeline_id, str) or not pipeline_id:
+        raise RuntimeError("JARVIS object has no pipeline identity")
+
+    def refuse_scheduler_launch(
+        *,
+        reason: str,
+        scheduler_name: str,
+        normalized_configured_provider: str,
+    ) -> None:
+        append_runtime_record(
+            {
+                "schema_version": "jarvis.runtime.v1",
+                "source": "jarvis_sidecar",
+                "execution_id": runtime_intent["execution_id"],
+                "pipeline_id": pipeline_id,
+                "scheduler_provider": scheduler_name,
+                "scheduler_phase": "launch_refused",
+                "terminal": {
+                    "state": "launch_refused",
+                    "terminal": True,
+                    "returncode": 2,
+                    "reason": reason,
+                },
+                "details": {
+                    "execution_owner": "jarvis_cd.pipeline.preflight",
+                    "execution_mode": "scheduler",
+                    "scheduler_expected": runtime_intent["scheduler_expected"],
+                    "scheduler_submission_attempted": False,
+                    "scheduler_launch_refused": True,
+                    "scheduler_provider": scheduler_name,
+                    "configured_scheduler_provider": normalized_configured_provider,
+                    "scheduler_launch_refusal_proof": runtime_direct_proof,
+                },
+            }
+        )
+        raise RuntimeError(reason)
+
+    scheduler_name: str | None = None
+    scheduler_config: dict[str, Any] | None = None
+    if not direct_execution:
+        scheduler_config = cast(dict[str, Any], scheduler)
+        raw_scheduler_name = cast(object, scheduler_config.get("name"))
+        if not isinstance(raw_scheduler_name, str) or not raw_scheduler_name:
+            raise RuntimeError("Scheduled JARVIS object has no scheduler provider name")
+        scheduler_name = raw_scheduler_name.strip().lower().replace("_", "-")
+        normalized_configured_provider = (
+            configured_scheduler_provider.strip().lower().replace("_", "-")
+        )
+        if normalized_configured_provider in {"none", "unmanaged"}:
+            normalized_configured_provider = "external"
+        if not normalized_configured_provider:
+            raise RuntimeError("configured worker scheduler provider is empty")
+        if scheduler_name != normalized_configured_provider:
+            refuse_scheduler_launch(
+                reason=(
+                    "JARVIS scheduler provider does not match the configured worker provider: "
+                    f"{scheduler_name} != {normalized_configured_provider}"
+                ),
+                scheduler_name=scheduler_name,
+                normalized_configured_provider=normalized_configured_provider,
+            )
+        if scheduler_name != "slurm":
+            refuse_scheduler_launch(
+                reason="clio-relay 1.0 supports scheduled JARVIS execution only through slurm",
+                scheduler_name=scheduler_name,
+                normalized_configured_provider=normalized_configured_provider,
+            )
+    execution_id = cast(str, runtime_intent["execution_id"])
+    submission_marker = cast(str, runtime_intent["marker"])
+    if not direct_execution:
+        assert scheduler_config is not None
+        scheduler_config["job_name"] = submission_marker
+    elif scheduler_expected == "unknown":
+        append_runtime_record(
+            {
+                "schema_version": "jarvis.runtime.v1",
+                "source": "jarvis_sidecar",
+                "execution_id": execution_id,
+                "pipeline_id": pipeline_id,
+                "details": {
+                    "execution_owner": "jarvis_cd.pipeline.run",
+                    "execution_mode": "direct",
+                    "scheduler_expected": False,
+                    "direct_execution_proof": runtime_direct_proof,
+                },
+            }
+        )
+
+    operation_results: list[object] = []
+    operation_errors: list[BaseException] = []
+
+    def execute_jarvis_operation() -> None:
+        try:
+            if direct_execution:
+                run = getattr(obj, "run", None)
+                if not callable(run):
+                    raise RuntimeError("named JARVIS object has no direct run operation")
+                # A detached direct process would escape the relay-owned broker
+                # tree, so direct work remains blocking in this contained process.
+                operation_results.append(run(execution_id=execution_id, wait=True))
+            else:
+                submit = getattr(obj, "submit", None)
+                if not callable(submit):
+                    raise RuntimeError("scheduled JARVIS object has no submit operation")
+                operation_results.append(submit(submit=True, wait=False, execution_id=execution_id))
+        except BaseException as exc:
+            operation_errors.append(exc)
+
+    operation = threading.Thread(
+        target=execute_jarvis_operation,
+        name=f"clio-relay-jarvis-{execution_id}",
+        daemon=True,
+    )
+    operation.start()
+    last_payload: str | None = None
+    last_record: Any = None
+    while True:
+        try:
+            payload, observed_record = _read_native_execution(
+                obj,
+                execution_id=execution_id,
+                pipeline_id=pipeline_id,
+                direct_execution=direct_execution,
+                scheduler_name=scheduler_name,
+                submission_marker=submission_marker,
+                sleep=sleep,
+            )
+        except FileNotFoundError:
+            if not operation.is_alive():
+                break
+        else:
+            canonical = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            if canonical != last_payload:
+                append_runtime_record(payload)
+                last_payload = canonical
+            last_record = observed_record
+            if observed_record.terminal is True:
+                break
+        if not operation.is_alive() and (operation_errors or direct_execution):
+            break
+        sleep(0.25)
+
+    operation.join()
+    try:
+        final_payload, final_record = _read_native_execution(
+            obj,
+            execution_id=execution_id,
+            pipeline_id=pipeline_id,
+            direct_execution=direct_execution,
+            scheduler_name=scheduler_name,
+            submission_marker=submission_marker,
+            sleep=sleep,
+        )
+    except FileNotFoundError:
+        final_payload = None
+        final_record = None
+    if final_payload is not None:
+        final_canonical = json.dumps(
+            final_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        if final_canonical != last_payload:
+            append_runtime_record(final_payload)
+        last_record = final_record
+
+    if operation_errors:
+        raise operation_errors[0]
+    if len(operation_results) != 1:
+        raise RuntimeError("JARVIS execution did not return exactly one handle")
+    _validate_operation_handle(
+        operation_results[0],
+        execution_id=execution_id,
+        pipeline_id=pipeline_id,
+        direct_execution=direct_execution,
+    )
+    if last_record is None or last_record.terminal is not True:
+        raise RuntimeError("JARVIS execution ended without an authoritative terminal record")
+    if last_record.state != "completed":
+        native_id = last_record.scheduler_native_id
+        identity = f" {native_id}" if isinstance(native_id, str) else ""
+        diagnostic = last_record.error or "no reason reported"
+        raise RuntimeError(f"JARVIS execution{identity} ended in {last_record.state}: {diagnostic}")
 
 
 def sanitized_jarvis_environment(
@@ -44,6 +337,7 @@ def sanitized_jarvis_environment(
         RUNTIME_METADATA_ANCHOR_ENV,
         RUNTIME_SUBMISSION_INTENT_ENV,
         RUNTIME_DIRECT_PROOF_ENV,
+        RUNTIME_SCHEDULER_PROVIDER_ENV,
         BROKER_CREDENTIAL_FD_ENV,
         BROKER_READY_FD_ENV,
     ):
@@ -63,6 +357,7 @@ def jarvis_private_credential_channel(
     raw_anchor = source.get(RUNTIME_METADATA_ANCHOR_ENV)
     raw_intent = source.get(RUNTIME_SUBMISSION_INTENT_ENV)
     runtime_direct_proof = source.get(RUNTIME_DIRECT_PROOF_ENV)
+    configured_scheduler_provider = source.get(RUNTIME_SCHEDULER_PROVIDER_ENV)
     sanitized = sanitized_jarvis_environment(source)
     if (
         not progress_file
@@ -72,6 +367,7 @@ def jarvis_private_credential_channel(
         or not raw_anchor
         or not raw_intent
         or not runtime_direct_proof
+        or not configured_scheduler_provider
     ):
         raise ConfigurationError("JARVIS execution requires private sidecar credentials")
     try:
@@ -126,6 +422,7 @@ def jarvis_private_credential_channel(
             "runtime_anchor": runtime_anchor,
             "runtime_intent": runtime_intent,
             "runtime_direct_proof": runtime_direct_proof,
+            "scheduler_provider": configured_scheduler_provider,
         },
         separators=(",", ":"),
         allow_nan=False,
@@ -150,17 +447,12 @@ def scheduled_jarvis_command(
 ) -> list[str]:
     """Return the explicit JARVIS execution adapter for a scheduled pipeline."""
     normalized = scheduler_name.strip().lower().replace("_", "-")
-    factory = _SCHEDULED_COMMAND_FACTORIES.get(normalized)
-    if factory is None:
+    if normalized != "slurm":
         raise ConfigurationError(
-            f"JARVIS scheduled execution adapter is not registered: {scheduler_name}"
+            "clio-relay 1.0 supports scheduled JARVIS execution only through slurm; "
+            f"requested {scheduler_name}"
         )
-    if normalized not in _CREDENTIAL_CONSUMING_ADAPTERS:
-        raise ConfigurationError(
-            f"JARVIS scheduled execution adapter did not declare credential consumption: "
-            f"{scheduler_name}"
-        )
-    return factory(python_bin, pipeline_path)
+    return _slurm_command(python_bin, pipeline_path)
 
 
 def named_jarvis_command(*, python_bin: str, pipeline_name: str) -> list[str]:
@@ -182,20 +474,14 @@ def register_scheduled_jarvis_command(
     consumes_runtime_credential: bool,
     replace: bool = False,
 ) -> None:
-    """Register a JARVIS scheduled-execution adapter independently of observation."""
+    """Reject custom scheduled execution adapters outside the hardened SLURM broker."""
+    del factory, consumes_runtime_credential, replace
     normalized = scheduler_name.strip().lower().replace("_", "-")
-    if not normalized:
-        raise ConfigurationError("scheduler name must be non-empty")
-    if normalized in _SCHEDULED_COMMAND_FACTORIES and not replace:
-        raise ConfigurationError(
-            f"JARVIS scheduled execution adapter is already registered: {normalized}"
-        )
-    if consumes_runtime_credential is not True:
-        raise ConfigurationError(
-            "scheduled JARVIS adapters must explicitly consume the private runtime credential"
-        )
-    _SCHEDULED_COMMAND_FACTORIES[normalized] = factory
-    _CREDENTIAL_CONSUMING_ADAPTERS.add(normalized)
+    requested = normalized or "<empty>"
+    raise ConfigurationError(
+        "custom JARVIS scheduled-execution adapters are not supported for clio-relay 1.0; "
+        f"the built-in slurm broker cannot be registered or replaced (requested {requested})"
+    )
 
 
 def _slurm_command(python_bin: str, pipeline_path: Path) -> list[str]:
@@ -218,12 +504,6 @@ def _credential_wrapper_command(
     ]
 
 
-_SCHEDULED_COMMAND_FACTORIES: dict[str, ScheduledJarvisCommandFactory] = {
-    "slurm": _slurm_command,
-}
-_CREDENTIAL_CONSUMING_ADAPTERS = {"slurm"}
-
-
 _JARVIS_SLURM_EXECUTION_ADAPTER = """
 from __future__ import annotations
 
@@ -235,8 +515,6 @@ import os
 import stat
 import sys
 import sysconfig
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 # Isolated/no-site startup prevents PYTHONPATH, .pth, sitecustomize, and
@@ -323,6 +601,8 @@ if (
         for value in credential["runtime_anchor"].values()
     )
     or not isinstance(credential.get("runtime_intent"), dict)
+    or not isinstance(credential.get("scheduler_provider"), str)
+    or not credential["scheduler_provider"].strip()
     or set(credential["runtime_intent"])
     != {
         "schema_version",
@@ -357,11 +637,14 @@ runtime_token = credential["runtime_token"]
 runtime_anchor = credential["runtime_anchor"]
 runtime_intent = credential["runtime_intent"]
 runtime_direct_proof = credential["runtime_direct_proof"]
+configured_scheduler_provider = credential["scheduler_provider"]
 if getpass.getuser() != runtime_intent["scheduler_user"]:
     fail_before_ready("JARVIS effective user did not match submission intent")
 runtime_sequence = 0
-RUNTIME_METADATA_MAX_RECORD_BYTES = 256 * 1024
-RUNTIME_METADATA_MAX_TOTAL_BYTES = 4 * 1024 * 1024
+# A native progress snapshot may use the full 4 MiB producer bound. Reserve
+# space for its execution handle, record, sidecar envelope, and HMAC.
+RUNTIME_METADATA_MAX_RECORD_BYTES = 5 * 1024 * 1024
+RUNTIME_METADATA_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 
 # These are absent from the initial process environment. Expose them only now,
 # after the non-dumpable gate and one-shot credential validation, so trusted
@@ -376,9 +659,8 @@ finally:
 if acknowledgement_written != 1:
     raise RuntimeError("scheduled JARVIS broker readiness acknowledgement was incomplete")
 
+from clio_relay.jarvis_execution import run_native_jarvis_broker
 from jarvis_cd.core.pipeline_test import load_yaml_auto
-from clio_relay.models import SchedulerPhase
-from clio_relay.scheduler_providers import provider_for_scheduler
 
 if len(sys.argv) != 3 or sys.argv[1] not in {"yaml", "named"}:
     raise RuntimeError("scheduled JARVIS wrapper launch contract did not match")
@@ -389,57 +671,12 @@ else:
 
     obj = Pipeline(sys.argv[2])
     obj.load()
-scheduler = getattr(obj, "scheduler", None)
-direct_execution = not scheduler
-if direct_execution and runtime_intent["scheduler_expected"] is True:
-    raise RuntimeError("JARVIS object lost its expected scheduler contract")
-if not direct_execution and runtime_intent["scheduler_expected"] is False:
-    raise RuntimeError("JARVIS object acquired an unexpected scheduler contract")
-if not direct_execution and not isinstance(scheduler, dict):
-    raise RuntimeError("Scheduled JARVIS object did not retain its scheduler contract")
 # Scheduled submissions do not execute packages in this process. Remove the
 # progress capability before JARVIS launches any scheduler CLI child; only
 # direct package execution retains it for signed progress emission.
-if not direct_execution:
+if getattr(obj, "scheduler", None):
     os.environ.pop("CLIO_RELAY_PROGRESS_FILE", None)
     os.environ.pop("CLIO_RELAY_PROGRESS_TOKEN", None)
-scheduler_name = None if direct_execution else scheduler.get("name")
-if not direct_execution and (not isinstance(scheduler_name, str) or not scheduler_name):
-    raise RuntimeError("Scheduled JARVIS object has no scheduler provider name")
-if not direct_execution and scheduler_name.strip().lower().replace("_", "-") != "slurm":
-    raise RuntimeError(
-        "named scheduled JARVIS execution requires an explicitly registered secure adapter"
-    )
-submit = None if direct_execution else getattr(obj, "submit")
-pipeline_id = getattr(obj, "name", None)
-execution_id = runtime_intent["execution_id"]
-started_at = runtime_intent["created_at"]
-submission_marker = runtime_intent["marker"]
-previous_job_name = None if direct_execution else scheduler.get("job_name")
-if not direct_execution:
-    scheduler["job_name"] = submission_marker
-submission_intent = None if direct_execution else {
-    "schema_version": "clio-relay.scheduler-submission-intent.v1",
-    "execution_id": execution_id,
-    "provider": scheduler_name,
-    "marker": submission_marker,
-    "created_at": started_at,
-    "scheduler_user": runtime_intent["scheduler_user"],
-    "scheduler_expected": runtime_intent["scheduler_expected"],
-    "direct_proof_sha256": runtime_intent["direct_proof_sha256"],
-    "previous_job_name": previous_job_name if isinstance(previous_job_name, str) else None,
-}
-package_provenance = []
-for package in getattr(obj, "packages", []):
-    if not isinstance(package, dict):
-        continue
-    package_provenance.append(
-        {
-            key: str(package[key])
-            for key in ("pkg_id", "pkg_type", "global_id", "config_path")
-            if package.get(key) is not None
-        }
-    )
 
 def append_runtime_record(runtime_metadata: dict[str, object]) -> None:
     global runtime_sequence
@@ -508,201 +745,11 @@ def append_runtime_record(runtime_metadata: dict[str, object]) -> None:
         os.close(descriptor)
 
 
-def emit_runtime_metadata(
-    phase: str,
-    *,
-    terminal: bool,
-    returncode: int | None = None,
-    reason: str | None = None,
-    status: object | None = None,
-) -> None:
-    if runtime_file is None or runtime_token is None:
-        return
-    runtime_metadata = {
-            "schema_version": "jarvis.runtime.v1",
-            "source": "jarvis_sidecar",
-            "execution_id": execution_id,
-            "pipeline_id": pipeline_id if isinstance(pipeline_id, str) else None,
-            "scheduler_provider": scheduler_name,
-            "scheduler_type": scheduler_name,
-            "scheduler_job_id": scheduler_job_id,
-            "scheduler_phase": phase,
-            "script_path": str(script_path),
-            "hostfile_path": (
-                str(scheduler["hostfile"]) if scheduler.get("hostfile") is not None else None
-            ),
-            "output_path": (
-                str(scheduler["output"]) if scheduler.get("output") is not None else None
-            ),
-            "error_path": (
-                str(scheduler["error"]) if scheduler.get("error") is not None else None
-            ),
-            "package_provenance": package_provenance,
-            "terminal": {
-                "state": phase,
-                "terminal": terminal,
-                "returncode": returncode,
-                "reason": reason,
-                "started_at": started_at,
-                "finished_at": (
-                    datetime.now(timezone.utc).isoformat() if terminal else None
-                ),
-            },
-            "details": {
-                "execution_owner": "jarvis_cd.pipeline.submit",
-                "identity_source": submission_metadata["identity_source"],
-                "scheduler_submission": submission_metadata,
-                "scheduler_submission_intent": submission_intent,
-                "scheduler_status": (
-                    status.model_dump(mode="json") if status is not None else None
-                ),
-                "wait": "relay_scheduler_provider",
-            },
-    }
-    append_runtime_record(runtime_metadata)
-
-
-def emit_direct_runtime_metadata(
-    phase: str,
-    *,
-    terminal: bool,
-    returncode: int | None = None,
-    reason: str | None = None,
-) -> None:
-    append_runtime_record(
-        {
-            "schema_version": "jarvis.runtime.v1",
-            "source": "jarvis_sidecar",
-            "execution_id": execution_id,
-            "pipeline_id": pipeline_id if isinstance(pipeline_id, str) else None,
-            "scheduler_phase": phase,
-            "package_provenance": package_provenance,
-            "terminal": {
-                "state": phase,
-                "terminal": terminal,
-                "returncode": returncode,
-                "reason": reason,
-                "started_at": started_at,
-                "finished_at": (
-                    datetime.now(timezone.utc).isoformat() if terminal else None
-                ),
-            },
-            "details": {
-                "execution_owner": "jarvis_cd.pipeline.run",
-                "execution_mode": "direct",
-                "scheduler_expected": False,
-                "direct_execution_proof": runtime_direct_proof,
-            },
-        }
-    )
-
-
-if direct_execution:
-    run = getattr(obj, "run", None)
-    if not callable(run):
-        raise RuntimeError("named JARVIS object has no direct run operation")
-    emit_direct_runtime_metadata("direct_running", terminal=False)
-    try:
-        run()
-    except BaseException as exc:
-        emit_direct_runtime_metadata(
-            "direct_failed",
-            terminal=True,
-            returncode=1,
-            reason=f"{type(exc).__name__}: {exc}",
-        )
-        raise
-    emit_direct_runtime_metadata("direct_completed", terminal=True, returncode=0)
-    raise SystemExit(0)
-
-
-# Persist an HMAC-authenticated intent before the scheduler side effect. The
-# unique provider-native job name lets the worker reconcile only an exact
-# single match if this adapter dies during or immediately after submit().
-append_runtime_record(
-    {
-        "schema_version": "jarvis.runtime.v1",
-        "source": "jarvis_sidecar",
-        "execution_id": execution_id,
-        "pipeline_id": pipeline_id if isinstance(pipeline_id, str) else None,
-        "scheduler_provider": scheduler_name,
-        "scheduler_type": scheduler_name,
-        "scheduler_phase": "submission_intent",
-        "package_provenance": package_provenance,
-        "terminal": {
-            "state": "submission_intent",
-            "terminal": False,
-            "started_at": started_at,
-        },
-        "details": {
-            "execution_owner": "jarvis_cd.pipeline.submit",
-            "scheduler_submission_intent": submission_intent,
-        },
-    }
+run_native_jarvis_broker(
+    obj,
+    runtime_intent=runtime_intent,
+    runtime_direct_proof=runtime_direct_proof,
+    configured_scheduler_provider=configured_scheduler_provider,
+    append_runtime_record=append_runtime_record,
 )
-
-
-# JARVIS owns script generation and scheduler submission. It submits without a
-# blocking scheduler wait so the provider-owned identity is available before
-# the workload completes. clio-relay then observes that exact identity through
-# its explicit scheduler provider; it never submits application work itself.
-script_path = submit(submit=True, wait=False)
-if script_path is None:
-    raise RuntimeError("Scheduled JARVIS object did not return a scheduler script path")
-
-submission_metadata = getattr(obj, "last_submission", None)
-if not isinstance(submission_metadata, dict):
-    raise RuntimeError("JARVIS-CD did not return structured scheduler submission metadata")
-if submission_metadata.get("schema_version") != "jarvis.scheduler.submission.v1":
-    raise RuntimeError("JARVIS-CD scheduler submission schema is unsupported")
-if submission_metadata.get("provider") != scheduler_name:
-    raise RuntimeError("JARVIS-CD scheduler submission provider did not match")
-if submission_metadata.get("script_path") != str(script_path):
-    raise RuntimeError("JARVIS-CD scheduler submission script did not match")
-if submission_metadata.get("identity_source") != "scheduler_submit_api":
-    raise RuntimeError("JARVIS-CD scheduler identity source is not authoritative")
-if submission_metadata.get("submitted") is not True:
-    raise RuntimeError("JARVIS-CD did not confirm scheduler submission")
-if submission_metadata.get("reconciliation_marker") != submission_marker:
-    raise RuntimeError("JARVIS-CD scheduler reconciliation marker did not match")
-scheduler_job_id = submission_metadata.get("scheduler_job_id")
-if not isinstance(scheduler_job_id, str) or not scheduler_job_id:
-    raise RuntimeError("JARVIS-CD did not return a scheduler job identity")
-if scheduler_name == "slurm" and not scheduler_job_id.isdecimal():
-    raise RuntimeError("JARVIS-CD returned an invalid SLURM job identity")
-
-provider = provider_for_scheduler(scheduler_name)
-emit_runtime_metadata("submitted", terminal=False)
-last_observation = None
-while True:
-    status = provider.poll(scheduler_job_id)
-    observation = (
-        status.phase.value,
-        status.raw_state,
-        status.reason,
-        status.nodes,
-        status.start_time,
-    )
-    if observation != last_observation:
-        terminal = status.phase in {
-            SchedulerPhase.COMPLETED,
-            SchedulerPhase.FAILED,
-            SchedulerPhase.CANCELED,
-        }
-        emit_runtime_metadata(
-            status.phase.value,
-            terminal=terminal,
-            returncode=(0 if status.phase is SchedulerPhase.COMPLETED else 1 if terminal else None),
-            reason=status.reason,
-            status=status,
-        )
-        last_observation = observation
-    if status.phase is SchedulerPhase.COMPLETED:
-        break
-    if status.phase in {SchedulerPhase.FAILED, SchedulerPhase.CANCELED}:
-        raise RuntimeError(
-            f"Scheduler job {scheduler_job_id} ended in {status.phase.value}: "
-            f"{status.reason or status.raw_state or 'no reason reported'}"
-        )
-    time.sleep(5)
 """

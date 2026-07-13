@@ -31,22 +31,12 @@ from clio_relay.validation_report import (
 )
 
 JSON = dict[str, Any]
-_PROVIDER_IDENTITY_KEYS = (
-    "provider_entry_point",
-    "provider_entry_point_value",
-    "provider_distribution",
-    "provider_distribution_version",
-    "adapter",
+_NATIVE_PROGRESS_IDENTITY_KEYS = (
+    "execution_id",
+    "pipeline_id",
+    "package_id",
     "package_name",
-    "package_version",
-    "application_profile",
-)
-_PROGRESS_REPLAY_KEYS = (
-    "provider_execution_id",
-    "provider_pipeline_id",
-    "provider_server_artifact_digest",
-    "provider_notification_sequence",
-    *_PROVIDER_IDENTITY_KEYS,
+    "server_artifact_digest",
 )
 
 
@@ -69,6 +59,15 @@ def build_jarvis_mcp_validation_report(
     remote_discovery_artifacts: list[JSON] | None = None,
     initialize_response: JSON | None = None,
     stdio_evidence: JSON | None = None,
+    query_tools_list_response: JSON | None,
+    query_call_response: JSON | None,
+    query_call_job_id: str,
+    query_call_status: JSON,
+    query_artifacts: list[JSON],
+    query_mcp_result: JSON | None,
+    query_provenance: JSON | None,
+    query_initialize_response: JSON | None,
+    query_stdio_evidence: JSON | None,
     launcher: str | None = None,
     install_source: str | None = None,
     artifact_sha256: str | None = None,
@@ -129,7 +128,7 @@ def build_jarvis_mcp_validation_report(
     report.checks.append(
         _check(
             "remote-mcp.jarvis-remote-contract",
-            "remote JARVIS MCP exposes the five-tool merged user contract",
+            "remote JARVIS MCP exposes the locked native-execution user contract",
             remote_contract_passed,
             report.started_at,
             observed_at,
@@ -176,20 +175,37 @@ def build_jarvis_mcp_validation_report(
         if remote_tools_list_result
         else None
     )
-    server_install_spec = _server_install_spec(cast(list[object], spec.get("server_args", [])))
     expected_server_artifact_digest = spec.get("expected_server_artifact_digest")
     computed_server_artifact_digest = (
         remote_mcp_server_artifact_digest(server_artifact) if server_artifact is not None else None
+    )
+    python_runtime = (
+        _mapping(server_artifact.get("python_distribution_runtime"))
+        if server_artifact is not None
+        else None
+    )
+    nested_runtime = (
+        _mapping(server_artifact.get("nested_runtime")) if server_artifact is not None else None
     )
     server_artifact_passed = (
         server_artifact is not None
         and server_artifact.get("verified") is True
         and server_artifact.get("server_process_artifact_verified") is True
         and bool(server_artifact.get("executable"))
-        and server_artifact.get("install_source") == "wheel"
+        and server_artifact.get("install_source") == "uv-tool"
         and _is_sha256(server_artifact.get("install_artifact_sha256"))
         and server_artifact.get("requested_command") == spec.get("server")
-        and server_artifact.get("install_spec") == server_install_spec
+        and spec.get("server_args") == ["mcp-server", "jarvis"]
+        and isinstance(server_artifact.get("install_spec"), str)
+        and str(server_artifact.get("install_spec")).endswith(".whl")
+        and python_runtime is not None
+        and str(python_runtime.get("distribution", "")).lower().replace("_", "-") == "clio-kit"
+        and python_runtime.get("entry_point") == "clio-kit"
+        and python_runtime.get("runtime_closure_verified") is True
+        and nested_runtime is not None
+        and nested_runtime.get("server_name") == "jarvis"
+        and nested_runtime.get("persistent_tool") is True
+        and nested_runtime.get("locked_runtime_verified") is True
         and server_artifact == discovery_server_artifact
         and _is_sha256(expected_server_artifact_digest)
         and expected_server_artifact_digest == computed_server_artifact_digest
@@ -209,6 +225,9 @@ def build_jarvis_mcp_validation_report(
                 "discovery_server_artifact": discovery_server_artifact or {},
                 "expected_server_artifact_digest": expected_server_artifact_digest,
                 "computed_server_artifact_digest": computed_server_artifact_digest,
+                "launcher": "uv tool",
+                "python_distribution_runtime": python_runtime or {},
+                "nested_runtime": nested_runtime or {},
                 "result_expected_server_artifact_digest": (
                     mcp_result.get("expected_server_artifact_digest") if mcp_result else None
                 ),
@@ -283,25 +302,25 @@ def build_jarvis_mcp_validation_report(
         (_mapping(spec.get("arguments")) or {}).get("spack_specs"),
     )
     spack_specs = raw_spack_specs if _is_string_list(raw_spack_specs) else None
-    environment = _spack_environment_metadata(runtime_metadata)
-    spack_runtime_passed = (
-        spack_specs is not None
-        and len(spack_specs) > 0
-        and environment is not None
-        and environment.get("specs") == spack_specs
-        and environment.get("persisted") is True
-        and environment.get("scheduler_reload") == "saved_pipeline_environment"
-    )
-    report.checks.append(
-        _check(
-            "jarvis.spack-runtime-environment",
-            "jarvis_run persisted the requested Spack environment for scheduler reload",
-            spack_runtime_passed,
-            report.started_at,
-            observed_at,
-            {"spack_specs": spack_specs, "environment": environment or {}},
+    if spack_specs is not None:
+        environment = _spack_environment_metadata(runtime_metadata)
+        spack_runtime_passed = (
+            len(spack_specs) > 0
+            and environment is not None
+            and environment.get("specs") == spack_specs
+            and environment.get("persisted") is True
+            and environment.get("scheduler_reload") == "saved_pipeline_environment"
         )
-    )
+        report.checks.append(
+            _check(
+                "jarvis.spack-runtime-environment",
+                "jarvis_run persisted the requested Spack environment for scheduler reload",
+                spack_runtime_passed,
+                report.started_at,
+                observed_at,
+                {"spack_specs": spack_specs, "environment": environment or {}},
+            )
+        )
 
     source = runtime_metadata.get("source") if runtime_metadata else None
     field_sources = _mapping(runtime_metadata.get("field_sources")) if runtime_metadata else None
@@ -318,6 +337,12 @@ def build_jarvis_mcp_validation_report(
     producer_contract = (
         _mapping(runtime_details.get("producer_contract")) if runtime_details else None
     )
+    native_execution = (
+        _mapping(runtime_details.get("native_execution")) if runtime_details else None
+    )
+    native_handle = _mapping(native_execution.get("execution_handle")) if native_execution else None
+    native_record = _mapping(native_execution.get("execution_record")) if native_execution else None
+    native_progress = _mapping(native_execution.get("progress")) if native_execution else None
     runtime_passed = (
         tool == "jarvis_run"
         and runtime_metadata is not None
@@ -334,7 +359,19 @@ def build_jarvis_mcp_validation_report(
         and scheduler_job_id_source in authoritative_runtime_sources
         and producer_contract is not None
         and producer_contract.get("trusted") is True
-        and producer_contract.get("producer_schema_version") == "jarvis.runtime.v1"
+        and producer_contract.get("contract_kind") == "native_execution"
+        and producer_contract.get("producer_schema_version") == "jarvis.execution.record.v1"
+        and producer_contract.get("handle_schema_version") == "jarvis.execution.handle.v1"
+        and producer_contract.get("progress_schema_version") == "jarvis.execution.progress.v1"
+        and native_handle is not None
+        and native_handle.get("schema_version") == "jarvis.execution.handle.v1"
+        and native_record is not None
+        and native_record.get("schema_version") == "jarvis.execution.record.v1"
+        and native_progress is not None
+        and native_progress.get("schema_version") == "jarvis.execution.progress.v1"
+        and native_handle.get("execution_id") == runtime_metadata.get("execution_id")
+        and native_record.get("execution_id") == runtime_metadata.get("execution_id")
+        and native_progress.get("execution_id") == runtime_metadata.get("execution_id")
         and terminal is not None
         and terminal.get("terminal") is True
         and terminal.get("returncode") == 0
@@ -351,6 +388,9 @@ def build_jarvis_mcp_validation_report(
                 "schema_version": (
                     runtime_metadata.get("schema_version") if runtime_metadata else None
                 ),
+                "execution_id": (
+                    runtime_metadata.get("execution_id") if runtime_metadata else None
+                ),
                 "source": source,
                 "pipeline_id": runtime_metadata.get("pipeline_id") if runtime_metadata else None,
                 "scheduler_provider": scheduler_provider,
@@ -359,6 +399,7 @@ def build_jarvis_mcp_validation_report(
                 "scheduler_job_id_source": scheduler_job_id_source,
                 "field_sources": field_sources or {},
                 "producer_contract": producer_contract or {},
+                "native_execution": native_execution or {},
                 "terminal": terminal or {},
                 "runtime_artifact_id": (
                     artifacts_by_kind.get("runtime_metadata", {}).get("artifact_id")
@@ -367,7 +408,35 @@ def build_jarvis_mcp_validation_report(
         )
     )
 
+    query_evidence, query_passed, generated_artifacts = _jarvis_execution_query_evidence(
+        cluster=cluster,
+        pipeline_id=runtime_metadata.get("pipeline_id") if runtime_metadata else None,
+        execution_id=runtime_metadata.get("execution_id") if runtime_metadata else None,
+        expected_server_artifact_digest=expected_server_artifact_digest,
+        expected_server_artifact=server_artifact,
+        tools_list_response=query_tools_list_response,
+        call_response=query_call_response,
+        call_job_id=query_call_job_id,
+        call_status=query_call_status,
+        artifacts=query_artifacts,
+        mcp_result=query_mcp_result,
+        provenance=query_provenance,
+        initialize_response=query_initialize_response,
+        stdio_evidence=query_stdio_evidence,
+    )
+    report.checks.append(
+        _check(
+            "remote-mcp.jarvis-execution-query",
+            "post-run JARVIS query returned coherent progress and a bounded artifact page",
+            query_passed,
+            report.started_at,
+            observed_at,
+            query_evidence,
+        )
+    )
+
     if isinstance(job.get("job_id"), str):
+        execution_id = runtime_metadata.get("execution_id") if runtime_metadata else None
         report.resources.append(
             ValidationResource(
                 kind="relay_job",
@@ -375,7 +444,20 @@ def build_jarvis_mcp_validation_report(
                 role="virtual_jarvis_mcp_call",
                 cluster=cluster,
                 state=str(job.get("state")) if job.get("state") is not None else None,
-                metadata=job,
+                metadata={**job, "execution_id": execution_id},
+            )
+        )
+    query_job = _mapping(query_call_status.get("job")) or {}
+    if isinstance(query_job.get("job_id"), str):
+        execution_id = runtime_metadata.get("execution_id") if runtime_metadata else None
+        report.resources.append(
+            ValidationResource(
+                kind="relay_job",
+                resource_id=cast(str, query_job["job_id"]),
+                role="jarvis_mcp_execution_query",
+                cluster=cluster,
+                state=(str(query_job.get("state")) if query_job.get("state") is not None else None),
+                metadata={**query_job, "execution_id": execution_id},
             )
         )
     if remote_discovery_job_id is not None:
@@ -450,6 +532,37 @@ def build_jarvis_mcp_validation_report(
                 metadata=artifact,
             )
         )
+    for artifact in query_artifacts:
+        artifact_id = artifact.get("artifact_id")
+        if not isinstance(artifact_id, str):
+            continue
+        uri = artifact.get("uri")
+        report.resources.append(
+            ValidationResource(
+                kind="artifact",
+                resource_id=artifact_id,
+                role=f"jarvis_execution_query_{artifact.get('kind', 'artifact')}",
+                cluster=cluster,
+                references=[str(uri)] if isinstance(uri, str) else [],
+                metadata=artifact,
+            )
+        )
+    for artifact in generated_artifacts:
+        artifact_id = artifact.get("artifact_id")
+        if not isinstance(artifact_id, str):
+            continue
+        report.resources.append(
+            ValidationResource(
+                kind="jarvis_generated_artifact",
+                resource_id=artifact_id,
+                role=str(artifact.get("role", "artifact")),
+                cluster=cluster,
+                state=str(artifact.get("state")) if artifact.get("state") is not None else None,
+                provider="jarvis-cd",
+                references=_artifact_location_references(artifact),
+                metadata=artifact,
+            )
+        )
     if isinstance(scheduler_job_id, str):
         report.resources.append(
             ValidationResource(
@@ -473,9 +586,9 @@ def build_jarvis_mcp_validation_report(
     if progress_resource is not None:
         report.resources.append(
             ValidationResource(
-                kind="package_progress_provider",
+                kind="jarvis_execution_progress",
                 resource_id=str(progress_resource["resource_id"]),
-                role="jarvis_mcp_package_progress",
+                role="jarvis_mcp_native_progress",
                 cluster=cluster,
                 state="verified" if progress_passed else "unverified",
                 provider=str(progress_resource["provider"]),
@@ -489,6 +602,299 @@ def build_jarvis_mcp_validation_report(
     return report
 
 
+def _artifact_location_references(artifact: dict[str, object]) -> list[str]:
+    """Render transport-neutral JARVIS artifact locations as typed references."""
+    location = _mapping(artifact.get("location")) or {}
+    uri = location.get("uri")
+    if isinstance(uri, str) and uri:
+        return [uri]
+    kind = location.get("kind")
+    value = location.get("value")
+    if isinstance(kind, str) and kind and isinstance(value, str) and value:
+        return [f"{kind}:{value}"]
+    return []
+
+
+def _jarvis_execution_query_evidence(
+    *,
+    cluster: str,
+    pipeline_id: object,
+    execution_id: object,
+    expected_server_artifact_digest: object,
+    expected_server_artifact: JSON | None,
+    tools_list_response: JSON | None,
+    call_response: JSON | None,
+    call_job_id: str,
+    call_status: JSON,
+    artifacts: list[JSON],
+    mcp_result: JSON | None,
+    provenance: JSON | None,
+    initialize_response: JSON | None,
+    stdio_evidence: JSON | None,
+) -> tuple[JSON, bool, list[JSON]]:
+    """Validate the durable post-run unified execution query and expose its evidence."""
+    tool = _listed_tool(tools_list_response, "jarvis_get_execution")
+    input_schema = _mapping(tool.get("inputSchema")) if tool else None
+    properties = _mapping(input_schema.get("properties")) if input_schema else None
+    required = input_schema.get("required") if input_schema else None
+    local_contract, local_contract_passed = _local_jarvis_contract(
+        tool,
+        "jarvis_get_execution",
+    )
+    stdio_passed = _stdio_initialize_passed(
+        initialize_response=initialize_response,
+        evidence=stdio_evidence,
+    )
+    local_surface_passed = (
+        properties is not None
+        and isinstance(properties.get("cluster"), dict)
+        and isinstance(required, list)
+        and "cluster" in required
+        and local_contract_passed
+        and stdio_passed
+    )
+
+    job = _mapping(call_status.get("job")) or {}
+    spec = _mapping(job.get("spec")) or {}
+    arguments = _mapping(spec.get("arguments")) or {}
+    artifact_request = _mapping(arguments.get("artifacts"))
+    page_size = artifact_request.get("page_size") if artifact_request else None
+    request_bounded = (
+        isinstance(pipeline_id, str)
+        and bool(pipeline_id)
+        and isinstance(execution_id, str)
+        and bool(execution_id)
+        and set(arguments) == {"pipeline_id", "execution_id", "include_progress", "artifacts"}
+        and arguments.get("pipeline_id") == pipeline_id
+        and arguments.get("execution_id") == execution_id
+        and arguments.get("include_progress") is True
+        and artifact_request is not None
+        and set(artifact_request) == {"page_size"}
+        and _positive_int(page_size)
+        and page_size <= 100
+    )
+    response_job_id = _response_job_id(call_response)
+    durable_artifacts = {
+        str(artifact.get("kind")): artifact
+        for artifact in artifacts
+        if isinstance(artifact.get("kind"), str)
+    }
+    required_artifacts = {"stdout", "stderr", "mcp_result", "provenance"}
+    provenance_job = _mapping(provenance.get("job")) if provenance else None
+    job_passed = (
+        response_job_id == call_job_id
+        and job.get("job_id") == call_job_id
+        and job.get("cluster") == cluster
+        and job.get("kind") == "mcp_call"
+        and job.get("state") == "succeeded"
+        and call_status.get("terminal") is True
+        and spec.get("operation") == "tools/call"
+        and spec.get("tool") == "jarvis_get_execution"
+        and request_bounded
+        and required_artifacts.issubset(durable_artifacts)
+        and provenance_job is not None
+        and provenance_job.get("job_id") == call_job_id
+    )
+
+    result_server_artifact = _mapping(mcp_result.get("server_artifact")) if mcp_result else None
+    server_binding_passed = (
+        _is_sha256(expected_server_artifact_digest)
+        and spec.get("expected_server_artifact_digest") == expected_server_artifact_digest
+        and mcp_result is not None
+        and mcp_result.get("expected_server_artifact_digest") == expected_server_artifact_digest
+        and mcp_result.get("observed_server_artifact_digest") == expected_server_artifact_digest
+        and result_server_artifact == expected_server_artifact
+    )
+
+    structured = _mapping(mcp_result.get("structured_result")) if mcp_result else None
+    handle = _mapping(structured.get("execution_handle")) if structured else None
+    record = _mapping(structured.get("execution_record")) if structured else None
+    progress = _mapping(structured.get("progress")) if structured else None
+    artifact_page = _mapping(structured.get("artifact_page")) if structured else None
+    runtime = _mapping(structured.get("runtime_metadata")) if structured else None
+    raw_generated = artifact_page.get("artifacts") if artifact_page else None
+    generated_artifacts = (
+        [cast(JSON, item) for item in cast(list[object], raw_generated) if isinstance(item, dict)]
+        if isinstance(raw_generated, list)
+        else []
+    )
+    expected_envelope = {
+        "schema_version",
+        "pipeline_id",
+        "execution_id",
+        "execution_handle",
+        "execution_record",
+        "runtime_metadata",
+        "progress",
+        "artifact_page",
+    }
+    envelope_passed = (
+        structured is not None
+        and set(structured) == expected_envelope
+        and structured.get("schema_version") == "clio-kit.jarvis-execution.v1"
+        and runtime is not None
+        and handle is not None
+        and record is not None
+        and progress is not None
+        and artifact_page is not None
+    )
+    identity_fields = (
+        "execution_id",
+        "pipeline_id",
+        "mode",
+        "scheduler_provider",
+        "scheduler_native_id",
+        "cluster",
+    )
+    identity_passed = bool(
+        envelope_passed
+        and isinstance(pipeline_id, str)
+        and isinstance(execution_id, str)
+        and structured is not None
+        and structured.get("pipeline_id") == pipeline_id
+        and structured.get("execution_id") == execution_id
+        and handle is not None
+        and record is not None
+        and all(handle.get(key) == record.get(key) for key in identity_fields)
+        and handle.get("pipeline_id") == pipeline_id
+        and handle.get("execution_id") == execution_id
+        and progress is not None
+        and progress.get("pipeline_id") == pipeline_id
+        and progress.get("execution_id") == execution_id
+        and artifact_page is not None
+        and artifact_page.get("pipeline_id") == pipeline_id
+        and artifact_page.get("execution_id") == execution_id
+        and all(artifact.get("execution_id") == execution_id for artifact in generated_artifacts)
+    )
+    state = record.get("state") if record else None
+    terminal = record.get("terminal") if record else None
+    lifecycle_passed = (
+        isinstance(state, str)
+        and isinstance(terminal, bool)
+        and progress is not None
+        and progress.get("execution_state") == state
+        and progress.get("terminal") is terminal
+        and artifact_page is not None
+        and artifact_page.get("execution_state") == state
+        and artifact_page.get("terminal") is terminal
+    )
+
+    returned = artifact_page.get("returned_artifact_count") if artifact_page else None
+    matching = artifact_page.get("matching_artifact_count") if artifact_page else None
+    next_cursor = artifact_page.get("next_cursor") if artifact_page else None
+    pagination_passed = (
+        artifact_page is not None
+        and artifact_page.get("producer_schema_version") == "jarvis.execution.artifacts.v1"
+        and _nonnegative_int(returned)
+        and returned == len(generated_artifacts)
+        and _nonnegative_int(matching)
+        and matching >= returned
+        and _positive_int(page_size)
+        and returned <= page_size
+        and (
+            next_cursor is None
+            or (isinstance(next_cursor, str) and bool(next_cursor) and bool(generated_artifacts))
+        )
+    )
+
+    expected_filters: JSON = {
+        "package_id": None,
+        "role": None,
+        "state": None,
+        "artifact_id": None,
+        "page_size": page_size,
+        "cursor": None,
+    }
+    filters_passed = all(
+        _artifact_matches_query(artifact, expected_filters) for artifact in generated_artifacts
+    )
+    runner_validation = _mapping(mcp_result.get("result_validation")) if mcp_result else None
+    runner_attested = (
+        runner_validation is not None
+        and runner_validation.get("schema_version")
+        == "clio-relay.jarvis-execution-query-validation.v1"
+        and runner_validation.get("pipeline_id") == pipeline_id
+        and runner_validation.get("execution_id") == execution_id
+        and runner_validation.get("include_progress") is True
+        and runner_validation.get("progress_included") is True
+        and runner_validation.get("artifacts_requested") is True
+        and runner_validation.get("artifact_filters") == expected_filters
+        and runner_validation.get("returned_artifact_count") == returned
+        and runner_validation.get("next_cursor_present") is (next_cursor is not None)
+    )
+    result_passed = (
+        mcp_result is not None
+        and mcp_result.get("returncode") == 0
+        and mcp_result.get("operation") == "tools/call"
+        and mcp_result.get("tool") == "jarvis_get_execution"
+        and mcp_result.get("protocol_error") is None
+        and envelope_passed
+        and identity_passed
+        and lifecycle_passed
+        and pagination_passed
+        and filters_passed
+        and runner_attested
+    )
+    assertions: JSON = {
+        "local_query_surface_verified": local_surface_passed,
+        "durable_query_job_verified": job_passed,
+        "server_artifact_binding_verified": server_binding_passed,
+        "result_transport_verified": result_passed,
+        "result_envelope_verified": envelope_passed,
+        "identity_coherent": identity_passed,
+        "lifecycle_coherent": lifecycle_passed,
+        "pagination_coherent": pagination_passed,
+        "artifact_filters_coherent": filters_passed,
+        "runner_semantic_validation_verified": runner_attested,
+    }
+    evidence: JSON = {
+        "execution_id": structured.get("execution_id") if structured else None,
+        "query_job_id": call_job_id,
+        "response_job_id": response_job_id,
+        "request": arguments,
+        "job_state": job.get("state"),
+        "terminal": call_status.get("terminal"),
+        "required_artifact_kinds": sorted(required_artifacts),
+        "artifact_kinds": sorted(durable_artifacts),
+        "local_contract": local_contract,
+        "packaged_stdio": stdio_evidence or {},
+        "runner_validation": runner_validation or {},
+        "result_identity": {
+            "pipeline_id": structured.get("pipeline_id") if structured else None,
+            "execution_id": structured.get("execution_id") if structured else None,
+        },
+        "result_lifecycle": {"state": state, "terminal": terminal},
+        "artifact_page": {
+            "producer_schema_version": (
+                artifact_page.get("producer_schema_version") if artifact_page else None
+            ),
+            "matching_artifact_count": matching,
+            "returned_artifact_count": returned,
+            "next_cursor": next_cursor,
+            "requested_page_size": page_size,
+        },
+        "assertions": assertions,
+    }
+    return (
+        evidence,
+        all(cast(bool, value) for value in assertions.values()),
+        generated_artifacts,
+    )
+
+
+def _artifact_matches_query(artifact: JSON, query: JSON) -> bool:
+    """Return whether one generated artifact satisfies the normalized request filters."""
+    return all(
+        query.get(filter_name) is None or artifact.get(artifact_name) == query.get(filter_name)
+        for filter_name, artifact_name in (
+            ("package_id", "package_id"),
+            ("role", "role"),
+            ("state", "state"),
+            ("artifact_id", "artifact_id"),
+        )
+    )
+
+
 def _jarvis_live_progress_evidence(
     *,
     progress: list[JSON],
@@ -499,18 +905,19 @@ def _jarvis_live_progress_evidence(
     mcp_result: JSON | None,
     runtime_metadata: JSON | None,
 ) -> tuple[JSON, bool, JSON | None]:
-    """Validate one warming-to-accepted virtual JARVIS progress replay."""
+    """Validate live and final progress owned by one native JARVIS execution."""
     candidates: list[tuple[int, JSON, JSON]] = []
     for index, record in enumerate(progress):
         metadata = _mapping(record.get("metadata"))
         if metadata is None or record.get("job_id") != call_job_id:
             continue
         if (
-            metadata.get("source") != "jarvis_package"
-            or metadata.get("provider_source_authority") != "mcp_progress_notification"
-            or metadata.get("provider_validated") is not True
-            or metadata.get("run_id") != call_job_id
-            or metadata.get("execution_id") != call_job_id
+            metadata.get("source") != "jarvis_execution"
+            or metadata.get("provider_source_authority") != "jarvis_mcp_progress_notification"
+            or metadata.get("producer_validated") is not True
+            or metadata.get("relay_job_id") != call_job_id
+            or metadata.get("run_id") != metadata.get("execution_id")
+            or metadata.get("progress_schema_version") != "jarvis.progress.v1"
         ):
             continue
         candidates.append((index, record, metadata))
@@ -519,9 +926,8 @@ def _jarvis_live_progress_evidence(
     accepted: tuple[int, JSON, JSON] | None = None
     for warming_candidate in candidates:
         warming_index, warming_record, warming_metadata = warming_candidate
-        if (
-            warming_metadata.get("acceptance_validated") is not False
-            or warming_metadata.get("provider_execution_validated") is not False
+        if warming_metadata.get("execution_binding_validated") is not False or not _positive_int(
+            warming_metadata.get("progress_transport_sequence")
         ):
             continue
         for accepted_candidate in candidates:
@@ -529,14 +935,12 @@ def _jarvis_live_progress_evidence(
             if accepted_index <= warming_index:
                 continue
             if (
-                accepted_metadata.get("acceptance_validated") is not True
-                or accepted_metadata.get("provider_execution_validated") is not True
-                or not _same_progress_replay(
-                    warming_record,
+                accepted_metadata.get("execution_binding_validated") is not True
+                or not _same_native_progress_execution(
                     warming_metadata,
-                    accepted_record,
                     accepted_metadata,
                 )
+                or not _nondecreasing_native_progress(warming_metadata, accepted_metadata)
             ):
                 continue
             warming = warming_candidate
@@ -559,63 +963,51 @@ def _jarvis_live_progress_evidence(
     progress_binding_valid = (
         accepted_metadata is not None
         and isinstance(pipeline_id, str)
-        and accepted_metadata.get("provider_pipeline_id") == pipeline_id
+        and accepted_metadata.get("pipeline_id") == pipeline_id
         and _is_sha256(expected_server_artifact_digest)
-        and accepted_metadata.get("provider_server_artifact_digest")
-        == expected_server_artifact_digest
+        and accepted_metadata.get("server_artifact_digest") == expected_server_artifact_digest
         and all(
             isinstance(accepted_metadata.get(key), str) and bool(accepted_metadata.get(key))
-            for key in _PROVIDER_IDENTITY_KEYS
-            if key != "application_profile"
+            for key in _NATIVE_PROGRESS_IDENTITY_KEYS
         )
+        and isinstance(accepted_metadata.get("progress_determinate"), bool)
+        and _nonnegative_int(accepted_metadata.get("progress_event_count"))
+        and _nonnegative_int(accepted_metadata.get("progress_sequence"))
+        and _nonnegative_int(accepted_metadata.get("progress_transport_sequence"))
     )
 
     result_bridge = _mapping(mcp_result.get("package_progress_bridge")) if mcp_result else None
-    result_provider = _mapping(result_bridge.get("provider")) if result_bridge else None
-    bridge_identity = (
-        {
-            "provider_entry_point": result_provider.get("entry_point"),
-            "provider_entry_point_value": result_provider.get("entry_point_value"),
-            "provider_distribution": result_provider.get("distribution"),
-            "provider_distribution_version": result_provider.get("distribution_version"),
-            "adapter": result_provider.get("adapter"),
-            "package_name": result_provider.get("package_name"),
-            "package_version": result_provider.get("package_version"),
-            "application_profile": result_provider.get("application_profile"),
-        }
-        if result_provider is not None
-        else None
-    )
     bridge_valid = (
         result_bridge is not None
         and accepted_metadata is not None
-        and result_bridge.get("schema_version") == "clio-relay.mcp-package-progress-bridge.v1"
+        and result_bridge.get("schema_version") == "clio-relay.mcp-jarvis-progress-bridge.v1"
         and result_bridge.get("execution_validated") is True
-        and isinstance(result_bridge.get("notification_count"), int)
-        and not isinstance(result_bridge.get("notification_count"), bool)
-        and cast(int, result_bridge["notification_count"]) >= 1
-        and result_bridge.get("execution_id") == accepted_metadata.get("provider_execution_id")
+        and _positive_int(result_bridge.get("notification_count"))
+        and result_bridge.get("execution_id") == accepted_metadata.get("execution_id")
         and result_bridge.get("pipeline_id") == pipeline_id
         and result_bridge.get("expected_server_artifact_digest") == expected_server_artifact_digest
         and result_bridge.get("observed_server_artifact_digest") == expected_server_artifact_digest
-        and bridge_identity == {key: accepted_metadata.get(key) for key in _PROVIDER_IDENTITY_KEYS}
+        and isinstance(result_bridge.get("package_sequences"), dict)
     )
 
-    runtime_packages = runtime_metadata.get("packages") if runtime_metadata else None
-    provider_package = accepted_metadata.get("package_name") if accepted_metadata else None
-    runtime_package_bound = (
-        isinstance(runtime_packages, list)
-        and isinstance(provider_package, str)
-        and any(
-            isinstance(item, dict) and cast(JSON, item).get("name") == provider_package
-            for item in cast(list[object], runtime_packages)
-        )
+    runtime_details = _mapping(runtime_metadata.get("details")) if runtime_metadata else None
+    native_execution = (
+        _mapping(runtime_details.get("native_execution")) if runtime_details else None
+    )
+    native_progress = _mapping(native_execution.get("progress")) if native_execution else None
+    native_packages = native_progress.get("packages") if native_progress else None
+    runtime_package_bound = _native_runtime_package_bound(
+        native_packages,
+        accepted_metadata,
     )
     runtime_bound = (
         runtime_metadata is not None
         and accepted_metadata is not None
-        and runtime_metadata.get("execution_id") == accepted_metadata.get("provider_execution_id")
+        and runtime_metadata.get("execution_id") == accepted_metadata.get("execution_id")
         and runtime_metadata.get("pipeline_id") == pipeline_id
+        and native_progress is not None
+        and native_progress.get("schema_version") == "jarvis.execution.progress.v1"
+        and native_progress.get("execution_id") == accepted_metadata.get("execution_id")
         and runtime_package_bound
     )
     passed = bool(
@@ -627,11 +1019,12 @@ def _jarvis_live_progress_evidence(
         and runtime_bound
     )
     evidence: JSON = {
+        "execution_id": (accepted_metadata.get("execution_id") if accepted_metadata else None),
         "progress_record_count": len(progress),
         "warming_progress_id": warming_record.get("progress_id") if warming_record else None,
         "accepted_progress_id": accepted_record.get("progress_id") if accepted_record else None,
         "notification_sequence": (
-            accepted_metadata.get("provider_notification_sequence") if accepted_metadata else None
+            accepted_metadata.get("progress_transport_sequence") if accepted_metadata else None
         ),
         "live_observation": live_observation or {},
         "live_observed_while_running": live_observed,
@@ -641,23 +1034,20 @@ def _jarvis_live_progress_evidence(
         "bridge_valid": bridge_valid,
         "runtime_bound": runtime_bound,
         "bridge": result_bridge or {},
-        "provider": (
-            {key: accepted_metadata.get(key) for key in _PROVIDER_IDENTITY_KEYS}
+        "native_progress": (
+            {key: accepted_metadata.get(key) for key in _NATIVE_PROGRESS_IDENTITY_KEYS}
             if accepted_metadata
             else {}
         ),
     }
     if accepted_record is None or accepted_metadata is None:
         return evidence, passed, None
-    provider_distribution = accepted_metadata.get("provider_distribution")
     resource = {
         "resource_id": (
-            f"{accepted_metadata.get('provider_entry_point', 'provider')}:"
-            f"{accepted_metadata.get('provider_execution_id', 'execution')}"
+            f"{accepted_metadata.get('execution_id', 'execution')}:"
+            f"{accepted_metadata.get('package_id', 'package')}"
         ),
-        "provider": (
-            str(provider_distribution) if provider_distribution is not None else "unknown"
-        ),
+        "provider": "jarvis-cd",
         "metadata": {
             **accepted_metadata,
             "warming_progress_id": warming_record.get("progress_id") if warming_record else None,
@@ -670,24 +1060,60 @@ def _jarvis_live_progress_evidence(
     return evidence, passed, resource
 
 
-def _same_progress_replay(
-    warming_record: JSON,
+def _same_native_progress_execution(
     warming_metadata: JSON,
-    accepted_record: JSON,
     accepted_metadata: JSON,
 ) -> bool:
-    """Return whether two durable records are the warming/final replay pair."""
-    record_keys = ("label", "current", "total", "unit", "message", "source_event_seq")
+    """Return whether two observations belong to one native package execution."""
     return all(
-        warming_metadata.get(key) == accepted_metadata.get(key) for key in _PROGRESS_REPLAY_KEYS
-    ) and all(warming_record.get(key) == accepted_record.get(key) for key in record_keys)
+        warming_metadata.get(key) == accepted_metadata.get(key)
+        for key in _NATIVE_PROGRESS_IDENTITY_KEYS
+    )
 
 
-def _server_install_spec(server_args: list[object]) -> str | None:
-    for index, argument in enumerate(server_args[:-1]):
-        if argument == "--from" and isinstance(server_args[index + 1], str):
-            return cast(str, server_args[index + 1])
-    return None
+def _nondecreasing_native_progress(warming: JSON, accepted: JSON) -> bool:
+    """Require final native progress counters not to regress from the live event."""
+    return all(
+        _nonnegative_int(warming.get(key))
+        and _nonnegative_int(accepted.get(key))
+        and cast(int, accepted[key]) >= cast(int, warming[key])
+        for key in (
+            "progress_sequence",
+            "progress_event_count",
+            "progress_transport_sequence",
+        )
+    )
+
+
+def _native_runtime_package_bound(
+    packages: object,
+    metadata: JSON | None,
+) -> bool:
+    """Bind an accepted progress observation to the final native snapshot."""
+    if not isinstance(packages, list) or metadata is None:
+        return False
+    for item in cast(list[object], packages):
+        package = _mapping(item)
+        if package is None:
+            continue
+        if (
+            package.get("package_id") == metadata.get("package_id")
+            and package.get("package_name") == metadata.get("package_name")
+            and _nonnegative_int(package.get("event_count"))
+            and cast(int, package["event_count"]) >= cast(int, metadata["progress_event_count"])
+        ):
+            return True
+    return False
+
+
+def _nonnegative_int(value: object) -> TypeGuard[int]:
+    """Return whether a value is a non-boolean, nonnegative integer."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _positive_int(value: object) -> TypeGuard[int]:
+    """Return whether a value is a non-boolean, positive integer."""
+    return _nonnegative_int(value) and value > 0
 
 
 def _remote_jarvis_contract(document: JSON | None) -> tuple[JSON, bool]:
@@ -706,6 +1132,9 @@ def _remote_jarvis_contract(document: JSON | None) -> tuple[JSON, bool]:
     run_schema = _mapping(by_name.get("jarvis_run", {}).get("inputSchema"))
     run_properties = _mapping(run_schema.get("properties")) if run_schema else None
     spack_specs = _mapping(run_properties.get("spack_specs")) if run_properties else None
+    query_evidence, query_passed = _execution_query_contract_evidence(
+        by_name.get("jarvis_get_execution")
+    )
     observed_digest: str | None = None
     contract_error: str | None = None
     try:
@@ -720,6 +1149,7 @@ def _remote_jarvis_contract(document: JSON | None) -> tuple[JSON, bool]:
         and operation is not None
         and operation.get("enum") == ["edit", "remove"]
         and spack_specs is not None
+        and query_passed
         and observed_digest == CLIO_KIT_JARVIS_USER_CONTRACT_SHA256
     )
     return (
@@ -728,6 +1158,7 @@ def _remote_jarvis_contract(document: JSON | None) -> tuple[JSON, bool]:
             "expected_tool_names": sorted(expected),
             "edit_operation_schema": operation or {},
             "spack_specs_schema": spack_specs or {},
+            "execution_query": query_evidence,
             "expected_contract_sha256": CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
             "expected_clio_kit_version": CLIO_KIT_JARVIS_MCP_VERSION,
             "observed_contract_sha256": observed_digest,
@@ -735,6 +1166,132 @@ def _remote_jarvis_contract(document: JSON | None) -> tuple[JSON, bool]:
         },
         passed,
     )
+
+
+def _execution_query_contract_evidence(tool: JSON | None) -> tuple[JSON, bool]:
+    """Summarize the unified progress/artifact query without copying its full schema."""
+    input_schema = _mapping(tool.get("inputSchema")) if tool else None
+    input_properties = _mapping(input_schema.get("properties")) if input_schema else None
+    required = input_schema.get("required") if input_schema else None
+    include_progress = (
+        _mapping(input_properties.get("include_progress")) if input_properties else None
+    )
+    artifact_selector = _mapping(input_properties.get("artifacts")) if input_properties else None
+    artifact_query = _schema_option(artifact_selector, expected_type="object")
+    artifact_filters = _mapping(artifact_query.get("properties")) if artifact_query else None
+    page_size = _mapping(artifact_filters.get("page_size")) if artifact_filters else None
+    output_schema = _mapping(tool.get("outputSchema")) if tool else None
+    output_properties = _mapping(output_schema.get("properties")) if output_schema else None
+    output_required = output_schema.get("required") if output_schema else None
+    progress_selector = _mapping(output_properties.get("progress")) if output_properties else None
+    progress = _schema_option(progress_selector, expected_type="object")
+    progress_properties = _mapping(progress.get("properties")) if progress else None
+    page_selector = _mapping(output_properties.get("artifact_page")) if output_properties else None
+    artifact_page = _schema_option(page_selector, expected_type="object")
+    artifact_page_properties = _mapping(artifact_page.get("properties")) if artifact_page else None
+    artifacts_schema = (
+        _mapping(artifact_page_properties.get("artifacts")) if artifact_page_properties else None
+    )
+    artifact_item = _mapping(artifacts_schema.get("items")) if artifacts_schema else None
+    artifact_item_properties = _mapping(artifact_item.get("properties")) if artifact_item else None
+    expected_inputs = {"pipeline_id", "execution_id", "include_progress", "artifacts"}
+    expected_filters = {
+        "package_id",
+        "role",
+        "state",
+        "artifact_id",
+        "page_size",
+        "cursor",
+    }
+    expected_outputs = {
+        "schema_version",
+        "pipeline_id",
+        "execution_id",
+        "execution_handle",
+        "execution_record",
+        "runtime_metadata",
+        "progress",
+        "artifact_page",
+    }
+    passed = bool(
+        input_schema is not None
+        and input_schema.get("additionalProperties") is False
+        and input_properties is not None
+        and set(input_properties) == expected_inputs
+        and isinstance(required, list)
+        and set(cast(list[object], required)) == {"pipeline_id", "execution_id"}
+        and include_progress == {"default": True, "type": "boolean"}
+        and artifact_selector is not None
+        and artifact_selector.get("default") is None
+        and artifact_query is not None
+        and artifact_query.get("additionalProperties") is False
+        and artifact_filters is not None
+        and set(artifact_filters) == expected_filters
+        and page_size
+        == {
+            "default": 50,
+            "description": "Maximum artifacts to return in this page.",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer",
+        }
+        and output_schema is not None
+        and output_schema.get("additionalProperties") is False
+        and output_properties is not None
+        and set(output_properties) == expected_outputs
+        and isinstance(output_required, list)
+        and set(cast(list[object], output_required)) == expected_outputs
+        and output_properties.get("schema_version")
+        == {"const": "clio-kit.jarvis-execution.v1", "type": "string"}
+        and progress_properties is not None
+        and progress_properties.get("schema_version")
+        == {"const": "jarvis.execution.progress.v1", "type": "string"}
+        and artifact_page_properties is not None
+        and artifact_page_properties.get("producer_schema_version")
+        == {"const": "jarvis.execution.artifacts.v1", "type": "string"}
+        and artifact_item_properties is not None
+        and artifact_item_properties.get("schema_version")
+        == {"const": "jarvis.artifact.v1", "type": "string"}
+    )
+    return (
+        {
+            "input_fields": sorted(input_properties) if input_properties else [],
+            "required_identity_fields": sorted(str(item) for item in cast(list[object], required))
+            if isinstance(required, list)
+            else [],
+            "include_progress_schema": include_progress or {},
+            "artifact_filter_fields": sorted(artifact_filters) if artifact_filters else [],
+            "artifact_page_size_schema": page_size or {},
+            "output_fields": sorted(output_properties) if output_properties else [],
+            "progress_schema_version": (
+                progress_properties.get("schema_version") if progress_properties else None
+            ),
+            "artifact_page_schema_version": (
+                artifact_page_properties.get("producer_schema_version")
+                if artifact_page_properties
+                else None
+            ),
+            "artifact_schema_version": (
+                artifact_item_properties.get("schema_version") if artifact_item_properties else None
+            ),
+        },
+        passed,
+    )
+
+
+def _schema_option(schema: JSON | None, *, expected_type: str) -> JSON | None:
+    """Return one non-null branch from a nullable JSON Schema property."""
+    raw_options = schema.get("anyOf") if schema else None
+    if not isinstance(raw_options, list):
+        return None
+    options = [
+        cast(JSON, item) for item in cast(list[object], raw_options) if isinstance(item, dict)
+    ]
+    non_null = [item for item in options if item.get("type") == expected_type]
+    nulls = [item for item in options if item == {"type": "null"}]
+    if len(options) != 2 or len(non_null) != 1 or len(nulls) != 1:
+        return None
+    return non_null[0]
 
 
 def _remote_contract_tool(tool: JSON) -> RemoteMcpToolSchema:
@@ -868,6 +1425,9 @@ def _response_job_id(response: JSON | None) -> str | None:
     if response is None or "error" in response:
         return None
     result = _mapping(response.get("result"))
+    structured = _mapping(result.get("structuredContent")) if result else None
+    if structured is not None and isinstance(structured.get("job_id"), str):
+        return cast(str, structured["job_id"])
     content = result.get("content") if result else None
     if not isinstance(content, list):
         return None
