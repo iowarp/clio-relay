@@ -307,7 +307,7 @@ def test_real_linux_process_identity_and_group_cancellation(
     durable_state = cast(dict[str, object], json.loads(original_state_text))
     assert durable_state["pid"] == durable_state["pgid"] == durable_state["session_id"]
     assert isinstance(durable_state["proc_start_ticks"], int)
-    assert cast(int, durable_state["proc_start_ticks"]) > 0
+    assert durable_state["proc_start_ticks"] > 0
     owner_token = cast(str, durable_state["owner_token"])
     assert len(owner_token) == 64 and int(owner_token, 16) > 0
     command_argv = cast(list[str], durable_state["command_argv"])
@@ -318,7 +318,7 @@ def test_real_linux_process_identity_and_group_cancellation(
         assert cast(dict[str, object], json.loads(status.stdout))["state"] == "running"
 
         forged_state = dict(durable_state)
-        forged_state["proc_start_ticks"] = cast(int, durable_state["proc_start_ticks"]) + 1
+        forged_state["proc_start_ticks"] = durable_state["proc_start_ticks"] + 1
         state_path.write_text(json.dumps(forged_state, sort_keys=True), encoding="utf-8")
         try:
             refused_status = _run_runtime_cli(
