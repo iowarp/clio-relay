@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import ConfigurationError, NotFoundError
+from clio_relay.core_queue import MAX_LIVE_LEASE_RECORDS, ClioCoreQueue
+from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError
 from clio_relay.models import (
     TERMINAL_STATES,
     EndpointRegistration,
@@ -29,7 +30,31 @@ DEFAULT_RESULT_LIMIT = 100
 DEFAULT_SCAN_LIMIT = 1_000
 MAX_RESULT_LIMIT = 500
 MAX_SCAN_LIMIT = 10_000
+DEFAULT_STALE_SCAN_LIMIT = MAX_SCAN_LIMIT
 DEFAULT_WORKER_FRESH_SECONDS = 60
+
+
+@dataclass(frozen=True)
+class _AdmissionSnapshot:
+    """Bounded worker-policy and lease state used by queue diagnosis."""
+
+    analysis_complete: bool
+    incomplete_reasons: tuple[str, ...]
+    configured_kind_concurrency: dict[JobKind, int] | None
+    kind_concurrency_consistent: bool
+    healthy_worker_count: int
+    configured_worker_slots: int
+    free_worker_slots: int | None
+    active_lease_count: int
+    active_leases_by_kind: dict[JobKind, int]
+    global_lease_count: int | None
+    lease_index_validated: bool
+    lease_index_validation_error: str | None
+    lease_index_validation_error_truncated: bool
+    endpoint_scan_truncated: bool
+    lease_scan_truncated: bool
+    unresolved_lease_job_ids: tuple[str, ...]
+    expired_cluster_lease_job_ids: tuple[str, ...]
 
 
 def list_queue_jobs(
@@ -95,12 +120,22 @@ def diagnose_job(
     _validate_bounds(limit=1, scan_limit=scan_limit)
     job = queue.get_job(job_id)
     _require_job_cluster(job, cluster)
-    jobs, scan_truncated = queue.scan_active_jobs(limit=MAX_SCAN_LIMIT)
+    now = utc_now()
+    jobs, scan_truncated = queue.scan_active_jobs(limit=scan_limit)
     leases, leases_truncated = queue.scan_job_leases(job.job_id, limit=20)
     endpoints, endpoints_truncated = queue.scan_fresh_endpoints(
         limit=scan_limit,
         cluster=job.cluster,
         fresh_seconds=DEFAULT_WORKER_FRESH_SECONDS,
+        now=now,
+    )
+    admission_snapshot = _admission_snapshot(
+        queue,
+        cluster=job.cluster,
+        endpoints=endpoints,
+        endpoint_scan_truncated=endpoints_truncated,
+        scan_limit=scan_limit,
+        now=now,
     )
     return _diagnose_job(
         queue,
@@ -109,9 +144,12 @@ def diagnose_job(
         scan_truncated=scan_truncated,
         leases=leases,
         endpoints=endpoints,
-        related_records_truncated=leases_truncated or endpoints_truncated,
+        admission_snapshot=admission_snapshot,
+        related_records_truncated=(
+            leases_truncated or endpoints_truncated or admission_snapshot.lease_scan_truncated
+        ),
         stale_after_seconds=stale_after_seconds,
-        now=utc_now(),
+        now=now,
     )
 
 
@@ -127,7 +165,7 @@ def diagnose_queue(
     queue.reconcile_pending_transitions()
     _validate_stale_after(stale_after_seconds)
     _validate_bounds(limit=limit, scan_limit=scan_limit)
-    jobs, scan_truncated = queue.scan_active_jobs(limit=MAX_SCAN_LIMIT)
+    jobs, scan_truncated = queue.scan_active_jobs(limit=scan_limit)
     if cluster is not None:
         jobs = [job for job in jobs if job.cluster == cluster]
     leases_by_job: dict[str, Lease] = {}
@@ -228,13 +266,13 @@ def discover_stale_jobs(
     job_id: str | None = None,
     kind: JobKind | None = None,
     limit: int = DEFAULT_RESULT_LIMIT,
-    scan_limit: int = DEFAULT_SCAN_LIMIT,
+    scan_limit: int = DEFAULT_STALE_SCAN_LIMIT,
 ) -> dict[str, object]:
     """Discover stale active jobs using an explicit operator age threshold."""
     queue.reconcile_pending_transitions()
     _validate_stale_after(older_than_seconds)
     _validate_bounds(limit=limit, scan_limit=scan_limit)
-    scanned_jobs, scan_truncated = queue.scan_active_jobs(limit=MAX_SCAN_LIMIT)
+    scanned_jobs, scan_truncated = queue.scan_active_jobs(limit=scan_limit)
     if job_id is not None:
         exact = queue.get_job(job_id)
         _require_job_cluster(exact, cluster)
@@ -251,12 +289,21 @@ def discover_stale_jobs(
             and job.state in ACTIVE_STATES
             and (kind is None or job.kind == kind)
         ]
+    now = utc_now()
     endpoints, endpoints_truncated = queue.scan_fresh_endpoints(
         limit=scan_limit,
         cluster=cluster,
         fresh_seconds=DEFAULT_WORKER_FRESH_SECONDS,
+        now=now,
     )
-    now = utc_now()
+    admission_snapshot = _admission_snapshot(
+        queue,
+        cluster=cluster,
+        endpoints=endpoints,
+        endpoint_scan_truncated=endpoints_truncated,
+        scan_limit=scan_limit,
+        now=now,
+    )
     stale: list[dict[str, object]] = []
     lease_scan_truncated_job_ids: list[str] = []
     lease_records_by_job: dict[str, list[Lease]] = {}
@@ -302,7 +349,8 @@ def discover_stale_jobs(
             scan_truncated=scan_truncated,
             leases=lease_records_by_job[job.job_id],
             endpoints=endpoints,
-            related_records_truncated=False,
+            admission_snapshot=admission_snapshot,
+            related_records_truncated=admission_snapshot.lease_scan_truncated,
             stale_after_seconds=older_than_seconds,
             now=now,
         )
@@ -344,7 +392,7 @@ def cleanup_stale_jobs(
     dry_run: bool = True,
     cancel_queued: bool = False,
     limit: int = DEFAULT_RESULT_LIMIT,
-    scan_limit: int = DEFAULT_SCAN_LIMIT,
+    scan_limit: int = DEFAULT_STALE_SCAN_LIMIT,
 ) -> dict[str, object]:
     """Preview or execute bounded stale recovery without scheduler cancellation."""
     if max_attempts < 1:
@@ -540,6 +588,7 @@ def _diagnose_job(
     scan_truncated: bool,
     leases: list[Lease],
     endpoints: list[EndpointRegistration],
+    admission_snapshot: _AdmissionSnapshot,
     related_records_truncated: bool,
     stale_after_seconds: int,
     now: datetime,
@@ -564,7 +613,13 @@ def _diagnose_job(
     last_activity_at = max(activity_times)
     age_seconds = max(0.0, (now - job.created_at).total_seconds())
     inactivity_seconds = max(0.0, (now - last_activity_at).total_seconds())
-    queue_evidence = _queue_evidence(job, jobs, scan_truncated=scan_truncated)
+    queue_evidence = _queue_evidence(
+        queue,
+        job,
+        jobs,
+        scan_truncated=scan_truncated,
+        admission_snapshot=admission_snapshot,
+    )
     scheduler = scheduler_status_for_job(queue, job.job_id, limit=20)
     scheduler_phases = _scheduler_phases(scheduler)
     lease_expired = lease is not None and lease.is_expired(now)
@@ -574,14 +629,28 @@ def _diagnose_job(
     owner_stale = owner is None or (
         owner_heartbeat_age is not None and owner_heartbeat_age >= stale_after_seconds
     )
-    jobs_ahead = queue_evidence.get("jobs_ahead")
+    admission = cast(dict[str, object], queue_evidence["admission"])
+    admission_complete = admission.get("analysis_complete") is True
+    target_admissible = admission.get("target_admissible_now")
+    target_ineligibility = admission.get("target_ineligibility")
+    effective_blockers = admission.get("effective_blocking_job_ids")
 
     if job.state in TERMINAL_STATES:
         reason = "terminal"
     elif job.state == JobState.QUEUED:
-        if isinstance(jobs_ahead, int) and jobs_ahead > 0:
-            reason = "blocked_by_jobs_ahead"
-        elif not healthy_workers:
+        if not admission_complete:
+            reason = "admission_analysis_incomplete"
+        elif target_admissible is True:
+            reason = "eligible_for_admission"
+        elif isinstance(effective_blockers, list) and effective_blockers:
+            reason = "blocked_by_admissible_jobs_ahead"
+        elif target_ineligibility == "kind_capacity_saturated":
+            reason = "waiting_for_kind_capacity"
+        elif target_ineligibility == "pending_execution_cleanup":
+            reason = "waiting_for_execution_cleanup"
+        elif target_ineligibility == "global_lease_capacity_exhausted":
+            reason = "waiting_for_global_lease_capacity"
+        elif not healthy_workers or target_ineligibility == "no_worker_capacity":
             reason = "waiting_for_worker_capacity"
         elif age_seconds >= stale_after_seconds:
             reason = "queued_beyond_threshold"
@@ -672,7 +741,214 @@ def _diagnose_job(
     }
 
 
+def _admission_snapshot(
+    queue: ClioCoreQueue,
+    *,
+    cluster: str,
+    endpoints: list[EndpointRegistration],
+    endpoint_scan_truncated: bool,
+    scan_limit: int,
+    now: datetime,
+) -> _AdmissionSnapshot:
+    workers = [endpoint for endpoint in endpoints if endpoint.role == EndpointRole.WORKER]
+    slot_endpoints = [endpoint for endpoint in workers if "worker_slot" in endpoint.metadata]
+    if slot_endpoints:
+        capacity_endpoints = slot_endpoints
+    else:
+        capacity_endpoints = [
+            endpoint
+            for endpoint in workers
+            if endpoint.metadata.get("worker_supervisor") is not True
+        ]
+    supervisor_endpoints = [
+        endpoint for endpoint in workers if endpoint.metadata.get("worker_supervisor") is True
+    ]
+    kind_policy_endpoints = supervisor_endpoints or capacity_endpoints
+    kind_configurations, kind_configurations_valid = _kind_concurrency_configurations(
+        kind_policy_endpoints
+    )
+    kind_concurrency_consistent = kind_configurations_valid and len(kind_configurations) <= 1
+    configured_kind_concurrency = (
+        {
+            JobKind(kind): limit
+            for kind, limit in (kind_configurations[0] if kind_configurations else {}).items()
+        }
+        if kind_concurrency_consistent
+        else None
+    )
+    lease_index_validation_error: str | None = None
+    lease_index_validation_error_truncated = False
+    try:
+        indexed_counts_by_kind, indexed_global_lease_count = (
+            queue.lease_admission_capacity_snapshot(cluster=cluster)
+        )
+    except QueueConflictError as exc:
+        indexed_counts_by_kind = None
+        indexed_global_lease_count = None
+        raw_error = str(exc)
+        lease_index_validation_error = raw_error[:1_000]
+        lease_index_validation_error_truncated = len(raw_error) > 1_000
+    scanned_leases, lease_scan_truncated = queue.scan_leases(limit=scan_limit)
+    unresolved_lease_job_ids: list[str] = []
+    expired_cluster_lease_job_ids: list[str] = []
+    active_leases_by_kind = {kind: 0 for kind in JobKind}
+    active_lease_endpoint_counts: dict[str, int] = {}
+    active_lease_job_ids: set[str] = set()
+    duplicate_active_lease_job_ids: list[str] = []
+    active_lease_count = 0
+    global_admission_lease_count = 0
+    global_lease_count_exact = not lease_scan_truncated
+    recoverable_expired_cluster_by_kind = {kind: 0 for kind in JobKind}
+    for lease in scanned_leases:
+        if lease.is_expired(now):
+            try:
+                expired_job = queue.get_job(lease.job_id)
+            except NotFoundError:
+                unresolved_lease_job_ids.append(lease.job_id)
+                global_lease_count_exact = False
+                continue
+            if expired_job.cluster != cluster:
+                global_admission_lease_count += 1
+            elif expired_job.state in ACTIVE_STATES:
+                expired_cluster_lease_job_ids.append(lease.job_id)
+                global_lease_count_exact = False
+            else:
+                recoverable_expired_cluster_by_kind[expired_job.kind] += 1
+            continue
+        global_admission_lease_count += 1
+        active_lease_endpoint_counts[lease.endpoint_id] = (
+            active_lease_endpoint_counts.get(lease.endpoint_id, 0) + 1
+        )
+        if lease.job_id in active_lease_job_ids:
+            duplicate_active_lease_job_ids.append(lease.job_id)
+        active_lease_job_ids.add(lease.job_id)
+        try:
+            leased_job = queue.get_job(lease.job_id)
+        except NotFoundError:
+            unresolved_lease_job_ids.append(lease.job_id)
+            continue
+        if leased_job.cluster != cluster:
+            continue
+        active_lease_count += 1
+        active_leases_by_kind[leased_job.kind] += 1
+
+    configured_worker_slots = (
+        len(slot_endpoints)
+        if slot_endpoints
+        else sum(_endpoint_concurrency(endpoint.metadata) for endpoint in capacity_endpoints)
+    )
+    capacity_ownership_invalid = False
+    free_worker_slots = 0
+    for endpoint in capacity_endpoints:
+        declared_slots = 1 if slot_endpoints else _endpoint_concurrency(endpoint.metadata)
+        owned = active_lease_endpoint_counts.get(endpoint.endpoint_id, 0)
+        if owned > declared_slots:
+            capacity_ownership_invalid = True
+            continue
+        free_worker_slots += declared_slots - owned
+
+    incomplete_reasons: list[str] = []
+    if endpoint_scan_truncated:
+        incomplete_reasons.append("worker_endpoint_scan_truncated")
+    if lease_scan_truncated:
+        incomplete_reasons.append("lease_scan_truncated")
+    if not kind_configurations_valid:
+        incomplete_reasons.append("invalid_worker_kind_policy")
+    elif not kind_concurrency_consistent:
+        incomplete_reasons.append("inconsistent_worker_kind_policy")
+    if unresolved_lease_job_ids:
+        incomplete_reasons.append("unresolved_lease_job")
+    if expired_cluster_lease_job_ids:
+        incomplete_reasons.append("lease_recovery_required")
+    if duplicate_active_lease_job_ids:
+        incomplete_reasons.append("duplicate_active_job_lease")
+    if capacity_ownership_invalid:
+        incomplete_reasons.append("worker_capacity_ownership_invalid")
+    if lease_index_validation_error is not None:
+        incomplete_reasons.append("lease_index_validation_failed")
+    lease_index_validated = False
+    if (
+        global_lease_count_exact
+        and indexed_counts_by_kind is not None
+        and indexed_global_lease_count is not None
+    ):
+        expected_global_count = indexed_global_lease_count - sum(
+            recoverable_expired_cluster_by_kind.values()
+        )
+        expected_counts_by_kind = {
+            kind: indexed_counts_by_kind.get(kind, 0) - recoverable_expired_cluster_by_kind[kind]
+            for kind in JobKind
+        }
+        lease_index_validated = (
+            expected_global_count == global_admission_lease_count
+            and expected_counts_by_kind == active_leases_by_kind
+        )
+        if not lease_index_validated:
+            incomplete_reasons.append("lease_index_snapshot_mismatch")
+    return _AdmissionSnapshot(
+        analysis_complete=not incomplete_reasons,
+        incomplete_reasons=tuple(incomplete_reasons),
+        configured_kind_concurrency=configured_kind_concurrency,
+        kind_concurrency_consistent=kind_concurrency_consistent,
+        healthy_worker_count=len(capacity_endpoints),
+        configured_worker_slots=configured_worker_slots,
+        free_worker_slots=free_worker_slots if not capacity_ownership_invalid else None,
+        active_lease_count=active_lease_count,
+        active_leases_by_kind=active_leases_by_kind,
+        global_lease_count=(global_admission_lease_count if global_lease_count_exact else None),
+        lease_index_validated=lease_index_validated,
+        lease_index_validation_error=lease_index_validation_error,
+        lease_index_validation_error_truncated=lease_index_validation_error_truncated,
+        endpoint_scan_truncated=endpoint_scan_truncated,
+        lease_scan_truncated=lease_scan_truncated,
+        unresolved_lease_job_ids=tuple(sorted(set(unresolved_lease_job_ids))),
+        expired_cluster_lease_job_ids=tuple(sorted(set(expired_cluster_lease_job_ids))),
+    )
+
+
 def _queue_evidence(
+    queue: ClioCoreQueue,
+    job: RelayJob,
+    jobs: list[RelayJob],
+    *,
+    scan_truncated: bool,
+    admission_snapshot: _AdmissionSnapshot,
+) -> dict[str, object]:
+    raw = _raw_queue_evidence(job, jobs, scan_truncated=scan_truncated)
+    if job.state != JobState.QUEUED:
+        admission: dict[str, object] = {
+            "analysis_complete": True,
+            "applicable": False,
+            "target_admissible_now": None,
+            "target_ineligibility": "job_not_queued",
+            "effective_blocking_job_ids": [],
+            "effective_blocking_job_ids_truncated": False,
+        }
+        return {
+            **raw,
+            "raw_submission_order": _raw_submission_payload(raw),
+            "blocking_job_ids": [],
+            "blocking_job_ids_truncated": False,
+            "admission": admission,
+        }
+    admission = _queued_admission_evidence(
+        queue,
+        job,
+        jobs,
+        scan_truncated=scan_truncated,
+        snapshot=admission_snapshot,
+    )
+    effective_blockers = cast(list[str], admission["effective_blocking_job_ids"])
+    return {
+        **raw,
+        "raw_submission_order": _raw_submission_payload(raw),
+        "blocking_job_ids": effective_blockers,
+        "blocking_job_ids_truncated": admission["effective_blocking_job_ids_truncated"],
+        "admission": admission,
+    }
+
+
+def _raw_queue_evidence(
     job: RelayJob,
     jobs: list[RelayJob],
     *,
@@ -683,7 +959,8 @@ def _queue_evidence(
             "state": job.state.value,
             "jobs_ahead": None,
             "position": None,
-            "blocking_job_ids": [],
+            "raw_preceding_job_ids": [],
+            "raw_preceding_job_ids_truncated": False,
             "scan_truncated": scan_truncated,
             "position_exact": True,
         }
@@ -705,21 +982,236 @@ def _queue_evidence(
             "state": job.state.value,
             "jobs_ahead": None,
             "position": None,
-            "blocking_job_ids": [],
-            "blocking_job_ids_truncated": False,
+            "raw_preceding_job_ids": [],
+            "raw_preceding_job_ids_truncated": False,
             "scan_truncated": scan_truncated,
             "position_exact": False,
         }
-    blocking = [candidate.job_id for candidate in ordered_cluster_jobs[:target_index]]
+    preceding = [candidate.job_id for candidate in ordered_cluster_jobs[:target_index]]
     return {
         "state": job.state.value,
-        "jobs_ahead": len(blocking),
-        "position": len(blocking) + 1,
-        "blocking_job_ids": blocking[:20],
-        "blocking_job_ids_truncated": len(blocking) > 20,
+        "jobs_ahead": len(preceding),
+        "position": len(preceding) + 1,
+        "raw_preceding_job_ids": preceding[:20],
+        "raw_preceding_job_ids_truncated": len(preceding) > 20,
         "scan_truncated": scan_truncated,
         "position_exact": not scan_truncated,
     }
+
+
+def _raw_submission_payload(raw: dict[str, object]) -> dict[str, object]:
+    return {
+        "jobs_ahead": raw["jobs_ahead"],
+        "position": raw["position"],
+        "preceding_job_ids": raw["raw_preceding_job_ids"],
+        "preceding_job_ids_truncated": raw["raw_preceding_job_ids_truncated"],
+        "scan_truncated": raw["scan_truncated"],
+        "position_exact": raw["position_exact"],
+        "semantics": "raw_cluster_submission_order",
+    }
+
+
+def _queued_admission_evidence(
+    queue: ClioCoreQueue,
+    job: RelayJob,
+    jobs: list[RelayJob],
+    *,
+    scan_truncated: bool,
+    snapshot: _AdmissionSnapshot,
+) -> dict[str, object]:
+    ordered = [
+        candidate
+        for candidate in jobs
+        if candidate.cluster == job.cluster and candidate.state == JobState.QUEUED
+    ]
+    target_index = next(
+        (index for index, candidate in enumerate(ordered) if candidate.job_id == job.job_id),
+        None,
+    )
+    incomplete_reasons = list(snapshot.incomplete_reasons)
+    if scan_truncated:
+        incomplete_reasons.append("active_job_scan_truncated")
+    if target_index is None:
+        incomplete_reasons.append("target_outside_active_job_snapshot")
+    analysis_complete = snapshot.analysis_complete and not incomplete_reasons
+    common: dict[str, object] = {
+        "applicable": True,
+        "analysis_complete": analysis_complete,
+        "incomplete_reasons": incomplete_reasons,
+        "semantics": "effective_next-job-admission-under-fresh-worker-policy",
+        "policy_source": "fresh_worker_endpoint_registrations",
+        "kind_concurrency_consistent": snapshot.kind_concurrency_consistent,
+        "configured_kind_concurrency": (
+            None
+            if snapshot.configured_kind_concurrency is None
+            else kind_concurrency_metadata(snapshot.configured_kind_concurrency)
+        ),
+        "healthy_worker_count": snapshot.healthy_worker_count,
+        "configured_worker_slots": snapshot.configured_worker_slots,
+        "free_worker_slots": snapshot.free_worker_slots,
+        "active_lease_count": snapshot.active_lease_count,
+        "active_leases_by_kind": {
+            kind.value: snapshot.active_leases_by_kind[kind] for kind in JobKind
+        },
+        "global_lease_count": snapshot.global_lease_count,
+        "global_lease_count_semantics": (
+            "durable_lease_records_after_requested_cluster_expiry_recovery"
+        ),
+        "lease_index_validated": snapshot.lease_index_validated,
+        "lease_index_validation_error": snapshot.lease_index_validation_error,
+        "lease_index_validation_error_truncated": (snapshot.lease_index_validation_error_truncated),
+        "global_lease_limit": MAX_LIVE_LEASE_RECORDS,
+        "global_lease_capacity_remaining": (
+            None
+            if snapshot.global_lease_count is None
+            else max(0, MAX_LIVE_LEASE_RECORDS - snapshot.global_lease_count)
+        ),
+        "active_job_scan_truncated": scan_truncated,
+        "endpoint_scan_truncated": snapshot.endpoint_scan_truncated,
+        "lease_scan_truncated": snapshot.lease_scan_truncated,
+        "unresolved_lease_job_ids": list(snapshot.unresolved_lease_job_ids),
+        "expired_cluster_lease_job_ids": list(snapshot.expired_cluster_lease_job_ids),
+        "target_admissible_now": None,
+        "target_ineligibility": "analysis_incomplete" if not analysis_complete else None,
+        "effective_blocking_job_ids": [],
+        "effective_blocking_job_ids_truncated": False,
+        "simulated_predecessor_admissions": [],
+        "simulated_predecessor_admissions_truncated": False,
+        "skipped_predecessors": [],
+        "skipped_predecessors_truncated": False,
+        "remaining_global_lease_capacity_at_target": None,
+        "simulated_global_lease_count_at_target": None,
+    }
+    if not analysis_complete or target_index is None:
+        return common
+
+    policy = snapshot.configured_kind_concurrency
+    free_slots = snapshot.free_worker_slots
+    if policy is None or free_slots is None:
+        common["analysis_complete"] = False
+        common["incomplete_reasons"] = [*incomplete_reasons, "capacity_policy_unavailable"]
+        common["target_ineligibility"] = "analysis_incomplete"
+        return common
+    if snapshot.global_lease_count is None:
+        common["analysis_complete"] = False
+        common["incomplete_reasons"] = [
+            *incomplete_reasons,
+            "global_lease_capacity_unavailable",
+        ]
+        common["target_ineligibility"] = "analysis_incomplete"
+        return common
+    remaining_global_slots = max(
+        0,
+        MAX_LIVE_LEASE_RECORDS - snapshot.global_lease_count,
+    )
+    if remaining_global_slots < 1:
+        common["target_admissible_now"] = False
+        common["target_ineligibility"] = "global_lease_capacity_exhausted"
+        common["remaining_global_lease_capacity_at_target"] = 0
+        common["simulated_global_lease_count_at_target"] = snapshot.global_lease_count
+        return common
+
+    simulated_counts = dict(snapshot.active_leases_by_kind)
+    admitted_predecessors: list[RelayJob] = []
+    skipped_predecessors: list[dict[str, str]] = []
+    target_ineligibility: str | None = None
+    target_admissible = False
+    for candidate in ordered[: target_index + 1]:
+        cleanup_pending = queue.job_has_pending_execution_cleanup(
+            candidate.job_id,
+            cluster=candidate.cluster,
+        )
+        kind_limit = policy.get(candidate.kind)
+        kind_saturated = (
+            kind_limit is not None and simulated_counts.get(candidate.kind, 0) >= kind_limit
+        )
+        is_target = candidate.job_id == job.job_id
+        if cleanup_pending:
+            if is_target:
+                target_ineligibility = "pending_execution_cleanup"
+                break
+            skipped_predecessors.append(
+                {"job_id": candidate.job_id, "reason": "pending_execution_cleanup"}
+            )
+            continue
+        if kind_saturated:
+            if is_target:
+                target_ineligibility = "kind_capacity_saturated"
+                break
+            skipped_predecessors.append(
+                {"job_id": candidate.job_id, "reason": "kind_capacity_saturated"}
+            )
+            continue
+        if remaining_global_slots < 1:
+            if is_target:
+                target_ineligibility = (
+                    "admissible_predecessors_consumed_global_lease_capacity"
+                    if admitted_predecessors
+                    else "global_lease_capacity_exhausted"
+                )
+                break
+            skipped_predecessors.append(
+                {"job_id": candidate.job_id, "reason": "global_lease_capacity_exhausted"}
+            )
+            continue
+        if free_slots < 1:
+            if is_target:
+                target_ineligibility = (
+                    "admissible_predecessors_consumed_capacity"
+                    if admitted_predecessors
+                    else "no_worker_capacity"
+                )
+                break
+            skipped_predecessors.append(
+                {"job_id": candidate.job_id, "reason": "no_worker_slot_available"}
+            )
+            continue
+        if is_target:
+            target_admissible = True
+            break
+        admitted_predecessors.append(candidate)
+        free_slots -= 1
+        remaining_global_slots -= 1
+        simulated_counts[candidate.kind] = simulated_counts.get(candidate.kind, 0) + 1
+
+    effective_blockers: list[str] = []
+    if target_ineligibility in {
+        "admissible_predecessors_consumed_capacity",
+        "admissible_predecessors_consumed_global_lease_capacity",
+    }:
+        effective_blockers = [candidate.job_id for candidate in admitted_predecessors]
+    elif target_ineligibility == "kind_capacity_saturated":
+        initial_kind_count = snapshot.active_leases_by_kind.get(job.kind, 0)
+        kind_limit = policy.get(job.kind)
+        if kind_limit is not None and initial_kind_count < kind_limit:
+            effective_blockers = [
+                candidate.job_id
+                for candidate in admitted_predecessors
+                if candidate.kind == job.kind
+            ]
+
+    admitted_ids = [candidate.job_id for candidate in admitted_predecessors]
+    common.update(
+        {
+            "target_admissible_now": target_admissible,
+            "target_ineligibility": target_ineligibility,
+            "effective_blocking_job_ids": effective_blockers[:20],
+            "effective_blocking_job_ids_truncated": len(effective_blockers) > 20,
+            "simulated_predecessor_admissions": admitted_ids[:20],
+            "simulated_predecessor_admissions_truncated": len(admitted_ids) > 20,
+            "skipped_predecessors": skipped_predecessors[:20],
+            "skipped_predecessors_truncated": len(skipped_predecessors) > 20,
+            "remaining_worker_slots_at_target": free_slots,
+            "remaining_global_lease_capacity_at_target": remaining_global_slots,
+            "simulated_global_lease_count_at_target": (
+                snapshot.global_lease_count + len(admitted_predecessors)
+            ),
+            "simulated_active_leases_by_kind_at_target": {
+                kind.value: simulated_counts[kind] for kind in JobKind
+            },
+        }
+    )
+    return common
 
 
 def _scheduler_phases(statuses: list[dict[str, object]]) -> set[str]:
@@ -865,7 +1357,7 @@ def worker_status(
 
 
 def _job_summary(job: RelayJob, jobs: list[RelayJob]) -> dict[str, object]:
-    queue_evidence = _queue_evidence(job, jobs, scan_truncated=False)
+    queue_evidence = _raw_queue_evidence(job, jobs, scan_truncated=False)
     return {
         "job": job.model_dump(mode="json"),
         "relay_queue": {

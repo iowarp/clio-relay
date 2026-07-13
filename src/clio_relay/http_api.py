@@ -28,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError
+from clio_relay.identifiers import DurableRecordId
 from clio_relay.jarvis_mcp import jarvis_mcp_server, jarvis_mcp_server_args
 from clio_relay.models import (
     ArtifactRef,
@@ -55,6 +56,7 @@ from clio_relay.pagination import (
 )
 from clio_relay.progress_provenance import external_progress_metadata
 from clio_relay.queue_management import (
+    DEFAULT_STALE_SCAN_LIMIT,
     cancel_queue_job,
     cleanup_stale_jobs,
     diagnose_job,
@@ -253,9 +255,79 @@ class TaskTimelineEventRequest(BaseModel):
     status: TaskEventStatus = TaskEventStatus.RUNNING
     summary: str
     detail: str | None = None
-    artifact_refs: list[str] = Field(default_factory=list)
+    artifact_refs: list[DurableRecordId] = Field(default_factory=list)
     path_refs: list[str] = Field(default_factory=list)
     metadata: dict[str, object] = Field(default_factory=dict)
+
+
+_RELAY_RUNTIME_GATEWAY_KEYS = frozenset(
+    {
+        "runtime_spec",
+        "ownership_intents",
+        "teardown_intent",
+        "teardown",
+        "detach",
+        "scheduler_provider",
+        "scheduler_job_id",
+        "scheduler_native_id",
+    }
+)
+_RELAY_RUNTIME_CONNECTOR_KEYS = frozenset({"desktop_connector", "remote_connector"})
+_RELAY_OWNERSHIP_METADATA_KEYS = frozenset(
+    {
+        "owner",
+        "owner_session_id",
+        "owner_session_generation_id",
+        "owner_session_admission_id",
+        "runtime_kind",
+        "scheduler_provider",
+        "scheduler_job_id",
+        "scheduler_native_id",
+    }
+)
+
+
+def _validate_generic_gateway_payload(
+    value: dict[str, object] | None,
+) -> dict[str, object] | None:
+    """Reject fields whose identity is written only by the runtime supervisor."""
+    if value is None:
+        return None
+    protected = sorted(_RELAY_RUNTIME_GATEWAY_KEYS.intersection(value))
+    transport = value.get("transport")
+    if isinstance(transport, dict):
+        typed_transport = cast(dict[str, object], transport)
+        protected.extend(
+            f"transport.{key}"
+            for key in sorted(_RELAY_RUNTIME_CONNECTOR_KEYS.intersection(typed_transport))
+        )
+    if protected:
+        raise ValueError(
+            "generic gateway requests cannot write relay-managed runtime fields: "
+            + ", ".join(protected)
+        )
+    return value
+
+
+def _validate_generic_gateway_metadata(value: dict[str, object]) -> dict[str, object]:
+    """Reject client-provided relay ownership identity; the server stamps it."""
+    protected = sorted(_RELAY_OWNERSHIP_METADATA_KEYS.intersection(value))
+    if protected:
+        raise ValueError(
+            "generic gateway requests cannot write relay ownership metadata: "
+            + ", ".join(protected)
+        )
+    return value
+
+
+def _has_relay_managed_gateway_state(gateway: dict[str, object]) -> bool:
+    """Return whether replacing this gateway payload could erase runtime ownership."""
+    if _RELAY_RUNTIME_GATEWAY_KEYS.intersection(gateway):
+        return True
+    transport = gateway.get("transport")
+    if not isinstance(transport, dict):
+        return False
+    return bool(_RELAY_RUNTIME_CONNECTOR_KEYS.intersection(cast(dict[str, object], transport)))
 
 
 class GatewaySessionCreateRequest(BaseModel):
@@ -266,8 +338,6 @@ class GatewaySessionCreateRequest(BaseModel):
     cluster: str
     name: str
     state: GatewaySessionState = GatewaySessionState.CREATED
-    scheduler: str = "external"
-    scheduler_job_id: str | None = None
     queue_state: str | None = None
     node: str | None = None
     requested_resources: dict[str, object] = Field(default_factory=dict)
@@ -277,6 +347,9 @@ class GatewaySessionCreateRequest(BaseModel):
     gateway: dict[str, object] = Field(default_factory=dict)
     metadata: dict[str, object] = Field(default_factory=dict)
 
+    _gateway_is_not_runtime_owned = field_validator("gateway")(_validate_generic_gateway_payload)
+    _metadata_is_not_runtime_owned = field_validator("metadata")(_validate_generic_gateway_metadata)
+
 
 class GatewaySessionUpdateRequest(BaseModel):
     """HTTP request to update scheduler-backed gateway session state."""
@@ -284,7 +357,6 @@ class GatewaySessionUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     state: GatewaySessionState | None = None
-    scheduler_job_id: str | None = None
     queue_state: str | None = None
     node: str | None = None
     requested_resources: dict[str, object] | None = None
@@ -294,6 +366,9 @@ class GatewaySessionUpdateRequest(BaseModel):
     gateway: dict[str, object] | None = None
     artifacts: list[str] | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
+
+    _gateway_is_not_runtime_owned = field_validator("gateway")(_validate_generic_gateway_payload)
+    _metadata_is_not_runtime_owned = field_validator("metadata")(_validate_generic_gateway_metadata)
 
 
 def create_app(settings: RelaySettings | None = None) -> FastAPI:
@@ -321,18 +396,18 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             == resolved.owner_session_generation_id
         )
 
-    def require_owned_job(job_id: str) -> RelayJob:
+    def require_owned_job(job_id: DurableRecordId) -> RelayJob:
         job = queue.get_job(job_id)
         if not owns_job(job):
             raise HTTPException(status_code=403, detail="job is not owned by this relay session")
         return job
 
-    def require_owned_task(task_id: str) -> RelayTask:
+    def require_owned_task(task_id: DurableRecordId) -> RelayTask:
         task = queue.get_task(task_id)
         require_owned_job(task.job_id)
         return task
 
-    def require_owned_artifact(artifact_id: str) -> ArtifactRef:
+    def require_owned_artifact(artifact_id: DurableRecordId) -> ArtifactRef:
         artifact = queue.get_artifact(artifact_id)
         require_owned_job(artifact.job_id)
         return artifact
@@ -354,7 +429,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         except StorageAdmissionError as exc:
             raise HTTPException(status_code=507, detail=exc.decision.to_dict()) from exc
 
-    def require_owned_gateway(session_id: str) -> GatewaySession:
+    def require_owned_gateway(session_id: DurableRecordId) -> GatewaySession:
         session = queue.get_gateway_session(session_id)
         if resolved.owner_session_id is None:
             return session
@@ -458,14 +533,14 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         )
 
     @app.get("/jobs/{job_id}", response_model=RelayJob, dependencies=[auth_dependency])
-    def get_job(job_id: str) -> RelayJob:
+    def get_job(job_id: DurableRecordId) -> RelayJob:
         try:
             return _public_record(require_owned_job(job_id))
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/jobs/{job_id}/status", dependencies=[auth_dependency])
-    def get_job_status(job_id: str) -> dict[str, object]:
+    def get_job_status(job_id: DurableRecordId) -> dict[str, object]:
         try:
             require_owned_job(job_id)
             return _public_payload(get_job_status_operation(queue, job_id))
@@ -478,7 +553,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         dependencies=[auth_dependency],
     )
     def get_events(
-        job_id: str,
+        job_id: DurableRecordId,
         cursor: Annotated[int, Query(ge=1)] = 1,
         limit: Annotated[int, Query(ge=1, le=MAX_RESPONSE_PAGE_RECORDS)] = (
             DEFAULT_RESPONSE_PAGE_RECORDS
@@ -493,7 +568,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         dependencies=[auth_dependency],
     )
     def get_tasks(
-        job_id: str,
+        job_id: DurableRecordId,
         cursor: Annotated[int, Query(ge=1)] = 1,
         limit: Annotated[int, Query(ge=1, le=MAX_RESPONSE_PAGE_RECORDS)] = (
             DEFAULT_RESPONSE_PAGE_RECORDS
@@ -522,7 +597,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         dependencies=[auth_dependency],
     )
     def get_task_events(
-        task_id: str,
+        task_id: DurableRecordId,
         cursor: Annotated[int, Query(ge=1)] = 1,
         limit: Annotated[int, Query(ge=1, le=MAX_RESPONSE_PAGE_RECORDS)] = (
             DEFAULT_RESPONSE_PAGE_RECORDS
@@ -541,7 +616,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         dependencies=[auth_dependency],
     )
     def append_task_event(
-        task_id: str,
+        task_id: DurableRecordId,
         request: TaskTimelineEventRequest,
     ) -> TaskTimelineEvent:
         try:
@@ -566,7 +641,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
 
     @app.get("/tasks/{task_id}/events/sse", dependencies=[auth_dependency])
     def task_events_sse(
-        task_id: str,
+        task_id: DurableRecordId,
         cursor: Annotated[int, Query(ge=1)] = 1,
         limit: Annotated[int, Query(ge=1, le=MAX_RESPONSE_PAGE_RECORDS)] = (
             DEFAULT_RESPONSE_PAGE_RECORDS
@@ -596,7 +671,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     @app.websocket("/tasks/{task_id}/events/ws")
     async def task_events_ws(
         websocket: WebSocket,
-        task_id: str,
+        task_id: DurableRecordId,
         cursor: int = 1,
         limit: int = DEFAULT_RESPONSE_PAGE_RECORDS,
         poll_seconds: float = 1.0,
@@ -625,7 +700,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
 
     @app.get("/jobs/{job_id}/monitor", dependencies=[auth_dependency])
     def monitor(
-        job_id: str,
+        job_id: DurableRecordId,
         cursor: Annotated[int, Query(ge=1)] = 1,
         limit: Annotated[int, Query(ge=1, le=MAX_RESPONSE_PAGE_RECORDS)] = (
             DEFAULT_RESPONSE_PAGE_RECORDS
@@ -639,7 +714,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
 
     @app.get("/jobs/{job_id}/monitor/sse", dependencies=[auth_dependency])
     def monitor_sse(
-        job_id: str,
+        job_id: DurableRecordId,
         cursor: Annotated[int, Query(ge=1)] = 1,
         limit: Annotated[int, Query(ge=1, le=MAX_RESPONSE_PAGE_RECORDS)] = (
             DEFAULT_RESPONSE_PAGE_RECORDS
@@ -669,7 +744,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     @app.websocket("/jobs/{job_id}/monitor/ws")
     async def monitor_ws(
         websocket: WebSocket,
-        job_id: str,
+        job_id: DurableRecordId,
         cursor: int = 1,
         limit: int = DEFAULT_RESPONSE_PAGE_RECORDS,
         poll_seconds: float = 1.0,
@@ -702,7 +777,11 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             return
 
     @app.post("/jobs/{job_id}/wait", response_model=RelayJob, dependencies=[auth_dependency])
-    def wait(job_id: str, timeout_seconds: float = 600, poll_seconds: float = 2) -> RelayJob:
+    def wait(
+        job_id: DurableRecordId,
+        timeout_seconds: float = 600,
+        poll_seconds: float = 2,
+    ) -> RelayJob:
         try:
             require_owned_job(job_id)
             return _public_record(
@@ -720,7 +799,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
 
     @app.get("/jobs/{job_id}/logs/{stream_name}", dependencies=[auth_dependency])
     def get_log(
-        job_id: str,
+        job_id: DurableRecordId,
         stream_name: str,
         offset: Annotated[int, Query(ge=0)] = 0,
         limit: Annotated[int, Query(ge=1, le=1_048_576)] = 65_536,
@@ -745,7 +824,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         dependencies=[auth_dependency],
     )
     def get_artifacts(
-        job_id: str,
+        job_id: DurableRecordId,
         cursor: Annotated[int, Query(ge=1)] = 1,
         limit: Annotated[int, Query(ge=1, le=MAX_RESPONSE_PAGE_RECORDS)] = (
             DEFAULT_RESPONSE_PAGE_RECORDS
@@ -773,7 +852,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         dependencies=[auth_dependency],
     )
     def get_progress(
-        job_id: str,
+        job_id: DurableRecordId,
         cursor: Annotated[int, Query(ge=1)] = 1,
         limit: Annotated[int, Query(ge=1, le=MAX_RESPONSE_PAGE_RECORDS)] = (
             DEFAULT_RESPONSE_PAGE_RECORDS
@@ -819,8 +898,6 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                     cluster=request.cluster,
                     name=request.name,
                     state=request.state,
-                    scheduler=request.scheduler,
-                    scheduler_job_id=request.scheduler_job_id,
                     queue_state=request.queue_state,
                     node=request.node,
                     requested_resources=request.requested_resources,
@@ -880,7 +957,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         response_model=GatewaySession,
         dependencies=[auth_dependency],
     )
-    def get_gateway_session(session_id: str) -> GatewaySession:
+    def get_gateway_session(session_id: DurableRecordId) -> GatewaySession:
         try:
             return _public_record(require_owned_gateway(session_id))
         except NotFoundError as exc:
@@ -892,13 +969,21 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         dependencies=[auth_dependency],
     )
     def update_gateway_session(
-        session_id: str,
+        session_id: DurableRecordId,
         request: GatewaySessionUpdateRequest,
     ) -> GatewaySession:
         try:
-            require_owned_gateway(session_id)
+            existing = require_owned_gateway(session_id)
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if request.gateway is not None and _has_relay_managed_gateway_state(existing.gateway):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "relay-managed runtime gateway state can only be changed by the "
+                    "runtime supervisor"
+                ),
+            )
         updates = request.model_dump(exclude={"state", "metadata"}, exclude_none=True)
         metadata = dict(request.metadata)
         if resolved.owner_session_id is not None:
@@ -916,6 +1001,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                     session_id,
                     state=request.state,
                     metadata=metadata,
+                    reject_relay_managed_fields=True,
                     **updates,
                 )
             )
@@ -929,7 +1015,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         response_model=GatewaySession,
         dependencies=[auth_dependency],
     )
-    def close_gateway_session(session_id: str) -> GatewaySession:
+    def close_gateway_session(session_id: DurableRecordId) -> GatewaySession:
         try:
             require_owned_gateway(session_id)
             return _public_record(queue.close_gateway_session(session_id))
@@ -943,7 +1029,10 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         response_model=ProgressRecord,
         dependencies=[auth_dependency],
     )
-    def record_progress(job_id: str, request: ProgressUpdateRequest) -> ProgressRecord:
+    def record_progress(
+        job_id: DurableRecordId,
+        request: ProgressUpdateRequest,
+    ) -> ProgressRecord:
         try:
             require_owned_job(job_id)
             metadata = external_progress_metadata("external_http", dict(request.metadata))
@@ -965,7 +1054,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/artifacts/{artifact_id}/content", dependencies=[auth_dependency])
-    def get_artifact_content(artifact_id: str) -> dict[str, object]:
+    def get_artifact_content(artifact_id: DurableRecordId) -> dict[str, object]:
         try:
             require_owned_artifact(artifact_id)
             return _public_payload(read_artifact_bytes(queue, artifact_id))
@@ -973,7 +1062,10 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/jobs/{job_id}/cancel", response_model=RelayJob, dependencies=[auth_dependency])
-    def cancel_job(job_id: str, request: QueueCancelRequest | None = None) -> RelayJob:
+    def cancel_job(
+        job_id: DurableRecordId,
+        request: QueueCancelRequest | None = None,
+    ) -> RelayJob:
         job = require_owned_job(job_id)
         if request is not None and request.cluster is not None and request.cluster != job.cluster:
             raise HTTPException(
@@ -988,7 +1080,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
 
     @app.post("/queue/jobs/{job_id}/cancel", dependencies=[auth_dependency])
     def cancel_queue_job_route(
-        job_id: str,
+        job_id: DurableRecordId,
         request: QueueCancelRequest | None = None,
     ) -> dict[str, object]:
         cancel_scheduler = False if request is None else request.cancel_scheduler_job
@@ -1061,7 +1153,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
 
     @app.get("/queue/jobs/{job_id}/diagnose", dependencies=[auth_dependency])
     def diagnose_queue_job_route(
-        job_id: str,
+        job_id: DurableRecordId,
         cluster: str | None = None,
         older_than_seconds: Annotated[int, Query(ge=1)] = 7_200,
         scan_limit: Annotated[int, Query(ge=1, le=10_000)] = 1_000,
@@ -1084,7 +1176,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
 
     @app.get("/retention/jobs/{job_id}/plan", dependencies=[auth_dependency])
     def retention_plan(
-        job_id: str,
+        job_id: DurableRecordId,
         expected_updated_at: datetime | None = None,
     ) -> dict[str, object]:
         """Build a read-only terminal-retention plan."""
@@ -1110,7 +1202,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         )
 
     @app.get("/retention/jobs/{job_id}/status", dependencies=[auth_dependency])
-    def retention_status(job_id: str) -> dict[str, object]:
+    def retention_status(job_id: DurableRecordId) -> dict[str, object]:
         """Read the current crash-resumable retention phase without mutation."""
         if resolved.owner_session_id is not None:
             raise HTTPException(
@@ -1135,7 +1227,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
 
     @app.post("/retention/jobs/{job_id}/collect", dependencies=[auth_dependency])
     def retention_collect(
-        job_id: str,
+        job_id: DurableRecordId,
         request: RetentionCollectRequest | None = None,
     ) -> dict[str, object]:
         """Dry-run by default or advance bounded retention without scheduler cancellation."""
@@ -1162,10 +1254,10 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     def discover_stale_queue_route(
         cluster: str,
         older_than_seconds: Annotated[int, Query(ge=1)] = 7_200,
-        job_id: str | None = None,
+        job_id: DurableRecordId | None = None,
         kind: JobKind | None = None,
         limit: Annotated[int, Query(ge=1, le=500)] = 100,
-        scan_limit: Annotated[int, Query(ge=1, le=10_000)] = 1_000,
+        scan_limit: Annotated[int, Query(ge=1, le=10_000)] = DEFAULT_STALE_SCAN_LIMIT,
     ) -> dict[str, object]:
         if resolved.owner_session_id is not None:
             raise HTTPException(
@@ -1204,13 +1296,13 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     def cleanup_stale_queue_route(
         cluster: str,
         older_than_seconds: Annotated[int, Query(ge=1)] = 7_200,
-        job_id: str | None = None,
+        job_id: DurableRecordId | None = None,
         kind: JobKind | None = None,
         max_attempts: Annotated[int, Query(ge=1)] = 3,
         dry_run: bool = True,
         cancel_queued: bool = False,
         limit: Annotated[int, Query(ge=1, le=500)] = 100,
-        scan_limit: Annotated[int, Query(ge=1, le=10_000)] = 1_000,
+        scan_limit: Annotated[int, Query(ge=1, le=10_000)] = DEFAULT_STALE_SCAN_LIMIT,
     ) -> dict[str, object]:
         if resolved.owner_session_id is not None:
             raise HTTPException(
@@ -1259,7 +1351,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
 
     @app.get("/monitor/rules", dependencies=[auth_dependency])
     def list_monitor_rules(
-        job_id: str | None = None,
+        job_id: DurableRecordId | None = None,
         cursor: Annotated[int, Query(ge=1)] = 1,
         limit: Annotated[int, Query(ge=1, le=MAX_RESPONSE_PAGE_RECORDS)] = (
             DEFAULT_RESPONSE_PAGE_RECORDS

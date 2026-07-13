@@ -7,10 +7,12 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from json import dumps, loads
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from typing import Any, cast
 
 import pytest
@@ -23,6 +25,7 @@ from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.jarvis_execution import (
     named_jarvis_command,
     register_scheduled_jarvis_command,
+    run_native_jarvis_broker,
     scheduled_jarvis_command,
     scheduled_runtime_credential_channel,
 )
@@ -33,7 +36,6 @@ from clio_relay.models import (
     RelayJob,
     RelayTask,
     SchedulerPhase,
-    SchedulerStatus,
 )
 from clio_relay.relay_ops import job_status
 from clio_relay.runtime_metadata import runtime_metadata_from_sidecar_record
@@ -52,6 +54,7 @@ def _install_runtime_credential_fd(
     runtime_path: Path,
     runtime_token: str,
     scheduler_expected: bool | str = True,
+    scheduler_provider: str = "slurm",
 ) -> int:
     """Install the one-shot broker credential channel for an in-process adapter test."""
     progress_path = runtime_path.with_name(f"{runtime_path.name}.progress")
@@ -97,6 +100,7 @@ def _install_runtime_credential_fd(
                 "direct_proof_sha256": hashlib.sha256(direct_proof.encode("utf-8")).hexdigest(),
             },
             "runtime_direct_proof": direct_proof,
+            "scheduler_provider": scheduler_provider,
         },
         separators=(",", ":"),
     ).encode("utf-8")
@@ -107,6 +111,241 @@ def _install_runtime_credential_fd(
     monkeypatch.setenv("CLIO_RELAY_BROKER_CREDENTIAL_FD", str(read_fd))
     monkeypatch.setenv("CLIO_RELAY_BROKER_READY_FD", str(ready_write_fd))
     return ready_read_fd
+
+
+@dataclass(frozen=True)
+class _NativeHandle:
+    execution_id: str
+    pipeline_id: str
+    mode: str
+    scheduler_provider: str | None = None
+    scheduler_native_id: str | None = None
+    cluster: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": "jarvis.execution.handle.v1",
+            "execution_id": self.execution_id,
+            "pipeline_id": self.pipeline_id,
+            "mode": self.mode,
+            "scheduler_provider": self.scheduler_provider,
+            "scheduler_native_id": self.scheduler_native_id,
+            "cluster": self.cluster,
+        }
+
+
+@dataclass(frozen=True)
+class _NativeRecord:
+    execution_id: str
+    pipeline_id: str
+    mode: str
+    state: str
+    submitted: bool
+    terminal: bool
+    scheduler_provider: str | None = None
+    scheduler_native_id: str | None = None
+    cluster: str | None = None
+    return_code: int | None = None
+    error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=lambda: {})
+    created_at: str = "2026-07-12T00:00:00Z"
+    updated_at: str = "2026-07-12T00:00:01Z"
+
+    @property
+    def handle(self) -> _NativeHandle:
+        return _NativeHandle(
+            execution_id=self.execution_id,
+            pipeline_id=self.pipeline_id,
+            mode=self.mode,
+            scheduler_provider=self.scheduler_provider,
+            scheduler_native_id=self.scheduler_native_id,
+            cluster=self.cluster,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": "jarvis.execution.record.v1",
+            "execution_id": self.execution_id,
+            "pipeline_id": self.pipeline_id,
+            "pipeline_name": self.pipeline_id,
+            "mode": self.mode,
+            "scheduler_provider": self.scheduler_provider,
+            "scheduler_native_id": self.scheduler_native_id,
+            "cluster": self.cluster,
+            "state": self.state,
+            "submitted": self.submitted,
+            "terminal": self.terminal,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "return_code": self.return_code,
+            "error": self.error,
+            "metadata": self.metadata,
+        }
+
+
+@dataclass(frozen=True)
+class _NativeProgress:
+    record: _NativeRecord
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": "jarvis.execution.progress.v1",
+            "execution_id": self.record.execution_id,
+            "pipeline_id": self.record.pipeline_id,
+            "execution_state": self.record.state,
+            "terminal": self.record.terminal,
+            "packages": [],
+        }
+
+
+class _ScheduledNativePipeline:
+    def __init__(
+        self,
+        *,
+        name: str,
+        job_id: str,
+        duplicate_running_reads: int = 0,
+        on_submit: Callable[[], None] | None = None,
+    ) -> None:
+        self.name = name
+        self.job_id = job_id
+        self.scheduler: dict[str, object] = {"name": "slurm"}
+        self.duplicate_running_reads = duplicate_running_reads
+        self.on_submit = on_submit
+        self.submit_calls: list[tuple[bool, bool, str]] = []
+        self._records: list[_NativeRecord] = []
+        self._read_index = 0
+        self._last_read: _NativeRecord | None = None
+
+    def submit(self, *, submit: bool, wait: bool, execution_id: str) -> _NativeHandle:
+        self.submit_calls.append((submit, wait, execution_id))
+        if self.on_submit is not None:
+            self.on_submit()
+        submission = {
+            "schema_version": "jarvis.scheduler.submission.v1",
+            "execution_id": execution_id,
+            "provider": "slurm",
+            "script_path": "/tmp/submit.slurm",
+            "scheduler_job_id": self.job_id,
+            "scheduler_cluster": None,
+            "identity_source": "scheduler_submit_api",
+            "submitted": True,
+            "reconciliation_marker": self.scheduler["job_name"],
+        }
+        submitted = _NativeRecord(
+            execution_id=execution_id,
+            pipeline_id=self.name,
+            mode="scheduler",
+            state="submitted",
+            submitted=True,
+            terminal=False,
+            scheduler_provider="slurm",
+            scheduler_native_id=self.job_id,
+            metadata={"submission": submission},
+        )
+        running = replace(
+            submitted,
+            state="running",
+            updated_at="2026-07-12T00:00:02Z",
+        )
+        completed = replace(
+            submitted,
+            state="completed",
+            terminal=True,
+            return_code=0,
+            updated_at="2026-07-12T00:00:03Z",
+        )
+        self._records = [
+            submitted,
+            *([running] * (self.duplicate_running_reads + 1)),
+            completed,
+        ]
+        return submitted.handle
+
+    def get_execution(self, execution_id: str) -> _NativeRecord:
+        if not self._records:
+            raise FileNotFoundError(execution_id)
+        index = min(self._read_index, len(self._records) - 1)
+        self._read_index += 1
+        self._last_read = self._records[index]
+        return self._last_read
+
+    def get_execution_progress(self, execution_id: str) -> _NativeProgress:
+        if self._last_read is None:
+            raise FileNotFoundError(execution_id)
+        return _NativeProgress(self._last_read)
+
+    @property
+    def read_count(self) -> int:
+        """Return the number of authoritative execution-record reads."""
+        return self._read_index
+
+
+def _install_yaml_pipeline_module(
+    monkeypatch: MonkeyPatch,
+    pipeline: object,
+    *,
+    on_load: Callable[[], None] | None = None,
+) -> None:
+    """Install a bounded fake JARVIS YAML loader for the embedded wrapper."""
+
+    def load_yaml_auto(_path: str) -> tuple[None, object]:
+        if on_load is not None:
+            on_load()
+        return None, pipeline
+
+    pipeline_test = ModuleType("jarvis_cd.core.pipeline_test")
+    pipeline_test.load_yaml_auto = load_yaml_auto  # type: ignore[attr-defined]
+    jarvis_cd = ModuleType("jarvis_cd")
+    jarvis_cd.__path__ = []  # type: ignore[attr-defined]
+    jarvis_core = ModuleType("jarvis_cd.core")
+    jarvis_core.__path__ = []  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "jarvis_cd", jarvis_cd)
+    monkeypatch.setitem(sys.modules, "jarvis_cd.core", jarvis_core)
+    monkeypatch.setitem(sys.modules, "jarvis_cd.core.pipeline_test", pipeline_test)
+
+
+def _install_named_pipeline_module(
+    monkeypatch: MonkeyPatch,
+    pipeline_class: type[object],
+) -> None:
+    """Install one fake named JARVIS pipeline class for the embedded wrapper."""
+
+    def reject_yaml(path: str) -> tuple[None, object]:
+        raise AssertionError(path)
+
+    pipeline_test = ModuleType("jarvis_cd.core.pipeline_test")
+    pipeline_test.load_yaml_auto = reject_yaml  # type: ignore[attr-defined]
+    pipeline_module = ModuleType("jarvis_cd.core.pipeline")
+    pipeline_module.Pipeline = pipeline_class  # type: ignore[attr-defined]
+    jarvis_cd = ModuleType("jarvis_cd")
+    jarvis_cd.__path__ = []  # type: ignore[attr-defined]
+    jarvis_core = ModuleType("jarvis_cd.core")
+    jarvis_core.__path__ = []  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "jarvis_cd", jarvis_cd)
+    monkeypatch.setitem(sys.modules, "jarvis_cd.core", jarvis_core)
+    monkeypatch.setitem(sys.modules, "jarvis_cd.core.pipeline", pipeline_module)
+    monkeypatch.setitem(sys.modules, "jarvis_cd.core.pipeline_test", pipeline_test)
+
+
+def _execute_test_wrapper(
+    monkeypatch: MonkeyPatch,
+    *,
+    command: list[str],
+    ready_read_fd: int,
+) -> None:
+    """Execute a credential-bound wrapper after replacing the platform gate in tests."""
+    monkeypatch.setattr(process_containment, "enforce_linux_secret_memory_gate", lambda: None)
+    try:
+        exec(compile(command[4], "<jarvis-native-adapter>", "exec"), {"__name__": "__main__"})
+        assert os.read(ready_read_fd, 1) == b"1"
+    finally:
+        os.close(ready_read_fd)
+
+
+def _fast_test_sleep(_seconds: float) -> None:
+    """Yield the GIL without adding wall-clock delay to polling tests."""
+    time.sleep(0)
 
 
 def test_relay_queue_status_counts_older_cluster_jobs(tmp_path: Path) -> None:
@@ -539,27 +778,51 @@ def test_slurm_execution_adapter_is_separate_from_observation_provider(
     assert "CLIO_RELAY_RUNTIME_METADATA_TOKEN" not in source
     assert "CLIO_RELAY_BROKER_CREDENTIAL_FD" in source
     assert "CLIO_RELAY_BROKER_READY_FD" in source
-    assert '"scheduler_provider": scheduler_name' in source
-    assert '"scheduler_job_id": scheduler_job_id' in source
-    assert 'emit_runtime_metadata("submitted", terminal=False)' in source
-    assert "submit(submit=True, wait=False)" in source
-    assert '"jarvis.scheduler.submission.v1"' in source
-    assert "provider.poll(scheduler_job_id)" in source
-    assert "SchedulerPhase.COMPLETED" in source
+    assert "from clio_relay.jarvis_execution import run_native_jarvis_broker" in source
+    assert "run_native_jarvis_broker(" in source
+    assert "provider_for_scheduler" not in source
+    assert "provider.poll(" not in source
+    assert "SchedulerPhase" not in source
     compile(source, "<jarvis-slurm-adapter>", "exec")
 
 
-def test_scheduled_adapter_registration_requires_private_credential_consumption(
+def test_custom_observation_provider_does_not_authorize_jarvis_submission(
     tmp_path: Path,
+) -> None:
+    provider_name = f"site-{tmp_path.name}".lower().replace("_", "-")
+
+    class SiteSchedulerProvider(ExternalSchedulerProvider):
+        name = provider_name
+
+    register_scheduler_provider(provider_name, SiteSchedulerProvider)
+
+    assert provider_for_scheduler(provider_name).name == provider_name
+    with pytest.raises(ConfigurationError, match="only through slurm"):
+        scheduled_jarvis_command(
+            provider_name,
+            python_bin="python",
+            pipeline_path=tmp_path / "pipeline.yaml",
+        )
+
+
+@pytest.mark.parametrize(
+    ("scheduler_name", "replace"),
+    [("site-batch", False), ("slurm", True)],
+)
+def test_scheduled_adapter_registration_cannot_bypass_or_replace_slurm_broker(
+    tmp_path: Path,
+    scheduler_name: str,
+    replace: bool,
 ) -> None:
     def factory(python_bin: str, pipeline_path: Path) -> list[str]:
         return [python_bin, str(pipeline_path)]
 
-    with pytest.raises(ConfigurationError, match="explicitly consume"):
+    with pytest.raises(ConfigurationError, match="not supported"):
         register_scheduled_jarvis_command(
-            f"site-{tmp_path.name}",
+            scheduler_name,
             factory,
-            consumes_runtime_credential=False,
+            consumes_runtime_credential=True,
+            replace=replace,
         )
 
 
@@ -567,93 +830,24 @@ def test_slurm_execution_adapter_emits_owned_identity_before_terminal(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    pipeline_path = tmp_path / "pipeline.yaml"
-    script_path = tmp_path / "submit.slurm"
     runtime_path = tmp_path / "runtime.jsonl"
-    pipeline = SimpleNamespace(
-        name="scheduled-test",
-        scheduler={"name": "slurm", "hostfile": tmp_path / "hosts"},
-        packages=[{"pkg_id": "step-1", "pkg_type": "site.simulation"}],
-        last_submission=None,
-    )
-
-    def submit(*, submit: bool, wait: bool) -> Path:
-        assert submit is True
-        assert wait is False
-        pipeline.last_submission = {
-            "schema_version": "jarvis.scheduler.submission.v1",
-            "provider": "slurm",
-            "script_path": str(script_path),
-            "scheduler_job_id": "24680",
-            "scheduler_cluster": "test-cluster",
-            "identity_source": "scheduler_submit_api",
-            "state": "submitted",
-            "submitted": True,
-            "wait": False,
-            "terminal": False,
-            "submission_returncode": 0,
-            "reconciliation_marker": pipeline.scheduler["job_name"],
-        }
-        return script_path
-
-    pipeline.submit = submit
-    pipeline_test = ModuleType("jarvis_cd.core.pipeline_test")
-    pipeline_test.load_yaml_auto = lambda _path: (None, pipeline)  # type: ignore[attr-defined]
-    jarvis_cd = ModuleType("jarvis_cd")
-    jarvis_cd.__path__ = []  # type: ignore[attr-defined]
-    jarvis_core = ModuleType("jarvis_cd.core")
-    jarvis_core.__path__ = []  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "jarvis_cd", jarvis_cd)
-    monkeypatch.setitem(sys.modules, "jarvis_cd.core", jarvis_core)
-    monkeypatch.setitem(sys.modules, "jarvis_cd.core.pipeline_test", pipeline_test)
-
-    class CompletedProvider:
-        def poll(self, scheduler_job_id: str) -> SchedulerStatus:
-            assert scheduler_job_id == "24680"
-            return SchedulerStatus(
-                scheduler="slurm",
-                scheduler_job_id=scheduler_job_id,
-                phase=SchedulerPhase.COMPLETED,
-                raw_state="COMPLETED",
-            )
-
-    def provider_factory(_name: str) -> CompletedProvider:
-        return CompletedProvider()
-
-    monkeypatch.setattr(
-        "clio_relay.scheduler_providers.provider_for_scheduler",
-        provider_factory,
-    )
+    pipeline = _ScheduledNativePipeline(name="scheduled-test", job_id="24680")
+    _install_yaml_pipeline_module(monkeypatch, pipeline)
     ready_read_fd = _install_runtime_credential_fd(
         monkeypatch,
         runtime_path=runtime_path,
         runtime_token="owned-token",
     )
-    monkeypatch.setattr(sys, "argv", ["adapter", "yaml", str(pipeline_path)])
+    monkeypatch.setattr(sys, "argv", ["adapter", "yaml", str(tmp_path / "pipeline.yaml")])
     command = scheduled_jarvis_command(
         "slurm",
         python_bin="python",
-        pipeline_path=pipeline_path,
+        pipeline_path=tmp_path / "pipeline.yaml",
     )
 
-    if os.name == "nt":
-        with pytest.raises(
-            RuntimeError,
-            match="secure JARVIS runtime signing requires Linux PR_SET_DUMPABLE",
-        ):
-            exec(compile(command[4], "<jarvis-slurm-adapter>", "exec"), {"__name__": "__main__"})
-        os.close(ready_read_fd)
-        return
-
-    exec(compile(command[4], "<jarvis-slurm-adapter>", "exec"), {"__name__": "__main__"})
+    _execute_test_wrapper(monkeypatch, command=command, ready_read_fd=ready_read_fd)
 
     records = [loads(line) for line in runtime_path.read_text(encoding="utf-8").splitlines()]
-    assert [record["runtime_metadata"]["scheduler_phase"] for record in records] == [
-        "submission_intent",
-        "submitted",
-        "completed",
-    ]
-    assert all("relay_runtime_token" not in record for record in records)
     verified = [
         runtime_metadata_from_sidecar_record(
             record,
@@ -662,121 +856,57 @@ def test_slurm_execution_adapter_emits_owned_identity_before_terminal(
         )
         for index, record in enumerate(records, start=1)
     ]
-    assert verified[1].scheduler_job_id == "24680"
-    assert records[0]["runtime_metadata"]["schema_version"] == "jarvis.runtime.v1"
-    assert records[1]["runtime_metadata"]["details"]["identity_source"] == ("scheduler_submit_api")
-    assert records[2]["runtime_metadata"]["terminal"]["terminal"] is True
-    os.close(ready_read_fd)
+    assert pipeline.submit_calls == [(True, False, "jarvis_test_execution")]
+    assert [metadata.scheduler_phase for metadata in verified] == [
+        "submitted",
+        "running",
+        "completed",
+    ]
+    assert all(metadata.scheduler_job_id == "24680" for metadata in verified)
+    assert records[0]["runtime_metadata"]["execution_handle"]["scheduler_native_id"] == "24680"
+    assert records[-1]["runtime_metadata"]["execution_record"]["terminal"] is True
 
 
 def test_slurm_execution_adapter_coalesces_more_than_4096_elapsed_only_polls(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    pipeline_path = tmp_path / "pipeline.yaml"
-    script_path = tmp_path / "submit.slurm"
     runtime_path = tmp_path / "runtime.jsonl"
-    pipeline = SimpleNamespace(
+    pipeline = _ScheduledNativePipeline(
         name="long-running-test",
-        scheduler={"name": "slurm"},
-        packages=[],
-        last_submission=None,
+        job_id="86420",
+        duplicate_running_reads=4_096,
     )
-
-    def submit(*, submit: bool, wait: bool) -> Path:
-        assert (submit, wait) == (True, False)
-        pipeline.last_submission = {
-            "schema_version": "jarvis.scheduler.submission.v1",
-            "provider": "slurm",
-            "script_path": str(script_path),
-            "scheduler_job_id": "86420",
-            "identity_source": "scheduler_submit_api",
-            "submitted": True,
-            "reconciliation_marker": pipeline.scheduler["job_name"],
-        }
-        return script_path
-
-    pipeline.submit = submit
-    pipeline_test = ModuleType("jarvis_cd.core.pipeline_test")
-    pipeline_test.load_yaml_auto = lambda _path: (None, pipeline)  # type: ignore[attr-defined]
-    jarvis_cd = ModuleType("jarvis_cd")
-    jarvis_cd.__path__ = []  # type: ignore[attr-defined]
-    jarvis_core = ModuleType("jarvis_cd.core")
-    jarvis_core.__path__ = []  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "jarvis_cd", jarvis_cd)
-    monkeypatch.setitem(sys.modules, "jarvis_cd.core", jarvis_core)
-    monkeypatch.setitem(sys.modules, "jarvis_cd.core.pipeline_test", pipeline_test)
-    poll_count = 0
-
-    class LongRunningProvider:
-        def poll(self, scheduler_job_id: str) -> SchedulerStatus:
-            nonlocal poll_count
-            assert scheduler_job_id == "86420"
-            poll_count += 1
-            if poll_count <= 5000:
-                return SchedulerStatus(
-                    scheduler="slurm",
-                    scheduler_job_id=scheduler_job_id,
-                    phase=SchedulerPhase.RUNNING,
-                    raw_state="RUNNING",
-                    start_time="2026-07-11T00:00:00+00:00",
-                    elapsed=str(poll_count),
-                )
-            return SchedulerStatus(
-                scheduler="slurm",
-                scheduler_job_id=scheduler_job_id,
-                phase=SchedulerPhase.COMPLETED,
-                raw_state="COMPLETED",
-                start_time="2026-07-11T00:00:00+00:00",
-                elapsed=str(poll_count),
-            )
-
-    def provider_factory(_name: str) -> LongRunningProvider:
-        return LongRunningProvider()
-
-    monkeypatch.setattr(
-        "clio_relay.scheduler_providers.provider_for_scheduler",
-        provider_factory,
-    )
+    _install_yaml_pipeline_module(monkeypatch, pipeline)
     ready_read_fd = _install_runtime_credential_fd(
         monkeypatch,
         runtime_path=runtime_path,
         runtime_token="long-running-token",
     )
-    monkeypatch.setattr(sys, "argv", ["adapter", "yaml", str(pipeline_path)])
+    monkeypatch.setattr(sys, "argv", ["adapter", "yaml", str(tmp_path / "pipeline.yaml")])
+    defaults = cast(dict[str, object], run_native_jarvis_broker.__kwdefaults__)
+    original_sleep = defaults["sleep"]
+    defaults["sleep"] = _fast_test_sleep
     command = scheduled_jarvis_command(
         "slurm",
         python_bin="python",
-        pipeline_path=pipeline_path,
+        pipeline_path=tmp_path / "pipeline.yaml",
     )
-    assert "status.elapsed," not in command[4]
-    if os.name == "nt":
-        with pytest.raises(
-            RuntimeError,
-            match="secure JARVIS runtime signing requires Linux PR_SET_DUMPABLE",
-        ):
-            exec(compile(command[4], "<jarvis-long-running>", "exec"), {"__name__": "__main__"})
-        os.close(ready_read_fd)
-        return
 
-    def no_sleep(_seconds: float) -> None:
-        return None
-
-    monkeypatch.setattr(time, "sleep", no_sleep)
-
-    exec(compile(command[4], "<jarvis-long-running>", "exec"), {"__name__": "__main__"})
+    try:
+        _execute_test_wrapper(monkeypatch, command=command, ready_read_fd=ready_read_fd)
+    finally:
+        defaults["sleep"] = original_sleep
 
     records = [loads(line) for line in runtime_path.read_text(encoding="utf-8").splitlines()]
-    assert poll_count == 5001
-    assert len(records) == 4
-    assert [record["runtime_metadata"]["scheduler_phase"] for record in records] == [
-        "submission_intent",
+    assert pipeline.read_count >= 4_099
+    assert len(records) == 3
+    assert [record["runtime_metadata"]["execution_record"]["state"] for record in records] == [
         "submitted",
         "running",
         "completed",
     ]
-    assert runtime_path.stat().st_size < 256 * 1024
-    os.close(ready_read_fd)
+    assert runtime_path.stat().st_size < 5 * 1024 * 1024
 
 
 def test_named_direct_wrapper_emits_authenticated_mode_before_and_after_run(
@@ -784,47 +914,53 @@ def test_named_direct_wrapper_emits_authenticated_mode_before_and_after_run(
     monkeypatch: MonkeyPatch,
 ) -> None:
     runtime_path = tmp_path / "direct-runtime.jsonl"
-    observations: list[str] = []
+    observations: list[tuple[str, bool] | str] = []
 
     class DirectPipeline:
+        scheduler = None
+
         def __init__(self, name: str) -> None:
             self.name = name
-            self.scheduler = None
-            self.packages: list[object] = []
+            self.record: _NativeRecord | None = None
 
         def load(self) -> None:
             observations.append("loaded")
 
-        def run(self) -> None:
-            observations.append("ran")
+        def run(self, *, execution_id: str, wait: bool) -> _NativeHandle:
+            observations.append((execution_id, wait))
+            assert wait is True
             assert os.environ.get("CLIO_RELAY_RUNTIME_METADATA_FILE") is None
             assert os.environ.get("CLIO_RELAY_RUNTIME_METADATA_TOKEN") is None
             assert os.environ.get("CLIO_RELAY_RUNTIME_DIRECT_PROOF") is None
             assert os.environ.get("CLIO_RELAY_BROKER_CREDENTIAL_FD") is None
             assert os.environ.get("CLIO_RELAY_BROKER_READY_FD") is None
-            if sys.platform.startswith("linux"):
-                import ctypes
-                import resource
+            self.record = _NativeRecord(
+                execution_id=execution_id,
+                pipeline_id=self.name,
+                mode="direct",
+                state="running",
+                submitted=False,
+                terminal=False,
+            )
+            time.sleep(0.3)
+            self.record = replace(
+                self.record,
+                state="completed",
+                terminal=True,
+                return_code=0,
+                updated_at="2026-07-12T00:00:02Z",
+            )
+            return self.record.handle
 
-                libc = ctypes.CDLL(None)
-                assert libc.prctl(3, 0, 0, 0, 0) == 0
-                typed_resource = cast(Any, resource)
-                assert typed_resource.getrlimit(typed_resource.RLIMIT_CORE) == (0, 0)
+        def get_execution(self, execution_id: str) -> _NativeRecord:
+            if self.record is None:
+                raise FileNotFoundError(execution_id)
+            return self.record
 
-    pipeline_test = ModuleType("jarvis_cd.core.pipeline_test")
-    pipeline_test.load_yaml_auto = lambda _path: (_ for _ in ()).throw(  # type: ignore[attr-defined]
-        AssertionError("named launch must not load YAML")
-    )
-    pipeline_module = ModuleType("jarvis_cd.core.pipeline")
-    pipeline_module.Pipeline = DirectPipeline  # type: ignore[attr-defined]
-    jarvis_cd = ModuleType("jarvis_cd")
-    jarvis_cd.__path__ = []  # type: ignore[attr-defined]
-    jarvis_core = ModuleType("jarvis_cd.core")
-    jarvis_core.__path__ = []  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "jarvis_cd", jarvis_cd)
-    monkeypatch.setitem(sys.modules, "jarvis_cd.core", jarvis_core)
-    monkeypatch.setitem(sys.modules, "jarvis_cd.core.pipeline", pipeline_module)
-    monkeypatch.setitem(sys.modules, "jarvis_cd.core.pipeline_test", pipeline_test)
+        def get_execution_progress(self, execution_id: str) -> _NativeProgress:
+            return _NativeProgress(self.get_execution(execution_id))
+
+    _install_named_pipeline_module(monkeypatch, DirectPipeline)
     ready_read_fd = _install_runtime_credential_fd(
         monkeypatch,
         runtime_path=runtime_path,
@@ -832,38 +968,79 @@ def test_named_direct_wrapper_emits_authenticated_mode_before_and_after_run(
         scheduler_expected="unknown",
     )
     monkeypatch.setattr(sys, "argv", ["adapter", "named", "direct-pipeline"])
-    command = scheduled_jarvis_command(
-        "slurm",
-        python_bin="python",
-        pipeline_path=tmp_path / "unused.yaml",
-    )
+    command = named_jarvis_command(python_bin="python", pipeline_name="direct-pipeline")
 
-    if os.name == "nt":
-        with pytest.raises(
-            RuntimeError,
-            match="secure JARVIS runtime signing requires Linux PR_SET_DUMPABLE",
-        ):
-            exec(compile(command[4], "<jarvis-named-direct>", "exec"), {"__name__": "__main__"})
-        os.close(ready_read_fd)
-        return
+    _execute_test_wrapper(monkeypatch, command=command, ready_read_fd=ready_read_fd)
 
-    with pytest.raises(SystemExit) as exit_info:
-        exec(compile(command[4], "<jarvis-named-direct>", "exec"), {"__name__": "__main__"})
-
-    assert exit_info.value.code == 0
-    assert observations == ["loaded", "ran"]
     records = [loads(line) for line in runtime_path.read_text(encoding="utf-8").splitlines()]
-    assert [record["runtime_metadata"]["scheduler_phase"] for record in records] == [
-        "direct_running",
-        "direct_completed",
+    assert observations == ["loaded", ("jarvis_test_execution", True)]
+    assert records[0]["runtime_metadata"]["details"]["direct_execution_proof"] == (
+        "test-direct-execution-proof"
+    )
+    native_records = [
+        record for record in records if "execution_record" in record["runtime_metadata"]
     ]
+    assert [
+        record["runtime_metadata"]["execution_record"]["state"] for record in native_records
+    ] == ["running", "completed"]
     for sequence, record in enumerate(records, start=1):
         runtime_metadata_from_sidecar_record(
             record,
             expected_key="direct-token",
             expected_sequence=sequence,
         )
-    os.close(ready_read_fd)
+
+
+def test_named_slurm_pipeline_on_external_worker_is_refused_before_submit(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime_path = tmp_path / "named-scheduler-refusal.jsonl"
+    instances: list[ScheduledPipeline] = []
+
+    class ScheduledPipeline:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.scheduler: dict[str, object] = {"name": "slurm", "job_name": "operator"}
+            self.submit_calls: list[tuple[bool, bool, str]] = []
+            instances.append(self)
+
+        def load(self) -> None:
+            return None
+
+        def submit(self, *, submit: bool, wait: bool, execution_id: str) -> object:
+            self.submit_calls.append((submit, wait, execution_id))
+            raise AssertionError("scheduler submission must not be reached")
+
+    _install_named_pipeline_module(monkeypatch, ScheduledPipeline)
+    ready_read_fd = _install_runtime_credential_fd(
+        monkeypatch,
+        runtime_path=runtime_path,
+        runtime_token="named-refusal-token",
+        scheduler_expected="unknown",
+        scheduler_provider="external",
+    )
+    monkeypatch.setattr(sys, "argv", ["adapter", "named", "scheduled-pipeline"])
+    command = named_jarvis_command(python_bin="python", pipeline_name="scheduled-pipeline")
+
+    with pytest.raises(RuntimeError, match="slurm != external"):
+        _execute_test_wrapper(monkeypatch, command=command, ready_read_fd=ready_read_fd)
+
+    assert len(instances) == 1
+    assert instances[0].submit_calls == []
+    assert instances[0].scheduler["job_name"] == "operator"
+    records = [loads(line) for line in runtime_path.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 1
+    verified = runtime_metadata_from_sidecar_record(
+        records[0],
+        expected_key="named-refusal-token",
+        expected_sequence=1,
+    )
+    assert verified.scheduler_phase == "launch_refused"
+    assert verified.scheduler_job_id is None
+    details = cast(dict[str, object], verified.details["details"])
+    assert details["scheduler_submission_attempted"] is False
+    assert details["scheduler_launch_refused"] is True
 
 
 def test_named_direct_wrapper_records_failure_after_mode_observation(
@@ -874,29 +1051,37 @@ def test_named_direct_wrapper_records_failure_after_mode_observation(
 
     class CrashingPipeline:
         scheduler = None
-        packages: list[object] = []
 
         def __init__(self, name: str) -> None:
             self.name = name
+            self.record: _NativeRecord | None = None
 
         def load(self) -> None:
             return None
 
-        def run(self) -> None:
+        def run(self, *, execution_id: str, wait: bool) -> _NativeHandle:
+            assert wait is True
+            self.record = _NativeRecord(
+                execution_id=execution_id,
+                pipeline_id=self.name,
+                mode="direct",
+                state="failed",
+                submitted=False,
+                terminal=True,
+                return_code=1,
+                error="direct workload crashed",
+            )
             raise RuntimeError("direct workload crashed")
 
-    pipeline_test = ModuleType("jarvis_cd.core.pipeline_test")
-    pipeline_test.load_yaml_auto = lambda _path: None  # type: ignore[attr-defined]
-    pipeline_module = ModuleType("jarvis_cd.core.pipeline")
-    pipeline_module.Pipeline = CrashingPipeline  # type: ignore[attr-defined]
-    jarvis_cd = ModuleType("jarvis_cd")
-    jarvis_cd.__path__ = []  # type: ignore[attr-defined]
-    jarvis_core = ModuleType("jarvis_cd.core")
-    jarvis_core.__path__ = []  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "jarvis_cd", jarvis_cd)
-    monkeypatch.setitem(sys.modules, "jarvis_cd.core", jarvis_core)
-    monkeypatch.setitem(sys.modules, "jarvis_cd.core.pipeline", pipeline_module)
-    monkeypatch.setitem(sys.modules, "jarvis_cd.core.pipeline_test", pipeline_test)
+        def get_execution(self, execution_id: str) -> _NativeRecord:
+            if self.record is None:
+                raise FileNotFoundError(execution_id)
+            return self.record
+
+        def get_execution_progress(self, execution_id: str) -> _NativeProgress:
+            return _NativeProgress(self.get_execution(execution_id))
+
+    _install_named_pipeline_module(monkeypatch, CrashingPipeline)
     ready_read_fd = _install_runtime_credential_fd(
         monkeypatch,
         runtime_path=runtime_path,
@@ -904,31 +1089,15 @@ def test_named_direct_wrapper_records_failure_after_mode_observation(
         scheduler_expected="unknown",
     )
     monkeypatch.setattr(sys, "argv", ["adapter", "named", "crashing-pipeline"])
-    command = scheduled_jarvis_command(
-        "slurm",
-        python_bin="python",
-        pipeline_path=tmp_path / "unused.yaml",
-    )
-
-    if os.name == "nt":
-        with pytest.raises(
-            RuntimeError,
-            match="secure JARVIS runtime signing requires Linux PR_SET_DUMPABLE",
-        ):
-            exec(compile(command[4], "<jarvis-named-crash>", "exec"), {"__name__": "__main__"})
-        os.close(ready_read_fd)
-        return
+    command = named_jarvis_command(python_bin="python", pipeline_name="crashing-pipeline")
 
     with pytest.raises(RuntimeError, match="direct workload crashed"):
-        exec(compile(command[4], "<jarvis-named-crash>", "exec"), {"__name__": "__main__"})
+        _execute_test_wrapper(monkeypatch, command=command, ready_read_fd=ready_read_fd)
 
     records = [loads(line) for line in runtime_path.read_text(encoding="utf-8").splitlines()]
-    assert [record["runtime_metadata"]["scheduler_phase"] for record in records] == [
-        "direct_running",
-        "direct_failed",
-    ]
-    assert records[1]["runtime_metadata"]["terminal"]["terminal"] is True
-    os.close(ready_read_fd)
+    assert records[0]["runtime_metadata"]["details"]["execution_mode"] == "direct"
+    assert records[-1]["runtime_metadata"]["execution_record"]["state"] == "failed"
+    assert records[-1]["runtime_metadata"]["progress"]["terminal"] is True
 
 
 def test_isolated_named_wrapper_loads_plain_module_roots_without_python_hooks(
@@ -988,6 +1157,26 @@ def test_isolated_named_wrapper_loads_plain_module_roots_without_python_hooks(
     assert containment_filename is not None
     containment_source = Path(containment_filename)
     (relay_package / "process_containment.py").write_bytes(containment_source.read_bytes())
+    jarvis_execution_filename = sys.modules[run_native_jarvis_broker.__module__].__file__
+    assert isinstance(jarvis_execution_filename, str)
+    (relay_package / "jarvis_execution.py").write_bytes(
+        Path(jarvis_execution_filename).read_bytes()
+    )
+    errors_filename = sys.modules[ConfigurationError.__module__].__file__
+    assert isinstance(errors_filename, str)
+    (relay_package / "errors.py").write_bytes(Path(errors_filename).read_bytes())
+    (relay_package / "runtime_metadata.py").write_text(
+        "from types import SimpleNamespace\n"
+        "class JarvisExecutionHandleDocument:\n"
+        "    @classmethod\n"
+        "    def model_validate(cls, document): return SimpleNamespace(**document)\n"
+        "def native_execution_documents(envelope):\n"
+        "    return SimpleNamespace(\n"
+        "        execution_handle=SimpleNamespace(**envelope['execution_handle']),\n"
+        "        execution_record=SimpleNamespace(**envelope['execution_record']),\n"
+        "    )\n",
+        encoding="utf-8",
+    )
     progress_source = (
         Path(__file__).parents[1]
         / "jarvis-packages"
@@ -1021,32 +1210,78 @@ def test_isolated_named_wrapper_loads_plain_module_roots_without_python_hooks(
         "    'cmdline_has_progress_file': progress_file in initial_cmdline,\n"
         "    'cmdline_has_progress_token': progress_token in initial_cmdline,\n"
         "}), encoding='utf-8')\n"
+        "class Handle:\n"
+        "    def __init__(self, record): self.record = record\n"
+        "    def to_dict(self):\n"
+        "        return {\n"
+        "            'schema_version': 'jarvis.execution.handle.v1',\n"
+        "            'execution_id': self.record.execution_id,\n"
+        "            'pipeline_id': self.record.pipeline_id,\n"
+        "            'mode': 'direct',\n"
+        "            'scheduler_provider': None,\n"
+        "            'scheduler_native_id': None,\n"
+        "            'cluster': None,\n"
+        "        }\n"
+        "class Record:\n"
+        "    def __init__(self, execution_id, pipeline_id, state, terminal, return_code):\n"
+        "        self.execution_id = execution_id\n"
+        "        self.pipeline_id = pipeline_id\n"
+        "        self.mode = 'direct'\n"
+        "        self.state = state\n"
+        "        self.submitted = False\n"
+        "        self.terminal = terminal\n"
+        "        self.scheduler_native_id = None\n"
+        "        self.error = None\n"
+        "        self.return_code = return_code\n"
+        "    @property\n"
+        "    def handle(self): return Handle(self)\n"
+        "    def to_dict(self):\n"
+        "        return {\n"
+        "            **self.handle.to_dict(),\n"
+        "            'schema_version': 'jarvis.execution.record.v1',\n"
+        "            'pipeline_name': self.pipeline_id,\n"
+        "            'state': self.state,\n"
+        "            'submitted': False,\n"
+        "            'terminal': self.terminal,\n"
+        "            'created_at': '2026-07-12T00:00:00Z',\n"
+        "            'updated_at': '2026-07-12T00:00:01Z',\n"
+        "            'return_code': self.return_code,\n"
+        "            'error': self.error,\n"
+        "            'metadata': {},\n"
+        "        }\n"
+        "class Progress:\n"
+        "    def __init__(self, record): self.record = record\n"
+        "    def to_dict(self):\n"
+        "        return {\n"
+        "            'schema_version': 'jarvis.execution.progress.v1',\n"
+        "            'execution_id': self.record.execution_id,\n"
+        "            'pipeline_id': self.record.pipeline_id,\n"
+        "            'execution_state': self.record.state,\n"
+        "            'terminal': self.record.terminal,\n"
+        "            'packages': [],\n"
+        "        }\n"
         "class Pipeline:\n"
         "    scheduler = None\n"
-        "    packages = []\n"
-        "    def __init__(self, name): self.name = name\n"
+        "    def __init__(self, name): self.name, self.record = name, None\n"
         "    def load(self): return None\n"
-        "    def run(self):\n"
+        "    def get_execution(self, execution_id):\n"
+        "        if self.record is None: raise FileNotFoundError(execution_id)\n"
+        "        return self.record\n"
+        "    def get_execution_progress(self, execution_id):\n"
+        "        return Progress(self.get_execution(execution_id))\n"
+        "    def run(self, *, execution_id, wait):\n"
+        "        if wait is not True: raise RuntimeError('direct execution detached')\n"
+        "        self.record = Record(execution_id, self.name, 'running', False, None)\n"
         "        append_progress_record({'label': 'live', 'current': 1, 'total': 1})\n"
         "        result = subprocess.run([sys.executable, '-I', '-S', "
         "os.environ['APP_PROBE'], os.environ['APP_MARKER']], check=False)\n"
-        "        if result.returncode != 0: raise RuntimeError('application probe failed')\n",
+        "        if result.returncode != 0: raise RuntimeError('application probe failed')\n"
+        "        self.record = Record(execution_id, self.name, 'completed', True, 0)\n"
+        "        return self.record.handle\n",
         encoding="utf-8",
     )
     (jarvis_core / "pipeline_test.py").write_text(
         "def load_yaml_auto(path): raise AssertionError(path)\n",
-        encoding="utf-8",
-    )
-    (relay_package / "models.py").write_text(
-        "from enum import Enum\n"
-        "class SchedulerPhase(Enum):\n"
-        "    COMPLETED = 'completed'\n"
-        "    FAILED = 'failed'\n"
-        "    CANCELED = 'canceled'\n",
-        encoding="utf-8",
-    )
-    (relay_package / "scheduler_providers.py").write_text(
-        "def provider_for_scheduler(name): raise AssertionError(name)\n",
         encoding="utf-8",
     )
     site_marker = tmp_path / "sitecustomize-ran"
@@ -1147,6 +1382,7 @@ def test_isolated_named_wrapper_loads_plain_module_roots_without_python_hooks(
                 }
             ),
             "CLIO_RELAY_RUNTIME_DIRECT_PROOF": direct_proof,
+            "CLIO_RELAY_RUNTIME_SCHEDULER_PROVIDER": "external",
         }
     )
     launch_environment, credential = scheduled_runtime_credential_channel(runtime_environment)
@@ -1191,10 +1427,12 @@ def test_isolated_named_wrapper_loads_plain_module_roots_without_python_hooks(
     assert not user_marker.exists()
     assert not pth_marker.exists()
     records = [loads(line) for line in runtime_path.read_text(encoding="utf-8").splitlines()]
-    assert [record["runtime_metadata"]["scheduler_phase"] for record in records] == [
-        "direct_running",
-        "direct_completed",
+    assert records[0]["runtime_metadata"]["details"]["direct_execution_proof"] == direct_proof
+    native_records = [
+        record for record in records if "execution_record" in record["runtime_metadata"]
     ]
+    assert native_records
+    assert native_records[-1]["runtime_metadata"]["execution_record"]["state"] == "completed"
     for sequence, record in enumerate(records, start=1):
         runtime_metadata_from_sidecar_record(
             record,
@@ -1228,48 +1466,24 @@ def test_slurm_broker_scrubs_sidecar_credentials_before_package_and_child_contex
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    pipeline_path = tmp_path / "pipeline.yaml"
-    script_path = tmp_path / "submit.slurm"
     runtime_path = tmp_path / "runtime.jsonl"
-    observations: dict[
-        str,
-        tuple[
-            str | None,
-            str | None,
-            str | None,
-            str | None,
-            str | None,
-            str | None,
-        ],
-    ] = {}
-    pipeline = SimpleNamespace(
-        name="credential-boundary",
-        scheduler={"name": "slurm"},
-        packages=[{"pkg_id": "child", "pkg_type": "site.child"}],
-        last_submission=None,
-    )
+    observations: dict[str, tuple[str | None, ...]] = {}
 
-    def load_yaml_auto(_path: str) -> tuple[None, SimpleNamespace]:
-        observations["package_load"] = (
-            os.environ.get("CLIO_RELAY_PROGRESS_FILE"),
-            os.environ.get("CLIO_RELAY_PROGRESS_TOKEN"),
-            os.environ.get("CLIO_RELAY_RUNTIME_METADATA_FILE"),
-            os.environ.get("CLIO_RELAY_RUNTIME_METADATA_TOKEN"),
-            os.environ.get("CLIO_RELAY_BROKER_CREDENTIAL_FD"),
-            os.environ.get("CLIO_RELAY_BROKER_READY_FD"),
+    def observe_environment(label: str) -> None:
+        observations[label] = tuple(
+            os.environ.get(name)
+            for name in (
+                "CLIO_RELAY_PROGRESS_FILE",
+                "CLIO_RELAY_PROGRESS_TOKEN",
+                "CLIO_RELAY_RUNTIME_METADATA_FILE",
+                "CLIO_RELAY_RUNTIME_METADATA_TOKEN",
+                "CLIO_RELAY_BROKER_CREDENTIAL_FD",
+                "CLIO_RELAY_BROKER_READY_FD",
+            )
         )
-        return None, pipeline
 
-    def submit(*, submit: bool, wait: bool) -> Path:
-        assert (submit, wait) == (True, False)
-        observations["submit"] = (
-            os.environ.get("CLIO_RELAY_PROGRESS_FILE"),
-            os.environ.get("CLIO_RELAY_PROGRESS_TOKEN"),
-            os.environ.get("CLIO_RELAY_RUNTIME_METADATA_FILE"),
-            os.environ.get("CLIO_RELAY_RUNTIME_METADATA_TOKEN"),
-            os.environ.get("CLIO_RELAY_BROKER_CREDENTIAL_FD"),
-            os.environ.get("CLIO_RELAY_BROKER_READY_FD"),
-        )
+    def observe_submit_and_child() -> None:
+        observe_environment("submit")
         child = subprocess.run(
             [
                 sys.executable,
@@ -1288,77 +1502,33 @@ def test_slurm_broker_scrubs_sidecar_credentials_before_package_and_child_contex
             capture_output=True,
             check=True,
         )
-        child_values = cast(object, loads(child.stdout))
+        child_values = loads(child.stdout)
         assert isinstance(child_values, list)
-        typed_child_values = cast(list[object], child_values)
-        assert len(typed_child_values) == 6
-        first, second, third, fourth, fifth, sixth = typed_child_values
-        assert first is None or isinstance(first, str)
-        assert second is None or isinstance(second, str)
-        assert third is None or isinstance(third, str)
-        assert fourth is None or isinstance(fourth, str)
-        assert fifth is None or isinstance(fifth, str)
-        assert sixth is None or isinstance(sixth, str)
-        observations["child"] = (first, second, third, fourth, fifth, sixth)
-        pipeline.last_submission = {
-            "schema_version": "jarvis.scheduler.submission.v1",
-            "provider": "slurm",
-            "script_path": str(script_path),
-            "scheduler_job_id": "13579",
-            "identity_source": "scheduler_submit_api",
-            "submitted": True,
-            "reconciliation_marker": pipeline.scheduler["job_name"],
-        }
-        return script_path
+        observations["child"] = tuple(cast(list[str | None], child_values))
 
-    pipeline.submit = submit
-    pipeline_test = ModuleType("jarvis_cd.core.pipeline_test")
-    pipeline_test.load_yaml_auto = load_yaml_auto  # type: ignore[attr-defined]
-    jarvis_cd = ModuleType("jarvis_cd")
-    jarvis_cd.__path__ = []  # type: ignore[attr-defined]
-    jarvis_core = ModuleType("jarvis_cd.core")
-    jarvis_core.__path__ = []  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "jarvis_cd", jarvis_cd)
-    monkeypatch.setitem(sys.modules, "jarvis_cd.core", jarvis_core)
-    monkeypatch.setitem(sys.modules, "jarvis_cd.core.pipeline_test", pipeline_test)
-
-    class CompletedProvider:
-        def poll(self, scheduler_job_id: str) -> SchedulerStatus:
-            return SchedulerStatus(
-                scheduler="slurm",
-                scheduler_job_id=scheduler_job_id,
-                phase=SchedulerPhase.COMPLETED,
-            )
-
-    def provider_factory(_name: str) -> CompletedProvider:
-        return CompletedProvider()
-
-    monkeypatch.setattr(
-        "clio_relay.scheduler_providers.provider_for_scheduler",
-        provider_factory,
+    pipeline = _ScheduledNativePipeline(
+        name="credential-boundary",
+        job_id="13579",
+        on_submit=observe_submit_and_child,
+    )
+    _install_yaml_pipeline_module(
+        monkeypatch,
+        pipeline,
+        on_load=lambda: observe_environment("package_load"),
     )
     ready_read_fd = _install_runtime_credential_fd(
         monkeypatch,
         runtime_path=runtime_path,
         runtime_token="broker-only-token",
     )
-    monkeypatch.setattr(sys, "argv", ["adapter", "yaml", str(pipeline_path)])
+    monkeypatch.setattr(sys, "argv", ["adapter", "yaml", str(tmp_path / "pipeline.yaml")])
     command = scheduled_jarvis_command(
         "slurm",
         python_bin="python",
-        pipeline_path=pipeline_path,
+        pipeline_path=tmp_path / "pipeline.yaml",
     )
 
-    if os.name == "nt":
-        with pytest.raises(
-            RuntimeError,
-            match="secure JARVIS runtime signing requires Linux PR_SET_DUMPABLE",
-        ):
-            exec(compile(command[4], "<jarvis-slurm-adapter>", "exec"), {"__name__": "__main__"})
-        os.close(ready_read_fd)
-        return
-
-    exec(compile(command[4], "<jarvis-slurm-adapter>", "exec"), {"__name__": "__main__"})
+    _execute_test_wrapper(monkeypatch, command=command, ready_read_fd=ready_read_fd)
 
     assert observations == {
         "package_load": (
@@ -1373,9 +1543,8 @@ def test_slurm_broker_scrubs_sidecar_credentials_before_package_and_child_contex
         "child": (None, None, None, None, None, None),
     }
     records = [loads(line) for line in runtime_path.read_text(encoding="utf-8").splitlines()]
-    assert all("relay_runtime_token" not in record for record in records)
-    assert records[1]["runtime_metadata"]["scheduler_job_id"] == "13579"
-    os.close(ready_read_fd)
+    assert all("broker-only-token" not in dumps(record) for record in records)
+    assert records[0]["runtime_metadata"]["execution_record"]["scheduler_native_id"] == "13579"
 
 
 def test_slurm_execution_adapter_uses_bounded_secure_sidecar_append(
@@ -1404,8 +1573,8 @@ def test_slurm_execution_adapter_uses_bounded_secure_sidecar_append(
     )
     assert "os.set_inheritable(credential_fd, False)" in source
     assert "os.close(credential_fd)" in source
-    assert "RUNTIME_METADATA_MAX_RECORD_BYTES = 256 * 1024" in source
-    assert "RUNTIME_METADATA_MAX_TOTAL_BYTES = 4 * 1024 * 1024" in source
+    assert "RUNTIME_METADATA_MAX_RECORD_BYTES = 5 * 1024 * 1024" in source
+    assert "RUNTIME_METADATA_MAX_TOTAL_BYTES = 64 * 1024 * 1024" in source
     assert "os.O_APPEND" in source
     assert 'getattr(os, "O_NOFOLLOW", 0)' in source
     assert "os.set_inheritable(descriptor, False)" in source

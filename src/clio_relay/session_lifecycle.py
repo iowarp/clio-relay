@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shlex
 import subprocess
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal, cast
@@ -13,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import RelayError
+from clio_relay.identifiers import DurableRecordId, validate_durable_record_id
 from clio_relay.remote_cli import remote_env
 
 if TYPE_CHECKING:
@@ -29,7 +31,9 @@ SESSION_GATEWAY_CHECK_ID = "cleanup.gateway-record"
 SESSION_WORKER_CHECK_ID = "cleanup.worker-service"
 SESSION_NO_RESIDUALS_CHECK_ID = "cleanup.no-owned-resources"
 SESSION_SCHEDULER_RETAINED_CHECK_ID = "cleanup.jobs-preserved-default"
+SESSION_RELAY_CANCELED_CHECK_ID = "cleanup.relay-jobs-canceled"
 SESSION_SCHEDULER_CANCELED_CHECK_ID = "cleanup.explicit-job-cancel"
+_REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS = 120.0
 
 
 @dataclass(frozen=True)
@@ -78,6 +82,7 @@ class CleanupResource(BaseModel):
             "remote_connector": "connector",
             "gateway_record": "gateway_session",
             "worker_service": "relay_worker",
+            "scheduler_sentinel": "scheduler_job",
         }.get(self.kind, self.kind)
         return ValidationResource(
             kind=validation_kind,
@@ -106,12 +111,53 @@ class RemoteSessionStateEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     api_pid: int | None = None
-    session_generation_id: str | None = None
+    session_generation_id: DurableRecordId | None = None
     process_start_marker: str | None = None
     running: bool
     ownership_verified: bool
     observed_at: datetime
     started_at: datetime | None = None
+
+
+def cleanup_connectors_cover_gateways(
+    connector_resources: list[CleanupResource],
+    gateway_resources: list[CleanupResource],
+    *,
+    mode: Literal["detach", "teardown"],
+) -> bool:
+    """Require exactly one desktop and remote connector disposition per gateway."""
+    gateway_counts = Counter(resource.resource_id for resource in gateway_resources)
+    if not gateway_counts or any(count != 1 for count in gateway_counts.values()):
+        return False
+    connector_counts: Counter[tuple[str, str]] = Counter()
+    for resource in connector_resources:
+        gateway_id = resource.metadata.get("gateway_session_id")
+        if not isinstance(gateway_id, str) or gateway_id not in gateway_counts:
+            return False
+        connector_counts[(gateway_id, resource.kind)] += 1
+        if not (
+            resource.ownership_verified
+            and resource.verified_after_operation
+            and not resource.residual
+        ):
+            return False
+        if resource.kind == "desktop_connector":
+            if resource.action != "stop" or resource.outcome not in {"stopped", "missing"}:
+                return False
+        elif resource.kind == "remote_connector":
+            if mode == "detach":
+                if resource.action != "retain" or resource.outcome != "retained":
+                    return False
+            elif resource.action != "stop" or resource.outcome not in {"stopped", "missing"}:
+                return False
+        else:
+            return False
+    expected = {
+        (gateway_id, connector_kind): 1
+        for gateway_id in gateway_counts
+        for connector_kind in ("desktop_connector", "remote_connector")
+    }
+    return connector_counts == Counter(expected)
 
 
 class SessionLifecycleReport(BaseModel):
@@ -121,8 +167,11 @@ class SessionLifecycleReport(BaseModel):
 
     cluster: str | None = None
     session_id: str
-    session_generation_id: str | None = None
+    session_generation_id: DurableRecordId | None = None
     mode: Literal["detach", "teardown"]
+    cleanup_operation_id: DurableRecordId | None = None
+    cleanup_policy: dict[str, bool] = Field(default_factory=dict[str, bool])
+    relay_cancel_requested: bool = False
     scheduler_cancel_requested: bool = False
     prior_session_status: RemoteSessionStateEvidence | None = None
     post_session_status: RemoteSessionStateEvidence | None = None
@@ -200,15 +249,25 @@ class SessionLifecycleReport(BaseModel):
             )
         return resources
 
-    def to_cleanup_evidence(self, *, stop_worker: bool = False) -> CleanupEvidence:
+    def to_cleanup_evidence(self, *, stop_worker: bool | None = None) -> CleanupEvidence:
         """Convert this lifecycle result to shared cleanup evidence."""
         from clio_relay.validation_report import CleanupEvidence
 
+        effective_stop_worker = (
+            any(
+                resource.kind == "worker_service" and resource.action == "stop"
+                for resource in self.resources
+            )
+            if stop_worker is None
+            else stop_worker
+        )
         return CleanupEvidence(
             requested=True,
             mode=self.mode,
+            operation_id=self.cleanup_operation_id,
+            cancel_relay_jobs=self.relay_cancel_requested,
             cancel_scheduler_jobs=self.scheduler_cancel_requested,
-            stop_worker=stop_worker,
+            stop_worker=effective_stop_worker,
             actions=[resource.model_dump(mode="json") for resource in self.resources],
             remaining_resources=[
                 resource.to_validation_resource(cluster=self.cluster)
@@ -219,8 +278,8 @@ class SessionLifecycleReport(BaseModel):
     def to_live_validation_report(
         self,
         *,
-        stop_worker: bool = False,
-        cancel_jobs: bool = False,
+        stop_worker: bool | None = None,
+        cancel_jobs: bool | None = None,
         launcher: str | None = None,
         install_source: str | None = None,
         artifact_sha256: str | None = None,
@@ -241,6 +300,15 @@ class SessionLifecycleReport(BaseModel):
             install_source=install_source,
             artifact_sha256=artifact_sha256,
         )
+        effective_stop_worker = (
+            any(
+                resource.kind == "worker_service" and resource.action == "stop"
+                for resource in self.resources
+            )
+            if stop_worker is None
+            else stop_worker
+        )
+        effective_cancel_jobs = self.relay_cancel_requested if cancel_jobs is None else cancel_jobs
         completed_at = datetime.now(UTC)
         checks: list[tuple[str, str, bool]] = []
         relay_stopped = False
@@ -290,27 +358,87 @@ class SessionLifecycleReport(BaseModel):
                 )
             )
             checks.append((SESSION_TEARDOWN_CHECK_ID, "owned relay session stopped", relay_stopped))
-        if not cancel_jobs:
-            retained_jobs = [
-                resource
-                for resource in self.resources
-                if resource.kind in {"relay_job", "scheduler_job"} and resource.action == "retain"
+        if effective_cancel_jobs:
+            relay_cancel_resources = [
+                resource for resource in self.resources if resource.kind == "relay_job"
             ]
-            if retained_jobs:
+            if relay_cancel_resources:
                 checks.append(
                     (
-                        SESSION_SCHEDULER_RETAINED_CHECK_ID,
-                        "owned relay and scheduler jobs were preserved by default",
-                        not self.scheduler_cancel_requested
-                        and all(
-                            resource.ownership_verified
-                            and resource.outcome in {"retained", "terminal"}
+                        SESSION_RELAY_CANCELED_CHECK_ID,
+                        "owned relay jobs reached acknowledged cancellation or terminal state",
+                        all(
+                            resource.action in {"cancel", "retain"}
+                            and resource.ownership_verified
+                            and resource.outcome in {"canceled", "terminal"}
                             and resource.verified_after_operation
                             and not resource.residual
-                            for resource in retained_jobs
+                            for resource in relay_cancel_resources
                         ),
                     )
                 )
+        retained_jobs = [
+            resource
+            for resource in self.resources
+            if resource.action == "retain"
+            and (
+                resource.kind == "scheduler_job"
+                or (resource.kind == "relay_job" and not effective_cancel_jobs)
+            )
+        ]
+        if not self.scheduler_cancel_requested and retained_jobs:
+            relay_resource_ids = {
+                resource.resource_id for resource in self.resources if resource.kind == "relay_job"
+            }
+            gateway_resource_ids = {
+                resource.resource_id
+                for resource in self.resources
+                if resource.kind == "gateway_record"
+            }
+            allowed_retention_outcomes = (
+                {"retained"} if self.mode == "detach" else {"retained", "terminal"}
+            )
+            checks.append(
+                (
+                    SESSION_SCHEDULER_RETAINED_CHECK_ID,
+                    (
+                        "scheduler jobs were preserved while relay cancellation completed"
+                        if effective_cancel_jobs
+                        else "owned relay and scheduler jobs were preserved by default"
+                    ),
+                    all(
+                        resource.ownership_verified
+                        and (
+                            resource.kind != "scheduler_job"
+                            or (
+                                resource.provider is not None
+                                and (
+                                    resource.metadata.get("relay_job_id") in relay_resource_ids
+                                    or resource.metadata.get("gateway_session_id")
+                                    in gateway_resource_ids
+                                )
+                            )
+                        )
+                        and resource.outcome in allowed_retention_outcomes
+                        and (
+                            self.mode != "detach"
+                            or resource.observed_state
+                            in {
+                                "submitted",
+                                "pending",
+                                "queued",
+                                "allocated",
+                                "starting",
+                                "ready",
+                                "running",
+                            }
+                        )
+                        and resource.verified_after_operation
+                        and not resource.residual
+                        for resource in retained_jobs
+                    ),
+                )
+            )
         if self.scheduler_cancel_requested:
             relay_resources = {
                 resource.resource_id: resource
@@ -349,10 +477,20 @@ class SessionLifecycleReport(BaseModel):
                 and resource.verified_after_operation
                 and not resource.residual
             }
+            gateway_resource_ids = {
+                resource.resource_id
+                for resource in self.resources
+                if resource.kind == "gateway_record"
+            }
             every_scheduler_resource_linked = all(
-                isinstance(resource.metadata.get("relay_job_id"), str)
-                and resource.metadata.get("relay_job_id") in relay_resources
-                or isinstance(resource.metadata.get("gateway_session_id"), str)
+                (
+                    isinstance(resource.metadata.get("relay_job_id"), str)
+                    and resource.metadata.get("relay_job_id") in relay_resources
+                )
+                or (
+                    isinstance(resource.metadata.get("gateway_session_id"), str)
+                    and resource.metadata.get("gateway_session_id") in gateway_resource_ids
+                )
                 for resource in canceled_scheduler_resources
             )
             scheduler_canceled = (
@@ -373,30 +511,54 @@ class SessionLifecycleReport(BaseModel):
                     scheduler_canceled,
                 )
             )
+        gateway_resources = [
+            resource for resource in self.resources if resource.kind == "gateway_record"
+        ]
         connector_resources = [
             resource
             for resource in self.resources
             if resource.kind in {"desktop_connector", "remote_connector"}
         ]
-        if self.mode == "teardown" and connector_resources:
+        if self.mode == "detach" and (connector_resources or gateway_resources):
+            checks.append(
+                (
+                    SESSION_CONNECTORS_CHECK_ID,
+                    "desktop connectors stopped and remote connectors retained",
+                    cleanup_connectors_cover_gateways(
+                        connector_resources,
+                        gateway_resources,
+                        mode="detach",
+                    ),
+                )
+            )
+        elif self.mode == "teardown" and (connector_resources or gateway_resources):
             checks.append(
                 (
                     SESSION_CONNECTORS_CHECK_ID,
                     "owned connectors were cleaned",
-                    all(
-                        resource.action == "stop"
-                        and resource.outcome in {"stopped", "missing"}
-                        and resource.ownership_verified
-                        and resource.verified_after_operation
-                        and not resource.residual
-                        for resource in connector_resources
+                    cleanup_connectors_cover_gateways(
+                        connector_resources,
+                        gateway_resources,
+                        mode="teardown",
                     ),
                 )
             )
-        gateway_resources = [
-            resource for resource in self.resources if resource.kind == "gateway_record"
-        ]
-        if self.mode == "teardown" and gateway_resources:
+        if self.mode == "detach" and gateway_resources:
+            checks.append(
+                (
+                    SESSION_GATEWAY_CHECK_ID,
+                    "owned gateway records were retained for reattachment",
+                    all(
+                        resource.action == "retain"
+                        and resource.outcome == "retained"
+                        and resource.ownership_verified
+                        and resource.verified_after_operation
+                        and not resource.residual
+                        for resource in gateway_resources
+                    ),
+                )
+            )
+        elif self.mode == "teardown" and gateway_resources:
             checks.append(
                 (
                     SESSION_GATEWAY_CHECK_ID,
@@ -414,7 +576,7 @@ class SessionLifecycleReport(BaseModel):
         worker_resources = [
             resource for resource in self.resources if resource.kind == "worker_service"
         ]
-        if self.mode == "teardown" and stop_worker:
+        if self.mode == "teardown" and effective_stop_worker:
             checks.append(
                 (
                     SESSION_WORKER_CHECK_ID,
@@ -458,7 +620,7 @@ class SessionLifecycleReport(BaseModel):
             for check_id, summary, passed in checks
         ]
         report.resources = self.validation_resources()
-        report.cleanup = self.to_cleanup_evidence(stop_worker=stop_worker)
+        report.cleanup = self.to_cleanup_evidence(stop_worker=effective_stop_worker)
         report.completed_at = completed_at
         report.status = (
             ValidationStatus.PASSED
@@ -511,21 +673,58 @@ def teardown_remote_session(
     definition: ClusterDefinition,
     session_id: str,
     expected_session_generation_id: str,
+    expected_cleanup_operation_id: str | None = None,
     stop_worker: bool = False,
+    cancel_jobs: bool = False,
+    cancel_scheduler_jobs: bool = False,
     cluster: str | None = None,
 ) -> SessionLifecycleReport:
     """Stop processes owned by a remote relay session."""
     _validate_session(session_id=session_id, remote_api_port=1)
+    _validate_durable_session_identity(
+        expected_session_generation_id,
+        field="expected_session_generation_id",
+    )
+    if expected_cleanup_operation_id is not None:
+        _validate_durable_session_identity(
+            expected_cleanup_operation_id,
+            field="expected_cleanup_operation_id",
+        )
     output = _ssh_script(
         definition,
         _owned_teardown_script(
             session_id=session_id,
             expected_session_generation_id=expected_session_generation_id,
             stop_worker=stop_worker,
+            cancel_jobs=cancel_jobs,
+            cancel_scheduler_jobs=cancel_scheduler_jobs,
             cluster=cluster,
         ),
     )
-    return SessionLifecycleReport.model_validate_json(output)
+    report = SessionLifecycleReport.model_validate_json(output)
+    if expected_cleanup_operation_id is not None:
+        if report.cleanup_operation_id != expected_cleanup_operation_id:
+            raise RelayError(
+                "remote teardown cleanup operation does not match the durable owner-session intent"
+            )
+        expected_policy = {
+            "stop_worker": stop_worker,
+            "cancel_jobs": cancel_jobs,
+            "cancel_scheduler_jobs": cancel_scheduler_jobs,
+        }
+        if report.cleanup_policy != expected_policy:
+            raise RelayError(
+                "remote teardown cleanup policy does not match the durable owner-session intent"
+            )
+        if (
+            report.relay_cancel_requested is not cancel_jobs
+            or report.scheduler_cancel_requested is not cancel_scheduler_jobs
+        ):
+            raise RelayError(
+                "remote teardown cancellation evidence does not match the durable owner-session "
+                "intent"
+            )
+    return report
 
 
 def detach_remote_session(
@@ -598,7 +797,7 @@ session_id={shlex.quote(session_id)}
 session_dir="$HOME/.local/share/clio-relay/sessions/$session_id"
 mkdir -p "$session_dir"
 exec 9>"$session_dir/transition.lock"
-flock -x 9
+flock -w 10 -x 9 || {{ echo "session transition lock timed out" >&2; exit 75; }}
 pid_file="$session_dir/api.pid"
 log_file="$session_dir/api.log"
 metadata_file="$session_dir/metadata.json"
@@ -1105,18 +1304,27 @@ def _owned_teardown_script(
     session_id: str,
     expected_session_generation_id: str,
     stop_worker: bool,
+    cancel_jobs: bool,
+    cancel_scheduler_jobs: bool,
     cluster: str | None,
 ) -> str:
     if stop_worker and cluster is None:
         raise RelayError("cluster is required when stopping the worker service")
     cluster_value = cluster or ""
     service = f"clio-relay-worker-{cluster_value}.service" if stop_worker else ""
+    cleanup_policy_flags = ""
+    if stop_worker:
+        cleanup_policy_flags += " --cleanup-stop-worker"
+    if cancel_jobs:
+        cleanup_policy_flags += " --cleanup-cancel-jobs"
+    if cancel_scheduler_jobs:
+        cleanup_policy_flags += " --cleanup-cancel-scheduler-jobs"
     return f"""set -euo pipefail
 session_id={shlex.quote(session_id)}
 session_dir="$HOME/.local/share/clio-relay/sessions/$session_id"
 mkdir -p "$session_dir"
 exec 9>"$session_dir/transition.lock"
-flock -x 9
+flock -w 10 -x 9 || {{ echo "session teardown lock timed out" >&2; exit 75; }}
 metadata_file="$session_dir/metadata.json"
 expected_session_generation_id={shlex.quote(expected_session_generation_id)}
 python3 - "$metadata_file" "$session_id" "$expected_session_generation_id" \
@@ -1135,11 +1343,14 @@ if metadata.get("owner") != "clio-relay" or metadata.get("session_id") != sessio
 if metadata.get("session_generation_id") != expected_generation_id:
     raise SystemExit("owned session generation changed before teardown")
 __CLIO_RELAY_EXPECTED_GENERATION__
-clio-relay session quiesce-intake \
+cleanup_intake_result="$(timeout --signal=TERM --kill-after=5s 10s \
+  clio-relay session quiesce-intake \
   --session-id "$session_id" \
-  --session-generation-id "$expected_session_generation_id" >/dev/null
-python3 - "$session_dir" "$session_id" {shlex.quote(cluster_value)} \
-  {"1" if stop_worker else "0"} {shlex.quote(service)} <<'__CLIO_RELAY_OWNED_TEARDOWN__'
+  --session-generation-id "$expected_session_generation_id"{cleanup_policy_flags})"
+timeout --signal=TERM --kill-after=5s 90s \
+  python3 - "$session_dir" "$session_id" {shlex.quote(cluster_value)} \
+  {"1" if stop_worker else "0"} {shlex.quote(service)} "$cleanup_intake_result" \
+  <<'__CLIO_RELAY_OWNED_TEARDOWN__'
 import json
 import os
 import signal
@@ -1150,8 +1361,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 session_dir = Path(sys.argv[1])
-session_id, cluster, stop_worker_raw, service = sys.argv[2:]
+session_id, cluster, stop_worker_raw, service, cleanup_intake_raw = sys.argv[2:]
 stop_worker = stop_worker_raw == "1"
+cleanup_intake = json.loads(cleanup_intake_raw)
+cleanup_intent = cleanup_intake.get("cleanup_intent")
+if not isinstance(cleanup_intent, dict):
+    raise RuntimeError("owner-session cleanup intent is missing")
 metadata_path = session_dir / "metadata.json"
 pid_path = session_dir / "api.pid"
 errors = []
@@ -1177,13 +1392,11 @@ def process_state(pid):
 def token_group_processes():
     token = metadata.get("owner_token")
     generation_id = metadata.get("session_generation_id")
-    pgid = metadata.get("api_pgid")
     if (
         not isinstance(token, str)
         or not token
         or not isinstance(generation_id, str)
         or not generation_id
-        or not isinstance(pgid, int)
     ):
         return []
     token_marker = f"CLIO_RELAY_SESSION_OWNER_TOKEN={{token}}".encode()
@@ -1193,19 +1406,51 @@ def token_group_processes():
         if not proc.name.isdigit():
             continue
         try:
+            if proc.stat().st_uid != os.geteuid():
+                continue
             environment = (proc / "environ").read_bytes().split(bytes([0]))
             state = (proc / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()[0]
-            process_group = os.getpgid(int(proc.name))
-        except (OSError, IndexError, ValueError):
+        except (FileNotFoundError, ProcessLookupError):
             continue
+        except (OSError, IndexError, ValueError) as exc:
+            raise RuntimeError(
+                f"cannot verify owned session process {{proc.name}}: {{exc}}"
+            ) from exc
         if (
             state != "Z"
-            and process_group == pgid
             and token_marker in environment
             and generation_marker in environment
         ):
             matches.append(int(proc.name))
-    return matches
+    return sorted(matches)
+
+
+def signal_token_processes(sig):
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise RuntimeError("race-safe pidfd session cleanup is unavailable")
+    signaled = []
+    for owned_pid in token_group_processes():
+        try:
+            process_fd = os.pidfd_open(owned_pid, 0)
+        except ProcessLookupError:
+            continue
+        except OSError as exc:
+            raise RuntimeError(f"cannot open session pidfd for {{owned_pid}}: {{exc}}") from exc
+        try:
+            if owned_pid not in token_group_processes():
+                continue
+            try:
+                signal.pidfd_send_signal(process_fd, sig, None, 0)
+            except ProcessLookupError:
+                continue
+            except OSError as exc:
+                raise RuntimeError(
+                    f"cannot signal owned session pid {{owned_pid}}: {{exc}}"
+                ) from exc
+            signaled.append(owned_pid)
+        finally:
+            os.close(process_fd)
+    return signaled
 
 
 pid = metadata.get("api_pid")
@@ -1226,10 +1471,20 @@ resource = {{
 }}
 state, observed_start = process_state(pid)
 owned_group_pids = token_group_processes()
-running = (state is not None and state != "Z") or bool(owned_group_pids)
+running = bool(owned_group_pids)
 prior_running = running
-ownership_verified = False
 prior_observed_at = datetime.now(timezone.utc).isoformat()
+durable_identity = (
+    metadata.get("owner") == "clio-relay"
+    and metadata.get("session_id") == session_id
+    and isinstance(metadata.get("owner_token"), str)
+    and bool(metadata.get("owner_token"))
+    and isinstance(metadata.get("session_generation_id"), str)
+    and bool(metadata.get("session_generation_id"))
+    and isinstance(metadata.get("process_start_ticks"), str)
+    and isinstance(metadata.get("api_pgid"), int)
+)
+leader_owned = False
 if state is not None and state != "Z" and isinstance(pid, int):
     try:
         proc = Path("/proc") / str(pid)
@@ -1240,13 +1495,10 @@ if state is not None and state != "Z" and isinstance(pid, int):
         token = metadata.get("owner_token")
         generation_id = metadata.get("session_generation_id")
         recorded_pgid = metadata.get("api_pgid")
-        ownership_verified = (
-            metadata.get("owner") == "clio-relay"
-            and metadata.get("session_id") == session_id
+        leader_owned = (
+            durable_identity
             and isinstance(token, str)
-            and bool(token)
             and isinstance(generation_id, str)
-            and bool(generation_id)
             and metadata.get("process_start_ticks") == observed_start
             and isinstance(recorded_pgid, int)
             and os.getpgid(pid) == recorded_pgid
@@ -1258,14 +1510,13 @@ if state is not None and state != "Z" and isinstance(pid, int):
             and " start" in command
         )
     except (OSError, TypeError):
-        ownership_verified = False
-elif owned_group_pids:
-    ownership_verified = (
-        metadata.get("owner") == "clio-relay"
-        and metadata.get("session_id") == session_id
-        and isinstance(metadata.get("api_pgid"), int)
+        leader_owned = False
+ownership_verified = durable_identity and bool(owned_group_pids)
+if running and not leader_owned:
+    resource["detail"] = (
+        "recorded API leader was absent or replaced; only exact token-generation "
+        "processes were targeted"
     )
-    resource["ownership_verified"] = ownership_verified
 if running:
     resource["ownership_verified"] = ownership_verified
     if not ownership_verified:
@@ -1274,43 +1525,29 @@ if running:
         resource["detail"] = "ownership proof failed; process was not signaled"
         errors.append(f"refused to stop unverified API pid {{pid}}")
     else:
-        pgid = metadata["api_pgid"]
         try:
-            os.killpg(pgid, signal.SIGTERM)
+            signal_token_processes(signal.SIGTERM)
             for _ in range(25):
-                state, _ = process_state(pid)
-                if (state is None or state == "Z") and not token_group_processes():
+                if not token_group_processes():
                     break
                 time.sleep(0.2)
-            state, _ = process_state(pid)
-            if (state is not None and state != "Z") or token_group_processes():
-                os.killpg(pgid, signal.SIGKILL)
+            if token_group_processes():
+                signal_token_processes(signal.SIGKILL)
                 time.sleep(0.2)
-            state, _ = process_state(pid)
-            residual = (state is not None and state != "Z") or bool(token_group_processes())
+            residual = bool(token_group_processes())
             resource["outcome"] = "failed" if residual else "stopped"
             resource["residual"] = residual
             if residual:
                 errors.append(f"API process group still running for pid {{pid}}")
             else:
                 pid_path.unlink(missing_ok=True)
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             resource["outcome"] = "failed"
             resource["residual"] = True
             resource["detail"] = str(exc)
             errors.append(f"failed to stop API pid {{pid}}: {{exc}}")
 elif isinstance(pid, int):
     pid_path.unlink(missing_ok=True)
-    durable_identity = (
-        metadata.get("owner") == "clio-relay"
-        and metadata.get("session_id") == session_id
-        and isinstance(metadata.get("owner_token"), str)
-        and bool(metadata.get("owner_token"))
-        and isinstance(metadata.get("session_generation_id"), str)
-        and bool(metadata.get("session_generation_id"))
-        and isinstance(metadata.get("process_start_ticks"), str)
-        and isinstance(metadata.get("api_pgid"), int)
-    )
     resource["ownership_verified"] = durable_identity
     ownership_verified = durable_identity
     if not durable_identity:
@@ -1324,12 +1561,30 @@ resource["verified_after_operation"] = (
     and not resource["residual"]
 )
 resources.append(resource)
-post_state, _ = process_state(pid)
-post_running = (post_state is not None and post_state != "Z") or bool(token_group_processes())
+post_running = bool(token_group_processes())
 post_observed_at = datetime.now(timezone.utc).isoformat()
 
+
+def cleanup_command(command):
+    try:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            command,
+            124,
+            "",
+            "cleanup command timed out after 20 seconds",
+        )
+
+
 if stop_worker:
-    ownership = subprocess.run(
+    ownership = cleanup_command(
         [
             "systemctl",
             "--user",
@@ -1339,9 +1594,6 @@ if stop_worker:
             "--property=FragmentPath",
             "--property=ExecStart",
         ],
-        capture_output=True,
-        text=True,
-        check=False,
     )
     service_missing = "LoadState=not-found" in ownership.stdout
     worker_owned = (
@@ -1352,18 +1604,8 @@ if stop_worker:
     )
     stopped = None
     if worker_owned:
-        stopped = subprocess.run(
-            ["systemctl", "--user", "stop", service],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    active = subprocess.run(
-        ["systemctl", "--user", "is-active", service],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+        stopped = cleanup_command(["systemctl", "--user", "stop", service])
+    active = cleanup_command(["systemctl", "--user", "is-active", service])
     active_state = active.stdout.strip().lower() or "unknown"
     observed_state = "not-found" if service_missing else active_state
     verified_after_operation = service_missing or (
@@ -1410,7 +1652,14 @@ print(json.dumps({{
     "session_id": session_id,
     "session_generation_id": metadata.get("session_generation_id"),
     "mode": "teardown",
-    "scheduler_cancel_requested": False,
+    "cleanup_operation_id": cleanup_intent.get("operation_id"),
+    "cleanup_policy": {{
+        "stop_worker": cleanup_intent.get("stop_worker"),
+        "cancel_jobs": cleanup_intent.get("cancel_jobs"),
+        "cancel_scheduler_jobs": cleanup_intent.get("cancel_scheduler_jobs"),
+    }},
+    "relay_cancel_requested": cleanup_intent.get("cancel_jobs") is True,
+    "scheduler_cancel_requested": cleanup_intent.get("cancel_scheduler_jobs") is True,
     "prior_session_status": {{
         "api_pid": pid if isinstance(pid, int) else None,
         "session_generation_id": metadata.get("session_generation_id"),
@@ -1443,13 +1692,28 @@ def _validate_session(*, session_id: str, remote_api_port: int) -> None:
         raise RelayError("remote_api_port must be positive")
 
 
+def _validate_durable_session_identity(value: str, *, field: str) -> str:
+    """Validate an execution identity before any remote lifecycle I/O."""
+    try:
+        return validate_durable_record_id(value)
+    except ValueError as error:
+        raise RelayError(f"invalid {field}: {error}") from error
+
+
 def _ssh_script(definition: ClusterDefinition, script: str) -> str:
-    result = subprocess.run(
-        ["ssh", definition.ssh_host, "bash", "-s"],
-        input=script.encode("utf-8"),
-        capture_output=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["ssh", definition.ssh_host, "bash", "-s"],
+            input=script.encode("utf-8"),
+            capture_output=True,
+            check=False,
+            timeout=_REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RelayError(
+            "remote session command timed out after "
+            f"{_REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS:g} seconds"
+        ) from exc
     if result.returncode != 0:
         stdout = result.stdout.decode("utf-8", errors="replace").strip()
         stderr = result.stderr.decode("utf-8", errors="replace").strip()

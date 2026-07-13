@@ -560,6 +560,7 @@ def run_queue_management_validation(
             task_id=peer_observation.task_id,
             metadata={**peer_observation.as_metadata(), **peer_termination},
         )
+
     except Exception as exc:
         primary_error = exc
 
@@ -670,19 +671,26 @@ def _validate_specific_diagnosis(
         )
         job = _mapping(diagnosis.get("job"), "diagnosis job")
         queue_evidence = _mapping(diagnosis.get("queue"), "diagnosis queue")
+        admission_evidence = _mapping(queue_evidence.get("admission"), "queue admission")
         lease_evidence = _mapping(diagnosis.get("lease"), "diagnosis lease")
         worker_evidence = _mapping(diagnosis.get("worker"), "diagnosis worker")
         scheduler_evidence = _list(diagnosis.get("scheduler"), "scheduler evidence")
         _require(job.get("job_id") == target.job_id, "diagnosis returned another job")
         _require(
-            diagnosis.get("reason") == "queued_beyond_threshold",
+            diagnosis.get("reason") == "waiting_for_kind_capacity",
             f"unexpected diagnosis reason: {diagnosis.get('reason')}",
         )
         _require(diagnosis.get("stale") is True, "diagnosis did not mark target stale")
         _require(
             queue_evidence.get("state") == JobState.QUEUED.value
             and queue_evidence.get("jobs_ahead") == 0,
-            "queued-beyond-threshold reason conflicts with queue position",
+            "kind-capacity reason conflicts with queue position",
+        )
+        _require(
+            admission_evidence.get("analysis_complete") is True
+            and admission_evidence.get("target_admissible_now") is False
+            and admission_evidence.get("target_ineligibility") == "kind_capacity_saturated",
+            "kind-capacity reason conflicts with admission evidence",
         )
         _require(lease_evidence.get("present") is False, "queued target unexpectedly leased")
         healthy = worker_evidence.get("healthy_worker_count")
@@ -697,6 +705,7 @@ def _validate_specific_diagnosis(
                     "stale": diagnosis["stale"],
                     "age_seconds": diagnosis["age_seconds"],
                     "queue": queue_evidence,
+                    "admission": admission_evidence,
                     "lease": lease_evidence,
                     "healthy_worker_count": healthy,
                     "scheduler_observation_count": 0,

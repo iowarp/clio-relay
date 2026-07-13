@@ -17,6 +17,7 @@ import stat
 import threading
 import time
 from collections.abc import Callable, Iterable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -27,7 +28,14 @@ from uuid import uuid4
 from filelock import FileLock, Timeout
 from pydantic import BaseModel
 
-from clio_relay.errors import NotFoundError, QueueConflictError
+from clio_relay.cluster_config import (
+    ensure_private_configuration_directory,
+    ensure_private_configuration_path,
+    open_private_atomic_file,
+)
+from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError
+from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
+from clio_relay.identifiers import filesystem_key, validate_durable_record_id
 from clio_relay.models import (
     TERMINAL_STATES,
     ArtifactRef,
@@ -73,6 +81,9 @@ _UNSET = object()
 DEFAULT_CORE_LOCK_TIMEOUT_SECONDS = 30.0
 ATOMIC_REPLACE_ATTEMPTS = 25
 ATOMIC_REPLACE_RETRY_SECONDS = 0.02
+WRITE_STAGING_FAMILY = "write_staging"
+WRITE_STAGING_MAX_LEFTOVERS = 10_000
+OWNER_SESSION_CLOSURE_WRITE_ATTEMPTS = 3
 JOB_INDEX_SCHEMA = "clio-relay.job-index.v1"
 INDEX_MIGRATION_SCHEMA = "clio-relay.index-migration.v1"
 LEASE_OPERATIONAL_INDEX_SCHEMA = "clio-relay.lease-operational-index.v2"
@@ -101,7 +112,6 @@ RECORD_FAMILY_MAX_BYTES: dict[str, int] = {
     "artifacts": 262_144,
     "artifacts_by_job": 262_144,
     "artifact_order_by_job": 262_144,
-    "cursors": 65_536,
     "endpoints_fresh": 65_536,
     "endpoints_fresh_by_id": 65_536,
     "events": 262_144,
@@ -141,6 +151,29 @@ RECORD_FAMILY_MAX_BYTES: dict[str, int] = {
     "task_order_by_job": 1_048_576,
     "transition_intents": 16_777_216,
 }
+
+
+class _TransientRecordReplacement(RuntimeError):
+    """Signal that an atomic replacement invalidated one bounded read attempt."""
+
+
+class LegacyQueueStateError(QueueConflictError):
+    """Machine-readable refusal for unsafe pre-1.0 canonical queue state."""
+
+    def __init__(self, *, family: str, path: Path, reason: str) -> None:
+        self.report: dict[str, str] = {
+            "schema_version": "clio-relay.legacy-state-audit.v1",
+            "family": family,
+            "path": str(logical_filesystem_path(path)),
+            "reason": reason,
+            "action": (
+                "move the unsafe state aside or export records with portable durable IDs "
+                "before retrying"
+            ),
+        }
+        super().__init__(json.dumps(self.report, sort_keys=True))
+
+
 _ORDER_FAMILIES = ("tasks", "artifacts", "progress")
 _GLOBAL_ORDER_FAMILIES = (
     "endpoints",
@@ -298,18 +331,331 @@ class ClioCoreQueue:
     ) -> None:
         if lock_timeout_seconds <= 0:
             raise ValueError("lock_timeout_seconds must be positive")
-        self.root = root
+        self.root = logical_filesystem_path(root)
+        self._storage_root = internal_filesystem_path(self.root, force_extended=True)
         self._lock = _FairBoundedFileLock(
-            str(root / ".lock"),
+            str(self._storage_root / ".lock"),
             timeout=lock_timeout_seconds,
         )
         self._initialized = False
 
+    def _audit_legacy_state_before_initialization(self) -> None:
+        """Refuse unsafe v0.9 canonical state before creating or changing files."""
+        try:
+            root_stat = os.lstat(self._storage_root)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise LegacyQueueStateError(
+                family="root",
+                path=self._storage_root,
+                reason=f"cannot inspect queue root: {type(error).__name__}",
+            ) from error
+        if not stat.S_ISDIR(root_stat.st_mode) or _record_is_reparse(root_stat):
+            raise LegacyQueueStateError(
+                family="root",
+                path=self._storage_root,
+                reason="queue root is not an owned directory",
+            )
+        lock_path = self._storage_root / ".lock"
+        try:
+            lock_stat = os.lstat(lock_path)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise LegacyQueueStateError(
+                family="root",
+                path=lock_path,
+                reason=f"cannot inspect queue lock: {type(error).__name__}",
+            ) from error
+        else:
+            if not stat.S_ISREG(lock_stat.st_mode) or _record_is_reparse(lock_stat):
+                raise LegacyQueueStateError(
+                    family="root",
+                    path=lock_path,
+                    reason="queue lock is not an owned regular file",
+                )
+
+        record_families: tuple[tuple[str, type[BaseModel], str], ...] = (
+            ("endpoints", EndpointRegistration, "endpoint_id"),
+            ("jobs", RelayJob, "job_id"),
+            ("tasks", RelayTask, "task_id"),
+            ("leases", Lease, "lease_id"),
+            ("artifacts", ArtifactRef, "artifact_id"),
+            ("progress", ProgressRecord, "progress_id"),
+            ("gateway_sessions", GatewaySession, "session_id"),
+            ("monitor_rules", MonitorRule, "rule_id"),
+        )
+        for family, model, identity_field in record_families:
+            self._audit_legacy_record_family(
+                family,
+                model=model,
+                identity_field=identity_field,
+            )
+        self._audit_legacy_event_family(
+            "events",
+            model=RelayEvent,
+            identity_field="job_id",
+        )
+        self._audit_legacy_event_family(
+            "task_events",
+            model=TaskTimelineEvent,
+            identity_field="task_id",
+        )
+        self._audit_legacy_record_family(
+            "cursors",
+            model=Cursor,
+            identity_field="job_id",
+        )
+        self._audit_legacy_idempotency_family()
+
+    def _require_legacy_family_directory(self, family: str) -> Path | None:
+        directory = self._storage_root / family
+        try:
+            directory_stat = os.lstat(directory)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise LegacyQueueStateError(
+                family=family,
+                path=directory,
+                reason=f"cannot inspect canonical family: {type(error).__name__}",
+            ) from error
+        if not stat.S_ISDIR(directory_stat.st_mode) or _record_is_reparse(directory_stat):
+            raise LegacyQueueStateError(
+                family=family,
+                path=directory,
+                reason="canonical family is not an owned directory",
+            )
+        return directory
+
+    def _bounded_legacy_family_entries(self, family: str) -> list[Path]:
+        directory = self._require_legacy_family_directory(family)
+        if directory is None:
+            return []
+        paths: list[Path] = []
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if len(paths) >= MAX_BOUNDED_SCAN_RECORDS:
+                        raise LegacyQueueStateError(
+                            family=family,
+                            path=directory,
+                            reason=(
+                                "canonical family exceeds the bounded legacy audit limit of "
+                                f"{MAX_BOUNDED_SCAN_RECORDS} entries"
+                            ),
+                        )
+                    paths.append(Path(entry.path))
+        except LegacyQueueStateError:
+            raise
+        except OSError as error:
+            raise LegacyQueueStateError(
+                family=family,
+                path=directory,
+                reason=f"cannot scan canonical family: {type(error).__name__}",
+            ) from error
+        return paths
+
+    def _audit_legacy_record_family(
+        self,
+        family: str,
+        *,
+        model: type[Record],
+        identity_field: str,
+    ) -> None:
+        for path in self._bounded_legacy_family_entries(family):
+            self._require_legacy_regular_json(family, path)
+            record_id = path.name.removesuffix(".json")
+            self._require_legacy_durable_id(family, path, record_id)
+            try:
+                record = self._read_json_file(path, model)
+            except (OSError, ValueError, QueueConflictError) as error:
+                raise LegacyQueueStateError(
+                    family=family,
+                    path=path,
+                    reason=f"canonical record is invalid: {type(error).__name__}",
+                ) from error
+            if getattr(record, identity_field, None) != record_id:
+                raise LegacyQueueStateError(
+                    family=family,
+                    path=path,
+                    reason=f"filename/content identity mismatch for {identity_field}",
+                )
+
+    def _audit_legacy_event_family(
+        self,
+        family: str,
+        *,
+        model: type[Record],
+        identity_field: str,
+    ) -> None:
+        record_count = 0
+        for directory in self._bounded_legacy_family_entries(family):
+            try:
+                directory_stat = os.lstat(directory)
+            except OSError as error:
+                raise LegacyQueueStateError(
+                    family=family,
+                    path=directory,
+                    reason=f"cannot inspect event identity directory: {type(error).__name__}",
+                ) from error
+            if not stat.S_ISDIR(directory_stat.st_mode) or _record_is_reparse(directory_stat):
+                raise LegacyQueueStateError(
+                    family=family,
+                    path=directory,
+                    reason="event identity entry is not an owned directory",
+                )
+            self._require_legacy_durable_id(family, directory, directory.name)
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        record_count += 1
+                        path = Path(entry.path)
+                        if record_count > MAX_BOUNDED_SCAN_RECORDS:
+                            raise LegacyQueueStateError(
+                                family=family,
+                                path=directory,
+                                reason=(
+                                    "event family exceeds the bounded legacy audit limit of "
+                                    f"{MAX_BOUNDED_SCAN_RECORDS} records"
+                                ),
+                            )
+                        self._require_legacy_regular_json(family, path)
+                        sequence_text = path.name.removesuffix(".json")
+                        if (
+                            len(sequence_text) != 20
+                            or not sequence_text.isascii()
+                            or not sequence_text.isdigit()
+                        ):
+                            raise LegacyQueueStateError(
+                                family=family,
+                                path=path,
+                                reason="event filename is not a canonical 20-digit sequence",
+                            )
+                        try:
+                            record = self._read_json_file(path, model)
+                        except (OSError, ValueError, QueueConflictError) as error:
+                            raise LegacyQueueStateError(
+                                family=family,
+                                path=path,
+                                reason=f"event record is invalid: {type(error).__name__}",
+                            ) from error
+                        if getattr(record, identity_field, None) != directory.name:
+                            raise LegacyQueueStateError(
+                                family=family,
+                                path=path,
+                                reason=(
+                                    "event directory/content identity mismatch for "
+                                    f"{identity_field}"
+                                ),
+                            )
+                        if getattr(record, "seq", None) != int(sequence_text):
+                            raise LegacyQueueStateError(
+                                family=family,
+                                path=path,
+                                reason="event filename/content sequence mismatch",
+                            )
+            except LegacyQueueStateError:
+                raise
+            except OSError as error:
+                raise LegacyQueueStateError(
+                    family=family,
+                    path=directory,
+                    reason=f"cannot scan event identity directory: {type(error).__name__}",
+                ) from error
+
+    def _audit_legacy_idempotency_family(self) -> None:
+        family = "idempotency"
+        for path in self._bounded_legacy_family_entries(family):
+            self._require_legacy_regular_json(family, path)
+            filename = path.name.removesuffix(".json")
+            digest = filename.removeprefix("key_")
+            if (
+                not filename.startswith("key_")
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise LegacyQueueStateError(
+                    family=family,
+                    path=path,
+                    reason="idempotency filename is not a canonical SHA-256",
+                )
+            try:
+                raw = self._read_json_document(path)
+            except (OSError, ValueError, QueueConflictError) as error:
+                raise LegacyQueueStateError(
+                    family=family,
+                    path=path,
+                    reason=f"idempotency record is invalid: {type(error).__name__}",
+                ) from error
+            if not isinstance(raw, dict):
+                raise LegacyQueueStateError(
+                    family=family,
+                    path=path,
+                    reason="idempotency record is not an object",
+                )
+            document = cast(dict[str, object], raw)
+            self._require_legacy_durable_id(family, path, document.get("job_id"))
+            idempotency_key = document.get("idempotency_key")
+            if not isinstance(idempotency_key, str) or not idempotency_key:
+                raise LegacyQueueStateError(
+                    family=family,
+                    path=path,
+                    reason="idempotency record has no string idempotency_key",
+                )
+            if _idempotency_key_filename(idempotency_key) != filename:
+                raise LegacyQueueStateError(
+                    family=family,
+                    path=path,
+                    reason="idempotency filename/content identity mismatch",
+                )
+
+    @staticmethod
+    def _require_legacy_regular_json(family: str, path: Path) -> None:
+        try:
+            path_stat = os.lstat(path)
+        except OSError as error:
+            raise LegacyQueueStateError(
+                family=family,
+                path=path,
+                reason=f"cannot inspect canonical record: {type(error).__name__}",
+            ) from error
+        if (
+            not path.name.endswith(".json")
+            or not stat.S_ISREG(path_stat.st_mode)
+            or _record_is_reparse(path_stat)
+        ):
+            raise LegacyQueueStateError(
+                family=family,
+                path=path,
+                reason="canonical record is not an owned .json regular file",
+            )
+
+    @staticmethod
+    def _require_legacy_durable_id(family: str, path: Path, value: object) -> str:
+        if not isinstance(value, str):
+            raise LegacyQueueStateError(
+                family=family,
+                path=path,
+                reason="canonical identity is not a string",
+            )
+        try:
+            return validate_durable_record_id(value)
+        except ValueError as error:
+            raise LegacyQueueStateError(
+                family=family,
+                path=path,
+                reason=f"canonical identity is not portable: {error}",
+            ) from error
+
     def initialize(self) -> None:
         """Create the record families used by the queue."""
         if self._initialized:
-            self._ensure_extended_migration_state()
+            with self._lock:
+                self._ensure_extended_migration_state()
             return
+        self._audit_legacy_state_before_initialization()
         for family in (
             "endpoints",
             "endpoints_fresh",
@@ -323,7 +669,6 @@ class ClioCoreQueue:
             "leases_by_cluster_kind",
             "leases_by_expiry",
             "events",
-            "cursors",
             "artifacts",
             "progress",
             "task_events",
@@ -333,7 +678,6 @@ class ClioCoreQueue:
             "gateways_by_scheduler",
             "active_gateway_refs_by_job",
             "active_gateway_refs_by_session",
-            "checkpoints",
             "idempotency",
             "monitor_rules",
             "monitor_rules_by_job",
@@ -365,88 +709,98 @@ class ClioCoreQueue:
             "gc_trash",
             "global_order",
         ):
-            (self.root / family).mkdir(parents=True, exist_ok=True)
+            (self._storage_root / family).mkdir(parents=True, exist_ok=True)
         for family in _GLOBAL_ORDER_FAMILIES:
-            (self.root / "global_order" / family / "by_id").mkdir(
+            (self._storage_root / "global_order" / family / "by_id").mkdir(
                 parents=True,
                 exist_ok=True,
             )
-            (self.root / "global_order" / family / "entries").mkdir(
+            (self._storage_root / "global_order" / family / "entries").mkdir(
                 parents=True,
                 exist_ok=True,
             )
-        migration_path = self.root / "migrations" / "index-v1.json"
-        if not migration_path.exists():
-            has_legacy_jobs = next((self.root / "jobs").glob("*.json"), None) is not None
-            retention_checkpoints = {
-                family: {
-                    "cursor": None,
-                    "complete": next((self.root / family).glob("*.json"), None) is None,
-                }
-                for family in _RETENTION_INDEX_FAMILIES
-            }
-            has_legacy_retention = any(
-                checkpoint["complete"] is not True for checkpoint in retention_checkpoints.values()
-            )
-            global_order_checkpoints = {
-                family: {
-                    "cursor": None,
-                    "complete": next((self.root / family).glob("*.json"), None) is None,
-                }
-                for family in _GLOBAL_ORDER_FAMILIES
-            }
-            has_legacy_global_order = any(
-                checkpoint["complete"] is not True
-                for checkpoint in global_order_checkpoints.values()
-            )
-            operational_checkpoints = {
-                family: {
-                    "cursor": None,
-                    "complete": next((self.root / family).glob("*.json"), None) is None,
-                    **(
-                        {"schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA}
-                        if family == "leases"
-                        else {}
-                    ),
-                }
-                for family in _OPERATIONAL_INDEX_FAMILIES
-            }
-            has_legacy_operational = any(
-                checkpoint["complete"] is not True
-                for checkpoint in operational_checkpoints.values()
-            )
-            self._write_json(
-                migration_path,
-                {
-                    "schema_version": INDEX_MIGRATION_SCHEMA,
-                    "complete": (
-                        not has_legacy_jobs
-                        and not has_legacy_retention
-                        and not has_legacy_global_order
-                        and not has_legacy_operational
-                        and not _lease_operational_records_present(self.root)
-                    ),
-                    "families": {
-                        family: {"cursor": None, "complete": not has_legacy_jobs}
-                        for family in ("jobs", "tasks", "leases", "artifacts", "progress")
-                    },
-                    "finalize": {"cursor": None, "complete": not has_legacy_jobs},
-                    "order_families": {
-                        family: {"cursor": None, "complete": not has_legacy_jobs}
-                        for family in _ORDER_FAMILIES
-                    },
-                    "global_order_families": global_order_checkpoints,
-                    "retention_families": retention_checkpoints,
-                    "operational_families": operational_checkpoints,
-                    "lease_operational_repair": {
-                        "complete": not _lease_operational_records_present(self.root),
-                        "schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA,
-                    },
-                },
-            )
-        else:
-            self._ensure_extended_migration_state()
         with self._lock:
+            self._purge_write_staging_unlocked()
+            migration_path = self._storage_root / "migrations" / "index-v1.json"
+            if not migration_path.exists():
+                has_legacy_jobs = (
+                    next((self._storage_root / "jobs").glob("*.json"), None) is not None
+                )
+                retention_checkpoints = {
+                    family: {
+                        "cursor": None,
+                        "complete": (
+                            next((self._storage_root / family).glob("*.json"), None) is None
+                        ),
+                    }
+                    for family in _RETENTION_INDEX_FAMILIES
+                }
+                has_legacy_retention = any(
+                    checkpoint["complete"] is not True
+                    for checkpoint in retention_checkpoints.values()
+                )
+                global_order_checkpoints = {
+                    family: {
+                        "cursor": None,
+                        "complete": (
+                            next((self._storage_root / family).glob("*.json"), None) is None
+                        ),
+                    }
+                    for family in _GLOBAL_ORDER_FAMILIES
+                }
+                has_legacy_global_order = any(
+                    checkpoint["complete"] is not True
+                    for checkpoint in global_order_checkpoints.values()
+                )
+                operational_checkpoints = {
+                    family: {
+                        "cursor": None,
+                        "complete": (
+                            next((self._storage_root / family).glob("*.json"), None) is None
+                        ),
+                        **(
+                            {"schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA}
+                            if family == "leases"
+                            else {}
+                        ),
+                    }
+                    for family in _OPERATIONAL_INDEX_FAMILIES
+                }
+                has_legacy_operational = any(
+                    checkpoint["complete"] is not True
+                    for checkpoint in operational_checkpoints.values()
+                )
+                self._write_json(
+                    migration_path,
+                    {
+                        "schema_version": INDEX_MIGRATION_SCHEMA,
+                        "complete": (
+                            not has_legacy_jobs
+                            and not has_legacy_retention
+                            and not has_legacy_global_order
+                            and not has_legacy_operational
+                            and not _lease_operational_records_present(self._storage_root)
+                        ),
+                        "families": {
+                            family: {"cursor": None, "complete": not has_legacy_jobs}
+                            for family in ("jobs", "tasks", "leases", "artifacts", "progress")
+                        },
+                        "finalize": {"cursor": None, "complete": not has_legacy_jobs},
+                        "order_families": {
+                            family: {"cursor": None, "complete": not has_legacy_jobs}
+                            for family in _ORDER_FAMILIES
+                        },
+                        "global_order_families": global_order_checkpoints,
+                        "retention_families": retention_checkpoints,
+                        "operational_families": operational_checkpoints,
+                        "lease_operational_repair": {
+                            "complete": not _lease_operational_records_present(self._storage_root),
+                            "schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA,
+                        },
+                    },
+                )
+            else:
+                self._ensure_extended_migration_state()
             self._recover_pending_transitions_unlocked()
         self._initialized = True
 
@@ -492,7 +846,7 @@ class ClioCoreQueue:
                 if cursor is not None and not isinstance(cursor, str):
                     raise QueueConflictError(f"index migration cursor is invalid: {family}")
                 paths, has_more = _migration_batch_paths(
-                    self.root / family,
+                    self._storage_root / family,
                     cursor=cursor,
                     limit=batch_size,
                 )
@@ -526,7 +880,7 @@ class ClioCoreQueue:
                 if cursor is not None and not isinstance(cursor, str):
                     raise QueueConflictError(f"order-index migration cursor is invalid: {family}")
                 paths, has_more = _migration_batch_paths(
-                    self.root / family,
+                    self._storage_root / family,
                     cursor=cursor,
                     limit=batch_size,
                 )
@@ -561,7 +915,7 @@ class ClioCoreQueue:
                 if cursor is not None and not isinstance(cursor, str):
                     raise QueueConflictError(f"global-order migration cursor is invalid: {family}")
                 paths, has_more = _migration_batch_paths(
-                    self.root / family,
+                    self._storage_root / family,
                     cursor=cursor,
                     limit=batch_size,
                 )
@@ -602,7 +956,7 @@ class ClioCoreQueue:
                         f"retention-index migration cursor is invalid: {family}"
                     )
                 paths, has_more = _migration_batch_paths(
-                    self.root / family,
+                    self._storage_root / family,
                     cursor=cursor,
                     limit=batch_size,
                 )
@@ -662,7 +1016,7 @@ class ClioCoreQueue:
                         f"operational-index migration cursor is invalid: {family}"
                     )
                 paths, has_more = _migration_batch_paths(
-                    self.root / family,
+                    self._storage_root / family,
                     cursor=cursor,
                     limit=batch_size,
                 )
@@ -683,7 +1037,7 @@ class ClioCoreQueue:
                 if cursor is not None and not isinstance(cursor, str):
                     raise QueueConflictError("index migration finalize cursor is invalid")
                 paths, has_more = _migration_batch_paths(
-                    self.root / "jobs",
+                    self._storage_root / "jobs",
                     cursor=cursor,
                     limit=batch_size,
                 )
@@ -752,7 +1106,7 @@ class ClioCoreQueue:
             or limit > MAX_LIVE_LEASE_RECORDS
         ):
             raise QueueConflictError(f"invalid lease index repair intent: {intent_path}")
-        leases, truncated = self._scan_many(self.root / "leases", Lease, limit=limit)
+        leases, truncated = self._scan_many(self._storage_root / "leases", Lease, limit=limit)
         if truncated:
             raise QueueConflictError(
                 f"lease index repair exceeded its safety bound of {limit} records"
@@ -762,7 +1116,7 @@ class ClioCoreQueue:
         lease_tokens: set[str] = set()
         for lease in leases:
             job = self._read_optional(
-                self.root / "jobs" / f"{lease.job_id}.json",
+                self._storage_root / "jobs" / f"{lease.job_id}.json",
                 RelayJob,
             )
             if job is None:
@@ -786,7 +1140,7 @@ class ClioCoreQueue:
 
     def _clear_lease_operational_indexes_unlocked(self) -> None:
         roots = tuple(
-            self.root / family
+            self._storage_root / family
             for family in (
                 "lease_indexes",
                 "lease_identity_refs",
@@ -843,13 +1197,12 @@ class ClioCoreQueue:
 
     def register_endpoint(self, endpoint: EndpointRegistration) -> EndpointRegistration:
         """Create or refresh an endpoint registration with exact identity continuity."""
-        if not _safe_global_record_id(endpoint.endpoint_id):
-            raise QueueConflictError(f"unsafe endpoint id: {endpoint.endpoint_id!r}")
+        self._require_durable_record_id(endpoint.endpoint_id, field="endpoint_id")
         self.initialize()
         self._require_index_migration_complete()
         with self._lock:
             existing = self._read_optional(
-                self.root / "endpoints" / f"{endpoint.endpoint_id}.json",
+                self._storage_root / "endpoints" / f"{endpoint.endpoint_id}.json",
                 EndpointRegistration,
             )
             if existing is not None:
@@ -876,7 +1229,7 @@ class ClioCoreQueue:
                     update={"last_seen_at": utc_now(), "metadata": endpoint.metadata}
                 )
             self._ensure_global_order_entry_unlocked("endpoints", endpoint.endpoint_id)
-            self._write(self.root / "endpoints" / f"{endpoint.endpoint_id}.json", endpoint)
+            self._write(self._storage_root / "endpoints" / f"{endpoint.endpoint_id}.json", endpoint)
             self._index_fresh_endpoint_unlocked(endpoint)
         return endpoint
 
@@ -885,9 +1238,8 @@ class ClioCoreQueue:
         job: RelayJob,
     ) -> IdempotentSubmissionResolution:
         """Resolve canonical idempotency identity without repairing or writing records."""
+        self._require_durable_record_id(job.job_id, field="job_id")
         _validate_new_owner_session_metadata(job.metadata)
-        if not _safe_global_record_id(job.job_id):
-            raise QueueConflictError(f"unsafe job id: {job.job_id!r}")
         self.initialize()
         self._require_index_migration_complete()
         job_digest = _job_idempotency_digest(job)
@@ -895,7 +1247,9 @@ class ClioCoreQueue:
             raise QueueConflictError("submitted job carries a mismatched submission_digest")
         submitted = job.model_copy(update={"submission_digest": job_digest})
         key_path = (
-            self.root / "idempotency" / f"{_idempotency_key_filename(job.idempotency_key)}.json"
+            self._storage_root
+            / "idempotency"
+            / f"{_idempotency_key_filename(job.idempotency_key)}.json"
         )
         with self._lock:
             try:
@@ -935,7 +1289,7 @@ class ClioCoreQueue:
                     existing_job=retired,
                 )
             existing = self._read_optional(
-                self.root / "jobs" / f"{canonical_job_id}.json",
+                self._storage_root / "jobs" / f"{canonical_job_id}.json",
                 RelayJob,
             )
             if existing is not None:
@@ -962,13 +1316,14 @@ class ClioCoreQueue:
 
     def submit_job(self, job: RelayJob) -> RelayJob:
         """Submit a job, returning the existing record for a repeated idempotency key."""
+        self._require_durable_record_id(job.job_id, field="job_id")
         _validate_new_owner_session_metadata(job.metadata)
-        if not _safe_global_record_id(job.job_id):
-            raise QueueConflictError(f"unsafe job id: {job.job_id!r}")
         self.initialize()
         self._require_index_migration_complete()
         key_path = (
-            self.root / "idempotency" / f"{_idempotency_key_filename(job.idempotency_key)}.json"
+            self._storage_root
+            / "idempotency"
+            / f"{_idempotency_key_filename(job.idempotency_key)}.json"
         )
         job_digest = _job_idempotency_digest(job)
         if job.submission_digest not in {None, job_digest}:
@@ -1010,7 +1365,7 @@ class ClioCoreQueue:
                 if existing_state == "retired":
                     return self._replay_retired_job(job, existing, job_digest=job_digest)
                 existing_job = self._read_optional(
-                    self.root / "jobs" / f"{existing_job_id}.json",
+                    self._storage_root / "jobs" / f"{existing_job_id}.json",
                     RelayJob,
                 )
                 if existing_job is not None:
@@ -1082,7 +1437,7 @@ class ClioCoreQueue:
         if not isinstance(job_id, str) or not job_id:
             raise QueueConflictError("retired idempotency record has no job_id")
         tombstone = self._read_optional(
-            self.root / "job_tombstones" / f"{self._safe_key(job_id)}.json",
+            self._storage_root / "job_tombstones" / f"{self._durable_key(job_id)}.json",
             JobTombstone,
         )
         if tombstone is None:
@@ -1116,22 +1471,30 @@ class ClioCoreQueue:
 
     def get_job(self, job_id: str) -> RelayJob:
         """Return a job by id."""
-        path = self.root / "jobs" / f"{job_id}.json"
+        job_id = self._require_durable_record_id(job_id, field="job_id")
+        path = self._storage_root / "jobs" / f"{job_id}.json"
         job = self._read_optional(path, RelayJob)
         if job is None:
             raise NotFoundError(f"job not found: {job_id}")
+        if job.job_id != job_id:
+            raise QueueConflictError(f"canonical job identity mismatch: {path}")
         return job
 
     def get_job_tombstone(self, job_id: str) -> JobTombstone | None:
         """Return the durable terminal tombstone for a retired job, if present."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         self.initialize()
-        return self._read_optional(
-            self.root / "job_tombstones" / f"{self._safe_key(job_id)}.json",
+        tombstone = self._read_optional(
+            self._storage_root / "job_tombstones" / f"{self._durable_key(job_id)}.json",
             JobTombstone,
         )
+        if tombstone is not None and tombstone.job_id != job_id:
+            raise QueueConflictError(f"canonical job tombstone identity mismatch: {job_id}")
+        return tombstone
 
     def plan_terminal_job_gc(self, job_id: str) -> TerminalJobGcPlan:
         """Build a read-only, fail-closed terminal-job collection plan."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         self.initialize()
         tombstone = self.get_job_tombstone(job_id)
         if tombstone is not None:
@@ -1162,6 +1525,7 @@ class ClioCoreQueue:
         external_quarantine_id: str | None = None,
     ) -> TerminalJobGcResult:
         """Dry-run or advance core GC after an outer coordinator quarantines spool data."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         batch_size = validate_gc_batch_size(batch_size)
         plan = self.plan_terminal_job_gc(job_id)
         if expected_updated_at is not None and plan.expected_updated_at != expected_updated_at:
@@ -1242,7 +1606,7 @@ class ClioCoreQueue:
             if tombstone.phase is JobGcPhase.IDEMPOTENCY_RETIRED:
                 if not tombstone.records_trash_started:
                     current_job = self._read_optional(
-                        self.root / "jobs" / f"{job_id}.json",
+                        self._storage_root / "jobs" / f"{job_id}.json",
                         RelayJob,
                     )
                     if current_job is not None:
@@ -1328,7 +1692,13 @@ class ClioCoreQueue:
     def list_jobs(self) -> list[RelayJob]:
         """Return all jobs in durable submission order."""
         self.initialize()
-        jobs = list(self._read_many(self.root / "jobs", RelayJob))
+        jobs = list(
+            self._read_many(
+                self._storage_root / "jobs",
+                RelayJob,
+                identity_field="job_id",
+            )
+        )
         with self._lock:
             return sorted(jobs, key=self._job_submission_order_key_unlocked)
 
@@ -1393,7 +1763,7 @@ class ClioCoreQueue:
             self._recover_pending_transitions_unlocked()
             self._repair_active_job_index_unlocked()
             indexed_jobs, truncated = self._scan_many(
-                self.root / "jobs_active",
+                self._storage_root / "jobs_active",
                 RelayJob,
                 limit=limit,
             )
@@ -1406,7 +1776,7 @@ class ClioCoreQueue:
         with self._lock:
             self._recover_pending_transitions_unlocked()
             count, over_capacity = _bounded_regular_json_count(
-                self.root / "jobs_active",
+                self._storage_root / "jobs_active",
                 limit=MAX_ACTIVE_JOB_RECORDS,
                 label="active job index",
             )
@@ -1416,7 +1786,7 @@ class ClioCoreQueue:
                 pass
             else:
                 count, over_capacity = _bounded_regular_json_count(
-                    self.root / "jobs_active",
+                    self._storage_root / "jobs_active",
                     limit=MAX_ACTIVE_JOB_RECORDS,
                     label="active job index",
                 )
@@ -1440,6 +1810,11 @@ class ClioCoreQueue:
         """Read one generation-scoped membership window without global job history."""
         if not owner_session_id:
             raise ValueError("owner_session_id must not be empty")
+        if session_generation_id is not None:
+            session_generation_id = self._require_durable_record_id(
+                session_generation_id,
+                field="session_generation_id",
+            )
         limit = validate_response_page_limit(limit)
         self.initialize()
         self._require_index_migration_complete()
@@ -1495,6 +1870,7 @@ class ClioCoreQueue:
         metadata: dict[str, object],
     ) -> RelayJob:
         """Merge durable execution metadata without changing job state."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         self.initialize()
         with self._lock:
             self._recover_pending_transitions_unlocked()
@@ -1510,7 +1886,13 @@ class ClioCoreQueue:
     def list_endpoints(self, cluster: str | None = None) -> list[EndpointRegistration]:
         """Return registered endpoints, optionally filtered by cluster."""
         self.initialize()
-        endpoints = list(self._read_many(self.root / "endpoints", EndpointRegistration))
+        endpoints = list(
+            self._read_many(
+                self._storage_root / "endpoints",
+                EndpointRegistration,
+                identity_field="endpoint_id",
+            )
+        )
         if cluster is not None:
             endpoints = [endpoint for endpoint in endpoints if endpoint.cluster == cluster]
         return sorted(endpoints, key=lambda endpoint: endpoint.registered_at)
@@ -1544,9 +1926,10 @@ class ClioCoreQueue:
     ) -> tuple[list[EndpointRegistration], bool]:
         """Read a bounded endpoint snapshot."""
         endpoints, truncated = self._scan_many(
-            self.root / "endpoints",
+            self._storage_root / "endpoints",
             EndpointRegistration,
             limit=limit,
+            identity_field="endpoint_id",
         )
         if cluster is not None:
             endpoints = [endpoint for endpoint in endpoints if endpoint.cluster == cluster]
@@ -1576,10 +1959,10 @@ class ClioCoreQueue:
         roots: list[Path]
         overflow = False
         if cluster is not None:
-            roots = [self.root / "endpoints_fresh" / _stable_ref_token(cluster)]
+            roots = [self._storage_root / "endpoints_fresh" / _stable_ref_token(cluster)]
         else:
             roots = []
-            with os.scandir(self.root / "endpoints_fresh") as entries:
+            with os.scandir(self._storage_root / "endpoints_fresh") as entries:
                 for entry in entries:
                     if not entry.is_dir(follow_symlinks=False):
                         raise QueueConflictError(
@@ -1631,15 +2014,25 @@ class ClioCoreQueue:
 
     def get_endpoint(self, endpoint_id: str) -> EndpointRegistration | None:
         """Return one exact endpoint registration when present."""
-        return self._read_optional(
-            self.root / "endpoints" / f"{endpoint_id}.json",
+        endpoint_id = self._require_durable_record_id(endpoint_id, field="endpoint_id")
+        endpoint = self._read_optional(
+            self._storage_root / "endpoints" / f"{endpoint_id}.json",
             EndpointRegistration,
         )
+        if endpoint is not None and endpoint.endpoint_id != endpoint_id:
+            raise QueueConflictError(f"canonical endpoint identity mismatch: {endpoint_id}")
+        return endpoint
 
     def list_leases(self, cluster: str | None = None) -> list[Lease]:
         """Return active and expired leases, optionally filtered by job cluster."""
         self.initialize()
-        leases = list(self._read_many(self.root / "leases", Lease))
+        leases = list(
+            self._read_many(
+                self._storage_root / "leases",
+                Lease,
+                identity_field="lease_id",
+            )
+        )
         if cluster is not None:
             matched: list[Lease] = []
             for lease in leases:
@@ -1659,7 +2052,12 @@ class ClioCoreQueue:
         cluster: str | None = None,
     ) -> tuple[list[Lease], bool]:
         """Read a bounded durable lease snapshot."""
-        leases, truncated = self._scan_many(self.root / "leases", Lease, limit=limit)
+        leases, truncated = self._scan_many(
+            self._storage_root / "leases",
+            Lease,
+            limit=limit,
+            identity_field="lease_id",
+        )
         if cluster is not None:
             matched: list[Lease] = []
             for lease in leases:
@@ -1674,11 +2072,12 @@ class ClioCoreQueue:
 
     def scan_job_leases(self, job_id: str, *, limit: int) -> tuple[list[Lease], bool]:
         """Read bounded leases from the exact per-job index."""
-        directory = self.root / "leases_by_job" / self._safe_key(job_id)
+        job_id = self._require_durable_record_id(job_id, field="job_id")
+        directory = self._storage_root / "leases_by_job" / self._durable_key(job_id)
         if self._job_index_exists(job_id):
             leases, truncated = self._scan_many(directory, Lease, limit=limit)
             return sorted(leases, key=lambda lease: lease.acquired_at), truncated
-        leases, truncated = self._scan_many(self.root / "leases", Lease, limit=limit)
+        leases, truncated = self._scan_many(self._storage_root / "leases", Lease, limit=limit)
         return [lease for lease in leases if lease.job_id == job_id], truncated
 
     def _lease_index_identity(
@@ -1695,8 +2094,7 @@ class ClioCoreQueue:
             (lease.job_id, "lease job id"),
             (lease.endpoint_id, "lease endpoint id"),
         ):
-            if not _safe_global_record_id(value):
-                raise QueueConflictError(f"unsafe {label}: {value!r}")
+            self._require_durable_record_id(value, field=label.replace(" ", "_"))
         return _LeaseIndexIdentity(
             lease_id=lease.lease_id,
             job_id=lease.job_id,
@@ -1710,7 +2108,7 @@ class ClioCoreQueue:
         return self._lease_index_path_from_token(_lease_index_token(lease_id))
 
     def _lease_index_path_from_token(self, lease_token: str) -> Path:
-        return self.root / "lease_indexes" / f"{lease_token}.json"
+        return self._storage_root / "lease_indexes" / f"{lease_token}.json"
 
     def _lease_identity_ref_path(
         self,
@@ -1724,16 +2122,21 @@ class ClioCoreQueue:
         lease_token: str,
         identity_token: str,
     ) -> Path:
-        return self.root / "lease_identity_refs" / f"{lease_token}.{identity_token}.ref"
+        return self._storage_root / "lease_identity_refs" / f"{lease_token}.{identity_token}.ref"
 
     def _lease_endpoint_directory(self, endpoint_id: str) -> Path:
         return self._lease_endpoint_directory_from_token(_lease_endpoint_token(endpoint_id))
 
     def _lease_endpoint_directory_from_token(self, endpoint_token: str) -> Path:
-        return self.root / "leases_by_endpoint" / endpoint_token
+        return self._storage_root / "leases_by_endpoint" / endpoint_token
 
     def _lease_cluster_kind_directory(self, cluster: str, kind: JobKind) -> Path:
-        return self.root / "leases_by_cluster_kind" / _lease_cluster_token(cluster) / kind.value
+        return (
+            self._storage_root
+            / "leases_by_cluster_kind"
+            / _lease_cluster_token(cluster)
+            / kind.value
+        )
 
     def _lease_endpoint_ref_path(self, identity: _LeaseIndexIdentity) -> Path:
         return self._lease_endpoint_directory(identity.endpoint_id) / _lease_scope_ref_name(
@@ -1757,7 +2160,7 @@ class ClioCoreQueue:
         )
 
     def _lease_expiry_ref_path(self, identity: _LeaseIndexIdentity) -> Path:
-        return self.root / "leases_by_expiry" / _lease_expiry_ref_name(identity)
+        return self._storage_root / "leases_by_expiry" / _lease_expiry_ref_name(identity)
 
     def _write_lease_index_identity_unlocked(self, identity: _LeaseIndexIdentity) -> None:
         path = self._lease_index_path(identity.lease_id)
@@ -1914,7 +2317,7 @@ class ClioCoreQueue:
         create: bool,
     ) -> bool:
         try:
-            relative = directory.relative_to(self.root)
+            relative = directory.relative_to(self._storage_root)
         except ValueError as exc:
             raise QueueConflictError(
                 f"lease index directory escaped queue root: {directory}"
@@ -1928,12 +2331,12 @@ class ClioCoreQueue:
         }:
             raise QueueConflictError(f"unsupported lease index directory: {directory}")
         try:
-            root_stat = os.lstat(self.root)
+            root_stat = os.lstat(self._storage_root)
         except FileNotFoundError as exc:
             raise QueueConflictError(f"queue root is missing: {self.root}") from exc
         if not stat.S_ISDIR(root_stat.st_mode) or _record_is_reparse(root_stat):
             raise QueueConflictError(f"queue root is unsafe: {self.root}")
-        current = self.root
+        current = self._storage_root
         for part in relative.parts:
             current /= part
             try:
@@ -1994,7 +2397,7 @@ class ClioCoreQueue:
         limit: int,
     ) -> tuple[list[_LeaseExpiryReference], bool]:
         """Enumerate bounded expiry identities entirely from validated filenames."""
-        directory = self.root / "leases_by_expiry"
+        directory = self._storage_root / "leases_by_expiry"
         self._require_safe_lease_index_directory(directory, create=False)
         try:
             directory_stat = os.lstat(directory)
@@ -2033,7 +2436,7 @@ class ClioCoreQueue:
         """Enumerate bounded identity sentinels without opening manifest JSON."""
         if limit < 1:
             raise ValueError("lease identity reference scan limit must be at least 1")
-        directory = self.root / "lease_identity_refs"
+        directory = self._storage_root / "lease_identity_refs"
         try:
             directory_stat = os.lstat(directory)
         except FileNotFoundError:
@@ -2158,6 +2561,9 @@ class ClioCoreQueue:
         leased_by: str | None | object = _UNSET,
     ) -> RelayJob:
         """Update a job state and append a state event."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
+        if isinstance(leased_by, str):
+            self._require_durable_record_id(leased_by, field="leased_by")
         self.initialize()
         with self._lock:
             self._recover_pending_transitions_unlocked()
@@ -2199,6 +2605,7 @@ class ClioCoreQueue:
         stale cleanup plan cannot cancel a job that was leased or otherwise
         updated after discovery.
         """
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         self.initialize()
         with self._lock:
             self._recover_pending_transitions_unlocked()
@@ -2269,6 +2676,7 @@ class ClioCoreQueue:
 
     def acknowledge_job_cancellation(self, job_id: str) -> RelayJob:
         """Terminalize a requested cancellation after worker cleanup succeeds."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         self.initialize()
         with self._lock:
             self._recover_pending_transitions_unlocked()
@@ -2318,6 +2726,7 @@ class ClioCoreQueue:
         reason: str,
     ) -> SchedulerCancelPending:
         """Ensure retryable scheduler cancellation work exists for one job."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         self.initialize()
         self._require_index_migration_complete()
         with self._lock:
@@ -2335,6 +2744,7 @@ class ClioCoreQueue:
         cluster: str,
     ) -> SchedulerCancelPending | None:
         """Return exact pending scheduler cancellation state when present."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         path = self._scheduler_cancel_record_path(
             "scheduler_cancel_pending",
             cluster,
@@ -2352,6 +2762,7 @@ class ClioCoreQueue:
         cluster: str,
     ) -> SchedulerCancelPending | None:
         """Return terminal scheduler cancellation evidence when present."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         path = self._scheduler_cancel_record_path(
             "scheduler_cancel_dispositions",
             cluster,
@@ -2383,7 +2794,7 @@ class ClioCoreQueue:
         self._require_index_migration_complete()
         with self._lock:
             records, index_truncated = self._scan_many(
-                self.root / "scheduler_cancel_pending" / _stable_ref_token(cluster),
+                self._storage_root / "scheduler_cancel_pending" / _stable_ref_token(cluster),
                 SchedulerCancelPending,
                 limit=MAX_ACTIVE_JOB_RECORDS,
             )
@@ -2423,6 +2834,7 @@ class ClioCoreQueue:
         ownership_verified: bool,
     ) -> SchedulerCancelPending:
         """Add a verified pending identity or a terminal refused disposition."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         self.initialize()
         with self._lock:
             record = self._require_scheduler_cancel_pending_unlocked(job_id, cluster=cluster)
@@ -2479,6 +2891,7 @@ class ClioCoreQueue:
         cluster: str,
     ) -> SchedulerCancelPending:
         """Declare the current durable identity set complete before attempts begin."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         self.initialize()
         with self._lock:
             record = self._require_scheduler_cancel_pending_unlocked(job_id, cluster=cluster)
@@ -2504,6 +2917,7 @@ class ClioCoreQueue:
         retry_delay_seconds: float,
     ) -> SchedulerCancelPending:
         """Persist one scheduler cancellation attempt and its next/final disposition."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         self.initialize()
         with self._lock:
             record = self._require_scheduler_cancel_pending_unlocked(job_id, cluster=cluster)
@@ -2562,6 +2976,7 @@ class ClioCoreQueue:
         retry_delay_seconds: float,
     ) -> SchedulerCancelPending:
         """Persist provider confirmation after a cancellation request was accepted."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         self.initialize()
         with self._lock:
             record = self._require_scheduler_cancel_pending_unlocked(job_id, cluster=cluster)
@@ -2624,6 +3039,7 @@ class ClioCoreQueue:
         superseded: bool = False,
     ) -> SchedulerCancelPending:
         """Close pending work when no scheduler identity exists or relay state won the race."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         self.initialize()
         with self._lock:
             record = self._require_scheduler_cancel_pending_unlocked(job_id, cluster=cluster)
@@ -2664,6 +3080,7 @@ class ClioCoreQueue:
         kind_concurrency: KindConcurrencyInput | None = None,
     ) -> Lease | None:
         """Lease the next queued job for a cluster worker."""
+        endpoint_id = self._require_durable_record_id(endpoint_id, field="endpoint_id")
         normalized_kind_concurrency = normalize_kind_concurrency(kind_concurrency)
         self.initialize()
         with self._lock:
@@ -2686,7 +3103,7 @@ class ClioCoreQueue:
             if global_lease_total >= MAX_LIVE_LEASE_RECORDS:
                 return None
             queued_jobs, _ = self._scan_many(
-                self.root / "jobs_queued",
+                self._storage_root / "jobs_queued",
                 RelayJob,
                 limit=MAX_ACTIVE_JOB_RECORDS,
             )
@@ -2721,6 +3138,8 @@ class ClioCoreQueue:
         Unlike :meth:`acquire_next_job`, this method never leases a different
         operator or validation workload while attempting an exact admission.
         """
+        job_id = self._require_durable_record_id(job_id, field="job_id")
+        endpoint_id = self._require_durable_record_id(endpoint_id, field="endpoint_id")
         normalized_kind_concurrency = normalize_kind_concurrency(kind_concurrency)
         self.initialize()
         with self._lock:
@@ -2775,6 +3194,8 @@ class ClioCoreQueue:
         worker from executing a bounded admission probe between submission and
         the exact lease decision.
         """
+        self._require_durable_record_id(job.job_id, field="job_id")
+        endpoint_id = self._require_durable_record_id(endpoint_id, field="endpoint_id")
         normalized_kind_concurrency = normalize_kind_concurrency(kind_concurrency)
         self.initialize()
         with self._lock:
@@ -2857,7 +3278,7 @@ class ClioCoreQueue:
             },
         )
         self._write_job_unlocked(leased_job)
-        self._write(self.root / "leases" / f"{lease.lease_id}.json", lease)
+        self._write(self._storage_root / "leases" / f"{lease.lease_id}.json", lease)
         self._write(self._job_record_path("leases_by_job", job.job_id, lease.lease_id), lease)
         self._sync_lease_operational_indexes_unlocked(lease, job=leased_job)
         self._after_lease_operational_index_write(lease)
@@ -2878,6 +3299,19 @@ class ClioCoreQueue:
         """Count structurally validated refs without opening global lease JSON."""
         counts, _global_total = self._lease_capacity_snapshot(cluster=cluster)
         return counts
+
+    def lease_admission_capacity_snapshot(
+        self,
+        *,
+        cluster: str,
+    ) -> tuple[dict[JobKind, int], int]:
+        """Return structurally validated pre-recovery lease admission counts."""
+        self.initialize()
+        self._require_index_migration_complete()
+        with self._lock:
+            self._recover_pending_transitions_unlocked()
+            counts, global_total = self._lease_capacity_snapshot(cluster=cluster)
+            return dict(counts), global_total
 
     def _lease_capacity_snapshot(
         self,
@@ -2956,14 +3390,17 @@ class ClioCoreQueue:
 
     def renew_lease(self, lease_id: str, *, ttl_seconds: int = 300) -> Lease | None:
         """Extend an active lease TTL."""
+        lease_id = self._require_durable_record_id(lease_id, field="lease_id")
         self.initialize()
         self._require_index_migration_complete()
         with self._lock:
             self._recover_pending_transitions_unlocked()
-            path = self.root / "leases" / f"{lease_id}.json"
+            path = self._storage_root / "leases" / f"{lease_id}.json"
             lease = self._read_optional(path, Lease)
             if lease is None:
                 return None
+            if lease.lease_id != lease_id:
+                raise QueueConflictError(f"canonical lease identity mismatch: {path}")
             job = self.get_job(lease.job_id)
             renewed = Lease.new(lease.job_id, lease.endpoint_id, ttl_seconds)
             renewed = renewed.model_copy(update={"lease_id": lease.lease_id})
@@ -3008,6 +3445,7 @@ class ClioCoreQueue:
         max_attempts: int = 3,
     ) -> RelayJob | None:
         """Recover exactly one job when its durable worker lease is expired."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
         self.initialize()
@@ -3099,7 +3537,7 @@ class ClioCoreQueue:
                 (self._lease_expiry_ref_path(indexed), "lease expiry reference"),
             ):
                 self._require_empty_lease_ref(path, label=label)
-        event_dir = self.root / "events" / job.job_id
+        event_dir = self._storage_root / "events" / job.job_id
         event = RelayEvent(
             job_id=job.job_id,
             seq=self._next_event_seq(job.job_id, event_dir),
@@ -3197,7 +3635,7 @@ class ClioCoreQueue:
         ):
             raise QueueConflictError(f"stale recovery intent identity mismatch: {intent_path}")
         current = self._read_optional(
-            self.root / "jobs" / f"{original.job_id}.json",
+            self._storage_root / "jobs" / f"{original.job_id}.json",
             RelayJob,
         )
         if current != original and current != target:
@@ -3206,7 +3644,7 @@ class ClioCoreQueue:
             )
         for lease in leases:
             canonical_lease = self._read_optional(
-                self.root / "leases" / f"{lease.lease_id}.json",
+                self._storage_root / "leases" / f"{lease.lease_id}.json",
                 Lease,
             )
             if canonical_lease is not None and canonical_lease != lease:
@@ -3244,7 +3682,7 @@ class ClioCoreQueue:
         return target
 
     def _write_recovery_event_unlocked(self, event: RelayEvent) -> None:
-        event_path = self.root / "events" / event.job_id / f"{event.seq:020d}.json"
+        event_path = self._storage_root / "events" / event.job_id / f"{event.seq:020d}.json"
         existing = self._read_optional(event_path, RelayEvent)
         if existing is not None and existing != event:
             raise QueueConflictError(
@@ -3274,12 +3712,15 @@ class ClioCoreQueue:
 
     def release_lease(self, lease_id: str) -> None:
         """Remove a lease record."""
+        lease_id = self._require_durable_record_id(lease_id, field="lease_id")
         self.initialize()
         with self._lock:
             self._recover_pending_transitions_unlocked()
-            path = self.root / "leases" / f"{lease_id}.json"
+            path = self._storage_root / "leases" / f"{lease_id}.json"
             lease = self._read_optional(path, Lease)
             if lease is not None:
+                if lease.lease_id != lease_id:
+                    raise QueueConflictError(f"canonical lease identity mismatch: {path}")
                 self._delete_lease_unlocked(lease)
 
     def _delete_lease_unlocked(
@@ -3328,7 +3769,7 @@ class ClioCoreQueue:
                     "index": _lease_index_document(identity),
                 },
             )
-        (self.root / "leases" / f"{lease.lease_id}.json").unlink(missing_ok=True)
+        (self._storage_root / "leases" / f"{lease.lease_id}.json").unlink(missing_ok=True)
         self._after_lease_canonical_delete(lease)
         self._job_record_path("leases_by_job", lease.job_id, lease.lease_id).unlink(missing_ok=True)
         self._delete_lease_operational_indexes_unlocked(identity)
@@ -3344,6 +3785,8 @@ class ClioCoreQueue:
 
     def append_task(self, task: RelayTask) -> RelayTask:
         """Create a task record."""
+        self._require_durable_record_id(task.task_id, field="task_id")
+        self._require_durable_record_id(task.job_id, field="job_id")
         self.initialize()
         with self._lock:
             self._recover_pending_transitions_unlocked()
@@ -3369,13 +3812,16 @@ class ClioCoreQueue:
         metadata: dict[str, object] | None = None,
     ) -> RelayTask:
         """Update a task state and append a task event."""
+        task_id = self._require_durable_record_id(task_id, field="task_id")
         self.initialize()
         with self._lock:
             self._recover_pending_transitions_unlocked()
-            path = self.root / "tasks" / f"{task_id}.json"
+            path = self._storage_root / "tasks" / f"{task_id}.json"
             task = self._read_optional(path, RelayTask)
             if task is None:
                 raise NotFoundError(f"task not found: {task_id}")
+            if task.task_id != task_id:
+                raise QueueConflictError(f"canonical task identity mismatch: {path}")
             update_metadata = dict(task.metadata)
             if metadata:
                 update_metadata.update(metadata)
@@ -3406,13 +3852,16 @@ class ClioCoreQueue:
         metadata: dict[str, object],
     ) -> RelayTask:
         """Merge task metadata without changing task state or emitting a task event."""
+        task_id = self._require_durable_record_id(task_id, field="task_id")
         self.initialize()
         with self._lock:
             self._recover_pending_transitions_unlocked()
-            path = self.root / "tasks" / f"{task_id}.json"
+            path = self._storage_root / "tasks" / f"{task_id}.json"
             task = self._read_optional(path, RelayTask)
             if task is None:
                 raise NotFoundError(f"task not found: {task_id}")
+            if task.task_id != task_id:
+                raise QueueConflictError(f"canonical task identity mismatch: {path}")
             updated_metadata = dict(task.metadata)
             updated_metadata.update(metadata)
             updated = task.model_copy(
@@ -3423,13 +3872,21 @@ class ClioCoreQueue:
 
     def list_tasks(self, job_id: str | None = None) -> list[RelayTask]:
         """Return durable task records, optionally filtered by job id."""
+        if job_id is not None:
+            job_id = self._require_durable_record_id(job_id, field="job_id")
         self.initialize()
         if job_id is not None and self._job_index_exists(job_id):
             tasks = list(
-                self._read_many(self.root / "tasks_by_job" / self._safe_key(job_id), RelayTask)
+                self._read_many(
+                    self._storage_root / "tasks_by_job" / self._durable_key(job_id),
+                    RelayTask,
+                    identity_field="task_id",
+                )
             )
         else:
-            tasks = list(self._read_many(self.root / "tasks", RelayTask))
+            tasks = list(
+                self._read_many(self._storage_root / "tasks", RelayTask, identity_field="task_id")
+            )
             if job_id is not None:
                 tasks = [task for task in tasks if task.job_id == job_id]
         return sorted(tasks, key=lambda task: task.created_at)
@@ -3442,6 +3899,7 @@ class ClioCoreQueue:
         limit: int = 100,
     ) -> tuple[list[RelayTask], int | None, int]:
         """Read one stable task page from the per-job sequence index."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         return self._read_ordered_job_page(
             job_id,
             family="task",
@@ -3453,28 +3911,37 @@ class ClioCoreQueue:
 
     def scan_job_tasks(self, job_id: str, *, limit: int) -> tuple[list[RelayTask], bool]:
         """Read bounded task records from one exact job index."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         directory = (
-            self.root / "tasks_by_job" / self._safe_key(job_id)
+            self._storage_root / "tasks_by_job" / self._durable_key(job_id)
             if self._job_index_exists(job_id)
-            else self.root / "tasks"
+            else self._storage_root / "tasks"
         )
-        tasks, truncated = self._scan_many(directory, RelayTask, limit=limit)
+        tasks, truncated = self._scan_many(
+            directory,
+            RelayTask,
+            limit=limit,
+            identity_field="task_id",
+        )
         if not self._job_index_exists(job_id):
             tasks = [task for task in tasks if task.job_id == job_id]
         return sorted(tasks, key=lambda task: task.created_at), truncated
 
     def append_task_event(self, event: TaskTimelineEvent) -> TaskTimelineEvent:
         """Append a structured task timeline event with a per-task sequence."""
+        self._require_durable_record_id(event.task_id, field="task_id")
+        for artifact_id in event.artifact_refs:
+            self._require_durable_record_id(artifact_id, field="artifact_id")
         self.initialize()
         with self._lock:
             task = self.get_task(event.task_id)
-            event_dir = self.root / "task_events" / event.task_id
+            event_dir = self._storage_root / "task_events" / event.task_id
             event_dir.mkdir(parents=True, exist_ok=True)
             seq = self._next_task_event_seq(event.task_id, event_dir)
             saved = event.model_copy(update={"seq": seq})
             self._write(event_dir / f"{seq:020d}.json", saved)
             self._write_json(
-                self.root / "task_event_heads" / f"{event.task_id}.json",
+                self._storage_root / "task_event_heads" / f"{event.task_id}.json",
                 {"task_id": event.task_id, "latest_seq": seq},
             )
             self.append_event(
@@ -3500,13 +3967,14 @@ class ClioCoreQueue:
         limit: int = 100,
     ) -> tuple[list[TaskTimelineEvent], int]:
         """Drain structured task timeline events from a task cursor."""
+        task_id = self._require_durable_record_id(task_id, field="task_id")
         cursor = validate_record_cursor(cursor, field_name="task event cursor")
         limit = validate_response_page_limit(limit, field_name="task event limit")
         self.initialize()
         self.get_task(task_id)
-        event_directory = self.root / "task_events" / task_id
+        event_directory = self._storage_root / "task_events" / task_id
         durable_latest_seq = _last_contiguous_sequence(event_directory)
-        head_path = self.root / "task_event_heads" / f"{task_id}.json"
+        head_path = self._storage_root / "task_event_heads" / f"{task_id}.json"
         try:
             raw_head = self._read_json_document(head_path)
         except FileNotFoundError:
@@ -3530,7 +3998,7 @@ class ClioCoreQueue:
         drained: list[TaskTimelineEvent] = []
         for sequence in range(cursor, stop):
             event = self._read_optional(
-                self.root / "task_events" / task_id / f"{sequence:020d}.json",
+                self._storage_root / "task_events" / task_id / f"{sequence:020d}.json",
                 TaskTimelineEvent,
             )
             if event is None or event.seq != sequence or event.task_id != task_id:
@@ -3543,9 +4011,12 @@ class ClioCoreQueue:
 
     def get_task(self, task_id: str) -> RelayTask:
         """Return a task by id."""
-        task = self._read_optional(self.root / "tasks" / f"{task_id}.json", RelayTask)
+        task_id = self._require_durable_record_id(task_id, field="task_id")
+        task = self._read_optional(self._storage_root / "tasks" / f"{task_id}.json", RelayTask)
         if task is None:
             raise NotFoundError(f"task not found: {task_id}")
+        if task.task_id != task_id:
+            raise QueueConflictError(f"canonical task identity mismatch: {task_id}")
         return task
 
     def register_execution_cleanup(
@@ -3554,12 +4025,15 @@ class ClioCoreQueue:
         metadata: dict[str, object],
     ) -> RelayTask:
         """Atomically update a task and make its execution cleanup discoverable."""
+        task_id = self._require_durable_record_id(task_id, field="task_id")
         self.initialize()
         with self._lock:
-            path = self.root / "tasks" / f"{task_id}.json"
+            path = self._storage_root / "tasks" / f"{task_id}.json"
             task = self._read_optional(path, RelayTask)
             if task is None:
                 raise NotFoundError(f"task not found: {task_id}")
+            if task.task_id != task_id:
+                raise QueueConflictError(f"canonical task identity mismatch: {path}")
             updated_metadata = dict(task.metadata)
             updated_metadata.update(metadata)
             updated = task.model_copy(
@@ -3606,12 +4080,16 @@ class ClioCoreQueue:
         metadata: dict[str, object],
     ) -> RelayTask:
         """Persist cleanup evidence before removing one durable retry marker."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
+        task_id = self._require_durable_record_id(task_id, field="task_id")
         self.initialize()
         with self._lock:
-            path = self.root / "tasks" / f"{task_id}.json"
+            path = self._storage_root / "tasks" / f"{task_id}.json"
             task = self._read_optional(path, RelayTask)
             if task is None:
                 raise NotFoundError(f"task not found: {task_id}")
+            if task.task_id != task_id:
+                raise QueueConflictError(f"canonical task identity mismatch: {path}")
             if task.job_id != job_id:
                 raise QueueConflictError(
                     f"task {task_id} belongs to job {task.job_id}, not requested job {job_id}"
@@ -3660,12 +4138,16 @@ class ClioCoreQueue:
         cleanup: dict[str, object],
     ) -> RelayTask:
         """Crash-safely upgrade an anchored legacy marker to staged cleanup."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
+        task_id = self._require_durable_record_id(task_id, field="task_id")
         self.initialize()
         with self._lock:
-            path = self.root / "tasks" / f"{task_id}.json"
+            path = self._storage_root / "tasks" / f"{task_id}.json"
             task = self._read_optional(path, RelayTask)
             if task is None:
                 raise NotFoundError(f"task not found: {task_id}")
+            if task.task_id != task_id:
+                raise QueueConflictError(f"canonical task identity mismatch: {path}")
             if task.job_id != job_id:
                 raise QueueConflictError(
                     f"task {task_id} belongs to job {task.job_id}, not requested job {job_id}"
@@ -3731,12 +4213,16 @@ class ClioCoreQueue:
         quarantine_name: str,
     ) -> RelayTask:
         """Persist one exact sidecar quarantine before acknowledging cleanup."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
+        task_id = self._require_durable_record_id(task_id, field="task_id")
         self.initialize()
         with self._lock:
-            path = self.root / "tasks" / f"{task_id}.json"
+            path = self._storage_root / "tasks" / f"{task_id}.json"
             task = self._read_optional(path, RelayTask)
             if task is None:
                 raise NotFoundError(f"task not found: {task_id}")
+            if task.task_id != task_id:
+                raise QueueConflictError(f"canonical task identity mismatch: {path}")
             if task.job_id != job_id:
                 raise QueueConflictError(
                     f"task {task_id} belongs to job {task.job_id}, not requested job {job_id}"
@@ -3816,8 +4302,8 @@ class ClioCoreQueue:
     ) -> tuple[list[RelayTask], bool]:
         """Read one fair, bounded cleanup shard and durably advance the scan cursor."""
         self.initialize()
-        cluster_key = self._safe_key(cluster)
-        cursor_path = self.root / "execution_cleanup_scan_cursors" / f"{cluster_key}.json"
+        cluster_key = self._label_key(cluster, domain="cluster")
+        cursor_path = self._storage_root / "execution_cleanup_scan_cursors" / f"{cluster_key}.json"
         with self._lock:
             try:
                 raw_cursor = self._read_json_document(cursor_path)
@@ -3873,6 +4359,21 @@ class ClioCoreQueue:
         matching = [marker for marker in markers if marker.metadata.get("cluster") == cluster]
         has_more = truncated or other_markers
         return sorted(matching, key=lambda marker: marker.created_at), has_more
+
+    def job_has_pending_execution_cleanup(self, job_id: str, *, cluster: str) -> bool:
+        """Return whether cleanup state currently makes a queued job ineligible."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
+        self.initialize()
+        self._require_index_migration_complete()
+        with self._lock:
+            self._recover_pending_transitions_unlocked()
+            job = self.get_job(job_id)
+            if job.cluster != cluster:
+                raise QueueConflictError(
+                    f"job {job_id} belongs to cluster {job.cluster}, not requested cluster "
+                    f"{cluster}"
+                )
+            return self._job_has_pending_execution_cleanup_unlocked(cluster, job_id)
 
     def _scan_execution_cleanup_shard_unlocked(
         self,
@@ -4006,7 +4507,7 @@ class ClioCoreQueue:
 
     def _execution_cleanup_path(self, cluster: str, job_id: str, task_id: str) -> Path:
         return self._execution_cleanup_job_path(cluster, job_id) / (
-            f"{self._safe_key(task_id)}.json"
+            f"{self._durable_key(task_id)}.json"
         )
 
     def _execution_cleanup_job_path(self, cluster: str, job_id: str) -> Path:
@@ -4015,14 +4516,14 @@ class ClioCoreQueue:
                 cluster,
                 self._execution_cleanup_shard(job_id),
             )
-            / f"{self._safe_key(job_id)}.pending"
+            / f"{self._durable_key(job_id)}.pending"
         )
 
     def _execution_cleanup_migration_receipt_path(self, cluster: str, shard: int) -> Path:
         return (
-            self.root
+            self._storage_root
             / "execution_cleanup_migrations"
-            / self._safe_key(cluster)
+            / self._label_key(cluster, domain="cluster")
             / f"{shard:02x}.json"
         )
 
@@ -4045,7 +4546,12 @@ class ClioCoreQueue:
             os.close(descriptor)
 
     def _execution_cleanup_shard_path(self, cluster: str, shard: int) -> Path:
-        return self.root / "execution_cleanup_pending" / self._safe_key(cluster) / f"{shard:02x}"
+        return (
+            self._storage_root
+            / "execution_cleanup_pending"
+            / self._label_key(cluster, domain="cluster")
+            / f"{shard:02x}"
+        )
 
     @staticmethod
     def _execution_cleanup_shard(job_id: str) -> int:
@@ -4061,6 +4567,7 @@ class ClioCoreQueue:
         payload: dict[str, object] | None = None,
     ) -> RelayEvent:
         """Append an event with a per-job monotonic sequence number."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         if locked:
             return self._append_event_unlocked(job_id, event_type, message, payload or {})
         with self._lock:
@@ -4068,13 +4575,13 @@ class ClioCoreQueue:
 
     def drain_events(self, cursor: Cursor, *, limit: int = 100) -> tuple[list[RelayEvent], Cursor]:
         """Drain events from a cursor and return the advanced cursor."""
+        self._require_durable_record_id(cursor.job_id, field="job_id")
         drained, next_seq = self.read_event_page(
             cursor.job_id,
             next_seq=cursor.next_seq,
             limit=limit,
         )
         advanced = Cursor(job_id=cursor.job_id, next_seq=next_seq)
-        self._write(self.root / "cursors" / f"{cursor.job_id}.json", advanced)
         return drained, advanced
 
     def read_event_page(
@@ -4085,12 +4592,13 @@ class ClioCoreQueue:
         limit: int = 100,
     ) -> tuple[list[RelayEvent], int]:
         """Read one bounded contiguous event page without updating a consumer cursor."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         if next_seq < 1:
             raise ValueError("event sequence must be greater than or equal to 1")
         if limit < 1:
             raise ValueError("event page limit must be greater than or equal to 1")
         self.initialize()
-        event_dir = self.root / "events" / job_id
+        event_dir = self._storage_root / "events" / job_id
         events: list[RelayEvent] = []
         candidate_seq = next_seq
         while len(events) < limit:
@@ -4100,18 +4608,22 @@ class ClioCoreQueue:
             )
             if event is None:
                 break
+            if event.job_id != job_id or event.seq != candidate_seq:
+                raise QueueConflictError(f"event filename/content identity mismatch: {event_dir}")
             events.append(event)
             candidate_seq += 1
         return events, candidate_seq
 
     def append_artifact(self, artifact: ArtifactRef) -> ArtifactRef:
         """Index an artifact reference."""
+        self._require_durable_record_id(artifact.artifact_id, field="artifact_id")
+        self._require_durable_record_id(artifact.job_id, field="job_id")
         self.initialize()
         with self._lock:
             self.get_job(artifact.job_id)
             sequence = self._next_job_record_sequence_unlocked(artifact.job_id, "artifact_count")
             saved = artifact.model_copy(update={"sequence": sequence})
-            self._write(self.root / "artifacts" / f"{saved.artifact_id}.json", saved)
+            self._write(self._storage_root / "artifacts" / f"{saved.artifact_id}.json", saved)
             self._write(
                 self._job_record_path("artifacts_by_job", saved.job_id, saved.artifact_id),
                 saved,
@@ -4130,17 +4642,23 @@ class ClioCoreQueue:
 
     def list_artifacts(self, job_id: str) -> list[ArtifactRef]:
         """Return artifact refs for a job."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         self.initialize()
         if self._job_index_exists(job_id):
             return list(
                 self._read_many(
-                    self.root / "artifacts_by_job" / self._safe_key(job_id),
+                    self._storage_root / "artifacts_by_job" / self._durable_key(job_id),
                     ArtifactRef,
+                    identity_field="artifact_id",
                 )
             )
         return [
             artifact
-            for artifact in self._read_many(self.root / "artifacts", ArtifactRef)
+            for artifact in self._read_many(
+                self._storage_root / "artifacts",
+                ArtifactRef,
+                identity_field="artifact_id",
+            )
             if artifact.job_id == job_id
         ]
 
@@ -4152,6 +4670,7 @@ class ClioCoreQueue:
         limit: int = 100,
     ) -> tuple[list[ArtifactRef], int | None, int]:
         """Read one stable artifact page from the per-job sequence index."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         return self._read_ordered_job_page(
             job_id,
             family="artifact",
@@ -4163,32 +4682,39 @@ class ClioCoreQueue:
 
     def job_artifact_count(self, job_id: str) -> tuple[int, bool]:
         """Return the exact indexed artifact count or a bounded legacy lower bound."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         index = self._read_job_index(job_id)
         if index is not None:
             return _index_integer(index, "artifact_count"), False
         artifacts, truncated = self._scan_many(
-            self.root / "artifacts",
+            self._storage_root / "artifacts",
             ArtifactRef,
             limit=DEFAULT_EXACT_RECORD_LIMIT,
+            identity_field="artifact_id",
         )
         return sum(artifact.job_id == job_id for artifact in artifacts), truncated
 
     def get_artifact(self, artifact_id: str) -> ArtifactRef:
         """Return an artifact by id."""
-        path = self.root / "artifacts" / f"{artifact_id}.json"
+        artifact_id = self._require_durable_record_id(artifact_id, field="artifact_id")
+        path = self._storage_root / "artifacts" / f"{artifact_id}.json"
         artifact = self._read_optional(path, ArtifactRef)
         if artifact is None:
             raise NotFoundError(f"artifact not found: {artifact_id}")
+        if artifact.artifact_id != artifact_id:
+            raise QueueConflictError(f"canonical artifact identity mismatch: {path}")
         return artifact
 
     def append_progress(self, progress: ProgressRecord) -> ProgressRecord:
         """Record a structured job progress observation."""
+        self._require_durable_record_id(progress.progress_id, field="progress_id")
+        self._require_durable_record_id(progress.job_id, field="job_id")
         self.initialize()
         with self._lock:
             self.get_job(progress.job_id)
             sequence = self._next_job_record_sequence_unlocked(progress.job_id, "progress_count")
             saved = progress.model_copy(update={"sequence": sequence})
-            self._write(self.root / "progress" / f"{saved.progress_id}.json", saved)
+            self._write(self._storage_root / "progress" / f"{saved.progress_id}.json", saved)
             self._write(
                 self._job_record_path("progress_by_job", saved.job_id, saved.progress_id),
                 saved,
@@ -4218,19 +4744,25 @@ class ClioCoreQueue:
 
     def list_progress(self, job_id: str) -> list[ProgressRecord]:
         """Return structured progress observations for a job."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         self.initialize()
         if self._job_index_exists(job_id):
             return sorted(
                 self._read_many(
-                    self.root / "progress_by_job" / self._safe_key(job_id),
+                    self._storage_root / "progress_by_job" / self._durable_key(job_id),
                     ProgressRecord,
+                    identity_field="progress_id",
                 ),
                 key=lambda progress: progress.created_at,
             )
         return sorted(
             [
                 progress
-                for progress in self._read_many(self.root / "progress", ProgressRecord)
+                for progress in self._read_many(
+                    self._storage_root / "progress",
+                    ProgressRecord,
+                    identity_field="progress_id",
+                )
                 if progress.job_id == job_id
             ],
             key=lambda progress: progress.created_at,
@@ -4244,6 +4776,7 @@ class ClioCoreQueue:
         limit: int = 100,
     ) -> tuple[list[ProgressRecord], int | None, int]:
         """Read one stable progress page from the per-job sequence index."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         return self._read_ordered_job_page(
             job_id,
             family="progress",
@@ -4258,6 +4791,7 @@ class ClioCoreQueue:
         job_id: str,
     ) -> tuple[ProgressRecord | None, int, bool]:
         """Read exact latest progress and indexed count without scanning other jobs."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         index = self._read_job_index(job_id)
         if index is not None:
             count = _index_integer(index, "progress_count")
@@ -4272,9 +4806,10 @@ class ClioCoreQueue:
                 raise QueueConflictError(f"progress index points to a missing record: {job_id}")
             return progress, count, False
         progress, truncated = self._scan_many(
-            self.root / "progress",
+            self._storage_root / "progress",
             ProgressRecord,
             limit=DEFAULT_EXACT_RECORD_LIMIT,
+            identity_field="progress_id",
         )
         matched = [item for item in progress if item.job_id == job_id]
         latest = max(matched, key=lambda item: item.created_at, default=None)
@@ -4282,20 +4817,26 @@ class ClioCoreQueue:
 
     def create_gateway_session(self, session: GatewaySession) -> GatewaySession:
         """Create a durable scheduler-backed gateway session record."""
-        if not _safe_global_record_id(session.session_id):
-            raise QueueConflictError(f"unsafe gateway session id: {session.session_id!r}")
+        self._require_durable_record_id(session.session_id, field="session_id")
         self.initialize()
         self._require_index_migration_complete()
         with self._lock:
             self._recover_pending_transitions_unlocked()
             existing = self._read_optional(
-                self.root / "gateway_sessions" / f"{session.session_id}.json",
+                self._storage_root / "gateway_sessions" / f"{session.session_id}.json",
                 GatewaySession,
             )
             if existing is not None:
+                if existing.session_id != session.session_id:
+                    raise QueueConflictError(
+                        f"canonical gateway session identity mismatch: {session.session_id}"
+                    )
                 raise QueueConflictError(f"gateway session already exists: {session.session_id}")
             _validate_owner_session_identity_metadata(session.metadata, allow_legacy=False)
-            self._assert_owner_session_intake_open_unlocked(session.metadata)
+            self._assert_owner_session_intake_open_unlocked(
+                session.metadata,
+                require_active=True,
+            )
             self._ensure_global_order_entry_unlocked(
                 "gateway_sessions",
                 session.session_id,
@@ -4305,18 +4846,27 @@ class ClioCoreQueue:
 
     def get_gateway_session(self, session_id: str) -> GatewaySession:
         """Return a gateway session by id."""
+        session_id = self._require_durable_record_id(session_id, field="session_id")
         session = self._read_optional(
-            self.root / "gateway_sessions" / f"{session_id}.json",
+            self._storage_root / "gateway_sessions" / f"{session_id}.json",
             GatewaySession,
         )
         if session is None:
             raise NotFoundError(f"gateway session not found: {session_id}")
+        if session.session_id != session_id:
+            raise QueueConflictError(f"canonical gateway session identity mismatch: {session_id}")
         return session
 
     def list_gateway_sessions(self, cluster: str | None = None) -> list[GatewaySession]:
         """Return durable gateway sessions, optionally filtered by cluster."""
         self.initialize()
-        sessions = list(self._read_many(self.root / "gateway_sessions", GatewaySession))
+        sessions = list(
+            self._read_many(
+                self._storage_root / "gateway_sessions",
+                GatewaySession,
+                identity_field="session_id",
+            )
+        )
         if cluster is not None:
             sessions = [session for session in sessions if session.cluster == cluster]
         return sorted(sessions, key=lambda session: session.created_at)
@@ -4374,9 +4924,11 @@ class ClioCoreQueue:
         state: GatewaySessionState | None = None,
         metadata: dict[str, object] | None = None,
         allow_owned_runtime_close: object = False,
+        reject_relay_managed_fields: object = False,
         **updates: object,
     ) -> GatewaySession:
         """Merge gateway session state and metadata updates."""
+        session_id = self._require_durable_record_id(session_id, field="session_id")
         self.initialize()
         self._require_index_migration_complete()
         with self._lock:
@@ -4389,6 +4941,15 @@ class ClioCoreQueue:
             is_owned_runtime = session.metadata.get("owner") == "clio-relay" and isinstance(
                 session.gateway.get("runtime_spec"), dict
             )
+            if (
+                reject_relay_managed_fields is True
+                and "gateway" in updates
+                and _has_relay_managed_gateway_state(session.gateway)
+            ):
+                raise QueueConflictError(
+                    "generic gateway updates cannot replace relay-managed runtime state: "
+                    f"{session_id}"
+                )
             if (
                 state == GatewaySessionState.CLOSED
                 and session.state != GatewaySessionState.CLOSED
@@ -4416,25 +4977,124 @@ class ClioCoreQueue:
             self._write_gateway_session_unlocked(updated)
             return updated
 
+    def prepare_gateway_teardown_intent(
+        self,
+        session_id: str,
+        *,
+        cancel_scheduler_job: bool,
+    ) -> GatewaySession:
+        """Atomically create or validate one immutable gateway cleanup policy."""
+        session_id = self._require_durable_record_id(session_id, field="session_id")
+        self.initialize()
+        self._require_index_migration_complete()
+        with self._lock:
+            self._recover_pending_transitions_unlocked()
+            session = self.get_gateway_session(session_id)
+            raw_intent = session.gateway.get("teardown_intent")
+            if raw_intent is not None:
+                if not isinstance(raw_intent, dict):
+                    raise QueueConflictError("gateway teardown intent is invalid")
+                intent = cast(dict[str, object], raw_intent)
+                operation_id = intent.get("operation_id")
+                created_at = intent.get("created_at")
+                if (
+                    intent.get("schema_version") != "clio-relay.gateway-teardown-intent.v1"
+                    or intent.get("gateway_session_id") != session_id
+                    or not isinstance(operation_id, str)
+                    or not operation_id.startswith("gateway_cleanup_")
+                    or not _safe_global_record_id(operation_id)
+                    or not isinstance(created_at, str)
+                    or not isinstance(intent.get("cancel_scheduler_job"), bool)
+                ):
+                    raise QueueConflictError("gateway teardown intent is invalid")
+                try:
+                    parsed_created_at = datetime.fromisoformat(created_at)
+                except ValueError as exc:
+                    raise QueueConflictError("gateway teardown intent time is invalid") from exc
+                if parsed_created_at.tzinfo is None:
+                    raise QueueConflictError("gateway teardown intent time is naive")
+                if intent.get("cancel_scheduler_job") is not cancel_scheduler_job:
+                    raise QueueConflictError(
+                        "gateway cleanup policy changed during retry; resume with the original "
+                        f"cancel_scheduler_job={intent.get('cancel_scheduler_job')} policy"
+                    )
+                return session
+            if session.state == GatewaySessionState.CLOSED:
+                raise QueueConflictError(
+                    f"closed gateway session has no durable teardown intent: {session_id}"
+                )
+            gateway = {
+                **session.gateway,
+                "teardown_intent": {
+                    "schema_version": "clio-relay.gateway-teardown-intent.v1",
+                    "operation_id": f"gateway_cleanup_{uuid4().hex}",
+                    "gateway_session_id": session_id,
+                    "cancel_scheduler_job": cancel_scheduler_job,
+                    "created_at": utc_now().isoformat(),
+                },
+            }
+            updated = session.model_copy(update={"gateway": gateway, "updated_at": utc_now()})
+            self._write_gateway_session_unlocked(updated)
+            return updated
+
     def set_owner_session_closing(
         self,
         owner_session_id: str,
         *,
         session_generation_id: str,
-    ) -> None:
-        """Durably quiesce new work creation for one owned relay session."""
-        if not session_generation_id:
-            raise ValueError("session_generation_id must not be empty")
+        operation_id: str | None = None,
+        stop_worker: bool = False,
+        cancel_jobs: bool = False,
+        cancel_scheduler_jobs: bool = False,
+    ) -> dict[str, object]:
+        """Quiesce one generation and persist its immutable cleanup policy."""
+        if not owner_session_id:
+            raise ValueError("owner_session_id must not be empty")
+        session_generation_id = self._require_durable_record_id(
+            session_generation_id,
+            field="session_generation_id",
+        )
+        if operation_id is not None and (
+            not operation_id.startswith("cleanup_") or not _safe_global_record_id(operation_id)
+        ):
+            raise ValueError("operation_id must be a safe cleanup_ identifier")
+        if cancel_scheduler_jobs and not cancel_jobs:
+            raise ValueError("cancel_scheduler_jobs requires cancel_jobs")
         self.initialize()
-        path = self.root / "owner_sessions" / f"{self._safe_key(owner_session_id)}.closing.json"
+        path = (
+            self._storage_root
+            / "owner_sessions"
+            / f"{self._label_key(owner_session_id, domain='owner-session')}.closing.json"
+        )
         with self._lock:
-            active_generation = self._owner_session_active_generation(owner_session_id)
-            if active_generation != session_generation_id:
-                raise QueueConflictError(
-                    f"owner session active generation does not match closing request: "
-                    f"{owner_session_id}"
-                )
             existing_closing = self._read_owner_session_transition_record(path)
+            existing_generation = self._validate_owner_session_closing_record(
+                owner_session_id,
+                existing_closing,
+            )
+            active_generation = self._owner_session_active_generation(owner_session_id)
+            safely_closed_retry = False
+            if active_generation != session_generation_id:
+                existing_closure = self._read_optional(
+                    self._owner_session_closed_path(
+                        owner_session_id,
+                        session_generation_id=session_generation_id,
+                    ),
+                    OwnerSessionClosure,
+                )
+                safely_closed_retry = (
+                    active_generation is None
+                    and existing_generation == session_generation_id
+                    and existing_closure is not None
+                    and existing_closure.owner_session_id == owner_session_id
+                    and existing_closure.session_generation_id == session_generation_id
+                    and not existing_closure.residual_resource_ids
+                )
+                if not safely_closed_retry:
+                    raise QueueConflictError(
+                        f"owner session active generation does not match closing request: "
+                        f"{owner_session_id}"
+                    )
             if existing_closing is not None and (
                 existing_closing.get("owner_session_id") != owner_session_id
                 or existing_closing.get("closing") is not True
@@ -4443,15 +5103,250 @@ class ClioCoreQueue:
                 raise QueueConflictError(
                     f"owner session generation changed before quiescence: {owner_session_id}"
                 )
+            expected_policy = {
+                "stop_worker": stop_worker,
+                "cancel_jobs": cancel_jobs,
+                "cancel_scheduler_jobs": cancel_scheduler_jobs,
+            }
+            existing_intent = self._validate_owner_session_cleanup_intent(
+                owner_session_id,
+                session_generation_id,
+                None if existing_closing is None else existing_closing.get("cleanup_intent"),
+                required=False,
+            )
+            if existing_intent is None and safely_closed_retry:
+                raise QueueConflictError(
+                    "closed owner session has no durable cleanup policy for retry: "
+                    f"{owner_session_id}"
+                )
+            if existing_intent is not None:
+                observed_policy = {
+                    key: existing_intent[key]
+                    for key in (
+                        "stop_worker",
+                        "cancel_jobs",
+                        "cancel_scheduler_jobs",
+                    )
+                }
+                if observed_policy != expected_policy:
+                    raise QueueConflictError(
+                        f"owner session cleanup policy changed during retry: {owner_session_id}"
+                    )
+                if operation_id is not None and existing_intent["operation_id"] != operation_id:
+                    raise QueueConflictError(
+                        f"owner session cleanup operation changed during retry: {owner_session_id}"
+                    )
+                return existing_intent
+            cleanup_intent: dict[str, object] = {
+                "schema_version": "clio-relay.owner-session-cleanup-intent.v1",
+                "operation_id": operation_id or f"cleanup_{uuid4().hex}",
+                "owner_session_id": owner_session_id,
+                "session_generation_id": session_generation_id,
+                **expected_policy,
+                "created_at": utc_now().isoformat(),
+            }
             self._write_json(
                 path,
                 {
                     "owner_session_id": owner_session_id,
                     "session_generation_id": session_generation_id,
                     "closing": True,
+                    "cleanup_intent": cleanup_intent,
                     "updated_at": utc_now().isoformat(),
                 },
             )
+            return cleanup_intent
+
+    def get_owner_session_cleanup_intent(
+        self,
+        owner_session_id: str,
+        *,
+        session_generation_id: str,
+    ) -> dict[str, object] | None:
+        """Return the immutable cleanup intent for one exact closing generation."""
+        if not owner_session_id:
+            raise ValueError("owner_session_id must not be empty")
+        session_generation_id = self._require_durable_record_id(
+            session_generation_id,
+            field="session_generation_id",
+        )
+        self.initialize()
+        path = (
+            self._storage_root
+            / "owner_sessions"
+            / f"{self._label_key(owner_session_id, domain='owner-session')}.closing.json"
+        )
+        with self._lock:
+            closing = self._read_owner_session_transition_record(path)
+            closing_generation = self._validate_owner_session_closing_record(
+                owner_session_id,
+                closing,
+            )
+            if closing_generation is None:
+                return None
+            if closing_generation != session_generation_id:
+                raise QueueConflictError(
+                    f"owner session closing generation does not match request: {owner_session_id}"
+                )
+            return self._validate_owner_session_cleanup_intent(
+                owner_session_id,
+                session_generation_id,
+                None if closing is None else closing.get("cleanup_intent"),
+                required=True,
+            )
+
+    def mirror_owner_session_generation_open(
+        self,
+        owner_session_id: str,
+        *,
+        session_generation_id: str,
+    ) -> dict[str, object]:
+        """Mirror a remotely verified generation into this queue's admission boundary.
+
+        The caller must verify the authoritative remote session before invoking this
+        method. The mirror never reopens the same closed generation and never erases
+        an unfinished local cleanup transition.
+        """
+        if not owner_session_id:
+            raise ValueError("owner_session_id must not be empty")
+        session_generation_id = self._require_durable_record_id(
+            session_generation_id,
+            field="session_generation_id",
+        )
+        self.initialize()
+        active_path = self._owner_session_active_path(owner_session_id)
+        closing_path = (
+            self._storage_root
+            / "owner_sessions"
+            / f"{self._label_key(owner_session_id, domain='owner-session')}.closing.json"
+        )
+        with self._lock:
+            active = self._read_owner_session_transition_record(active_path)
+            closing = self._read_owner_session_transition_record(closing_path)
+            active_generation = self._validate_owner_session_active_record(
+                owner_session_id,
+                active,
+            )
+            closing_generation = self._validate_owner_session_closing_record(
+                owner_session_id,
+                closing,
+            )
+            if active_generation not in {None, session_generation_id}:
+                raise QueueConflictError(
+                    f"owner session active generation does not match remote mirror: "
+                    f"{owner_session_id}"
+                )
+            previous_generation_id: str | None = None
+            if closing_generation is not None:
+                prior_closure = self.get_owner_session_closed(
+                    owner_session_id,
+                    session_generation_id=closing_generation,
+                )
+                safely_closed_prior_generation = (
+                    closing_generation != session_generation_id
+                    and prior_closure is not None
+                    and not prior_closure.residual_resource_ids
+                )
+                if not safely_closed_prior_generation:
+                    raise QueueConflictError(
+                        f"owner session has unfinished local cleanup and rejects remote mirror: "
+                        f"{owner_session_id}"
+                    )
+                previous_generation_id = closing_generation
+                closing_path.unlink(missing_ok=True)
+                closing_generation = None
+            if (
+                self.get_owner_session_closed(
+                    owner_session_id,
+                    session_generation_id=session_generation_id,
+                )
+                is not None
+            ):
+                raise QueueConflictError(
+                    f"owner session generation is already closed: {owner_session_id}"
+                )
+            if active_generation is None:
+                self._write_json(
+                    active_path,
+                    {
+                        "owner_session_id": owner_session_id,
+                        "session_generation_id": session_generation_id,
+                        "previous_session_generation_id": previous_generation_id,
+                        "active": True,
+                        "mirrored_remote_authority": True,
+                        "updated_at": utc_now().isoformat(),
+                    },
+                )
+            return {
+                "schema_version": "clio-relay.owner-session-admission-status.v1",
+                "owner_session_id": owner_session_id,
+                "session_generation_id": session_generation_id,
+                "active_generation_id": session_generation_id,
+                "closing_generation_id": closing_generation,
+                "active": True,
+                "closing": False,
+                "closed": False,
+                "open": True,
+                "cleanup_intent": None,
+            }
+
+    def owner_session_generation_status(
+        self,
+        owner_session_id: str,
+        *,
+        session_generation_id: str,
+    ) -> dict[str, object]:
+        """Return exact machine-readable admission state for one generation."""
+        if not owner_session_id:
+            raise ValueError("owner_session_id must not be empty")
+        session_generation_id = self._require_durable_record_id(
+            session_generation_id,
+            field="session_generation_id",
+        )
+        self.initialize()
+        closing_path = (
+            self._storage_root
+            / "owner_sessions"
+            / f"{self._label_key(owner_session_id, domain='owner-session')}.closing.json"
+        )
+        with self._lock:
+            active_generation = self._owner_session_active_generation(owner_session_id)
+            closing = self._read_owner_session_transition_record(closing_path)
+            closing_generation = self._validate_owner_session_closing_record(
+                owner_session_id,
+                closing,
+            )
+            cleanup_intent = (
+                self._validate_owner_session_cleanup_intent(
+                    owner_session_id,
+                    session_generation_id,
+                    closing.get("cleanup_intent"),
+                    required=True,
+                )
+                if closing_generation == session_generation_id and closing is not None
+                else None
+            )
+            closed = (
+                self.get_owner_session_closed(
+                    owner_session_id,
+                    session_generation_id=session_generation_id,
+                )
+                is not None
+            )
+            exact_active = active_generation == session_generation_id
+            exact_closing = closing_generation == session_generation_id
+            return {
+                "schema_version": "clio-relay.owner-session-admission-status.v1",
+                "owner_session_id": owner_session_id,
+                "session_generation_id": session_generation_id,
+                "active_generation_id": active_generation,
+                "closing_generation_id": closing_generation,
+                "active": exact_active,
+                "closing": exact_closing,
+                "closed": closed,
+                "open": exact_active and closing_generation is None and not closed,
+                "cleanup_intent": cleanup_intent,
+            }
 
     def prepare_owner_session_start(
         self,
@@ -4461,13 +5356,22 @@ class ClioCoreQueue:
         candidate_generation_id: str,
     ) -> str:
         """Atomically select the only generation allowed to start under a transition lock."""
-        if recorded_generation_id == "":
-            raise ValueError("recorded_generation_id must not be empty")
-        if not candidate_generation_id:
-            raise ValueError("candidate_generation_id must not be empty")
+        if not owner_session_id:
+            raise ValueError("owner_session_id must not be empty")
+        if recorded_generation_id is not None:
+            recorded_generation_id = self._require_durable_record_id(
+                recorded_generation_id,
+                field="recorded_generation_id",
+            )
+        candidate_generation_id = self._require_durable_record_id(
+            candidate_generation_id,
+            field="candidate_generation_id",
+        )
         self.initialize()
         closing_path = (
-            self.root / "owner_sessions" / f"{self._safe_key(owner_session_id)}.closing.json"
+            self._storage_root
+            / "owner_sessions"
+            / f"{self._label_key(owner_session_id, domain='owner-session')}.closing.json"
         )
         with self._lock:
             active = self._read_owner_session_transition_record(
@@ -4574,10 +5478,18 @@ class ClioCoreQueue:
         session_generation_id: str,
     ) -> None:
         """Assert an exact active generation; never erase a closing transition."""
-        if not session_generation_id:
-            raise ValueError("session_generation_id must not be empty")
+        if not owner_session_id:
+            raise ValueError("owner_session_id must not be empty")
+        session_generation_id = self._require_durable_record_id(
+            session_generation_id,
+            field="session_generation_id",
+        )
         self.initialize()
-        path = self.root / "owner_sessions" / f"{self._safe_key(owner_session_id)}.closing.json"
+        path = (
+            self._storage_root
+            / "owner_sessions"
+            / f"{self._label_key(owner_session_id, domain='owner-session')}.closing.json"
+        )
         with self._lock:
             if self._read_owner_session_transition_record(path) is not None:
                 raise QueueConflictError(
@@ -4596,6 +5508,16 @@ class ClioCoreQueue:
         session_generation_id: str,
     ) -> None:
         """Activate a new generation only after exact prior-generation closure."""
+        if not owner_session_id:
+            raise ValueError("owner_session_id must not be empty")
+        previous_session_generation_id = self._require_durable_record_id(
+            previous_session_generation_id,
+            field="previous_session_generation_id",
+        )
+        session_generation_id = self._require_durable_record_id(
+            session_generation_id,
+            field="session_generation_id",
+        )
         selected = self.prepare_owner_session_start(
             owner_session_id,
             recorded_generation_id=previous_session_generation_id,
@@ -4615,8 +5537,12 @@ class ClioCoreQueue:
         legacy_unversioned_job_ids: list[str] | None = None,
     ) -> OwnerSessionClosure:
         """Record verified teardown completion for an owner session generation."""
-        if not session_generation_id:
-            raise ValueError("session_generation_id must not be empty")
+        if not owner_session_id:
+            raise ValueError("owner_session_id must not be empty")
+        session_generation_id = self._require_durable_record_id(
+            session_generation_id,
+            field="session_generation_id",
+        )
         raw_legacy_job_ids = legacy_unversioned_job_ids or []
         legacy_job_ids = sorted(set(raw_legacy_job_ids))
         if raw_legacy_job_ids != legacy_job_ids:
@@ -4631,7 +5557,9 @@ class ClioCoreQueue:
             )
         self.initialize()
         closing_path = (
-            self.root / "owner_sessions" / f"{self._safe_key(owner_session_id)}.closing.json"
+            self._storage_root
+            / "owner_sessions"
+            / f"{self._label_key(owner_session_id, domain='owner-session')}.closing.json"
         )
         with self._lock:
             try:
@@ -4709,15 +5637,36 @@ class ClioCoreQueue:
         path: Path,
         closure: OwnerSessionClosure,
     ) -> OwnerSessionClosure:
-        existing = self._read_optional(path, OwnerSessionClosure)
-        if existing is not None:
-            if existing != closure.model_copy(update={"closed_at": existing.closed_at}):
+        for attempt in range(OWNER_SESSION_CLOSURE_WRITE_ATTEMPTS):
+            existing = self._read_optional(path, OwnerSessionClosure)
+            if existing is not None:
+                if existing != closure.model_copy(update={"closed_at": existing.closed_at}):
+                    raise QueueConflictError(
+                        f"owner session closure history changed: {closure.owner_session_id}"
+                    )
+                return existing
+            try:
+                self._write(path, closure)
+            except FileNotFoundError as exc:
+                if attempt + 1 >= OWNER_SESSION_CLOSURE_WRITE_ATTEMPTS:
+                    raise QueueConflictError(
+                        "owner session closure directory did not remain available: "
+                        f"{closure.owner_session_id}"
+                    ) from exc
+                continue
+            persisted = self._read_optional(path, OwnerSessionClosure)
+            if persisted is None:
+                if attempt + 1 >= OWNER_SESSION_CLOSURE_WRITE_ATTEMPTS:
+                    raise QueueConflictError(
+                        f"owner session closure did not remain durable: {closure.owner_session_id}"
+                    )
+                continue
+            if persisted != closure.model_copy(update={"closed_at": persisted.closed_at}):
                 raise QueueConflictError(
                     f"owner session closure history changed: {closure.owner_session_id}"
                 )
-            return existing
-        self._write(path, closure)
-        return closure
+            return persisted
+        raise AssertionError("owner session closure retry loop exhausted without an outcome")
 
     def get_owner_session_closed(
         self,
@@ -4726,6 +5675,13 @@ class ClioCoreQueue:
         session_generation_id: str | None = None,
     ) -> OwnerSessionClosure | None:
         """Return exact verified closure history for one owner-session generation."""
+        if not owner_session_id:
+            raise ValueError("owner_session_id must not be empty")
+        if session_generation_id is not None:
+            session_generation_id = self._require_durable_record_id(
+                session_generation_id,
+                field="session_generation_id",
+            )
         self.initialize()
         closure = self._read_optional(
             self._owner_session_closed_path(
@@ -4750,16 +5706,25 @@ class ClioCoreQueue:
         session_generation_id: str | None = None,
     ) -> Path:
         if session_generation_id is None:
-            return self.root / "owner_sessions" / f"{self._safe_key(owner_session_id)}.closed.json"
-        return (
-            self.root
+            return (
+                self._storage_root
+                / "owner_sessions"
+                / f"{self._label_key(owner_session_id, domain='owner-session')}.closed.json"
+            )
+        path = (
+            self._storage_root
             / "owner_sessions"
-            / f"{self._safe_key(owner_session_id)}.closures"
+            / f"{self._label_key(owner_session_id, domain='owner-session')}.closures"
             / f"{_stable_ref_token(session_generation_id)}.json"
         )
+        return path
 
     def _owner_session_active_path(self, owner_session_id: str) -> Path:
-        return self.root / "owner_sessions" / f"{self._safe_key(owner_session_id)}.active.json"
+        return (
+            self._storage_root
+            / "owner_sessions"
+            / f"{self._label_key(owner_session_id, domain='owner-session')}.active.json"
+        )
 
     def _owner_session_membership_dir(
         self,
@@ -4769,9 +5734,9 @@ class ClioCoreQueue:
     ) -> Path:
         owner_token = _stable_ref_token(owner_session_id)
         if session_generation_id is None:
-            return self.root / "owner_session_legacy_jobs" / owner_token
+            return self._storage_root / "owner_session_legacy_jobs" / owner_token
         return (
-            self.root
+            self._storage_root
             / "owner_session_jobs"
             / owner_token
             / _stable_ref_token(session_generation_id)
@@ -4780,28 +5745,41 @@ class ClioCoreQueue:
     def _assert_owner_session_intake_open_unlocked(
         self,
         metadata: dict[str, object],
+        *,
+        require_active: bool = False,
     ) -> None:
         """Enforce owner generation and closing state at the durable write boundary."""
         identity = _owner_session_identity(metadata, allow_legacy=False)
         if identity is None:
             return
         owner_session_id, session_generation_id = identity
+        admission_session_id = metadata.get("owner_session_admission_id", owner_session_id)
+        if not isinstance(admission_session_id, str) or not _safe_global_record_id(
+            admission_session_id
+        ):
+            raise QueueConflictError("owner_session_admission_id must be a safe identifier")
         closing_path = (
-            self.root / "owner_sessions" / f"{self._safe_key(owner_session_id)}.closing.json"
+            self._storage_root
+            / "owner_sessions"
+            / f"{self._durable_key(admission_session_id)}.closing.json"
         )
         closing = self._read_owner_session_transition_record(closing_path)
-        if self._validate_owner_session_closing_record(owner_session_id, closing) is not None:
+        if self._validate_owner_session_closing_record(admission_session_id, closing) is not None:
             raise QueueConflictError(
                 f"owner session generation is closing and rejects new work: {owner_session_id}"
             )
-        active_generation = self._owner_session_active_generation(owner_session_id)
+        active_generation = self._owner_session_active_generation(admission_session_id)
+        if require_active and active_generation is None:
+            raise QueueConflictError(
+                f"owner session generation has no active admission state: {owner_session_id}"
+            )
         if active_generation is not None and active_generation != session_generation_id:
             raise QueueConflictError(
                 f"owner session generation does not match active intake: {owner_session_id}"
             )
         if (
             self.get_owner_session_closed(
-                owner_session_id,
+                admission_session_id,
                 session_generation_id=session_generation_id,
             )
             is not None
@@ -4862,11 +5840,8 @@ class ClioCoreQueue:
             active.get("owner_session_id") != owner_session_id
             or active.get("active") is not True
             or not isinstance(generation, str)
-            or not generation
-            or (
-                previous_generation is not None
-                and (not isinstance(previous_generation, str) or not previous_generation)
-            )
+            or not _safe_global_record_id(generation)
+            or (previous_generation is not None and not _safe_global_record_id(previous_generation))
         ):
             raise QueueConflictError(f"owner session active record is invalid: {owner_session_id}")
         return generation
@@ -4883,10 +5858,55 @@ class ClioCoreQueue:
             closing.get("owner_session_id") != owner_session_id
             or closing.get("closing") is not True
             or not isinstance(generation, str)
-            or not generation
+            or not _safe_global_record_id(generation)
         ):
             raise QueueConflictError(f"owner session closing record is invalid: {owner_session_id}")
         return generation
+
+    @staticmethod
+    def _validate_owner_session_cleanup_intent(
+        owner_session_id: str,
+        session_generation_id: str,
+        raw_intent: object,
+        *,
+        required: bool,
+    ) -> dict[str, object] | None:
+        """Validate the immutable policy attached to one closing generation."""
+        if raw_intent is None and not required:
+            return None
+        if not isinstance(raw_intent, dict):
+            raise QueueConflictError(f"owner session cleanup intent is invalid: {owner_session_id}")
+        intent = cast(dict[str, object], raw_intent)
+        operation_id = intent.get("operation_id")
+        created_at = intent.get("created_at")
+        stop_worker = intent.get("stop_worker")
+        cancel_jobs = intent.get("cancel_jobs")
+        cancel_scheduler_jobs = intent.get("cancel_scheduler_jobs")
+        if (
+            intent.get("schema_version") != "clio-relay.owner-session-cleanup-intent.v1"
+            or intent.get("owner_session_id") != owner_session_id
+            or intent.get("session_generation_id") != session_generation_id
+            or not isinstance(operation_id, str)
+            or not operation_id.startswith("cleanup_")
+            or not _safe_global_record_id(operation_id)
+            or not isinstance(created_at, str)
+            or not isinstance(stop_worker, bool)
+            or not isinstance(cancel_jobs, bool)
+            or not isinstance(cancel_scheduler_jobs, bool)
+            or (cancel_scheduler_jobs and not cancel_jobs)
+        ):
+            raise QueueConflictError(f"owner session cleanup intent is invalid: {owner_session_id}")
+        try:
+            parsed_created_at = datetime.fromisoformat(created_at)
+        except ValueError as exc:
+            raise QueueConflictError(
+                f"owner session cleanup intent time is invalid: {owner_session_id}"
+            ) from exc
+        if parsed_created_at.tzinfo is None:
+            raise QueueConflictError(
+                f"owner session cleanup intent time is naive: {owner_session_id}"
+            )
+        return intent
 
     def _read_owner_session_transition_record(self, path: Path) -> dict[str, object] | None:
         try:
@@ -4899,8 +5919,14 @@ class ClioCoreQueue:
 
     def owner_session_is_closing(self, owner_session_id: str) -> bool:
         """Return whether new work is quiesced for an owned relay session."""
+        if not owner_session_id:
+            raise ValueError("owner_session_id must not be empty")
         self.initialize()
-        path = self.root / "owner_sessions" / f"{self._safe_key(owner_session_id)}.closing.json"
+        path = (
+            self._storage_root
+            / "owner_sessions"
+            / f"{self._label_key(owner_session_id, domain='owner-session')}.closing.json"
+        )
         try:
             payload = self._read_json_document(path)
         except (FileNotFoundError, QueueConflictError, OSError):
@@ -4914,18 +5940,19 @@ class ClioCoreQueue:
 
     def close_gateway_session(self, session_id: str) -> GatewaySession:
         """Mark a gateway session closed."""
+        session_id = self._require_durable_record_id(session_id, field="session_id")
         return self.update_gateway_session(session_id, state=GatewaySessionState.CLOSED)
 
     def append_monitor_rule(self, rule: MonitorRule) -> MonitorRule:
         """Create a durable monitor rule."""
-        if not _safe_global_record_id(rule.rule_id):
-            raise QueueConflictError(f"unsafe monitor rule id: {rule.rule_id!r}")
+        self._require_durable_record_id(rule.rule_id, field="rule_id")
+        self._require_durable_record_id(rule.job_id, field="job_id")
         self.initialize()
         self._require_index_migration_complete()
         with self._lock:
             self.get_job(rule.job_id)
             self._ensure_global_order_entry_unlocked("monitor_rules", rule.rule_id)
-            self._write(self.root / "monitor_rules" / f"{rule.rule_id}.json", rule)
+            self._write(self._storage_root / "monitor_rules" / f"{rule.rule_id}.json", rule)
             self._sync_monitor_rule_indexes_unlocked(rule)
             self.append_event(
                 rule.job_id,
@@ -4938,16 +5965,25 @@ class ClioCoreQueue:
 
     def list_monitor_rules(self, job_id: str | None = None) -> list[MonitorRule]:
         """Return monitor rules, optionally filtered by job id."""
+        if job_id is not None:
+            job_id = self._require_durable_record_id(job_id, field="job_id")
         self.initialize()
         if job_id is not None and self._job_index_exists(job_id):
             rules = list(
                 self._read_many(
-                    self.root / "monitor_rules_by_job" / self._safe_key(job_id),
+                    self._storage_root / "monitor_rules_by_job" / self._durable_key(job_id),
                     MonitorRule,
+                    identity_field="rule_id",
                 )
             )
         else:
-            rules = list(self._read_many(self.root / "monitor_rules", MonitorRule))
+            rules = list(
+                self._read_many(
+                    self._storage_root / "monitor_rules",
+                    MonitorRule,
+                    identity_field="rule_id",
+                )
+            )
             if job_id is not None:
                 rules = [rule for rule in rules if rule.job_id == job_id]
         return sorted(rules, key=lambda rule: rule.created_at)
@@ -4961,6 +5997,8 @@ class ClioCoreQueue:
         enabled: bool | None = None,
     ) -> tuple[list[MonitorRule], int | None, int]:
         """Read one global monitor-rule source window with in-window filters."""
+        if job_id is not None:
+            job_id = self._require_durable_record_id(job_id, field="job_id")
 
         def matches(rule: MonitorRule) -> bool:
             return (job_id is None or rule.job_id == job_id) and (
@@ -4984,6 +6022,8 @@ class ClioCoreQueue:
         enabled: bool | None = None,
     ) -> tuple[list[MonitorRule], bool]:
         """Read one bounded monitor-rule source window and truncation state."""
+        if job_id is not None:
+            job_id = self._require_durable_record_id(job_id, field="job_id")
 
         def matches(rule: MonitorRule) -> bool:
             return (job_id is None or rule.job_id == job_id) and (
@@ -5000,19 +6040,25 @@ class ClioCoreQueue:
 
     def update_monitor_rule(self, rule: MonitorRule) -> MonitorRule:
         """Persist a monitor rule update."""
+        self._require_durable_record_id(rule.rule_id, field="rule_id")
+        self._require_durable_record_id(rule.job_id, field="job_id")
         self.initialize()
         self._require_index_migration_complete()
         with self._lock:
             existing = self._read_optional(
-                self.root / "monitor_rules" / f"{rule.rule_id}.json",
+                self._storage_root / "monitor_rules" / f"{rule.rule_id}.json",
                 MonitorRule,
             )
             if existing is None:
                 raise NotFoundError(f"monitor rule not found: {rule.rule_id}")
+            if existing.rule_id != rule.rule_id:
+                raise QueueConflictError(
+                    f"canonical monitor rule identity mismatch: {rule.rule_id}"
+                )
             if existing.job_id != rule.job_id:
                 raise QueueConflictError(f"monitor rule cannot change job: {rule.rule_id}")
             self._ensure_global_order_entry_unlocked("monitor_rules", rule.rule_id)
-            self._write(self.root / "monitor_rules" / f"{rule.rule_id}.json", rule)
+            self._write(self._storage_root / "monitor_rules" / f"{rule.rule_id}.json", rule)
             self._sync_monitor_rule_indexes_unlocked(rule)
         return rule
 
@@ -5158,7 +6204,7 @@ class ClioCoreQueue:
         for artifact_id in set(session.artifacts):
             self._write_gateway_reverse_ref_unlocked("artifact", artifact_id, session)
             artifact = self._read_optional(
-                self.root / "artifacts" / f"{artifact_id}.json",
+                self._storage_root / "artifacts" / f"{artifact_id}.json",
                 ArtifactRef,
             )
             if artifact is not None:
@@ -5196,7 +6242,7 @@ class ClioCoreQueue:
     def _sync_gateway_session_derived_unlocked(self, session_id: str) -> None:
         """Clear stale gateway references and rebuild them from the canonical record."""
         session = self._read_optional(
-            self.root / "gateway_sessions" / f"{session_id}.json",
+            self._storage_root / "gateway_sessions" / f"{session_id}.json",
             GatewaySession,
         )
         self._unindex_gateway_session_id_unlocked(session_id, preserve=None)
@@ -5226,7 +6272,9 @@ class ClioCoreQueue:
         preserve: GatewaySession | None,
     ) -> None:
         """Remove gateway backlinks by stable identity, optionally preserving live relations."""
-        active_backlinks = self.root / "active_gateway_refs_by_session" / self._safe_key(session_id)
+        active_backlinks = (
+            self._storage_root / "active_gateway_refs_by_session" / self._durable_key(session_id)
+        )
         active_paths = self._bounded_json_record_paths(
             active_backlinks,
             limit=MAX_GATEWAY_INDEX_RECORDS,
@@ -5244,11 +6292,14 @@ class ClioCoreQueue:
             if not isinstance(job_id, str) or not isinstance(record_name, str):
                 raise QueueConflictError(f"gateway job reference is invalid: {path}")
             (
-                self.root / "active_gateway_refs_by_job" / self._safe_key(job_id) / record_name
+                self._storage_root
+                / "active_gateway_refs_by_job"
+                / self._durable_key(job_id)
+                / record_name
             ).unlink(missing_ok=True)
             path.unlink(missing_ok=True)
         reverse_backlinks = (
-            self.root / "gateway_reverse_refs_by_session" / self._safe_key(session_id)
+            self._storage_root / "gateway_reverse_refs_by_session" / self._durable_key(session_id)
         )
         reverse_paths = self._bounded_json_record_paths(
             reverse_backlinks,
@@ -5282,15 +6333,15 @@ class ClioCoreQueue:
         relation_key: str,
         session: GatewaySession,
     ) -> None:
-        record_name = f"{self._safe_key(session.session_id)}.json"
+        record_name = f"{self._durable_key(session.session_id)}.json"
         self._write(
             self._gateway_reverse_directory(relation_kind, relation_key) / record_name,
             session,
         )
         self._write_json(
-            self.root
+            self._storage_root
             / "gateway_reverse_refs_by_session"
-            / self._safe_key(session.session_id)
+            / self._durable_key(session.session_id)
             / f"{_stable_ref_token(relation_kind, relation_key)}.json",
             {
                 "session_id": session.session_id,
@@ -5343,13 +6394,16 @@ class ClioCoreQueue:
             "record_name": record_name,
         }
         self._write_json(
-            self.root / "active_gateway_refs_by_job" / self._safe_key(job_id) / record_name,
+            self._storage_root
+            / "active_gateway_refs_by_job"
+            / self._durable_key(job_id)
+            / record_name,
             document,
         )
         self._write_json(
-            self.root
+            self._storage_root
             / "active_gateway_refs_by_session"
-            / self._safe_key(session.session_id)
+            / self._durable_key(session.session_id)
             / backlink_name,
             document,
         )
@@ -5366,23 +6420,26 @@ class ClioCoreQueue:
         record_name = (
             f"{_stable_ref_token(session_id, relation_kind, relation_key, source_id or '')}.json"
         )
-        (self.root / "active_gateway_refs_by_job" / self._safe_key(job_id) / record_name).unlink(
-            missing_ok=True
-        )
         (
-            self.root
+            self._storage_root
+            / "active_gateway_refs_by_job"
+            / self._durable_key(job_id)
+            / record_name
+        ).unlink(missing_ok=True)
+        (
+            self._storage_root
             / "active_gateway_refs_by_session"
-            / self._safe_key(session_id)
+            / self._durable_key(session_id)
             / f"{_stable_ref_token(job_id, record_name)}.json"
         ).unlink(missing_ok=True)
 
     def _gateway_reverse_directory(self, relation_kind: str, relation_key: str) -> Path:
         if relation_kind not in {"artifact", "scheduler"}:
             raise QueueConflictError(f"unsupported gateway reference kind: {relation_kind}")
-        return self.root / f"gateways_by_{relation_kind}" / _stable_ref_token(relation_key)
+        return self._storage_root / f"gateways_by_{relation_kind}" / _stable_ref_token(relation_key)
 
     def _gateway_scheduler_jobs_directory(self, scheduler_id: str) -> Path:
-        return self.root / "scheduler_jobs" / _stable_ref_token(scheduler_id)
+        return self._storage_root / "scheduler_jobs" / _stable_ref_token(scheduler_id)
 
     def _scheduler_reverse_ref_path(
         self,
@@ -5402,7 +6459,7 @@ class ClioCoreQueue:
         message: str,
         payload: dict[str, object],
     ) -> RelayEvent:
-        event_dir = self.root / "events" / job_id
+        event_dir = self._storage_root / "events" / job_id
         event_dir.mkdir(parents=True, exist_ok=True)
         seq = self._next_event_seq(job_id, event_dir)
         event = RelayEvent(
@@ -5418,24 +6475,29 @@ class ClioCoreQueue:
 
     def latest_job_event(self, job_id: str) -> tuple[RelayEvent | None, bool]:
         """Read the exact indexed event head without enumerating the event directory."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
         index = self._read_job_index(job_id)
         if index is not None:
             latest_seq = _index_integer(index, "latest_event_seq")
             if latest_seq == 0:
                 return None, False
             event = self._read_optional(
-                self.root / "events" / job_id / f"{latest_seq:020d}.json",
+                self._storage_root / "events" / job_id / f"{latest_seq:020d}.json",
                 RelayEvent,
             )
             if event is None:
                 raise QueueConflictError(f"event index points to a missing record: {job_id}")
+            if event.job_id != job_id or event.seq != latest_seq:
+                raise QueueConflictError(f"event index identity mismatch: {job_id}")
             return event, False
-        event_dir = self.root / "events" / job_id
+        event_dir = self._storage_root / "events" / job_id
         latest: RelayEvent | None = None
         for seq in range(1, DEFAULT_EXACT_RECORD_LIMIT + 1):
             event = self._read_optional(event_dir / f"{seq:020d}.json", RelayEvent)
             if event is None:
                 return latest, False
+            if event.job_id != job_id or event.seq != seq:
+                raise QueueConflictError(f"event filename/content identity mismatch: {job_id}")
             latest = event
         truncated = (event_dir / f"{DEFAULT_EXACT_RECORD_LIMIT + 1:020d}.json").exists()
         return latest, truncated
@@ -5457,7 +6519,7 @@ class ClioCoreQueue:
         raise QueueConflictError(f"legacy event sequence requires index migration: {job_id}")
 
     def _next_task_event_seq(self, task_id: str, directory: Path) -> int:
-        head_path = self.root / "task_event_heads" / f"{task_id}.json"
+        head_path = self._storage_root / "task_event_heads" / f"{task_id}.json"
         try:
             raw = self._read_json_document(head_path)
         except FileNotFoundError:
@@ -5525,7 +6587,7 @@ class ClioCoreQueue:
                 identity_token,
             )
             lease = self._read_optional(
-                self.root / "leases" / f"{identity.lease_id}.json",
+                self._storage_root / "leases" / f"{identity.lease_id}.json",
                 Lease,
             )
             if lease is None:
@@ -5583,7 +6645,7 @@ class ClioCoreQueue:
                 identity_token,
             )
             lease = self._read_optional(
-                self.root / "leases" / f"{identity.lease_id}.json",
+                self._storage_root / "leases" / f"{identity.lease_id}.json",
                 Lease,
             )
             if lease is None:
@@ -5649,7 +6711,7 @@ class ClioCoreQueue:
         ):
             leases_by_job.setdefault(lease.job_id, []).append(lease)
         for job_id, leases in leases_by_job.items():
-            job = self._read_optional(self.root / "jobs" / f"{job_id}.json", RelayJob)
+            job = self._read_optional(self._storage_root / "jobs" / f"{job_id}.json", RelayJob)
             if job is None:
                 for lease in leases:
                     self._delete_lease_unlocked(lease)
@@ -5686,7 +6748,7 @@ class ClioCoreQueue:
             )
         for family in ("scheduler_protections_by_job", "scheduler_refs_by_job"):
             paths = self._bounded_json_record_paths(
-                self.root / family / self._safe_key(job.job_id),
+                self._storage_root / family / self._durable_key(job.job_id),
                 limit=MAX_BOUNDED_SCAN_RECORDS,
                 label=f"{family} for {job.job_id}",
             )
@@ -5695,7 +6757,7 @@ class ClioCoreQueue:
         return False
 
     def _ensure_job_queued_event(self, job: RelayJob) -> None:
-        event_dir = self.root / "events" / job.job_id
+        event_dir = self._storage_root / "events" / job.job_id
         if (event_dir / f"{1:020d}.json").is_file():
             return
         self._update_job_index_unlocked(job.job_id, latest_event_seq=0)
@@ -5715,7 +6777,12 @@ class ClioCoreQueue:
         cluster: str,
         job_id: str,
     ) -> Path:
-        return self.root / family / _stable_ref_token(cluster) / f"{_stable_ref_token(job_id)}.json"
+        return (
+            self._storage_root
+            / family
+            / _stable_ref_token(cluster)
+            / f"{self._durable_key(job_id)}.json"
+        )
 
     def _ensure_scheduler_cancel_pending_unlocked(
         self,
@@ -5748,7 +6815,9 @@ class ClioCoreQueue:
                     f"scheduler cancellation disposition identity mismatch: {completed_path}"
                 )
             return completed
-        pending_root = self.root / "scheduler_cancel_pending" / _stable_ref_token(job.cluster)
+        pending_root = (
+            self._storage_root / "scheduler_cancel_pending" / _stable_ref_token(job.cluster)
+        )
         count = 0
         try:
             with os.scandir(pending_root) as entries:
@@ -5821,7 +6890,7 @@ class ClioCoreQueue:
         """Reject a new active record before it can exceed the serviceable bound."""
         if job.state is not JobState.QUEUED:
             return
-        directory = self.root / "jobs_active"
+        directory = self._storage_root / "jobs_active"
         initial_count, _initial_over_capacity = _bounded_regular_json_count(
             directory,
             limit=MAX_ACTIVE_JOB_RECORDS,
@@ -5866,7 +6935,9 @@ class ClioCoreQueue:
         cluster_token = _stable_ref_token(cluster_identity)
         bucket = _endpoint_fresh_bucket(endpoint.last_seen_at)
         mapping_path = (
-            self.root / "endpoints_fresh_by_id" / f"{_stable_ref_token(endpoint.endpoint_id)}.json"
+            self._storage_root
+            / "endpoints_fresh_by_id"
+            / f"{_stable_ref_token(endpoint.endpoint_id)}.json"
         )
         previous: dict[str, object] | None = None
         try:
@@ -5888,7 +6959,7 @@ class ClioCoreQueue:
                     f"fresh endpoint mapping identity mismatch: {mapping_path}"
                 )
         target = (
-            self.root
+            self._storage_root
             / "endpoints_fresh"
             / cluster_token
             / f"{bucket:020d}"
@@ -5896,7 +6967,7 @@ class ClioCoreQueue:
         )
         if previous is not None:
             previous_target = (
-                self.root
+                self._storage_root
                 / "endpoints_fresh"
                 / cast(str, previous["cluster_token"])
                 / f"{cast(int, previous['bucket']):020d}"
@@ -5931,7 +7002,7 @@ class ClioCoreQueue:
                 "updated_at": job.updated_at.isoformat(),
             },
         )
-        self._write(self.root / "jobs" / f"{job.job_id}.json", job)
+        self._write(self._storage_root / "jobs" / f"{job.job_id}.json", job)
         self._sync_job_derived_unlocked(job)
         intent_path.unlink(missing_ok=True)
 
@@ -5943,8 +7014,8 @@ class ClioCoreQueue:
             source_id="job",
             metadata=job.metadata,
         )
-        active_path = self.root / "jobs_active" / f"{job.job_id}.json"
-        queued_path = self.root / "jobs_queued" / f"{job.job_id}.json"
+        active_path = self._storage_root / "jobs_active" / f"{job.job_id}.json"
+        queued_path = self._storage_root / "jobs_queued" / f"{job.job_id}.json"
         if job.state in TERMINAL_STATES:
             active_path.unlink(missing_ok=True)
             queued_path.unlink(missing_ok=True)
@@ -5962,7 +7033,7 @@ class ClioCoreQueue:
             task.task_id,
             {"job_id": task.job_id, "task_id": task.task_id},
         )
-        self._write(self.root / "tasks" / f"{task.task_id}.json", task)
+        self._write(self._storage_root / "tasks" / f"{task.task_id}.json", task)
         self._sync_task_derived_unlocked(task)
         intent_path.unlink(missing_ok=True)
 
@@ -5988,7 +7059,7 @@ class ClioCoreQueue:
             {"session_id": session.session_id},
         )
         self._write(
-            self.root / "gateway_sessions" / f"{session.session_id}.json",
+            self._storage_root / "gateway_sessions" / f"{session.session_id}.json",
             session,
         )
         self._after_gateway_canonical_write(session)
@@ -6005,7 +7076,11 @@ class ClioCoreQueue:
         payload: dict[str, object],
     ) -> Path:
         """Persist a bounded write-ahead intent before a canonical/index transition."""
-        path = self.root / "transition_intents" / f"{kind}-{_stable_ref_token(kind, identity)}.json"
+        path = (
+            self._storage_root
+            / "transition_intents"
+            / f"{kind}-{_stable_ref_token(kind, identity)}.json"
+        )
         self._write_json(
             path,
             {
@@ -6020,14 +7095,14 @@ class ClioCoreQueue:
 
     def _recover_pending_transitions_unlocked(self) -> list[RelayJob]:
         """Replay pending intents when the bounded journal is nonempty."""
-        if next((self.root / "transition_intents").glob("*.json"), None) is not None:
+        if next((self._storage_root / "transition_intents").glob("*.json"), None) is not None:
             return self._reconcile_transition_intents_unlocked()
         return []
 
     def _reconcile_transition_intents_unlocked(self) -> list[RelayJob]:
         """Replay interrupted queue transitions from canonical records or exact intents."""
         paths = self._bounded_json_record_paths(
-            self.root / "transition_intents",
+            self._storage_root / "transition_intents",
             limit=MAX_TRANSITION_INTENT_RECORDS,
             label="queue transition intent directory",
         )
@@ -6074,7 +7149,7 @@ class ClioCoreQueue:
                 job = RelayJob.model_validate(payload.get("job"))
                 if lease.job_id != job.job_id or previous.lease_id != lease.lease_id:
                     raise QueueConflictError(f"lease synchronization identity mismatch: {path}")
-                self._write(self.root / "leases" / f"{lease.lease_id}.json", lease)
+                self._write(self._storage_root / "leases" / f"{lease.lease_id}.json", lease)
                 self._write(
                     self._job_record_path("leases_by_job", lease.job_id, lease.lease_id),
                     lease,
@@ -6107,7 +7182,7 @@ class ClioCoreQueue:
                     self._validate_lease_index_identity(lease, identity)
                     if lease_id != lease.lease_id or job_id != lease.job_id:
                         raise QueueConflictError(f"lease deletion intent identity mismatch: {path}")
-                (self.root / "leases" / f"{lease_id}.json").unlink(missing_ok=True)
+                (self._storage_root / "leases" / f"{lease_id}.json").unlink(missing_ok=True)
                 self._job_record_path("leases_by_job", job_id, lease_id).unlink(missing_ok=True)
                 if identity is not None:
                     self._delete_lease_operational_indexes_unlocked(identity)
@@ -6122,7 +7197,7 @@ class ClioCoreQueue:
                 job_id = payload.get("job_id")
                 if not isinstance(job_id, str) or not job_id:
                     raise QueueConflictError(f"invalid job transition intent: {path}")
-                job = self._read_optional(self.root / "jobs" / f"{job_id}.json", RelayJob)
+                job = self._read_optional(self._storage_root / "jobs" / f"{job_id}.json", RelayJob)
                 if job is not None:
                     self._sync_job_derived_unlocked(job)
                 path.unlink(missing_ok=True)
@@ -6131,7 +7206,9 @@ class ClioCoreQueue:
                 task_id = payload.get("task_id")
                 if not isinstance(task_id, str) or not task_id:
                     raise QueueConflictError(f"invalid task transition intent: {path}")
-                task = self._read_optional(self.root / "tasks" / f"{task_id}.json", RelayTask)
+                task = self._read_optional(
+                    self._storage_root / "tasks" / f"{task_id}.json", RelayTask
+                )
                 if task is not None:
                     self._sync_task_derived_unlocked(task)
                 path.unlink(missing_ok=True)
@@ -6168,7 +7245,7 @@ class ClioCoreQueue:
         ):
             raise QueueConflictError(f"lease acquisition intent identity mismatch: {path}")
         current = self._read_optional(
-            self.root / "jobs" / f"{lease.job_id}.json",
+            self._storage_root / "jobs" / f"{lease.job_id}.json",
             RelayJob,
         )
         target_is_current = (
@@ -6178,9 +7255,9 @@ class ClioCoreQueue:
             and current.leased_by == lease.endpoint_id
         )
         if target_is_current:
-            self._write(self.root / "jobs" / f"{original_job.job_id}.json", original_job)
+            self._write(self._storage_root / "jobs" / f"{original_job.job_id}.json", original_job)
             self._sync_job_derived_unlocked(original_job)
-        lease_path = self.root / "leases" / f"{lease.lease_id}.json"
+        lease_path = self._storage_root / "leases" / f"{lease.lease_id}.json"
         indexed_path = self._job_record_path("leases_by_job", lease.job_id, lease.lease_id)
         identity = self._lease_index_identity(lease, job=original_job)
         if (
@@ -6206,22 +7283,24 @@ class ClioCoreQueue:
     def _repair_active_job_index_unlocked(self) -> None:
         """Remove stale capacity entries and refresh every indexed active job."""
         paths = self._bounded_json_record_paths(
-            self.root / "jobs_active",
+            self._storage_root / "jobs_active",
             limit=MAX_ACTIVE_JOB_RECORDS,
             label="active job index",
         )
         for path in paths:
             indexed = self._read_json_file(path, RelayJob)
             canonical = self._read_optional(
-                self.root / "jobs" / f"{indexed.job_id}.json",
+                self._storage_root / "jobs" / f"{indexed.job_id}.json",
                 RelayJob,
             )
             if canonical is None or canonical.state in TERMINAL_STATES:
                 path.unlink(missing_ok=True)
-                (self.root / "jobs_queued" / f"{indexed.job_id}.json").unlink(missing_ok=True)
+                (self._storage_root / "jobs_queued" / f"{indexed.job_id}.json").unlink(
+                    missing_ok=True
+                )
                 continue
             self._write(path, canonical)
-            queued_path = self.root / "jobs_queued" / f"{canonical.job_id}.json"
+            queued_path = self._storage_root / "jobs_queued" / f"{canonical.job_id}.json"
             if canonical.state is JobState.QUEUED:
                 self._write(queued_path, canonical)
             else:
@@ -6285,7 +7364,9 @@ class ClioCoreQueue:
                     elif closure.residual_resource_ids:
                         protections.append("owner_session_residual_resources")
         key_path = (
-            self.root / "idempotency" / (f"{_idempotency_key_filename(job.idempotency_key)}.json")
+            self._storage_root
+            / "idempotency"
+            / (f"{_idempotency_key_filename(job.idempotency_key)}.json")
         )
         try:
             raw_idempotency = self._read_json_document(key_path)
@@ -6338,7 +7419,7 @@ class ClioCoreQueue:
         return list(dict.fromkeys(protections))
 
     def _indexed_gc_entry_state(self, family: str, job_id: str) -> tuple[bool, bool]:
-        directory = self.root / family / self._safe_key(job_id)
+        directory = self._storage_root / family / self._durable_key(job_id)
         try:
             directory_stat = os.lstat(directory)
             if not stat.S_ISDIR(directory_stat.st_mode) or _record_is_reparse(directory_stat):
@@ -6369,14 +7450,16 @@ class ClioCoreQueue:
             return False, True
 
     def _job_tombstone_path(self, job_id: str) -> Path:
-        return self.root / "job_tombstones" / f"{self._safe_key(job_id)}.json"
+        return self._storage_root / "job_tombstones" / f"{self._durable_key(job_id)}.json"
 
     def _job_gc_trash_path(self, job_id: str) -> Path:
-        return self.root / "gc_trash" / self._safe_key(job_id)
+        return self._storage_root / "gc_trash" / self._durable_key(job_id)
 
     def _read_committed_job_digest(self, job: RelayJob) -> str:
         key_path = (
-            self.root / "idempotency" / f"{_idempotency_key_filename(job.idempotency_key)}.json"
+            self._storage_root
+            / "idempotency"
+            / f"{_idempotency_key_filename(job.idempotency_key)}.json"
         )
         raw = self._read_json_document(key_path)
         if not isinstance(raw, dict):
@@ -6394,7 +7477,7 @@ class ClioCoreQueue:
 
     def _retire_idempotency_unlocked(self, tombstone: JobTombstone) -> None:
         key_path = (
-            self.root
+            self._storage_root
             / "idempotency"
             / (f"{_idempotency_key_filename(tombstone.idempotency_key)}.json")
         )
@@ -6466,7 +7549,7 @@ class ClioCoreQueue:
         if limit <= 0:
             return 0, False
         job_id = tombstone.job_id
-        safe_job_id = self._safe_key(job_id)
+        safe_job_id = self._durable_key(job_id)
         trash = self._job_gc_trash_path(job_id)
         directory_families = (
             "events",
@@ -6486,14 +7569,14 @@ class ClioCoreQueue:
         )
         moves: list[tuple[Path, Path]] = [
             (
-                self.root / family / safe_job_id,
+                self._storage_root / family / safe_job_id,
                 trash / "owned" / family,
             )
             for family in directory_families
         ]
         moves.extend(
             (
-                self.root / family / filename,
+                self._storage_root / family / filename,
                 trash / "root_records" / family / filename,
             )
             for family, filename in (
@@ -6501,7 +7584,6 @@ class ClioCoreQueue:
                 ("jobs_active", f"{job_id}.json"),
                 ("jobs_queued", f"{job_id}.json"),
                 ("job_indexes", f"{safe_job_id}.json"),
-                ("cursors", f"{job_id}.json"),
             )
         )
         actions = 0
@@ -6586,39 +7668,39 @@ class ClioCoreQueue:
     def _trash_primary_record_unlocked(self, record: BaseModel, *, trash: Path) -> None:
         if isinstance(record, RelayTask):
             _move_gc_path(
-                self.root / "tasks" / f"{record.task_id}.json",
+                self._storage_root / "tasks" / f"{record.task_id}.json",
                 trash / "primary" / "tasks" / f"{record.task_id}.json",
             )
             _move_gc_path(
-                self.root / "task_events" / record.task_id,
+                self._storage_root / "task_events" / record.task_id,
                 trash / "primary" / "task_events" / record.task_id,
             )
             _move_gc_path(
-                self.root / "task_event_heads" / f"{record.task_id}.json",
+                self._storage_root / "task_event_heads" / f"{record.task_id}.json",
                 trash / "primary" / "task_event_heads" / f"{record.task_id}.json",
             )
             return
         if isinstance(record, Lease):
             _move_gc_path(
-                self.root / "leases" / f"{record.lease_id}.json",
+                self._storage_root / "leases" / f"{record.lease_id}.json",
                 trash / "primary" / "leases" / f"{record.lease_id}.json",
             )
             return
         if isinstance(record, ArtifactRef):
             _move_gc_path(
-                self.root / "artifacts" / f"{record.artifact_id}.json",
+                self._storage_root / "artifacts" / f"{record.artifact_id}.json",
                 trash / "primary" / "artifacts" / f"{record.artifact_id}.json",
             )
             return
         if isinstance(record, ProgressRecord):
             _move_gc_path(
-                self.root / "progress" / f"{record.progress_id}.json",
+                self._storage_root / "progress" / f"{record.progress_id}.json",
                 trash / "primary" / "progress" / f"{record.progress_id}.json",
             )
             return
         if isinstance(record, MonitorRule):
             _move_gc_path(
-                self.root / "monitor_rules" / f"{record.rule_id}.json",
+                self._storage_root / "monitor_rules" / f"{record.rule_id}.json",
                 trash / "primary" / "monitor_rules" / f"{record.rule_id}.json",
             )
             return
@@ -6649,7 +7731,7 @@ class ClioCoreQueue:
             raise QueueConflictError(f"unsupported global-order family: {family}")
         if not _safe_global_record_id(record_id):
             raise QueueConflictError(f"unsafe global-order record id: {record_id!r}")
-        root = self.root / "global_order" / family
+        root = self._storage_root / "global_order" / family
         mapping_path = root / "by_id" / f"{_stable_ref_token(record_id)}.json"
         mapping = self._read_global_order_record_optional(
             mapping_path,
@@ -6707,7 +7789,9 @@ class ClioCoreQueue:
         record_id: str,
         sequence: int,
     ) -> None:
-        entry_path = self.root / "global_order" / family / "entries" / f"{sequence:020d}.json"
+        entry_path = (
+            self._storage_root / "global_order" / family / "entries" / f"{sequence:020d}.json"
+        )
         existing = self._read_global_order_record_optional(entry_path, family=family)
         if existing is not None:
             if existing != (record_id, sequence):
@@ -6724,7 +7808,7 @@ class ClioCoreQueue:
         )
 
     def _read_global_order_head(self, family: str) -> int:
-        path = self.root / "global_order" / family / "head.json"
+        path = self._storage_root / "global_order" / family / "head.json"
         try:
             raw = self._read_json_document(path)
         except FileNotFoundError:
@@ -6791,7 +7875,7 @@ class ClioCoreQueue:
             return [], None, latest_sequence
         stop = min(latest_sequence + 1, cursor + limit)
         records: list[Record] = []
-        root = self.root / "global_order" / family
+        root = self._storage_root / "global_order" / family
         for sequence in range(cursor, stop):
             entry = self._read_global_order_record_optional(
                 root / "entries" / f"{sequence:020d}.json",
@@ -6812,7 +7896,7 @@ class ClioCoreQueue:
                 raise QueueConflictError(
                     f"global-order reverse mapping mismatch: {family}/{record_id}"
                 )
-            record = self._read_optional(self.root / family / f"{record_id}.json", model)
+            record = self._read_optional(self._storage_root / family / f"{record_id}.json", model)
             if record is None:
                 continue
             if getattr(record, identity_field, None) != record_id:
@@ -6866,7 +7950,7 @@ class ClioCoreQueue:
             state["order_families"] = {
                 family: {
                     "cursor": None,
-                    "complete": next((self.root / family).glob("*.json"), None) is None,
+                    "complete": next((self._storage_root / family).glob("*.json"), None) is None,
                 }
                 for family in _ORDER_FAMILIES
             }
@@ -6875,7 +7959,7 @@ class ClioCoreQueue:
             state["retention_families"] = {
                 family: {
                     "cursor": None,
-                    "complete": next((self.root / family).glob("*.json"), None) is None,
+                    "complete": next((self._storage_root / family).glob("*.json"), None) is None,
                 }
                 for family in _RETENTION_INDEX_FAMILIES
             }
@@ -6884,7 +7968,7 @@ class ClioCoreQueue:
             state["global_order_families"] = {
                 family: {
                     "cursor": None,
-                    "complete": next((self.root / family).glob("*.json"), None) is None,
+                    "complete": next((self._storage_root / family).glob("*.json"), None) is None,
                 }
                 for family in _GLOBAL_ORDER_FAMILIES
             }
@@ -6899,7 +7983,7 @@ class ClioCoreQueue:
                     global_order_state[family] = {
                         "cursor": None,
                         "complete": next(
-                            (self.root / family).glob("*.json"),
+                            (self._storage_root / family).glob("*.json"),
                             None,
                         )
                         is None,
@@ -6909,7 +7993,7 @@ class ClioCoreQueue:
             state["operational_families"] = {
                 family: {
                     "cursor": None,
-                    "complete": next((self.root / family).glob("*.json"), None) is None,
+                    "complete": next((self._storage_root / family).glob("*.json"), None) is None,
                     **(
                         {"schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA}
                         if family == "leases"
@@ -6925,7 +8009,8 @@ class ClioCoreQueue:
                 if not isinstance(operational_state.get(family), dict):
                     operational_state[family] = {
                         "cursor": None,
-                        "complete": next((self.root / family).glob("*.json"), None) is None,
+                        "complete": next((self._storage_root / family).glob("*.json"), None)
+                        is None,
                         **(
                             {"schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA}
                             if family == "leases"
@@ -6941,7 +8026,7 @@ class ClioCoreQueue:
                         {
                             "cursor": None,
                             "complete": next(
-                                (self.root / "leases").glob("*.json"),
+                                (self._storage_root / "leases").glob("*.json"),
                                 None,
                             )
                             is None,
@@ -6951,7 +8036,7 @@ class ClioCoreQueue:
                     changed = True
         if not isinstance(state.get("lease_operational_repair"), dict):
             state["lease_operational_repair"] = {
-                "complete": not _lease_operational_records_present(self.root),
+                "complete": not _lease_operational_records_present(self._storage_root),
                 "schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA,
             }
             changed = True
@@ -6996,7 +8081,7 @@ class ClioCoreQueue:
             self._write_index_migration_state(state)
 
     def _read_index_migration_state(self) -> dict[str, object]:
-        path = self.root / "migrations" / "index-v1.json"
+        path = self._storage_root / "migrations" / "index-v1.json"
         try:
             raw = self._read_json_document(path)
         except (OSError, QueueConflictError) as exc:
@@ -7009,7 +8094,7 @@ class ClioCoreQueue:
         return state
 
     def _write_index_migration_state(self, state: dict[str, object]) -> None:
-        self._write_json(self.root / "migrations" / "index-v1.json", state)
+        self._write_json(self._storage_root / "migrations" / "index-v1.json", state)
 
     def _require_index_migration_complete(self) -> None:
         if self._read_index_migration_state().get("complete") is not True:
@@ -7102,23 +8187,28 @@ class ClioCoreQueue:
 
     def _finalize_job_index_unlocked(self, job_id: str) -> None:
         self._initialize_job_index_unlocked(job_id)
-        safe_job_id = self._safe_key(job_id)
-        task_count = _last_contiguous_sequence(self.root / "task_order_by_job" / safe_job_id)
+        safe_job_id = self._durable_key(job_id)
+        task_count = _last_contiguous_sequence(
+            self._storage_root / "task_order_by_job" / safe_job_id
+        )
         artifact_count = _last_contiguous_sequence(
-            self.root / "artifact_order_by_job" / safe_job_id
+            self._storage_root / "artifact_order_by_job" / safe_job_id
         )
         progress_count = _last_contiguous_sequence(
-            self.root / "progress_order_by_job" / safe_job_id
+            self._storage_root / "progress_order_by_job" / safe_job_id
         )
         latest_progress = (
             self._read_optional(
-                self.root / "progress_order_by_job" / safe_job_id / f"{progress_count:020d}.json",
+                self._storage_root
+                / "progress_order_by_job"
+                / safe_job_id
+                / f"{progress_count:020d}.json",
                 ProgressRecord,
             )
             if progress_count > 0
             else None
         )
-        latest_event_seq = _last_contiguous_sequence(self.root / "events" / job_id)
+        latest_event_seq = _last_contiguous_sequence(self._storage_root / "events" / job_id)
         self._update_job_index_unlocked(
             job_id,
             task_count=task_count,
@@ -7129,7 +8219,7 @@ class ClioCoreQueue:
         )
 
     def _initialize_job_index_unlocked(self, job_id: str) -> None:
-        index_path = self.root / "job_indexes" / f"{self._safe_key(job_id)}.json"
+        index_path = self._storage_root / "job_indexes" / f"{self._durable_key(job_id)}.json"
         for family in (
             "tasks_by_job",
             "leases_by_job",
@@ -7145,7 +8235,9 @@ class ClioCoreQueue:
             "active_monitor_rules_by_job",
             "active_gateway_refs_by_job",
         ):
-            (self.root / family / self._safe_key(job_id)).mkdir(parents=True, exist_ok=True)
+            (self._storage_root / family / self._durable_key(job_id)).mkdir(
+                parents=True, exist_ok=True
+            )
         if index_path.exists():
             return
         self._write_json(
@@ -7164,10 +8256,10 @@ class ClioCoreQueue:
         )
 
     def _job_index_exists(self, job_id: str) -> bool:
-        return (self.root / "job_indexes" / f"{self._safe_key(job_id)}.json").is_file()
+        return (self._storage_root / "job_indexes" / f"{self._durable_key(job_id)}.json").is_file()
 
     def _read_job_index(self, job_id: str) -> dict[str, object] | None:
-        path = self.root / "job_indexes" / f"{self._safe_key(job_id)}.json"
+        path = self._storage_root / "job_indexes" / f"{self._durable_key(job_id)}.json"
         try:
             raw = self._read_json_document(path)
         except FileNotFoundError:
@@ -7192,7 +8284,7 @@ class ClioCoreQueue:
             return
         index.update(updates)
         self._write_json(
-            self.root / "job_indexes" / f"{self._safe_key(job_id)}.json",
+            self._storage_root / "job_indexes" / f"{self._durable_key(job_id)}.json",
             index,
         )
 
@@ -7208,7 +8300,7 @@ class ClioCoreQueue:
         index[field] = _index_integer(index, field) + 1
         index.update(updates)
         self._write_json(
-            self.root / "job_indexes" / f"{self._safe_key(job_id)}.json",
+            self._storage_root / "job_indexes" / f"{self._durable_key(job_id)}.json",
             index,
         )
 
@@ -7225,7 +8317,7 @@ class ClioCoreQueue:
         sequence: int,
         record: BaseModel,
     ) -> None:
-        directory = self.root / f"{family}_order_by_job" / self._safe_key(job_id)
+        directory = self._storage_root / f"{family}_order_by_job" / self._durable_key(job_id)
         self._write(directory / f"{sequence:020d}.json", record)
 
     def _read_ordered_job_page(
@@ -7250,7 +8342,7 @@ class ClioCoreQueue:
             return [], None, total
         stop = min(total + 1, cursor + limit)
         records: list[Record] = []
-        directory = self.root / f"{family}_order_by_job" / self._safe_key(job_id)
+        directory = self._storage_root / f"{family}_order_by_job" / self._durable_key(job_id)
         for sequence in range(cursor, stop):
             record = self._read_optional(directory / f"{sequence:020d}.json", model)
             if record is None:
@@ -7265,24 +8357,24 @@ class ClioCoreQueue:
         if family == "tasks" and isinstance(record, RelayTask):
             sequence = record.sequence or (
                 _last_contiguous_sequence(
-                    self.root / "task_order_by_job" / self._safe_key(record.job_id)
+                    self._storage_root / "task_order_by_job" / self._durable_key(record.job_id)
                 )
                 + 1
             )
             saved = record.model_copy(update={"sequence": sequence})
-            self._write(self.root / "tasks" / f"{saved.task_id}.json", saved)
+            self._write(self._storage_root / "tasks" / f"{saved.task_id}.json", saved)
             self._write(self._job_record_path("tasks_by_job", saved.job_id, saved.task_id), saved)
             self._write_ordered_job_record("task", saved.job_id, sequence, saved)
             return
         if family == "artifacts" and isinstance(record, ArtifactRef):
             sequence = record.sequence or (
                 _last_contiguous_sequence(
-                    self.root / "artifact_order_by_job" / self._safe_key(record.job_id)
+                    self._storage_root / "artifact_order_by_job" / self._durable_key(record.job_id)
                 )
                 + 1
             )
             saved = record.model_copy(update={"sequence": sequence})
-            self._write(self.root / "artifacts" / f"{saved.artifact_id}.json", saved)
+            self._write(self._storage_root / "artifacts" / f"{saved.artifact_id}.json", saved)
             self._write(
                 self._job_record_path("artifacts_by_job", saved.job_id, saved.artifact_id),
                 saved,
@@ -7292,12 +8384,12 @@ class ClioCoreQueue:
         if family == "progress" and isinstance(record, ProgressRecord):
             sequence = record.sequence or (
                 _last_contiguous_sequence(
-                    self.root / "progress_order_by_job" / self._safe_key(record.job_id)
+                    self._storage_root / "progress_order_by_job" / self._durable_key(record.job_id)
                 )
                 + 1
             )
             saved = record.model_copy(update={"sequence": sequence})
-            self._write(self.root / "progress" / f"{saved.progress_id}.json", saved)
+            self._write(self._storage_root / "progress" / f"{saved.progress_id}.json", saved)
             self._write(
                 self._job_record_path("progress_by_job", saved.job_id, saved.progress_id),
                 saved,
@@ -7307,40 +8399,174 @@ class ClioCoreQueue:
         raise QueueConflictError(f"order-index migration record mismatch: {family}")
 
     def _job_record_path(self, family: str, job_id: str, record_id: str) -> Path:
-        return self.root / family / self._safe_key(job_id) / f"{record_id}.json"
-
-    @staticmethod
-    def _safe_key(value: str) -> str:
-        return "".join(
-            character if character.isalnum() or character in "-_." else "_" for character in value
+        return (
+            self._storage_root
+            / family
+            / self._durable_key(job_id)
+            / f"{self._durable_key(record_id)}.json"
         )
 
     @staticmethod
-    def _write(path: Path, record: BaseModel) -> None:
-        ClioCoreQueue._write_text(path, record.model_dump_json(indent=2))
+    def _durable_key(value: str) -> str:
+        return ClioCoreQueue._require_durable_record_id(value, field="record_id")
 
     @staticmethod
-    def _write_json(path: Path, record: dict[str, object]) -> None:
-        ClioCoreQueue._write_text(path, json.dumps(record))
+    def _require_durable_record_id(value: str, *, field: str) -> str:
+        try:
+            return validate_durable_record_id(value)
+        except ValueError as error:
+            raise ValueError(f"invalid {field}: {error}") from error
 
     @staticmethod
-    def _write_text(path: Path, text: str) -> None:
+    def _label_key(value: str, *, domain: str) -> str:
+        return filesystem_key(value, domain=domain)
+
+    def _write(self, path: Path, record: BaseModel) -> None:
+        self._write_text(path, record.model_dump_json(indent=2))
+
+    def _write_json(self, path: Path, record: dict[str, object]) -> None:
+        self._write_text(path, json.dumps(record))
+
+    def _require_safe_write_directory(self, directory: Path) -> os.stat_result:
+        """Create and validate one owner-controlled directory below the queue root."""
+        try:
+            logical_directory = logical_filesystem_path(directory)
+            internal_directory = internal_filesystem_path(
+                logical_directory,
+                force_extended=True,
+            )
+        except ValueError as error:
+            raise QueueConflictError(
+                f"write directory has an unsupported path: {directory}"
+            ) from error
+        try:
+            relative = internal_directory.relative_to(self._storage_root)
+        except ValueError as error:
+            raise QueueConflictError(
+                f"write directory escaped queue root: {logical_directory}"
+            ) from error
+        if any(part in {"", ".", ".."} for part in relative.parts):
+            raise QueueConflictError(f"write directory has unsafe ancestry: {logical_directory}")
+        current = self._storage_root
+        for part in relative.parts:
+            current /= part
+            try:
+                current_stat = os.lstat(current)
+            except FileNotFoundError:
+                with suppress(FileExistsError):
+                    current.mkdir(mode=0o700)
+                current_stat = os.lstat(current)
+            if not stat.S_ISDIR(current_stat.st_mode) or _record_is_reparse(current_stat):
+                raise QueueConflictError(
+                    f"write directory ancestry is unsafe: {logical_filesystem_path(current)}"
+                )
+            if os.name != "nt" and hasattr(os, "geteuid") and current_stat.st_uid != os.geteuid():
+                raise QueueConflictError(
+                    f"write directory is not owned by this user: {logical_filesystem_path(current)}"
+                )
+        return os.lstat(internal_directory)
+
+    def _require_private_write_staging(self) -> tuple[Path, os.stat_result]:
+        """Return the private non-reparse staging directory used for atomic writes."""
+        staging = self._storage_root / WRITE_STAGING_FAMILY
+        try:
+            if not os.path.lexists(staging):
+                ensure_private_configuration_directory(staging)
+            if os.name != "nt":
+                os.chmod(staging, 0o700)
+            ensure_private_configuration_path(staging, directory=True)
+        except (ConfigurationError, OSError) as error:
+            raise QueueConflictError(
+                f"queue write staging is not owner-private: {logical_filesystem_path(staging)}"
+            ) from error
+        staging_stat = self._require_safe_write_directory(staging)
+        if not stat.S_ISDIR(staging_stat.st_mode) or _record_is_reparse(staging_stat):
+            raise QueueConflictError(
+                f"queue write staging is not a safe directory: {logical_filesystem_path(staging)}"
+            )
+        return staging, staging_stat
+
+    def _purge_write_staging_unlocked(self) -> None:
+        """Remove bounded crash leftovers while holding the cross-process queue lock."""
+        staging, _ = self._require_private_write_staging()
+        leftovers: list[Path] = []
+        try:
+            with os.scandir(staging) as entries:
+                for entry in entries:
+                    if len(leftovers) >= WRITE_STAGING_MAX_LEFTOVERS:
+                        raise QueueConflictError(
+                            f"queue write staging exceeds the bounded cleanup limit: {staging}"
+                        )
+                    path = Path(entry.path)
+                    stem = entry.name.removesuffix(".tmp")
+                    entry_stat = os.lstat(path)
+                    if (
+                        not entry.name.endswith(".tmp")
+                        or len(stem) != 32
+                        or any(character not in "0123456789abcdef" for character in stem)
+                        or not stat.S_ISREG(entry_stat.st_mode)
+                        or _record_is_reparse(entry_stat)
+                        or entry_stat.st_nlink != 1
+                    ):
+                        raise QueueConflictError(
+                            f"queue write staging contains an unsafe entry: {path}"
+                        )
+                    leftovers.append(path)
+        except QueueConflictError:
+            raise
+        except OSError as error:
+            raise QueueConflictError(f"cannot scan queue write staging: {staging}") from error
+        for path in leftovers:
+            path.unlink()
+        if leftovers:
+            self._fsync_write_directory(staging)
+
+    def _write_text(self, path: Path, text: str) -> None:
+        try:
+            logical_path = logical_filesystem_path(path)
+            internal_path = internal_filesystem_path(logical_path, force_extended=True)
+        except ValueError as error:
+            raise QueueConflictError(f"queue write path is unsupported: {path}") from error
         payload = text.encode("utf-8")
-        limit = _record_max_bytes(path)
+        limit = _record_max_bytes(internal_path)
         if len(payload) > limit:
             raise QueueConflictError(
-                f"{_record_family(path)} record exceeds the {limit}-byte limit: {path}"
+                f"{_record_family(internal_path)} record exceeds the {limit}-byte limit: "
+                f"{logical_path}"
             )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{uuid4().hex}.tmp")
+        target_parent_stat = self._require_safe_write_directory(internal_path.parent)
+        staging, staging_stat = self._require_private_write_staging()
+        if staging_stat.st_dev != target_parent_stat.st_dev:
+            raise QueueConflictError(
+                "atomic queue replacement crosses filesystems: "
+                f"{logical_filesystem_path(staging)} -> {logical_path.parent}"
+            )
+        temporary = staging / f"{uuid4().hex}.tmp"
         try:
-            with temporary.open("wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
+            try:
+                with open_private_atomic_file(temporary) as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except (ConfigurationError, OSError) as error:
+                raise QueueConflictError(
+                    "cannot create private staged queue record: "
+                    f"{logical_filesystem_path(temporary)}"
+                ) from error
+            observed_staging = os.lstat(staging)
+            observed_parent = os.lstat(internal_path.parent)
+            if not os.path.samestat(staging_stat, observed_staging):
+                raise QueueConflictError(
+                    "queue write staging changed before replace: "
+                    f"{logical_filesystem_path(staging)}"
+                )
+            if not os.path.samestat(target_parent_stat, observed_parent):
+                raise QueueConflictError(
+                    f"queue write target directory changed before replace: {logical_path.parent}"
+                )
             for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
                 try:
-                    temporary.replace(path)
+                    temporary.replace(internal_path)
                     break
                 except PermissionError:
                     if attempt + 1 >= ATOMIC_REPLACE_ATTEMPTS:
@@ -7348,8 +8574,14 @@ class ClioCoreQueue:
                     time.sleep(ATOMIC_REPLACE_RETRY_SECONDS)
         finally:
             temporary.unlink(missing_ok=True)
+        self._fsync_write_directory(staging)
+        self._fsync_write_directory(internal_path.parent)
+
+    @staticmethod
+    def _fsync_write_directory(path: Path) -> None:
+        """Persist directory metadata where the platform exposes directory fsync."""
         try:
-            directory_fd = os.open(path.parent, os.O_RDONLY)
+            directory_fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         except OSError:
             return
         try:
@@ -7367,15 +8599,35 @@ class ClioCoreQueue:
             return None
 
     @classmethod
-    def _read_many(cls, directory: Path, model: type[Record]) -> Iterable[Record]:
-        if not directory.exists():
-            return []
+    def _read_many(
+        cls,
+        directory: Path,
+        model: type[Record],
+        *,
+        identity_field: str | None = None,
+    ) -> Iterable[Record]:
+        identity_field = identity_field or _record_identity_field(model)
+        paths, truncated = cls._scan_json_record_paths(
+            directory,
+            limit=MAX_BOUNDED_SCAN_RECORDS,
+            label=f"canonical {identity_field} records",
+        )
+        if truncated:
+            raise QueueConflictError(
+                "canonical record family exceeds the bounded read limit of "
+                f"{MAX_BOUNDED_SCAN_RECORDS}: {directory}"
+            )
         records: list[Record] = []
-        for path in directory.glob("*.json"):
+        for path in paths:
             try:
-                records.append(cls._read_json_file(path, model))
+                record = cls._read_json_file(path, model)
             except FileNotFoundError:
                 continue
+            if getattr(record, identity_field, None) != path.stem:
+                raise QueueConflictError(
+                    f"canonical {identity_field} filename/content identity mismatch: {path}"
+                )
+            records.append(record)
         return records
 
     @classmethod
@@ -7385,20 +8637,68 @@ class ClioCoreQueue:
         model: type[Record],
         *,
         limit: int,
+        identity_field: str | None = None,
     ) -> tuple[list[Record], bool]:
         if limit < 1:
             raise ValueError("record scan limit must be at least 1")
-        if not directory.exists():
-            return [], False
+        identity_field = identity_field or _record_identity_field(model)
+        paths, truncated = cls._scan_json_record_paths(
+            directory,
+            limit=limit,
+            label=f"canonical {identity_field} records",
+        )
         records: list[Record] = []
-        for path in directory.glob("*.json"):
-            if len(records) >= limit:
-                return records, True
+        for path in paths:
             try:
-                records.append(cls._read_json_file(path, model))
+                record = cls._read_json_file(path, model)
             except FileNotFoundError:
                 continue
-        return records, False
+            if getattr(record, identity_field, None) != path.stem:
+                raise QueueConflictError(
+                    f"canonical {identity_field} filename/content identity mismatch: {path}"
+                )
+            records.append(record)
+        return records, truncated
+
+    @staticmethod
+    def _scan_json_record_paths(
+        directory: Path,
+        *,
+        limit: int,
+        label: str,
+    ) -> tuple[list[Path], bool]:
+        """Scan regular JSON children without following a replaced directory or entry."""
+        try:
+            directory_stat = os.lstat(directory)
+        except FileNotFoundError:
+            return [], False
+        except OSError as error:
+            raise QueueConflictError(f"cannot inspect {label}: {directory}") from error
+        if not stat.S_ISDIR(directory_stat.st_mode) or _record_is_reparse(directory_stat):
+            raise QueueConflictError(f"{label} is not a safe directory: {directory}")
+        paths: list[Path] = []
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    path = Path(entry.path)
+                    if (
+                        not entry.name.endswith(".json")
+                        or not stat.S_ISREG(entry_stat.st_mode)
+                        or _record_is_reparse(entry_stat)
+                    ):
+                        raise QueueConflictError(f"{label} contains an unsafe record: {path}")
+                    if len(paths) >= limit:
+                        return paths, True
+                    paths.append(path)
+        except QueueConflictError:
+            raise
+        except OSError as error:
+            raise QueueConflictError(f"cannot scan {label}: {directory}") from error
+        return paths, False
 
     @staticmethod
     def _bounded_json_record_paths(
@@ -7462,6 +8762,41 @@ class ClioCoreQueue:
             return json.loads(_read_bounded_record_bytes(path))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise QueueConflictError(f"invalid JSON record {path}: {exc}") from exc
+
+
+def _record_identity_field(model: type[BaseModel]) -> str:
+    """Return the filename-bound identity field for a canonical queue model."""
+    identity_fields: dict[type[BaseModel], str] = {
+        ArtifactRef: "artifact_id",
+        EndpointRegistration: "endpoint_id",
+        GatewaySession: "session_id",
+        Lease: "lease_id",
+        MonitorRule: "rule_id",
+        ProgressRecord: "progress_id",
+        RelayJob: "job_id",
+        RelayTask: "task_id",
+        SchedulerCancelPending: "job_id",
+    }
+    try:
+        return identity_fields[model]
+    except KeyError as error:
+        raise QueueConflictError(
+            f"canonical record model has no filename identity contract: {model.__name__}"
+        ) from error
+
+
+def _has_relay_managed_gateway_state(gateway: dict[str, object]) -> bool:
+    """Return whether a gateway payload contains relay-owned runtime identity."""
+    if {"runtime_spec", "ownership_intents", "teardown_intent", "teardown", "detach"}.intersection(
+        gateway
+    ):
+        return True
+    transport = gateway.get("transport")
+    if not isinstance(transport, dict):
+        return False
+    return bool(
+        {"desktop_connector", "remote_connector"}.intersection(cast(dict[str, object], transport))
+    )
 
 
 def _metadata_scheduler_gc_state(metadata: dict[str, object]) -> tuple[set[str], bool]:
@@ -7531,37 +8866,46 @@ def _owner_session_identity(
 ) -> tuple[str, str | None] | None:
     owner_session_id = metadata.get("owner_session_id")
     generation_id = metadata.get("owner_session_generation_id")
+    admission_session_id = metadata.get("owner_session_admission_id")
     if owner_session_id is None:
-        if generation_id is not None:
-            raise QueueConflictError("owner_session_generation_id requires owner_session_id")
+        if generation_id is not None or admission_session_id is not None:
+            raise QueueConflictError(
+                "owner_session_generation_id and owner_session_admission_id require "
+                "owner_session_id"
+            )
         return None
     if not isinstance(owner_session_id, str) or not owner_session_id:
         raise QueueConflictError("owner_session_id must be a non-empty string")
+    if admission_session_id is not None and (
+        not isinstance(admission_session_id, str)
+        or not _safe_global_record_id(admission_session_id)
+    ):
+        raise QueueConflictError("owner_session_admission_id must be a safe identifier")
     if generation_id is None and allow_legacy:
         return owner_session_id, None
-    if not isinstance(generation_id, str) or not generation_id:
+    if not isinstance(generation_id, str):
         raise QueueConflictError("new owner-session records require owner_session_generation_id")
+    try:
+        validate_durable_record_id(generation_id)
+    except ValueError as error:
+        raise QueueConflictError(
+            "owner_session_generation_id must be a portable durable identifier"
+        ) from error
     return owner_session_id, generation_id
 
 
 def _safe_owner_legacy_job_id(job_id: object) -> bool:
-    return (
-        isinstance(job_id, str)
-        and bool(job_id)
-        and len(job_id) <= 256
-        and job_id not in {".", ".."}
-        and all(character.isalnum() or character in "-_." for character in job_id)
-    )
+    return _safe_global_record_id(job_id)
 
 
 def _safe_global_record_id(record_id: object) -> bool:
-    return (
-        isinstance(record_id, str)
-        and bool(record_id)
-        and len(record_id) <= 256
-        and record_id not in {".", ".."}
-        and all(character.isalnum() or character in "-_." for character in record_id)
-    )
+    if not isinstance(record_id, str):
+        return False
+    try:
+        validate_durable_record_id(record_id)
+    except ValueError:
+        return False
+    return True
 
 
 def _endpoint_fresh_bucket(value: datetime) -> int:
@@ -8164,23 +9508,53 @@ def _record_max_bytes(path: Path) -> int:
 
 
 def _record_is_reparse(file_stat: os.stat_result) -> bool:
-    attributes = getattr(file_stat, "st_file_attributes", 0)
+    attributes = getattr(file_stat, "st_file_attributes", 0) or 0
     return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
 
 
 def _validate_record_stat(file_stat: os.stat_result, *, path: Path) -> None:
     if not stat.S_ISREG(file_stat.st_mode) or _record_is_reparse(file_stat):
         raise QueueConflictError(f"durable record is not a regular owned file: {path}")
+    if file_stat.st_nlink == 0:
+        raise _TransientRecordReplacement(f"durable record was atomically unlinked: {path}")
     if file_stat.st_nlink != 1:
         raise QueueConflictError(f"durable record must not be hard linked: {path}")
 
 
-def _read_bounded_record_bytes(path: Path) -> bytes:
-    limit = _record_max_bytes(path)
-    try:
-        before = os.lstat(path)
-    except OSError as exc:
-        raise exc
+def _record_stats_match(
+    expected: os.stat_result,
+    observed: os.stat_result,
+    *,
+    compare_ctime: bool,
+) -> bool:
+    """Return whether two observations describe one unchanged durable record."""
+    shared_metadata_matches = (
+        expected.st_mode,
+        expected.st_nlink,
+        expected.st_uid,
+        expected.st_gid,
+        expected.st_size,
+        expected.st_mtime_ns,
+        getattr(expected, "st_file_attributes", 0) or 0,
+    ) == (
+        observed.st_mode,
+        observed.st_nlink,
+        observed.st_uid,
+        observed.st_gid,
+        observed.st_size,
+        observed.st_mtime_ns,
+        getattr(observed, "st_file_attributes", 0) or 0,
+    )
+    return (
+        os.path.samestat(expected, observed)
+        and shared_metadata_matches
+        and (not compare_ctime or expected.st_ctime_ns == observed.st_ctime_ns)
+    )
+
+
+def _read_bounded_record_bytes_once(path: Path, *, limit: int) -> bytes:
+    """Read one stable record generation or identify a transient replacement."""
+    before = os.lstat(path)
     _validate_record_stat(before, path=path)
     flags = (
         os.O_RDONLY
@@ -8190,46 +9564,96 @@ def _read_bounded_record_bytes(path: Path) -> bytes:
     )
     descriptor = -1
     try:
-        descriptor = os.open(path, flags)
+        try:
+            descriptor = os.open(path, flags)
+        except FileNotFoundError as exc:
+            raise _TransientRecordReplacement(
+                f"durable record disappeared while opening: {path}"
+            ) from exc
         opened = os.fstat(descriptor)
         _validate_record_stat(opened, path=path)
-        after_open = os.lstat(path)
+        try:
+            after_open = os.lstat(path)
+        except FileNotFoundError as exc:
+            raise _TransientRecordReplacement(
+                f"durable record disappeared after opening: {path}"
+            ) from exc
         _validate_record_stat(after_open, path=path)
-        if not os.path.samestat(before, opened) or not os.path.samestat(opened, after_open):
-            raise QueueConflictError(f"durable record changed while opening: {path}")
+        if (
+            not _record_stats_match(before, opened, compare_ctime=False)
+            or not _record_stats_match(opened, after_open, compare_ctime=False)
+            or not _record_stats_match(before, after_open, compare_ctime=True)
+        ):
+            raise _TransientRecordReplacement(f"durable record changed while opening: {path}")
         chunks: list[bytes] = []
         total = 0
         while total <= limit:
+            before_chunk = os.fstat(descriptor)
+            _validate_record_stat(before_chunk, path=path)
+            if not _record_stats_match(opened, before_chunk, compare_ctime=True):
+                raise _TransientRecordReplacement(f"durable record changed while reading: {path}")
             chunk = os.read(descriptor, min(65_536, limit + 1 - total))
+            after_chunk = os.fstat(descriptor)
+            _validate_record_stat(after_chunk, path=path)
+            if not _record_stats_match(opened, after_chunk, compare_ctime=True):
+                raise _TransientRecordReplacement(f"durable record changed while reading: {path}")
             if not chunk:
                 break
             chunks.append(chunk)
             total += len(chunk)
+        final = os.fstat(descriptor)
+        _validate_record_stat(final, path=path)
+        try:
+            after_read = os.lstat(path)
+        except FileNotFoundError as exc:
+            raise _TransientRecordReplacement(
+                f"durable record disappeared after reading: {path}"
+            ) from exc
+        _validate_record_stat(after_read, path=path)
+        if (
+            not _record_stats_match(opened, final, compare_ctime=True)
+            or not _record_stats_match(final, after_read, compare_ctime=False)
+            or not _record_stats_match(before, after_read, compare_ctime=True)
+        ):
+            raise _TransientRecordReplacement(f"durable record changed while reading: {path}")
         if total > limit:
             raise QueueConflictError(
                 f"{_record_family(path)} record exceeds the {limit}-byte limit: {path}"
             )
-        final = os.fstat(descriptor)
-        _validate_record_stat(final, path=path)
-        after_read = os.lstat(path)
-        _validate_record_stat(after_read, path=path)
-        if (
-            not os.path.samestat(opened, final)
-            or not os.path.samestat(final, after_read)
-            or total != final.st_size
-            or opened.st_size != final.st_size
-            or opened.st_mtime_ns != final.st_mtime_ns
-            or opened.st_ctime_ns != final.st_ctime_ns
-        ):
-            raise QueueConflictError(f"durable record changed while reading: {path}")
+        if total != final.st_size:
+            raise _TransientRecordReplacement(f"durable record changed size while reading: {path}")
         return b"".join(chunks)
-    except FileNotFoundError:
+    except (_TransientRecordReplacement, QueueConflictError):
         raise
     except OSError as exc:
         raise QueueConflictError(f"cannot read durable record {path}: {exc}") from exc
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def _read_bounded_record_bytes(path: Path) -> bytes:
+    """Read one stable bounded record, retrying only atomic replacement races."""
+    limit = _record_max_bytes(path)
+    last_replacement: _TransientRecordReplacement | None = None
+    for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
+        try:
+            return _read_bounded_record_bytes_once(path, limit=limit)
+        except FileNotFoundError as exc:
+            if last_replacement is None:
+                raise
+            last_replacement = _TransientRecordReplacement(
+                f"durable record remained absent during atomic replacement: {path}"
+            )
+            last_replacement.__cause__ = exc
+        except _TransientRecordReplacement as exc:
+            last_replacement = exc
+        if attempt + 1 < ATOMIC_REPLACE_ATTEMPTS:
+            time.sleep(ATOMIC_REPLACE_RETRY_SECONDS)
+    raise QueueConflictError(
+        f"durable record did not stabilize after {ATOMIC_REPLACE_ATTEMPTS} "
+        f"atomic replacement attempts: {path}"
+    ) from last_replacement
 
 
 def _transient_record_access_conflict(error: QueueConflictError) -> bool:

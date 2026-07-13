@@ -332,14 +332,8 @@ def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
     assert mcp.spec.env_from == {"SCIENCE_TOKEN": "SITE_SCIENCE_TOKEN"}
     assert mcp.spec.arguments == {"case": "site-simulation", "steps": 100}
     assert isinstance(jarvis_mcp.spec, McpCallSpec)
-    assert jarvis_mcp.spec.server == "uvx"
-    assert jarvis_mcp.spec.server_args == [
-        "--from",
-        "clio-kit==3.0.0",
-        "clio-kit",
-        "mcp-server",
-        "jarvis",
-    ]
+    assert jarvis_mcp.spec.server == "clio-kit"
+    assert jarvis_mcp.spec.server_args == ["mcp-server", "jarvis"]
     assert jarvis_mcp.spec.tool == "jarvis_describe"
     assert jarvis_mcp.spec.arguments == {"target": "packages"}
 
@@ -523,7 +517,6 @@ def test_http_gateway_session_lifecycle(tmp_path: Path) -> None:
         f"/gateway-sessions/{session_id}",
         json={
             "state": "ready",
-            "scheduler_job_id": "12345",
             "node": "ares-comp-01",
             "gateway": {"strategy": "ssh_forward", "local_port": 5900},
             "metadata": {"dataset": "example_001"},
@@ -538,7 +531,8 @@ def test_http_gateway_session_lifecycle(tmp_path: Path) -> None:
     assert listed.status_code == 200
     assert closed.status_code == 200
     assert updated.json()["state"] == GatewaySessionState.READY.value
-    assert updated.json()["scheduler_job_id"] == "12345"
+    assert updated.json()["scheduler"] == "external"
+    assert updated.json()["scheduler_job_id"] is None
     listed_page = listed.json()
     assert listed_page["gateway_sessions"][0]["session_id"] == session_id
     assert listed_page["source_cursor"] == 1
@@ -549,6 +543,91 @@ def test_http_gateway_session_lifecycle(tmp_path: Path) -> None:
     assert reopen.status_code == 409
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"scheduler": "slurm"},
+        {"scheduler_job_id": "12345"},
+        {"gateway": {"runtime_spec": {"kind": "forged"}}},
+        {"gateway": {"scheduler_job_id": "12345"}},
+        {"gateway": {"ownership_intents": {"scheduler_submission": {}}}},
+        {"gateway": {"transport": {"remote_connector": {"pid": 42}}}},
+        {"metadata": {"owner": "clio-relay"}},
+        {"metadata": {"scheduler_provider": "slurm"}},
+        {"metadata": {"owner_session_generation_id": "forged-generation"}},
+    ],
+)
+def test_http_generic_gateway_create_rejects_relay_runtime_ownership_fields(
+    tmp_path: Path,
+    payload: dict[str, object],
+) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    client = cast(Any, TestClient(create_app(settings)))
+
+    response = client.post(
+        "/gateway-sessions",
+        json={"cluster": "test-cluster", "name": "forged-runtime", **payload},
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"scheduler_job_id": "12345"},
+        {"gateway": {"runtime_spec": {"kind": "forged"}}},
+        {"gateway": {"transport": {"desktop_connector": {"pid": 42}}}},
+        {"metadata": {"owner_session_id": "forged-session"}},
+    ],
+)
+def test_http_generic_gateway_update_rejects_relay_runtime_ownership_fields(
+    tmp_path: Path,
+    payload: dict[str, object],
+) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    client = cast(Any, TestClient(create_app(settings)))
+    created = client.post(
+        "/gateway-sessions",
+        json={"cluster": "test-cluster", "name": "ordinary-gateway"},
+    )
+
+    response = client.patch(
+        f"/gateway-sessions/{created.json()['session_id']}",
+        json=payload,
+    )
+
+    assert created.status_code == 200
+    assert response.status_code == 422
+
+
+def test_http_generic_gateway_update_cannot_replace_relay_managed_runtime_state(
+    tmp_path: Path,
+) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    runtime = queue.create_gateway_session(
+        GatewaySession(
+            cluster="test-cluster",
+            name="relay-managed-runtime",
+            gateway={
+                "runtime_spec": {"kind": "image-service"},
+                "ownership_intents": {"scheduler_submission": {"state": "recorded"}},
+            },
+            metadata={"owner": "clio-relay", "runtime_kind": "image-service"},
+        )
+    )
+    client = cast(Any, TestClient(create_app(settings)))
+
+    response = client.patch(
+        f"/gateway-sessions/{runtime.session_id}",
+        json={"gateway": {"strategy": "ssh_forward"}},
+    )
+
+    assert response.status_code == 409
+    assert queue.get_gateway_session(runtime.session_id).gateway == runtime.gateway
+
+
 def test_owned_session_api_stamps_jobs_and_gateways_with_server_ownership(
     tmp_path: Path,
 ) -> None:
@@ -557,6 +636,15 @@ def test_owned_session_api_stamps_jobs_and_gateways_with_server_ownership(
         spool_dir=tmp_path / "spool",
         owner_session_id="desktop-session-1",
         owner_session_generation_id="generation-1",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    assert (
+        queue.prepare_owner_session_start(
+            "desktop-session-1",
+            recorded_generation_id=None,
+            candidate_generation_id="generation-1",
+        )
+        == "generation-1"
     )
     client = cast(Any, TestClient(create_app(settings)))
     raw_job = RelayJob(
@@ -573,12 +661,12 @@ def test_owned_session_api_stamps_jobs_and_gateways_with_server_ownership(
         json={
             "cluster": "test-cluster",
             "name": "owned-gateway",
-            "metadata": {"owner": "untrusted-client", "owner_session_id": "forged-session"},
+            "metadata": {"dataset": "example"},
         },
     )
     patched = client.patch(
         f"/gateway-sessions/{gateway.json()['session_id']}",
-        json={"metadata": {"owner": "untrusted-client", "owner_session_id": "other"}},
+        json={"metadata": {"phase": "ready"}},
     )
 
     assert submitted.status_code == 200
@@ -593,6 +681,8 @@ def test_owned_session_api_stamps_jobs_and_gateways_with_server_ownership(
     assert patched.json()["metadata"]["owner"] == "clio-relay"
     assert patched.json()["metadata"]["owner_session_id"] == "desktop-session-1"
     assert patched.json()["metadata"]["owner_session_generation_id"] == "generation-1"
+    assert patched.json()["metadata"]["dataset"] == "example"
+    assert patched.json()["metadata"]["phase"] == "ready"
 
 
 def test_owned_session_api_cannot_take_over_or_close_other_gateways(tmp_path: Path) -> None:
@@ -603,6 +693,14 @@ def test_owned_session_api_cannot_take_over_or_close_other_gateways(tmp_path: Pa
         owner_session_generation_id="generation-1",
     )
     queue = ClioCoreQueue(settings.core_dir)
+    assert (
+        queue.prepare_owner_session_start(
+            "desktop-session-2",
+            recorded_generation_id=None,
+            candidate_generation_id="generation-2",
+        )
+        == "generation-2"
+    )
     other_owned = queue.create_gateway_session(
         GatewaySession(
             cluster="test-cluster",
@@ -613,6 +711,14 @@ def test_owned_session_api_cannot_take_over_or_close_other_gateways(tmp_path: Pa
                 "owner_session_generation_id": "generation-2",
             },
         )
+    )
+    assert (
+        queue.prepare_owner_session_start(
+            "desktop-session-1",
+            recorded_generation_id=None,
+            candidate_generation_id="generation-0",
+        )
+        == "generation-0"
     )
     prior_generation = queue.create_gateway_session(
         GatewaySession(
@@ -625,20 +731,37 @@ def test_owned_session_api_cannot_take_over_or_close_other_gateways(tmp_path: Pa
             },
         )
     )
+    prior_generation = queue.close_gateway_session(prior_generation.session_id)
+    queue.set_owner_session_closing(
+        "desktop-session-1",
+        session_generation_id="generation-0",
+    )
+    queue.set_owner_session_closed(
+        "desktop-session-1",
+        session_generation_id="generation-0",
+    )
+    assert (
+        queue.prepare_owner_session_start(
+            "desktop-session-1",
+            recorded_generation_id="generation-0",
+            candidate_generation_id="generation-1",
+        )
+        == "generation-1"
+    )
     unowned = queue.create_gateway_session(GatewaySession(cluster="test-cluster", name="unowned"))
     client = cast(Any, TestClient(create_app(settings)))
 
     for session in (other_owned, prior_generation, unowned):
         patched = client.patch(
             f"/gateway-sessions/{session.session_id}",
-            json={"metadata": {"owner_session_id": "desktop-session-1"}},
+            json={"metadata": {"phase": "forged"}},
         )
         closed = client.post(f"/gateway-sessions/{session.session_id}/close")
 
         assert patched.status_code == 403
         assert closed.status_code == 403
         unchanged = queue.get_gateway_session(session.session_id)
-        assert unchanged.state is GatewaySessionState.CREATED
+        assert unchanged.state is session.state
         assert unchanged.metadata == session.metadata
 
 

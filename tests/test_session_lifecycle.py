@@ -8,8 +8,12 @@ from typing import Literal
 import pytest
 from pytest import MonkeyPatch
 
+import clio_relay.session_lifecycle as session_lifecycle
 from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.errors import RelayError
 from clio_relay.session_lifecycle import (
+    SESSION_CONNECTORS_CHECK_ID,
+    SESSION_GATEWAY_CHECK_ID,
     SESSION_SCHEDULER_CANCELED_CHECK_ID,
     SESSION_WORKER_CHECK_ID,
     CleanupResource,
@@ -63,6 +67,141 @@ def test_scheduler_cancellation_evidence_rejects_an_extra_relay_link() -> None:
     assert checks[SESSION_SCHEDULER_CANCELED_CHECK_ID].status.value == "failed"
 
 
+def test_scheduler_cancellation_evidence_rejects_a_missing_gateway_record() -> None:
+    observed_at = datetime.now(UTC)
+    report = SessionLifecycleReport(
+        cluster="ares",
+        session_id="session-1",
+        session_generation_id="generation-1",
+        mode="teardown",
+        scheduler_cancel_requested=True,
+        prior_session_status=RemoteSessionStateEvidence(
+            api_pid=123,
+            session_generation_id="generation-1",
+            running=True,
+            ownership_verified=True,
+            observed_at=observed_at,
+        ),
+        post_session_status=RemoteSessionStateEvidence(
+            api_pid=123,
+            session_generation_id="generation-1",
+            running=False,
+            ownership_verified=True,
+            observed_at=observed_at,
+        ),
+        resources=[
+            CleanupResource(
+                kind="remote_relay_api",
+                resource_id="123",
+                location="ares",
+                action="stop",
+                ownership_verified=True,
+                outcome="stopped",
+                verified_after_operation=True,
+            ),
+            CleanupResource(
+                kind="scheduler_job",
+                resource_id="scheduler-1",
+                location="ares",
+                provider="slurm",
+                action="cancel",
+                ownership_verified=True,
+                outcome="canceled",
+                verified_after_operation=True,
+                metadata={"gateway_session_id": "missing-gateway"},
+            ),
+        ],
+    )
+
+    canonical = report.to_live_validation_report()
+    checks = {check.check_id: check for check in canonical.checks}
+
+    assert checks[SESSION_SCHEDULER_CANCELED_CHECK_ID].status.value == "failed"
+    assert canonical.status.value == "failed"
+
+
+def test_scheduler_cancellation_evidence_accepts_a_linked_gateway_cleanup() -> None:
+    observed_at = datetime.now(UTC)
+    report = SessionLifecycleReport(
+        cluster="ares",
+        session_id="session-1",
+        session_generation_id="generation-1",
+        mode="teardown",
+        scheduler_cancel_requested=True,
+        prior_session_status=RemoteSessionStateEvidence(
+            api_pid=123,
+            session_generation_id="generation-1",
+            running=True,
+            ownership_verified=True,
+            observed_at=observed_at,
+        ),
+        post_session_status=RemoteSessionStateEvidence(
+            api_pid=123,
+            session_generation_id="generation-1",
+            running=False,
+            ownership_verified=True,
+            observed_at=observed_at,
+        ),
+        resources=[
+            CleanupResource(
+                kind="remote_relay_api",
+                resource_id="123",
+                location="ares",
+                action="stop",
+                ownership_verified=True,
+                outcome="stopped",
+                verified_after_operation=True,
+            ),
+            CleanupResource(
+                kind="desktop_connector",
+                resource_id="desktop-connector-1",
+                location="desktop",
+                action="stop",
+                ownership_verified=True,
+                outcome="stopped",
+                verified_after_operation=True,
+                metadata={"gateway_session_id": "gateway-1"},
+            ),
+            CleanupResource(
+                kind="remote_connector",
+                resource_id="remote-connector-1",
+                location="ares",
+                action="stop",
+                ownership_verified=True,
+                outcome="stopped",
+                verified_after_operation=True,
+                metadata={"gateway_session_id": "gateway-1"},
+            ),
+            CleanupResource(
+                kind="gateway_record",
+                resource_id="gateway-1",
+                location="desktop",
+                action="close",
+                ownership_verified=True,
+                outcome="closed",
+                verified_after_operation=True,
+            ),
+            CleanupResource(
+                kind="scheduler_job",
+                resource_id="scheduler-1",
+                location="ares",
+                provider="slurm",
+                action="cancel",
+                ownership_verified=True,
+                outcome="canceled",
+                verified_after_operation=True,
+                metadata={"gateway_session_id": "gateway-1"},
+            ),
+        ],
+    )
+
+    canonical = report.to_live_validation_report()
+    checks = {check.check_id: check for check in canonical.checks}
+
+    assert checks[SESSION_SCHEDULER_CANCELED_CHECK_ID].status.value == "passed"
+    assert canonical.status.value == "passed"
+
+
 def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyPatch) -> None:
     calls: list[tuple[list[str], str]] = []
 
@@ -72,10 +211,12 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
         input: bytes,
         capture_output: bool,
         check: bool,
+        timeout: float,
     ) -> subprocess.CompletedProcess[bytes]:
         calls.append((command, input.decode("utf-8")))
         assert capture_output is True
         assert check is False
+        assert timeout == 120
         return subprocess.CompletedProcess(
             command,
             0,
@@ -110,7 +251,7 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
     assert "nohup setsid" in script
     assert "umask 077" in script
     assert "trap cleanup_incomplete_start EXIT" in script
-    assert "flock -x 9" in script
+    assert "flock -w 10 -x 9" in script
     assert "CLIO_RELAY_SESSION_GENERATION_ID" in script
     assert "session_generation_id" in script
     assert "clio-relay session prepare-start" in script
@@ -120,7 +261,7 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
     )
     assert "clio-relay session resume-intake" in script
     assert '--session-generation-id "$session_generation_id"' in script
-    assert script.index("flock -x 9") < script.index("clio-relay session resume-intake")
+    assert script.index("flock -w 10 -x 9") < script.index("clio-relay session resume-intake")
     assert 'kill -0 -- "-$existing_owned_pgid"' in script
     assert 'kill -0 -- "-$api_pid"' in script
     assert "os.replace(temporary, path)" in script
@@ -139,8 +280,9 @@ def test_status_remote_session_returns_json(monkeypatch: MonkeyPatch) -> None:
         input: bytes,
         capture_output: bool,
         check: bool,
+        timeout: float,
     ) -> subprocess.CompletedProcess[bytes]:
-        del capture_output, check
+        del capture_output, check, timeout
         scripts.append(input.decode("utf-8"))
         return subprocess.CompletedProcess(
             command,
@@ -158,6 +300,27 @@ def test_status_remote_session_returns_json(monkeypatch: MonkeyPatch) -> None:
 
     assert status == {"session_id": "session-1", "running": True}
     assert 'metadata.pop("owner_token", None)' in scripts[0]
+
+
+def test_remote_session_command_timeout_is_reported(monkeypatch: MonkeyPatch) -> None:
+    def timed_out(
+        command: list[str],
+        *,
+        input: bytes,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input, capture_output, check
+        raise subprocess.TimeoutExpired(command, timeout)
+
+    monkeypatch.setattr("clio_relay.session_lifecycle.subprocess.run", timed_out)
+
+    with pytest.raises(RelayError, match="timed out after 120 seconds"):
+        status_remote_session(
+            definition=ClusterDefinition(name="ares", ssh_host="ares"),
+            session_id="session-1",
+        )
 
 
 def test_detach_remote_session_retains_verified_remote_api(monkeypatch: MonkeyPatch) -> None:
@@ -229,6 +392,103 @@ def test_detach_remote_session_rejects_unverified_remote_api_retention(
     assert report.to_live_validation_report().status.value == "failed"
 
 
+def test_detach_report_requires_verified_connector_and_gateway_dispositions() -> None:
+    report = SessionLifecycleReport(
+        cluster="cluster",
+        session_id="session-1",
+        session_generation_id="generation-1",
+        mode="detach",
+        resources=[
+            CleanupResource(
+                kind="remote_relay_api",
+                resource_id="123",
+                location="cluster",
+                action="retain",
+                ownership_verified=True,
+                outcome="retained",
+                verified_after_operation=True,
+            ),
+            CleanupResource(
+                kind="desktop_connector",
+                resource_id="456",
+                location="desktop",
+                action="stop",
+                ownership_verified=True,
+                outcome="stopped",
+                verified_after_operation=True,
+                metadata={"gateway_session_id": "gateway-1"},
+            ),
+            CleanupResource(
+                kind="remote_connector",
+                resource_id="789",
+                location="cluster",
+                action="retain",
+                ownership_verified=True,
+                outcome="retained",
+                verified_after_operation=True,
+                metadata={"gateway_session_id": "gateway-1"},
+            ),
+            CleanupResource(
+                kind="gateway_record",
+                resource_id="gateway-1",
+                location="desktop",
+                action="retain",
+                ownership_verified=True,
+                outcome="retained",
+                verified_after_operation=True,
+                observed_state="degraded",
+            ),
+        ],
+    )
+
+    canonical = report.to_live_validation_report()
+    checks = {check.check_id: check.status.value for check in canonical.checks}
+
+    assert checks[SESSION_CONNECTORS_CHECK_ID] == "passed"
+    assert checks[SESSION_GATEWAY_CHECK_ID] == "passed"
+    assert canonical.status.value == "passed"
+
+    missing_gateway = report.model_copy(
+        update={
+            "resources": [
+                resource for resource in report.resources if resource.kind != "gateway_record"
+            ]
+        }
+    )
+    incomplete_checks = {
+        check.check_id: check.status.value
+        for check in missing_gateway.to_live_validation_report().checks
+    }
+    assert incomplete_checks[SESSION_CONNECTORS_CHECK_ID] == "failed"
+
+    duplicate_first_gateway = report.model_copy(
+        update={
+            "resources": [
+                *report.resources,
+                *[
+                    resource.model_copy(update={"resource_id": f"duplicate-{resource.resource_id}"})
+                    for resource in report.resources
+                    if resource.kind in {"desktop_connector", "remote_connector"}
+                ],
+                CleanupResource(
+                    kind="gateway_record",
+                    resource_id="gateway-2",
+                    location="desktop",
+                    action="retain",
+                    ownership_verified=True,
+                    outcome="retained",
+                    verified_after_operation=True,
+                ),
+            ]
+        }
+    )
+    duplicate_checks = {
+        check.check_id: check.status.value
+        for check in duplicate_first_gateway.to_live_validation_report().checks
+    }
+    assert duplicate_checks[SESSION_CONNECTORS_CHECK_ID] == "failed"
+
+
 @pytest.mark.parametrize(
     ("outcome", "observed_state"),
     [("stopped", "inactive"), ("missing", "not-found")],
@@ -287,6 +547,9 @@ def test_worker_cleanup_requires_exact_terminal_post_stop_evidence(
 
     assert worker_check.status.value == "passed"
     assert canonical.status.value == "passed"
+    cleanup_payload = report.json_payload()["cleanup_evidence"]
+    assert isinstance(cleanup_payload, dict)
+    assert cleanup_payload["stop_worker"] is True
 
 
 def test_teardown_remote_session_kills_owned_pid_and_optional_worker(
@@ -300,8 +563,9 @@ def test_teardown_remote_session_kills_owned_pid_and_optional_worker(
         input: bytes,
         capture_output: bool,
         check: bool,
+        timeout: float,
     ) -> subprocess.CompletedProcess[bytes]:
-        del capture_output, check
+        del capture_output, check, timeout
         scripts.append(input.decode("utf-8"))
         return subprocess.CompletedProcess(
             command,
@@ -311,6 +575,14 @@ def test_teardown_remote_session_kills_owned_pid_and_optional_worker(
                     "cluster": "ares",
                     "session_id": "session-1",
                     "mode": "teardown",
+                    "cleanup_operation_id": "cleanup-test",
+                    "cleanup_policy": {
+                        "stop_worker": True,
+                        "cancel_jobs": False,
+                        "cancel_scheduler_jobs": False,
+                    },
+                    "relay_cancel_requested": False,
+                    "scheduler_cancel_requested": False,
                     "resources": [
                         {
                             "kind": "remote_relay_api",
@@ -343,6 +615,7 @@ def test_teardown_remote_session_kills_owned_pid_and_optional_worker(
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
         session_id="session-1",
         expected_session_generation_id="generation-1",
+        expected_cleanup_operation_id="cleanup-test",
         stop_worker=True,
         cluster="ares",
     )
@@ -350,15 +623,61 @@ def test_teardown_remote_session_kills_owned_pid_and_optional_worker(
     assert report.resources[0].outcome == "stopped"
     assert report.resources[1].resource_id == "clio-relay-worker-ares.service"
     assert report.to_cleanup_evidence(stop_worker=True).stop_worker is True
-    assert "os.killpg" in scripts[0]
+    assert "os.killpg" not in scripts[0]
     assert "process_start_ticks" in scripts[0]
     assert "ownership proof failed" in scripts[0]
     assert "token_group_processes" in scripts[0]
-    assert "flock -x 9" in scripts[0]
+    token_scan = scripts[0].split("def token_group_processes():", 1)[1].split("pid =", 1)[0]
+    assert "process_group ==" not in token_scan
+    assert "proc.stat().st_uid != os.geteuid()" in token_scan
+    assert "os.pidfd_open(owned_pid, 0)" in scripts[0]
+    assert "signal.pidfd_send_signal(process_fd, sig, None, 0)" in scripts[0]
+    assert "signal_token_processes(signal.SIGTERM)" in scripts[0]
+    assert "signal_token_processes(signal.SIGKILL)" in scripts[0]
+    assert "flock -w 10 -x 9" in scripts[0]
+    assert "timeout --signal=TERM --kill-after=5s 10s" in scripts[0]
+    assert "timeout --signal=TERM --kill-after=5s 90s" in scripts[0]
     assert "owned session generation changed before teardown" in scripts[0]
     assert '--session-generation-id "$expected_session_generation_id"' in scripts[0]
+    assert "--cleanup-stop-worker" in scripts[0]
     assert '["systemctl", "--user", "stop", service]' in scripts[0]
     assert 'active_state == "inactive"' in scripts[0]
     assert 'observed_state = "not-found" if service_missing else active_state' in scripts[0]
     assert '"verified_after_operation": verified_after_operation' in scripts[0]
     assert '"observed_state": observed_state' in scripts[0]
+    assert "timeout=20" in scripts[0]
+    assert "cleanup command timed out after 20 seconds" in scripts[0]
+
+    with pytest.raises(RelayError, match="cleanup operation does not match"):
+        teardown_remote_session(
+            definition=ClusterDefinition(name="ares", ssh_host="ares"),
+            session_id="session-1",
+            expected_session_generation_id="generation-1",
+            expected_cleanup_operation_id="cleanup-other",
+            stop_worker=True,
+            cluster="ares",
+        )
+
+
+def test_owned_teardown_revalidates_exact_pidfd_identity_after_leader_pid_reuse() -> None:
+    script = session_lifecycle._owned_teardown_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_id="session-1",
+        expected_session_generation_id="generation-1",
+        stop_worker=False,
+        cancel_jobs=False,
+        cancel_scheduler_jobs=False,
+        cluster="ares",
+    )
+
+    pidfd_open = script.index("process_fd = os.pidfd_open(owned_pid, 0)")
+    identity_recheck = script.index("if owned_pid not in token_group_processes():")
+    pidfd_signal = script.index("signal.pidfd_send_signal(process_fd, sig, None, 0)")
+    assert pidfd_open < identity_recheck < pidfd_signal
+    assert "os.killpg" not in script
+    assert "running = bool(owned_group_pids)" in script
+    assert "post_running = bool(token_group_processes())" in script
+    teardown_program = script.split("<<'__CLIO_RELAY_OWNED_TEARDOWN__'\n", 1)[1].split(
+        "\n__CLIO_RELAY_OWNED_TEARDOWN__",
+        1,
+    )[0]
+    compile(teardown_program, "owned-session-teardown", "exec")

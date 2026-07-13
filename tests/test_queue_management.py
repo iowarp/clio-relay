@@ -4,10 +4,12 @@ from datetime import timedelta
 from pathlib import Path
 from typing import cast
 
-from pytest import raises
+from pytest import MonkeyPatch, raises
 
+import clio_relay.core_queue as core_queue_module
+import clio_relay.queue_management as queue_management_module
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import ConfigurationError
+from clio_relay.errors import ConfigurationError, QueueConflictError
 from clio_relay.models import (
     Cursor,
     EndpointRegistration,
@@ -203,14 +205,300 @@ def test_specific_job_diagnosis_exposes_reason_and_operational_evidence(tmp_path
     queue_evidence = cast(dict[str, object], diagnosis["queue"])
     worker = cast(dict[str, object], diagnosis["worker"])
 
-    assert diagnosis["reason"] == "blocked_by_jobs_ahead"
+    assert diagnosis["reason"] == "blocked_by_admissible_jobs_ahead"
     assert diagnosis["terminal"] is False
     assert queue_evidence["blocking_job_ids"] == [blocker.job_id]
+    assert queue_evidence["raw_preceding_job_ids"] == [blocker.job_id]
+    admission = cast(dict[str, object], queue_evidence["admission"])
+    assert admission["analysis_complete"] is True
+    assert admission["target_admissible_now"] is False
+    assert admission["target_ineligibility"] == "admissible_predecessors_consumed_capacity"
     assert cast(dict[str, object], diagnosis["lease"])["present"] is False
     assert worker["healthy_worker_count"] == 1
     assert cast(list[dict[str, object]], diagnosis["scheduler"])[0]["task_id"]
     assert cast(dict[str, object], diagnosis["last_event"])["event_type"] == "task.queued"
     assert cast(dict[str, object], diagnosis["last_progress"])["message"] == "waiting"
+
+
+def test_diagnosis_skips_saturated_kind_without_false_head_of_line_blocker(
+    tmp_path: Path,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    policy = {"kind_concurrency": {"remote_agent": 1}}
+    supervisor = queue.register_endpoint(
+        EndpointRegistration(
+            endpoint_id="worker-supervisor",
+            role=EndpointRole.WORKER,
+            cluster="ares",
+            hostname="worker",
+            pid=101,
+            metadata={**policy, "concurrency": 2, "worker_supervisor": True},
+        )
+    )
+    slots = [
+        queue.register_endpoint(
+            EndpointRegistration(
+                endpoint_id=f"worker-slot-{index}",
+                role=EndpointRole.WORKER,
+                cluster="ares",
+                hostname="worker",
+                pid=101,
+                metadata={
+                    **policy,
+                    "concurrency": 1,
+                    "worker_slot": index,
+                    "parent_endpoint_id": supervisor.endpoint_id,
+                },
+            )
+        )
+        for index in range(2)
+    ]
+    running_remote = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.REMOTE_AGENT,
+            spec=RemoteAgentTaskSpec(prompt_path="/tmp/running.md"),
+            idempotency_key="diagnosis-running-remote",
+        )
+    )
+    saturated_remote = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.REMOTE_AGENT,
+            spec=RemoteAgentTaskSpec(prompt_path="/tmp/saturated.md"),
+            idempotency_key="diagnosis-saturated-remote",
+        )
+    )
+    jarvis = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="diagnosis-eligible-jarvis",
+        )
+    )
+    lease = queue.acquire_next_job(
+        slots[0].endpoint_id,
+        cluster="ares",
+        kind_concurrency={JobKind.REMOTE_AGENT: 1},
+    )
+
+    diagnosis = diagnose_job(queue, jarvis.job_id, cluster="ares")
+
+    assert lease is not None and lease.job_id == running_remote.job_id
+    queue_evidence = cast(dict[str, object], diagnosis["queue"])
+    admission = cast(dict[str, object], queue_evidence["admission"])
+    assert diagnosis["reason"] == "eligible_for_admission"
+    assert queue_evidence["raw_preceding_job_ids"] == [saturated_remote.job_id]
+    assert queue_evidence["blocking_job_ids"] == []
+    assert admission["analysis_complete"] is True
+    assert admission["target_admissible_now"] is True
+    assert admission["configured_worker_slots"] == 2
+    assert admission["free_worker_slots"] == 1
+    assert admission["effective_blocking_job_ids"] == []
+    assert admission["skipped_predecessors"] == [
+        {"job_id": saturated_remote.job_id, "reason": "kind_capacity_saturated"}
+    ]
+
+    next_lease = queue.acquire_next_job(
+        slots[1].endpoint_id,
+        cluster="ares",
+        kind_concurrency={JobKind.REMOTE_AGENT: 1},
+    )
+    assert next_lease is not None and next_lease.job_id == jarvis.job_id
+
+
+def test_diagnosis_fails_closed_when_lease_index_validation_fails(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    blocker = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="diagnosis-index-blocker",
+        )
+    )
+    target = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="diagnosis-index-target",
+        )
+    )
+    queue.register_endpoint(
+        EndpointRegistration(
+            endpoint_id="worker",
+            role=EndpointRole.WORKER,
+            cluster="ares",
+            hostname="worker",
+            pid=104,
+        )
+    )
+
+    def fail_validation(*, cluster: str) -> tuple[dict[JobKind, int], int]:
+        assert cluster == "ares"
+        raise QueueConflictError("corrupt lease index " + "x" * 1_100)
+
+    monkeypatch.setattr(queue, "lease_admission_capacity_snapshot", fail_validation)
+
+    diagnosis = diagnose_job(queue, target.job_id, cluster="ares")
+
+    queue_evidence = cast(dict[str, object], diagnosis["queue"])
+    admission = cast(dict[str, object], queue_evidence["admission"])
+    assert diagnosis["reason"] == "admission_analysis_incomplete"
+    assert queue_evidence["raw_preceding_job_ids"] == [blocker.job_id]
+    assert queue_evidence["blocking_job_ids"] == []
+    assert admission["analysis_complete"] is False
+    assert admission["incomplete_reasons"] == ["lease_index_validation_failed"]
+    assert admission["lease_index_validated"] is False
+    assert len(cast(str, admission["lease_index_validation_error"])) == 1_000
+    assert admission["lease_index_validation_error_truncated"] is True
+
+
+def test_diagnosis_models_predecessor_consuming_last_global_lease_slot(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(core_queue_module, "MAX_LIVE_LEASE_RECORDS", 2)
+    monkeypatch.setattr(queue_management_module, "MAX_LIVE_LEASE_RECORDS", 2)
+    queue = ClioCoreQueue(tmp_path / "core")
+    external = queue.submit_job(
+        RelayJob(
+            cluster="homelab",
+            kind=JobKind.REMOTE_AGENT,
+            spec=RemoteAgentTaskSpec(prompt_path="/tmp/external.md"),
+            idempotency_key="diagnosis-global-external",
+        )
+    )
+    external_lease = queue.acquire_next_job("external-worker", cluster="homelab")
+    workers = [
+        queue.register_endpoint(
+            EndpointRegistration(
+                endpoint_id=f"ares-worker-{index}",
+                role=EndpointRole.WORKER,
+                cluster="ares",
+                hostname=f"worker-{index}",
+                pid=200 + index,
+            )
+        )
+        for index in range(2)
+    ]
+    predecessor = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="diagnosis-global-predecessor",
+        )
+    )
+    target = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="diagnosis-global-target",
+        )
+    )
+
+    diagnosis = diagnose_job(queue, target.job_id, cluster="ares")
+
+    assert external_lease is not None and external_lease.job_id == external.job_id
+    queue_evidence = cast(dict[str, object], diagnosis["queue"])
+    admission = cast(dict[str, object], queue_evidence["admission"])
+    assert diagnosis["reason"] == "blocked_by_admissible_jobs_ahead"
+    assert queue_evidence["blocking_job_ids"] == [predecessor.job_id]
+    assert admission["target_admissible_now"] is False
+    assert admission["target_ineligibility"] == (
+        "admissible_predecessors_consumed_global_lease_capacity"
+    )
+    assert admission["global_lease_capacity_remaining"] == 1
+    assert admission["remaining_global_lease_capacity_at_target"] == 0
+    assert admission["simulated_global_lease_count_at_target"] == 2
+    assert admission["effective_blocking_job_ids"] == [predecessor.job_id]
+
+    predecessor_lease = queue.acquire_next_job(workers[0].endpoint_id, cluster="ares")
+    target_lease = queue.acquire_next_job(workers[1].endpoint_id, cluster="ares")
+    assert predecessor_lease is not None and predecessor_lease.job_id == predecessor.job_id
+    assert target_lease is None
+    assert queue.get_job(target.job_id).state is JobState.QUEUED
+
+
+def test_diagnosis_ignores_expired_terminal_lease_history(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    historical = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.REMOTE_AGENT,
+            spec=RemoteAgentTaskSpec(prompt_path="/tmp/historical.md"),
+            idempotency_key="diagnosis-expired-history",
+        )
+    )
+    historical_lease = queue.acquire_next_job(
+        "retired-worker",
+        cluster="ares",
+        ttl_seconds=-1,
+    )
+    queue.update_job_state(historical.job_id, JobState.SUCCEEDED)
+    live_other_cluster = queue.submit_job(
+        RelayJob(
+            cluster="homelab",
+            kind=JobKind.REMOTE_AGENT,
+            spec=RemoteAgentTaskSpec(prompt_path="/tmp/live-other-cluster.md"),
+            idempotency_key="diagnosis-live-other-cluster",
+        )
+    )
+    other_lease = queue.acquire_next_job("homelab-worker", cluster="homelab")
+    expired_other_cluster = queue.submit_job(
+        RelayJob(
+            cluster="homelab",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="diagnosis-expired-other-cluster",
+        )
+    )
+    expired_other_lease = queue.acquire_next_job(
+        "retired-homelab-worker",
+        cluster="homelab",
+        ttl_seconds=-1,
+    )
+    queue.update_job_state(expired_other_cluster.job_id, JobState.SUCCEEDED)
+    queue.register_endpoint(
+        EndpointRegistration(
+            endpoint_id="current-worker",
+            role=EndpointRole.WORKER,
+            cluster="ares",
+            hostname="worker",
+            pid=103,
+        )
+    )
+    target = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="diagnosis-after-expired-history",
+        )
+    )
+
+    diagnosis = diagnose_job(queue, target.job_id, cluster="ares")
+
+    assert historical_lease is not None
+    assert other_lease is not None and other_lease.job_id == live_other_cluster.job_id
+    assert expired_other_lease is not None
+    admission = cast(
+        dict[str, object],
+        cast(dict[str, object], diagnosis["queue"])["admission"],
+    )
+    assert diagnosis["reason"] == "eligible_for_admission"
+    assert admission["analysis_complete"] is True
+    assert admission["global_lease_count"] == 2
+    assert admission["lease_index_validated"] is True
+    assert admission["active_lease_count"] == 0
+    assert admission["expired_cluster_lease_job_ids"] == []
 
 
 def test_specific_job_operations_reject_cluster_mismatch(tmp_path: Path) -> None:
@@ -562,7 +850,7 @@ def test_worker_status_counts_active_slots_not_supervisor(tmp_path: Path) -> Non
     assert status["stale_worker_count"] == 0
 
 
-def test_stale_discovery_uses_exact_leases_when_global_window_would_truncate(
+def test_stale_discovery_fails_closed_when_active_window_truncates(
     tmp_path: Path,
 ) -> None:
     queue = ClioCoreQueue(tmp_path / "core")
@@ -624,15 +912,45 @@ def test_stale_discovery_uses_exact_leases_when_global_window_would_truncate(
         scan_limit=2,
     )
 
-    assert discovered["active_scan_truncated"] is False, discovered
+    assert discovered["active_scan_truncated"] is True, discovered
     assert discovered["endpoint_scan_truncated"] is False, discovered
     assert discovered["lease_scan_truncated"] is False, discovered
-    assert discovered["classification_complete"] is True, discovered
+    assert discovered["classification_complete"] is False, discovered
     assert discovered["lease_scan_truncated"] is False
     assert discovered["jobs"] == []
     assert cleaned["planned"] == []
     assert all(queue.get_job(job.job_id).state is JobState.RUNNING for job in jobs)
     assert all("cancellation_request" not in queue.get_job(job.job_id).metadata for job in jobs)
+
+
+def test_diagnostics_honor_the_caller_active_scan_limit(tmp_path: Path) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    jobs = [
+        queue.submit_job(
+            RelayJob(
+                cluster="ares",
+                kind=JobKind.JARVIS,
+                spec=JarvisRunSpec(command=["true"]),
+                idempotency_key=f"bounded-diagnosis-{index}",
+            )
+        )
+        for index in range(3)
+    ]
+
+    exact = diagnose_job(
+        queue,
+        jobs[-1].job_id,
+        cluster="ares",
+        scan_limit=1,
+    )
+    summary = diagnose_queue(queue, cluster="ares", limit=1, scan_limit=1)
+
+    exact_queue = cast(dict[str, object], exact["queue"])
+    assert exact_queue["scan_truncated"] is True
+    assert exact_queue["position_exact"] is False
+    assert summary["checked_jobs"] == 1
+    assert summary["scan_limit"] == 1
+    assert summary["scan_truncated"] is True
 
 
 def test_stale_discovery_fails_closed_when_exact_lease_index_truncates(

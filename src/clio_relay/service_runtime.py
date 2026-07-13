@@ -67,6 +67,8 @@ _LOCAL_CONNECTOR_WRAPPER_CODE = (
 )
 _OWNERSHIP_INTENT_SCHEMA = "clio-relay.gateway-ownership-intent.v1"
 _MAX_SUBMISSION_OUTPUT_BYTES = 262_144
+_REMOTE_RUNTIME_COMMAND_TIMEOUT_SECONDS = 120.0
+_LOCAL_CLEANUP_COMMAND_TIMEOUT_SECONDS = 30.0
 _TERMINAL_RUNTIME_STATES = {
     "canceled",
     "cancelled",
@@ -74,6 +76,15 @@ _TERMINAL_RUNTIME_STATES = {
     "failed",
     "terminated",
     "timeout",
+}
+_ACTIVE_RUNTIME_STATES = {
+    "submitted",
+    "pending",
+    "queued",
+    "allocated",
+    "starting",
+    "ready",
+    "running",
 }
 _CANCELED_RUNTIME_STATES = {"canceled", "cancelled"}
 
@@ -95,6 +106,15 @@ class _ObservedLocalProcess:
     process_start_marker: str
     command_line: str
     environment: bytes | None
+
+
+@dataclass(frozen=True)
+class _VerifiedSchedulerSubmission:
+    """Scheduler identity proven against the relay-created remote sidecar."""
+
+    provider: str
+    scheduler_job_id: str
+    spec: ServiceRuntimeSpec
 
 
 class CommandRunner(Protocol):
@@ -361,9 +381,11 @@ class ServiceRuntimeStopResult:
             resource.kind == "scheduler_job" and resource.action == "cancel"
             for resource in self.resources
         )
+        teardown_intent = _object(self.session.gateway.get("teardown_intent", {}))
         return CleanupEvidence(
             requested=True,
             mode=self.mode,
+            operation_id=_optional_str(teardown_intent.get("operation_id")),
             cancel_scheduler_jobs=scheduler_cancel_requested,
             actions=[resource.model_dump(mode="json") for resource in self.resources],
             remaining_resources=[
@@ -405,41 +427,65 @@ class ServiceRuntimeStopResult:
         scheduler_resources = [
             resource for resource in self.resources if resource.kind == "scheduler_job"
         ]
+        gateway_resources = [
+            resource for resource in self.resources if resource.kind == "gateway_record"
+        ]
         cancellation_requested = any(
             resource.action == "cancel" for resource in scheduler_resources
+        )
+        scheduler_identity_exact = (
+            not scheduler_resources
+            if self.session.scheduler_job_id is None
+            else len(scheduler_resources) == 1
+            and scheduler_resources[0].resource_id == self.session.scheduler_job_id
+            and scheduler_resources[0].provider == self.session.scheduler
         )
         if cancellation_requested:
             scheduler_check = (
                 RUNTIME_SCHEDULER_CANCELED_CHECK_ID,
                 "scheduler cancellation reached an observed canceled state",
-                any(
+                scheduler_identity_exact
+                and all(
                     resource.action == "cancel"
                     and resource.outcome == "canceled"
+                    and resource.ownership_verified
                     and resource.verified_after_operation
                     and resource.observed_state in _CANCELED_RUNTIME_STATES
+                    and not resource.residual
                     for resource in scheduler_resources
                 ),
             )
         else:
+            allowed_retention_outcomes = (
+                {"retained"} if self.mode == "detach" else {"retained", "terminal"}
+            )
             scheduler_check = (
                 RUNTIME_SCHEDULER_RETAINED_CHECK_ID,
-                "scheduler job preserved by default and observed active",
-                self.session.scheduler_job_id is None
-                or any(
-                    resource.action == "retain"
-                    and resource.outcome == "retained"
-                    and resource.ownership_verified
-                    and resource.verified_after_operation
-                    and resource.observed_state is not None
-                    and resource.observed_state not in _TERMINAL_RUNTIME_STATES
-                    and resource.observed_state
-                    not in {"missing", "not-found", "not_found", "unknown"}
-                    for resource in scheduler_resources
+                "scheduler job preserved by default and its disposition observed",
+                scheduler_identity_exact
+                and (
+                    self.session.scheduler_job_id is None
+                    or all(
+                        resource.action == "retain"
+                        and resource.outcome in allowed_retention_outcomes
+                        and resource.ownership_verified
+                        and resource.verified_after_operation
+                        and resource.observed_state is not None
+                        and (
+                            resource.observed_state in _ACTIVE_RUNTIME_STATES
+                            if self.mode == "detach"
+                            else resource.observed_state
+                            not in {"missing", "not-found", "not_found", "unknown"}
+                        )
+                        and not resource.residual
+                        for resource in scheduler_resources
+                    )
                 ),
             )
         if self.mode == "detach":
             desktop_stopped = len(desktop_connectors) == 1 and all(
-                resource.action == "stop"
+                resource.metadata.get("gateway_session_id") == self.session.session_id
+                and resource.action == "stop"
                 and resource.outcome in {"stopped", "missing"}
                 and resource.ownership_verified
                 and resource.verified_after_operation
@@ -447,7 +493,8 @@ class ServiceRuntimeStopResult:
                 for resource in desktop_connectors
             )
             remote_retained = len(remote_connectors) == 1 and all(
-                resource.action == "retain"
+                resource.metadata.get("gateway_session_id") == self.session.session_id
+                and resource.action == "retain"
                 and resource.outcome == "retained"
                 and resource.ownership_verified
                 and resource.verified_after_operation
@@ -464,18 +511,43 @@ class ServiceRuntimeStopResult:
                 (
                     RUNTIME_DETACHED_RECORD_CHECK_ID,
                     "gateway record remains available for reattachment",
-                    self.session.state == GatewaySessionState.DEGRADED,
+                    self.session.state == GatewaySessionState.DEGRADED
+                    and len(gateway_resources) == 1
+                    and all(
+                        resource.resource_id == self.session.session_id
+                        and resource.action == "retain"
+                        and resource.outcome == "retained"
+                        and resource.ownership_verified
+                        and resource.verified_after_operation
+                        and not resource.residual
+                        for resource in gateway_resources
+                    ),
                 ),
             ]
         else:
             connector_resources = [*desktop_connectors, *remote_connectors]
-            connectors_stopped = bool(connector_resources) and all(
-                resource.action == "stop"
-                and resource.outcome in {"stopped", "missing"}
-                and resource.ownership_verified
-                and resource.verified_after_operation
-                and not resource.residual
-                for resource in connector_resources
+            connectors_stopped = (
+                len(desktop_connectors) == 1
+                and len(remote_connectors) == 1
+                and all(
+                    resource.metadata.get("gateway_session_id") == self.session.session_id
+                    and resource.action == "stop"
+                    and resource.outcome in {"stopped", "missing"}
+                    and resource.ownership_verified
+                    and resource.verified_after_operation
+                    and not resource.residual
+                    for resource in connector_resources
+                )
+            )
+            gateway_closed = (
+                self.session.state == GatewaySessionState.CLOSED
+                and len(gateway_resources) == 1
+                and gateway_resources[0].resource_id == self.session.session_id
+                and gateway_resources[0].action == "close"
+                and gateway_resources[0].outcome == "closed"
+                and gateway_resources[0].ownership_verified
+                and gateway_resources[0].verified_after_operation
+                and not gateway_resources[0].residual
             )
             check_values = [
                 (RUNTIME_TEARDOWN_CHECK_ID, "owned runtime connectors stopped", connectors_stopped),
@@ -483,7 +555,7 @@ class ServiceRuntimeStopResult:
                 (
                     RUNTIME_CLOSED_CHECK_ID,
                     "gateway record closed",
-                    self.session.state == GatewaySessionState.CLOSED,
+                    gateway_closed,
                 ),
             ]
         report.checks = [
@@ -586,11 +658,16 @@ class ServiceRuntimeSupervisor:
         spec: ServiceRuntimeSpec,
         owner_session_id: str | None = None,
         owner_session_generation_id: str | None = None,
+        owner_session_admission_id: str | None = None,
     ) -> ServiceRuntimeStartResult:
         """Start a scheduler-backed remote service and bind it to a desktop port."""
         if (owner_session_id is None) != (owner_session_generation_id is None):
             raise ConfigurationError(
                 "owner_session_id and owner_session_generation_id must be provided together"
+            )
+        if owner_session_admission_id is not None and owner_session_id is None:
+            raise ConfigurationError(
+                "owner_session_admission_id requires owner_session_id and generation"
             )
         scheduler_provider = provider_for_scheduler(spec.scheduler)
         if scheduler_provider.name != spec.scheduler:
@@ -607,6 +684,8 @@ class ServiceRuntimeSupervisor:
                     "owner_session_generation_id": owner_session_generation_id,
                 }
             )
+            if owner_session_admission_id is not None:
+                owner_metadata["owner_session_admission_id"] = owner_session_admission_id
         session = self.queue.create_gateway_session(
             GatewaySession(
                 cluster=self.cluster,
@@ -751,6 +830,7 @@ class ServiceRuntimeSupervisor:
                 health_url,
                 spec.readiness_timeout_seconds,
                 spec.poll_seconds,
+                expected_body=spec.health_expected_body,
             )
             events_url = (
                 f"http://{spec.desktop_bind_addr}:{spec.desktop_bind_port}{spec.event_stream_path}"
@@ -879,6 +959,11 @@ class ServiceRuntimeSupervisor:
                 f"gateway session {session_id} is not an owned clio-relay runtime"
             )
         session = self._reconcile_ownership_intents(session)
+        session = self._prepare_teardown_intent(
+            session,
+            cancel_scheduler_job=cancel_scheduler_job,
+        )
+        teardown_intent = _object(session.gateway.get("teardown_intent", {}))
         ownership_intents = _object(session.gateway.get("ownership_intents", {}))
         transport = _object(session.gateway.get("transport", {}))
         desktop_connector = _object(transport.get("desktop_connector", {}))
@@ -894,6 +979,7 @@ class ServiceRuntimeSupervisor:
                 "desktop_connector",
             ),
         )
+        local_resource = _bind_cleanup_resource_to_gateway(local_resource, session.session_id)
         resources.append(local_resource)
         if local_resource.residual:
             errors.append(local_resource.detail or "desktop connector cleanup failed")
@@ -972,7 +1058,7 @@ class ServiceRuntimeSupervisor:
                     detail=str(exc),
                 )
                 errors.append(str(exc))
-        resources.append(remote_resource)
+        resources.append(_bind_cleanup_resource_to_gateway(remote_resource, session.session_id))
         canceled_scheduler_job = None
         scheduler_intent = _object(ownership_intents.get("scheduler_submission", {}))
         if session.scheduler_job_id is None and scheduler_intent.get("state") in {
@@ -997,89 +1083,144 @@ class ServiceRuntimeSupervisor:
             resources.append(unresolved_scheduler)
             errors.append(unresolved_scheduler.detail or "scheduler submission is unresolved")
         if session.scheduler_job_id is not None:
-            spec = ServiceRuntimeSpec.model_validate(session.gateway["runtime_spec"])
-            if cancel_scheduler_job:
-                try:
-                    scheduler_provider = provider_for_scheduler(session.scheduler)
-                    if scheduler_provider.name == "external":
-                        if spec.cancel_command is None:
-                            raise RelayError(
-                                "externally managed runtime has no deployment-driver cancel command"
-                            )
-                        if spec.status_command is None:
-                            raise RelayError(
-                                "externally managed runtime has no deployment-driver "
-                                "status command for terminal cancellation confirmation"
-                            )
-                        self._ssh(
-                            _template_command_script(spec.cancel_command, session.scheduler_job_id)
-                        )
-                    else:
-                        self._request_scheduler_provider_cancel(
-                            provider=scheduler_provider.name,
-                            scheduler_job_id=session.scheduler_job_id,
-                        )
-                    terminal_state = self._wait_for_scheduler_terminal(
-                        scheduler=session.scheduler,
-                        spec=spec,
-                        scheduler_job_id=session.scheduler_job_id,
-                    )
-                    if terminal_state in _CANCELED_RUNTIME_STATES:
-                        canceled_scheduler_job = session.scheduler_job_id
-                        scheduler_resource = CleanupResource(
-                            kind="scheduler_job",
-                            resource_id=session.scheduler_job_id,
-                            location=self.definition.ssh_host,
-                            provider=session.scheduler,
-                            action="cancel",
-                            metadata={"gateway_session_id": session.session_id},
-                            ownership_verified=True,
-                            outcome="canceled",
-                            verified_after_operation=True,
-                            observed_state=terminal_state,
-                            detail=f"canceled scheduler state confirmed: {terminal_state}",
-                        )
-                    else:
-                        scheduler_resource = CleanupResource(
-                            kind="scheduler_job",
-                            resource_id=session.scheduler_job_id,
-                            location=self.definition.ssh_host,
-                            provider=session.scheduler,
-                            action="cancel",
-                            metadata={"gateway_session_id": session.session_id},
-                            ownership_verified=True,
-                            outcome="terminal",
-                            verified_after_operation=True,
-                            observed_state=terminal_state,
-                            detail=(
-                                "cancel was requested, but the observed terminal scheduler "
-                                f"state was {terminal_state}; cancellation is not claimed"
-                            ),
-                        )
-                except (ConfigurationError, RelayError) as exc:
-                    scheduler_resource = CleanupResource(
-                        kind="scheduler_job",
-                        resource_id=session.scheduler_job_id,
-                        location=self.definition.ssh_host,
-                        provider=session.scheduler,
-                        action="cancel",
-                        metadata={"gateway_session_id": session.session_id},
-                        ownership_verified=True,
-                        outcome="failed",
-                        residual=True,
-                        detail=str(exc),
-                    )
-                    errors.append(str(exc))
-            else:
-                scheduler_resource = self._retained_scheduler_resource(
-                    session=session,
-                    spec=spec,
+            try:
+                verified_submission = self._verified_scheduler_submission(session)
+            except (ConfigurationError, RelayError) as exc:
+                scheduler_resource = CleanupResource(
+                    kind="scheduler_job",
+                    resource_id=session.scheduler_job_id,
+                    location=self.definition.ssh_host,
+                    provider=session.scheduler,
+                    action="cancel" if cancel_scheduler_job else "retain",
+                    metadata={"gateway_session_id": session.session_id},
+                    ownership_verified=False,
+                    outcome="refused",
+                    verified_after_operation=False,
+                    residual=True,
+                    detail=f"scheduler ownership verification failed: {exc}",
                 )
+            else:
+                scheduler_job_id = verified_submission.scheduler_job_id
+                spec = verified_submission.spec
+                if cancel_scheduler_job:
+                    cancel_request_error: str | None = None
+                    try:
+                        if verified_submission.provider == "external":
+                            if spec.cancel_command is None:
+                                raise RelayError(
+                                    "externally managed runtime has no deployment-driver "
+                                    "cancel command"
+                                )
+                            if spec.status_command is None:
+                                raise RelayError(
+                                    "externally managed runtime has no deployment-driver "
+                                    "status command for terminal cancellation confirmation"
+                                )
+                            self._ssh(
+                                _template_command_script(spec.cancel_command, scheduler_job_id)
+                            )
+                        else:
+                            self._request_scheduler_provider_cancel(
+                                provider=verified_submission.provider,
+                                scheduler_job_id=scheduler_job_id,
+                            )
+                    except (ConfigurationError, RelayError) as exc:
+                        cancel_request_error = str(exc)
+                    try:
+                        terminal_state = self._wait_for_scheduler_terminal(
+                            scheduler=verified_submission.provider,
+                            spec=spec,
+                            scheduler_job_id=scheduler_job_id,
+                        )
+                        if terminal_state in _CANCELED_RUNTIME_STATES:
+                            canceled_scheduler_job = scheduler_job_id
+                            scheduler_resource = CleanupResource(
+                                kind="scheduler_job",
+                                resource_id=scheduler_job_id,
+                                location=self.definition.ssh_host,
+                                provider=verified_submission.provider,
+                                action="cancel",
+                                metadata={"gateway_session_id": session.session_id},
+                                ownership_verified=True,
+                                outcome="canceled",
+                                verified_after_operation=True,
+                                observed_state=terminal_state,
+                                detail=(
+                                    f"canceled scheduler state confirmed: {terminal_state}"
+                                    + (
+                                        "; the repeated cancel request returned an error: "
+                                        f"{cancel_request_error}"
+                                        if cancel_request_error is not None
+                                        else ""
+                                    )
+                                ),
+                            )
+                        else:
+                            scheduler_resource = CleanupResource(
+                                kind="scheduler_job",
+                                resource_id=scheduler_job_id,
+                                location=self.definition.ssh_host,
+                                provider=verified_submission.provider,
+                                action="cancel",
+                                metadata={"gateway_session_id": session.session_id},
+                                ownership_verified=True,
+                                outcome="terminal",
+                                verified_after_operation=True,
+                                observed_state=terminal_state,
+                                detail=(
+                                    "cancel was requested, but the observed terminal scheduler "
+                                    f"state was {terminal_state}; cancellation is not claimed"
+                                    + (
+                                        "; the repeated cancel request returned an error: "
+                                        f"{cancel_request_error}"
+                                        if cancel_request_error is not None
+                                        else ""
+                                    )
+                                ),
+                            )
+                    except (ConfigurationError, RelayError) as exc:
+                        detail = str(exc)
+                        if cancel_request_error is not None:
+                            detail = (
+                                f"scheduler cancel request failed: {cancel_request_error}; "
+                                f"terminal-state verification failed: {detail}"
+                            )
+                        scheduler_resource = CleanupResource(
+                            kind="scheduler_job",
+                            resource_id=scheduler_job_id,
+                            location=self.definition.ssh_host,
+                            provider=verified_submission.provider,
+                            action="cancel",
+                            metadata={"gateway_session_id": session.session_id},
+                            ownership_verified=True,
+                            outcome="failed",
+                            residual=True,
+                            detail=detail,
+                        )
+                        errors.append(detail)
+                else:
+                    scheduler_resource = self._retained_scheduler_resource(
+                        session=session,
+                        spec=spec,
+                    )
             resources.append(scheduler_resource)
             if scheduler_resource.residual:
                 errors.append(
-                    scheduler_resource.detail or "scheduler retention verification failed"
+                    scheduler_resource.detail or "scheduler lifecycle verification failed"
                 )
+        cleanup_operation_id = _required_intent_str(teardown_intent, "operation_id")
+        resources = [
+            resource.model_copy(
+                update={
+                    "metadata": {
+                        **resource.metadata,
+                        "cleanup_operation_id": cleanup_operation_id,
+                        "cancel_scheduler_job": cancel_scheduler_job,
+                    }
+                }
+            )
+            for resource in resources
+        ]
         cleanup_succeeded = not errors and not any(resource.residual for resource in resources)
         effective_state = (
             final_state
@@ -1100,6 +1241,10 @@ class ServiceRuntimeSupervisor:
             verified_after_operation=cleanup_succeeded,
             residual=not cleanup_succeeded,
             detail=None if cleanup_succeeded else "gateway remains retryable after cleanup failure",
+            metadata={
+                "cleanup_operation_id": cleanup_operation_id,
+                "cancel_scheduler_job": cancel_scheduler_job,
+            },
         )
         resources.append(gateway_resource)
         cleanup_completed_at = utc_now().isoformat()
@@ -1115,6 +1260,7 @@ class ServiceRuntimeSupervisor:
                 "cancel_scheduler_job": cancel_scheduler_job,
                 "cleanup_retryable": not cleanup_succeeded,
                 "cleanup_errors": errors,
+                "cleanup_operation_id": cleanup_operation_id,
             },
             gateway={
                 **session.gateway,
@@ -1149,6 +1295,10 @@ class ServiceRuntimeSupervisor:
             raise ConfigurationError(
                 f"gateway session {session_id} is not an owned clio-relay runtime"
             )
+        if session.gateway.get("teardown_intent") is not None:
+            raise ConfigurationError(
+                f"gateway session {session_id} is committed to teardown and cannot detach"
+            )
         session = self._reconcile_ownership_intents(session)
         transport = _object(session.gateway.get("transport", {}))
         desktop_connector = _object(transport.get("desktop_connector", {}))
@@ -1157,6 +1307,7 @@ class ServiceRuntimeSupervisor:
             connector=desktop_connector,
             require_record=True,
         )
+        local_resource = _bind_cleanup_resource_to_gateway(local_resource, session.session_id)
         resources = [local_resource]
         errors = (
             [local_resource.detail] if local_resource.residual and local_resource.detail else []
@@ -1194,16 +1345,19 @@ class ServiceRuntimeSupervisor:
                 except RelayError as exc:
                     remote_detail = str(exc)
             resources.append(
-                CleanupResource(
-                    kind="remote_connector",
-                    resource_id=str(remote_pid),
-                    location=self.definition.ssh_host,
-                    action="retain",
-                    ownership_verified=remote_verified,
-                    outcome="retained" if remote_verified else "failed",
-                    verified_after_operation=remote_verified,
-                    residual=not remote_verified,
-                    detail=remote_detail,
+                _bind_cleanup_resource_to_gateway(
+                    CleanupResource(
+                        kind="remote_connector",
+                        resource_id=str(remote_pid),
+                        location=self.definition.ssh_host,
+                        action="retain",
+                        ownership_verified=remote_verified,
+                        outcome="retained" if remote_verified else "failed",
+                        verified_after_operation=remote_verified,
+                        residual=not remote_verified,
+                        detail=remote_detail,
+                    ),
+                    session.session_id,
                 )
             )
             if not remote_verified:
@@ -1211,33 +1365,70 @@ class ServiceRuntimeSupervisor:
         else:
             errors.append("owned remote connector record is missing during detach")
             resources.append(
-                CleanupResource(
-                    kind="remote_connector",
-                    resource_id=session.session_id,
-                    location=self.definition.ssh_host,
-                    action="retain",
-                    ownership_verified=False,
-                    outcome="failed",
-                    residual=True,
-                    detail="owned remote connector record is missing during detach",
+                _bind_cleanup_resource_to_gateway(
+                    CleanupResource(
+                        kind="remote_connector",
+                        resource_id=session.session_id,
+                        location=self.definition.ssh_host,
+                        action="retain",
+                        ownership_verified=False,
+                        outcome="failed",
+                        residual=True,
+                        detail="owned remote connector record is missing during detach",
+                    ),
+                    session.session_id,
                 )
             )
         if session.scheduler_job_id is not None:
-            scheduler_resource = self._retained_scheduler_resource(
-                session=session,
-                spec=ServiceRuntimeSpec.model_validate(session.gateway["runtime_spec"]),
-            )
+            try:
+                verified_submission = self._verified_scheduler_submission(session)
+            except (ConfigurationError, RelayError) as exc:
+                scheduler_resource = CleanupResource(
+                    kind="scheduler_job",
+                    resource_id=session.scheduler_job_id,
+                    location=self.definition.ssh_host,
+                    provider=session.scheduler,
+                    action="retain",
+                    metadata={"gateway_session_id": session.session_id},
+                    ownership_verified=False,
+                    outcome="refused",
+                    verified_after_operation=False,
+                    residual=True,
+                    detail=f"scheduler ownership verification failed: {exc}",
+                )
+            else:
+                scheduler_resource = self._retained_scheduler_resource(
+                    session=session,
+                    spec=verified_submission.spec,
+                )
             resources.append(scheduler_resource)
             if scheduler_resource.residual:
                 errors.append(
                     scheduler_resource.detail or "scheduler retention verification failed"
                 )
+            elif scheduler_resource.outcome == "terminal":
+                errors.append(
+                    "scheduler job is terminal; detached runtime cannot be proven reattachable"
+                )
+        resources.append(
+            CleanupResource(
+                kind="gateway_record",
+                resource_id=session.session_id,
+                location=str(self.settings.core_dir),
+                action="retain",
+                ownership_verified=True,
+                outcome="retained",
+                verified_after_operation=True,
+                observed_state=GatewaySessionState.DEGRADED.value,
+                detail="gateway record retained for an explicit later reattachment or teardown",
+            )
+        )
         updated = self.queue.update_gateway_session(
             session_id,
             state=GatewaySessionState.DEGRADED,
             metadata={
                 "detached_at": utc_now().isoformat(),
-                "cleanup_retryable": bool(errors or any(item.residual for item in resources)),
+                "cleanup_retryable": any(item.residual for item in resources),
                 "cleanup_errors": errors,
             },
             gateway={
@@ -1270,6 +1461,10 @@ class ServiceRuntimeSupervisor:
         if session.metadata.get("owner") != "clio-relay":
             raise ConfigurationError(
                 f"gateway session {session_id} is not an owned clio-relay runtime"
+            )
+        if session.gateway.get("teardown_intent") is not None:
+            raise ConfigurationError(
+                f"gateway session {session_id} is committed to teardown and cannot attach"
             )
         session = self._reconcile_ownership_intents(session)
         spec = ServiceRuntimeSpec.model_validate(session.gateway["runtime_spec"])
@@ -1332,6 +1527,7 @@ class ServiceRuntimeSupervisor:
                 health_url,
                 spec.readiness_timeout_seconds,
                 spec.poll_seconds,
+                expected_body=spec.health_expected_body,
             )
         except Exception as exc:
             cleanup_error: str | None = None
@@ -1418,6 +1614,18 @@ class ServiceRuntimeSupervisor:
         """Durably record one resource intent before or after its side effect."""
         gateway = self._gateway_with_ownership_intent(session, role, intent)
         return self._update(session, gateway=gateway)
+
+    def _prepare_teardown_intent(
+        self,
+        session: GatewaySession,
+        *,
+        cancel_scheduler_job: bool,
+    ) -> GatewaySession:
+        """Persist an immutable cleanup policy before any teardown side effect."""
+        return self.queue.prepare_gateway_teardown_intent(
+            session.session_id,
+            cancel_scheduler_job=cancel_scheduler_job,
+        )
 
     def _gateway_with_ownership_intent(
         self,
@@ -1616,6 +1824,91 @@ class ServiceRuntimeSupervisor:
             )
         return self._update(session, gateway=gateway)
 
+    def _verified_scheduler_submission(
+        self,
+        session: GatewaySession,
+    ) -> _VerifiedSchedulerSubmission:
+        """Prove the exact provider and job ID from the relay-created remote sidecar."""
+        scheduler_job_id = _optional_str(session.scheduler_job_id)
+        if scheduler_job_id is None:
+            raise RelayError("scheduler ownership verification requires an exact job id")
+        try:
+            spec = ServiceRuntimeSpec.model_validate(session.gateway.get("runtime_spec"))
+        except ValueError as exc:
+            raise RelayError("owned runtime has no valid service runtime specification") from exc
+        intents = _object(session.gateway.get("ownership_intents", {}))
+        scheduler_intent = _object(intents.get("scheduler_submission", {}))
+        if (
+            scheduler_intent.get("schema_version") != _OWNERSHIP_INTENT_SCHEMA
+            or scheduler_intent.get("state") != "recorded"
+        ):
+            raise RelayError(
+                "scheduler ownership is not backed by a recorded relay submission intent"
+            )
+        submission_id = _optional_str(scheduler_intent.get("submission_id"))
+        intent_provider = _optional_str(scheduler_intent.get("scheduler_provider"))
+        submission_marker = _optional_str(scheduler_intent.get("submission_marker"))
+        intent_job_id = _optional_str(scheduler_intent.get("scheduler_job_id"))
+        if None in {
+            submission_id,
+            intent_provider,
+            submission_marker,
+            intent_job_id,
+        }:
+            raise RelayError("recorded scheduler ownership intent has incomplete identity")
+        assert submission_id is not None
+        assert intent_provider is not None
+        assert submission_marker is not None
+        assert intent_job_id is not None
+        try:
+            canonical_provider = provider_for_scheduler(session.scheduler).name
+        except ConfigurationError as exc:
+            raise RelayError(f"scheduler provider identity is invalid: {exc}") from exc
+        if (
+            session.scheduler != canonical_provider
+            or intent_provider != canonical_provider
+            or spec.scheduler != canonical_provider
+        ):
+            raise RelayError(
+                "scheduler provider identity disagrees between the runtime, "
+                "submission intent, and runtime specification"
+            )
+        if intent_job_id != scheduler_job_id:
+            raise RelayError(
+                "scheduler job identity disagrees between the gateway and submission intent"
+            )
+        record = _last_json_object(
+            self._ssh(
+                _remote_submission_record_script(
+                    session_id=session.session_id,
+                    submission_id=submission_id,
+                    scheduler_provider=intent_provider,
+                    submission_marker=submission_marker,
+                )
+            )
+        )
+        output = record.get("output")
+        if (
+            record.get("schema_version") != "clio-relay.gateway-submission-sidecar.v1"
+            or record.get("present") is not True
+            or record.get("session_id") != session.session_id
+            or record.get("submission_id") != submission_id
+            or record.get("scheduler_provider") != canonical_provider
+            or record.get("submission_marker") != submission_marker
+            or record.get("returncode") != 0
+            or record.get("output_truncated") is True
+            or not isinstance(output, str)
+        ):
+            raise RelayError("scheduler submission sidecar identity is invalid")
+        submission = _parse_runtime_submission(output)
+        if submission.scheduler_job_id != scheduler_job_id:
+            raise RelayError("scheduler job identity disagrees with the anchored submission output")
+        return _VerifiedSchedulerSubmission(
+            provider=canonical_provider,
+            scheduler_job_id=scheduler_job_id,
+            spec=spec,
+        )
+
     def _stop_local_connector(
         self,
         *,
@@ -1810,7 +2103,12 @@ class ServiceRuntimeSupervisor:
             )
             if node is not None:
                 health = self._ssh(
-                    _remote_http_probe_script(node, spec.service_port, spec.health_path)
+                    _remote_http_probe_script(
+                        node,
+                        spec.service_port,
+                        spec.health_path,
+                        expected_body=spec.health_expected_body,
+                    )
                 )
                 if "service_health=ok" in health:
                     return node
@@ -1870,6 +2168,7 @@ class ServiceRuntimeSupervisor:
                     f"verification remained unresolved: {observed_state}"
                 ),
             )
+        scheduler_terminal = observed_state in _TERMINAL_RUNTIME_STATES
         return CleanupResource(
             kind="scheduler_job",
             resource_id=scheduler_job_id,
@@ -1878,11 +2177,12 @@ class ServiceRuntimeSupervisor:
             action="retain",
             metadata={"gateway_session_id": session.session_id},
             ownership_verified=True,
-            outcome="retained",
+            outcome="terminal" if scheduler_terminal else "retained",
             verified_after_operation=True,
             observed_state=observed_state,
             detail=(
-                "scheduler cancellation was not requested; observed runtime state: "
+                "scheduler cancellation was not requested; observed "
+                f"{'terminal' if scheduler_terminal else 'active'} runtime state: "
                 f"{observed_state}"
             ),
         )
@@ -1901,7 +2201,13 @@ class ServiceRuntimeSupervisor:
             raise RelayError(
                 f"runtime status did not report a state for scheduler job {scheduler_job_id}"
             )
-        return status.state.strip().lower()
+        normalized = status.state.strip().lower()
+        if normalized not in _ACTIVE_RUNTIME_STATES | _TERMINAL_RUNTIME_STATES:
+            raise RelayError(
+                "runtime status reported an unsupported state for scheduler job "
+                f"{scheduler_job_id}: {normalized}"
+            )
+        return normalized
 
     def _observe_scheduler_state(
         self,
@@ -2139,15 +2445,20 @@ class ServiceRuntimeSupervisor:
         health_url: str,
         timeout_seconds: float,
         poll_seconds: float,
+        *,
+        expected_body: str | None = None,
     ) -> None:
         deadline = time.time() + timeout_seconds
         last_error: str | None = None
         while time.time() < deadline:
             try:
                 response = httpx.get(health_url, timeout=5.0)
-                if response.status_code < 500:
-                    return
-                last_error = f"HTTP {response.status_code}"
+                if 200 <= response.status_code < 300:
+                    if expected_body is None or response.content == expected_body.encode("utf-8"):
+                        return
+                    last_error = "HTTP response body did not match the runtime identity"
+                else:
+                    last_error = f"HTTP {response.status_code}"
             except httpx.HTTPError as exc:
                 last_error = str(exc)
             self.sleep(poll_seconds)
@@ -2169,11 +2480,17 @@ class ServiceRuntimeSupervisor:
         )
 
     def _ssh(self, script: str) -> str:
-        result = self.runner.run(
-            ["ssh", self.definition.ssh_host, "bash", "-s"],
-            input_text=script,
-            timeout_seconds=None,
-        )
+        try:
+            result = self.runner.run(
+                ["ssh", self.definition.ssh_host, "bash", "-s"],
+                input_text=script,
+                timeout_seconds=_REMOTE_RUNTIME_COMMAND_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RelayError(
+                "remote service runtime command timed out after "
+                f"{_REMOTE_RUNTIME_COMMAND_TIMEOUT_SECONDS:g} seconds"
+            ) from exc
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip()
             raise RelayError(f"remote service runtime command failed: {detail}")
@@ -2629,19 +2946,40 @@ def _remote_scheduler_script(
     return f"set -euo pipefail\n{remote_env(definition)} {shlex.join(command)}\n"
 
 
-def _remote_http_probe_script(host: str, port: int, path: str) -> str:
+def _remote_http_probe_script(
+    host: str,
+    port: int,
+    path: str,
+    *,
+    expected_body: str | None = None,
+) -> str:
+    encoded_body = (
+        ""
+        if expected_body is None
+        else base64.b64encode(expected_body.encode("utf-8")).decode("ascii")
+    )
+    probe_arguments = shlex.join((host, str(port), path, encoded_body))
     return f"""set -euo pipefail
-python3 - {shlex.quote(host)} {port} {shlex.quote(path)} <<'__CLIO_SERVICE_HEALTH__'
+python3 - {probe_arguments} <<'__CLIO_SERVICE_HEALTH__'
+import base64
 import http.client
 import sys
-host, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+host, port, path, encoded_body = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+expected_body = base64.b64decode(encoded_body) if encoded_body else None
 try:
     conn = http.client.HTTPConnection(host, port, timeout=5)
     conn.request("GET", path)
     response = conn.getresponse()
-    print(f"service_health={{'ok' if response.status < 500 else 'bad'}}")
+    body = response.read(4097)
+    healthy = (
+        200 <= response.status < 300
+        and len(body) <= 4096
+        and (expected_body is None or body == expected_body)
+    )
+    print(f"service_health={{'ok' if healthy else 'bad'}}")
     print(f"service_status={{response.status}}")
-except OSError as exc:
+    conn.close()
+except (OSError, http.client.HTTPException) as exc:
     print(f"service_health=unreachable")
     print(f"service_error={{exc}}")
 __CLIO_SERVICE_HEALTH__
@@ -2665,7 +3003,7 @@ session_id={shlex.quote(session_id)}
 session_dir="$HOME/.local/share/clio-relay/service-sessions/$session_id"
 mkdir -p "$session_dir"
 exec 9>"$session_dir/transition.lock"
-flock -x 9
+flock -w 10 -x 9 || {{ echo "connector start lock timed out" >&2; exit 75; }}
 config_file="$session_dir/remote-frpc.toml"
 log_file="$session_dir/remote-frpc.log"
 pid_file="$session_dir/remote-frpc.pid"
@@ -3013,7 +3351,7 @@ metadata_file="$session_dir/metadata.json"
 pid_file="$session_dir/remote-frpc.pid"
 mkdir -p "$session_dir"
 exec 9>"$session_dir/transition.lock"
-flock -x 9
+flock -w 10 -x 9 || {{ echo "connector stop lock timed out" >&2; exit 75; }}
 python3 - "$metadata_file" "$pid_file" "$pid" "$session_id" <<'__CLIO_STOP_CONNECTOR__'
 import json
 import os
@@ -3057,21 +3395,19 @@ def owned_group_processes():
             continue
         member_pid = int(proc.name)
         try:
+            if proc.stat().st_uid != os.geteuid():
+                continue
             fields = (proc / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
-            process_group = os.getpgid(member_pid)
         except (FileNotFoundError, ProcessLookupError):
             continue
         except (OSError, IndexError, ValueError) as exc:
             raise RuntimeError(
                 f"cannot inspect remote connector candidate {{member_pid}}: {{exc}}"
             ) from exc
-        if fields[0] == "Z" or process_group != pgid:
+        if fields[0] == "Z":
             continue
         try:
             environment = (proc / "environ").read_bytes().split(bytes([0]))
-            command = (proc / "cmdline").read_bytes().replace(bytes([0]), b" ").decode(
-                "utf-8", errors="replace"
-            )
         except (FileNotFoundError, ProcessLookupError):
             continue
         except OSError as exc:
@@ -3081,11 +3417,37 @@ def owned_group_processes():
         if (
             token_marker in environment
             and generation_marker in environment
-            and "frpc" in command
-            and metadata["remote_frpc_config"] in command
         ):
             matches.append(member_pid)
     return sorted(matches)
+
+
+def signal_owned_processes(sig):
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise RuntimeError("race-safe pidfd connector cleanup is unavailable")
+    signaled = []
+    for member_pid in owned_group_processes():
+        try:
+            process_fd = os.pidfd_open(member_pid, 0)
+        except ProcessLookupError:
+            continue
+        except OSError as exc:
+            raise RuntimeError(f"cannot open connector pidfd for {{member_pid}}: {{exc}}") from exc
+        try:
+            if member_pid not in owned_group_processes():
+                continue
+            try:
+                signal.pidfd_send_signal(process_fd, sig, None, 0)
+            except ProcessLookupError:
+                continue
+            except OSError as exc:
+                raise RuntimeError(
+                    f"cannot signal owned connector pid {{member_pid}}: {{exc}}"
+                ) from exc
+            signaled.append(member_pid)
+        finally:
+            os.close(process_fd)
+    return signaled
 
 
 proc = Path("/proc") / str(pid)
@@ -3111,7 +3473,7 @@ if proc.exists():
         leader_owned = False
     except (OSError, IndexError) as exc:
         raise RuntimeError(f"connector leader ownership observation failed: {{exc}}") from exc
-    if not leader_owned and pid not in matches:
+    if not leader_owned and not matches:
         raise RuntimeError("connector leader PID ownership proof failed")
 if not matches:
     Path(pid_file).unlink(missing_ok=True)
@@ -3125,14 +3487,14 @@ if not matches:
     }}))
     raise SystemExit(0)
 
-os.killpg(pgid, signal.SIGTERM)
+signal_owned_processes(signal.SIGTERM)
 for _ in range(25):
     if not owned_group_processes():
         break
     time.sleep(0.2)
 remaining = owned_group_processes()
 if remaining:
-    os.killpg(pgid, signal.SIGKILL)
+    signal_owned_processes(signal.SIGKILL)
     time.sleep(0.2)
 remaining = owned_group_processes()
 if remaining:
@@ -3189,6 +3551,8 @@ if durable:
             continue
         member_pid = int(proc.name)
         try:
+            if proc.stat().st_uid != os.geteuid():
+                continue
             fields = (proc / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
             process_group = os.getpgid(member_pid)
         except (FileNotFoundError, ProcessLookupError):
@@ -3472,7 +3836,7 @@ def _local_process_ids(*, command_markers: tuple[str, ...] = ()) -> list[int]:
             return sorted(candidates)
         except OSError as exc:
             raise RelayError(f"cannot enumerate local processes: {exc}") from exc
-    result = subprocess.run(
+    result = _run_bounded_local_cleanup(
         [
             "powershell",
             "-NoProfile",
@@ -3480,9 +3844,6 @@ def _local_process_ids(*, command_markers: tuple[str, ...] = ()) -> list[int]:
             "@(Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine) "
             "| ConvertTo-Json -Compress",
         ],
-        capture_output=True,
-        text=True,
-        check=False,
     )
     if result.returncode != 0:
         raise RelayError("cannot enumerate local Windows processes")
@@ -3579,6 +3940,8 @@ def _local_connector_identity_status(
             return "owned", "owned connector descendants remain after the group leader exited"
         return "missing", "recorded connector process is no longer running"
     if observed.process_start_marker != start_marker:
+        if os.name == "nt":
+            return "replaced", "recorded connector PID now belongs to a different process"
         if group_members:
             return "owned", "owned connector group remains after leader PID reuse"
         return "replaced", "recorded connector PID now belongs to a different process"
@@ -3592,39 +3955,42 @@ def _local_connector_identity_status(
 
 
 def _local_connector_group_members(connector: dict[str, object]) -> list[int]:
-    """Return live processes that match the connector's complete durable group identity."""
+    """Return all live processes carrying the connector's unforgeable identity."""
     pid = _optional_int(connector.get("pid"))
     process_group_id = _optional_int(connector.get("process_group_id"))
     owner_token = _optional_str(connector.get("owner_token"))
+    generation_id = _optional_str(connector.get("connector_generation_id"))
     config_path = _optional_str(connector.get("config_path"))
-    if pid is None or process_group_id is None or owner_token is None or config_path is None:
+    if (
+        pid is None
+        or process_group_id is None
+        or owner_token is None
+        or generation_id is None
+        or config_path is None
+    ):
         return []
     if os.name == "nt":
         return _windows_connector_descendants(pid=pid, expected_config=config_path)
     token_marker = f"CLIO_RELAY_CONNECTOR_OWNER_TOKEN={owner_token}".encode()
+    generation_marker = f"CLIO_RELAY_CONNECTOR_GENERATION_ID={generation_id}".encode()
     matches: list[int] = []
     for proc in Path("/proc").iterdir():
         if not proc.name.isdigit():
             continue
         member_pid = int(proc.name)
         try:
+            if proc.stat().st_uid != os.geteuid():
+                continue
             fields = (proc / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
-            observed_group = os.getpgid(member_pid)
         except (FileNotFoundError, ProcessLookupError):
             continue
         except (OSError, IndexError, ValueError) as exc:
             raise RelayError(
                 f"cannot inspect local process group member {member_pid}: {exc}"
             ) from exc
-        if fields[0] == "Z" or observed_group != process_group_id:
+        if fields[0] == "Z":
             continue
         try:
-            command = (
-                (proc / "cmdline")
-                .read_bytes()
-                .replace(bytes([0]), b" ")
-                .decode("utf-8", errors="replace")
-            )
             environment = (proc / "environ").read_bytes().split(bytes([0]))
         except (FileNotFoundError, ProcessLookupError):
             continue
@@ -3632,11 +3998,7 @@ def _local_connector_group_members(connector: dict[str, object]) -> list[int]:
             raise RelayError(
                 f"cannot verify local connector group member {member_pid}: {exc}"
             ) from exc
-        if (
-            token_marker in environment
-            and "frpc" in command.casefold()
-            and _command_contains_path(command, config_path)
-        ):
+        if token_marker in environment and generation_marker in environment:
             matches.append(member_pid)
     return sorted(matches)
 
@@ -3647,11 +4009,8 @@ def _windows_connector_descendants(*, pid: int, expected_config: str) -> list[in
         "Select-Object ProcessId,ParentProcessId,CommandLine); "
         "$items | ConvertTo-Json -Compress"
     )
-    result = subprocess.run(
+    result = _run_bounded_local_cleanup(
         ["powershell", "-NoProfile", "-Command", command],
-        capture_output=True,
-        text=True,
-        check=False,
     )
     if result.returncode != 0:
         raise RelayError(
@@ -3763,11 +4122,8 @@ def _observe_windows_process(pid: int) -> _ObservedLocalProcess | None:
         "start_marker=$process.StartTime.ToUniversalTime().Ticks.ToString()}; "
         "$value | ConvertTo-Json -Compress"
     )
-    result = subprocess.run(
+    result = _run_bounded_local_cleanup(
         ["powershell", "-NoProfile", "-Command", command],
-        capture_output=True,
-        text=True,
-        check=False,
     )
     if result.returncode == 3:
         return None
@@ -3796,6 +4152,41 @@ def _observe_windows_process(pid: int) -> _ObservedLocalProcess | None:
     )
 
 
+def _signal_owned_posix_connector_processes(
+    connector: dict[str, object],
+    sig: int,
+) -> list[int]:
+    """Signal only revalidated connector identities through race-safe pidfds."""
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if not callable(pidfd_open) or not callable(pidfd_send_signal):
+        raise RelayError("race-safe pidfd connector cleanup is unavailable on this platform")
+    signaled: list[int] = []
+    for member_pid in _local_connector_group_members(connector):
+        try:
+            raw_process_fd = pidfd_open(member_pid, 0)
+        except ProcessLookupError:
+            continue
+        except OSError as exc:
+            raise RelayError(f"cannot open connector pidfd for {member_pid}: {exc}") from exc
+        if not isinstance(raw_process_fd, int):
+            raise RelayError(f"connector pidfd for {member_pid} is not an integer")
+        process_fd = raw_process_fd
+        try:
+            if member_pid not in _local_connector_group_members(connector):
+                continue
+            try:
+                pidfd_send_signal(process_fd, sig, None, 0)
+            except ProcessLookupError:
+                continue
+            except OSError as exc:
+                raise RelayError(f"cannot signal owned connector pid {member_pid}: {exc}") from exc
+            signaled.append(member_pid)
+        finally:
+            os.close(process_fd)
+    return signaled
+
+
 def _terminate_local_connector(connector: dict[str, object]) -> int | None:
     pid = _optional_int(connector.get("pid"))
     process_group_id = _optional_int(connector.get("process_group_id"))
@@ -3804,26 +4195,17 @@ def _terminate_local_connector(connector: dict[str, object]) -> int | None:
     if _local_connector_identity_status(connector)[0] != "owned":
         return None
     if os.name == "nt":
-        result = subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        result = _run_bounded_local_cleanup(["taskkill", "/PID", str(pid), "/T", "/F"])
         if result.returncode not in {0, 128}:
             return None
     else:
-        try:
-            os.killpg(process_group_id, signal.SIGTERM)
-        except ProcessLookupError:
-            return pid
+        _signal_owned_posix_connector_processes(connector, signal.SIGTERM)
         deadline = time.time() + 5
         while time.time() < deadline:
             if not _local_connector_group_members(connector):
                 return pid
             time.sleep(0.2)
-        with suppress(ProcessLookupError):
-            os.killpg(process_group_id, signal.SIGKILL)
+        _signal_owned_posix_connector_processes(connector, signal.SIGKILL)
     deadline = time.time() + 5
     while time.time() < deadline:
         if not _local_connector_group_members(connector):
@@ -3835,12 +4217,14 @@ def _terminate_local_connector(connector: dict[str, object]) -> int | None:
 def _terminate_just_started_process_group(pid: int) -> None:
     """Best-effort rollback for a process whose durable identity capture failed."""
     if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        with suppress(subprocess.TimeoutExpired):
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=_LOCAL_CLEANUP_COMMAND_TIMEOUT_SECONDS,
+            )
         return
     with suppress(ProcessLookupError):
         os.killpg(pid, signal.SIGTERM)
@@ -3849,8 +4233,40 @@ def _terminate_just_started_process_group(pid: int) -> None:
         os.killpg(pid, signal.SIGKILL)
 
 
+def _run_bounded_local_cleanup(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    """Run one local ownership/cleanup command with a strict wall-clock bound."""
+    try:
+        return subprocess.run(
+            list(command),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_LOCAL_CLEANUP_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RelayError(
+            "local cleanup command timed out after "
+            f"{_LOCAL_CLEANUP_COMMAND_TIMEOUT_SECONDS:g} seconds: {command[0]}"
+        ) from exc
+
+
 def _object(value: object) -> dict[str, object]:
     return cast(dict[str, object], value) if isinstance(value, dict) else {}
+
+
+def _bind_cleanup_resource_to_gateway(
+    resource: CleanupResource,
+    gateway_session_id: str,
+) -> CleanupResource:
+    """Bind connector cleanup evidence to its exact durable gateway record."""
+    return resource.model_copy(
+        update={
+            "metadata": {
+                **resource.metadata,
+                "gateway_session_id": gateway_session_id,
+            }
+        }
+    )
 
 
 def _optional_int(value: object) -> int | None:
