@@ -12,6 +12,7 @@ from typing import cast
 
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
+from click import unstyle
 from typer.testing import CliRunner
 
 from clio_relay import cli
@@ -3811,8 +3812,9 @@ def test_cli_session_rejects_scheduler_sentinel_without_both_cancel_flags(
         )
 
         assert result.exit_code == 2
-        assert "--preserve-scheduler-job-id requires both --cancel-jobs" in result.output
-        assert "--cancel-scheduler-jobs" in result.output
+        output = unstyle(result.output)
+        assert "--preserve-scheduler-job-id requires both --cancel-jobs" in output
+        assert "--cancel-scheduler-jobs" in output
 
 
 def test_remote_owned_job_discovery_never_cancels_unrelated_session(

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any, Protocol, cast
 
 import pytest
+from click import unstyle
 from jsonschema import Draft4Validator, Draft201909Validator, Draft202012Validator
 from pydantic import ValidationError
 from pytest import MonkeyPatch
@@ -3327,10 +3328,12 @@ def test_cli_rejects_mismatched_structured_result_expectation_before_dispatch(
             "--validation-report",
             str(report_path),
         ],
+        color=False,
+        terminal_width=200,
     )
 
     assert result.exit_code != 0
-    assert "expectation tool must match --tool" in result.output
+    assert "expectation tool must match --tool" in unstyle(result.output)
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["checks"][-1]["check_id"] == "remote-mcp.preflight"
 
