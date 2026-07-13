@@ -52,6 +52,78 @@ def test_windows_recorded_cleanup_accepts_taskkill_failure_only_after_pid_absenc
     assert commands == [["taskkill", "/PID", "4312", "/T", "/F"]]
 
 
+def test_windows_live_cleanup_accepts_taskkill_race_after_process_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private = cast(Any, process_containment)
+    poll_results = iter([None, 0])
+    kills: list[bool] = []
+    waits: list[float] = []
+
+    def poll() -> int | None:
+        return next(poll_results)
+
+    def kill() -> None:
+        kills.append(True)
+
+    def wait(*, timeout: float) -> int:
+        waits.append(timeout)
+        return 0
+
+    process = SimpleNamespace(
+        pid=4312,
+        poll=poll,
+        kill=kill,
+        wait=wait,
+    )
+
+    def failed_taskkill(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            "",
+            "ERROR: There is no running instance of the task.",
+        )
+
+    monkeypatch.setattr(process_containment.subprocess, "run", failed_taskkill)
+
+    private._terminate_windows_tree(process, timeout_seconds=3.0)
+
+    assert kills == []
+    assert waits == [3.0]
+
+
+def test_windows_live_cleanup_fails_closed_after_taskkill_error_and_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private = cast(Any, process_containment)
+    kills: list[bool] = []
+
+    def kill() -> None:
+        kills.append(True)
+
+    def wait(*, timeout: float) -> int:
+        del timeout
+        return 0
+
+    process = SimpleNamespace(
+        pid=4312,
+        poll=lambda: None,
+        kill=kill,
+        wait=wait,
+    )
+
+    def failed_taskkill(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 1, "", "taskkill failed")
+
+    monkeypatch.setattr(process_containment.subprocess, "run", failed_taskkill)
+
+    with pytest.raises(RuntimeError, match="taskkill failed"):
+        private._terminate_windows_tree(process, timeout_seconds=3.0)
+
+    assert kills == [True]
+
+
 @pytest.mark.parametrize(
     ("observed_identity", "error_match"),
     [

@@ -1388,14 +1388,20 @@ def _terminate_windows_tree(
     except (OSError, subprocess.TimeoutExpired) as exc:
         taskkill_error = exc
         result = subprocess.CompletedProcess(["taskkill", str(process.pid)], 1, "", str(exc))
-    if result.returncode not in {0, 128} and process.poll() is None:
+    # The Popen handle is PID-reuse safe; taskkill diagnostics are localized.
+    exited_before_fallback = process.poll() is not None
+    taskkill_failed = taskkill_error is not None or result.returncode not in {0, 128}
+    if taskkill_failed and not exited_before_fallback:
         process.kill()
     try:
         process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=timeout_seconds)
-    if taskkill_error is not None or result.returncode not in {0, 128}:
+    benign_exit_race = (
+        taskkill_error is None and result.returncode not in {0, 128} and exited_before_fallback
+    )
+    if taskkill_failed and not benign_exit_race:
         raise RuntimeError(
             result.stderr.strip()
             or f"taskkill could not prove process-tree termination: {process.pid}"
