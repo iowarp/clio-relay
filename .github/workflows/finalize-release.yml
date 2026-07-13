@@ -13,7 +13,7 @@ on:
         type: string
 
 concurrency:
-  group: release-finalization-${{ inputs.tag }}
+  group: clio-relay-release-${{ inputs.tag }}
   cancel-in-progress: false
 
 permissions: {}
@@ -22,6 +22,7 @@ jobs:
   authorize:
     name: reject non-main dispatch before protected environment
     runs-on: ubuntu-latest
+    timeout-minutes: 5  # Fail closed if the dispatch identity check cannot complete.
     permissions: {}
     outputs:
       workflow_sha: ${{ steps.dispatch.outputs.workflow_sha }}
@@ -44,6 +45,7 @@ jobs:
   finalize:
     name: verify released evidence and publish GitHub release
     runs-on: ubuntu-latest
+    timeout-minutes: 45  # Bound final chain verification and the atomic publication sequence.
     needs: authorize
     environment:
       name: release-finalization
@@ -89,7 +91,10 @@ jobs:
           DISPATCH_SHA: ${{ github.sha }}
         shell: bash
         run: |
-          git fetch --force --no-tags origin refs/heads/main:refs/remotes/origin/main
+          source .github/scripts/authenticated-git.sh
+          source .github/scripts/release-api.sh
+          relay_authenticated_git_fetch --force --no-tags origin \
+            refs/heads/main:refs/remotes/origin/main
           test "$DISPATCH_REF" = "refs/heads/main"
           test "$DISPATCH_SHA" = "$(git rev-parse refs/remotes/origin/main)"
           test "$DISPATCH_SHA" = "$(git rev-parse HEAD)"
@@ -101,9 +106,9 @@ jobs:
             --source-commit "$DISPATCH_SHA" \
             --draft any \
             --prerelease false
-          release_state="$(gh release view "$TAG_NAME" --repo "$REPOSITORY" --json isDraft,isPrerelease)"
-          test "$(jq -r .isPrerelease <<<"$release_state")" = "false"
-          is_draft="$(jq -r .isDraft <<<"$release_state")"
+          relay_release_resolve "$TAG_NAME" any "$RUNNER_TEMP/finalize-release.json"
+          test "$(jq -r .prerelease "$RUNNER_TEMP/finalize-release.json")" = "false"
+          is_draft="$(jq -r .draft "$RUNNER_TEMP/finalize-release.json")"
           [[ "$is_draft" == "true" || "$is_draft" == "false" ]]
           version="${TAG_NAME#v}"
           policy_version="$(sed -nE 's/^release_version:[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' docs/release-gate-1.0.yaml)"
@@ -123,26 +128,47 @@ jobs:
         shell: bash
         run: |
           mkdir -p finalization/evidence
-          gh api "repos/$REPOSITORY/releases/tags/$TAG_NAME" \
-            > finalization/evidence/release-metadata-before.json
-          release_id="$(jq -r .id finalization/evidence/release-metadata-before.json)"
-          [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
-          gh api "repos/$REPOSITORY/releases/$release_id/assets?per_page=100&page=1" \
-            > finalization/evidence/release-asset-list-before-page-1.json
-          gh api "repos/$REPOSITORY/releases/$release_id/assets?per_page=100&page=2" \
-            > finalization/evidence/release-asset-list-before-page-2.json
-          test "$(jq length finalization/evidence/release-asset-list-before-page-2.json)" -eq 0
-          jq --slurpfile assets finalization/evidence/release-asset-list-before-page-1.json \
-            '.assets = $assets[0]' finalization/evidence/release-metadata-before.json \
-            > finalization/evidence/release-assets-before.json
+          source .github/scripts/release-api.sh
+          relay_release_resolve "$TAG_NAME" any \
+            finalization/evidence/release-metadata-before.json
+          relay_release_complete_assets finalization/evidence/release-metadata-before.json \
+            finalization/evidence/release-assets-before.json
           python src/clio_relay/ci_validation.py report-assets \
             --release finalization/evidence/release-assets-before.json \
             --kind candidate \
+            --matrix examples/release-gate/report-matrix-1.0.json \
             --output finalization/evidence/candidate-report-assets-before.json
           python src/clio_relay/ci_validation.py report-assets \
             --release finalization/evidence/release-assets-before.json \
             --kind released \
+            --matrix examples/release-gate/report-matrix-1.0.json \
             --output finalization/evidence/released-report-assets-before.json
+
+      - name: prove immutable releases are enabled before publication
+        env:
+          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          test -n "$IMMUTABLE_RELEASES_READ_TOKEN"
+          GH_TOKEN="$IMMUTABLE_RELEASES_READ_TOKEN" \
+            gh api "repos/$REPOSITORY/immutable-releases" \
+            > "$RUNNER_TEMP/immutable-releases-api.json"
+          jq -e '
+            type == "object"
+            and .enabled == true
+            and (.enforced_by_owner | type == "boolean")
+          ' "$RUNNER_TEMP/immutable-releases-api.json" >/dev/null
+          jq -n \
+            --arg repository "$REPOSITORY" \
+            --slurpfile settings "$RUNNER_TEMP/immutable-releases-api.json" \
+            '{
+              schema_version: "clio-relay.immutable-releases-receipt.v1",
+              repository: $repository,
+              endpoint: ("repos/" + $repository + "/immutable-releases"),
+              enabled: $settings[0].enabled,
+              enforced_by_owner: $settings[0].enforced_by_owner
+            }' > finalization/evidence/IMMUTABLE-RELEASES.json
 
       - name: download the complete immutable release evidence chain
         env:
@@ -153,38 +179,35 @@ jobs:
         run: |
           mkdir -p finalization/packages finalization/evidence/candidate-reports \
             finalization/evidence/released-reports
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern '*.whl' --dir finalization/packages
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern '*.tar.gz' --dir finalization/packages
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'SHA256SUMS' --dir finalization/evidence
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'CI-STATUS.json' --dir finalization/evidence
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'REPOSITORY-GOVERNANCE.json' --dir finalization/evidence
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'validation-*.json' --dir finalization/evidence/candidate-reports
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'LIVE-VALIDATION-BINDING.json' --dir finalization/evidence
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'candidate-release-gate-1.0.json' --dir finalization/evidence
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'PYPI-PROMOTION.json' --dir finalization/evidence
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'released-validation-*.json' --dir finalization/evidence/released-reports
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'RELEASED-VALIDATION-BINDING.json' --dir finalization/evidence
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'released-release-gate-1.0.json' --dir finalization/evidence
-          gh api "repos/$REPOSITORY/releases/tags/$TAG_NAME" \
-            > finalization/evidence/release-metadata-after.json
-          release_id="$(jq -r .id finalization/evidence/release-metadata-after.json)"
-          [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
-          gh api "repos/$REPOSITORY/releases/$release_id/assets?per_page=100&page=1" \
-            > finalization/evidence/release-asset-list-after-page-1.json
-          gh api "repos/$REPOSITORY/releases/$release_id/assets?per_page=100&page=2" \
-            > finalization/evidence/release-asset-list-after-page-2.json
-          test "$(jq length finalization/evidence/release-asset-list-after-page-2.json)" -eq 0
-          jq --slurpfile assets finalization/evidence/release-asset-list-after-page-1.json \
-            '.assets = $assets[0]' finalization/evidence/release-metadata-after.json \
-            > finalization/evidence/release-assets-after.json
+          source .github/scripts/release-api.sh
+          release_before=finalization/evidence/release-assets-before.json
+          relay_release_download_pattern "$release_before" '*.whl' finalization/packages
+          relay_release_download_pattern "$release_before" '*.tar.gz' finalization/packages
+          for asset in SHA256SUMS CI-STATUS.json REPOSITORY-GOVERNANCE.json \
+            LIVE-VALIDATION-BINDING.json candidate-release-gate-1.0.json \
+            PYPI-PROMOTION.json RELEASED-VALIDATION-BINDING.json \
+            released-release-gate-1.0.json; do
+            relay_release_download_exact "$release_before" "$asset" \
+              "finalization/evidence/$asset"
+          done
+          relay_release_download_pattern "$release_before" 'validation-*.json' \
+            finalization/evidence/candidate-reports
+          relay_release_download_pattern "$release_before" 'released-validation-*.json' \
+            finalization/evidence/released-reports
+          relay_release_resolve "$TAG_NAME" any \
+            finalization/evidence/release-metadata-after.json
+          relay_release_complete_assets finalization/evidence/release-metadata-after.json \
+            finalization/evidence/release-assets-after.json
           python src/clio_relay/ci_validation.py report-assets \
             --release finalization/evidence/release-assets-after.json \
             --kind candidate \
+            --matrix examples/release-gate/report-matrix-1.0.json \
             --report-dir finalization/evidence/candidate-reports \
             --output finalization/evidence/candidate-report-assets-after.json
           python src/clio_relay/ci_validation.py report-assets \
             --release finalization/evidence/release-assets-after.json \
             --kind released \
+            --matrix examples/release-gate/report-matrix-1.0.json \
             --report-dir finalization/evidence/released-reports \
             --output finalization/evidence/released-report-assets-after.json
           cmp --silent finalization/evidence/candidate-report-assets-before.json \
@@ -267,6 +290,7 @@ jobs:
           python - finalization "$TAG_NAME" "$SOURCE_COMMIT" "$VERSION" <<'PY'
           import hashlib
           import json
+          import os
           import re
           import sys
           import urllib.request
@@ -302,6 +326,17 @@ jobs:
           released_gate_path = root / "evidence" / "released-release-gate-1.0.json"
           ci_status_path = root / "evidence" / "CI-STATUS.json"
           governance_path = root / "evidence" / "REPOSITORY-GOVERNANCE.json"
+          immutable_releases_path = root / "evidence" / "IMMUTABLE-RELEASES.json"
+          candidate_report_manifest = json.loads(
+              (root / "evidence" / "candidate-report-assets-after.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          released_report_manifest = json.loads(
+              (root / "evidence" / "released-report-assets-after.json").read_text(
+                  encoding="utf-8"
+              )
+          )
           manifest_subjects[ci_status_path.name] = hashlib.sha256(
               ci_status_path.read_bytes()
           ).hexdigest()
@@ -339,7 +374,10 @@ jobs:
           with urllib.request.urlopen(
               f"https://pypi.org/pypi/clio-relay/{version}/json", timeout=30
           ) as response:
-              pypi = json.load(response)
+              content = response.read(4 * 1024 * 1024 + 1)
+          if len(content) > 4 * 1024 * 1024:
+              raise SystemExit("PyPI project metadata exceeds the bounded response size")
+          pypi = json.loads(content)
           observed_files = {
               item["filename"]: item.get("digests", {}).get("sha256")
               for item in pypi.get("urls", [])
@@ -350,29 +388,17 @@ jobs:
           def verify_binding(
               binding_path: Path,
               report_dir: Path,
+              report_manifest: dict,
               *,
               stage: str,
+              matrix_stage: str,
               workflow: str,
-              pattern: str,
           ) -> tuple[dict, dict[str, dict]]:
               binding = json.loads(binding_path.read_text(encoding="utf-8"))
-              source_pr_authors = binding.get("source_pr_authors")
-              source_contributor_ids = binding.get("source_contributor_ids")
-              pr_author_ids = {
-                  item.get("id")
-                  for item in source_pr_authors
-                  if isinstance(item, dict)
-                  and isinstance(item.get("id"), int)
-                  and not isinstance(item.get("id"), bool)
-                  and item["id"] > 0
-                  and isinstance(item.get("login"), str)
-                  and bool(item["login"])
-              } if isinstance(source_pr_authors, list) else set()
-              contributor_ids = {
-                  item
-                  for item in source_contributor_ids
-                  if isinstance(item, int) and not isinstance(item, bool) and item > 0
-              } if isinstance(source_contributor_ids, list) else set()
+              matrix = report_manifest.get("acceptance_matrix")
+              if not isinstance(matrix, dict):
+                  raise SystemExit(f"{stage} report manifest has no acceptance matrix")
+              sealer_id = binding.get("sealer_id")
               checks = {
                   "schema": binding.get("schema_version") == "1.0",
                   "stage": binding.get("artifact_stage") == stage,
@@ -381,41 +407,24 @@ jobs:
                   "version": binding.get("version") == version,
                   "wheel": binding.get("wheel", {}).get("sha256") == wheel_sha256,
                   "workflow": binding.get("authorized_workflow") == workflow,
-                   "trust_model": binding.get("trust_model")
-                       == "reviewer_sealed_operator_evidence",
-                   "producer_scope": binding.get("producer_execution_verified") is False,
-                   "review_environment": binding.get("review_environment")
-                       == (
-                           "live-validation"
-                           if stage == "immutable_candidate"
-                           else "released-validation"
-                       ),
-                   "review_method": binding.get("review_method")
-                       == "independent_maintainer_workflow_dispatch",
-                   "reviewer_login": isinstance(binding.get("reviewer_login"), str)
-                       and bool(binding["reviewer_login"]),
-                  "source_author_login": isinstance(
-                      binding.get("source_commit_author_login"), str
-                  )
-                      and bool(binding["source_commit_author_login"]),
-                  "independent_reviewer": binding.get("reviewer_login")
-                      != binding.get("source_commit_author_login"),
-                  "reviewer_id": isinstance(binding.get("reviewer_id"), int)
-                      and not isinstance(binding.get("reviewer_id"), bool)
-                      and binding["reviewer_id"] > 0,
-                  "source_author_id": isinstance(
-                      binding.get("source_commit_author_id"), int
-                  )
-                      and not isinstance(binding.get("source_commit_author_id"), bool)
-                      and binding["source_commit_author_id"] > 0,
-                  "source_pr_authors": bool(pr_author_ids)
-                      and len(pr_author_ids) == len(source_pr_authors),
-                  "source_contributor_ids": bool(contributor_ids)
-                      and len(contributor_ids) == len(source_contributor_ids)
-                      and pr_author_ids.issubset(contributor_ids),
-                  "independent_numeric_reviewer": binding.get("reviewer_id")
-                      != binding.get("source_commit_author_id")
-                      and binding.get("reviewer_id") not in contributor_ids,
+                  "trust_model": binding.get("trust_model")
+                      == "maintainer_sealed_operator_evidence",
+                  "producer_scope": binding.get("producer_execution_verified") is False,
+                  "seal_environment": binding.get("seal_environment")
+                      == (
+                          "live-validation"
+                          if stage == "immutable_candidate"
+                          else "released-validation"
+                      ),
+                  "seal_method": binding.get("seal_method")
+                      == "write_capable_maintainer_workflow_dispatch",
+                  "sealer_login": isinstance(binding.get("sealer_login"), str)
+                      and bool(binding["sealer_login"]),
+                  "sealer_id": isinstance(sealer_id, int)
+                      and not isinstance(sealer_id, bool)
+                      and sealer_id > 0,
+                  "sealer_permission": binding.get("sealer_permission")
+                      in {"admin", "maintain", "write"},
                   "environment_reviewers_not_claimed": binding.get(
                       "environment_reviewers_available"
                   ) is False,
@@ -424,12 +433,26 @@ jobs:
                   "repository_governance": binding.get(
                       "repository_governance_sha256"
                   ) == hashlib.sha256(governance_path.read_bytes()).hexdigest(),
+                  "acceptance_matrix": binding.get("acceptance_matrix") == matrix,
+                  "matrix_stage": matrix.get("stage") == matrix_stage,
+                  "matrix_artifact_stage": matrix.get("artifact_stage") == stage,
+                  "matrix_version": matrix.get("release_version") == version,
+                  "matrix_report_count": matrix.get("report_count") == 17,
               }
               failed = sorted(name for name, passed in checks.items() if not passed)
               if failed:
                   raise SystemExit(f"invalid {stage} validation binding: {failed}")
               declared_reports = {}
-              for item in binding.get("reports", []):
+              declared_report_list = binding.get("reports", [])
+              expected_reports = matrix.get("reports", [])
+              if (
+                  not isinstance(declared_report_list, list)
+                  or not isinstance(expected_reports, list)
+                  or len(declared_report_list) != matrix.get("report_count")
+                  or len(expected_reports) != matrix.get("report_count")
+              ):
+                  raise SystemExit(f"{stage} binding does not contain the exact matrix")
+              for item in declared_report_list:
                   if not isinstance(item, dict) or not isinstance(item.get("filename"), str):
                       raise SystemExit(f"invalid {stage} binding report entry")
                   if item["filename"] in declared_reports:
@@ -439,9 +462,10 @@ jobs:
               invocation_ids = set()
               expected_kind = "wheel" if stage == "immutable_candidate" else "pypi"
               expected_released = stage == "published"
-              for path in sorted(report_dir.glob(pattern)):
-                  if path.name == "validation-local.json":
-                      continue
+              for expected_report in expected_reports:
+                  if not isinstance(expected_report, dict):
+                      raise SystemExit(f"invalid {stage} acceptance matrix report")
+                  path = report_dir / str(expected_report.get("filename"))
                   document = json.loads(path.read_text(encoding="utf-8"))
                   item = declared_reports.get(path.name, {})
                   trust = document.get("evidence_trust", {})
@@ -456,6 +480,12 @@ jobs:
                       "report_id": item.get("report_id") == document.get("report_id"),
                       "scenario": item.get("scenario") == document.get("scenario"),
                       "cluster": item.get("cluster") == document.get("cluster"),
+                      "matrix_id": item.get("acceptance_id") == expected_report.get("id"),
+                      "matrix_ordinal": item.get("ordinal") == expected_report.get("ordinal"),
+                      "matrix_scenario": document.get("scenario")
+                          == expected_report.get("scenario"),
+                      "matrix_cluster": document.get("cluster")
+                          == expected_report.get("cluster"),
                       "status": document.get("status") == "passed",
                       "version": software.get("version") == version,
                       "tag": software.get("tag") == tag,
@@ -467,8 +497,12 @@ jobs:
                       "source_kind": source.get("kind") == expected_kind,
                       "detected_source_kind": source.get("detected_kind") == expected_kind,
                       "released_claim": source.get("released_artifact") is expected_released,
-                      "launcher": source.get("launcher") == "uvx",
+                      "launcher": source.get("launcher") == "uv-tool",
                       "launcher_verified": source.get("launcher_verified") is True,
+                      "tool_environment": launcher_receipt.get("tool_environment_verified") is True,
+                      "tool_bin_bound": launcher_receipt.get("tool_bin_bound") is True,
+                      "tool_target_bound": launcher_receipt.get("tool_target_bound") is True,
+                      "record_closure": launcher_receipt.get("distribution_record", {}).get("verified") is True,
                       "producer_login": trust.get("producer_github_login")
                           == item.get("producer_github_login")
                           == item.get("uploader_github_login"),
@@ -477,7 +511,6 @@ jobs:
                           and producer_id > 0
                           and producer_id == item.get("producer_github_id")
                           == item.get("uploader_github_id"),
-                      "reviewer_not_producer": producer_id != binding.get("reviewer_id"),
                       "invocation_id": isinstance(invocation_id, str)
                           and 16 <= len(invocation_id) <= 256
                           and invocation_id == item.get("invocation_id")
@@ -513,17 +546,33 @@ jobs:
           candidate_binding, _ = verify_binding(
               candidate_binding_path,
               root / "evidence" / "candidate-reports",
+              candidate_report_manifest,
               stage="immutable_candidate",
+              matrix_stage="candidate",
               workflow=".github/workflows/live-validation-attest.yml",
-              pattern="validation-*.json",
           )
           released_binding, released_reports = verify_binding(
               released_binding_path,
               root / "evidence" / "released-reports",
+              released_report_manifest,
               stage="published",
+              matrix_stage="released",
               workflow=".github/workflows/released-validation-attest.yml",
-              pattern="released-validation-*.json",
           )
+          candidate_matrix = candidate_binding["acceptance_matrix"]
+          released_matrix = released_binding["acceptance_matrix"]
+          candidate_matrix_ids = [item["id"] for item in candidate_matrix["reports"]]
+          released_matrix_ids = [item["id"] for item in released_matrix["reports"]]
+          if (
+              candidate_matrix.get("sha256") != released_matrix.get("sha256")
+              or candidate_matrix.get("schema_version")
+                  != released_matrix.get("schema_version")
+              or candidate_matrix.get("release_version")
+                  != released_matrix.get("release_version")
+              or candidate_matrix.get("report_count") != released_matrix.get("report_count")
+              or candidate_matrix_ids != released_matrix_ids
+          ):
+              raise SystemExit("candidate and released evidence bind different matrices")
           candidate_invocations = {
               item["invocation_id"] for item in candidate_binding["reports"]
           }
@@ -538,6 +587,33 @@ jobs:
               promotion_path.read_bytes()
           ).hexdigest():
               raise SystemExit("released binding does not identify the PyPI publication record")
+          candidate_decision = json.loads(candidate_gate_path.read_text(encoding="utf-8"))
+          candidate_document_ids = [
+              item["report_id"] for item in candidate_binding["reports"]
+          ]
+          candidate_decision_checks = {
+              "passed": candidate_decision.get("passed") is True,
+              "matrix_schema": candidate_decision.get("acceptance_matrix_schema_version")
+                  == candidate_matrix.get("schema_version"),
+              "matrix_version": candidate_decision.get("acceptance_matrix_release_version")
+                  == candidate_matrix.get("release_version"),
+              "matrix_digest": candidate_decision.get("acceptance_matrix_sha256")
+                  == candidate_matrix.get("sha256"),
+              "matrix_stage": candidate_decision.get("acceptance_matrix_stage")
+                  == "candidate",
+              "matrix_ids": candidate_decision.get("acceptance_report_ids")
+                  == candidate_matrix_ids,
+              "matrix_document_ids": candidate_decision.get(
+                  "acceptance_report_document_ids"
+              ) == candidate_document_ids,
+          }
+          failed_candidate_decision = sorted(
+              name for name, passed in candidate_decision_checks.items() if not passed
+          )
+          if failed_candidate_decision:
+              raise SystemExit(
+                  f"invalid candidate gate matrix binding: {failed_candidate_decision}"
+              )
           decision = json.loads(released_gate_path.read_text(encoding="utf-8"))
           decision_checks = {
               "passed": decision.get("passed") is True,
@@ -551,6 +627,18 @@ jobs:
                   decision.get("policy_target_identity_sha256"), dict
               ) and decision.get("policy_target_identity_sha256")
                   == decision.get("target_identity_sha256"),
+              "matrix_schema": decision.get("acceptance_matrix_schema_version")
+                  == released_matrix.get("schema_version"),
+              "matrix_version": decision.get("acceptance_matrix_release_version")
+                  == released_matrix.get("release_version"),
+              "matrix_digest": decision.get("acceptance_matrix_sha256")
+                  == released_matrix.get("sha256"),
+              "matrix_stage": decision.get("acceptance_matrix_stage") == "released",
+              "matrix_ids": decision.get("acceptance_report_ids")
+                  == released_matrix_ids,
+              "matrix_document_count": len(
+                  decision.get("acceptance_report_document_ids", [])
+              ) == released_matrix.get("report_count"),
           }
           failed_decision = sorted(
               name for name, passed in decision_checks.items() if not passed
@@ -611,6 +699,29 @@ jobs:
           used_reports = [released_by_id[report_id] for report_id in nonlocal_report_ids]
           if not used_reports:
               raise SystemExit("final decision does not use released-artifact live reports")
+          ordered_document_ids = decision.get("acceptance_report_document_ids")
+          if (
+              not isinstance(ordered_document_ids, list)
+              or len(ordered_document_ids) != released_matrix.get("report_count")
+              or set(ordered_document_ids) != set(nonlocal_report_ids)
+          ):
+              raise SystemExit(
+                  "final decision matrix order does not exactly cover sealed released reports"
+              )
+          released_binding_by_filename = {
+              item["filename"]: item for item in released_binding["reports"]
+          }
+          used_reports = []
+          for report_id in ordered_document_ids:
+              report = released_by_id[report_id]
+              bound = released_binding_by_filename[report["filename"]]
+              used_reports.append(
+                  {
+                      **report,
+                      "acceptance_id": bound["acceptance_id"],
+                      "ordinal": bound["ordinal"],
+                  }
+              )
           all_requirements = decision.get("satisfied_requirements", [])
           local_requirements = [
               requirement
@@ -626,15 +737,38 @@ jobs:
               raise SystemExit("final decision does not separate local and released gates")
           ci_status = json.loads(ci_status_path.read_text(encoding="utf-8"))
           governance = json.loads(governance_path.read_text(encoding="utf-8"))
+          immutable_releases = json.loads(
+              immutable_releases_path.read_text(encoding="utf-8")
+          )
+          if immutable_releases != {
+              "schema_version": "clio-relay.immutable-releases-receipt.v1",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "endpoint": (
+                  "repos/" + os.environ["GITHUB_REPOSITORY"] + "/immutable-releases"
+              ),
+              "enabled": True,
+              "enforced_by_owner": immutable_releases.get("enforced_by_owner"),
+          } or not isinstance(immutable_releases.get("enforced_by_owner"), bool):
+              raise SystemExit("immutable releases receipt is invalid or disabled")
           claims = {
               "schema_version": "1.0",
               "artifact_stage": "published",
               "tag": tag,
               "source_commit": commit,
               "version": version,
-              "install_path": f"uvx --from clio-relay=={version}",
+              "install_path": f"uv tool install clio-relay=={version}; clio-relay",
               "wheel": {"filename": wheel.name, "sha256": wheel_sha256},
               "policy": "docs/release-gate-1.0.yaml",
+              "acceptance_matrix": {
+                  "schema_version": released_matrix["schema_version"],
+                  "release_version": released_matrix["release_version"],
+                  "sha256": released_matrix["sha256"],
+                  "report_count": released_matrix["report_count"],
+                  "candidate_stage": candidate_matrix["stage"],
+                  "released_stage": released_matrix["stage"],
+                  "ordered_report_ids": released_matrix_ids,
+                  "ordered_report_document_ids": ordered_document_ids,
+              },
               "target_identity_sha256": decision["target_identity_sha256"],
               "policy_target_identity_sha256": decision[
                   "policy_target_identity_sha256"
@@ -654,22 +788,25 @@ jobs:
                   ),
                   "environments": governance.get("environments"),
               },
+              "immutable_releases": immutable_releases,
               "local_quality_requirements": local_requirements,
               "released_artifact_requirements": released_requirements,
               "released_reports": used_reports,
               "clusters": sorted({item["cluster"] for item in used_reports}),
               "scenarios": sorted({item["scenario"] for item in used_reports}),
-              "evidence_trust_model": "reviewer_sealed_operator_evidence",
+              "evidence_trust_model": "maintainer_sealed_operator_evidence",
               "producer_execution_verified": False,
-              "evidence_reviewers": sorted(
+              "evidence_sealers": sorted(
                   [
                       {
-                          "login": candidate_binding["reviewer_login"],
-                          "id": candidate_binding["reviewer_id"],
+                          "login": candidate_binding["sealer_login"],
+                          "id": candidate_binding["sealer_id"],
+                          "permission": candidate_binding["sealer_permission"],
                       },
                       {
-                          "login": released_binding["reviewer_login"],
-                          "id": released_binding["reviewer_id"],
+                          "login": released_binding["sealer_login"],
+                          "id": released_binding["sealer_id"],
+                          "permission": released_binding["sealer_permission"],
                       },
                   ],
                   key=lambda item: item["id"],
@@ -687,8 +824,8 @@ jobs:
           )
           notes = (
               f"clio-relay {tag}\n\n"
-              f"Release acceptance passed through the published `uvx --from "
-              f"clio-relay=={version}` path on "
+              f"Release acceptance passed through one persistent published "
+              f"`uv tool install clio-relay=={version}` path on "
               f"{', '.join(claims['clusters'])}. Claims are limited to the "
               "machine-readable requirements and reports in `RELEASE-CLAIMS.json`.\n\n"
               f"Validated requirements:\n\n{requirements}\n"
@@ -729,6 +866,7 @@ jobs:
           TAG_NAME: ${{ inputs.tag }}
         shell: bash
         run: |
+          source .github/scripts/release-api.sh
           python src/clio_relay/ci_validation.py verify-live-release \
             --repository "$REPOSITORY" \
             --tag "$TAG_NAME" \
@@ -737,10 +875,17 @@ jobs:
             --prerelease false
           claims=finalization/evidence/RELEASE-CLAIMS.json
           mkdir -p existing-claims
-          if gh release download "$TAG_NAME" --repo "$REPOSITORY" \
-            --pattern 'RELEASE-CLAIMS.json' --dir existing-claims >/dev/null 2>&1; then
+          relay_release_resolve "$TAG_NAME" any "$RUNNER_TEMP/claims-release.json"
+          relay_release_complete_assets "$RUNNER_TEMP/claims-release.json" \
+            "$RUNNER_TEMP/claims-release-assets.json"
+          if relay_release_asset_id "$RUNNER_TEMP/claims-release-assets.json" \
+            RELEASE-CLAIMS.json >/dev/null; then
+            relay_release_download_exact "$RUNNER_TEMP/claims-release-assets.json" \
+              RELEASE-CLAIMS.json existing-claims/RELEASE-CLAIMS.json
             cmp --silent "$claims" existing-claims/RELEASE-CLAIMS.json
           else
+            asset_status="$?"
+            test "$asset_status" -eq 1
             python src/clio_relay/ci_validation.py mutation-authority \
               --governance-receipt finalization/evidence/REPOSITORY-GOVERNANCE.json \
               --repository "$REPOSITORY" \
@@ -750,7 +895,7 @@ jobs:
               --workflow-sha "$GITHUB_SHA" \
               --release-state present \
               --draft true
-            gh release upload "$TAG_NAME" "$claims" --repo "$REPOSITORY"
+            relay_release_upload_exact "$RUNNER_TEMP/claims-release-assets.json" "$claims"
           fi
 
       - name: verify final claims attestation on first run or retry
@@ -770,13 +915,17 @@ jobs:
       - name: bind exact final assets, publish once, and verify immutable equality
         env:
           GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           REVIEWED_MAIN_SHA: ${{ inputs.reviewed_main_sha }}
           SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
           TAG_NAME: ${{ inputs.tag }}
         shell: bash
         run: |
-          git fetch --force --no-tags origin refs/heads/main:refs/remotes/origin/main
+          source .github/scripts/authenticated-git.sh
+          source .github/scripts/release-api.sh
+          relay_authenticated_git_fetch --force --no-tags origin \
+            refs/heads/main:refs/remotes/origin/main
           test "$SOURCE_COMMIT" = "$REVIEWED_MAIN_SHA"
           test "$SOURCE_COMMIT" = "$(git rev-parse refs/remotes/origin/main)"
           python src/clio_relay/ci_validation.py verify-live-release \
@@ -786,7 +935,8 @@ jobs:
             --draft any \
             --prerelease false
           notes=finalization/evidence/RELEASE-NOTES.md
-          is_draft="$(gh release view "$TAG_NAME" --repo "$REPOSITORY" --json isDraft --jq .isDraft)"
+          relay_release_resolve "$TAG_NAME" any "$RUNNER_TEMP/final-release-current.json"
+          is_draft="$(jq -r .draft "$RUNNER_TEMP/final-release-current.json")"
           [[ "$is_draft" == "true" || "$is_draft" == "false" ]]
           python src/clio_relay/ci_validation.py mutation-authority \
             --governance-receipt finalization/evidence/REPOSITORY-GOVERNANCE.json \
@@ -818,18 +968,10 @@ jobs:
           done
           capture_release_assets() {
             local suffix="$1"
-            gh api "repos/$REPOSITORY/releases/tags/$TAG_NAME" \
-              > "$RUNNER_TEMP/final-release-$suffix.json"
-            local release_id
-            release_id="$(jq -r .id "$RUNNER_TEMP/final-release-$suffix.json")"
-            [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
-            gh api "repos/$REPOSITORY/releases/$release_id/assets?per_page=100&page=1" \
-              > "$RUNNER_TEMP/final-assets-$suffix-page-1.json"
-            gh api "repos/$REPOSITORY/releases/$release_id/assets?per_page=100&page=2" \
-              > "$RUNNER_TEMP/final-assets-$suffix-page-2.json"
-            jq --slurpfile assets "$RUNNER_TEMP/final-assets-$suffix-page-1.json" \
-              '.assets = $assets[0]' "$RUNNER_TEMP/final-release-$suffix.json" \
-              > "$RUNNER_TEMP/final-release-assets-$suffix.json"
+            relay_release_resolve "$TAG_NAME" any "$RUNNER_TEMP/final-release-$suffix.json"
+            relay_release_complete_assets "$RUNNER_TEMP/final-release-$suffix.json" \
+              "$RUNNER_TEMP/final-release-assets-$suffix.json"
+            printf '[]\n' > "$RUNNER_TEMP/final-assets-$suffix-page-2.json"
           }
           capture_release_assets before-publish
           python src/clio_relay/ci_validation.py exact-release-assets \
@@ -838,11 +980,35 @@ jobs:
             --page-size 100 \
             "${asset_args[@]}" \
             --output "$RUNNER_TEMP/EXACT-FINAL-ASSETS.json"
+          test -n "$IMMUTABLE_RELEASES_READ_TOKEN"
+          GH_TOKEN="$IMMUTABLE_RELEASES_READ_TOKEN" \
+            gh api "repos/$REPOSITORY/immutable-releases" \
+            > "$RUNNER_TEMP/immutable-releases-before-publish-api.json"
+          jq -e '
+            type == "object"
+            and .enabled == true
+            and (.enforced_by_owner | type == "boolean")
+          ' "$RUNNER_TEMP/immutable-releases-before-publish-api.json" >/dev/null
+          jq -n \
+            --arg repository "$REPOSITORY" \
+            --slurpfile settings "$RUNNER_TEMP/immutable-releases-before-publish-api.json" \
+            '{
+              schema_version: "clio-relay.immutable-releases-receipt.v1",
+              repository: $repository,
+              endpoint: ("repos/" + $repository + "/immutable-releases"),
+              enabled: $settings[0].enabled,
+              enforced_by_owner: $settings[0].enforced_by_owner
+            }' > "$RUNNER_TEMP/IMMUTABLE-RELEASES-before-publish.json"
+          cmp --silent finalization/evidence/IMMUTABLE-RELEASES.json \
+            "$RUNNER_TEMP/IMMUTABLE-RELEASES-before-publish.json"
           if test "$is_draft" = "true"; then
-            gh release edit "$TAG_NAME" --repo "$REPOSITORY" \
-              --notes-file "$notes" --draft=false --prerelease=false
+            jq -n --rawfile body "$notes" \
+              '{body: $body, draft: false, prerelease: false}' \
+              > "$RUNNER_TEMP/publish-release.json"
+            relay_release_patch "$RUNNER_TEMP/final-release-before-publish.json" \
+              "$RUNNER_TEMP/publish-release.json" "$RUNNER_TEMP/published-release.json"
           else
-            actual="$(gh release view "$TAG_NAME" --repo "$REPOSITORY" --json body --jq .body)"
+            actual="$(jq -r .body "$RUNNER_TEMP/final-release-before-publish.json")"
             expected="$(cat "$notes")"
             test "$actual" = "$expected"
           fi
@@ -853,7 +1019,6 @@ jobs:
             --page-size 100 \
             "${asset_args[@]}" \
             --verify-existing "$RUNNER_TEMP/EXACT-FINAL-ASSETS.json"
-          test "$(gh release view "$TAG_NAME" --repo "$REPOSITORY" --json isDraft --jq .isDraft)" = "false"
-          test "$(gh release view "$TAG_NAME" --repo "$REPOSITORY" \
-            --json isImmutable --jq .isImmutable)" = "true"
+          test "$(jq -r .draft "$RUNNER_TEMP/final-release-immutable.json")" = "false"
+          test "$(jq -r .immutable "$RUNNER_TEMP/final-release-immutable.json")" = "true"
           gh release verify "$TAG_NAME" --repo "$REPOSITORY"

@@ -1,4 +1,4 @@
-name: attest released uvx validation evidence
+name: attest released uv tool validation evidence
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ on:
         type: string
 
 concurrency:
-  group: released-validation-attestation-${{ inputs.tag }}
+  group: clio-relay-release-${{ inputs.tag }}
   cancel-in-progress: false
 
 permissions: {}
@@ -18,6 +18,7 @@ jobs:
   authorize:
     name: reject non-main dispatch before protected environment
     runs-on: ubuntu-latest
+    timeout-minutes: 5  # Fail closed if the dispatch identity check cannot complete.
     permissions: {}
     outputs:
       workflow_sha: ${{ steps.dispatch.outputs.workflow_sha }}
@@ -38,6 +39,7 @@ jobs:
   seal:
     name: verify and attest released-artifact reports
     runs-on: ubuntu-latest
+    timeout-minutes: 45  # Bound PyPI, release-asset, policy, and attestation verification.
     needs: authorize
     environment:
       name: released-validation
@@ -47,7 +49,6 @@ jobs:
       id-token: write  # Mint the identity used to sign released evidence.
       attestations: write  # Verify and persist released-evidence attestations.
       artifact-metadata: write  # Link evidence to GitHub's artifact record.
-      pull-requests: read  # Bind review independence to associated source PR authors.
 
     steps:
       - name: validate tag input
@@ -88,7 +89,8 @@ jobs:
           DISPATCH_SHA: ${{ github.sha }}
         shell: bash
         run: |
-          git fetch --force --no-tags origin \
+          source .github/scripts/authenticated-git.sh
+          relay_authenticated_git_fetch --force --no-tags origin \
             refs/heads/main:refs/remotes/origin/main \
             "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
           test "$DISPATCH_REF" = "refs/heads/main"
@@ -120,28 +122,23 @@ jobs:
         shell: bash
         run: |
           mkdir -p released/evidence
-          gh api "repos/$REPOSITORY/releases/tags/$TAG_NAME" \
-            > released/evidence/release-metadata-before.json
-          release_id="$(jq -r .id released/evidence/release-metadata-before.json)"
-          [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
-          gh api "repos/$REPOSITORY/releases/$release_id/assets?per_page=100" \
-            > released/evidence/release-asset-list-before.json
-          jq --slurpfile assets released/evidence/release-asset-list-before.json \
-            '.assets = $assets[0]' released/evidence/release-metadata-before.json \
-            > released/evidence/release-assets-before.json
+          source .github/scripts/release-api.sh
+          relay_release_resolve "$TAG_NAME" true \
+            released/evidence/release-metadata-before.json
+          relay_release_complete_assets released/evidence/release-metadata-before.json \
+            released/evidence/release-assets-before.json
           python src/clio_relay/ci_validation.py report-assets \
             --release released/evidence/release-assets-before.json \
             --kind released \
+            --matrix examples/release-gate/report-matrix-1.0.json \
             --output released/evidence/report-assets-before.json
 
-      - name: require an independent maintainer to review and dispatch sealing
-        id: reviewer
+      - name: require a write-capable maintainer to dispatch sealing
+        id: sealer
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          TAG_NAME: ${{ inputs.tag }}
           DISPATCH_ACTOR: ${{ github.actor }}
-          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
         shell: bash
         run: |
           permission="$(gh api "repos/$REPOSITORY/collaborators/$DISPATCH_ACTOR/permission" --jq .permission)"
@@ -151,46 +148,10 @@ jobs:
           esac
           dispatcher_id="$(gh api "users/$DISPATCH_ACTOR" --jq .id)"
           [[ "$dispatcher_id" =~ ^[1-9][0-9]*$ ]]
-          exclusions="$RUNNER_TEMP/released-reviewer-exclusions.json"
-          python src/clio_relay/ci_validation.py reviewer-exclusions \
-            --repository "$REPOSITORY" \
-            --source-commit "$SOURCE_COMMIT" \
-            --dispatcher-login "$DISPATCH_ACTOR" \
-            --dispatcher-id "$dispatcher_id" \
-            --output "$exclusions"
-          test "$(jq -r .reviewer_login "$exclusions")" = "$DISPATCH_ACTOR"
-          test "$(jq -r .reviewer_id "$exclusions")" = "$dispatcher_id"
-          source_author="$(jq -r .source_author.login "$exclusions")"
-          source_author_id="$(jq -r .source_author.id "$exclusions")"
-          source_committer="$(jq -r .source_committer.login "$exclusions")"
-          source_committer_id="$(jq -r .source_committer.id "$exclusions")"
-          source_pr_authors="$(jq -c .source_pr_authors "$exclusions")"
-          source_contributor_ids="$(jq -c .source_contributor_ids "$exclusions")"
-          mapfile -t report_uploader_ids < <(
-            jq -r '.assets[].uploader.id' released/evidence/report-assets-before.json \
-              | sort -n --unique
-          )
-          test "${#report_uploader_ids[@]}" -gt 0
-          mapfile -t report_uploaders < <(
-            jq -r '.assets[].uploader.login' released/evidence/report-assets-before.json \
-              | sort --unique
-          )
-          for uploader in "${report_uploaders[@]}"; do
-            test "$DISPATCH_ACTOR" != "$uploader"
-          done
-          for uploader_id in "${report_uploader_ids[@]}"; do
-            [[ "$uploader_id" =~ ^[1-9][0-9]*$ ]]
-            test "$dispatcher_id" != "$uploader_id"
-          done
           {
             echo "login=$DISPATCH_ACTOR"
             echo "id=$dispatcher_id"
-            echo "source_author=$source_author"
-            echo "source_author_id=$source_author_id"
-            echo "source_committer=$source_committer"
-            echo "source_committer_id=$source_committer_id"
-            echo "source_pr_authors=$(jq -c . <<<"$source_pr_authors")"
-            echo "source_contributor_ids=$(jq -c . <<<"$source_contributor_ids")"
+            echo "permission=$permission"
           } >> "$GITHUB_OUTPUT"
 
       - name: download candidate identity, publication record, and released reports
@@ -201,28 +162,25 @@ jobs:
         shell: bash
         run: |
           mkdir -p released/packages released/evidence/reports
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern '*.whl' --dir released/packages
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern '*.tar.gz' --dir released/packages
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'SHA256SUMS' --dir released/evidence
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'validation-local.json' --dir released/evidence
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'CI-STATUS.json' --dir released/evidence
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'REPOSITORY-GOVERNANCE.json' --dir released/evidence
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'LIVE-VALIDATION-BINDING.json' --dir released/evidence
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'candidate-release-gate-1.0.json' --dir released/evidence
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'PYPI-PROMOTION.json' --dir released/evidence
-          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern 'released-validation-*.json' --dir released/evidence/reports
-          gh api "repos/$REPOSITORY/releases/tags/$TAG_NAME" \
-            > released/evidence/release-metadata-after.json
-          release_id="$(jq -r .id released/evidence/release-metadata-after.json)"
-          [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
-          gh api "repos/$REPOSITORY/releases/$release_id/assets?per_page=100" \
-            > released/evidence/release-asset-list-after.json
-          jq --slurpfile assets released/evidence/release-asset-list-after.json \
-            '.assets = $assets[0]' released/evidence/release-metadata-after.json \
-            > released/evidence/release-assets.json
+          source .github/scripts/release-api.sh
+          release_before=released/evidence/release-assets-before.json
+          relay_release_download_pattern "$release_before" '*.whl' released/packages
+          relay_release_download_pattern "$release_before" '*.tar.gz' released/packages
+          for asset in SHA256SUMS validation-local.json CI-STATUS.json \
+            REPOSITORY-GOVERNANCE.json LIVE-VALIDATION-BINDING.json \
+            candidate-release-gate-1.0.json PYPI-PROMOTION.json; do
+            relay_release_download_exact "$release_before" "$asset" "released/evidence/$asset"
+          done
+          relay_release_download_pattern "$release_before" 'released-validation-*.json' \
+            released/evidence/reports
+          relay_release_resolve "$TAG_NAME" true \
+            released/evidence/release-metadata-after.json
+          relay_release_complete_assets released/evidence/release-metadata-after.json \
+            released/evidence/release-assets.json
           python src/clio_relay/ci_validation.py report-assets \
             --release released/evidence/release-assets.json \
             --kind released \
+            --matrix examples/release-gate/report-matrix-1.0.json \
             --report-dir released/evidence/reports \
             --output released/evidence/report-assets-after.json
           cmp --silent released/evidence/report-assets-before.json \
@@ -236,14 +194,9 @@ jobs:
           SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
           TAG_NAME: ${{ inputs.tag }}
           VERSION: ${{ steps.release.outputs.version }}
-          REVIEWER_LOGIN: ${{ steps.reviewer.outputs.login }}
-          REVIEWER_ID: ${{ steps.reviewer.outputs.id }}
-          SOURCE_AUTHOR_LOGIN: ${{ steps.reviewer.outputs.source_author }}
-          SOURCE_AUTHOR_ID: ${{ steps.reviewer.outputs.source_author_id }}
-          SOURCE_COMMITTER_LOGIN: ${{ steps.reviewer.outputs.source_committer }}
-          SOURCE_COMMITTER_ID: ${{ steps.reviewer.outputs.source_committer_id }}
-          SOURCE_PR_AUTHORS_JSON: ${{ steps.reviewer.outputs.source_pr_authors }}
-          SOURCE_CONTRIBUTOR_IDS_JSON: ${{ steps.reviewer.outputs.source_contributor_ids }}
+          SEALER_LOGIN: ${{ steps.sealer.outputs.login }}
+          SEALER_ID: ${{ steps.sealer.outputs.id }}
+          SEALER_PERMISSION: ${{ steps.sealer.outputs.permission }}
           EXPECTED_UV_VERSION: "0.11.28"
         shell: bash
         run: |
@@ -291,7 +244,7 @@ jobs:
             released/evidence/LIVE-VALIDATION-BINDING.json \
             released/evidence/candidate-release-gate-1.0.json \
             released/evidence/PYPI-PROMOTION.json released/evidence/reports \
-            released/evidence/release-assets.json \
+            released/evidence/release-assets.json released/evidence/report-assets-after.json \
             released/evidence/RELEASED-VALIDATION-BINDING.json \
             "$TAG_NAME" "$SOURCE_COMMIT" "$VERSION" <<'PY'
           import hashlib
@@ -308,16 +261,12 @@ jobs:
           )
           report_dir = Path(sys.argv[9])
           assets_path = Path(sys.argv[10])
-          destination = Path(sys.argv[11])
-          tag, commit, version = sys.argv[12:15]
-          reviewer_login = os.environ["REVIEWER_LOGIN"]
-          reviewer_id = int(os.environ["REVIEWER_ID"])
-          source_author_login = os.environ["SOURCE_AUTHOR_LOGIN"]
-          source_author_id = int(os.environ["SOURCE_AUTHOR_ID"])
-          source_committer_login = os.environ["SOURCE_COMMITTER_LOGIN"]
-          source_committer_id = int(os.environ["SOURCE_COMMITTER_ID"])
-          source_pr_authors = json.loads(os.environ["SOURCE_PR_AUTHORS_JSON"])
-          source_contributor_ids = json.loads(os.environ["SOURCE_CONTRIBUTOR_IDS_JSON"])
+          report_manifest_path = Path(sys.argv[11])
+          destination = Path(sys.argv[12])
+          tag, commit, version = sys.argv[13:16]
+          sealer_login = os.environ["SEALER_LOGIN"]
+          sealer_id = int(os.environ["SEALER_ID"])
+          sealer_permission = os.environ["SEALER_PERMISSION"]
           expected_uv_version = os.environ["EXPECTED_UV_VERSION"]
           expected_files = {
               path.name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -378,7 +327,10 @@ jobs:
           with urllib.request.urlopen(
               f"https://pypi.org/pypi/clio-relay/{version}/json", timeout=30
           ) as response:
-              pypi = json.load(response)
+              content = response.read(4 * 1024 * 1024 + 1)
+          if len(content) > 4 * 1024 * 1024:
+              raise SystemExit("PyPI project metadata exceeds the bounded response size")
+          pypi = json.loads(content)
           observed = {
               item["filename"]: item.get("digests", {}).get("sha256")
               for item in pypi.get("urls", [])
@@ -393,10 +345,60 @@ jobs:
               for item in release.get("assets", [])
               if isinstance(item, dict) and isinstance(item.get("name"), str)
           }
+          report_manifest = json.loads(report_manifest_path.read_text(encoding="utf-8"))
+          matrix_binding = report_manifest.get("acceptance_matrix")
+          if not isinstance(matrix_binding, dict):
+              raise SystemExit("released report manifest is not bound to the acceptance matrix")
+          if (
+              matrix_binding.get("stage") != "released"
+              or matrix_binding.get("artifact_stage") != "published"
+              or matrix_binding.get("release_version") != version
+              or matrix_binding.get("report_count") != 17
+          ):
+              raise SystemExit("released acceptance matrix binding does not match the release")
+          expected_reports = matrix_binding.get("reports")
+          if not isinstance(expected_reports, list) or len(expected_reports) != 17:
+              raise SystemExit("released acceptance matrix report list is incomplete")
+          candidate_matrix = candidate.get("acceptance_matrix")
+          candidate_decision = json.loads(candidate_gate.read_text(encoding="utf-8"))
+          expected_ids = [item.get("id") for item in expected_reports]
+          matrix_chain_checks = {
+              "candidate_matrix": isinstance(candidate_matrix, dict),
+              "candidate_stage": isinstance(candidate_matrix, dict)
+                  and candidate_matrix.get("stage") == "candidate",
+              "candidate_digest": isinstance(candidate_matrix, dict)
+                  and candidate_matrix.get("sha256") == matrix_binding.get("sha256"),
+              "candidate_version": isinstance(candidate_matrix, dict)
+                  and candidate_matrix.get("release_version")
+                      == matrix_binding.get("release_version"),
+              "candidate_count": isinstance(candidate_matrix, dict)
+                  and candidate_matrix.get("report_count") == matrix_binding.get("report_count"),
+              "candidate_ids": isinstance(candidate_matrix, dict)
+                  and [item.get("id") for item in candidate_matrix.get("reports", [])]
+                      == expected_ids,
+              "candidate_decision_digest": candidate_decision.get(
+                  "acceptance_matrix_sha256"
+              ) == matrix_binding.get("sha256"),
+              "candidate_decision_stage": candidate_decision.get(
+                  "acceptance_matrix_stage"
+              ) == "candidate",
+              "candidate_decision_ids": candidate_decision.get("acceptance_report_ids")
+                  == expected_ids,
+          }
+          failed_matrix_chain = sorted(
+              name for name, passed in matrix_chain_checks.items() if not passed
+          )
+          if failed_matrix_chain:
+              raise SystemExit(
+                  f"candidate-to-released matrix binding failed: {failed_matrix_chain}"
+              )
           reports = []
           report_ids = set()
           invocation_ids = set()
-          for path in sorted(report_dir.glob("released-validation-*.json")):
+          for expected_report in expected_reports:
+              if not isinstance(expected_report, dict):
+                  raise SystemExit("released acceptance matrix report entry is invalid")
+              path = report_dir / str(expected_report.get("filename"))
               document = json.loads(path.read_text(encoding="utf-8"))
               report_id = document.get("report_id")
               if not isinstance(report_id, str) or not report_id or report_id in report_ids:
@@ -417,6 +419,8 @@ jobs:
                   and invocation_id not in invocation_ids
               )
               checks = {
+                  "matrix_cluster": document.get("cluster") == expected_report.get("cluster"),
+                  "matrix_scenario": document.get("scenario") == expected_report.get("scenario"),
                   "status": document.get("status") == "passed",
                   "version": software.get("version") == version,
                   "tag": software.get("tag") == tag,
@@ -428,9 +432,13 @@ jobs:
                   "source_kind": source.get("kind") == "pypi",
                   "detected_source_kind": source.get("detected_kind") == "pypi",
                   "source_reference": source.get("reference") == f"clio-relay=={version}",
-                  "launcher": source.get("launcher") == "uvx",
+                  "launcher": source.get("launcher") == "uv-tool",
                   "launcher_verified": source.get("launcher_verified") is True,
                   "launcher_receipt": source.get("launcher_receipt", {}).get("verified") is True,
+                  "tool_environment": launcher_receipt.get("tool_environment_verified") is True,
+                  "tool_bin_bound": launcher_receipt.get("tool_bin_bound") is True,
+                  "tool_target_bound": launcher_receipt.get("tool_target_bound") is True,
+                  "record_closure": launcher_receipt.get("distribution_record", {}).get("verified") is True,
                   "released_claim": source.get("released_artifact") is True,
                   "operator_origin": trust.get("origin") == "operator_generated",
                   "no_producer_overclaim": trust.get("producer_execution_verified") is False,
@@ -440,7 +448,6 @@ jobs:
                       and not isinstance(producer_id, bool)
                       and producer_id > 0
                       and producer_id == uploader.get("id"),
-                  "reviewer_not_producer": producer_id != reviewer_id,
                   "invocation_id": valid_invocation,
                   "launcher_invocation": launcher_receipt.get("invocation_id")
                       == invocation_id,
@@ -458,6 +465,8 @@ jobs:
               invocation_ids.add(invocation_id)
               reports.append(
                   {
+                      "acceptance_id": expected_report.get("id"),
+                      "ordinal": expected_report.get("ordinal"),
                       "filename": path.name,
                       "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                       "report_id": report_id,
@@ -474,8 +483,8 @@ jobs:
                       ),
                   }
               )
-          if not reports:
-              raise SystemExit("no released-artifact live validation reports were submitted")
+          if len(reports) != matrix_binding["report_count"]:
+              raise SystemExit("released acceptance matrix report count changed while sealing")
           binding = {
               "schema_version": "1.0",
               "artifact_stage": "published",
@@ -489,19 +498,15 @@ jobs:
               ).hexdigest(),
               "publication_record_sha256": hashlib.sha256(promotion.read_bytes()).hexdigest(),
               "authorized_workflow": ".github/workflows/released-validation-attest.yml",
-              "trust_model": "reviewer_sealed_operator_evidence",
+              "trust_model": "maintainer_sealed_operator_evidence",
               "producer_execution_verified": False,
-              "review_environment": "released-validation",
-              "review_method": "independent_maintainer_workflow_dispatch",
-              "reviewer_login": reviewer_login,
-              "reviewer_id": reviewer_id,
-              "source_commit_author_login": source_author_login,
-              "source_commit_author_id": source_author_id,
-              "source_commit_committer_login": source_committer_login,
-              "source_commit_committer_id": source_committer_id,
-              "source_pr_authors": source_pr_authors,
-              "source_contributor_ids": source_contributor_ids,
+              "seal_environment": "released-validation",
+              "seal_method": "write_capable_maintainer_workflow_dispatch",
+              "sealer_login": sealer_login,
+              "sealer_id": sealer_id,
+              "sealer_permission": sealer_permission,
               "environment_reviewers_available": False,
+              "acceptance_matrix": matrix_binding,
               "reports": reports,
           }
           destination.write_text(
@@ -525,17 +530,35 @@ jobs:
             --expected-artifact-sha256 "$WHEEL_SHA256" \
             --output released/evidence/released-release-gate-1.0.json
           python - released/evidence/released-release-gate-1.0.json \
+            released/evidence/report-assets-after.json \
+            released/evidence/RELEASED-VALIDATION-BINDING.json \
             "$WHEEL_SHA256" "$VERSION" <<'PY'
           import json
           import sys
           from pathlib import Path
 
           decision = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          report_manifest = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+          binding = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+          matrix = report_manifest["acceptance_matrix"]
+          expected_ids = [item["id"] for item in matrix["reports"]]
           checks = {
               "passed": decision.get("passed") is True,
-              "digest": decision.get("artifact_sha256") == sys.argv[2],
-              "version": decision.get("release_version") == sys.argv[3],
+              "digest": decision.get("artifact_sha256") == sys.argv[4],
+              "version": decision.get("release_version") == sys.argv[5],
               "no_unsatisfied": decision.get("unsatisfied_requirements") == {},
+              "matrix_binding": binding.get("acceptance_matrix") == matrix,
+              "matrix_schema": decision.get("acceptance_matrix_schema_version")
+                  == matrix.get("schema_version"),
+              "matrix_version": decision.get("acceptance_matrix_release_version")
+                  == matrix.get("release_version"),
+              "matrix_digest": decision.get("acceptance_matrix_sha256")
+                  == matrix.get("sha256"),
+              "matrix_stage": decision.get("acceptance_matrix_stage") == "released",
+              "matrix_ids": decision.get("acceptance_report_ids") == expected_ids,
+              "matrix_document_count": len(
+                  decision.get("acceptance_report_document_ids", [])
+              ) == matrix.get("report_count"),
           }
           failed = sorted(name for name, passed in checks.items() if not passed)
           if failed:
@@ -576,6 +599,7 @@ jobs:
           TAG_NAME: ${{ inputs.tag }}
         shell: bash
         run: |
+          source .github/scripts/release-api.sh
           python src/clio_relay/ci_validation.py mutation-authority \
             --governance-receipt released/evidence/REPOSITORY-GOVERNANCE.json \
             --repository "$REPOSITORY" \
@@ -585,15 +609,23 @@ jobs:
             --workflow-sha "$GITHUB_SHA" \
             --release-state present \
             --draft true
+          relay_release_resolve "$TAG_NAME" true "$RUNNER_TEMP/released-evidence-release.json"
+          relay_release_complete_assets "$RUNNER_TEMP/released-evidence-release.json" \
+            "$RUNNER_TEMP/released-evidence-release-assets.json"
           mkdir -p existing-released-evidence
           for evidence in released/evidence/RELEASED-VALIDATION-BINDING.json \
             released/evidence/released-release-gate-1.0.json; do
             asset="$(basename "$evidence")"
             rm -f "existing-released-evidence/$asset"
-            if gh release download "$TAG_NAME" --repo "$REPOSITORY" \
-              --pattern "$asset" --dir existing-released-evidence >/dev/null 2>&1; then
+            if relay_release_asset_id "$RUNNER_TEMP/released-evidence-release-assets.json" \
+              "$asset" >/dev/null; then
+              relay_release_download_exact \
+                "$RUNNER_TEMP/released-evidence-release-assets.json" "$asset" \
+                "existing-released-evidence/$asset"
               cmp --silent "$evidence" "existing-released-evidence/$asset"
             else
+              asset_status="$?"
+              test "$asset_status" -eq 1
               python src/clio_relay/ci_validation.py mutation-authority \
                 --governance-receipt released/evidence/REPOSITORY-GOVERNANCE.json \
                 --repository "$REPOSITORY" \
@@ -603,6 +635,7 @@ jobs:
                 --workflow-sha "$GITHUB_SHA" \
                 --release-state present \
                 --draft true
-              gh release upload "$TAG_NAME" "$evidence" --repo "$REPOSITORY"
+              relay_release_upload_exact \
+                "$RUNNER_TEMP/released-evidence-release-assets.json" "$evidence"
             fi
           done

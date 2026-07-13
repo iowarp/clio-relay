@@ -13,7 +13,7 @@ on:
         type: string
 
 concurrency:
-  group: release-candidate-staging-${{ inputs.tag }}
+  group: clio-relay-release-${{ inputs.tag }}
   cancel-in-progress: false
 
 permissions: {}
@@ -22,6 +22,7 @@ jobs:
   authorize:
     name: reject non-main dispatch before protected environment
     runs-on: ubuntu-latest
+    timeout-minutes: 5  # Fail closed if the dispatch identity check cannot complete.
     permissions: {}
     outputs:
       workflow_sha: ${{ steps.dispatch.outputs.workflow_sha }}
@@ -44,6 +45,7 @@ jobs:
   stage:
     name: verify, attest, and create immutable-identity draft
     runs-on: ubuntu-latest
+    timeout-minutes: 45  # Bound GitHub API, artifact, governance, and attestation work.
     needs: authorize
     environment:
       name: live-validation
@@ -77,7 +79,8 @@ jobs:
           WORKFLOW_SHA: ${{ needs.authorize.outputs.workflow_sha }}
         shell: bash
         run: |
-          git fetch --force --no-tags origin \
+          source .github/scripts/authenticated-git.sh
+          relay_authenticated_git_fetch --force --no-tags origin \
             refs/heads/main:refs/remotes/origin/main \
             "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
           source_commit="$(gh api "repos/$REPOSITORY/commits/$TAG_NAME" --jq .sha)"
@@ -280,6 +283,7 @@ jobs:
           TAG_NAME: ${{ inputs.tag }}
         shell: bash
         run: |
+          source .github/scripts/release-api.sh
           authority=(python src/clio_relay/ci_validation.py mutation-authority
             --governance-receipt dist/REPOSITORY-GOVERNANCE.json
             --repository "$REPOSITORY"
@@ -287,7 +291,9 @@ jobs:
             --tag "$TAG_NAME"
             --workflow-ref "$GITHUB_REF"
             --workflow-sha "$GITHUB_SHA")
-          if gh release view "$TAG_NAME" --repo "$REPOSITORY" >/dev/null 2>&1; then
+          relay_release_resolve "$TAG_NAME" any "$RUNNER_TEMP/release-before-create.json" \
+            --allow-absent
+          if jq -e '. != null' "$RUNNER_TEMP/release-before-create.json" >/dev/null; then
             "${authority[@]}" --release-state present --draft true
           else
             "${authority[@]}" --release-state absent --draft any
@@ -302,6 +308,7 @@ jobs:
               --notes "Immutable candidate wheel SHA-256: $wheel_sha. Live validation and PyPI promotion are pending."
           fi
           "${authority[@]}" --release-state present --draft true
+          relay_release_resolve "$TAG_NAME" true "$RUNNER_TEMP/release-after-create.json"
 
       - name: revalidate protected main immediately before candidate attestation
         env:
@@ -334,17 +341,12 @@ jobs:
           TAG_NAME: ${{ inputs.tag }}
         shell: bash
         run: |
+          source .github/scripts/release-api.sh
           inspect_assets() {
             local suffix="$1"
-            gh api "repos/$REPOSITORY/releases/tags/$TAG_NAME" \
-              > "$RUNNER_TEMP/release-$suffix.json"
-            release_id="$(jq -r .id "$RUNNER_TEMP/release-$suffix.json")"
-            [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
-            gh api "repos/$REPOSITORY/releases/$release_id/assets?per_page=100" \
-              > "$RUNNER_TEMP/release-assets-$suffix.json"
-            jq --slurpfile assets "$RUNNER_TEMP/release-assets-$suffix.json" \
-              '.assets = $assets[0]' "$RUNNER_TEMP/release-$suffix.json" \
-              > "$RUNNER_TEMP/release-complete-$suffix.json"
+            relay_release_resolve "$TAG_NAME" true "$RUNNER_TEMP/release-$suffix.json"
+            relay_release_complete_assets "$RUNNER_TEMP/release-$suffix.json" \
+              "$RUNNER_TEMP/release-complete-$suffix.json"
             python src/clio_relay/ci_validation.py staged-assets \
               --release "$RUNNER_TEMP/release-complete-$suffix.json" \
               --candidate-dir dist \
@@ -353,20 +355,19 @@ jobs:
           inspect_assets before
           mapfile -t missing < <(jq -r '.missing[].name' "$RUNNER_TEMP/release-plan-before.json")
           if test "${#missing[@]}" -gt 0; then
-            upload=()
             for name in "${missing[@]}"; do
-              upload+=("dist/$name")
+              subject="dist/$name"
+              python src/clio_relay/ci_validation.py mutation-authority \
+                --governance-receipt dist/REPOSITORY-GOVERNANCE.json \
+                --repository "$REPOSITORY" \
+                --source-commit "$SOURCE_COMMIT" \
+                --tag "$TAG_NAME" \
+                --workflow-ref "$GITHUB_REF" \
+                --workflow-sha "$GITHUB_SHA" \
+                --release-state present \
+                --draft true
+              relay_release_upload_exact "$RUNNER_TEMP/release-complete-before.json" "$subject"
             done
-            python src/clio_relay/ci_validation.py mutation-authority \
-              --governance-receipt dist/REPOSITORY-GOVERNANCE.json \
-              --repository "$REPOSITORY" \
-              --source-commit "$SOURCE_COMMIT" \
-              --tag "$TAG_NAME" \
-              --workflow-ref "$GITHUB_REF" \
-              --workflow-sha "$GITHUB_SHA" \
-              --release-state present \
-              --draft true
-            gh release upload "$TAG_NAME" "${upload[@]}" --repo "$REPOSITORY"
           fi
           inspect_assets after
           test "$(jq '.missing | length' "$RUNNER_TEMP/release-plan-after.json")" -eq 0

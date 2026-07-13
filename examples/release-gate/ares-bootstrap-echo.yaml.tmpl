@@ -1,0 +1,12 @@
+name: __RUN_ID__-bootstrap-echo
+scheduler:
+  name: slurm
+  job_name: __RUN_ID__-bootstrap
+  nodes: 1
+  ntasks: 1
+  time: "00:05:00"
+  output: "__REMOTE_ROOT__/bootstrap-%j.out"
+  error: "__REMOTE_ROOT__/bootstrap-%j.err"
+pkgs:
+  - pkg_type: builtin.echo
+    pkg_name: echo

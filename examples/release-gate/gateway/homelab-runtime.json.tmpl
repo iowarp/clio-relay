@@ -1,0 +1,53 @@
+{
+  "kind": "release-validation-http-service",
+  "submit_command": [
+    "python3",
+    "__REMOTE_FIXTURE_ROOT__/gateway/external_runtime.py",
+    "submit",
+    "--service-script",
+    "__REMOTE_FIXTURE_ROOT__/gateway/http_service.py",
+    "--port",
+    "__SERVICE_PORT__",
+    "--state-dir",
+    "__REMOTE_STATE_ROOT__",
+    "--health-nonce",
+    "__HEALTH_NONCE__",
+    "--lifetime-seconds",
+    "600"
+  ],
+  "status_command": [
+    "python3",
+    "__REMOTE_FIXTURE_ROOT__/gateway/external_runtime.py",
+    "status",
+    "--state-dir",
+    "__REMOTE_STATE_ROOT__",
+    "{scheduler_job_id}"
+  ],
+  "cancel_command": [
+    "python3",
+    "__REMOTE_FIXTURE_ROOT__/gateway/external_runtime.py",
+    "cancel",
+    "--state-dir",
+    "__REMOTE_STATE_ROOT__",
+    "{scheduler_job_id}"
+  ],
+  "deployment_driver": "custom",
+  "service_port": __SERVICE_PORT__,
+  "health_path": "/healthz",
+  "health_expected_body": "__HEALTH_NONCE__",
+  "stream_mode": "pull",
+  "stream_path": null,
+  "event_stream_path": null,
+  "state_path": null,
+  "compatibility_paths": {},
+  "desktop_bind_addr": "127.0.0.1",
+  "desktop_bind_port": __DESKTOP_PORT__,
+  "proxy_name": "__RUN_ID__-gateway",
+  "transport_mode": "frp-stcp-wss",
+  "readiness_timeout_seconds": 90,
+  "poll_seconds": 1,
+  "scheduler": "external",
+  "metadata": {
+    "acceptance_run_id": "__RUN_ID__"
+  }
+}

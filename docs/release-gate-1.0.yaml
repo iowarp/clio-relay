@@ -4,8 +4,10 @@
 # neither action requires a clio-relay code change.
 schema_version: "1.0"
 release_version: "1.0.0"
+acceptance_matrix_path: examples/release-gate/report-matrix-1.0.json
+acceptance_matrix_sha256: b62a51a57d55fd2928c928d2a6b7892b006c627e5e64bd06cb03874d28602fe2
 artifact_stage: published
-evidence_trust_model: reviewer_sealed_operator_evidence
+evidence_trust_model: maintainer_sealed_operator_evidence
 require_released_artifact: true
 require_artifact_sha256: true
 require_clean_build: true
@@ -44,13 +46,8 @@ targets:
 allowed_install_sources:
   - pypi
 allowed_launchers:
-  - uvx
-release_blockers:
-  - JARVIS-CD structured scheduler submission changes do not yet have an immutable upstream commit or release
-  - clio-kit does not yet have a released artifact containing the merged JARVIS and Spack MCP contracts
-  - Cross-platform owned-process containment and hard-crash worker recovery have not completed adversarial acceptance
-  - Global core and spool retention, indexed queue reads, page caps, and sidecar reclamation have not completed production acceptance
-  - The Windows and Python 3.14 CI matrix has not yet passed on the reviewed release commit
+  - uv-tool
+release_blockers: []
 requirements:
   - requirement_id: local-release-gate
     description: lint, format, strict types, full tests, locked dependency audit, package build, artifact metadata, exact-wheel smoke, and unprivileged exact-sdist smoke
@@ -85,7 +82,7 @@ requirements:
       - uv
 
   - requirement_id: ares-released-bootstrap
-    description: bootstrap and execute the worker on Ares through the released PyPI uvx path
+    description: bootstrap and execute the worker on Ares through one persistent released PyPI uv tool install
     cluster: ares
     scenarios:
       - cluster-bootstrap
@@ -98,7 +95,8 @@ requirements:
       - worker.scheduler-provider
       - worker.target-identity
       - worker.component-clio-kit-released
-      - worker.component-jarvis-package-provenance
+      - worker.component-clio-kit-native-jarvis-contract
+      - worker.component-jarvis-native-execution
       - worker.execute
     required_resource_kinds:
       - relay_worker
@@ -110,25 +108,42 @@ requirements:
         states: [running]
         metadata_equals:
           components:
-            clio-kit: "3.0.0"
-            jarvis-cd: "2.0.0"
+            clio-kit: "2.3.2"
+            jarvis-cd: "1.2.2"
             jarvis-util: c91bfdc9bba802e4b03bfb1babe614ffa3e09644
           component_artifacts:
             clio-kit:
               distribution: clio-kit
-              distribution_version: "3.0.0"
-              install_spec: clio-kit==3.0.0
+              distribution_version: "2.3.2"
+              install_spec: clio-kit==2.3.2
               requested_source: pypi
-              artifact_sha256: PENDING_CLIO_KIT_3_0_0_PYPI_WHEEL_SHA256
+              artifact_sha256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
+              native_execution:
+                schema_version: clio-relay.jarvis-native-execution-capability.v1
+                handle_schema: jarvis.execution.handle.v1
+                record_schema: jarvis.execution.record.v1
+                progress_schema: jarvis.execution.progress.v1
+                operations: [jarvis_get_execution, jarvis_run]
+                contract_id: clio-kit-jarvis-user-v3
+                contract_schema_version: clio-kit.mcp-user-contract.v1
+                contract_sha256: c70e350d919e0f3fa0c116d7eaf861e23b4087a18a06b2704ddbf7384f8d1f82
             jarvis-cd:
               distribution: jarvis_cd
-              distribution_version: "2.0.0"
-              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v2.0.0/jarvis_cd-2.0.0-py3-none-any.whl
+              distribution_version: "1.2.2"
+              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v1.2.2/jarvis_cd-1.2.2-py3-none-any.whl
               requested_source: github_release
-              artifact_filename: jarvis_cd-2.0.0-py3-none-any.whl
-              artifact_sha256: PENDING_JARVIS_CD_2_0_0_RELEASE_WHEEL_SHA256
-              entry_points:
-                - clio_relay.package_progress_adapters:lammps
+              artifact_filename: jarvis_cd-1.2.2-py3-none-any.whl
+              artifact_sha256: f05454718a4efe4dadebefb98c83511ba3dcc662238c0c05430a1b621a8ab8b7
+              native_execution:
+                schema_version: clio-relay.jarvis-native-execution-capability.v1
+                handle_schema: jarvis.execution.handle.v1
+                record_schema: jarvis.execution.record.v1
+                progress_schema: jarvis.execution.progress.v1
+                operations:
+                  - execution_handle.progress
+                  - pipeline.get_execution
+                  - pipeline.get_execution_progress
+                  - pipeline.run
       - kind: relay_job
         states: [succeeded]
       - kind: cluster_target
@@ -137,6 +152,7 @@ requirements:
         providers: [slurm]
         metadata_equals:
           verified: true
+    evidence_group_resource_kind: cluster_target
 
   - requirement_id: ares-queue-management
     description: validate exact stale cleanup, live scheduler preservation, and enforced per-kind concurrency on Ares
@@ -200,14 +216,14 @@ requirements:
         states: [running]
         metadata_equals:
           components:
-            clio-kit: "3.0.0"
+            clio-kit: "2.3.2"
           component_artifacts:
             clio-kit:
               distribution: clio-kit
-              distribution_version: "3.0.0"
-              install_spec: clio-kit==3.0.0
+              distribution_version: "2.3.2"
+              install_spec: clio-kit==2.3.2
               requested_source: pypi
-              artifact_sha256: PENDING_CLIO_KIT_3_0_0_PYPI_WHEEL_SHA256
+              artifact_sha256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
       - kind: scheduler_job
         roles: [queue-preservation-fixture]
         states: [completed]
@@ -235,21 +251,23 @@ requirements:
       - remote-mcp.server-artifact
       - remote-mcp.durable-result
       - remote-mcp.jarvis-live-progress
+      - remote-mcp.jarvis-execution-query
       - jarvis.structured-runtime-metadata
-      - jarvis.spack-runtime-environment
       - worker.artifact-version
       - worker.artifact-sha256
       - worker.source-identity
       - worker.scheduler-provider
       - worker.target-identity
       - worker.component-clio-kit-released
-      - worker.component-jarvis-package-provenance
+      - worker.component-clio-kit-native-jarvis-contract
+      - worker.component-jarvis-native-execution
     required_resource_kinds:
       - relay_job
       - relay_worker
       - artifact
       - mcp_server
-      - package_progress_provider
+      - jarvis_execution_progress
+      - jarvis_generated_artifact
     required_resources:
       - kind: relay_job
         roles: [virtual_jarvis_mcp_call]
@@ -257,124 +275,313 @@ requirements:
       - kind: relay_job
         roles: [jarvis_mcp_remote_discovery]
         states: [succeeded]
+      - kind: relay_job
+        roles: [jarvis_mcp_execution_query]
+        states: [succeeded]
       - kind: relay_worker
         roles: [cluster_worker]
         states: [running]
         metadata_equals:
           components:
-            jarvis-cd: "2.0.0"
+            clio-kit: "2.3.2"
+            jarvis-cd: "1.2.2"
           component_artifacts:
+            clio-kit:
+              distribution: clio-kit
+              distribution_version: "2.3.2"
+              install_spec: clio-kit==2.3.2
+              requested_source: pypi
+              artifact_filename: clio_kit-2.3.2-py3-none-any.whl
+              artifact_sha256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
+              persistent_tool:
+                manager: uv
+                uv_version: "0.11.28"
+                pyvenv_uv_version: "0.11.28"
+                distribution: clio-kit
+                distribution_version: "2.3.2"
+                entry_point: clio-kit
+                source_artifact_sha256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
+              native_execution:
+                schema_version: clio-relay.jarvis-native-execution-capability.v1
+                handle_schema: jarvis.execution.handle.v1
+                record_schema: jarvis.execution.record.v1
+                progress_schema: jarvis.execution.progress.v1
+                operations:
+                  - jarvis_get_execution
+                  - jarvis_run
+                contract_id: clio-kit-jarvis-user-v3
+                contract_schema_version: clio-kit.mcp-user-contract.v1
+                contract_sha256: c70e350d919e0f3fa0c116d7eaf861e23b4087a18a06b2704ddbf7384f8d1f82
             jarvis-cd:
               distribution: jarvis_cd
-              distribution_version: "2.0.0"
-              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v2.0.0/jarvis_cd-2.0.0-py3-none-any.whl
+              distribution_version: "1.2.2"
+              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v1.2.2/jarvis_cd-1.2.2-py3-none-any.whl
               requested_source: github_release
-              artifact_filename: jarvis_cd-2.0.0-py3-none-any.whl
-              artifact_sha256: PENDING_JARVIS_CD_2_0_0_RELEASE_WHEEL_SHA256
-              entry_points:
-                - clio_relay.package_progress_adapters:lammps
+              artifact_filename: jarvis_cd-1.2.2-py3-none-any.whl
+              artifact_sha256: f05454718a4efe4dadebefb98c83511ba3dcc662238c0c05430a1b621a8ab8b7
+              native_execution:
+                schema_version: clio-relay.jarvis-native-execution-capability.v1
+                handle_schema: jarvis.execution.handle.v1
+                record_schema: jarvis.execution.record.v1
+                progress_schema: jarvis.execution.progress.v1
+                operations:
+                  - execution_handle.progress
+                  - pipeline.get_execution
+                  - pipeline.get_execution_progress
+                  - pipeline.run
           component_runtime:
+            clio-kit:
+              launcher: uv tool
+              artifact_identity_verified: true
+              command_matches_receipt: true
+              persistent_tool_verified: true
+              provider_interpreter_verified: true
+              distribution_identity_verified: true
+              source_identity_verified: true
+              uv_tool_environment_verified: true
+              record_closure_verified: true
+              native_execution_capability_verified: true
             jarvis-cd:
               verified: true
+              provider_interpreter_verified: true
               distribution_identity_verified: true
-              entry_points_visible: true
               runtime_artifact_path_verified: true
               artifact_sha256_verified: true
-              provider_interpreter_verified: true
               execution_interpreter_verified: true
               execution_distribution_identity_verified: true
-              execution_entry_points_visible: true
               execution_source_verified: true
+              execution_native_execution_capability_verified: true
+              native_execution_capability_verified: true
               jarvis_executable_verified: true
       - kind: mcp_server
         roles: [jarvis_mcp_server]
         states: [verified]
         metadata_equals:
-          install_source: wheel
-          install_artifact_sha256: PENDING_CLIO_KIT_3_0_0_PYPI_WHEEL_SHA256
+          install_source: uv-tool
+          install_artifact_sha256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
+          python_distribution_runtime:
+            distribution: clio-kit
+            distribution_version: "2.3.2"
+            entry_point: clio-kit
+            runtime_closure_verified: true
+          nested_runtime:
+            server_name: jarvis
+            persistent_tool: true
+            locked_runtime_verified: true
           server_process_artifact_verified: true
           verified: true
-      - kind: package_progress_provider
-        roles: [jarvis_mcp_package_progress]
+      - kind: jarvis_execution_progress
+        roles: [jarvis_mcp_native_progress]
         states: [verified]
         providers: [jarvis_cd]
         metadata_equals:
-          adapter: lammps
-          application_profile: lammps
-          package_name: builtin.lammps
-          provider_entry_point: lammps
-          provider_entry_point_value: jarvis_cd.progress.lammps:adapter_from_package
-          provider_distribution: jarvis_cd
-          provider_distribution_version: "2.0.0"
-          provider_source_authority: mcp_progress_notification
-          provider_validated: true
-          acceptance_validated: true
-          provider_execution_validated: true
+          source: jarvis_execution
+          package_name: builtin.gray_scott
+          package_id: gray_scott_bp5
+          progress_schema_version: jarvis.progress.v1
+          provider_source_authority: jarvis_mcp_progress_notification
+          producer_validated: true
+          execution_binding_validated: true
           live_observed_while_running: true
           bridge_validated: true
           runtime_bound: true
+      - kind: jarvis_generated_artifact
+        roles: [output]
+        states: [finalized]
+        providers: [jarvis-cd]
+        metadata_equals:
+          package_id: gray_scott_bp5
+          logical_name: gray-scott-timesteps
+          kind: scientific_dataset
+          role: output
+          structure: collection
+          ownership: shared
+          state: finalized
+          media_type: application/x-adios2-bp
+          format: adios2-bp5
+          location:
+            kind: cluster_path
+          metadata:
+            application: gray_scott
+            io_backend: adios2
+            latest_timestep: 20
+            member_pattern: adios2-steps
+            members_observed: 2
+            completion_signal: process_exit_zero_after_final_output
 
-  - requirement_id: ares-lammps-application-boundary
-    description: validate JARVIS-owned LAMMPS progress through the released relay artifact
+  - requirement_id: ares-jarvis-native-application-progress
+    description: validate a bounded 20-step Gray-Scott run through JARVIS-owned progress and artifact semantics
     cluster: ares
     scenarios:
-      - live-test
+      - remote-mcp
     required_checks:
-      - acceptance.application_boundary
-      - acceptance.package_adapter
-      - acceptance.package_owner
-      - acceptance.progress_adapter
-      - package-progress.provider
-      - package-progress.acceptance
+      - remote-mcp.jarvis-live-progress
+      - remote-mcp.jarvis-execution-query
+      - jarvis.structured-runtime-metadata
       - worker.artifact-version
       - worker.artifact-sha256
       - worker.source-identity
-      - worker.component-jarvis-package-provenance
+      - worker.component-clio-kit-native-jarvis-contract
+      - worker.component-jarvis-native-execution
     required_resource_kinds:
       - relay_job
       - relay_worker
-      - package_progress_provider
+      - jarvis_execution_progress
+      - jarvis_generated_artifact
     required_resources:
       - kind: relay_job
+        roles: [virtual_jarvis_mcp_call]
         states: [succeeded]
-      - kind: package_progress_provider
-        roles: [jarvis_package_progress]
+      - kind: relay_job
+        roles: [jarvis_mcp_execution_query]
+        states: [succeeded]
+      - kind: jarvis_execution_progress
+        roles: [jarvis_mcp_native_progress]
         states: [verified]
         providers: [jarvis_cd]
         metadata_equals:
-          adapter: lammps
-          package_name: builtin.lammps
-          provider_entry_point: lammps
-          provider_entry_point_value: jarvis_cd.progress.lammps:adapter_from_package
-          provider_distribution: jarvis_cd
-          provider_source_authority: package_log
-          provider_validated: true
-          acceptance_validated: true
+          source: jarvis_execution
+          package_name: builtin.gray_scott
+          package_id: gray_scott_bp5
+          progress_schema_version: jarvis.progress.v1
+          provider_source_authority: jarvis_mcp_progress_notification
+          producer_validated: true
+          execution_binding_validated: true
+          live_observed_while_running: true
+          bridge_validated: true
+          runtime_bound: true
+      - kind: jarvis_generated_artifact
+        roles: [output]
+        states: [finalized]
+        providers: [jarvis-cd]
+        metadata_equals:
+          package_id: gray_scott_bp5
+          logical_name: gray-scott-timesteps
+          kind: scientific_dataset
+          role: output
+          structure: collection
+          ownership: shared
+          state: finalized
+          media_type: application/x-adios2-bp
+          format: adios2-bp5
+          location:
+            kind: cluster_path
+          metadata:
+            application: gray_scott
+            io_backend: adios2
+            latest_timestep: 20
+            member_pattern: adios2-steps
+            members_observed: 2
+            completion_signal: process_exit_zero_after_final_output
       - kind: relay_worker
         roles: [cluster_worker]
         states: [running]
         metadata_equals:
           components:
-            jarvis-cd: "2.0.0"
+            jarvis-cd: "1.2.2"
           component_artifacts:
             jarvis-cd:
               distribution: jarvis_cd
-              distribution_version: "2.0.0"
-              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v2.0.0/jarvis_cd-2.0.0-py3-none-any.whl
+              distribution_version: "1.2.2"
+              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v1.2.2/jarvis_cd-1.2.2-py3-none-any.whl
               requested_source: github_release
-              artifact_filename: jarvis_cd-2.0.0-py3-none-any.whl
-              artifact_sha256: PENDING_JARVIS_CD_2_0_0_RELEASE_WHEEL_SHA256
-              entry_points:
-                - clio_relay.package_progress_adapters:lammps
+              artifact_filename: jarvis_cd-1.2.2-py3-none-any.whl
+              artifact_sha256: f05454718a4efe4dadebefb98c83511ba3dcc662238c0c05430a1b621a8ab8b7
+              native_execution:
+                schema_version: clio-relay.jarvis-native-execution-capability.v1
+                handle_schema: jarvis.execution.handle.v1
+                record_schema: jarvis.execution.record.v1
+                progress_schema: jarvis.execution.progress.v1
+                operations:
+                  - execution_handle.progress
+                  - pipeline.get_execution
+                  - pipeline.get_execution_progress
+                  - pipeline.run
           component_runtime:
             jarvis-cd:
               verified: true
               artifact_sha256_verified: true
-              provider_interpreter_verified: true
               execution_interpreter_verified: true
               execution_distribution_identity_verified: true
-              execution_entry_points_visible: true
               execution_source_verified: true
+              execution_native_execution_capability_verified: true
+              native_execution_capability_verified: true
+              jarvis_executable_verified: true
+
+  - requirement_id: ares-jarvis-lammps-package-progress
+    description: validate the post-split builtin LAMMPS path through JARVIS-owned native progress semantics on Ares
+    cluster: ares
+    scenarios:
+      - remote-mcp
+    required_checks:
+      - remote-mcp.jarvis-live-progress
+      - remote-mcp.jarvis-execution-query
+      - jarvis.structured-runtime-metadata
+      - worker.artifact-version
+      - worker.artifact-sha256
+      - worker.source-identity
+      - worker.component-clio-kit-native-jarvis-contract
+      - worker.component-jarvis-native-execution
+    required_resource_kinds:
+      - relay_job
+      - relay_worker
+      - jarvis_execution_progress
+    required_resources:
+      - kind: relay_job
+        roles: [virtual_jarvis_mcp_call]
+        states: [succeeded]
+      - kind: relay_job
+        roles: [jarvis_mcp_execution_query]
+        states: [succeeded]
+      - kind: jarvis_execution_progress
+        roles: [jarvis_mcp_native_progress]
+        states: [verified]
+        providers: [jarvis_cd]
+        metadata_equals:
+          source: jarvis_execution
+          package_name: builtin.lammps
+          package_id: lammps
+          progress_schema_version: jarvis.progress.v1
+          progress_determinate: true
+          provider_source_authority: jarvis_mcp_progress_notification
+          producer_validated: true
+          execution_binding_validated: true
+          live_observed_while_running: true
+          bridge_validated: true
+          runtime_bound: true
+      - kind: relay_worker
+        roles: [cluster_worker]
+        states: [running]
+        metadata_equals:
+          components:
+            jarvis-cd: "1.2.2"
+          component_artifacts:
+            jarvis-cd:
+              distribution: jarvis_cd
+              distribution_version: "1.2.2"
+              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v1.2.2/jarvis_cd-1.2.2-py3-none-any.whl
+              requested_source: github_release
+              artifact_filename: jarvis_cd-1.2.2-py3-none-any.whl
+              artifact_sha256: f05454718a4efe4dadebefb98c83511ba3dcc662238c0c05430a1b621a8ab8b7
+              native_execution:
+                schema_version: clio-relay.jarvis-native-execution-capability.v1
+                handle_schema: jarvis.execution.handle.v1
+                record_schema: jarvis.execution.record.v1
+                progress_schema: jarvis.execution.progress.v1
+                operations:
+                  - execution_handle.progress
+                  - pipeline.get_execution
+                  - pipeline.get_execution_progress
+                  - pipeline.run
+          component_runtime:
+            jarvis-cd:
+              verified: true
+              artifact_sha256_verified: true
+              execution_interpreter_verified: true
+              execution_distribution_identity_verified: true
+              execution_source_verified: true
+              execution_native_execution_capability_verified: true
+              native_execution_capability_verified: true
               jarvis_executable_verified: true
 
   - requirement_id: ares-non-jarvis-virtual-mcp
@@ -410,12 +617,12 @@ requirements:
         states: [verified]
         metadata_equals:
           install_source: wheel
-          install_artifact_sha256: PENDING_CLIO_KIT_3_0_0_PYPI_WHEEL_SHA256
+          install_artifact_sha256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
           server_process_artifact_verified: true
           verified: true
 
   - requirement_id: ares-spack-virtual-mcp
-    description: discover and exercise the complete released Spack MCP user contract on Ares
+    description: discover the complete released Spack MCP user contract and resolve the existing LAMMPS installation on Ares
     cluster: ares
     scenarios:
       - remote-mcp
@@ -427,6 +634,7 @@ requirements:
       - remote-mcp.call
       - remote-mcp.server-artifact
       - remote-mcp.durable-result
+      - remote-mcp.structured-result
       - worker.artifact-version
       - worker.artifact-sha256
       - worker.source-identity
@@ -446,6 +654,24 @@ requirements:
           spec:
             arguments:
               query: lammps
+          structured_result_assertion:
+            contract: clio-kit-spack-user-v2
+            tool: spack_find
+            expected:
+              contract: clio-kit-spack-user-v2
+              tool: spack_find
+              package_name: lammps
+              dag_hash: p5gjmq4rseitqanua7mdd2zdnag4v3u2
+            observed:
+              structured_content_present: true
+              schema_version: spack.mcp.result.v1
+              operation: find
+              query: lammps
+              package_count: 1
+              expected_package_match_count: 1
+              expected_package_name_count: 1
+              package_hashes_for_expected_name: [p5gjmq4rseitqanua7mdd2zdnag4v3u2]
+            failures: []
       - kind: relay_job
         roles: [virtual_remote_mcp_call]
         states: [succeeded]
@@ -455,15 +681,30 @@ requirements:
           spec:
             arguments:
               spec: lammps
-      - kind: relay_job
-        roles: [virtual_remote_mcp_call]
-        states: [succeeded]
-        metadata_equals:
-          remote_mcp_server_name: spack
-          remote_mcp_tool_name: spack_install
-          spec:
-            arguments:
-              spec: lammps
+          structured_result_assertion:
+            contract: clio-kit-spack-user-v2
+            tool: spack_locate
+            expected:
+              contract: clio-kit-spack-user-v2
+              tool: spack_locate
+              package_name: lammps
+              dag_hash: p5gjmq4rseitqanua7mdd2zdnag4v3u2
+              requested_spec: lammps
+              prefix: /mnt/common/jcernudagarcia/spack/opt/spack/linux-ubuntu22.04-skylake_avx512/gcc-11.4.0/lammps-20240829.1-p5gjmq4rseitqanua7mdd2zdnag4v3u2
+            observed:
+              structured_content_present: true
+              schema_version: spack.mcp.result.v1
+              operation: locate
+              requested_spec: lammps
+              load_spec: /p5gjmq4rseitqanua7mdd2zdnag4v3u2
+              prefix: /mnt/common/jcernudagarcia/spack/opt/spack/linux-ubuntu22.04-skylake_avx512/gcc-11.4.0/lammps-20240829.1-p5gjmq4rseitqanua7mdd2zdnag4v3u2
+              prefix_is_canonical_absolute: true
+              prefix_matches_expected: true
+              package:
+                name: lammps
+                dag_hash: p5gjmq4rseitqanua7mdd2zdnag4v3u2
+              expected_package_match_count: 1
+            failures: []
       - kind: relay_worker
         roles: [cluster_worker]
         states: [running]
@@ -475,7 +716,114 @@ requirements:
           remote_tool_names: [spack_find, spack_install, spack_locate]
           allowlisted_tool_names: [spack_find, spack_install, spack_locate]
           install_source: wheel
-          install_artifact_sha256: PENDING_CLIO_KIT_3_0_0_PYPI_WHEEL_SHA256
+          install_artifact_sha256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
+          contract_id: clio-kit-spack-user-v2
+          contract_sha256: 3c5412148c770f4844e98eb893c4db0d0afdbf13afe967df67bd5f7d25e1f7db
+          server_process_artifact_verified: true
+          verified: true
+    evidence_group_resource_kind: mcp_server
+
+  - requirement_id: ares-spack-fresh-install
+    description: prove one ordered absent-to-fresh-install-to-locate transition in a disposable Ares Spack store
+    cluster: ares
+    scenarios:
+      - remote-mcp
+    required_checks:
+      - remote-mcp.spack-preinstall-absent
+      - remote-mcp.spack-fresh-install
+      - remote-mcp.spack-postinstall-locate
+      - remote-mcp.spack-disposable-store
+      - remote-mcp.spack-transition-identity
+      - remote-mcp.spack-transition-durable-evidence
+      - remote-mcp.spack-fresh-configuration
+    required_resource_kinds:
+      - relay_job
+      - relay_worker
+      - artifact
+      - configuration_manifest
+      - mcp_server
+    spack_fresh_install_transition:
+      schema_version: clio-relay.release-spack-fresh-install.v1
+      server_name: spack-fresh
+      profile: user
+      package_name: libsigsegv
+      requested_spec: "libsigsegv@2.14"
+      reuse: false
+    required_resources:
+      - kind: relay_job
+        roles: [spack_preinstall_find]
+        states: [succeeded]
+        metadata_equals:
+          remote_mcp_server_name: spack-fresh
+          remote_mcp_tool_name: spack_find
+          profile: user
+          arguments:
+            query: "libsigsegv@2.14"
+          structured_result:
+            schema_version: spack.mcp.result.v1
+            operation: find
+            query: "libsigsegv@2.14"
+            count: 0
+            packages: []
+      - kind: relay_job
+        roles: [spack_fresh_install]
+        states: [succeeded]
+        metadata_equals:
+          remote_mcp_server_name: spack-fresh
+          remote_mcp_tool_name: spack_install
+          profile: user
+          arguments:
+            spec: "libsigsegv@2.14"
+            reuse: false
+          structured_result:
+            schema_version: spack.mcp.result.v1
+            operation: install
+            requested_spec: "libsigsegv@2.14"
+            reuse: false
+            status: installed
+            package_count: 1
+            package:
+              name: libsigsegv
+      - kind: relay_job
+        roles: [spack_postinstall_locate]
+        states: [succeeded]
+        metadata_equals:
+          remote_mcp_server_name: spack-fresh
+          remote_mcp_tool_name: spack_locate
+          profile: user
+          structured_result:
+            schema_version: spack.mcp.result.v1
+            operation: locate
+            package:
+              name: libsigsegv
+      - kind: artifact
+        minimum_count: 12
+      - kind: configuration_manifest
+        roles: [spack_fresh_install_configuration]
+        states: [verified]
+        metadata_equals:
+          preinstall:
+            schema_version: clio-relay.spack-configuration-observation.v1
+            phase: preinstall
+            manifest_regular_file: true
+          postinstall:
+            schema_version: clio-relay.spack-configuration-observation.v1
+            phase: postinstall
+            manifest_regular_file: true
+      - kind: relay_worker
+        roles: [cluster_worker]
+        states: [running]
+      - kind: mcp_server
+        roles: [remote_mcp_server]
+        states: [verified]
+        metadata_equals:
+          server_name: spack-fresh
+          remote_tool_names: [spack_find, spack_install, spack_locate]
+          allowlisted_tool_names: [spack_find, spack_install, spack_locate]
+          install_source: wheel
+          install_artifact_sha256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
+          contract_id: clio-kit-spack-user-v2
+          contract_sha256: 3c5412148c770f4844e98eb893c4db0d0afdbf13afe967df67bd5f7d25e1f7db
           server_process_artifact_verified: true
           verified: true
 
@@ -574,6 +922,16 @@ requirements:
         metadata_equals:
           ownership_verified: true
           verified_after_operation: true
+      - kind: scheduler_job
+        roles: [scheduler_sentinel:retain]
+        states: [retained]
+        providers: [slurm]
+        metadata_equals:
+          ownership_verified: false
+          verified_after_operation: true
+          unowned_sentinel: true
+          active_before_operation: true
+          preservation_verified: true
       - kind: relay_worker
         roles: [cluster_worker]
         states: [running]
@@ -599,6 +957,7 @@ requirements:
       - relay_session
       - connector
       - relay_job
+      - gateway_session
       - relay_worker
     required_resources:
       - kind: relay_session
@@ -619,7 +978,7 @@ requirements:
     evidence_group_resource_kind: relay_session
 
   - requirement_id: homelab-transport
-    description: exercise released PyPI uvx relay and SSH transport paths on homelab
+    description: exercise the released persistent uv-tool relay and SSH transport paths on homelab
     cluster: homelab
     scenarios:
       - transport
@@ -648,6 +1007,7 @@ requirements:
         states: [verified]
         metadata_equals:
           verified: true
+    evidence_group_resource_kind: cluster_target
 
   - requirement_id: ares-gateway-runtime
     description: run and clean a scheduler-backed gateway service lifecycle on Ares

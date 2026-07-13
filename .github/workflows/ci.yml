@@ -13,6 +13,7 @@ jobs:
   workflow-lint:
     name: GitHub Actions syntax and semantics
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # Bound tool download and static workflow analysis.
 
     steps:
       - name: check out repository
@@ -37,6 +38,7 @@ jobs:
   test:
     name: ${{ matrix.os }} / python ${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60  # The evidence-producing full gate is intentionally comprehensive.
     strategy:
       fail-fast: false
       matrix:
@@ -61,11 +63,49 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: install dependencies
-        run: uv sync --locked --all-groups
+        run: uv sync --python "${{ matrix.python-version }}" --locked --all-groups
+
+      - name: verify matrix interpreter
+        run: >-
+          uv run --python "${{ matrix.python-version }}" python -c
+          "import sys; expected = tuple(map(int, '${{ matrix.python-version }}'.split('.'))); assert sys.version_info[:2] == expected, (sys.version, expected)"
+
+      - name: stage exact clio-kit release wheel
+        shell: bash
+        env:
+          CLIO_KIT_WHEEL_FILENAME: clio_kit-2.3.2-py3-none-any.whl
+          CLIO_KIT_WHEEL_SHA256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
+          CLIO_KIT_WHEEL_URL: https://github.com/iowarp/clio-kit/releases/download/v2.3.2/clio_kit-2.3.2-py3-none-any.whl
+        run: |
+          set -euo pipefail
+          umask 077
+          wheel_dir="$RUNNER_TEMP/clio-kit-v2.3.2"
+          mkdir "$wheel_dir"
+          wheel="$wheel_dir/$CLIO_KIT_WHEEL_FILENAME"
+          temporary="$wheel.part"
+          trap 'rm -f -- "$temporary"' EXIT
+          curl --fail --show-error --silent --location \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 180 \
+            --connect-timeout 20 --max-time 180 \
+            --output "$temporary" "$CLIO_KIT_WHEEL_URL"
+          printf '%s  %s\n' "$CLIO_KIT_WHEEL_SHA256" "$temporary" \
+            | sha256sum --check --strict
+          mv -- "$temporary" "$wheel"
+          trap - EXIT
+          if [ "$RUNNER_OS" = Windows ]; then
+            exported_wheel="$(cygpath --windows --absolute "$wheel")"
+          else
+            exported_wheel="$wheel"
+          fi
+          printf 'CLIO_RELAY_CLIO_KIT_WHEEL=%s\n' "$exported_wheel" >> "$GITHUB_ENV"
+          printf 'CLIO_RELAY_CLIO_KIT_WHEEL_SHA256=%s\n' \
+            "$CLIO_KIT_WHEEL_SHA256" >> "$GITHUB_ENV"
 
       - name: run evidence-producing local release gate
         run: >-
-          uv run clio-relay release validate-local
+          uv run --python "${{ matrix.python-version }}"
+          clio-relay release validate-local
           --project-root .
           --report dist/validation-local-${{ runner.os }}-${{ matrix.python-version }}.json
           --artifact-dir dist

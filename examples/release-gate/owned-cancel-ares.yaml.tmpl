@@ -1,0 +1,14 @@
+name: __RUN_ID__-owned-cancel
+scheduler:
+  name: slurm
+  job_name: __RUN_ID__-owned-cancel
+  nodes: 1
+  ntasks: 1
+  time: "00:30:00"
+  output: "__REMOTE_ROOT__/owned-cancel-%j.out"
+  error: "__REMOTE_ROOT__/owned-cancel-%j.err"
+  pre_cmds:
+    - sleep 1200
+pkgs:
+  - pkg_type: builtin.echo
+    pkg_name: echo

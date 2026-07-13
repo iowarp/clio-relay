@@ -5,29 +5,37 @@ on:
     tags: ["v*"]
 
 concurrency:
-  group: release-candidate-${{ github.ref_name }}
+  group: clio-relay-release-${{ github.ref_name }}
   cancel-in-progress: false
 
-permissions: {}
+permissions:
+  contents: read
 
 jobs:
   build:
     name: build candidate payload without publication authority
     runs-on: ubuntu-latest
-    permissions: {}
+    timeout-minutes: 60  # Includes the complete local release gate and artifact smoke tests.
+    permissions:
+      contents: read
 
     steps:
-      - name: fetch the exact public tag without a repository token
+      - name: check out the exact private-repository tag commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: fetch the exact tag with ephemeral read credentials
         env:
+          GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
         shell: bash
         run: |
           [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
-          git init .
-          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
-          git fetch --force --no-tags --depth=1 origin "$GITHUB_SHA"
-          git checkout --detach FETCH_HEAD
-          git fetch --force --no-tags --depth=1 origin \
+          source .github/scripts/authenticated-git.sh
+          relay_authenticated_git_fetch --force --no-tags --depth=1 origin \
             "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
 
       - name: install uv
@@ -46,15 +54,45 @@ jobs:
 
       - name: require the tag to match the package version and commit
         env:
+          GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
           test "$GITHUB_REF_TYPE" = "tag"
-          git fetch --force --no-tags origin refs/heads/main:refs/remotes/origin/main
+          source .github/scripts/authenticated-git.sh
+          relay_authenticated_git_fetch --force --no-tags origin \
+            refs/heads/main:refs/remotes/origin/main
           version="$(uv run --no-sync python -c 'from clio_relay import __version__; print(__version__)')"
           test "$TAG_NAME" = "v$version"
           test "$(git rev-list -n 1 "$TAG_NAME")" = "$GITHUB_SHA"
           test "$(git tag --points-at HEAD --list "$TAG_NAME")" = "$TAG_NAME"
           test "$GITHUB_SHA" = "$(git rev-parse refs/remotes/origin/main)"
+
+      - name: stage exact clio-kit release wheel
+        shell: bash
+        env:
+          CLIO_KIT_WHEEL_FILENAME: clio_kit-2.3.2-py3-none-any.whl
+          CLIO_KIT_WHEEL_SHA256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
+          CLIO_KIT_WHEEL_URL: https://github.com/iowarp/clio-kit/releases/download/v2.3.2/clio_kit-2.3.2-py3-none-any.whl
+        run: |
+          set -euo pipefail
+          umask 077
+          wheel_dir="$RUNNER_TEMP/clio-kit-v2.3.2"
+          mkdir "$wheel_dir"
+          wheel="$wheel_dir/$CLIO_KIT_WHEEL_FILENAME"
+          temporary="$wheel.part"
+          trap 'rm -f -- "$temporary"' EXIT
+          curl --fail --show-error --silent --location \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 180 \
+            --connect-timeout 20 --max-time 180 \
+            --output "$temporary" "$CLIO_KIT_WHEEL_URL"
+          printf '%s  %s\n' "$CLIO_KIT_WHEEL_SHA256" "$temporary" \
+            | sha256sum --check --strict
+          mv -- "$temporary" "$wheel"
+          trap - EXIT
+          printf 'CLIO_RELAY_CLIO_KIT_WHEEL=%s\n' "$wheel" >> "$GITHUB_ENV"
+          printf 'CLIO_RELAY_CLIO_KIT_WHEEL_SHA256=%s\n' \
+            "$CLIO_KIT_WHEEL_SHA256" >> "$GITHUB_ENV"
 
       - name: run evidence-producing local release gate
         run: >-

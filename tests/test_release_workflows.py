@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import textwrap
 from pathlib import Path
@@ -33,12 +34,31 @@ def test_tag_workflow_only_builds_an_unprivileged_actions_payload() -> None:
     assert "environment:" not in text
     assert "--clobber" not in text
     assert set(jobs) == {"build"}
-    assert jobs["build"]["permissions"] == {}
-    assert "actions/checkout@" not in text
+    assert jobs["build"]["permissions"] == {"contents": "read"}
+    steps = cast(list[dict[str, Any]], jobs["build"]["steps"])
+    checkout = next(step for step in steps if "actions/checkout@" in str(step.get("uses")))
+    assert cast(dict[str, str], checkout["with"])["persist-credentials"] == "false"
+    assert cast(dict[str, str], checkout["with"])["ref"] == "${{ github.sha }}"
     assert "CI-STATUS.json" not in text
     assert "REPOSITORY-GOVERNANCE.json" not in text
-    assert "https://github.com/$GITHUB_REPOSITORY.git" in text
+    assert "relay_authenticated_git_fetch" in text
     assert "actions/upload-artifact@" in text
+
+
+def test_same_tag_release_stages_share_one_non_canceling_concurrency_group() -> None:
+    workflows = (
+        ("release.yml", "${{ github.ref_name }}"),
+        ("stage-candidate.yml", "${{ inputs.tag }}"),
+        ("live-validation-attest.yml", "${{ inputs.tag }}"),
+        ("release-gate.yml", "${{ inputs.tag }}"),
+        ("released-validation-attest.yml", "${{ inputs.tag }}"),
+        ("finalize-release.yml", "${{ inputs.tag }}"),
+    )
+
+    for workflow_name, tag_expression in workflows:
+        concurrency = cast(dict[str, str], _workflow(workflow_name)["concurrency"])
+        assert concurrency["group"] == f"clio-relay-release-{tag_expression}"
+        assert concurrency["cancel-in-progress"] == "false"
 
 
 def test_protected_main_staging_attests_and_creates_the_explicit_target_draft() -> None:
@@ -62,30 +82,30 @@ def test_protected_main_staging_attests_and_creates_the_explicit_target_draft() 
     assert "ci_validation.py extract-actions-artifact" in text
 
 
-def test_final_policy_requires_published_artifacts_and_retains_external_blockers() -> None:
+def test_final_policy_requires_published_artifacts_without_declared_blockers() -> None:
     policy = cast(
         dict[str, Any],
         yaml.safe_load((ROOT / "docs" / "release-gate-1.0.yaml").read_text(encoding="utf-8")),
     )
 
     assert policy["artifact_stage"] == "published"
-    assert policy["evidence_trust_model"] == "reviewer_sealed_operator_evidence"
+    assert policy["evidence_trust_model"] == "maintainer_sealed_operator_evidence"
     assert policy["require_released_artifact"] is True
     assert policy["require_target_identity"] is True
     assert policy["allowed_install_sources"] == ["pypi"]
-    assert policy["allowed_launchers"] == ["uvx"]
+    assert policy["allowed_launchers"] == ["uv-tool"]
     blockers = cast(list[str], policy["release_blockers"])
-    assert len(blockers) == 5
-    assert any("JARVIS-CD" in blocker for blocker in blockers)
-    assert any("clio-kit" in blocker for blocker in blockers)
-    assert any("owned-process containment" in blocker for blocker in blockers)
-    assert any("retention" in blocker for blocker in blockers)
-    assert any("Python 3.14" in blocker for blocker in blockers)
-    assert not any("nested" in blocker for blocker in blockers)
+    assert blockers == []
     requirement_ids = {
         item["requirement_id"] for item in cast(list[dict[str, Any]], policy["requirements"])
     }
     assert "ares-spack-virtual-mcp" in requirement_ids
+    homelab_transport = next(
+        item
+        for item in cast(list[dict[str, Any]], policy["requirements"])
+        if item["requirement_id"] == "homelab-transport"
+    )
+    assert homelab_transport["evidence_group_resource_kind"] == "cluster_target"
     local = next(
         item
         for item in cast(list[dict[str, Any]], policy["requirements"])
@@ -125,7 +145,27 @@ def test_ci_uses_read_only_permissions_and_nonpersistent_checkout_credentials() 
     assert 'requires = ["hatchling==1.31.0"]' in pyproject
 
 
-def test_jarvis_release_requirement_enforces_remote_contract_and_spack_reload() -> None:
+def test_ci_matrix_pins_sync_probe_and_release_gate_to_each_declared_python() -> None:
+    workflow = _workflow("ci.yml")
+    jobs = cast(dict[str, dict[str, Any]], workflow["jobs"])
+    steps = cast(list[dict[str, Any]], jobs["test"]["steps"])
+    by_name = {str(step["name"]): step for step in steps}
+    matrix_python = '"${{ matrix.python-version }}"'
+
+    sync_command = str(by_name["install dependencies"]["run"])
+    probe_command = str(by_name["verify matrix interpreter"]["run"])
+    gate_command = str(by_name["run evidence-producing local release gate"]["run"])
+
+    assert sync_command == f"uv sync --python {matrix_python} --locked --all-groups"
+    assert probe_command.startswith(f"uv run --python {matrix_python} python -c ")
+    assert "sys.version_info[:2] == expected" in probe_command
+    assert gate_command.startswith(
+        f"uv run --python {matrix_python} clio-relay release validate-local "
+    )
+    assert gate_command.count("${{ matrix.python-version }}") == 2
+
+
+def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> None:
     policy = cast(
         dict[str, Any],
         yaml.safe_load((ROOT / "docs" / "release-gate-1.0.yaml").read_text(encoding="utf-8")),
@@ -136,30 +176,97 @@ def test_jarvis_release_requirement_enforces_remote_contract_and_spack_reload() 
     jarvis = requirements["ares-jarvis-virtual-mcp"]
 
     assert "remote-mcp.jarvis-remote-contract" in jarvis["required_checks"]
-    assert "jarvis.spack-runtime-environment" in jarvis["required_checks"]
+    assert "remote-mcp.jarvis-execution-query" in jarvis["required_checks"]
+    assert "jarvis.spack-runtime-environment" not in jarvis["required_checks"]
     server = next(
         resource
         for resource in cast(list[dict[str, Any]], jarvis["required_resources"])
         if resource["kind"] == "mcp_server"
     )
+    assert server["metadata_equals"]["install_source"] == "uv-tool"
+    assert server["metadata_equals"]["nested_runtime"] == {
+        "server_name": "jarvis",
+        "persistent_tool": True,
+        "locked_runtime_verified": True,
+    }
     assert server["metadata_equals"]["server_process_artifact_verified"] is True
     worker = next(
         resource
         for resource in cast(list[dict[str, Any]], jarvis["required_resources"])
         if resource["kind"] == "relay_worker"
     )
+    clio_kit_component = worker["metadata_equals"]["component_artifacts"]["clio-kit"]
+    assert clio_kit_component["distribution_version"] == "2.3.2"
+    assert clio_kit_component["persistent_tool"]["manager"] == "uv"
+    assert clio_kit_component["persistent_tool"]["uv_version"] == "0.11.28"
+    assert clio_kit_component["persistent_tool"]["source_artifact_sha256"] == (
+        "6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321"
+    )
     jarvis_component = worker["metadata_equals"]["component_artifacts"]["jarvis-cd"]
-    assert jarvis_component["distribution_version"] == "2.0.0"
+    assert jarvis_component["distribution_version"] == "1.2.2"
     assert jarvis_component["requested_source"] == "github_release"
-    assert jarvis_component["install_spec"].endswith("/v2.0.0/jarvis_cd-2.0.0-py3-none-any.whl")
-    assert jarvis_component["artifact_sha256"] == "PENDING_JARVIS_CD_2_0_0_RELEASE_WHEEL_SHA256"
+    assert jarvis_component["install_spec"].endswith("/v1.2.2/jarvis_cd-1.2.2-py3-none-any.whl")
+    assert jarvis_component["artifact_sha256"] == (
+        "f05454718a4efe4dadebefb98c83511ba3dcc662238c0c05430a1b621a8ab8b7"
+    )
     runtime = worker["metadata_equals"]["component_runtime"]["jarvis-cd"]
     assert runtime["provider_interpreter_verified"] is True
     assert runtime["execution_interpreter_verified"] is True
     assert runtime["jarvis_executable_verified"] is True
+    clio_kit_runtime = worker["metadata_equals"]["component_runtime"]["clio-kit"]
+    assert clio_kit_runtime["uv_tool_environment_verified"] is True
+    assert clio_kit_runtime["record_closure_verified"] is True
+    progress = next(
+        resource
+        for resource in cast(list[dict[str, Any]], jarvis["required_resources"])
+        if resource["kind"] == "jarvis_execution_progress"
+    )
+    assert progress["metadata_equals"]["package_name"] == "builtin.gray_scott"
+    assert progress["metadata_equals"]["package_id"] == "gray_scott_bp5"
+    artifact = next(
+        resource
+        for resource in cast(list[dict[str, Any]], jarvis["required_resources"])
+        if resource["kind"] == "jarvis_generated_artifact"
+    )
+    assert artifact["metadata_equals"]["logical_name"] == "gray-scott-timesteps"
+    assert artifact["metadata_equals"]["metadata"]["latest_timestep"] == 20
+
+    lammps = requirements["ares-jarvis-lammps-package-progress"]
+    lammps_progress = next(
+        resource
+        for resource in cast(list[dict[str, Any]], lammps["required_resources"])
+        if resource["kind"] == "jarvis_execution_progress"
+    )
+    assert lammps_progress["metadata_equals"] == {
+        "source": "jarvis_execution",
+        "package_name": "builtin.lammps",
+        "package_id": "lammps",
+        "progress_schema_version": "jarvis.progress.v1",
+        "progress_determinate": True,
+        "provider_source_authority": "jarvis_mcp_progress_notification",
+        "producer_validated": True,
+        "execution_binding_validated": True,
+        "live_observed_while_running": True,
+        "bridge_validated": True,
+        "runtime_bound": True,
+    }
+    lammps_worker = next(
+        resource
+        for resource in cast(list[dict[str, Any]], lammps["required_resources"])
+        if resource["kind"] == "relay_worker"
+    )
+    assert lammps_worker["metadata_equals"]["components"] == {"jarvis-cd": "1.2.2"}
+    assert (
+        lammps_worker["metadata_equals"]["component_artifacts"]["jarvis-cd"]["artifact_sha256"]
+        == "f05454718a4efe4dadebefb98c83511ba3dcc662238c0c05430a1b621a8ab8b7"
+    )
+    assert lammps.get("evidence_group_resource_kind") is None
+
+    spack = requirements["ares-spack-virtual-mcp"]
+    assert spack["evidence_group_resource_kind"] == "mcp_server"
 
 
-def test_spack_release_requirement_enforces_exact_user_contract() -> None:
+def test_spack_release_requirements_split_existing_resolution_from_fresh_install() -> None:
     policy = cast(
         dict[str, Any],
         yaml.safe_load((ROOT / "docs" / "release-gate-1.0.yaml").read_text(encoding="utf-8")),
@@ -185,6 +292,10 @@ def test_spack_release_requirement_enforces_exact_user_contract() -> None:
         "spack_install",
         "spack_locate",
     ]
+    assert server["metadata_equals"]["contract_id"] == "clio-kit-spack-user-v2"
+    assert server["metadata_equals"]["contract_sha256"] == (
+        "3c5412148c770f4844e98eb893c4db0d0afdbf13afe967df67bd5f7d25e1f7db"
+    )
     calls = {
         resource["metadata_equals"]["remote_mcp_tool_name"]: resource["metadata_equals"]["spec"][
             "arguments"
@@ -194,9 +305,74 @@ def test_spack_release_requirement_enforces_exact_user_contract() -> None:
     }
     assert calls == {
         "spack_find": {"query": "lammps"},
-        "spack_install": {"spec": "lammps"},
         "spack_locate": {"spec": "lammps"},
     }
+    assert server["metadata_equals"]["server_name"] == "spack"
+    assert spack["evidence_group_resource_kind"] == "mcp_server"
+
+    fresh = requirements["ares-spack-fresh-install"]
+    assert fresh["required_checks"] == [
+        "remote-mcp.spack-preinstall-absent",
+        "remote-mcp.spack-fresh-install",
+        "remote-mcp.spack-postinstall-locate",
+        "remote-mcp.spack-disposable-store",
+        "remote-mcp.spack-transition-identity",
+        "remote-mcp.spack-transition-durable-evidence",
+        "remote-mcp.spack-fresh-configuration",
+    ]
+    assert fresh["spack_fresh_install_transition"] == {
+        "schema_version": "clio-relay.release-spack-fresh-install.v1",
+        "server_name": "spack-fresh",
+        "profile": "user",
+        "package_name": "libsigsegv",
+        "requested_spec": "libsigsegv@2.14",
+        "reuse": False,
+    }
+    fresh_jobs = {
+        cast(list[str], resource["roles"])[0]: resource["metadata_equals"]
+        for resource in cast(list[dict[str, Any]], fresh["required_resources"])
+        if resource["kind"] == "relay_job"
+    }
+    assert set(fresh_jobs) == {
+        "spack_preinstall_find",
+        "spack_fresh_install",
+        "spack_postinstall_locate",
+    }
+    assert fresh_jobs["spack_preinstall_find"]["arguments"] == {"query": "libsigsegv@2.14"}
+    assert fresh_jobs["spack_fresh_install"]["arguments"] == {
+        "spec": "libsigsegv@2.14",
+        "reuse": False,
+    }
+    assert fresh_jobs["spack_fresh_install"]["structured_result"]["package"] == {
+        "name": "libsigsegv"
+    }
+    assert fresh_jobs["spack_postinstall_locate"]["structured_result"]["package"] == {
+        "name": "libsigsegv"
+    }
+    assert all(job["remote_mcp_server_name"] == "spack-fresh" for job in fresh_jobs.values())
+    configuration = next(
+        resource
+        for resource in cast(list[dict[str, Any]], fresh["required_resources"])
+        if resource["kind"] == "configuration_manifest"
+    )
+    assert configuration["roles"] == ["spack_fresh_install_configuration"]
+    fresh_server = next(
+        resource
+        for resource in cast(list[dict[str, Any]], fresh["required_resources"])
+        if resource["kind"] == "mcp_server"
+    )
+    assert fresh_server["metadata_equals"]["server_name"] == "spack-fresh"
+    assert fresh_server["metadata_equals"]["install_artifact_sha256"] == (
+        "6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321"
+    )
+    assert fresh_server["metadata_equals"]["contract_id"] == "clio-kit-spack-user-v2"
+    assert fresh_server["metadata_equals"]["contract_sha256"] == (
+        "3c5412148c770f4844e98eb893c4db0d0afdbf13afe967df67bd5f7d25e1f7db"
+    )
+    serialized_fresh = json.dumps(fresh, sort_keys=True)
+    assert "fresh_install_store_root" not in serialized_fresh
+    assert "fresh_install_configuration_sha256" not in serialized_fresh
+    assert "fresh_install_configuration_manifest_path" not in serialized_fresh
 
 
 def test_candidate_gate_publishes_only_to_pypi_and_keeps_github_draft() -> None:
@@ -220,7 +396,7 @@ def test_candidate_gate_publishes_only_to_pypi_and_keeps_github_draft() -> None:
     assert "candidate-policy.yaml" in text
     assert "PYPI-PROMOTION.json" in text
     assert '"artifact_stage": "published"' in promotion_source
-    assert 'test "$(gh release view "$TAG_NAME"' in text
+    assert 'relay_release_resolve "$TAG_NAME" true' in text
     assert "DISPATCH_REF: ${{ github.ref }}" in text
     assert "DISPATCH_SHA: ${{ github.sha }}" in text
     assert 'test "$DISPATCH_REF" = "refs/heads/main"' in text
@@ -234,10 +410,14 @@ def test_release_stages_require_the_exact_reviewed_origin_main_commit() -> None:
     finalization = (WORKFLOWS / "finalize-release.yml").read_text(encoding="utf-8")
     staging = (WORKFLOWS / "stage-candidate.yml").read_text(encoding="utf-8")
 
-    fetch = "git fetch --force --no-tags origin refs/heads/main:refs/remotes/origin/main"
+    fetch = "relay_authenticated_git_fetch --force --no-tags origin"
     assert fetch in release
     assert fetch in gate
     assert fetch in finalization
+    assert fetch in staging
+    assert "refs/heads/main:refs/remotes/origin/main" in release
+    assert "refs/heads/main:refs/remotes/origin/main" in gate
+    assert "refs/heads/main:refs/remotes/origin/main" in finalization
     assert 'test "$GITHUB_SHA" = "$(git rev-parse refs/remotes/origin/main)"' in release
     assert 'test "$source_commit" = "$REVIEWED_MAIN_SHA"' in gate
     assert 'test "$source_commit" = "$(git rev-parse refs/remotes/origin/main)"' in gate
@@ -253,15 +433,76 @@ def test_release_stages_require_the_exact_reviewed_origin_main_commit() -> None:
         assert inputs["reviewed_main_sha"]["required"] == "true"
 
 
+def test_every_post_checkout_fetch_uses_ephemeral_job_token_authentication() -> None:
+    protected = (
+        "release.yml",
+        "stage-candidate.yml",
+        "live-validation-attest.yml",
+        "release-gate.yml",
+        "released-validation-attest.yml",
+        "finalize-release.yml",
+    )
+    for workflow_name in protected:
+        workflow = _workflow(workflow_name)
+        jobs = cast(dict[str, dict[str, Any]], workflow["jobs"])
+        text = (WORKFLOWS / workflow_name).read_text(encoding="utf-8")
+        assert "git fetch" not in text, workflow_name
+        for job in jobs.values():
+            for step in cast(list[dict[str, Any]], job.get("steps", [])):
+                script = str(step.get("run", ""))
+                if "relay_authenticated_git_fetch" not in script:
+                    continue
+                assert "source .github/scripts/authenticated-git.sh" in script
+                assert cast(dict[str, str], step.get("env", {})).get("GH_TOKEN") == (
+                    "${{ github.token }}"
+                )
+
+    helper = (ROOT / ".github" / "scripts" / "authenticated-git.sh").read_text(encoding="utf-8")
+    assert "GIT_CONFIG_COUNT=1" in helper
+    assert "GIT_CONFIG_VALUE_0=" in helper
+    assert "GIT_TERMINAL_PROMPT=0" in helper
+    assert "git config" not in helper
+    assert "x-access-token:${GH_TOKEN}@" not in helper
+
+
+def test_draft_release_io_resolves_a_bounded_numeric_id() -> None:
+    protected = (
+        "stage-candidate.yml",
+        "live-validation-attest.yml",
+        "release-gate.yml",
+        "released-validation-attest.yml",
+        "finalize-release.yml",
+    )
+    forbidden = (
+        "releases/tags/",
+        "gh release view",
+        "gh release download",
+        "gh release upload",
+        "gh release edit",
+    )
+    for workflow_name in protected:
+        text = (WORKFLOWS / workflow_name).read_text(encoding="utf-8")
+        assert not any(item in text for item in forbidden), workflow_name
+        assert "source .github/scripts/release-api.sh" in text, workflow_name
+
+    helper = (ROOT / ".github" / "scripts" / "release-api.sh").read_text(encoding="utf-8")
+    assert "releases/$release_id/assets?per_page=100&page=1" in helper
+    assert "releases/$release_id/assets?per_page=100&page=2" in helper
+    assert "releases/assets/$asset_id" in helper
+    assert "releases/$release_id/assets?name=$encoded_name" in helper
+    assert '"repos/$REPOSITORY/releases/$release_id"' in helper
+    assert "--method PATCH" in helper
+    assert "releases/tags/" not in helper
+
+
 def test_release_stages_reject_assets_outside_the_exact_allowlist() -> None:
     staging = (WORKFLOWS / "stage-candidate.yml").read_text(encoding="utf-8")
     gate = (WORKFLOWS / "release-gate.yml").read_text(encoding="utf-8")
     finalization = (WORKFLOWS / "finalize-release.yml").read_text(encoding="utf-8")
 
-    assert "--json assets" in gate
-    assert "--jq '.assets[].name'" in gate
+    assert "jq -r '.assets[].name'" in gate
     assert "diff --unified expected-assets.txt observed-assets.txt" in gate
-    assert "/assets?per_page=100" in finalization
+    assert "relay_release_complete_assets" in finalization
     assert "ci_validation.py staged-assets" in staging
     assert "candidate directory file set does not match" not in staging
     assert "draft release contains assets outside the verified prepublication set" in gate
@@ -290,13 +531,15 @@ def test_live_reports_are_sealed_by_authorized_candidate_tag_workflow() -> None:
     assert 'source.get("launcher_receipt", {}).get("verified") is True' in text
     assert 'trust.get("origin") == "operator_generated"' in text
     assert 'trust.get("producer_execution_verified") is False' in text
-    assert '"trust_model": "reviewer_sealed_operator_evidence"' in text
+    assert '"trust_model": "maintainer_sealed_operator_evidence"' in text
     assert "sealing dispatcher is not a write-capable maintainer" in text
-    assert "ci_validation.py reviewer-exclusions" in text
-    assert 'test "$DISPATCH_ACTOR" != "$uploader"' in text
-    assert '"review_method": "independent_maintainer_workflow_dispatch"' in text
-    assert '"reviewer_login": reviewer_login' in text
-    assert '"source_commit_author_login": source_author_login' in text
+    assert "ci_validation.py reviewer-exclusions" not in text
+    assert 'test "$DISPATCH_ACTOR" != "$uploader"' not in text
+    assert 'test "$dispatcher_id" != "$uploader_id"' not in text
+    assert '"seal_method": "write_capable_maintainer_workflow_dispatch"' in text
+    assert '"sealer_login": sealer_login' in text
+    assert '"sealer_permission": sealer_permission' in text
+    assert "source_commit_author_login" not in text
     assert 'source.get("released_artifact") is False' in text
     assert 'source.get("detected_kind") == "wheel"' in text
     assert "LIVE-VALIDATION-BINDING.json" in text
@@ -305,7 +548,7 @@ def test_live_reports_are_sealed_by_authorized_candidate_tag_workflow() -> None:
     assert '--from "$wheel"' not in text
 
 
-def test_released_reports_require_actual_pypi_uvx_source_before_final_gate() -> None:
+def test_released_reports_require_actual_pypi_uv_tool_source_before_final_gate() -> None:
     workflow = _workflow("released-validation-attest.yml")
     jobs = cast(dict[str, dict[str, Any]], workflow["jobs"])
     seal = jobs["seal"]
@@ -318,15 +561,20 @@ def test_released_reports_require_actual_pypi_uvx_source_before_final_gate() -> 
     assert 'source.get("released_artifact") is True' in text
     assert 'source.get("launcher_verified") is True' in text
     assert 'source.get("launcher_receipt", {}).get("verified") is True' in text
+    assert 'source.get("launcher") == "uv-tool"' in text
+    assert 'launcher_receipt.get("tool_environment_verified") is True' in text
+    assert 'launcher_receipt.get("distribution_record", {}).get("verified") is True' in text
     assert 'trust.get("origin") == "operator_generated"' in text
     assert 'trust.get("producer_execution_verified") is False' in text
-    assert '"trust_model": "reviewer_sealed_operator_evidence"' in text
+    assert '"trust_model": "maintainer_sealed_operator_evidence"' in text
     assert "sealing dispatcher is not a write-capable maintainer" in text
-    assert "ci_validation.py reviewer-exclusions" in text
-    assert 'test "$DISPATCH_ACTOR" != "$uploader"' in text
-    assert '"review_method": "independent_maintainer_workflow_dispatch"' in text
-    assert '"reviewer_login": reviewer_login' in text
-    assert '"source_commit_author_login": source_author_login' in text
+    assert "ci_validation.py reviewer-exclusions" not in text
+    assert 'test "$DISPATCH_ACTOR" != "$uploader"' not in text
+    assert 'test "$dispatcher_id" != "$uploader_id"' not in text
+    assert '"seal_method": "write_capable_maintainer_workflow_dispatch"' in text
+    assert '"sealer_login": sealer_login' in text
+    assert '"sealer_permission": sealer_permission' in text
+    assert "source_commit_author_login" not in text
     assert "uv run --no-sync clio-relay release gate" in text
     assert 'uvx --from "clio-relay==$VERSION"' not in text
     assert "--policy docs/release-gate-1.0.yaml" in text
@@ -335,13 +583,13 @@ def test_released_reports_require_actual_pypi_uvx_source_before_final_gate() -> 
     assert "released-release-gate-1.0.json" in text
 
 
-def test_released_validation_commands_preserve_uv_cache_for_launcher_receipts() -> None:
+def test_released_validation_commands_reuse_one_persistent_uv_tool() -> None:
     release_document = (ROOT / "docs" / "release.md").read_text(encoding="utf-8")
 
-    assert release_document.count("uvx --refresh --no-config `") == 3
-    assert "uvx --refresh --no-cache" not in release_document
-    assert release_document.count("--default-index https://pypi.org/simple `") == 3
-    assert release_document.count('--from "clio-relay==$Version" `') == 3
+    assert release_document.count("uv tool install --force --refresh --no-config `") == 1
+    assert release_document.count("--default-index https://pypi.org/simple `") == 1
+    assert release_document.count("& $Relay ") >= 3
+    assert "uvx" not in release_document
 
 
 def test_github_release_finalization_depends_on_sealed_released_evidence() -> None:
@@ -360,12 +608,13 @@ def test_github_release_finalization_depends_on_sealed_released_evidence() -> No
     assert "released_artifact_requirements" in text
     assert "local_quality_requirements" in text
     assert "released_reports" in text
-    assert '"review_method": binding.get("review_method")' in text
-    assert 'candidate_binding["reviewer_login"]' in text
-    assert 'released_binding["reviewer_login"]' in text
-    assert '"independent_reviewer": binding.get("reviewer_login")' in text
-    assert '!= binding.get("source_commit_author_login")' in text
-    assert "--draft=false" in text
+    assert '"seal_method": binding.get("seal_method")' in text
+    assert 'candidate_binding["sealer_login"]' in text
+    assert 'released_binding["sealer_login"]' in text
+    assert "independent_reviewer" not in text
+    assert "source_commit_author_login" not in text
+    assert "'{body: $body, draft: false, prerelease: false}'" in text
+    assert "relay_release_patch" in text
 
 
 def test_only_finalization_can_publish_the_github_release() -> None:
@@ -377,10 +626,11 @@ def test_only_finalization_can_publish_the_github_release() -> None:
         "released-validation-attest.yml",
     ):
         text = (WORKFLOWS / workflow_name).read_text(encoding="utf-8")
-        assert "--draft=false" not in text
+        assert "relay_release_patch" not in text
 
     finalization = (WORKFLOWS / "finalize-release.yml").read_text(encoding="utf-8")
-    assert finalization.count("--draft=false") == 1
+    assert finalization.count("relay_release_patch") == 1
+    assert finalization.count("draft: false") == 1
 
 
 def test_pypi_promotion_recovers_only_from_exact_existing_bytes() -> None:
@@ -480,23 +730,20 @@ def test_ci_and_governance_receipts_survive_every_release_stage() -> None:
     assert '"environment_reviewers_available"' in finalization
 
 
-def test_live_seals_bind_numeric_producer_uploader_reviewer_and_invocation() -> None:
+def test_live_seals_bind_numeric_producer_uploader_sealer_and_invocation() -> None:
     for workflow_name in (
         "live-validation-attest.yml",
         "released-validation-attest.yml",
     ):
         text = (WORKFLOWS / workflow_name).read_text(encoding="utf-8")
         assert 'dispatcher_id="$(gh api "users/$DISPATCH_ACTOR" --jq .id)"' in text
-        assert "source_author_id" in text
-        assert "source_committer_id" in text
-        assert "source_pr_authors" in text
-        assert "source_contributor_ids" in text
-        assert "ci_validation.py reviewer-exclusions" in text
-        assert '--dispatcher-login "$DISPATCH_ACTOR"' in text
-        assert '--dispatcher-id "$dispatcher_id"' in text
-        assert "report_uploader_ids" in text
-        assert 'test "$dispatcher_id" != "$uploader_id"' in text
-        assert "source_commit_committer_id" in text
+        assert "source_author_id" not in text
+        assert "source_committer_id" not in text
+        assert "source_pr_authors" not in text
+        assert "source_contributor_ids" not in text
+        assert "ci_validation.py reviewer-exclusions" not in text
+        assert 'echo "permission=$permission"' in text
+        assert 'test "$dispatcher_id" != "$uploader_id"' not in text
         assert 'trust.get("producer_github_login")' in text
         assert 'trust.get("producer_github_id")' in text
         assert 'trust.get("invocation_id")' in text
@@ -505,7 +752,8 @@ def test_live_seals_bind_numeric_producer_uploader_reviewer_and_invocation() -> 
         assert 'launcher_receipt.get("uv_executable_sha256")' in text
         assert '"producer_github_id": producer_id' in text
         assert '"uploader_github_id": uploader.get("id")' in text
-        assert '"reviewer_id": reviewer_id' in text
+        assert '"sealer_id": sealer_id' in text
+        assert '"sealer_permission": sealer_permission' in text
         assert '"uv_version": launcher_receipt.get("uv_version")' in text
         assert '"uv_executable_sha256": launcher_receipt.get(' in text
         assert '"environment_reviewers_available": False' in text
@@ -560,11 +808,29 @@ def test_release_workflows_preflight_bounded_report_assets() -> None:
         assert "report-assets-before.json" in text, workflow_name
         assert "report-assets-after.json" in text, workflow_name
         assert "cmp --silent" in text, workflow_name
-        assert "/assets?per_page=100" in text, workflow_name
-        assert text.index("preflight bounded") < text.index("gh release download"), workflow_name
+        assert "relay_release_complete_assets" in text, workflow_name
+        assert text.index("preflight bounded") < text.index("relay_release_download"), workflow_name
         assert text.index("report-assets-after.json") < text.index("json.loads"), workflow_name
+        assert text.count("ci_validation.py report-assets") == text.count(
+            "--matrix examples/release-gate/report-matrix-1.0.json"
+        ), workflow_name
         for kind in kinds:
             assert kind in text, workflow_name
+
+
+def test_release_seals_decisions_and_claims_bind_the_exact_matrix() -> None:
+    candidate = (WORKFLOWS / "live-validation-attest.yml").read_text(encoding="utf-8")
+    gate = (WORKFLOWS / "release-gate.yml").read_text(encoding="utf-8")
+    released = (WORKFLOWS / "released-validation-attest.yml").read_text(encoding="utf-8")
+    finalization = (WORKFLOWS / "finalize-release.yml").read_text(encoding="utf-8")
+
+    assert '"acceptance_matrix": matrix_binding' in candidate
+    assert 'matrix_binding.get("report_count") != 17' in candidate
+    assert 'decision.get("acceptance_report_ids") == expected_ids' in gate
+    assert '"acceptance_matrix": matrix_binding' in released
+    assert "candidate-to-released matrix binding failed" in released
+    assert '"ordered_report_ids": released_matrix_ids' in finalization
+    assert '"ordered_report_document_ids": ordered_document_ids' in finalization
 
 
 def test_actions_artifacts_are_preflighted_and_downloaded_by_exact_api_id() -> None:
@@ -606,7 +872,9 @@ def test_final_binding_publish_steps_receive_the_exact_source_commit() -> None:
         workflow = _workflow(workflow_name)
         jobs = cast(dict[str, dict[str, Any]], workflow["jobs"])
         steps = cast(list[dict[str, Any]], jobs["seal"]["steps"])
-        publish = next(step for step in steps if "gh release upload" in str(step.get("run", "")))
+        publish = next(
+            step for step in steps if "relay_release_upload_exact" in str(step.get("run", ""))
+        )
         assert "SOURCE_COMMIT" in cast(dict[str, str], publish["env"]), workflow_name
 
 
@@ -627,8 +895,8 @@ def test_every_release_mutation_rechecks_live_identity_immediately_before_write(
                 for line_index, line in enumerate(script.splitlines()):
                     mutations = (
                         "gh release create",
-                        "gh release upload",
-                        "gh release edit",
+                        "relay_release_upload_exact",
+                        "relay_release_patch",
                     )
                     if any(mutation in line for mutation in mutations):
                         preceding = script.splitlines()[max(0, line_index - 120) : line_index]
@@ -661,25 +929,26 @@ def test_final_publication_rechecks_exact_assets_before_and_after_immutability()
     workflow = _workflow("finalize-release.yml")
     jobs = cast(dict[str, dict[str, Any]], workflow["jobs"])
     steps = cast(list[dict[str, Any]], jobs["finalize"]["steps"])
-    publication = next(step for step in steps if "gh release edit" in str(step.get("run", "")))
+    publication = next(step for step in steps if "relay_release_patch" in str(step.get("run", "")))
     script = str(publication["run"])
 
     authority = script.index("ci_validation.py mutation-authority")
     preflight = script.index("ci_validation.py exact-release-assets", authority)
     receipt = script.index('--output "$RUNNER_TEMP/EXACT-FINAL-ASSETS.json"', preflight)
-    publish = script.index("gh release edit", receipt)
+    publish = script.index("relay_release_patch", receipt)
     postflight = script.index("ci_validation.py exact-release-assets", publish)
     immutable_receipt = script.index(
         '--verify-existing "$RUNNER_TEMP/EXACT-FINAL-ASSETS.json"',
         postflight,
     )
-    immutable_check = script.index("--json isImmutable", immutable_receipt)
+    immutable_check = script.index(
+        '.immutable "$RUNNER_TEMP/final-release-immutable.json"', immutable_receipt
+    )
 
     assert authority < preflight < receipt < publish
     assert publish < postflight < immutable_receipt < immutable_check
     assert '"${asset_args[@]}"' in script
-    assert script.count("/assets?per_page=100&page=1") == 1
-    assert script.count("/assets?per_page=100&page=2") == 1
+    assert script.count("relay_release_complete_assets") == 1
     assert script.count("--next-assets-page") == 2
     assert script.count("--page-size 100") == 2
 
@@ -744,16 +1013,17 @@ def test_privileged_release_jobs_never_execute_candidate_or_pypi_code() -> None:
                     assert "uv run --no-sync clio-relay release gate" in script
 
 
-def test_release_workflows_do_not_claim_unavailable_immutable_setting_access() -> None:
-    for workflow_name in (
-        "stage-candidate.yml",
-        "live-validation-attest.yml",
-        "released-validation-attest.yml",
-        "release-gate.yml",
-        "finalize-release.yml",
-    ):
-        text = (WORKFLOWS / workflow_name).read_text(encoding="utf-8")
-        assert "/immutable-releases" not in text
+def test_finalization_proves_immutable_mode_before_publishing() -> None:
+    text = (WORKFLOWS / "finalize-release.yml").read_text(encoding="utf-8")
+
+    endpoint = 'gh api "repos/$REPOSITORY/immutable-releases"'
+    publish = "relay_release_patch"
+    assert text.count(endpoint) == 2
+    assert "secrets.IMMUTABLE_RELEASES_READ_TOKEN" in text
+    assert 'test -n "$IMMUTABLE_RELEASES_READ_TOKEN"' in text
+    assert ".enabled == true" in text
+    assert "clio-relay.immutable-releases-receipt.v1" in text
+    assert text.rindex(endpoint) < text.rindex(publish)
 
 
 def test_final_claims_resolve_all_decision_reports_and_bind_target_policy() -> None:
@@ -803,6 +1073,34 @@ def test_every_setup_uv_action_installs_the_tested_uv_version() -> None:
     for workflow_name, step in setup_steps:
         options = cast(dict[str, str], step.get("with", {}))
         assert options.get("version") == "0.11.28", workflow_name
+
+
+def test_every_workflow_job_has_an_explicit_bounded_timeout() -> None:
+    for workflow_path in sorted(WORKFLOWS.glob("*.yml")):
+        workflow = _workflow(workflow_path.name)
+        jobs = cast(dict[str, dict[str, Any]], workflow["jobs"])
+        for job_name, job in jobs.items():
+            timeout = int(job["timeout-minutes"])
+            assert 1 <= timeout <= 60, (workflow_path.name, job_name, timeout)
+
+
+def test_release_network_metadata_is_bounded_before_json_parsing() -> None:
+    workflow_reads = {
+        "release-gate.yml": 2,
+        "released-validation-attest.yml": 1,
+        "finalize-release.yml": 1,
+    }
+    for workflow_name, expected_reads in workflow_reads.items():
+        text = (WORKFLOWS / workflow_name).read_text(encoding="utf-8")
+        assert text.count("response.read(4 * 1024 * 1024 + 1)") == expected_reads
+        assert "json.load(response)" not in text
+
+    bootstrap = (ROOT / "src" / "clio_relay" / "bootstrap.py").read_text(encoding="utf-8")
+    promotion = (ROOT / "src" / "clio_relay" / "promotion_record.py").read_text(encoding="utf-8")
+    assert "response.read(4 * 1024 * 1024 + 1)" in bootstrap
+    assert "json.load(response)" not in bootstrap
+    assert "response.read(MAX_PYPI_JSON_BYTES + 1)" in promotion
+    assert "json.load(response)" not in promotion
 
 
 def test_embedded_workflow_python_compiles() -> None:
