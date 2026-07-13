@@ -321,9 +321,19 @@ existing entry with a partial `cluster add` command because that command replace
 the whole definition.
 
 ```powershell
-$AresSpack = "$AresHome/spack/bin/spack"
+$AresSpack = [string]$AresDefinition.spack_executable
+$AresFreshBaseSpack = "$AresHome/spack/bin/spack"
 if ($AresDefinition.scheduler_provider -ne "slurm") { throw "Ares must explicitly use slurm" }
-if ($AresDefinition.spack_executable -ne $AresSpack) { throw "Ares spack_executable mismatch" }
+if ($AresSpack -notmatch '^/[A-Za-z0-9._+/-]+$' -or
+    $AresSpack.StartsWith("//") -or
+    $AresSpack.EndsWith("/") -or
+    $AresSpack -match '(^|/)\.\.(/|$)') {
+  throw "Ares spack_executable must be one canonical absolute path"
+}
+foreach ($Executable in @($AresSpack, $AresFreshBaseSpack)) {
+  & $OpenSsh $AresSshHost "test -x '$Executable'"
+  if ($LASTEXITCODE -ne 0) { throw "required Ares Spack executable is absent: $Executable" }
+}
 if ($HomelabDefinition.scheduler_provider -ne "external") { throw "homelab must explicitly use external" }
 foreach ($Name in @(
   $AresDefinition.frp_transport.token_env,
@@ -751,7 +761,7 @@ $FreshSpackSpec = "libsigsegv@2.14"
 & $OpenScp examples/release-gate/spack-fresh-store.sh `
   "${AresSshHost}:$AresRemoteRoot/spack-fresh-store.sh"
 if ($LASTEXITCODE -ne 0) { throw "fresh Spack setup-script staging failed" }
-& $OpenSsh $AresSshHost "chmod 700 '$AresRemoteRoot/spack-fresh-store.sh' && '$AresRemoteRoot/spack-fresh-store.sh' '$FreshSpackRoot' '$AresSpack'"
+& $OpenSsh $AresSshHost "chmod 700 '$AresRemoteRoot/spack-fresh-store.sh' && '$AresRemoteRoot/spack-fresh-store.sh' '$FreshSpackRoot' '$AresFreshBaseSpack'"
 if ($LASTEXITCODE -ne 0) { throw "disposable Spack store setup failed" }
 $ExpectedFreshSpackConfigurationSha256 = (
   & $OpenSsh $AresSshHost "sha256sum '$FreshSpackConfigurationManifest' | cut -d' ' -f1" |

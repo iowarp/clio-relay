@@ -313,6 +313,9 @@ def test_release_acceptance_runbook_binds_production_specifics_without_secrets()
     assert "acceptance tag checkout is not clean" in text
     assert "$AresSshHost = [string]$AresDefinition.ssh_host" in text
     assert "$AresHome = Get-RemoteHome $AresSshHost" in text
+    assert "$AresSpack = [string]$AresDefinition.spack_executable" in text
+    assert '$AresFreshBaseSpack = "$AresHome/spack/bin/spack"' in text
+    assert "'$FreshSpackRoot' '$AresFreshBaseSpack'" in text
     assert "$Promotion.version -cne $Version" in text
     assert "promotion wheel digest is missing or malformed" in text
     index_cleanup = text.index("$AllowedUvLocationEnvironment = @(")
