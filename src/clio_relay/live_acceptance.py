@@ -27,8 +27,10 @@ from clio_relay import __version__
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.doctor import run_cluster_doctor
 from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.identifiers import DurableRecordId
 from clio_relay.installation import (
-    verify_remote_package_progress_component,
+    verify_remote_clio_kit_native_execution_component,
+    verify_remote_native_jarvis_component,
     verify_remote_worker_info,
 )
 from clio_relay.pagination import MAX_RESPONSE_PAGE_RECORDS
@@ -127,6 +129,7 @@ class LiveAcceptanceOptions:
     require_structured_runtime_metadata: bool = False
     validation_scenario: str = "live-test"
     verify_cluster_deployment: bool = False
+    report_id: DurableRecordId | None = None
 
 
 def run_live_acceptance(
@@ -163,6 +166,7 @@ def run_live_acceptance(
                 launcher=options.validation_launcher,
                 install_source=options.validation_install_source,
                 artifact_sha256=options.validation_artifact_sha256,
+                report_id=options.report_id,
             )
         )
         if transport_modes:
@@ -596,7 +600,8 @@ def _verify_cluster_deployment(
     except ConfigurationError as exc:
         raise RelayError(str(exc)) from exc
     try:
-        package_progress_runtime = verify_remote_package_progress_component(info, receipt)
+        clio_kit_runtime = verify_remote_clio_kit_native_execution_component(info, receipt)
+        native_jarvis_runtime = verify_remote_native_jarvis_component(info, receipt)
     except ConfigurationError as exc:
         raise RelayError(str(exc)) from exc
     software = receipt.software
@@ -617,8 +622,15 @@ def _verify_cluster_deployment(
             sort_keys=True,
         ),
         "worker.component-runtime="
-        + json.dumps({"jarvis-cd": package_progress_runtime}, sort_keys=True),
-        "worker.component-jarvis-package-provenance=passed",
+        + json.dumps(
+            {
+                "clio-kit": clio_kit_runtime,
+                "jarvis-cd": native_jarvis_runtime,
+            },
+            sort_keys=True,
+        ),
+        "worker.component-clio-kit-native-jarvis-contract=passed",
+        "worker.component-jarvis-native-execution=passed",
     ]
 
 

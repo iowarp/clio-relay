@@ -9,7 +9,8 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from json import JSONDecodeError
 from typing import Any, TextIO, cast
 from uuid import uuid4
@@ -17,13 +18,25 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from clio_relay import __version__
-from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, default_registry_path
+from clio_relay.cluster_config import (
+    ClusterDefinition,
+    ClusterRegistry,
+    cluster_route_revision,
+    default_registry_path,
+)
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError
+from clio_relay.filesystem_paths import logical_filesystem_text
+from clio_relay.identifiers import (
+    durable_record_id_json_schema,
+    validate_durable_record_id,
+)
 from clio_relay.jarvis_mcp import (
+    JARVIS_MCP_CACHE_SERVER_NAME,
     is_virtual_jarvis_tool,
     jarvis_mcp_artifact_binding,
+    jarvis_mcp_artifact_binding_from_entry,
     jarvis_mcp_server,
     jarvis_mcp_server_args,
     render_virtual_jarvis_agent_context,
@@ -54,6 +67,7 @@ from clio_relay.pagination import (
 )
 from clio_relay.progress_provenance import external_progress_metadata
 from clio_relay.queue_management import (
+    DEFAULT_STALE_SCAN_LIMIT,
     cancel_queue_job,
     cleanup_stale_jobs,
     diagnose_job,
@@ -76,9 +90,11 @@ from clio_relay.remote_cli import (
     write_remote_file,
 )
 from clio_relay.remote_mcp import (
+    RemoteMcpSchemaCache,
     VirtualRemoteMcpCatalog,
     default_remote_mcp_cache_path,
     load_virtual_remote_mcp_catalog,
+    remote_mcp_registration_revision,
     unavailable_virtual_remote_mcp_catalog,
 )
 from clio_relay.retention import TerminalRetentionCoordinator
@@ -106,6 +122,25 @@ USER_MCP_TOOL_NAMES = {
 }
 
 
+@dataclass
+class McpSessionState:
+    """Catalog revisions advertised to one connected MCP client."""
+
+    remote_mcp_catalog_revisions: dict[str, str] = field(default_factory=lambda: dict[str, str]())
+
+    def reset(self) -> None:
+        """Forget catalogs advertised before a new MCP initialization."""
+        self.remote_mcp_catalog_revisions.clear()
+
+    def observe_remote_mcp_catalog(self, *, profile: str, revision: str) -> None:
+        """Record the exact remote-tool catalog rendered by ``tools/list``."""
+        self.remote_mcp_catalog_revisions[profile] = revision
+
+    def observed_remote_mcp_catalog_revision(self, *, profile: str) -> str | None:
+        """Return the catalog revision advertised for one MCP profile."""
+        return self.remote_mcp_catalog_revisions.get(profile)
+
+
 def serve_stdio(
     *,
     stdin: TextIO = sys.stdin,
@@ -118,6 +153,7 @@ def serve_stdio(
     resolved_profile = _normalize_profile(profile or _mcp_profile_from_env())
     queue = storage_managed_queue(resolved)
     queue.initialize()
+    session = McpSessionState()
     first_line = True
     for line in stdin:
         if first_line:
@@ -135,6 +171,7 @@ def serve_stdio(
                 queue=queue,
                 settings=resolved,
                 profile=resolved_profile,
+                session=session,
             )
         if response is None:
             continue
@@ -148,6 +185,7 @@ def handle_request(
     queue: ClioCoreQueue,
     settings: RelaySettings | None = None,
     profile: str | None = None,
+    session: McpSessionState | None = None,
 ) -> JSON | None:
     """Handle one JSON-RPC MCP request."""
     request_id = request.get("id")
@@ -157,9 +195,25 @@ def handle_request(
         return None
     try:
         if method == "initialize":
+            if session is not None:
+                session.reset()
             result = _initialize_result()
         elif method == "tools/list":
-            result = {"tools": _tool_definitions(profile=resolved_profile)}
+            tool_definitions, catalog = _tool_definitions_and_remote_catalog(
+                profile=resolved_profile
+            )
+            if session is not None:
+                session.observe_remote_mcp_catalog(
+                    profile=resolved_profile,
+                    revision=catalog.revision,
+                )
+            result = {
+                "tools": tool_definitions,
+                "_meta": {
+                    "clio-relay/remote-mcp-catalog-revision": catalog.revision,
+                    "clio-relay/profile": resolved_profile,
+                },
+            }
         elif method == "tools/call":
             params = _object(request.get("params"))
             result = _call_tool(
@@ -167,6 +221,12 @@ def handle_request(
                 queue=queue,
                 settings=settings or RelaySettings.from_env(),
                 profile=resolved_profile,
+                observed_remote_mcp_catalog_revision=(
+                    session.observed_remote_mcp_catalog_revision(profile=resolved_profile)
+                    if session is not None
+                    else None
+                ),
+                require_advertised_remote_mcp_catalog=session is not None,
             )
         else:
             return _error(request_id, -32601, f"unknown method: {method}")
@@ -178,7 +238,7 @@ def handle_request(
             data={"storage_decision": exc.decision.to_dict()},
         )
     except Exception as exc:
-        return _error(request_id, -32000, str(exc))
+        return _error(request_id, -32000, logical_filesystem_text(str(exc)))
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
@@ -236,7 +296,11 @@ def _initialize_result() -> JSON:
     }
 
 
-def _tool_definitions(*, profile: str | None = None) -> list[JSON]:
+def _tool_definitions_and_remote_catalog(
+    *,
+    profile: str | None = None,
+) -> tuple[list[JSON], VirtualRemoteMcpCatalog]:
+    """Render tools and return the exact remote catalog used for this list."""
     tools = _all_tool_definitions(clusters=_configured_cluster_names())
     normalized = _normalize_profile(profile or _mcp_profile_from_env())
     catalog = _remote_mcp_catalog(
@@ -251,7 +315,7 @@ def _tool_definitions(*, profile: str | None = None) -> list[JSON]:
             for tool in tools
             if tool["name"] in USER_MCP_TOOL_NAMES or is_virtual_jarvis_tool(str(tool["name"]))
         ]
-    return [*selected, *catalog.tool_definitions()]
+    return [*selected, *catalog.tool_definitions()], catalog
 
 
 def _authorized_static_tool_names(profile: str) -> set[str]:
@@ -311,7 +375,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "cluster": {"type": "string"},
                     "route_revision": {"type": "string"},
                 },
@@ -325,7 +389,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "cluster": {"type": "string"},
                     "route_revision": {"type": "string"},
                     "cancel_scheduler_job": {"type": "boolean", "default": False},
@@ -343,7 +407,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "cluster": {"type": "string"},
                     "route_revision": {"type": "string"},
                     "cursor": {"type": "integer", "default": 1, "minimum": 1},
@@ -372,7 +436,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "cluster": {"type": "string"},
                     "route_revision": {"type": "string"},
                     "timeout_seconds": {"type": "number", "default": 600},
@@ -507,7 +571,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "description": "Read a relay job record by id.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"job_id": {"type": "string"}},
+                "properties": {"job_id": durable_record_id_json_schema()},
                 "required": ["job_id"],
                 "additionalProperties": False,
             },
@@ -517,7 +581,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "description": "Read job state, relay queue position, and scheduler status.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"job_id": {"type": "string"}},
+                "properties": {"job_id": durable_record_id_json_schema()},
                 "required": ["job_id"],
                 "additionalProperties": False,
             },
@@ -528,7 +592,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "cursor": {"type": "integer", "default": 1, "minimum": 1},
                     "limit": {
                         "type": "integer",
@@ -547,7 +611,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "cursor": {"type": "integer", "default": 1, "minimum": 1},
                     "limit": {
                         "type": "integer",
@@ -566,7 +630,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "cursor": {"type": "integer", "default": 1, "minimum": 1},
                     "limit": {
                         "type": "integer",
@@ -585,7 +649,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string"},
+                    "task_id": durable_record_id_json_schema(),
                     "event_type": {"type": "string"},
                     "label": {"type": "string"},
                     "status": {
@@ -597,7 +661,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     "detail": {"type": "string"},
                     "artifact_refs": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "items": durable_record_id_json_schema(),
                         "default": [],
                     },
                     "path_refs": {
@@ -617,7 +681,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string"},
+                    "task_id": durable_record_id_json_schema(),
                     "cursor": {"type": "integer", "default": 1, "minimum": 1},
                     "limit": {
                         "type": "integer",
@@ -636,7 +700,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "stream": {"type": "string", "enum": ["stdout", "stderr"]},
                     "offset": {"type": "integer", "default": 0, "minimum": 0},
                     "limit": {
@@ -656,7 +720,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "cursor": {"type": "integer", "default": 1, "minimum": 1},
                     "limit": {
                         "type": "integer",
@@ -675,7 +739,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "label": {"type": "string", "default": "progress"},
                     "current": {"type": "number"},
                     "total": {"type": "number", "exclusiveMinimum": 0},
@@ -696,7 +760,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "cursor": {"type": "integer", "default": 1, "minimum": 1},
                     "limit": {
                         "type": "integer",
@@ -714,7 +778,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "description": "Read a file artifact payload as base64.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"artifact_id": {"type": "string"}},
+                "properties": {"artifact_id": durable_record_id_json_schema()},
                 "required": ["artifact_id"],
                 "additionalProperties": False,
             },
@@ -725,8 +789,9 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "cluster": {"type": "string"},
+                    "route_revision": {"type": "string"},
                     "cancel_scheduler_job": {"type": "boolean", "default": False},
                 },
                 "required": ["job_id"],
@@ -740,6 +805,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                 "type": "object",
                 "properties": {
                     "cluster": {"type": "string"},
+                    "route_revision": {"type": "string"},
                     "state": {
                         "type": "string",
                         "enum": ["queued", "leased", "running", "succeeded", "failed", "canceled"],
@@ -767,8 +833,9 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "cluster": {"type": "string"},
+                    "route_revision": {"type": "string"},
                     "older_than_seconds": {
                         "type": "integer",
                         "minimum": 1,
@@ -792,7 +859,8 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                 "type": "object",
                 "properties": {
                     "cluster": {"type": "string"},
-                    "job_id": {"type": "string"},
+                    "route_revision": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "older_than_seconds": {"type": "integer", "minimum": 1},
                     "kind": {
                         "type": "string",
@@ -803,7 +871,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 10000,
-                        "default": 1000,
+                        "default": DEFAULT_STALE_SCAN_LIMIT,
                     },
                 },
                 "required": ["cluster", "older_than_seconds"],
@@ -819,7 +887,8 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                 "type": "object",
                 "properties": {
                     "cluster": {"type": "string"},
-                    "job_id": {"type": "string"},
+                    "route_revision": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "older_than_seconds": {
                         "type": "integer",
                         "minimum": 1,
@@ -837,7 +906,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 10000,
-                        "default": 1000,
+                        "default": DEFAULT_STALE_SCAN_LIMIT,
                     },
                 },
                 "required": ["cluster"],
@@ -850,7 +919,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "expected_updated_at": {"type": "string", "format": "date-time"},
                 },
                 "required": ["job_id"],
@@ -862,7 +931,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "description": "Read the crash-resumable terminal-retention phase.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"job_id": {"type": "string"}},
+                "properties": {"job_id": durable_record_id_json_schema()},
                 "required": ["job_id"],
                 "additionalProperties": False,
             },
@@ -876,7 +945,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "execute": {"type": "boolean", "default": False},
                     "batch_size": {
                         "type": "integer",
@@ -895,7 +964,10 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "description": "Show registered worker capacity and leases.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"cluster": {"type": "string"}},
+                "properties": {
+                    "cluster": {"type": "string"},
+                    "route_revision": {"type": "string"},
+                },
                 "additionalProperties": False,
             },
         },
@@ -905,7 +977,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "pattern": {"type": "string"},
                     "action": {
                         "type": "string",
@@ -929,7 +1001,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string"},
+                    "job_id": durable_record_id_json_schema(),
                     "cursor": {"type": "integer", "default": 1, "minimum": 1},
                     "limit": {
                         "type": "integer",
@@ -981,8 +1053,6 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                         ],
                         "default": "created",
                     },
-                    "scheduler": {"type": "string", "default": "external"},
-                    "scheduler_job_id": {"type": "string"},
                     "queue_state": {"type": "string"},
                     "node": {"type": "string"},
                     "requested_resources": {"type": "object", "default": {}},
@@ -1028,7 +1098,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "description": "Read a durable gateway service session.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"session_id": {"type": "string"}},
+                "properties": {"session_id": durable_record_id_json_schema()},
                 "required": ["session_id"],
                 "additionalProperties": False,
             },
@@ -1039,9 +1109,8 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "session_id": {"type": "string"},
+                    "session_id": durable_record_id_json_schema(),
                     "state": {"type": "string"},
-                    "scheduler_job_id": {"type": "string"},
                     "queue_state": {"type": "string"},
                     "node": {"type": "string"},
                     "requested_resources": {"type": "object"},
@@ -1061,7 +1130,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "description": "Mark a gateway service session closed.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"session_id": {"type": "string"}},
+                "properties": {"session_id": durable_record_id_json_schema()},
                 "required": ["session_id"],
                 "additionalProperties": False,
             },
@@ -1089,6 +1158,8 @@ def _call_tool(
     queue: ClioCoreQueue,
     settings: RelaySettings,
     profile: str,
+    observed_remote_mcp_catalog_revision: str | None,
+    require_advertised_remote_mcp_catalog: bool,
 ) -> JSON:
     name = _required_str(params, "name")
     static_names = static_mcp_tool_names()
@@ -1098,8 +1169,21 @@ def _call_tool(
             raise ValueError(f"tool is not available in MCP profile {profile!r}: {name}")
     else:
         catalog = _remote_mcp_catalog(profile=profile, reserved_names=static_names)
+        _require_observed_remote_mcp_catalog(
+            profile=profile,
+            observed_revision=observed_remote_mcp_catalog_revision,
+            current_revision=catalog.revision,
+        )
         if name not in catalog.tools:
             raise ValueError(f"tool is not available in MCP profile {profile!r}: {name}")
+    if is_virtual_jarvis_tool(name):
+        catalog = _remote_mcp_catalog(profile=profile, reserved_names=static_names)
+        if require_advertised_remote_mcp_catalog:
+            _require_observed_remote_mcp_catalog(
+                profile=profile,
+                observed_revision=observed_remote_mcp_catalog_revision,
+                current_revision=catalog.revision,
+            )
     arguments = _object(params.get("arguments", {}))
     if name == "relay_submit_jarvis_pipeline":
         result = _submit_jarvis_pipeline(arguments, queue=queue)
@@ -1134,10 +1218,28 @@ def _call_tool(
     elif name == "relay_call_jarvis_mcp":
         result = _submit_jarvis_mcp_call(arguments, queue=queue)
     elif is_virtual_jarvis_tool(name):
-        result = _submit_jarvis_mcp_call(
-            virtual_jarvis_call_arguments(name, arguments),
-            queue=queue,
-        )
+        call_arguments = virtual_jarvis_call_arguments(name, arguments)
+        if require_advertised_remote_mcp_catalog:
+            if catalog is None:
+                raise ValueError("JARVIS virtual tool catalog was not resolved")
+            cluster = _required_str(call_arguments, "cluster")
+            expected_route_revision = catalog.cluster_route_revisions.get(cluster)
+            if expected_route_revision is None:
+                raise ValueError(
+                    f"cluster route is not available in the advertised catalog: {cluster}"
+                )
+            expected_artifact_digest = catalog.jarvis_artifact_bindings.get(cluster)
+            if expected_artifact_digest is None:
+                raise ValueError(
+                    "JARVIS MCP identity is not available in the advertised catalog for "
+                    f"{cluster}; refresh JARVIS MCP discovery and call tools/list again"
+                )
+            call_arguments["expected_cluster_route_revision"] = expected_route_revision
+            call_arguments["catalog_expected_server_artifact_digest"] = expected_artifact_digest
+        result = _submit_jarvis_mcp_call(call_arguments, queue=queue)
+        if catalog is None:
+            raise ValueError("JARVIS virtual tool catalog was not resolved")
+        result["catalog_revision"] = catalog.revision
     elif catalog is not None and name in catalog.tools:
         cluster = _required_str(arguments, "cluster")
         route = catalog.resolve(name, cluster)
@@ -1146,10 +1248,14 @@ def _call_tool(
             {
                 "cluster": cluster,
                 "registered_route": True,
+                "registered_remote_mcp_route": True,
                 "server": route.command,
                 "server_args": list(route.args),
                 "env_from": dict(route.env_from),
                 "expected_server_artifact_digest": route.expected_server_artifact_digest,
+                "expected_cluster_route_revision": route.cluster_route_revision,
+                "registered_server_name": route.server_name,
+                "expected_remote_mcp_registration_revision": (route.registration_revision),
                 "tool": route.remote_tool_name,
                 "arguments": forwarded_arguments,
                 "timeout_seconds": route.timeout_seconds,
@@ -1160,21 +1266,24 @@ def _call_tool(
             },
             queue=queue,
         )
+        result["catalog_revision"] = catalog.revision
     elif name == "relay_get_job":
-        result = queue.get_job(_required_str(arguments, "job_id")).model_dump(mode="json")
+        result = queue.get_job(_required_durable_record_id(arguments, "job_id")).model_dump(
+            mode="json"
+        )
     elif name == "relay_get_job_status":
-        result = job_status(queue, _required_str(arguments, "job_id"))
+        result = job_status(queue, _required_durable_record_id(arguments, "job_id"))
     elif name == "relay_monitor_job":
         result = monitor_job(
             queue,
-            _required_str(arguments, "job_id"),
+            _required_durable_record_id(arguments, "job_id"),
             cursor=int(arguments.get("cursor", 1)),
             limit=_response_page_limit(arguments),
         )
     elif name == "relay_watch_job_events":
         events, cursor = queue.drain_events(
             Cursor(
-                job_id=_required_str(arguments, "job_id"),
+                job_id=_required_durable_record_id(arguments, "job_id"),
                 next_seq=int(arguments.get("cursor", 1)),
             ),
             limit=_response_page_limit(arguments),
@@ -1187,7 +1296,7 @@ def _call_tool(
         cursor = _response_page_cursor(arguments)
         limit = _response_page_limit(arguments)
         tasks, next_cursor, total = queue.list_tasks_page(
-            _required_str(arguments, "job_id"),
+            _required_durable_record_id(arguments, "job_id"),
             cursor=cursor,
             limit=limit,
         )
@@ -1203,7 +1312,7 @@ def _call_tool(
         result = _record_task_event(arguments, queue=queue)
     elif name == "relay_watch_task_events":
         events, cursor = queue.drain_task_events(
-            _required_str(arguments, "task_id"),
+            _required_durable_record_id(arguments, "task_id"),
             cursor=int(arguments.get("cursor", 1)),
             limit=_response_page_limit(arguments),
         )
@@ -1212,7 +1321,7 @@ def _call_tool(
             "next_cursor": cursor,
         }
     elif name == "relay_read_job_log":
-        job = queue.get_job(_required_str(arguments, "job_id"))
+        job = queue.get_job(_required_durable_record_id(arguments, "job_id"))
         stream = _required_str(arguments, "stream")
         if stream not in {"stdout", "stderr"}:
             raise ValueError("stream must be stdout or stderr")
@@ -1227,7 +1336,7 @@ def _call_tool(
         cursor = _response_page_cursor(arguments)
         limit = _response_page_limit(arguments)
         artifacts, next_cursor, total = queue.list_artifacts_page(
-            _required_str(arguments, "job_id"),
+            _required_durable_record_id(arguments, "job_id"),
             cursor=cursor,
             limit=limit,
         )
@@ -1240,14 +1349,17 @@ def _call_tool(
             total=total,
         )
     elif name == "relay_read_artifact":
-        result = read_artifact_bytes(queue, _required_str(arguments, "artifact_id"))
+        result = read_artifact_bytes(
+            queue,
+            _required_durable_record_id(arguments, "artifact_id"),
+        )
     elif name == "relay_record_progress":
         result = _record_progress(arguments, queue=queue)
     elif name == "relay_list_progress":
         cursor = _response_page_cursor(arguments)
         limit = _response_page_limit(arguments)
         progress, next_cursor, total = queue.list_progress_page(
-            _required_str(arguments, "job_id"),
+            _required_durable_record_id(arguments, "job_id"),
             cursor=cursor,
             limit=limit,
         )
@@ -1260,67 +1372,18 @@ def _call_tool(
             total=total,
         )
     elif name == "relay_cancel_job":
-        result = cancel_queue_job(
-            queue,
-            _required_str(arguments, "job_id"),
-            cluster=_optional_str(arguments, "cluster"),
-            scheduler_policy=(
-                "request-scheduler"
-                if arguments.get("cancel_scheduler_job") is True
-                else "relay-only"
-            ),
-        )
+        result = _queue_cancel_tool(arguments, queue=queue)
     elif name == "relay_queue_list":
-        raw_state = arguments.get("state")
-        state = JobState(raw_state) if isinstance(raw_state, str) else None
-        raw_kind = arguments.get("kind")
-        kind = JobKind(raw_kind) if isinstance(raw_kind, str) else None
-        result = list_queue_jobs(
-            queue,
-            cluster=_optional_str(arguments, "cluster"),
-            state=state,
-            kind=kind,
-            include_terminal=arguments.get("include_terminal") is True,
-            cursor=_response_page_cursor(arguments),
-            limit=_response_page_limit(arguments),
-            scan_limit=int(arguments.get("scan_limit", 1000)),
-        )
+        result = _queue_list_tool(arguments, queue=queue)
     elif name == "relay_queue_diagnose":
-        result = diagnose_job(
-            queue,
-            _required_str(arguments, "job_id"),
-            cluster=_optional_str(arguments, "cluster"),
-            stale_after_seconds=int(arguments.get("older_than_seconds", 7200)),
-            scan_limit=int(arguments.get("scan_limit", 1000)),
-        )
+        result = _queue_diagnose_tool(arguments, queue=queue)
     elif name == "relay_queue_stale":
-        raw_kind = arguments.get("kind")
-        result = discover_stale_jobs(
-            queue,
-            cluster=_required_str(arguments, "cluster"),
-            older_than_seconds=int(arguments["older_than_seconds"]),
-            job_id=_optional_str(arguments, "job_id"),
-            kind=JobKind(raw_kind) if isinstance(raw_kind, str) else None,
-            limit=int(arguments.get("limit", 100)),
-            scan_limit=int(arguments.get("scan_limit", 1000)),
-        )
+        result = _queue_stale_tool(arguments, queue=queue)
     elif name == "relay_queue_cleanup_stale":
-        raw_kind = arguments.get("kind")
-        result = cleanup_stale_jobs(
-            queue,
-            cluster=_required_str(arguments, "cluster"),
-            older_than_seconds=int(arguments.get("older_than_seconds", 7200)),
-            job_id=_optional_str(arguments, "job_id"),
-            kind=JobKind(raw_kind) if isinstance(raw_kind, str) else None,
-            max_attempts=int(arguments.get("max_attempts", 3)),
-            dry_run=arguments.get("dry_run", True) is not False,
-            cancel_queued=arguments.get("cancel_queued") is True,
-            limit=int(arguments.get("limit", 100)),
-            scan_limit=int(arguments.get("scan_limit", 1000)),
-        )
+        result = _queue_cleanup_stale_tool(arguments, queue=queue)
     elif name == "relay_retention_plan":
         plan = TerminalRetentionCoordinator(queue, settings.spool_dir).plan(
-            _required_str(arguments, "job_id"),
+            _required_durable_record_id(arguments, "job_id"),
             expected_updated_at=_optional_datetime_argument(
                 arguments,
                 "expected_updated_at",
@@ -1331,7 +1394,7 @@ def _call_tool(
             "scheduler_cancel_requested": False,
         }
     elif name == "relay_retention_status":
-        job_id = _required_str(arguments, "job_id")
+        job_id = _required_durable_record_id(arguments, "job_id")
         plan = TerminalRetentionCoordinator(queue, settings.spool_dir).plan(job_id)
         result = {
             "job_id": job_id,
@@ -1349,7 +1412,7 @@ def _call_tool(
         result = (
             TerminalRetentionCoordinator(queue, settings.spool_dir)
             .collect(
-                _required_str(arguments, "job_id"),
+                _required_durable_record_id(arguments, "job_id"),
                 execute=execute,
                 batch_size=_bounded_integer_limit(
                     arguments,
@@ -1365,15 +1428,13 @@ def _call_tool(
             .model_dump(mode="json")
         )
     elif name == "relay_worker_status":
-        result = worker_status(queue, cluster=_optional_str(arguments, "cluster"))
+        result = _worker_status_tool(arguments, queue=queue)
     elif name == "relay_create_monitor_rule":
         result = queue.append_monitor_rule(_monitor_rule_from_arguments(arguments)).model_dump(
             mode="json"
         )
     elif name == "relay_list_monitor_rules":
-        job_id = arguments.get("job_id")
-        if job_id is not None and not isinstance(job_id, str):
-            raise ValueError("job_id must be a string")
+        job_id = _optional_durable_record_id(arguments, "job_id")
         cursor = _response_page_cursor(arguments)
         limit = _response_page_limit(arguments)
         rules, next_cursor, total = queue.list_monitor_rules_page(
@@ -1412,15 +1473,15 @@ def _call_tool(
             "filters_apply_within_source_window": True,
         }
     elif name == "relay_get_gateway_session":
-        result = queue.get_gateway_session(_required_str(arguments, "session_id")).model_dump(
-            mode="json"
-        )
+        result = queue.get_gateway_session(
+            _required_durable_record_id(arguments, "session_id")
+        ).model_dump(mode="json")
     elif name == "relay_update_gateway_session":
         result = _update_gateway_session(arguments, queue=queue)
     elif name == "relay_close_gateway_session":
-        result = queue.close_gateway_session(_required_str(arguments, "session_id")).model_dump(
-            mode="json"
-        )
+        result = queue.close_gateway_session(
+            _required_durable_record_id(arguments, "session_id")
+        ).model_dump(mode="json")
     else:
         raise ValueError(f"unknown tool: {name}")
     return {
@@ -1430,18 +1491,62 @@ def _call_tool(
     }
 
 
+def _require_observed_remote_mcp_catalog(
+    *,
+    profile: str,
+    observed_revision: str | None,
+    current_revision: str,
+) -> None:
+    """Reject virtual calls that are not bound to the current listed catalog."""
+    if observed_revision is None:
+        raise ValueError(
+            "virtual remote MCP tools must be discovered with tools/list in this "
+            f"MCP session for profile {profile!r} before they can be called"
+        )
+    if observed_revision != current_revision:
+        raise ValueError(
+            "remote MCP catalog changed after tools/list for profile "
+            f"{profile!r}; call tools/list again before invoking a virtual remote MCP tool"
+        )
+
+
 def _remote_mcp_catalog(
     *,
     profile: str,
     reserved_names: set[str],
 ) -> VirtualRemoteMcpCatalog:
     try:
-        return load_virtual_remote_mcp_catalog(
+        catalog = load_virtual_remote_mcp_catalog(
             profile=profile,
             reserved_names=reserved_names,
         )
+        cache = RemoteMcpSchemaCache.load(default_remote_mcp_cache_path())
     except (ConfigurationError, OSError, ValidationError) as exc:
         return unavailable_virtual_remote_mcp_catalog(str(exc))
+    now = datetime.now(UTC)
+    jarvis_bindings: dict[str, str | None] = {}
+    for cluster in catalog.cluster_route_revisions:
+        entry = cache.entry_for(cluster, JARVIS_MCP_CACHE_SERVER_NAME)
+        if entry is None:
+            jarvis_bindings[cluster] = None
+            continue
+        try:
+            jarvis_bindings[cluster] = jarvis_mcp_artifact_binding_from_entry(entry, now=now)
+        except ValueError:
+            jarvis_bindings[cluster] = None
+    revision = _stable_digest(
+        {
+            "remote_mcp_catalog_revision": catalog.revision,
+            "jarvis_artifact_bindings": jarvis_bindings,
+        }
+    )
+    return VirtualRemoteMcpCatalog(
+        revision=revision,
+        tools=catalog.tools,
+        issues=catalog.issues,
+        cluster_route_revisions=catalog.cluster_route_revisions,
+        jarvis_artifact_bindings=jarvis_bindings,
+    )
 
 
 def _configured_cluster_names() -> list[str]:
@@ -1457,14 +1562,7 @@ def _configured_cluster_names() -> list[str]:
 
 def _route_revision(definition: ClusterDefinition) -> str:
     """Bind a returned job handle to one durable cluster queue route."""
-    return _stable_digest(
-        {
-            "cluster": definition.name,
-            "ssh_host": definition.ssh_host,
-            "core_dir": definition.core_dir,
-            "spool_dir": definition.spool_dir,
-        }
-    )
+    return cluster_route_revision(definition)
 
 
 def _job_target(arguments: JSON) -> ClusterDefinition | None:
@@ -1501,7 +1599,7 @@ def _require_local_job_cluster(
 
 
 def _status_job(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
-    job_id = _required_str(arguments, "job_id")
+    job_id = _required_durable_record_id(arguments, "job_id")
     target = _job_target(arguments)
     if target is not None and should_execute_on_cluster(target):
         result = _remote_json(target, ["job", "status", job_id], "remote job status")
@@ -1514,6 +1612,364 @@ def _status_job(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
         result["cluster"] = target.name
         result["route_revision"] = _route_revision(target)
     return result
+
+
+def _queue_cancel_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+    """Cancel one queue job through the same local-or-SSH route as the CLI."""
+    job_id = _required_durable_record_id(arguments, "job_id")
+    target = _queue_tool_target(arguments)
+    cluster = _optional_str(arguments, "cluster")
+    cancel_scheduler = _boolean_argument(arguments, "cancel_scheduler_job", default=False)
+    if target is not None and should_execute_on_cluster(target):
+        command = ["queue", "cancel", job_id, "--cluster", target.name]
+        command.append("--cancel-scheduler-job" if cancel_scheduler else "--keep-scheduler-job")
+        return _queue_route_result(
+            _remote_json(target, command, "remote queue cancellation"),
+            target=target,
+            remote=True,
+        )
+    result = cast(
+        JSON,
+        cancel_queue_job(
+            queue,
+            job_id,
+            cluster=cluster,
+            scheduler_policy="request-scheduler" if cancel_scheduler else "relay-only",
+        ),
+    )
+    return _queue_route_result(result, target=target, remote=False)
+
+
+def _queue_list_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+    """List the selected cluster queue locally or through its configured SSH route."""
+    target = _queue_tool_target(arguments)
+    cluster = _optional_str(arguments, "cluster")
+    raw_state = arguments.get("state")
+    if raw_state is not None and not isinstance(raw_state, str):
+        raise ValueError("state must be a string")
+    state = JobState(raw_state) if isinstance(raw_state, str) else None
+    raw_kind = arguments.get("kind")
+    if raw_kind is not None and not isinstance(raw_kind, str):
+        raise ValueError("kind must be a string")
+    kind = JobKind(raw_kind) if isinstance(raw_kind, str) else None
+    include_terminal = _boolean_argument(arguments, "include_terminal", default=False)
+    cursor = _response_page_cursor(arguments)
+    limit = _response_page_limit(arguments)
+    scan_limit = _bounded_integer_limit(
+        arguments,
+        field_name="scan_limit",
+        default=1_000,
+        maximum=10_000,
+    )
+    if scan_limit < limit:
+        raise ValueError("scan_limit must be greater than or equal to limit")
+    if target is not None and should_execute_on_cluster(target):
+        command = [
+            "queue",
+            "list",
+            "--cluster",
+            target.name,
+            "--cursor",
+            str(cursor),
+            "--limit",
+            str(limit),
+            "--scan-limit",
+            str(scan_limit),
+        ]
+        if state is not None:
+            command.extend(["--state", state.value])
+        if kind is not None:
+            command.extend(["--kind", kind.value])
+        if include_terminal:
+            command.append("--include-terminal")
+        return _queue_route_result(
+            _remote_json(target, command, "remote queue listing"),
+            target=target,
+            remote=True,
+        )
+    result = cast(
+        JSON,
+        list_queue_jobs(
+            queue,
+            cluster=cluster,
+            state=state,
+            kind=kind,
+            include_terminal=include_terminal,
+            cursor=cursor,
+            limit=limit,
+            scan_limit=scan_limit,
+        ),
+    )
+    return _queue_route_result(result, target=target, remote=False)
+
+
+def _queue_diagnose_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+    """Diagnose one exact queue job on its configured local or SSH route."""
+    job_id = _required_durable_record_id(arguments, "job_id")
+    target = _queue_tool_target(arguments)
+    cluster = _optional_str(arguments, "cluster")
+    older_than_seconds = _positive_integer_argument(
+        arguments,
+        "older_than_seconds",
+        default=7_200,
+    )
+    scan_limit = _bounded_integer_limit(
+        arguments,
+        field_name="scan_limit",
+        default=1_000,
+        maximum=10_000,
+    )
+    if target is not None and should_execute_on_cluster(target):
+        return _queue_route_result(
+            _remote_json(
+                target,
+                [
+                    "queue",
+                    "diagnose",
+                    job_id,
+                    "--cluster",
+                    target.name,
+                    "--older-than",
+                    f"{older_than_seconds}s",
+                    "--scan-limit",
+                    str(scan_limit),
+                ],
+                "remote queue diagnosis",
+            ),
+            target=target,
+            remote=True,
+        )
+    result = cast(
+        JSON,
+        diagnose_job(
+            queue,
+            job_id,
+            cluster=cluster,
+            stale_after_seconds=older_than_seconds,
+            scan_limit=scan_limit,
+        ),
+    )
+    return _queue_route_result(result, target=target, remote=False)
+
+
+def _queue_stale_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+    """Discover stale jobs on the selected local or SSH-backed cluster queue."""
+    target = _queue_tool_target(arguments)
+    cluster = _required_str(arguments, "cluster")
+    older_than_seconds = _positive_integer_argument(
+        arguments,
+        "older_than_seconds",
+        required=True,
+    )
+    job_id = _optional_durable_record_id(arguments, "job_id")
+    raw_kind = arguments.get("kind")
+    if raw_kind is not None and not isinstance(raw_kind, str):
+        raise ValueError("kind must be a string")
+    kind = JobKind(raw_kind) if isinstance(raw_kind, str) else None
+    limit = _response_page_limit(arguments)
+    scan_limit = _bounded_integer_limit(
+        arguments,
+        field_name="scan_limit",
+        default=DEFAULT_STALE_SCAN_LIMIT,
+        maximum=10_000,
+    )
+    if scan_limit < limit:
+        raise ValueError("scan_limit must be greater than or equal to limit")
+    if target is not None and should_execute_on_cluster(target):
+        command = [
+            "queue",
+            "stale",
+            "--cluster",
+            target.name,
+            "--older-than",
+            f"{older_than_seconds}s",
+            "--limit",
+            str(limit),
+            "--scan-limit",
+            str(scan_limit),
+        ]
+        if job_id is not None:
+            command.extend(["--job-id", job_id])
+        if kind is not None:
+            command.extend(["--kind", kind.value])
+        return _queue_route_result(
+            _remote_json(target, command, "remote stale queue discovery"),
+            target=target,
+            remote=True,
+        )
+    result = cast(
+        JSON,
+        discover_stale_jobs(
+            queue,
+            cluster=cluster,
+            older_than_seconds=older_than_seconds,
+            job_id=job_id,
+            kind=kind,
+            limit=limit,
+            scan_limit=scan_limit,
+        ),
+    )
+    return _queue_route_result(result, target=target, remote=False)
+
+
+def _queue_cleanup_stale_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+    """Preview or execute stale cleanup on the selected cluster queue route."""
+    target = _queue_tool_target(arguments)
+    cluster = _required_str(arguments, "cluster")
+    older_than_seconds = _positive_integer_argument(
+        arguments,
+        "older_than_seconds",
+        default=7_200,
+    )
+    max_attempts = _positive_integer_argument(arguments, "max_attempts", default=3)
+    dry_run = _boolean_argument(arguments, "dry_run", default=True)
+    cancel_queued = _boolean_argument(arguments, "cancel_queued", default=False)
+    job_id = _optional_durable_record_id(arguments, "job_id")
+    raw_kind = arguments.get("kind")
+    if raw_kind is not None and not isinstance(raw_kind, str):
+        raise ValueError("kind must be a string")
+    kind = JobKind(raw_kind) if isinstance(raw_kind, str) else None
+    limit = _response_page_limit(arguments)
+    scan_limit = _bounded_integer_limit(
+        arguments,
+        field_name="scan_limit",
+        default=DEFAULT_STALE_SCAN_LIMIT,
+        maximum=10_000,
+    )
+    if scan_limit < limit:
+        raise ValueError("scan_limit must be greater than or equal to limit")
+    if target is not None and should_execute_on_cluster(target):
+        command = [
+            "queue",
+            "cleanup-stale",
+            "--cluster",
+            target.name,
+            "--older-than",
+            f"{older_than_seconds}s",
+            "--max-attempts",
+            str(max_attempts),
+            "--limit",
+            str(limit),
+            "--scan-limit",
+            str(scan_limit),
+            "--dry-run" if dry_run else "--no-dry-run",
+        ]
+        if job_id is not None:
+            command.extend(["--job-id", job_id])
+        if kind is not None:
+            command.extend(["--kind", kind.value])
+        if cancel_queued:
+            command.append("--cancel-queued")
+        return _queue_route_result(
+            _remote_json(target, command, "remote stale queue cleanup"),
+            target=target,
+            remote=True,
+        )
+    result = cast(
+        JSON,
+        cleanup_stale_jobs(
+            queue,
+            cluster=cluster,
+            older_than_seconds=older_than_seconds,
+            job_id=job_id,
+            kind=kind,
+            max_attempts=max_attempts,
+            dry_run=dry_run,
+            cancel_queued=cancel_queued,
+            limit=limit,
+            scan_limit=scan_limit,
+        ),
+    )
+    return _queue_route_result(result, target=target, remote=False)
+
+
+def _worker_status_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+    """Read worker capacity from the selected local or SSH-backed queue route."""
+    target = _queue_tool_target(arguments)
+    cluster = _optional_str(arguments, "cluster")
+    if target is not None and should_execute_on_cluster(target):
+        return _queue_route_result(
+            _remote_json(
+                target,
+                ["worker", "status", "--cluster", target.name],
+                "remote worker status",
+            ),
+            target=target,
+            remote=True,
+        )
+    result = cast(JSON, worker_status(queue, cluster=cluster))
+    return _queue_route_result(result, target=target, remote=False)
+
+
+def _queue_tool_target(arguments: JSON) -> ClusterDefinition | None:
+    """Resolve an optional cluster route while preserving unregistered local queues."""
+    raw_cluster = arguments.get("cluster")
+    raw_revision = arguments.get("route_revision")
+    if raw_cluster is None:
+        if raw_revision is not None:
+            raise ValueError("route_revision requires cluster")
+        return None
+    if not isinstance(raw_cluster, str) or not raw_cluster:
+        raise ValueError("cluster must be a non-empty string")
+    if raw_revision is not None and (not isinstance(raw_revision, str) or not raw_revision):
+        raise ValueError("route_revision must be a non-empty string")
+    registry_path = default_registry_path()
+    if not registry_path.exists():
+        if raw_revision is not None:
+            raise ValueError(f"cluster route is not configured: {raw_cluster}")
+        return None
+    definition = ClusterRegistry.load(registry_path).clusters.get(raw_cluster)
+    if definition is None:
+        if raw_revision is not None:
+            raise ValueError(f"cluster route is not configured: {raw_cluster}")
+        return None
+    expected_revision = _route_revision(definition)
+    if raw_revision is not None and raw_revision != expected_revision:
+        raise ValueError(
+            f"cluster route changed for {raw_cluster}; refuse to use stale queue routing"
+        )
+    return definition
+
+
+def _queue_route_result(
+    result: JSON,
+    *,
+    target: ClusterDefinition | None,
+    remote: bool,
+) -> JSON:
+    """Attach stable route identity to queue results when a target is configured."""
+    if target is None:
+        return result
+    result["cluster"] = target.name
+    result["route_revision"] = _route_revision(target)
+    result["remote"] = remote
+    return result
+
+
+def _positive_integer_argument(
+    arguments: JSON,
+    field_name: str,
+    *,
+    default: int | None = None,
+    required: bool = False,
+) -> int:
+    """Read one positive integer without treating booleans as integers."""
+    if field_name not in arguments:
+        if required or default is None:
+            raise ValueError(f"{field_name} is required")
+        return default
+    value = arguments[field_name]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{field_name} must be a positive integer")
+    return value
+
+
+def _boolean_argument(arguments: JSON, field_name: str, *, default: bool) -> bool:
+    """Read one strict boolean argument."""
+    value = arguments.get(field_name, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a boolean")
+    return value
 
 
 def _remote_json(
@@ -1771,6 +2227,7 @@ def _decode_verified_mcp_result(envelope: JSON, *, artifact: JSON, job_id: str) 
             "protocol_result",
             "protocol_version",
             "server_info",
+            "result_validation",
         )
     }
 
@@ -1791,7 +2248,7 @@ def _render_remote_mcp_context(catalog: VirtualRemoteMcpCatalog) -> str:
 def _cancel_job(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     target = _job_target(arguments)
     if target is not None and should_execute_on_cluster(target):
-        job_id = _required_str(arguments, "job_id")
+        job_id = _required_durable_record_id(arguments, "job_id")
         command = ["job", "cancel", job_id]
         cancel_scheduler = arguments.get("cancel_scheduler_job") is True
         if cancel_scheduler:
@@ -1803,10 +2260,14 @@ def _cancel_job(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
         result["cluster"] = target.name
         result["route_revision"] = _route_revision(target)
         return result
-    _require_local_job_cluster(queue, _required_str(arguments, "job_id"), target)
+    _require_local_job_cluster(
+        queue,
+        _required_durable_record_id(arguments, "job_id"),
+        target,
+    )
     result = cancel_queue_job(
         queue,
-        _required_str(arguments, "job_id"),
+        _required_durable_record_id(arguments, "job_id"),
         scheduler_policy=(
             "request-scheduler" if arguments.get("cancel_scheduler_job") is True else "relay-only"
         ),
@@ -1824,7 +2285,7 @@ def _cancel_job(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
 
 
 def _observe_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -> JSON:
-    job_id = _required_str(arguments, "job_id")
+    job_id = _required_durable_record_id(arguments, "job_id")
     cursor = int(arguments.get("cursor", 1))
     limit = _response_page_limit(arguments)
     target = _job_target(arguments)
@@ -1888,7 +2349,7 @@ def _observe_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettin
 
 
 def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -> JSON:
-    job_id = _required_str(arguments, "job_id")
+    job_id = _required_durable_record_id(arguments, "job_id")
     target = _job_target(arguments)
     if target is not None and should_execute_on_cluster(target):
         run_remote_clio(
@@ -2110,11 +2571,52 @@ def _submit_mcp_call(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
         )
     )
     registered_route = arguments.get("registered_route") is True
+    registered_remote_mcp_route = arguments.get("registered_remote_mcp_route") is True
+    if registered_remote_mcp_route and not registered_route:
+        raise ValueError("registered remote MCP route requires a strict cluster route")
+    expected_cluster_route_revision = _optional_str(
+        arguments,
+        "expected_cluster_route_revision",
+    )
+    registered_server_name = _optional_str(arguments, "registered_server_name")
+    expected_registration_revision = _optional_str(
+        arguments,
+        "expected_remote_mcp_registration_revision",
+    )
     definition = (
         _remote_cluster_definition(cluster)
         if registered_route
         else _optional_cluster_definition(cluster)
     )
+    if definition is not None and expected_cluster_route_revision is not None:
+        observed_cluster_route_revision = _route_revision(definition)
+        if not hmac.compare_digest(
+            observed_cluster_route_revision,
+            expected_cluster_route_revision,
+        ):
+            raise ValueError(
+                f"cluster route changed for {cluster}; call tools/list again before submission"
+            )
+    if registered_remote_mcp_route:
+        if registered_server_name is None or expected_registration_revision is None:
+            raise ValueError("registered remote MCP route is missing its revision binding")
+        if definition is None:
+            raise ValueError(f"cluster is not configured: {cluster}")
+        current_registration = definition.remote_mcp_servers.get(registered_server_name)
+        if current_registration is None:
+            raise ValueError(
+                f"remote MCP registration changed for {cluster}/{registered_server_name}; "
+                "call tools/list again before submission"
+            )
+        current_registration_revision = remote_mcp_registration_revision(current_registration)
+        if not hmac.compare_digest(
+            current_registration_revision,
+            expected_registration_revision,
+        ):
+            raise ValueError(
+                f"remote MCP registration changed for {cluster}/{registered_server_name}; "
+                "call tools/list again before submission"
+            )
     if definition is not None and should_execute_on_cluster(definition):
         remote_args_path = (
             ".local/share/clio-relay/desktop-submissions/"
@@ -2225,9 +2727,36 @@ def _submit_jarvis_mcp_call(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
         if registered_route
         else _optional_cluster_definition(cluster)
     )
+    expected_cluster_route_revision = _optional_str(
+        arguments,
+        "expected_cluster_route_revision",
+    )
+    if definition is not None and expected_cluster_route_revision is not None:
+        observed_cluster_route_revision = _route_revision(definition)
+        if not hmac.compare_digest(
+            observed_cluster_route_revision,
+            expected_cluster_route_revision,
+        ):
+            raise ValueError(
+                f"cluster route changed for {cluster}; call tools/list again before submission"
+            )
     expected_server_artifact_digest = (
         jarvis_mcp_artifact_binding(cluster) if registered_route else None
     )
+    catalog_expected_server_artifact_digest = _optional_str(
+        arguments,
+        "catalog_expected_server_artifact_digest",
+    )
+    if catalog_expected_server_artifact_digest is not None and (
+        expected_server_artifact_digest is None
+        or not hmac.compare_digest(
+            expected_server_artifact_digest,
+            catalog_expected_server_artifact_digest,
+        )
+    ):
+        raise ValueError(
+            f"JARVIS MCP identity changed for {cluster}; call tools/list again before submission"
+        )
     if expected_server_artifact_digest is not None:
         forwarded["expected_server_artifact_digest"] = expected_server_artifact_digest
     if definition is not None and should_execute_on_cluster(definition):
@@ -2311,7 +2840,7 @@ def _monitor_rule_from_arguments(arguments: JSON) -> MonitorRule:
         raise ValueError("event_types must be a string array")
     event_types = cast(list[str], event_type_items)
     return MonitorRule(
-        job_id=_required_str(arguments, "job_id"),
+        job_id=_required_durable_record_id(arguments, "job_id"),
         pattern=_required_str(arguments, "pattern"),
         action=MonitorRuleAction(str(arguments.get("action", "emit_event"))),
         event_types=event_types,
@@ -2326,7 +2855,7 @@ def _record_progress(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     typed_metadata = external_progress_metadata("external_mcp", cast(dict[str, Any], metadata))
     progress = queue.append_progress(
         ProgressRecord(
-            job_id=_required_str(arguments, "job_id"),
+            job_id=_required_durable_record_id(arguments, "job_id"),
             label=str(arguments.get("label", "progress")),
             current=_optional_float(arguments, "current"),
             total=_optional_float(arguments, "total"),
@@ -2343,7 +2872,7 @@ def _record_task_event(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     metadata = _object(arguments.get("metadata", {}))
     event = queue.append_task_event(
         TaskTimelineEvent(
-            task_id=_required_str(arguments, "task_id"),
+            task_id=_required_durable_record_id(arguments, "task_id"),
             event_type=_required_str(arguments, "event_type"),
             label=_required_str(arguments, "label"),
             status=TaskEventStatus(str(arguments.get("status", "running"))),
@@ -2358,13 +2887,12 @@ def _record_task_event(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
 
 
 def _create_gateway_session(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+    _reject_generic_gateway_runtime_fields(arguments, creating=True)
     session = queue.create_gateway_session(
         GatewaySession(
             cluster=_required_str(arguments, "cluster"),
             name=_required_str(arguments, "name"),
             state=GatewaySessionState(str(arguments.get("state", "created"))),
-            scheduler=str(arguments.get("scheduler", "external")),
-            scheduler_job_id=_optional_str(arguments, "scheduler_job_id"),
             queue_state=_optional_str(arguments, "queue_state"),
             node=_optional_str(arguments, "node"),
             requested_resources=_object(arguments.get("requested_resources", {})),
@@ -2379,9 +2907,9 @@ def _create_gateway_session(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
 
 
 def _update_gateway_session(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+    _reject_generic_gateway_runtime_fields(arguments, creating=False)
     updates: dict[str, object] = {}
     for key in {
-        "scheduler_job_id",
         "queue_state",
         "node",
         "stdout_uri",
@@ -2399,12 +2927,67 @@ def _update_gateway_session(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     state_value = arguments.get("state")
     state = GatewaySessionState(str(state_value)) if state_value is not None else None
     session = queue.update_gateway_session(
-        _required_str(arguments, "session_id"),
+        _required_durable_record_id(arguments, "session_id"),
         state=state,
         metadata=_object(arguments.get("metadata", {})),
+        reject_relay_managed_fields=True,
         **updates,
     )
     return session.model_dump(mode="json")
+
+
+_RELAY_RUNTIME_GATEWAY_KEYS = frozenset(
+    {
+        "runtime_spec",
+        "ownership_intents",
+        "teardown_intent",
+        "teardown",
+        "detach",
+        "scheduler_provider",
+        "scheduler_job_id",
+        "scheduler_native_id",
+    }
+)
+_RELAY_RUNTIME_CONNECTOR_KEYS = frozenset({"desktop_connector", "remote_connector"})
+_RELAY_OWNERSHIP_METADATA_KEYS = frozenset(
+    {
+        "owner",
+        "owner_session_id",
+        "owner_session_generation_id",
+        "owner_session_admission_id",
+        "runtime_kind",
+        "scheduler_provider",
+        "scheduler_job_id",
+        "scheduler_native_id",
+    }
+)
+
+
+def _reject_generic_gateway_runtime_fields(arguments: JSON, *, creating: bool) -> None:
+    """Keep generic MCP gateway tools outside relay-owned runtime identity."""
+    protected: list[str] = []
+    top_level = {"scheduler_job_id"}
+    if creating:
+        top_level.add("scheduler")
+    protected.extend(sorted(top_level.intersection(arguments)))
+    gateway = _object(arguments.get("gateway", {}))
+    protected.extend(sorted(_RELAY_RUNTIME_GATEWAY_KEYS.intersection(gateway)))
+    transport = gateway.get("transport")
+    if isinstance(transport, dict):
+        typed_transport = cast(JSON, transport)
+        protected.extend(
+            f"gateway.transport.{key}"
+            for key in sorted(_RELAY_RUNTIME_CONNECTOR_KEYS.intersection(typed_transport))
+        )
+    metadata = _object(arguments.get("metadata", {}))
+    protected.extend(
+        f"metadata.{key}" for key in sorted(_RELAY_OWNERSHIP_METADATA_KEYS.intersection(metadata))
+    )
+    if protected:
+        raise ValueError(
+            "generic gateway tools cannot write relay-managed runtime fields: "
+            + ", ".join(protected)
+        )
 
 
 def _object(value: Any) -> JSON:
@@ -2427,6 +3010,17 @@ def _optional_str(value: JSON, key: str) -> str | None:
     if not isinstance(item, str) or not item:
         raise ValueError(f"{key} must be a non-empty string")
     return item
+
+
+def _required_durable_record_id(value: JSON, key: str) -> str:
+    """Read and validate a required durable record ID before queue access."""
+    return validate_durable_record_id(_required_str(value, key))
+
+
+def _optional_durable_record_id(value: JSON, key: str) -> str | None:
+    """Read and validate an optional durable record ID before queue access."""
+    item = _optional_str(value, key)
+    return None if item is None else validate_durable_record_id(item)
 
 
 def _string_list(value: Any, name: str) -> list[str]:

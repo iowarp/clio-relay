@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from pathlib import Path
 from typing import cast
 
 import pytest
 
-from clio_relay.promotion_record import build_promotion_record, canonical_promotion_bytes
+from clio_relay.promotion_record import (
+    MAX_PYPI_JSON_BYTES,
+    build_promotion_record,
+    canonical_promotion_bytes,
+    fetch_pypi_document,
+)
 
 
 def _write_candidate(tmp_path: Path) -> tuple[Path, Path, Path, str, dict[str, object]]:
@@ -84,3 +90,24 @@ def test_promotion_record_rejects_partial_or_different_pypi_state(tmp_path: Path
             candidate_gate=gate,
             pypi_document=document,
         )
+
+
+def test_pypi_document_fetch_is_bounded_before_json_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Response(io.BytesIO):
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.close()
+
+    def oversized_response(url: str, *, timeout: int) -> Response:
+        assert url == "https://pypi.org/pypi/clio-relay/1.0.0/json"
+        assert timeout == 30
+        return Response(b"x" * (MAX_PYPI_JSON_BYTES + 1))
+
+    monkeypatch.setattr("urllib.request.urlopen", oversized_response)
+
+    with pytest.raises(ValueError, match="bounded response size"):
+        fetch_pypi_document("1.0.0")

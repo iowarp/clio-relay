@@ -42,6 +42,7 @@ REQUIRED_ENVIRONMENTS: tuple[str, ...] = (
 CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
 RELEASE_TAG_PATTERN = "refs/tags/v*"
 MAX_RELEASE_ASSET_METADATA_RECORDS = 96
+MAX_RELEASE_HISTORY_PAGES = 100
 MAX_VALIDATION_REPORT_ASSETS = 64
 MAX_VALIDATION_REPORT_BYTES = 8 * 1024 * 1024
 MAX_VALIDATION_REPORT_AGGREGATE_BYTES = 64 * 1024 * 1024
@@ -61,6 +62,8 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_RELEASE_ASSET_BYTES = 128 * 1024 * 1024
 MAX_RELEASE_ASSET_AGGREGATE_BYTES = 512 * 1024 * 1024
 TAG_PAYLOAD_FIXED_FILES = frozenset({"SHA256SUMS", "validation-local.json"})
+RELEASE_ACCEPTANCE_MATRIX_SCHEMA = "clio-relay.release-acceptance-matrix.v1"
+RELEASE_ACCEPTANCE_MATRIX_STAGES = ("candidate", "released")
 
 
 class ProvenanceError(ValueError):
@@ -1266,7 +1269,6 @@ def verify_release_identity(
     _positive_integer(release.get("id"), "GitHub release id")
     expected: dict[str, object] = {
         "tag_name": tag,
-        "target_commitish": source_commit,
         "prerelease": expect_prerelease,
     }
     if expect_draft is not None:
@@ -1276,8 +1278,81 @@ def verify_release_identity(
         raise ProvenanceError(f"GitHub release identity mismatch: {sorted(mismatches)}")
     if resolved_tag_commit != source_commit:
         raise ProvenanceError("live release tag does not resolve to the reviewed source commit")
+    # GitHub ignores target_commitish when a release is created for an existing
+    # tag.  The stored value may therefore be ``main`` even when the workflow
+    # supplied the exact SHA.  Its live resolution, not its spelling, is what
+    # must remain bound to the reviewed commit.
     if resolved_target_commit != source_commit:
         raise ProvenanceError("release target does not resolve to the reviewed source commit")
+
+
+def resolve_live_release(
+    *,
+    repository: str,
+    tag: str,
+    expect_draft: bool | None,
+    fetch_json: GitHubJsonFetcher,
+    allow_absent: bool = False,
+) -> dict[str, object] | None:
+    """Resolve one exact release by tag through a bounded list and numeric ID.
+
+    GitHub's tag-scoped release endpoint does not expose draft releases. This
+    resolver therefore walks bounded 100-record pages to an explicit empty page,
+    requires stable numeric identities and one unique tag match, and then reloads
+    that match through the numeric release endpoint before returning it.
+    """
+    _validate_repository(repository)
+    _validate_tag(tag)
+    release_summaries: list[object] = []
+    for page_number in range(1, MAX_RELEASE_HISTORY_PAGES + 1):
+        page = _list(
+            fetch_json(f"repos/{repository}/releases?per_page=100&page={page_number}"),
+            f"GitHub releases page {page_number}",
+        )
+        if len(page) > 100:
+            raise ProvenanceError(
+                f"GitHub releases page {page_number} exceeds the requested page size"
+            )
+        if not page:
+            break
+        release_summaries.extend(page)
+    else:
+        raise ProvenanceError("repository release history exceeds the bounded pagination window")
+    matches: list[dict[str, object]] = []
+    seen_release_ids: set[int] = set()
+    for item in release_summaries:
+        summary = _mapping(item, "GitHub release summary")
+        release_id = _positive_integer(summary.get("id"), "GitHub release id")
+        if release_id in seen_release_ids:
+            raise ProvenanceError(
+                f"GitHub release history changed during pagination: duplicate id {release_id}"
+            )
+        seen_release_ids.add(release_id)
+        if summary.get("tag_name") == tag:
+            matches.append(summary)
+    if not matches:
+        if allow_absent:
+            return None
+        raise GitHubNotFound(f"GitHub release was not found for tag: {tag}")
+    if len(matches) != 1:
+        raise ProvenanceError(f"expected one GitHub release for {tag}; found {len(matches)}")
+    summary = matches[0]
+    release_id = _positive_integer(summary.get("id"), "GitHub release id")
+    release = _mapping(
+        fetch_json(f"repos/{repository}/releases/{release_id}"),
+        "GitHub release",
+    )
+    compared_fields = ("id", "tag_name", "target_commitish", "draft", "prerelease")
+    mismatches = [field for field in compared_fields if release.get(field) != summary.get(field)]
+    if mismatches:
+        raise ProvenanceError(
+            f"GitHub release changed during numeric resolution: {sorted(mismatches)}"
+        )
+    if release.get("tag_name") != tag:
+        raise ProvenanceError("numeric GitHub release identity does not match the requested tag")
+    if expect_draft is not None and release.get("draft") is not expect_draft:
+        raise ProvenanceError("GitHub release draft state does not match the required state")
+    return release
 
 
 def verify_live_release_identity(
@@ -1293,10 +1368,14 @@ def verify_live_release_identity(
     _validate_repository(repository)
     _validate_tag(tag)
     _validate_commit(source_commit)
-    release = _mapping(
-        fetch_json(f"repos/{repository}/releases/tags/{tag}"),
-        "GitHub release",
+    release = resolve_live_release(
+        repository=repository,
+        tag=tag,
+        expect_draft=expect_draft,
+        fetch_json=fetch_json,
     )
+    if release is None:  # pragma: no cover - allow_absent is false above.
+        raise GitHubNotFound(f"GitHub release was not found for tag: {tag}")
     target = _nonempty_string(release.get("target_commitish"), "release target_commitish")
     if re.fullmatch(r"[A-Za-z0-9_./-]+", target) is None or ".." in target:
         raise ProvenanceError("release target_commitish is unsafe")
@@ -1360,14 +1439,14 @@ def verify_live_mutation_authority(
         raise ProvenanceError("release state expectation is invalid")
     if release_state == "present" and expect_draft is None:
         raise ProvenanceError("present release mutation requires an exact draft state")
-    try:
-        release = _mapping(
-            fetch_json(f"repos/{repository}/releases/tags/{tag}"),
-            "GitHub release",
-        )
-    except GitHubNotFound:
-        if release_state == "present":
-            raise ProvenanceError("GitHub release is absent before persistent mutation") from None
+    release = resolve_live_release(
+        repository=repository,
+        tag=tag,
+        expect_draft=expect_draft if release_state == "present" else None,
+        fetch_json=fetch_json,
+        allow_absent=release_state == "absent",
+    )
+    if release is None:
         return
     if release_state == "absent":
         raise ProvenanceError("GitHub release appeared before create mutation")
@@ -1388,156 +1467,6 @@ def verify_live_mutation_authority(
         ),
         expect_draft=expect_draft,
         expect_prerelease=False,
-    )
-
-
-def build_reviewer_exclusions(
-    source_identity: object,
-    source_prs_document: object,
-    pr_commit_documents: Mapping[int, object],
-    *,
-    dispatcher_login: str,
-    dispatcher_id: int,
-) -> dict[str, object]:
-    """Build the fail-closed contributor set for an independent seal reviewer."""
-    reviewer_login = _nonempty_string(dispatcher_login, "dispatcher login")
-    reviewer_id = _positive_integer(dispatcher_id, "dispatcher id")
-    source = _mapping(source_identity, "source commit identity")
-    author = _github_identity(source.get("author"), "source commit author")
-    committer = _github_identity(source.get("committer"), "source commit committer")
-    raw_prs = _list(source_prs_document, "associated source pull requests")
-    if len(raw_prs) >= 100:
-        raise ProvenanceError("associated pull request query is not provably complete")
-    summaries: list[tuple[int, int, dict[str, object]]] = []
-    for raw in raw_prs:
-        pr = _mapping(raw, "associated source pull request")
-        base = _mapping(pr.get("base"), "associated source pull request base")
-        if pr.get("merged_at") is None or base.get("ref") != "main":
-            continue
-        number = _positive_integer(pr.get("number"), "associated pull request number")
-        expected_commits = _positive_integer(
-            pr.get("commits"), f"associated pull request {number} commit count"
-        )
-        if expected_commits > 100:
-            raise ProvenanceError(f"associated pull request {number} has over 100 commits")
-        opener = _github_identity(pr.get("user"), f"associated pull request {number} opener")
-        summaries.append((number, expected_commits, opener))
-    if not summaries:
-        raise ProvenanceError("source commit has no merged associated pull request to main")
-    numbers = [number for number, _, _ in summaries]
-    if len(numbers) != len(set(numbers)):
-        raise ProvenanceError("associated pull request query contains duplicate numbers")
-    if set(pr_commit_documents) != set(numbers):
-        raise ProvenanceError("associated pull request commit documents are missing or extra")
-
-    identities: dict[int, str] = {}
-    pr_authors: dict[int, str] = {}
-
-    def add_identity(identity: Mapping[str, object], *, is_pr_author: bool = False) -> None:
-        login = cast(str, identity["login"])
-        identity_id = cast(int, identity["id"])
-        existing = identities.get(identity_id)
-        if existing is not None and existing != login:
-            raise ProvenanceError(f"GitHub identity {identity_id} has conflicting logins")
-        identities[identity_id] = login
-        if is_pr_author:
-            pr_authors[identity_id] = login
-
-    add_identity(author)
-    add_identity(committer)
-    for number, expected_commits, opener in summaries:
-        add_identity(opener, is_pr_author=True)
-        commits = _list(
-            pr_commit_documents[number],
-            f"associated pull request {number} commits",
-        )
-        if len(commits) != expected_commits:
-            raise ProvenanceError(
-                f"associated pull request {number} commit query is incomplete: "
-                f"expected={expected_commits}, observed={len(commits)}"
-            )
-        for index, raw in enumerate(commits, start=1):
-            commit = _mapping(raw, f"associated pull request {number} commit {index}")
-            add_identity(
-                _github_identity(
-                    commit.get("author"),
-                    f"associated pull request {number} commit {index} author",
-                )
-            )
-            add_identity(
-                _github_identity(
-                    commit.get("committer"),
-                    f"associated pull request {number} commit {index} committer",
-                )
-            )
-    if reviewer_id in identities or reviewer_login in identities.values():
-        raise ProvenanceError("sealing dispatcher contributed to the associated source change")
-    return {
-        "schema_version": "1.0",
-        "reviewer_login": reviewer_login,
-        "reviewer_id": reviewer_id,
-        "source_author": author,
-        "source_committer": committer,
-        "source_pr_authors": [
-            {"login": pr_authors[identity_id], "id": identity_id}
-            for identity_id in sorted(pr_authors)
-        ],
-        "source_contributor_ids": sorted(identities),
-    }
-
-
-def fetch_reviewer_exclusions(
-    *,
-    repository: str,
-    source_commit: str,
-    dispatcher_login: str,
-    dispatcher_id: int,
-    fetch_json: GitHubJsonFetcher,
-) -> dict[str, object]:
-    """Fetch every bounded associated-PR identity and build reviewer exclusions."""
-    _validate_repository(repository)
-    _validate_commit(source_commit)
-    source = fetch_json(f"repos/{repository}/commits/{source_commit}")
-    raw_associations = fetch_json(f"repos/{repository}/commits/{source_commit}/pulls?per_page=100")
-    associations = _list(raw_associations, "associated source pull requests")
-    if len(associations) >= 100:
-        raise ProvenanceError("associated pull request query is not provably complete")
-    detailed_prs: list[object] = []
-    seen_numbers: set[int] = set()
-    for raw in associations:
-        association = _mapping(raw, "associated source pull request")
-        number = _positive_integer(association.get("number"), "associated pull request number")
-        if number in seen_numbers:
-            raise ProvenanceError("associated pull request query contains duplicate numbers")
-        seen_numbers.add(number)
-        detail = _mapping(
-            fetch_json(f"repos/{repository}/pulls/{number}"),
-            f"associated pull request {number} detail",
-        )
-        if detail.get("number") != number:
-            raise ProvenanceError(f"associated pull request {number} detail identity mismatch")
-        detailed_prs.append(detail)
-    pr_commits: dict[int, object] = {}
-    for raw in detailed_prs:
-        pr = _mapping(raw, "associated source pull request")
-        base = _mapping(pr.get("base"), "associated source pull request base")
-        if pr.get("merged_at") is None or base.get("ref") != "main":
-            continue
-        number = _positive_integer(pr.get("number"), "associated pull request number")
-        expected_commits = _positive_integer(
-            pr.get("commits"), f"associated pull request {number} commit count"
-        )
-        if expected_commits > 100:
-            raise ProvenanceError(f"associated pull request {number} has over 100 commits")
-        if number in pr_commits:
-            raise ProvenanceError("associated pull request query contains duplicate numbers")
-        pr_commits[number] = fetch_json(f"repos/{repository}/pulls/{number}/commits?per_page=100")
-    return build_reviewer_exclusions(
-        source,
-        detailed_prs,
-        pr_commits,
-        dispatcher_login=dispatcher_login,
-        dispatcher_id=dispatcher_id,
     )
 
 
@@ -1602,10 +1531,196 @@ def build_staged_release_asset_plan(
     }
 
 
+def validate_release_acceptance_matrix(
+    document: object,
+    *,
+    expected_sha256: str | None = None,
+    expected_release_version: str | None = None,
+) -> dict[str, object]:
+    """Validate and normalize the exact ordered live-acceptance report matrix."""
+    matrix = _mapping(document, "release acceptance matrix")
+    expected_top_level = {
+        "schema_version",
+        "release_version",
+        "matrix_sha256",
+        "report_count_per_stage",
+        "target_labels_are_policy_evidence_instances",
+        "stages",
+        "reports",
+    }
+    if set(matrix) != expected_top_level:
+        raise ProvenanceError(
+            "release acceptance matrix fields do not exactly match: "
+            f"missing={sorted(expected_top_level - set(matrix))}, "
+            f"unexpected={sorted(set(matrix) - expected_top_level)}"
+        )
+    if matrix.get("schema_version") != RELEASE_ACCEPTANCE_MATRIX_SCHEMA:
+        raise ProvenanceError("release acceptance matrix schema does not match")
+    release_version = _nonempty_string(
+        matrix.get("release_version"), "release acceptance matrix version"
+    )
+    if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z.-]+)?", release_version) is None:
+        raise ProvenanceError("release acceptance matrix version is invalid")
+    if expected_release_version is not None and release_version != expected_release_version:
+        raise ProvenanceError(
+            "release acceptance matrix version does not match policy: "
+            f"{release_version} != {expected_release_version}"
+        )
+    if matrix.get("target_labels_are_policy_evidence_instances") is not True:
+        raise ProvenanceError("release acceptance matrix target-label semantics are not explicit")
+    count = _positive_integer(
+        matrix.get("report_count_per_stage"), "release acceptance matrix report count"
+    )
+    if count > MAX_VALIDATION_REPORT_ASSETS:
+        raise ProvenanceError("release acceptance matrix report count exceeds the asset limit")
+
+    stages = _list(matrix.get("stages"), "release acceptance matrix stages")
+    if len(stages) != len(RELEASE_ACCEPTANCE_MATRIX_STAGES):
+        raise ProvenanceError("release acceptance matrix must define exactly two stages")
+    normalized_stages: list[dict[str, object]] = []
+    expected_artifact_stages = {
+        "candidate": "immutable_candidate",
+        "released": "published",
+    }
+    expected_prefixes = {
+        "candidate": "validation",
+        "released": "released-validation",
+    }
+    for index, raw in enumerate(stages):
+        stage = _mapping(raw, "release acceptance matrix stage")
+        if set(stage) != {"name", "artifact_stage", "filename_prefix"}:
+            raise ProvenanceError("release acceptance matrix stage fields do not exactly match")
+        name = _nonempty_string(stage.get("name"), "release acceptance matrix stage name")
+        if name != RELEASE_ACCEPTANCE_MATRIX_STAGES[index]:
+            raise ProvenanceError("release acceptance matrix stage order does not match")
+        artifact_stage = _nonempty_string(
+            stage.get("artifact_stage"), "release acceptance matrix artifact stage"
+        )
+        prefix = _nonempty_string(
+            stage.get("filename_prefix"), "release acceptance matrix filename prefix"
+        )
+        if artifact_stage != expected_artifact_stages[name] or prefix != expected_prefixes[name]:
+            raise ProvenanceError(f"release acceptance matrix stage semantics differ: {name}")
+        normalized_stages.append(
+            {"name": name, "artifact_stage": artifact_stage, "filename_prefix": prefix}
+        )
+
+    reports = _list(matrix.get("reports"), "release acceptance matrix reports")
+    if len(reports) != count:
+        raise ProvenanceError(
+            "release acceptance matrix count does not equal its ordered report list"
+        )
+    required_report_fields = {
+        "ordinal",
+        "id",
+        "cluster",
+        "scenario",
+        "command",
+        "report_option",
+    }
+    optional_report_fields = {"package", "remote_tool", "evidence_group"}
+    normalized_reports: list[dict[str, object]] = []
+    report_ids: set[str] = set()
+    for ordinal, raw in enumerate(reports, start=1):
+        report = _mapping(raw, "release acceptance matrix report")
+        fields = set(report)
+        if not required_report_fields.issubset(fields) or not fields.issubset(
+            required_report_fields | optional_report_fields
+        ):
+            raise ProvenanceError(
+                f"release acceptance matrix report {ordinal} fields do not exactly match"
+            )
+        if _positive_integer(report.get("ordinal"), "matrix report ordinal") != ordinal:
+            raise ProvenanceError("release acceptance matrix report order is not contiguous")
+        report_id = _nonempty_string(report.get("id"), "matrix report id")
+        if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", report_id) is None:
+            raise ProvenanceError(f"release acceptance matrix report id is unsafe: {report_id}")
+        if report_id in report_ids:
+            raise ProvenanceError(f"duplicate release acceptance matrix report id: {report_id}")
+        report_ids.add(report_id)
+        cluster = _nonempty_string(report.get("cluster"), "matrix report cluster")
+        scenario = _nonempty_string(report.get("scenario"), "matrix report scenario")
+        if (
+            re.fullmatch(r"[A-Za-z0-9._-]+", cluster) is None
+            or re.fullmatch(r"[A-Za-z0-9._-]+", scenario) is None
+        ):
+            raise ProvenanceError(
+                f"release acceptance matrix report identity is unsafe: {report_id}"
+            )
+        command = _list(report.get("command"), "matrix report command")
+        if not command or any(not isinstance(item, str) or not item.strip() for item in command):
+            raise ProvenanceError(f"release acceptance matrix command is invalid: {report_id}")
+        report_option = _nonempty_string(report.get("report_option"), "matrix report option")
+        if report_option not in {"--report", "--validation-report"}:
+            raise ProvenanceError(
+                f"release acceptance matrix report option is invalid: {report_id}"
+            )
+        normalized_reports.append(
+            {
+                "ordinal": ordinal,
+                "id": report_id,
+                "cluster": cluster,
+                "scenario": scenario,
+            }
+        )
+
+    claimed_sha256 = _nonempty_string(
+        matrix.get("matrix_sha256"), "release acceptance matrix SHA-256"
+    )
+    if re.fullmatch(r"[0-9a-f]{64}", claimed_sha256) is None:
+        raise ProvenanceError("release acceptance matrix SHA-256 is invalid")
+    canonical = dict(matrix)
+    del canonical["matrix_sha256"]
+    actual_sha256 = hashlib.sha256(
+        json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    if claimed_sha256 != actual_sha256:
+        raise ProvenanceError("release acceptance matrix self-digest does not match")
+    if expected_sha256 is not None and expected_sha256 != actual_sha256:
+        raise ProvenanceError("release acceptance matrix digest does not match policy")
+    return {
+        "schema_version": RELEASE_ACCEPTANCE_MATRIX_SCHEMA,
+        "release_version": release_version,
+        "matrix_sha256": actual_sha256,
+        "report_count_per_stage": count,
+        "stages": normalized_stages,
+        "reports": normalized_reports,
+    }
+
+
+def load_release_acceptance_matrix(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+    expected_release_version: str | None = None,
+) -> dict[str, object]:
+    """Load an acceptance matrix with bounded JSON parsing and semantic digest checks."""
+    return validate_release_acceptance_matrix(
+        _load_json(path),
+        expected_sha256=expected_sha256,
+        expected_release_version=expected_release_version,
+    )
+
+
+def _release_acceptance_matrix_stage(
+    matrix: Mapping[str, object],
+    kind: str,
+) -> dict[str, object]:
+    stages = _list(matrix.get("stages"), "release acceptance matrix stages")
+    for raw in stages:
+        stage = _mapping(raw, "release acceptance matrix stage")
+        if stage.get("name") == kind:
+            return stage
+    raise ProvenanceError(f"release acceptance matrix does not define stage: {kind}")
+
+
 def build_validation_report_asset_manifest(
     document: object,
     *,
     kind: str,
+    acceptance_matrix: object | None = None,
 ) -> dict[str, object]:
     """Validate and normalize the bounded release assets used as live reports."""
     if kind == "candidate":
@@ -1710,7 +1825,51 @@ def build_validation_report_asset_manifest(
             raise ProvenanceError("candidate assets contain no non-local validation report")
     elif not names:
         raise ProvenanceError("release assets contain no released-artifact validation report")
-    return {
+    matrix_binding: dict[str, object] | None = None
+    if acceptance_matrix is not None:
+        matrix = validate_release_acceptance_matrix(acceptance_matrix)
+        stage = _release_acceptance_matrix_stage(matrix, kind)
+        matrix_reports = _list(matrix.get("reports"), "release acceptance matrix reports")
+        expected_reports = [
+            {
+                "ordinal": _positive_integer(item.get("ordinal"), "matrix report ordinal"),
+                "id": _nonempty_string(item.get("id"), "matrix report id"),
+                "cluster": _nonempty_string(item.get("cluster"), "matrix report cluster"),
+                "scenario": _nonempty_string(item.get("scenario"), "matrix report scenario"),
+                "filename": (
+                    f"{_nonempty_string(stage.get('filename_prefix'), 'matrix stage prefix')}-"
+                    f"{_nonempty_string(item.get('id'), 'matrix report id')}.json"
+                ),
+            }
+            for item in (
+                _mapping(raw, "release acceptance matrix report") for raw in matrix_reports
+            )
+        ]
+        expected_names = [cast(str, item["filename"]) for item in expected_reports]
+        actual_names = [name for name in names if name != local_name]
+        if len(actual_names) != len(expected_names) or set(actual_names) != set(expected_names):
+            missing = sorted(set(expected_names) - set(actual_names))
+            unexpected = sorted(set(actual_names) - set(expected_names))
+            raise ProvenanceError(
+                "validation report assets do not exactly match the release acceptance matrix: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        assets_by_name = {cast(str, item["name"]): item for item in normalized}
+        ordered_assets = [assets_by_name[name] for name in expected_names]
+        if local_name is not None:
+            ordered_assets.insert(0, assets_by_name[local_name])
+        normalized = ordered_assets
+        matrix_binding = {
+            "schema_version": matrix["schema_version"],
+            "release_version": matrix["release_version"],
+            "sha256": matrix["matrix_sha256"],
+            "report_count": matrix["report_count_per_stage"],
+            "stage": stage["name"],
+            "artifact_stage": stage["artifact_stage"],
+            "filename_prefix": stage["filename_prefix"],
+            "reports": expected_reports,
+        }
+    manifest: dict[str, object] = {
         "schema_version": "1.0",
         "kind": kind,
         "release_asset_count": len(raw_assets),
@@ -1731,6 +1890,9 @@ def build_validation_report_asset_manifest(
         "aggregate_bytes": total_bytes,
         "assets": normalized,
     }
+    if matrix_binding is not None:
+        manifest["acceptance_matrix"] = matrix_binding
+    return manifest
 
 
 def verify_downloaded_validation_report_assets(
@@ -2184,7 +2346,7 @@ def _github_fetcher(token: str) -> GitHubJsonFetcher:
                 "Accept": "application/vnd.github+json",
                 "Authorization": f"Bearer {token}",
                 "User-Agent": "clio-relay-release-governance",
-                "X-GitHub-Api-Version": "2022-11-28",
+                "X-GitHub-Api-Version": "2026-03-10",
             },
         )
         try:
@@ -2276,14 +2438,6 @@ def _rfc3339_timestamp(value: object, field: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ProvenanceError(f"{field} must include a timezone")
     return parsed
-
-
-def _github_identity(value: object, field: str) -> dict[str, object]:
-    identity = _mapping(value, field)
-    return {
-        "login": _nonempty_string(identity.get("login"), f"{field} login"),
-        "id": _positive_integer(identity.get("id"), f"{field} id"),
-    }
 
 
 def _sha256_bounded_file(path: Path, *, maximum_bytes: int) -> str:
@@ -2542,6 +2696,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     verify_live_release.add_argument("--draft", choices=("true", "false", "any"), required=True)
     verify_live_release.add_argument("--prerelease", choices=("true", "false"), required=True)
 
+    resolve_release = subparsers.add_parser("resolve-live-release")
+    resolve_release.add_argument("--repository", required=True)
+    resolve_release.add_argument("--tag", required=True)
+    resolve_release.add_argument("--draft", choices=("true", "false", "any"), required=True)
+    resolve_release.add_argument("--allow-absent", action="store_true")
+    resolve_release.add_argument("--output", type=Path, required=True)
+
     mutation_authority = subparsers.add_parser("mutation-authority")
     mutation_authority.add_argument("--governance-receipt", type=Path, required=True)
     mutation_authority.add_argument("--repository", required=True)
@@ -2556,16 +2717,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     mutation_authority.add_argument("--draft", choices=("true", "false", "any"), required=True)
 
-    reviewer_exclusions = subparsers.add_parser("reviewer-exclusions")
-    reviewer_exclusions.add_argument("--repository", required=True)
-    reviewer_exclusions.add_argument("--source-commit", required=True)
-    reviewer_exclusions.add_argument("--dispatcher-login", required=True)
-    reviewer_exclusions.add_argument("--dispatcher-id", type=int, required=True)
-    reviewer_exclusions.add_argument("--output", type=Path, required=True)
-
     report_assets = subparsers.add_parser("report-assets")
     report_assets.add_argument("--release", type=Path, required=True)
     report_assets.add_argument("--kind", choices=("candidate", "released"), required=True)
+    report_assets.add_argument("--matrix", type=Path, required=True)
     report_assets.add_argument("--report-dir", type=Path)
     report_assets.add_argument("--output", type=Path, required=True)
 
@@ -2678,6 +2833,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 expect_prerelease=args.prerelease == "true",
                 fetch_json=_github_fetcher(os.environ.get("GH_TOKEN", "")),
             )
+        elif args.command == "resolve-live-release":
+            release = resolve_live_release(
+                repository=args.repository,
+                tag=args.tag,
+                expect_draft=None if args.draft == "any" else args.draft == "true",
+                fetch_json=_github_fetcher(os.environ.get("GH_TOKEN", "")),
+                allow_absent=args.allow_absent,
+            )
+            _write_json(args.output, release)
         elif args.command == "mutation-authority":
             verify_live_mutation_authority(
                 _load_json(args.governance_receipt),
@@ -2690,19 +2854,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 expect_draft=None if args.draft == "any" else args.draft == "true",
                 fetch_json=_github_fetcher(os.environ.get("GH_TOKEN", "")),
             )
-        elif args.command == "reviewer-exclusions":
-            exclusions = fetch_reviewer_exclusions(
-                repository=args.repository,
-                source_commit=args.source_commit,
-                dispatcher_login=args.dispatcher_login,
-                dispatcher_id=args.dispatcher_id,
-                fetch_json=_github_fetcher(os.environ.get("GH_TOKEN", "")),
-            )
-            _write_json(args.output, exclusions)
         elif args.command == "report-assets":
             manifest = build_validation_report_asset_manifest(
                 _load_json(args.release),
                 kind=args.kind,
+                acceptance_matrix=_load_json(args.matrix),
             )
             if args.report_dir is not None:
                 verify_downloaded_validation_report_assets(manifest, args.report_dir)

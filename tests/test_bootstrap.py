@@ -16,6 +16,7 @@ from clio_relay.application_profiles import (
     render_cluster_app_install_script,
 )
 from clio_relay.bootstrap import (
+    CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
     FRP_LINUX_AMD64_SHA256,
     FRPC_LINUX_AMD64_SHA256,
     FRPS_LINUX_AMD64_SHA256,
@@ -72,6 +73,8 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert f'UV_SHA256="{UV_LINUX_AMD64_SHA256}"' in script
     assert "https://astral.sh/uv/install.sh" not in script
     assert "uv python install 3.12" in script
+    assert 'export UV_TOOL_DIR="$HOME/.local/share/uv/tools"' in script
+    assert 'export UV_TOOL_BIN_DIR="$HOME/.local/bin"' in script
     assert 'uv venv --python 3.12 --seed --clear "$JARVIS_VENV"' in script
     assert "python3 -m venv" not in script
     assert "CLIO_RELAY_AGENT_NPM_PACKAGE" in script
@@ -96,30 +99,58 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     ) in script
     assert "pull --ff-only" not in script
     assert 'python -m pip install -e "$HOME/.local/src/jarvis' not in script
-    assert "JARVIS_MCP_INSTALL_SPEC=clio-kit==3.0.0" in script
-    assert (
-        "python -m pip download --disable-pip-version-check --no-deps --only-binary=:all:" in script
+    assert "JARVIS_MCP_INSTALL_SPEC=clio-kit==2.3.2" in script
+    assert f"JARVIS_MCP_ARTIFACT_SHA256={CLIO_KIT_JARVIS_MCP_WHEEL_SHA256}" in script
+    assert "python -m pip download --isolated --disable-pip-version-check --no-cache-dir" in script
+    assert '"$JARVIS_VENV/bin/python" -m pip download' in script
+    assert "uv tool install --force --python 3.12 --no-config \\" in script
+    assert '--default-index https://pypi.org/simple "$JARVIS_MCP_INSTALL_TARGET"' in script
+    digest_check = (
+        'echo "$JARVIS_MCP_ARTIFACT_SHA256 *$JARVIS_MCP_ARTIFACT_PATH" | '
+        "  sha256sum --check --strict -"
     )
-    assert 'uvx --refresh --no-config --from "$JARVIS_MCP_INSTALL_TARGET"' in script
-    assert 'uvx --refresh --no-cache --from "$JARVIS_MCP_INSTALL_TARGET"' not in script
+    assert digest_check in script.replace("\\\n", "")
+    assert script.index("JARVIS_MCP_ARTIFACT_SHA256 *$JARVIS_MCP_ARTIFACT_PATH") < (
+        script.index("uv tool install --force")
+    )
+    assert 'uvx --refresh --no-config --from "$JARVIS_MCP_INSTALL_TARGET"' not in script
+    assert 'JARVIS_MCP_EXECUTABLE="$(uv tool dir --bin --no-config)/clio-kit"' in script
+    assert 'JARVIS_MCP_UV_EXECUTABLE="$(command -v uv)"' in script
+    assert '"$JARVIS_MCP_EXECUTABLE" --help' in script
     assert 'JARVIS_MCP_INSTALL_TARGET="$JARVIS_MCP_ARTIFACT_PATH"' in script
     assert (
         "runtime_artifact_path=(str(component_artifact) if component_artifact else None)" in script
     )
     assert "runtime_command=runtime_command" in script
+    assert '"provider": os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_PROVIDER_PYTHON"]' in script
+    assert '"clio-kit": os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_EXECUTABLE"]' in script
     assert "clio-kit.git@main#subdirectory=clio-kit-mcp-servers/jarvis" not in script
     assert script.count("status --porcelain=v1 --untracked-files=all") == 1
     assert 'ln -sf "$JARVIS_VENV/bin/jarvis-mcp" "$HOME/.local/bin/jarvis-mcp"' not in script
     assert 'RELAY_INSTALL_SPEC="$DEST"' in script
-    assert 'uv pip install --refresh-package clio-relay "$RELAY_INSTALL_TARGET"' in script
-    assert ('uv pip install --no-deps --refresh-package jarvis-cd "$JARVIS_CD_WHEEL"') in script
-    assert 'python -m pip install "$JARVIS_CD_WHEEL"' in script
+    assert "uv tool install --force --python 3.12 --no-config" in script
+    assert '--with "$JARVIS_CD_WHEEL" "$RELAY_INSTALL_TARGET"' in script
+    assert 'RELAY_EXECUTABLE="$(uv tool dir --bin --no-config)/clio-relay"' in script
+    assert 'RELAY_PROVIDER_PYTHON="$(sed -n' in script
+    assert "relay-venv312" not in script
+    assert 'uv pip install --refresh-package clio-relay "$RELAY_INSTALL_TARGET"' not in script
+    assert "uv pip install --no-deps --refresh-package jarvis-cd" not in script
+    assert (
+        'python -m pip install --isolated --index-url https://pypi.org/simple "$JARVIS_CD_WHEEL"'
+    ) in script
     assert "JARVIS-CD was not installed from the verified release wheel" in script
-    assert "verify_jarvis_cd_distribution python" in script
+    assert 'verify_jarvis_cd_distribution "$RELAY_PROVIDER_PYTHON"' in script
     assert 'verify_jarvis_cd_distribution "$JARVIS_VENV/bin/python"' in script
-    assert 'entry_point.group == "clio_relay.package_progress_adapters"' in script
+    assert 'entry_point.group == "clio_relay.package_progress_adapters"' not in script
+    assert "probe_jarvis_native_execution_capability" in script
+    assert "probe_clio_kit_native_execution_contract" in script
+    assert "probe_persistent_uv_tool_identity" in script
+    assert 'distribution="clio-relay"' in script
+    assert 'entry_point="clio-relay"' in script
+    assert "persistent_tool=relay_persistent_tool" in script
     assert (
         'uv pip install --python "$JARVIS_VENV/bin/python" \\\n'
+        "  --default-index https://pypi.org/simple \\\n"
         '  --refresh-package clio-relay "$RELAY_INSTALL_TARGET"'
     ) in script
     assert "\"$JARVIS_VENV/bin/python\" -c 'import clio_relay, jarvis_cd'" in script
@@ -135,17 +166,42 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert '"jarvis-cd": ComponentArtifactIdentity(' in script
     assert 'requested_source="github_release"' in script
     assert "artifact_sha256=jarvis_cd_wheel_sha256" in script
+    assert "artifact_sha256=component_artifact_sha256" in script
     assert '"provider": sys.executable' in script
     assert '"execution": os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_CD_EXECUTION_PYTHON"]' in script
-    assert "entry_points=jarvis_cd_entry_points" in script
+    assert "native_execution=clio_kit_native_execution" in script
+    assert "persistent_tool=persistent_clio_kit_tool" in script
+    assert "native_execution=jarvis_execution_native_execution" in script
+    assert "jarvis_cd_entry_points" not in script
     assert 'requested_source=os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_SOURCE"]' in script
     assert "relay_artifact_sha256=" in script
     assert 'jarvis repo add "$DEST/jarvis-packages/clio_relay" --force true' in script
+    assert '"$HOME/.local/share/clio-relay/jarvis-shared" || true' not in script
+    assert "python -m pip install --upgrade pip setuptools wheel" not in script
     assert "spack install" not in script
     assert "site_stack=ready" not in script
     assert "CLIO_RELAY_CORE_DIR" in script
     assert "clio-relay init" in script
+    assert "done < <(compgen -e)" in script
+    assert "UV_*|PIP_*) unset" in script
+    assert "--index-url https://pypi.org/simple --no-deps --only-binary=:all:" in script
     assert "\r" not in script
+
+
+def test_custom_clio_kit_bootstrap_wheel_requires_preinstall_digest() -> None:
+    with pytest.raises(ConfigurationError, match="requires its expected wheel SHA-256"):
+        render_linux_user_bootstrap_script(
+            jarvis_mcp_install_spec="/tmp/clio_kit-2.3.1-py3-none-any.whl"
+        )
+
+    script = render_linux_user_bootstrap_script(
+        jarvis_mcp_install_spec="/tmp/clio_kit-2.3.1-py3-none-any.whl",
+        jarvis_mcp_artifact_sha256="d" * 64,
+    )
+    assert "JARVIS_MCP_ARTIFACT_SHA256=" + "d" * 64 in script
+    assert script.index("JARVIS_MCP_ARTIFACT_SHA256 *$JARVIS_MCP_ARTIFACT_PATH") < (
+        script.index("uv tool install --force")
+    )
 
 
 def test_bootstrap_uv_pin_matches_release_policy() -> None:
@@ -161,11 +217,23 @@ def test_bootstrap_uv_pin_matches_release_policy() -> None:
 
 def test_linux_user_bootstrap_script_expands_dest_wheel_install_spec() -> None:
     script = render_linux_user_bootstrap_script(
-        relay_install_spec="$DEST/wheels/clio_relay-0.9.16-py3-none-any.whl"
+        relay_install_spec="$DEST/wheels/clio_relay-0.9.16-py3-none-any.whl",
+        relay_artifact_sha256="e" * 64,
     )
     expected = 'RELAY_INSTALL_SPEC="$DEST"/wheels/clio_relay-0.9.16-py3-none-any.whl'
 
     assert expected in script
+    assert "RELAY_ARTIFACT_SHA256=" + "e" * 64 in script
+    assert script.index("RELAY_ARTIFACT_SHA256 *$RELAY_ARTIFACT_PATH") < script.index(
+        '--with "$JARVIS_CD_WHEEL"'
+    )
+
+
+def test_relay_bootstrap_wheel_requires_preinstall_digest() -> None:
+    with pytest.raises(ConfigurationError, match="requires its expected SHA-256"):
+        render_linux_user_bootstrap_script(
+            relay_install_spec="$DEST/wheels/clio_relay-1.0.0-py3-none-any.whl"
+        )
 
 
 def test_linux_user_bootstrap_script_accepts_explicit_npm_agent() -> None:
@@ -252,6 +320,7 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
     from clio_relay import bootstrap
 
     calls: list[list[str]] = []
+    uploaded_scripts: list[str] = []
     receipt_document: dict[str, object] = {
         "schema_version": "clio-relay.bootstrap-receipt.v1",
         "invocation_id": "bootstrap_abc",
@@ -269,11 +338,17 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
     ) -> bootstrap.BootstrapArchive:
         assert source_root == tmp_path
         assert relay_wheel is None
+        archive.write_bytes(b"bootstrap archive")
         return bootstrap.BootstrapArchive(archive=archive, install_spec="clio-relay==1.0.0")
 
     def fake_run(command: list[str]) -> subprocess.CompletedProcess[str]:
         calls.append(command)
-        if command[-2:] == ["bash", "/tmp/clio-relay-bootstrap.sh"]:
+        if command[0] == "scp" and command[-1].endswith("/clio-relay-bootstrap.sh"):
+            uploaded_scripts.append(Path(command[1]).read_text(encoding="utf-8"))
+        if command[-2:] == [
+            "bash",
+            "/tmp/clio-relay-bootstrap_abc/clio-relay-bootstrap.sh",
+        ]:
             return subprocess.CompletedProcess(
                 command,
                 0,
@@ -308,18 +383,45 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
     receipt_line = next(line for line in lines if line.startswith("bootstrap_receipt_json="))
     receipt = json.loads(receipt_line.partition("=")[2])
     assert receipt["invocation_id"] == "bootstrap_abc"
-    assert calls[-1] == [
+    assert [
         "ssh",
         "ares",
         "cat",
         "$HOME/.local/share/clio-relay/bootstrap-receipt.json",
+    ] in calls
+    assert calls[-1] == [
+        "ssh",
+        "ares",
+        "rm",
+        "-rf",
+        "--",
+        "/tmp/clio-relay-bootstrap_abc",
     ]
+    assert any(
+        command[-1] == "ares:/tmp/clio-relay-bootstrap_abc/clio-relay-head.tar" for command in calls
+    )
+    assert uploaded_scripts
+    assert 'exec 9>"$HOME/.local/share/clio-relay/bootstrap.lock"' in uploaded_scripts[0]
+    assert "sha256sum --check --strict" in uploaded_scripts[0]
+    assert "/tmp/clio-relay-head.tar" not in uploaded_scripts[0]
 
     receipt_document["relay_install_spec"] = "unreviewed-source"
     with pytest.raises(RelayError, match="relay_install_spec"):
         bootstrap.bootstrap_cluster_over_ssh(
             bootstrap_profile="linux-user",
             ssh_host="ares",
+            source_root=tmp_path,
+        )
+    assert calls[-1][-1] == "/tmp/clio-relay-bootstrap_abc"
+
+
+def test_bootstrap_over_ssh_rejects_option_like_destination(tmp_path: Path) -> None:
+    from clio_relay import bootstrap
+
+    with pytest.raises(ConfigurationError, match="non-option destination"):
+        bootstrap.bootstrap_cluster_over_ssh(
+            bootstrap_profile="linux-user",
+            ssh_host="-oProxyCommand=evil",
             source_root=tmp_path,
         )
 

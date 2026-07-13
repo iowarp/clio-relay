@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import cast
 from uuid import uuid4
 
+MAX_PYPI_JSON_BYTES = 4 * 1024 * 1024
+
 
 def build_promotion_record(
     *,
@@ -70,7 +72,13 @@ def fetch_pypi_document(version: str) -> object:
     """Fetch authoritative release metadata for one clio-relay version."""
     url = f"https://pypi.org/pypi/clio-relay/{version}/json"
     with urllib.request.urlopen(url, timeout=30) as response:
-        return cast(object, json.load(response))
+        content = response.read(MAX_PYPI_JSON_BYTES + 1)
+    if len(content) > MAX_PYPI_JSON_BYTES:
+        raise ValueError("PyPI project metadata exceeds the bounded response size")
+    try:
+        return cast(object, json.loads(content))
+    except json.JSONDecodeError as exc:
+        raise ValueError("PyPI returned invalid project metadata") from exc
 
 
 def main(argv: Sequence[str] | None = None) -> int:

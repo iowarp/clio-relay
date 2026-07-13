@@ -10,7 +10,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from clio_relay.command_evidence import command_evidence
 from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.filesystem_paths import (
+    WINDOWS_LEGACY_PATH_HEADROOM,
+    internal_filesystem_path,
+    logical_filesystem_path,
+    logical_filesystem_text,
+)
+from clio_relay.identifiers import DurableRecordId
 from clio_relay.validation_report import (
     EvidenceReference,
     LiveValidationReport,
@@ -74,6 +82,7 @@ class LocalReleaseValidationOptions:
     report_path: Path
     markdown_report_path: Path | None = None
     artifact_dir: Path | None = None
+    report_id: DurableRecordId | None = None
 
 
 def run_local_release_validation(
@@ -82,8 +91,9 @@ def run_local_release_validation(
     runner: ReleaseCommandRunner | None = None,
 ) -> LiveValidationReport:
     """Run every local release check and persist partial evidence on failure."""
-    root = options.project_root.resolve()
-    if not (root / "pyproject.toml").is_file():
+    root = logical_filesystem_path(options.project_root).resolve()
+    storage_root = internal_filesystem_path(root, force_extended=True)
+    if not (storage_root / "pyproject.toml").is_file():
         raise ConfigurationError(f"release checkout has no pyproject.toml: {root}")
     command_runner = runner or _run_command
     report = new_live_validation_report(
@@ -91,11 +101,13 @@ def run_local_release_validation(
         cluster="local",
         launcher="uv",
         install_source=f"checkout:{root.as_uri()}",
+        report_id=options.report_id,
     )
     recorder = ValidationRecorder(report)
-    artifact_dir = (
+    logical_artifact_dir = (
         options.artifact_dir or root / ".clio-relay" / "release-artifacts" / report.report_id
     ).resolve()
+    artifact_dir = internal_filesystem_path(logical_artifact_dir, force_extended=True)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     support_dir = artifact_dir / ".validation-support"
     support_dir.mkdir(parents=True, exist_ok=True)
@@ -317,10 +329,20 @@ def run_local_release_validation(
         if not report.checks or report.checks[-1].status.value != "failed":
             recorder.record_failure("local-release.completed", "complete local release gate", exc)
         recorder.finish(exc)
-        recorder.write(options.report_path, options.markdown_report_path)
+        recorder.write(
+            internal_filesystem_path(options.report_path, force_extended=True),
+            None
+            if options.markdown_report_path is None
+            else internal_filesystem_path(options.markdown_report_path, force_extended=True),
+        )
         raise
     recorder.finish()
-    recorder.write(options.report_path, options.markdown_report_path)
+    recorder.write(
+        internal_filesystem_path(options.report_path, force_extended=True),
+        None
+        if options.markdown_report_path is None
+        else internal_filesystem_path(options.markdown_report_path, force_extended=True),
+    )
     return report
 
 
@@ -335,18 +357,22 @@ def _run_check(
 ) -> str:
     with recorder.check(check_id, summary) as evidence:
         completed = runner(command, cwd=root)
-        output = "\n".join(part for part in (completed.stdout, completed.stderr) if part).strip()
+        diagnostic = command_evidence(
+            _logicalize_windows_text(completed.stdout),
+            _logicalize_windows_text(completed.stderr),
+            exit_code=completed.returncode,
+        )
         evidence.append(
             EvidenceReference(
                 kind="command",
-                reference=" ".join(command),
-                excerpt=output[-4000:] if output else f"exit_code={completed.returncode}",
-                metadata={"exit_code": completed.returncode},
+                reference=" ".join(_logical_command(command)),
+                excerpt=diagnostic.excerpt,
+                metadata=diagnostic.metadata,
             )
         )
         if completed.returncode != 0:
-            raise RelayError(f"release check failed ({check_id}): {output[-1000:]}")
-        return output
+            raise RelayError(f"release check failed ({check_id}): {diagnostic.error_detail}")
+        return diagnostic.output
 
 
 def _run_check_sequence(
@@ -361,19 +387,21 @@ def _run_check_sequence(
     with recorder.check(check_id, summary) as evidence:
         for command in commands:
             completed = runner(command, cwd=root)
-            output = "\n".join(
-                part for part in (completed.stdout, completed.stderr) if part
-            ).strip()
+            diagnostic = command_evidence(
+                _logicalize_windows_text(completed.stdout),
+                _logicalize_windows_text(completed.stderr),
+                exit_code=completed.returncode,
+            )
             evidence.append(
                 EvidenceReference(
                     kind="command",
-                    reference=" ".join(command),
-                    excerpt=output[-4000:] if output else f"exit_code={completed.returncode}",
-                    metadata={"exit_code": completed.returncode},
+                    reference=" ".join(_logical_command(command)),
+                    excerpt=diagnostic.excerpt,
+                    metadata=diagnostic.metadata,
                 )
             )
             if completed.returncode != 0:
-                raise RelayError(f"release check failed ({check_id}): {output[-1000:]}")
+                raise RelayError(f"release check failed ({check_id}): {diagnostic.error_detail}")
 
 
 def _run_required_tests(
@@ -414,8 +442,8 @@ def _run_sdist_smoke(
     runner: ReleaseCommandRunner,
 ) -> None:
     """Build and launch the exact sdist only inside the unprivileged local gate."""
-    build_dir = (support_dir / "sdist-wheel-build").resolve()
-    environment = (support_dir / "sdist-smoke-environment").resolve()
+    build_dir = support_dir / "sdist-wheel-build"
+    environment = support_dir / "sdist-smoke-environment"
     smoke_python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     smoke_executable = environment / (
         "Scripts/clio-relay.exe" if os.name == "nt" else "bin/clio-relay"
@@ -482,17 +510,21 @@ def _run_evidenced_command(
     runner: ReleaseCommandRunner,
 ) -> None:
     completed = runner(command, cwd=root)
-    output = "\n".join(part for part in (completed.stdout, completed.stderr) if part).strip()
+    diagnostic = command_evidence(
+        _logicalize_windows_text(completed.stdout),
+        _logicalize_windows_text(completed.stderr),
+        exit_code=completed.returncode,
+    )
     evidence.append(
         EvidenceReference(
             kind="command",
-            reference=" ".join(command),
-            excerpt=output[-4000:] if output else f"exit_code={completed.returncode}",
-            metadata={"exit_code": completed.returncode},
+            reference=" ".join(_logical_command(command)),
+            excerpt=diagnostic.excerpt,
+            metadata=diagnostic.metadata,
         )
     )
     if completed.returncode != 0:
-        raise RelayError(f"release check failed (local.sdist-smoke): {output[-1000:]}")
+        raise RelayError(f"release check failed (local.sdist-smoke): {diagnostic.error_detail}")
 
 
 def _release_artifacts(artifact_dir: Path) -> list[Path]:
@@ -513,18 +545,19 @@ def _record_release_artifacts(
     for path in artifacts:
         kind = "wheel" if path.suffix == ".whl" else "source_distribution"
         digest = sha256_file(path)
+        logical_path = logical_filesystem_path(path)
         recorder.add_resource(
             ValidationResource(
                 kind=kind,
                 resource_id=path.name,
                 role="release_artifact",
                 cluster="local",
-                references=[str(path.resolve())],
+                references=[str(logical_path)],
                 metadata={"sha256": digest, "size_bytes": path.stat().st_size},
             )
         )
         recorder.report.artifacts.append(
-            EvidenceReference(kind=kind, reference=str(path.resolve()), sha256=digest)
+            EvidenceReference(kind=kind, reference=str(logical_path), sha256=digest)
         )
 
 
@@ -533,4 +566,32 @@ def _run_command(
     *,
     cwd: Path,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, cwd=cwd, capture_output=True, check=False, text=True)
+    logical_cwd = logical_filesystem_path(cwd)
+    if os.name == "nt":
+        absolute_cwd = os.path.abspath(logical_cwd)
+        if absolute_cwd.startswith("\\\\"):
+            raise ConfigurationError(
+                "release subprocess checkout paths on Windows must not use UNC; "
+                "run the gate from a local checkout path"
+            )
+        if len(absolute_cwd) >= WINDOWS_LEGACY_PATH_HEADROOM:
+            raise ConfigurationError(
+                "release subprocess checkout path exceeds the verified Windows path bound; "
+                "run the gate from a shorter checkout path"
+            )
+    return subprocess.run(
+        command,
+        cwd=logical_cwd,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+
+def _logical_command(command: list[str]) -> list[str]:
+    """Remove internal Windows path prefixes from recorded command evidence."""
+    return [_logicalize_windows_text(argument) for argument in command]
+
+
+def _logicalize_windows_text(value: str) -> str:
+    return logical_filesystem_text(value)

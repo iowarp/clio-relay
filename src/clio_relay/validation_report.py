@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -28,10 +29,17 @@ from typing import Any, Literal, cast
 from uuid import uuid4
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, model_validator
 
 from clio_relay import __version__
+from clio_relay.ci_validation import ProvenanceError, load_release_acceptance_matrix
 from clio_relay.errors import ConfigurationError
+from clio_relay.filesystem_paths import (
+    internal_filesystem_path,
+    logical_filesystem_path,
+    logical_filesystem_text,
+)
+from clio_relay.identifiers import DurableRecordId
 
 REPORT_SCHEMA_VERSION = "1.0"
 TRANSPORT_PROBE_EVIDENCE_KEY = "transport.probe_evidence"
@@ -41,6 +49,15 @@ MAX_TRANSPORT_PROBE_JSON_DEPTH = 16
 MAX_TRANSPORT_PROBE_JSON_NODES = 4096
 MAX_LAUNCHER_PROCESS_ANCESTORS = 64
 MAX_PYVENV_CONFIG_BYTES = 64 * 1024
+SPACK_FRESH_INSTALL_TRANSITION_CHECK_IDS = (
+    "remote-mcp.spack-preinstall-absent",
+    "remote-mcp.spack-fresh-install",
+    "remote-mcp.spack-postinstall-locate",
+    "remote-mcp.spack-disposable-store",
+    "remote-mcp.spack-transition-identity",
+    "remote-mcp.spack-transition-durable-evidence",
+    "remote-mcp.spack-fresh-configuration",
+)
 TransportCleanupAction = Literal["retain", "stop", "close", "cancel"]
 TransportCleanupOutcome = Literal[
     "retained",
@@ -193,12 +210,12 @@ class InstallSource(BaseModel):
         if self.released_artifact and not (
             self.kind is InstallSourceKind.PYPI
             and self.detected_kind is InstallSourceKind.PYPI
-            and self.launcher == "uvx"
+            and self.launcher == "uv-tool"
             and self.artifact_sha256 is not None
             and self.artifact_identity_verified
             and self.launcher_verified
         ):
-            raise ValueError("released artifact requires verified PyPI uvx artifact identity")
+            raise ValueError("released artifact requires verified PyPI uv-tool artifact identity")
         return self
 
 
@@ -358,6 +375,8 @@ class CleanupEvidence(BaseModel):
 
     requested: bool = False
     mode: str = "not_requested"
+    operation_id: DurableRecordId | None = None
+    cancel_relay_jobs: bool = False
     cancel_scheduler_jobs: bool = False
     stop_worker: bool = False
     actions: list[dict[str, Any]] = Field(default_factory=lambda: list[dict[str, Any]]())
@@ -372,7 +391,7 @@ class LiveValidationReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: Literal["1.0"] = REPORT_SCHEMA_VERSION
-    report_id: str = Field(default_factory=lambda: f"validation_{uuid4().hex}")
+    report_id: DurableRecordId = Field(default_factory=lambda: f"validation_{uuid4().hex}")
     scenario: str
     cluster: str
     transport_modes: list[str] = Field(default_factory=list)
@@ -388,6 +407,12 @@ class LiveValidationReport(BaseModel):
     artifacts: list[EvidenceReference] = Field(default_factory=lambda: list[EvidenceReference]())
     cleanup: CleanupEvidence = Field(default_factory=CleanupEvidence)
     error: str | None = None
+    _source_path: Path | None = PrivateAttr(default=None)
+
+    @property
+    def source_path(self) -> Path | None:
+        """Return the validated source path when the report was loaded from disk."""
+        return self._source_path
 
     @model_validator(mode="after")
     def validate_passed_report(self) -> LiveValidationReport:
@@ -422,6 +447,30 @@ class ReleaseResourceRequirement(BaseModel):
     metadata_equals: dict[str, Any] = Field(default_factory=lambda: dict[str, Any]())
 
 
+class ReleaseSpackFreshInstallRequirement(BaseModel):
+    """Fixed semantics independently rebound from one fresh-install report."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["clio-relay.release-spack-fresh-install.v1"] = (
+        "clio-relay.release-spack-fresh-install.v1"
+    )
+    server_name: str = Field(min_length=1, max_length=255, pattern=r"^[A-Za-z0-9._-]+$")
+    profile: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    package_name: str = Field(min_length=1, max_length=255, pattern=r"^[A-Za-z0-9._+-]+$")
+    requested_spec: str = Field(min_length=1, max_length=4_096)
+    reuse: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_requested_spec(self) -> ReleaseSpackFreshInstallRequirement:
+        """Reject ambiguous control characters or whitespace in the exact Spack spec."""
+        if self.requested_spec != self.requested_spec.strip() or any(
+            ord(character) < 32 or ord(character) == 127 for character in self.requested_spec
+        ):
+            raise ValueError("fresh-install requested_spec must be one exact printable value")
+        return self
+
+
 class ReleaseGateRequirement(BaseModel):
     """One evidence-backed condition in a release policy."""
 
@@ -437,10 +486,31 @@ class ReleaseGateRequirement(BaseModel):
         default_factory=lambda: list[ReleaseResourceRequirement]()
     )
     evidence_group_resource_kind: str | None = None
+    spack_fresh_install_transition: ReleaseSpackFreshInstallRequirement | None = None
     require_released_artifact: bool | None = None
     require_artifact_sha256: bool | None = None
     allowed_install_sources: list[InstallSourceKind] | None = None
     allowed_launchers: list[str] | None = None
+
+    @model_validator(mode="after")
+    def validate_specialized_evidence(self) -> ReleaseGateRequirement:
+        """Require a coherent report and complete checks for typed Spack transitions."""
+        if self.spack_fresh_install_transition is None:
+            return self
+        missing_checks = sorted(
+            set(SPACK_FRESH_INSTALL_TRANSITION_CHECK_IDS) - set(self.required_checks)
+        )
+        if missing_checks:
+            raise ValueError(f"fresh-install transition omits required checks: {missing_checks}")
+        required_kinds = {"relay_job", "artifact", "configuration_manifest", "mcp_server"}
+        missing_kinds = sorted(required_kinds - set(self.required_resource_kinds))
+        if missing_kinds:
+            raise ValueError(
+                f"fresh-install transition omits required resource kinds: {missing_kinds}"
+            )
+        if self.evidence_group_resource_kind is not None:
+            raise ValueError("fresh-install transition must be satisfied by one coherent report")
+        return self
 
 
 class ReleaseTargetIdentity(BaseModel):
@@ -483,9 +553,11 @@ class ReleaseGatePolicy(BaseModel):
 
     schema_version: Literal["1.0"] = REPORT_SCHEMA_VERSION
     release_version: str
+    acceptance_matrix_path: str | None = None
+    acceptance_matrix_sha256: str | None = None
     artifact_stage: Literal["published", "immutable_candidate"] = "published"
-    evidence_trust_model: Literal["reviewer_sealed_operator_evidence"] = (
-        "reviewer_sealed_operator_evidence"
+    evidence_trust_model: Literal["maintainer_sealed_operator_evidence"] = (
+        "maintainer_sealed_operator_evidence"
     )
     require_released_artifact: bool = True
     require_artifact_sha256: bool = True
@@ -496,13 +568,19 @@ class ReleaseGatePolicy(BaseModel):
     allowed_install_sources: list[InstallSourceKind] = Field(
         default_factory=lambda: [InstallSourceKind.PYPI]
     )
-    allowed_launchers: list[str] = Field(default_factory=lambda: ["uvx"])
+    allowed_launchers: list[str] = Field(default_factory=lambda: ["uv-tool"])
     required_uv_version: str | None = None
     targets: dict[str, ReleaseTargetIdentity] = Field(
         default_factory=lambda: dict[str, ReleaseTargetIdentity]()
     )
     release_blockers: list[str] = Field(default_factory=list)
     requirements: list[ReleaseGateRequirement] = Field(min_length=1)
+    _acceptance_matrix: dict[str, object] | None = PrivateAttr(default=None)
+
+    @property
+    def acceptance_matrix(self) -> dict[str, object] | None:
+        """Return the digest-verified acceptance matrix bound while loading the policy."""
+        return self._acceptance_matrix
 
     @model_validator(mode="after")
     def validate_artifact_stage(self) -> ReleaseGatePolicy:
@@ -516,6 +594,20 @@ class ReleaseGatePolicy(BaseModel):
                 raise ValueError("immutable candidate policies must allow wheel install evidence")
         if any(not blocker.strip() for blocker in self.release_blockers):
             raise ValueError("release blockers must be non-empty descriptions")
+        if (self.acceptance_matrix_path is None) != (self.acceptance_matrix_sha256 is None):
+            raise ValueError("acceptance matrix path and SHA-256 must be configured together")
+        if self.acceptance_matrix_path is not None:
+            matrix_path = PurePosixPath(self.acceptance_matrix_path)
+            if (
+                matrix_path.is_absolute()
+                or ".." in matrix_path.parts
+                or str(matrix_path) != self.acceptance_matrix_path
+            ):
+                raise ValueError("acceptance_matrix_path must be a canonical repository path")
+            if re.fullmatch(r"[A-Za-z0-9._/-]+", self.acceptance_matrix_path) is None:
+                raise ValueError("acceptance_matrix_path contains unsafe characters")
+            if re.fullmatch(r"[0-9a-f]{64}", cast(str, self.acceptance_matrix_sha256)) is None:
+                raise ValueError("acceptance_matrix_sha256 must be a lowercase SHA-256")
         if (
             self.required_uv_version is not None
             and re.fullmatch(
@@ -539,6 +631,12 @@ class ReleaseGateResult(BaseModel):
 
     release_version: str
     artifact_sha256: str | None = None
+    acceptance_matrix_schema_version: str | None = None
+    acceptance_matrix_release_version: str | None = None
+    acceptance_matrix_sha256: str | None = None
+    acceptance_matrix_stage: str | None = None
+    acceptance_report_ids: list[str] = Field(default_factory=list)
+    acceptance_report_document_ids: list[str] = Field(default_factory=list)
     policy_target_identity_sha256: dict[str, str] = Field(default_factory=lambda: dict[str, str]())
     target_identity_sha256: dict[str, str] = Field(default_factory=lambda: dict[str, str]())
     passed: bool
@@ -581,7 +679,7 @@ class ValidationRecorder:
                     started_at=started_at,
                     completed_at=_utc_now(),
                     evidence=evidence,
-                    error=f"{type(exc).__name__}: {exc}",
+                    error=logical_filesystem_text(f"{type(exc).__name__}: {exc}"),
                 )
             )
             raise
@@ -896,14 +994,16 @@ class ValidationRecorder:
                 status=ValidationStatus.FAILED,
                 started_at=now,
                 completed_at=now,
-                error=f"{type(error).__name__}: {error}",
+                error=logical_filesystem_text(f"{type(error).__name__}: {error}"),
             )
         )
 
     def finish(self, error: BaseException | None = None) -> None:
         """Set terminal report state without hiding the original exception."""
         self.report.completed_at = _utc_now()
-        self.report.error = None if error is None else f"{type(error).__name__}: {error}"
+        self.report.error = (
+            None if error is None else logical_filesystem_text(f"{type(error).__name__}: {error}")
+        )
         self.report.status = (
             ValidationStatus.PASSED
             if error is None
@@ -949,9 +1049,11 @@ def new_live_validation_report(
     launcher: str | None = None,
     install_source: str | None = None,
     artifact_sha256: str | None = None,
+    report_id: DurableRecordId | None = None,
 ) -> LiveValidationReport:
     """Create a report seeded with package, source, and invocation provenance."""
     return LiveValidationReport(
+        report_id=(report_id if report_id is not None else f"validation_{uuid4().hex}"),
         scenario=scenario,
         cluster=cluster,
         transport_modes=list(dict.fromkeys(transport_modes)),
@@ -1039,11 +1141,12 @@ def detect_install_source(
         resolved_launcher,
         detected_kind=detected_kind,
         package_path=package_path,
+        distribution=distribution,
     )
     released = (
         kind is InstallSourceKind.PYPI
         and detected_kind is InstallSourceKind.PYPI
-        and resolved_launcher == "uvx"
+        and resolved_launcher == "uv-tool"
         and artifact_identity_verified
         and launcher_verified
     )
@@ -1068,8 +1171,15 @@ def _detect_launcher_receipt(
     *,
     detected_kind: InstallSourceKind,
     package_path: str,
+    distribution: metadata.Distribution,
 ) -> tuple[bool, dict[str, Any]]:
     """Capture process-observed uv tool-environment evidence, not a caller label alone."""
+    if launcher == "uv-tool":
+        return _detect_persistent_uv_tool_receipt(
+            detected_kind=detected_kind,
+            package_path=package_path,
+            distribution=distribution,
+        )
     uv_executable = os.environ.get("UV")
     prefix = Path(sys.prefix).resolve()
     base_prefix = Path(sys.base_prefix).resolve()
@@ -1144,6 +1254,212 @@ def _detect_launcher_receipt(
         "pyvenv_matches_uv": pyvenv_matches_uv,
         "isolated_environment": isolated_environment,
         "detected_install_source": detected_kind.value,
+        "verified": verified,
+    }
+
+
+def _detect_persistent_uv_tool_receipt(
+    *,
+    detected_kind: InstallSourceKind,
+    package_path: str,
+    distribution: metadata.Distribution,
+) -> tuple[bool, dict[str, Any]]:
+    """Capture structural evidence for an install-once uv tool invocation."""
+    uv_executable = os.environ.get("UV")
+    uv_path = Path(uv_executable) if uv_executable is not None else None
+    uv_identity_before = _regular_file_identity(uv_path) if uv_path is not None else None
+    uv_path_verified, uv_version, uv_executable_sha256 = _uv_executable_identity(uv_executable)
+    uv_identity_after = _regular_file_identity(uv_path) if uv_path is not None else None
+    uv_stable = uv_identity_before is not None and uv_identity_after == uv_identity_before
+    tool_directory = _uv_tool_dir(uv_path, bin_directory=False) if uv_path_verified else None
+    tool_bin_directory = _uv_tool_dir(uv_path, bin_directory=True) if uv_path_verified else None
+    prefix = Path(sys.prefix).resolve()
+    base_prefix = Path(sys.base_prefix).resolve()
+    process_executable = Path(os.path.abspath(sys.executable))
+    process_executable_resolved = process_executable.resolve()
+    package = Path(package_path).resolve()
+    package_in_environment = _within_or_equal(package, prefix)
+    executable_in_environment = _within_or_equal(process_executable_resolved, prefix)
+    environment_in_tool_directory = tool_directory is not None and _strictly_contains(
+        tool_directory, prefix
+    )
+    pyvenv_uv_version = _pyvenv_uv_version(prefix)
+    pyvenv_matches_uv = uv_version is not None and pyvenv_uv_version == uv_version
+    configured_tool = os.environ.get("CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE")
+    selected_tool = configured_tool or shutil.which("clio-relay")
+    tool_path = Path(selected_tool).expanduser() if selected_tool is not None else None
+    try:
+        tool_path_absolute = tool_path.absolute() if tool_path is not None else None
+        tool_target = tool_path.resolve(strict=True) if tool_path is not None else None
+    except OSError:
+        tool_path_absolute = None
+        tool_target = None
+    tool_bin_bound = (
+        tool_path_absolute is not None
+        and tool_bin_directory is not None
+        and tool_path_absolute.parent.resolve() == tool_bin_directory
+    )
+    tool_target_identity = _regular_file_identity(tool_target) if tool_target is not None else None
+    tool_executable_sha256 = (
+        _hash_open_regular_file(tool_target, tool_target_identity)
+        if tool_target is not None
+        else None
+    )
+    record_identity = _installed_record_identity(distribution)
+    owned_console_digests = record_identity.pop("console_script_sha256", [])
+    tool_target_bound = tool_target is not None and (
+        _within_or_equal(tool_target, prefix)
+        or (
+            isinstance(tool_executable_sha256, str)
+            and tool_executable_sha256 in owned_console_digests
+        )
+    )
+    project_environment = (Path.cwd() / ".venv").resolve()
+    isolated_environment = prefix != base_prefix and prefix != project_environment
+    verified = (
+        detected_kind in {InstallSourceKind.WHEEL, InstallSourceKind.PYPI}
+        and uv_path_verified
+        and uv_stable
+        and tool_directory is not None
+        and tool_bin_directory is not None
+        and environment_in_tool_directory
+        and pyvenv_matches_uv
+        and package_in_environment
+        and executable_in_environment
+        and tool_bin_bound
+        and tool_target_bound
+        and record_identity.get("verified") is True
+        and isolated_environment
+    )
+    return verified, {
+        "schema_version": "clio-relay.launcher-receipt.v3",
+        "claimed_launcher": "uv-tool",
+        "uv_executable": uv_executable,
+        "uv_executable_verified": uv_path_verified,
+        "uv_executable_stable": uv_stable,
+        "uv_version": uv_version,
+        "uv_executable_sha256": uv_executable_sha256,
+        "uv_tool_directory": str(tool_directory) if tool_directory is not None else None,
+        "uv_tool_bin_directory": (
+            str(tool_bin_directory) if tool_bin_directory is not None else None
+        ),
+        "tool_environment_verified": environment_in_tool_directory,
+        "tool_executable": str(tool_path_absolute) if tool_path_absolute is not None else None,
+        "tool_executable_resolved": str(tool_target) if tool_target is not None else None,
+        "tool_executable_sha256": tool_executable_sha256,
+        "tool_bin_bound": tool_bin_bound,
+        "tool_target_bound": tool_target_bound,
+        "invocation_id": os.environ.get("CLIO_RELAY_VALIDATION_INVOCATION_ID"),
+        "process_prefix": str(prefix),
+        "base_prefix": str(base_prefix),
+        "process_executable": str(process_executable),
+        "process_executable_resolved": str(process_executable_resolved),
+        "package_in_process_environment": package_in_environment,
+        "executable_in_process_environment": executable_in_environment,
+        "pyvenv_uv_version": pyvenv_uv_version,
+        "pyvenv_matches_uv": pyvenv_matches_uv,
+        "isolated_environment": isolated_environment,
+        "distribution_record": record_identity,
+        "detected_install_source": detected_kind.value,
+        "verified": verified,
+    }
+
+
+def _uv_tool_dir(executable: Path | None, *, bin_directory: bool) -> Path | None:
+    """Return one directory reported by the exact stable uv executable."""
+    identity = _regular_file_identity(executable) if executable is not None else None
+    if executable is None or identity is None:
+        return None
+    command = [str(executable), "tool", "dir"]
+    if bin_directory:
+        command.append("--bin")
+    command.append("--no-config")
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    output = completed.stdout.strip()
+    if (
+        completed.returncode != 0
+        or _regular_file_identity(executable) != identity
+        or not output
+        or "\x00" in output
+        or "\n" in output
+        or "\r" in output
+    ):
+        return None
+    candidate = Path(output)
+    if not candidate.is_absolute():
+        return None
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None
+    return resolved if resolved.is_dir() else None
+
+
+def _installed_record_identity(distribution: metadata.Distribution) -> dict[str, Any]:
+    """Verify and summarize the complete installed distribution RECORD closure."""
+    files = distribution.files
+    if files is None or not files or len(files) > 100_000:
+        return {"verified": False, "console_script_sha256": []}
+    closure = hashlib.sha256()
+    runtime_bytes = 0
+    record_paths: list[Path] = []
+    console_digests: list[str] = []
+    try:
+        for item in sorted(files, key=lambda value: str(value)):
+            relative = str(item).replace("\\", "/")
+            located = Path(str(distribution.locate_file(item))).resolve(strict=True)
+            identity = _regular_file_identity(located)
+            if identity is None:
+                return {"verified": False, "console_script_sha256": []}
+            digest = _hash_open_regular_file(located, identity)
+            if digest is None:
+                return {"verified": False, "console_script_sha256": []}
+            size = identity[2]
+            runtime_bytes += size
+            if runtime_bytes > 4 * 1024 * 1024 * 1024:
+                return {"verified": False, "console_script_sha256": []}
+            expected_hash = item.hash
+            if expected_hash is not None:
+                if expected_hash.mode != "sha256":
+                    return {"verified": False, "console_script_sha256": []}
+                encoded = base64.urlsafe_b64encode(bytes.fromhex(digest)).rstrip(b"=").decode()
+                if encoded != expected_hash.value:
+                    return {"verified": False, "console_script_sha256": []}
+            elif not relative.endswith(".dist-info/RECORD"):
+                return {"verified": False, "console_script_sha256": []}
+            closure.update(relative.encode("utf-8"))
+            closure.update(b"\0")
+            closure.update(digest.encode("ascii"))
+            closure.update(b"\0")
+            closure.update(str(size).encode("ascii"))
+            closure.update(b"\n")
+            if relative.endswith(".dist-info/RECORD"):
+                record_paths.append(located)
+            if located.name.casefold() in {"clio-relay", "clio-relay.exe"}:
+                console_digests.append(digest)
+    except (OSError, ValueError):
+        return {"verified": False, "console_script_sha256": []}
+    if len(record_paths) != 1:
+        return {"verified": False, "console_script_sha256": []}
+    record_identity = _regular_file_identity(record_paths[0])
+    record_sha256 = _hash_open_regular_file(record_paths[0], record_identity)
+    verified = record_sha256 is not None and bool(console_digests)
+    return {
+        "record_path": str(record_paths[0]),
+        "record_sha256": record_sha256,
+        "runtime_closure_sha256": closure.hexdigest(),
+        "runtime_file_count": len(files),
+        "runtime_bytes": runtime_bytes,
+        "console_script_sha256": sorted(set(console_digests)),
         "verified": verified,
     }
 
@@ -1512,22 +1828,61 @@ def write_release_gate_result(result: ReleaseGateResult, path: Path) -> None:
 
 def load_validation_report(path: Path) -> LiveValidationReport:
     """Load and strictly validate a report from disk."""
+    logical_path = logical_filesystem_path(path)
     try:
-        return LiveValidationReport.model_validate_json(path.read_text(encoding="utf-8"))
+        report = LiveValidationReport.model_validate_json(
+            internal_filesystem_path(logical_path, force_extended=True).read_text(encoding="utf-8")
+        )
     except (OSError, ValidationError) as exc:
-        raise ConfigurationError(f"could not read validation report {path}: {exc}") from exc
+        raise ConfigurationError(f"could not read validation report {logical_path}: {exc}") from exc
+    report._source_path = logical_path  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    return report
 
 
 def load_release_gate_policy(path: Path) -> ReleaseGatePolicy:
     """Load a JSON or YAML release policy."""
+    logical_path = logical_filesystem_path(path)
+    internal_path = internal_filesystem_path(logical_path, force_extended=True)
     try:
-        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        document = yaml.safe_load(internal_path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
-        raise ConfigurationError(f"could not read release gate policy {path}: {exc}") from exc
+        raise ConfigurationError(
+            f"could not read release gate policy {logical_path}: {exc}"
+        ) from exc
     try:
-        return ReleaseGatePolicy.model_validate(document)
+        policy = ReleaseGatePolicy.model_validate(document)
     except ValidationError as exc:
-        raise ConfigurationError(f"invalid release gate policy {path}: {exc}") from exc
+        raise ConfigurationError(f"invalid release gate policy {logical_path}: {exc}") from exc
+    if policy.acceptance_matrix_path is None:
+        return policy
+    repository_root = next(
+        (
+            parent
+            for parent in (internal_path.parent, *internal_path.parents)
+            if (parent / "pyproject.toml").is_file()
+        ),
+        None,
+    )
+    if repository_root is None:
+        raise ConfigurationError(
+            f"could not resolve repository root for release gate policy {logical_path}"
+        )
+    matrix_path = (repository_root / PurePosixPath(policy.acceptance_matrix_path)).resolve()
+    try:
+        matrix_path.relative_to(repository_root.resolve())
+    except ValueError as exc:
+        raise ConfigurationError("release acceptance matrix escapes the policy repository") from exc
+    try:
+        policy._acceptance_matrix = load_release_acceptance_matrix(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            matrix_path,
+            expected_sha256=policy.acceptance_matrix_sha256,
+            expected_release_version=policy.release_version,
+        )
+    except (OSError, ProvenanceError) as exc:
+        raise ConfigurationError(
+            f"could not bind release acceptance matrix {matrix_path}: {exc}"
+        ) from exc
+    return policy
 
 
 def evaluate_release_gate(
@@ -1537,13 +1892,83 @@ def evaluate_release_gate(
     expected_artifact_sha256: str | None = None,
 ) -> ReleaseGateResult:
     """Evaluate immutable-artifact reports without inferring untested claims."""
+    all_reports = list(reports)
     expected_digest = _validated_sha256(expected_artifact_sha256)
     if _policy_requires_expected_artifact_digest(policy) and expected_digest is None:
         raise ConfigurationError(
             f"{policy.artifact_stage} gates requiring artifact SHA-256 evidence require an "
             "independently computed expected artifact SHA-256"
         )
-    candidates = [report for report in reports if report.software.version == policy.release_version]
+    matrix = policy.acceptance_matrix
+    if policy.acceptance_matrix_path is not None and matrix is None:
+        raise ConfigurationError(
+            "release gate policy acceptance matrix was not digest-verified by the policy loader"
+        )
+    matrix_stage: dict[str, object] | None = None
+    matrix_pairs: list[tuple[dict[str, object], LiveValidationReport]] = []
+    matrix_failures: list[str] = []
+    if matrix is not None:
+        stages = cast(list[dict[str, object]], matrix["stages"])
+        matching_stages = [
+            stage for stage in stages if stage.get("artifact_stage") == policy.artifact_stage
+        ]
+        if len(matching_stages) != 1:
+            raise ConfigurationError(
+                f"release acceptance matrix does not define artifact stage {policy.artifact_stage}"
+            )
+        matrix_stage = matching_stages[0]
+        prefix = cast(str, matrix_stage["filename_prefix"])
+        matrix_reports = cast(list[dict[str, object]], matrix["reports"])
+        expected_names = [f"{prefix}-{entry['id']}.json" for entry in matrix_reports]
+        nonlocal_reports = [report for report in all_reports if report.cluster != "local"]
+        reports_by_name: dict[str, LiveValidationReport] = {}
+        duplicate_names: set[str] = set()
+        missing_source_ids: list[str] = []
+        for report in nonlocal_reports:
+            if report.source_path is None:
+                missing_source_ids.append(report.report_id)
+                continue
+            name = report.source_path.name
+            if name in reports_by_name:
+                duplicate_names.add(name)
+            reports_by_name[name] = report
+        if missing_source_ids:
+            matrix_failures.append(
+                "matrix reports were not loaded from provenance-bearing paths: "
+                f"{sorted(missing_source_ids)}"
+            )
+        if duplicate_names:
+            matrix_failures.append(f"duplicate matrix report filenames: {sorted(duplicate_names)}")
+        actual_names = set(reports_by_name)
+        if len(nonlocal_reports) != len(expected_names) or actual_names != set(expected_names):
+            matrix_failures.append(
+                "non-local report filenames do not exactly match the acceptance matrix: "
+                f"missing={sorted(set(expected_names) - actual_names)}, "
+                f"unexpected={sorted(actual_names - set(expected_names))}"
+            )
+        document_ids = [report.report_id for report in nonlocal_reports]
+        if len(document_ids) != len(set(document_ids)):
+            matrix_failures.append(
+                "acceptance matrix reports contain duplicate document report ids"
+            )
+        for entry, filename in zip(matrix_reports, expected_names, strict=True):
+            report = reports_by_name.get(filename)
+            if report is None:
+                continue
+            if report.cluster != entry["cluster"] or report.scenario != entry["scenario"]:
+                matrix_failures.append(
+                    f"{filename} cluster/scenario does not match acceptance matrix entry "
+                    f"{entry['id']}"
+                )
+            if report.software.version != policy.release_version:
+                matrix_failures.append(
+                    f"{filename} does not identify clio-relay {policy.release_version}"
+                )
+            matrix_pairs.append((entry, report))
+
+    candidates = [
+        report for report in all_reports if report.software.version == policy.release_version
+    ]
     policy_target_identity_sha256 = _policy_target_identity_digests(policy)
     target_identity_sha256: dict[str, str] = {}
     target_identity_failures: list[str] = []
@@ -1595,13 +2020,21 @@ def evaluate_release_gate(
                 if check.status is ValidationStatus.PASSED and check.evidence
             }
             combined_resources = {
-                resource.kind for report in group for resource in report.resources
+                resource.kind
+                for report in group
+                for resource in report.resources
+                if resource.cluster == requirement.cluster
             }
             missing_checks = sorted(set(requirement.required_checks) - combined_checks)
             missing_resources = sorted(
                 set(requirement.required_resource_kinds) - combined_resources
             )
             resource_predicate_failures = _required_resource_failures(
+                requirement,
+                [resource for report in group for resource in report.resources],
+                expected_cluster=requirement.cluster,
+            )
+            resource_scope_failures = _requirement_resource_scope_failures(
                 requirement,
                 [resource for report in group for resource in report.resources],
             )
@@ -1615,6 +2048,7 @@ def evaluate_release_gate(
                 not missing_checks
                 and not missing_resources
                 and not resource_predicate_failures
+                and not resource_scope_failures
                 and not identity_failures
             ):
                 matched_group = group
@@ -1624,10 +2058,11 @@ def evaluate_release_gate(
                     len(missing_checks)
                     + len(missing_resources)
                     + len(resource_predicate_failures)
+                    + len(resource_scope_failures)
                     + len(identity_failures),
                     missing_checks,
                     missing_resources,
-                    resource_predicate_failures,
+                    [*resource_scope_failures, *resource_predicate_failures],
                     identity_failures,
                 )
             )
@@ -1635,11 +2070,14 @@ def evaluate_release_gate(
             satisfied.append(requirement.requirement_id)
             used_report_ids.update(report.report_id for report in matched_group)
             continue
-        if eligible and requirement.evidence_group_resource_kind and not evidence_groups:
-            reasons.add(
-                "no reports share required evidence group resource kind "
-                f"{requirement.evidence_group_resource_kind}"
-            )
+        if eligible and not evidence_groups:
+            if requirement.evidence_group_resource_kind is None:
+                reasons.add("requirement evidence must be satisfied by one coherent report")
+            else:
+                reasons.add(
+                    "no reports share required evidence group resource kind "
+                    f"{requirement.evidence_group_resource_kind}"
+                )
         if group_failures:
             (
                 _,
@@ -1671,9 +2109,36 @@ def evaluate_release_gate(
         unsatisfied["target-identity"] = target_identity_failures
     if policy.release_blockers:
         unsatisfied["declared-release-blockers"] = list(policy.release_blockers)
+    if matrix_pairs:
+        unused_matrix_ids = [
+            cast(str, entry["id"])
+            for entry, report in matrix_pairs
+            if report.report_id not in used_report_ids
+        ]
+        if unused_matrix_ids:
+            matrix_failures.append(
+                "acceptance matrix reports were not used by any policy requirement: "
+                f"{unused_matrix_ids}"
+            )
+    if matrix_failures:
+        unsatisfied["acceptance-matrix"] = matrix_failures
     return ReleaseGateResult(
         release_version=policy.release_version,
         artifact_sha256=expected_digest,
+        acceptance_matrix_schema_version=(
+            cast(str, matrix["schema_version"]) if matrix is not None else None
+        ),
+        acceptance_matrix_release_version=(
+            cast(str, matrix["release_version"]) if matrix is not None else None
+        ),
+        acceptance_matrix_sha256=(
+            cast(str, matrix["matrix_sha256"]) if matrix is not None else None
+        ),
+        acceptance_matrix_stage=(
+            cast(str, matrix_stage["name"]) if matrix_stage is not None else None
+        ),
+        acceptance_report_ids=[cast(str, entry["id"]) for entry, _ in matrix_pairs],
+        acceptance_report_document_ids=[report.report_id for _, report in matrix_pairs],
         policy_target_identity_sha256=policy_target_identity_sha256,
         target_identity_sha256=target_identity_sha256,
         passed=not unsatisfied,
@@ -1740,7 +2205,7 @@ def _requirement_evidence_groups(
     """Group multi-report evidence by a shared stable resource when required."""
     kind = requirement.evidence_group_resource_kind
     if kind is None:
-        return [reports] if reports else []
+        return []
     grouped: dict[str, list[LiveValidationReport]] = {}
     for report in reports:
         resource_ids = {
@@ -1785,7 +2250,7 @@ def render_validation_markdown(report: LiveValidationReport) -> str:
 def sha256_file(path: Path) -> str:
     """Return the SHA-256 digest of an artifact without loading it all at once."""
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
+    with internal_filesystem_path(path, force_extended=True).open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -1835,8 +2300,11 @@ def _report_requirement_failures(
         )
     if report.install_source.launcher not in allowed_launchers:
         failures.append(f"launcher {report.install_source.launcher} is not release-approved")
-    if report.install_source.launcher == "uvx" and not report.install_source.launcher_verified:
-        failures.append("report does not contain a process-observed uvx launcher receipt")
+    if (
+        report.install_source.launcher in {"uv-tool", "uvx"}
+        and not report.install_source.launcher_verified
+    ):
+        failures.append("report does not contain a process-observed uv launcher receipt")
     if require_released and not report.install_source.released_artifact:
         failures.append("report does not prove a released artifact")
     if require_released and not report.install_source.artifact_identity_verified:
@@ -1877,6 +2345,7 @@ def _report_requirement_failures(
             policy.targets.get(report.cluster),
         )
         failures.extend(identity_failures)
+    failures.extend(_requirement_resource_scope_failures(requirement, report.resources))
     if include_requirement_evidence:
         passed_checks = {
             check.check_id
@@ -1886,7 +2355,11 @@ def _report_requirement_failures(
         missing_checks = sorted(set(requirement.required_checks) - passed_checks)
         if missing_checks:
             failures.append(f"missing passed checks: {missing_checks}")
-        resource_kinds = {resource.kind for resource in report.resources}
+        resource_kinds = {
+            resource.kind
+            for resource in report.resources
+            if resource.cluster == requirement.cluster
+        }
         missing_resources = sorted(set(requirement.required_resource_kinds) - resource_kinds)
         if missing_resources:
             failures.append(f"missing resource evidence: {missing_resources}")
@@ -1902,7 +2375,15 @@ def _report_requirement_failures(
                     f"of kind {requirement.evidence_group_resource_kind}; "
                     f"found {sorted(grouping_ids)}"
                 )
-        failures.extend(_required_resource_failures(requirement, report.resources))
+        failures.extend(
+            _required_resource_failures(
+                requirement,
+                report.resources,
+                expected_cluster=requirement.cluster,
+            )
+        )
+        failures.extend(_spack_fresh_install_transition_failures(requirement, report))
+        failures.extend(_jarvis_execution_identity_failures(requirement, report))
     return failures
 
 
@@ -1947,6 +2428,32 @@ def _launcher_identity_failures(
         or re.fullmatch(r"[0-9a-f]{64}", executable_sha256) is None
     ):
         failures.append("launcher receipt omits a lowercase uv executable SHA-256")
+    if report.install_source.launcher == "uv-tool":
+        if receipt.get("claimed_launcher") != "uv-tool":
+            failures.append("launcher receipt does not identify the persistent uv tool path")
+        for field in ("uv_tool_directory", "uv_tool_bin_directory", "process_prefix"):
+            value = receipt.get(field)
+            if not isinstance(value, str) or not value or not Path(value).is_absolute():
+                failures.append(f"launcher receipt omits absolute {field}")
+        for field in (
+            "tool_environment_verified",
+            "tool_bin_bound",
+            "tool_target_bound",
+            "pyvenv_matches_uv",
+            "package_in_process_environment",
+            "executable_in_process_environment",
+            "isolated_environment",
+        ):
+            if receipt.get(field) is not True:
+                failures.append(f"launcher receipt does not verify {field}")
+        record = receipt.get("distribution_record")
+        record_mapping = cast(dict[str, Any], record) if isinstance(record, dict) else {}
+        if record_mapping.get("verified") is not True:
+            failures.append("launcher receipt does not verify the installed RECORD closure")
+        for field in ("record_sha256", "runtime_closure_sha256"):
+            value = record_mapping.get(field)
+            if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                failures.append(f"launcher receipt omits lowercase {field}")
     return failures
 
 
@@ -2176,23 +2683,18 @@ def _normalized_hostname(value: str) -> str:
 def _required_resource_failures(
     requirement: ReleaseGateRequirement,
     resources_to_check: Iterable[ValidationResource],
+    *,
+    expected_cluster: str,
 ) -> list[str]:
     """Return failures for stateful resource predicates in a release policy."""
     resources = list(resources_to_check)
     failures: list[str] = []
     for required in requirement.required_resources:
-        matching = [
-            resource
-            for resource in resources
-            if resource.kind == required.kind
-            and (required.roles is None or resource.role in required.roles)
-            and (required.states is None or resource.state in required.states)
-            and (required.providers is None or resource.provider in required.providers)
-            and all(
-                _metadata_value_matches(resource.metadata.get(key), expected)
-                for key, expected in required.metadata_equals.items()
-            )
-        ]
+        matching = _matching_required_resources(
+            required,
+            resources,
+            expected_cluster=expected_cluster,
+        )
         if len(matching) >= required.minimum_count:
             continue
         constraints: list[str] = []
@@ -2210,6 +2712,715 @@ def _required_resource_failures(
             f"found {len(matching)}"
         )
     return failures
+
+
+def _matching_required_resources(
+    required: ReleaseResourceRequirement,
+    resources: Iterable[ValidationResource],
+    *,
+    expected_cluster: str,
+) -> list[ValidationResource]:
+    """Return resources matching one predicate on the exact policy target."""
+    return [
+        resource
+        for resource in resources
+        if resource.cluster == expected_cluster
+        and resource.kind == required.kind
+        and (required.roles is None or resource.role in required.roles)
+        and (required.states is None or resource.state in required.states)
+        and (required.providers is None or resource.provider in required.providers)
+        and all(
+            _metadata_value_matches(resource.metadata.get(key), expected)
+            for key, expected in required.metadata_equals.items()
+        )
+    ]
+
+
+def _requirement_resource_scope_failures(
+    requirement: ReleaseGateRequirement,
+    resources_to_check: Iterable[ValidationResource],
+) -> list[str]:
+    """Reject required evidence kinds attributed to any other target or no target."""
+    target_scoped_kinds = {
+        *requirement.required_resource_kinds,
+        *(required.kind for required in requirement.required_resources),
+    }
+    mismatched = sorted(
+        {
+            f"{resource.kind}:{resource.resource_id}:{resource.cluster or '<unscoped>'}"
+            for resource in resources_to_check
+            if resource.kind in target_scoped_kinds and resource.cluster != requirement.cluster
+        }
+    )
+    if not mismatched:
+        return []
+    return [
+        f"required evidence resources must belong to cluster {requirement.cluster}: {mismatched}"
+    ]
+
+
+_JARVIS_EXECUTION_CHECK_IDS = frozenset(
+    {
+        "jarvis.structured-runtime-metadata",
+        "remote-mcp.jarvis-execution-query",
+        "remote-mcp.jarvis-live-progress",
+    }
+)
+_JARVIS_EXECUTION_RELAY_JOB_ROLES = frozenset(
+    {"jarvis_mcp_execution_query", "virtual_jarvis_mcp_call"}
+)
+
+
+def _jarvis_execution_identity_failures(
+    requirement: ReleaseGateRequirement,
+    report: LiveValidationReport,
+) -> list[str]:
+    """Bind JARVIS checks and semantic resources to one durable execution."""
+    if "jarvis_execution_progress" not in {
+        *requirement.required_resource_kinds,
+        *(required.kind for required in requirement.required_resources),
+    }:
+        return []
+
+    failures: list[str] = []
+    execution_ids: set[str] = set()
+    identity_requirements = [
+        required
+        for required in requirement.required_resources
+        if required.kind in {"jarvis_execution_progress", "jarvis_generated_artifact"}
+        or (
+            required.kind == "relay_job"
+            and required.roles is not None
+            and bool(_JARVIS_EXECUTION_RELAY_JOB_ROLES.intersection(required.roles))
+        )
+    ]
+    for required in identity_requirements:
+        for resource in _matching_required_resources(
+            required,
+            report.resources,
+            expected_cluster=requirement.cluster,
+        ):
+            execution_id = resource.metadata.get("execution_id")
+            if not isinstance(execution_id, str) or not execution_id:
+                failures.append(
+                    "JARVIS execution-scoped resource omits execution_id: "
+                    f"{resource.kind}:{resource.resource_id}"
+                )
+                continue
+            execution_ids.add(execution_id)
+
+    if len(execution_ids) != 1:
+        failures.append(
+            "JARVIS execution-scoped resources do not identify exactly one execution: "
+            f"{sorted(execution_ids)}"
+        )
+        return failures
+    expected_execution_id = next(iter(execution_ids))
+
+    for check_id in sorted(_JARVIS_EXECUTION_CHECK_IDS.intersection(requirement.required_checks)):
+        checks = [
+            check
+            for check in report.checks
+            if check.check_id == check_id
+            and check.status is ValidationStatus.PASSED
+            and check.evidence
+        ]
+        if len(checks) != 1:
+            failures.append(
+                f"JARVIS execution check {check_id} must appear exactly once in the report"
+            )
+            continue
+        evidence_ids = [evidence.metadata.get("execution_id") for evidence in checks[0].evidence]
+        if (
+            not evidence_ids
+            or any(not isinstance(value, str) or not value for value in evidence_ids)
+            or set(cast(list[str], evidence_ids)) != {expected_execution_id}
+        ):
+            failures.append(
+                f"JARVIS execution check {check_id} is not bound to "
+                f"execution {expected_execution_id}"
+            )
+    return failures
+
+
+def _spack_fresh_install_transition_failures(
+    requirement: ReleaseGateRequirement,
+    report: LiveValidationReport,
+) -> list[str]:
+    """Independently bind one typed Spack fresh-install transition report."""
+    expected = requirement.spack_fresh_install_transition
+    if expected is None:
+        return []
+    failures: list[str] = []
+    checks: dict[str, dict[str, Any]] = {}
+    for check_id in SPACK_FRESH_INSTALL_TRANSITION_CHECK_IDS:
+        metadata = _unique_spack_transition_check_metadata(report, check_id, failures)
+        if metadata is not None:
+            checks[check_id] = metadata
+
+    phase_definitions = (
+        (
+            "preinstall",
+            "spack_preinstall_find",
+            "spack_find",
+            {"query": expected.requested_spec},
+        ),
+        (
+            "install",
+            "spack_fresh_install",
+            "spack_install",
+            {"spec": expected.requested_spec, "reuse": False},
+        ),
+        ("postinstall", "spack_postinstall_locate", "spack_locate", None),
+    )
+    phase_resources: dict[str, ValidationResource] = {}
+    phase_indexes: list[int] = []
+    for phase, role, tool, arguments in phase_definitions:
+        matches = [
+            (index, resource)
+            for index, resource in enumerate(report.resources)
+            if resource.cluster == requirement.cluster
+            and resource.kind == "relay_job"
+            and resource.role == role
+        ]
+        if len(matches) != 1:
+            failures.append(
+                f"Spack fresh-install transition requires exactly one {phase} phase job; "
+                f"found {len(matches)}"
+            )
+            continue
+        index, resource = matches[0]
+        phase_indexes.append(index)
+        phase_resources[phase] = resource
+        metadata = resource.metadata
+        if resource.state != "succeeded":
+            failures.append(f"Spack {phase} phase job did not succeed")
+        if metadata.get("remote_mcp_server_name") != expected.server_name:
+            failures.append(f"Spack {phase} phase job identifies the wrong server")
+        if metadata.get("profile") != expected.profile:
+            failures.append(f"Spack {phase} phase job identifies the wrong profile")
+        if metadata.get("remote_mcp_tool_name") != tool:
+            failures.append(f"Spack {phase} phase job identifies the wrong tool")
+        if arguments is not None and metadata.get("arguments") != arguments:
+            failures.append(f"Spack {phase} phase job arguments do not match policy")
+
+    if len(phase_indexes) == len(phase_definitions) and phase_indexes != sorted(phase_indexes):
+        failures.append("Spack phase jobs are not recorded in preinstall/install/postinstall order")
+    phase_job_ids = [
+        phase_resources[phase].resource_id
+        for phase in ("preinstall", "install", "postinstall")
+        if phase in phase_resources
+    ]
+    if len(phase_job_ids) == 3 and len(set(phase_job_ids)) != 3:
+        failures.append("Spack transition phase jobs do not have distinct durable identities")
+
+    preinstall_result = _spack_phase_structured_result(
+        phase_resources.get("preinstall"),
+        phase="preinstall",
+        failures=failures,
+    )
+    if preinstall_result is not None and preinstall_result != {
+        "schema_version": "spack.mcp.result.v1",
+        "operation": "find",
+        "query": expected.requested_spec,
+        "count": 0,
+        "packages": [],
+    }:
+        failures.append("Spack preinstall phase does not prove the exact spec was absent")
+
+    install_result = _spack_phase_structured_result(
+        phase_resources.get("install"),
+        phase="install",
+        failures=failures,
+    )
+    dag_hash: str | None = None
+    if install_result is not None:
+        package = _spack_transition_mapping(install_result.get("package"))
+        raw_hash = package.get("dag_hash") if package is not None else None
+        if isinstance(raw_hash, str) and re.fullmatch(r"[a-z0-9]{32}", raw_hash) is not None:
+            dag_hash = raw_hash
+        install_matches = (
+            install_result.get("schema_version") == "spack.mcp.result.v1"
+            and install_result.get("operation") == "install"
+            and install_result.get("requested_spec") == expected.requested_spec
+            and install_result.get("reuse") is expected.reuse
+            and install_result.get("status") == "installed"
+            and install_result.get("package_count") == 1
+            and package is not None
+            and package.get("name") == expected.package_name
+            and dag_hash is not None
+        )
+        if not install_matches:
+            failures.append(
+                "Spack install phase does not bind the exact package/spec with reuse=false"
+            )
+
+    postinstall_resource = phase_resources.get("postinstall")
+    postinstall_result = _spack_phase_structured_result(
+        postinstall_resource,
+        phase="postinstall",
+        failures=failures,
+    )
+    prefix: str | None = None
+    exact_hash_spec = f"/{dag_hash}" if dag_hash is not None else None
+    if postinstall_result is not None:
+        package = _spack_transition_mapping(postinstall_result.get("package"))
+        raw_prefix = postinstall_result.get("prefix")
+        prefix = raw_prefix if isinstance(raw_prefix, str) and raw_prefix else None
+        postinstall_matches = (
+            exact_hash_spec is not None
+            and postinstall_result.get("schema_version") == "spack.mcp.result.v1"
+            and postinstall_result.get("operation") == "locate"
+            and postinstall_result.get("requested_spec") == exact_hash_spec
+            and postinstall_result.get("load_spec") == exact_hash_spec
+            and package is not None
+            and package.get("name") == expected.package_name
+            and package.get("dag_hash") == dag_hash
+            and prefix is not None
+        )
+        if not postinstall_matches:
+            failures.append("Spack postinstall phase does not locate the exact installed DAG")
+    if postinstall_resource is not None and postinstall_resource.metadata.get("arguments") != {
+        "spec": exact_hash_spec
+    }:
+        failures.append("Spack postinstall phase does not query the exact /dag_hash")
+
+    _bind_spack_transition_phase_checks(
+        checks,
+        expected=expected,
+        preinstall_result=preinstall_result,
+        install_result=install_result,
+        postinstall_result=postinstall_result,
+        dag_hash=dag_hash,
+        failures=failures,
+    )
+    _bind_spack_transition_identity(
+        checks.get("remote-mcp.spack-transition-identity"),
+        requirement=requirement,
+        expected=expected,
+        failures=failures,
+    )
+    _bind_spack_transition_durable_evidence(
+        checks.get("remote-mcp.spack-transition-durable-evidence"),
+        phase_job_ids=phase_job_ids,
+        failures=failures,
+    )
+    store_root = _bind_spack_disposable_store(
+        checks.get("remote-mcp.spack-disposable-store"),
+        prefix=prefix,
+        failures=failures,
+    )
+    if store_root is None or prefix is None:
+        failures.append("Spack transition omits its disposable store or installed prefix")
+    _bind_spack_configuration_identity(
+        checks.get("remote-mcp.spack-fresh-configuration"),
+        report=report,
+        requirement=requirement,
+        failures=failures,
+    )
+    _bind_spack_transition_artifacts(
+        report,
+        requirement=requirement,
+        phase_resources=phase_resources,
+        failures=failures,
+    )
+    server_resources = [
+        resource
+        for resource in report.resources
+        if resource.cluster == requirement.cluster
+        and resource.kind == "mcp_server"
+        and resource.role == "remote_mcp_server"
+        and resource.metadata.get("server_name") == expected.server_name
+    ]
+    if len(server_resources) != 1 or server_resources[0].state != "verified":
+        failures.append("Spack transition does not identify one verified fresh MCP server")
+    return failures
+
+
+def _unique_spack_transition_check_metadata(
+    report: LiveValidationReport,
+    check_id: str,
+    failures: list[str],
+) -> dict[str, Any] | None:
+    """Return one passed transition check's single structured evidence object."""
+    matches = [check for check in report.checks if check.check_id == check_id]
+    if len(matches) != 1:
+        failures.append(f"Spack transition check {check_id} must appear exactly once")
+        return None
+    check = matches[0]
+    if check.status is not ValidationStatus.PASSED or len(check.evidence) != 1:
+        failures.append(f"Spack transition check {check_id} is not one passed evidence record")
+        return None
+    metadata = check.evidence[0].metadata
+    if not metadata:
+        failures.append(f"Spack transition check {check_id} has no structured evidence")
+        return None
+    return metadata
+
+
+def _spack_transition_mapping(value: object) -> dict[str, Any] | None:
+    """Narrow one untrusted report value to a string-keyed mapping."""
+    if not isinstance(value, dict):
+        return None
+    raw = cast(dict[object, object], value)
+    if any(not isinstance(key, str) for key in raw):
+        return None
+    return cast(dict[str, Any], value)
+
+
+def _spack_phase_structured_result(
+    resource: ValidationResource | None,
+    *,
+    phase: str,
+    failures: list[str],
+) -> dict[str, Any] | None:
+    """Read one phase result from its exact durable relay-job resource."""
+    result = (
+        _spack_transition_mapping(resource.metadata.get("structured_result"))
+        if resource is not None
+        else None
+    )
+    if result is None:
+        failures.append(f"Spack {phase} phase job omits structured result evidence")
+    return result
+
+
+def _bind_spack_transition_phase_checks(
+    checks: dict[str, dict[str, Any]],
+    *,
+    expected: ReleaseSpackFreshInstallRequirement,
+    preinstall_result: dict[str, Any] | None,
+    install_result: dict[str, Any] | None,
+    postinstall_result: dict[str, Any] | None,
+    dag_hash: str | None,
+    failures: list[str],
+) -> None:
+    """Cross-bind phase check evidence to the three canonical job projections."""
+    phase_checks = (
+        (
+            "remote-mcp.spack-preinstall-absent",
+            {"query": expected.requested_spec},
+            preinstall_result,
+        ),
+        (
+            "remote-mcp.spack-fresh-install",
+            {"spec": expected.requested_spec, "reuse": False},
+            install_result,
+        ),
+        (
+            "remote-mcp.spack-postinstall-locate",
+            {"spec": f"/{dag_hash}" if dag_hash is not None else None},
+            postinstall_result,
+        ),
+    )
+    for check_id, arguments, observed in phase_checks:
+        evidence = checks.get(check_id)
+        if evidence is None:
+            continue
+        if (
+            evidence.get("submitted_arguments") != arguments
+            or evidence.get("observed") != observed
+            or evidence.get("failures") != []
+        ):
+            failures.append(f"Spack transition check {check_id} is not bound to its phase job")
+    preinstall = checks.get("remote-mcp.spack-preinstall-absent")
+    if preinstall is not None and preinstall.get("expected_requested_spec") != (
+        expected.requested_spec
+    ):
+        failures.append("Spack absence check identifies the wrong requested spec")
+    install = checks.get("remote-mcp.spack-fresh-install")
+    install_expected = (
+        _spack_transition_mapping(install.get("expected")) if install is not None else None
+    )
+    if install_expected != {
+        "requested_spec": expected.requested_spec,
+        "package_name": expected.package_name,
+        "dag_hash": dag_hash,
+        "reuse": False,
+        "status": "installed",
+    }:
+        failures.append("Spack fresh-install check does not match the policy package identity")
+    locate = checks.get("remote-mcp.spack-postinstall-locate")
+    locate_expected = (
+        _spack_transition_mapping(locate.get("expected")) if locate is not None else None
+    )
+    if locate_expected != {
+        "requested_spec": f"/{dag_hash}" if dag_hash is not None else None,
+        "package_name": expected.package_name,
+        "dag_hash": dag_hash,
+    }:
+        failures.append("Spack postinstall check does not match the installed package identity")
+
+
+def _bind_spack_transition_identity(
+    evidence: dict[str, Any] | None,
+    *,
+    requirement: ReleaseGateRequirement,
+    expected: ReleaseSpackFreshInstallRequirement,
+    failures: list[str],
+) -> None:
+    """Require all phases to retain the policy server, profile, and route identity."""
+    if evidence is None:
+        return
+    revision_matches = _spack_transition_mapping(evidence.get("revision_matches"))
+    if (
+        evidence.get("underlying_reports_passed") is not True
+        or evidence.get("scopes") != [[requirement.cluster, expected.server_name, expected.profile]]
+        or evidence.get("tool_names") != ["spack_find", "spack_install", "spack_locate"]
+        or evidence.get("expected_tool_names") != ["spack_find", "spack_install", "spack_locate"]
+        or revision_matches != {"registration": True, "cluster_route": True, "catalog": True}
+        or evidence.get("same_server_artifact") is not True
+        or not _spack_sha256(evidence.get("server_artifact_sha256"))
+    ):
+        failures.append("Spack transition phases do not share one verified route identity")
+
+
+def _bind_spack_transition_durable_evidence(
+    evidence: dict[str, Any] | None,
+    *,
+    phase_job_ids: list[str],
+    failures: list[str],
+) -> None:
+    """Cross-bind ordered phase jobs to the durable-evidence assertion."""
+    if evidence is None:
+        return
+    phases = _spack_transition_mapping(evidence.get("phases"))
+    valid = (
+        len(phase_job_ids) == 3
+        and evidence.get("job_ids") == phase_job_ids
+        and evidence.get("distinct_job_ids") is True
+        and evidence.get("distinct_artifact_ids") is True
+        and evidence.get("required_artifact_kinds")
+        == ["mcp_result", "provenance", "stderr", "stdout"]
+        and phases is not None
+    )
+    if valid and phases is not None:
+        for phase, job_id in zip(
+            ("preinstall", "install", "postinstall"), phase_job_ids, strict=True
+        ):
+            phase_evidence = _spack_transition_mapping(phases.get(phase))
+            valid = (
+                valid
+                and phase_evidence is not None
+                and (
+                    phase_evidence.get("job_id") == job_id
+                    and phase_evidence.get("state") == "succeeded"
+                    and phase_evidence.get("artifacts_valid") is True
+                    and phase_evidence.get("stdio_valid") is True
+                    and phase_evidence.get("passed") is True
+                )
+            )
+    if not valid:
+        failures.append("Spack transition durable evidence is not bound to its ordered jobs")
+
+
+def _bind_spack_disposable_store(
+    evidence: dict[str, Any] | None,
+    *,
+    prefix: str | None,
+    failures: list[str],
+) -> str | None:
+    """Require nonempty dynamic store/prefix fields and their producer-validated relation."""
+    if evidence is None:
+        return None
+    raw_root = evidence.get("fresh_install_store_root")
+    store_root = raw_root if isinstance(raw_root, str) and raw_root else None
+    if (
+        store_root is None
+        or prefix is None
+        or not _release_spack_canonical_absolute_path(store_root)
+        or not _release_spack_canonical_absolute_path(prefix)
+        or not _release_spack_strict_descendant(prefix, store_root)
+        or evidence.get("observed_prefix") != prefix
+        or evidence.get("root_is_canonical_absolute") is not True
+        or evidence.get("prefix_is_strict_descendant") is not True
+    ):
+        failures.append("Spack disposable-store evidence is missing or not prefix-bound")
+    return store_root
+
+
+def _bind_spack_configuration_identity(
+    evidence: dict[str, Any] | None,
+    *,
+    report: LiveValidationReport,
+    requirement: ReleaseGateRequirement,
+    failures: list[str],
+) -> None:
+    """Bind one dynamic configuration SHA/path across checks, resource, and artifact."""
+    if evidence is None:
+        return
+    expected = _spack_transition_mapping(evidence.get("expected"))
+    preinstall = _spack_transition_mapping(evidence.get("preinstall"))
+    postinstall = _spack_transition_mapping(evidence.get("postinstall"))
+    path = expected.get("manifest_path") if expected is not None else None
+    sha256 = expected.get("configuration_sha256") if expected is not None else None
+    observations_match = (
+        isinstance(path, str)
+        and bool(path)
+        and _release_spack_canonical_absolute_path(path)
+        and _spack_sha256(sha256)
+        and _spack_configuration_observation_matches(preinstall, "preinstall", path, sha256)
+        and _spack_configuration_observation_matches(postinstall, "postinstall", path, sha256)
+        and preinstall is not None
+        and postinstall is not None
+        and preinstall.get("components") == postinstall.get("components")
+        and evidence.get("digest_matches") is True
+        and evidence.get("path_matches") is True
+        and evidence.get("components_match") is True
+        and evidence.get("manifest_metadata_matches") is True
+        and evidence.get("phases_match") is True
+    )
+    if not observations_match:
+        failures.append("Spack configuration observations do not share one SHA/path identity")
+        return
+    resources = [
+        resource
+        for resource in report.resources
+        if resource.cluster == requirement.cluster
+        and resource.kind == "configuration_manifest"
+        and resource.role == "spack_fresh_install_configuration"
+    ]
+    if len(resources) != 1:
+        failures.append("Spack transition requires exactly one configuration manifest resource")
+    else:
+        resource = resources[0]
+        if (
+            resource.state != "verified"
+            or resource.resource_id != sha256
+            or resource.references != [path]
+            or resource.metadata.get("expected_sha256") != sha256
+            or resource.metadata.get("preinstall") != preinstall
+            or resource.metadata.get("postinstall") != postinstall
+        ):
+            failures.append("Spack configuration resource differs from transition evidence")
+    artifacts = [
+        artifact
+        for artifact in report.artifacts
+        if artifact.kind == "spack_fresh_install_configuration"
+    ]
+    if len(artifacts) != 1 or artifacts[0].reference != path or artifacts[0].sha256 != sha256:
+        failures.append("Spack configuration artifact differs from transition evidence")
+
+
+def _spack_configuration_observation_matches(
+    observation: dict[str, Any] | None,
+    phase: str,
+    path: object,
+    sha256: object,
+) -> bool:
+    """Validate bounded dynamic configuration fields retained in canonical evidence."""
+    if observation is None:
+        return False
+    components = observation.get("components")
+    if not isinstance(components, list) or not components:
+        return False
+    for raw in cast(list[object], components):
+        component = _spack_transition_mapping(raw)
+        if (
+            component is None
+            or not isinstance(component.get("relative_path"), str)
+            or not component.get("relative_path")
+            or not _release_spack_canonical_relative_path(component.get("relative_path"))
+            or not _spack_sha256(component.get("sha256"))
+            or not isinstance(component.get("size_bytes"), int)
+            or isinstance(component.get("size_bytes"), bool)
+            or cast(int, component["size_bytes"]) < 0
+            or component.get("regular_file") is not True
+        ):
+            return False
+    size = observation.get("manifest_size_bytes")
+    return (
+        observation.get("schema_version") == "clio-relay.spack-configuration-observation.v1"
+        and observation.get("phase") == phase
+        and observation.get("manifest_path") == path
+        and observation.get("manifest_sha256") == sha256
+        and isinstance(size, int)
+        and not isinstance(size, bool)
+        and size > 0
+        and observation.get("manifest_regular_file") is True
+    )
+
+
+def _bind_spack_transition_artifacts(
+    report: LiveValidationReport,
+    *,
+    requirement: ReleaseGateRequirement,
+    phase_resources: dict[str, ValidationResource],
+    failures: list[str],
+) -> None:
+    """Require four distinct hashed durable artifacts for every phase job."""
+    roles = {
+        "preinstall": "spack_preinstall_find",
+        "install": "spack_fresh_install",
+        "postinstall": "spack_postinstall_locate",
+    }
+    artifact_ids: list[str] = []
+    for phase, base_role in roles.items():
+        phase_resource = phase_resources.get(phase)
+        if phase_resource is None:
+            continue
+        for kind in ("stdout", "stderr", "mcp_result", "provenance"):
+            role = f"{base_role}_{kind}"
+            matches = [
+                resource
+                for resource in report.resources
+                if resource.cluster == requirement.cluster
+                and resource.kind == "artifact"
+                and resource.role == role
+            ]
+            if len(matches) != 1:
+                failures.append(f"Spack {phase} phase requires exactly one {kind} artifact")
+                continue
+            artifact = matches[0]
+            artifact_ids.append(artifact.resource_id)
+            if (
+                artifact.metadata.get("transition_phase") != phase
+                or artifact.metadata.get("kind") != kind
+                or artifact.metadata.get("job_id") != phase_resource.resource_id
+                or not _spack_sha256(artifact.metadata.get("sha256"))
+            ):
+                failures.append(f"Spack {phase} {kind} artifact is not phase/job/hash bound")
+    if len(artifact_ids) == 12 and len(set(artifact_ids)) != 12:
+        failures.append("Spack transition artifacts do not have distinct durable identities")
+
+
+def _spack_sha256(value: object) -> bool:
+    """Return whether dynamic transition evidence carries one lowercase SHA-256."""
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _release_spack_canonical_absolute_path(value: object) -> bool:
+    """Validate dynamic POSIX paths at the release boundary after JSON projection."""
+    if (
+        not isinstance(value, str)
+        or not value.startswith("/")
+        or value.startswith("//")
+        or value == "/"
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return False
+    path = PurePosixPath(value)
+    return ".." not in path.parts and str(path) == value
+
+
+def _release_spack_canonical_relative_path(value: object) -> bool:
+    """Validate component paths retained inside dynamic configuration evidence."""
+    if (
+        not isinstance(value, str)
+        or value.startswith("/")
+        or value in {"", "."}
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return False
+    path = PurePosixPath(value)
+    return ".." not in path.parts and str(path) == value
+
+
+def _release_spack_strict_descendant(path: str, root: str) -> bool:
+    """Independently prove the located prefix is contained by the disposable store."""
+    candidate = PurePosixPath(path)
+    parent = PurePosixPath(root)
+    return candidate != parent and parent in candidate.parents
 
 
 def _metadata_value_matches(observed: object, expected: object) -> bool:
@@ -2296,7 +3507,7 @@ def _verify_running_artifact_identity(
     if artifact_sha256 is None or not re.fullmatch(r"[0-9a-fA-F]{64}", artifact_sha256):
         return False
     expected = artifact_sha256.lower()
-    if launcher != "uvx":
+    if launcher not in {"uv-tool", "uvx"}:
         return False
     if detected_kind is InstallSourceKind.WHEEL:
         return _local_wheel_matches_install(distribution, direct_url, expected)
@@ -2387,7 +3598,10 @@ def _pypi_wheel_matches_install(
             f"https://pypi.org/pypi/clio-relay/{urllib.parse.quote(distribution.version)}/json",
             timeout=30,
         ) as response:
-            payload = cast(object, json.loads(response.read(4 * 1024 * 1024)))
+            content = response.read(4 * 1024 * 1024 + 1)
+        if len(content) > 4 * 1024 * 1024:
+            return False
+        payload = cast(object, json.loads(content))
         payload_mapping = cast(dict[object, object], payload) if isinstance(payload, dict) else {}
         urls = payload_mapping.get("urls")
         if not isinstance(urls, list):
@@ -2785,13 +3999,15 @@ def _acceptance_scope(key: str) -> str:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    logical_path = logical_filesystem_path(path)
+    storage_path = internal_filesystem_path(logical_path, force_extended=True)
+    storage_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = storage_path.with_name(f".{storage_path.name}.{uuid4().hex}.tmp")
     try:
         with temporary.open("w", encoding="utf-8", newline="\n") as stream:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        os.replace(temporary, storage_path)
     finally:
         temporary.unlink(missing_ok=True)

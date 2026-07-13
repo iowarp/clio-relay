@@ -59,8 +59,8 @@ def run_packaged_mcp_stdio_session(
     executable = shutil.which("clio-relay")
     if executable is None:
         raise RelayError(
-            "packaged clio-relay executable is unavailable; run validation through uvx or "
-            "an installed wheel"
+            "packaged clio-relay executable is unavailable; install the exact wheel as a "
+            "persistent uv tool before running validation"
         )
     command = (executable, "mcp-server", "--profile", profile)
     messages: tuple[JSON, ...] = (

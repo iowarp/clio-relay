@@ -8,7 +8,9 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import socket
+import stat
 import subprocess
 import sys
 from collections.abc import Callable
@@ -16,7 +18,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from json import JSONDecodeError
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from time import monotonic, sleep
 from typing import Annotated, Any, Literal, cast
 from uuid import uuid4
@@ -55,15 +57,18 @@ from clio_relay.doctor import run_cluster_doctor, run_doctor
 from clio_relay.endpoint import EndpointWorker
 from clio_relay.errors import ConfigurationError, NotFoundError, RelayError
 from clio_relay.frp_check import run_frpc_connection_check
+from clio_relay.identifiers import validate_durable_record_id
 from clio_relay.installation import (
     attach_verified_worker_identity,
     installation_info,
     worker_runtime_info,
 )
 from clio_relay.jarvis_mcp import (
+    CLIO_KIT_JARVIS_MCP_VERSION,
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
     JARVIS_MCP_CACHE_SERVER_NAME,
     jarvis_mcp_artifact_binding_from_entry,
+    jarvis_mcp_env_from,
     jarvis_mcp_server,
     jarvis_mcp_server_args,
 )
@@ -75,7 +80,7 @@ from clio_relay.mcp_server import (
     serve_stdio,
     static_mcp_tool_names,
 )
-from clio_relay.mcp_stdio_validation import run_packaged_mcp_stdio_session
+from clio_relay.mcp_stdio_validation import PackagedMcpStdioSession, run_packaged_mcp_stdio_session
 from clio_relay.models import (
     Cursor,
     EndpointRole,
@@ -103,6 +108,7 @@ from clio_relay.progress_provenance import external_progress_metadata
 from clio_relay.queue_management import (
     DEFAULT_RESULT_LIMIT,
     DEFAULT_SCAN_LIMIT,
+    DEFAULT_STALE_SCAN_LIMIT,
     cancel_queue_job,
     cleanup_stale_jobs,
     diagnose_job,
@@ -138,16 +144,26 @@ from clio_relay.release_validation import (
     run_local_release_validation,
 )
 from clio_relay.remote_cli import (
+    remote_command_timeout,
     remove_remote_file,
     run_remote_clio,
+    run_remote_shell,
     should_execute_on_cluster,
     stage_jarvis_yaml,
     write_remote_file,
 )
 from clio_relay.remote_mcp import (
+    MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES,
+    MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS,
+    MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES,
+    RemoteMcpAcceptanceReport,
     RemoteMcpSchemaCache,
     RemoteMcpSchemaCacheEntry,
+    RemoteMcpSpackConfigurationObservation,
+    RemoteMcpStructuredResultExpectation,
+    VirtualRemoteMcpCatalog,
     build_remote_mcp_acceptance_report,
+    build_remote_mcp_spack_fresh_install_transition_report,
     cache_entry_from_discovery_artifact,
     default_remote_mcp_cache_path,
     remote_mcp_execution_fingerprint,
@@ -158,10 +174,11 @@ from clio_relay.scheduler_providers import (
     validation_provider_for_scheduler,
 )
 from clio_relay.scheduler_validation import run_scheduler_lifecycle_validation
-from clio_relay.service_runtime import ServiceRuntimeSupervisor
+from clio_relay.service_runtime import ServiceRuntimeStartResult, ServiceRuntimeSupervisor
 from clio_relay.session_lifecycle import (
     CleanupResource,
     SessionLifecycleReport,
+    cleanup_connectors_cover_gateways,
     detach_remote_session,
     start_remote_session,
     status_remote_session,
@@ -197,9 +214,26 @@ from clio_relay.validation_report import (
 from clio_relay.worker_concurrency import parse_kind_concurrency_options
 
 MAX_INTERNAL_COLLECTION_RECORDS = 10_000
+MAX_OWNER_GATEWAY_CLEANUP_PASSES = 4
 DEFAULT_RELAY_CANCEL_TIMEOUT_SECONDS = 30.0
 DEFAULT_RELAY_CANCEL_POLL_SECONDS = 0.25
 MAX_RELAY_CANCEL_TIMEOUT_SECONDS = 3_600.0
+REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS = 120.0
+SPACK_CONFIGURATION_OBSERVATION_TIMEOUT_SECONDS = 60.0
+MAX_SPACK_CONFIGURATION_OBSERVATION_OUTPUT_BYTES = 128 * 1024
+MAX_SPACK_CONFIGURATION_TREE_ENTRIES = 1_024
+SCHEDULER_SENTINEL_ACTIVE_PHASES = frozenset({"submitted", "pending", "allocated", "running"})
+SCHEDULER_SENTINEL_PRESERVED_PHASES = SCHEDULER_SENTINEL_ACTIVE_PHASES | {"completed"}
+_ACCEPTANCE_REPORT_COMMAND_ATTRIBUTE = "__clio_relay_acceptance_report_command__"
+
+
+def _acceptance_report_command[CommandCallback: Callable[..., Any]](
+    callback: CommandCallback,
+) -> CommandCallback:
+    """Mark a CLI callback as a canonical acceptance-report producer."""
+    setattr(callback, _ACCEPTANCE_REPORT_COMMAND_ATTRIBUTE, True)
+    return callback
+
 
 app = typer.Typer(no_args_is_help=True)
 endpoint_app = typer.Typer(no_args_is_help=True)
@@ -260,6 +294,7 @@ def init() -> None:
 
 
 @release_app.command("validate-local")
+@_acceptance_report_command
 def release_validate_local(
     project_root: Annotated[
         Path,
@@ -280,6 +315,11 @@ def release_validate_local(
 ) -> None:
     """Run the complete local release gate and persist evidence on failure."""
     report_path = report or default_report_path("local")
+    seed_report = new_live_validation_report(
+        scenario="local-release",
+        cluster="local",
+    )
+    write_validation_report(seed_report, report_path)
 
     def _run() -> None:
         try:
@@ -289,11 +329,35 @@ def release_validate_local(
                     report_path=report_path,
                     markdown_report_path=markdown_report,
                     artifact_dir=artifact_dir,
+                    report_id=seed_report.report_id,
                 )
             )
-        except BaseException:
-            if report_path.exists():
-                typer.echo(f"validation.report={report_path.resolve()}")
+            current_report = _load_current_acceptance_report(
+                report_path,
+                expected_report_id=seed_report.report_id,
+            )
+            if current_report is None or result.report_id != seed_report.report_id:
+                raise RelayError(
+                    "local release validation did not persist the current invocation report"
+                )
+        except BaseException as exc:
+            current_report = _load_current_acceptance_report(
+                report_path,
+                expected_report_id=seed_report.report_id,
+            )
+            _write_failed_acceptance_report(
+                path=report_path,
+                scenario="local-release",
+                cluster="local",
+                check_id="local-release.completed",
+                summary="complete local release gate",
+                error=exc,
+                launcher=None,
+                install_source=None,
+                artifact=None,
+                partial_report=current_report or seed_report,
+            )
+            typer.echo(f"validation.report={report_path.resolve()}")
             raise
         typer.echo(f"validation.status={result.status.value}")
         typer.echo(f"validation.report={report_path.resolve()}")
@@ -424,6 +488,7 @@ def render_frpc(
 
 
 @relay_host_app.command("test-frpc-connection")
+@_acceptance_report_command
 def test_frpc(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     local_port: Annotated[int, typer.Option(help="Local relay endpoint port.")],
@@ -448,7 +513,7 @@ def test_frpc(
     ] = None,
     validation_launcher: Annotated[
         str | None,
-        typer.Option(help="Launcher evidence, such as uvx."),
+        typer.Option(help="Launcher evidence, such as uv-tool."),
     ] = None,
     validation_install_source: Annotated[
         str | None,
@@ -569,6 +634,7 @@ def render_frpc_visitor(
 
 
 @relay_host_app.command("test-http-transport")
+@_acceptance_report_command
 def test_http_transport(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     local_bind_port: Annotated[int, typer.Option(help="Local desktop visitor bind port.")],
@@ -592,7 +658,7 @@ def test_http_transport(
     ] = None,
     validation_launcher: Annotated[
         str | None,
-        typer.Option(help="Launcher evidence, such as uvx."),
+        typer.Option(help="Launcher evidence, such as uv-tool."),
     ] = None,
     validation_install_source: Annotated[
         str | None,
@@ -663,6 +729,7 @@ def test_http_transport(
 
 
 @relay_host_app.command("test-direct-transport")
+@_acceptance_report_command
 def test_direct_transport(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     local_bind_port: Annotated[int, typer.Option(help="Local desktop visitor bind port.")],
@@ -696,7 +763,7 @@ def test_direct_transport(
     ] = None,
     validation_launcher: Annotated[
         str | None,
-        typer.Option(help="Launcher evidence, such as uvx."),
+        typer.Option(help="Launcher evidence, such as uv-tool."),
     ] = None,
     validation_install_source: Annotated[
         str | None,
@@ -768,6 +835,7 @@ def test_direct_transport(
 
 
 @relay_host_app.command("test-ssh-transport")
+@_acceptance_report_command
 def test_ssh_transport(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     local_bind_port: Annotated[int, typer.Option(help="Local desktop SSH-forward bind port.")],
@@ -793,7 +861,7 @@ def test_ssh_transport(
     ] = None,
     validation_launcher: Annotated[
         str | None,
-        typer.Option(help="Launcher evidence, such as uvx."),
+        typer.Option(help="Launcher evidence, such as uv-tool."),
     ] = None,
     validation_install_source: Annotated[
         str | None,
@@ -1072,6 +1140,10 @@ def cluster_add(
         str | None,
         typer.Option(help="Remote JARVIS-CD executable path."),
     ] = None,
+    spack_executable: Annotated[
+        str | None,
+        typer.Option(help="Absolute remote Spack executable used by the cluster-side JARVIS MCP."),
+    ] = None,
     frpc_bin: Annotated[
         str | None,
         typer.Option(help="Remote frpc executable path."),
@@ -1169,6 +1241,7 @@ def cluster_add(
             core_dir=core_dir,
             spool_dir=spool_dir,
             jarvis_bin=jarvis_bin,
+            spack_executable=_none_if_blank(spack_executable),
             frpc_bin=frpc_bin,
             agent_bin=_none_if_blank(agent_bin),
             agent_adapter=agent_adapter,
@@ -1323,7 +1396,7 @@ def remote_mcp_register(
     contract: Annotated[
         str | None,
         typer.Option(
-            help=("Optional audited semantic contract. Supported: clio-kit-spack-user-v3.")
+            help=("Optional audited semantic contract. Supported: clio-kit-spack-user-v2.")
         ),
     ] = None,
     schema_cache_ttl_seconds: Annotated[
@@ -1636,7 +1709,72 @@ def remote_mcp_refresh(
     _run_or_exit(action)
 
 
+@dataclass(frozen=True)
+class _RemoteMcpValidationRoute:
+    """One preflight-resolved virtual alias and its argument wrapping mode."""
+
+    alias: str
+    arguments_wrapped: bool
+
+
+@dataclass(frozen=True)
+class _RemoteMcpValidationPreflight:
+    """Inputs and immutable routes resolved before any validation dispatch."""
+
+    registry_path: Path
+    registry: ClusterRegistry
+    definition: ClusterDefinition
+    remote_arguments: dict[str, Any]
+    routes: dict[str, _RemoteMcpValidationRoute]
+    result_expectation: RemoteMcpStructuredResultExpectation | None
+
+    @property
+    def fresh_spack_transition(self) -> bool:
+        """Return whether this run requests disposable-store install proof."""
+        return (
+            self.result_expectation is not None
+            and self.result_expectation.fresh_install_store_root is not None
+        )
+
+
+@dataclass(frozen=True)
+class _RemoteMcpValidationCall:
+    """One completed ordinary remote-MCP acceptance call and its protocol result."""
+
+    report: RemoteMcpAcceptanceReport
+    protocol_result: dict[str, Any] | None
+    stdio_session: PackagedMcpStdioSession
+
+
+def _resolve_remote_mcp_validation_route(
+    *,
+    catalog: VirtualRemoteMcpCatalog,
+    cluster: str,
+    server_name: str,
+    remote_tool_name: str,
+) -> _RemoteMcpValidationRoute:
+    """Resolve exactly one fresh virtual alias before any MCP call is dispatched."""
+    aliases = [
+        alias
+        for alias, virtual in catalog.tools.items()
+        if virtual.remote_tool.name == remote_tool_name
+        and cluster in virtual.routes
+        and virtual.routes[cluster].server_name == server_name
+    ]
+    if len(aliases) != 1:
+        raise typer.BadParameter(
+            f"expected one fresh virtual alias for {cluster}/{server_name}/{remote_tool_name}, "
+            f"found {len(aliases)}; run remote-mcp refresh and reload"
+        )
+    virtual = catalog.tools[aliases[0]]
+    return _RemoteMcpValidationRoute(
+        alias=aliases[0],
+        arguments_wrapped=virtual.arguments_wrapped,
+    )
+
+
 @remote_mcp_app.command("validate")
+@_acceptance_report_command
 def remote_mcp_validate(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     name: Annotated[str, typer.Option(help="Remote MCP server registration name.")],
@@ -1648,6 +1786,16 @@ def remote_mcp_validate(
     arguments_json_file: Annotated[
         Path | None,
         typer.Option(help="Path to a JSON object argument file for the remote tool."),
+    ] = None,
+    result_expectation_json: Annotated[
+        str,
+        typer.Option(
+            help=("Optional JSON object describing semantic expectations for structuredContent.")
+        ),
+    ] = "{}",
+    result_expectation_json_file: Annotated[
+        Path | None,
+        typer.Option(help="Path to a structured-result expectation JSON object."),
     ] = None,
     profile: Annotated[
         str,
@@ -1671,7 +1819,7 @@ def remote_mcp_validate(
     ] = None,
     validation_launcher: Annotated[
         str | None,
-        typer.Option(help="Launcher evidence, such as uvx."),
+        typer.Option(help="Launcher evidence, such as uv-tool."),
     ] = None,
     validation_install_source: Annotated[
         str | None,
@@ -1690,59 +1838,82 @@ def remote_mcp_validate(
     canonical_report_path = validation_report or default_report_path(cluster)
     canonical_written = [False]
 
-    def preflight() -> tuple[
-        Path,
-        ClusterRegistry,
-        ClusterDefinition,
-        dict[str, Any],
-        str,
-        bool,
-    ]:
+    def preflight() -> _RemoteMcpValidationPreflight:
         if profile not in {"user", "admin", "operator", "all"}:
             raise typer.BadParameter("--profile must be user, admin, operator, or all")
         arguments_source = _json_text_from_option(arguments_json, arguments_json_file)
         remote_arguments = _json_object(arguments_source)
+        result_expectation: RemoteMcpStructuredResultExpectation | None = None
+        if result_expectation_json_file is not None or result_expectation_json != "{}":
+            expectation_source = _json_text_from_option(
+                result_expectation_json,
+                result_expectation_json_file,
+            )
+            try:
+                result_expectation = RemoteMcpStructuredResultExpectation.model_validate(
+                    _json_object(expectation_source)
+                )
+            except ValidationError as exc:
+                raise typer.BadParameter(
+                    f"structured-result expectation is invalid: {exc.errors()[0]['msg']}"
+                ) from exc
         registry_path = default_registry_path()
         registry = ClusterRegistry.load(registry_path)
         definition = registry.require(cluster)
         if name not in definition.remote_mcp_servers:
             raise typer.BadParameter(f"remote MCP server is not registered for {cluster}: {name}")
+        registration = definition.remote_mcp_servers[name]
+        if result_expectation is not None:
+            if result_expectation.tool != tool:
+                raise typer.BadParameter("structured-result expectation tool must match --tool")
+            if registration.contract != result_expectation.contract:
+                raise typer.BadParameter(
+                    "structured-result expectation contract must match the registered contract"
+                )
         catalog = load_registered_remote_mcp_catalog(profile)
-        aliases = [
-            alias
-            for alias, virtual in catalog.tools.items()
-            if virtual.remote_tool.name == tool
-            and cluster in virtual.routes
-            and virtual.routes[cluster].server_name == name
-        ]
-        if len(aliases) != 1:
-            raise typer.BadParameter(
-                f"expected one fresh virtual alias for {cluster}/{name}/{tool}, "
-                f"found {len(aliases)}; run remote-mcp refresh and reload"
+        fresh_transition = (
+            result_expectation is not None
+            and result_expectation.fresh_install_store_root is not None
+        )
+        if fresh_transition:
+            if result_expectation is None:
+                raise typer.BadParameter("fresh Spack expectation is unavailable")
+            if (
+                remote_arguments.get("spec") != result_expectation.requested_spec
+                or remote_arguments.get("reuse") is not False
+            ):
+                raise typer.BadParameter(
+                    "fresh Spack validation arguments must submit the expected spec "
+                    "with reuse=false"
+                )
+        required_tools = (
+            ("spack_find", "spack_install", "spack_locate") if fresh_transition else (tool,)
+        )
+        routes = {
+            remote_tool_name: _resolve_remote_mcp_validation_route(
+                catalog=catalog,
+                cluster=cluster,
+                server_name=name,
+                remote_tool_name=remote_tool_name,
             )
-        virtual = catalog.tools[aliases[0]]
-        if not virtual.arguments_wrapped and "cluster" in remote_arguments:
+            for remote_tool_name in required_tools
+        }
+        requested_route = routes[tool]
+        if not requested_route.arguments_wrapped and "cluster" in remote_arguments:
             raise typer.BadParameter(
                 "flat remote tool arguments must not contain reserved key 'cluster'"
             )
-        return (
-            registry_path,
-            registry,
-            definition,
-            remote_arguments,
-            aliases[0],
-            virtual.arguments_wrapped,
+        return _RemoteMcpValidationPreflight(
+            registry_path=registry_path,
+            registry=registry,
+            definition=definition,
+            remote_arguments=remote_arguments,
+            routes=routes,
+            result_expectation=result_expectation,
         )
 
     try:
-        (
-            registry_path,
-            registry,
-            definition,
-            remote_arguments,
-            alias,
-            arguments_wrapped,
-        ) = preflight()
+        prepared = preflight()
     except BaseException as exc:
         _write_failed_acceptance_report(
             path=canonical_report_path,
@@ -1761,84 +1932,115 @@ def remote_mcp_validate(
         settings = RelaySettings.from_env()
         queue = storage_managed_queue(settings)
         queue.initialize()
-        stdio_session = run_packaged_mcp_stdio_session(
-            profile=profile,
-            tool=alias,
-            arguments=(
-                {"cluster": cluster, "arguments": remote_arguments}
-                if arguments_wrapped
-                else {"cluster": cluster, **remote_arguments}
-            ),
+        execute_remotely = should_execute_on_cluster(prepared.definition)
+        remote_install_info = _remote_worker_info(prepared.definition) if execute_remotely else None
+        cache = RemoteMcpSchemaCache.load(
+            default_remote_mcp_cache_path(registry_path=prepared.registry_path)
         )
-        response = stdio_session.tools_call_response
-        job_id = _mcp_response_job_id(response)
-        remote_install_info: dict[str, object] | None = None
-        if should_execute_on_cluster(definition):
-            remote_install_info = _remote_worker_info(definition)
-            run_remote_clio(
-                definition,
-                [
-                    "job",
-                    "wait",
-                    job_id,
-                    "--timeout-seconds",
-                    str(wait_timeout_seconds),
-                    "--poll-seconds",
-                    str(poll_seconds),
-                ],
+        reserved_names = static_mcp_tool_names()
+        if prepared.fresh_spack_transition:
+            expectation = prepared.result_expectation
+            if expectation is None or expectation.requested_spec is None:
+                raise RelayError("fresh Spack transition expectation became unavailable")
+            preinstall_call = _execute_remote_mcp_validation_call(
+                queue=queue,
+                definition=prepared.definition,
+                execute_remotely=execute_remotely,
+                registry=prepared.registry,
+                cache=cache,
+                cluster=cluster,
+                server_name=name,
+                profile=profile,
+                remote_tool_name="spack_find",
+                route=prepared.routes["spack_find"],
+                remote_arguments={"query": expectation.requested_spec},
+                result_expectation=None,
+                wait_timeout_seconds=wait_timeout_seconds,
+                poll_seconds=poll_seconds,
+                reserved_names=reserved_names,
             )
-            call_status = _json_output(
-                run_remote_clio(definition, ["job", "status", job_id]),
-                "remote MCP validation job status",
+            _require_passing_remote_mcp_call(preinstall_call, phase="preinstall find")
+            _require_spack_preinstall_absent(
+                preinstall_call.protocol_result,
+                requested_spec=expectation.requested_spec,
             )
-            artifacts = _remote_artifact_records(definition, job_id)
-            mcp_result = _read_remote_json_artifact_kind(
-                definition,
-                artifacts,
-                kind="mcp_result",
+            preinstall_configuration = _collect_spack_configuration_observation(
+                definition=prepared.definition,
+                execute_remotely=execute_remotely,
+                expectation=expectation,
+                phase="preinstall",
             )
-            provenance = _read_remote_json_artifact_kind(
-                definition,
-                artifacts,
-                kind="provenance",
+            install_call = _execute_remote_mcp_validation_call(
+                queue=queue,
+                definition=prepared.definition,
+                execute_remotely=execute_remotely,
+                registry=prepared.registry,
+                cache=cache,
+                cluster=cluster,
+                server_name=name,
+                profile=profile,
+                remote_tool_name="spack_install",
+                route=prepared.routes["spack_install"],
+                remote_arguments=prepared.remote_arguments,
+                result_expectation=expectation,
+                wait_timeout_seconds=wait_timeout_seconds,
+                poll_seconds=poll_seconds,
+                reserved_names=reserved_names,
+            )
+            _require_passing_remote_mcp_call(install_call, phase="fresh install")
+            postinstall_call = _execute_remote_mcp_validation_call(
+                queue=queue,
+                definition=prepared.definition,
+                execute_remotely=execute_remotely,
+                registry=prepared.registry,
+                cache=cache,
+                cluster=cluster,
+                server_name=name,
+                profile=profile,
+                remote_tool_name="spack_locate",
+                route=prepared.routes["spack_locate"],
+                remote_arguments={"spec": f"/{expectation.dag_hash}"},
+                result_expectation=None,
+                wait_timeout_seconds=wait_timeout_seconds,
+                poll_seconds=poll_seconds,
+                reserved_names=reserved_names,
+            )
+            postinstall_configuration = _collect_spack_configuration_observation(
+                definition=prepared.definition,
+                execute_remotely=execute_remotely,
+                expectation=expectation,
+                phase="postinstall",
+            )
+            report = build_remote_mcp_spack_fresh_install_transition_report(
+                preinstall_report=preinstall_call.report,
+                install_report=install_call.report,
+                postinstall_report=postinstall_call.report,
+                preinstall_protocol_result=preinstall_call.protocol_result,
+                install_protocol_result=install_call.protocol_result,
+                postinstall_protocol_result=postinstall_call.protocol_result,
+                install_expectation=expectation,
+                preinstall_configuration=preinstall_configuration,
+                postinstall_configuration=postinstall_configuration,
             )
         else:
-            wait_for_terminal(
-                queue,
-                job_id,
-                timeout_seconds=wait_timeout_seconds,
+            requested_call = _execute_remote_mcp_validation_call(
+                queue=queue,
+                definition=prepared.definition,
+                execute_remotely=execute_remotely,
+                registry=prepared.registry,
+                cache=cache,
+                cluster=cluster,
+                server_name=name,
+                profile=profile,
+                remote_tool_name=tool,
+                route=prepared.routes[tool],
+                remote_arguments=prepared.remote_arguments,
+                result_expectation=prepared.result_expectation,
+                wait_timeout_seconds=wait_timeout_seconds,
                 poll_seconds=poll_seconds,
+                reserved_names=reserved_names,
             )
-            call_status = get_job_status(queue, job_id)
-            artifacts = _complete_local_artifact_records(queue, job_id)
-            mcp_result = _read_local_json_artifact_kind(
-                queue,
-                artifacts,
-                kind="mcp_result",
-            )
-            provenance = _read_local_json_artifact_kind(
-                queue,
-                artifacts,
-                kind="provenance",
-            )
-        cache = RemoteMcpSchemaCache.load(
-            default_remote_mcp_cache_path(registry_path=registry_path)
-        )
-        report = build_remote_mcp_acceptance_report(
-            registry=registry,
-            cache=cache,
-            cluster=cluster,
-            server_name=name,
-            remote_tool_name=tool,
-            profile=profile,
-            call_job_id=job_id,
-            call_status=call_status,
-            artifacts=artifacts,
-            mcp_result=mcp_result,
-            provenance=provenance,
-            reserved_names=static_mcp_tool_names(),
-            mcp_stdio_evidence=stdio_session.evidence(),
-        )
+            report = requested_call.report
         canonical_report = report.to_live_validation_report(
             launcher=validation_launcher,
             install_source=validation_install_source,
@@ -1885,7 +2087,626 @@ def remote_mcp_validate(
     _run_or_exit(guarded_action)
 
 
+def _execute_remote_mcp_validation_call(
+    *,
+    queue: ClioCoreQueue,
+    definition: ClusterDefinition,
+    execute_remotely: bool,
+    registry: ClusterRegistry,
+    cache: RemoteMcpSchemaCache,
+    cluster: str,
+    server_name: str,
+    profile: str,
+    remote_tool_name: str,
+    route: _RemoteMcpValidationRoute,
+    remote_arguments: dict[str, Any],
+    result_expectation: RemoteMcpStructuredResultExpectation | None,
+    wait_timeout_seconds: float,
+    poll_seconds: float,
+    reserved_names: set[str],
+) -> _RemoteMcpValidationCall:
+    """Run one virtual alias and build its ordinary durable acceptance report."""
+    stdio_session = run_packaged_mcp_stdio_session(
+        profile=profile,
+        tool=route.alias,
+        arguments=(
+            {"cluster": cluster, "arguments": remote_arguments}
+            if route.arguments_wrapped
+            else {"cluster": cluster, **remote_arguments}
+        ),
+    )
+    job_id = _mcp_response_job_id(stdio_session.tools_call_response)
+    if execute_remotely:
+        run_remote_clio(
+            definition,
+            [
+                "job",
+                "wait",
+                job_id,
+                "--timeout-seconds",
+                str(wait_timeout_seconds),
+                "--poll-seconds",
+                str(poll_seconds),
+            ],
+        )
+        call_status = _json_output(
+            run_remote_clio(definition, ["job", "status", job_id]),
+            "remote MCP validation job status",
+        )
+        artifacts = _remote_artifact_records(definition, job_id)
+        mcp_result = _read_remote_json_artifact_kind(
+            definition,
+            artifacts,
+            kind="mcp_result",
+        )
+        provenance = _read_remote_json_artifact_kind(
+            definition,
+            artifacts,
+            kind="provenance",
+        )
+    else:
+        wait_for_terminal(
+            queue,
+            job_id,
+            timeout_seconds=wait_timeout_seconds,
+            poll_seconds=poll_seconds,
+        )
+        call_status = get_job_status(queue, job_id)
+        artifacts = _complete_local_artifact_records(queue, job_id)
+        mcp_result = _read_local_json_artifact_kind(
+            queue,
+            artifacts,
+            kind="mcp_result",
+        )
+        provenance = _read_local_json_artifact_kind(
+            queue,
+            artifacts,
+            kind="provenance",
+        )
+    protocol_result = (
+        cast(dict[str, Any], mcp_result["protocol_result"])
+        if mcp_result is not None and isinstance(mcp_result.get("protocol_result"), dict)
+        else None
+    )
+    report = build_remote_mcp_acceptance_report(
+        registry=registry,
+        cache=cache,
+        cluster=cluster,
+        server_name=server_name,
+        remote_tool_name=remote_tool_name,
+        profile=profile,
+        call_job_id=job_id,
+        call_status=call_status,
+        artifacts=artifacts,
+        mcp_result=mcp_result,
+        provenance=provenance,
+        result_expectation=result_expectation,
+        reserved_names=reserved_names,
+        mcp_stdio_evidence=stdio_session.evidence(),
+    )
+    return _RemoteMcpValidationCall(
+        report=report,
+        protocol_result=protocol_result,
+        stdio_session=stdio_session,
+    )
+
+
+def _require_passing_remote_mcp_call(
+    call: _RemoteMcpValidationCall,
+    *,
+    phase: str,
+) -> None:
+    """Stop a transition before its next mutation when an earlier call failed."""
+    if not call.report.passed:
+        failed = [check.name for check in call.report.checks if not check.passed]
+        raise RelayError(f"{phase} acceptance failed before next dispatch: {failed}")
+
+
+def _require_spack_preinstall_absent(
+    protocol_result: dict[str, Any] | None,
+    *,
+    requested_spec: str,
+) -> None:
+    """Require exact structured absence before dispatching the mutating install call."""
+    structured = (
+        cast(dict[str, Any], protocol_result.get("structuredContent"))
+        if protocol_result is not None
+        and isinstance(protocol_result.get("structuredContent"), dict)
+        else None
+    )
+    if (
+        protocol_result is None
+        or protocol_result.get("isError") is True
+        or structured is None
+        or structured.get("schema_version") != "spack.mcp.result.v1"
+        or structured.get("operation") != "find"
+        or structured.get("query") != requested_spec
+        or structured.get("count") != 0
+        or isinstance(structured.get("count"), bool)
+        or structured.get("packages") != []
+    ):
+        raise RelayError(
+            "fresh Spack preinstall call did not prove count=0 and packages=[] "
+            "for the exact requested spec"
+        )
+
+
+def _collect_spack_configuration_observation(
+    *,
+    definition: ClusterDefinition,
+    execute_remotely: bool,
+    expectation: RemoteMcpStructuredResultExpectation,
+    phase: Literal["preinstall", "postinstall"],
+) -> RemoteMcpSpackConfigurationObservation:
+    """Collect one real, bounded wrapper/configuration manifest observation."""
+    manifest_path = expectation.fresh_install_configuration_manifest_path
+    expected_sha256 = expectation.fresh_install_configuration_sha256
+    if manifest_path is None or expected_sha256 is None:
+        raise RelayError("fresh Spack configuration expectation is incomplete")
+    if execute_remotely:
+        observation = _collect_remote_spack_configuration_observation(
+            definition=definition,
+            phase=phase,
+            manifest_path=manifest_path,
+            expected_sha256=expected_sha256,
+        )
+    else:
+        observation = _collect_local_spack_configuration_observation(
+            phase=phase,
+            manifest_path=manifest_path,
+            expected_sha256=expected_sha256,
+        )
+    if (
+        observation.phase != phase
+        or observation.manifest_path != manifest_path
+        or observation.manifest_sha256 != expected_sha256
+    ):
+        raise RelayError("fresh Spack configuration observation does not match expectation")
+    return observation
+
+
+def _collect_remote_spack_configuration_observation(
+    *,
+    definition: ClusterDefinition,
+    phase: Literal["preinstall", "postinstall"],
+    manifest_path: str,
+    expected_sha256: str,
+) -> RemoteMcpSpackConfigurationObservation:
+    """Collect a configuration observation through one bounded Bash/SSH command."""
+    script = _remote_spack_configuration_observer_script()
+    command = " ".join(
+        (
+            "python3",
+            "-c",
+            shlex.quote(script),
+            shlex.quote(phase),
+            shlex.quote(manifest_path),
+            shlex.quote(expected_sha256),
+            str(MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES),
+            str(MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS),
+            str(MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES),
+            str(MAX_SPACK_CONFIGURATION_TREE_ENTRIES),
+        )
+    )
+    with remote_command_timeout(SPACK_CONFIGURATION_OBSERVATION_TIMEOUT_SECONDS):
+        output = run_remote_shell(definition, command)
+    if len(output.encode("utf-8")) > MAX_SPACK_CONFIGURATION_OBSERVATION_OUTPUT_BYTES:
+        raise RelayError("remote Spack configuration observation output exceeded its bound")
+    payload = _json_output(output, f"{phase} Spack configuration observation")
+    try:
+        return RemoteMcpSpackConfigurationObservation.model_validate(payload)
+    except ValidationError as exc:
+        raise RelayError(
+            f"remote Spack configuration observation is invalid: {exc.errors()[0]['msg']}"
+        ) from exc
+
+
+def _collect_local_spack_configuration_observation(
+    *,
+    phase: Literal["preinstall", "postinstall"],
+    manifest_path: str,
+    expected_sha256: str,
+) -> RemoteMcpSpackConfigurationObservation:
+    """Collect the same evidence locally using POSIX no-follow file operations."""
+    if os.name == "nt":
+        raise RelayError(
+            "local fresh Spack configuration observation requires a POSIX host; "
+            "use the configured SSH target from Windows"
+        )
+    manifest = Path(manifest_path)
+    base = manifest.parent
+    _require_regular_nonsymlink_directory(base, label="configuration manifest directory")
+    manifest_bytes, manifest_size = _read_bounded_regular_nonsymlink_file(
+        manifest,
+        maximum_bytes=MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES,
+        label="configuration manifest",
+        require_nonempty=True,
+    )
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    if manifest_sha256 != expected_sha256:
+        raise RelayError("configuration manifest SHA-256 does not match the expectation")
+    declarations = _parse_spack_configuration_manifest(manifest_bytes)
+    _require_exact_spack_configuration_component_set(base, declarations)
+    components: list[dict[str, object]] = []
+    for declared_sha256, relative_path in declarations:
+        component_path = _safe_spack_configuration_component_path(base, relative_path)
+        component_bytes, component_size = _read_bounded_regular_nonsymlink_file(
+            component_path,
+            maximum_bytes=MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES,
+            label=f"configuration component {relative_path}",
+            require_nonempty=False,
+        )
+        observed_sha256 = hashlib.sha256(component_bytes).hexdigest()
+        if observed_sha256 != declared_sha256:
+            raise RelayError(f"configuration component SHA-256 changed: {relative_path}")
+        components.append(
+            {
+                "relative_path": relative_path,
+                "sha256": observed_sha256,
+                "size_bytes": component_size,
+                "regular_file": True,
+            }
+        )
+    return RemoteMcpSpackConfigurationObservation.model_validate(
+        {
+            "phase": phase,
+            "manifest_path": manifest_path,
+            "manifest_sha256": manifest_sha256,
+            "manifest_size_bytes": manifest_size,
+            "manifest_regular_file": True,
+            "components": components,
+        }
+    )
+
+
+_SPACK_MANIFEST_LINE = re.compile(r"^([0-9a-f]{64})  ([^\r\n]+)$")
+
+
+def _parse_spack_configuration_manifest(payload: bytes) -> list[tuple[str, str]]:
+    """Parse one strict, sorted GNU sha256sum manifest within fixed limits."""
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RelayError("configuration manifest must be UTF-8") from exc
+    if not text.endswith("\n") or "\x00" in text:
+        raise RelayError("configuration manifest must be newline-terminated text")
+    declarations: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        match = _SPACK_MANIFEST_LINE.fullmatch(line)
+        if match is None:
+            raise RelayError("configuration manifest contains an invalid sha256sum line")
+        relative_path = match.group(2)
+        if not _is_canonical_spack_component_relative_path(relative_path):
+            raise RelayError("configuration manifest contains an unsafe component path")
+        declarations.append((match.group(1), relative_path))
+    paths = [relative_path for _digest, relative_path in declarations]
+    if not 1 <= len(paths) <= MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS:
+        raise RelayError("configuration manifest component count is outside its bound")
+    if paths != sorted(paths) or len(paths) != len(set(paths)):
+        raise RelayError("configuration manifest component paths must be unique and sorted")
+    return declarations
+
+
+def _is_canonical_spack_component_relative_path(value: str) -> bool:
+    """Return whether a manifest component is canonical and safely relative."""
+    if (
+        not value
+        or len(value) > 1_024
+        or value.startswith("/")
+        or value == "."
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return False
+    path = PurePosixPath(value)
+    return ".." not in path.parts and str(path) == value
+
+
+def _safe_spack_configuration_component_path(base: Path, relative_path: str) -> Path:
+    """Resolve a validated component while rejecting symlinked in-root parents."""
+    if not _is_canonical_spack_component_relative_path(relative_path):
+        raise RelayError("configuration component path is unsafe")
+    current = base
+    parts = PurePosixPath(relative_path).parts
+    for part in parts[:-1]:
+        current /= part
+        _require_regular_nonsymlink_directory(
+            current,
+            label=f"configuration component parent {relative_path}",
+        )
+    return base.joinpath(*parts)
+
+
+def _require_exact_spack_configuration_component_set(
+    base: Path,
+    declarations: list[tuple[str, str]],
+) -> None:
+    """Reject unmanifested files or symlinks in every covered configuration tree."""
+    declared_paths = {relative_path for _digest, relative_path in declarations}
+    covered_directories = sorted(
+        {PurePosixPath(path).parts[0] for path in declared_paths if "/" in path}
+    )
+    observed_paths: set[str] = set()
+    observed_entries = 0
+    for relative_directory in covered_directories:
+        directory = base / relative_directory
+        _require_regular_nonsymlink_directory(
+            directory,
+            label=f"configuration tree {relative_directory}",
+        )
+        observed_entries += 1
+        if observed_entries > MAX_SPACK_CONFIGURATION_TREE_ENTRIES:
+            raise RelayError("configuration tree entry count exceeded its bound")
+        pending = [directory]
+        while pending:
+            current = pending.pop()
+            try:
+                entries = os.scandir(current)
+            except OSError as exc:
+                raise RelayError(f"configuration tree is unavailable: {current}") from exc
+            with entries:
+                for entry in entries:
+                    observed_entries += 1
+                    if observed_entries > MAX_SPACK_CONFIGURATION_TREE_ENTRIES:
+                        raise RelayError("configuration tree entry count exceeded its bound")
+                    candidate = Path(entry.path)
+                    relative_path = candidate.relative_to(base).as_posix()
+                    if not _is_canonical_spack_component_relative_path(relative_path):
+                        raise RelayError(
+                            f"configuration tree entry has an unsafe path: {candidate}"
+                        )
+                    try:
+                        metadata = candidate.lstat()
+                    except OSError as exc:
+                        raise RelayError(
+                            f"configuration tree entry is unavailable: {candidate}"
+                        ) from exc
+                    if stat.S_ISLNK(metadata.st_mode):
+                        raise RelayError(
+                            f"configuration tree entry must not be a symbolic link: {candidate}"
+                        )
+                    if stat.S_ISDIR(metadata.st_mode):
+                        pending.append(candidate)
+                        continue
+                    if not stat.S_ISREG(metadata.st_mode):
+                        raise RelayError(
+                            f"configuration tree entry must be a regular file: {candidate}"
+                        )
+                    observed_paths.add(relative_path)
+    expected_covered_paths = {
+        path for path in declared_paths if PurePosixPath(path).parts[0] in covered_directories
+    }
+    if observed_paths != expected_covered_paths:
+        raise RelayError(
+            "configuration tree files do not exactly match the bounded manifest: "
+            f"missing={sorted(expected_covered_paths - observed_paths)} "
+            f"unexpected={sorted(observed_paths - expected_covered_paths)}"
+        )
+
+
+def _require_regular_nonsymlink_directory(path: Path, *, label: str) -> None:
+    """Require one existing directory without following its final path entry."""
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise RelayError(f"{label} is unavailable: {path}") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise RelayError(f"{label} must be a non-symlink directory: {path}")
+
+
+def _read_bounded_regular_nonsymlink_file(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    label: str,
+    require_nonempty: bool,
+) -> tuple[bytes, int]:
+    """Read one stable regular file through a no-follow descriptor within a byte cap."""
+    nofollow = cast(int | None, getattr(os, "O_NOFOLLOW", None))
+    if nofollow is None:
+        raise RelayError(f"{label} cannot be verified without O_NOFOLLOW support")
+    flags = os.O_RDONLY | nofollow | cast(int, getattr(os, "O_CLOEXEC", 0))
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RelayError(f"{label} is unavailable or is a symbolic link: {path}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise RelayError(f"{label} must be a regular file: {path}")
+        if before.st_size > maximum_bytes or (require_nonempty and before.st_size < 1):
+            raise RelayError(f"{label} size is outside its bound: {path}")
+        chunks: list[bytes] = []
+        observed = 0
+        while True:
+            chunk = os.read(descriptor, min(1024 * 1024, maximum_bytes + 1 - observed))
+            if not chunk:
+                break
+            observed += len(chunk)
+            if observed > maximum_bytes:
+                raise RelayError(f"{label} exceeded its byte bound while reading: {path}")
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        stable_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) == (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        )
+        if not stable_identity or observed != before.st_size:
+            raise RelayError(f"{label} changed while it was observed: {path}")
+        return b"".join(chunks), observed
+    finally:
+        os.close(descriptor)
+
+
+def _remote_spack_configuration_observer_script() -> str:
+    """Return the bounded POSIX observer executed by remote ``bash -lc``."""
+    return r"""
+import hashlib
+import json
+import os
+import posixpath
+import re
+import stat
+import sys
+
+phase, manifest_path, expected_sha = sys.argv[1:4]
+max_manifest, max_components, max_component, max_tree_entries = map(int, sys.argv[4:8])
+line_pattern = re.compile(r"^([0-9a-f]{64})  ([^\r\n]+)$")
+
+def safe_relative(value):
+    return (
+        bool(value)
+        and len(value) <= 1024
+        and not value.startswith("/")
+        and value != "."
+        and ".." not in value.split("/")
+        and posixpath.normpath(value) == value
+        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
+    )
+
+def require_directory(path):
+    metadata = os.lstat(path)
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError(f"not a non-symlink directory: {path}")
+
+def read_regular(path, maximum, nonempty, retain_bytes=False):
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise RuntimeError("O_NOFOLLOW is unavailable")
+    descriptor = os.open(path, os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0))
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError(f"not a regular file: {path}")
+        if before.st_size > maximum or (nonempty and before.st_size < 1):
+            raise RuntimeError(f"file size outside bound: {path}")
+        digest = hashlib.sha256()
+        chunks = []
+        observed = 0
+        while True:
+            chunk = os.read(descriptor, min(1024 * 1024, maximum + 1 - observed))
+            if not chunk:
+                break
+            observed += len(chunk)
+            if observed > maximum:
+                raise RuntimeError(f"file exceeded bound while reading: {path}")
+            digest.update(chunk)
+            if retain_bytes:
+                chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or observed != before.st_size
+        ):
+            raise RuntimeError(f"file changed while observed: {path}")
+        return digest.hexdigest(), observed, b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+base = posixpath.dirname(manifest_path)
+require_directory(base)
+manifest_sha, manifest_size, manifest_bytes = read_regular(
+    manifest_path, max_manifest, True, retain_bytes=True
+)
+if manifest_sha != expected_sha:
+    raise RuntimeError("configuration manifest SHA-256 mismatch")
+text = manifest_bytes.decode("utf-8")
+if not text.endswith("\n") or "\x00" in text:
+    raise RuntimeError("configuration manifest is not newline-terminated text")
+declarations = []
+for line in text.splitlines():
+    match = line_pattern.fullmatch(line)
+    if match is None or not safe_relative(match.group(2)):
+        raise RuntimeError("configuration manifest line is invalid")
+    declarations.append((match.group(1), match.group(2)))
+paths = [relative_path for _digest, relative_path in declarations]
+if not 1 <= len(paths) <= max_components:
+    raise RuntimeError("configuration component count is outside its bound")
+if paths != sorted(paths) or len(paths) != len(set(paths)):
+    raise RuntimeError("configuration component paths must be unique and sorted")
+declared_paths = set(paths)
+covered_directories = sorted({path.split("/", 1)[0] for path in paths if "/" in path})
+observed_paths = set()
+observed_entries = 0
+for relative_directory in covered_directories:
+    directory = posixpath.join(base, relative_directory)
+    require_directory(directory)
+    observed_entries += 1
+    if observed_entries > max_tree_entries:
+        raise RuntimeError("configuration tree entry count exceeded its bound")
+    pending = [directory]
+    while pending:
+        current = pending.pop()
+        with os.scandir(current) as entries:
+            for entry in entries:
+                observed_entries += 1
+                if observed_entries > max_tree_entries:
+                    raise RuntimeError("configuration tree entry count exceeded its bound")
+                candidate = entry.path
+                relative_path = posixpath.relpath(candidate, base)
+                if not safe_relative(relative_path):
+                    raise RuntimeError(f"configuration tree entry has an unsafe path: {candidate}")
+                metadata = os.lstat(candidate)
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise RuntimeError(
+                        f"configuration tree entry must not be a symbolic link: {candidate}"
+                    )
+                if stat.S_ISDIR(metadata.st_mode):
+                    pending.append(candidate)
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise RuntimeError(
+                        f"configuration tree entry must be a regular file: {candidate}"
+                    )
+                observed_paths.add(relative_path)
+expected_covered_paths = {
+    path for path in declared_paths if path.split("/", 1)[0] in covered_directories
+}
+if observed_paths != expected_covered_paths:
+    missing = sorted(expected_covered_paths - observed_paths)
+    unexpected = sorted(observed_paths - expected_covered_paths)
+    raise RuntimeError(
+        "configuration tree files do not exactly match the bounded manifest: "
+        f"missing={missing} unexpected={unexpected}"
+    )
+components = []
+for declared_sha, relative_path in declarations:
+    current = base
+    parts = relative_path.split("/")
+    for part in parts[:-1]:
+        current = posixpath.join(current, part)
+        require_directory(current)
+    component_path = posixpath.join(base, *parts)
+    observed_sha, observed_size, _unused = read_regular(component_path, max_component, False)
+    if observed_sha != declared_sha:
+        raise RuntimeError(f"configuration component SHA-256 mismatch: {relative_path}")
+    components.append({
+        "relative_path": relative_path,
+        "sha256": observed_sha,
+        "size_bytes": observed_size,
+        "regular_file": True,
+    })
+print(json.dumps({
+    "schema_version": "clio-relay.spack-configuration-observation.v1",
+    "phase": phase,
+    "manifest_path": manifest_path,
+    "manifest_sha256": manifest_sha,
+    "manifest_size_bytes": manifest_size,
+    "manifest_regular_file": True,
+    "components": components,
+}, sort_keys=True, separators=(",", ":")))
+""".strip()
+
+
 @cluster_app.command("bootstrap")
+@_acceptance_report_command
 def cluster_bootstrap(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     ssh_host: Annotated[
@@ -1905,7 +2726,7 @@ def cluster_bootstrap(
     ] = None,
     validation_launcher: Annotated[
         str | None,
-        typer.Option(help="Launcher evidence, such as uvx."),
+        typer.Option(help="Launcher evidence, such as uv-tool."),
     ] = None,
     validation_install_source: Annotated[
         str | None,
@@ -1949,6 +2770,7 @@ def cluster_bootstrap(
                     ssh_host=ssh_host or definition.ssh_host,
                     source_root=package_source_root(),
                     relay_wheel=relay_wheel,
+                    relay_artifact_sha256=validation.install_source.artifact_sha256,
                     agent_adapter=definition.agent_adapter,
                     agent_npm_package=definition.agent_npm_package,
                     agent_npm_bin=definition.agent_npm_bin,
@@ -2000,6 +2822,34 @@ def cluster_bootstrap(
                         },
                     )
                 )
+            with recorder.check(
+                "worker.target-identity",
+                "verify the bootstrapped physical cluster against the operator pin",
+            ) as target_evidence:
+                target_definition = (
+                    definition.model_copy(update={"ssh_host": ssh_host})
+                    if ssh_host is not None
+                    else definition
+                )
+                target_identity = _remote_target_identity(target_definition)
+                target_evidence.append(
+                    EvidenceReference(
+                        kind="cluster_target",
+                        reference=f"ssh-target:{target_definition.ssh_host}",
+                        metadata=target_identity,
+                    )
+                )
+            recorder.add_resource(
+                ValidationResource(
+                    kind="cluster_target",
+                    resource_id=f"target:{cluster}",
+                    role="physical_cluster_target",
+                    cluster=cluster,
+                    state="verified",
+                    provider=definition.scheduler_provider,
+                    metadata=target_identity,
+                )
+            )
         except BaseException as exc:
             recorder.finish(exc)
             recorder.write(report_path)
@@ -2138,14 +2988,34 @@ def session_quiesce_intake(
         str,
         typer.Option(help="Exact owned relay session generation id."),
     ],
+    cleanup_operation_id: Annotated[
+        str | None,
+        typer.Option(help="Exact cleanup operation id selected by the desktop coordinator."),
+    ] = None,
+    cleanup_stop_worker: Annotated[
+        bool,
+        typer.Option(help="Persist worker-stop scope in the immutable cleanup intent."),
+    ] = False,
+    cleanup_cancel_jobs: Annotated[
+        bool,
+        typer.Option(help="Persist relay cancellation scope in the immutable cleanup intent."),
+    ] = False,
+    cleanup_cancel_scheduler_jobs: Annotated[
+        bool,
+        typer.Option(help="Persist scheduler cancellation scope in the cleanup intent."),
+    ] = False,
 ) -> None:
     """Durably stop one owned API session from accepting new work."""
 
     def action() -> None:
         queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
-        queue.set_owner_session_closing(
+        cleanup_intent = queue.set_owner_session_closing(
             session_id,
             session_generation_id=session_generation_id,
+            operation_id=cleanup_operation_id,
+            stop_worker=cleanup_stop_worker,
+            cancel_jobs=cleanup_cancel_jobs,
+            cancel_scheduler_jobs=cleanup_cancel_scheduler_jobs,
         )
         typer.echo(
             json.dumps(
@@ -2153,7 +3023,32 @@ def session_quiesce_intake(
                     "session_id": session_id,
                     "session_generation_id": session_generation_id,
                     "intake": "quiesced",
+                    "cleanup_intent": cleanup_intent,
                 }
+            )
+        )
+
+    _run_or_exit(action)
+
+
+@session_app.command("admission-status", hidden=True)
+def session_admission_status(
+    session_id: Annotated[str, typer.Option(help="Owned relay session id.")],
+    session_generation_id: Annotated[
+        str,
+        typer.Option(help="Exact owned relay session generation id."),
+    ],
+) -> None:
+    """Return machine-readable intake state for one exact session generation."""
+
+    def action() -> None:
+        queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+        typer.echo(
+            json.dumps(
+                queue.owner_session_generation_status(
+                    session_id,
+                    session_generation_id=session_generation_id,
+                )
             )
         )
 
@@ -2259,6 +3154,7 @@ def session_mark_closed(
 
 
 @session_app.command("detach")
+@_acceptance_report_command
 def session_detach(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     session_id: Annotated[str, typer.Option(help="Owned remote relay session id.")],
@@ -2268,7 +3164,7 @@ def session_detach(
     ] = None,
     validation_launcher: Annotated[
         str | None,
-        typer.Option(help="Launcher evidence, such as uvx."),
+        typer.Option(help="Launcher evidence, such as uv-tool."),
     ] = None,
     validation_install_source: Annotated[
         str | None,
@@ -2285,6 +3181,22 @@ def session_detach(
 ) -> None:
     """Close the desktop attachment while retaining remote work and session processes."""
     canonical_report_path = validation_report or default_report_path(cluster)
+    seed_report = _new_cleanup_acceptance_report(
+        scenario="cleanup",
+        cluster=cluster,
+        mode="detach",
+        resource_kind="owner_session",
+        resource_id=session_id,
+        action="detach",
+        cancel_relay_jobs=False,
+        cancel_scheduler_jobs=False,
+        stop_worker=False,
+        launcher=validation_launcher,
+        install_source=validation_install_source,
+        artifact=validation_artifact,
+    )
+    canonical_report: list[LiveValidationReport | None] = [seed_report]
+    write_validation_report(seed_report, canonical_report_path)
     try:
         definition = _require_cluster(cluster)
     except BaseException as exc:
@@ -2298,38 +3210,52 @@ def session_detach(
             launcher=validation_launcher,
             install_source=validation_install_source,
             artifact=validation_artifact,
+            partial_report=canonical_report[0],
         )
         raise
-    canonical_report: list[LiveValidationReport | None] = [None]
 
     def action() -> None:
         remote_execution = should_execute_on_cluster(definition)
         queue = _managed_queue_from_env()
-        report = detach_remote_session(
+        pre_detach_report = detach_remote_session(
             definition=definition,
             session_id=session_id,
             cluster=cluster,
+        )
+        pre_detach_canonical = pre_detach_report.to_live_validation_report(
+            launcher=validation_launcher,
+            install_source=validation_install_source,
+            artifact_sha256=(
+                sha256_file(validation_artifact) if validation_artifact is not None else None
+            ),
+        )
+        canonical_report[0] = pre_detach_canonical.model_copy(
+            update={"report_id": seed_report.report_id, "started_at": seed_report.started_at}
+        )
+        session_generation_id = _verified_owner_session_detach(
+            pre_detach_report,
+            session_id=session_id,
         )
         if remote_execution:
             owned_jobs = _list_remote_owned_active_cluster_jobs(
                 definition,
                 cluster,
                 owner_session_id=session_id,
-                owner_session_generation_id=report.session_generation_id,
+                owner_session_generation_id=session_generation_id,
             )
         else:
             owned_jobs = _list_owned_active_cluster_jobs(
                 queue,
                 cluster,
                 owner_session_id=session_id,
-                owner_session_generation_id=report.session_generation_id,
+                owner_session_generation_id=session_generation_id,
                 scheduler_provider=definition.scheduler_provider,
             )
         gateway_reports = _cleanup_owned_runtime_sessions(
             cluster=cluster,
             definition=definition,
             owner_session_id=session_id,
-            owner_session_generation_id=report.session_generation_id,
+            owner_session_generation_id=session_generation_id,
             mode="detach",
             cancel_scheduler_jobs=False,
         )
@@ -2338,16 +3264,31 @@ def session_detach(
                 definition,
                 cluster,
                 owner_session_id=session_id,
-                owner_session_generation_id=report.session_generation_id,
+                owner_session_generation_id=session_generation_id,
             )
         else:
             post_operation_jobs = _list_owned_active_cluster_jobs(
                 queue,
                 cluster,
                 owner_session_id=session_id,
-                owner_session_generation_id=report.session_generation_id,
+                owner_session_generation_id=session_generation_id,
                 scheduler_provider=definition.scheduler_provider,
             )
+        report = detach_remote_session(
+            definition=definition,
+            session_id=session_id,
+            cluster=cluster,
+        )
+        try:
+            _verified_owner_session_detach(
+                report,
+                session_id=session_id,
+                expected_session_generation_id=session_generation_id,
+            )
+        except RelayError as exc:
+            detail = str(exc)
+            if detail not in report.errors:
+                report.errors.append(detail)
         report.resources.extend(
             _owned_job_cleanup_resources(
                 owned_jobs,
@@ -2367,6 +3308,9 @@ def session_detach(
             artifact_sha256=(
                 sha256_file(validation_artifact) if validation_artifact is not None else None
             ),
+        )
+        canonical = canonical.model_copy(
+            update={"report_id": seed_report.report_id, "started_at": seed_report.started_at}
         )
         canonical_report[0] = canonical
         _write_remote_verified_report(canonical, definition, canonical_report_path)
@@ -2397,13 +3341,17 @@ def session_detach(
             raise
 
     def locked_action() -> None:
-        with _session_transition_lock(cluster=cluster, session_id=session_id):
+        with (
+            remote_command_timeout(REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS),
+            _session_transition_lock(cluster=cluster, session_id=session_id),
+        ):
             guarded_action()
 
     _run_or_exit(locked_action)
 
 
 @session_app.command("teardown")
+@_acceptance_report_command
 def session_teardown(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     session_id: Annotated[str, typer.Option(help="Owned remote relay session id.")],
@@ -2425,6 +3373,17 @@ def session_teardown(
             help="Also request scheduler cancellation for canceled relay jobs.",
         ),
     ] = False,
+    preserve_scheduler_job_ids: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--preserve-scheduler-job-id",
+            help=(
+                "Unrelated active scheduler job id that must remain uncanceled; repeat for "
+                "multiple live-gate sentinels. Requires --cancel-jobs and "
+                "--cancel-scheduler-jobs."
+            ),
+        ),
+    ] = None,
     relay_cancel_timeout_seconds: Annotated[
         float,
         typer.Option(
@@ -2447,7 +3406,7 @@ def session_teardown(
     ] = None,
     validation_launcher: Annotated[
         str | None,
-        typer.Option(help="Launcher evidence, such as uvx."),
+        typer.Option(help="Launcher evidence, such as uv-tool."),
     ] = None,
     validation_install_source: Annotated[
         str | None,
@@ -2464,11 +3423,33 @@ def session_teardown(
 ) -> None:
     """Stop owned remote relay session processes, optionally stopping the worker service."""
     canonical_report_path = validation_report or default_report_path(cluster)
+    seed_report = _new_cleanup_acceptance_report(
+        scenario="cleanup",
+        cluster=cluster,
+        mode="teardown",
+        resource_kind="owner_session",
+        resource_id=session_id,
+        action="teardown",
+        cancel_relay_jobs=cancel_jobs,
+        cancel_scheduler_jobs=cancel_scheduler_jobs,
+        stop_worker=stop_worker,
+        launcher=validation_launcher,
+        install_source=validation_install_source,
+        artifact=validation_artifact,
+    )
+    canonical_report: list[LiveValidationReport | None] = [seed_report]
+    write_validation_report(seed_report, canonical_report_path)
     try:
         definition = _require_cluster(cluster)
+        scheduler_sentinel_ids = _normalize_scheduler_sentinel_ids(preserve_scheduler_job_ids or [])
         if cancel_scheduler_jobs and not cancel_jobs:
             raise typer.BadParameter(
                 "--cancel-scheduler-jobs requires the separate --cancel-jobs flag"
+            )
+        if scheduler_sentinel_ids and not (cancel_jobs and cancel_scheduler_jobs):
+            raise typer.BadParameter(
+                "--preserve-scheduler-job-id requires both --cancel-jobs and "
+                "--cancel-scheduler-jobs"
             )
     except BaseException as exc:
         _write_failed_acceptance_report(
@@ -2481,9 +3462,9 @@ def session_teardown(
             launcher=validation_launcher,
             install_source=validation_install_source,
             artifact=validation_artifact,
+            partial_report=canonical_report[0],
         )
         raise
-    canonical_report: list[LiveValidationReport | None] = [None]
 
     def action() -> None:
         remote_execution = should_execute_on_cluster(definition)
@@ -2496,13 +3477,113 @@ def session_teardown(
             pre_teardown_status,
             session_id=session_id,
         )
-        _quiesce_owner_session_intake(
+        local_admission_session_id = _desktop_owner_session_admission_id(
+            cluster=cluster,
+            session_id=session_id,
+        )
+        if remote_execution:
+            _assert_no_unscoped_desktop_admission_state(
+                queue,
+                cluster=cluster,
+                session_id=session_id,
+                session_generation_id=session_generation_id,
+            )
+        authoritative_admission = _owner_session_admission_status(
             queue=queue,
             definition=definition,
             remote_execution=remote_execution,
             session_id=session_id,
             session_generation_id=session_generation_id,
         )
+        local_cleanup_intent = queue.get_owner_session_cleanup_intent(
+            local_admission_session_id,
+            session_generation_id=session_generation_id,
+        )
+        cleanup_operation_id = _select_owner_session_cleanup_operation(
+            authoritative_status=authoritative_admission,
+            local_intent=local_cleanup_intent,
+            session_id=session_id,
+            session_generation_id=session_generation_id,
+            stop_worker=stop_worker,
+            cancel_jobs=cancel_jobs,
+            cancel_scheduler_jobs=cancel_scheduler_jobs,
+        )
+        partial = seed_report
+        partial.cleanup = CleanupEvidence(
+            requested=True,
+            mode="teardown",
+            operation_id=cleanup_operation_id,
+            cancel_relay_jobs=cancel_jobs,
+            cancel_scheduler_jobs=cancel_jobs and cancel_scheduler_jobs,
+            stop_worker=stop_worker,
+            actions=[
+                {
+                    "kind": "owner_session_admission",
+                    "resource_id": f"{session_id}:{session_generation_id}",
+                    "action": "quiesce",
+                    "outcome": "pending",
+                    "verified_after_operation": False,
+                    "residual": True,
+                },
+                {
+                    "kind": "remote_relay_api",
+                    "resource_id": session_id,
+                    "action": "stop",
+                    "outcome": "pending",
+                    "verified_after_operation": False,
+                    "residual": True,
+                },
+            ],
+        )
+        admission_resource = ValidationResource(
+            kind="owner_session_admission",
+            resource_id=f"{session_id}:{session_generation_id}",
+            role="cleanup_admission",
+            cluster=cluster,
+            state="pending",
+            metadata={
+                "operation_id": cleanup_operation_id,
+                "local_admission_session_id": local_admission_session_id,
+                "remote_execution": remote_execution,
+            },
+        )
+        api_resource = ValidationResource(
+            kind="remote_relay_api",
+            resource_id=session_id,
+            role="cleanup_target",
+            cluster=cluster,
+            state="running" if pre_teardown_status.get("running") is True else "stopped",
+            metadata={
+                "session_generation_id": session_generation_id,
+                "ownership_verified": pre_teardown_status.get("ownership_verified") is True,
+                "cleanup_operation_id": cleanup_operation_id,
+            },
+        )
+        partial.resources.extend([admission_resource, api_resource])
+        partial.cleanup.remaining_resources.extend([admission_resource, api_resource])
+        canonical_report[0] = partial
+        write_validation_report(partial, canonical_report_path)
+        cleanup_intent = _quiesce_owner_session_intake(
+            queue=queue,
+            definition=definition,
+            remote_execution=remote_execution,
+            session_id=session_id,
+            local_admission_session_id=local_admission_session_id,
+            session_generation_id=session_generation_id,
+            cleanup_operation_id=cleanup_operation_id,
+            stop_worker=stop_worker,
+            cancel_jobs=cancel_jobs,
+            cancel_scheduler_jobs=cancel_scheduler_jobs,
+        )
+        partial.resources[0] = partial.resources[0].model_copy(update={"state": "quiesced"})
+        partial.cleanup.remaining_resources[0] = partial.resources[0]
+        partial.cleanup.actions[0].update(
+            {
+                "outcome": "quiesced",
+                "verified_after_operation": True,
+            }
+        )
+        write_validation_report(partial, canonical_report_path)
 
         def list_owned_jobs(*, include_terminal: bool = False) -> list[_OwnedRelayJob]:
             if remote_execution:
@@ -2522,6 +3603,25 @@ def session_teardown(
                 include_terminal=include_terminal,
             )
 
+        def list_legacy_jobs() -> list[_OwnedRelayJob]:
+            """Discover unversioned records without treating them as this generation's jobs."""
+            if remote_execution:
+                return _list_remote_owned_active_cluster_jobs(
+                    definition,
+                    cluster,
+                    owner_session_id=session_id,
+                    owner_session_generation_id=None,
+                    include_terminal=True,
+                )
+            return _list_owned_active_cluster_jobs(
+                queue,
+                cluster,
+                owner_session_id=session_id,
+                owner_session_generation_id=None,
+                scheduler_provider=definition.scheduler_provider,
+                include_terminal=True,
+            )
+
         def read_owned_job(job_id: str) -> _OwnedRelayJob:
             return _read_owned_relay_job(
                 queue=queue,
@@ -2533,29 +3633,176 @@ def session_teardown(
                 owner_session_generation_id=session_generation_id,
             )
 
+        legacy_jobs = list_legacy_jobs()
+        if legacy_jobs:
+            for legacy_job in legacy_jobs:
+                resource = ValidationResource(
+                    kind="relay_job",
+                    resource_id=legacy_job.job_id,
+                    role="ambiguous_legacy_owner_session",
+                    cluster=cluster,
+                    state=legacy_job.relay_state.value,
+                    provider=legacy_job.scheduler_provider,
+                    metadata={
+                        "ownership_verified": False,
+                        "expected_owner_session_generation_id": session_generation_id,
+                        "observed_owner_session_generation_id": None,
+                        "mutation_refused": True,
+                    },
+                )
+                partial.resources.append(resource)
+                partial.cleanup.remaining_resources.append(resource)
+            write_validation_report(partial, canonical_report_path)
+            raise RelayError(
+                "owner-session cleanup found unversioned legacy jobs whose generation cannot be "
+                "proven; no relay or scheduler cancellation was attempted: "
+                + ", ".join(sorted(job.job_id for job in legacy_jobs))
+            )
+
         owned_jobs = list_owned_jobs()
+        if cancel_jobs:
+            for job in owned_jobs:
+                resource = ValidationResource(
+                    kind="relay_job",
+                    resource_id=job.job_id,
+                    role="cleanup_cancel_target",
+                    cluster=cluster,
+                    state=job.relay_state.value,
+                    provider=job.scheduler_provider,
+                    metadata={
+                        "action": "cancel",
+                        "ownership_verified": True,
+                        "owner_session_generation_id": session_generation_id,
+                        "cleanup_operation_id": cleanup_operation_id,
+                    },
+                )
+                partial.resources.append(resource)
+                partial.cleanup.remaining_resources.append(resource)
+                partial.cleanup.actions.append(
+                    {
+                        "kind": "relay_job",
+                        "resource_id": job.job_id,
+                        "action": "cancel",
+                        "outcome": "pending",
+                        "verified_after_operation": False,
+                        "residual": True,
+                    }
+                )
+            write_validation_report(partial, canonical_report_path)
+        gateway_scheduler_job_ids = (
+            _owned_gateway_scheduler_job_ids(
+                queue=queue,
+                definition=definition,
+                cluster=cluster,
+                owner_session_id=session_id,
+                owner_session_generation_id=session_generation_id,
+            )
+            if scheduler_sentinel_ids
+            else ()
+        )
+        for scheduler_job_id in gateway_scheduler_job_ids:
+            scheduler_resource = ValidationResource(
+                kind="scheduler_job",
+                resource_id=scheduler_job_id,
+                role="gateway_cleanup_target",
+                cluster=cluster,
+                state="discovered",
+                provider=definition.scheduler_provider,
+                metadata={
+                    "action": "cancel" if cancel_scheduler_jobs else "retain",
+                    "ownership_verified": True,
+                    "owner_session_generation_id": session_generation_id,
+                    "cleanup_operation_id": cleanup_operation_id,
+                },
+            )
+            partial.resources.append(scheduler_resource)
+            partial.cleanup.remaining_resources.append(scheduler_resource)
+            partial.cleanup.actions.append(
+                {
+                    "kind": "scheduler_job",
+                    "resource_id": scheduler_job_id,
+                    "action": "cancel" if cancel_scheduler_jobs else "retain",
+                    "outcome": "pending",
+                    "verified_after_operation": False,
+                    "residual": True,
+                    "source": "gateway",
+                }
+            )
+        if gateway_scheduler_job_ids:
+            write_validation_report(partial, canonical_report_path)
+        scheduler_sentinel_pre_phases = _preflight_scheduler_sentinels(
+            definition,
+            scheduler_sentinel_ids,
+            owned_jobs,
+            gateway_scheduler_job_ids=gateway_scheduler_job_ids,
+        )
         canceled: list[str] = []
         if cancel_jobs:
-            cancellation_targets = (
-                _cancel_remote_owned_jobs(definition, cluster, owned_jobs)
-                if remote_execution
-                else _cancel_local_owned_jobs(queue, owned_jobs)
-            )
-            canceled.extend(
-                _wait_for_owned_relay_cancellations(
-                    cancellation_targets,
-                    read_owned_job=read_owned_job,
-                    timeout_seconds=relay_cancel_timeout_seconds,
-                    poll_seconds=relay_cancel_poll_seconds,
+            try:
+                cancellation_targets = (
+                    _cancel_remote_owned_jobs(definition, cluster, owned_jobs)
+                    if remote_execution
+                    else _cancel_local_owned_jobs(queue, owned_jobs)
                 )
-            )
+                canceled.extend(
+                    _wait_for_owned_relay_cancellations(
+                        cancellation_targets,
+                        read_owned_job=read_owned_job,
+                        timeout_seconds=relay_cancel_timeout_seconds,
+                        poll_seconds=relay_cancel_poll_seconds,
+                    )
+                )
+            except BaseException as exc:
+                for action_evidence in partial.cleanup.actions:
+                    if action_evidence.get("kind") == "relay_job":
+                        action_evidence.update(
+                            {
+                                "outcome": "failed",
+                                "verified_after_operation": False,
+                                "residual": True,
+                                "detail": str(exc),
+                            }
+                        )
+                write_validation_report(partial, canonical_report_path)
+                raise
+            canceled_ids = set(canceled)
+            for index, resource in enumerate(partial.resources):
+                if resource.kind == "relay_job" and resource.resource_id in canceled_ids:
+                    partial.resources[index] = resource.model_copy(update={"state": "canceled"})
+            partial.cleanup.remaining_resources = [
+                resource
+                for resource in partial.cleanup.remaining_resources
+                if not (resource.kind == "relay_job" and resource.resource_id in canceled_ids)
+            ]
+            for action_evidence in partial.cleanup.actions:
+                if (
+                    action_evidence.get("kind") == "relay_job"
+                    and action_evidence.get("resource_id") in canceled_ids
+                ):
+                    action_evidence.update(
+                        {
+                            "outcome": "canceled",
+                            "verified_after_operation": True,
+                            "residual": False,
+                        }
+                    )
+            write_validation_report(partial, canonical_report_path)
         report = teardown_remote_session(
             definition=definition,
             session_id=session_id,
             expected_session_generation_id=session_generation_id,
+            expected_cleanup_operation_id=cast(str, cleanup_intent["operation_id"]),
             stop_worker=stop_worker,
+            cancel_jobs=cancel_jobs,
+            cancel_scheduler_jobs=cancel_scheduler_jobs,
             cluster=cluster,
         )
+        report.cleanup_operation_id = cast(str, cleanup_intent["operation_id"])
+        report.cleanup_policy = {
+            key: cast(bool, cleanup_intent[key])
+            for key in ("stop_worker", "cancel_jobs", "cancel_scheduler_jobs")
+        }
+        report.relay_cancel_requested = cancel_jobs
         report.scheduler_cancel_requested = cancel_jobs and cancel_scheduler_jobs
         partial = report.to_live_validation_report(
             stop_worker=stop_worker,
@@ -2565,6 +3812,9 @@ def session_teardown(
             artifact_sha256=(
                 sha256_file(validation_artifact) if validation_artifact is not None else None
             ),
+        )
+        partial = partial.model_copy(
+            update={"report_id": seed_report.report_id, "started_at": seed_report.started_at}
         )
         canonical_report[0] = partial
         post_api_jobs = list_owned_jobs(include_terminal=True)
@@ -2586,6 +3836,23 @@ def session_teardown(
             )
             owned_jobs.extend(late_jobs)
 
+        gateway_scheduler_job_ids = (
+            _owned_gateway_scheduler_job_ids(
+                queue=queue,
+                definition=definition,
+                cluster=cluster,
+                owner_session_id=session_id,
+                owner_session_generation_id=session_generation_id,
+            )
+            if scheduler_sentinel_ids
+            else ()
+        )
+        _assert_scheduler_sentinels_unrelated(
+            scheduler_sentinel_ids,
+            owned_jobs,
+            gateway_scheduler_job_ids=gateway_scheduler_job_ids,
+        )
+
         gateway_reports = _cleanup_owned_runtime_sessions(
             cluster=cluster,
             definition=definition,
@@ -2593,6 +3860,8 @@ def session_teardown(
             owner_session_generation_id=session_generation_id,
             mode="teardown",
             cancel_scheduler_jobs=cancel_scheduler_jobs,
+            scheduler_sentinel_ids=scheduler_sentinel_ids,
+            owned_jobs=owned_jobs,
         )
 
         scheduler_jobs = list_owned_jobs(include_terminal=True)
@@ -2600,6 +3869,22 @@ def session_teardown(
         for job in [*owned_jobs, *scheduler_jobs]:
             by_job_id.setdefault(job.job_id, job)
         owned_jobs = list(by_job_id.values())
+        gateway_scheduler_job_ids = (
+            _owned_gateway_scheduler_job_ids(
+                queue=queue,
+                definition=definition,
+                cluster=cluster,
+                owner_session_id=session_id,
+                owner_session_generation_id=session_generation_id,
+            )
+            if scheduler_sentinel_ids
+            else ()
+        )
+        _assert_scheduler_sentinels_unrelated(
+            scheduler_sentinel_ids,
+            owned_jobs,
+            gateway_scheduler_job_ids=gateway_scheduler_job_ids,
+        )
         report.resources.extend(
             _owned_job_cleanup_resources(
                 owned_jobs,
@@ -2617,6 +3902,12 @@ def session_teardown(
             )
             report.resources.extend(scheduler_resources)
             report.errors.extend(scheduler_errors)
+        sentinel_resources, sentinel_errors = _scheduler_sentinel_preservation_resources(
+            definition,
+            scheduler_sentinel_pre_phases,
+        )
+        report.resources.extend(sentinel_resources)
+        report.errors.extend(sentinel_errors)
         final_jobs = list_owned_jobs(include_terminal=True)
         if cancel_jobs:
             uncanceled = [
@@ -2639,14 +3930,13 @@ def session_teardown(
             session_generation_id=session_generation_id,
             stop_worker=stop_worker,
         )
-        legacy_unversioned_job_ids = sorted(
-            {job.job_id for job in final_jobs if job.owner_session_generation_id is None}
-        )
+        legacy_unversioned_job_ids: list[str] = []
         _mark_owner_session_closed(
             queue=queue,
             definition=definition,
             remote_execution=remote_execution,
             session_id=session_id,
+            local_admission_session_id=local_admission_session_id,
             session_generation_id=session_generation_id,
             legacy_unversioned_job_ids=legacy_unversioned_job_ids,
         )
@@ -2661,6 +3951,8 @@ def session_teardown(
                 verified_after_operation=True,
                 metadata={
                     "session_generation_id": session_generation_id,
+                    "cleanup_operation_id": report.cleanup_operation_id,
+                    "cleanup_policy": report.cleanup_policy,
                     "covered_legacy_job_ids": legacy_unversioned_job_ids,
                 },
             )
@@ -2683,6 +3975,9 @@ def session_teardown(
             artifact_sha256=(
                 sha256_file(validation_artifact) if validation_artifact is not None else None
             ),
+        )
+        canonical = canonical.model_copy(
+            update={"report_id": seed_report.report_id, "started_at": seed_report.started_at}
         )
         canonical_report[0] = canonical
         for job_id in canceled:
@@ -2723,7 +4018,10 @@ def session_teardown(
             raise
 
     def locked_action() -> None:
-        with _session_transition_lock(cluster=cluster, session_id=session_id):
+        with (
+            remote_command_timeout(REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS),
+            _session_transition_lock(cluster=cluster, session_id=session_id),
+        ):
             guarded_action()
 
     _run_or_exit(locked_action)
@@ -3574,7 +4872,7 @@ def queue_stale(
     scan_limit: Annotated[
         int,
         typer.Option(help="Maximum durable job records scanned.", min=1, max=10_000),
-    ] = DEFAULT_SCAN_LIMIT,
+    ] = DEFAULT_STALE_SCAN_LIMIT,
 ) -> None:
     """Discover stale relay jobs without changing queue or scheduler state."""
     args = [
@@ -3680,7 +4978,7 @@ def queue_cleanup_stale(
     scan_limit: Annotated[
         int,
         typer.Option(help="Maximum durable job records scanned.", min=1, max=10_000),
-    ] = DEFAULT_SCAN_LIMIT,
+    ] = DEFAULT_STALE_SCAN_LIMIT,
 ) -> None:
     """Preview or recover stale jobs; queued cancellation is explicit and relay-only."""
     args = [
@@ -3850,6 +5148,7 @@ def queue_retention_collect(
 
 
 @queue_app.command("validate")
+@_acceptance_report_command
 def queue_validate(
     cluster: Annotated[str, typer.Option(help="Cluster containing the live worker service.")],
     job_id: Annotated[
@@ -3897,7 +5196,7 @@ def queue_validate(
     ] = None,
     validation_launcher: Annotated[
         str | None,
-        typer.Option(help="Acceptance launcher identity, such as uvx."),
+        typer.Option(help="Acceptance launcher identity, such as uv-tool."),
     ] = None,
     validation_install_source: Annotated[
         str | None,
@@ -4197,6 +5496,7 @@ def scheduler_release_validation(
 
 
 @scheduler_app.command("validate-lifecycle")
+@_acceptance_report_command
 def scheduler_validate_lifecycle(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     provider: Annotated[
@@ -4225,7 +5525,7 @@ def scheduler_validate_lifecycle(
     ] = None,
     validation_launcher: Annotated[
         str | None,
-        typer.Option(help="Launcher evidence, such as uvx."),
+        typer.Option(help="Launcher evidence, such as uv-tool."),
     ] = None,
     validation_install_source: Annotated[
         str | None,
@@ -4349,6 +5649,56 @@ def job_cancel(
     typer.echo(f"{job.job_id} {job.state.value}")
 
 
+_GENERIC_GATEWAY_RUNTIME_KEYS = frozenset(
+    {
+        "runtime_spec",
+        "ownership_intents",
+        "teardown_intent",
+        "teardown",
+        "detach",
+        "scheduler_provider",
+        "scheduler_job_id",
+        "scheduler_native_id",
+    }
+)
+_GENERIC_GATEWAY_CONNECTOR_KEYS = frozenset({"desktop_connector", "remote_connector"})
+_GENERIC_GATEWAY_OWNER_METADATA_KEYS = frozenset(
+    {
+        "owner",
+        "owner_session_id",
+        "owner_session_generation_id",
+        "owner_session_admission_id",
+        "runtime_kind",
+        "scheduler_provider",
+        "scheduler_job_id",
+        "scheduler_native_id",
+    }
+)
+
+
+def _reject_generic_cli_gateway_runtime_fields(
+    *,
+    gateway: dict[str, object],
+    metadata: dict[str, object],
+) -> None:
+    """Keep generic CLI gateway writes outside supervisor-owned runtime identity."""
+    protected = [f"gateway.{key}" for key in sorted(_GENERIC_GATEWAY_RUNTIME_KEYS & gateway.keys())]
+    transport = gateway.get("transport")
+    if isinstance(transport, dict):
+        protected.extend(
+            f"gateway.transport.{key}"
+            for key in sorted(_GENERIC_GATEWAY_CONNECTOR_KEYS & transport.keys())
+        )
+    protected.extend(
+        f"metadata.{key}" for key in sorted(_GENERIC_GATEWAY_OWNER_METADATA_KEYS & metadata.keys())
+    )
+    if protected:
+        raise typer.BadParameter(
+            "generic gateway commands cannot write relay-managed runtime fields: "
+            + ", ".join(protected)
+        )
+
+
 @gateway_app.command("create")
 def gateway_create(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
@@ -4357,11 +5707,6 @@ def gateway_create(
         GatewaySessionState,
         typer.Option(help="Initial gateway session state."),
     ] = GatewaySessionState.CREATED,
-    scheduler: Annotated[str, typer.Option(help="Scheduler provider name.")] = "external",
-    scheduler_job_id: Annotated[
-        str | None,
-        typer.Option(help="Scheduler job id if already known."),
-    ] = None,
     queue_state: Annotated[str | None, typer.Option(help="Scheduler queue state.")] = None,
     node: Annotated[str | None, typer.Option(help="Allocated node or host.")] = None,
     stdout_uri: Annotated[str | None, typer.Option(help="Gateway stdout log URI.")] = None,
@@ -4403,6 +5748,12 @@ def gateway_create(
     gateway_source = _json_text_from_option(gateway_json, gateway_json_file)
     resources_source = _json_text_from_option(resources_json, resources_json_file)
     metadata_source = _json_text_from_option(metadata_json, metadata_json_file)
+    gateway_payload = _json_object(gateway_source)
+    metadata_payload = _json_object(metadata_source)
+    _reject_generic_cli_gateway_runtime_fields(
+        gateway=gateway_payload,
+        metadata=metadata_payload,
+    )
     remote_args = [
         "gateway",
         "create",
@@ -4412,8 +5763,6 @@ def gateway_create(
         name,
         "--state",
         state.value,
-        "--scheduler",
-        scheduler,
         "--gateway-json",
         gateway_source,
         "--resources-json",
@@ -4421,8 +5770,6 @@ def gateway_create(
         "--metadata-json",
         metadata_source,
     ]
-    if scheduler_job_id is not None:
-        remote_args.extend(["--scheduler-job-id", scheduler_job_id])
     if queue_state is not None:
         remote_args.extend(["--queue-state", queue_state])
     if node is not None:
@@ -4442,17 +5789,15 @@ def gateway_create(
             cluster=cluster,
             name=name,
             state=state,
-            scheduler=scheduler,
-            scheduler_job_id=scheduler_job_id,
             queue_state=queue_state,
             node=node,
             stdout_uri=stdout_uri,
             stderr_uri=stderr_uri,
             log_uris=log_uri or [],
-            gateway=_json_object(gateway_source),
+            gateway=gateway_payload,
             artifacts=artifact or [],
             requested_resources=_json_object(resources_source),
-            metadata=_json_object(metadata_source),
+            metadata=metadata_payload,
         )
     )
     typer.echo(_public_json(session.model_dump(mode="json")))
@@ -4666,10 +6011,6 @@ def gateway_update(
         GatewaySessionState | None,
         typer.Option(help="Updated gateway session state."),
     ] = None,
-    scheduler_job_id: Annotated[
-        str | None,
-        typer.Option(help="Scheduler job id."),
-    ] = None,
     queue_state: Annotated[str | None, typer.Option(help="Scheduler queue state.")] = None,
     node: Annotated[str | None, typer.Option(help="Allocated node or host.")] = None,
     stdout_uri: Annotated[str | None, typer.Option(help="Gateway stdout log URI.")] = None,
@@ -4719,11 +6060,15 @@ def gateway_update(
     if resources_json is not None or resources_json_file is not None:
         resources_source = _json_text_from_option(resources_json or "{}", resources_json_file)
     metadata_source = _json_text_from_option(metadata_json, metadata_json_file)
+    gateway_payload = _json_object(gateway_source) if gateway_source is not None else None
+    metadata_payload = _json_object(metadata_source)
+    _reject_generic_cli_gateway_runtime_fields(
+        gateway=gateway_payload or {},
+        metadata=metadata_payload,
+    )
     remote_args = ["gateway", "update", session_id]
     if state is not None:
         remote_args.extend(["--state", state.value])
-    if scheduler_job_id is not None:
-        remote_args.extend(["--scheduler-job-id", scheduler_job_id])
     if queue_state is not None:
         remote_args.extend(["--queue-state", queue_state])
     if node is not None:
@@ -4745,8 +6090,6 @@ def gateway_update(
     if local_session is None and _try_remote_cluster_passthrough(cluster, remote_args):
         return
     updates: dict[str, object] = {}
-    if scheduler_job_id is not None:
-        updates["scheduler_job_id"] = scheduler_job_id
     if queue_state is not None:
         updates["queue_state"] = queue_state
     if node is not None:
@@ -4761,8 +6104,8 @@ def gateway_update(
         updates["artifacts"] = artifact
     if resources_source is not None:
         updates["requested_resources"] = _json_object(resources_source)
-    if gateway_source is not None:
-        updates["gateway"] = _json_object(gateway_source)
+    if gateway_payload is not None:
+        updates["gateway"] = gateway_payload
     _run_or_exit(
         lambda: typer.echo(
             _public_json(
@@ -4770,7 +6113,8 @@ def gateway_update(
                 .update_gateway_session(
                     session_id,
                     state=state,
-                    metadata=_json_object(metadata_source),
+                    metadata=metadata_payload,
+                    reject_relay_managed_fields=True,
                     **updates,
                 )
                 .model_dump(mode="json")
@@ -4805,6 +6149,7 @@ def gateway_close(
 
 
 @gateway_app.command("start-runtime")
+@_acceptance_report_command
 def gateway_start_runtime(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     name: Annotated[str, typer.Option(help="Human-readable runtime session name.")],
@@ -4836,7 +6181,7 @@ def gateway_start_runtime(
     ] = None,
     validation_launcher: Annotated[
         str | None,
-        typer.Option(help="Launcher evidence, such as uvx."),
+        typer.Option(help="Launcher evidence, such as uv-tool."),
     ] = None,
     validation_install_source: Annotated[
         str | None,
@@ -4867,9 +6212,10 @@ def gateway_start_runtime(
             runtime_json_file.read_text(encoding="utf-8-sig")
         )
         settings = RelaySettings.from_env()
+        queue = storage_managed_queue(settings)
         supervisor = ServiceRuntimeSupervisor(
             settings=settings,
-            queue=storage_managed_queue(settings),
+            queue=queue,
             cluster=cluster,
             definition=definition,
             token=_resolve_env_secret(token, definition.frp_transport.token_env, "frp token"),
@@ -4879,12 +6225,90 @@ def gateway_start_runtime(
                 "stcp secret",
             ),
         )
-        result = supervisor.start(
-            name=name,
-            spec=spec,
-            owner_session_id=owner_session_id,
-            owner_session_generation_id=owner_session_generation_id,
-        )
+
+        def start_runtime() -> ServiceRuntimeStartResult:
+            if owner_session_id is None or owner_session_generation_id is None:
+                return supervisor.start(name=name, spec=spec)
+            remote_execution = should_execute_on_cluster(definition)
+            local_admission_id = _desktop_owner_session_admission_id(
+                cluster=cluster,
+                session_id=owner_session_id,
+            )
+            if remote_execution:
+                _assert_no_unscoped_desktop_admission_state(
+                    queue,
+                    cluster=cluster,
+                    session_id=owner_session_id,
+                    session_generation_id=owner_session_generation_id,
+                )
+            process_status = status_remote_session(
+                definition=definition,
+                session_id=owner_session_id,
+            )
+            _require_live_owner_session_for_gateway(
+                process_status,
+                session_id=owner_session_id,
+                session_generation_id=owner_session_generation_id,
+            )
+            authoritative_admission = _owner_session_admission_status(
+                queue=queue,
+                definition=definition,
+                remote_execution=remote_execution,
+                session_id=owner_session_id,
+                session_generation_id=owner_session_generation_id,
+            )
+            _require_owner_session_admission_open(
+                authoritative_admission,
+                session_id=owner_session_id,
+                session_generation_id=owner_session_generation_id,
+            )
+            local_admission = queue.mirror_owner_session_generation_open(
+                local_admission_id,
+                session_generation_id=owner_session_generation_id,
+            )
+            _require_owner_session_admission_open(
+                local_admission,
+                session_id=local_admission_id,
+                session_generation_id=owner_session_generation_id,
+            )
+
+            # Reverify the authoritative boundary immediately before the first
+            # durable gateway write. The desktop transition lock remains held
+            # through all scheduler and connector side effects and rollback.
+            process_status = status_remote_session(
+                definition=definition,
+                session_id=owner_session_id,
+            )
+            _require_live_owner_session_for_gateway(
+                process_status,
+                session_id=owner_session_id,
+                session_generation_id=owner_session_generation_id,
+            )
+            authoritative_admission = _owner_session_admission_status(
+                queue=queue,
+                definition=definition,
+                remote_execution=remote_execution,
+                session_id=owner_session_id,
+                session_generation_id=owner_session_generation_id,
+            )
+            _require_owner_session_admission_open(
+                authoritative_admission,
+                session_id=owner_session_id,
+                session_generation_id=owner_session_generation_id,
+            )
+            return supervisor.start(
+                name=name,
+                spec=spec,
+                owner_session_id=owner_session_id,
+                owner_session_generation_id=owner_session_generation_id,
+                owner_session_admission_id=local_admission_id,
+            )
+
+        if owner_session_id is not None:
+            with _session_transition_lock(cluster=cluster, session_id=owner_session_id):
+                result = start_runtime()
+        else:
+            result = start_runtime()
         canonical = result.to_live_validation_report(
             launcher=validation_launcher,
             install_source=validation_install_source,
@@ -4934,6 +6358,7 @@ def gateway_start_runtime(
 
 
 @gateway_app.command("detach-runtime")
+@_acceptance_report_command
 def gateway_detach_runtime(
     session_id: str,
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
@@ -4945,7 +6370,7 @@ def gateway_detach_runtime(
     ] = None,
     validation_launcher: Annotated[
         str | None,
-        typer.Option(help="Launcher evidence, such as uvx."),
+        typer.Option(help="Launcher evidence, such as uv-tool."),
     ] = None,
     validation_install_source: Annotated[
         str | None,
@@ -4962,7 +6387,22 @@ def gateway_detach_runtime(
 ) -> None:
     """Stop the owned desktop connector while retaining the remote runtime and job."""
     canonical_report_path = validation_report or default_report_path(cluster)
-    canonical_report: list[LiveValidationReport | None] = [None]
+    seed_report = _new_cleanup_acceptance_report(
+        scenario="gateway-runtime",
+        cluster=cluster,
+        mode="detach",
+        resource_kind="gateway_record",
+        resource_id=session_id,
+        action="retain",
+        cancel_relay_jobs=False,
+        cancel_scheduler_jobs=False,
+        stop_worker=False,
+        launcher=validation_launcher,
+        install_source=validation_install_source,
+        artifact=validation_artifact,
+    )
+    canonical_report: list[LiveValidationReport | None] = [seed_report]
+    write_validation_report(seed_report, canonical_report_path)
 
     def action() -> None:
         definition = _require_cluster(cluster)
@@ -4982,6 +6422,9 @@ def gateway_detach_runtime(
             artifact_sha256=(
                 sha256_file(validation_artifact) if validation_artifact is not None else None
             ),
+        )
+        canonical = canonical.model_copy(
+            update={"report_id": seed_report.report_id, "started_at": seed_report.started_at}
         )
         canonical_report[0] = canonical
         _write_remote_verified_report(canonical, definition, canonical_report_path)
@@ -5056,6 +6499,7 @@ def gateway_attach_runtime(
 
 
 @gateway_app.command("stop-runtime")
+@_acceptance_report_command
 def gateway_stop_runtime(
     session_id: str,
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
@@ -5074,7 +6518,7 @@ def gateway_stop_runtime(
     ] = None,
     validation_launcher: Annotated[
         str | None,
-        typer.Option(help="Launcher evidence, such as uvx."),
+        typer.Option(help="Launcher evidence, such as uv-tool."),
     ] = None,
     validation_install_source: Annotated[
         str | None,
@@ -5091,7 +6535,22 @@ def gateway_stop_runtime(
 ) -> None:
     """Stop owned runtime relay connectors and optionally cancel scheduler work."""
     canonical_report_path = validation_report or default_report_path(cluster)
-    canonical_report: list[LiveValidationReport | None] = [None]
+    seed_report = _new_cleanup_acceptance_report(
+        scenario="gateway-runtime",
+        cluster=cluster,
+        mode="teardown",
+        resource_kind="gateway_record",
+        resource_id=session_id,
+        action="close",
+        cancel_relay_jobs=False,
+        cancel_scheduler_jobs=cancel_scheduler_job,
+        stop_worker=False,
+        launcher=validation_launcher,
+        install_source=validation_install_source,
+        artifact=validation_artifact,
+    )
+    canonical_report: list[LiveValidationReport | None] = [seed_report]
+    write_validation_report(seed_report, canonical_report_path)
 
     def action() -> None:
         definition = _require_cluster(cluster)
@@ -5114,6 +6573,9 @@ def gateway_stop_runtime(
             artifact_sha256=(
                 sha256_file(validation_artifact) if validation_artifact is not None else None
             ),
+        )
+        canonical = canonical.model_copy(
+            update={"report_id": seed_report.report_id, "started_at": seed_report.started_at}
         )
         canonical_report[0] = canonical
         _write_remote_verified_report(canonical, definition, canonical_report_path)
@@ -5537,6 +6999,7 @@ def jarvis_mcp_call(
         spec=McpCallSpec(
             server=server,
             server_args=server_args,
+            env_from=jarvis_mcp_env_from(),
             expected_server_artifact_digest=expected_server_artifact_digest,
             operation=operation,
             tool=tool,
@@ -5603,6 +7066,7 @@ def jarvis_mcp_refresh(
 
 
 @app.command("jarvis-mcp-validate")
+@_acceptance_report_command
 def jarvis_mcp_validate(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     arguments_json: Annotated[
@@ -5631,7 +7095,7 @@ def jarvis_mcp_validate(
     ] = None,
     validation_launcher: Annotated[
         str | None,
-        typer.Option(help="Launcher evidence, such as uvx."),
+        typer.Option(help="Launcher evidence, such as uv-tool."),
     ] = None,
     validation_install_source: Annotated[
         str | None,
@@ -5646,7 +7110,7 @@ def jarvis_mcp_validate(
         ),
     ] = None,
 ) -> None:
-    """Exercise virtual jarvis_run and persist structured-runtime acceptance evidence."""
+    """Exercise JARVIS run/query semantics and persist release acceptance evidence."""
     report_path = report or default_report_path(cluster)
     report_written = [False]
 
@@ -5736,6 +7200,22 @@ def jarvis_mcp_validate(
             runtime_metadata = _read_local_json_artifact_kind(
                 queue, artifacts, kind="runtime_metadata"
             )
+        pipeline_id = runtime_metadata.get("pipeline_id") if runtime_metadata else None
+        execution_id = runtime_metadata.get("execution_id") if runtime_metadata else None
+        if not isinstance(pipeline_id, str) or not pipeline_id:
+            raise RelayError("JARVIS run metadata omitted the pipeline_id required for its query")
+        if not isinstance(execution_id, str) or not execution_id:
+            raise RelayError("JARVIS run metadata omitted the execution_id required for its query")
+        execution_query = _run_post_run_jarvis_execution_query(
+            cluster=cluster,
+            definition=definition,
+            queue=queue,
+            profile=profile,
+            pipeline_id=pipeline_id,
+            execution_id=execution_id,
+            wait_timeout_seconds=wait_timeout_seconds,
+            poll_seconds=poll_seconds,
+        )
         validation = build_jarvis_mcp_validation_report(
             cluster=cluster,
             tool="jarvis_run",
@@ -5754,6 +7234,15 @@ def jarvis_mcp_validate(
             remote_discovery_artifacts=remote_discovery_artifacts,
             initialize_response=stdio_session.initialize_response,
             stdio_evidence=stdio_session.evidence(),
+            query_tools_list_response=execution_query.tools_list_response,
+            query_call_response=execution_query.call_response,
+            query_call_job_id=execution_query.call_job_id,
+            query_call_status=execution_query.call_status,
+            query_artifacts=execution_query.artifacts,
+            query_mcp_result=execution_query.mcp_result,
+            query_provenance=execution_query.provenance,
+            query_initialize_response=execution_query.initialize_response,
+            query_stdio_evidence=execution_query.stdio_evidence,
             launcher=validation_launcher,
             install_source=validation_install_source,
             artifact_sha256=(
@@ -5865,6 +7354,7 @@ def doctor(
 
 
 @app.command("live-test")
+@_acceptance_report_command
 def live_test(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     jarvis_yaml: Annotated[
@@ -5982,7 +7472,9 @@ def live_test(
     ] = None,
     validation_launcher: Annotated[
         str | None,
-        typer.Option(help="Launcher evidence, such as uvx. Can use the validation environment."),
+        typer.Option(
+            help="Launcher evidence, such as uv-tool. Can use the validation environment."
+        ),
     ] = None,
     validation_install_source: Annotated[
         str | None,
@@ -6024,6 +7516,16 @@ def live_test(
 ) -> None:
     """Run configurable live acceptance checks for a cluster."""
     report_path = report or default_report_path(cluster)
+    seed_report = new_live_validation_report(
+        scenario=validation_scenario,
+        cluster=cluster,
+        launcher=validation_launcher,
+        install_source=validation_install_source,
+        artifact_sha256=(
+            sha256_file(validation_artifact) if validation_artifact is not None else None
+        ),
+    )
+    write_validation_report(seed_report, report_path)
     try:
         definition = _require_cluster(cluster)
         should_verify_transport = (
@@ -6041,6 +7543,10 @@ def live_test(
         )
         needs_transport_secrets = should_verify_transport or should_verify_direct_transport
     except BaseException as exc:
+        current_report = _load_current_acceptance_report(
+            report_path,
+            expected_report_id=seed_report.report_id,
+        )
         _write_failed_acceptance_report(
             path=report_path,
             scenario=validation_scenario,
@@ -6051,6 +7557,7 @@ def live_test(
             launcher=validation_launcher,
             install_source=validation_install_source,
             artifact=validation_artifact,
+            partial_report=current_report or seed_report,
         )
         raise
 
@@ -6113,17 +7620,39 @@ def live_test(
                     require_structured_runtime_metadata=require_structured_runtime_metadata,
                     validation_scenario=validation_scenario,
                     verify_cluster_deployment=verify_cluster_deployment,
+                    report_id=seed_report.report_id,
                 )
             )
+            current_report = _load_current_acceptance_report(
+                report_path,
+                expected_report_id=seed_report.report_id,
+            )
+            if current_report is None:
+                raise RelayError("live acceptance did not persist the current invocation report")
             if should_execute_on_cluster(definition):
                 _write_remote_verified_report(
-                    load_validation_report(report_path),
+                    current_report,
                     definition,
                     report_path,
                 )
-        except BaseException:
-            if report_path.exists():
-                typer.echo(f"validation.report={report_path.resolve()}")
+        except BaseException as exc:
+            current_report = _load_current_acceptance_report(
+                report_path,
+                expected_report_id=seed_report.report_id,
+            )
+            _write_failed_acceptance_report(
+                path=report_path,
+                scenario=validation_scenario,
+                cluster=cluster,
+                check_id="live.completed",
+                summary="complete live acceptance",
+                error=exc,
+                launcher=validation_launcher,
+                install_source=validation_install_source,
+                artifact=validation_artifact,
+                partial_report=current_report or seed_report,
+            )
+            typer.echo(f"validation.report={report_path.resolve()}")
             raise
         _echo_lines(lines)
 
@@ -6280,28 +7809,68 @@ def _quiesce_owner_session_intake(
     definition: ClusterDefinition,
     remote_execution: bool,
     session_id: str,
+    local_admission_session_id: str,
     session_generation_id: str,
-) -> None:
-    """Stop new owned submissions before lifecycle cleanup discovers its job set."""
-    if not remote_execution:
-        queue.set_owner_session_closing(
-            session_id,
+    cleanup_operation_id: str,
+    stop_worker: bool,
+    cancel_jobs: bool,
+    cancel_scheduler_jobs: bool,
+) -> dict[str, object]:
+    """Quiesce desktop and authoritative intake under one immutable operation id."""
+    existing_local_intent = queue.get_owner_session_cleanup_intent(
+        local_admission_session_id,
+        session_generation_id=session_generation_id,
+    )
+    if existing_local_intent is None:
+        queue.mirror_owner_session_generation_open(
+            local_admission_session_id,
             session_generation_id=session_generation_id,
         )
-        return
+    local_intent = queue.set_owner_session_closing(
+        local_admission_session_id,
+        session_generation_id=session_generation_id,
+        operation_id=cleanup_operation_id,
+        stop_worker=stop_worker,
+        cancel_jobs=cancel_jobs,
+        cancel_scheduler_jobs=cancel_scheduler_jobs,
+    )
+    if not remote_execution:
+        authoritative_intent = queue.set_owner_session_closing(
+            session_id,
+            session_generation_id=session_generation_id,
+            operation_id=cleanup_operation_id,
+            stop_worker=stop_worker,
+            cancel_jobs=cancel_jobs,
+            cancel_scheduler_jobs=cancel_scheduler_jobs,
+        )
+        _require_matching_cleanup_intents(
+            authoritative_intent,
+            local_intent,
+            cleanup_operation_id=cleanup_operation_id,
+        )
+        return authoritative_intent
+    command = [
+        "session",
+        "quiesce-intake",
+        "--session-id",
+        session_id,
+        "--session-generation-id",
+        session_generation_id,
+        "--cleanup-operation-id",
+        cleanup_operation_id,
+    ]
+    if stop_worker:
+        command.append("--cleanup-stop-worker")
+    if cancel_jobs:
+        command.append("--cleanup-cancel-jobs")
+    if cancel_scheduler_jobs:
+        command.append("--cleanup-cancel-scheduler-jobs")
     raw_result = cast(
         object,
         json.loads(
             run_remote_clio(
                 definition,
-                [
-                    "session",
-                    "quiesce-intake",
-                    "--session-id",
-                    session_id,
-                    "--session-generation-id",
-                    session_generation_id,
-                ],
+                command,
             )
         ),
     )
@@ -6314,6 +7883,193 @@ def _quiesce_owner_session_intake(
         or result.get("intake") != "quiesced"
     ):
         raise RelayError("remote owner-session intake quiescence identity did not match")
+    raw_intent = result.get("cleanup_intent")
+    if not isinstance(raw_intent, dict):
+        raise RelayError("remote owner-session intake quiescence omitted cleanup intent")
+    intent = {str(key): value for key, value in cast(dict[object, object], raw_intent).items()}
+    expected_policy = {
+        "stop_worker": stop_worker,
+        "cancel_jobs": cancel_jobs,
+        "cancel_scheduler_jobs": cancel_scheduler_jobs,
+    }
+    if (
+        intent.get("schema_version") != "clio-relay.owner-session-cleanup-intent.v1"
+        or intent.get("owner_session_id") != session_id
+        or intent.get("session_generation_id") != session_generation_id
+        or intent.get("operation_id") != cleanup_operation_id
+        or any(intent.get(key) is not value for key, value in expected_policy.items())
+    ):
+        raise RelayError("remote owner-session cleanup intent did not match requested policy")
+    _require_matching_cleanup_intents(
+        intent,
+        local_intent,
+        cleanup_operation_id=cleanup_operation_id,
+    )
+    return intent
+
+
+def _require_matching_cleanup_intents(
+    authoritative: dict[str, object],
+    local: dict[str, object],
+    *,
+    cleanup_operation_id: str,
+) -> None:
+    """Require identical operation and policy across authoritative and desktop records."""
+    keys = (
+        "operation_id",
+        "session_generation_id",
+        "stop_worker",
+        "cancel_jobs",
+        "cancel_scheduler_jobs",
+    )
+    if (
+        authoritative.get("operation_id") != cleanup_operation_id
+        or local.get("operation_id") != cleanup_operation_id
+        or any(authoritative.get(key) != local.get(key) for key in keys)
+    ):
+        raise RelayError("desktop and authoritative owner-session cleanup intents did not match")
+
+
+def _owner_session_admission_status(
+    *,
+    queue: ClioCoreQueue,
+    definition: ClusterDefinition,
+    remote_execution: bool,
+    session_id: str,
+    session_generation_id: str,
+) -> dict[str, object]:
+    """Read and strictly validate exact local or remote owner-session intake state."""
+    if remote_execution:
+        raw_status = cast(
+            object,
+            json.loads(
+                run_remote_clio(
+                    definition,
+                    [
+                        "session",
+                        "admission-status",
+                        "--session-id",
+                        session_id,
+                        "--session-generation-id",
+                        session_generation_id,
+                    ],
+                )
+            ),
+        )
+        if not isinstance(raw_status, dict):
+            raise RelayError("remote owner-session admission status was not an object")
+        status = {str(key): value for key, value in cast(dict[object, object], raw_status).items()}
+    else:
+        status = queue.owner_session_generation_status(
+            session_id,
+            session_generation_id=session_generation_id,
+        )
+    if (
+        status.get("schema_version") != "clio-relay.owner-session-admission-status.v1"
+        or status.get("owner_session_id") != session_id
+        or status.get("session_generation_id") != session_generation_id
+        or not all(
+            isinstance(status.get(key), bool) for key in ("active", "closing", "closed", "open")
+        )
+    ):
+        raise RelayError("owner-session admission status identity or schema did not match")
+    raw_intent = status.get("cleanup_intent")
+    if status.get("closing") is True:
+        if not isinstance(raw_intent, dict):
+            raise RelayError("closing owner-session admission status omitted cleanup intent")
+        intent = cast(dict[str, object], raw_intent)
+        operation_id = intent.get("operation_id")
+        if (
+            intent.get("schema_version") != "clio-relay.owner-session-cleanup-intent.v1"
+            or intent.get("owner_session_id") != session_id
+            or intent.get("session_generation_id") != session_generation_id
+            or not isinstance(operation_id, str)
+            or re.fullmatch(r"cleanup_[A-Za-z0-9_.-]+", operation_id) is None
+            or not all(
+                isinstance(intent.get(key), bool)
+                for key in ("stop_worker", "cancel_jobs", "cancel_scheduler_jobs")
+            )
+        ):
+            raise RelayError("owner-session admission cleanup intent was invalid")
+    elif raw_intent is not None:
+        raise RelayError("open owner-session admission status contained a cleanup intent")
+    return status
+
+
+def _require_owner_session_admission_open(
+    status: dict[str, object],
+    *,
+    session_id: str,
+    session_generation_id: str,
+) -> None:
+    """Fail closed unless exact generation intake is authoritatively open."""
+    if not (
+        status.get("owner_session_id") == session_id
+        and status.get("session_generation_id") == session_generation_id
+        and status.get("active") is True
+        and status.get("closing") is False
+        and status.get("closed") is False
+        and status.get("open") is True
+        and status.get("active_generation_id") == session_generation_id
+        and status.get("closing_generation_id") is None
+    ):
+        raise RelayError(
+            "owned session generation is not open for gateway admission: "
+            f"{session_id}:{session_generation_id}"
+        )
+
+
+def _select_owner_session_cleanup_operation(
+    *,
+    authoritative_status: dict[str, object],
+    local_intent: dict[str, object] | None,
+    session_id: str,
+    session_generation_id: str,
+    stop_worker: bool,
+    cancel_jobs: bool,
+    cancel_scheduler_jobs: bool,
+) -> str:
+    """Reuse a retry operation or choose one id before the first cleanup mutation."""
+    _require_durable_session_identity(
+        session_generation_id,
+        field="session_generation_id",
+    )
+    if not (
+        authoritative_status.get("owner_session_id") == session_id
+        and authoritative_status.get("session_generation_id") == session_generation_id
+    ):
+        raise RelayError("owner-session cleanup admission identity changed")
+    if not (
+        authoritative_status.get("open") is True or authoritative_status.get("closing") is True
+    ):
+        raise RelayError("owner-session generation is neither open nor a resumable cleanup")
+    raw_authoritative_intent = authoritative_status.get("cleanup_intent")
+    authoritative_intent = (
+        cast(dict[str, object], raw_authoritative_intent)
+        if isinstance(raw_authoritative_intent, dict)
+        else None
+    )
+    expected_policy = {
+        "stop_worker": stop_worker,
+        "cancel_jobs": cancel_jobs,
+        "cancel_scheduler_jobs": cancel_scheduler_jobs,
+    }
+    operation_ids: set[str] = set()
+    for intent in (authoritative_intent, local_intent):
+        if intent is None:
+            continue
+        if intent.get("session_generation_id") != session_generation_id or any(
+            intent.get(key) is not value for key, value in expected_policy.items()
+        ):
+            raise RelayError("owner-session cleanup retry changed generation or policy")
+        operation_id = intent.get("operation_id")
+        if not isinstance(operation_id, str):
+            raise RelayError("owner-session cleanup retry omitted its operation id")
+        _require_durable_session_identity(operation_id, field="operation_id")
+        operation_ids.add(operation_id)
+    if len(operation_ids) > 1:
+        raise RelayError("desktop and authoritative cleanup operation ids disagree")
+    return next(iter(operation_ids), f"cleanup_{uuid4().hex}")
 
 
 def _list_owned_active_cluster_jobs(
@@ -6327,8 +8083,6 @@ def _list_owned_active_cluster_jobs(
 ) -> list[_OwnedRelayJob]:
     owned: list[_OwnedRelayJob] = []
     membership_generations = [owner_session_generation_id]
-    if owner_session_generation_id is not None:
-        membership_generations.append(None)
     for membership_generation in membership_generations:
         cursor: str | None = None
         expected_total: int | None = None
@@ -6379,8 +8133,6 @@ def _list_remote_owned_active_cluster_jobs(
 ) -> list[_OwnedRelayJob]:
     owned: list[_OwnedRelayJob] = []
     membership_generations = [owner_session_generation_id]
-    if owner_session_generation_id is not None:
-        membership_generations.append(None)
     for membership_generation in membership_generations:
         cursor: str | None = None
         expected_total: int | None = None
@@ -6613,7 +8365,17 @@ def _wait_for_owned_relay_cancellations(
     last_states: dict[str, str] = {}
     while pending:
         for job_id in list(pending):
-            observed = read_owned_job(job_id)
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                detail = ", ".join(
+                    f"{pending_id}={last_states.get(pending_id, 'missing')}"
+                    for pending_id in sorted(pending)
+                )
+                raise RelayError(
+                    "timed out waiting for worker-acknowledged relay cancellation: " + detail
+                )
+            with remote_command_timeout(min(REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS, remaining)):
+                observed = read_owned_job(job_id)
             last_states[job_id] = observed.relay_state.value
             _require_durable_relay_cancellation(observed)
             if observed.relay_state is JobState.CANCELED:
@@ -6659,11 +8421,7 @@ def _job_is_owned_by_session(
     ):
         return False
     recorded_generation = typed_metadata.get("owner_session_generation_id")
-    return (
-        owner_session_generation_id is None
-        or recorded_generation is None
-        or recorded_generation == owner_session_generation_id
-    )
+    return recorded_generation == owner_session_generation_id
 
 
 def _relay_cancellation_evidence(
@@ -6860,6 +8618,202 @@ def _append_scheduler_job_id(target: list[str], value: object) -> None:
         target.append(value)
 
 
+def _normalize_scheduler_sentinel_ids(values: list[str]) -> tuple[str, ...]:
+    """Validate and de-duplicate scheduler preservation sentinel ids."""
+    normalized: list[str] = []
+    for value in values:
+        scheduler_job_id = value.strip()
+        if not scheduler_job_id:
+            raise typer.BadParameter("--preserve-scheduler-job-id cannot be empty")
+        if scheduler_job_id not in normalized:
+            normalized.append(scheduler_job_id)
+    return tuple(normalized)
+
+
+def _owned_gateway_scheduler_job_ids(
+    *,
+    queue: ClioCoreQueue,
+    definition: ClusterDefinition,
+    cluster: str,
+    owner_session_id: str,
+    owner_session_generation_id: str,
+) -> tuple[str, ...]:
+    """Discover every exact-generation gateway scheduler allocation without mutation."""
+    local_gateways, local_truncated = queue.scan_gateway_sessions(
+        limit=MAX_INTERNAL_COLLECTION_RECORDS,
+        cluster=cluster,
+    )
+    if local_truncated:
+        raise RelayError(
+            "local gateway scheduler discovery exceeds the bounded source limit; "
+            "no scheduler cancellation was attempted"
+        )
+    documents = [gateway.model_dump(mode="json") for gateway in local_gateways]
+    if should_execute_on_cluster(definition):
+        documents.extend(
+            _complete_remote_source_collection(
+                definition,
+                ["gateway", "list", "--cluster", cluster],
+                record_key="gateway_sessions",
+                label=f"remote gateway scheduler discovery for {cluster}",
+            )
+        )
+    ids_by_gateway: dict[str, set[str]] = {}
+    for gateway in documents:
+        session_id = gateway.get("session_id")
+        metadata = gateway.get("metadata")
+        if not isinstance(session_id, str) or not isinstance(metadata, dict):
+            continue
+        typed_metadata = cast(dict[str, object], metadata)
+        if (
+            typed_metadata.get("owner") != "clio-relay"
+            or typed_metadata.get("owner_session_id") != owner_session_id
+            or typed_metadata.get("owner_session_generation_id") != owner_session_generation_id
+        ):
+            continue
+        exact_ids = ids_by_gateway.setdefault(session_id, set())
+        scheduler_job_id = gateway.get("scheduler_job_id")
+        if isinstance(scheduler_job_id, str) and scheduler_job_id:
+            exact_ids.add(scheduler_job_id)
+        raw_gateway = gateway.get("gateway")
+        if not isinstance(raw_gateway, dict):
+            continue
+        ownership_intents = cast(dict[str, object], raw_gateway).get("ownership_intents")
+        if not isinstance(ownership_intents, dict):
+            continue
+        raw_scheduler_intent = cast(dict[str, object], ownership_intents).get(
+            "scheduler_submission"
+        )
+        if not isinstance(raw_scheduler_intent, dict):
+            continue
+        scheduler_intent = cast(dict[str, object], raw_scheduler_intent)
+        intent_state = scheduler_intent.get("state")
+        intent_scheduler_job_id = scheduler_intent.get("scheduler_job_id")
+        if isinstance(intent_scheduler_job_id, str) and intent_scheduler_job_id:
+            exact_ids.add(intent_scheduler_job_id)
+        if intent_state in {"starting", "recorded"} and not exact_ids:
+            raise RelayError(
+                "owned gateway has an unresolved scheduler submission; no scheduler "
+                f"cancellation was attempted: {session_id}"
+            )
+        if len(exact_ids) > 1:
+            raise RelayError(
+                "owned gateway scheduler identity disagrees across durable evidence; no "
+                f"scheduler cancellation was attempted: {session_id}"
+            )
+    return tuple(sorted({job_id for ids in ids_by_gateway.values() for job_id in ids}))
+
+
+def _assert_scheduler_sentinels_unrelated(
+    scheduler_sentinel_ids: tuple[str, ...],
+    jobs: list[_OwnedRelayJob],
+    *,
+    gateway_scheduler_job_ids: tuple[str, ...] = (),
+) -> None:
+    """Fail closed if a preservation sentinel appears in session-owned job evidence."""
+    session_scheduler_ids = {
+        scheduler_job_id
+        for job in jobs
+        for scheduler_job_id in (*job.scheduler_job_ids, *job.unowned_scheduler_job_ids)
+    }
+    session_scheduler_ids.update(gateway_scheduler_job_ids)
+    conflicts = sorted(set(scheduler_sentinel_ids) & session_scheduler_ids)
+    if conflicts:
+        raise RelayError(
+            "scheduler preservation sentinel ids appeared in owned or unowned scheduler "
+            "evidence for the target session generation; no scheduler cancellation was "
+            "attempted: " + ", ".join(conflicts)
+        )
+
+
+def _preflight_scheduler_sentinels(
+    definition: ClusterDefinition,
+    scheduler_sentinel_ids: tuple[str, ...],
+    jobs: list[_OwnedRelayJob],
+    *,
+    gateway_scheduler_job_ids: tuple[str, ...] = (),
+) -> dict[str, str]:
+    """Prove unrelated scheduler sentinels are active before cleanup mutation."""
+    _assert_scheduler_sentinels_unrelated(
+        scheduler_sentinel_ids,
+        jobs,
+        gateway_scheduler_job_ids=gateway_scheduler_job_ids,
+    )
+    provider = definition.scheduler_provider
+    observed_phases: dict[str, str] = {}
+    errors: list[str] = []
+    for scheduler_job_id in scheduler_sentinel_ids:
+        phase, error = _scheduler_phase_after_operation(
+            definition,
+            scheduler_job_id,
+            provider=provider,
+        )
+        normalized_phase = phase.strip().lower() if phase is not None else "unknown"
+        if error is not None or normalized_phase not in SCHEDULER_SENTINEL_ACTIVE_PHASES:
+            errors.append(
+                f"{scheduler_job_id} phase={normalized_phase}"
+                + (f" error={error}" if error is not None else "")
+            )
+            continue
+        observed_phases[scheduler_job_id] = normalized_phase
+    if errors:
+        raise RelayError(
+            "scheduler preservation sentinels must be unrelated active jobs before "
+            "cancellation; " + "; ".join(errors)
+        )
+    return observed_phases
+
+
+def _scheduler_sentinel_preservation_resources(
+    definition: ClusterDefinition,
+    pre_phases: dict[str, str],
+) -> tuple[list[CleanupResource], list[str]]:
+    """Re-poll scheduler sentinels and emit canonical preservation evidence."""
+    provider = definition.scheduler_provider
+    resources: list[CleanupResource] = []
+    errors: list[str] = []
+    for scheduler_job_id, pre_phase in pre_phases.items():
+        phase, poll_error = _scheduler_phase_after_operation(
+            definition,
+            scheduler_job_id,
+            provider=provider,
+        )
+        post_phase = phase.strip().lower() if phase is not None else "unknown"
+        preserved = poll_error is None and post_phase in SCHEDULER_SENTINEL_PRESERVED_PHASES
+        detail = (
+            "unrelated scheduler sentinel remained active after owned cancellation"
+            if preserved and post_phase != "completed"
+            else "unrelated scheduler sentinel completed naturally during owned cancellation"
+            if preserved
+            else "unrelated scheduler sentinel preservation was not proven"
+            + (f": {poll_error}" if poll_error is not None else f": phase={post_phase}")
+        )
+        resource = CleanupResource(
+            kind="scheduler_sentinel",
+            resource_id=scheduler_job_id,
+            location=definition.ssh_host,
+            action="retain",
+            ownership_verified=False,
+            outcome="retained" if preserved else "failed",
+            provider=provider,
+            verified_after_operation=preserved,
+            observed_state=post_phase,
+            residual=not preserved,
+            detail=detail,
+            metadata={
+                "unowned_sentinel": True,
+                "active_before_operation": True,
+                "preservation_verified": preserved,
+                "pre_phase": pre_phase,
+                "post_phase": post_phase,
+            },
+        )
+        resources.append(resource)
+        if not preserved:
+            errors.append(f"scheduler sentinel {scheduler_job_id} was not preserved: {detail}")
+    return resources, errors
+
+
 def _owned_job_cleanup_resources(
     jobs: list[_OwnedRelayJob],
     *,
@@ -6990,6 +8944,7 @@ def _owned_job_cleanup_resources(
                         else "scheduler preservation was not verified"
                         + (f": {status_error}" if status_error else "")
                     ),
+                    metadata={"relay_job_id": job.job_id},
                 )
             )
         for scheduler_job_id in job.unowned_scheduler_job_ids:
@@ -7087,27 +9042,34 @@ def _cancel_owned_scheduler_job(
     timeout_seconds: float,
     poll_seconds: float,
 ) -> tuple[CleanupResource, str | None]:
+    deadline = monotonic() + timeout_seconds
     accepted = False
     cancel_detail: str | None = None
     try:
         if should_execute_on_cluster(definition):
-            raw_cancel = cast(
-                object,
-                json.loads(
-                    run_remote_clio(
-                        definition,
-                        [
-                            "scheduler",
-                            "cancel",
-                            scheduler_job_id,
-                            "--cluster",
-                            definition.name,
-                            "--provider",
-                            provider,
-                        ],
-                    )
-                ),
-            )
+            with remote_command_timeout(
+                min(
+                    REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS,
+                    max(0.01, deadline - monotonic()),
+                )
+            ):
+                raw_cancel = cast(
+                    object,
+                    json.loads(
+                        run_remote_clio(
+                            definition,
+                            [
+                                "scheduler",
+                                "cancel",
+                                scheduler_job_id,
+                                "--cluster",
+                                definition.name,
+                                "--provider",
+                                provider,
+                            ],
+                        )
+                    ),
+                )
             accepted = (
                 isinstance(raw_cancel, dict)
                 and cast(dict[str, object], raw_cancel).get("accepted") is True
@@ -7119,28 +9081,33 @@ def _cancel_owned_scheduler_job(
     except (RelayError, json.JSONDecodeError) as exc:
         cancel_detail = str(exc)
 
-    deadline = monotonic() + timeout_seconds
     last_phase = "unknown"
     while monotonic() < deadline:
         try:
             if should_execute_on_cluster(definition):
-                raw_status = cast(
-                    object,
-                    json.loads(
-                        run_remote_clio(
-                            definition,
-                            [
-                                "scheduler",
-                                "status",
-                                scheduler_job_id,
-                                "--cluster",
-                                definition.name,
-                                "--provider",
-                                provider,
-                            ],
-                        )
-                    ),
-                )
+                with remote_command_timeout(
+                    min(
+                        REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS,
+                        max(0.01, deadline - monotonic()),
+                    )
+                ):
+                    raw_status = cast(
+                        object,
+                        json.loads(
+                            run_remote_clio(
+                                definition,
+                                [
+                                    "scheduler",
+                                    "status",
+                                    scheduler_job_id,
+                                    "--cluster",
+                                    definition.name,
+                                    "--provider",
+                                    provider,
+                                ],
+                            )
+                        ),
+                    )
                 if not isinstance(raw_status, dict):
                     raise RelayError("scheduler status did not return a JSON object")
                 phase = cast(dict[str, object], raw_status).get("phase")
@@ -7167,7 +9134,26 @@ def _cancel_owned_scheduler_job(
                 None,
             )
         if last_phase in {"completed", "failed"}:
-            break
+            return (
+                CleanupResource(
+                    kind="scheduler_job",
+                    resource_id=scheduler_job_id,
+                    location=definition.ssh_host,
+                    action="cancel",
+                    ownership_verified=True,
+                    outcome="terminal",
+                    provider=provider,
+                    verified_after_operation=True,
+                    observed_state=last_phase,
+                    detail=(
+                        "scheduler reached a terminal phase during the cancellation race; "
+                        f"cancellation is not claimed: accepted={accepted}, phase={last_phase}"
+                        + (f", detail={cancel_detail}" if cancel_detail else "")
+                    ),
+                    metadata={"relay_job_id": relay_job_id},
+                ),
+                None,
+            )
         sleep(poll_seconds)
 
     detail = (
@@ -7199,6 +9185,145 @@ def _cleanup_owned_runtime_sessions(
     owner_session_generation_id: str | None = None,
     mode: Literal["detach", "teardown"],
     cancel_scheduler_jobs: bool,
+    scheduler_sentinel_ids: tuple[str, ...] = (),
+    owned_jobs: list[_OwnedRelayJob] | None = None,
+) -> list[dict[str, object]]:
+    """Clean exact owned gateways and rescan boundedly until admission is stable."""
+    queue = storage_managed_queue(RelaySettings.from_env())
+    reports: list[dict[str, object]] = []
+    if mode == "detach":
+        target_ids = _owned_runtime_gateway_ids_needing_cleanup(
+            queue=queue,
+            definition=definition,
+            cluster=cluster,
+            owner_session_id=owner_session_id,
+            owner_session_generation_id=owner_session_generation_id,
+        )
+        return _cleanup_owned_runtime_sessions_once(
+            cluster=cluster,
+            definition=definition,
+            owner_session_id=owner_session_id,
+            owner_session_generation_id=owner_session_generation_id,
+            mode=mode,
+            cancel_scheduler_jobs=cancel_scheduler_jobs,
+            target_session_ids=target_ids,
+        )
+    for _pass in range(MAX_OWNER_GATEWAY_CLEANUP_PASSES):
+        target_ids = _owned_runtime_gateway_ids_needing_cleanup(
+            queue=queue,
+            definition=definition,
+            cluster=cluster,
+            owner_session_id=owner_session_id,
+            owner_session_generation_id=owner_session_generation_id,
+        )
+        if not target_ids:
+            return reports
+        if owner_session_generation_id is not None and scheduler_sentinel_ids:
+            gateway_scheduler_job_ids = _owned_gateway_scheduler_job_ids(
+                queue=queue,
+                definition=definition,
+                cluster=cluster,
+                owner_session_id=owner_session_id,
+                owner_session_generation_id=owner_session_generation_id,
+            )
+            _assert_scheduler_sentinels_unrelated(
+                scheduler_sentinel_ids,
+                owned_jobs or [],
+                gateway_scheduler_job_ids=gateway_scheduler_job_ids,
+            )
+        pass_reports = _cleanup_owned_runtime_sessions_once(
+            cluster=cluster,
+            definition=definition,
+            owner_session_id=owner_session_id,
+            owner_session_generation_id=owner_session_generation_id,
+            mode=mode,
+            cancel_scheduler_jobs=cancel_scheduler_jobs,
+            target_session_ids=target_ids,
+        )
+        reports.extend(pass_reports)
+        if any(
+            report.get("ok") is False or bool(report.get("residual_resources"))
+            for report in pass_reports
+        ):
+            return reports
+    residual_ids = _owned_runtime_gateway_ids_needing_cleanup(
+        queue=queue,
+        definition=definition,
+        cluster=cluster,
+        owner_session_id=owner_session_id,
+        owner_session_generation_id=owner_session_generation_id,
+    )
+    if residual_ids:
+        raise RelayError(
+            "owned gateway cleanup did not converge after bounded rescans: "
+            + ", ".join(sorted(residual_ids))
+        )
+    return reports
+
+
+def _owned_runtime_gateway_ids_needing_cleanup(
+    *,
+    queue: ClioCoreQueue,
+    definition: ClusterDefinition,
+    cluster: str,
+    owner_session_id: str,
+    owner_session_generation_id: str | None,
+) -> set[str]:
+    """Return the current non-closed owned gateway ids from local and remote stores."""
+    local_gateways, local_truncated = queue.scan_gateway_sessions(
+        limit=MAX_INTERNAL_COLLECTION_RECORDS,
+        cluster=cluster,
+    )
+    if local_truncated:
+        raise RelayError(
+            "local gateway cleanup discovery exceeds the bounded source limit; "
+            "no gateway cleanup was attempted"
+        )
+    documents = [gateway.model_dump(mode="json") for gateway in local_gateways]
+    if should_execute_on_cluster(definition):
+        documents.extend(
+            _complete_remote_source_collection(
+                definition,
+                ["gateway", "list", "--cluster", cluster],
+                record_key="gateway_sessions",
+                label=f"remote gateway cleanup discovery for {cluster}",
+            )
+        )
+    targets: set[str] = set()
+    for gateway in documents:
+        session_id = gateway.get("session_id")
+        metadata = gateway.get("metadata")
+        if (
+            not isinstance(session_id, str)
+            or gateway.get("state") == GatewaySessionState.CLOSED.value
+            or not isinstance(metadata, dict)
+        ):
+            continue
+        typed_metadata = cast(dict[str, object], metadata)
+        if (
+            typed_metadata.get("owner") != "clio-relay"
+            or typed_metadata.get("owner_session_id") != owner_session_id
+        ):
+            continue
+        observed_generation = typed_metadata.get("owner_session_generation_id")
+        if owner_session_generation_id is not None and observed_generation not in {
+            None,
+            owner_session_generation_id,
+        }:
+            continue
+        targets.add(session_id)
+    return targets
+
+
+def _cleanup_owned_runtime_sessions_once(
+    *,
+    cluster: str,
+    definition: ClusterDefinition,
+    owner_session_id: str,
+    owner_session_generation_id: str | None = None,
+    mode: Literal["detach", "teardown"],
+    cancel_scheduler_jobs: bool,
+    target_session_ids: set[str],
 ) -> list[dict[str, object]]:
     settings = RelaySettings.from_env()
     queue = storage_managed_queue(settings)
@@ -7232,19 +9357,29 @@ def _cleanup_owned_runtime_sessions(
         )
 
     for gateway in local_gateways:
-        if gateway.state == GatewaySessionState.CLOSED:
+        if gateway.session_id not in target_session_ids:
+            continue
+        if gateway.state == GatewaySessionState.CLOSED and mode == "detach":
             continue
         if gateway.metadata.get("owner") != "clio-relay":
             continue
         if gateway.metadata.get("owner_session_id") != owner_session_id:
             continue
         gateway_generation = gateway.metadata.get("owner_session_generation_id")
-        if (
-            owner_session_generation_id is not None
-            and gateway_generation is not None
-            and gateway_generation != owner_session_generation_id
-        ):
-            continue
+        if owner_session_generation_id is not None:
+            if not isinstance(gateway_generation, str) or not gateway_generation:
+                reports.append(
+                    _unverified_gateway_generation_report(
+                        gateway_session_id=gateway.session_id,
+                        location=str(settings.core_dir),
+                        mode=mode,
+                        expected_generation_id=owner_session_generation_id,
+                        observed_generation_id=gateway_generation,
+                    )
+                )
+                continue
+            if gateway_generation != owner_session_generation_id:
+                continue
         if mode == "detach":
             result = supervisor.detach(session_id=gateway.session_id)
         else:
@@ -7257,9 +9392,13 @@ def _cleanup_owned_runtime_sessions(
     for gateway in remote_gateways:
         remote_session_id = gateway.get("session_id")
         metadata = gateway.get("metadata")
-        if not isinstance(remote_session_id, str) or remote_session_id in seen_session_ids:
+        if (
+            not isinstance(remote_session_id, str)
+            or remote_session_id not in target_session_ids
+            or remote_session_id in seen_session_ids
+        ):
             continue
-        if gateway.get("state") == GatewaySessionState.CLOSED.value:
+        if gateway.get("state") == GatewaySessionState.CLOSED.value and mode == "detach":
             continue
         if not isinstance(metadata, dict):
             continue
@@ -7269,12 +9408,20 @@ def _cleanup_owned_runtime_sessions(
         if typed_metadata.get("owner_session_id") != owner_session_id:
             continue
         gateway_generation = typed_metadata.get("owner_session_generation_id")
-        if (
-            owner_session_generation_id is not None
-            and gateway_generation is not None
-            and gateway_generation != owner_session_generation_id
-        ):
-            continue
+        if owner_session_generation_id is not None:
+            if not isinstance(gateway_generation, str) or not gateway_generation:
+                reports.append(
+                    _unverified_gateway_generation_report(
+                        gateway_session_id=remote_session_id,
+                        location=definition.ssh_host,
+                        mode=mode,
+                        expected_generation_id=owner_session_generation_id,
+                        observed_generation_id=gateway_generation,
+                    )
+                )
+                continue
+            if gateway_generation != owner_session_generation_id:
+                continue
         if mode == "detach":
             args = [
                 "gateway",
@@ -7302,6 +9449,43 @@ def _cleanup_owned_runtime_sessions(
         )
         seen_session_ids.add(remote_session_id)
     return reports
+
+
+def _unverified_gateway_generation_report(
+    *,
+    gateway_session_id: str,
+    location: str,
+    mode: Literal["detach", "teardown"],
+    expected_generation_id: str,
+    observed_generation_id: object,
+) -> dict[str, object]:
+    """Return fail-closed evidence for an owner-session gateway without a generation."""
+    detail = (
+        "owned gateway record has no exact session generation; cleanup was refused: "
+        f"gateway={gateway_session_id} expected={expected_generation_id} "
+        f"observed={observed_generation_id!r}"
+    )
+    resource = CleanupResource(
+        kind="gateway_record",
+        resource_id=gateway_session_id,
+        location=location,
+        action="retain" if mode == "detach" else "close",
+        ownership_verified=False,
+        outcome="refused",
+        verified_after_operation=False,
+        residual=True,
+        detail=detail,
+        metadata={
+            "expected_owner_session_generation_id": expected_generation_id,
+            "observed_owner_session_generation_id": observed_generation_id,
+        },
+    )
+    return {
+        "resources": [resource.model_dump(mode="json")],
+        "residual_resources": [resource.model_dump(mode="json")],
+        "errors": [detail],
+        "ok": False,
+    }
 
 
 def _merge_gateway_cleanup_resources(
@@ -7342,8 +9526,90 @@ def _verified_owner_session_generation(
     generation_id = status.get("session_generation_id")
     if not isinstance(generation_id, str) or not generation_id:
         raise RelayError("remote session status did not contain an owned generation id")
+    _require_durable_session_identity(generation_id, field="session_generation_id")
     if status.get("running") is True and status.get("ownership_verified") is not True:
         raise RelayError("running remote session failed process ownership verification")
+    return generation_id
+
+
+def _require_live_owner_session_for_gateway(
+    status: dict[str, object],
+    *,
+    session_id: str,
+    session_generation_id: str,
+) -> None:
+    """Require a live, owned, exact-generation API before gateway side effects."""
+    if not (
+        status.get("session_id") == session_id
+        and status.get("owner") == "clio-relay"
+        and status.get("session_generation_id") == session_generation_id
+        and status.get("running") is True
+        and status.get("ownership_verified") is True
+    ):
+        raise RelayError(
+            "gateway admission requires a live owned session with the exact generation: "
+            f"{session_id}:{session_generation_id}"
+        )
+
+
+def _assert_no_unscoped_desktop_admission_state(
+    queue: ClioCoreQueue,
+    *,
+    cluster: str,
+    session_id: str,
+    session_generation_id: str,
+) -> None:
+    """Fail closed when legacy desktop state cannot be attributed to one cluster."""
+    legacy = queue.owner_session_generation_status(
+        session_id,
+        session_generation_id=session_generation_id,
+    )
+    if (
+        legacy.get("active_generation_id") is not None
+        or legacy.get("closing_generation_id") is not None
+        or legacy.get("closed") is True
+    ):
+        raise RelayError(
+            "legacy unscoped desktop owner-session admission state cannot be safely assigned "
+            f"to cluster {cluster!r} for session {session_id!r}; clean or migrate it before "
+            "cluster-scoped admission"
+        )
+
+
+def _verified_owner_session_detach(
+    report: SessionLifecycleReport,
+    *,
+    session_id: str,
+    expected_session_generation_id: str | None = None,
+) -> str:
+    """Return the exact generation only when detach retained its owned API."""
+    if report.mode != "detach" or report.session_id != session_id:
+        raise RelayError("session detach report identity did not match the requested session")
+    generation_id = report.session_generation_id
+    if not isinstance(generation_id, str) or not generation_id:
+        raise RelayError("session detach did not prove an owned session generation")
+    _require_durable_session_identity(generation_id, field="session_generation_id")
+    if (
+        expected_session_generation_id is not None
+        and generation_id != expected_session_generation_id
+    ):
+        raise RelayError("owned session generation changed during desktop detach")
+    if report.errors or report.residual_resources:
+        raise RelayError("session detach did not prove remote session retention")
+    api_resources = [
+        resource for resource in report.resources if resource.kind == "remote_relay_api"
+    ]
+    if len(api_resources) != 1:
+        raise RelayError("session detach must contain exactly one remote relay API result")
+    api_resource = api_resources[0]
+    if not (
+        api_resource.action == "retain"
+        and api_resource.outcome == "retained"
+        and api_resource.ownership_verified
+        and api_resource.verified_after_operation
+        and not api_resource.residual
+    ):
+        raise RelayError("session detach did not verify remote relay API retention")
     return generation_id
 
 
@@ -7398,6 +9664,27 @@ def _verify_owner_session_teardown(
     ):
         raise RelayError("session teardown did not verify remote relay API cleanup")
 
+    gateway_resources = [
+        resource for resource in report.resources if resource.kind == "gateway_record"
+    ]
+    relay_resource_ids = {
+        resource.resource_id for resource in report.resources if resource.kind == "relay_job"
+    }
+    gateway_resource_ids = {resource.resource_id for resource in gateway_resources}
+    connector_resources = [
+        resource
+        for resource in report.resources
+        if resource.kind in {"desktop_connector", "remote_connector"}
+    ]
+    if (gateway_resources or connector_resources) and not cleanup_connectors_cover_gateways(
+        connector_resources,
+        gateway_resources,
+        mode="teardown",
+    ):
+        raise RelayError(
+            "session teardown connector evidence did not cover each owned gateway exactly"
+        )
+
     for resource in report.resources:
         if resource.kind in {"desktop_connector", "remote_connector"} and not (
             resource.action == "stop"
@@ -7420,6 +9707,11 @@ def _verify_owner_session_teardown(
                 f"session teardown did not verify gateway closure: {resource.resource_id}"
             )
         if resource.kind == "scheduler_job":
+            linked_relay_id = resource.metadata.get("relay_job_id")
+            linked_gateway_id = resource.metadata.get("gateway_session_id")
+            linked = (
+                isinstance(linked_relay_id, str) and linked_relay_id in relay_resource_ids
+            ) or (isinstance(linked_gateway_id, str) and linked_gateway_id in gateway_resource_ids)
             retained = (
                 resource.action == "retain"
                 and resource.outcome in {"retained", "terminal"}
@@ -7434,13 +9726,17 @@ def _verify_owner_session_teardown(
                     "canceled",
                 }
             )
-            canceled = (
-                resource.action == "cancel"
-                and resource.outcome == "canceled"
-                and resource.observed_state == "canceled"
+            canceled = resource.action == "cancel" and (
+                (resource.outcome == "canceled" and resource.observed_state == "canceled")
+                or (
+                    resource.outcome == "terminal"
+                    and resource.observed_state in {"completed", "failed"}
+                )
             )
             if not (
-                (retained or canceled)
+                linked
+                and resource.provider is not None
+                and (retained or canceled)
                 and resource.ownership_verified
                 and resource.verified_after_operation
                 and not resource.residual
@@ -7475,10 +9771,11 @@ def _mark_owner_session_closed(
     definition: ClusterDefinition,
     remote_execution: bool,
     session_id: str,
+    local_admission_session_id: str,
     session_generation_id: str,
     legacy_unversioned_job_ids: list[str],
 ) -> None:
-    """Write closure only in the queue that authoritatively owned the session API."""
+    """Close the authoritative generation, then its cluster-scoped desktop mirror."""
     if remote_execution:
         args = [
             "session",
@@ -7531,6 +9828,17 @@ def _mark_owner_session_closed(
             != sorted(set(legacy_unversioned_job_ids))
         ):
             raise RelayError("owner-session legacy coverage did not match verified job ids")
+    local_closure = queue.set_owner_session_closed(
+        local_admission_session_id,
+        session_generation_id=session_generation_id,
+        residual_resource_ids=[],
+    )
+    if (
+        local_closure.owner_session_id != local_admission_session_id
+        or local_closure.session_generation_id != session_generation_id
+        or local_closure.residual_resource_ids
+    ):
+        raise RelayError("desktop owner-session admission mirror did not close exactly")
 
 
 def _remote_mcp_cache_status(
@@ -7622,6 +9930,7 @@ def _run_jarvis_remote_contract_discovery(
                 spec=McpCallSpec(
                     server=server,
                     server_args=server_args,
+                    env_from=jarvis_mcp_env_from(),
                     operation=McpOperation.TOOLS_LIST,
                     timeout_seconds=max(1, int(wait_timeout_seconds)),
                 ),
@@ -7683,6 +9992,7 @@ def _persist_jarvis_remote_contract_discovery(
             "jarvis_describe",
             "jarvis_add_step",
             "jarvis_edit_step",
+            "jarvis_get_execution",
             "jarvis_run",
         ],
         profiles=["user"],
@@ -7697,7 +10007,9 @@ def _persist_jarvis_remote_contract_discovery(
         artifact_payload=json.dumps(result, sort_keys=True, separators=(",", ":")).encode("utf-8"),
     )
     if entry.schema_digest != CLIO_KIT_JARVIS_USER_CONTRACT_SHA256:
-        raise RelayError("JARVIS MCP discovery contract does not match clio-kit 3.0.0")
+        raise RelayError(
+            f"JARVIS MCP discovery contract does not match clio-kit {CLIO_KIT_JARVIS_MCP_VERSION}"
+        )
     try:
         binding = jarvis_mcp_artifact_binding_from_entry(entry)
     except ValueError as exc:
@@ -7843,6 +10155,130 @@ def _decode_artifact_envelope(envelope: dict[str, object]) -> bytes:
         raise RelayError("remote MCP result artifact contains invalid base64") from exc
 
 
+@dataclass(frozen=True)
+class _JarvisExecutionQueryAcceptance:
+    """Durable evidence from one post-run unified JARVIS execution query."""
+
+    tools_list_response: dict[str, Any]
+    call_response: dict[str, Any]
+    call_job_id: str
+    call_status: dict[str, Any]
+    artifacts: list[dict[str, Any]]
+    mcp_result: dict[str, Any] | None
+    provenance: dict[str, Any] | None
+    initialize_response: dict[str, Any]
+    stdio_evidence: dict[str, Any]
+
+
+def _run_post_run_jarvis_execution_query(
+    *,
+    cluster: str,
+    definition: ClusterDefinition,
+    queue: ClioCoreQueue,
+    profile: str,
+    pipeline_id: str,
+    execution_id: str,
+    wait_timeout_seconds: float,
+    poll_seconds: float,
+) -> _JarvisExecutionQueryAcceptance:
+    """Query the completed JARVIS execution through the local virtual MCP surface."""
+    arguments: dict[str, Any] = {
+        "cluster": cluster,
+        "pipeline_id": pipeline_id,
+        "execution_id": execution_id,
+        "include_progress": True,
+        "artifacts": {"page_size": 25},
+    }
+    session = run_packaged_mcp_stdio_session(
+        profile=profile,
+        tool="jarvis_get_execution",
+        arguments=arguments,
+    )
+    call_job_id = _mcp_response_job_id(session.tools_call_response)
+    if should_execute_on_cluster(definition):
+        call_status = _wait_for_remote_job_terminal(
+            definition,
+            call_job_id,
+            timeout_seconds=wait_timeout_seconds,
+            poll_seconds=poll_seconds,
+        )
+        artifacts = _remote_artifact_records(definition, call_job_id)
+        mcp_result = _read_remote_json_artifact_kind(
+            definition,
+            artifacts,
+            kind="mcp_result",
+        )
+        provenance = _read_remote_json_artifact_kind(
+            definition,
+            artifacts,
+            kind="provenance",
+        )
+    else:
+        call_status = _wait_for_local_job_terminal(
+            queue,
+            call_job_id,
+            timeout_seconds=wait_timeout_seconds,
+            poll_seconds=poll_seconds,
+        )
+        artifacts = _complete_local_artifact_records(queue, call_job_id)
+        mcp_result = _read_local_json_artifact_kind(queue, artifacts, kind="mcp_result")
+        provenance = _read_local_json_artifact_kind(queue, artifacts, kind="provenance")
+    return _JarvisExecutionQueryAcceptance(
+        tools_list_response=session.tools_list_response,
+        call_response=session.tools_call_response,
+        call_job_id=call_job_id,
+        call_status=cast(dict[str, Any], call_status),
+        artifacts=artifacts,
+        mcp_result=mcp_result,
+        provenance=provenance,
+        initialize_response=session.initialize_response,
+        stdio_evidence=session.evidence(),
+    )
+
+
+def _wait_for_remote_job_terminal(
+    definition: ClusterDefinition,
+    job_id: str,
+    *,
+    timeout_seconds: float,
+    poll_seconds: float,
+) -> dict[str, object]:
+    """Wait for one remote relay job without requiring progress observations."""
+    _validate_progress_wait(timeout_seconds=timeout_seconds, poll_seconds=poll_seconds)
+    deadline = monotonic() + timeout_seconds
+    while True:
+        status = _json_output(
+            run_remote_clio(definition, ["job", "status", job_id]),
+            "JARVIS MCP execution-query job status",
+        )
+        if status.get("terminal") is True:
+            return status
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"job did not reach terminal state before timeout: {job_id}")
+        sleep(min(poll_seconds, remaining))
+
+
+def _wait_for_local_job_terminal(
+    queue: ClioCoreQueue,
+    job_id: str,
+    *,
+    timeout_seconds: float,
+    poll_seconds: float,
+) -> dict[str, object]:
+    """Wait for one local relay job without requiring progress observations."""
+    _validate_progress_wait(timeout_seconds=timeout_seconds, poll_seconds=poll_seconds)
+    deadline = monotonic() + timeout_seconds
+    while True:
+        status = get_job_status(queue, job_id)
+        if status.get("terminal") is True:
+            return status
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"job did not reach terminal state before timeout: {job_id}")
+        sleep(min(poll_seconds, remaining))
+
+
 def _wait_for_remote_jarvis_mcp_progress(
     definition: ClusterDefinition,
     job_id: str,
@@ -7910,7 +10346,7 @@ def _live_jarvis_progress_observation(
     progress: list[dict[str, Any]],
     status: dict[str, object],
 ) -> dict[str, Any] | None:
-    """Capture one provider-valid warming record while the outer job is running."""
+    """Capture one native JARVIS progress record while the relay job is running."""
     job = status.get("job")
     if not isinstance(job, dict):
         return None
@@ -7925,20 +10361,21 @@ def _live_jarvis_progress_observation(
         progress_id = record.get("progress_id")
         if (
             isinstance(progress_id, str)
-            and typed_metadata.get("source") == "jarvis_package"
-            and typed_metadata.get("provider_source_authority") == "mcp_progress_notification"
-            and typed_metadata.get("provider_validated") is True
-            and typed_metadata.get("acceptance_validated") is False
-            and typed_metadata.get("provider_execution_validated") is False
+            and typed_metadata.get("source") == "jarvis_execution"
+            and typed_metadata.get("provider_source_authority")
+            == "jarvis_mcp_progress_notification"
+            and typed_metadata.get("producer_validated") is True
+            and typed_metadata.get("execution_binding_validated") is False
+            and isinstance(typed_metadata.get("progress_transport_sequence"), int)
+            and not isinstance(typed_metadata.get("progress_transport_sequence"), bool)
+            and cast(int, typed_metadata["progress_transport_sequence"]) > 0
         ):
             return {
                 "progress_id": progress_id,
                 "job_state": typed_job.get("state"),
                 "job_updated_at": typed_job.get("updated_at"),
                 "terminal": False,
-                "provider_notification_sequence": typed_metadata.get(
-                    "provider_notification_sequence"
-                ),
+                "progress_transport_sequence": typed_metadata.get("progress_transport_sequence"),
             }
     return None
 
@@ -8183,11 +10620,6 @@ def _validate_complete_page(
 
 def _remote_worker_info(definition: ClusterDefinition) -> dict[str, object]:
     """Read fresh process-bound worker identity over the configured transport."""
-    target = definition.target_identity
-    if target is None:
-        raise ConfigurationError(
-            f"cluster {definition.name} has no operator-pinned target_identity"
-        )
     info = _json_output(
         run_remote_clio(
             definition,
@@ -8200,6 +10632,17 @@ def _remote_worker_info(definition: ClusterDefinition) -> dict[str, object]:
         raise ConfigurationError(
             "remote worker scheduler provider does not match the cluster definition: "
             f"{actual_provider!r} != {definition.scheduler_provider!r}"
+        )
+    info["target_identity"] = _remote_target_identity(definition)
+    return info
+
+
+def _remote_target_identity(definition: ClusterDefinition) -> dict[str, object]:
+    """Verify and return one operator-pinned physical cluster identity."""
+    target = definition.target_identity
+    if target is None:
+        raise ConfigurationError(
+            f"cluster {definition.name} has no operator-pinned target_identity"
         )
     remote_target = _json_output(
         run_remote_clio(
@@ -8244,7 +10687,7 @@ def _remote_worker_info(definition: ClusterDefinition) -> dict[str, object]:
         raise ConfigurationError(
             "live SSH host keys do not match the operator-pinned cluster target identity"
         )
-    info["target_identity"] = {
+    return {
         **remote_target,
         "ssh_host": definition.ssh_host,
         "ssh_host_key_sha256": fingerprints,
@@ -8254,7 +10697,6 @@ def _remote_worker_info(definition: ClusterDefinition) -> dict[str, object]:
         "expected_site_marker_sha256": target.site_marker_sha256,
         "verified": True,
     }
-    return info
 
 
 def _ssh_host_key_fingerprints(ssh_host: str) -> list[str]:
@@ -8705,6 +11147,53 @@ def _write_remote_verified_report(
     write_validation_report(report, path)
 
 
+def _new_cleanup_acceptance_report(
+    *,
+    scenario: str,
+    cluster: str,
+    mode: str,
+    resource_kind: str,
+    resource_id: str,
+    action: str,
+    cancel_relay_jobs: bool,
+    cancel_scheduler_jobs: bool,
+    stop_worker: bool,
+    launcher: str | None,
+    install_source: str | None,
+    artifact: Path | None,
+) -> LiveValidationReport:
+    """Seed requested cleanup policy before any fallible preflight or observation."""
+    artifact_sha256: str | None = None
+    if artifact is not None:
+        with suppress(OSError):
+            artifact_sha256 = sha256_file(artifact)
+    report = new_live_validation_report(
+        scenario=scenario,
+        cluster=cluster,
+        launcher=launcher,
+        install_source=install_source,
+        artifact_sha256=artifact_sha256,
+    )
+    report.cleanup = CleanupEvidence(
+        requested=True,
+        mode=mode,
+        cancel_relay_jobs=cancel_relay_jobs,
+        cancel_scheduler_jobs=cancel_scheduler_jobs,
+        stop_worker=stop_worker,
+        actions=[
+            {
+                "kind": resource_kind,
+                "resource_id": resource_id,
+                "action": action,
+                "outcome": "pending",
+                "verified_after_operation": False,
+                "residual": True,
+            }
+        ],
+    )
+    return report
+
+
 def _write_failed_acceptance_report(
     *,
     path: Path,
@@ -8719,26 +11208,56 @@ def _write_failed_acceptance_report(
     partial_report: LiveValidationReport | None = None,
 ) -> None:
     """Persist one canonical failed report without discarding partial evidence."""
+    report = partial_report
     if partial_report is not None and path.exists():
         with suppress(OSError, ValidationError, ValueError):
             existing = load_validation_report(path)
             if existing.report_id == partial_report.report_id:
-                return
+                expected_error = f"{type(error).__name__}: {error}"
+                already_recorded = (
+                    existing.status is ValidationStatus.FAILED
+                    and existing.error == expected_error
+                    and any(
+                        check.check_id == check_id
+                        and check.status is ValidationStatus.FAILED
+                        and check.error == expected_error
+                        for check in existing.checks
+                    )
+                )
+                if already_recorded:
+                    return
+                # The caller's in-memory report may contain the latest observation that
+                # failed before its next checkpoint write. The on-disk copy is used only
+                # for idempotency here; replacing the partial would discard that evidence.
     artifact_sha256: str | None = None
     if artifact is not None:
         with suppress(OSError):
             artifact_sha256 = sha256_file(artifact)
-    report = partial_report or new_live_validation_report(
-        scenario=scenario,
-        cluster=cluster,
-        launcher=launcher,
-        install_source=install_source,
-        artifact_sha256=artifact_sha256,
-    )
+    if report is None:
+        report = new_live_validation_report(
+            scenario=scenario,
+            cluster=cluster,
+            launcher=launcher,
+            install_source=install_source,
+            artifact_sha256=artifact_sha256,
+        )
     recorder = ValidationRecorder(report)
     recorder.record_failure(check_id, summary, error)
     recorder.finish(error)
     recorder.write(path)
+
+
+def _load_current_acceptance_report(
+    path: Path,
+    *,
+    expected_report_id: str,
+) -> LiveValidationReport | None:
+    """Load strict evidence only when it belongs to the current CLI invocation."""
+    try:
+        report = load_validation_report(path)
+    except ConfigurationError:
+        return None
+    return report if report.report_id == expected_report_id else None
 
 
 def _echo_lines(lines: list[str]) -> None:
@@ -8786,6 +11305,20 @@ def _session_transition_lock(*, cluster: str, session_id: str) -> FileLock:
     directory.mkdir(parents=True, exist_ok=True)
     identity = hashlib.sha256(f"{cluster}\0{session_id}".encode()).hexdigest()
     return FileLock(str(directory / f"{identity}.lock"), timeout=60)
+
+
+def _desktop_owner_session_admission_id(*, cluster: str, session_id: str) -> str:
+    """Return a cluster-scoped local admission key without exposing raw names in paths."""
+    identity = hashlib.sha256(f"{cluster}\0{session_id}".encode()).hexdigest()
+    return f"desktop_{identity}"
+
+
+def _require_durable_session_identity(value: str, *, field: str) -> str:
+    """Validate a session identity before it reaches local or remote persistence."""
+    try:
+        return validate_durable_record_id(value)
+    except ValueError as error:
+        raise RelayError(f"invalid {field}: {error}") from error
 
 
 def _kind_concurrency_options(items: list[str] | None) -> dict[JobKind, int]:

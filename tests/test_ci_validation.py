@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import io
+import json
 import stat
 import tarfile
 import zipfile
@@ -31,19 +32,18 @@ from clio_relay.ci_validation import (
     MAX_VALIDATION_REPORT_BYTES,
     REQUIRED_CI_JOBS,
     REQUIRED_ENVIRONMENTS,
-    GitHubNotFound,
     ProvenanceError,
     build_actions_artifact_manifest,
     build_ci_status,
     build_distribution_archive_receipt,
     build_exact_release_asset_inventory,
     build_repository_governance,
-    build_reviewer_exclusions,
     build_staged_release_asset_plan,
     build_validation_report_asset_manifest,
     fetch_live_repository_governance,
-    fetch_reviewer_exclusions,
+    resolve_live_release,
     select_ci_run,
+    validate_release_acceptance_matrix,
     verify_actions_artifact_archive,
     verify_ci_status,
     verify_downloaded_validation_report_assets,
@@ -965,6 +965,15 @@ def _release_identity() -> dict[str, object]:
     }
 
 
+def _release_routes(*, release: dict[str, object] | None = None) -> dict[str, object]:
+    exact = _release_identity() if release is None else release
+    return {
+        f"repos/{REPOSITORY}/releases?per_page=100&page=1": [exact],
+        f"repos/{REPOSITORY}/releases?per_page=100&page=2": [],
+        f"repos/{REPOSITORY}/releases/{exact['id']}": exact,
+    }
+
+
 def test_release_identity_binds_tag_target_and_state_to_source_commit() -> None:
     verify_release_identity(
         _release_identity(),
@@ -979,7 +988,7 @@ def test_release_identity_binds_tag_target_and_state_to_source_commit() -> None:
 
 @pytest.mark.parametrize(
     "mutation",
-    ["tag_name", "target_commitish", "tag_resolution", "target_resolution", "draft"],
+    ["tag_name", "tag_resolution", "target_resolution", "draft"],
 )
 def test_release_identity_rejects_mutable_or_mismatched_identity(mutation: str) -> None:
     release = _release_identity()
@@ -987,8 +996,6 @@ def test_release_identity_rejects_mutable_or_mismatched_identity(mutation: str) 
     target_commit = COMMIT
     if mutation == "tag_name":
         release["tag_name"] = "v1.0.1"
-    elif mutation == "target_commitish":
-        release["target_commitish"] = "main"
     elif mutation == "tag_resolution":
         tag_commit = "b" * 40
     elif mutation == "target_resolution":
@@ -1008,9 +1015,24 @@ def test_release_identity_rejects_mutable_or_mismatched_identity(mutation: str) 
         )
 
 
+def test_release_identity_accepts_existing_tag_target_spelling_when_it_resolves_exactly() -> None:
+    release = _release_identity()
+    release["target_commitish"] = "main"
+
+    verify_release_identity(
+        release,
+        tag=TAG,
+        source_commit=COMMIT,
+        resolved_tag_commit=COMMIT,
+        resolved_target_commit=COMMIT,
+        expect_draft=True,
+        expect_prerelease=False,
+    )
+
+
 def test_live_release_identity_resolves_both_tag_and_explicit_target() -> None:
     routes: dict[str, object] = {
-        f"repos/{REPOSITORY}/releases/tags/{TAG}": _release_identity(),
+        **_release_routes(),
         f"repos/{REPOSITORY}/commits/{TAG}": {"sha": COMMIT},
         f"repos/{REPOSITORY}/commits/{COMMIT}": {"sha": COMMIT},
     }
@@ -1023,6 +1045,124 @@ def test_live_release_identity_resolves_both_tag_and_explicit_target() -> None:
         expect_prerelease=False,
         fetch_json=lambda path: routes[path],
     )
+
+
+def test_live_release_resolver_uses_bounded_numeric_identity() -> None:
+    paths: list[str] = []
+
+    def fetch(path: str) -> object:
+        paths.append(path)
+        return deepcopy(_release_routes()[path])
+
+    release = resolve_live_release(
+        repository=REPOSITORY,
+        tag=TAG,
+        expect_draft=True,
+        fetch_json=fetch,
+    )
+
+    assert release == _release_identity()
+    assert paths == [
+        f"repos/{REPOSITORY}/releases?per_page=100&page=1",
+        f"repos/{REPOSITORY}/releases?per_page=100&page=2",
+        f"repos/{REPOSITORY}/releases/8001",
+    ]
+    assert all("/releases/tags/" not in path for path in paths)
+
+
+def test_live_release_resolver_paginates_complete_history_before_numeric_resolution() -> None:
+    routes = _release_routes()
+    routes[f"repos/{REPOSITORY}/releases?per_page=100&page=1"] = [
+        {**_release_identity(), "id": 7999, "tag_name": "v0.9.22"}
+    ]
+    routes[f"repos/{REPOSITORY}/releases?per_page=100&page=2"] = [_release_identity()]
+    routes[f"repos/{REPOSITORY}/releases?per_page=100&page=3"] = []
+
+    release = resolve_live_release(
+        repository=REPOSITORY,
+        tag=TAG,
+        expect_draft=True,
+        fetch_json=lambda path: deepcopy(routes[path]),
+    )
+
+    assert release == _release_identity()
+
+
+def test_live_release_resolver_allows_proven_absence() -> None:
+    routes = _release_routes()
+    routes[f"repos/{REPOSITORY}/releases?per_page=100&page=1"] = []
+
+    assert (
+        resolve_live_release(
+            repository=REPOSITORY,
+            tag=TAG,
+            expect_draft=None,
+            fetch_json=lambda path: deepcopy(routes[path]),
+            allow_absent=True,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["duplicate", "duplicate_later_page", "repeated_id", "oversized_page", "numeric_drift"],
+)
+def test_live_release_resolver_fails_closed_on_unbounded_or_racing_state(mutation: str) -> None:
+    routes = _release_routes()
+    if mutation == "duplicate":
+        routes[f"repos/{REPOSITORY}/releases?per_page=100&page=1"] = [
+            _release_identity(),
+            {**_release_identity(), "id": 8002},
+        ]
+    elif mutation == "duplicate_later_page":
+        routes[f"repos/{REPOSITORY}/releases?per_page=100&page=2"] = [
+            {**_release_identity(), "id": 8002}
+        ]
+        routes[f"repos/{REPOSITORY}/releases?per_page=100&page=3"] = []
+    elif mutation == "repeated_id":
+        routes[f"repos/{REPOSITORY}/releases?per_page=100&page=2"] = [
+            {**_release_identity(), "tag_name": "v0.9.22"}
+        ]
+        routes[f"repos/{REPOSITORY}/releases?per_page=100&page=3"] = []
+    elif mutation == "oversized_page":
+        routes[f"repos/{REPOSITORY}/releases?per_page=100&page=1"] = [
+            {**_release_identity(), "id": index + 1, "tag_name": f"v0.0.{index}"}
+            for index in range(101)
+        ]
+    else:
+        routes[f"repos/{REPOSITORY}/releases/8001"] = {
+            **_release_identity(),
+            "draft": False,
+        }
+
+    with pytest.raises(ProvenanceError):
+        resolve_live_release(
+            repository=REPOSITORY,
+            tag=TAG,
+            expect_draft=True,
+            fetch_json=lambda path: deepcopy(routes[path]),
+        )
+
+
+def test_live_release_resolver_rejects_an_unterminated_paginated_history() -> None:
+    paths: list[str] = []
+
+    def fetch(path: str) -> object:
+        paths.append(path)
+        page = int(path.rpartition("=")[2])
+        return [{**_release_identity(), "id": page, "tag_name": f"v0.0.{page}"}]
+
+    with pytest.raises(ProvenanceError, match="bounded pagination window"):
+        resolve_live_release(
+            repository=REPOSITORY,
+            tag=TAG,
+            expect_draft=None,
+            fetch_json=fetch,
+            allow_absent=True,
+        )
+
+    assert len(paths) == 100
 
 
 def _governance_receipt() -> dict[str, object]:
@@ -1041,10 +1181,10 @@ def _governance_receipt() -> dict[str, object]:
 def _mutation_routes() -> dict[str, object]:
     return {
         **_governance_routes(),
+        **_release_routes(),
         f"repos/{REPOSITORY}/commits/main": {"sha": COMMIT},
         f"repos/{REPOSITORY}/commits/{TAG}": {"sha": COMMIT},
         f"repos/{REPOSITORY}/commits/{COMMIT}": {"sha": COMMIT},
-        f"repos/{REPOSITORY}/releases/tags/{TAG}": _release_identity(),
     }
 
 
@@ -1066,12 +1206,7 @@ def test_mutation_authority_revalidates_exact_main_tag_governance_and_draft() ->
 
 def test_mutation_authority_proves_release_absence_before_create() -> None:
     routes = _mutation_routes()
-    del routes[f"repos/{REPOSITORY}/releases/tags/{TAG}"]
-
-    def fetch(path: str) -> object:
-        if path == f"repos/{REPOSITORY}/releases/tags/{TAG}":
-            raise GitHubNotFound("not found")
-        return deepcopy(routes[path])
+    routes[f"repos/{REPOSITORY}/releases?per_page=100&page=1"] = []
 
     verify_live_mutation_authority(
         _governance_receipt(),
@@ -1082,7 +1217,7 @@ def test_mutation_authority_proves_release_absence_before_create() -> None:
         workflow_sha=COMMIT,
         release_state="absent",
         expect_draft=True,
-        fetch_json=fetch,
+        fetch_json=lambda path: deepcopy(routes[path]),
     )
 
 
@@ -1112,7 +1247,7 @@ def test_mutation_authority_rejects_stale_or_bypassable_live_state(mutation: str
     elif mutation == "tag":
         routes[f"repos/{REPOSITORY}/commits/{TAG}"] = {"sha": "b" * 40}
     elif mutation == "draft":
-        cast(dict[str, object], routes[f"repos/{REPOSITORY}/releases/tags/{TAG}"])["draft"] = False
+        cast(dict[str, object], routes[f"repos/{REPOSITORY}/releases/8001"])["draft"] = False
     else:
         cast(dict[str, object], routes[f"repos/{REPOSITORY}/rulesets/{MAIN_RULESET_ID}"])[
             "current_user_can_bypass"
@@ -1130,112 +1265,6 @@ def test_mutation_authority_rejects_stale_or_bypassable_live_state(mutation: str
             expect_draft=True,
             fetch_json=lambda path: deepcopy(routes[path]),
         )
-
-
-def _reviewer_identity_documents() -> tuple[
-    dict[str, object], list[dict[str, object]], dict[int, object]
-]:
-    source: dict[str, object] = {
-        "author": {"login": "source-author", "id": 1},
-        "committer": {"login": "source-committer", "id": 2},
-    }
-    prs: list[dict[str, object]] = [
-        {
-            "number": 10,
-            "commits": 1,
-            "merged_at": "2026-07-10T00:00:00Z",
-            "base": {"ref": "main"},
-            "user": {"login": "pr-opener", "id": 3},
-        }
-    ]
-    commits: dict[int, object] = {
-        10: [
-            {
-                "author": {"login": "commit-author", "id": 4},
-                "committer": {"login": "commit-committer", "id": 5},
-            }
-        ]
-    }
-    return source, prs, commits
-
-
-def test_reviewer_exclusions_cover_every_source_and_pr_commit_identity() -> None:
-    source, prs, commits = _reviewer_identity_documents()
-
-    result = build_reviewer_exclusions(
-        source,
-        prs,
-        commits,
-        dispatcher_login="independent-reviewer",
-        dispatcher_id=99,
-    )
-
-    assert result["source_contributor_ids"] == [1, 2, 3, 4, 5]
-    assert result["source_author"] == {"login": "source-author", "id": 1}
-    assert result["source_committer"] == {"login": "source-committer", "id": 2}
-
-
-@pytest.mark.parametrize("dispatcher_id", [1, 2, 3, 4, 5])
-def test_reviewer_exclusions_reject_every_contributor_role(dispatcher_id: int) -> None:
-    source, prs, commits = _reviewer_identity_documents()
-
-    with pytest.raises(ProvenanceError, match="contributed"):
-        build_reviewer_exclusions(
-            source,
-            prs,
-            commits,
-            dispatcher_login="independent-reviewer",
-            dispatcher_id=dispatcher_id,
-        )
-
-
-@pytest.mark.parametrize(
-    ("surface", "role"),
-    [
-        ("source", "author"),
-        ("source", "committer"),
-        ("commit", "author"),
-        ("commit", "committer"),
-    ],
-)
-def test_reviewer_exclusions_fail_closed_on_unlinked_identity(
-    surface: str,
-    role: str,
-) -> None:
-    source, prs, commits = _reviewer_identity_documents()
-    if surface == "source":
-        source[role] = None
-    else:
-        cast(list[dict[str, object]], commits[10])[0][role] = None
-
-    with pytest.raises(ProvenanceError):
-        build_reviewer_exclusions(
-            source,
-            prs,
-            commits,
-            dispatcher_login="independent-reviewer",
-            dispatcher_id=99,
-        )
-
-
-def test_fetch_reviewer_exclusions_fetches_every_associated_pr_commit() -> None:
-    source, prs, commits = _reviewer_identity_documents()
-    routes: dict[str, object] = {
-        f"repos/{REPOSITORY}/commits/{COMMIT}": source,
-        f"repos/{REPOSITORY}/commits/{COMMIT}/pulls?per_page=100": [{"number": 10}],
-        f"repos/{REPOSITORY}/pulls/10": prs[0],
-        f"repos/{REPOSITORY}/pulls/10/commits?per_page=100": commits[10],
-    }
-
-    result = fetch_reviewer_exclusions(
-        repository=REPOSITORY,
-        source_commit=COMMIT,
-        dispatcher_login="independent-reviewer",
-        dispatcher_id=99,
-        fetch_json=lambda path: routes[path],
-    )
-
-    assert result["source_contributor_ids"] == [1, 2, 3, 4, 5]
 
 
 def test_validation_report_asset_manifest_is_bounded_and_matches_downloads(
@@ -1262,6 +1291,61 @@ def test_validation_report_asset_manifest_is_bounded_and_matches_downloads(
         "maximum_asset_bytes": MAX_VALIDATION_REPORT_BYTES,
         "maximum_aggregate_bytes": MAX_VALIDATION_REPORT_AGGREGATE_BYTES,
     }
+
+
+def test_release_report_asset_manifest_enforces_exact_ordered_matrix() -> None:
+    matrix_path = (
+        Path(__file__).parents[1] / "examples" / "release-gate" / ("report-matrix-1.0.json")
+    )
+    raw_matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
+    raw_reports = cast(list[dict[str, object]], raw_matrix["reports"])
+    assert [item["id"] for item in raw_reports[5:8]] == [
+        "ares-spack-find",
+        "ares-spack-locate",
+        "ares-spack-install",
+    ]
+    assert [item["evidence_group"] for item in raw_reports[5:8]] == [
+        "spack",
+        "spack",
+        "spack-fresh",
+    ]
+    assert [item["package"] for item in raw_reports[5:8]] == [
+        "lammps",
+        "lammps",
+        "libsigsegv@2.14",
+    ]
+    matrix = validate_release_acceptance_matrix(raw_matrix)
+    assert matrix["matrix_sha256"] == (
+        "b62a51a57d55fd2928c928d2a6b7892b006c627e5e64bd06cb03874d28602fe2"
+    )
+    reports = cast(list[dict[str, object]], matrix["reports"])
+    report_ids = [cast(str, item["id"]) for item in reports]
+    assets = [
+        ("validation-local.json", 2),
+        *[(f"validation-{report_id}.json", 3) for report_id in reversed(report_ids)],
+    ]
+
+    manifest = build_validation_report_asset_manifest(
+        _release_assets(assets),
+        kind="candidate",
+        acceptance_matrix=raw_matrix,
+    )
+
+    binding = cast(dict[str, object], manifest["acceptance_matrix"])
+    assert binding["sha256"] == matrix["matrix_sha256"]
+    assert binding["report_count"] == 17
+    manifest_assets = cast(list[dict[str, object]], manifest["assets"])
+    assert [cast(str, item["name"]) for item in manifest_assets] == [
+        "validation-local.json",
+        *[f"validation-{report_id}.json" for report_id in report_ids],
+    ]
+
+    with pytest.raises(ProvenanceError, match="do not exactly match"):
+        build_validation_report_asset_manifest(
+            _release_assets(assets[:-1]),
+            kind="candidate",
+            acceptance_matrix=raw_matrix,
+        )
 
 
 @pytest.mark.parametrize("mutation", ["count", "single_size", "aggregate", "unsafe", "missing"])

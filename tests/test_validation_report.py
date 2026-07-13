@@ -23,7 +23,12 @@ from pytest import MonkeyPatch
 from clio_relay import validation_report as validation_report_module
 from clio_relay.errors import ConfigurationError
 from clio_relay.models import GatewaySession, GatewaySessionState
-from clio_relay.remote_mcp import RemoteMcpAcceptanceCheck, RemoteMcpAcceptanceReport
+from clio_relay.remote_mcp import (
+    RemoteMcpAcceptanceCheck,
+    RemoteMcpAcceptanceReport,
+    RemoteMcpStructuredResultExpectation,
+    build_remote_mcp_structured_result_check,
+)
 from clio_relay.service_runtime import ServiceRuntimeStartResult, ServiceRuntimeStopResult
 from clio_relay.session_lifecycle import (
     CleanupResource,
@@ -399,11 +404,12 @@ def test_real_uvx_no_cache_temporary_environment_is_not_a_verified_receipt(
 def _report(
     *,
     kind: InstallSourceKind = InstallSourceKind.PYPI,
-    launcher: str = "uvx",
+    launcher: str = "uv-tool",
     released_artifact: bool = True,
     artifact_identity_verified: bool = True,
 ) -> LiveValidationReport:
     now = _timestamp()
+    absolute_root = Path(Path.cwd().anchor) / "clio-relay-test"
     return LiveValidationReport(
         report_id="validation_test",
         scenario="remote-mcp",
@@ -432,13 +438,29 @@ def _report(
             artifact_sha256="b" * 64,
             artifact_identity_verified=artifact_identity_verified,
             released_artifact=released_artifact,
-            launcher_verified=launcher == "uvx",
+            launcher_verified=launcher == "uv-tool",
             launcher_receipt={
-                "verified": launcher == "uvx",
-                "uv_executable_verified": launcher == "uvx",
+                "verified": launcher == "uv-tool",
+                "claimed_launcher": launcher,
+                "uv_executable_verified": launcher == "uv-tool",
                 "uv_version": "0.11.28",
                 "uv_executable_sha256": "e" * 64,
                 "invocation_id": "run-20260710-0001",
+                "uv_tool_directory": str(absolute_root / "uv" / "tools"),
+                "uv_tool_bin_directory": str(absolute_root / "uv" / "bin"),
+                "process_prefix": str(absolute_root / "uv" / "tools" / "clio-relay"),
+                "tool_environment_verified": True,
+                "tool_bin_bound": True,
+                "tool_target_bound": True,
+                "pyvenv_matches_uv": True,
+                "package_in_process_environment": True,
+                "executable_in_process_environment": True,
+                "isolated_environment": True,
+                "distribution_record": {
+                    "verified": True,
+                    "record_sha256": "c" * 64,
+                    "runtime_closure_sha256": "d" * 64,
+                },
             },
         ),
         checks=[
@@ -477,6 +499,14 @@ def _policy() -> ReleaseGatePolicy:
             )
         ],
     )
+
+
+def _without_acceptance_matrix(policy: ReleaseGatePolicy) -> ReleaseGatePolicy:
+    """Clone a production policy for isolated requirement unit tests."""
+    document = policy.model_dump(mode="python")
+    document["acceptance_matrix_path"] = None
+    document["acceptance_matrix_sha256"] = None
+    return ReleaseGatePolicy.model_validate(document)
 
 
 def _evaluate(
@@ -911,7 +941,7 @@ def test_recorder_records_failed_check_and_report() -> None:
     assert report.checks[0].status is ValidationStatus.FAILED
 
 
-def test_release_gate_accepts_only_complete_released_uvx_evidence() -> None:
+def test_release_gate_accepts_only_complete_released_uv_tool_evidence() -> None:
     result = _evaluate(_policy(), [_report()])
 
     assert result.passed is True
@@ -1138,7 +1168,7 @@ def test_release_gate_fails_closed_for_declared_external_blockers() -> None:
 def test_release_gate_rejects_checkout_or_local_wheel_claim() -> None:
     report = _report(
         kind=InstallSourceKind.WHEEL,
-        launcher="uvx",
+        launcher="uv-tool",
         released_artifact=False,
     )
 
@@ -1169,7 +1199,7 @@ def test_release_gate_binds_candidate_wheel_reports_to_independent_digest() -> N
     policy.allowed_install_sources = [InstallSourceKind.WHEEL]
     report = _report(
         kind=InstallSourceKind.WHEEL,
-        launcher="uvx",
+        launcher="uv-tool",
         released_artifact=False,
     )
 
@@ -1263,11 +1293,38 @@ def test_release_gate_enforces_resource_state_role_and_metadata() -> None:
     )
 
 
+def test_release_gate_rejects_required_resources_from_another_target() -> None:
+    policy = _policy()
+    report = _report()
+    report.resources.append(
+        ValidationResource(
+            kind="relay_job",
+            resource_id="job_cross_target",
+            cluster="different-target",
+            state="succeeded",
+        )
+    )
+
+    result = _evaluate(policy, [report])
+
+    assert result.passed is False
+    assert any(
+        "required evidence resources must belong to cluster primary" in reason
+        and "relay_job:job_cross_target:different-target" in reason
+        for reason in result.unsatisfied_requirements["remote-mcp-primary"]
+    )
+
+
 def test_release_gate_can_combine_checks_from_multiple_live_reports() -> None:
     now = _timestamp()
     policy = _policy()
     policy.requirements[0].required_checks = ["cleanup.detach", "cleanup.teardown"]
-    policy.requirements[0].required_resource_kinds = ["relay_job", "connector"]
+    policy.requirements[0].required_resource_kinds = [
+        "relay_job",
+        "connector",
+        "relay_session",
+    ]
+    policy.requirements[0].evidence_group_resource_kind = "relay_session"
     detached = _report()
     detached.report_id = "validation_detach"
     detached.checks = [
@@ -1280,6 +1337,9 @@ def test_release_gate_can_combine_checks_from_multiple_live_reports() -> None:
             evidence=[EvidenceReference(kind="test", excerpt="test evidence")],
         )
     ]
+    detached.resources.append(
+        ValidationResource(kind="relay_session", resource_id="session-1", cluster="primary")
+    )
     teardown = _report()
     teardown.report_id = "validation_teardown"
     teardown.checks = [
@@ -1293,13 +1353,137 @@ def test_release_gate_can_combine_checks_from_multiple_live_reports() -> None:
         )
     ]
     teardown.resources = [
-        ValidationResource(kind="connector", resource_id="connector_1", cluster="primary")
+        ValidationResource(kind="connector", resource_id="connector_1", cluster="primary"),
+        ValidationResource(kind="relay_session", resource_id="session-1", cluster="primary"),
     ]
 
     result = _evaluate(policy, [detached, teardown])
 
     assert result.passed is True
     assert result.report_ids == ["validation_detach", "validation_teardown"]
+
+
+def test_actual_release_policy_combines_bootstrap_with_worker_by_physical_target() -> None:
+    now = _timestamp()
+    policy = load_release_gate_policy(Path(__file__).parents[1] / "docs" / "release-gate-1.0.yaml")
+    requirement = next(
+        item for item in policy.requirements if item.requirement_id == "ares-released-bootstrap"
+    )
+    policy.requirements = [requirement]
+    target = policy.targets["ares"]
+    policy.targets = {"ares": target}
+    policy = _without_acceptance_matrix(policy)
+
+    def attach_target(report: LiveValidationReport) -> None:
+        report.checks.append(
+            ValidationCheck(
+                check_id="worker.target-identity",
+                summary="verify the physical cluster target",
+                status=ValidationStatus.PASSED,
+                started_at=now,
+                completed_at=now,
+                evidence=[EvidenceReference(kind="cluster_target", excerpt="verified")],
+            )
+        )
+        report.resources.append(
+            ValidationResource(
+                kind="cluster_target",
+                resource_id="target:ares",
+                role="physical_cluster_target",
+                cluster="ares",
+                state="verified",
+                provider=target.scheduler_provider,
+                metadata={
+                    "schema_version": "clio-relay.cluster-target-info.v1",
+                    "hostname": target.hostnames[0],
+                    "fqdn": target.hostnames[0],
+                    "scheduler_provider": target.scheduler_provider,
+                    "scheduler_cluster_name": target.scheduler_cluster_name,
+                    "site_marker_sha256": target.site_marker_sha256,
+                    "ssh_host_key_sha256": target.ssh_host_key_sha256,
+                    "expected_hostnames": target.hostnames,
+                    "expected_ssh_host_key_sha256": target.ssh_host_key_sha256,
+                    "expected_scheduler_cluster_name": target.scheduler_cluster_name,
+                    "expected_site_marker_sha256": target.site_marker_sha256,
+                    "verified": True,
+                },
+            )
+        )
+
+    bootstrap = _report()
+    bootstrap.report_id = "validation_bootstrap"
+    bootstrap.scenario = "cluster-bootstrap"
+    bootstrap.cluster = "ares"
+    bootstrap.evidence_trust.invocation_id = "bootstrap-invocation"
+    bootstrap.install_source.launcher_receipt["invocation_id"] = "bootstrap-invocation"
+    bootstrap.checks = [
+        ValidationCheck(
+            check_id="cluster.bootstrap",
+            summary="bootstrap the exact artifact",
+            status=ValidationStatus.PASSED,
+            started_at=now,
+            completed_at=now,
+            evidence=[EvidenceReference(kind="bootstrap_receipt", excerpt="verified")],
+        )
+    ]
+    bootstrap.resources = [
+        ValidationResource(
+            kind="bootstrap_invocation",
+            resource_id="bootstrap_unique",
+            role="cluster_bootstrap",
+            cluster="ares",
+            state="succeeded",
+        )
+    ]
+    attach_target(bootstrap)
+
+    worker = _report()
+    worker.report_id = "validation_worker"
+    worker.scenario = "cluster-bootstrap"
+    worker.cluster = "ares"
+    worker.evidence_trust.invocation_id = "worker-invocation"
+    worker.install_source.launcher_receipt["invocation_id"] = "worker-invocation"
+    worker.checks = [
+        ValidationCheck(
+            check_id=check_id,
+            summary=check_id,
+            status=ValidationStatus.PASSED,
+            started_at=now,
+            completed_at=now,
+            evidence=[EvidenceReference(kind="test", excerpt="verified")],
+        )
+        for check_id in requirement.required_checks
+        if check_id not in {"cluster.bootstrap", "worker.target-identity"}
+    ]
+    worker_requirement = next(
+        item for item in requirement.required_resources if item.kind == "relay_worker"
+    )
+    worker.resources = [
+        ValidationResource(
+            kind="relay_worker",
+            resource_id="worker:ares",
+            role="cluster_worker",
+            cluster="ares",
+            state="running",
+            metadata=dict(worker_requirement.metadata_equals),
+        ),
+        ValidationResource(
+            kind="relay_job",
+            resource_id="job_bootstrap_execution",
+            cluster="ares",
+            state="succeeded",
+        ),
+    ]
+    attach_target(worker)
+
+    result = evaluate_release_gate(
+        policy,
+        [bootstrap, worker],
+        expected_artifact_sha256="b" * 64,
+    )
+
+    assert result.passed is True, result.unsatisfied_requirements
+    assert result.report_ids == ["validation_bootstrap", "validation_worker"]
 
 
 def test_release_gate_does_not_combine_reports_outside_expected_artifact_hash() -> None:
@@ -1428,14 +1612,247 @@ def test_repository_release_policy_is_machine_readable() -> None:
     policy = load_release_gate_policy(Path("docs/release-gate-1.0.yaml"))
 
     assert policy.release_version == "1.0.0"
+    assert policy.acceptance_matrix is not None
+    assert policy.acceptance_matrix["report_count_per_stage"] == 17
+    assert policy.acceptance_matrix["matrix_sha256"] == policy.acceptance_matrix_sha256
+    matrix_stages = cast(list[dict[str, object]], policy.acceptance_matrix["stages"])
+    assert [stage["name"] for stage in matrix_stages] == [
+        "candidate",
+        "released",
+    ]
     assert set(policy.targets) == {"ares", "homelab"}
     assert policy.targets["ares"].identity_sha256 == (
         "f114f70f952dad7eccb5c5cfb340feb653e8879080238e5a8465205ff84afa6b"
     )
     requirement_ids = {item.requirement_id for item in policy.requirements}
     assert "ares-non-jarvis-virtual-mcp" in requirement_ids
-    assert "ares-lammps-application-boundary" in requirement_ids
+    assert "ares-jarvis-native-application-progress" in requirement_ids
+    assert "ares-jarvis-lammps-package-progress" in requirement_ids
     assert "homelab-owned-cleanup" in requirement_ids
+    homelab_cleanup = next(
+        item for item in policy.requirements if item.requirement_id == "homelab-owned-cleanup"
+    )
+    assert "cleanup.gateway-record" in homelab_cleanup.required_checks
+    assert "gateway_session" in homelab_cleanup.required_resource_kinds
+
+
+def test_release_gate_rejects_exact_matrix_when_any_report_is_only_a_subset_match(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    policy_dir = repository / "docs"
+    matrix_dir = repository / "examples"
+    reports_dir = repository / "reports"
+    policy_dir.mkdir(parents=True)
+    matrix_dir.mkdir()
+    reports_dir.mkdir()
+    (repository / "pyproject.toml").write_text("[project]\nname = 'gate-test'\n", encoding="utf-8")
+    matrix: dict[str, object] = {
+        "schema_version": "clio-relay.release-acceptance-matrix.v1",
+        "release_version": "1.0.0",
+        "report_count_per_stage": 2,
+        "target_labels_are_policy_evidence_instances": True,
+        "stages": [
+            {
+                "name": "candidate",
+                "artifact_stage": "immutable_candidate",
+                "filename_prefix": "validation",
+            },
+            {
+                "name": "released",
+                "artifact_stage": "published",
+                "filename_prefix": "released-validation",
+            },
+        ],
+        "reports": [
+            {
+                "ordinal": 1,
+                "id": "first",
+                "cluster": "primary",
+                "scenario": "remote-mcp",
+                "command": ["remote-mcp", "validate"],
+                "report_option": "--report",
+            },
+            {
+                "ordinal": 2,
+                "id": "second",
+                "cluster": "primary",
+                "scenario": "remote-mcp",
+                "command": ["remote-mcp", "validate"],
+                "report_option": "--report",
+            },
+        ],
+    }
+    matrix_digest = hashlib.sha256(
+        json.dumps(matrix, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    matrix["matrix_sha256"] = matrix_digest
+    matrix_path = matrix_dir / "matrix.json"
+    matrix_path.write_text(json.dumps(matrix), encoding="utf-8")
+    policy_document = _policy().model_dump(mode="json")
+    policy_document["acceptance_matrix_path"] = "examples/matrix.json"
+    policy_document["acceptance_matrix_sha256"] = matrix_digest
+    policy_path = policy_dir / "release-gate.yaml"
+    policy_path.write_text(json.dumps(policy_document), encoding="utf-8")
+    policy = load_release_gate_policy(policy_path)
+
+    reports: list[LiveValidationReport] = []
+    for logical_id in ("first", "second"):
+        report = _report()
+        report.report_id = f"validation_document_{logical_id}"
+        report_path = reports_dir / f"released-validation-{logical_id}.json"
+        write_validation_report(report, report_path)
+        reports.append(load_validation_report(report_path))
+
+    result = _evaluate(policy, list(reversed(reports)))
+
+    assert result.passed is False
+    assert result.satisfied_requirements == ["remote-mcp-primary"]
+    assert result.acceptance_matrix_sha256 == matrix_digest
+    assert result.acceptance_matrix_stage == "released"
+    assert result.acceptance_report_ids == ["first", "second"]
+    assert result.acceptance_report_document_ids == [
+        "validation_document_first",
+        "validation_document_second",
+    ]
+    assert result.unsatisfied_requirements["acceptance-matrix"] == [
+        "acceptance matrix reports were not used by any policy requirement: ['first']"
+    ]
+
+
+def test_explicit_cancel_release_gate_requires_preserved_unowned_scheduler_sentinel() -> None:
+    repository_policy = load_release_gate_policy(Path("docs/release-gate-1.0.yaml"))
+    requirement = next(
+        item
+        for item in repository_policy.requirements
+        if item.requirement_id == "ares-explicit-job-cancel"
+    )
+    policy = _policy().model_copy(update={"requirements": [requirement]})
+    report = _report()
+    report.scenario = "cleanup"
+    report.cluster = "ares"
+    now = _timestamp()
+    report.checks = [
+        ValidationCheck(
+            check_id=check_id,
+            summary=check_id,
+            status=ValidationStatus.PASSED,
+            started_at=now,
+            completed_at=now,
+            evidence=[EvidenceReference(kind="test", excerpt=f"{check_id}=passed")],
+        )
+        for check_id in requirement.required_checks
+    ]
+    report.resources = [
+        ValidationResource(
+            kind="relay_session",
+            resource_id="session-1:generation-1",
+            role="remote_relay_api:stop",
+            cluster="ares",
+            state="stopped",
+        ),
+        ValidationResource(
+            kind="relay_job",
+            resource_id="relay-owned",
+            cluster="ares",
+            state="canceled",
+        ),
+        ValidationResource(
+            kind="scheduler_job",
+            resource_id="scheduler-owned",
+            cluster="ares",
+            state="canceled",
+            provider="slurm",
+            metadata={
+                "ownership_verified": True,
+                "verified_after_operation": True,
+            },
+        ),
+        ValidationResource(
+            kind="scheduler_job",
+            resource_id="scheduler-unrelated",
+            role="scheduler_sentinel:retain",
+            cluster="ares",
+            state="retained",
+            provider="slurm",
+            metadata={
+                "ownership_verified": False,
+                "verified_after_operation": True,
+                "unowned_sentinel": True,
+                "active_before_operation": True,
+                "preservation_verified": True,
+                "pre_phase": "running",
+                "post_phase": "running",
+            },
+        ),
+        ValidationResource(
+            kind="relay_worker",
+            resource_id="worker-1",
+            role="cluster_worker",
+            cluster="ares",
+            state="running",
+        ),
+    ]
+
+    accepted = _evaluate(policy, [report])
+    assert accepted.passed is True
+
+    rejected_cases: dict[str, list[LiveValidationReport]] = {}
+    without_sentinel = report.model_copy(deep=True)
+    without_sentinel.resources = [
+        resource
+        for resource in without_sentinel.resources
+        if resource.role != "scheduler_sentinel:retain"
+    ]
+    rejected_cases["missing"] = [without_sentinel]
+
+    target_not_canceled = report.model_copy(deep=True)
+    next(
+        resource
+        for resource in target_not_canceled.resources
+        if resource.resource_id == "scheduler-owned"
+    ).state = "failed"
+    rejected_cases["target-not-canceled"] = [target_not_canceled]
+
+    sentinel_canceled = report.model_copy(deep=True)
+    next(
+        resource
+        for resource in sentinel_canceled.resources
+        if resource.resource_id == "scheduler-unrelated"
+    ).state = "canceled"
+    rejected_cases["sentinel-canceled"] = [sentinel_canceled]
+
+    sentinel_unverified = report.model_copy(deep=True)
+    next(
+        resource
+        for resource in sentinel_unverified.resources
+        if resource.resource_id == "scheduler-unrelated"
+    ).metadata["preservation_verified"] = False
+    rejected_cases["sentinel-unverified"] = [sentinel_unverified]
+
+    split_owned = without_sentinel.model_copy(deep=True)
+    split_sentinel = report.model_copy(deep=True)
+    split_sentinel.report_id = "validation_other_session"
+    split_sentinel.resources = [
+        ValidationResource(
+            kind="relay_session",
+            resource_id="session-2:generation-2",
+            role="remote_relay_api:stop",
+            cluster="ares",
+            state="stopped",
+        ),
+        next(
+            resource
+            for resource in split_sentinel.resources
+            if resource.resource_id == "scheduler-unrelated"
+        ),
+    ]
+    rejected_cases["different-session-group"] = [split_owned, split_sentinel]
+
+    for case, reports in rejected_cases.items():
+        result = _evaluate(policy, reports)
+        assert result.passed is False, case
+        assert requirement.requirement_id in result.unsatisfied_requirements, case
 
 
 def test_repository_policy_target_digests_match_canonical_live_pins() -> None:
@@ -1490,26 +1907,34 @@ def test_repository_policy_target_digests_match_canonical_live_pins() -> None:
     assert result.policy_target_identity_sha256 == result.target_identity_sha256
 
 
-def test_lammps_application_boundary_gate_rejects_and_accepts_provider_attestation() -> None:
+def test_native_application_progress_gate_rejects_legacy_adapter_only_evidence() -> None:
     repository_policy = load_release_gate_policy(Path("docs/release-gate-1.0.yaml"))
     requirement = next(
         item
         for item in repository_policy.requirements
-        if item.requirement_id == "ares-lammps-application-boundary"
+        if item.requirement_id == "ares-jarvis-native-application-progress"
     )
-    policy = repository_policy.model_copy(
-        update={
-            "release_blockers": [],
-            "requirements": [requirement],
-            "targets": {
-                "ares": _target_policy(hostnames=["ares-login.example"]),
-            },
-        }
+    lammps_requirement = next(
+        item
+        for item in repository_policy.requirements
+        if item.requirement_id == "ares-jarvis-lammps-package-progress"
+    )
+    policy = _without_acceptance_matrix(
+        repository_policy.model_copy(
+            update={
+                "release_blockers": [],
+                "requirements": [requirement],
+                "targets": {
+                    "ares": _target_policy(hostnames=["ares-login.example"]),
+                },
+            }
+        )
     )
     report = _report()
-    report.scenario = "live-test"
+    report.scenario = "remote-mcp"
     report.cluster = "ares"
     now = _timestamp()
+    gray_execution_id = "execution-gray-scott"
     report.checks = [
         ValidationCheck(
             check_id=check_id,
@@ -1517,40 +1942,60 @@ def test_lammps_application_boundary_gate_rejects_and_accepts_provider_attestati
             status=ValidationStatus.PASSED,
             started_at=now,
             completed_at=now,
-            evidence=[EvidenceReference(kind="test", excerpt=f"{check_id}=passed")],
+            evidence=[
+                EvidenceReference(
+                    kind="test",
+                    excerpt=f"{check_id}=passed",
+                    metadata={"execution_id": gray_execution_id},
+                )
+            ],
         )
         for check_id in requirement.required_checks
     ]
-    provider_metadata = {
+    legacy_provider_metadata = {
         "adapter": "lammps",
         "package_name": "builtin.lammps",
         "package_version": "builtin",
         "provider_entry_point": "lammps",
         "provider_entry_point_value": "jarvis_cd.progress.lammps:adapter_from_package",
         "provider_distribution": "jarvis_cd",
-        "provider_distribution_version": "2.0.0",
+        "provider_distribution_version": "1.2.2",
         "provider_source_authority": "package_log",
         "provider_validated": True,
-        "acceptance_validated": False,
+        "acceptance_validated": True,
+    }
+    native_capability = {
+        "schema_version": "clio-relay.jarvis-native-execution-capability.v1",
+        "handle_schema": "jarvis.execution.handle.v1",
+        "record_schema": "jarvis.execution.record.v1",
+        "progress_schema": "jarvis.execution.progress.v1",
+        "operations": [
+            "execution_handle.progress",
+            "pipeline.get_execution",
+            "pipeline.get_execution_progress",
+            "pipeline.run",
+        ],
     }
     jarvis_component = {
         "distribution": "jarvis_cd",
-        "distribution_version": "2.0.0",
+        "distribution_version": "1.2.2",
         "install_spec": (
             "https://github.com/grc-iit/jarvis-cd/releases/download/"
-            "v2.0.0/jarvis_cd-2.0.0-py3-none-any.whl"
+            "v1.2.2/jarvis_cd-1.2.2-py3-none-any.whl"
         ),
         "requested_source": "github_release",
-        "artifact_filename": "jarvis_cd-2.0.0-py3-none-any.whl",
-        "artifact_sha256": "PENDING_JARVIS_CD_2_0_0_RELEASE_WHEEL_SHA256",
-        "entry_points": ["clio_relay.package_progress_adapters:lammps"],
+        "artifact_filename": "jarvis_cd-1.2.2-py3-none-any.whl",
+        "artifact_sha256": "f05454718a4efe4dadebefb98c83511ba3dcc662238c0c05430a1b621a8ab8b7",
+        "native_execution": native_capability,
     }
     report.resources = [
         ValidationResource(
             kind="relay_job",
-            resource_id="job_lammps",
+            resource_id="job_gray_scott",
+            role="virtual_jarvis_mcp_call",
             cluster="ares",
             state="succeeded",
+            metadata={"execution_id": gray_execution_id},
         ),
         ValidationResource(
             kind="relay_worker",
@@ -1559,7 +2004,7 @@ def test_lammps_application_boundary_gate_rejects_and_accepts_provider_attestati
             cluster="ares",
             state="running",
             metadata={
-                "components": {"jarvis-cd": "2.0.0"},
+                "components": {"jarvis-cd": "1.2.2"},
                 "component_artifacts": {"jarvis-cd": jarvis_component},
                 "component_runtime": {
                     "jarvis-cd": {
@@ -1568,8 +2013,10 @@ def test_lammps_application_boundary_gate_rejects_and_accepts_provider_attestati
                         "provider_interpreter_verified": True,
                         "execution_interpreter_verified": True,
                         "execution_distribution_identity_verified": True,
-                        "execution_entry_points_visible": True,
                         "execution_source_verified": True,
+                        "provider_native_execution_capability_verified": True,
+                        "execution_native_execution_capability_verified": True,
+                        "native_execution_capability_verified": True,
                         "jarvis_executable_verified": True,
                         "extra_runtime_evidence": "preserved",
                     }
@@ -1578,26 +2025,210 @@ def test_lammps_application_boundary_gate_rejects_and_accepts_provider_attestati
         ),
         ValidationResource(
             kind="package_progress_provider",
-            resource_id="jarvis_cd:2.0.0:lammps:lammps",
+            resource_id="jarvis_cd:1.2.2:lammps:lammps",
             role="jarvis_package_progress",
             cluster="ares",
             state="verified",
             provider="jarvis_cd",
-            metadata=provider_metadata,
+            metadata=legacy_provider_metadata,
         ),
     ]
     _attach_verified_target_identity(report, hostname="ares-login.example")
 
-    rejected = _evaluate(policy, [report])
-    provider_metadata["acceptance_validated"] = True
-    progress_provider = next(
+    legacy_provider = next(
         resource for resource in report.resources if resource.kind == "package_progress_provider"
     )
-    progress_provider.metadata = provider_metadata
+    legacy_provider.metadata = legacy_provider_metadata
+    rejected = _evaluate(policy, [report])
+    report.resources.append(
+        ValidationResource(
+            kind="relay_job",
+            resource_id="job_gray_scott_query",
+            role="jarvis_mcp_execution_query",
+            cluster="ares",
+            state="succeeded",
+            metadata={"execution_id": gray_execution_id},
+        )
+    )
+    report.resources.append(
+        ValidationResource(
+            kind="jarvis_execution_progress",
+            resource_id="native-execution:gray_scott_bp5",
+            role="jarvis_mcp_native_progress",
+            cluster="ares",
+            state="verified",
+            provider="jarvis_cd",
+            metadata={
+                "source": "jarvis_execution",
+                "execution_id": gray_execution_id,
+                "package_name": "builtin.gray_scott",
+                "package_id": "gray_scott_bp5",
+                "progress_schema_version": "jarvis.progress.v1",
+                "provider_source_authority": "jarvis_mcp_progress_notification",
+                "producer_validated": True,
+                "execution_binding_validated": True,
+                "live_observed_while_running": True,
+                "bridge_validated": True,
+                "runtime_bound": True,
+            },
+        )
+    )
+    report.resources.append(
+        ValidationResource(
+            kind="jarvis_generated_artifact",
+            resource_id="art_gray_scott_output",
+            role="output",
+            cluster="ares",
+            state="finalized",
+            provider="jarvis-cd",
+            metadata={
+                "execution_id": gray_execution_id,
+                "package_id": "gray_scott_bp5",
+                "logical_name": "gray-scott-timesteps",
+                "kind": "scientific_dataset",
+                "role": "output",
+                "structure": "collection",
+                "ownership": "shared",
+                "state": "finalized",
+                "media_type": "application/x-adios2-bp",
+                "format": "adios2-bp5",
+                "location": {
+                    "kind": "cluster_path",
+                    "value": "/scratch/ares/gray-scott/gs.bp",
+                },
+                "metadata": {
+                    "application": "gray_scott",
+                    "io_backend": "adios2",
+                    "latest_timestep": 20,
+                    "member_pattern": "adios2-steps",
+                    "members_observed": 2,
+                    "completion_signal": "process_exit_zero_after_final_output",
+                },
+            },
+        )
+    )
     accepted = _evaluate(policy, [report])
+
+    lammps_policy = policy.model_copy(update={"requirements": [lammps_requirement]})
+    lammps_rejected = _evaluate(lammps_policy, [report])
+    lammps_execution_id = "execution-lammps"
+    mixed_execution_report = report.model_copy(deep=True)
+    mixed_execution_report.resources.append(
+        ValidationResource(
+            kind="jarvis_execution_progress",
+            resource_id="native-execution:lammps",
+            role="jarvis_mcp_native_progress",
+            cluster="ares",
+            state="verified",
+            provider="jarvis_cd",
+            metadata={
+                "source": "jarvis_execution",
+                "execution_id": lammps_execution_id,
+                "package_name": "builtin.lammps",
+                "package_id": "lammps",
+                "progress_schema_version": "jarvis.progress.v1",
+                "progress_determinate": True,
+                "provider_source_authority": "jarvis_mcp_progress_notification",
+                "producer_validated": True,
+                "execution_binding_validated": True,
+                "live_observed_while_running": True,
+                "bridge_validated": True,
+                "runtime_bound": True,
+            },
+        )
+    )
+    mixed_execution = _evaluate(lammps_policy, [mixed_execution_report])
+
+    lammps_report = mixed_execution_report.model_copy(deep=True)
+    lammps_report.report_id = "validation_lammps_execution"
+    lammps_report.evidence_trust.invocation_id = "run-20260710-lammps"
+    lammps_report.install_source.launcher_receipt["invocation_id"] = "run-20260710-lammps"
+    lammps_report.resources = [
+        resource
+        for resource in lammps_report.resources
+        if resource.kind != "jarvis_generated_artifact"
+        and not (
+            resource.kind == "jarvis_execution_progress"
+            and resource.metadata.get("package_id") == "gray_scott_bp5"
+        )
+    ]
+    for check in lammps_report.checks:
+        for evidence in check.evidence:
+            evidence.metadata["execution_id"] = lammps_execution_id
+    for resource in lammps_report.resources:
+        if resource.role in {"virtual_jarvis_mcp_call", "jarvis_mcp_execution_query"}:
+            resource.metadata["execution_id"] = lammps_execution_id
+            resource.resource_id = resource.resource_id.replace("gray_scott", "lammps")
+
+    lammps_accepted = _evaluate(lammps_policy, [lammps_report])
+    dual_policy = policy.model_copy(update={"requirements": [requirement, lammps_requirement]})
+    dual_accepted = _evaluate(dual_policy, [report, lammps_report])
+
+    lammps_progress_only = lammps_report.model_copy(deep=True)
+    lammps_progress_only.report_id = "validation_lammps_progress_only"
+    lammps_progress_only.evidence_trust.invocation_id = "run-20260710-lammps-progress"
+    lammps_progress_only.install_source.launcher_receipt["invocation_id"] = (
+        "run-20260710-lammps-progress"
+    )
+    lammps_progress_only.checks = [
+        ValidationCheck(
+            check_id="worker.artifact-version",
+            summary="worker identity only",
+            status=ValidationStatus.PASSED,
+            started_at=now,
+            completed_at=now,
+            evidence=[EvidenceReference(kind="test", excerpt="worker identity")],
+        )
+    ]
+    split_reports = _evaluate(lammps_policy, [report, lammps_progress_only])
+
+    cross_execution_artifact = report.model_copy(deep=True)
+    next(
+        resource
+        for resource in cross_execution_artifact.resources
+        if resource.kind == "jarvis_generated_artifact"
+    ).metadata["execution_id"] = "execution-other"
+    cross_execution = _evaluate(policy, [cross_execution_artifact])
 
     assert rejected.passed is False
     assert accepted.passed is True
+    assert lammps_rejected.passed is False
+    assert lammps_requirement.requirement_id in lammps_rejected.unsatisfied_requirements
+    assert mixed_execution.passed is False
+    assert lammps_accepted.passed is True
+    assert dual_accepted.passed is True
+    assert split_reports.passed is False
+    assert any(
+        "one coherent report" in reason
+        for reason in split_reports.unsatisfied_requirements[lammps_requirement.requirement_id]
+    )
+    assert cross_execution.passed is False
+    assert any(
+        "do not identify exactly one execution" in reason
+        for reason in cross_execution.unsatisfied_requirements[requirement.requirement_id]
+    )
+
+    artifact = next(
+        resource for resource in report.resources if resource.kind == "jarvis_generated_artifact"
+    )
+    invalid_values: list[tuple[str, str, object]] = [
+        ("location", "kind", "local_path"),
+        ("metadata", "member_pattern", "empty"),
+        ("metadata", "members_observed", 0),
+        ("metadata", "completion_signal", "compute_step_completed"),
+    ]
+    for parent, key, invalid_value in invalid_values:
+        invalid = report.model_copy(deep=True)
+        invalid_artifact = next(
+            resource
+            for resource in invalid.resources
+            if resource.resource_id == artifact.resource_id
+        )
+        nested = cast(dict[str, object], invalid_artifact.metadata[parent])
+        nested[key] = invalid_value
+        result = _evaluate(policy, [invalid])
+        assert result.passed is False, f"{parent}.{key}"
+        assert requirement.requirement_id in result.unsatisfied_requirements
 
 
 def test_report_invocation_redacts_cli_secrets(monkeypatch: MonkeyPatch) -> None:
@@ -1651,7 +2282,7 @@ def test_remote_mcp_acceptance_converts_to_canonical_report() -> None:
     )
 
     canonical = domain.to_live_validation_report(
-        launcher="uvx",
+        launcher="uv-tool",
         install_source="pypi:clio-relay==1.0.0",
         artifact_sha256="b" * 64,
     )
@@ -1665,6 +2296,639 @@ def test_remote_mcp_acceptance_converts_to_canonical_report() -> None:
         "artifact_schema",
         "artifact_result",
     }
+
+
+def test_spack_producer_evidence_satisfies_real_policy_and_rejects_mutations() -> None:
+    full_policy = load_release_gate_policy(
+        Path(__file__).parents[1] / "docs" / "release-gate-1.0.yaml"
+    )
+    requirement = next(
+        item for item in full_policy.requirements if item.requirement_id == "ares-spack-virtual-mcp"
+    )
+    policy = _without_acceptance_matrix(full_policy).model_copy(
+        update={
+            "requirements": [requirement],
+            "require_target_identity": False,
+            "targets": {},
+        }
+    )
+    expected_hash = "p5gjmq4rseitqanua7mdd2zdnag4v3u2"
+    expected_prefix = (
+        "/mnt/common/jcernudagarcia/spack/opt/spack/"
+        "linux-ubuntu22.04-skylake_avx512/gcc-11.4.0/"
+        f"lammps-20240829.1-{expected_hash}"
+    )
+    cases: list[
+        tuple[
+            str,
+            dict[str, object],
+            dict[str, object],
+            dict[str, object],
+        ]
+    ] = [
+        (
+            "spack_find",
+            {"query": "lammps"},
+            {},
+            {
+                "schema_version": "spack.mcp.result.v1",
+                "operation": "find",
+                "query": "lammps",
+                "count": 1,
+                "packages": [{"name": "lammps", "dag_hash": expected_hash}],
+            },
+        ),
+        (
+            "spack_locate",
+            {"spec": "lammps"},
+            {"requested_spec": "lammps", "prefix": expected_prefix},
+            {
+                "schema_version": "spack.mcp.result.v1",
+                "operation": "locate",
+                "requested_spec": "lammps",
+                "load_spec": f"/{expected_hash}",
+                "package": {"name": "lammps", "dag_hash": expected_hash},
+                "prefix": expected_prefix,
+            },
+        ),
+    ]
+    server_requirement = next(
+        item for item in requirement.required_resources if item.kind == "mcp_server"
+    )
+    worker_requirement = next(
+        item for item in requirement.required_resources if item.kind == "relay_worker"
+    )
+    reports: list[LiveValidationReport] = []
+    trusted = _report()
+    for index, (tool, arguments, expectation_fields, structured) in enumerate(cases, start=1):
+        expectation = RemoteMcpStructuredResultExpectation.model_validate(
+            {
+                "contract": "clio-kit-spack-user-v2",
+                "tool": tool,
+                "package_name": "lammps",
+                "dag_hash": expected_hash,
+                **expectation_fields,
+            }
+        )
+        semantic = build_remote_mcp_structured_result_check(
+            expectation=expectation,
+            remote_tool_name=tool,
+            arguments=arguments,
+            protocol_result={"structuredContent": structured},
+            output_schema={
+                "type": "object",
+                "properties": {key: {} for key in structured},
+                "required": sorted(structured),
+                "additionalProperties": False,
+            },
+        )
+        checks = [semantic]
+        checks.extend(
+            RemoteMcpAcceptanceCheck(
+                name=check_id,
+                passed=True,
+                message=f"{check_id} passed",
+                evidence={"production_policy_fixture": True},
+            )
+            for check_id in requirement.required_checks
+            if check_id != semantic.name
+        )
+        domain = RemoteMcpAcceptanceReport(
+            generated_at=_timestamp(),
+            cluster="ares",
+            server_name="spack",
+            remote_tool_name=tool,
+            virtual_alias=f"remote_spack_{tool}",
+            profile="user",
+            passed=True,
+            checks=checks,
+            call_job={
+                "job_id": f"job_{tool}",
+                "cluster": "ares",
+                "kind": "mcp_call",
+                "state": "succeeded",
+                "spec": {"arguments": arguments},
+            },
+            artifacts=[
+                {
+                    "artifact_id": f"artifact_{tool}",
+                    "kind": "mcp_result",
+                    "sha256": str(index) * 64,
+                }
+            ],
+        )
+        report = domain.to_live_validation_report()
+        invocation_id = f"run-20260710-spack-{index}"
+        report.report_id = f"validation_ares_{tool}"
+        report.software = trusted.software.model_copy(deep=True)
+        report.install_source = trusted.install_source.model_copy(deep=True)
+        report.install_source.launcher_receipt["invocation_id"] = invocation_id
+        report.evidence_trust = trusted.evidence_trust.model_copy(
+            update={"invocation_id": invocation_id}
+        )
+        report.resources.extend(
+            [
+                ValidationResource(
+                    kind="mcp_server",
+                    resource_id="ares-spack-server",
+                    role=cast(list[str], server_requirement.roles)[0],
+                    cluster="ares",
+                    state=cast(list[str], server_requirement.states)[0],
+                    metadata=server_requirement.metadata_equals,
+                ),
+                ValidationResource(
+                    kind="relay_worker",
+                    resource_id="ares-relay-worker",
+                    role=cast(list[str], worker_requirement.roles)[0],
+                    cluster="ares",
+                    state=cast(list[str], worker_requirement.states)[0],
+                    metadata=worker_requirement.metadata_equals,
+                ),
+            ]
+        )
+        reports.append(report)
+
+    accepted = _evaluate(policy, reports)
+    assert accepted.passed is True
+    assert requirement.requirement_id in accepted.satisfied_requirements
+
+    mutations: list[tuple[str, str, object]] = [
+        ("spack_find", "package_hashes_for_expected_name", ["f" * 32]),
+        ("spack_locate", "prefix", "/wrong/prefix"),
+    ]
+    for tool, key, value in mutations:
+        changed = [report.model_copy(deep=True) for report in reports]
+        target = next(
+            resource
+            for report in changed
+            for resource in report.resources
+            if resource.role == "virtual_remote_mcp_call"
+            and resource.metadata.get("remote_mcp_tool_name") == tool
+        )
+        assertion = cast(dict[str, object], target.metadata["structured_result_assertion"])
+        observed = cast(dict[str, object], assertion["observed"])
+        observed[key] = value
+
+        rejected = _evaluate(policy, changed)
+        assert requirement.requirement_id in rejected.unsatisfied_requirements
+
+
+def _fresh_spack_transition_report(
+    requirement: ReleaseGateRequirement,
+) -> LiveValidationReport:
+    """Build representative canonical evidence for the typed fresh-install gate."""
+    requested_spec = "libsigsegv@2.14"
+    package_name = "libsigsegv"
+    dag_hash = "a" * 32
+    exact_hash_spec = f"/{dag_hash}"
+    root = "/scratch/clio-relay-acceptance/run-42/spack-fresh"
+    store_root = f"{root}/store"
+    prefix = f"{store_root}/linux-x86_64/gcc-12.3.0/libsigsegv-2.14-a"
+    configuration_path = f"{root}/acceptance-manifest.sha256"
+    configuration_sha256 = "6" * 64
+    components = [
+        {
+            "relative_path": "bin/spack",
+            "sha256": "7" * 64,
+            "size_bytes": 256,
+            "regular_file": True,
+        },
+        {
+            "relative_path": "overrides/config.yaml",
+            "sha256": "8" * 64,
+            "size_bytes": 128,
+            "regular_file": True,
+        },
+    ]
+    pre_configuration = {
+        "schema_version": "clio-relay.spack-configuration-observation.v1",
+        "phase": "preinstall",
+        "manifest_path": configuration_path,
+        "manifest_sha256": configuration_sha256,
+        "manifest_size_bytes": 512,
+        "manifest_regular_file": True,
+        "components": components,
+    }
+    post_configuration = {
+        **pre_configuration,
+        "phase": "postinstall",
+        "components": [dict(item) for item in components],
+    }
+    preinstall_result: dict[str, object] = {
+        "schema_version": "spack.mcp.result.v1",
+        "operation": "find",
+        "query": requested_spec,
+        "count": 0,
+        "packages": [],
+    }
+    package: dict[str, object] = {
+        "name": package_name,
+        "version": "2.14",
+        "dag_hash": dag_hash,
+        "compiler": "gcc@12.3.0",
+        "architecture": "linux-x86_64",
+    }
+    install_result: dict[str, object] = {
+        "schema_version": "spack.mcp.result.v1",
+        "operation": "install",
+        "requested_spec": requested_spec,
+        "reuse": False,
+        "status": "installed",
+        "duration_seconds": 1.25,
+        "package": package,
+        "package_count": 1,
+    }
+    postinstall_result: dict[str, object] = {
+        "schema_version": "spack.mcp.result.v1",
+        "operation": "locate",
+        "requested_spec": exact_hash_spec,
+        "load_spec": exact_hash_spec,
+        "prefix": prefix,
+        "package": package,
+    }
+    phase_jobs = {
+        "preinstall": "job-spack-preinstall",
+        "install": "job-spack-install",
+        "postinstall": "job-spack-postinstall",
+    }
+    check_evidence: dict[str, dict[str, object]] = {
+        "remote-mcp.spack-preinstall-absent": {
+            "expected_requested_spec": requested_spec,
+            "submitted_arguments": {"query": requested_spec},
+            "observed": preinstall_result,
+            "output_schema": {"structured_content_valid": True},
+            "failures": [],
+        },
+        "remote-mcp.spack-fresh-install": {
+            "expected": {
+                "requested_spec": requested_spec,
+                "package_name": package_name,
+                "dag_hash": dag_hash,
+                "reuse": False,
+                "status": "installed",
+            },
+            "submitted_arguments": {"spec": requested_spec, "reuse": False},
+            "observed": install_result,
+            "output_schema": {"structured_content_valid": True},
+            "failures": [],
+        },
+        "remote-mcp.spack-postinstall-locate": {
+            "expected": {
+                "requested_spec": exact_hash_spec,
+                "package_name": package_name,
+                "dag_hash": dag_hash,
+            },
+            "submitted_arguments": {"spec": exact_hash_spec},
+            "observed": postinstall_result,
+            "output_schema": {"structured_content_valid": True},
+            "failures": [],
+        },
+        "remote-mcp.spack-disposable-store": {
+            "fresh_install_store_root": store_root,
+            "observed_prefix": prefix,
+            "root_is_canonical_absolute": True,
+            "prefix_is_strict_descendant": True,
+        },
+        "remote-mcp.spack-transition-identity": {
+            "underlying_reports_passed": True,
+            "scopes": [["ares", "spack-fresh", "user"]],
+            "tool_names": ["spack_find", "spack_install", "spack_locate"],
+            "expected_tool_names": ["spack_find", "spack_install", "spack_locate"],
+            "registration_revisions": ["3" * 64] * 3,
+            "cluster_route_revisions": ["4" * 64] * 3,
+            "catalog_revisions": ["5" * 64] * 3,
+            "revision_matches": {
+                "registration": True,
+                "cluster_route": True,
+                "catalog": True,
+            },
+            "same_server_artifact": True,
+            "server_artifact_sha256": "9" * 64,
+        },
+        "remote-mcp.spack-transition-durable-evidence": {
+            "required_artifact_kinds": ["mcp_result", "provenance", "stderr", "stdout"],
+            "job_ids": list(phase_jobs.values()),
+            "distinct_job_ids": True,
+            "distinct_artifact_ids": True,
+            "phases": {
+                phase: {
+                    "job_id": job_id,
+                    "state": "succeeded",
+                    "artifact_kinds": ["mcp_result", "provenance", "stderr", "stdout"],
+                    "artifact_count": 4,
+                    "artifacts_valid": True,
+                    "stdio_valid": True,
+                    "passed": True,
+                }
+                for phase, job_id in phase_jobs.items()
+            },
+        },
+        "remote-mcp.spack-fresh-configuration": {
+            "expected": {
+                "manifest_path": configuration_path,
+                "configuration_sha256": configuration_sha256,
+            },
+            "preinstall": pre_configuration,
+            "postinstall": post_configuration,
+            "digest_matches": True,
+            "path_matches": True,
+            "components_match": True,
+            "manifest_metadata_matches": True,
+            "phases_match": True,
+        },
+    }
+    report = _report()
+    report.report_id = "validation_ares_spack_fresh_install"
+    report.cluster = "ares"
+    report.checks = [
+        ValidationCheck(
+            check_id=check_id,
+            summary=f"{check_id} passed",
+            status=ValidationStatus.PASSED,
+            started_at=_timestamp(),
+            completed_at=_timestamp(),
+            evidence=[
+                EvidenceReference(
+                    kind="remote_mcp_acceptance",
+                    excerpt=f"{check_id} passed",
+                    metadata=evidence,
+                )
+            ],
+        )
+        for check_id, evidence in check_evidence.items()
+    ]
+    phase_definitions: tuple[tuple[str, str, str, dict[str, object], dict[str, object]], ...] = (
+        (
+            "preinstall",
+            "spack_preinstall_find",
+            "spack_find",
+            {"query": requested_spec},
+            preinstall_result,
+        ),
+        (
+            "install",
+            "spack_fresh_install",
+            "spack_install",
+            {"spec": requested_spec, "reuse": False},
+            install_result,
+        ),
+        (
+            "postinstall",
+            "spack_postinstall_locate",
+            "spack_locate",
+            {"spec": exact_hash_spec},
+            postinstall_result,
+        ),
+    )
+    report.resources = []
+    for phase, role, tool, arguments, structured_result in phase_definitions:
+        report.resources.append(
+            ValidationResource(
+                kind="relay_job",
+                resource_id=phase_jobs[phase],
+                role=role,
+                cluster="ares",
+                state="succeeded",
+                metadata={
+                    "remote_mcp_server_name": "spack-fresh",
+                    "remote_mcp_tool_name": tool,
+                    "virtual_alias": f"remote_spack_fresh_{tool}",
+                    "profile": "user",
+                    "arguments": arguments,
+                    "stdio": {"initialize_passed": True},
+                    "structured_result": structured_result,
+                },
+            )
+        )
+    report.artifacts = [
+        EvidenceReference(
+            kind="spack_fresh_install_configuration",
+            reference=configuration_path,
+            sha256=configuration_sha256,
+        )
+    ]
+    for phase, role, _, _, _ in phase_definitions:
+        for kind in ("stdout", "stderr", "mcp_result", "provenance"):
+            artifact_id = f"artifact-{phase}-{kind}"
+            uri = f"relay-artifact://ares/{artifact_id}"
+            artifact_sha256 = hashlib.sha256(artifact_id.encode()).hexdigest()
+            report.resources.append(
+                ValidationResource(
+                    kind="artifact",
+                    resource_id=artifact_id,
+                    role=f"{role}_{kind}",
+                    cluster="ares",
+                    references=[uri],
+                    metadata={
+                        "artifact_id": artifact_id,
+                        "job_id": phase_jobs[phase],
+                        "kind": kind,
+                        "sha256": artifact_sha256,
+                        "uri": uri,
+                        "transition_phase": phase,
+                    },
+                )
+            )
+            report.artifacts.append(
+                EvidenceReference(kind=f"{role}_{kind}", reference=uri, sha256=artifact_sha256)
+            )
+    report.resources.append(
+        ValidationResource(
+            kind="configuration_manifest",
+            resource_id=configuration_sha256,
+            role="spack_fresh_install_configuration",
+            cluster="ares",
+            state="verified",
+            references=[configuration_path],
+            metadata={
+                "expected_sha256": configuration_sha256,
+                "preinstall": pre_configuration,
+                "postinstall": post_configuration,
+            },
+        )
+    )
+    server_requirement = next(
+        item for item in requirement.required_resources if item.kind == "mcp_server"
+    )
+    worker_requirement = next(
+        item for item in requirement.required_resources if item.kind == "relay_worker"
+    )
+    report.resources.extend(
+        [
+            ValidationResource(
+                kind="relay_worker",
+                resource_id="ares-relay-worker",
+                role="cluster_worker",
+                cluster="ares",
+                state="running",
+                metadata=worker_requirement.metadata_equals,
+            ),
+            ValidationResource(
+                kind="mcp_server",
+                resource_id="spack-fresh:clio-kit-2.3.2",
+                role="remote_mcp_server",
+                cluster="ares",
+                state="verified",
+                metadata=server_requirement.metadata_equals,
+            ),
+        ]
+    )
+    return LiveValidationReport.model_validate(report.model_dump(mode="python"))
+
+
+def _mutate_fresh_spack_transition(
+    report: LiveValidationReport,
+    case: str,
+) -> None:
+    """Apply one adversarial mutation to typed fresh-install evidence."""
+    phase_resources = {
+        resource.role: resource
+        for resource in report.resources
+        if resource.kind == "relay_job" and resource.role is not None
+    }
+    checks = {check.check_id: check.evidence[0].metadata for check in report.checks}
+    if case == "profile":
+        phase_resources["spack_fresh_install"].metadata["profile"] = "admin"
+    elif case == "package":
+        structured = cast(
+            dict[str, object],
+            phase_resources["spack_fresh_install"].metadata["structured_result"],
+        )
+        cast(dict[str, object], structured["package"])["name"] = "wrong"
+    elif case == "reuse":
+        phase_resources["spack_fresh_install"].metadata["arguments"] = {
+            "spec": "libsigsegv@2.14",
+            "reuse": True,
+        }
+    elif case == "duplicate-job":
+        phase_resources["spack_postinstall_locate"].resource_id = phase_resources[
+            "spack_preinstall_find"
+        ].resource_id
+    elif case == "phase-order":
+        pre_index = report.resources.index(phase_resources["spack_preinstall_find"])
+        post_index = report.resources.index(phase_resources["spack_postinstall_locate"])
+        report.resources[pre_index], report.resources[post_index] = (
+            report.resources[post_index],
+            report.resources[pre_index],
+        )
+    elif case == "dag-shape":
+        structured = cast(
+            dict[str, object],
+            phase_resources["spack_fresh_install"].metadata["structured_result"],
+        )
+        cast(dict[str, object], structured["package"])["dag_hash"] = "not-a-dag-hash"
+    elif case == "store-path":
+        checks["remote-mcp.spack-disposable-store"]["fresh_install_store_root"] = "relative/store"
+    elif case == "prefix-path":
+        structured = cast(
+            dict[str, object],
+            phase_resources["spack_postinstall_locate"].metadata["structured_result"],
+        )
+        structured["prefix"] = "relative/prefix"
+        postinstall = cast(
+            dict[str, object],
+            checks["remote-mcp.spack-postinstall-locate"]["observed"],
+        )
+        postinstall["prefix"] = "relative/prefix"
+        checks["remote-mcp.spack-disposable-store"]["observed_prefix"] = "relative/prefix"
+    elif case == "configuration-resource":
+        configuration = next(
+            resource for resource in report.resources if resource.kind == "configuration_manifest"
+        )
+        configuration.resource_id = "f" * 64
+    elif case == "configuration-artifact":
+        configuration = next(
+            artifact
+            for artifact in report.artifacts
+            if artifact.kind == "spack_fresh_install_configuration"
+        )
+        configuration.reference = "/wrong/configuration"
+    elif case == "configuration-path":
+        configuration_check = checks["remote-mcp.spack-fresh-configuration"]
+        cast(dict[str, object], configuration_check["expected"])["manifest_path"] = (
+            "relative/configuration"
+        )
+        for phase in ("preinstall", "postinstall"):
+            cast(dict[str, object], configuration_check[phase])["manifest_path"] = (
+                "relative/configuration"
+            )
+        configuration = next(
+            resource for resource in report.resources if resource.kind == "configuration_manifest"
+        )
+        configuration.references = ["relative/configuration"]
+        for phase in ("preinstall", "postinstall"):
+            cast(dict[str, object], configuration.metadata[phase])["manifest_path"] = (
+                "relative/configuration"
+            )
+        artifact = next(
+            item for item in report.artifacts if item.kind == "spack_fresh_install_configuration"
+        )
+        artifact.reference = "relative/configuration"
+    elif case == "configuration-sha":
+        configuration_check = checks["remote-mcp.spack-fresh-configuration"]
+        cast(dict[str, object], configuration_check["expected"])["configuration_sha256"] = "bad-sha"
+        for phase in ("preinstall", "postinstall"):
+            cast(dict[str, object], configuration_check[phase])["manifest_sha256"] = "bad-sha"
+        configuration = next(
+            resource for resource in report.resources if resource.kind == "configuration_manifest"
+        )
+        configuration.resource_id = "bad-sha"
+        configuration.metadata["expected_sha256"] = "bad-sha"
+        for phase in ("preinstall", "postinstall"):
+            cast(dict[str, object], configuration.metadata[phase])["manifest_sha256"] = "bad-sha"
+        artifact = next(
+            item for item in report.artifacts if item.kind == "spack_fresh_install_configuration"
+        )
+        artifact.sha256 = "bad-sha"
+    else:  # pragma: no cover - parametrization is closed below.
+        raise AssertionError(f"unknown mutation: {case}")
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "profile",
+        "package",
+        "reuse",
+        "duplicate-job",
+        "phase-order",
+        "dag-shape",
+        "store-path",
+        "prefix-path",
+        "configuration-resource",
+        "configuration-artifact",
+        "configuration-path",
+        "configuration-sha",
+    ],
+)
+def test_fresh_spack_transition_policy_cross_binds_dynamic_evidence(case: str) -> None:
+    full_policy = load_release_gate_policy(
+        Path(__file__).parents[1] / "docs" / "release-gate-1.0.yaml"
+    )
+    requirement = next(
+        item
+        for item in full_policy.requirements
+        if item.requirement_id == "ares-spack-fresh-install"
+    )
+    policy = _without_acceptance_matrix(full_policy).model_copy(
+        update={
+            "requirements": [requirement],
+            "require_target_identity": False,
+            "targets": {},
+        }
+    )
+    report = _fresh_spack_transition_report(requirement)
+
+    accepted = _evaluate(policy, [report])
+    assert accepted.passed is True
+    assert accepted.satisfied_requirements == [requirement.requirement_id]
+
+    changed = report.model_copy(deep=True)
+    _mutate_fresh_spack_transition(changed, case)
+    rejected = _evaluate(policy, [changed])
+
+    assert rejected.passed is False, case
+    assert requirement.requirement_id in rejected.unsatisfied_requirements, case
 
 
 def test_session_cleanup_converts_to_canonical_report_with_safe_job_default() -> None:
@@ -1702,6 +2966,16 @@ def test_session_cleanup_converts_to_canonical_report_with_safe_job_default() ->
                 verified_after_operation=True,
             ),
             CleanupResource(
+                kind="relay_job",
+                resource_id="relay-123",
+                location="primary-login",
+                action="retain",
+                ownership_verified=True,
+                outcome="retained",
+                verified_after_operation=True,
+                metadata={"scheduler_job_ids": ["slurm-123"]},
+            ),
+            CleanupResource(
                 kind="scheduler_job",
                 resource_id="slurm-123",
                 location="primary-login",
@@ -1710,6 +2984,8 @@ def test_session_cleanup_converts_to_canonical_report_with_safe_job_default() ->
                 outcome="retained",
                 provider="slurm",
                 verified_after_operation=True,
+                observed_state="running",
+                metadata={"relay_job_id": "relay-123"},
             ),
         ],
     )
@@ -1765,7 +3041,7 @@ def test_nonexistent_session_teardown_is_not_passing_acceptance_evidence() -> No
 def test_gateway_start_and_stop_reports_combine_for_release_gate() -> None:
     ready = GatewaySession(
         session_id="gateway_1",
-        cluster="primary",
+        cluster="ares",
         name="service",
         state=GatewaySessionState.READY,
         scheduler="slurm",
@@ -1803,6 +3079,7 @@ def test_gateway_start_and_stop_reports_combine_for_release_gate() -> None:
                 ownership_verified=True,
                 outcome="stopped",
                 verified_after_operation=True,
+                metadata={"gateway_session_id": "gateway_1"},
             ),
             CleanupResource(
                 kind="remote_connector",
@@ -1812,6 +3089,7 @@ def test_gateway_start_and_stop_reports_combine_for_release_gate() -> None:
                 ownership_verified=True,
                 outcome="stopped",
                 verified_after_operation=True,
+                metadata={"gateway_session_id": "gateway_1"},
             ),
             CleanupResource(
                 kind="scheduler_job",
@@ -1823,6 +3101,15 @@ def test_gateway_start_and_stop_reports_combine_for_release_gate() -> None:
                 outcome="retained",
                 verified_after_operation=True,
                 observed_state="running",
+            ),
+            CleanupResource(
+                kind="gateway_record",
+                resource_id="gateway_1",
+                location="core",
+                action="close",
+                ownership_verified=True,
+                outcome="closed",
+                verified_after_operation=True,
             ),
         ],
         errors=[],
@@ -1841,3 +3128,81 @@ def test_gateway_start_and_stop_reports_combine_for_release_gate() -> None:
         "gateway.jobs-preserved-default",
         "gateway.closed-record",
     }
+
+    policy_path = Path(__file__).parents[1] / "docs" / "release-gate-1.0.yaml"
+    full_policy = load_release_gate_policy(policy_path)
+    gateway_requirement = next(
+        requirement
+        for requirement in full_policy.requirements
+        if requirement.requirement_id == "ares-gateway-runtime"
+    )
+    policy = _without_acceptance_matrix(
+        full_policy.model_copy(
+            update={
+                "requirements": [gateway_requirement],
+                "require_target_identity": False,
+                "targets": {},
+            }
+        )
+    )
+    worker_checks = [
+        ValidationCheck(
+            check_id=check_id,
+            summary=check_id,
+            status=ValidationStatus.PASSED,
+            started_at=_timestamp(),
+            completed_at=_timestamp(),
+            evidence=[EvidenceReference(kind="test", excerpt="verified")],
+        )
+        for check_id in gateway_requirement.required_checks
+        if check_id.startswith("worker.")
+    ]
+
+    def bind_production_evidence(
+        canonical: LiveValidationReport,
+        *,
+        report_id: str,
+        invocation_id: str,
+        include_worker: bool,
+    ) -> LiveValidationReport:
+        evidence = _report()
+        evidence.report_id = report_id
+        evidence.scenario = canonical.scenario
+        evidence.cluster = canonical.cluster
+        evidence.status = canonical.status
+        evidence.checks = [*canonical.checks, *(worker_checks if include_worker else [])]
+        evidence.resources = [*canonical.resources]
+        if include_worker:
+            evidence.resources.append(
+                ValidationResource(
+                    kind="relay_worker",
+                    resource_id="worker:ares",
+                    role="cluster_worker",
+                    cluster="ares",
+                    state="running",
+                )
+            )
+        evidence.evidence_trust.invocation_id = invocation_id
+        evidence.install_source.launcher_receipt["invocation_id"] = invocation_id
+        return evidence
+
+    result = evaluate_release_gate(
+        policy,
+        [
+            bind_production_evidence(
+                started,
+                report_id="validation_gateway_start",
+                invocation_id="gateway-start-invocation",
+                include_worker=False,
+            ),
+            bind_production_evidence(
+                stopped,
+                report_id="validation_gateway_stop",
+                invocation_id="gateway-stop-invocation",
+                include_worker=True,
+            ),
+        ],
+        expected_artifact_sha256="b" * 64,
+    )
+
+    assert result.passed is True, result.unsatisfied_requirements
