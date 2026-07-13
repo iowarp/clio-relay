@@ -363,6 +363,142 @@ def test_terminal_gc_protects_active_lease_scheduler_gateway_and_owner_records(
     )
 
 
+def test_owner_session_cleanup_policy_is_immutable_and_closed_retry_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    generation_id = queue.prepare_owner_session_start(
+        "desktop-session",
+        recorded_generation_id=None,
+        candidate_generation_id="generation-1",
+    )
+    first = queue.set_owner_session_closing(
+        "desktop-session",
+        session_generation_id=generation_id,
+        stop_worker=True,
+        cancel_jobs=True,
+        cancel_scheduler_jobs=True,
+    )
+
+    repeated = queue.set_owner_session_closing(
+        "desktop-session",
+        session_generation_id=generation_id,
+        stop_worker=True,
+        cancel_jobs=True,
+        cancel_scheduler_jobs=True,
+    )
+    assert repeated == first
+    with pytest.raises(QueueConflictError, match="cleanup policy changed during retry"):
+        queue.set_owner_session_closing(
+            "desktop-session",
+            session_generation_id=generation_id,
+            stop_worker=False,
+            cancel_jobs=False,
+            cancel_scheduler_jobs=False,
+        )
+
+    queue.set_owner_session_closed(
+        "desktop-session",
+        session_generation_id=generation_id,
+    )
+    closed_retry = queue.set_owner_session_closing(
+        "desktop-session",
+        session_generation_id=generation_id,
+        stop_worker=True,
+        cancel_jobs=True,
+        cancel_scheduler_jobs=True,
+    )
+    assert closed_retry == first
+    with pytest.raises(QueueConflictError, match="cleanup policy changed during retry"):
+        queue.set_owner_session_closing(
+            "desktop-session",
+            session_generation_id=generation_id,
+        )
+
+
+def test_owner_session_cleanup_operation_id_is_coordinated_and_immutable(
+    tmp_path: Path,
+) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    queue.prepare_owner_session_start(
+        "desktop-session",
+        recorded_generation_id=None,
+        candidate_generation_id="generation-1",
+    )
+
+    first = queue.set_owner_session_closing(
+        "desktop-session",
+        session_generation_id="generation-1",
+        operation_id="cleanup_desktop_cluster_shared",
+        cancel_jobs=True,
+    )
+    repeated = queue.set_owner_session_closing(
+        "desktop-session",
+        session_generation_id="generation-1",
+        operation_id="cleanup_desktop_cluster_shared",
+        cancel_jobs=True,
+    )
+
+    assert repeated == first
+    assert first["operation_id"] == "cleanup_desktop_cluster_shared"
+    assert (
+        queue.get_owner_session_cleanup_intent(
+            "desktop-session",
+            session_generation_id="generation-1",
+        )
+        == first
+    )
+    with pytest.raises(QueueConflictError, match="cleanup operation changed during retry"):
+        queue.set_owner_session_closing(
+            "desktop-session",
+            session_generation_id="generation-1",
+            operation_id="cleanup_different_operation",
+            cancel_jobs=True,
+        )
+
+
+def test_remote_owner_session_mirror_blocks_late_gateway_and_advances_after_closure(
+    tmp_path: Path,
+) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    admission_id = "desktop_cluster_a_session_1"
+    status = queue.mirror_owner_session_generation_open(
+        admission_id,
+        session_generation_id="generation-1",
+    )
+    assert status["open"] is True
+    queue.set_owner_session_closing(
+        admission_id,
+        session_generation_id="generation-1",
+        operation_id="cleanup_generation_1",
+    )
+
+    with pytest.raises(QueueConflictError, match="closing and rejects new work"):
+        queue.create_gateway_session(
+            GatewaySession(
+                cluster="cluster-a",
+                name="late-gateway",
+                metadata={
+                    "owner": "clio-relay",
+                    "owner_session_id": "session-1",
+                    "owner_session_generation_id": "generation-1",
+                    "owner_session_admission_id": admission_id,
+                },
+            )
+        )
+
+    queue.set_owner_session_closed(
+        admission_id,
+        session_generation_id="generation-1",
+    )
+    reopened = queue.mirror_owner_session_generation_open(
+        admission_id,
+        session_generation_id="generation-2",
+    )
+    assert reopened["open"] is True
+    assert reopened["active_generation_id"] == "generation-2"
+
+
 def test_terminal_gc_uses_per_job_monitor_and_gateway_reference_indexes(
     tmp_path: Path,
 ) -> None:
@@ -670,6 +806,63 @@ def test_owner_session_generation_state_machine_is_atomic_and_crash_resumable(
         "state-machine-session",
         session_generation_id="generation-b",
     )
+
+
+def test_owner_session_closure_recovers_if_history_directory_disappears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    owner_session_id = "closure-directory-race"
+    generation_id = queue.prepare_owner_session_start(
+        owner_session_id,
+        recorded_generation_id=None,
+        candidate_generation_id="generation-a",
+    )
+    queue.set_owner_session_closing(
+        owner_session_id,
+        session_generation_id=generation_id,
+    )
+    closure_path = cast(Any, queue)._owner_session_closed_path(
+        owner_session_id,
+        session_generation_id=generation_id,
+    )
+    original_write = cast(Any, queue)._write
+    attempts = 0
+
+    def remove_history_directory_once(path: Path, record: object) -> None:
+        nonlocal attempts
+        if path == closure_path and attempts == 0:
+            attempts += 1
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.parent.rmdir()
+            raise FileNotFoundError(2, "injected closure-directory removal", str(path))
+        attempts += 1
+        original_write(path, record)
+
+    monkeypatch.setattr(queue, "_write", remove_history_directory_once)
+
+    closure = queue.set_owner_session_closed(
+        owner_session_id,
+        session_generation_id=generation_id,
+    )
+
+    assert attempts == 2
+    assert closure.owner_session_id == owner_session_id
+    assert closure.session_generation_id == generation_id
+    assert closure.residual_resource_ids == []
+    assert (
+        queue.get_owner_session_closed(
+            owner_session_id,
+            session_generation_id=generation_id,
+        )
+        == closure
+    )
+    with pytest.raises(QueueConflictError, match="generation changed"):
+        queue.set_owner_session_closed(
+            owner_session_id,
+            session_generation_id="generation-b",
+        )
 
 
 def test_owner_session_initial_activation_race_selects_one_authoritative_generation(

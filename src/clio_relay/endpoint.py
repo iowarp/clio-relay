@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import concurrent.futures
 import ctypes
 import errno
@@ -9,6 +10,7 @@ import getpass
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -31,7 +33,15 @@ from clio_relay import process_containment
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import DEFAULT_EXACT_RECORD_LIMIT, ClioCoreQueue
 from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
+from clio_relay.filesystem_paths import (
+    WINDOWS_LEGACY_PATH_HEADROOM,
+    internal_filesystem_path,
+    logical_filesystem_path,
+    logical_filesystem_text,
+)
+from clio_relay.identifiers import filesystem_key
 from clio_relay.installation import installation_info
+from clio_relay.jarvis_execution import RUNTIME_SCHEDULER_PROVIDER_ENV
 from clio_relay.jarvis_mcp import jarvis_mcp_command
 from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.models import (
@@ -59,8 +69,10 @@ from clio_relay.progress_adapters import (
 from clio_relay.progress_provenance import (
     PROTECTED_PROGRESS_METADATA_KEYS,
     PackageProgressSourceAuthority,
+    jarvis_execution_progress_metadata,
     package_progress_metadata,
     package_progress_provider_metadata,
+    validate_jarvis_execution_progress_metadata,
     validate_package_progress_metadata,
     validate_package_progress_provider_metadata,
 )
@@ -132,11 +144,14 @@ PROGRESS_SIDECAR_MAX_RECORD_BYTES = 64 * 1024
 PROGRESS_SIDECAR_MAX_TOTAL_BYTES = 16 * 1024 * 1024
 PROGRESS_SIDECAR_MAX_RECORDS = 10_000
 PROGRESS_SIDECAR_RECORD_SCHEMA = "clio-relay.progress-sidecar-record.v1"
-RUNTIME_SIDECAR_MAX_RECORD_BYTES = 256 * 1024
-RUNTIME_SIDECAR_MAX_TOTAL_BYTES = 4 * 1024 * 1024
+# One exact native JARVIS snapshot may be 4 MiB before the execution record,
+# handle, sidecar envelope, and HMAC are added.
+RUNTIME_SIDECAR_MAX_RECORD_BYTES = 5 * 1024 * 1024
+RUNTIME_SIDECAR_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 RUNTIME_SIDECAR_MAX_RECORDS = 4_096
 SIDECAR_DRAIN_CHUNK_BYTES = 64 * 1024
 MCP_PACKAGE_PROGRESS_BRIDGE_SCHEMA = "clio-relay.mcp-package-progress-bridge.v1"
+MCP_JARVIS_NATIVE_PROGRESS_BRIDGE_SCHEMA = "clio-relay.mcp-jarvis-progress-bridge.v1"
 OUTPUT_EVENT_MAX_BYTES = 64 * 1024
 # One larger than the queue's enforced active-lease scan bound. Since a pending
 # cleanup marker blocks a second lease for its job, a full batch cannot consist
@@ -260,7 +275,7 @@ class EndpointWorker:
         return self.queue.get_job(job.job_id)
 
     def _record_unhandled_job_failure(self, job: RelayJob, error: Exception) -> None:
-        detail = f"{type(error).__name__}: {error}"
+        detail = logical_filesystem_text(f"{type(error).__name__}: {error}")
         current = self.queue.get_job(job.job_id)
         if current.state == JobState.CANCELED:
             self.queue.append_event(
@@ -477,8 +492,15 @@ class EndpointWorker:
         runtime_spools.append(spool)
         self._check_runtime_storage(job, spool, force_job_scan=True)
         pipeline_name = _jarvis_pipeline_name(job)
+        configured_scheduler_provider = _configured_scheduler_provider_name(self.scheduler_provider)
+        scheduler_name: str | None = None
         if pipeline_name is None:
             yaml_text = self._render_job_yaml(job)
+            scheduler_name = _scheduler_name_from_yaml(yaml_text)
+            _validate_scheduler_launch_provider(
+                requested=scheduler_name,
+                configured=configured_scheduler_provider,
+            )
             pipeline_path = spool.write_pipeline(yaml_text)
             package_progress_adapter = package_progress_adapter_from_pipeline(yaml_text)
             if package_progress_adapter is None:
@@ -504,7 +526,7 @@ class EndpointWorker:
         else:
             yaml_text = None
             pipeline_path = spool.path / "pipeline-reference.json"
-            pipeline_path.write_text(
+            internal_filesystem_path(pipeline_path).write_text(
                 json.dumps(
                     {"pipeline_name": pipeline_name, "execution": "jarvis_named_pipeline"},
                     indent=2,
@@ -577,7 +599,6 @@ class EndpointWorker:
             )
             raise
         runtime_direct_proof_token = secrets.token_urlsafe(32)
-        scheduler_name = _scheduler_name_from_job(job)
         runtime_submission_intent = {
             "schema_version": "clio-relay.scheduler-submission-intent.v1",
             "execution_id": f"jarvis_{secrets.token_hex(16)}",
@@ -640,9 +661,9 @@ class EndpointWorker:
         scheduler_cancel_attempted = [False]
         with _job_subprocess_env(
             {
-                "CLIO_RELAY_PROGRESS_FILE": str(progress_sidecar),
+                "CLIO_RELAY_PROGRESS_FILE": str(internal_filesystem_path(progress_sidecar)),
                 "CLIO_RELAY_PROGRESS_TOKEN": progress_sidecar_token,
-                "CLIO_RELAY_RUNTIME_METADATA_FILE": str(runtime_sidecar),
+                "CLIO_RELAY_RUNTIME_METADATA_FILE": str(internal_filesystem_path(runtime_sidecar)),
                 "CLIO_RELAY_RUNTIME_METADATA_TOKEN": runtime_sidecar_key,
                 "CLIO_RELAY_RUNTIME_METADATA_ANCHOR": json.dumps(
                     runtime_sidecar_anchor.as_metadata(),
@@ -655,6 +676,7 @@ class EndpointWorker:
                     separators=(",", ":"),
                 ),
                 "CLIO_RELAY_RUNTIME_DIRECT_PROOF": runtime_direct_proof_token,
+                RUNTIME_SCHEDULER_PROVIDER_ENV: configured_scheduler_provider,
             }
         ) as execution_env:
             result = self._run_jarvis_streaming(
@@ -726,7 +748,25 @@ class EndpointWorker:
                 ),
             )
         self._check_runtime_storage(job, spool, force_job_scan=True)
-        if jarvis_stdout_progress_adapter is not None:
+        self._ingest_runtime_metadata_sidecar(
+            job,
+            task_id=task.task_id,
+            path=runtime_sidecar,
+            offset=runtime_sidecar_offset,
+            record_count=runtime_sidecar_record_count,
+            sequence=runtime_sidecar_sequence,
+            expected_key=runtime_sidecar_key,
+            expected_anchor=runtime_sidecar_anchor,
+            failures=runtime_sidecar_failures,
+            state=runtime_metadata_state,
+            digests=runtime_metadata_digests,
+            scheduler_job_ids=scheduler_job_ids,
+            allow_final_record=True,
+        )
+        native_runtime_active = runtime_metadata_state[
+            0
+        ] is not None and _runtime_metadata_is_native(runtime_metadata_state[0])
+        if jarvis_stdout_progress_adapter is not None and not native_runtime_active:
             self._append_package_progress_records(
                 job,
                 jarvis_stdout_progress_adapter.finalize_jarvis_stdout(),
@@ -745,7 +785,7 @@ class EndpointWorker:
             failures=progress_sidecar_failures,
             allow_final_record=True,
         )
-        if package_log_progress_adapter is not None:
+        if package_log_progress_adapter is not None and not native_runtime_active:
             self._drain_package_progress_logs(
                 job,
                 package_log_progress_adapter,
@@ -758,21 +798,6 @@ class EndpointWorker:
                 package_progress_provider=package_log_progress_adapter,
                 source_authority=PackageProgressSourceAuthority.PACKAGE_LOG,
             )
-        self._ingest_runtime_metadata_sidecar(
-            job,
-            task_id=task.task_id,
-            path=runtime_sidecar,
-            offset=runtime_sidecar_offset,
-            record_count=runtime_sidecar_record_count,
-            sequence=runtime_sidecar_sequence,
-            expected_key=runtime_sidecar_key,
-            expected_anchor=runtime_sidecar_anchor,
-            failures=runtime_sidecar_failures,
-            state=runtime_metadata_state,
-            digests=runtime_metadata_digests,
-            scheduler_job_ids=scheduler_job_ids,
-            allow_final_record=True,
-        )
         self._ingest_mcp_runtime_metadata(
             job,
             task_id=task.task_id,
@@ -966,10 +991,11 @@ class EndpointWorker:
         on_timeout: Callable[[], None],
         on_poll: Callable[[], None],
     ) -> subprocess.CompletedProcess[str]:
+        runtime_cwd = None if cwd is None else _validated_native_subprocess_cwd(cwd)
         if pipeline_name is not None:
             return self.provider.run_named_pipeline_streaming(
                 pipeline_name,
-                cwd=cwd,
+                cwd=runtime_cwd,
                 env=env,
                 on_stdout=on_stdout,
                 on_stderr=on_stderr,
@@ -980,8 +1006,8 @@ class EndpointWorker:
                 on_poll=on_poll,
             )
         return self.provider.run_pipeline_streaming(
-            pipeline_path,
-            cwd=cwd,
+            internal_filesystem_path(pipeline_path),
+            cwd=runtime_cwd,
             env=env,
             on_stdout=on_stdout,
             on_stderr=on_stderr,
@@ -1047,7 +1073,12 @@ class EndpointWorker:
         if typed_stream != "stdout":
             return
         self._append_ignored_stdout_markers(job, text)
-        if package_progress_adapter is not None:
+        native_runtime_active = (
+            runtime_metadata_state is not None
+            and runtime_metadata_state[0] is not None
+            and _runtime_metadata_is_native(runtime_metadata_state[0])
+        )
+        if package_progress_adapter is not None and not native_runtime_active:
             self._append_package_progress_records(
                 job,
                 package_progress_adapter.observe_jarvis_stdout(text),
@@ -1089,6 +1120,7 @@ class EndpointWorker:
             try:
                 metadata = _optional_metadata(typed_payload.get("metadata"))
                 provider_validated_record = package_progress_provider is not None
+                native_progress_record = False
                 if not progress_sidecar_authenticated and package_progress_provider is None:
                     raise ConfigurationError("package progress record has no bound provider")
                 if package_progress_provider is not None:
@@ -1137,6 +1169,11 @@ class EndpointWorker:
                 ):
                     trusted_metadata = _trusted_mcp_progress_metadata(job, metadata)
                     provider_validated_record = True
+                elif progress_sidecar_authenticated and isinstance(
+                    metadata.get("mcp_native_progress_bridge"), dict
+                ):
+                    trusted_metadata = _trusted_native_mcp_progress_metadata(job, metadata)
+                    native_progress_record = True
                 else:
                     trusted_metadata = _trusted_sidecar_metadata(metadata, job_id=job.job_id)
                 progress = ProgressRecord(
@@ -1149,7 +1186,15 @@ class EndpointWorker:
                     source_event_seq=source_event_seq,
                     metadata=trusted_metadata,
                 )
-                if provider_validated_record:
+                if native_progress_record:
+                    validate_jarvis_execution_progress_metadata(progress.metadata)
+                    if progress.metadata["progress_determinate"] is not (
+                        progress.current is not None and progress.total is not None
+                    ):
+                        raise ConfigurationError(
+                            "native JARVIS progress determinate flag did not match values"
+                        )
+                elif provider_validated_record:
                     validate_package_progress_provider_metadata(progress.metadata)
                 else:
                     validate_package_progress_metadata(progress.metadata)
@@ -1292,12 +1337,6 @@ class EndpointWorker:
             progress_sidecar_anchor=progress_sidecar_anchor,
             failures=progress_sidecar_failures,
         )
-        if package_progress_adapter is not None and package_progress_log_offsets is not None:
-            self._ingest_package_progress_logs(
-                job,
-                package_progress_adapter,
-                package_progress_log_offsets,
-            )
         if (
             runtime_sidecar is not None
             and runtime_sidecar_offset is not None
@@ -1323,6 +1362,21 @@ class EndpointWorker:
                 digests=runtime_metadata_digests,
                 scheduler_job_ids=scheduler_job_ids,
                 allow_final_record=False,
+            )
+        native_runtime_active = (
+            runtime_metadata_state is not None
+            and runtime_metadata_state[0] is not None
+            and _runtime_metadata_is_native(runtime_metadata_state[0])
+        )
+        if (
+            package_progress_adapter is not None
+            and package_progress_log_offsets is not None
+            and not native_runtime_active
+        ):
+            self._ingest_package_progress_logs(
+                job,
+                package_progress_adapter,
+                package_progress_log_offsets,
             )
         if scheduler_job_ids:
             self._refresh_scheduler_status(job, scheduler_job_ids, task_id=task_id)
@@ -1656,7 +1710,7 @@ class EndpointWorker:
             digests.clear()
             scheduler_job_ids.clear()
             return
-        if not path.exists():
+        if not internal_filesystem_path(path).exists():
             fail("precreated JARVIS runtime metadata sidecar disappeared")
             return
         try:
@@ -1711,6 +1765,11 @@ class EndpointWorker:
                             expected_key=expected_key,
                             expected_sequence=sequence[0] + 1,
                         )
+                        metadata = self._consume_scheduler_launch_refusal(
+                            job,
+                            task_id=task_id,
+                            metadata=metadata,
+                        )
                         metadata = self._consume_direct_execution_proof(
                             job,
                             task_id=task_id,
@@ -1748,6 +1807,85 @@ class EndpointWorker:
                 "runtime.metadata_read_failed",
                 message,
             )
+
+    def _consume_scheduler_launch_refusal(
+        self,
+        job: RelayJob,
+        *,
+        task_id: str,
+        metadata: JarvisRuntimeMetadata,
+    ) -> JarvisRuntimeMetadata:
+        """Validate proof that the broker rejected a named scheduler before submit."""
+        raw_details = metadata.details.get("details")
+        details = cast(dict[str, Any], raw_details) if isinstance(raw_details, dict) else {}
+        proof = details.get("scheduler_launch_refusal_proof")
+        if proof is None:
+            return metadata
+        task = self.queue.get_task(task_id)
+        if _runtime_sidecar_channel_failed(task):
+            raise ValueError("scheduler launch refusal cannot resolve a failed runtime channel")
+        intent = _durable_scheduler_submission_intent(task)
+        configured_provider = _configured_scheduler_provider_name(self.scheduler_provider)
+        requested_provider = details.get("scheduler_provider")
+        if (
+            not isinstance(proof, str)
+            or not proof
+            or intent["scheduler_expected"] != "unknown"
+            or metadata.execution_id != intent["execution_id"]
+            or metadata.pipeline_id != _jarvis_pipeline_name(job)
+            or metadata.scheduler_job_id is not None
+            or metadata.scheduler_phase != "launch_refused"
+            or metadata.terminal.state != "launch_refused"
+            or metadata.terminal.terminal is not True
+            or metadata.terminal.returncode != 2
+            or details.get("execution_owner") != "jarvis_cd.pipeline.preflight"
+            or details.get("execution_mode") != "scheduler"
+            or details.get("scheduler_expected") != intent["scheduler_expected"]
+            or details.get("scheduler_submission_attempted") is not False
+            or details.get("scheduler_launch_refused") is not True
+            or not isinstance(requested_provider, str)
+            or metadata.scheduler_provider != requested_provider
+            or details.get("configured_scheduler_provider") != configured_provider
+            or (requested_provider == configured_provider and requested_provider == "slurm")
+            or not secrets.compare_digest(
+                hashlib.sha256(proof.encode("utf-8")).hexdigest(),
+                cast(str, intent["direct_proof_sha256"]),
+            )
+        ):
+            raise ValueError("scheduler launch refusal did not match durable intent")
+        sidecars = cast(dict[str, object], task.metadata["execution_sidecars"])
+        if sidecars.get("scheduler_submission_refused") is not True:
+            self.queue.update_task_metadata(
+                task_id,
+                {
+                    "execution_sidecars": {
+                        **sidecars,
+                        "scheduler_submission_refused": True,
+                    }
+                },
+            )
+            self.queue.append_event(
+                job.job_id,
+                "scheduler.launch_refused",
+                "Authenticated JARVIS preflight refused scheduler launch before submission",
+                payload={
+                    "task_id": task_id,
+                    "execution_id": metadata.execution_id,
+                    "requested_provider": requested_provider,
+                    "configured_provider": configured_provider,
+                    "scheduler_submission_attempted": False,
+                },
+            )
+        redacted_details = {**details}
+        redacted_details.pop("scheduler_launch_refusal_proof", None)
+        return metadata.model_copy(
+            update={
+                "details": {
+                    **metadata.details,
+                    "details": redacted_details,
+                }
+            }
+        )
 
     def _consume_direct_execution_proof(
         self,
@@ -1823,10 +1961,11 @@ class EndpointWorker:
     ) -> None:
         """Ingest structured runtime metadata returned by a remote MCP call."""
         result_path = spool.path / "mcp-result.json"
-        if not result_path.exists():
+        storage_result_path = internal_filesystem_path(result_path)
+        if not storage_result_path.exists():
             return
         try:
-            result_document = json.loads(result_path.read_text(encoding="utf-8"))
+            result_document = json.loads(storage_result_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             self.queue.append_event(
                 job.job_id,
@@ -1834,9 +1973,41 @@ class EndpointWorker:
                 f"MCP runtime result could not be read: {exc}",
             )
             return
-        metadata = runtime_metadata_from_mcp_result_document(result_document)
+        try:
+            metadata = runtime_metadata_from_mcp_result_document(result_document)
+        except ValueError as exc:
+            self.queue.append_event(
+                job.job_id,
+                "runtime.metadata_refused",
+                f"Refused invalid native JARVIS execution documents: {exc}",
+                payload={
+                    "source": RuntimeMetadataSource.JARVIS_MCP.value,
+                    "ownership_verified": False,
+                    "reason": str(exc),
+                },
+            )
+            raise ConfigurationError(
+                f"native JARVIS execution documents were invalid: {exc}"
+            ) from exc
         if metadata is None:
             return
+        if _runtime_metadata_is_native(metadata):
+            expected_pipeline_id = (
+                job.spec.arguments.get("pipeline_id") if isinstance(job.spec, McpCallSpec) else None
+            )
+            if metadata.pipeline_id != expected_pipeline_id:
+                reason = "native JARVIS pipeline identity did not match the durable MCP request"
+                self.queue.append_event(
+                    job.job_id,
+                    "runtime.metadata_refused",
+                    f"Refused JARVIS MCP runtime metadata: {reason}",
+                    payload={
+                        "source": RuntimeMetadataSource.JARVIS_MCP.value,
+                        "ownership_verified": False,
+                        "reason": reason,
+                    },
+                )
+                raise ConfigurationError(reason)
         trusted, reason = _trusted_jarvis_mcp_result(job, result_document)
         if not trusted:
             self.queue.append_event(
@@ -1919,6 +2090,16 @@ class EndpointWorker:
             return
         digests.add(digest)
         previous = state[0]
+        if (
+            _runtime_metadata_is_native(metadata)
+            and previous is not None
+            and previous.source
+            in {
+                RuntimeMetadataSource.LEGACY_STDOUT,
+                RuntimeMetadataSource.UNTRUSTED_COMPATIBILITY,
+            }
+        ):
+            previous = None
         try:
             merged = merge_runtime_metadata(previous, metadata)
         except RuntimeMetadataIdentityConflictError as exc:
@@ -1996,8 +2177,18 @@ class EndpointWorker:
             "scheduler_job_ids": list(scheduler_job_ids),
             "scheduler_job_ownership": scheduler_ownership,
         }
-        if merged.scheduler_provider is not None:
-            durable_metadata["scheduler"] = merged.scheduler_provider
+        native_execution = merged.details.get("native_execution")
+        if isinstance(native_execution, dict):
+            typed_native = cast(dict[str, object], native_execution)
+            for source_key, durable_key in (
+                ("execution_handle", "jarvis_execution_handle"),
+                ("execution_record", "jarvis_execution_record"),
+                ("progress", "jarvis_execution_progress"),
+            ):
+                document = typed_native.get(source_key)
+                if isinstance(document, dict):
+                    durable_metadata[durable_key] = document
+        durable_metadata["scheduler"] = merged.scheduler_provider
         self.queue.update_job_metadata(job.job_id, durable_metadata)
         self.queue.update_task_metadata(task_id, durable_metadata)
         if failed_channel and exact_marker_reconciliation is not None:
@@ -2112,6 +2303,8 @@ class EndpointWorker:
         task = self.queue.get_task(task_id)
         intent = _durable_scheduler_submission_intent(task)
         if intent["scheduler_expected"] is False:
+            return False
+        if _task_scheduler_submission_refused(task):
             return False
         if _runtime_sidecar_channel_failed(task):
             state[0] = None
@@ -2382,12 +2575,14 @@ class EndpointWorker:
         raw_sidecars = cast(dict[str, object], task.metadata.get("execution_sidecars", {}))
         if raw_sidecars.get("scheduler_expected_resolved") is False:
             return False
+        if raw_sidecars.get("scheduler_submission_refused") is True:
+            return False
         if durable_intent["scheduler_expected"] is False:
             return False
         if (
             allow_raw_direct_proof
             and durable_intent["scheduler_expected"] == "unknown"
-            and self._recorded_direct_execution_proven(job, task, durable_intent)
+            and self._recorded_prelaunch_resolution_proven(job, task, durable_intent)
         ):
             return False
         if _owned_scheduler_job_ids_from_metadata(
@@ -2506,13 +2701,13 @@ class EndpointWorker:
         )
         return True
 
-    def _recorded_direct_execution_proven(
+    def _recorded_prelaunch_resolution_proven(
         self,
         job: RelayJob,
         task: RelayTask,
         intent: dict[str, Any],
     ) -> bool:
-        """Verify a one-use direct-mode proof left before a named run began."""
+        """Verify a one-use direct-mode or pre-submit refusal proof after restart."""
         if _runtime_sidecar_channel_failed(task):
             return False
         raw_sidecars = task.metadata.get("execution_sidecars")
@@ -2542,7 +2737,7 @@ class EndpointWorker:
         with handle:
             if os.fstat(handle.fileno()).st_size > RUNTIME_SIDECAR_MAX_TOTAL_BYTES:
                 raise SchedulerSubmissionUnresolvedError(
-                    "direct execution proof sidecar exceeded its byte limit"
+                    "prelaunch resolution proof sidecar exceeded its byte limit"
                 )
             for _ in range(RUNTIME_SIDECAR_MAX_RECORDS):
                 line, status = _read_bounded_sidecar_record(
@@ -2566,6 +2761,59 @@ class EndpointWorker:
                 typed_runtime = cast(dict[str, Any], runtime)
                 raw_details = typed_runtime.get("details")
                 details = cast(dict[str, Any], raw_details) if isinstance(raw_details, dict) else {}
+                refusal_proof = details.get("scheduler_launch_refusal_proof")
+                requested_provider = details.get("scheduler_provider")
+                configured_provider = _configured_scheduler_provider_name(self.scheduler_provider)
+                raw_terminal = typed_runtime.get("terminal")
+                terminal = (
+                    cast(dict[str, Any], raw_terminal) if isinstance(raw_terminal, dict) else {}
+                )
+                if (
+                    typed_runtime.get("schema_version") == "jarvis.runtime.v1"
+                    and typed_runtime.get("execution_id") == intent["execution_id"]
+                    and typed_runtime.get("pipeline_id") == _jarvis_pipeline_name(job)
+                    and typed_runtime.get("scheduler_job_id") is None
+                    and typed_runtime.get("scheduler_provider") == requested_provider
+                    and typed_runtime.get("scheduler_phase") == "launch_refused"
+                    and terminal.get("state") == "launch_refused"
+                    and terminal.get("terminal") is True
+                    and terminal.get("returncode") == 2
+                    and details.get("execution_owner") == "jarvis_cd.pipeline.preflight"
+                    and details.get("execution_mode") == "scheduler"
+                    and details.get("scheduler_expected") == intent["scheduler_expected"]
+                    and details.get("scheduler_submission_attempted") is False
+                    and details.get("scheduler_launch_refused") is True
+                    and isinstance(requested_provider, str)
+                    and details.get("configured_scheduler_provider") == configured_provider
+                    and (requested_provider != configured_provider or requested_provider != "slurm")
+                    and isinstance(refusal_proof, str)
+                    and secrets.compare_digest(
+                        hashlib.sha256(refusal_proof.encode("utf-8")).hexdigest(),
+                        cast(str, intent["direct_proof_sha256"]),
+                    )
+                ):
+                    self.queue.update_task_metadata(
+                        task.task_id,
+                        {
+                            "execution_sidecars": {
+                                **sidecars,
+                                "scheduler_submission_refused": True,
+                            }
+                        },
+                    )
+                    self.queue.append_event(
+                        job.job_id,
+                        "scheduler.launch_refusal_recovered",
+                        "Restart cleanup verified scheduler launch was refused before submission",
+                        payload={
+                            "task_id": task.task_id,
+                            "execution_id": intent["execution_id"],
+                            "requested_provider": requested_provider,
+                            "configured_provider": configured_provider,
+                            "scheduler_submission_attempted": False,
+                        },
+                    )
+                    return True
                 proof = details.get("direct_execution_proof")
                 if (
                     typed_runtime.get("schema_version") == "jarvis.runtime.v1"
@@ -3578,7 +3826,7 @@ class EndpointWorker:
             "mcp_result": spool.path / "mcp-result.json",
         }
         for kind, path in candidates.items():
-            if path.exists():
+            if internal_filesystem_path(path).exists():
                 self.queue.append_artifact(spool.artifact_for(path, kind=kind))
                 self.queue.append_event(
                     job.job_id,
@@ -3617,8 +3865,9 @@ class EndpointWorker:
 
     @contextmanager
     def _single_cluster_worker_lock(self) -> Generator[None, None, None]:
-        lock_path = self.settings.core_dir / f"{self.cluster}-worker.lock"
-        lock = FileLock(str(lock_path), timeout=0)
+        cluster_key = filesystem_key(self.cluster, domain="cluster")
+        lock_path = self.settings.core_dir / f"{cluster_key}-worker.lock"
+        lock = FileLock(str(internal_filesystem_path(lock_path)), timeout=0)
         try:
             lock.acquire()
         except Timeout as exc:
@@ -3645,8 +3894,14 @@ def _worker_installation_snapshot() -> dict[str, object]:
 
 def bootstrap_cluster_environment(settings: RelaySettings) -> None:
     """Create endpoint directories and verify required executables are configured."""
-    settings.core_dir.mkdir(parents=True, exist_ok=True)
-    settings.spool_dir.mkdir(parents=True, exist_ok=True)
+    internal_filesystem_path(settings.core_dir, force_extended=True).mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    internal_filesystem_path(settings.spool_dir, force_extended=True).mkdir(
+        parents=True,
+        exist_ok=True,
+    )
     queue = storage_managed_queue(settings)
     queue.storage_runtime.ensure_new_intake_allowed()
     provider = JarvisCdProvider(
@@ -3684,13 +3939,14 @@ def _bounded_output_event_chunks(text: str) -> list[str]:
 
 
 def _file_summary(path: Path) -> dict[str, object]:
-    if not path.exists():
+    storage_path = internal_filesystem_path(path)
+    if not storage_path.exists():
         return {"path": str(path), "exists": False}
     return {
         "path": str(path),
         "exists": True,
-        "size_bytes": path.stat().st_size,
-        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "size_bytes": storage_path.stat().st_size,
+        "sha256": hashlib.sha256(storage_path.read_bytes()).hexdigest(),
     }
 
 
@@ -3770,6 +4026,36 @@ def _scheduler_status_is_not_found(status: SchedulerStatus) -> bool:
     return status.phase is SchedulerPhase.UNKNOWN and status.record_found is False
 
 
+def _configured_scheduler_provider_name(provider: SchedulerProvider | None) -> str:
+    raw_name = "external" if provider is None else provider.name
+    normalized = raw_name.strip().lower().replace("_", "-")
+    if normalized in {"none", "unmanaged"}:
+        return "external"
+    if not normalized:
+        raise ConfigurationError("configured worker scheduler provider must be non-empty")
+    return normalized
+
+
+def _validate_scheduler_launch_provider(*, requested: str | None, configured: str) -> None:
+    if requested is None:
+        return
+    normalized_requested = requested.strip().lower().replace("_", "-")
+    if normalized_requested in {"none", "unmanaged"}:
+        normalized_requested = "external"
+    if not normalized_requested:
+        raise ConfigurationError("JARVIS scheduler provider must be non-empty")
+    if normalized_requested != configured:
+        raise ConfigurationError(
+            "JARVIS pipeline scheduler provider does not match the configured worker provider: "
+            f"{normalized_requested} != {configured}; no JARVIS execution was launched"
+        )
+    if normalized_requested != "slurm":
+        raise ConfigurationError(
+            "clio-relay 1.0 supports scheduled JARVIS execution only through slurm; "
+            f"requested {normalized_requested}; no JARVIS execution was launched"
+        )
+
+
 def _scheduler_name_from_job(job: RelayJob) -> str | None:
     if not isinstance(job.spec, JarvisRunSpec):
         return None
@@ -3777,7 +4063,9 @@ def _scheduler_name_from_job(job: RelayJob) -> str | None:
         return _scheduler_name_from_yaml(job.spec.pipeline_yaml)
     if job.spec.pipeline_path is not None:
         try:
-            pipeline_yaml = Path(job.spec.pipeline_path).read_text(encoding="utf-8")
+            pipeline_yaml = internal_filesystem_path(Path(job.spec.pipeline_path)).read_text(
+                encoding="utf-8"
+            )
         except OSError:
             return None
         return _scheduler_name_from_yaml(pipeline_yaml)
@@ -3857,6 +4145,23 @@ def _normalize_package_progress_log_path(child_cwd: Path, path: Path) -> Path:
     return Path(os.path.abspath(candidate))
 
 
+def _validated_native_subprocess_cwd(cwd: Path) -> Path:
+    """Return a logical cwd or reject unverified native Windows path forms."""
+    logical_cwd = logical_filesystem_path(cwd)
+    if os.name != "nt":
+        return logical_cwd
+    absolute_cwd = os.path.abspath(logical_cwd)
+    if absolute_cwd.startswith("\\\\"):
+        raise ConfigurationError(
+            "native JARVIS working directories on Windows must not use UNC paths"
+        )
+    if len(absolute_cwd) >= WINDOWS_LEGACY_PATH_HEADROOM:
+        raise ConfigurationError(
+            "native JARVIS working directory exceeds the verified Windows path bound"
+        )
+    return logical_cwd
+
+
 def _render_progress_log_identity(identity: tuple[int, int] | None) -> str | None:
     if identity is None:
         return None
@@ -3865,8 +4170,9 @@ def _render_progress_log_identity(identity: tuple[int, int] | None) -> str | Non
 
 def _open_package_progress_log(path: Path) -> BinaryIO | None:
     """Open one regular provider log without following symlinks or path races."""
+    storage_path = internal_filesystem_path(path)
     try:
-        path_stat = os.stat(path, follow_symlinks=False)
+        path_stat = os.stat(storage_path, follow_symlinks=False)
     except FileNotFoundError:
         return None
     except OSError as exc:
@@ -3882,7 +4188,7 @@ def _open_package_progress_log(path: Path) -> BinaryIO | None:
         | getattr(os, "O_NONBLOCK", 0)
     )
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(storage_path, flags)
     except OSError as exc:
         raise ConfigurationError(f"could not open package progress log {path}: {exc}") from exc
     try:
@@ -3899,6 +4205,7 @@ def _open_package_progress_log(path: Path) -> BinaryIO | None:
 
 def _precreate_runtime_sidecar(path: Path) -> _RuntimeSidecarAnchor:
     """Create an empty private runtime sidecar and pin its filesystem identity."""
+    storage_path = internal_filesystem_path(path)
     flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -3908,7 +4215,7 @@ def _precreate_runtime_sidecar(path: Path) -> _RuntimeSidecarAnchor:
         | getattr(os, "O_NOFOLLOW", 0)
     )
     try:
-        descriptor = os.open(path, flags, 0o600)
+        descriptor = os.open(storage_path, flags, 0o600)
     except OSError as exc:
         raise ConfigurationError(
             f"could not precreate runtime metadata sidecar {path}: {exc}"
@@ -4000,6 +4307,7 @@ def _open_owned_sidecar(
     expected_anchor: _RuntimeSidecarAnchor | None = None,
 ) -> BinaryIO | None:
     """Open a regular relay sidecar without following symlinks or path races."""
+    storage_path = internal_filesystem_path(path)
     if expected_anchor is not None and expected_anchor.descriptor is not None:
         _validate_runtime_sidecar_stat(
             os.fstat(expected_anchor.descriptor),
@@ -4007,7 +4315,7 @@ def _open_owned_sidecar(
             label=label,
         )
     try:
-        path_stat = os.stat(path, follow_symlinks=False)
+        path_stat = os.stat(storage_path, follow_symlinks=False)
     except FileNotFoundError:
         return None
     except OSError as exc:
@@ -4026,7 +4334,7 @@ def _open_owned_sidecar(
         | getattr(os, "O_NONBLOCK", 0)
     )
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(storage_path, flags)
     except OSError as exc:
         raise ConfigurationError(f"could not open {label} {path}: {exc}") from exc
     try:
@@ -4045,15 +4353,20 @@ def _open_owned_sidecar(
 
 
 def _execution_sidecar_quarantine_name(anchor: _RuntimeSidecarAnchor) -> str:
-    """Return the deterministic retention name for one exact sidecar inode."""
+    """Return a bounded deterministic retention name for one exact sidecar inode."""
     digest = hashlib.sha256(
         json.dumps(
             anchor.as_metadata(),
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-    ).hexdigest()
-    return f".clio-relay-sidecar-quarantine-v1-{digest}.jsonl"
+    ).digest()
+    token = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    # Keep the target no longer than the shortest generated runtime sidecar
+    # name. This preserves all 256 identity bits while avoiding a rename that
+    # crosses the legacy Windows MAX_PATH boundary after the source was
+    # successfully created in the same spool directory.
+    return f".q1-{token}"
 
 
 def _execution_sidecar_cleanup_plan(
@@ -4236,6 +4549,7 @@ def _remove_execution_sidecars(
     """Atomically quarantine exact sidecar inodes and retain durable evidence."""
     anchors = expected_anchors or {}
     quarantines = expected_quarantines or {}
+    storage_spool_path = internal_filesystem_path(spool_path)
     try:
         if any(path.parent != spool_path for path in paths):
             raise ConfigurationError("execution sidecar path escaped its job spool")
@@ -4251,7 +4565,7 @@ def _remove_execution_sidecars(
         ):
             raise ConfigurationError("execution sidecar quarantine path escaped its job spool")
         try:
-            spool_stat = os.stat(spool_path, follow_symlinks=False)
+            spool_stat = os.stat(storage_spool_path, follow_symlinks=False)
         except FileNotFoundError as exc:
             if anchors:
                 raise ConfigurationError(
@@ -4290,7 +4604,7 @@ def _remove_execution_sidecars(
             | getattr(os, "O_NOFOLLOW", 0)
         )
         try:
-            directory_fd = os.open(spool_path, flags)
+            directory_fd = os.open(storage_spool_path, flags)
         except OSError as exc:
             raise ConfigurationError(
                 f"could not anchor execution spool {spool_path}: {exc}"
@@ -4500,7 +4814,7 @@ def _quarantine_windows_sidecar_by_handle(
                 quarantine,
                 expected_anchor=expected_anchor,
             )
-            if os.path.lexists(path):
+            if os.path.lexists(internal_filesystem_path(path)):
                 raise ConfigurationError(
                     f"execution sidecar source was replaced after quarantine: {path}"
                 )
@@ -4526,7 +4840,7 @@ def _quarantine_windows_sidecar_by_handle(
             _mark_windows_handle_for_rename(file_handle, path, quarantine)
     finally:
         _close_windows_cleanup_handle(file_handle)
-    if os.path.lexists(path):
+    if os.path.lexists(internal_filesystem_path(path)):
         raise ConfigurationError(f"execution sidecar source was replaced during quarantine: {path}")
     quarantine_handle = _open_windows_cleanup_handle(
         quarantine,
@@ -4562,7 +4876,7 @@ def _validate_windows_sidecar_handle(
     if file_id != expected_anchor.inode:
         raise ConfigurationError(f"execution sidecar file identity changed: {path}")
     try:
-        file_stat = os.stat(path, follow_symlinks=False)
+        file_stat = os.stat(internal_filesystem_path(path), follow_symlinks=False)
     except OSError as exc:
         raise ConfigurationError(f"could not inspect execution sidecar {path}: {exc}") from exc
     _validate_runtime_sidecar_stat(
@@ -4613,7 +4927,7 @@ def _open_windows_cleanup_handle(
     ]
     kernel32.CreateFileW.restype = wintypes.HANDLE
     raw_handle = kernel32.CreateFileW(
-        str(path),
+        str(internal_filesystem_path(path)),
         desired_access,
         share_mode,
         None,
@@ -4681,7 +4995,7 @@ def _mark_windows_handle_for_rename(
         raise RuntimeError("Windows handle rename requires Windows")
     from ctypes import wintypes
 
-    quarantine_text = str(quarantine)
+    quarantine_text = str(internal_filesystem_path(quarantine))
     quarantine_bytes = quarantine_text.encode("utf-16-le")
     if not quarantine_bytes or "\x00" in quarantine_text:
         raise ConfigurationError(f"invalid execution sidecar quarantine name: {quarantine}")
@@ -5056,6 +5370,141 @@ def _trusted_mcp_progress_metadata(
     return trusted
 
 
+def _trusted_native_mcp_progress_metadata(
+    job: RelayJob,
+    metadata: dict[str, object],
+) -> dict[str, object]:
+    """Validate an HMAC-protected native JARVIS progress observation."""
+    raw_bridge = metadata.get("mcp_native_progress_bridge")
+    if not isinstance(raw_bridge, dict):
+        raise ConfigurationError("native MCP JARVIS progress bridge metadata is missing")
+    bridge = cast(dict[str, object], raw_bridge)
+    expected_fields = {
+        "schema_version",
+        "execution_id",
+        "pipeline_id",
+        "execution_state",
+        "terminal",
+        "transport_sequence",
+        "package_name",
+        "package_id",
+        "event_count",
+        "event_schema_version",
+        "event_sequence",
+        "event_state",
+        "observed_at_epoch",
+        "determinate",
+        "skipped_event_count",
+        "expected_server_artifact_digest",
+        "observed_server_artifact_digest",
+        "execution_validated",
+    }
+    if (
+        set(bridge) != expected_fields
+        or bridge.get("schema_version") != MCP_JARVIS_NATIVE_PROGRESS_BRIDGE_SCHEMA
+        or bridge.get("event_schema_version") != "jarvis.progress.v1"
+    ):
+        raise ConfigurationError("native MCP JARVIS progress bridge schema did not match")
+    route_valid, route_reason = _trusted_jarvis_mcp_route(job)
+    if not route_valid:
+        raise ConfigurationError(
+            f"native MCP JARVIS progress route was not trusted: {route_reason}"
+        )
+    assert isinstance(job.spec, McpCallSpec)
+    expected_digest = job.spec.expected_server_artifact_digest
+    if (
+        expected_digest is None
+        or bridge.get("expected_server_artifact_digest") != expected_digest
+        or bridge.get("observed_server_artifact_digest") != expected_digest
+    ):
+        raise ConfigurationError("native MCP JARVIS progress server artifact did not match")
+    arguments = job.spec.arguments
+    pipeline_id = bridge.get("pipeline_id")
+    if (
+        not isinstance(pipeline_id, str)
+        or not pipeline_id
+        or arguments.get("pipeline_id") != pipeline_id
+    ):
+        raise ConfigurationError("native MCP JARVIS progress pipeline identity did not match")
+    string_fields = (
+        "execution_id",
+        "execution_state",
+        "package_name",
+        "package_id",
+        "event_state",
+    )
+    for field_name in string_fields:
+        value = bridge.get(field_name)
+        if not isinstance(value, str) or not value:
+            raise ConfigurationError(f"native MCP JARVIS progress {field_name} must be non-empty")
+    if bridge["execution_state"] not in {
+        "preparing",
+        "scripted",
+        "submitting",
+        "submitted",
+        "running",
+        "completed",
+        "failed",
+        "canceled",
+        "unknown",
+    }:
+        raise ConfigurationError("native MCP JARVIS progress execution state was invalid")
+    if bridge["event_state"] not in {
+        "pending",
+        "starting",
+        "running",
+        "ready",
+        "completed",
+        "failed",
+        "canceled",
+    }:
+        raise ConfigurationError("native MCP JARVIS progress event state was invalid")
+    integer_fields = (
+        "transport_sequence",
+        "event_count",
+        "event_sequence",
+        "skipped_event_count",
+    )
+    for field_name in integer_fields:
+        value = bridge.get(field_name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ConfigurationError(f"native MCP JARVIS progress {field_name} was invalid")
+    if cast(int, bridge["event_count"]) < 1:
+        raise ConfigurationError("native MCP JARVIS progress event count was invalid")
+    observed = bridge.get("observed_at_epoch")
+    if (
+        isinstance(observed, bool)
+        or not isinstance(observed, int | float)
+        or not math.isfinite(float(observed))
+        or observed < 0
+    ):
+        raise ConfigurationError("native MCP JARVIS progress observed time was invalid")
+    for field_name in ("terminal", "determinate", "execution_validated"):
+        if not isinstance(bridge.get(field_name), bool):
+            raise ConfigurationError(f"native MCP JARVIS progress {field_name} was invalid")
+    candidate_metadata = dict(metadata)
+    candidate_metadata.pop("mcp_native_progress_bridge", None)
+    return jarvis_execution_progress_metadata(
+        candidate_metadata,
+        relay_job_id=job.job_id,
+        execution_id=cast(str, bridge["execution_id"]),
+        pipeline_id=pipeline_id,
+        package_name=cast(str, bridge["package_name"]),
+        package_id=cast(str, bridge["package_id"]),
+        progress_state=cast(str, bridge["event_state"]),
+        progress_sequence=cast(int, bridge["event_sequence"]),
+        observed_at_epoch=float(observed),
+        determinate=cast(bool, bridge["determinate"]),
+        event_count=cast(int, bridge["event_count"]),
+        skipped_event_count=cast(int, bridge["skipped_event_count"]),
+        execution_state=cast(str, bridge["execution_state"]),
+        execution_terminal=cast(bool, bridge["terminal"]),
+        transport_sequence=cast(int, bridge["transport_sequence"]),
+        server_artifact_digest=expected_digest,
+        execution_binding_validated=cast(bool, bridge["execution_validated"]),
+    )
+
+
 def _normalized_provider_distribution(value: str) -> str:
     return value.lower().replace("_", "-").replace(".", "-")
 
@@ -5151,12 +5600,32 @@ def _runtime_metadata_exact_marker_reconciliation(
     return reconciliation
 
 
+def _runtime_metadata_is_native(metadata: JarvisRuntimeMetadata) -> bool:
+    """Return whether exact JARVIS handle, record, and progress documents were validated."""
+    producer_contract = metadata.details.get("producer_contract")
+    native_execution = metadata.details.get("native_execution")
+    return (
+        isinstance(producer_contract, dict)
+        and cast(dict[str, object], producer_contract).get("contract_kind") == "native_execution"
+        and isinstance(native_execution, dict)
+    )
+
+
 def _task_direct_execution_pinned(task: RelayTask) -> bool:
     raw_sidecars = task.metadata.get("execution_sidecars")
     return (
         not _runtime_sidecar_channel_failed(task)
         and isinstance(raw_sidecars, dict)
         and cast(dict[str, object], raw_sidecars).get("scheduler_expected_resolved") is False
+    )
+
+
+def _task_scheduler_submission_refused(task: RelayTask) -> bool:
+    raw_sidecars = task.metadata.get("execution_sidecars")
+    return (
+        not _runtime_sidecar_channel_failed(task)
+        and isinstance(raw_sidecars, dict)
+        and cast(dict[str, object], raw_sidecars).get("scheduler_submission_refused") is True
     )
 
 

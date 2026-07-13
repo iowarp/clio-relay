@@ -15,7 +15,6 @@ import hashlib
 import hmac
 import json
 import os
-import re
 import shutil
 import stat
 import tempfile
@@ -31,10 +30,15 @@ from typing import Final, Literal, cast
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
+from clio_relay.filesystem_paths import (
+    internal_filesystem_path,
+    logical_filesystem_path,
+)
+from clio_relay.identifiers import validate_durable_record_id
+
 _LEDGER_SCHEMA: Final = "clio-relay.storage-reservations.v1"
 _STATUS_SCHEMA: Final = "clio-relay.storage-status.v1"
 _DECISION_SCHEMA: Final = "clio-relay.storage-decision.v1"
-_JOB_ID_PATTERN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _MIB: Final = 1024**2
 _GIB: Final = 1024**3
 _TIB: Final = 1024**4
@@ -345,13 +349,14 @@ def scan_tree(
     _require_positive_bound("max_accounted_bytes", max_accounted_bytes)
     if link_policy not in {"reject", "count"}:
         raise ValueError("link_policy must be 'reject' or 'count'")
-    normalized = Path(os.path.abspath(root))
+    logical_root = logical_filesystem_path(Path(os.path.abspath(root)))
+    normalized = internal_filesystem_path(logical_root, force_extended=True)
     root_stat = _safe_lstat(normalized, root=True)
     if not stat.S_ISDIR(root_stat.st_mode):
         raise StoragePolicyError(
             StorageReason.SCAN_ROOT_INVALID,
             "storage root is not a directory",
-            details={"root": str(normalized)},
+            details={"root": str(logical_root)},
         )
 
     total_bytes = 0
@@ -372,7 +377,7 @@ def scan_tree(
                         raise StoragePolicyError(
                             StorageReason.SCAN_ENTRY_LIMIT,
                             "storage tree exceeds the configured entry scan limit",
-                            details={"root": str(normalized), "max_entries": max_entries},
+                            details={"root": str(logical_root), "max_entries": max_entries},
                         )
                     try:
                         entry_stat = entry.stat(follow_symlinks=False)
@@ -380,13 +385,13 @@ def scan_tree(
                         raise StoragePolicyError(
                             StorageReason.SCAN_CHANGED,
                             "storage tree changed while it was being accounted",
-                            details={"root": str(normalized)},
+                            details={"root": str(logical_root)},
                         ) from exc
                     except OSError as exc:
                         raise StoragePolicyError(
                             StorageReason.SCAN_IO_ERROR,
                             "storage entry could not be inspected",
-                            details={"root": str(normalized), "error": type(exc).__name__},
+                            details={"root": str(logical_root), "error": type(exc).__name__},
                         ) from exc
                     child = directory / entry.name
                     if os.name == "nt":
@@ -399,14 +404,14 @@ def scan_tree(
                             raise StoragePolicyError(
                                 StorageReason.SCAN_CHANGED,
                                 "storage tree changed while it was being accounted",
-                                details={"root": str(normalized)},
+                                details={"root": str(logical_root)},
                             ) from exc
                     if _is_link_or_reparse(entry_stat) or entry.is_symlink():
                         if link_policy == "reject":
                             raise StoragePolicyError(
                                 StorageReason.SCAN_UNSAFE_ENTRY,
                                 "storage tree contains a link or reparse point",
-                                details={"root": str(normalized)},
+                                details={"root": str(logical_root)},
                             )
                         link_count += 1
                         total_bytes += max(0, int(entry_stat.st_size))
@@ -415,7 +420,7 @@ def scan_tree(
                                 StorageReason.SCAN_BYTE_LIMIT,
                                 "storage tree exceeds the configured accounting byte limit",
                                 details={
-                                    "root": str(normalized),
+                                    "root": str(logical_root),
                                     "max_accounted_bytes": max_accounted_bytes,
                                 },
                             )
@@ -426,7 +431,7 @@ def scan_tree(
                             raise StoragePolicyError(
                                 StorageReason.SCAN_DEPTH_LIMIT,
                                 "storage tree exceeds the configured depth limit",
-                                details={"root": str(normalized), "max_depth": max_depth},
+                                details={"root": str(logical_root), "max_depth": max_depth},
                             )
                         directory_count += 1
                         stack.append(
@@ -442,7 +447,7 @@ def scan_tree(
                             raise StoragePolicyError(
                                 StorageReason.SCAN_UNSAFE_ENTRY,
                                 "storage entry reported a negative size",
-                                details={"root": str(normalized)},
+                                details={"root": str(logical_root)},
                             )
                         file_count += 1
                         total_bytes += int(entry_stat.st_size)
@@ -451,7 +456,7 @@ def scan_tree(
                                 StorageReason.SCAN_BYTE_LIMIT,
                                 "storage tree exceeds the configured accounting byte limit",
                                 details={
-                                    "root": str(normalized),
+                                    "root": str(logical_root),
                                     "max_accounted_bytes": max_accounted_bytes,
                                 },
                             )
@@ -459,7 +464,7 @@ def scan_tree(
                         raise StoragePolicyError(
                             StorageReason.SCAN_UNSAFE_ENTRY,
                             "storage tree contains a non-regular entry",
-                            details={"root": str(normalized)},
+                            details={"root": str(logical_root)},
                         )
         except StoragePolicyError:
             raise
@@ -467,17 +472,17 @@ def scan_tree(
             raise StoragePolicyError(
                 StorageReason.SCAN_CHANGED,
                 "storage tree changed while it was being accounted",
-                details={"root": str(normalized)},
+                details={"root": str(logical_root)},
             ) from exc
         except OSError as exc:
             raise StoragePolicyError(
                 StorageReason.SCAN_IO_ERROR,
                 "storage directory could not be scanned",
-                details={"root": str(normalized), "error": type(exc).__name__},
+                details={"root": str(logical_root), "error": type(exc).__name__},
             ) from exc
 
     return TreeUsage(
-        root=str(normalized),
+        root=str(logical_root),
         bytes=total_bytes,
         files=file_count,
         links=link_count,
@@ -498,10 +503,14 @@ class StoragePolicy:
         limits: StorageLimits | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
-        self.core_root = Path(os.path.abspath(core_root))
-        self.spool_root = Path(os.path.abspath(spool_root))
+        self.core_root = Path(os.path.abspath(logical_filesystem_path(core_root)))
+        self.spool_root = Path(os.path.abspath(logical_filesystem_path(spool_root)))
         self.state_root = Path(
-            os.path.abspath(state_root if state_root is not None else self.core_root / ".storage")
+            os.path.abspath(
+                logical_filesystem_path(
+                    state_root if state_root is not None else self.core_root / ".storage"
+                )
+            )
         )
         self.limits = limits or StorageLimits()
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -521,7 +530,7 @@ class StoragePolicy:
         """
         _prepare_lock_file(self.admission_lock_path)
         lock = FileLock(
-            str(self.admission_lock_path),
+            str(internal_filesystem_path(self.admission_lock_path, force_extended=True)),
             timeout=float(self.limits.lock_timeout_seconds),
         )
         try:
@@ -1032,7 +1041,9 @@ class StoragePolicy:
             if volume_id in volume_free:
                 continue
             try:
-                volume_free[volume_id] = int(shutil.disk_usage(root).free)
+                volume_free[volume_id] = int(
+                    shutil.disk_usage(internal_filesystem_path(root, force_extended=True)).free
+                )
             except OSError as exc:
                 raise StoragePolicyError(
                     StorageReason.FILESYSTEM_QUERY_FAILED,
@@ -1053,7 +1064,10 @@ class StoragePolicy:
     @contextmanager
     def _ledger_lock(self) -> Generator[None, None, None]:
         _prepare_lock_file(self.lock_path)
-        lock = FileLock(str(self.lock_path), timeout=float(self.limits.lock_timeout_seconds))
+        lock = FileLock(
+            str(internal_filesystem_path(self.lock_path, force_extended=True)),
+            timeout=float(self.limits.lock_timeout_seconds),
+        )
         try:
             with lock:
                 _validate_private_regular_file(self.lock_path, allow_empty=True)
@@ -1067,7 +1081,7 @@ class StoragePolicy:
 
     def _read_ledger(self) -> _LedgerState:
         try:
-            os.lstat(self.ledger_path)
+            os.lstat(internal_filesystem_path(self.ledger_path, force_extended=True))
         except FileNotFoundError:
             return _LedgerState(generation=0, reservations=())
         except OSError as exc:
@@ -1097,7 +1111,9 @@ class StoragePolicy:
         temporary: Path | None = None
         try:
             descriptor, temporary_name = tempfile.mkstemp(
-                prefix=".reservations.v1.", suffix=".tmp", dir=self.state_root
+                prefix=".reservations.v1.",
+                suffix=".tmp",
+                dir=internal_filesystem_path(self.state_root, force_extended=True),
             )
             temporary = Path(temporary_name)
             try:
@@ -1203,7 +1219,11 @@ class StoragePolicy:
         for volume_id in sorted(grouped):
             members = grouped[volume_id]
             try:
-                free = int(shutil.disk_usage(members[0][1]).free)
+                free = int(
+                    shutil.disk_usage(
+                        internal_filesystem_path(members[0][1], force_extended=True)
+                    ).free
+                )
             except OSError as exc:
                 raise StoragePolicyError(
                     StorageReason.FILESYSTEM_QUERY_FAILED,
@@ -1234,15 +1254,13 @@ def _error_decision(error: StoragePolicyError) -> StorageDecision:
 
 
 def _validate_job_id(job_id: str) -> None:
-    if not _is_valid_job_id(job_id):
+    try:
+        validate_durable_record_id(job_id)
+    except (TypeError, ValueError) as error:
         raise StoragePolicyError(
             StorageReason.INVALID_REQUEST,
-            "job_id must be 1-128 safe identifier characters",
-        )
-
-
-def _is_valid_job_id(value: object) -> bool:
-    return isinstance(value, str) and _JOB_ID_PATTERN.fullmatch(value) is not None
+            "job_id must be a lowercase portable durable record ID",
+        ) from error
 
 
 def _is_non_boolean_number(value: object) -> bool:
@@ -1443,6 +1461,7 @@ def _canonical_json(value: object) -> bytes:
 
 
 def _bounded_read_regular_file(path: Path, max_bytes: int) -> bytes:
+    path = internal_filesystem_path(path, force_extended=True)
     before = _validate_private_regular_file(path, allow_empty=False)
     if before.st_size > max_bytes:
         raise StoragePolicyError(
@@ -1502,6 +1521,7 @@ def _bounded_read_regular_file(path: Path, max_bytes: int) -> bytes:
 
 
 def _validate_private_regular_file(path: Path, *, allow_empty: bool) -> os.stat_result:
+    path = internal_filesystem_path(path, force_extended=True)
     try:
         result = os.lstat(path)
     except OSError as exc:
@@ -1529,6 +1549,7 @@ def _validate_private_regular_file(path: Path, *, allow_empty: bool) -> os.stat_
 
 
 def _prepare_lock_file(path: Path) -> None:
+    path = internal_filesystem_path(path, force_extended=True)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     try:
         descriptor = os.open(path, flags, 0o600)
@@ -1549,19 +1570,21 @@ def _prepare_lock_file(path: Path) -> None:
 
 
 def _safe_lstat(path: Path, *, root: bool) -> os.stat_result:
+    logical_path = logical_filesystem_path(path)
+    path = internal_filesystem_path(path, force_extended=True)
     try:
         result = os.lstat(path)
     except OSError as exc:
         raise StoragePolicyError(
             StorageReason.SCAN_ROOT_INVALID if root else StorageReason.SCAN_CHANGED,
             "storage path could not be inspected",
-            details={"root": str(path), "error": type(exc).__name__},
+            details={"root": str(logical_path), "error": type(exc).__name__},
         ) from exc
     if _is_link_or_reparse(result):
         raise StoragePolicyError(
             StorageReason.SCAN_ROOT_INVALID if root else StorageReason.SCAN_UNSAFE_ENTRY,
             "storage path is a link or reparse point",
-            details={"root": str(path)},
+            details={"root": str(logical_path)},
         )
     return result
 
@@ -1624,6 +1647,7 @@ def _is_link_or_reparse(result: os.stat_result) -> bool:
 
 
 def _ensure_directory_no_links(path: Path) -> None:
+    path = internal_filesystem_path(path, force_extended=True)
     missing: list[Path] = []
     cursor = path
     while not cursor.exists():
@@ -1716,7 +1740,7 @@ def _reject_overlapping_roots(first: Path, second: Path) -> None:
 
 def _volume_id(path: Path, result: os.stat_result) -> str:
     if os.name == "nt":
-        drive = os.path.splitdrive(str(path))[0].casefold()
+        drive = os.path.splitdrive(str(logical_filesystem_path(path)))[0].casefold()
         return f"volume:{drive}:{int(result.st_dev)}"
     return f"device:{int(result.st_dev)}"
 
@@ -1727,6 +1751,8 @@ def _require_positive_bound(name: str, value: int) -> None:
 
 
 def _replace_file(source: Path, destination: Path) -> None:
+    source = internal_filesystem_path(source, force_extended=True)
+    destination = internal_filesystem_path(destination, force_extended=True)
     attempts = 8 if os.name == "nt" else 1
     for attempt in range(attempts):
         try:
@@ -1739,6 +1765,7 @@ def _replace_file(source: Path, destination: Path) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
+    path = internal_filesystem_path(path, force_extended=True)
     if os.name == "nt":
         return
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)

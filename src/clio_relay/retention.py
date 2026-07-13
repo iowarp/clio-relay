@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from clio_relay.core_queue import ClioCoreQueue, purge_quarantined_tree_batch
 from clio_relay.errors import QueueConflictError
+from clio_relay.identifiers import DurableRecordId, validate_durable_record_id
 from clio_relay.models import (
     TerminalJobGcPlan,
     TerminalJobGcResult,
@@ -52,11 +53,11 @@ class SpoolQuarantineReceipt(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: str = RETENTION_RECEIPT_SCHEMA
-    receipt_id: str = Field(min_length=1, max_length=128)
-    job_id: str = Field(min_length=1, max_length=256)
+    receipt_id: DurableRecordId
+    job_id: DurableRecordId
     expected_updated_at: datetime
-    source_name: str = Field(min_length=1, max_length=256)
-    quarantine_name: str = Field(min_length=1, max_length=256)
+    source_name: DurableRecordId
+    quarantine_name: DurableRecordId
     source_existed_at_prepare: bool
     source_device: int | None = Field(default=None, ge=0)
     source_inode: int | None = Field(default=None, ge=0)
@@ -75,12 +76,12 @@ class TerminalRetentionPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: str = RETENTION_PLAN_SCHEMA
-    job_id: str
+    job_id: DurableRecordId
     core_plan: TerminalJobGcPlan
     eligible: bool
     protections: list[str] = Field(default_factory=list)
     spool_path: str
-    receipt_id: str | None = None
+    receipt_id: DurableRecordId | None = None
     receipt_phase: SpoolRetentionPhase | None = None
     planned_at: datetime = Field(default_factory=utc_now)
 
@@ -123,6 +124,7 @@ class TerminalRetentionCoordinator:
         expected_updated_at: datetime | None = None,
     ) -> TerminalRetentionPlan:
         """Build a read-only retention plan without moving or deleting spool data."""
+        validate_durable_record_id(job_id)
         core_plan = self.queue.plan_terminal_job_gc(job_id)
         protections = list(core_plan.protections)
         if not _safe_component(job_id):

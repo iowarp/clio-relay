@@ -204,9 +204,11 @@ def test_remote_probe_cleanup_script_targets_real_proc_paths(monkeypatch: Monkey
         input: bytes,
         capture_output: bool,
         check: bool,
+        timeout: float,
     ) -> subprocess.CompletedProcess[bytes]:
         assert capture_output is True
         assert check is False
+        assert timeout == 120
         scripts.append(input.decode("utf-8"))
         return subprocess.CompletedProcess(
             _command,
@@ -260,10 +262,12 @@ def test_remote_probe_cleanup_rejects_failed_ssh_cleanup(monkeypatch: MonkeyPatc
         input: bytes,
         capture_output: bool,
         check: bool,
+        timeout: float,
     ) -> subprocess.CompletedProcess[bytes]:
         del input
         assert capture_output is True
         assert check is False
+        assert timeout == 120
         return subprocess.CompletedProcess(
             command,
             2,
@@ -292,6 +296,36 @@ def test_remote_probe_cleanup_rejects_failed_ssh_cleanup(monkeypatch: MonkeyPatc
     assert connector.outcome == "residual"
     assert connector.observed_state == "residual"
     assert connector.residual is True
+
+
+def test_remote_probe_cleanup_timeout_preserves_unverified_evidence(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    def timed_out(
+        command: list[str],
+        *,
+        input: bytes,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input, capture_output, check
+        raise subprocess.TimeoutExpired(command, timeout)
+
+    monkeypatch.setattr(transport_probe.subprocess, "run", timed_out)
+
+    with pytest.raises(RelayError, match="timed out after 120 seconds") as exc_info:
+        transport_probe._cleanup_remote_probe(  # pyright: ignore[reportPrivateUsage]
+            definition=_frp_cluster_definition(),
+            probe_id="timed-out-cleanup",
+        )
+
+    evidence_line = transport_evidence_lines_from_error(exc_info.value)[0]
+    evidence = parse_transport_probe_evidence(evidence_line.partition("=")[2])
+    assert evidence.cleanup_mode == "transport_probe_teardown"
+    assert evidence.resources[0].outcome == "unknown"
+    assert evidence.resources[0].ownership_verified is False
+    assert evidence.resources[0].residual is True
 
 
 def test_frp_http_probe_rejects_dead_visitor_even_if_local_healthz_passes(

@@ -542,11 +542,16 @@ def terminate_process_tree(
         )
 
 
-def terminate_nested_process(process: subprocess.Popen[str]) -> None:
+def terminate_nested_process(
+    process: subprocess.Popen[str],
+    *,
+    timeout_seconds: float = TERMINATION_TIMEOUT_SECONDS,
+) -> None:
     """Terminate a child from an embedded runner without killing its relay parent."""
     terminate_process_tree(
         process,
         owns_group=not inherited_relay_containment(),
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -621,6 +626,33 @@ def process_start_identity(process_id: int) -> str | None:
     return None
 
 
+def _terminate_recorded_windows_process_tree(
+    process_id: int,
+    expected_start_identity: str,
+) -> None:
+    try:
+        result = subprocess.run(
+            ["taskkill", "/PID", str(process_id), "/T", "/F"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=TERMINATION_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"could not terminate recorded process {process_id}: {exc}") from exc
+    observed_identity = process_start_identity(process_id)
+    if observed_identity is None:
+        return
+    if observed_identity != expected_start_identity:
+        raise RuntimeError(
+            f"refused cleanup for reused process id {process_id}: "
+            f"expected {expected_start_identity}, observed {observed_identity}"
+        )
+    detail = (result.stderr or "").strip()
+    suffix = f": {detail}" if detail else ""
+    raise RuntimeError(f"recorded process survived cleanup: {process_id}{suffix}")
+
+
 def terminate_recorded_process_tree(
     *,
     process_id: int,
@@ -660,22 +692,7 @@ def terminate_recorded_process_tree(
     if os.name == "nt":
         if observed_identity is None:
             return
-        try:
-            result = subprocess.run(
-                ["taskkill", "/PID", str(process_id), "/T", "/F"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=TERMINATION_TIMEOUT_SECONDS,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise RuntimeError(f"could not terminate recorded process {process_id}: {exc}") from exc
-        if result.returncode not in {0, 128}:
-            raise RuntimeError(
-                result.stderr.strip() or f"taskkill failed for recorded process {process_id}"
-            )
-        if process_start_identity(process_id) is not None:
-            raise RuntimeError(f"recorded process survived cleanup: {process_id}")
+        _terminate_recorded_windows_process_tree(process_id, expected_start_identity)
         return
     if process_group_id is None or process_group_id <= 0:
         raise RuntimeError("recorded POSIX execution has no process-group identity")

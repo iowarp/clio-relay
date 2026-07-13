@@ -45,6 +45,7 @@ from clio_relay.validation_report import (
 MAX_REMOTE_CLEANUP_OUTPUT_BYTES = 1024 * 1024
 MAX_REMOTE_CLEANUP_RESOURCES = 128
 MAX_TRANSPORT_ERROR_EVIDENCE_LINES = 16
+REMOTE_PROBE_CLEANUP_TIMEOUT_SECONDS = 120.0
 
 
 class _RemoteCleanupResource(BaseModel):
@@ -1515,12 +1516,29 @@ if errors or residuals:
     raise SystemExit(2)
 __CLIO_RELAY_CLEANUP_PROBE__
 """
-    result = subprocess.run(
-        ["ssh", definition.ssh_host, "bash", "-s"],
-        input=script.encode("utf-8"),
-        capture_output=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["ssh", definition.ssh_host, "bash", "-s"],
+            input=script.encode("utf-8"),
+            capture_output=True,
+            check=False,
+            timeout=REMOTE_PROBE_CLEANUP_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        detail = (
+            "remote cleanup command timed out after "
+            f"{REMOTE_PROBE_CLEANUP_TIMEOUT_SECONDS:g} seconds"
+            if isinstance(exc, subprocess.TimeoutExpired)
+            else f"remote cleanup command could not start: {exc}"
+        )
+        evidence_line = _unverified_remote_cleanup_evidence_line(
+            cluster=cluster or definition.name,
+            definition=definition,
+            probe_id=probe_id,
+            detail=detail,
+        )
+        error = RelayError(f"remote transport cleanup failed for {probe_id}: {detail}")
+        raise _attach_transport_evidence(error, [evidence_line]) from exc
     if (
         len(result.stdout) > MAX_REMOTE_CLEANUP_OUTPUT_BYTES
         or len(result.stderr) > MAX_REMOTE_CLEANUP_OUTPUT_BYTES

@@ -24,6 +24,7 @@ from clio_relay.core_queue import (
     ClioCoreQueue,
 )
 from clio_relay.errors import NotFoundError, QueueConflictError, RelayError
+from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
 from clio_relay.models import (
     TERMINAL_STATES,
     JobKind,
@@ -84,6 +85,8 @@ class StorageRuntimeConfig:
     limits: StorageLimits
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "core_root", logical_filesystem_path(self.core_root))
+        object.__setattr__(self, "spool_root", logical_filesystem_path(self.spool_root))
         for name in (
             "max_log_bytes_per_job",
             "job_core_allowance_bytes",
@@ -134,8 +137,14 @@ class StorageRuntime:
         policy: StoragePolicy | None = None,
     ) -> None:
         self.config = config
-        config.core_root.mkdir(parents=True, exist_ok=True)
-        config.spool_root.mkdir(parents=True, exist_ok=True)
+        internal_filesystem_path(config.core_root, force_extended=True).mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        internal_filesystem_path(config.spool_root, force_extended=True).mkdir(
+            parents=True,
+            exist_ok=True,
+        )
         self.policy = policy or StoragePolicy(
             config.core_root,
             config.spool_root,
@@ -500,7 +509,7 @@ class StorageManagedQueue(ClioCoreQueue):
             if global_lease_total >= MAX_LIVE_LEASE_RECORDS:
                 return None
             queued_jobs, truncated = self._scan_many(  # pyright: ignore[reportPrivateUsage]
-                self.root / "jobs_queued",
+                self._storage_root / "jobs_queued",  # pyright: ignore[reportPrivateUsage]
                 RelayJob,
                 limit=MAX_ACTIVE_JOB_RECORDS,
             )

@@ -22,6 +22,22 @@ class ApplicationProfile(Protocol):
         ...
 
 
+def _validate_ssh_destination(value: str) -> None:
+    """Reject destinations that SSH could interpret as options or multiple tokens."""
+    if (
+        not value
+        or value != value.strip()
+        or value.startswith("-")
+        or any(
+            character.isspace() or ord(character) < 32 or ord(character) == 127
+            for character in value
+        )
+    ):
+        raise ConfigurationError(
+            "ssh host must be one non-option destination without whitespace or controls"
+        )
+
+
 def load_application_profile(name: str) -> ApplicationProfile:
     """Load an explicitly selected application profile by entry-point name."""
     normalized = name.strip().lower()
@@ -49,6 +65,7 @@ def render_cluster_app_install_script(*, app_name: str) -> str:
 
 def install_cluster_app_over_ssh(*, ssh_host: str, app_name: str) -> list[str]:
     """Install an explicit application profile on a cluster over SSH."""
+    _validate_ssh_destination(ssh_host)
     if shutil.which("ssh") is None:
         raise ConfigurationError("ssh is required for remote app installation")
     script = render_cluster_app_install_script(app_name=app_name)

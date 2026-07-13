@@ -25,6 +25,61 @@ def test_embedded_containment_source_is_an_exact_isolated_runtime_mirror() -> No
     assert embedded.read_bytes() == source.read_bytes()
 
 
+def test_windows_recorded_cleanup_accepts_taskkill_failure_only_after_pid_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private = cast(Any, process_containment)
+    commands: list[list[str]] = []
+
+    def failed_taskkill(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            "",
+            "ERROR: There is no running instance of the task.",
+        )
+
+    def absent_after_taskkill(process_id: int) -> None:
+        assert process_id == 4312
+        return None
+
+    monkeypatch.setattr(process_containment.subprocess, "run", failed_taskkill)
+    monkeypatch.setattr(process_containment, "process_start_identity", absent_after_taskkill)
+
+    private._terminate_recorded_windows_process_tree(4312, "windows-start:expected")
+
+    assert commands == [["taskkill", "/PID", "4312", "/T", "/F"]]
+
+
+@pytest.mark.parametrize(
+    ("observed_identity", "error_match"),
+    [
+        ("windows-start:expected", "recorded process survived cleanup: 4312"),
+        ("windows-start:replacement", "refused cleanup for reused process id 4312"),
+    ],
+)
+def test_windows_recorded_cleanup_refuses_surviving_or_reused_pid(
+    observed_identity: str,
+    error_match: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private = cast(Any, process_containment)
+
+    def failed_taskkill(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 1, "", "taskkill failed")
+
+    def observed_after_taskkill(process_id: int) -> str:
+        assert process_id == 4312
+        return observed_identity
+
+    monkeypatch.setattr(process_containment.subprocess, "run", failed_taskkill)
+    monkeypatch.setattr(process_containment, "process_start_identity", observed_after_taskkill)
+
+    with pytest.raises(RuntimeError, match=error_match):
+        private._terminate_recorded_windows_process_tree(4312, "windows-start:expected")
+
+
 def test_secret_memory_gate_is_verified_or_explicitly_unsupported() -> None:
     if not sys.platform.startswith("linux"):
         with pytest.raises(RuntimeError, match="requires Linux PR_SET_DUMPABLE"):

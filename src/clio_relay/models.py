@@ -10,6 +10,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from clio_relay.identifiers import DurableRecordId, validate_durable_record_id
+
 RELAY_CREDENTIAL_ENV_NAMES = frozenset(
     {
         "CLIO_RELAY_API_TOKEN",
@@ -55,8 +57,8 @@ def utc_now() -> datetime:
 
 
 def new_id(prefix: str) -> str:
-    """Create a readable relay identifier."""
-    return f"{prefix}_{uuid4().hex}"
+    """Create a readable portable relay identifier."""
+    return validate_durable_record_id(f"{prefix}_{uuid4().hex}")
 
 
 class EndpointRole(StrEnum):
@@ -168,7 +170,7 @@ class EndpointRegistration(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    endpoint_id: str = Field(default_factory=lambda: new_id("endpoint"))
+    endpoint_id: DurableRecordId = Field(default_factory=lambda: new_id("endpoint"))
     role: EndpointRole
     cluster: str | None = None
     hostname: str
@@ -204,7 +206,7 @@ class SchedulerCancelPending(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: str = "clio-relay.scheduler-cancel-pending.v1"
-    job_id: str = Field(min_length=1, max_length=256)
+    job_id: DurableRecordId
     cluster: str = Field(min_length=1, max_length=256)
     requested_at: datetime = Field(default_factory=utc_now)
     reason: str = Field(default="operator_request", min_length=1, max_length=256)
@@ -244,8 +246,8 @@ class OwnerSessionJobMembership(BaseModel):
 
     schema_version: str = "clio-relay.owner-session-job-membership.v1"
     owner_session_id: str = Field(min_length=1, max_length=256)
-    session_generation_id: str | None = Field(default=None, min_length=1, max_length=256)
-    job_id: str = Field(min_length=1, max_length=256)
+    session_generation_id: DurableRecordId | None = None
+    job_id: DurableRecordId
     cluster: str = Field(min_length=1, max_length=256)
     state: JobState
     created_at: datetime
@@ -378,7 +380,7 @@ class RelayJob(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    job_id: str = Field(default_factory=lambda: new_id("job"))
+    job_id: DurableRecordId = Field(default_factory=lambda: new_id("job"))
     cluster: str
     kind: JobKind
     state: JobState = JobState.QUEUED
@@ -399,8 +401,8 @@ class RelayTask(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    task_id: str = Field(default_factory=lambda: new_id("task"))
-    job_id: str
+    task_id: DurableRecordId = Field(default_factory=lambda: new_id("task"))
+    job_id: DurableRecordId
     sequence: int | None = Field(default=None, ge=1)
     name: str
     state: JobState = JobState.QUEUED
@@ -443,7 +445,7 @@ class RelayEvent(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    job_id: str
+    job_id: DurableRecordId
     seq: int
     event_type: str
     message: str
@@ -457,14 +459,14 @@ class TaskTimelineEvent(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    task_id: str
+    task_id: DurableRecordId
     seq: int = Field(default=0, ge=0)
     event_type: str
     label: str
     status: TaskEventStatus = TaskEventStatus.RUNNING
     summary: str
     detail: str | None = None
-    artifact_refs: list[str] = Field(default_factory=list)
+    artifact_refs: list[DurableRecordId] = Field(default_factory=list)
     path_refs: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -483,8 +485,8 @@ class ArtifactRef(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    artifact_id: str = Field(default_factory=lambda: new_id("artifact"))
-    job_id: str
+    artifact_id: DurableRecordId = Field(default_factory=lambda: new_id("artifact"))
+    job_id: DurableRecordId
     sequence: int | None = Field(default=None, ge=1)
     uri: str
     kind: str
@@ -499,8 +501,8 @@ class ProgressRecord(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    progress_id: str = Field(default_factory=lambda: new_id("progress"))
-    job_id: str
+    progress_id: DurableRecordId = Field(default_factory=lambda: new_id("progress"))
+    job_id: DurableRecordId
     sequence: int | None = Field(default=None, ge=1)
     label: str = "progress"
     current: float | None = None
@@ -531,8 +533,8 @@ class MonitorRule(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    rule_id: str = Field(default_factory=lambda: new_id("rule"))
-    job_id: str
+    rule_id: DurableRecordId = Field(default_factory=lambda: new_id("rule"))
+    job_id: DurableRecordId
     pattern: str
     action: MonitorRuleAction = MonitorRuleAction.EMIT_EVENT
     event_types: list[str] = Field(default_factory=list)
@@ -549,7 +551,7 @@ class GatewaySession(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    session_id: str = Field(default_factory=lambda: new_id("gateway"))
+    session_id: DurableRecordId = Field(default_factory=lambda: new_id("gateway"))
     cluster: str
     name: str
     state: GatewaySessionState = GatewaySessionState.CREATED
@@ -596,7 +598,7 @@ class TerminalJobGcPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: str = "clio-relay.terminal-job-gc-plan.v1"
-    job_id: str
+    job_id: DurableRecordId
     expected_updated_at: datetime
     eligible: bool
     protections: list[str] = Field(default_factory=list)
@@ -609,7 +611,7 @@ class JobTombstone(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: str = "clio-relay.job-tombstone.v1"
-    job_id: str
+    job_id: DurableRecordId
     cluster: str
     kind: JobKind
     final_state: JobState
@@ -650,13 +652,9 @@ class OwnerSessionClosure(BaseModel):
 
     schema_version: str = "clio-relay.owner-session-closure.v1"
     owner_session_id: str = Field(min_length=1, max_length=256)
-    session_generation_id: str | None = Field(default=None, min_length=1, max_length=256)
-    covered_by_session_generation_id: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=256,
-    )
-    covered_legacy_job_ids: list[str] = Field(default_factory=list, max_length=1_000)
+    session_generation_id: DurableRecordId | None = None
+    covered_by_session_generation_id: DurableRecordId | None = None
+    covered_legacy_job_ids: list[DurableRecordId] = Field(default_factory=list, max_length=1_000)
     residual_resource_ids: list[str] = Field(default_factory=list, max_length=1_000)
     closed_at: datetime = Field(default_factory=utc_now)
 
@@ -673,14 +671,6 @@ class OwnerSessionClosure(BaseModel):
             raise ValueError("legacy closure requires at least one exact job id")
         if self.covered_legacy_job_ids != sorted(set(self.covered_legacy_job_ids)):
             raise ValueError("legacy closure job ids must be unique and sorted")
-        if any(
-            not job_id
-            or len(job_id) > 256
-            or job_id in {".", ".."}
-            or any(not (character.isalnum() or character in "-_.") for character in job_id)
-            for job_id in self.covered_legacy_job_ids
-        ):
-            raise ValueError("legacy closure contains an unsafe job id")
         if self.residual_resource_ids:
             raise ValueError("legacy closure cannot retain residual resources")
         return self
@@ -698,6 +688,7 @@ class ServiceRuntimeSpec(BaseModel):
     deployment_driver: str = "jarvis"
     service_port: int = Field(gt=0, le=65535)
     health_path: str = "/healthz"
+    health_expected_body: str | None = Field(default=None, max_length=4096)
     stream_mode: str = "push"
     stream_path: str | None = "/stream"
     event_stream_path: str | None = "/events"
@@ -769,6 +760,17 @@ class ServiceRuntimeSpec(BaseModel):
             raise ValueError("service runtime HTTP paths must start with /")
         return value
 
+    @field_validator("health_expected_body")
+    @classmethod
+    def service_runtime_health_body_must_not_be_empty(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        """Reject an empty exact health-response body assertion."""
+        if value == "":
+            raise ValueError("health_expected_body must not be empty")
+        return value
+
     @field_validator("compatibility_paths")
     @classmethod
     def service_runtime_compatibility_paths_must_be_absolute(
@@ -789,7 +791,7 @@ class Cursor(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    job_id: str
+    job_id: DurableRecordId
     next_seq: int = Field(default=1, ge=1)
 
 
@@ -798,9 +800,9 @@ class Lease(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    lease_id: str = Field(default_factory=lambda: new_id("lease"))
-    job_id: str
-    endpoint_id: str
+    lease_id: DurableRecordId = Field(default_factory=lambda: new_id("lease"))
+    job_id: DurableRecordId
+    endpoint_id: DurableRecordId
     acquired_at: datetime = Field(default_factory=utc_now)
     expires_at: datetime
 

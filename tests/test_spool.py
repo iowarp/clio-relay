@@ -10,6 +10,7 @@ from typing import BinaryIO, cast
 import pytest
 
 import clio_relay.spool as spool_module
+from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.models import JarvisRunSpec, JobKind, RelayJob
 from clio_relay.spool import (
     ARTIFACT_OWNERSHIP_SCHEMA,
@@ -25,6 +26,51 @@ def _job(key: str = "spool-test") -> RelayJob:
         spec=JarvisRunSpec(command=["true"]),
         idempotency_key=key,
     )
+
+
+def test_operator_configured_long_spool_root_preserves_artifact_provenance(
+    tmp_path: Path,
+) -> None:
+    """Spool and artifact I/O may use extended paths without exposing them."""
+    root = tmp_path.joinpath(*(f"operator-spool-{index}-{'x' * 72}" for index in range(3)))
+    job = _job("long-spool-root")
+    spool = JobSpool(root, job)
+    spool.initialize()
+    pipeline = spool.write_pipeline("name: long-path\n")
+    spool.append_stdout("completed\n")
+
+    artifact = spool.artifact_for(pipeline, kind="jarvis_pipeline")
+    text, _, eof = spool.read_log("stdout")
+    reopened = JobSpool(internal_filesystem_path(root, force_extended=True), job)
+
+    assert spool.root == root
+    assert reopened.root == root.absolute()
+    assert pipeline == spool.path / "pipeline.yaml"
+    assert artifact.uri == pipeline.absolute().as_uri()
+    assert "\\\\?\\" not in artifact.uri
+    assert artifact.metadata["owned_root_uri"] == spool.path.absolute().as_uri()
+    assert text == "completed\n"
+    assert eof is True
+    assert internal_filesystem_path(pipeline).read_text(encoding="utf-8") == ("name: long-path\n")
+
+
+def test_long_spool_errors_expose_only_logical_paths(tmp_path: Path) -> None:
+    """Durable spool diagnostics never expose the private Windows namespace."""
+    root = tmp_path.joinpath(*(f"error-spool-{index}-{'x' * 72}" for index in range(3)))
+    spool = JobSpool(
+        root,
+        _job("long-spool-error"),
+        max_log_bytes_per_stream=4,
+        max_log_bytes_per_job=8,
+    )
+    internal_filesystem_path(spool.path, force_extended=True).mkdir(parents=True)
+    internal_filesystem_path(spool.path / "stdout.log").write_bytes(b"oversized")
+
+    with pytest.raises(RuntimeError, match="stream quota") as caught:
+        spool.initialize()
+
+    assert "\\\\?\\" not in str(caught.value)
+    assert str(spool.path / "stdout.log") in str(caught.value)
 
 
 def test_spool_enforces_stream_and_job_byte_quotas_without_splitting_utf8(

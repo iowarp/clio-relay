@@ -11,6 +11,7 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from clio_relay.identifiers import DurableRecordId
 from clio_relay.spool import (
     DEFAULT_MAX_LOG_BYTES_PER_JOB,
     DEFAULT_MAX_LOG_BYTES_PER_STREAM,
@@ -104,7 +105,7 @@ class RelaySettings(BaseModel):
     frpc_bin: str = "frpc"
     api_token: str | None = None
     owner_session_id: str | None = None
-    owner_session_generation_id: str | None = None
+    owner_session_generation_id: DurableRecordId | None = None
     agent_bin: str = "agent"
     agent_adapter: str = "exec"
     agent_args: list[str] = Field(default_factory=list)

@@ -8,7 +8,10 @@ from pathlib import Path
 import pytest
 from pytest import MonkeyPatch
 
-from clio_relay.application_profiles import load_application_profile
+from clio_relay.application_profiles import (
+    install_cluster_app_over_ssh,
+    load_application_profile,
+)
 from clio_relay.errors import ConfigurationError
 from clio_relay.progress_adapters import package_progress_adapter_from_pipeline
 from tests.plugin_fakes import (
@@ -88,3 +91,18 @@ def test_application_and_progress_behavior_load_through_external_plugins(
 def test_missing_external_application_profile_fails_closed() -> None:
     with pytest.raises(ConfigurationError, match="unsupported cluster app profile"):
         load_application_profile("missing-site-stack")
+
+
+@pytest.mark.parametrize(
+    "ssh_host",
+    [
+        "-oProxyCommand=malicious-command",
+        "host with-space",
+        "host\nsecond-command",
+        "\x7fhost",
+        "",
+    ],
+)
+def test_cluster_app_install_rejects_unsafe_ssh_destination(ssh_host: str) -> None:
+    with pytest.raises(ConfigurationError, match="ssh host must be one non-option"):
+        install_cluster_app_over_ssh(ssh_host=ssh_host, app_name="site-stack")

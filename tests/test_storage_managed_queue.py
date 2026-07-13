@@ -90,6 +90,32 @@ def _resolve_as(
     )
 
 
+def test_managed_queue_acquires_from_long_operator_configured_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Storage admission and queued-index scans share the safe internal root."""
+    configured_root = tmp_path.joinpath(
+        *(f"operator-storage-{index}-{'x' * 72}" for index in range(3))
+    )
+    queue = storage_managed_queue(_settings(configured_root))
+    intent = _job("long-managed-queue")
+    _resolve_as(
+        queue,
+        monkeypatch,
+        state="new",
+        canonical_job_id=intent.job_id,
+        existing_job=None,
+    )
+
+    submitted = queue.submit_job(intent)
+    lease = queue.acquire_next_job("long-managed-worker", cluster=intent.cluster)
+
+    assert queue.root == configured_root / "core"
+    assert lease is not None
+    assert lease.job_id == submitted.job_id
+
+
 def test_managed_queue_reserves_before_new_admission_and_releases_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

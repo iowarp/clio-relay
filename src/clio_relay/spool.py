@@ -15,6 +15,11 @@ from typing import Any, BinaryIO, Literal, NotRequired, TypedDict, cast
 
 from filelock import FileLock
 
+from clio_relay.filesystem_paths import (
+    internal_filesystem_path,
+    logical_filesystem_path,
+    logical_filesystem_text,
+)
 from clio_relay.models import ArtifactRef, RelayJob
 
 MAX_LOG_READ_BYTES = 1_048_576
@@ -98,9 +103,10 @@ class JobSpool:
             raise ValueError("max_log_bytes_per_stream must be positive")
         if max_log_bytes_per_job <= 0:
             raise ValueError("max_log_bytes_per_job must be positive")
-        self.root = root
+        self.root = logical_filesystem_path(root)
         self.job = job
-        self.path = root / job.job_id
+        self.path = self.root / job.job_id
+        self._storage_path = internal_filesystem_path(self.path, force_extended=True)
         self.max_log_bytes_per_stream = max_log_bytes_per_stream
         self.max_log_bytes_per_job = max_log_bytes_per_job
 
@@ -111,13 +117,13 @@ class JobSpool:
 
     def initialize(self) -> None:
         """Create metadata and log files for a job spool."""
-        self.path.mkdir(parents=True, exist_ok=True)
-        (self.path / "metadata.json").write_text(
+        self._storage_path.mkdir(parents=True, exist_ok=True)
+        (self._storage_path / "metadata.json").write_text(
             self.job.model_dump_json(indent=2),
             encoding="utf-8",
         )
         for name in ("events.jsonl", "stdout.log", "stderr.log", "artifacts.jsonl"):
-            target = self.path / name
+            target = self._storage_path / name
             if not target.exists():
                 target.write_text("", encoding="utf-8")
         with self._capture_lock():
@@ -127,19 +133,25 @@ class JobSpool:
     def write_pipeline(self, yaml_text: str) -> Path:
         """Write the materialized JARVIS pipeline for this job."""
         target = self.path / "pipeline.yaml"
-        target.write_text(yaml_text, encoding="utf-8")
+        (self._storage_path / target.name).write_text(yaml_text, encoding="utf-8")
         return target
 
     def write_provenance(self, provenance: dict[str, Any]) -> Path:
         """Write a relay execution provenance manifest."""
         target = self.path / "provenance.json"
-        target.write_text(json.dumps(provenance, indent=2, sort_keys=True), encoding="utf-8")
+        (self._storage_path / target.name).write_text(
+            json.dumps(provenance, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
         return target
 
     def write_runtime_metadata(self, metadata: dict[str, Any]) -> Path:
         """Write the normalized JARVIS runtime metadata manifest."""
         target = self.path / "runtime-metadata.json"
-        target.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+        (self._storage_path / target.name).write_text(
+            json.dumps(metadata, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
         return target
 
     def append_stdout(self, text: str) -> LogAppendResult:
@@ -177,7 +189,10 @@ class JobSpool:
             }
             self._write_capture_state_unlocked(state)
             if accepted_payload:
-                with _open_owned_log(self.path / f"{stream_name}.log", mode="ab") as stream:
+                with _open_owned_log(
+                    self._storage_path / f"{stream_name}.log",
+                    mode="ab",
+                ) as stream:
                     stream.write(accepted_payload)
                     stream.flush()
                     os.fsync(stream.fileno())
@@ -246,7 +261,7 @@ class JobSpool:
             raise ValueError("limit must be positive")
         if limit > MAX_LOG_READ_BYTES:
             raise ValueError(f"limit cannot exceed {MAX_LOG_READ_BYTES} bytes")
-        path = self.path / f"{stream_name}.log"
+        path = self._storage_path / f"{stream_name}.log"
         if not path.exists():
             return "", offset, True
         with _open_owned_log(path, mode="rb") as stream:
@@ -275,19 +290,22 @@ class JobSpool:
 
     def _capture_lock(self) -> FileLock:
         return FileLock(
-            str(self.path / ".log-capture.lock"),
+            str(self._storage_path / ".log-capture.lock"),
             timeout=LOG_CAPTURE_LOCK_TIMEOUT_SECONDS,
         )
 
     def _load_capture_state_unlocked(self) -> _LogCaptureState:
-        if not self.log_capture_path.exists():
+        storage_capture_path = self._storage_path / self.log_capture_path.name
+        if not storage_capture_path.exists():
             streams: dict[str, _StreamCaptureState] = {}
             for name in ("stdout", "stderr"):
-                path = self.path / f"{name}.log"
+                path = self._storage_path / f"{name}.log"
                 persisted_bytes = _owned_log_size(path) if path.exists() else 0
                 if persisted_bytes > self.max_log_bytes_per_stream:
                     raise RuntimeError(
-                        f"existing {name} log exceeds the configured stream quota: {path}"
+                        "existing "
+                        f"{name} log exceeds the configured stream quota: "
+                        f"{logical_filesystem_path(path)}"
                     )
                 streams[name] = {
                     "observed_bytes": persisted_bytes,
@@ -309,7 +327,7 @@ class JobSpool:
                 "streams": streams,
             }
         try:
-            raw = json.loads(self.log_capture_path.read_text(encoding="utf-8"))
+            raw = json.loads(storage_capture_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RuntimeError(
                 f"invalid log capture state: {self.log_capture_path}: {exc}"
@@ -325,11 +343,12 @@ class JobSpool:
             )
         self._recover_pending_capture_unlocked(state)
         for name in ("stdout", "stderr"):
-            path = self.path / f"{name}.log"
+            path = self._storage_path / f"{name}.log"
             actual_size = _owned_log_size(path) if path.exists() else 0
             if actual_size != state["streams"][name]["persisted_bytes"]:
                 raise RuntimeError(
-                    f"log capture state does not match {path}: expected "
+                    "log capture state does not match "
+                    f"{logical_filesystem_path(path)}: expected "
                     f"{state['streams'][name]['persisted_bytes']} bytes, found {actual_size}"
                 )
         return state
@@ -343,7 +362,7 @@ class JobSpool:
         before = pending["before_persisted_bytes"]
         if stream_state["persisted_bytes"] != before:
             raise RuntimeError(f"invalid pending log capture baseline: {self.log_capture_path}")
-        path = self.path / f"{stream_name}.log"
+        path = self._storage_path / f"{stream_name}.log"
         actual_size = _owned_log_size(path) if path.exists() else 0
         accepted = pending["accepted_bytes"]
         if actual_size == before + accepted:
@@ -354,7 +373,8 @@ class JobSpool:
             dropped = pending["observed_bytes"]
         else:
             raise RuntimeError(
-                f"pending log capture cannot reconcile {path}: expected {before} or "
+                "pending log capture cannot reconcile "
+                f"{logical_filesystem_path(path)}: expected {before} or "
                 f"{before + accepted} bytes, found {actual_size}"
             )
         stream_state["observed_bytes"] += pending["observed_bytes"]
@@ -365,14 +385,15 @@ class JobSpool:
         self._write_capture_state_unlocked(state)
 
     def _write_capture_state_unlocked(self, state: _LogCaptureState) -> None:
-        temporary = self.path / f".log-capture-{secrets.token_hex(8)}.tmp"
+        storage_capture_path = self._storage_path / self.log_capture_path.name
+        temporary = self._storage_path / f".log-capture-{secrets.token_hex(8)}.tmp"
         try:
             with temporary.open("w", encoding="utf-8", newline="\n") as stream:
                 json.dump(state, stream, indent=2, sort_keys=True)
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())
-            temporary.replace(self.log_capture_path)
+            temporary.replace(storage_capture_path)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -386,7 +407,10 @@ def _open_owned_log(
     try:
         before = os.lstat(path)
     except OSError as exc:
-        raise RuntimeError(f"cannot inspect owned log {path}: {exc}") from exc
+        raise RuntimeError(
+            "cannot inspect owned log "
+            f"{logical_filesystem_path(path)}: {logical_filesystem_text(str(exc))}"
+        ) from exc
     _validate_owned_log_stat(before, path=path)
     flags = os.O_RDONLY if mode == "rb" else os.O_WRONLY | os.O_APPEND
     flags |= getattr(os, "O_BINARY", 0)
@@ -394,17 +418,23 @@ def _open_owned_log(
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
-        raise RuntimeError(f"cannot open owned log {path}: {exc}") from exc
+        raise RuntimeError(
+            "cannot open owned log "
+            f"{logical_filesystem_path(path)}: {logical_filesystem_text(str(exc))}"
+        ) from exc
     try:
         opened = os.fstat(descriptor)
         _validate_owned_log_stat(opened, path=path)
         try:
             after = os.lstat(path)
         except OSError as exc:
-            raise RuntimeError(f"owned log changed while opening {path}: {exc}") from exc
+            raise RuntimeError(
+                "owned log changed while opening "
+                f"{logical_filesystem_path(path)}: {logical_filesystem_text(str(exc))}"
+            ) from exc
         _validate_owned_log_stat(after, path=path)
         if not os.path.samestat(before, opened) or not os.path.samestat(opened, after):
-            raise RuntimeError(f"owned log changed while opening: {path}")
+            raise RuntimeError(f"owned log changed while opening: {logical_filesystem_path(path)}")
         with os.fdopen(descriptor, mode) as stream:
             descriptor = -1
             yield stream
@@ -415,9 +445,9 @@ def _open_owned_log(
 
 def _validate_owned_log_stat(file_stat: os.stat_result, *, path: Path) -> None:
     if not stat.S_ISREG(file_stat.st_mode):
-        raise RuntimeError(f"owned log is not a regular file: {path}")
+        raise RuntimeError(f"owned log is not a regular file: {logical_filesystem_path(path)}")
     if file_stat.st_nlink != 1:
-        raise RuntimeError(f"owned log must not be hard linked: {path}")
+        raise RuntimeError(f"owned log must not be hard linked: {logical_filesystem_path(path)}")
 
 
 def _owned_log_size(path: Path) -> int:
@@ -507,11 +537,21 @@ def _open_owned_regular_file(
         raise RuntimeError(f"owned file is outside its root {root}: {target}") from exc
     if relative == Path(".") or not relative.parts:
         raise RuntimeError(f"owned file path names the root directory: {target}")
+    storage_root = internal_filesystem_path(root, force_extended=True)
+    storage_target = internal_filesystem_path(target)
     if os.open in os.supports_dir_fd and os.stat in os.supports_dir_fd:
-        with _open_owned_regular_file_dirfd(root, relative, target=target) as stream:
+        with _open_owned_regular_file_dirfd(
+            storage_root,
+            relative,
+            target=storage_target,
+        ) as stream:
             yield stream
         return
-    with _open_owned_regular_file_path(root, relative, target=target) as stream:
+    with _open_owned_regular_file_path(
+        storage_root,
+        relative,
+        target=storage_target,
+    ) as stream:
         yield stream
 
 

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 import clio_relay.storage_policy as storage_module
+from clio_relay.filesystem_paths import logical_filesystem_path
 from clio_relay.storage_policy import (
     StorageLimits,
     StoragePolicy,
@@ -470,7 +471,7 @@ def test_dangling_or_linked_ledger_is_not_treated_as_absent(
     link_stat = os.stat_result((stat.S_IFLNK | 0o777, 0, 0, 1, 0, 0, 8, 0, 0, 0))
 
     def lstat(path: os.PathLike[str] | str) -> os.stat_result:
-        if os.path.abspath(path) == os.path.abspath(policy.ledger_path):
+        if logical_filesystem_path(Path(path)) == policy.ledger_path:
             return link_stat
         return real_lstat(path)
 

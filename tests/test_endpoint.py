@@ -26,6 +26,8 @@ from clio_relay.config import RelaySettings
 from clio_relay.core_queue import DEFAULT_EXACT_RECORD_LIMIT, ClioCoreQueue
 from clio_relay.endpoint import EndpointWorker
 from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
+from clio_relay.jarvis_execution import run_native_jarvis_broker
 from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.models import (
     Cursor,
@@ -59,6 +61,84 @@ def _write_anchored_sidecar(path: Path, payload: str = "owned\n") -> dict[str, i
     if anchor.descriptor is not None:
         os.close(anchor.descriptor)
     return metadata
+
+
+def test_runtime_sidecar_supports_long_operator_configured_spool_root(
+    tmp_path: Path,
+) -> None:
+    """Endpoint-owned sidecars work past MAX_PATH without leaking the prefix."""
+    spool = tmp_path.joinpath(*(f"operator-sidecar-{index}-{'x' * 72}" for index in range(3)))
+    internal_filesystem_path(spool, force_extended=True).mkdir(parents=True)
+    sidecar = spool / ".runtime-metadata-owned.jsonl"
+    private = cast(Any, endpoint_module)
+    anchor = private._precreate_runtime_sidecar(sidecar)
+    try:
+        internal_filesystem_path(sidecar).write_text(
+            "owned\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        summary = private._file_summary(sidecar)
+    finally:
+        if anchor.descriptor is not None:
+            os.close(anchor.descriptor)
+
+    assert summary["path"] == str(sidecar)
+    assert summary["exists"] is True
+    assert summary["size_bytes"] == len(b"owned\n")
+    assert "\\\\?\\" not in str(summary)
+
+
+def test_native_jarvis_cwd_rejects_long_and_unc_windows_paths(tmp_path: Path) -> None:
+    """Native JARVIS cannot silently launch from a different Windows directory."""
+    private = cast(Any, endpoint_module)
+    assert private._validated_native_subprocess_cwd(tmp_path) == tmp_path
+    long_cwd = tmp_path.joinpath(*(f"native-{index}-{'x' * 72}" for index in range(3)))
+    unc_cwd = Path(r"\\storage.example\relay\checkout")
+    if os.name != "nt":
+        assert private._validated_native_subprocess_cwd(long_cwd) == long_cwd
+        assert private._validated_native_subprocess_cwd(unc_cwd) == unc_cwd
+        return
+
+    with pytest.raises(ConfigurationError, match="path bound"):
+        private._validated_native_subprocess_cwd(long_cwd)
+    with pytest.raises(ConfigurationError, match="must not use UNC"):
+        private._validated_native_subprocess_cwd(unc_cwd)
+
+
+def test_worker_failure_persists_only_logical_windows_paths(tmp_path: Path) -> None:
+    """Worker failure state and events must not persist private path namespaces."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="configured-target",
+        queue=queue,
+    )
+    job = queue.submit_job(
+        RelayJob(
+            cluster="configured-target",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["workload"]),
+            idempotency_key="logical-worker-error",
+        )
+    )
+    logical_failure_path = tmp_path / "spool" / job.job_id / "stdout.log"
+    internal_failure_path = internal_filesystem_path(
+        logical_failure_path,
+        force_extended=True,
+    )
+
+    cast(Any, worker)._record_unhandled_job_failure(
+        job,
+        RuntimeError(f"failed to read {internal_failure_path}"),
+    )
+
+    failed = queue.get_job(job.job_id)
+    assert failed.last_error is not None
+    assert "\\\\?\\" not in failed.last_error
+    assert str(logical_failure_path) in failed.last_error
 
 
 def test_replacement_worker_reconciles_owned_process_before_cancel_acknowledgment(
@@ -658,7 +738,7 @@ def test_execution_cleanup_marker_is_durable_before_task_metadata_update(
     task_path = settings.core_dir / "tasks" / f"{task.task_id}.json"
 
     def fail_task_write(path: Path, record: object) -> None:
-        if path == task_path:
+        if logical_filesystem_path(path) == task_path:
             raise OSError("injected post-marker task write crash")
         original_write(path, record)
 
@@ -978,6 +1058,80 @@ def test_execution_sidecar_cleanup_removes_only_owned_non_directory_entries(
             },
         )
     assert hostile.is_dir()
+
+
+def test_execution_sidecar_quarantine_name_is_bounded_on_long_spool_paths(
+    tmp_path: Path,
+) -> None:
+    private = cast(Any, endpoint_module)
+    source_name = f".runtime-{'a' * 32}.jsonl"
+    spool = tmp_path / "spool"
+    source = spool / source_name
+    while len(str(source)) < 235:
+        remaining = 235 - len(str(source))
+        spool /= "d" * min(40, max(1, remaining - 1))
+        source = spool / source_name
+    spool.mkdir(parents=True)
+    anchor_metadata = _write_anchored_sidecar(source, "long-path-evidence")
+    anchor = private._runtime_sidecar_anchor_from_metadata(
+        anchor_metadata,
+        task_id="long-path-sidecar",
+    )
+    quarantine = spool / private._execution_sidecar_quarantine_name(anchor)
+
+    assert len(quarantine.name) == 47
+    assert len(quarantine.name) <= len(source.name)
+    assert quarantine.name.startswith(".q1-")
+    assert len(str(quarantine)) <= len(str(source))
+
+    quarantined = private._remove_execution_sidecars(
+        [source],
+        spool_path=spool,
+        expected_anchors={source: anchor},
+        expected_quarantines={source: quarantine},
+    )
+
+    assert quarantined == {source: quarantine}
+    assert source.exists() is False
+    assert quarantine.read_text(encoding="utf-8") == "long-path-evidence"
+
+
+def test_execution_sidecar_quarantine_restarts_beyond_windows_max_path(
+    tmp_path: Path,
+) -> None:
+    """A real deep sidecar quarantine is durable and idempotent after restart."""
+    private = cast(Any, endpoint_module)
+    spool = tmp_path.joinpath(*(f"quarantine-{index}-{'x' * 72}" for index in range(3)))
+    assert len(str(spool / ".runtime-owned.jsonl")) > 260
+    internal_filesystem_path(spool, force_extended=True).mkdir(parents=True)
+    source = spool / ".runtime-owned.jsonl"
+    anchor = private._precreate_runtime_sidecar(source)
+    internal_filesystem_path(source).write_text(
+        "restart-evidence",
+        encoding="utf-8",
+    )
+    quarantine = spool / private._execution_sidecar_quarantine_name(anchor)
+
+    first = private._remove_execution_sidecars(
+        [source],
+        spool_path=spool,
+        expected_anchors={source: anchor},
+        expected_quarantines={source: quarantine},
+    )
+    restarted_anchor = private._runtime_sidecar_anchor(
+        os.stat(internal_filesystem_path(quarantine), follow_symlinks=False)
+    )
+    second = private._remove_execution_sidecars(
+        [source],
+        spool_path=spool,
+        expected_anchors={source: restarted_anchor},
+        expected_quarantines={source: quarantine},
+    )
+
+    assert first == second == {source: quarantine}
+    assert internal_filesystem_path(source).exists() is False
+    assert internal_filesystem_path(quarantine).read_text(encoding="utf-8") == ("restart-evidence")
+    assert "\\\\?\\" not in str(first)
 
 
 @pytest.mark.parametrize("replace_spool", [False, True])
@@ -2398,54 +2552,10 @@ def test_worker_records_scheduler_status_from_polling(tmp_path: Path) -> None:
     assert "scheduler.pending" in [event.event_type for event in events]
 
 
-def test_worker_uses_scheduler_provider_from_pipeline_metadata(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    class SchedulerProvider(RecordingProvider):
-        def run_pipeline_streaming(
-            self,
-            pipeline_path: Path,
-            *,
-            cwd: Path | None = None,
-            env: dict[str, str] | None = None,
-            on_stdout: Callable[[str], None] | None = None,
-            on_stderr: Callable[[str], None] | None = None,
-            on_start: Callable[[int], None] | None = None,
-            should_cancel: Callable[[], bool] | None = None,
-            on_poll: Callable[[], None] | None = None,
-            timeout_seconds: int | None = None,
-            on_timeout: Callable[[], None] | None = None,
-        ) -> subprocess.CompletedProcess[str]:
-            del cwd, on_stderr, on_start, should_cancel, on_poll
-            del timeout_seconds, on_timeout
-            self.runs.append(pipeline_path)
-            if on_stdout is not None:
-                on_stdout("scheduler_job_id=abc123\n")
-            return subprocess.CompletedProcess(
-                args=["jarvis"],
-                returncode=0,
-                stdout="scheduler_job_id=abc123\n",
-                stderr="",
-            )
-
+def test_external_worker_rejects_inline_slurm_before_jarvis_launch(tmp_path: Path) -> None:
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
-    provider = SchedulerProvider()
-    scheduler_provider = FakeSchedulerProvider(
-        SchedulerStatus(
-            scheduler="test-scheduler",
-            scheduler_job_id="abc123",
-            phase=SchedulerPhase.PENDING,
-        )
-    )
-    requested_scheduler_names: list[str | None] = []
-
-    def fake_provider_for_scheduler(name: str | None) -> FakeSchedulerProvider:
-        requested_scheduler_names.append(name)
-        return scheduler_provider
-
-    monkeypatch.setattr("clio_relay.endpoint.provider_for_scheduler", fake_provider_for_scheduler)
+    provider = RecordingProvider()
     job = queue.submit_job(
         RelayJob(
             cluster="ares",
@@ -2454,11 +2564,11 @@ def test_worker_uses_scheduler_provider_from_pipeline_metadata(
                 pipeline_yaml="""
 name: scheduled
 scheduler:
-  name: test-scheduler
+  name: slurm
 pkgs: []
 """
             ),
-            idempotency_key="worker-scheduler-provider-from-yaml",
+            idempotency_key="external-worker-rejects-inline-slurm",
         )
     )
     worker = EndpointWorker(
@@ -2474,18 +2584,185 @@ pkgs: []
 
     assert result is not None
     assert result.job_id == job.job_id
-    assert requested_scheduler_names == []
-    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=50)
-    observed = [event for event in events if event.event_type == "scheduler.job_observed_untrusted"]
-    assert observed
-    assert observed[0].payload["scheduler"] == "test-scheduler"
-    assert observed[0].payload["metadata_source"] == "legacy_stdout"
-    assert observed[0].payload["cancellation_eligible"] is False
+    assert result.state is JobState.FAILED
+    assert result.last_error is not None
+    assert "slurm != external" in result.last_error
+    assert "no JARVIS execution was launched" in result.last_error
+    assert provider.runs == []
+    assert queue.list_artifacts(job.job_id) == []
     task = queue.list_tasks(job.job_id)[0]
-    assert task.metadata["scheduler"] == "test-scheduler"
-    assert task.metadata["runtime_metadata_source"] == "legacy_stdout"
-    assert task.metadata["scheduler_job_ids"] == []
-    assert task.metadata["scheduler_job_ownership"] == []
+    assert task.state is JobState.FAILED
+    assert "scheduler_job_ids" not in task.metadata
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=50)
+    assert "execution.started" not in [event.event_type for event in events]
+    assert "scheduler.job_detected" not in [event.event_type for event in events]
+
+
+def test_slurm_worker_rejects_other_inline_provider_before_jarvis_launch(
+    tmp_path: Path,
+) -> None:
+    class SlurmSchedulerProvider(FakeSchedulerProvider):
+        name = "slurm"
+
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    provider = RecordingProvider()
+    scheduler = SlurmSchedulerProvider()
+    queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(
+                pipeline_yaml="""
+name: scheduled
+scheduler:
+  name: site-batch
+pkgs: []
+"""
+            ),
+            idempotency_key="slurm-worker-rejects-other-provider",
+        )
+    )
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=queue,
+        provider=provider,
+        scheduler_provider=scheduler,
+    )
+    worker.register()
+
+    result = worker.run_once()
+
+    assert result is not None
+    assert result.state is JobState.FAILED
+    assert result.last_error is not None
+    assert "site-batch != slurm" in result.last_error
+    assert provider.runs == []
+    assert scheduler.polled == []
+    assert scheduler.canceled == []
+    assert scheduler.reconciliation_markers == []
+
+
+def test_external_worker_named_slurm_refusal_proves_zero_submission(
+    tmp_path: Path,
+) -> None:
+    class ExternalSchedulerProvider(FakeSchedulerProvider):
+        name = "external"
+
+    class NamedScheduledPipeline:
+        name = "site-scheduled-pipeline"
+
+        def __init__(self) -> None:
+            self.scheduler: dict[str, object] = {"name": "slurm", "job_name": "operator"}
+            self.submit_calls: list[tuple[bool, bool, str]] = []
+
+        def submit(self, *, submit: bool, wait: bool, execution_id: str) -> object:
+            self.submit_calls.append((submit, wait, execution_id))
+            raise AssertionError("scheduler submission must not be reached")
+
+    scheduled_pipeline = NamedScheduledPipeline()
+
+    class NamedScheduledProvider(RecordingProvider):
+        def run_named_pipeline_streaming(
+            self,
+            pipeline_name: str,
+            *,
+            cwd: Path | None = None,
+            env: dict[str, str] | None = None,
+            on_stdout: Callable[[str], None] | None = None,
+            on_stderr: Callable[[str], None] | None = None,
+            on_start: Callable[[int], None] | None = None,
+            should_cancel: Callable[[], bool] | None = None,
+            on_poll: Callable[[], None] | None = None,
+            timeout_seconds: int | None = None,
+            on_timeout: Callable[[], None] | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            del cwd, on_stdout, on_stderr, on_start, should_cancel, on_poll
+            del timeout_seconds, on_timeout
+            self.named_runs.append(pipeline_name)
+            assert env is not None
+            intent = cast(
+                dict[str, object],
+                json.loads(env["CLIO_RELAY_RUNTIME_SUBMISSION_INTENT"]),
+            )
+            sequence = 0
+
+            def append_runtime_record(record: dict[str, Any]) -> None:
+                nonlocal sequence
+                sequence += 1
+                with Path(env["CLIO_RELAY_RUNTIME_METADATA_FILE"]).open(
+                    "a", encoding="utf-8", newline="\n"
+                ) as handle:
+                    handle.write(
+                        json.dumps(
+                            runtime_sidecar_record(
+                                record,
+                                key=env["CLIO_RELAY_RUNTIME_METADATA_TOKEN"],
+                                sequence=sequence,
+                            )
+                        )
+                        + "\n"
+                    )
+
+            try:
+                run_native_jarvis_broker(
+                    scheduled_pipeline,
+                    runtime_intent=intent,
+                    runtime_direct_proof=env["CLIO_RELAY_RUNTIME_DIRECT_PROOF"],
+                    configured_scheduler_provider=env["CLIO_RELAY_RUNTIME_SCHEDULER_PROVIDER"],
+                    append_runtime_record=append_runtime_record,
+                )
+            except RuntimeError as exc:
+                return subprocess.CompletedProcess(
+                    ["jarvis", "ppl", "run"],
+                    1,
+                    "",
+                    str(exc),
+                )
+            raise AssertionError("provider mismatch must fail before submission")
+
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    provider = NamedScheduledProvider()
+    scheduler = ExternalSchedulerProvider()
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_name=scheduled_pipeline.name),
+            idempotency_key="external-worker-rejects-named-slurm",
+        )
+    )
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=queue,
+        provider=provider,
+        scheduler_provider=scheduler,
+    )
+    worker.register()
+
+    result = worker.run_once()
+
+    assert result is not None
+    assert result.state is JobState.FAILED
+    assert provider.named_runs == [scheduled_pipeline.name]
+    assert scheduled_pipeline.submit_calls == []
+    assert scheduler.polled == []
+    assert scheduler.canceled == []
+    assert scheduler.reconciliation_markers == []
+    task = queue.list_tasks(job.job_id)[0]
+    sidecars = cast(dict[str, object], task.metadata["execution_sidecars"])
+    assert sidecars["scheduler_submission_refused"] is True
+    assert task.metadata["execution_sidecars_removed"] is True
+    assert task.metadata.get("scheduler_job_ids", []) == []
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=100)
+    refusal = [event for event in events if event.event_type == "scheduler.launch_refused"]
+    assert len(refusal) == 1
+    assert refusal[0].payload["scheduler_submission_attempted"] is False
 
 
 def test_worker_ignores_forged_stdout_progress_markers(tmp_path: Path) -> None:
@@ -2802,6 +3079,92 @@ def test_virtual_jarvis_progress_rejects_provider_identity_mismatch(
     )
 
 
+def test_virtual_jarvis_native_progress_accepts_indeterminate_event_without_adapter(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    command = ["locked-clio-kit", "mcp-server", "jarvis"]
+    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    digest = "c" * 64
+    job = queue.submit_job(
+        RelayJob(
+            cluster="research-cluster",
+            kind=JobKind.MCP_CALL,
+            spec=McpCallSpec(
+                server=command[0],
+                server_args=command[1:],
+                expected_server_artifact_digest=digest,
+                tool="jarvis_run",
+                arguments={"pipeline_id": "pipeline-live"},
+            ),
+            idempotency_key="virtual-jarvis-native-progress",
+        )
+    )
+
+    class NativeMcpProgressProvider(RecordingProvider):
+        def run_pipeline_streaming(
+            self,
+            pipeline_path: Path,
+            *,
+            cwd: Path | None = None,
+            env: dict[str, str] | None = None,
+            on_stdout: Callable[[str], None] | None = None,
+            on_stderr: Callable[[str], None] | None = None,
+            on_start: Callable[[int], None] | None = None,
+            should_cancel: Callable[[], bool] | None = None,
+            on_poll: Callable[[], None] | None = None,
+            timeout_seconds: int | None = None,
+            on_timeout: Callable[[], None] | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            del pipeline_path, cwd, on_stdout, on_stderr, should_cancel
+            del timeout_seconds, on_timeout
+            assert env is not None
+            if on_start is not None:
+                on_start(912)
+            record = _virtual_native_mcp_progress_record(digest=digest)
+            Path(env["CLIO_RELAY_PROGRESS_FILE"]).write_text(
+                json.dumps(
+                    _signed_progress_sidecar_record(
+                        record,
+                        key=env["CLIO_RELAY_PROGRESS_TOKEN"],
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            if on_poll is not None:
+                on_poll()
+            return subprocess.CompletedProcess(["jarvis"], 0, "", "")
+
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="research-cluster",
+        queue=queue,
+        provider=NativeMcpProgressProvider(),
+    )
+
+    result = worker.run_once()
+    progress = queue.list_progress(job.job_id)
+
+    assert result is not None
+    assert result.state is JobState.SUCCEEDED
+    assert len(progress) == 1
+    assert progress[0].current is None
+    assert progress[0].total is None
+    assert progress[0].source == "jarvis_execution"
+    assert progress[0].metadata["relay_job_id"] == job.job_id
+    assert progress[0].metadata["execution_id"] == "native-execution-live"
+    assert progress[0].metadata["pipeline_id"] == "pipeline-live"
+    assert progress[0].metadata["package_name"] == "builtin.paraview"
+    assert progress[0].metadata["package_id"] == "server"
+    assert progress[0].metadata["progress_state"] == "ready"
+    assert progress[0].metadata["progress_determinate"] is False
+    assert progress[0].metadata["execution_binding_validated"] is True
+
+
 def _virtual_mcp_progress_record(
     *,
     digest: str,
@@ -2843,6 +3206,146 @@ def _virtual_mcp_progress_record(
                 "execution_validated": execution_validated,
             },
         },
+    }
+
+
+def _virtual_native_mcp_progress_record(*, digest: str) -> dict[str, object]:
+    return {
+        "label": "server readiness",
+        "message": "ParaView server is ready",
+        "metadata": {
+            "mode": "server",
+            "mcp_native_progress_bridge": {
+                "schema_version": "clio-relay.mcp-jarvis-progress-bridge.v1",
+                "execution_id": "native-execution-live",
+                "pipeline_id": "pipeline-live",
+                "execution_state": "running",
+                "terminal": False,
+                "transport_sequence": 1,
+                "package_name": "builtin.paraview",
+                "package_id": "server",
+                "event_count": 1,
+                "event_schema_version": "jarvis.progress.v1",
+                "event_sequence": 0,
+                "event_state": "ready",
+                "observed_at_epoch": 1_789_000_000.0,
+                "determinate": False,
+                "skipped_event_count": 0,
+                "expected_server_artifact_digest": digest,
+                "observed_server_artifact_digest": digest,
+                "execution_validated": True,
+            },
+        },
+    }
+
+
+def _native_mcp_result_document(
+    *,
+    command: list[str],
+    digest: str,
+    pipeline_id: str,
+) -> dict[str, object]:
+    execution_id = f"{pipeline_id}-execution"
+    handle: dict[str, object] = {
+        "schema_version": "jarvis.execution.handle.v1",
+        "execution_id": execution_id,
+        "pipeline_id": pipeline_id,
+        "mode": "direct",
+        "scheduler_provider": None,
+        "scheduler_native_id": None,
+        "cluster": None,
+    }
+    record: dict[str, object] = {
+        "schema_version": "jarvis.execution.record.v1",
+        "execution_id": execution_id,
+        "pipeline_id": pipeline_id,
+        "pipeline_name": pipeline_id,
+        "mode": "direct",
+        "scheduler_provider": None,
+        "scheduler_native_id": None,
+        "cluster": None,
+        "state": "completed",
+        "submitted": False,
+        "terminal": True,
+        "created_at": "2026-07-12T10:00:00Z",
+        "updated_at": "2026-07-12T10:00:01Z",
+        "return_code": 0,
+        "error": None,
+        "metadata": {},
+    }
+    progress: dict[str, object] = {
+        "schema_version": "jarvis.execution.progress.v1",
+        "execution_id": execution_id,
+        "pipeline_id": pipeline_id,
+        "execution_state": "completed",
+        "terminal": True,
+        "packages": [],
+    }
+    structured: dict[str, object] = {
+        "execution_handle": handle,
+        "execution_record": record,
+        "progress": progress,
+        "runtime_metadata": {
+            "schema_version": "jarvis.runtime.v1",
+            "source": "jarvis_mcp",
+            "execution_id": execution_id,
+            "pipeline_id": pipeline_id,
+            "mode": "direct",
+            "scheduler_provider": None,
+            "scheduler_native_id": None,
+            "cluster": None,
+            "scheduler_type": None,
+            "scheduler_job_id": None,
+            "scheduler_phase": "completed",
+            "script_path": None,
+            "hostfile_path": None,
+            "output_path": f"/runs/{pipeline_id}/stdout.log",
+            "error_path": f"/runs/{pipeline_id}/stderr.log",
+            "package_provenance": [
+                {
+                    "pkg_id": "render",
+                    "pkg_type": "builtin.paraview",
+                    "global_id": "builtin.paraview.render",
+                    "config_path": f"/runs/{pipeline_id}/render.yaml",
+                }
+            ],
+            "terminal": {
+                "state": "completed",
+                "terminal": True,
+                "returncode": 0,
+                "reason": None,
+                "started_at": "2026-07-12T10:00:00Z",
+                "finished_at": "2026-07-12T10:00:01Z",
+            },
+            "details": {
+                "execution_owner": "jarvis_cd.execution_record",
+                "submit": None,
+                "wait": True,
+                "environment": {
+                    "schema_version": "jarvis.environment.v1",
+                    "spack_specs": ["paraview"],
+                },
+                "execution_handle": handle,
+                "execution_record": record,
+                "scheduler_submission": None,
+            },
+        },
+    }
+    return {
+        "server": command[0],
+        "server_args": command[1:],
+        "expected_server_artifact_digest": digest,
+        "observed_server_artifact_digest": digest,
+        "operation": "tools/call",
+        "tool": "jarvis_run",
+        "arguments": {"pipeline_id": pipeline_id},
+        "env_from": {},
+        "protocol_result": {"structuredContent": structured},
+        "structured_result": structured,
+        "stdout": "Submitted batch job forged-stdout-id\n",
+        "returncode": 0,
+        "timed_out": False,
+        "protocol_error": None,
     }
 
 
@@ -5038,7 +5541,7 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
     queue = ClioCoreQueue(settings.core_dir)
     server_args = [
         "--from",
-        "clio-kit==3.0.0",
+        "clio-kit==2.3.1",
         "clio-kit",
         "mcp-server",
         "jarvis",
@@ -5191,6 +5694,114 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
     assert task.metadata["scheduler_job_ownership"][0]["ownership_verified"] is True
 
 
+def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    command = ["locked-clio-kit", "mcp-server", "jarvis"]
+    digest = "d" * 64
+    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="research-cluster",
+            kind=JobKind.MCP_CALL,
+            spec=McpCallSpec(
+                server=command[0],
+                server_args=command[1:],
+                expected_server_artifact_digest=digest,
+                tool="jarvis_run",
+                arguments={"pipeline_id": "native-direct"},
+            ),
+            idempotency_key="native-direct-runtime",
+        )
+    )
+
+    class NativeRuntimeProvider(RecordingProvider):
+        def run_pipeline_streaming(
+            self,
+            pipeline_path: Path,
+            *,
+            cwd: Path | None = None,
+            env: dict[str, str] | None = None,
+            on_stdout: Callable[[str], None] | None = None,
+            on_stderr: Callable[[str], None] | None = None,
+            on_start: Callable[[int], None] | None = None,
+            should_cancel: Callable[[], bool] | None = None,
+            on_poll: Callable[[], None] | None = None,
+            timeout_seconds: int | None = None,
+            on_timeout: Callable[[], None] | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            del pipeline_path, env, on_stderr, should_cancel, on_poll
+            del timeout_seconds, on_timeout
+            assert cwd is not None
+            if on_start is not None:
+                on_start(701)
+            if on_stdout is not None:
+                on_stdout("Submitted batch job forged-stdout-id\n")
+            (cwd / "mcp-result.json").write_text(
+                json.dumps(
+                    _native_mcp_result_document(
+                        command=command,
+                        digest=digest,
+                        pipeline_id="native-direct",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(["jarvis"], 0, "", "")
+
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="research-cluster",
+        queue=queue,
+        provider=NativeRuntimeProvider(),
+    )
+
+    result = worker.run_once()
+    task = queue.list_tasks(job.job_id)[0]
+    runtime = cast(dict[str, Any], task.metadata["runtime_metadata"])
+
+    assert result is not None
+    assert result.state is JobState.SUCCEEDED
+    assert runtime["execution_id"] == "native-direct-execution"
+    assert runtime["scheduler_provider"] is None
+    assert runtime["scheduler_job_id"] is None
+    assert runtime["output_path"] == "/runs/native-direct/stdout.log"
+    assert runtime["error_path"] == "/runs/native-direct/stderr.log"
+    assert runtime["packages"] == [
+        {
+            "name": "builtin.paraview",
+            "version": None,
+            "package_type": "builtin.paraview",
+            "package_id": "render",
+            "source": None,
+            "path": "/runs/native-direct/render.yaml",
+            "metadata": {"global_id": "builtin.paraview.render"},
+        }
+    ]
+    assert runtime["details"]["environment"] == {
+        "schema_version": "jarvis.environment.v1",
+        "spack_specs": ["paraview"],
+    }
+    assert runtime["details"]["producer_contract"]["runtime_projection_merged"] is True
+    assert task.metadata["scheduler"] is None
+    assert task.metadata["scheduler_job_ids"] == []
+    assert task.metadata["scheduler_job_ownership"] == []
+    assert task.metadata["jarvis_execution_handle"]["schema_version"] == (
+        "jarvis.execution.handle.v1"
+    )
+    assert task.metadata["jarvis_execution_record"]["state"] == "completed"
+    assert task.metadata["jarvis_execution_progress"]["terminal"] is True
+    provenance = json.loads(
+        (settings.spool_dir / job.job_id / "provenance.json").read_text(encoding="utf-8")
+    )
+    assert provenance["runtime_metadata"]["output_path"] == "/runs/native-direct/stdout.log"
+    assert provenance["runtime_metadata"]["packages"][0]["package_id"] == "render"
+
+
 def test_worker_refuses_runtime_identity_from_unconfigured_jarvis_named_tool() -> None:
     job = RelayJob(
         cluster="research-cluster",
@@ -5232,7 +5843,7 @@ def test_worker_refuses_runtime_identity_when_result_arguments_do_not_match(
 ) -> None:
     server_args = [
         "--from",
-        "clio-kit==3.0.0",
+        "clio-kit==2.3.1",
         "clio-kit",
         "mcp-server",
         "jarvis",
@@ -5286,7 +5897,7 @@ def test_worker_refuses_stdout_only_jarvis_mcp_runtime_identity(
 ) -> None:
     server_args = [
         "--from",
-        "clio-kit==3.0.0",
+        "clio-kit==2.3.1",
         "clio-kit",
         "mcp-server",
         "jarvis",
@@ -5462,9 +6073,7 @@ def test_worker_reconciles_interrupted_submission_by_one_exact_marker_without_ca
             cluster="research-cluster",
             kind=JobKind.JARVIS,
             spec=JarvisRunSpec(
-                pipeline_yaml=(
-                    "name: interrupted-submit\nscheduler:\n  name: test-scheduler\npkgs: []\n"
-                )
+                pipeline_yaml=("name: interrupted-submit\nscheduler:\n  name: slurm\npkgs: []\n")
             ),
             idempotency_key="jarvis-interrupted-submit-reconciliation",
         )
@@ -5508,14 +6117,14 @@ def test_worker_reconciles_interrupted_submission_by_one_exact_marker_without_ca
                         {
                             "schema_version": "jarvis.runtime.v1",
                             "execution_id": intent["execution_id"],
-                            "scheduler_provider": "test-scheduler",
-                            "scheduler_type": "test-scheduler",
+                            "scheduler_provider": "slurm",
+                            "scheduler_type": "slurm",
                             "scheduler_phase": "submission_intent",
                             "terminal": {"state": "submission_intent", "terminal": False},
                             "details": {
                                 "scheduler_submission_intent": {
                                     **intent,
-                                    "provider": "test-scheduler",
+                                    "provider": "slurm",
                                 }
                             },
                         },
@@ -5528,7 +6137,10 @@ def test_worker_reconciles_interrupted_submission_by_one_exact_marker_without_ca
             )
             return subprocess.CompletedProcess(["jarvis"], 70, "", "submit adapter crashed")
 
-    scheduler = FakeSchedulerProvider()
+    class SlurmSchedulerProvider(FakeSchedulerProvider):
+        name = "slurm"
+
+    scheduler = SlurmSchedulerProvider()
     scheduler.reconciliation_matches = ["24680"]
     worker = EndpointWorker(
         role=EndpointRole.WORKER,
@@ -5695,6 +6307,105 @@ def test_restart_cleanup_uses_direct_mode_proof_without_scheduler_query(
     assert sidecars["scheduler_expected_resolved"] is False
     events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=100)
     assert "scheduler.direct_execution_recovered" in {event.event_type for event in events}
+
+
+def test_restart_cleanup_uses_scheduler_refusal_proof_without_scheduler_query(
+    tmp_path: Path,
+) -> None:
+    class ExternalSchedulerProvider(FakeSchedulerProvider):
+        name = "external"
+
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="research-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_name="named-scheduled"),
+            idempotency_key="named-scheduler-refusal-restart-proof",
+        )
+    )
+    task = queue.append_task(RelayTask(job_id=job.job_id, name="jarvis.execution"))
+    spool = settings.spool_dir / job.job_id
+    spool.mkdir(parents=True)
+    runtime_path = spool / ".runtime-scheduler-refusal.jsonl"
+    private = cast(Any, endpoint_module)
+    anchor = private._precreate_runtime_sidecar(runtime_path)
+    refusal_proof = "one-use-scheduler-refusal-proof"
+    execution_id = "jarvis_0123456789abcdef"
+    runtime_path.write_text(
+        json.dumps(
+            runtime_sidecar_record(
+                {
+                    "schema_version": "jarvis.runtime.v1",
+                    "execution_id": execution_id,
+                    "pipeline_id": "named-scheduled",
+                    "scheduler_provider": "slurm",
+                    "scheduler_phase": "launch_refused",
+                    "terminal": {
+                        "state": "launch_refused",
+                        "terminal": True,
+                        "returncode": 2,
+                        "reason": "slurm != external",
+                    },
+                    "details": {
+                        "execution_owner": "jarvis_cd.pipeline.preflight",
+                        "execution_mode": "scheduler",
+                        "scheduler_expected": "unknown",
+                        "scheduler_submission_attempted": False,
+                        "scheduler_launch_refused": True,
+                        "scheduler_provider": "slurm",
+                        "configured_scheduler_provider": "external",
+                        "scheduler_launch_refusal_proof": refusal_proof,
+                    },
+                },
+                key="discarded-after-worker-crash",
+                sequence=1,
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    task = queue.update_task_metadata(
+        task.task_id,
+        {
+            "execution_sidecars": {
+                "schema_version": "clio-relay.execution-sidecars.v1",
+                "progress": ".progress-scheduler-refusal.jsonl",
+                "runtime": runtime_path.name,
+                "runtime_anchor": anchor.as_metadata(),
+                "scheduler_submission_intent": {
+                    "schema_version": "clio-relay.scheduler-submission-intent.v1",
+                    "execution_id": execution_id,
+                    "marker": "clio-relay-0123456789abcdef",
+                    "created_at": utc_now().isoformat(),
+                    "scheduler_user": "alice",
+                    "scheduler_expected": "unknown",
+                    "direct_proof_sha256": hashlib.sha256(
+                        refusal_proof.encode("utf-8")
+                    ).hexdigest(),
+                },
+            }
+        },
+    )
+    scheduler = ExternalSchedulerProvider()
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="research-cluster",
+        queue=queue,
+        scheduler_provider=scheduler,
+    )
+
+    reconciled = cast(Any, worker)._reconcile_recorded_scheduler_submission(job, task)
+
+    assert reconciled is False
+    assert scheduler.reconciliation_markers == []
+    refreshed = queue.get_task(task.task_id)
+    sidecars = cast(dict[str, object], refreshed.metadata["execution_sidecars"])
+    assert sidecars["scheduler_submission_refused"] is True
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=100)
+    assert "scheduler.launch_refusal_recovered" in {event.event_type for event in events}
 
 
 def test_runtime_sidecar_anchor_refuses_replacement_and_cleanup_leaves_it_in_place(
