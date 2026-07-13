@@ -216,6 +216,12 @@ def test_local_release_validation_runs_all_checks_and_records_artifacts(
         and command[-1].endswith(".tar.gz")
         for command in commands
     )
+    build_commands = [command for command in commands if command[:2] == ["uv", "build"]]
+    assert len(build_commands) == 2
+    assert all("--python" in command for command in build_commands)
+    assert all(
+        command[command.index("--python") + 1] == sys.executable for command in build_commands
+    )
     assert any(command[:2] == ["uv", "venv"] for command in commands)
     assert any("--require-hashes" in command for command in commands)
     assert commands[-1][-1] == "--help"
