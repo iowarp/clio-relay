@@ -7,6 +7,9 @@ import os
 import posixpath
 import shlex
 import subprocess
+from collections.abc import Generator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import cast
 
@@ -14,6 +17,32 @@ import yaml
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.jarvis_mcp import JARVIS_MCP_SPACK_COMMAND_ENV
+
+_REMOTE_COMMAND_TIMEOUT_SECONDS: ContextVar[float | None] = ContextVar(
+    "clio_relay_remote_command_timeout_seconds",
+    default=None,
+)
+
+_VALIDATION_PROVENANCE_ENV = (
+    "CLIO_RELAY_VALIDATION_PRODUCER_GITHUB_LOGIN",
+    "CLIO_RELAY_VALIDATION_PRODUCER_GITHUB_ID",
+    "CLIO_RELAY_VALIDATION_INVOCATION_ID",
+    "CLIO_RELAY_VALIDATION_LAUNCHER",
+    "CLIO_RELAY_VALIDATION_ARTIFACT_SHA256",
+)
+
+
+@contextmanager
+def remote_command_timeout(timeout_seconds: float) -> Generator[None, None, None]:
+    """Bound nested remote CLI calls in the current execution context."""
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    token = _REMOTE_COMMAND_TIMEOUT_SECONDS.set(timeout_seconds)
+    try:
+        yield
+    finally:
+        _REMOTE_COMMAND_TIMEOUT_SECONDS.reset(token)
 
 
 def should_execute_on_cluster(definition: ClusterDefinition) -> bool:
@@ -38,11 +67,24 @@ def run_remote_clio(definition: ClusterDefinition, args: list[str]) -> str:
 
 def run_remote_shell(definition: ClusterDefinition, script: str) -> str:
     """Run a bash script on a configured cluster through SSH."""
-    result = subprocess.run(
-        ["ssh", definition.ssh_host, f"bash -lc {shlex.quote(script)}"],
-        capture_output=True,
-        check=False,
-    )
+    command = ["ssh", definition.ssh_host, f"bash -lc {shlex.quote(script)}"]
+    timeout_seconds = _REMOTE_COMMAND_TIMEOUT_SECONDS.get()
+    try:
+        if timeout_seconds is None:
+            result = subprocess.run(command, capture_output=True, check=False)
+        else:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                check=False,
+                timeout=timeout_seconds,
+            )
+    except subprocess.TimeoutExpired as exc:
+        raise RelayError(
+            f"remote command timed out after {timeout_seconds:g} seconds: {definition.ssh_host}"
+        ) from exc
+    except OSError as exc:
+        raise RelayError(f"remote command could not start: {definition.ssh_host}: {exc}") from exc
     if result.returncode != 0:
         raise RelayError(_command_error("remote command failed", result))
     return result.stdout.decode("utf-8", errors="replace")
@@ -114,6 +156,8 @@ def remote_env(definition: ClusterDefinition) -> str:
     agent_bin = _cluster_agent_bin(definition)
     exports = [
         'export PATH="$HOME/.local/bin:$PATH";',
+        'export UV="$HOME/.local/bin/uv";',
+        'export CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE="$HOME/.local/bin/clio-relay";',
         "export CLIO_RELAY_CLI_MODE=local;",
         f"export CLIO_RELAY_REMOTE_CLUSTER={shlex.quote(definition.name)};",
         f"export CLIO_RELAY_CORE_DIR={_shell_double_quoted(definition.core_dir)};",
@@ -127,6 +171,14 @@ def remote_env(definition: ClusterDefinition) -> str:
         exports.append(
             f"export CLIO_RELAY_AGENT_ARGS={shlex.quote(shlex.join(definition.agent_args))};"
         )
+    if definition.spack_executable is not None:
+        exports.append(
+            f"export {JARVIS_MCP_SPACK_COMMAND_ENV}={shlex.quote(definition.spack_executable)};"
+        )
+    for name in _VALIDATION_PROVENANCE_ENV:
+        value = os.environ.get(name)
+        if value:
+            exports.append(f"export {name}={shlex.quote(value)};")
     return " ".join(exports)
 
 

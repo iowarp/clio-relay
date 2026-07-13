@@ -15,11 +15,12 @@ import math
 import os
 import re
 import time
+from collections.abc import Iterable
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 from uuid import uuid4
 
 from filelock import FileLock
@@ -32,12 +33,14 @@ from jsonschema import (
     Draft202012Validator,
 )
 from jsonschema.exceptions import SchemaError
+from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from clio_relay.cluster_config import (
     ClusterRegistry,
     RemoteMcpProfile,
     RemoteMcpServerConfig,
+    cluster_route_revision,
     default_registry_path,
     ensure_private_configuration_directory,
     open_private_atomic_file,
@@ -60,16 +63,23 @@ MAX_REMOTE_MCP_PROVENANCE_BYTES = 1024 * 1024
 MAX_REMOTE_MCP_JSON_DEPTH = 64
 MAX_REMOTE_MCP_JSON_NODES = 100_000
 MAX_REMOTE_MCP_DIAGNOSTIC_CHARS = 4_096
+MAX_REMOTE_MCP_RESULT_SCHEMA_ERRORS = 8
+MAX_REMOTE_MCP_TRANSITION_ARTIFACTS_PER_CALL = 64
+MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS = 64
+MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES = 16 * 1024 * 1024
+MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES = 64 * 1024
 MAX_VIRTUAL_REMOTE_MCP_CANDIDATES = 10_000
 MAX_REMOTE_MCP_CATALOG_ISSUES = 10_000
+MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH = 64
 REMOTE_MCP_REPLACE_ATTEMPTS = 25
 REMOTE_MCP_REPLACE_RETRY_SECONDS = 0.02
-CLIO_KIT_SPACK_USER_CONTRACT_VERSION = "3.0.0"
+CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.3.2"
+CLIO_KIT_SPACK_USER_CONTRACT_ID = "clio-kit-spack-user-v2"
 # Digest the MCP wire ``tools/list`` result. FastMCP's in-process FunctionTool
 # schemas retain ``$defs`` that its protocol serializer dereferences, so their
 # digest is intentionally not the relay contract.
 CLIO_KIT_SPACK_USER_CONTRACT_SHA256 = (
-    "d0709c552f6042ce4143d49706ddfbd8d05a80e4425412fbc3393d1eb00a216c"
+    "3c5412148c770f4844e98eb893c4db0d0afdbf13afe967df67bd5f7d25e1f7db"
 )
 _COMPOSED_SCHEMA_KEYS = {
     "$dynamicRef",
@@ -125,6 +135,14 @@ class _NonFiniteJsonError(ValueError):
     """Non-standard NaN or infinity token in a purported JSON artifact."""
 
 
+class _JsonSchemaInstanceValidator(Protocol):
+    """Typed subset of a jsonschema validator used for instance checks."""
+
+    def iter_errors(self, instance: object) -> Iterable[JsonSchemaValidationError]:
+        """Yield every schema violation observed in one JSON-compatible instance."""
+        ...
+
+
 _SAFE_NAME_PATTERN = re.compile(r"[^a-z0-9_]+")
 VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA: JSON = {
     "type": "object",
@@ -139,8 +157,17 @@ VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA: JSON = {
         "terminal": {"type": "boolean"},
         "remote": {"type": "boolean"},
         "route_revision": {"type": "string"},
+        "catalog_revision": {"type": "string"},
     },
-    "required": ["cluster", "job_id", "state", "kind", "terminal", "route_revision"],
+    "required": [
+        "cluster",
+        "job_id",
+        "state",
+        "kind",
+        "terminal",
+        "route_revision",
+        "catalog_revision",
+    ],
     "additionalProperties": False,
 }
 
@@ -407,6 +434,313 @@ class RemoteMcpAcceptanceCheck(BaseModel):
     evidence: JSON = Field(default_factory=dict)
 
 
+class RemoteMcpStructuredResultExpectation(BaseModel):
+    """Operator-supplied semantic expectations for one structured MCP result."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["clio-relay.remote-mcp-result-expectation.v1"] = (
+        "clio-relay.remote-mcp-result-expectation.v1"
+    )
+    contract: Literal["clio-kit-spack-user-v2"]
+    tool: Literal["spack_find", "spack_locate", "spack_install"]
+    package_name: str = Field(min_length=1, max_length=255, pattern=r"^[A-Za-z0-9_.+-]+$")
+    dag_hash: str = Field(pattern=r"^[a-z0-9]{32}$")
+    requested_spec: str | None = Field(default=None, min_length=1, max_length=4_096)
+    prefix: str | None = Field(default=None, min_length=2, max_length=4_096)
+    reuse: bool | None = None
+    fresh_install_store_root: str | None = Field(default=None, min_length=2, max_length=4_096)
+    fresh_install_configuration_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    fresh_install_configuration_manifest_path: str | None = Field(
+        default=None,
+        min_length=2,
+        max_length=4_096,
+    )
+
+    @model_validator(mode="after")
+    def validate_operation_fields(self) -> RemoteMcpStructuredResultExpectation:
+        """Require only the operation-specific expectations used by the contract."""
+        if self.tool == "spack_find":
+            if (
+                self.requested_spec is not None
+                or self.prefix is not None
+                or self.reuse is not None
+                or self.fresh_install_store_root is not None
+                or self.fresh_install_configuration_sha256 is not None
+                or self.fresh_install_configuration_manifest_path is not None
+            ):
+                raise ValueError(
+                    "spack_find must not declare requested_spec, prefix, reuse, "
+                    "or fresh-install configuration expectations"
+                )
+            return self
+        if self.requested_spec is None:
+            raise ValueError(f"{self.tool} requires requested_spec")
+        if self.tool == "spack_locate":
+            if (
+                self.reuse is not None
+                or self.fresh_install_store_root is not None
+                or self.fresh_install_configuration_sha256 is not None
+                or self.fresh_install_configuration_manifest_path is not None
+            ):
+                raise ValueError("spack_locate must not declare reuse or fresh_install_store_root")
+            if not _is_canonical_absolute_posix_path(self.prefix):
+                raise ValueError("spack_locate requires a canonical absolute POSIX prefix")
+        if self.tool == "spack_install":
+            if self.prefix is not None:
+                raise ValueError("spack_install must not declare prefix")
+            if self.reuse is None:
+                raise ValueError("spack_install requires reuse")
+            configuration_fields = (
+                self.fresh_install_store_root,
+                self.fresh_install_configuration_sha256,
+                self.fresh_install_configuration_manifest_path,
+            )
+            if any(value is not None for value in configuration_fields):
+                if not all(value is not None for value in configuration_fields):
+                    raise ValueError(
+                        "fresh install requires store root, configuration SHA-256, and "
+                        "configuration manifest path together"
+                    )
+                if self.reuse is not False:
+                    raise ValueError("fresh_install_store_root requires spack_install reuse=false")
+                if not _is_canonical_absolute_posix_path(self.fresh_install_store_root):
+                    raise ValueError(
+                        "fresh_install_store_root must be a canonical absolute POSIX path"
+                    )
+                if not _is_canonical_absolute_posix_path(
+                    self.fresh_install_configuration_manifest_path
+                ):
+                    raise ValueError(
+                        "fresh_install_configuration_manifest_path must be a canonical "
+                        "absolute POSIX path"
+                    )
+        return self
+
+
+class RemoteMcpSpackTransitionArtifactEvidence(BaseModel):
+    """Bounded identity for one durable artifact in a Spack transition call."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_id: str | None = Field(default=None, max_length=1_024)
+    job_id: str | None = Field(default=None, max_length=1_024)
+    kind: str | None = Field(default=None, max_length=128)
+    sha256: str | None = Field(default=None, max_length=64)
+    uri: str | None = Field(default=None, max_length=4_096)
+
+
+class RemoteMcpSpackTransitionStdioEvidence(BaseModel):
+    """Bounded packaged-stdio proof associated with one transition call."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    boundary: str | None = Field(default=None, max_length=128)
+    returncode: int | None = None
+    initialize_passed: bool
+    tools_list_passed: bool
+    call_job_id: str | None = Field(default=None, max_length=1_024)
+
+
+class RemoteMcpSpackConfigurationComponentObservation(BaseModel):
+    """One regular file bound into an observed fresh-install configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    relative_path: str = Field(min_length=1, max_length=1_024)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size_bytes: int = Field(
+        ge=0,
+        le=MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES,
+    )
+    regular_file: Literal[True] = True
+
+    @field_validator("relative_path")
+    @classmethod
+    def validate_relative_path(cls, value: str) -> str:
+        """Reject absolute, traversing, or non-canonical component paths."""
+        if not _is_canonical_relative_posix_path(value):
+            raise ValueError("configuration component path must be canonical and relative")
+        return value
+
+
+class RemoteMcpSpackConfigurationObservation(BaseModel):
+    """Independent digest observation of one bounded configuration manifest."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["clio-relay.spack-configuration-observation.v1"] = (
+        "clio-relay.spack-configuration-observation.v1"
+    )
+    phase: Literal["preinstall", "postinstall"]
+    manifest_path: str = Field(min_length=2, max_length=4_096)
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    manifest_size_bytes: int = Field(
+        ge=1,
+        le=MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES,
+    )
+    manifest_regular_file: Literal[True] = True
+    components: list[RemoteMcpSpackConfigurationComponentObservation] = Field(
+        min_length=1,
+        max_length=MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS,
+    )
+
+    @model_validator(mode="after")
+    def validate_manifest(self) -> RemoteMcpSpackConfigurationObservation:
+        """Require an absolute manifest and one canonical, sorted component set."""
+        if not _is_canonical_absolute_posix_path(self.manifest_path):
+            raise ValueError("configuration manifest path must be canonical and absolute")
+        paths = [component.relative_path for component in self.components]
+        if paths != sorted(paths) or len(paths) != len(set(paths)):
+            raise ValueError("configuration component paths must be unique and sorted")
+        return self
+
+
+class RemoteMcpSpackTransitionCallEvidence(BaseModel):
+    """Bounded durable call evidence for one phase of a fresh Spack install."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    phase: Literal["preinstall", "install", "postinstall"]
+    report_passed: bool
+    cluster: str = Field(min_length=1, max_length=255)
+    server_name: str = Field(min_length=1, max_length=255)
+    profile: str = Field(min_length=1, max_length=64)
+    remote_tool_name: str = Field(min_length=1, max_length=64)
+    virtual_alias: str | None = Field(default=None, max_length=64)
+    job_id: str | None = Field(default=None, max_length=1_024)
+    state: str | None = Field(default=None, max_length=128)
+    arguments: JSON = Field(default_factory=dict)
+    artifacts: list[RemoteMcpSpackTransitionArtifactEvidence] = Field(
+        default_factory=lambda: list[RemoteMcpSpackTransitionArtifactEvidence](),
+        max_length=MAX_REMOTE_MCP_TRANSITION_ARTIFACTS_PER_CALL,
+    )
+    artifacts_truncated: bool = False
+    stdio: RemoteMcpSpackTransitionStdioEvidence
+    structured_result: JSON = Field(default_factory=dict)
+
+
+class RemoteMcpSpackInstallTransitionEvidence(BaseModel):
+    """Ordered, machine-readable evidence for a disposable-store Spack install."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["clio-relay.spack-fresh-install-transition.v1"] = (
+        "clio-relay.spack-fresh-install-transition.v1"
+    )
+    cluster: str = Field(min_length=1, max_length=255)
+    server_name: str = Field(min_length=1, max_length=255)
+    profile: str = Field(min_length=1, max_length=64)
+    requested_spec: str = Field(min_length=1, max_length=4_096)
+    package_name: str = Field(min_length=1, max_length=255)
+    dag_hash: str = Field(pattern=r"^[a-z0-9]{32}$")
+    fresh_install_store_root: str = Field(min_length=2, max_length=4_096)
+    fresh_install_configuration_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    fresh_install_configuration_manifest_path: str = Field(min_length=2, max_length=4_096)
+    preinstall_configuration: RemoteMcpSpackConfigurationObservation
+    postinstall_configuration: RemoteMcpSpackConfigurationObservation
+    executed_spack_command_path: str | None = Field(default=None, max_length=4_096)
+    executed_spack_command_relative_path: str | None = Field(default=None, max_length=1_024)
+    executed_spack_command_sha256: str | None = Field(
+        default=None,
+        max_length=64,
+    )
+    executed_spack_command_size_bytes: int | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES,
+    )
+    registration_revision: str | None = Field(default=None, max_length=128)
+    cluster_route_revision: str | None = Field(default=None, max_length=128)
+    catalog_revision: str | None = Field(default=None, max_length=128)
+    server_artifact_sha256: str | None = Field(default=None, max_length=64)
+    preinstall: RemoteMcpSpackTransitionCallEvidence
+    install: RemoteMcpSpackTransitionCallEvidence
+    postinstall: RemoteMcpSpackTransitionCallEvidence
+
+    @model_validator(mode="after")
+    def validate_transition_shape(self) -> RemoteMcpSpackInstallTransitionEvidence:
+        """Reject forged phase labels or an unsafe disposable-store root."""
+        if not _is_canonical_absolute_posix_path(self.fresh_install_store_root):
+            raise ValueError("fresh_install_store_root must be a canonical absolute POSIX path")
+        if not _is_canonical_absolute_posix_path(self.fresh_install_configuration_manifest_path):
+            raise ValueError(
+                "fresh_install_configuration_manifest_path must be a canonical absolute POSIX path"
+            )
+        command_identity = (
+            self.executed_spack_command_path,
+            self.executed_spack_command_relative_path,
+            self.executed_spack_command_sha256,
+            self.executed_spack_command_size_bytes,
+        )
+        if any(value is not None for value in command_identity):
+            if not all(value is not None for value in command_identity):
+                raise ValueError("executed Spack command identity must be complete")
+            if not _is_canonical_absolute_posix_path(self.executed_spack_command_path):
+                raise ValueError("executed Spack command path must be canonical and absolute")
+            if not _is_canonical_relative_posix_path(self.executed_spack_command_relative_path):
+                raise ValueError("executed Spack command relative path must be canonical")
+            command_sha256 = cast(str, self.executed_spack_command_sha256)
+            if len(command_sha256) != 64 or any(
+                character not in "0123456789abcdef" for character in command_sha256
+            ):
+                raise ValueError("executed Spack command SHA-256 must be lowercase hexadecimal")
+            if cast(int, self.executed_spack_command_size_bytes) < 1:
+                raise ValueError("executed Spack command size must be positive")
+            expected_path = str(
+                PurePosixPath(self.fresh_install_configuration_manifest_path).parent
+                / cast(str, self.executed_spack_command_relative_path)
+            )
+            if self.executed_spack_command_path != expected_path:
+                raise ValueError(
+                    "executed Spack command path must resolve from the configuration manifest"
+                )
+            relative_path = cast(str, self.executed_spack_command_relative_path)
+            preinstall_components = [
+                component
+                for component in self.preinstall_configuration.components
+                if component.relative_path == relative_path
+            ]
+            postinstall_components = [
+                component
+                for component in self.postinstall_configuration.components
+                if component.relative_path == relative_path
+            ]
+            if len(preinstall_components) != 1 or len(postinstall_components) != 1:
+                raise ValueError(
+                    "executed Spack command must identify one preinstall and postinstall "
+                    "configuration component"
+                )
+            if preinstall_components[0] != postinstall_components[0]:
+                raise ValueError(
+                    "executed Spack command configuration component must remain unchanged"
+                )
+            if (
+                command_sha256 != preinstall_components[0].sha256
+                or self.executed_spack_command_size_bytes != preinstall_components[0].size_bytes
+            ):
+                raise ValueError(
+                    "executed Spack command SHA-256 and size must match its configuration component"
+                )
+        if (
+            self.preinstall_configuration.phase != "preinstall"
+            or self.postinstall_configuration.phase != "postinstall"
+        ):
+            raise ValueError("configuration observations must retain their ordered phases")
+        expected_phases = (
+            (self.preinstall, "preinstall", "spack_find"),
+            (self.install, "install", "spack_install"),
+            (self.postinstall, "postinstall", "spack_locate"),
+        )
+        for call, phase, tool in expected_phases:
+            if call.phase != phase or call.remote_tool_name != tool:
+                raise ValueError(f"{phase} evidence must represent {tool}")
+        return self
+
+
 class RemoteMcpAcceptanceReport(BaseModel):
     """Machine-readable evidence for one virtual remote MCP acceptance call."""
 
@@ -426,6 +760,7 @@ class RemoteMcpAcceptanceReport(BaseModel):
     call_job: JSON = Field(default_factory=dict)
     artifacts: list[JSON] = Field(default_factory=lambda: list[JSON]())
     mcp_stdio: JSON = Field(default_factory=dict)
+    spack_install_transition: RemoteMcpSpackInstallTransitionEvidence | None = None
 
     def to_live_validation_report(
         self,
@@ -473,7 +808,7 @@ class RemoteMcpAcceptanceReport(BaseModel):
         report.status = ValidationStatus.PASSED if self.passed else ValidationStatus.FAILED
         report.error = None if self.passed else "one or more remote MCP checks failed"
         call_job_id = self.call_job.get("job_id")
-        if isinstance(call_job_id, str):
+        if self.spack_install_transition is None and isinstance(call_job_id, str):
             call_metadata = {
                 **self.call_job,
                 "remote_mcp_server_name": self.server_name,
@@ -481,6 +816,12 @@ class RemoteMcpAcceptanceReport(BaseModel):
                 "virtual_alias": self.virtual_alias,
                 "profile": self.profile,
             }
+            result_check = next(
+                (check for check in self.checks if check.name == "remote-mcp.structured-result"),
+                None,
+            )
+            if result_check is not None:
+                call_metadata["structured_result_assertion"] = result_check.evidence
             report.resources.append(
                 ValidationResource(
                     kind="relay_job",
@@ -522,28 +863,45 @@ class RemoteMcpAcceptanceReport(BaseModel):
                     metadata=discovery_provenance,
                 )
             )
-        for artifact in self.artifacts:
-            resource = _acceptance_artifact_resource(self.cluster, artifact)
-            if resource is None:
-                continue
-            report.resources.append(resource)
-            report.artifacts.append(
-                EvidenceReference(
-                    kind=resource.role or "artifact",
-                    reference=(
-                        resource.references[0]
-                        if resource.references
-                        else f"relay-artifact://{self.cluster}/{resource.resource_id}"
-                    ),
-                    sha256=(
-                        str(artifact["sha256"]) if isinstance(artifact.get("sha256"), str) else None
-                    ),
+        if self.spack_install_transition is None:
+            for artifact in self.artifacts:
+                resource = _acceptance_artifact_resource(self.cluster, artifact)
+                if resource is None:
+                    continue
+                report.resources.append(resource)
+                report.artifacts.append(
+                    EvidenceReference(
+                        kind=resource.role or "artifact",
+                        reference=(
+                            resource.references[0]
+                            if resource.references
+                            else f"relay-artifact://{self.cluster}/{resource.resource_id}"
+                        ),
+                        sha256=(
+                            str(artifact["sha256"])
+                            if isinstance(artifact.get("sha256"), str)
+                            else None
+                        ),
+                    )
                 )
-            )
+        else:
+            _append_spack_transition_resources(report, self.spack_install_transition)
         server_check = next(
             (check for check in self.checks if check.name == "remote-mcp.server-artifact"),
             None,
         )
+        contract_check = next(
+            (check for check in self.checks if check.name == "remote-mcp.spack-user-contract"),
+            None,
+        )
+        contract_metadata: JSON = {}
+        if contract_check is not None:
+            contract_id = contract_check.evidence.get("declared_contract")
+            contract_sha256 = contract_check.evidence.get("observed_contract_sha256")
+            if isinstance(contract_id, str):
+                contract_metadata["contract_id"] = contract_id
+            if isinstance(contract_sha256, str):
+                contract_metadata["contract_sha256"] = contract_sha256
         raw_server_artifact = (
             server_check.evidence.get("call_server_artifact") if server_check is not None else None
         )
@@ -571,6 +929,7 @@ class RemoteMcpAcceptanceReport(BaseModel):
                         "remote_tool_names": self.discovery.get("remote_tool_names", []),
                         "allowlisted_tool_names": self.discovery.get("allowlisted_tool_names", []),
                         **server_artifact,
+                        **contract_metadata,
                     },
                 )
             )
@@ -597,6 +956,92 @@ def _acceptance_artifact_resource(
     )
 
 
+def _append_spack_transition_resources(
+    report: LiveValidationReport,
+    transition: RemoteMcpSpackInstallTransitionEvidence,
+) -> None:
+    """Append phase-scoped jobs and artifacts without duplicating the install call."""
+    from clio_relay.validation_report import EvidenceReference, ValidationResource
+
+    roles = {
+        "preinstall": "spack_preinstall_find",
+        "install": "spack_fresh_install",
+        "postinstall": "spack_postinstall_locate",
+    }
+    report.resources.append(
+        ValidationResource(
+            kind="configuration_manifest",
+            resource_id=transition.fresh_install_configuration_sha256,
+            role="spack_fresh_install_configuration",
+            cluster=transition.cluster,
+            state="verified",
+            references=[transition.fresh_install_configuration_manifest_path],
+            metadata={
+                "expected_sha256": transition.fresh_install_configuration_sha256,
+                "preinstall": transition.preinstall_configuration.model_dump(mode="json"),
+                "postinstall": transition.postinstall_configuration.model_dump(mode="json"),
+            },
+        )
+    )
+    report.artifacts.append(
+        EvidenceReference(
+            kind="spack_fresh_install_configuration",
+            reference=transition.fresh_install_configuration_manifest_path,
+            sha256=transition.fresh_install_configuration_sha256,
+        )
+    )
+    for call in (transition.preinstall, transition.install, transition.postinstall):
+        role = roles[call.phase]
+        if call.job_id is not None:
+            report.resources.append(
+                ValidationResource(
+                    kind="relay_job",
+                    resource_id=call.job_id,
+                    role=role,
+                    cluster=transition.cluster,
+                    state=call.state,
+                    metadata={
+                        "remote_mcp_server_name": transition.server_name,
+                        "remote_mcp_tool_name": call.remote_tool_name,
+                        "virtual_alias": call.virtual_alias,
+                        "profile": transition.profile,
+                        "arguments": call.arguments,
+                        "stdio": call.stdio.model_dump(mode="json"),
+                        "structured_result": call.structured_result,
+                    },
+                )
+            )
+        for artifact in call.artifacts:
+            if artifact.artifact_id is None:
+                continue
+            artifact_role = f"{role}_{artifact.kind or 'artifact'}"
+            references = [artifact.uri] if artifact.uri is not None else []
+            report.resources.append(
+                ValidationResource(
+                    kind="artifact",
+                    resource_id=artifact.artifact_id,
+                    role=artifact_role,
+                    cluster=transition.cluster,
+                    references=references,
+                    metadata={
+                        **artifact.model_dump(mode="json"),
+                        "transition_phase": call.phase,
+                    },
+                )
+            )
+            report.artifacts.append(
+                EvidenceReference(
+                    kind=artifact_role,
+                    reference=(
+                        artifact.uri
+                        if artifact.uri is not None
+                        else f"relay-artifact://{transition.cluster}/{artifact.artifact_id}"
+                    ),
+                    sha256=artifact.sha256,
+                )
+            )
+
+
 @dataclass(frozen=True)
 class RemoteMcpRoute:
     """Execution route selected by a virtual tool alias and cluster argument."""
@@ -610,6 +1055,8 @@ class RemoteMcpRoute:
     remote_tool_name: str
     timeout_seconds: int
     contract: str | None
+    cluster_route_revision: str
+    registration_revision: str
 
 
 @dataclass(frozen=True)
@@ -667,6 +1114,10 @@ class VirtualRemoteMcpCatalog:
     revision: str
     tools: dict[str, VirtualRemoteMcpTool]
     issues: tuple[RemoteMcpCatalogIssue, ...]
+    cluster_route_revisions: dict[str, str] = field(default_factory=lambda: dict[str, str]())
+    jarvis_artifact_bindings: dict[str, str | None] = field(
+        default_factory=lambda: dict[str, str | None]()
+    )
 
     def tool_definitions(self) -> list[JSON]:
         """Return deterministic agent-facing tool definitions."""
@@ -742,6 +1193,11 @@ def remote_mcp_execution_fingerprint(registration: RemoteMcpServerConfig) -> str
             "env_from": registration.env_from,
         }
     )
+
+
+def remote_mcp_registration_revision(registration: RemoteMcpServerConfig) -> str:
+    """Hash the complete operator-controlled registration used for one route."""
+    return _stable_digest({"registration": registration.model_dump(mode="json")})
 
 
 def remote_mcp_schema_digest(tools: list[RemoteMcpToolSchema]) -> str:
@@ -1029,6 +1485,10 @@ def build_virtual_remote_mcp_catalog(
                     )
                 )
 
+    route_revisions = {
+        cluster: cluster_route_revision(definition)
+        for cluster, definition in sorted(registry.clusters.items())
+    }
     grouped: dict[str, list[_Candidate]] = {}
     for candidate in candidates:
         grouped.setdefault(candidate.identity, []).append(candidate)
@@ -1073,6 +1533,8 @@ def build_virtual_remote_mcp_catalog(
                 remote_tool_name=candidate.tool.name,
                 timeout_seconds=candidate.registration.call_timeout_seconds,
                 contract=candidate.registration.contract,
+                cluster_route_revision=route_revisions[candidate.cluster],
+                registration_revision=remote_mcp_registration_revision(candidate.registration),
             )
             for candidate in group
         }
@@ -1086,6 +1548,7 @@ def build_virtual_remote_mcp_catalog(
     revision = _stable_digest(
         {
             "profile": profile,
+            "cluster_routes": route_revisions,
             "tools": {
                 alias: {
                     "namespace": tool.namespace,
@@ -1094,9 +1557,7 @@ def build_virtual_remote_mcp_catalog(
                     "routes": {
                         cluster: {
                             "server_name": route.server_name,
-                            "execution_fingerprint": remote_mcp_execution_fingerprint(
-                                registry.clusters[cluster].remote_mcp_servers[route.server_name]
-                            ),
+                            "registration_revision": route.registration_revision,
                             "expected_server_artifact_digest": (
                                 route.expected_server_artifact_digest
                             ),
@@ -1113,6 +1574,7 @@ def build_virtual_remote_mcp_catalog(
         revision=revision,
         tools=virtual_tools,
         issues=tuple(issues),
+        cluster_route_revisions=route_revisions,
     )
 
 
@@ -1156,6 +1618,7 @@ def build_remote_mcp_acceptance_report(
     artifacts: list[JSON],
     mcp_result: JSON | None,
     provenance: JSON | None,
+    result_expectation: RemoteMcpStructuredResultExpectation | None = None,
     mcp_stdio_evidence: JSON | None = None,
     now: datetime | None = None,
     reserved_names: set[str] | None = None,
@@ -1183,6 +1646,12 @@ def build_remote_mcp_acceptance_report(
             _profile_allows(registration.profiles, profile) if registration is not None else False
         ),
         "declared_contract": registration.contract if registration is not None else None,
+        "registration_revision": (
+            remote_mcp_registration_revision(registration) if registration is not None else None
+        ),
+        "cluster_route_revision": (
+            cluster_route_revision(definition) if definition is not None else None
+        ),
     }
     checks = [
         RemoteMcpAcceptanceCheck(
@@ -1260,6 +1729,9 @@ def build_remote_mcp_acceptance_report(
         and virtual.routes[cluster].server_name == server_name
     ]
     virtual_alias = matching_aliases[0] if len(matching_aliases) == 1 else None
+    selected_route = (
+        catalog.tools[virtual_alias].routes.get(cluster) if virtual_alias is not None else None
+    )
     stdio_initialize_passed = _stdio_initialize_passed(mcp_stdio_evidence)
     stdio_listed_tools = _stdio_listed_tool_names(mcp_stdio_evidence)
     stdio_tools_list_passed = mcp_stdio_evidence is None or (
@@ -1279,6 +1751,12 @@ def build_remote_mcp_acceptance_report(
             ),
             evidence={
                 "catalog_revision": catalog.revision,
+                "registration_revision": (
+                    selected_route.registration_revision if selected_route is not None else None
+                ),
+                "cluster_route_revision": (
+                    selected_route.cluster_route_revision if selected_route is not None else None
+                ),
                 "matching_aliases": sorted(matching_aliases),
                 "catalog_issues": [issue.model_dump(mode="json") for issue in catalog.issues],
                 "packaged_stdio": mcp_stdio_evidence or {},
@@ -1412,6 +1890,22 @@ def build_remote_mcp_acceptance_report(
             },
         )
     )
+    if result_expectation is not None:
+        matching_tools = (
+            [tool for tool in entry.tools if tool.name == remote_tool_name]
+            if entry is not None
+            else []
+        )
+        output_schema = matching_tools[0].output_schema if len(matching_tools) == 1 else None
+        checks.append(
+            build_remote_mcp_structured_result_check(
+                expectation=result_expectation,
+                remote_tool_name=remote_tool_name,
+                arguments=spec.get("arguments", {}),
+                protocol_result=protocol_result,
+                output_schema=output_schema,
+            )
+        )
     passed = all(check.passed for check in checks)
     return RemoteMcpAcceptanceReport(
         cluster=cluster,
@@ -1426,6 +1920,1288 @@ def build_remote_mcp_acceptance_report(
         artifacts=artifacts,
         mcp_stdio=mcp_stdio_evidence or {},
     )
+
+
+def build_remote_mcp_spack_fresh_install_transition_report(
+    *,
+    preinstall_report: RemoteMcpAcceptanceReport,
+    install_report: RemoteMcpAcceptanceReport,
+    postinstall_report: RemoteMcpAcceptanceReport,
+    preinstall_protocol_result: JSON | None,
+    install_protocol_result: JSON | None,
+    postinstall_protocol_result: JSON | None,
+    install_expectation: RemoteMcpStructuredResultExpectation,
+    preinstall_configuration: RemoteMcpSpackConfigurationObservation,
+    postinstall_configuration: RemoteMcpSpackConfigurationObservation,
+) -> RemoteMcpAcceptanceReport:
+    """Bind absent, install, and locate calls into one fail-closed Spack proof.
+
+    The returned acceptance report retains the install call as its primary
+    operation, while phase-prefixed checks and transition evidence prove that
+    the package was absent immediately before a non-reusing install and was
+    subsequently located strictly inside the disposable acceptance store.
+    """
+    store_root = install_expectation.fresh_install_store_root
+    requested_spec = install_expectation.requested_spec
+    configuration_sha256 = install_expectation.fresh_install_configuration_sha256
+    configuration_manifest_path = install_expectation.fresh_install_configuration_manifest_path
+    if (
+        install_expectation.tool != "spack_install"
+        or install_expectation.reuse is not False
+        or requested_spec is None
+        or store_root is None
+        or configuration_sha256 is None
+        or configuration_manifest_path is None
+    ):
+        raise ValueError(
+            "fresh Spack transition requires a spack_install expectation with "
+            "reuse=false, fresh_install_store_root, configuration SHA-256, and "
+            "configuration manifest path"
+        )
+
+    configuration_check, executed_wrapper = _spack_fresh_configuration_check(
+        expected_sha256=configuration_sha256,
+        expected_manifest_path=configuration_manifest_path,
+        preinstall=preinstall_configuration,
+        postinstall=postinstall_configuration,
+        install_report=install_report,
+    )
+
+    preinstall_check, preinstall_structured = _spack_preinstall_absent_check(
+        report=preinstall_report,
+        protocol_result=preinstall_protocol_result,
+        expectation=install_expectation,
+    )
+    install_check, install_structured = _spack_fresh_install_check(
+        report=install_report,
+        protocol_result=install_protocol_result,
+        expectation=install_expectation,
+    )
+    locate_check, locate_structured, locate_prefix = _spack_postinstall_locate_check(
+        report=postinstall_report,
+        protocol_result=postinstall_protocol_result,
+        expectation=install_expectation,
+    )
+    disposable_store_passed = _is_strict_canonical_posix_descendant(
+        locate_prefix,
+        store_root,
+    )
+    disposable_store_check = RemoteMcpAcceptanceCheck(
+        name="remote-mcp.spack-disposable-store",
+        passed=disposable_store_passed,
+        message=(
+            "installed prefix is strictly inside the disposable Spack store"
+            if disposable_store_passed
+            else "installed prefix is not strictly inside the disposable Spack store"
+        ),
+        evidence={
+            "fresh_install_store_root": store_root,
+            "observed_prefix": _bounded_evidence_scalar(locate_prefix),
+            "root_is_canonical_absolute": _is_canonical_absolute_posix_path(store_root),
+            "prefix_is_strict_descendant": disposable_store_passed,
+        },
+    )
+
+    identity_check, identity = _spack_transition_identity_check(
+        preinstall_report=preinstall_report,
+        install_report=install_report,
+        postinstall_report=postinstall_report,
+    )
+    durable_check = _spack_transition_durable_evidence_check(
+        preinstall_report=preinstall_report,
+        install_report=install_report,
+        postinstall_report=postinstall_report,
+    )
+    transition = RemoteMcpSpackInstallTransitionEvidence(
+        cluster=install_report.cluster,
+        server_name=install_report.server_name,
+        profile=install_report.profile,
+        requested_spec=requested_spec,
+        package_name=install_expectation.package_name,
+        dag_hash=install_expectation.dag_hash,
+        fresh_install_store_root=store_root,
+        fresh_install_configuration_sha256=configuration_sha256,
+        fresh_install_configuration_manifest_path=configuration_manifest_path,
+        preinstall_configuration=preinstall_configuration,
+        postinstall_configuration=postinstall_configuration,
+        executed_spack_command_path=(
+            executed_wrapper["path"] if configuration_check.passed else None
+        ),
+        executed_spack_command_relative_path=(
+            executed_wrapper["relative_path"] if configuration_check.passed else None
+        ),
+        executed_spack_command_sha256=(
+            executed_wrapper["sha256"] if configuration_check.passed else None
+        ),
+        executed_spack_command_size_bytes=(
+            executed_wrapper["size_bytes"] if configuration_check.passed else None
+        ),
+        registration_revision=identity["registration_revision"],
+        cluster_route_revision=identity["cluster_route_revision"],
+        catalog_revision=identity["catalog_revision"],
+        server_artifact_sha256=identity["server_artifact_sha256"],
+        preinstall=_spack_transition_call_evidence(
+            report=preinstall_report,
+            phase="preinstall",
+            structured_result=preinstall_structured,
+        ),
+        install=_spack_transition_call_evidence(
+            report=install_report,
+            phase="install",
+            structured_result=install_structured,
+        ),
+        postinstall=_spack_transition_call_evidence(
+            report=postinstall_report,
+            phase="postinstall",
+            structured_result=locate_structured,
+        ),
+    )
+
+    flattened_checks = [
+        *_phase_prefixed_acceptance_checks(preinstall_report, phase="preinstall"),
+        *(check.model_copy(deep=True) for check in install_report.checks),
+        *_phase_prefixed_acceptance_checks(postinstall_report, phase="postinstall"),
+        identity_check,
+        durable_check,
+        configuration_check,
+        preinstall_check,
+        install_check,
+        locate_check,
+        disposable_store_check,
+    ]
+    flattened_checks = _uniquely_named_acceptance_checks(flattened_checks)
+    passed = all(check.passed for check in flattened_checks)
+    payload = install_report.model_dump(mode="python")
+    payload.update(
+        {
+            "passed": passed,
+            "checks": flattened_checks,
+            "spack_install_transition": transition,
+        }
+    )
+    return RemoteMcpAcceptanceReport.model_validate(payload)
+
+
+def _spack_fresh_configuration_check(
+    *,
+    expected_sha256: str,
+    expected_manifest_path: str,
+    preinstall: RemoteMcpSpackConfigurationObservation,
+    postinstall: RemoteMcpSpackConfigurationObservation,
+    install_report: RemoteMcpAcceptanceReport,
+) -> tuple[RemoteMcpAcceptanceCheck, JSON]:
+    """Bind independently observed wrapper/config bytes before and after installation."""
+    pre_components = [component.model_dump(mode="json") for component in preinstall.components]
+    post_components = [component.model_dump(mode="json") for component in postinstall.components]
+    digest_matches = (
+        preinstall.manifest_sha256 == expected_sha256
+        and postinstall.manifest_sha256 == expected_sha256
+    )
+    path_matches = (
+        preinstall.manifest_path == expected_manifest_path
+        and postinstall.manifest_path == expected_manifest_path
+    )
+    components_match = pre_components == post_components
+    manifest_metadata_matches = (
+        preinstall.manifest_size_bytes == postinstall.manifest_size_bytes
+        and preinstall.manifest_regular_file
+        and postinstall.manifest_regular_file
+    )
+    phases_match = preinstall.phase == "preinstall" and postinstall.phase == "postinstall"
+    wrapper_binding = _spack_command_configuration_binding(
+        install_report=install_report,
+        manifest_path=expected_manifest_path,
+        preinstall=preinstall,
+        postinstall=postinstall,
+    )
+    wrapper_matches = wrapper_binding["matches"] is True
+    passed = (
+        digest_matches
+        and path_matches
+        and components_match
+        and manifest_metadata_matches
+        and phases_match
+        and wrapper_matches
+    )
+    return (
+        RemoteMcpAcceptanceCheck(
+            name="remote-mcp.spack-fresh-configuration",
+            passed=passed,
+            message=(
+                "executed Spack wrapper and configuration bytes remained exactly bound"
+                if passed
+                else "executed Spack wrapper or configuration identity was not exactly bound"
+            ),
+            evidence={
+                "expected": {
+                    "manifest_path": expected_manifest_path,
+                    "configuration_sha256": expected_sha256,
+                },
+                "preinstall": preinstall.model_dump(mode="json"),
+                "postinstall": postinstall.model_dump(mode="json"),
+                "digest_matches": digest_matches,
+                "path_matches": path_matches,
+                "components_match": components_match,
+                "manifest_metadata_matches": manifest_metadata_matches,
+                "phases_match": phases_match,
+                "executed_spack_command": wrapper_binding,
+                "wrapper_matches": wrapper_matches,
+            },
+        ),
+        wrapper_binding,
+    )
+
+
+def _spack_command_configuration_binding(
+    *,
+    install_report: RemoteMcpAcceptanceReport,
+    manifest_path: str,
+    preinstall: RemoteMcpSpackConfigurationObservation,
+    postinstall: RemoteMcpSpackConfigurationObservation,
+) -> JSON:
+    """Bind the executed ``--spack-command`` path to one observed manifest file."""
+    evidence: JSON = {
+        "matches": False,
+        "path": None,
+        "relative_path": None,
+        "sha256": None,
+        "size_bytes": None,
+        "failures": [],
+    }
+    failures = cast(list[str], evidence["failures"])
+    call_checks = [check for check in install_report.checks if check.name == "remote-mcp.call"]
+    if len(call_checks) != 1 or not call_checks[0].passed or not install_report.passed:
+        failures.append("install report does not contain one passing immutable call binding")
+    spec = _as_json(install_report.call_job.get("spec")) or {}
+    raw_server_args = spec.get("server_args")
+    server_args = cast(list[object], raw_server_args) if isinstance(raw_server_args, list) else []
+    candidates: list[str] = []
+    for index, value in enumerate(server_args):
+        if value == "--spack-command" and index + 1 < len(server_args):
+            next_value = server_args[index + 1]
+            if isinstance(next_value, str):
+                candidates.append(next_value)
+        elif isinstance(value, str) and value.startswith("--spack-command="):
+            candidates.append(value.partition("=")[2])
+    if len(candidates) != 1 or not _is_canonical_absolute_posix_path(candidates[0]):
+        failures.append("install call does not contain one canonical --spack-command path")
+        return evidence
+    wrapper_path = candidates[0]
+    manifest_parent = PurePosixPath(manifest_path).parent
+    typed_wrapper = PurePosixPath(wrapper_path)
+    try:
+        relative = typed_wrapper.relative_to(manifest_parent)
+    except ValueError:
+        failures.append("executed Spack wrapper is outside the configuration manifest root")
+        return evidence
+    relative_path = str(relative)
+    if not _is_canonical_relative_posix_path(relative_path):
+        failures.append("executed Spack wrapper relative path is not canonical")
+        return evidence
+    pre_matches = [
+        component for component in preinstall.components if component.relative_path == relative_path
+    ]
+    post_matches = [
+        component
+        for component in postinstall.components
+        if component.relative_path == relative_path
+    ]
+    if len(pre_matches) != 1 or len(post_matches) != 1:
+        failures.append("executed Spack wrapper is not one unique manifest component")
+        return evidence
+    pre_component = pre_matches[0]
+    post_component = post_matches[0]
+    component_matches = pre_component == post_component and pre_component.regular_file
+    if not component_matches:
+        failures.append("executed Spack wrapper bytes or regular-file identity changed")
+    evidence.update(
+        {
+            "matches": not failures,
+            "path": wrapper_path,
+            "relative_path": relative_path,
+            "sha256": pre_component.sha256,
+            "size_bytes": pre_component.size_bytes,
+        }
+    )
+    return evidence
+
+
+def _phase_prefixed_acceptance_checks(
+    report: RemoteMcpAcceptanceReport,
+    *,
+    phase: Literal["preinstall", "postinstall"],
+) -> list[RemoteMcpAcceptanceCheck]:
+    """Copy ordinary acceptance checks under one unambiguous phase namespace."""
+    checks: list[RemoteMcpAcceptanceCheck] = []
+    for check in report.checks:
+        suffix = check.name.removeprefix("remote-mcp.")
+        checks.append(
+            RemoteMcpAcceptanceCheck(
+                name=f"remote-mcp.{phase}.{suffix}",
+                passed=check.passed,
+                message=check.message,
+                evidence=deepcopy(check.evidence),
+            )
+        )
+    return checks
+
+
+def _uniquely_named_acceptance_checks(
+    checks: list[RemoteMcpAcceptanceCheck],
+) -> list[RemoteMcpAcceptanceCheck]:
+    """Preserve every assertion while giving duplicate source checks stable suffixes."""
+    occurrences: dict[str, int] = {}
+    result: list[RemoteMcpAcceptanceCheck] = []
+    for check in checks:
+        occurrence = occurrences.get(check.name, 0) + 1
+        occurrences[check.name] = occurrence
+        if occurrence == 1:
+            result.append(check)
+            continue
+        result.append(
+            RemoteMcpAcceptanceCheck(
+                name=f"{check.name}-{occurrence}",
+                passed=check.passed,
+                message=check.message,
+                evidence=deepcopy(check.evidence),
+            )
+        )
+    return result
+
+
+def _spack_transition_identity_check(
+    *,
+    preinstall_report: RemoteMcpAcceptanceReport,
+    install_report: RemoteMcpAcceptanceReport,
+    postinstall_report: RemoteMcpAcceptanceReport,
+) -> tuple[RemoteMcpAcceptanceCheck, dict[str, str | None]]:
+    """Require all phases to retain one registration, catalog, and wheel identity."""
+    reports = (preinstall_report, install_report, postinstall_report)
+    scopes = {(report.cluster, report.server_name, report.profile) for report in reports}
+    tool_names = tuple(report.remote_tool_name for report in reports)
+    reports_passed = all(
+        report.passed and all(check.passed for check in report.checks) for report in reports
+    )
+    registration_revisions = tuple(
+        _acceptance_check_string(report, "remote-mcp.register", "registration_revision")
+        for report in reports
+    )
+    cluster_route_revisions = tuple(
+        _acceptance_check_string(report, "remote-mcp.register", "cluster_route_revision")
+        for report in reports
+    )
+    catalog_revisions = tuple(
+        _acceptance_check_string(report, "remote-mcp.tools-list", "catalog_revision")
+        for report in reports
+    )
+    server_artifacts = tuple(_acceptance_server_artifact(report) for report in reports)
+    same_server_artifact = (
+        all(artifact is not None for artifact in server_artifacts)
+        and server_artifacts[0] == server_artifacts[1] == server_artifacts[2]
+    )
+    server_artifact_sha256 = (
+        _stable_digest(server_artifacts[1]) if server_artifacts[1] is not None else None
+    )
+    revision_matches = {
+        "registration": _same_nonempty_strings(registration_revisions),
+        "cluster_route": _same_nonempty_strings(cluster_route_revisions),
+        "catalog": _same_nonempty_strings(catalog_revisions),
+    }
+    expected_tools = ("spack_find", "spack_install", "spack_locate")
+    passed = (
+        reports_passed
+        and len(scopes) == 1
+        and tool_names == expected_tools
+        and all(revision_matches.values())
+        and same_server_artifact
+    )
+    identity: dict[str, str | None] = {
+        "registration_revision": _common_string(registration_revisions),
+        "cluster_route_revision": _common_string(cluster_route_revisions),
+        "catalog_revision": _common_string(catalog_revisions),
+        "server_artifact_sha256": server_artifact_sha256,
+    }
+    return (
+        RemoteMcpAcceptanceCheck(
+            name="remote-mcp.spack-transition-identity",
+            passed=passed,
+            message=(
+                "all Spack phases share one passing route and verified server artifact"
+                if passed
+                else "Spack transition phases do not share one passing immutable route"
+            ),
+            evidence={
+                "underlying_reports_passed": reports_passed,
+                "scopes": [list(scope) for scope in sorted(scopes)],
+                "tool_names": list(tool_names),
+                "expected_tool_names": list(expected_tools),
+                "registration_revisions": list(registration_revisions),
+                "cluster_route_revisions": list(cluster_route_revisions),
+                "catalog_revisions": list(catalog_revisions),
+                "revision_matches": revision_matches,
+                "same_server_artifact": same_server_artifact,
+                "server_artifact_sha256": server_artifact_sha256,
+            },
+        ),
+        identity,
+    )
+
+
+def _spack_transition_durable_evidence_check(
+    *,
+    preinstall_report: RemoteMcpAcceptanceReport,
+    install_report: RemoteMcpAcceptanceReport,
+    postinstall_report: RemoteMcpAcceptanceReport,
+) -> RemoteMcpAcceptanceCheck:
+    """Require distinct succeeded jobs, packaged stdio, and hashed durable artifacts."""
+    reports = (preinstall_report, install_report, postinstall_report)
+    required_kinds = {"stdout", "stderr", "mcp_result", "provenance"}
+    jobs: list[str] = []
+    phases: JSON = {}
+    all_artifact_ids: list[str] = []
+    passed = True
+    for phase, report in zip(("preinstall", "install", "postinstall"), reports, strict=True):
+        raw_job_id = report.call_job.get("job_id")
+        job_id = raw_job_id if isinstance(raw_job_id, str) else None
+        if job_id is not None:
+            jobs.append(job_id)
+        relevant_artifacts = report.artifacts[:MAX_REMOTE_MCP_TRANSITION_ARTIFACTS_PER_CALL]
+        artifact_kinds: set[str] = set()
+        artifacts_valid = len(report.artifacts) <= MAX_REMOTE_MCP_TRANSITION_ARTIFACTS_PER_CALL
+        for artifact in relevant_artifacts:
+            kind = artifact.get("kind")
+            artifact_id = artifact.get("artifact_id")
+            if isinstance(kind, str):
+                artifact_kinds.add(kind)
+            if isinstance(artifact_id, str):
+                all_artifact_ids.append(artifact_id)
+            artifacts_valid = artifacts_valid and (
+                isinstance(artifact_id, str)
+                and artifact.get("job_id") == job_id
+                and _is_sha256(artifact.get("sha256"))
+            )
+        stdio_valid = (
+            bool(report.mcp_stdio)
+            and _stdio_initialize_passed(report.mcp_stdio)
+            and report.virtual_alias is not None
+            and report.virtual_alias in _stdio_listed_tool_names(report.mcp_stdio)
+            and _stdio_call_job_id(report.mcp_stdio) == job_id
+        )
+        phase_passed = (
+            job_id is not None
+            and report.call_job.get("state") == "succeeded"
+            and required_kinds.issubset(artifact_kinds)
+            and artifacts_valid
+            and stdio_valid
+        )
+        passed = passed and phase_passed
+        phases[phase] = {
+            "job_id": job_id,
+            "state": report.call_job.get("state"),
+            "artifact_kinds": sorted(artifact_kinds),
+            "artifact_count": len(report.artifacts),
+            "artifacts_valid": artifacts_valid,
+            "stdio_valid": stdio_valid,
+            "passed": phase_passed,
+        }
+    distinct_jobs = len(jobs) == 3 and len(set(jobs)) == 3
+    distinct_artifacts = len(all_artifact_ids) == len(set(all_artifact_ids))
+    passed = passed and distinct_jobs and distinct_artifacts
+    return RemoteMcpAcceptanceCheck(
+        name="remote-mcp.spack-transition-durable-evidence",
+        passed=passed,
+        message=(
+            "three distinct succeeded jobs retain packaged stdio and durable artifacts"
+            if passed
+            else "Spack transition jobs, stdio, or durable artifacts are incomplete"
+        ),
+        evidence={
+            "required_artifact_kinds": sorted(required_kinds),
+            "job_ids": jobs,
+            "distinct_job_ids": distinct_jobs,
+            "distinct_artifact_ids": distinct_artifacts,
+            "phases": phases,
+        },
+    )
+
+
+def _spack_preinstall_absent_check(
+    *,
+    report: RemoteMcpAcceptanceReport,
+    protocol_result: JSON | None,
+    expectation: RemoteMcpStructuredResultExpectation,
+) -> tuple[RemoteMcpAcceptanceCheck, JSON]:
+    """Prove an exact requested spec was absent immediately before installation."""
+    structured, schema_evidence, failures = _spack_transition_structured_result(
+        protocol_result,
+        tool="spack_find",
+    )
+    arguments = _transition_call_arguments(report)
+    expected_spec = cast(str, expectation.requested_spec)
+    packages = structured.get("packages") if structured is not None else None
+    count = structured.get("count") if structured is not None else None
+    query = structured.get("query") if structured is not None else None
+    if arguments.get("query") != expected_spec:
+        failures.append("preinstall find call did not query the exact requested spec")
+    if query != expected_spec:
+        failures.append("preinstall find result query does not match the requested spec")
+    if not isinstance(count, int) or isinstance(count, bool) or count != 0:
+        failures.append("preinstall find result count is not zero")
+    if packages != []:
+        failures.append("preinstall find result packages is not an empty array")
+    projection: JSON = {
+        "schema_version": structured.get("schema_version") if structured is not None else None,
+        "operation": structured.get("operation") if structured is not None else None,
+        "query": _bounded_evidence_scalar(query),
+        "count": count,
+        "packages": [],
+    }
+    passed = not failures
+    return (
+        RemoteMcpAcceptanceCheck(
+            name="remote-mcp.spack-preinstall-absent",
+            passed=passed,
+            message=(
+                "exact requested spec was absent immediately before installation"
+                if passed
+                else "preinstall absence for the exact requested spec was not proven"
+            ),
+            evidence={
+                "expected_requested_spec": expected_spec,
+                "submitted_arguments": _bounded_transition_arguments(arguments, "spack_find"),
+                "observed": projection,
+                "output_schema": schema_evidence,
+                "failures": failures,
+            },
+        ),
+        projection,
+    )
+
+
+def _spack_fresh_install_check(
+    *,
+    report: RemoteMcpAcceptanceReport,
+    protocol_result: JSON | None,
+    expectation: RemoteMcpStructuredResultExpectation,
+) -> tuple[RemoteMcpAcceptanceCheck, JSON]:
+    """Prove one exact package identity was installed with reuse disabled."""
+    structured, schema_evidence, failures = _spack_transition_structured_result(
+        protocol_result,
+        tool="spack_install",
+    )
+    arguments = _transition_call_arguments(report)
+    expected_spec = cast(str, expectation.requested_spec)
+    packages = (
+        _spack_package_records(structured.get("packages")) if structured is not None else None
+    )
+    duration = structured.get("duration_seconds") if structured is not None else None
+    if arguments.get("spec") != expected_spec or arguments.get("reuse") is not False:
+        failures.append("install call did not submit the exact spec with reuse=false")
+    if structured is None or structured.get("requested_spec") != expected_spec:
+        failures.append("install result requested_spec does not match the exact submitted spec")
+    if structured is None or structured.get("reuse") is not False:
+        failures.append("install result does not prove reuse=false")
+    if structured is None or structured.get("status") != "installed":
+        failures.append("install result status is not installed")
+    if (
+        not isinstance(duration, (int, float))
+        or isinstance(duration, bool)
+        or not math.isfinite(duration)
+        or duration < 0
+    ):
+        failures.append("install duration is not a finite non-negative number")
+    package = packages[0] if packages is not None and len(packages) == 1 else None
+    if package is None or not _spack_package_matches(package, expectation):
+        failures.append("install result does not contain exactly one expected package identity")
+    projection: JSON = {
+        "schema_version": structured.get("schema_version") if structured is not None else None,
+        "operation": structured.get("operation") if structured is not None else None,
+        "requested_spec": _bounded_evidence_scalar(
+            structured.get("requested_spec") if structured is not None else None
+        ),
+        "reuse": structured.get("reuse") if structured is not None else None,
+        "status": _bounded_evidence_scalar(
+            structured.get("status") if structured is not None else None
+        ),
+        "duration_seconds": duration,
+        "package": _bounded_spack_package_identity(package),
+        "package_count": len(packages) if packages is not None else None,
+    }
+    passed = not failures
+    return (
+        RemoteMcpAcceptanceCheck(
+            name="remote-mcp.spack-fresh-install",
+            passed=passed,
+            message=(
+                "exact package identity was installed with reuse disabled"
+                if passed
+                else "fresh non-reusing installation of the exact package was not proven"
+            ),
+            evidence={
+                "expected": {
+                    "requested_spec": expected_spec,
+                    "package_name": expectation.package_name,
+                    "dag_hash": expectation.dag_hash,
+                    "reuse": False,
+                    "status": "installed",
+                },
+                "submitted_arguments": _bounded_transition_arguments(arguments, "spack_install"),
+                "observed": projection,
+                "output_schema": schema_evidence,
+                "failures": failures,
+            },
+        ),
+        projection,
+    )
+
+
+def _spack_postinstall_locate_check(
+    *,
+    report: RemoteMcpAcceptanceReport,
+    protocol_result: JSON | None,
+    expectation: RemoteMcpStructuredResultExpectation,
+) -> tuple[RemoteMcpAcceptanceCheck, JSON, object]:
+    """Prove the exact installed DAG hash resolves to one canonical prefix."""
+    structured, schema_evidence, failures = _spack_transition_structured_result(
+        protocol_result,
+        tool="spack_locate",
+    )
+    arguments = _transition_call_arguments(report)
+    exact_hash_spec = f"/{expectation.dag_hash}"
+    requested_spec = structured.get("requested_spec") if structured is not None else None
+    load_spec = structured.get("load_spec") if structured is not None else None
+    prefix = structured.get("prefix") if structured is not None else None
+    package = _as_json(structured.get("package")) if structured is not None else None
+    if arguments.get("spec") != exact_hash_spec:
+        failures.append("postinstall locate call did not query the exact /dag_hash")
+    if requested_spec != exact_hash_spec or load_spec != exact_hash_spec:
+        failures.append("postinstall locate result is not bound to the exact /dag_hash")
+    if package is None or not _spack_package_matches(package, expectation):
+        failures.append("postinstall locate result package identity does not match")
+    if not _is_canonical_absolute_posix_path(prefix):
+        failures.append("postinstall locate prefix is not a canonical absolute POSIX path")
+    projection: JSON = {
+        "schema_version": structured.get("schema_version") if structured is not None else None,
+        "operation": structured.get("operation") if structured is not None else None,
+        "requested_spec": _bounded_evidence_scalar(requested_spec),
+        "load_spec": _bounded_evidence_scalar(load_spec),
+        "prefix": _bounded_evidence_scalar(prefix),
+        "package": _bounded_spack_package_identity(package),
+    }
+    passed = not failures
+    return (
+        RemoteMcpAcceptanceCheck(
+            name="remote-mcp.spack-postinstall-locate",
+            passed=passed,
+            message=(
+                "exact installed DAG hash resolves to one canonical prefix"
+                if passed
+                else "postinstall locate did not prove the exact installed DAG identity"
+            ),
+            evidence={
+                "expected": {
+                    "requested_spec": exact_hash_spec,
+                    "package_name": expectation.package_name,
+                    "dag_hash": expectation.dag_hash,
+                },
+                "submitted_arguments": _bounded_transition_arguments(arguments, "spack_locate"),
+                "observed": projection,
+                "output_schema": schema_evidence,
+                "failures": failures,
+            },
+        ),
+        projection,
+        prefix,
+    )
+
+
+def _spack_transition_structured_result(
+    protocol_result: JSON | None,
+    *,
+    tool: Literal["spack_find", "spack_install", "spack_locate"],
+) -> tuple[JSON | None, JSON, list[str]]:
+    """Return a schema-validated transition result without retaining MCP text output."""
+    failures: list[str] = []
+    if protocol_result is None:
+        failures.append("protocol result is missing")
+        structured_value: object = None
+    else:
+        try:
+            _require_bounded_json_structure(protocol_result, label="transition protocol result")
+            _require_finite_json(protocol_result, label="transition protocol result")
+        except (RecursionError, ValueError) as exc:
+            failures.append(_bounded_diagnostic(str(exc)))
+            structured_value = None
+        else:
+            if protocol_result.get("isError") is True:
+                failures.append("protocol result reports isError=true")
+            structured_value = protocol_result.get("structuredContent")
+    structured = _as_json(structured_value)
+    schema_evidence = _structured_result_schema_evidence(
+        output_schema=_spack_transition_output_schema(tool),
+        structured_value=structured_value,
+    )
+    if schema_evidence.get("structured_content_valid") is not True:
+        failures.append("structuredContent does not satisfy the pinned Spack result schema")
+    expected_operation = tool.removeprefix("spack_")
+    if structured is None:
+        failures.append("protocol result has no structuredContent object")
+    else:
+        if structured.get("schema_version") != "spack.mcp.result.v1":
+            failures.append("structured result schema_version is not spack.mcp.result.v1")
+        if structured.get("operation") != expected_operation:
+            failures.append("structured result operation does not match the transition phase")
+    return structured, schema_evidence, failures
+
+
+def _spack_transition_output_schema(
+    tool: Literal["spack_find", "spack_install", "spack_locate"],
+) -> JSON:
+    """Return the strict result schema pinned by the clio-kit Spack user contract."""
+    nullable_string: JSON = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+    package_schema: JSON = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "version": deepcopy(nullable_string),
+            "dag_hash": deepcopy(nullable_string),
+            "compiler": deepcopy(nullable_string),
+            "architecture": deepcopy(nullable_string),
+        },
+        "required": ["name"],
+        "additionalProperties": False,
+    }
+    common: JSON = {
+        "schema_version": {"type": "string", "const": "spack.mcp.result.v1"},
+        "operation": {"type": "string", "const": tool.removeprefix("spack_")},
+    }
+    if tool == "spack_find":
+        return {
+            "type": "object",
+            "properties": {
+                **common,
+                "query": deepcopy(nullable_string),
+                "packages": {"type": "array", "items": package_schema},
+                "count": {"type": "integer"},
+            },
+            "required": ["count"],
+            "additionalProperties": False,
+        }
+    if tool == "spack_install":
+        return {
+            "type": "object",
+            "properties": {
+                **common,
+                "requested_spec": {"type": "string"},
+                "reuse": {"type": "boolean"},
+                "status": {"type": "string", "const": "installed"},
+                "duration_seconds": {"type": "number"},
+                "packages": {"type": "array", "items": package_schema},
+                "stdout_excerpt": deepcopy(nullable_string),
+            },
+            "required": ["requested_spec", "reuse", "duration_seconds", "packages"],
+            "additionalProperties": False,
+        }
+    return {
+        "type": "object",
+        "properties": {
+            **common,
+            "requested_spec": {"type": "string"},
+            "load_spec": {"type": "string"},
+            "package": package_schema,
+            "prefix": {"type": "string"},
+        },
+        "required": ["requested_spec", "load_spec", "package", "prefix"],
+        "additionalProperties": False,
+    }
+
+
+def _spack_transition_call_evidence(
+    *,
+    report: RemoteMcpAcceptanceReport,
+    phase: Literal["preinstall", "install", "postinstall"],
+    structured_result: JSON,
+) -> RemoteMcpSpackTransitionCallEvidence:
+    """Project one ordinary acceptance report into bounded transition evidence."""
+    artifacts = [
+        RemoteMcpSpackTransitionArtifactEvidence(
+            artifact_id=_bounded_optional_string(artifact.get("artifact_id"), 1_024),
+            job_id=_bounded_optional_string(artifact.get("job_id"), 1_024),
+            kind=_bounded_optional_string(artifact.get("kind"), 128),
+            sha256=_bounded_optional_string(artifact.get("sha256"), 64),
+            uri=_bounded_optional_string(artifact.get("uri"), 4_096),
+        )
+        for artifact in report.artifacts[:MAX_REMOTE_MCP_TRANSITION_ARTIFACTS_PER_CALL]
+    ]
+    alias = report.virtual_alias
+    return RemoteMcpSpackTransitionCallEvidence(
+        phase=phase,
+        report_passed=report.passed and all(check.passed for check in report.checks),
+        cluster=report.cluster,
+        server_name=report.server_name,
+        profile=report.profile,
+        remote_tool_name=report.remote_tool_name,
+        virtual_alias=alias,
+        job_id=_bounded_optional_string(report.call_job.get("job_id"), 1_024),
+        state=_bounded_optional_string(report.call_job.get("state"), 128),
+        arguments=_bounded_transition_arguments(
+            _transition_call_arguments(report),
+            report.remote_tool_name,
+        ),
+        artifacts=artifacts,
+        artifacts_truncated=(len(report.artifacts) > MAX_REMOTE_MCP_TRANSITION_ARTIFACTS_PER_CALL),
+        stdio=RemoteMcpSpackTransitionStdioEvidence(
+            boundary=_bounded_optional_string(report.mcp_stdio.get("boundary"), 128),
+            returncode=(
+                cast(int, report.mcp_stdio["returncode"])
+                if isinstance(report.mcp_stdio.get("returncode"), int)
+                and not isinstance(report.mcp_stdio.get("returncode"), bool)
+                else None
+            ),
+            initialize_passed=_stdio_initialize_passed(report.mcp_stdio),
+            tools_list_passed=(
+                alias is not None and alias in _stdio_listed_tool_names(report.mcp_stdio)
+            ),
+            call_job_id=_bounded_optional_string(_stdio_call_job_id(report.mcp_stdio), 1_024),
+        ),
+        structured_result=structured_result,
+    )
+
+
+def _transition_call_arguments(report: RemoteMcpAcceptanceReport) -> JSON:
+    """Return the ordinary report's MCP call arguments when structurally present."""
+    spec = _as_json(report.call_job.get("spec")) or {}
+    return _as_json(spec.get("arguments")) or {}
+
+
+def _bounded_transition_arguments(arguments: JSON, tool: str) -> JSON:
+    """Retain only operation-defining scalar arguments in transition evidence."""
+    keys = {"spack_find": ("query",), "spack_install": ("spec", "reuse")}.get(
+        tool,
+        ("spec",),
+    )
+    return {key: _bounded_evidence_scalar(arguments.get(key)) for key in keys}
+
+
+def _bounded_spack_package_identity(package: JSON | None) -> JSON:
+    """Return bounded Spack package identity fields for durable evidence."""
+    if package is None:
+        return {}
+    return {
+        key: _bounded_evidence_scalar(package.get(key))
+        for key in ("name", "version", "dag_hash", "compiler", "architecture")
+    }
+
+
+def _bounded_evidence_scalar(value: object) -> object:
+    """Bound strings retained in acceptance evidence while preserving scalar types."""
+    if isinstance(value, str):
+        return _bounded_diagnostic(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _bounded_diagnostic(type(value).__name__)
+
+
+def _bounded_optional_string(value: object, maximum: int) -> str | None:
+    """Return a string only when it is safe to retain in a bounded evidence model."""
+    return value if isinstance(value, str) and len(value) <= maximum else None
+
+
+def _acceptance_check_string(
+    report: RemoteMcpAcceptanceReport,
+    check_name: str,
+    evidence_key: str,
+) -> str | None:
+    """Read one bounded string from a uniquely named passing acceptance check."""
+    matches = [check for check in report.checks if check.name == check_name]
+    if len(matches) != 1 or not matches[0].passed:
+        return None
+    return _bounded_optional_string(matches[0].evidence.get(evidence_key), 128)
+
+
+def _acceptance_server_artifact(report: RemoteMcpAcceptanceReport) -> JSON | None:
+    """Return the exact verified call artifact from one ordinary acceptance report."""
+    matches = [check for check in report.checks if check.name == "remote-mcp.server-artifact"]
+    if len(matches) != 1 or not matches[0].passed:
+        return None
+    artifact = matches[0].evidence.get("call_server_artifact")
+    return cast(JSON, artifact) if isinstance(artifact, dict) else None
+
+
+def _same_nonempty_strings(values: tuple[str | None, ...]) -> bool:
+    """Return whether all values are the same non-empty string."""
+    return all(isinstance(value, str) and bool(value) for value in values) and len(set(values)) == 1
+
+
+def _common_string(values: tuple[str | None, ...]) -> str | None:
+    """Return one common non-empty value, or ``None`` when identity is ambiguous."""
+    return values[0] if _same_nonempty_strings(values) else None
+
+
+def _is_strict_canonical_posix_descendant(path: object, root: object) -> bool:
+    """Return whether ``path`` is canonical and strictly contained by ``root``."""
+    if not _is_canonical_absolute_posix_path(path) or not _is_canonical_absolute_posix_path(root):
+        return False
+    typed_path = PurePosixPath(cast(str, path))
+    typed_root = PurePosixPath(cast(str, root))
+    return typed_path != typed_root and typed_root in typed_path.parents
+
+
+def build_remote_mcp_structured_result_check(
+    *,
+    expectation: RemoteMcpStructuredResultExpectation,
+    remote_tool_name: str,
+    arguments: object,
+    protocol_result: JSON | None,
+    output_schema: JSON | None,
+) -> RemoteMcpAcceptanceCheck:
+    """Validate a remote structured result against an explicit semantic contract."""
+    if expectation.contract == "clio-kit-spack-user-v2":
+        return _spack_structured_result_check(
+            expectation=expectation,
+            remote_tool_name=remote_tool_name,
+            arguments=arguments,
+            protocol_result=protocol_result,
+            output_schema=output_schema,
+        )
+    raise ValueError(f"unsupported structured result contract: {expectation.contract}")
+
+
+def _spack_structured_result_check(
+    *,
+    expectation: RemoteMcpStructuredResultExpectation,
+    remote_tool_name: str,
+    arguments: object,
+    protocol_result: JSON | None,
+    output_schema: JSON | None,
+) -> RemoteMcpAcceptanceCheck:
+    """Validate the exact clio-kit Spack v2 result semantics for one operation."""
+    failures: list[str] = []
+    typed_arguments = _as_json(arguments) or {}
+    structured_value = (
+        protocol_result.get("structuredContent") if protocol_result is not None else None
+    )
+    structured = _as_json(structured_value)
+    output_schema_evidence = _structured_result_schema_evidence(
+        output_schema=output_schema,
+        structured_value=structured_value,
+    )
+    observed: JSON = {
+        "structured_content_present": structured is not None,
+        "schema_version": structured.get("schema_version") if structured is not None else None,
+        "operation": structured.get("operation") if structured is not None else None,
+    }
+    if remote_tool_name != expectation.tool:
+        failures.append("called tool does not match the configured result expectation")
+    if output_schema_evidence["schema_present"] is not True:
+        failures.append("cached tool outputSchema is absent")
+    elif output_schema_evidence["schema_valid"] is not True:
+        failures.append("cached tool outputSchema is invalid")
+    elif output_schema_evidence["structured_content_valid"] is not True:
+        failures.append("structuredContent does not satisfy the cached tool outputSchema")
+    if structured is None:
+        failures.append("protocol result has no structuredContent object")
+    else:
+        if structured.get("schema_version") != "spack.mcp.result.v1":
+            failures.append("structured result schema_version is not spack.mcp.result.v1")
+        expected_operation = expectation.tool.removeprefix("spack_")
+        if structured.get("operation") != expected_operation:
+            failures.append("structured result operation does not match the called tool")
+        if expectation.tool == "spack_find":
+            _validate_spack_find_result(
+                structured,
+                typed_arguments,
+                expectation,
+                failures,
+                observed,
+            )
+        elif expectation.tool == "spack_locate":
+            _validate_spack_locate_result(
+                structured,
+                typed_arguments,
+                expectation,
+                failures,
+                observed,
+            )
+        else:
+            _validate_spack_install_result(
+                structured,
+                typed_arguments,
+                expectation,
+                failures,
+                observed,
+            )
+    passed = not failures
+    return RemoteMcpAcceptanceCheck(
+        name="remote-mcp.structured-result",
+        passed=passed,
+        message=(
+            "structured MCP result matches the configured semantic expectations"
+            if passed
+            else "structured MCP result does not match the configured semantic expectations"
+        ),
+        evidence={
+            "contract": expectation.contract,
+            "tool": expectation.tool,
+            "expected": expectation.model_dump(mode="json"),
+            "observed": observed,
+            "output_schema": output_schema_evidence,
+            "failures": failures,
+        },
+    )
+
+
+def _structured_result_schema_evidence(
+    *,
+    output_schema: JSON | None,
+    structured_value: object,
+) -> JSON:
+    """Validate one result against its cached schema and return bounded evidence."""
+    evidence: JSON = {
+        "schema_present": output_schema is not None,
+        "schema_valid": False,
+        "schema_sha256": None,
+        "structured_content_valid": False,
+        "validation_errors": [],
+        "validation_errors_truncated": False,
+    }
+    if output_schema is None:
+        return evidence
+    try:
+        _require_bounded_json_structure(output_schema, label="outputSchema")
+        _require_finite_json(output_schema, label="outputSchema")
+        _validate_json_schema(output_schema, label="outputSchema")
+    except (RecursionError, ValueError) as exc:
+        evidence["validation_errors"] = [_bounded_diagnostic(str(exc))]
+        return evidence
+    evidence["schema_sha256"] = _stable_digest(output_schema)
+    evidence["schema_valid"] = True
+    declared_dialect = output_schema.get("$schema")
+    validator_type = (
+        _JSON_SCHEMA_VALIDATORS.get(declared_dialect.rstrip("#"), Draft202012Validator)
+        if isinstance(declared_dialect, str)
+        else Draft202012Validator
+    )
+    errors: list[str] = []
+    truncated = False
+    try:
+        validator = cast(_JsonSchemaInstanceValidator, validator_type(output_schema))
+        for index, error in enumerate(validator.iter_errors(structured_value)):
+            if index >= MAX_REMOTE_MCP_RESULT_SCHEMA_ERRORS:
+                truncated = True
+                break
+            path = "/".join(str(part) for part in error.absolute_path)
+            prefix = f"/{path}: " if path else ""
+            errors.append(_bounded_diagnostic(f"{prefix}{error.message}"))
+    except Exception as exc:  # A broken external reference must fail closed as evidence.
+        errors.append(
+            _bounded_diagnostic(f"outputSchema evaluation failed: {type(exc).__name__}: {exc}")
+        )
+    evidence["structured_content_valid"] = not errors and not truncated
+    evidence["validation_errors"] = errors
+    evidence["validation_errors_truncated"] = truncated
+    return evidence
+
+
+def _validate_spack_find_result(
+    structured: JSON,
+    arguments: JSON,
+    expectation: RemoteMcpStructuredResultExpectation,
+    failures: list[str],
+    observed: JSON,
+) -> None:
+    """Validate a Spack find result and record bounded evidence."""
+    packages = _spack_package_records(structured.get("packages"))
+    count = structured.get("count")
+    expected_query = arguments.get("query")
+    observed.update(
+        {
+            "query": structured.get("query"),
+            "count": count,
+        }
+    )
+    if structured.get("query") != expected_query:
+        failures.append("find result query does not match the submitted query")
+    if packages is None:
+        failures.append("find result packages is not an array of objects")
+        return
+    if not isinstance(count, int) or isinstance(count, bool) or count != len(packages):
+        failures.append("find result count does not match the package array")
+    _record_expected_spack_package(packages, expectation, failures, observed)
+
+
+def _validate_spack_locate_result(
+    structured: JSON,
+    arguments: JSON,
+    expectation: RemoteMcpStructuredResultExpectation,
+    failures: list[str],
+    observed: JSON,
+) -> None:
+    """Validate one unique Spack package, prefix, and canonical load spec."""
+    expected_spec = expectation.requested_spec
+    package = _as_json(structured.get("package"))
+    prefix = structured.get("prefix")
+    load_spec = structured.get("load_spec")
+    expected_load_spec = f"/{expectation.dag_hash}"
+    canonical_prefix = _is_canonical_absolute_posix_path(prefix)
+    prefix_matches_expected = prefix == expectation.prefix
+    package_matches = package is not None and _spack_package_matches(package, expectation)
+    observed.update(
+        {
+            "requested_spec": structured.get("requested_spec"),
+            "load_spec": load_spec,
+            "prefix": prefix,
+            "prefix_is_canonical_absolute": canonical_prefix,
+            "prefix_matches_expected": prefix_matches_expected,
+            "package": _spack_package_identity(package),
+            "expected_package_match_count": 1 if package_matches else 0,
+        }
+    )
+    if arguments.get("spec") != expected_spec:
+        failures.append("submitted locate spec does not match the configured expectation")
+    if structured.get("requested_spec") != expected_spec:
+        failures.append("locate result requested_spec does not match the expectation")
+    if load_spec != expected_load_spec:
+        failures.append("locate result load_spec is not the canonical /dag_hash")
+    if not canonical_prefix:
+        failures.append("locate result prefix is not a canonical absolute POSIX path")
+    if not prefix_matches_expected:
+        failures.append("locate result prefix does not match the configured exact prefix")
+    if not package_matches:
+        failures.append("locate result package does not match the expected name and DAG hash")
+
+
+def _validate_spack_install_result(
+    structured: JSON,
+    arguments: JSON,
+    expectation: RemoteMcpStructuredResultExpectation,
+    failures: list[str],
+    observed: JSON,
+) -> None:
+    """Validate installed/reused status and the observed exact Spack identity."""
+    expected_spec = expectation.requested_spec
+    packages = _spack_package_records(structured.get("packages"))
+    duration = structured.get("duration_seconds")
+    observed.update(
+        {
+            "requested_spec": structured.get("requested_spec"),
+            "reuse": structured.get("reuse"),
+            "status": structured.get("status"),
+            "duration_seconds": duration,
+        }
+    )
+    if arguments.get("spec") != expected_spec or arguments.get("reuse") is not expectation.reuse:
+        failures.append("submitted install arguments do not match the configured expectation")
+    if structured.get("requested_spec") != expected_spec:
+        failures.append("install result requested_spec does not match the expectation")
+    if structured.get("reuse") is not expectation.reuse:
+        failures.append("install result reuse does not match the expectation")
+    if structured.get("status") != "installed":
+        failures.append("install result does not report installed status")
+    if (
+        not isinstance(duration, (int, float))
+        or isinstance(duration, bool)
+        or not math.isfinite(duration)
+        or duration < 0
+    ):
+        failures.append("install result duration_seconds is not a finite non-negative number")
+    if packages is None:
+        failures.append("install result packages is not an array of objects")
+        return
+    _record_expected_spack_package(packages, expectation, failures, observed)
+
+
+def _record_expected_spack_package(
+    packages: list[JSON],
+    expectation: RemoteMcpStructuredResultExpectation,
+    failures: list[str],
+    observed: JSON,
+) -> None:
+    """Record and require one exact package identity without retaining an unbounded list."""
+    matches = [package for package in packages if _spack_package_matches(package, expectation)]
+    named_packages = [
+        package for package in packages if package.get("name") == expectation.package_name
+    ]
+    named_hashes = sorted(
+        {
+            str(package["dag_hash"])
+            for package in packages
+            if package.get("name") == expectation.package_name
+            and isinstance(package.get("dag_hash"), str)
+        }
+    )
+    observed["package_count"] = len(packages)
+    observed["expected_package_match_count"] = len(matches)
+    observed["expected_package_name_count"] = len(named_packages)
+    observed["package_hashes_for_expected_name"] = named_hashes[:20]
+    if len(matches) != 1:
+        failures.append("result does not contain exactly one expected package name and DAG hash")
+    if named_hashes != [expectation.dag_hash]:
+        failures.append("result contains an unexpected or ambiguous hash for the package name")
+    if len(named_packages) != 1:
+        failures.append("result does not contain one unique package record for the package name")
+    if len(packages) != 1:
+        failures.append("result does not contain exactly one matching root package")
+
+
+def _spack_package_records(value: object) -> list[JSON] | None:
+    """Return typed Spack package records only when every array item is an object."""
+    if not isinstance(value, list):
+        return None
+    records: list[JSON] = []
+    for item in cast(list[object], value):
+        record = _as_json(item)
+        if record is None:
+            return None
+        records.append(record)
+    return records
+
+
+def _spack_package_matches(
+    package: JSON,
+    expectation: RemoteMcpStructuredResultExpectation,
+) -> bool:
+    """Return whether one package has the exact configured stable identity."""
+    return (
+        package.get("name") == expectation.package_name
+        and package.get("dag_hash") == expectation.dag_hash
+    )
+
+
+def _spack_package_identity(package: JSON | None) -> JSON:
+    """Return the bounded identity fields needed in release evidence."""
+    if package is None:
+        return {}
+    return {
+        key: package.get(key) for key in ("name", "version", "dag_hash", "compiler", "architecture")
+    }
+
+
+def _is_canonical_absolute_posix_path(value: object) -> bool:
+    """Return whether a value is a normalized absolute POSIX path without traversal."""
+    if (
+        not isinstance(value, str)
+        or not value.startswith("/")
+        or value.startswith("//")
+        or value == "/"
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return False
+    path = PurePosixPath(value)
+    return ".." not in path.parts and str(path) == value
+
+
+def _is_canonical_relative_posix_path(value: object) -> bool:
+    """Return whether a value is a normalized, non-traversing relative POSIX path."""
+    if (
+        not isinstance(value, str)
+        or value.startswith("/")
+        or value in {"", "."}
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return False
+    path = PurePosixPath(value)
+    return ".." not in path.parts and str(path) == value
 
 
 def _spack_user_contract_check(
@@ -1504,7 +3280,7 @@ def _spack_user_contract_check(
         actual_names == expected_names
         and allowlisted_names == expected_names
         and registration is not None
-        and registration.contract == "clio-kit-spack-user-v3"
+        and registration.contract == CLIO_KIT_SPACK_USER_CONTRACT_ID
         and "user" in registration.profiles
         and all(annotation_matches.values())
         and all(schema_matches.values())
@@ -1530,7 +3306,7 @@ def _spack_user_contract_check(
             "locate_load_spec_matches": locate_load_spec_matches,
             "stateful_load_exposed": "spack_load" in actual_names,
             "expected_contract_sha256": CLIO_KIT_SPACK_USER_CONTRACT_SHA256,
-            "expected_clio_kit_version": CLIO_KIT_SPACK_USER_CONTRACT_VERSION,
+            "expected_clio_kit_version": CLIO_KIT_SPACK_USER_WHEEL_VERSION,
             "observed_contract_sha256": observed_contract_digest,
         },
     )
@@ -1541,7 +3317,7 @@ def _declared_contract_check(
     registration: RemoteMcpServerConfig,
 ) -> RemoteMcpAcceptanceCheck:
     """Evaluate the semantic contract explicitly declared by an operator."""
-    if registration.contract == "clio-kit-spack-user-v3":
+    if registration.contract == CLIO_KIT_SPACK_USER_CONTRACT_ID:
         return _spack_user_contract_check(entry, registration)
     raise ValueError(f"unsupported remote MCP semantic contract: {registration.contract}")
 
@@ -1702,8 +3478,10 @@ def remote_input_schema_requires_wrapper(input_schema: JSON) -> bool:
     _require_bounded_json_structure(input_schema, label="inputSchema")
     properties = input_schema.get("properties", {})
     required = input_schema.get("required", [])
+    root_identifier = input_schema.get("$id")
     return (
-        any(key in input_schema for key in _COMPOSED_SCHEMA_KEYS)
+        (isinstance(root_identifier, str) and bool(root_identifier))
+        or any(key in input_schema for key in _COMPOSED_SCHEMA_KEYS)
         or bool(set(input_schema) - _FLAT_SCHEMA_KEYS)
         or _contains_document_root_reference(input_schema)
         or (isinstance(properties, dict) and "cluster" in properties)
@@ -1898,7 +3676,8 @@ def _assign_aliases(
 ) -> dict[str, str]:
     bases: dict[str, list[str]] = {}
     for identity, candidates in grouped.items():
-        bases.setdefault(candidates[0].base_alias, []).append(identity)
+        base = _bounded_base_alias(candidates[0].base_alias)
+        bases.setdefault(base, []).append(identity)
     all_bases = set(bases)
     assigned: dict[str, str] = {}
     used = set(reserved_names)
@@ -1921,14 +3700,38 @@ def _assign_aliases(
 
 
 def _collision_alias(base: str, identity: str, *, blocked: set[str]) -> str:
-    for length in range(10, len(identity) + 1):
-        candidate = f"{base}_{identity[:length]}"
+    maximum_suffix_length = MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH - len("remote_")
+    for length in range(10, min(len(identity), maximum_suffix_length) + 1):
+        candidate = _alias_with_suffix(base, identity[:length])
         if candidate not in blocked:
             return candidate
-    suffix = 2
-    while f"{base}_{identity}_{suffix}" in blocked:
-        suffix += 1
-    return f"{base}_{identity}_{suffix}"
+    for nonce in range(1, len(blocked) + MAX_VIRTUAL_REMOTE_MCP_CANDIDATES + 2):
+        suffix = hashlib.sha256(f"{identity}\0{nonce}".encode("ascii")).hexdigest()[
+            :maximum_suffix_length
+        ]
+        candidate = f"remote_{suffix}"
+        if candidate not in blocked:
+            return candidate
+    raise ValueError("could not assign a unique bounded remote MCP alias")
+
+
+def _bounded_base_alias(base: str) -> str:
+    """Bound one readable generated alias to the MCP interoperability limit."""
+    if len(base) <= MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH:
+        return base
+    suffix = hashlib.sha256(base.encode("utf-8")).hexdigest()[:10]
+    return _alias_with_suffix(base, suffix)
+
+
+def _alias_with_suffix(base: str, suffix: str) -> str:
+    """Append a stable suffix without exceeding the MCP tool-name limit."""
+    head_length = MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH - len(suffix) - 1
+    if head_length < 1:
+        raise ValueError("remote MCP alias suffix leaves no readable prefix")
+    head = base[:head_length].rstrip("_")
+    if not head:
+        head = "remote"[:head_length]
+    return f"{head}_{suffix}"
 
 
 def _profile_allows(profiles: list[RemoteMcpProfile], profile: str) -> bool:

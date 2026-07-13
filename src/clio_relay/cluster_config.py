@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import stat
 import time
 from collections.abc import Callable
 from importlib import import_module
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Literal, cast
 from uuid import uuid4
 
@@ -254,7 +255,16 @@ class ClusterTargetIdentity(BaseModel):
 
 
 RemoteMcpProfile = Literal["user", "admin", "operator"]
-RemoteMcpContract = Literal["clio-kit-spack-user-v3"]
+RemoteMcpContract = Literal["clio-kit-spack-user-v2"]
+
+
+def _validated_cluster_label(value: str, *, field: str) -> str:
+    """Return a visible logical cluster label without changing its identity."""
+    if value != value.strip() or any(
+        ord(character) < 32 or ord(character) == 127 for character in value
+    ):
+        raise ValueError(f"{field} must not contain surrounding whitespace or controls")
+    return value
 
 
 class RemoteMcpServerConfig(BaseModel):
@@ -358,11 +368,12 @@ class ClusterDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1, max_length=256)
-    ssh_host: str
+    ssh_host: str = Field(min_length=1, max_length=1_024)
     bootstrap_profile: str = "linux-user"
     core_dir: str = "$HOME/.local/share/clio-relay/core"
     spool_dir: str = "$HOME/.local/share/clio-relay/spool"
     jarvis_bin: str | None = None
+    spack_executable: str | None = None
     frpc_bin: str | None = None
     agent_bin: str | None = None
     agent_adapter: str = "exec"
@@ -377,6 +388,27 @@ class ClusterDefinition(BaseModel):
     frp_transport: FrpTransportConfig = Field(default_factory=FrpTransportConfig)
     live_test: LiveTestConfig = Field(default_factory=LiveTestConfig)
     target_identity: ClusterTargetIdentity | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        return _validated_cluster_label(value, field="cluster name")
+
+    @field_validator("ssh_host")
+    @classmethod
+    def _validate_ssh_host(cls, value: str) -> str:
+        if (
+            value != value.strip()
+            or value.startswith("-")
+            or any(
+                character.isspace() or ord(character) < 32 or ord(character) == 127
+                for character in value
+            )
+        ):
+            raise ValueError(
+                "ssh_host must be one non-option SSH destination without whitespace or controls"
+            )
+        return value
 
     @field_validator("remote_mcp_servers")
     @classmethod
@@ -403,6 +435,18 @@ class ClusterDefinition(BaseModel):
             raise ValueError("scheduler_provider must be a lowercase provider identifier")
         return normalized
 
+    @field_validator("spack_executable")
+    @classmethod
+    def _validate_spack_executable(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if value != value.strip() or any(character in value for character in "\x00\r\n"):
+            raise ValueError("spack_executable must be one absolute remote path")
+        path = PurePosixPath(value)
+        if not path.is_absolute() or ".." in path.parts:
+            raise ValueError("spack_executable must be one absolute remote path")
+        return value
+
     @model_validator(mode="after")
     def _remote_mcp_must_not_reference_transport_credentials(self) -> ClusterDefinition:
         forbidden = {
@@ -422,6 +466,14 @@ class ClusterDefinition(BaseModel):
         return self
 
 
+def cluster_route_revision(definition: ClusterDefinition) -> str:
+    """Return a stable digest for every operator-controlled cluster route field."""
+    payload = definition.model_dump(mode="json", exclude={"remote_mcp_servers"})
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 class ClusterRegistry(BaseModel):
     """Configured cluster targets."""
 
@@ -438,10 +490,10 @@ class ClusterRegistry(BaseModel):
         cls,
         value: dict[str, ClusterDefinition],
     ) -> dict[str, ClusterDefinition]:
-        if any(not name.strip() for name in value):
-            raise ValueError("cluster registry keys must not be blank")
-        if any(len(name) > 256 for name in value):
-            raise ValueError("cluster registry keys must not exceed 256 characters")
+        for name in value:
+            _validated_cluster_label(name, field="cluster registry key")
+            if len(name) > 256:
+                raise ValueError("cluster registry keys must not exceed 256 characters")
         mismatches = sorted(name for name, definition in value.items() if definition.name != name)
         if mismatches:
             raise ValueError(

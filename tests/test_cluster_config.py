@@ -555,6 +555,20 @@ def test_cluster_registry_and_remote_mcp_cardinality_are_bounded(
         )
 
 
+@pytest.mark.parametrize("name", [" cluster", "cluster ", "cluster\nExecStart=x", "cluster\x00x"])
+def test_cluster_names_reject_controls_and_ambiguous_whitespace(name: str) -> None:
+    """Logical labels may be rich text but cannot become line-oriented injection."""
+    with pytest.raises(ValueError, match="cluster name"):
+        ClusterDefinition(name=name, ssh_host="localhost")
+
+
+@pytest.mark.parametrize("ssh_host", ["-oProxyCommand=evil", "host name", "host\nnext"])
+def test_cluster_ssh_host_rejects_option_and_control_injection(ssh_host: str) -> None:
+    """Configured SSH destinations cannot be interpreted as client options."""
+    with pytest.raises(ValueError, match="ssh_host"):
+        ClusterDefinition(name="cluster", ssh_host=ssh_host)
+
+
 def test_cluster_target_identity_round_trips_operator_pins(tmp_path: Path) -> None:
     path = tmp_path / "clusters.json"
     registry = ClusterRegistry(
@@ -598,6 +612,22 @@ def test_cluster_target_identity_rejects_ambiguous_pins(
 
     with pytest.raises(ValueError, match=message):
         ClusterTargetIdentity.model_validate(values)
+
+
+def test_cluster_spack_executable_is_explicit_site_configuration() -> None:
+    definition = ClusterDefinition(
+        name="site-cluster",
+        ssh_host="site-login",
+        spack_executable="/srv/site/spack/bin/spack",
+    )
+
+    assert definition.spack_executable == "/srv/site/spack/bin/spack"
+    with pytest.raises(ValueError, match="absolute remote path"):
+        ClusterDefinition(
+            name="site-cluster",
+            ssh_host="site-login",
+            spack_executable="spack",
+        )
 
 
 def _registry(name: str) -> ClusterRegistry:
