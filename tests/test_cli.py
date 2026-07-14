@@ -4825,6 +4825,27 @@ def test_ssh_host_key_fingerprint_parser_rejects_revoked_and_malformed_records()
     assert fingerprints == {f"SHA256:{expected}"}
 
 
+def test_endpoint_target_info_hashes_raw_machine_id_bytes(
+    tmp_path: Path,
+) -> None:
+    machine_id = tmp_path / "machine-id"
+    marker = b"production-site-id\n"
+    machine_id.write_bytes(marker)
+
+    observed = cli._physical_site_marker_sha256(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        machine_id
+    )
+
+    assert observed == hashlib.sha256(marker).hexdigest()
+    assert observed != hashlib.sha256(marker.strip()).hexdigest()
+
+    machine_id.write_bytes(b"\n")
+    with pytest.raises(ConfigurationError, match="physical site marker is empty"):
+        cli._physical_site_marker_sha256(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            machine_id
+        )
+
+
 def test_remote_worker_info_binds_worker_to_operator_pinned_physical_target(
     monkeypatch: MonkeyPatch,
 ) -> None:
