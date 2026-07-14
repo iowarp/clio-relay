@@ -49,7 +49,7 @@ def test_release_identity_is_consistent_across_package_policy_matrix_and_runbook
 
 def test_candidate_manifest_parser_accepts_the_exact_gnu_checksum_separator() -> None:
     digest = "a" * 64
-    wheel_name = "clio_relay-1.0.2-py3-none-any.whl"
+    wheel_name = "clio_relay-1.0.3-py3-none-any.whl"
     selector = re.compile(rf"^[0-9A-Fa-f]{{64}} [ *]{re.escape(wheel_name)}$")
     parser = re.compile(r"^([0-9A-Fa-f]{64}) [ *](.+)$")
 
@@ -61,6 +61,18 @@ def test_candidate_manifest_parser_accepts_the_exact_gnu_checksum_separator() ->
         assert match.groups() == (digest, wheel_name)
 
     assert selector.fullmatch(f"{digest}*{wheel_name}") is None
+
+
+def test_spack_json_array_fallback_is_safe_under_powershell_strict_mode() -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+
+    assert "$AdiosDecoded.specs" not in runbook
+    assert '$AdiosSpecs = $AdiosDecoded.PSObject.Properties["specs"]' in runbook
+    assert "$AdiosRecords = @(" in runbook
+    assert "if ($null -ne $AdiosSpecs) { $AdiosSpecs.Value } else { $AdiosDecoded }" in runbook
+    assert "$Record.$Property" not in runbook
+    assert "$Candidate = $Record.PSObject.Properties[$Property]" in runbook
+    assert "$Value = [string]$Candidate.Value" in runbook
 
 
 def test_release_helper_scripts_bind_direct_gray_scott_and_private_spack_state() -> None:
