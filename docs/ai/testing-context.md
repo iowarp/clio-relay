@@ -1,8 +1,8 @@
-# Testing Context
+# testing context
 
 Local tests are necessary but not sufficient for transport or cluster behavior.
 
-## Local Gates
+## local gates
 
 Run:
 
@@ -20,7 +20,23 @@ For CI parity, also verify the built artifacts:
 uvx twine check dist/*
 ```
 
-## Live Acceptance
+## build-once release CI
+
+The trusted release candidate is produced only by the primary Ubuntu/Python
+3.12 leg of a `merge_group` run. The other five matrix legs pass the downloaded
+wheel, source distribution, and canonical checksum file through
+`release validate-local --prebuilt-artifact-dir`; that mode rejects extra,
+missing, or changed files and cannot execute either `uv build` path. The final
+CI seal binds all six machine-readable reports to one distribution digest map,
+tested merge-group commit, Git tree, queued PR, run, and attempt.
+
+A protected-main tag must identify the merged PR commit and the same tested Git
+tree. The tag workflow is a lightweight binding workflow: it performs no sync,
+test, component fetch, artifact build, or candidate execution. Repository rules
+and merge-queue behavior require a live disposable canary before an owner
+enables them; checkout tests alone cannot prove GitHub's eventual merge identity.
+
+## live acceptance
 
 A feature that depends on a cluster, transport, scheduler, agent process, or MCP call is not done until that path has been live-tested.
 
@@ -35,7 +51,7 @@ The expected Ares acceptance includes:
 - verify transport through the configured path when transport behavior is in scope.
 - verify detach and teardown behavior when lifecycle behavior is in scope.
 
-## Recent Live Evidence
+## recent live evidence
 
 Historical release-candidate evidence is retained in
 `release-validation-0.9.17.md`. Use that file only as the authoritative record
@@ -60,7 +76,7 @@ are not current proof for a release candidate.
 
 Refresh this evidence when changing the relevant code. Do not present old live evidence as current proof after transport, lifecycle, worker, or acceptance code changes.
 
-## Machine-readable evidence
+## machine-readable evidence
 
 `clio-relay live-test` writes a versioned JSON report by default under
 `.clio-relay/validation-reports`. The report is canonical; an optional Markdown

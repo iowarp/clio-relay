@@ -23,14 +23,18 @@ from pathlib import Path
 from typing import BinaryIO, NoReturn, Protocol, cast
 from uuid import uuid4
 
-REQUIRED_CI_JOBS: tuple[str, ...] = (
-    "GitHub Actions syntax and semantics",
+REQUIRED_MATRIX_JOBS: tuple[str, ...] = (
     "ubuntu-latest / python 3.12",
     "ubuntu-latest / python 3.13",
     "ubuntu-latest / python 3.14",
     "windows-latest / python 3.12",
     "windows-latest / python 3.13",
     "windows-latest / python 3.14",
+)
+REQUIRED_CI_JOBS: tuple[str, ...] = (
+    "GitHub Actions syntax and semantics",
+    *REQUIRED_MATRIX_JOBS,
+    "seal tested release candidate",
 )
 GITHUB_ACTIONS_APP_ID = 15368
 MAIN_REVIEW_POLICY = "single-maintainer"
@@ -43,6 +47,17 @@ REQUIRED_ENVIRONMENTS: tuple[str, ...] = (
     "released-validation",
 )
 CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
+RELEASE_WORKFLOW_PATH = ".github/workflows/release.yml"
+IMMUTABLE_RELEASES_API_VERSION = "2026-03-10"
+REQUIRED_MERGE_QUEUE_PARAMETERS: dict[str, object] = {
+    "check_response_timeout_minutes": 60,
+    "grouping_strategy": "ALLGREEN",
+    "max_entries_to_build": 5,
+    "max_entries_to_merge": 5,
+    "merge_method": "SQUASH",
+    "min_entries_to_merge": 1,
+    "min_entries_to_merge_wait_minutes": 0,
+}
 RELEASE_TAG_PATTERN = "refs/tags/v*"
 MAX_RELEASE_ASSET_METADATA_RECORDS = 96
 MAX_RELEASE_HISTORY_PAGES = 100
@@ -65,6 +80,9 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_RELEASE_ASSET_BYTES = 128 * 1024 * 1024
 MAX_RELEASE_ASSET_AGGREGATE_BYTES = 512 * 1024 * 1024
 TAG_PAYLOAD_FIXED_FILES = frozenset({"SHA256SUMS", "validation-local.json"})
+CANDIDATE_PAYLOAD_FIXED_FILES = frozenset(
+    {"SHA256SUMS", "validation-local.json", "CANDIDATE-BUILD.json"}
+)
 RELEASE_ACCEPTANCE_MATRIX_SCHEMA = "clio-relay.release-acceptance-matrix.v1"
 RELEASE_ACCEPTANCE_MATRIX_STAGES = ("candidate", "released")
 
@@ -97,7 +115,7 @@ def select_ci_run(
     repository: str,
     source_commit: str,
 ) -> dict[str, object]:
-    """Select the sole successful completed push run for an exact main commit."""
+    """Select the sole successful merge-queue CI run for an exact tested commit."""
     _validate_repository(repository)
     _validate_commit(source_commit)
     payload = _mapping(document, "workflow-runs document")
@@ -112,12 +130,14 @@ def select_ci_run(
         run = _mapping(raw, "workflow run")
         if (
             run.get("head_sha") == source_commit
-            and run.get("head_branch") == "main"
-            and run.get("event") == "push"
+            and run.get("event") == "merge_group"
             and run.get("status") == "completed"
             and run.get("conclusion") == "success"
             and run.get("path") == CI_WORKFLOW_PATH
         ):
+            head_branch = _nonempty_string(run.get("head_branch"), "workflow head branch")
+            if not head_branch.startswith("gh-readonly-queue/main/"):
+                continue
             matches.append(
                 {
                     "run_id": _positive_integer(run.get("id"), "workflow run id"),
@@ -127,11 +147,13 @@ def select_ci_run(
                     "run_number": _positive_integer(run.get("run_number"), "workflow run number"),
                     "workflow_id": _positive_integer(run.get("workflow_id"), "workflow id"),
                     "url": _https_url(run.get("html_url"), "workflow run URL"),
+                    "event": "merge_group",
+                    "head_branch": head_branch,
                 }
             )
     if len(matches) != 1:
         raise ProvenanceError(
-            "exact release commit must have exactly one successful completed push run of ci.yml; "
+            "tested merge-group commit must have exactly one successful completed run of ci.yml; "
             f"found {len(matches)}"
         )
     return matches[0]
@@ -140,16 +162,40 @@ def select_ci_run(
 def build_ci_status(
     runs_document: object,
     jobs_document: object,
+    candidate_build: object,
+    candidate_artifact: object,
+    tag_binding: object,
     *,
     repository: str,
     source_commit: str,
 ) -> dict[str, object]:
-    """Build a deterministic receipt for the exact successful CI run and jobs."""
+    """Build a receipt binding release main to its one tested merge-queue artifact."""
+    binding = _mapping(tag_binding, "tag binding")
+    verify_tag_binding(binding, repository=repository, source_commit=source_commit)
+    build = _mapping(candidate_build, "candidate build receipt")
+    verify_candidate_build_receipt(build, repository=repository)
+    artifact_manifest = _mapping(candidate_artifact, "candidate artifact manifest")
+    _verify_candidate_artifact_manifest(
+        artifact_manifest,
+        candidate_build=build,
+        repository=repository,
+    )
+    if binding.get("candidate_build_sha256") != _canonical_json_sha256(build):
+        raise ProvenanceError("tag binding does not identify the candidate build receipt")
+    if binding.get("merge_group_anchor_pull_request_number") != build.get("pull_request_number"):
+        raise ProvenanceError("tag binding does not identify the merge-group anchor pull request")
+    if binding.get("candidate_artifact") != artifact_manifest.get("artifact"):
+        raise ProvenanceError("tag binding does not identify the selected candidate artifact")
+    tested_commit = _nonempty_string(build.get("tested_commit"), "tested merge-group commit")
     selected = select_ci_run(
         runs_document,
         repository=repository,
-        source_commit=source_commit,
+        source_commit=tested_commit,
     )
+    if selected["run_id"] != build.get("run_id") or selected["run_attempt"] != build.get(
+        "run_attempt"
+    ):
+        raise ProvenanceError("candidate build receipt does not identify the selected CI run")
     payload = _mapping(jobs_document, "workflow-jobs document")
     jobs = _list(payload.get("jobs"), "jobs")
     total_count = _integer(payload.get("total_count"), "workflow-jobs total_count")
@@ -186,17 +232,28 @@ def build_ci_status(
     if nonpassing:
         raise ProvenanceError(f"CI jobs did not succeed: {sorted(nonpassing)}")
     receipt: dict[str, object] = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "repository": repository,
         "source_commit": source_commit,
+        "source_tree": build["source_tree"],
         "workflow": CI_WORKFLOW_PATH,
-        "event": "push",
-        "head_branch": "main",
+        "event": "merge_group",
+        "head_branch": selected["head_branch"],
         "status": "completed",
         "conclusion": "success",
         **selected,
         "required_jobs": list(REQUIRED_CI_JOBS),
         "jobs": [observed[name] for name in REQUIRED_CI_JOBS],
+        "tested_merge_group": {
+            "commit": tested_commit,
+            "tree": build["source_tree"],
+            "base_ref": build["base_ref"],
+            "head_ref": build["head_ref"],
+            "pull_request_number": build["pull_request_number"],
+        },
+        "candidate_artifact": artifact_manifest["artifact"],
+        "candidate_build_sha256": _canonical_json_sha256(build),
+        "tag_binding_sha256": _canonical_json_sha256(binding),
     }
     verify_ci_status(receipt, repository=repository, source_commit=source_commit)
     return receipt
@@ -213,18 +270,21 @@ def verify_ci_status(
     _validate_commit(source_commit)
     document = _mapping(receipt, "CI status receipt")
     expected_scalars = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "repository": repository,
         "source_commit": source_commit,
         "workflow": CI_WORKFLOW_PATH,
-        "event": "push",
-        "head_branch": "main",
+        "event": "merge_group",
         "status": "completed",
         "conclusion": "success",
     }
     mismatches = [key for key, value in expected_scalars.items() if document.get(key) != value]
     if mismatches:
         raise ProvenanceError(f"CI receipt identity mismatch: {sorted(mismatches)}")
+    _validate_git_tree(_nonempty_string(document.get("source_tree"), "CI source tree"))
+    head_branch = _nonempty_string(document.get("head_branch"), "CI head branch")
+    if not head_branch.startswith("gh-readonly-queue/main/"):
+        raise ProvenanceError("CI receipt is not from the main merge queue")
     for key in ("run_id", "run_attempt", "run_number", "workflow_id"):
         _positive_integer(document.get(key), f"CI receipt {key}")
     _https_url(document.get("url"), "CI receipt URL")
@@ -245,6 +305,376 @@ def verify_ci_status(
             raise ProvenanceError(f"CI receipt contains a nonpassing job: {name}")
     if names != list(REQUIRED_CI_JOBS) or len(set(names)) != len(names):
         raise ProvenanceError("CI receipt jobs are missing, duplicated, or out of canonical order")
+    tested = _mapping(document.get("tested_merge_group"), "tested merge group")
+    _validate_commit(_nonempty_string(tested.get("commit"), "tested merge-group commit"))
+    tree = _nonempty_string(tested.get("tree"), "tested merge-group tree")
+    _validate_git_tree(tree)
+    if tree != document.get("source_tree"):
+        raise ProvenanceError("CI receipt tree identities differ")
+    if tested.get("base_ref") != "refs/heads/main":
+        raise ProvenanceError("CI receipt merge group does not target main")
+    pull_number = _positive_integer(
+        tested.get("pull_request_number"), "CI receipt pull request number"
+    )
+    head_ref = _nonempty_string(tested.get("head_ref"), "CI receipt merge-group head ref")
+    if (
+        re.fullmatch(
+            rf"refs/heads/gh-readonly-queue/main/pr-{pull_number}-[A-Za-z0-9._/-]+",
+            head_ref,
+        )
+        is None
+    ):
+        raise ProvenanceError("CI receipt merge-group head ref does not bind its pull request")
+    artifact = _mapping(document.get("candidate_artifact"), "CI candidate artifact")
+    _positive_integer(artifact.get("id"), "CI candidate artifact id")
+    _positive_integer(artifact.get("size_in_bytes"), "CI candidate artifact size")
+    digest = _nonempty_string(artifact.get("digest"), "CI candidate artifact digest")
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+        raise ProvenanceError("CI candidate artifact digest is invalid")
+    for field in ("candidate_build_sha256", "tag_binding_sha256"):
+        value = _nonempty_string(document.get(field), f"CI receipt {field}")
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ProvenanceError(f"CI receipt {field} is invalid")
+
+
+def build_candidate_build_receipt(
+    candidate_dir: Path,
+    reports_dir: Path,
+    *,
+    repository: str,
+    source_commit: str,
+    source_tree: str,
+    event: str,
+    run_id: int,
+    run_attempt: int,
+    head_ref: str,
+    base_ref: str,
+) -> dict[str, object]:
+    """Seal one build and six matrix validations from a merge-queue commit."""
+    _validate_repository(repository)
+    _validate_commit(source_commit)
+    _validate_git_tree(source_tree)
+    if event != "merge_group" or base_ref != "refs/heads/main":
+        raise ProvenanceError("candidate build must originate from the main merge queue")
+    match = re.fullmatch(
+        r"refs/heads/gh-readonly-queue/main/pr-([1-9][0-9]*)-[A-Za-z0-9._/-]+",
+        head_ref,
+    )
+    if match is None:
+        raise ProvenanceError("candidate build head ref does not identify one queued pull request")
+    pull_request_number = int(match.group(1))
+    observed_run_id = _positive_integer(run_id, "candidate build run id")
+    observed_run_attempt = _positive_integer(run_attempt, "candidate build run attempt")
+    try:
+        candidate_paths = sorted(candidate_dir.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        raise ProvenanceError(f"could not inspect build-once candidate directory: {exc}") from exc
+    wheels = [path for path in candidate_paths if path.name.endswith(".whl")]
+    sdists = [path for path in candidate_paths if path.name.endswith(".tar.gz")]
+    expected_candidate_names = {
+        *(path.name for path in wheels),
+        *(path.name for path in sdists),
+        "SHA256SUMS",
+    }
+    if (
+        len(wheels) != 1
+        or len(sdists) != 1
+        or {path.name for path in candidate_paths} != expected_candidate_names
+    ):
+        raise ProvenanceError(
+            "build-once candidate must contain exactly one wheel, one sdist, and SHA256SUMS"
+        )
+    _verify_checksum_manifest(
+        candidate_dir,
+        expected_names={wheels[0].name, sdists[0].name},
+    )
+    distribution_digests = {
+        path.name: _sha256_bounded_file(path, maximum_bytes=MAX_DISTRIBUTION_BYTES)
+        for path in (wheels[0], sdists[0])
+    }
+    expected_reports = {
+        f"validation-local-{job.split(' / python ')[0]}-{job.rsplit(' ', 1)[1]}.json": job
+        for job in REQUIRED_MATRIX_JOBS
+    }
+    try:
+        report_paths = sorted(reports_dir.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        raise ProvenanceError(f"could not inspect matrix report directory: {exc}") from exc
+    if {path.name for path in report_paths} != set(expected_reports):
+        raise ProvenanceError("matrix validation report set is missing, extra, or renamed")
+    reports: list[dict[str, object]] = []
+    for path in report_paths:
+        report = _mapping(_load_json(path), f"matrix validation report {path.name}")
+        if (
+            report.get("status") != "passed"
+            or report.get("scenario") != "local-release"
+            or report.get("cluster") != "local"
+        ):
+            raise ProvenanceError(f"matrix validation report did not pass: {path.name}")
+        software = _mapping(report.get("software"), f"matrix report software {path.name}")
+        if software.get("commit") != source_commit or software.get("dirty") is not False:
+            raise ProvenanceError(f"matrix validation report source identity differs: {path.name}")
+        resources = _list(report.get("resources"), f"matrix report resources {path.name}")
+        observed_digests: dict[str, str] = {}
+        for raw in resources:
+            resource = _mapping(raw, f"matrix report resource {path.name}")
+            name = resource.get("resource_id")
+            if name not in distribution_digests:
+                continue
+            metadata = _mapping(resource.get("metadata"), f"matrix report metadata {path.name}")
+            digest = _nonempty_string(
+                metadata.get("sha256"), f"matrix report artifact digest {path.name}"
+            )
+            if name in observed_digests:
+                raise ProvenanceError(f"matrix report duplicates a release artifact: {path.name}")
+            observed_digests[cast(str, name)] = digest
+        if observed_digests != distribution_digests:
+            raise ProvenanceError(f"matrix report artifact digests differ: {path.name}")
+        checks = {
+            _mapping(raw, f"matrix report check {path.name}").get("check_id")
+            for raw in _list(report.get("checks"), f"matrix report checks {path.name}")
+        }
+        job = expected_reports[path.name]
+        primary = job == "ubuntu-latest / python 3.12"
+        if primary:
+            if "local.build" not in checks or "local.sdist-smoke" not in checks:
+                raise ProvenanceError("primary matrix report does not prove the sole build")
+            mode = "build"
+        else:
+            if (
+                "local.prebuilt-artifacts" not in checks
+                or "local.build" in checks
+                or "local.sdist-smoke" in checks
+            ):
+                raise ProvenanceError(
+                    f"matrix report did not use the build-once artifact path: {path.name}"
+                )
+            mode = "prebuilt"
+        reports.append(
+            {
+                "job": job,
+                "filename": path.name,
+                "sha256": _sha256_bounded_file(path, maximum_bytes=MAX_FIXED_JSON_BYTES),
+                "mode": mode,
+                "artifact_sha256": distribution_digests,
+            }
+        )
+    reports.sort(key=lambda item: REQUIRED_MATRIX_JOBS.index(cast(str, item["job"])))
+    receipt: dict[str, object] = {
+        "schema_version": "clio-relay.candidate-build.v1",
+        "repository": repository,
+        "workflow": CI_WORKFLOW_PATH,
+        "event": "merge_group",
+        "tested_commit": source_commit,
+        "source_tree": source_tree,
+        "base_ref": base_ref,
+        "head_ref": head_ref,
+        "pull_request_number": pull_request_number,
+        "run_id": observed_run_id,
+        "run_attempt": observed_run_attempt,
+        "distribution_sha256": distribution_digests,
+        "matrix_reports": reports,
+    }
+    verify_candidate_build_receipt(receipt, repository=repository)
+    return receipt
+
+
+def verify_candidate_build_receipt(receipt: object, *, repository: str) -> None:
+    """Verify the structural identity of a sealed merge-queue candidate build."""
+    _validate_repository(repository)
+    document = _mapping(receipt, "candidate build receipt")
+    expected = {
+        "schema_version": "clio-relay.candidate-build.v1",
+        "repository": repository,
+        "workflow": CI_WORKFLOW_PATH,
+        "event": "merge_group",
+        "base_ref": "refs/heads/main",
+    }
+    mismatches = [key for key, value in expected.items() if document.get(key) != value]
+    if mismatches:
+        raise ProvenanceError(f"candidate build receipt identity mismatch: {mismatches}")
+    _validate_commit(_nonempty_string(document.get("tested_commit"), "tested commit"))
+    _validate_git_tree(_nonempty_string(document.get("source_tree"), "candidate source tree"))
+    pull_number = _positive_integer(
+        document.get("pull_request_number"), "candidate pull request number"
+    )
+    head_ref = _nonempty_string(document.get("head_ref"), "candidate head ref")
+    if (
+        re.fullmatch(
+            rf"refs/heads/gh-readonly-queue/main/pr-{pull_number}-[A-Za-z0-9._/-]+",
+            head_ref,
+        )
+        is None
+    ):
+        raise ProvenanceError("candidate head ref does not match its pull request number")
+    _positive_integer(document.get("run_id"), "candidate run id")
+    _positive_integer(document.get("run_attempt"), "candidate run attempt")
+    digests = _mapping(document.get("distribution_sha256"), "candidate distribution digests")
+    if len(digests) != 2:
+        raise ProvenanceError("candidate receipt must identify exactly two distributions")
+    for name, digest in digests.items():
+        if (
+            not (name.endswith(".whl") or name.endswith(".tar.gz"))
+            or re.fullmatch(r"[0-9a-f]{64}", _nonempty_string(digest, f"candidate digest {name}"))
+            is None
+        ):
+            raise ProvenanceError(f"candidate distribution digest is invalid: {name}")
+    reports = _list(document.get("matrix_reports"), "candidate matrix reports")
+    if len(reports) != len(REQUIRED_MATRIX_JOBS):
+        raise ProvenanceError("candidate receipt matrix report count differs")
+    observed_jobs: list[str] = []
+    for raw in reports:
+        report = _mapping(raw, "candidate matrix report")
+        observed_jobs.append(_nonempty_string(report.get("job"), "candidate matrix job"))
+        filename = _nonempty_string(report.get("filename"), "candidate matrix filename")
+        if re.fullmatch(r"validation-local-[A-Za-z0-9._-]+\.json", filename) is None:
+            raise ProvenanceError("candidate matrix report filename is invalid")
+        digest = _nonempty_string(report.get("sha256"), "candidate matrix report digest")
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ProvenanceError("candidate matrix report digest is invalid")
+        expected_mode = "build" if report["job"] == REQUIRED_MATRIX_JOBS[0] else "prebuilt"
+        if report.get("mode") != expected_mode or report.get("artifact_sha256") != digests:
+            raise ProvenanceError("candidate matrix report build mode or artifact digest differs")
+    if observed_jobs != list(REQUIRED_MATRIX_JOBS) or len(set(observed_jobs)) != len(observed_jobs):
+        raise ProvenanceError("candidate matrix jobs are missing, duplicated, or out of order")
+
+
+def build_tag_binding(
+    candidate_build: object,
+    candidate_artifact: object,
+    pulls_document: object,
+    *,
+    repository: str,
+    source_commit: str,
+    source_tree: str,
+    tag: str,
+) -> dict[str, object]:
+    """Bind a protected release tag to the already tested merge-queue tree."""
+    _validate_repository(repository)
+    _validate_commit(source_commit)
+    _validate_git_tree(source_tree)
+    _validate_tag(tag)
+    build = _mapping(candidate_build, "candidate build receipt")
+    verify_candidate_build_receipt(build, repository=repository)
+    if build.get("source_tree") != source_tree:
+        raise ProvenanceError("release tag tree differs from the tested merge-group tree")
+    artifact = _mapping(candidate_artifact, "candidate artifact manifest")
+    _verify_candidate_artifact_manifest(artifact, candidate_build=build, repository=repository)
+    pulls = _list(pulls_document, "release commit pull requests")
+    if len(pulls) >= 100:
+        raise ProvenanceError("release commit pull-request query is not provably complete")
+    merge_group_anchor = _positive_integer(
+        build.get("pull_request_number"), "candidate merge-group anchor pull request"
+    )
+    matches: list[dict[str, object]] = []
+    for raw in pulls:
+        pull = _mapping(raw, "release commit pull request")
+        base = _mapping(pull.get("base"), "release pull request base")
+        if (
+            pull.get("state") == "closed"
+            and pull.get("merged_at") is not None
+            and pull.get("merge_commit_sha") == source_commit
+            and base.get("ref") == "main"
+        ):
+            matches.append(pull)
+    if len(matches) != 1:
+        raise ProvenanceError("release commit does not identify the tested merged pull request")
+    pull = matches[0]
+    merged_pull_number = _positive_integer(pull.get("number"), "release commit pull request number")
+    binding: dict[str, object] = {
+        "schema_version": "clio-relay.tag-candidate-binding.v1",
+        "repository": repository,
+        "tag": tag,
+        "source_commit": source_commit,
+        "source_tree": source_tree,
+        "merge_group_anchor_pull_request_number": merge_group_anchor,
+        "pull_request": {
+            "number": merged_pull_number,
+            "merge_commit_sha": source_commit,
+            "url": _https_url(pull.get("html_url"), "release pull request URL"),
+        },
+        "tested_commit": build["tested_commit"],
+        "candidate_build_sha256": _canonical_json_sha256(build),
+        "candidate_run": {
+            "id": artifact["run_id"],
+            "attempt": artifact["run_attempt"],
+            "head_sha": build["tested_commit"],
+            "head_branch": artifact["head_branch"],
+        },
+        "candidate_artifact": artifact["artifact"],
+    }
+    verify_tag_binding(binding, repository=repository, source_commit=source_commit)
+    return binding
+
+
+def verify_tag_binding(
+    binding: object,
+    *,
+    repository: str,
+    source_commit: str,
+) -> None:
+    """Verify a release tag's tree, PR, and merge-queue candidate binding."""
+    _validate_repository(repository)
+    _validate_commit(source_commit)
+    document = _mapping(binding, "tag binding")
+    if document.get("schema_version") != "clio-relay.tag-candidate-binding.v1":
+        raise ProvenanceError("tag binding schema does not match")
+    if document.get("repository") != repository or document.get("source_commit") != source_commit:
+        raise ProvenanceError("tag binding release identity differs")
+    _validate_tag(_nonempty_string(document.get("tag"), "tag binding release tag"))
+    _validate_git_tree(_nonempty_string(document.get("source_tree"), "tag binding source tree"))
+    _validate_commit(_nonempty_string(document.get("tested_commit"), "tag binding tested commit"))
+    merge_group_anchor = _positive_integer(
+        document.get("merge_group_anchor_pull_request_number"),
+        "tag binding merge-group anchor pull request number",
+    )
+    build_digest = _nonempty_string(
+        document.get("candidate_build_sha256"), "tag binding candidate build digest"
+    )
+    if re.fullmatch(r"[0-9a-f]{64}", build_digest) is None:
+        raise ProvenanceError("tag binding candidate build digest is invalid")
+    pull = _mapping(document.get("pull_request"), "tag binding pull request")
+    _positive_integer(pull.get("number"), "tag binding pull request number")
+    if pull.get("merge_commit_sha") != source_commit:
+        raise ProvenanceError("tag binding pull request does not identify the release commit")
+    _https_url(pull.get("url"), "tag binding pull request URL")
+    artifact = _mapping(document.get("candidate_artifact"), "tag binding candidate artifact")
+    _positive_integer(artifact.get("id"), "tag binding candidate artifact id")
+    digest = _nonempty_string(artifact.get("digest"), "tag binding candidate artifact digest")
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+        raise ProvenanceError("tag binding candidate artifact digest is invalid")
+    run = _mapping(document.get("candidate_run"), "tag binding candidate run")
+    _positive_integer(run.get("id"), "tag binding candidate run id")
+    _positive_integer(run.get("attempt"), "tag binding candidate run attempt")
+    if run.get("head_sha") != document.get("tested_commit"):
+        raise ProvenanceError("tag binding candidate run commit differs")
+    head_branch = _nonempty_string(run.get("head_branch"), "tag binding candidate head branch")
+    if not head_branch.startswith(f"gh-readonly-queue/main/pr-{merge_group_anchor}-"):
+        raise ProvenanceError("tag binding candidate run is not from the main merge queue")
+
+
+def _verify_candidate_artifact_manifest(
+    manifest: Mapping[str, object],
+    *,
+    candidate_build: Mapping[str, object],
+    repository: str,
+) -> None:
+    if (
+        manifest.get("schema_version") != "1.1"
+        or manifest.get("repository") != repository
+        or manifest.get("artifact_kind") != "candidate"
+        or manifest.get("source_commit") != candidate_build.get("tested_commit")
+        or manifest.get("source_tree") != candidate_build.get("source_tree")
+        or manifest.get("run_id") != candidate_build.get("run_id")
+        or manifest.get("run_attempt") != candidate_build.get("run_attempt")
+        or manifest.get("head_branch")
+        != str(candidate_build.get("head_ref", "")).removeprefix("refs/heads/")
+    ):
+        raise ProvenanceError("candidate artifact manifest differs from its build receipt")
+    artifact = _mapping(manifest.get("artifact"), "candidate artifact")
+    expected_name = f"release-candidate-{candidate_build['source_tree']}"
+    if artifact.get("name") != expected_name:
+        raise ProvenanceError("candidate artifact name does not bind the tested tree")
 
 
 def build_actions_artifact_manifest(
@@ -258,39 +688,68 @@ def build_actions_artifact_manifest(
     run_attempt: int,
     artifact_name: str,
     artifact_kind: str,
+    source_tree: str | None = None,
 ) -> dict[str, object]:
-    """Bind one nonexpired Actions artifact to an exact successful tag run."""
+    """Bind one nonexpired Actions artifact to its exact trusted workflow run."""
     _validate_repository(repository)
     _validate_commit(source_commit)
     _validate_tag(tag)
     expected_run_id = _positive_integer(run_id, "workflow run id")
     expected_attempt = _positive_integer(run_attempt, "workflow run attempt")
     expected_name = _nonempty_string(artifact_name, "Actions artifact name")
-    if artifact_kind not in {"tag-payload", "promotion"}:
+    if artifact_kind not in {"candidate", "tag-binding", "tag-payload", "promotion"}:
         raise ProvenanceError("Actions artifact kind is invalid")
-    required_name = (
-        f"release-candidate-{tag}" if artifact_kind == "tag-payload" else f"verified-release-{tag}"
-    )
+    if artifact_kind == "candidate":
+        tree = _nonempty_string(source_tree, "candidate source tree")
+        _validate_git_tree(tree)
+        required_name = f"release-candidate-{tree}"
+    elif artifact_kind == "tag-binding":
+        tree = None
+        required_name = f"release-binding-{tag}"
+    elif artifact_kind == "tag-payload":
+        tree = None
+        required_name = f"release-candidate-{tag}"
+    else:
+        tree = None
+        required_name = f"verified-release-{tag}"
     if expected_name != required_name:
         raise ProvenanceError("Actions artifact name does not match the release tag")
     run = _mapping(run_document, "workflow run attempt")
+    if artifact_kind == "candidate":
+        expected_head_branch: str | None = None
+        expected_event = "merge_group"
+        expected_status = "completed"
+        expected_conclusion: str | None = "success"
+        expected_path = CI_WORKFLOW_PATH
+    elif artifact_kind in {"tag-binding", "tag-payload"}:
+        expected_head_branch = tag
+        expected_event = "push"
+        expected_status = "completed"
+        expected_conclusion = "success"
+        expected_path = RELEASE_WORKFLOW_PATH
+    else:
+        expected_head_branch = "main"
+        expected_event = "workflow_dispatch"
+        expected_status = "in_progress"
+        expected_conclusion = None
+        expected_path = ".github/workflows/release-gate.yml"
     run_expected = {
         "id": expected_run_id,
         "run_attempt": expected_attempt,
-        "head_branch": tag if artifact_kind == "tag-payload" else "main",
         "head_sha": source_commit,
-        "event": "push" if artifact_kind == "tag-payload" else "workflow_dispatch",
-        "status": "completed" if artifact_kind == "tag-payload" else "in_progress",
-        "conclusion": "success" if artifact_kind == "tag-payload" else None,
-        "path": (
-            ".github/workflows/release.yml"
-            if artifact_kind == "tag-payload"
-            else ".github/workflows/release-gate.yml"
-        ),
+        "event": expected_event,
+        "status": expected_status,
+        "conclusion": expected_conclusion,
+        "path": expected_path,
     }
+    if expected_head_branch is not None:
+        run_expected["head_branch"] = expected_head_branch
     run_mismatches = [key for key, value in run_expected.items() if run.get(key) != value]
     if run_mismatches:
         raise ProvenanceError(f"tag-build run identity mismatch: {sorted(run_mismatches)}")
+    run_head_branch = _nonempty_string(run.get("head_branch"), "workflow run head branch")
+    if artifact_kind == "candidate" and not run_head_branch.startswith("gh-readonly-queue/main/"):
+        raise ProvenanceError("candidate artifact run is not a main merge-group run")
     run_started_at = _rfc3339_timestamp(run.get("run_started_at"), "workflow run attempt start")
     repository_id = _positive_integer(
         _mapping(run.get("repository"), "workflow run repository").get("id"),
@@ -333,7 +792,7 @@ def build_actions_artifact_manifest(
     artifact_run_expected = {
         "id": expected_run_id,
         "head_sha": source_commit,
-        "head_branch": tag if artifact_kind == "tag-payload" else "main",
+        "head_branch": run_head_branch,
         "repository_id": repository_id,
         "head_repository_id": repository_id,
     }
@@ -349,11 +808,13 @@ def build_actions_artifact_manifest(
     if archive_url != expected_url:
         raise ProvenanceError("Actions artifact archive URL does not match its repository and id")
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1" if artifact_kind in {"candidate", "tag-binding"} else "1.0",
         "repository": repository,
         "source_commit": source_commit,
+        "source_tree": tree,
         "tag": tag,
         "artifact_kind": artifact_kind,
+        "head_branch": run_head_branch,
         "run_id": expected_run_id,
         "run_attempt": expected_attempt,
         "run_started_at": run_started_at.isoformat(),
@@ -376,13 +837,14 @@ def verify_actions_artifact_archive(
 ) -> None:
     """Verify and safely extract the exact inert tag-build payload archive."""
     document = _mapping(manifest, "Actions artifact manifest")
-    if document.get("schema_version") != "1.0":
+    artifact_kind = _nonempty_string(document.get("artifact_kind"), "Actions artifact kind")
+    expected_schema = "1.1" if artifact_kind in {"candidate", "tag-binding"} else "1.0"
+    if document.get("schema_version") != expected_schema:
         raise ProvenanceError("Actions artifact manifest schema does not match")
     _validate_repository(_nonempty_string(document.get("repository"), "artifact repository"))
     _validate_commit(_nonempty_string(document.get("source_commit"), "artifact source commit"))
     _validate_tag(_nonempty_string(document.get("tag"), "artifact release tag"))
-    artifact_kind = _nonempty_string(document.get("artifact_kind"), "Actions artifact kind")
-    if artifact_kind not in {"tag-payload", "promotion"}:
+    if artifact_kind not in {"candidate", "tag-binding", "tag-payload", "promotion"}:
         raise ProvenanceError("Actions artifact manifest kind is invalid")
     _positive_integer(document.get("run_id"), "artifact workflow run id")
     _positive_integer(document.get("run_attempt"), "artifact workflow run attempt")
@@ -432,17 +894,23 @@ def verify_actions_artifact_archive(
             names = [item.filename for item in members]
             if len(names) != len(set(names)):
                 raise ProvenanceError("Actions artifact archive contains duplicate paths")
-            if artifact_kind == "tag-payload":
+            if artifact_kind == "candidate":
+                _validate_candidate_payload_names(names)
+            elif artifact_kind == "tag-payload":
                 _validate_tag_payload_names(names)
+            elif artifact_kind == "tag-binding":
+                _validate_tag_binding_payload_names(names)
             else:
                 _validate_promotion_payload_names(names)
             aggregate_size = 0
             for member in members:
                 maximum = (
                     _tag_payload_file_limit(member.filename)
-                    if artifact_kind == "tag-payload"
+                    if artifact_kind in {"candidate", "tag-payload"}
                     else _promotion_payload_file_limit(member.filename)
                 )
+                if artifact_kind == "tag-binding":
+                    maximum = MAX_FIXED_JSON_BYTES
                 if member.flag_bits & 0x1:
                     raise ProvenanceError("Actions artifact archive contains encrypted content")
                 mode = member.external_attr >> 16
@@ -487,13 +955,105 @@ def verify_actions_artifact_archive(
                     )
     except (OSError, zipfile.BadZipFile) as exc:
         raise ProvenanceError(f"could not verify Actions artifact archive: {exc}") from exc
-    if artifact_kind == "tag-payload":
+    if artifact_kind in {"candidate", "tag-payload"}:
         _verify_checksum_manifest(
             output_dir,
             expected_names={
                 item.name for item in output_dir.iterdir() if item.name != "SHA256SUMS"
             },
         )
+    if artifact_kind == "candidate":
+        _verify_extracted_candidate_payload(output_dir, document)
+
+
+def _verify_extracted_candidate_payload(
+    directory: Path,
+    artifact_manifest: Mapping[str, object],
+) -> None:
+    """Bind extracted build-once bytes to their tested merge-group receipt."""
+    repository = _nonempty_string(
+        artifact_manifest.get("repository"), "candidate artifact repository"
+    )
+    candidate_build = _mapping(
+        _load_json(directory / "CANDIDATE-BUILD.json"),
+        "extracted candidate build receipt",
+    )
+    verify_candidate_build_receipt(candidate_build, repository=repository)
+    expected_identity = {
+        "tested_commit": artifact_manifest.get("source_commit"),
+        "source_tree": artifact_manifest.get("source_tree"),
+        "run_id": artifact_manifest.get("run_id"),
+        "run_attempt": artifact_manifest.get("run_attempt"),
+    }
+    mismatches = [
+        key for key, value in expected_identity.items() if candidate_build.get(key) != value
+    ]
+    if mismatches:
+        raise ProvenanceError(
+            "extracted candidate build identity differs from its Actions artifact: "
+            f"{sorted(mismatches)}"
+        )
+    distributions = sorted(
+        (
+            path
+            for path in directory.iterdir()
+            if path.name.endswith(".whl") or path.name.endswith(".tar.gz")
+        ),
+        key=lambda path: path.name,
+    )
+    observed_digests = {
+        path.name: _sha256_bounded_file(path, maximum_bytes=MAX_DISTRIBUTION_BYTES)
+        for path in distributions
+    }
+    if observed_digests != candidate_build.get("distribution_sha256"):
+        raise ProvenanceError("extracted candidate distributions differ from the build receipt")
+    report_path = directory / "validation-local.json"
+    primary_reports = [
+        _mapping(raw, "candidate primary matrix report")
+        for raw in _list(candidate_build.get("matrix_reports"), "candidate matrix reports")
+        if _mapping(raw, "candidate matrix report").get("job") == REQUIRED_MATRIX_JOBS[0]
+    ]
+    if len(primary_reports) != 1:
+        raise ProvenanceError("candidate build receipt does not identify one primary report")
+    primary = primary_reports[0]
+    if primary.get("sha256") != _sha256_bounded_file(
+        report_path,
+        maximum_bytes=MAX_FIXED_JSON_BYTES,
+    ):
+        raise ProvenanceError("extracted primary validation report differs from the build receipt")
+    report = _mapping(_load_json(report_path), "extracted primary validation report")
+    if (
+        report.get("status") != "passed"
+        or report.get("scenario") != "local-release"
+        or report.get("cluster") != "local"
+    ):
+        raise ProvenanceError("extracted primary validation report did not pass")
+    software = _mapping(report.get("software"), "extracted primary report software")
+    if (
+        software.get("commit") != candidate_build.get("tested_commit")
+        or software.get("dirty") is not False
+    ):
+        raise ProvenanceError("extracted primary validation report source identity differs")
+    report_digests: dict[str, str] = {}
+    for raw in _list(report.get("resources"), "extracted primary report resources"):
+        resource = _mapping(raw, "extracted primary report resource")
+        name = resource.get("resource_id")
+        if name not in observed_digests:
+            continue
+        metadata = _mapping(resource.get("metadata"), "extracted primary report metadata")
+        if name in report_digests:
+            raise ProvenanceError("extracted primary report duplicates a distribution")
+        report_digests[cast(str, name)] = _nonempty_string(
+            metadata.get("sha256"), "extracted primary report distribution digest"
+        )
+    if report_digests != observed_digests:
+        raise ProvenanceError("extracted primary report distribution digests differ")
+    checks = {
+        _mapping(raw, "extracted primary report check").get("check_id")
+        for raw in _list(report.get("checks"), "extracted primary report checks")
+    }
+    if "local.build" not in checks or "local.sdist-smoke" not in checks:
+        raise ProvenanceError("extracted primary report does not prove the sole build")
 
 
 def build_distribution_archive_receipt(
@@ -1071,6 +1631,7 @@ def build_repository_governance(
     branch_rulesets: object,
     tag_rulesets: object,
     environments: Mapping[str, object],
+    immutable_releases: object,
     *,
     repository: str,
     source_commit: str,
@@ -1084,8 +1645,9 @@ def build_repository_governance(
     protected_branch_names = _protected_branch_names(protected_branches)
     tags = _tag_protection_receipts(tag_rulesets)
     environment_receipts = _environment_receipts(environments)
+    immutable_receipt = _immutable_releases_receipt(immutable_releases)
     receipt: dict[str, object] = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "repository": repository,
         "source_commit": source_commit,
         "tag": tag,
@@ -1096,6 +1658,7 @@ def build_repository_governance(
         "tag_protections": tags,
         "environment_reviewers_available": False,
         "environments": environment_receipts,
+        "immutable_releases": immutable_receipt,
     }
     verify_repository_governance(
         receipt,
@@ -1119,7 +1682,7 @@ def verify_repository_governance(
     _validate_tag(tag)
     document = _mapping(receipt, "repository governance receipt")
     expected = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "repository": repository,
         "source_commit": source_commit,
         "tag": tag,
@@ -1164,6 +1727,13 @@ def verify_repository_governance(
             "custom_branch_policies": False,
         }:
             raise ProvenanceError("environment receipt branch policy does not match")
+    immutable = _mapping(document.get("immutable_releases"), "immutable releases receipt")
+    if immutable != {
+        "api_version": IMMUTABLE_RELEASES_API_VERSION,
+        "enabled": True,
+        "enforced_by_owner": True,
+    }:
+        raise ProvenanceError("repository governance does not enforce immutable releases")
 
 
 def fetch_live_repository_governance(
@@ -1172,6 +1742,7 @@ def fetch_live_repository_governance(
     source_commit: str,
     tag: str,
     fetch_json: GitHubJsonFetcher,
+    fetch_admin_json: GitHubJsonFetcher,
 ) -> dict[str, object]:
     """Query and normalize the current GitHub controls for a release identity."""
     _validate_repository(repository)
@@ -1214,12 +1785,14 @@ def fetch_live_repository_governance(
             f"environment {name}",
         )
         environments[name] = environment
+    immutable_releases = fetch_admin_json(f"repos/{repository}/immutable-releases")
     return build_repository_governance(
         main_effective_rules,
         protected_branches,
         branch_rulesets,
         tag_rulesets,
         environments,
+        immutable_releases,
         repository=repository,
         source_commit=source_commit,
         tag=tag,
@@ -1233,6 +1806,7 @@ def verify_live_repository_governance(
     source_commit: str,
     tag: str,
     fetch_json: GitHubJsonFetcher,
+    fetch_admin_json: GitHubJsonFetcher,
 ) -> None:
     """Require the carried governance receipt to equal current GitHub state."""
     verify_repository_governance(
@@ -1246,6 +1820,7 @@ def verify_live_repository_governance(
         source_commit=source_commit,
         tag=tag,
         fetch_json=fetch_json,
+        fetch_admin_json=fetch_admin_json,
     )
     if current != receipt:
         raise ProvenanceError(
@@ -1262,6 +1837,7 @@ def verify_release_identity(
     resolved_target_commit: str,
     expect_draft: bool | None,
     expect_prerelease: bool,
+    expect_immutable: bool | None = None,
 ) -> None:
     """Require a GitHub release to identify one exact immutable source commit."""
     _validate_tag(tag)
@@ -1276,6 +1852,8 @@ def verify_release_identity(
     }
     if expect_draft is not None:
         expected["draft"] = expect_draft
+    if expect_immutable is not None:
+        expected["immutable"] = expect_immutable
     mismatches = [key for key, value in expected.items() if release.get(key) != value]
     if mismatches:
         raise ProvenanceError(f"GitHub release identity mismatch: {sorted(mismatches)}")
@@ -1296,6 +1874,7 @@ def resolve_live_release(
     expect_draft: bool | None,
     fetch_json: GitHubJsonFetcher,
     allow_absent: bool = False,
+    expect_immutable: bool | None = None,
 ) -> dict[str, object] | None:
     """Resolve one exact release by tag through a bounded list and numeric ID.
 
@@ -1345,7 +1924,7 @@ def resolve_live_release(
         fetch_json(f"repos/{repository}/releases/{release_id}"),
         "GitHub release",
     )
-    compared_fields = ("id", "tag_name", "target_commitish", "draft", "prerelease")
+    compared_fields = ("id", "tag_name", "target_commitish", "draft", "prerelease", "immutable")
     mismatches = [field for field in compared_fields if release.get(field) != summary.get(field)]
     if mismatches:
         raise ProvenanceError(
@@ -1355,6 +1934,10 @@ def resolve_live_release(
         raise ProvenanceError("numeric GitHub release identity does not match the requested tag")
     if expect_draft is not None and release.get("draft") is not expect_draft:
         raise ProvenanceError("GitHub release draft state does not match the required state")
+    if expect_immutable is not None and release.get("immutable") is not expect_immutable:
+        raise ProvenanceError("GitHub release immutable state does not match the required state")
+    if release.get("draft") is True and release.get("immutable") is not False:
+        raise ProvenanceError("a draft GitHub release must remain mutable")
     return release
 
 
@@ -1366,6 +1949,7 @@ def verify_live_release_identity(
     expect_draft: bool | None,
     expect_prerelease: bool,
     fetch_json: GitHubJsonFetcher,
+    expect_immutable: bool | None = None,
 ) -> None:
     """Fetch and verify the live release, tag, and target identities."""
     _validate_repository(repository)
@@ -1376,6 +1960,7 @@ def verify_live_release_identity(
         tag=tag,
         expect_draft=expect_draft,
         fetch_json=fetch_json,
+        expect_immutable=expect_immutable,
     )
     if release is None:  # pragma: no cover - allow_absent is false above.
         raise GitHubNotFound(f"GitHub release was not found for tag: {tag}")
@@ -1400,6 +1985,7 @@ def verify_live_release_identity(
         ),
         expect_draft=expect_draft,
         expect_prerelease=expect_prerelease,
+        expect_immutable=expect_immutable,
     )
 
 
@@ -1414,6 +2000,7 @@ def verify_live_mutation_authority(
     release_state: str,
     expect_draft: bool | None,
     fetch_json: GitHubJsonFetcher,
+    fetch_admin_json: GitHubJsonFetcher,
 ) -> None:
     """Revalidate protected main, tag, governance, and release before mutation."""
     _validate_repository(repository)
@@ -1421,6 +2008,8 @@ def verify_live_mutation_authority(
     _validate_tag(tag)
     if workflow_ref != "refs/heads/main" or workflow_sha != source_commit:
         raise ProvenanceError("persistent mutation is not executing from the exact main commit")
+    if release_state == "present" and expect_draft is not True:
+        raise ProvenanceError("release mutation is permitted only while the release is a draft")
     main_commit = _mapping(
         fetch_json(f"repos/{repository}/commits/main"),
         "live main commit",
@@ -1437,6 +2026,7 @@ def verify_live_mutation_authority(
         source_commit=source_commit,
         tag=tag,
         fetch_json=fetch_json,
+        fetch_admin_json=fetch_admin_json,
     )
     if release_state not in {"absent", "present"}:
         raise ProvenanceError("release state expectation is invalid")
@@ -1454,6 +2044,8 @@ def verify_live_mutation_authority(
     if release_state == "absent":
         raise ProvenanceError("GitHub release appeared before create mutation")
     target = _nonempty_string(release.get("target_commitish"), "release target_commitish")
+    if release.get("immutable") is not False:
+        raise ProvenanceError("a mutable draft is required before every release mutation")
     if re.fullmatch(r"[A-Za-z0-9_./-]+", target) is None or ".." in target:
         raise ProvenanceError("release target_commitish is unsafe")
     target_commit = _mapping(
@@ -1470,6 +2062,7 @@ def verify_live_mutation_authority(
         ),
         expect_draft=expect_draft,
         expect_prerelease=False,
+        expect_immutable=False,
     )
 
 
@@ -2060,7 +2653,13 @@ def _main_ruleset_protection_receipt(
             )
         effective_ruleset_ids.add(ruleset_id)
         by_type.setdefault(rule_type, []).append(rule)
-    required_types = {"deletion", "non_fast_forward", "pull_request", "required_status_checks"}
+    required_types = {
+        "deletion",
+        "merge_queue",
+        "non_fast_forward",
+        "pull_request",
+        "required_status_checks",
+    }
     missing = sorted(required_types - set(by_type))
     if missing:
         raise ProvenanceError(f"effective main branch rules are incomplete: {missing}")
@@ -2088,6 +2687,15 @@ def _main_ruleset_protection_receipt(
         by_type["pull_request"][0].get("parameters"),
         "effective pull request rule parameters",
     )
+    merge_queue = _mapping(
+        by_type["merge_queue"][0].get("parameters"),
+        "effective merge queue rule parameters",
+    )
+    normalized_merge_queue = {key: merge_queue.get(key) for key in REQUIRED_MERGE_QUEUE_PARAMETERS}
+    if normalized_merge_queue != REQUIRED_MERGE_QUEUE_PARAMETERS or set(merge_queue) != set(
+        REQUIRED_MERGE_QUEUE_PARAMETERS
+    ):
+        raise ProvenanceError("effective merge queue parameters differ from the release contract")
     receipt: dict[str, object] = {
         "source": "effective_rulesets",
         "ruleset_ids": sorted(effective_ruleset_ids),
@@ -2102,6 +2710,7 @@ def _main_ruleset_protection_receipt(
         "require_last_push_approval": reviews.get("require_last_push_approval") is True,
         "required_conversation_resolution": reviews.get("required_review_thread_resolution")
         is True,
+        "merge_queue": normalized_merge_queue,
         "prevents_force_pushes": True,
         "prevents_deletions": True,
         "current_workflow_token_can_bypass": False,
@@ -2154,6 +2763,7 @@ def _verify_main_protection(branch: Mapping[str, object]) -> None:
         "require_last_push_approval": type(last_push_approval) is bool
         and last_push_approval == REQUIRE_LAST_PUSH_APPROVAL,
         "required_conversation_resolution": branch.get("required_conversation_resolution") is True,
+        "merge_queue": branch.get("merge_queue") == REQUIRED_MERGE_QUEUE_PARAMETERS,
         "prevents_force_pushes": branch.get("prevents_force_pushes") is True,
         "prevents_deletions": branch.get("prevents_deletions") is True,
         "current_workflow_token_cannot_bypass": branch.get("current_workflow_token_can_bypass")
@@ -2321,6 +2931,22 @@ def _environment_receipts(environments: Mapping[str, object]) -> list[dict[str, 
     return receipts
 
 
+def _immutable_releases_receipt(document: object) -> dict[str, object]:
+    """Normalize the administration-read immutable-release policy response."""
+    policy = _mapping(document, "immutable releases policy")
+    if set(policy) != {"enabled", "enforced_by_owner"}:
+        raise ProvenanceError("immutable releases policy contains an unexpected schema")
+    if policy.get("enabled") is not True or policy.get("enforced_by_owner") is not True:
+        raise ProvenanceError(
+            "immutable releases must be enabled and enforced by the repository owner"
+        )
+    return {
+        "api_version": IMMUTABLE_RELEASES_API_VERSION,
+        "enabled": True,
+        "enforced_by_owner": True,
+    }
+
+
 def _load_json(path: Path) -> object:
     try:
         details = path.lstat()
@@ -2485,10 +3111,41 @@ def _validate_tag_payload_names(names: Sequence[str]) -> None:
         )
 
 
+def _validate_candidate_payload_names(names: Sequence[str]) -> None:
+    _validate_flat_artifact_names(names)
+    wheels = [name for name in names if name.endswith(".whl")]
+    sdists = [name for name in names if name.endswith(".tar.gz")]
+    fixed = set(names) - set(wheels) - set(sdists)
+    if len(wheels) != 1 or len(sdists) != 1 or fixed != set(CANDIDATE_PAYLOAD_FIXED_FILES):
+        raise ProvenanceError(
+            "Actions artifact archive file set does not match the sealed candidate contract"
+        )
+
+
+def _validate_tag_binding_payload_names(names: Sequence[str]) -> None:
+    _validate_flat_artifact_names(names)
+    if list(names) != ["TAG-BINDING.json"]:
+        raise ProvenanceError("tag binding artifact must contain only TAG-BINDING.json")
+
+
+def _validate_flat_artifact_names(names: Sequence[str]) -> None:
+    if any(
+        not name
+        or name != Path(name).name
+        or "/" in name
+        or "\\" in name
+        or re.fullmatch(r"[A-Za-z0-9_.+-]+", name) is None
+        for name in names
+    ):
+        raise ProvenanceError("Actions artifact archive contains an unsafe path")
+
+
 def _tag_payload_file_limit(name: str) -> int:
     if name.endswith((".whl", ".tar.gz")):
         return MAX_DISTRIBUTION_BYTES
     if name == "validation-local.json":
+        return MAX_FIXED_JSON_BYTES
+    if name == "CANDIDATE-BUILD.json":
         return MAX_FIXED_JSON_BYTES
     if name == "SHA256SUMS":
         return MAX_MANIFEST_BYTES
@@ -2613,6 +3270,21 @@ def _validate_commit(commit: str) -> None:
         raise ProvenanceError("source commit must be a lowercase 40-character SHA")
 
 
+def _validate_git_tree(tree: str) -> None:
+    if re.fullmatch(r"[0-9a-f]{40}", tree) is None:
+        raise ProvenanceError("source tree must be a lowercase 40-character Git object id")
+
+
+def _canonical_json_sha256(document: object) -> str:
+    encoded = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _validate_tag(tag: str) -> None:
     if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z.-]+)?", tag) is None:
         raise ProvenanceError("release tag is invalid")
@@ -2636,6 +3308,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     build_ci = subparsers.add_parser("build-ci-status")
     build_ci.add_argument("--runs", type=Path, required=True)
     build_ci.add_argument("--jobs", type=Path, required=True)
+    build_ci.add_argument("--candidate-build", type=Path, required=True)
+    build_ci.add_argument("--candidate-artifact", type=Path, required=True)
+    build_ci.add_argument("--tag-binding", type=Path, required=True)
     build_ci.add_argument("--repository", required=True)
     build_ci.add_argument("--source-commit", required=True)
     build_ci.add_argument("--output", type=Path, required=True)
@@ -2650,8 +3325,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     artifact_manifest.add_argument("--run-attempt", type=int, required=True)
     artifact_manifest.add_argument("--artifact-name", required=True)
     artifact_manifest.add_argument(
-        "--artifact-kind", choices=("tag-payload", "promotion"), required=True
+        "--artifact-kind",
+        choices=("candidate", "tag-binding", "tag-payload", "promotion"),
+        required=True,
     )
+    artifact_manifest.add_argument("--source-tree")
     artifact_manifest.add_argument("--output", type=Path, required=True)
 
     extract_artifact = subparsers.add_parser("extract-actions-artifact")
@@ -2678,6 +3356,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     build_governance.add_argument("--branch-rulesets", type=Path, required=True)
     build_governance.add_argument("--tag-rulesets", type=Path, required=True)
     build_governance.add_argument("--environments-dir", type=Path, required=True)
+    build_governance.add_argument("--immutable-releases", type=Path, required=True)
     build_governance.add_argument("--repository", required=True)
     build_governance.add_argument("--source-commit", required=True)
     build_governance.add_argument("--tag", required=True)
@@ -2701,12 +3380,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     verify_live_release.add_argument("--source-commit", required=True)
     verify_live_release.add_argument("--draft", choices=("true", "false", "any"), required=True)
     verify_live_release.add_argument("--prerelease", choices=("true", "false"), required=True)
+    verify_live_release.add_argument("--immutable", choices=("true", "false", "any"), default="any")
 
     resolve_release = subparsers.add_parser("resolve-live-release")
     resolve_release.add_argument("--repository", required=True)
     resolve_release.add_argument("--tag", required=True)
     resolve_release.add_argument("--draft", choices=("true", "false", "any"), required=True)
     resolve_release.add_argument("--allow-absent", action="store_true")
+    resolve_release.add_argument("--immutable", choices=("true", "false", "any"), default="any")
     resolve_release.add_argument("--output", type=Path, required=True)
 
     mutation_authority = subparsers.add_parser("mutation-authority")
@@ -2746,6 +3427,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     exact_destination.add_argument("--output", type=Path)
     exact_destination.add_argument("--verify-existing", type=Path)
 
+    candidate_build = subparsers.add_parser("candidate-build-receipt")
+    candidate_build.add_argument("--candidate-dir", type=Path, required=True)
+    candidate_build.add_argument("--reports-dir", type=Path, required=True)
+    candidate_build.add_argument("--repository", required=True)
+    candidate_build.add_argument("--source-commit", required=True)
+    candidate_build.add_argument("--source-tree", required=True)
+    candidate_build.add_argument("--event", required=True)
+    candidate_build.add_argument("--run-id", type=int, required=True)
+    candidate_build.add_argument("--run-attempt", type=int, required=True)
+    candidate_build.add_argument("--head-ref", required=True)
+    candidate_build.add_argument("--base-ref", required=True)
+    candidate_build.add_argument("--output", type=Path, required=True)
+
+    tag_binding = subparsers.add_parser("tag-binding")
+    tag_binding.add_argument("--candidate-build", type=Path, required=True)
+    tag_binding.add_argument("--candidate-artifact", type=Path, required=True)
+    tag_binding.add_argument("--pulls", type=Path, required=True)
+    tag_binding.add_argument("--repository", required=True)
+    tag_binding.add_argument("--source-commit", required=True)
+    tag_binding.add_argument("--source-tree", required=True)
+    tag_binding.add_argument("--tag", required=True)
+    tag_binding.add_argument("--output", type=Path, required=True)
+
     args = parser.parse_args(argv)
     try:
         if args.command == "select-ci-run":
@@ -2759,6 +3463,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             receipt = build_ci_status(
                 _load_json(args.runs),
                 _load_json(args.jobs),
+                _load_json(args.candidate_build),
+                _load_json(args.candidate_artifact),
+                _load_json(args.tag_binding),
                 repository=args.repository,
                 source_commit=args.source_commit,
             )
@@ -2774,6 +3481,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 run_attempt=args.run_attempt,
                 artifact_name=args.artifact_name,
                 artifact_kind=args.artifact_kind,
+                source_tree=args.source_tree,
             )
             _write_json(args.output, manifest)
         elif args.command == "extract-actions-artifact":
@@ -2810,6 +3518,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _load_json(args.branch_rulesets),
                 _load_json(args.tag_rulesets),
                 environment_documents,
+                _load_json(args.immutable_releases),
                 repository=args.repository,
                 source_commit=args.source_commit,
                 tag=args.tag,
@@ -2829,6 +3538,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 source_commit=args.source_commit,
                 tag=args.tag,
                 fetch_json=_github_fetcher(os.environ.get("GH_TOKEN", "")),
+                fetch_admin_json=_github_fetcher(os.environ.get("GH_ADMIN_READ_TOKEN", "")),
             )
         elif args.command == "verify-live-release":
             verify_live_release_identity(
@@ -2837,6 +3547,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 source_commit=args.source_commit,
                 expect_draft=None if args.draft == "any" else args.draft == "true",
                 expect_prerelease=args.prerelease == "true",
+                expect_immutable=(None if args.immutable == "any" else args.immutable == "true"),
                 fetch_json=_github_fetcher(os.environ.get("GH_TOKEN", "")),
             )
         elif args.command == "resolve-live-release":
@@ -2846,6 +3557,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 expect_draft=None if args.draft == "any" else args.draft == "true",
                 fetch_json=_github_fetcher(os.environ.get("GH_TOKEN", "")),
                 allow_absent=args.allow_absent,
+                expect_immutable=(None if args.immutable == "any" else args.immutable == "true"),
             )
             _write_json(args.output, release)
         elif args.command == "mutation-authority":
@@ -2859,6 +3571,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 release_state=args.release_state,
                 expect_draft=None if args.draft == "any" else args.draft == "true",
                 fetch_json=_github_fetcher(os.environ.get("GH_TOKEN", "")),
+                fetch_admin_json=_github_fetcher(os.environ.get("GH_ADMIN_READ_TOKEN", "")),
             )
         elif args.command == "report-assets":
             manifest = build_validation_report_asset_manifest(
@@ -2895,6 +3608,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                     page_size=args.page_size,
                 )
                 _write_json(args.output, inventory)
+        elif args.command == "candidate-build-receipt":
+            receipt = build_candidate_build_receipt(
+                args.candidate_dir,
+                args.reports_dir,
+                repository=args.repository,
+                source_commit=args.source_commit,
+                source_tree=args.source_tree,
+                event=args.event,
+                run_id=args.run_id,
+                run_attempt=args.run_attempt,
+                head_ref=args.head_ref,
+                base_ref=args.base_ref,
+            )
+            _write_json(args.output, receipt)
+        elif args.command == "tag-binding":
+            binding = build_tag_binding(
+                _load_json(args.candidate_build),
+                _load_json(args.candidate_artifact),
+                _load_json(args.pulls),
+                repository=args.repository,
+                source_commit=args.source_commit,
+                source_tree=args.source_tree,
+                tag=args.tag,
+            )
+            _write_json(args.output, binding)
         else:  # pragma: no cover - argparse owns command validation.
             _error(f"unsupported command: {args.command}")
     except ProvenanceError as exc:

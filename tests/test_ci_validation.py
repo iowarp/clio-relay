@@ -35,13 +35,17 @@ from clio_relay.ci_validation import (
     REQUIRED_APPROVING_REVIEW_COUNT,
     REQUIRED_CI_JOBS,
     REQUIRED_ENVIRONMENTS,
+    REQUIRED_MATRIX_JOBS,
+    REQUIRED_MERGE_QUEUE_PARAMETERS,
     ProvenanceError,
     build_actions_artifact_manifest,
+    build_candidate_build_receipt,
     build_ci_status,
     build_distribution_archive_receipt,
     build_exact_release_asset_inventory,
     build_repository_governance,
     build_staged_release_asset_plan,
+    build_tag_binding,
     build_validation_report_asset_manifest,
     fetch_live_repository_governance,
     resolve_live_release,
@@ -61,6 +65,8 @@ from clio_relay.ci_validation import (
 
 REPOSITORY = "iowarp/clio-relay"
 COMMIT = "a" * 40
+TESTED_COMMIT = "b" * 40
+TREE = "c" * 40
 TAG = "v1.0.0"
 
 
@@ -74,9 +80,9 @@ def _runs() -> dict[str, object]:
                 "run_number": 75,
                 "workflow_id": 99,
                 "html_url": "https://github.com/iowarp/clio-relay/actions/runs/1001",
-                "head_sha": COMMIT,
-                "head_branch": "main",
-                "event": "push",
+                "head_sha": TESTED_COMMIT,
+                "head_branch": "gh-readonly-queue/main/pr-23-deadbeef",
+                "event": "merge_group",
                 "status": "completed",
                 "conclusion": "success",
                 "path": ".github/workflows/ci.yml",
@@ -101,6 +107,96 @@ def _jobs() -> dict[str, object]:
     }
 
 
+def _candidate_build() -> dict[str, object]:
+    distributions = {
+        "clio_relay-1.0.0-py3-none-any.whl": "d" * 64,
+        "clio_relay-1.0.0.tar.gz": "e" * 64,
+    }
+    return {
+        "schema_version": "clio-relay.candidate-build.v1",
+        "repository": REPOSITORY,
+        "workflow": ".github/workflows/ci.yml",
+        "event": "merge_group",
+        "tested_commit": TESTED_COMMIT,
+        "source_tree": TREE,
+        "base_ref": "refs/heads/main",
+        "head_ref": "refs/heads/gh-readonly-queue/main/pr-23-deadbeef",
+        "pull_request_number": 23,
+        "run_id": 1001,
+        "run_attempt": 2,
+        "distribution_sha256": distributions,
+        "matrix_reports": [
+            {
+                "job": job,
+                "filename": (
+                    f"validation-local-{job.split(' / python ')[0]}-{job.rsplit(' ', 1)[1]}.json"
+                ),
+                "sha256": f"{index:x}" * 64,
+                "mode": "build" if index == 1 else "prebuilt",
+                "artifact_sha256": distributions,
+            }
+            for index, job in enumerate(REQUIRED_MATRIX_JOBS, start=1)
+        ],
+    }
+
+
+def _candidate_artifact() -> dict[str, object]:
+    return {
+        "schema_version": "1.1",
+        "repository": REPOSITORY,
+        "source_commit": TESTED_COMMIT,
+        "source_tree": TREE,
+        "tag": TAG,
+        "artifact_kind": "candidate",
+        "head_branch": "gh-readonly-queue/main/pr-23-deadbeef",
+        "run_id": 1001,
+        "run_attempt": 2,
+        "artifact": {
+            "id": 6001,
+            "name": f"release-candidate-{TREE}",
+            "size_in_bytes": 100,
+            "digest": f"sha256:{'f' * 64}",
+            "archive_download_url": (
+                f"https://api.github.com/repos/{REPOSITORY}/actions/artifacts/6001/zip"
+            ),
+            "expired": False,
+            "created_at": "2026-07-11T10:05:00+00:00",
+        },
+    }
+
+
+def _canonical_digest(document: object) -> str:
+    return hashlib.sha256(
+        json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _tag_binding() -> dict[str, object]:
+    artifact = _candidate_artifact()
+    return {
+        "schema_version": "clio-relay.tag-candidate-binding.v1",
+        "repository": REPOSITORY,
+        "tag": TAG,
+        "source_commit": COMMIT,
+        "source_tree": TREE,
+        "merge_group_anchor_pull_request_number": 23,
+        "pull_request": {
+            "number": 23,
+            "merge_commit_sha": COMMIT,
+            "url": "https://github.com/iowarp/clio-relay/pull/23",
+        },
+        "tested_commit": TESTED_COMMIT,
+        "candidate_build_sha256": _canonical_digest(_candidate_build()),
+        "candidate_run": {
+            "id": 1001,
+            "attempt": 2,
+            "head_sha": TESTED_COMMIT,
+            "head_branch": "gh-readonly-queue/main/pr-23-deadbeef",
+        },
+        "candidate_artifact": artifact["artifact"],
+    }
+
+
 MAIN_RULESET_ID = 18816105
 TAG_RULESET_ID = 18813108
 
@@ -109,6 +205,11 @@ def _main_effective_rules() -> list[dict[str, object]]:
     return [
         {"type": "deletion", "ruleset_id": MAIN_RULESET_ID},
         {"type": "non_fast_forward", "ruleset_id": MAIN_RULESET_ID},
+        {
+            "type": "merge_queue",
+            "ruleset_id": MAIN_RULESET_ID,
+            "parameters": deepcopy(REQUIRED_MERGE_QUEUE_PARAMETERS),
+        },
         {
             "type": "pull_request",
             "ruleset_id": MAIN_RULESET_ID,
@@ -187,6 +288,10 @@ def _environments() -> dict[str, object]:
     }
 
 
+def _immutable_releases() -> dict[str, object]:
+    return {"enabled": True, "enforced_by_owner": True}
+
+
 def _governance_routes() -> dict[str, object]:
     routes: dict[str, object] = {
         f"repos/{REPOSITORY}/rules/branches/main?per_page=100": _main_effective_rules(),
@@ -197,6 +302,7 @@ def _governance_routes() -> dict[str, object]:
         ],
         f"repos/{REPOSITORY}/rulesets/{MAIN_RULESET_ID}": _branch_rulesets()[0],
         f"repos/{REPOSITORY}/rulesets/{TAG_RULESET_ID}": _tag_rulesets()[0],
+        f"repos/{REPOSITORY}/immutable-releases": _immutable_releases(),
     }
     for name, environment in _environments().items():
         routes[f"repos/{REPOSITORY}/environments/{name}"] = environment
@@ -219,10 +325,13 @@ def _release_assets(names_and_sizes: list[tuple[str, int]]) -> dict[str, object]
 
 
 def test_ci_status_requires_exact_successful_push_run_and_job_set() -> None:
-    selected = select_ci_run(_runs(), repository=REPOSITORY, source_commit=COMMIT)
+    selected = select_ci_run(_runs(), repository=REPOSITORY, source_commit=TESTED_COMMIT)
     receipt = build_ci_status(
         _runs(),
         _jobs(),
+        _candidate_build(),
+        _candidate_artifact(),
+        _tag_binding(),
         repository=REPOSITORY,
         source_commit=COMMIT,
     )
@@ -233,6 +342,8 @@ def test_ci_status_requires_exact_successful_push_run_and_job_set() -> None:
         "run_number": 75,
         "workflow_id": 99,
         "url": "https://github.com/iowarp/clio-relay/actions/runs/1001",
+        "event": "merge_group",
+        "head_branch": "gh-readonly-queue/main/pr-23-deadbeef",
     }
     assert receipt["required_jobs"] == list(REQUIRED_CI_JOBS)
     assert [job["name"] for job in cast(list[dict[str, object]], receipt["jobs"])] == list(
@@ -256,7 +367,15 @@ def test_ci_status_rejects_incomplete_or_nonpassing_jobs(mutation: str) -> None:
         jobs["total_count"] = len(typed_jobs) + 1
 
     with pytest.raises(ProvenanceError):
-        build_ci_status(_runs(), jobs, repository=REPOSITORY, source_commit=COMMIT)
+        build_ci_status(
+            _runs(),
+            jobs,
+            _candidate_build(),
+            _candidate_artifact(),
+            _tag_binding(),
+            repository=REPOSITORY,
+            source_commit=COMMIT,
+        )
 
 
 def test_ci_status_rejects_a_caller_supplied_non_push_or_wrong_sha_run() -> None:
@@ -265,15 +384,143 @@ def test_ci_status_rejects_a_caller_supplied_non_push_or_wrong_sha_run() -> None
     run["event"] = "workflow_dispatch"
 
     with pytest.raises(ProvenanceError, match="exactly one"):
-        select_ci_run(runs, repository=REPOSITORY, source_commit=COMMIT)
+        select_ci_run(runs, repository=REPOSITORY, source_commit=TESTED_COMMIT)
 
-    run["event"] = "push"
-    run["head_sha"] = "b" * 40
+    run["event"] = "merge_group"
+    run["head_sha"] = "d" * 40
     with pytest.raises(ProvenanceError, match="exactly one"):
-        select_ci_run(runs, repository=REPOSITORY, source_commit=COMMIT)
+        select_ci_run(runs, repository=REPOSITORY, source_commit=TESTED_COMMIT)
+
+
+def test_candidate_build_receipt_proves_one_build_and_five_exact_reuses(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "candidate"
+    reports = tmp_path / "reports"
+    candidate.mkdir()
+    reports.mkdir()
+    wheel = candidate / "clio_relay-1.0.0-py3-none-any.whl"
+    sdist = candidate / "clio_relay-1.0.0.tar.gz"
+    wheel.write_bytes(b"wheel")
+    sdist.write_bytes(b"sdist")
+    distribution_digests = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (wheel, sdist)
+    }
+    (candidate / "SHA256SUMS").write_text(
+        "".join(
+            f"{distribution_digests[path.name]} *{path.name}\n"
+            for path in sorted((wheel, sdist), key=lambda item: item.name)
+        ),
+        encoding="ascii",
+        newline="\n",
+    )
+    for index, job in enumerate(REQUIRED_MATRIX_JOBS):
+        filename = f"validation-local-{job.split(' / python ')[0]}-{job.rsplit(' ', 1)[1]}.json"
+        checks = (
+            ["local.build", "local.sdist-smoke"] if index == 0 else ["local.prebuilt-artifacts"]
+        )
+        document = {
+            "status": "passed",
+            "scenario": "local-release",
+            "cluster": "local",
+            "software": {"commit": TESTED_COMMIT, "dirty": False},
+            "checks": [{"check_id": check_id} for check_id in checks],
+            "resources": [
+                {
+                    "resource_id": name,
+                    "metadata": {"sha256": digest},
+                }
+                for name, digest in distribution_digests.items()
+            ],
+        }
+        (reports / filename).write_text(json.dumps(document), encoding="utf-8")
+
+    receipt = build_candidate_build_receipt(
+        candidate,
+        reports,
+        repository=REPOSITORY,
+        source_commit=TESTED_COMMIT,
+        source_tree=TREE,
+        event="merge_group",
+        run_id=1001,
+        run_attempt=2,
+        head_ref="refs/heads/gh-readonly-queue/main/pr-23-deadbeef",
+        base_ref="refs/heads/main",
+    )
+
+    matrix = cast(list[dict[str, object]], receipt["matrix_reports"])
+    assert [item["mode"] for item in matrix] == ["build", *(["prebuilt"] * 5)]
+    assert all(item["artifact_sha256"] == distribution_digests for item in matrix)
+
+    changed = json.loads((reports / cast(str, matrix[-1]["filename"])).read_text())
+    cast(list[dict[str, object]], changed["resources"])[0]["metadata"] = {"sha256": "0" * 64}
+    (reports / cast(str, matrix[-1]["filename"])).write_text(json.dumps(changed), encoding="utf-8")
+    with pytest.raises(ProvenanceError, match="artifact digests differ"):
+        build_candidate_build_receipt(
+            candidate,
+            reports,
+            repository=REPOSITORY,
+            source_commit=TESTED_COMMIT,
+            source_tree=TREE,
+            event="merge_group",
+            run_id=1001,
+            run_attempt=2,
+            head_ref="refs/heads/gh-readonly-queue/main/pr-23-deadbeef",
+            base_ref="refs/heads/main",
+        )
+
+
+def test_tag_binding_accepts_a_multi_pr_group_final_commit_and_requires_tested_tree() -> None:
+    pulls = [
+        {
+            "number": 47,
+            "state": "closed",
+            "merged_at": "2026-07-14T01:00:00Z",
+            "merge_commit_sha": COMMIT,
+            "html_url": "https://github.com/iowarp/clio-relay/pull/47",
+            "base": {"ref": "main"},
+        }
+    ]
+    binding = build_tag_binding(
+        _candidate_build(),
+        _candidate_artifact(),
+        pulls,
+        repository=REPOSITORY,
+        source_commit=COMMIT,
+        source_tree=TREE,
+        tag=TAG,
+    )
+
+    assert binding["candidate_build_sha256"] == _canonical_digest(_candidate_build())
+    assert binding["merge_group_anchor_pull_request_number"] == 23
+    assert cast(dict[str, object], binding["pull_request"])["number"] == 47
+    with pytest.raises(ProvenanceError, match="tree differs"):
+        build_tag_binding(
+            _candidate_build(),
+            _candidate_artifact(),
+            pulls,
+            repository=REPOSITORY,
+            source_commit=COMMIT,
+            source_tree="9" * 40,
+            tag=TAG,
+        )
 
 
 def _artifact_run(*, kind: str = "tag-payload") -> dict[str, object]:
+    if kind == "candidate":
+        return {
+            "id": 1001,
+            "run_attempt": 2,
+            "head_branch": "gh-readonly-queue/main/pr-23-deadbeef",
+            "head_sha": TESTED_COMMIT,
+            "event": "merge_group",
+            "status": "completed",
+            "conclusion": "success",
+            "run_started_at": "2026-07-11T10:00:00Z",
+            "path": ".github/workflows/ci.yml",
+            "repository": {"id": 100},
+            "head_repository": {"id": 100},
+        }
     is_tag = kind == "tag-payload"
     return {
         "id": 5001,
@@ -293,7 +540,18 @@ def _artifact_run(*, kind: str = "tag-payload") -> dict[str, object]:
 
 
 def _artifact_listing(*, size: int, digest: str, kind: str = "tag-payload") -> dict[str, object]:
-    name = f"release-candidate-{TAG}" if kind == "tag-payload" else f"verified-release-{TAG}"
+    if kind == "candidate":
+        name = f"release-candidate-{TREE}"
+        head_sha = TESTED_COMMIT
+        head_branch = "gh-readonly-queue/main/pr-23-deadbeef"
+    elif kind == "tag-payload":
+        name = f"release-candidate-{TAG}"
+        head_sha = COMMIT
+        head_branch = TAG
+    else:
+        name = f"verified-release-{TAG}"
+        head_sha = COMMIT
+        head_branch = "main"
     return {
         "total_count": 1,
         "artifacts": [
@@ -308,9 +566,9 @@ def _artifact_listing(*, size: int, digest: str, kind: str = "tag-payload") -> d
                     f"https://api.github.com/repos/{REPOSITORY}/actions/artifacts/6001/zip"
                 ),
                 "workflow_run": {
-                    "id": 5001,
-                    "head_sha": COMMIT,
-                    "head_branch": TAG if kind == "tag-payload" else "main",
+                    "id": 1001 if kind == "candidate" else 5001,
+                    "head_sha": head_sha,
+                    "head_branch": head_branch,
                     "repository_id": 100,
                     "head_repository_id": 100,
                 },
@@ -332,6 +590,62 @@ def _write_tag_payload_zip(path: Path, *, extra_name: str | None = None) -> None
     files["SHA256SUMS"] = checksum
     if extra_name is not None:
         files[extra_name] = b"extra"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in files.items():
+            archive.writestr(name, payload)
+
+
+def _write_candidate_zip(path: Path, *, inconsistent_receipt: bool = False) -> None:
+    wheel_name = "clio_relay-1.0.0-py3-none-any.whl"
+    sdist_name = "clio_relay-1.0.0.tar.gz"
+    wheel = b"one tested wheel"
+    sdist = b"one tested sdist"
+    distribution_digests = {
+        wheel_name: hashlib.sha256(wheel).hexdigest(),
+        sdist_name: hashlib.sha256(sdist).hexdigest(),
+    }
+    report = {
+        "status": "passed",
+        "scenario": "local-release",
+        "cluster": "local",
+        "software": {"commit": TESTED_COMMIT, "dirty": False},
+        "resources": [
+            {
+                "resource_id": name,
+                "metadata": {"sha256": digest},
+            }
+            for name, digest in distribution_digests.items()
+        ],
+        "checks": [
+            {"check_id": "local.build"},
+            {"check_id": "local.sdist-smoke"},
+        ],
+    }
+    report_bytes = json.dumps(report, sort_keys=True, separators=(",", ":")).encode()
+    build = _candidate_build()
+    build["distribution_sha256"] = dict(distribution_digests)
+    matrix = cast(list[dict[str, object]], build["matrix_reports"])
+    for item in matrix:
+        item["artifact_sha256"] = dict(distribution_digests)
+    matrix[0]["sha256"] = hashlib.sha256(report_bytes).hexdigest()
+    if inconsistent_receipt:
+        build["distribution_sha256"][wheel_name] = "0" * 64
+        for item in matrix:
+            cast(dict[str, str], item["artifact_sha256"])[wheel_name] = "0" * 64
+    files = {
+        wheel_name: wheel,
+        sdist_name: sdist,
+        "validation-local.json": report_bytes,
+        "CANDIDATE-BUILD.json": json.dumps(
+            build,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode(),
+    }
+    files["SHA256SUMS"] = "".join(
+        f"{hashlib.sha256(payload).hexdigest()} *{name}\n"
+        for name, payload in sorted(files.items())
+    ).encode()
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, payload in files.items():
             archive.writestr(name, payload)
@@ -424,6 +738,38 @@ def test_actions_artifact_manifest_and_archive_bind_exact_api_identity(tmp_path:
         "validation-local.json",
         "SHA256SUMS",
     }
+
+
+@pytest.mark.parametrize("inconsistent_receipt", [False, True])
+def test_candidate_archive_binds_extracted_distributions_to_build_receipt(
+    tmp_path: Path,
+    inconsistent_receipt: bool,
+) -> None:
+    archive = tmp_path / "candidate.zip"
+    _write_candidate_zip(archive, inconsistent_receipt=inconsistent_receipt)
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    manifest = build_actions_artifact_manifest(
+        _artifact_run(kind="candidate"),
+        _artifact_listing(
+            size=archive.stat().st_size,
+            digest=digest,
+            kind="candidate",
+        ),
+        repository=REPOSITORY,
+        source_commit=TESTED_COMMIT,
+        source_tree=TREE,
+        tag=TAG,
+        run_id=1001,
+        run_attempt=2,
+        artifact_name=f"release-candidate-{TREE}",
+        artifact_kind="candidate",
+    )
+
+    if inconsistent_receipt:
+        with pytest.raises(ProvenanceError, match="distributions differ"):
+            verify_actions_artifact_archive(manifest, archive, tmp_path / "candidate")
+    else:
+        verify_actions_artifact_archive(manifest, archive, tmp_path / "candidate")
 
 
 @pytest.mark.parametrize(
@@ -828,6 +1174,7 @@ def test_repository_governance_receipt_requires_effective_current_token_controls
         _branch_rulesets(),
         _tag_rulesets(),
         _environments(),
+        _immutable_releases(),
         repository=REPOSITORY,
         source_commit=COMMIT,
         tag=TAG,
@@ -866,6 +1213,7 @@ def test_live_governance_requery_must_equal_the_carried_receipt() -> None:
         source_commit=COMMIT,
         tag=TAG,
         fetch_json=fetch,
+        fetch_admin_json=fetch,
     )
     verify_live_repository_governance(
         receipt,
@@ -873,6 +1221,7 @@ def test_live_governance_requery_must_equal_the_carried_receipt() -> None:
         source_commit=COMMIT,
         tag=TAG,
         fetch_json=fetch,
+        fetch_admin_json=fetch,
     )
 
     branch = cast(dict[str, object], routes[f"repos/{REPOSITORY}/rulesets/{MAIN_RULESET_ID}"])
@@ -884,6 +1233,7 @@ def test_live_governance_requery_must_equal_the_carried_receipt() -> None:
             source_commit=COMMIT,
             tag=TAG,
             fetch_json=fetch,
+            fetch_admin_json=fetch,
         )
 
 
@@ -893,6 +1243,7 @@ def test_live_governance_requery_must_equal_the_carried_receipt() -> None:
         ("status_app", "integration id"),
         ("main_bypass", "current workflow token can bypass"),
         ("missing_main_rule", "effective main branch rules are incomplete"),
+        ("merge_queue", "merge queue parameters"),
         ("review_count", "required_approving_review_count"),
         ("last_push_approval", "require_last_push_approval"),
         ("tag_bypass", "current_workflow_token_cannot_bypass"),
@@ -900,6 +1251,7 @@ def test_live_governance_requery_must_equal_the_carried_receipt() -> None:
         ("environment", "protected-branch deployment policy"),
         ("environment_policy", "protected-branch deployment policy"),
         ("environment_admin_bypass", "administrator bypass"),
+        ("immutable_releases", "immutable releases must be enabled"),
     ],
 )
 def test_repository_governance_rejects_weakened_controls(
@@ -910,6 +1262,7 @@ def test_repository_governance_rejects_weakened_controls(
     branch_rulesets = deepcopy(_branch_rulesets())
     tag_rulesets = deepcopy(_tag_rulesets())
     environments = deepcopy(_environments())
+    immutable_releases = deepcopy(_immutable_releases())
     if surface == "status_app":
         status = cast(dict[str, object], effective[-1]["parameters"])
         cast(list[dict[str, object]], status["required_status_checks"])[0]["integration_id"] = None
@@ -917,11 +1270,14 @@ def test_repository_governance_rejects_weakened_controls(
         branch_rulesets[0]["current_user_can_bypass"] = "always"
     elif surface == "missing_main_rule":
         effective.pop(0)
+    elif surface == "merge_queue":
+        queue = cast(dict[str, object], effective[2]["parameters"])
+        queue["max_entries_to_build"] = 6
     elif surface == "review_count":
-        reviews = cast(dict[str, object], effective[2]["parameters"])
+        reviews = cast(dict[str, object], effective[3]["parameters"])
         reviews["required_approving_review_count"] = 1
     elif surface == "last_push_approval":
-        reviews = cast(dict[str, object], effective[2]["parameters"])
+        reviews = cast(dict[str, object], effective[3]["parameters"])
         reviews["require_last_push_approval"] = True
     elif surface == "tag_bypass":
         tag_rulesets[0]["current_user_can_bypass"] = "always"
@@ -936,9 +1292,11 @@ def test_repository_governance_rejects_weakened_controls(
             "protected_branches": False,
             "custom_branch_policies": True,
         }
-    else:
+    elif surface == "environment_admin_bypass":
         environment = cast(dict[str, object], environments["live-validation"])
         environment["can_admins_bypass"] = True
+    else:
+        immutable_releases["enabled"] = False
 
     with pytest.raises(ProvenanceError, match=expected_message):
         build_repository_governance(
@@ -947,6 +1305,7 @@ def test_repository_governance_rejects_weakened_controls(
             branch_rulesets,
             tag_rulesets,
             environments,
+            immutable_releases,
             repository=REPOSITORY,
             source_commit=COMMIT,
             tag=TAG,
@@ -963,6 +1322,7 @@ def test_repository_governance_rejects_another_protected_branch() -> None:
             _branch_rulesets(),
             _tag_rulesets(),
             _environments(),
+            _immutable_releases(),
             repository=REPOSITORY,
             source_commit=COMMIT,
             tag=TAG,
@@ -976,6 +1336,7 @@ def _release_identity() -> dict[str, object]:
         "target_commitish": COMMIT,
         "draft": True,
         "prerelease": False,
+        "immutable": False,
     }
 
 
@@ -1186,6 +1547,7 @@ def _governance_receipt() -> dict[str, object]:
         _branch_rulesets(),
         _tag_rulesets(),
         _environments(),
+        _immutable_releases(),
         repository=REPOSITORY,
         source_commit=COMMIT,
         tag=TAG,
@@ -1215,6 +1577,7 @@ def test_mutation_authority_revalidates_exact_main_tag_governance_and_draft() ->
         release_state="present",
         expect_draft=True,
         fetch_json=lambda path: deepcopy(routes[path]),
+        fetch_admin_json=lambda path: deepcopy(routes[path]),
     )
 
 
@@ -1232,11 +1595,12 @@ def test_mutation_authority_proves_release_absence_before_create() -> None:
         release_state="absent",
         expect_draft=True,
         fetch_json=lambda path: deepcopy(routes[path]),
+        fetch_admin_json=lambda path: deepcopy(routes[path]),
     )
 
 
 def test_mutation_authority_rejects_an_unspecified_present_draft_state() -> None:
-    with pytest.raises(ProvenanceError, match="exact draft state"):
+    with pytest.raises(ProvenanceError, match="only while the release is a draft"):
         verify_live_mutation_authority(
             _governance_receipt(),
             repository=REPOSITORY,
@@ -1247,6 +1611,7 @@ def test_mutation_authority_rejects_an_unspecified_present_draft_state() -> None
             release_state="present",
             expect_draft=None,
             fetch_json=lambda path: deepcopy(_mutation_routes()[path]),
+            fetch_admin_json=lambda path: deepcopy(_mutation_routes()[path]),
         )
 
 
@@ -1278,6 +1643,7 @@ def test_mutation_authority_rejects_stale_or_bypassable_live_state(mutation: str
             release_state="present",
             expect_draft=True,
             fetch_json=lambda path: deepcopy(routes[path]),
+            fetch_admin_json=lambda path: deepcopy(routes[path]),
         )
 
 

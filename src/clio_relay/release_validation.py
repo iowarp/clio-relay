@@ -82,6 +82,7 @@ class LocalReleaseValidationOptions:
     report_path: Path
     markdown_report_path: Path | None = None
     artifact_dir: Path | None = None
+    prebuilt_artifact_dir: Path | None = None
     report_id: DurableRecordId | None = None
 
 
@@ -108,6 +109,18 @@ def run_local_release_validation(
         options.artifact_dir or root / ".clio-relay" / "release-artifacts" / report.report_id
     ).resolve()
     artifact_dir = internal_filesystem_path(logical_artifact_dir, force_extended=True)
+    prebuilt_artifact_dir = (
+        None
+        if options.prebuilt_artifact_dir is None
+        else internal_filesystem_path(
+            logical_filesystem_path(options.prebuilt_artifact_dir).resolve(),
+            force_extended=True,
+        )
+    )
+    if prebuilt_artifact_dir is not None and prebuilt_artifact_dir == artifact_dir:
+        raise ConfigurationError(
+            "prebuilt artifact input and release validation output directories must differ"
+        )
     artifact_dir.mkdir(parents=True, exist_ok=True)
     support_dir = artifact_dir / ".validation-support"
     support_dir.mkdir(parents=True, exist_ok=True)
@@ -232,23 +245,29 @@ def run_local_release_validation(
             root=root,
             runner=command_runner,
         )
-        _run_check(
-            recorder,
-            "local.build",
-            "build wheel and source distribution",
-            [
-                "uv",
-                "build",
-                "--no-build-isolation",
-                "--python",
-                sys.executable,
-                "--out-dir",
-                str(artifact_dir),
-            ],
-            root=root,
-            runner=command_runner,
-        )
-        artifacts = _release_artifacts(artifact_dir)
+        if prebuilt_artifact_dir is None:
+            _run_check(
+                recorder,
+                "local.build",
+                "build wheel and source distribution",
+                [
+                    "uv",
+                    "build",
+                    "--no-build-isolation",
+                    "--python",
+                    sys.executable,
+                    "--out-dir",
+                    str(artifact_dir),
+                ],
+                root=root,
+                runner=command_runner,
+            )
+            artifacts = _release_artifacts(artifact_dir)
+        else:
+            artifacts = _verify_prebuilt_release_artifacts(
+                recorder,
+                prebuilt_artifact_dir,
+            )
         _record_release_artifacts(recorder, artifacts)
         _run_check(
             recorder,
@@ -325,14 +344,15 @@ def run_local_release_validation(
             )
         finally:
             shutil.rmtree(smoke_environment, ignore_errors=True)
-        _run_sdist_smoke(
-            recorder,
-            sdist=sdist,
-            runtime_requirements=runtime_requirements,
-            support_dir=support_dir,
-            root=root,
-            runner=command_runner,
-        )
+        if prebuilt_artifact_dir is None:
+            _run_sdist_smoke(
+                recorder,
+                sdist=sdist,
+                runtime_requirements=runtime_requirements,
+                support_dir=support_dir,
+                root=root,
+                runner=command_runner,
+            )
     except BaseException as exc:
         if not report.checks or report.checks[-1].status.value != "failed":
             recorder.record_failure("local-release.completed", "complete local release gate", exc)
@@ -546,6 +566,71 @@ def _release_artifacts(artifact_dir: Path) -> list[Path]:
             f"found wheels={len(wheels)}, sdists={len(sdists)}"
         )
     return [*wheels, *sdists]
+
+
+def _verify_prebuilt_release_artifacts(
+    recorder: ValidationRecorder,
+    artifact_dir: Path,
+) -> list[Path]:
+    """Verify an exact external wheel/sdist pair without rebuilding either file."""
+    with recorder.check(
+        "local.prebuilt-artifacts",
+        "verify and reuse the exact build-once wheel and source distribution",
+    ) as evidence:
+        try:
+            paths = sorted(artifact_dir.iterdir(), key=lambda path: path.name)
+        except OSError as exc:
+            raise ConfigurationError(
+                f"could not inspect prebuilt artifact directory: {artifact_dir}: {exc}"
+            ) from exc
+        expected_fixed = {"SHA256SUMS"}
+        wheels = [path for path in paths if path.name.endswith(".whl")]
+        sdists = [path for path in paths if path.name.endswith(".tar.gz")]
+        expected_names = {
+            *expected_fixed,
+            *(path.name for path in wheels),
+            *(path.name for path in sdists),
+        }
+        if len(wheels) != 1 or len(sdists) != 1 or {path.name for path in paths} != expected_names:
+            raise ConfigurationError(
+                "prebuilt artifact directory must contain exactly one wheel, one source "
+                "distribution, and SHA256SUMS"
+            )
+        for path in paths:
+            try:
+                details = path.lstat()
+            except OSError as exc:
+                raise ConfigurationError(
+                    f"could not inspect prebuilt artifact: {path}: {exc}"
+                ) from exc
+            if path.is_symlink() or not path.is_file() or details.st_size < 1:
+                raise ConfigurationError(
+                    f"prebuilt artifact is not a nonempty regular file: {path}"
+                )
+        manifest_path = artifact_dir / "SHA256SUMS"
+        try:
+            manifest = manifest_path.read_text(encoding="ascii")
+        except (OSError, UnicodeError) as exc:
+            raise ConfigurationError(f"could not read prebuilt SHA256SUMS: {exc}") from exc
+        artifacts = [wheels[0], sdists[0]]
+        expected_manifest = "".join(
+            f"{sha256_file(path)} *{path.name}\n"
+            for path in sorted(artifacts, key=lambda item: item.name)
+        )
+        if manifest != expected_manifest:
+            raise ConfigurationError(
+                "prebuilt SHA256SUMS is noncanonical or differs from the supplied artifacts"
+            )
+        evidence.extend(
+            EvidenceReference(
+                kind="prebuilt_artifact",
+                reference=str(logical_filesystem_path(path)),
+                sha256=sha256_file(path),
+                metadata={"size_bytes": path.stat().st_size},
+            )
+            for path in artifacts
+        )
+        return artifacts
 
 
 def _record_release_artifacts(

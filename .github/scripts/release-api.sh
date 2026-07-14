@@ -45,7 +45,8 @@ relay_release_complete_assets() {
     .tag_name == $expected[0].tag_name and
     .target_commitish == $expected[0].target_commitish and
     .draft == $expected[0].draft and
-    .prerelease == $expected[0].prerelease
+    .prerelease == $expected[0].prerelease and
+    .immutable == $expected[0].immutable
   ' "$refreshed" >/dev/null
   gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
     "repos/$REPOSITORY/releases/$release_id/assets?per_page=100&page=1" >"$page_one"

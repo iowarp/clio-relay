@@ -22,7 +22,7 @@ def _workflow(name: str) -> dict[str, Any]:
     return cast(dict[str, Any], document)
 
 
-def test_tag_workflow_only_builds_an_unprivileged_actions_payload() -> None:
+def test_tag_workflow_only_binds_the_unprivileged_merge_queue_payload() -> None:
     workflow = _workflow("release.yml")
     jobs = cast(dict[str, dict[str, Any]], workflow["jobs"])
     text = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
@@ -33,9 +33,13 @@ def test_tag_workflow_only_builds_an_unprivileged_actions_payload() -> None:
     assert "gh release upload" not in text
     assert "environment:" not in text
     assert "--clobber" not in text
-    assert set(jobs) == {"build"}
-    assert jobs["build"]["permissions"] == {"contents": "read"}
-    steps = cast(list[dict[str, Any]], jobs["build"]["steps"])
+    assert set(jobs) == {"bind"}
+    assert workflow["permissions"] == {
+        "actions": "read",
+        "contents": "read",
+        "pull-requests": "read",
+    }
+    steps = cast(list[dict[str, Any]], jobs["bind"]["steps"])
     checkout = next(step for step in steps if "actions/checkout@" in str(step.get("uses")))
     assert cast(dict[str, str], checkout["with"])["persist-credentials"] == "false"
     assert cast(dict[str, str], checkout["with"])["ref"] == "${{ github.sha }}"
@@ -43,6 +47,10 @@ def test_tag_workflow_only_builds_an_unprivileged_actions_payload() -> None:
     assert "REPOSITORY-GOVERNANCE.json" not in text
     assert "relay_authenticated_git_fetch" in text
     assert "actions/upload-artifact@" in text
+    assert "release validate-local" not in text
+    assert "uv build" not in text
+    assert "TAG-BINDING.json" in text
+    assert "--artifact-kind candidate" in text
 
 
 def test_same_tag_release_stages_share_one_non_canceling_concurrency_group() -> None:
@@ -134,15 +142,22 @@ def test_ci_uses_read_only_permissions_and_nonpersistent_checkout_credentials() 
     workflow = _workflow("ci.yml")
     permissions = cast(dict[str, str], workflow["permissions"])
     jobs = cast(dict[str, dict[str, Any]], workflow["jobs"])
-    steps = cast(list[dict[str, Any]], jobs["test"]["steps"])
+    steps = cast(list[dict[str, Any]], jobs["validate"]["steps"])
     checkout = next(step for step in steps if "actions/checkout@" in str(step.get("uses")))
-    strategy = cast(dict[str, Any], jobs["test"]["strategy"])
-    matrix = cast(dict[str, list[str]], strategy["matrix"])
+    strategy = cast(dict[str, Any], jobs["validate"]["strategy"])
+    matrix = cast(dict[str, list[dict[str, str]]], strategy["matrix"])
 
     assert permissions == {"contents": "read"}
     assert cast(dict[str, str], checkout["with"])["persist-credentials"] == "false"
-    assert matrix["os"] == ["ubuntu-latest", "windows-latest"]
-    assert matrix["python-version"] == ["3.12", "3.13", "3.14"]
+    assert matrix["include"] == [
+        {"os": "ubuntu-latest", "python-version": "3.13"},
+        {"os": "ubuntu-latest", "python-version": "3.14"},
+        {"os": "windows-latest", "python-version": "3.12"},
+        {"os": "windows-latest", "python-version": "3.13"},
+        {"os": "windows-latest", "python-version": "3.14"},
+    ]
+    assert jobs["build"]["name"] == "ubuntu-latest / python 3.12"
+    assert jobs["seal"]["name"] == "seal tested release candidate"
     workflow_lint = str(jobs["workflow-lint"])
     assert "actionlint_1.7.12_linux_amd64.tar.gz" in workflow_lint
     assert "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8" in (workflow_lint)
@@ -154,13 +169,13 @@ def test_ci_uses_read_only_permissions_and_nonpersistent_checkout_credentials() 
 def test_ci_matrix_pins_sync_probe_and_release_gate_to_each_declared_python() -> None:
     workflow = _workflow("ci.yml")
     jobs = cast(dict[str, dict[str, Any]], workflow["jobs"])
-    steps = cast(list[dict[str, Any]], jobs["test"]["steps"])
+    steps = cast(list[dict[str, Any]], jobs["validate"]["steps"])
     by_name = {str(step["name"]): step for step in steps}
     matrix_python = '"${{ matrix.python-version }}"'
 
     sync_command = str(by_name["install dependencies"]["run"])
     probe_command = str(by_name["verify matrix interpreter"]["run"])
-    gate_command = str(by_name["run evidence-producing local release gate"]["run"])
+    gate_command = str(by_name["validate without rebuilding the distributions"]["run"])
 
     assert sync_command == f"uv sync --python {matrix_python} --locked --all-groups"
     assert probe_command.startswith(f"uv run --python {matrix_python} python -c ")
@@ -168,7 +183,55 @@ def test_ci_matrix_pins_sync_probe_and_release_gate_to_each_declared_python() ->
     assert gate_command.startswith(
         f"uv run --python {matrix_python} clio-relay release validate-local "
     )
+    assert "--prebuilt-artifact-dir dist/prebuilt" in gate_command
     assert gate_command.count("${{ matrix.python-version }}") == 2
+    primary = str(jobs["build"])
+    assert "run the sole artifact-building release gate" in primary
+    assert "--prebuilt-artifact-dir" not in primary
+
+
+def test_merge_queue_builds_once_and_main_or_tag_never_repeat_the_full_gate() -> None:
+    ci = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+    main = (WORKFLOWS / "main-provenance.yml").read_text(encoding="utf-8")
+    tag = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
+
+    assert "merge_group:" in ci
+    assert "push:" not in ci
+    assert "push:" in main
+    assert "record merged-main provenance" in main
+    assert "validate-local" not in main
+    assert ci.count("--artifact-dir dist/build-output") == 1
+    assert ci.count("--prebuilt-artifact-dir dist/prebuilt") == 1
+    assert "--report dist/reports/validation-local" in ci
+    assert "candidate-build-receipt" in ci
+    assert "release-candidate-${{ steps.candidate.outputs.tree }}" in ci
+    assert "release validate-local" not in tag
+    assert "uv sync" not in tag
+    assert "uv build" not in tag
+    assert "stage exact clio-kit" not in tag
+
+
+def test_release_mutations_require_live_admin_read_immutability_governance() -> None:
+    privileged = (
+        "stage-candidate.yml",
+        "live-validation-attest.yml",
+        "release-gate.yml",
+        "released-validation-attest.yml",
+        "finalize-release.yml",
+    )
+    for workflow_name in privileged:
+        text = (WORKFLOWS / workflow_name).read_text(encoding="utf-8")
+        assert "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1" in text
+        assert "permission-administration: read" in text
+        assert "GH_ADMIN_READ_TOKEN" in text
+        assert "mutation-authority" in text
+        assert "--method PUT" not in text
+        assert "--method DELETE" not in text
+
+    source = (ROOT / "src" / "clio_relay" / "ci_validation.py").read_text(encoding="utf-8")
+    assert 'fetch_admin_json(f"repos/{repository}/immutable-releases")' in source
+    assert '"enabled": True' in source
+    assert '"enforced_by_owner": True' in source
 
 
 def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> None:
@@ -689,8 +752,8 @@ def test_candidate_staging_binds_live_exact_sha_ci_and_governance() -> None:
     text = (WORKFLOWS / "stage-candidate.yml").read_text(encoding="utf-8")
 
     assert permissions["actions"] == "read"
-    assert "actions/workflows/ci.yml/runs?head_sha=$SOURCE_COMMIT" in text
-    assert "event=push&status=completed&per_page=100" in text
+    assert "actions/workflows/ci.yml/runs?head_sha=$TESTED_COMMIT" in text
+    assert "event=merge_group&status=completed&per_page=100" in text
     assert "actions/runs/$ci_run_id/attempts/$ci_run_attempt/jobs?per_page=100" in text
     assert "ci_validation.py select-ci-run" in text
     assert "ci_validation.py build-ci-status" in text
@@ -708,6 +771,11 @@ def test_candidate_staging_binds_live_exact_sha_ci_and_governance() -> None:
         assert environment in text
     assert "deployment-branch-policies" not in text
     assert "ci_validation.py build-governance" in text
+    assert '--immutable-releases "$inputs/immutable-releases.json"' in text
+    assert "permission-administration: read" in text
+    assert "GH_ADMIN_READ_TOKEN" in text
+    assert "--candidate-build dist/CANDIDATE-BUILD.json" in text
+    assert "--tag-binding binding/TAG-BINDING.json" in text
     assert "ci_validation.py candidate-manifest" in text
 
 
@@ -859,9 +927,11 @@ def test_actions_artifacts_are_preflighted_and_downloaded_by_exact_api_id() -> N
     stage = (WORKFLOWS / "stage-candidate.yml").read_text(encoding="utf-8")
     publish = (WORKFLOWS / "release-gate.yml").read_text(encoding="utf-8")
 
-    assert "--artifact-kind tag-payload" in stage
+    assert "--artifact-kind tag-binding" in stage
+    assert "--artifact-kind candidate" in stage
     assert "actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT" in stage
     assert "actions/artifacts/$ARTIFACT_ID/zip" in stage
+    assert "actions/artifacts/$artifact_id/zip" in stage
     assert "--artifact-kind promotion" in publish
     assert "actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT" in publish
     assert "actions/artifacts/$ARTIFACT_ID/zip" in publish
@@ -970,8 +1040,10 @@ def test_final_publication_rechecks_exact_assets_before_and_after_publication() 
     assert authority < preflight < receipt < publish
     assert publish < postflight < published_receipt < mutable_check
     assert (
-        'test "$(jq -r .immutable "$RUNNER_TEMP/final-release-published.json")" = "false"' in script
+        'test "$(jq -r .immutable "$RUNNER_TEMP/final-release-published.json")" = "true"' in script
     )
+    assert 'gh release verify "$TAG_NAME"' in script
+    assert 'gh release verify-asset "$TAG_NAME" "$asset"' in script
     assert '"${asset_args[@]}"' in script
     assert script.count("relay_release_complete_assets") == 1
     assert script.count("--next-assets-page") == 2
@@ -1004,7 +1076,8 @@ def test_distribution_archives_are_parsed_but_never_executed_in_privileged_jobs(
     assert gate.count("ci_validation.py distribution-archives") == 2
     assert "DISTRIBUTION-ARCHIVES.json" in gate
     assert "local.sdist-smoke" not in gate
-    assert "release validate-local" in release
+    assert "release validate-local" not in release
+    assert "CANDIDATE-BUILD.json" in release
 
 
 def test_privileged_release_jobs_never_execute_candidate_or_pypi_code() -> None:
@@ -1038,18 +1111,17 @@ def test_privileged_release_jobs_never_execute_candidate_or_pypi_code() -> None:
                     assert "uv run --no-sync clio-relay release gate" in script
 
 
-def test_finalization_intentionally_publishes_a_normal_mutable_release() -> None:
+def test_finalization_publishes_once_then_verifies_immutable_release_and_assets() -> None:
     text = (WORKFLOWS / "finalize-release.yml").read_text(encoding="utf-8")
 
     assert 'gh api "repos/$REPOSITORY/immutable-releases"' not in text
-    assert "IMMUTABLE_RELEASES_READ_TOKEN" not in text
-    assert '"github_release_immutable": False' in text
-    assert '"immutability_deferred_to_version": "1.1"' in text
+    assert "permission-administration: read" in text
+    assert '"github_release_immutable": True' in text
     assert '.immutable "$RUNNER_TEMP/final-release-published.json"' in text
-    assert (
-        'test "$(jq -r .immutable "$RUNNER_TEMP/final-release-published.json")" = "false"' in text
-    )
-    assert "gh release verify" not in text
+    assert 'test "$(jq -r .immutable "$RUNNER_TEMP/final-release-published.json")" = "true"' in text
+    assert 'gh release verify "$TAG_NAME"' in text
+    assert 'gh release verify-asset "$TAG_NAME" "$asset"' in text
+    assert text.count("relay_release_patch") == 1
 
 
 def test_final_claims_resolve_all_decision_reports_and_bind_target_policy() -> None:
@@ -1069,6 +1141,7 @@ def test_final_claims_resolve_all_decision_reports_and_bind_target_policy() -> N
 def test_release_workflow_actions_are_commit_pinned() -> None:
     for workflow_name in (
         "ci.yml",
+        "main-provenance.yml",
         "release.yml",
         "stage-candidate.yml",
         "release-gate.yml",

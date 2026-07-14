@@ -69,8 +69,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: bind the tag and unprivileged payload run to reviewed main
-        id: candidate
+      - name: bind the tag workflow to reviewed main
+        id: tag_run
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
@@ -95,11 +95,11 @@ jobs:
           test -n "$policy_version"
           test "$version" = "$policy_version"
           gh api "repos/$REPOSITORY/actions/workflows/release.yml/runs?head_sha=$source_commit&event=push&status=completed&per_page=100" \
-            > "$RUNNER_TEMP/tag-build-runs.json"
-          test "$(jq -r .total_count "$RUNNER_TEMP/tag-build-runs.json")" -lt 100
+            > "$RUNNER_TEMP/tag-binding-runs.json"
+          test "$(jq -r .total_count "$RUNNER_TEMP/tag-binding-runs.json")" -lt 100
           matches="$(jq -c --arg tag "$TAG_NAME" --arg commit "$source_commit" \
             '[.workflow_runs[] | select(.head_branch == $tag and .head_sha == $commit and .event == "push" and .status == "completed" and .conclusion == "success" and .path == ".github/workflows/release.yml")]' \
-            "$RUNNER_TEMP/tag-build-runs.json")"
+            "$RUNNER_TEMP/tag-binding-runs.json")"
           test "$(jq length <<<"$matches")" -eq 1
           run_id="$(jq -r '.[0].id' <<<"$matches")"
           run_attempt="$(jq -r '.[0].run_attempt' <<<"$matches")"
@@ -112,18 +112,18 @@ jobs:
             echo "version=$version"
           } >> "$GITHUB_OUTPUT"
 
-      - name: preflight the exact Actions artifact before download
-        id: artifact
+      - name: preflight the exact tag-binding artifact
+        id: tag_artifact
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          RUN_ID: ${{ steps.candidate.outputs.run_id }}
-          RUN_ATTEMPT: ${{ steps.candidate.outputs.run_attempt }}
-          SOURCE_COMMIT: ${{ steps.candidate.outputs.source_commit }}
+          RUN_ID: ${{ steps.tag_run.outputs.run_id }}
+          RUN_ATTEMPT: ${{ steps.tag_run.outputs.run_attempt }}
+          SOURCE_COMMIT: ${{ steps.tag_run.outputs.source_commit }}
           TAG_NAME: ${{ inputs.tag }}
         shell: bash
         run: |
-          preflight="$RUNNER_TEMP/tag-payload-preflight"
+          preflight="$RUNNER_TEMP/tag-binding-preflight"
           rm -rf "$preflight"
           mkdir "$preflight"
           gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT" \
@@ -138,47 +138,105 @@ jobs:
             --tag "$TAG_NAME" \
             --run-id "$RUN_ID" \
             --run-attempt "$RUN_ATTEMPT" \
-            --artifact-name "release-candidate-$TAG_NAME" \
-            --artifact-kind tag-payload \
+            --artifact-name "release-binding-$TAG_NAME" \
+            --artifact-kind tag-binding \
             --output "$preflight/ARTIFACT.json"
           artifact_id="$(jq -r .artifact.id "$preflight/ARTIFACT.json")"
           [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
           echo "artifact_id=$artifact_id" >> "$GITHUB_OUTPUT"
           echo "manifest=$preflight/ARTIFACT.json" >> "$GITHUB_OUTPUT"
 
-      - name: download by artifact id and verify API digest before extraction
+      - name: download and verify the tag binding
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          ARTIFACT_ID: ${{ steps.artifact.outputs.artifact_id }}
-          ARTIFACT_MANIFEST: ${{ steps.artifact.outputs.manifest }}
+          ARTIFACT_ID: ${{ steps.tag_artifact.outputs.artifact_id }}
+          ARTIFACT_MANIFEST: ${{ steps.tag_artifact.outputs.manifest }}
         shell: bash
         run: |
-          rm -rf dist "$RUNNER_TEMP/tag-payload.zip"
+          rm -rf binding "$RUNNER_TEMP/tag-binding.zip"
           gh api "repos/$REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" \
-            > "$RUNNER_TEMP/tag-payload.zip"
+            > "$RUNNER_TEMP/tag-binding.zip"
           python src/clio_relay/ci_validation.py extract-actions-artifact \
             --manifest "$ARTIFACT_MANIFEST" \
-            --archive "$RUNNER_TEMP/tag-payload.zip" \
+            --archive "$RUNNER_TEMP/tag-binding.zip" \
+            --output-dir binding
+
+      - name: download the original sealed candidate by bound numeric id
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG_NAME: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          run_id="$(jq -r .candidate_run.id binding/TAG-BINDING.json)"
+          run_attempt="$(jq -r .candidate_run.attempt binding/TAG-BINDING.json)"
+          tested_commit="$(jq -r .candidate_run.head_sha binding/TAG-BINDING.json)"
+          source_tree="$(jq -r .source_tree binding/TAG-BINDING.json)"
+          artifact_id="$(jq -r .candidate_artifact.id binding/TAG-BINDING.json)"
+          artifact_name="$(jq -r .candidate_artifact.name binding/TAG-BINDING.json)"
+          gh api "repos/$REPOSITORY/actions/runs/$run_id/attempts/$run_attempt" \
+            > "$RUNNER_TEMP/candidate-run.json"
+          gh api "repos/$REPOSITORY/actions/artifacts/$artifact_id" \
+            > "$RUNNER_TEMP/candidate-artifact.json"
+          jq '{total_count: 1, artifacts: [.]}' "$RUNNER_TEMP/candidate-artifact.json" \
+            > "$RUNNER_TEMP/candidate-artifacts.json"
+          python src/clio_relay/ci_validation.py actions-artifact-manifest \
+            --run "$RUNNER_TEMP/candidate-run.json" \
+            --artifacts "$RUNNER_TEMP/candidate-artifacts.json" \
+            --repository "$REPOSITORY" \
+            --source-commit "$tested_commit" \
+            --source-tree "$source_tree" \
+            --tag "$TAG_NAME" \
+            --run-id "$run_id" \
+            --run-attempt "$run_attempt" \
+            --artifact-name "$artifact_name" \
+            --artifact-kind candidate \
+            --output "$RUNNER_TEMP/CANDIDATE-ARTIFACT.json"
+          rm -rf dist "$RUNNER_TEMP/candidate.zip"
+          gh api "repos/$REPOSITORY/actions/artifacts/$artifact_id/zip" \
+            > "$RUNNER_TEMP/candidate.zip"
+          python src/clio_relay/ci_validation.py extract-actions-artifact \
+            --manifest "$RUNNER_TEMP/CANDIDATE-ARTIFACT.json" \
+            --archive "$RUNNER_TEMP/candidate.zip" \
             --output-dir dist
+          {
+            echo "tested_commit=$tested_commit"
+            echo "source_tree=$source_tree"
+            echo "run_id=$run_id"
+            echo "run_attempt=$run_attempt"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: mint repository-scoped administration-read token
+        id: admin_read
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ vars.IMMUTABLE_RELEASES_APP_ID }}
+          private-key: ${{ secrets.IMMUTABLE_RELEASES_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-administration: read
 
       - name: build trusted CI and live-governance receipts from protected main
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_ADMIN_READ_TOKEN: ${{ steps.admin_read.outputs.token }}
           REPOSITORY: ${{ github.repository }}
-          SOURCE_COMMIT: ${{ steps.candidate.outputs.source_commit }}
+          SOURCE_COMMIT: ${{ steps.tag_run.outputs.source_commit }}
+          TESTED_COMMIT: ${{ steps.candidate.outputs.tested_commit }}
           TAG_NAME: ${{ inputs.tag }}
         shell: bash
         run: |
           inputs="$RUNNER_TEMP/release-prerequisites"
           rm -rf "$inputs"
           mkdir -p "$inputs/branch-rulesets" "$inputs/tag-rulesets" "$inputs/environments"
-          gh api "repos/$REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SOURCE_COMMIT&event=push&status=completed&per_page=100" \
+          gh api "repos/$REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$TESTED_COMMIT&event=merge_group&status=completed&per_page=100" \
             > "$inputs/ci-runs.json"
           python src/clio_relay/ci_validation.py select-ci-run \
             --runs "$inputs/ci-runs.json" \
             --repository "$REPOSITORY" \
-            --source-commit "$SOURCE_COMMIT" \
+            --source-commit "$TESTED_COMMIT" \
             --output "$inputs/selected-ci-run.json"
           ci_run_id="$(jq -r .run_id "$inputs/selected-ci-run.json")"
           ci_run_attempt="$(jq -r .run_attempt "$inputs/selected-ci-run.json")"
@@ -187,6 +245,9 @@ jobs:
           python src/clio_relay/ci_validation.py build-ci-status \
             --runs "$inputs/ci-runs.json" \
             --jobs "$inputs/ci-jobs.json" \
+            --candidate-build dist/CANDIDATE-BUILD.json \
+            --candidate-artifact "$RUNNER_TEMP/CANDIDATE-ARTIFACT.json" \
+            --tag-binding binding/TAG-BINDING.json \
             --repository "$REPOSITORY" \
             --source-commit "$SOURCE_COMMIT" \
             --output dist/CI-STATUS.json
@@ -223,12 +284,17 @@ jobs:
             gh api "repos/$REPOSITORY/environments/$environment" \
               > "$inputs/environments/$environment.json"
           done
+          GH_TOKEN="$GH_ADMIN_READ_TOKEN" gh api \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$REPOSITORY/immutable-releases" \
+            > "$inputs/immutable-releases.json"
           python src/clio_relay/ci_validation.py build-governance \
             --main-effective-rules "$inputs/main-effective-rules.json" \
             --protected-branches "$inputs/protected-branches.json" \
             --branch-rulesets "$inputs/branch-rulesets.json" \
             --tag-rulesets "$inputs/tag-rulesets.json" \
             --environments-dir "$inputs/environments" \
+            --immutable-releases "$inputs/immutable-releases.json" \
             --repository "$REPOSITORY" \
             --source-commit "$SOURCE_COMMIT" \
             --tag "$TAG_NAME" \
@@ -237,10 +303,12 @@ jobs:
       - name: normalize and verify the complete candidate payload
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_ADMIN_READ_TOKEN: ${{ steps.admin_read.outputs.token }}
           REPOSITORY: ${{ github.repository }}
-          SOURCE_COMMIT: ${{ steps.candidate.outputs.source_commit }}
+          SOURCE_COMMIT: ${{ steps.tag_run.outputs.source_commit }}
+          TESTED_COMMIT: ${{ steps.candidate.outputs.tested_commit }}
           TAG_NAME: ${{ inputs.tag }}
-          VERSION: ${{ steps.candidate.outputs.version }}
+          VERSION: ${{ steps.tag_run.outputs.version }}
         shell: bash
         run: |
           python src/clio_relay/ci_validation.py verify-ci-status \
@@ -252,20 +320,20 @@ jobs:
             --repository "$REPOSITORY" \
             --source-commit "$SOURCE_COMMIT" \
             --tag "$TAG_NAME"
-          python - dist/validation-local.json "$SOURCE_COMMIT" "$TAG_NAME" "$VERSION" <<'PY'
+          python - dist/validation-local.json "$TESTED_COMMIT" "$VERSION" <<'PY'
           import json
           import sys
           from pathlib import Path
 
           report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          commit, tag, version = sys.argv[2:]
+          commit, version = sys.argv[2:]
           software = report.get("software", {})
           source = report.get("install_source", {})
           checks = {
               "status": report.get("status") == "passed",
               "cluster": report.get("cluster") == "local",
               "commit": software.get("commit") == commit,
-              "tag": software.get("tag") == tag,
+              "tag": software.get("tag") is None,
               "clean": software.get("dirty") is False,
               "version": source.get("distribution_version") == version,
           }
@@ -273,13 +341,15 @@ jobs:
           if failed:
               raise SystemExit(f"local release report identity failed: {failed}")
           PY
+          rm dist/CANDIDATE-BUILD.json
           python src/clio_relay/ci_validation.py candidate-manifest --candidate-dir dist
 
       - name: create or verify the empty exact-target draft
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_ADMIN_READ_TOKEN: ${{ steps.admin_read.outputs.token }}
           REPOSITORY: ${{ github.repository }}
-          SOURCE_COMMIT: ${{ steps.candidate.outputs.source_commit }}
+          SOURCE_COMMIT: ${{ steps.tag_run.outputs.source_commit }}
           TAG_NAME: ${{ inputs.tag }}
         shell: bash
         run: |
@@ -304,8 +374,8 @@ jobs:
               --verify-tag \
               --target "$SOURCE_COMMIT" \
               --draft \
-              --title "$TAG_NAME" \
-              --notes "Production 1.0 candidate. Exact wheel SHA-256: $wheel_sha. Candidate and released-artifact validation are pending; GitHub release immutability is planned for 1.1."
+              --title "clio-relay ${TAG_NAME#v}" \
+              --notes "Production candidate. Exact wheel SHA-256: $wheel_sha. Candidate and released-artifact validation are pending; publication requires repository-enforced immutable releases."
           fi
           relay_release_resolve_eventually "$TAG_NAME" true \
             "$RUNNER_TEMP/release-after-create.json"
@@ -314,8 +384,9 @@ jobs:
       - name: revalidate protected main immediately before candidate attestation
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_ADMIN_READ_TOKEN: ${{ steps.admin_read.outputs.token }}
           REPOSITORY: ${{ github.repository }}
-          SOURCE_COMMIT: ${{ steps.candidate.outputs.source_commit }}
+          SOURCE_COMMIT: ${{ steps.tag_run.outputs.source_commit }}
           TAG_NAME: ${{ inputs.tag }}
         shell: bash
         run: >-
@@ -337,8 +408,9 @@ jobs:
       - name: attach only missing candidate assets and verify API digests
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_ADMIN_READ_TOKEN: ${{ steps.admin_read.outputs.token }}
           REPOSITORY: ${{ github.repository }}
-          SOURCE_COMMIT: ${{ steps.candidate.outputs.source_commit }}
+          SOURCE_COMMIT: ${{ steps.tag_run.outputs.source_commit }}
           TAG_NAME: ${{ inputs.tag }}
         shell: bash
         run: |
