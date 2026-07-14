@@ -36,6 +36,12 @@ from clio_relay.models import (
 from clio_relay.relay_ops import evaluate_monitor_rules
 
 
+class _SimulatedWindowsSharingViolation(PermissionError):
+    """Portable WinError 32 fixture for cross-platform queue tests."""
+
+    winerror = 32
+
+
 def _stat_with_link_count(value: os.stat_result, link_count: int) -> os.stat_result:
     fields = list(value)
     fields[3] = link_count
@@ -224,9 +230,11 @@ def test_release_lease_retries_windows_sharing_violation(
         nonlocal attempts
         if logical_filesystem_path(path) == indexed_path and attempts < 2:
             attempts += 1
-            error = PermissionError(13, "simulated Windows sharing violation", str(path))
-            error.winerror = 32
-            raise error
+            raise _SimulatedWindowsSharingViolation(
+                13,
+                "simulated Windows sharing violation",
+                str(path),
+            )
         original_unlink(path, missing_ok=missing_ok)
 
     monkeypatch.setattr(Path, "unlink", transient_unlink)
@@ -266,9 +274,11 @@ def test_release_lease_sharing_violation_exhaustion_replays_on_restart(
         nonlocal attempts
         if logical_filesystem_path(path) == indexed_path:
             attempts += 1
-            error = PermissionError(13, "simulated persistent sharing violation", str(path))
-            error.winerror = 32
-            raise error
+            raise _SimulatedWindowsSharingViolation(
+                13,
+                "simulated persistent sharing violation",
+                str(path),
+            )
         original_unlink(path, missing_ok=missing_ok)
 
     with monkeypatch.context() as patch:
