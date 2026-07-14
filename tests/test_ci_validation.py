@@ -18,6 +18,7 @@ import pytest
 from clio_relay import ci_validation
 from clio_relay.ci_validation import (
     GITHUB_ACTIONS_APP_ID,
+    MAIN_REVIEW_POLICY,
     MAX_ACTIONS_ARTIFACT_ARCHIVE_BYTES,
     MAX_DISTRIBUTION_BYTES,
     MAX_DISTRIBUTION_MEMBERS,
@@ -30,6 +31,8 @@ from clio_relay.ci_validation import (
     MAX_VALIDATION_REPORT_AGGREGATE_BYTES,
     MAX_VALIDATION_REPORT_ASSETS,
     MAX_VALIDATION_REPORT_BYTES,
+    REQUIRE_LAST_PUSH_APPROVAL,
+    REQUIRED_APPROVING_REVIEW_COUNT,
     REQUIRED_CI_JOBS,
     REQUIRED_ENVIRONMENTS,
     ProvenanceError,
@@ -111,8 +114,8 @@ def _main_effective_rules() -> list[dict[str, object]]:
             "ruleset_id": MAIN_RULESET_ID,
             "parameters": {
                 "dismiss_stale_reviews_on_push": True,
-                "require_last_push_approval": True,
-                "required_approving_review_count": 1,
+                "require_last_push_approval": REQUIRE_LAST_PUSH_APPROVAL,
+                "required_approving_review_count": REQUIRED_APPROVING_REVIEW_COUNT,
                 "required_review_thread_resolution": True,
             },
         },
@@ -835,6 +838,9 @@ def test_repository_governance_receipt_requires_effective_current_token_controls
     assert main["source"] == "effective_rulesets"
     assert main["ruleset_ids"] == [MAIN_RULESET_ID]
     assert main["current_workflow_token_can_bypass"] is False
+    assert main["review_policy"] == MAIN_REVIEW_POLICY
+    assert main["required_approving_review_count"] == REQUIRED_APPROVING_REVIEW_COUNT
+    assert main["require_last_push_approval"] is REQUIRE_LAST_PUSH_APPROVAL
     main_ruleset = cast(list[dict[str, object]], main["rulesets"])[0]
     assert main_ruleset["global_bypass_actors_visible"] is True
     assert main_ruleset["configured_bypass_actor_count"] == 1
@@ -887,6 +893,8 @@ def test_live_governance_requery_must_equal_the_carried_receipt() -> None:
         ("status_app", "integration id"),
         ("main_bypass", "current workflow token can bypass"),
         ("missing_main_rule", "effective main branch rules are incomplete"),
+        ("review_count", "required_approving_review_count"),
+        ("last_push_approval", "require_last_push_approval"),
         ("tag_bypass", "current_workflow_token_cannot_bypass"),
         ("tag_update", "no active workflow-token-protected tag ruleset"),
         ("environment", "protected-branch deployment policy"),
@@ -909,6 +917,12 @@ def test_repository_governance_rejects_weakened_controls(
         branch_rulesets[0]["current_user_can_bypass"] = "always"
     elif surface == "missing_main_rule":
         effective.pop(0)
+    elif surface == "review_count":
+        reviews = cast(dict[str, object], effective[2]["parameters"])
+        reviews["required_approving_review_count"] = 1
+    elif surface == "last_push_approval":
+        reviews = cast(dict[str, object], effective[2]["parameters"])
+        reviews["require_last_push_approval"] = True
     elif surface == "tag_bypass":
         tag_rulesets[0]["current_user_can_bypass"] = "always"
     elif surface == "tag_update":
