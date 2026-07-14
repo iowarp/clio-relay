@@ -70,7 +70,7 @@ Commit the release change with a conventional commit, then create and push an
 exact matching tag:
 
 ```powershell
-$Tag = "v1.0.0"
+$Tag = "v1.0.1"
 git fetch origin main
 $ReviewedMainSha = (git rev-parse refs/remotes/origin/main).Trim()
 if ((git rev-parse HEAD).Trim() -ne $ReviewedMainSha) {
@@ -123,6 +123,11 @@ manifest, attests the bytes, and creates the draft with an explicit target of
 the reviewed commit. Tag-supplied workflow code never receives release-write or
 OIDC authority.
 
+GitHub's release list can lag immediately after draft creation. Staging retries
+only a conclusively absent draft through the same numeric-ID resolver, ten times
+at three-second intervals. API errors, duplicate tag matches, numeric drift, or
+an unexpected draft state remain immediate failures.
+
 An existing draft is reusable only when every staged asset is byte-for-byte
 identical and its complete asset-name set equals the six staged candidate
 assets. The workflow never replaces a candidate distribution.
@@ -150,7 +155,7 @@ Download the draft wheel and manifest, verify both the digest and the signed
 tag-build provenance, and compute the digest locally:
 
 ```powershell
-$Tag = "v1.0.0"
+$Tag = "v1.0.1"
 New-Item -ItemType Directory -Force .clio-relay\candidate | Out-Null
 gh release download $Tag --pattern "*.whl" --pattern "SHA256SUMS" `
   --dir .clio-relay\candidate
@@ -158,7 +163,7 @@ $Wheel = (Get-ChildItem .clio-relay\candidate\*.whl).FullName
 $Expected = ((Get-FileHash -Algorithm SHA256 $Wheel).Hash).ToLowerInvariant()
 $WheelName = Split-Path $Wheel -Leaf
 $ManifestLine = Get-Content .clio-relay\candidate\SHA256SUMS |
-  Where-Object { $_ -match "[ *]$([Regex]::Escape($WheelName))$" }
+  Where-Object { $_ -match " [ *]$([Regex]::Escape($WheelName))$" }
 if ($ManifestLine -notmatch "^$Expected [ *]") { throw "candidate digest mismatch" }
 $Commit = gh api "repos/iowarp/clio-relay/commits/$Tag" --jq .sha
 gh attestation verify $Wheel `

@@ -73,6 +73,12 @@ def test_protected_main_staging_attests_and_creates_the_explicit_target_draft() 
     assert "actions/attest@" in text
     assert "gh release create" in text
     assert '--target "$SOURCE_COMMIT"' in text
+    assert 'relay_release_resolve_eventually "$TAG_NAME" true' in text
+    assert text.index("gh release create") < text.index("relay_release_resolve_eventually")
+    eventual_index = text.index("relay_release_resolve_eventually")
+    assert eventual_index < text.index(
+        '"${authority[@]}" --release-state present --draft true', eventual_index
+    )
     assert '--signer-workflow "$REPOSITORY/.github/workflows/stage-candidate.yml"' in text
     assert '--source-ref "refs/heads/main"' in text
     assert "ci_validation.py mutation-authority" in text
@@ -486,6 +492,14 @@ def test_draft_release_io_resolves_a_bounded_numeric_id() -> None:
         assert "source .github/scripts/release-api.sh" in text, workflow_name
 
     helper = (ROOT / ".github" / "scripts" / "release-api.sh").read_text(encoding="utf-8")
+    assert "relay_release_resolve_eventually()" in helper
+    assert "for attempt in $(seq 1 10)" in helper
+    assert (
+        'relay_release_resolve "$tag_name" "$draft_state" "$output_path" --allow-absent' in helper
+    )
+    assert "if jq -e '. != null'" in helper
+    assert 'if [ "$attempt" -eq 10 ]' in helper
+    assert "sleep 3" in helper
     assert "releases/$release_id/assets?per_page=100&page=1" in helper
     assert "releases/$release_id/assets?per_page=100&page=2" in helper
     assert "releases/assets/$asset_id" in helper
