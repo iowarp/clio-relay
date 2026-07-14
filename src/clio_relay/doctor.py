@@ -9,6 +9,7 @@ import subprocess
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.remote_values import render_remote_shell_value
 
 
 def check_required_binary(name: str, value: str) -> str:
@@ -42,9 +43,15 @@ def run_doctor(
 
 def run_cluster_doctor(definition: ClusterDefinition) -> list[str]:
     """Run live cluster-side checks over SSH and return status lines."""
-    jarvis_bin = _shell_double_quote(definition.jarvis_bin or "$HOME/.local/bin/jarvis")
-    frpc_bin = _shell_double_quote(definition.frpc_bin or "$HOME/.local/bin/frpc")
-    agent_bin = _shell_double_quote(definition.agent_bin or "")
+    jarvis_bin = render_remote_shell_value(
+        definition.jarvis_bin or "$HOME/.local/bin/jarvis",
+        field="jarvis_bin",
+    )
+    frpc_bin = render_remote_shell_value(
+        definition.frpc_bin or "$HOME/.local/bin/frpc",
+        field="frpc_bin",
+    )
+    agent_bin = render_remote_shell_value(definition.agent_bin or "", field="agent_bin")
     agent_npm_bin = shlex.quote(definition.agent_npm_bin or "")
     script = f"""set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
@@ -85,7 +92,3 @@ echo "clio_relay=$(clio-relay --help | head -n 1)"
         detail = stderr.strip() or stdout.strip()
         raise RelayError(f"cluster doctor failed for {definition.name}: {detail}")
     return stdout.splitlines()
-
-
-def _shell_double_quote(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'

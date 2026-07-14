@@ -192,7 +192,62 @@ class SchedulerCancelDisposition(BaseModel):
     confirmation_attempts: int = Field(default=0, ge=0, le=100)
     next_attempt_at: datetime | None = None
     last_error: str | None = Field(default=None, max_length=16_384)
+    attempt_claim_id: DurableRecordId | None = None
+    attempt_claimed_at: datetime | None = None
+    attempt_claim_expires_at: datetime | None = None
+    confirmation_claim_id: DurableRecordId | None = None
+    confirmation_claimed_at: datetime | None = None
+    confirmation_claim_expires_at: datetime | None = None
     updated_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def validate_attempt_claim(self) -> SchedulerCancelDisposition:
+        """Require one complete, bounded-lifecycle claim on retryable work."""
+        claim_values = (
+            self.attempt_claim_id,
+            self.attempt_claimed_at,
+            self.attempt_claim_expires_at,
+        )
+        populated = sum(value is not None for value in claim_values)
+        if populated not in {0, len(claim_values)}:
+            raise ValueError("scheduler cancellation attempt claim must be complete")
+        if self.attempt_claim_id is None:
+            return self
+        if self.state not in {
+            SchedulerCancelDispositionState.PENDING,
+            SchedulerCancelDispositionState.RETRY_WAIT,
+        }:
+            raise ValueError("scheduler cancellation attempt claim requires retryable state")
+        claimed_at = self.attempt_claimed_at
+        expires_at = self.attempt_claim_expires_at
+        if claimed_at is None or expires_at is None or expires_at <= claimed_at:
+            raise ValueError("scheduler cancellation attempt claim must expire after acquisition")
+        return self
+
+    @model_validator(mode="after")
+    def validate_confirmation_claim(self) -> SchedulerCancelDisposition:
+        """Require one complete, bounded-lifecycle claim on confirmation work."""
+        claim_values = (
+            self.confirmation_claim_id,
+            self.confirmation_claimed_at,
+            self.confirmation_claim_expires_at,
+        )
+        populated = sum(value is not None for value in claim_values)
+        if populated not in {0, len(claim_values)}:
+            raise ValueError("scheduler cancellation confirmation claim must be complete")
+        if self.confirmation_claim_id is None:
+            return self
+        if self.state is not SchedulerCancelDispositionState.CANCEL_REQUESTED:
+            raise ValueError(
+                "scheduler cancellation confirmation claim requires cancel-requested state"
+            )
+        claimed_at = self.confirmation_claimed_at
+        expires_at = self.confirmation_claim_expires_at
+        if claimed_at is None or expires_at is None or expires_at <= claimed_at:
+            raise ValueError(
+                "scheduler cancellation confirmation claim must expire after acquisition"
+            )
+        return self
 
 
 def _empty_scheduler_cancel_dispositions() -> list[SchedulerCancelDisposition]:

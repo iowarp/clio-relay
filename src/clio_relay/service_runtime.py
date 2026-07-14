@@ -38,6 +38,7 @@ from clio_relay.relay_host import (
     render_frpc_visitor_config,
 )
 from clio_relay.remote_cli import remote_env
+from clio_relay.remote_values import render_remote_shell_value
 from clio_relay.scheduler_providers import provider_for_scheduler
 from clio_relay.session_lifecycle import CleanupResource
 
@@ -3107,7 +3108,7 @@ data = base64.b64decode({encoded!r}).decode("utf-8")
 with open(path, "w", encoding="utf-8") as handle:
     handle.write(data)
 __CLIO_WRITE_FRPC__
-frpc_bin={_shell_double_quote(frpc_bin)}
+frpc_bin={render_remote_shell_value(frpc_bin, field="frpc_bin")}
 owner_token={shlex.quote(owner_token)}
 connector_generation_id={shlex.quote(connector_generation_id)}
 pid=""
@@ -4308,7 +4309,3 @@ def _frp_proxy_type(transport_mode: str) -> str:
     if normalized in {"frp-xtcp", "frp-xtcp-wss", "xtcp", "direct", "nat-bypass"}:
         return "xtcp"
     raise ConfigurationError(f"unsupported service runtime transport mode: {transport_mode}")
-
-
-def _shell_double_quote(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'

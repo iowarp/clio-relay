@@ -282,10 +282,20 @@ def storage_status() -> None:
 
 
 @app.command()
-def init() -> None:
+def init(
+    migrate_legacy_output: Annotated[
+        bool,
+        typer.Option(
+            help=(
+                "Authorize migration of exact oversized v0.9 output events after every "
+                "queue writer has been stopped and verified inactive."
+            )
+        ),
+    ] = False,
+) -> None:
     """Initialize local queue, spool, and cluster registry files."""
     settings = RelaySettings.from_env()
-    storage_managed_queue(settings)
+    storage_managed_queue(settings, migrate_legacy_output=migrate_legacy_output)
     registry = ClusterRegistry.load(default_registry_path())
     typer.echo(
         f"initialized core={settings.core_dir} spool={settings.spool_dir} "
@@ -969,11 +979,14 @@ def endpoint_start(
             provider_for_scheduler(selected_scheduler) if role == EndpointRole.WORKER else None
         ),
     )
-    worker.register()
-    if once:
-        worker.run_once()
-        return
-    worker.serve_forever()
+    try:
+        worker.register()
+        if once:
+            worker.run_once()
+            return
+        worker.serve_forever()
+    finally:
+        worker.close()
 
 
 @endpoint_app.command("status")
@@ -2773,6 +2786,9 @@ def cluster_bootstrap(
                     bootstrap_profile=definition.bootstrap_profile,
                     ssh_host=ssh_host or definition.ssh_host,
                     source_root=package_source_root(),
+                    cluster=definition.name,
+                    core_dir=definition.core_dir,
+                    spool_dir=definition.spool_dir,
                     relay_wheel=relay_wheel,
                     relay_artifact_sha256=validation.install_source.artifact_sha256,
                     agent_adapter=definition.agent_adapter,

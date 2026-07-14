@@ -8,10 +8,11 @@ the authoritative active-job index, and a cheap running-child guard.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -23,7 +24,7 @@ from clio_relay.core_queue import (
     MAX_LIVE_LEASE_RECORDS,
     ClioCoreQueue,
 )
-from clio_relay.errors import NotFoundError, QueueConflictError, RelayError
+from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError, RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
 from clio_relay.models import (
     TERMINAL_STATES,
@@ -41,6 +42,11 @@ from clio_relay.storage_policy import (
     StorageReason,
 )
 from clio_relay.worker_concurrency import KindConcurrencyInput, normalize_kind_concurrency
+from clio_relay.worker_lifetime_lock import (
+    LockedCoreIdentity,
+    WorkerLifetimeLock,
+    exclusive_migration_lifetime,
+)
 
 if TYPE_CHECKING:
     from clio_relay.config import RelaySettings
@@ -324,12 +330,73 @@ class StorageManagedQueue(ClioCoreQueue):
         root: Path,
         *,
         storage_runtime: StorageRuntime,
+        writer_lifetime_lock: WorkerLifetimeLock | None = None,
+        owns_writer_lifetime_lock: bool = False,
         lock_timeout_seconds: float = DEFAULT_CORE_LOCK_TIMEOUT_SECONDS,
     ) -> None:
+        self._closed = False
         if Path(root).absolute() != storage_runtime.config.core_root.absolute():
             raise ValueError("managed queue root must match the storage runtime core root")
+        if owns_writer_lifetime_lock and writer_lifetime_lock is None:
+            raise ValueError("an owned writer lifetime lock must be provided")
+        if writer_lifetime_lock is not None:
+            if not writer_lifetime_lock.acquired or writer_lifetime_lock.mode != "shared":
+                raise ValueError("managed queue writer lifetime lock must hold shared ownership")
+            root_stat = os.stat(root)
+            lock_stat = os.stat(writer_lifetime_lock.core_dir)
+            if (root_stat.st_dev, root_stat.st_ino) != (lock_stat.st_dev, lock_stat.st_ino):
+                raise ValueError("managed queue root must match its writer lifetime lock")
         super().__init__(root, lock_timeout_seconds=lock_timeout_seconds)
         self.storage_runtime = storage_runtime
+        self._writer_lifetime_lock = writer_lifetime_lock
+        self._owns_writer_lifetime_lock = owns_writer_lifetime_lock
+
+    def __getattribute__(self, name: str) -> object:
+        """Reject every public queue operation after lifetime ownership ends."""
+        value = super().__getattribute__(name)
+        if name == "close" or name.startswith("_") or not callable(value):
+            return value
+        try:
+            closed = super().__getattribute__("_closed")
+        except AttributeError:
+            return value
+        if closed:
+            raise ConfigurationError("managed queue is closed and cannot perform operations")
+        return value
+
+    @property
+    def closed(self) -> bool:
+        """Return whether this queue's writer lifetime has ended."""
+        return self._closed
+
+    def initialize(
+        self,
+        *,
+        migrate_legacy_output: bool = False,
+        locked_core: LockedCoreIdentity | None = None,
+    ) -> None:
+        """Initialize only while this managed queue retains writer ownership."""
+        if self._closed:
+            raise ConfigurationError("managed queue is closed and cannot perform operations")
+        super().initialize(
+            migrate_legacy_output=migrate_legacy_output,
+            locked_core=locked_core,
+        )
+
+    def close(self) -> None:
+        """Release queue-owned core writer lifetime ownership."""
+        self._closed = True
+        if not self._owns_writer_lifetime_lock:
+            return
+        self._owns_writer_lifetime_lock = False
+        lifetime_lock = self._writer_lifetime_lock
+        self._writer_lifetime_lock = None
+        if lifetime_lock is not None:
+            lifetime_lock.release()
+
+    def __del__(self) -> None:
+        with suppress(Exception):
+            self.close()
 
     @contextmanager
     def _acquire_lock_with_replay(self) -> Generator[None]:
@@ -668,13 +735,55 @@ class StorageManagedQueue(ClioCoreQueue):
             return
 
 
-def storage_managed_queue(settings: RelaySettings) -> StorageManagedQueue:
-    """Create the production queue, complete bounded migration, and reconcile storage."""
-    runtime = storage_runtime_from_settings(settings)
-    queue = StorageManagedQueue(settings.core_dir, storage_runtime=runtime)
-    queue.initialize()
-    _complete_bounded_index_migration(queue, runtime)
-    runtime.reconcile_startup(queue)
+def storage_managed_queue(
+    settings: RelaySettings,
+    *,
+    migrate_legacy_output: bool = False,
+    writer_lifetime_lock: WorkerLifetimeLock | None = None,
+) -> StorageManagedQueue:
+    """Create a production queue under shared writer or exclusive migration ownership."""
+    if migrate_legacy_output:
+        if writer_lifetime_lock is not None:
+            raise ValueError("migration cannot reuse shared writer lifetime ownership")
+        with exclusive_migration_lifetime(settings.core_dir) as locked_core:
+            pinned_settings = settings.model_copy(update={"core_dir": locked_core.root})
+            runtime = storage_runtime_from_settings(pinned_settings)
+            queue = StorageManagedQueue(locked_core.root, storage_runtime=runtime)
+            queue.initialize(
+                migrate_legacy_output=True,
+                locked_core=locked_core,
+            )
+            _complete_bounded_index_migration(queue, runtime)
+            runtime.reconcile_startup(queue)
+            queue.close()
+            return queue
+    owned_lifetime_lock: WorkerLifetimeLock | None = None
+    lifetime_lock = writer_lifetime_lock
+    if lifetime_lock is None:
+        owned_lifetime_lock = WorkerLifetimeLock(settings.core_dir, mode="shared").acquire()
+        lifetime_lock = owned_lifetime_lock
+    if not lifetime_lock.acquired or lifetime_lock.mode != "shared":
+        raise ValueError("production queue requires acquired shared writer lifetime ownership")
+    pinned_settings = settings.model_copy(update={"core_dir": lifetime_lock.core_dir})
+    try:
+        # Audit and initialize before StorageRuntime or StoragePolicy can create
+        # `.storage`. A normal startup that encounters legacy output remains a
+        # read-only refusal with respect to storage accounting and spool state.
+        ClioCoreQueue(lifetime_lock.core_dir).initialize()
+        runtime = storage_runtime_from_settings(pinned_settings)
+        queue = StorageManagedQueue(
+            lifetime_lock.core_dir,
+            storage_runtime=runtime,
+            writer_lifetime_lock=lifetime_lock,
+            owns_writer_lifetime_lock=owned_lifetime_lock is not None,
+        )
+        queue.initialize()
+        _complete_bounded_index_migration(queue, runtime)
+        runtime.reconcile_startup(queue)
+    except BaseException:
+        if owned_lifetime_lock is not None:
+            owned_lifetime_lock.release()
+        raise
     return queue
 
 

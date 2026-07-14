@@ -6,9 +6,10 @@ import shutil
 import threading
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
-from filelock import Timeout
+from filelock import FileLock, Timeout
 
 import clio_relay.core_queue as core_queue_module
 from clio_relay.core_queue import DEFAULT_CORE_LOCK_TIMEOUT_SECONDS, ClioCoreQueue
@@ -1095,6 +1096,57 @@ def test_legacy_queue_requires_and_completes_crash_safe_bounded_index_migration(
     assert migrated_progress[0].sequence == 1
     lease = queue.acquire_next_job("worker-after-migration", cluster="ares")
     assert lease is not None and lease.job_id == job.job_id
+
+
+def test_index_migration_reconciles_flat_job_written_after_finalize_cursor(
+    tmp_path: Path,
+) -> None:
+    """A late pre-1.0 flat write must be indexed before migration completes."""
+    (tmp_path / "jobs").mkdir(parents=True)
+    first = RelayJob(
+        cluster="configured-target",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(command=["true"]),
+        idempotency_key="first-flat-job",
+    )
+    (tmp_path / "jobs" / f"{first.job_id}.json").write_text(
+        first.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+
+    queue = ClioCoreQueue(tmp_path)
+    state = queue.index_migration_status()
+    batches = 0
+    while True:
+        finalize = state.get("finalize")
+        assert isinstance(finalize, dict)
+        finalize = cast(dict[str, object], finalize)
+        if finalize.get("complete") is True and state.get("complete") is False:
+            break
+        state = queue.migrate_indexes_batch(batch_size=1)
+        batches += 1
+        assert batches < 40
+
+    late = RelayJob(
+        cluster="configured-target",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(command=["true"]),
+        idempotency_key="late-flat-job",
+    )
+    with FileLock(str(tmp_path / ".lock")):
+        (tmp_path / "jobs" / f"{late.job_id}.json").write_text(
+            late.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+
+    completed = queue.migrate_indexes_batch(batch_size=1)
+    jobs, next_cursor, total = queue.list_jobs_page(limit=10)
+
+    assert completed["complete"] is True
+    assert next_cursor is None
+    assert total == 2
+    assert [job.job_id for job in jobs] == [first.job_id, late.job_id]
+    assert (tmp_path / "jobs_queued" / f"{late.job_id}.json").is_file()
 
 
 def test_leasing_reads_active_index_not_terminal_history(

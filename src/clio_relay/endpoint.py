@@ -30,6 +30,7 @@ import yaml
 from filelock import FileLock, Timeout
 
 from clio_relay import process_containment
+from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import DEFAULT_EXACT_RECORD_LIMIT, ClioCoreQueue
 from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
@@ -58,6 +59,7 @@ from clio_relay.models import (
     RelayTask,
     RemoteAgentTaskSpec,
     SchedulerCancelDispositionState,
+    SchedulerCancelPending,
     SchedulerPhase,
     SchedulerStatus,
     utc_now,
@@ -103,6 +105,7 @@ from clio_relay.worker_concurrency import (
     kind_concurrency_metadata,
     normalize_kind_concurrency,
 )
+from clio_relay.worker_lifetime_lock import WorkerLifetimeLock
 
 
 @dataclass
@@ -177,6 +180,8 @@ class EndpointWorker:
     scheduler_cancel_confirmation_max_attempts = 5
     scheduler_cancel_retry_base_seconds = 2.0
     scheduler_cancel_retry_max_seconds = 30.0
+    scheduler_cancel_claim_lease_seconds = 60.0
+    scheduler_cancel_confirmation_claim_lease_seconds = 60.0
     scheduler_poll_interval_seconds = 5.0
 
     def __init__(
@@ -198,33 +203,109 @@ class EndpointWorker:
         self.cluster = cluster
         self.concurrency = concurrency
         self.kind_concurrency = normalize_kind_concurrency(kind_concurrency)
+        self._closed = False
+        self._queue_root_path: Path | None = None
+        self._queue_root_identity: tuple[int, int] | None = None
+        self._worker_lifetime_lock: WorkerLifetimeLock | None = None
+        self._owned_managed_queue: StorageManagedQueue | None = None
+        if self.role == EndpointRole.WORKER:
+            lifetime_core = queue.root if queue is not None else settings.core_dir
+            self._worker_lifetime_lock = WorkerLifetimeLock(
+                lifetime_core,
+                mode="shared",
+            ).acquire()
+            settings = settings.model_copy(update={"core_dir": self._worker_lifetime_lock.core_dir})
         self.settings = settings
-        resolved_queue = queue if queue is not None else storage_managed_queue(settings)
-        managed_runtime = (
-            resolved_queue.storage_runtime
-            if isinstance(resolved_queue, StorageManagedQueue)
-            else None
-        )
-        if (
-            storage_runtime is not None
-            and managed_runtime is not None
-            and storage_runtime is not managed_runtime
-        ):
-            raise ConfigurationError("worker storage runtime must match its managed queue instance")
-        self.queue = resolved_queue
-        self.provider = provider or JarvisCdProvider(
-            jarvis_bin=settings.jarvis_bin,
-            agent_bin=settings.agent_bin,
-            agent_adapter=settings.agent_adapter,
-            agent_args=settings.agent_args,
-        )
-        self.scheduler_provider = scheduler_provider
-        self.storage_runtime = storage_runtime or managed_runtime
-        self._scheduler_last_poll: dict[tuple[str, str], float] = {}
-        self.endpoint: EndpointRegistration | None = None
+        try:
+            resolved_queue = (
+                queue
+                if queue is not None
+                else storage_managed_queue(
+                    settings,
+                    writer_lifetime_lock=self._worker_lifetime_lock,
+                )
+            )
+            if self.role == EndpointRole.WORKER:
+                canonical_stat = os.stat(settings.core_dir)
+                queue_stat = os.stat(resolved_queue.root)
+                if (queue_stat.st_dev, queue_stat.st_ino) != (
+                    canonical_stat.st_dev,
+                    canonical_stat.st_ino,
+                ):
+                    raise ConfigurationError(
+                        "worker queue root does not match its core lifetime lock"
+                    )
+                self._queue_root_path = resolved_queue.root
+                self._queue_root_identity = (queue_stat.st_dev, queue_stat.st_ino)
+            managed_runtime = (
+                resolved_queue.storage_runtime
+                if isinstance(resolved_queue, StorageManagedQueue)
+                else None
+            )
+            if queue is None and isinstance(resolved_queue, StorageManagedQueue):
+                self._owned_managed_queue = resolved_queue
+            if (
+                storage_runtime is not None
+                and managed_runtime is not None
+                and storage_runtime is not managed_runtime
+            ):
+                raise ConfigurationError(
+                    "worker storage runtime must match its managed queue instance"
+                )
+            self.queue = resolved_queue
+            self.provider = provider or JarvisCdProvider(
+                jarvis_bin=settings.jarvis_bin,
+                agent_bin=settings.agent_bin,
+                agent_adapter=settings.agent_adapter,
+                agent_args=settings.agent_args,
+            )
+            self.scheduler_provider = scheduler_provider
+            self.storage_runtime = storage_runtime or managed_runtime
+            self._scheduler_last_poll: dict[tuple[str, str], float] = {}
+            self.endpoint: EndpointRegistration | None = None
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Release endpoint-owned queue and core-scoped lifetime ownership."""
+        self._closed = True
+        owned_queue = self._owned_managed_queue
+        self._owned_managed_queue = None
+        if owned_queue is not None:
+            owned_queue.close()
+        lifetime_lock = self._worker_lifetime_lock
+        if lifetime_lock is None:
+            return
+        self._worker_lifetime_lock = None
+        lifetime_lock.release()
+
+    def __del__(self) -> None:
+        with suppress(Exception):
+            self.close()
+
+    def _require_open_queue_identity(self) -> None:
+        """Reject use after close or after an injected queue alias is retargeted."""
+        if self._closed:
+            raise ConfigurationError("endpoint worker is closed")
+        if self.role != EndpointRole.WORKER:
+            return
+        queue_root = self._queue_root_path
+        expected = self._queue_root_identity
+        if queue_root is None or expected is None or self._worker_lifetime_lock is None:
+            raise ConfigurationError("worker lifetime ownership is incomplete")
+        try:
+            observed_stat = os.stat(queue_root)
+        except OSError as exc:
+            raise ConfigurationError(
+                f"worker queue root identity cannot be verified: {exc}"
+            ) from exc
+        if (observed_stat.st_dev, observed_stat.st_ino) != expected:
+            raise ConfigurationError("worker queue root identity changed after lifetime locking")
 
     def register(self) -> EndpointRegistration:
         """Register this endpoint in the durable queue."""
+        self._require_open_queue_identity()
         metadata: dict[str, object] = {
             "concurrency": self.concurrency,
             "kind_concurrency": kind_concurrency_metadata(self.kind_concurrency),
@@ -234,6 +315,9 @@ class EndpointWorker:
             metadata["worker_supervisor"] = True
         if self.role == EndpointRole.WORKER:
             metadata["installation_info"] = _worker_installation_snapshot()
+            process_identity = _worker_process_identity()
+            if process_identity is not None:
+                metadata["process_identity"] = process_identity
             metadata["scheduler_provider"] = (
                 self.scheduler_provider.name if self.scheduler_provider is not None else "external"
             )
@@ -249,6 +333,7 @@ class EndpointWorker:
 
     def run_once(self) -> RelayJob | None:
         """Run one leased cluster job if available."""
+        self._require_open_queue_identity()
         if self.role != EndpointRole.WORKER:
             return None
         endpoint = self.endpoint or self.register()
@@ -310,6 +395,7 @@ class EndpointWorker:
 
     def serve_forever(self, *, poll_seconds: float = 2.0) -> None:
         """Run the endpoint loop until interrupted."""
+        self._require_open_queue_identity()
         self.register()
         if self.role == EndpointRole.DESKTOP:
             while True:
@@ -3381,7 +3467,7 @@ class EndpointWorker:
     ) -> None:
         runtime_metadata = job.metadata.get("runtime_metadata")
         observed_scheduler_job_id = scheduler_job_id
-        if isinstance(runtime_metadata, dict):
+        if observed_scheduler_job_id is None and isinstance(runtime_metadata, dict):
             typed_runtime = cast(dict[str, Any], runtime_metadata)
             candidate = typed_runtime.get("scheduler_job_id")
             if isinstance(candidate, str):
@@ -3425,14 +3511,15 @@ class EndpointWorker:
             try:
                 status = provider.poll(scheduler_job_id)
             except RelayError as exc:
+                error_detail = bounded_error_detail(str(exc)) or type(exc).__name__
                 self.queue.append_event(
                     job.job_id,
                     "scheduler.poll_failed",
-                    f"Scheduler status polling failed for {scheduler_job_id}: {exc}",
+                    f"Scheduler status polling failed for {scheduler_job_id}: {error_detail}",
                     payload={
                         "scheduler": provider.name,
                         "scheduler_job_id": scheduler_job_id,
-                        "error": str(exc),
+                        "error": error_detail,
                     },
                 )
                 continue
@@ -3453,6 +3540,12 @@ class EndpointWorker:
         *,
         task_id: str | None,
     ) -> None:
+        provider = self._scheduler_provider_for_job(job)
+        status = _normalized_scheduler_status(
+            status,
+            expected_scheduler=provider.name,
+            expected_scheduler_job_id=scheduler_job_id,
+        )
         tasks = self._bounded_job_tasks(job.job_id)
         target_task_id = task_id or _task_id_for_scheduler_job(tasks, scheduler_job_id)
         if target_task_id is None:
@@ -3517,14 +3610,14 @@ class EndpointWorker:
         provider = self._scheduler_provider_for_job(job)
         for scheduler_job_id in scheduler_job_ids:
             ownership_verified = self._scheduler_job_id_is_owned(job, scheduler_job_id)
-            self.queue.register_scheduler_cancel_identity(
+            registration = self.queue.register_scheduler_cancel_identity_once(
                 job.job_id,
                 cluster=job.cluster,
                 scheduler_job_id=scheduler_job_id,
                 provider=provider.name,
                 ownership_verified=ownership_verified,
             )
-            if not ownership_verified:
+            if not ownership_verified and registration.disposition_created:
                 self.queue.append_event(
                     job.job_id,
                     "scheduler.cancel_refused",
@@ -3553,7 +3646,6 @@ class EndpointWorker:
                 job,
                 provider,
                 disposition.scheduler_job_id,
-                confirmation_attempts=disposition.confirmation_attempts,
             )
         due_dispositions = [
             item
@@ -3566,6 +3658,16 @@ class EndpointWorker:
         ]
         for disposition in due_dispositions:
             scheduler_job_id = disposition.scheduler_job_id
+            claim = self.queue.claim_scheduler_cancel_attempt(
+                job.job_id,
+                cluster=job.cluster,
+                scheduler_job_id=scheduler_job_id,
+                provider=provider.name,
+                lease_seconds=self.scheduler_cancel_claim_lease_seconds,
+                now=utc_now(),
+            )
+            if claim is None:
+                continue
             try:
                 result = provider.cancel(scheduler_job_id)
             except (OSError, RelayError) as exc:
@@ -3575,21 +3677,26 @@ class EndpointWorker:
                     "",
                     str(exc),
                 )
-            attempt = disposition.attempts + 1
+            error_detail = bounded_error_detail(result.stderr) if result.stderr else None
+            attempt = claim.attempt
             retry_delay = min(
                 self.scheduler_cancel_retry_base_seconds * 2 ** (attempt - 1),
                 self.scheduler_cancel_retry_max_seconds,
             )
-            self.queue.record_scheduler_cancel_attempt(
+            recorded = self.queue.record_scheduler_cancel_attempt(
                 job.job_id,
                 cluster=job.cluster,
                 scheduler_job_id=scheduler_job_id,
                 provider=provider.name,
+                claim_id=claim.claim_id,
                 accepted=result.returncode == 0,
-                error=result.stderr or None,
+                error=error_detail,
                 max_attempts=self.scheduler_cancel_max_attempts,
                 retry_delay_seconds=retry_delay,
+                now=utc_now(),
             )
+            if recorded is None:
+                continue
             if result.returncode == 0:
                 self.queue.append_event(
                     job.job_id,
@@ -3600,43 +3707,7 @@ class EndpointWorker:
                         "scheduler_job_id": scheduler_job_id,
                     },
                 )
-                try:
-                    status = provider.poll(scheduler_job_id)
-                except RelayError as exc:
-                    status = SchedulerStatus(
-                        scheduler=provider.name,
-                        scheduler_job_id=scheduler_job_id,
-                        phase=SchedulerPhase.UNKNOWN,
-                        reason="scheduler cancellation was accepted but status polling failed",
-                        queue_position_note=str(exc),
-                    )
-                if status.phase == SchedulerPhase.UNKNOWN:
-                    status = status.model_copy(
-                        update={
-                            "reason": "scheduler cancellation requested; confirmation pending",
-                            "queue_position_note": (
-                                status.queue_position_note
-                                or "provider did not return a terminal scheduler record yet"
-                            ),
-                        }
-                    )
-                self._record_scheduler_status(
-                    job,
-                    [scheduler_job_id],
-                    scheduler_job_id,
-                    status,
-                    task_id=None,
-                )
-                self.queue.record_scheduler_cancel_observation(
-                    job.job_id,
-                    cluster=job.cluster,
-                    scheduler_job_id=scheduler_job_id,
-                    phase=status.phase,
-                    not_found=_scheduler_status_is_not_found(status),
-                    error=status.queue_position_note,
-                    max_confirmation_attempts=self.scheduler_cancel_confirmation_max_attempts,
-                    retry_delay_seconds=self.scheduler_cancel_retry_base_seconds,
-                )
+                self._confirm_scheduler_cancellation(job, provider, scheduler_job_id)
                 continue
             self.queue.append_event(
                 job.job_id,
@@ -3646,7 +3717,7 @@ class EndpointWorker:
                     "scheduler": provider.name,
                     "scheduler_job_id": scheduler_job_id,
                     "returncode": result.returncode,
-                    "stderr": result.stderr,
+                    "stderr": error_detail,
                     "attempt": attempt,
                     "max_attempts": self.scheduler_cancel_max_attempts,
                     "retryable": attempt < self.scheduler_cancel_max_attempts,
@@ -3661,48 +3732,60 @@ class EndpointWorker:
             now=utc_now(),
         )
         for pending_record in pending_records:
+            self._reconcile_canceled_scheduler_job(pending_record)
+
+    def _reconcile_canceled_scheduler_job(
+        self,
+        pending_record: SchedulerCancelPending,
+    ) -> None:
+        """Resolve one durable scheduler-cancellation record idempotently."""
+        try:
+            job = self.queue.get_job(pending_record.job_id)
+        except RelayError:
+            return
+        if pending_record.reason == "operator_request" and not self._scheduler_cancel_was_requested(
+            job.job_id
+        ):
             try:
-                job = self.queue.get_job(pending_record.job_id)
-            except RelayError:
-                continue
-            if (
-                pending_record.reason == "operator_request"
-                and not self._scheduler_cancel_was_requested(job.job_id)
-            ):
                 self.queue.complete_scheduler_cancel_identity_scan(
                     job.job_id,
                     cluster=self.cluster,
                     superseded=True,
                 )
-                continue
-            observed_ids: set[str] = set()
-            owned_ids: set[str] = set()
-            for task in self._bounded_job_tasks(job.job_id):
-                observed_scheduler_job_ids = _scheduler_job_ids_from_metadata(task.metadata)
-                scheduler_job_ids = _owned_scheduler_job_ids_from_metadata(
-                    task.metadata,
-                    relay_job_id=job.job_id,
-                    task_id=task.task_id,
+            except QueueConflictError:
+                completed = self.queue.get_scheduler_cancel_disposition(
+                    job.job_id,
+                    cluster=job.cluster,
                 )
-                observed_ids.update(observed_scheduler_job_ids)
-                owned_ids.update(scheduler_job_ids)
-            if pending_record.identity_resolution == "pending":
-                provider = self._scheduler_provider_for_job(job)
+                if completed is None:
+                    raise
+            return
+        observed_ids: set[str] = set()
+        owned_ids: set[str] = set()
+        for task in self._bounded_job_tasks(job.job_id):
+            observed_scheduler_job_ids = _scheduler_job_ids_from_metadata(task.metadata)
+            scheduler_job_ids = _owned_scheduler_job_ids_from_metadata(
+                task.metadata,
+                relay_job_id=job.job_id,
+                task_id=task.task_id,
+            )
+            observed_ids.update(observed_scheduler_job_ids)
+            owned_ids.update(scheduler_job_ids)
+        if pending_record.identity_resolution == "pending":
+            provider = self._scheduler_provider_for_job(job)
+            newly_refused: list[str] = []
+            try:
                 for scheduler_job_id in sorted(observed_ids):
                     ownership_verified = scheduler_job_id in owned_ids
-                    self.queue.register_scheduler_cancel_identity(
+                    registration = self.queue.register_scheduler_cancel_identity_once(
                         job.job_id,
                         cluster=job.cluster,
                         scheduler_job_id=scheduler_job_id,
                         provider=provider.name,
                         ownership_verified=ownership_verified,
                     )
-                    if not ownership_verified:
-                        self._record_scheduler_cancel_refused(
-                            job,
-                            scheduler_job_id=scheduler_job_id,
-                            metadata_source="unverified_durable_metadata",
-                        )
+                    if not ownership_verified and registration.disposition_created:
+                        newly_refused.append(scheduler_job_id)
                 if observed_ids:
                     self.queue.finalize_scheduler_cancel_identities(
                         job.job_id,
@@ -3717,45 +3800,88 @@ class EndpointWorker:
                         job.job_id,
                         cluster=job.cluster,
                     )
-                    continue
+                    return
                 else:
-                    continue
-            if owned_ids:
-                self._cancel_scheduler_jobs(job, sorted(owned_ids))
+                    return
+            except QueueConflictError:
+                completed = self.queue.get_scheduler_cancel_disposition(
+                    job.job_id,
+                    cluster=job.cluster,
+                )
+                if completed is not None:
+                    return
+                raise
+            for scheduler_job_id in newly_refused:
+                self._record_scheduler_cancel_refused(
+                    job,
+                    scheduler_job_id=scheduler_job_id,
+                    metadata_source="unverified_durable_metadata",
+                )
+        if owned_ids:
+            self._cancel_scheduler_jobs(job, sorted(owned_ids))
 
     def _confirm_scheduler_cancellation(
         self,
         job: RelayJob,
         provider: SchedulerProvider,
         scheduler_job_id: str,
-        *,
-        confirmation_attempts: int,
     ) -> None:
         """Poll one accepted cancellation until the exact scheduler id is terminal."""
+        claim = self.queue.claim_scheduler_cancel_confirmation(
+            job.job_id,
+            cluster=job.cluster,
+            scheduler_job_id=scheduler_job_id,
+            provider=provider.name,
+            lease_seconds=self.scheduler_cancel_confirmation_claim_lease_seconds,
+            now=utc_now(),
+        )
+        if claim is None:
+            return
         try:
             status = provider.poll(scheduler_job_id)
         except RelayError as exc:
+            error_detail = bounded_error_detail(str(exc)) or type(exc).__name__
             status = SchedulerStatus(
                 scheduler=provider.name,
                 scheduler_job_id=scheduler_job_id,
                 phase=SchedulerPhase.UNKNOWN,
                 reason="scheduler cancellation confirmation failed",
-                queue_position_note=str(exc),
+                queue_position_note=error_detail,
+            )
+        status = _normalized_scheduler_status(
+            status,
+            expected_scheduler=provider.name,
+            expected_scheduler_job_id=scheduler_job_id,
+        )
+        if status.phase == SchedulerPhase.UNKNOWN:
+            status = status.model_copy(
+                update={
+                    "reason": "scheduler cancellation requested; confirmation pending",
+                    "queue_position_note": (
+                        status.queue_position_note
+                        or "provider did not return a terminal scheduler record yet"
+                    ),
+                }
             )
         retry_delay = min(
-            self.scheduler_cancel_retry_base_seconds * 2**confirmation_attempts,
+            self.scheduler_cancel_retry_base_seconds * 2 ** (claim.confirmation_attempt - 1),
             self.scheduler_cancel_retry_max_seconds,
         )
-        self.queue.record_scheduler_cancel_observation(
+        recorded = self.queue.record_scheduler_cancel_observation(
             job.job_id,
             cluster=job.cluster,
             scheduler_job_id=scheduler_job_id,
+            provider=provider.name,
+            claim_id=claim.claim_id,
             phase=status.phase,
             not_found=_scheduler_status_is_not_found(status),
             error=status.queue_position_note,
             max_confirmation_attempts=self.scheduler_cancel_confirmation_max_attempts,
             retry_delay_seconds=retry_delay,
+            now=utc_now(),
         )
+        if recorded is None:
+            return
         self._record_scheduler_status(
             job,
             [scheduler_job_id],
@@ -3892,6 +4018,40 @@ def _worker_installation_snapshot() -> dict[str, object]:
         }
 
 
+def _worker_process_identity() -> dict[str, object] | None:
+    """Return exact Linux process-generation evidence for durable endpoint records."""
+    if os.name != "posix" or not hasattr(os, "getuid"):
+        return None
+    try:
+        boot_id = (
+            Path("/proc/sys/kernel/random/boot_id")
+            .read_text(
+                encoding="ascii",
+            )
+            .strip()
+        )
+        raw_stat = Path("/proc/self/stat").read_bytes()
+    except OSError:
+        return None
+    if not boot_id or len(boot_id) > 128 or len(raw_stat) > 4096:
+        return None
+    closing_parenthesis = raw_stat.rfind(b")")
+    fields = raw_stat[closing_parenthesis + 1 :].split()
+    if closing_parenthesis < 0 or len(fields) <= 19:
+        return None
+    try:
+        start_ticks = int(fields[19])
+    except ValueError:
+        return None
+    return {
+        "schema_version": "clio-relay.process-identity.v1",
+        "boot_id": boot_id,
+        "start_ticks": start_ticks,
+        "uid": os.getuid(),
+        "pid": os.getpid(),
+    }
+
+
 def bootstrap_cluster_environment(settings: RelaySettings) -> None:
     """Create endpoint directories and verify required executables are configured."""
     internal_filesystem_path(settings.core_dir, force_extended=True).mkdir(
@@ -4024,6 +4184,56 @@ def _trusted_jarvis_mcp_result(
 def _scheduler_status_is_not_found(status: SchedulerStatus) -> bool:
     """Recognize a provider's exact-job not-found terminal observation."""
     return status.phase is SchedulerPhase.UNKNOWN and status.record_found is False
+
+
+_SCHEDULER_STATUS_TEXT_FIELDS = (
+    "raw_state",
+    "reason",
+    "partition",
+    "qos",
+    "user",
+    "memory",
+    "submit_time",
+    "eligible_time",
+    "start_time",
+    "elapsed",
+    "time_limit",
+    "queue_position_scope",
+    "queue_position_note",
+)
+
+
+def _normalized_scheduler_status(
+    status: SchedulerStatus,
+    *,
+    expected_scheduler: str,
+    expected_scheduler_job_id: str,
+) -> SchedulerStatus:
+    """Bind provider status to the requested identity and bound all durable text."""
+    if (
+        status.scheduler != expected_scheduler
+        or status.scheduler_job_id != expected_scheduler_job_id
+    ):
+        detail = bounded_error_detail(
+            "scheduler provider returned mismatched identity: "
+            f"expected scheduler={expected_scheduler!r} "
+            f"job_id={expected_scheduler_job_id!r}; "
+            f"observed scheduler={status.scheduler!r} job_id={status.scheduler_job_id!r}"
+        )
+        return SchedulerStatus(
+            scheduler=expected_scheduler,
+            scheduler_job_id=expected_scheduler_job_id,
+            phase=SchedulerPhase.UNKNOWN,
+            reason="scheduler provider response identity mismatch",
+            queue_position_note=detail,
+            observed_at=status.observed_at,
+        )
+    payload = status.model_dump(mode="python")
+    for field_name in _SCHEDULER_STATUS_TEXT_FIELDS:
+        value = payload.get(field_name)
+        if isinstance(value, str):
+            payload[field_name] = bounded_error_detail(value)
+    return SchedulerStatus.model_validate(payload)
 
 
 def _configured_scheduler_provider_name(provider: SchedulerProvider | None) -> str:

@@ -20,8 +20,14 @@ from urllib.request import urlretrieve
 from uuid import uuid4
 
 from clio_relay import __version__
+from clio_relay.deployment import endpoint_user_service_name
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.jarvis_mcp import CLIO_KIT_JARVIS_MCP_VERSION
+from clio_relay.remote_values import render_remote_shell_path
+from clio_relay.worker_lifetime_lock import (
+    WORKER_LIFETIME_GUARD_FD_ENV,
+    WORKER_LIFETIME_LOCK_NAME,
+)
 
 FRP_VERSION = "0.69.1"
 FRP_WINDOWS_AMD64_SHA256 = "829ac915f8655d4d4e021b8db61b46c3445205ed80d32b04cda7fa89d87c46e0"
@@ -43,6 +49,500 @@ JARVIS_CD_WHEEL_SHA256 = "f05454718a4efe4dadebefb98c83511ba3dcc662238c0c05430a1b
 CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 = (
     "6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321"
 )
+DEFAULT_REMOTE_CORE_DIR = "$HOME/.local/share/clio-relay/core"
+DEFAULT_REMOTE_SPOOL_DIR = "$HOME/.local/share/clio-relay/spool"
+
+_WORKER_WRITER_PROOF_PYTHON = r'''from __future__ import annotations
+
+import errno
+import json
+import os
+import socket
+import stat
+import sys
+from pathlib import Path
+
+MAX_PROC_ENTRIES = 1_000_000
+MAX_OWNED_PROCESSES = 65_536
+MAX_PROC_FILE_BYTES = 1_048_576
+MAX_ENDPOINT_RECORDS = 10_000
+MAX_ENDPOINT_TOTAL_BYTES = 64 * 1_048_576
+
+
+def fail(message: str) -> "NoReturn":
+    """Stop the bootstrap because writer exclusion could not be proved."""
+    raise SystemExit(f"relay worker writer proof failed: {message}")
+
+
+def vanished(error: OSError) -> bool:
+    """Return whether a proc entry disappeared during inspection."""
+    return error.errno in {errno.ENOENT, errno.ESRCH}
+
+
+def read_bounded(path: Path) -> bytes | None:
+    """Read one proc pseudo-file without accepting an unbounded value."""
+    try:
+        with path.open("rb") as stream:
+            value = stream.read(MAX_PROC_FILE_BYTES + 1)
+    except OSError as error:
+        if vanished(error):
+            return None
+        fail(f"cannot inspect {path}: {error}")
+    if len(value) > MAX_PROC_FILE_BYTES:
+        fail(f"{path} exceeds the bounded inspection size")
+    return value
+
+
+def decode_nul_values(value: bytes) -> list[str]:
+    """Decode an exact NUL-delimited proc value with filesystem semantics."""
+    return [os.fsdecode(part) for part in value.split(b"\0") if part]
+
+
+def relay_process_invocation(argv: list[str]) -> list[str] | None:
+    """Return command arguments for one exact installed relay invocation."""
+    for index, argument in enumerate(argv):
+        if os.path.basename(argument) == "clio-relay":
+            return argv[index + 1 :]
+    return None
+
+
+def option_value(arguments: list[str], name: str) -> str | None:
+    """Return the last exact Click-style option value before an option terminator."""
+    found: str | None = None
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            break
+        if argument == name:
+            if index + 1 >= len(arguments):
+                return None
+            found = arguments[index + 1]
+            index += 2
+            continue
+        prefix = f"{name}="
+        if argument.startswith(prefix):
+            found = argument[len(prefix) :]
+        index += 1
+    return found
+
+
+def environment(value: bytes) -> dict[str, str]:
+    """Parse the process environment without substring or shell matching."""
+    parsed: dict[str, str] = {}
+    for item in value.split(b"\0"):
+        if b"=" not in item:
+            continue
+        key, raw_value = item.split(b"=", 1)
+        parsed[os.fsdecode(key)] = os.fsdecode(raw_value)
+    return parsed
+
+
+def process_cwd(process: Path) -> str | None:
+    """Read a process working directory, accounting for an ordinary exit race."""
+    try:
+        return os.readlink(process / "cwd")
+    except OSError as error:
+        if vanished(error):
+            return None
+        fail(f"cannot inspect {process / 'cwd'}: {error}")
+
+
+def target_home(process_environment: dict[str, str], uid: int | None) -> str:
+    """Resolve Path.home() as the inspected process would resolve it."""
+    if "HOME" in process_environment:
+        # posixpath.expanduser maps an explicitly empty HOME to the filesystem
+        # root for both '~' and '~/...'; it does not fall back to passwd.
+        return process_environment["HOME"].rstrip("/") or "/"
+    if uid is None:
+        fail("an inspected process has no HOME and no numeric uid")
+    try:
+        import pwd
+
+        return pwd.getpwuid(uid).pw_dir
+    except (ImportError, KeyError, OSError) as error:
+        fail(f"cannot resolve the inspected process home directory: {error}")
+
+
+def expand_user(value: str, home: str) -> str:
+    """Expand a user path with the inspected process's HOME semantics."""
+    if value == "~":
+        return home
+    if value.startswith("~/"):
+        return os.path.join(home, value[2:])
+    if not value.startswith("~"):
+        return value
+    user, separator, suffix = value[1:].partition("/")
+    try:
+        import pwd
+
+        user_home = pwd.getpwnam(user).pw_dir
+    except (ImportError, KeyError, OSError) as error:
+        fail(f"cannot expand inspected core directory {value!r}: {error}")
+    return os.path.join(user_home, suffix) if separator else user_home
+
+
+def canonical(value: str, *, cwd: str | None = None) -> str:
+    """Return a non-strict canonical absolute path."""
+    if not os.path.isabs(value):
+        if cwd is None:
+            fail(f"relative path {value!r} has no inspected working directory")
+        value = os.path.join(cwd, value)
+    return os.path.realpath(os.path.abspath(value))
+
+
+def process_core_candidates(
+    process: Path,
+    process_environment: dict[str, str],
+    uid: int | None,
+) -> set[str] | None:
+    """Reconstruct every core path the live endpoint could have selected at startup."""
+    home = target_home(process_environment, uid)
+    configured = process_environment.get("CLIO_RELAY_CORE_DIR")
+    if configured:
+        expanded = expand_user(configured, home)
+        cwd = None if os.path.isabs(expanded) else process_cwd(process)
+        if cwd is None and not os.path.isabs(expanded):
+            return None
+        return {canonical(expanded, cwd=cwd)}
+
+    cwd = process_cwd(process)
+    if cwd is None:
+        return None
+    # RelaySettings selects the bootstrap directory when it exists, otherwise
+    # its cwd-relative compatibility directory.  /proc cannot prove which one
+    # existed at process startup, so both are safety-relevant candidates.
+    return {
+        canonical(os.path.join(home, ".local", "share", "clio-relay", "core")),
+        canonical(os.path.join(".clio-relay", "core"), cwd=cwd),
+    }
+
+
+def endpoint_record_pids(
+    expected_core: str,
+) -> dict[int, list[tuple[str, dict[str, object] | None]]]:
+    """Read bounded worker PID evidence from the exact core's endpoint records."""
+    endpoint_directory = Path(expected_core) / "endpoints"
+    try:
+        directory_stat = os.lstat(endpoint_directory)
+    except FileNotFoundError:
+        return {}
+    except OSError as error:
+        fail(f"cannot inspect endpoint evidence directory {endpoint_directory}: {error}")
+    if not stat.S_ISDIR(directory_stat.st_mode) or stat.S_ISLNK(directory_stat.st_mode):
+        fail(f"endpoint evidence path is not a real directory: {endpoint_directory}")
+    current_uid = os.getuid() if hasattr(os, "getuid") else None
+    if current_uid is not None and directory_stat.st_uid != current_uid:
+        fail(f"endpoint evidence directory has a foreign owner: {endpoint_directory}")
+
+    records: dict[int, list[tuple[str, dict[str, object] | None]]] = {}
+    record_count = 0
+    total_bytes = 0
+    try:
+        entries = os.scandir(endpoint_directory)
+    except OSError as error:
+        fail(f"cannot enumerate endpoint evidence {endpoint_directory}: {error}")
+    with entries:
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            record_count += 1
+            if record_count > MAX_ENDPOINT_RECORDS:
+                fail("endpoint evidence exceeds the bounded record count")
+            path = Path(entry.path)
+            try:
+                before = os.lstat(path)
+            except OSError as error:
+                if vanished(error):
+                    fail(f"endpoint evidence changed during inspection: {path}")
+                fail(f"cannot inspect endpoint evidence {path}: {error}")
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or (current_uid is not None and before.st_uid != current_uid)
+            ):
+                fail(f"endpoint evidence is not one owned regular file: {path}")
+            value = read_bounded(path)
+            if value is None:
+                fail(f"endpoint evidence disappeared during inspection: {path}")
+            total_bytes += len(value)
+            if total_bytes > MAX_ENDPOINT_TOTAL_BYTES:
+                fail("endpoint evidence exceeds the bounded aggregate size")
+            try:
+                after = os.lstat(path)
+            except OSError as error:
+                fail(f"endpoint evidence changed during inspection: {path}: {error}")
+            if (
+                before.st_dev != after.st_dev
+                or before.st_ino != after.st_ino
+                or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+            ):
+                fail(f"endpoint evidence changed during inspection: {path}")
+            try:
+                document = json.loads(value)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                fail(f"endpoint evidence is not valid JSON: {path}: {error}")
+            if not isinstance(document, dict):
+                fail(f"endpoint evidence is not an object: {path}")
+            endpoint_id = document.get("endpoint_id")
+            role = document.get("role")
+            hostname = document.get("hostname")
+            pid = document.get("pid")
+            cluster = document.get("cluster")
+            metadata = document.get("metadata")
+            if not isinstance(endpoint_id, str) or path.stem != endpoint_id:
+                fail(f"endpoint evidence identity does not match its filename: {path}")
+            if role != "worker":
+                continue
+            if hostname != socket.gethostname():
+                continue
+            if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+                fail(f"worker endpoint evidence has an invalid pid: {path}")
+            if not isinstance(cluster, str) or not cluster:
+                fail(f"worker endpoint evidence has no cluster: {path}")
+            process_identity: dict[str, object] | None = None
+            raw_identity = metadata.get("process_identity") if isinstance(metadata, dict) else None
+            if isinstance(raw_identity, dict):
+                identity_start_ticks = raw_identity.get("start_ticks")
+                identity_uid = raw_identity.get("uid")
+                identity_pid = raw_identity.get("pid")
+                if (
+                    raw_identity.get("schema_version") == "clio-relay.process-identity.v1"
+                    and isinstance(raw_identity.get("boot_id"), str)
+                    and bool(raw_identity["boot_id"])
+                    and len(raw_identity["boot_id"]) <= 128
+                    and isinstance(identity_start_ticks, int)
+                    and not isinstance(identity_start_ticks, bool)
+                    and identity_start_ticks > 0
+                    and isinstance(identity_uid, int)
+                    and not isinstance(identity_uid, bool)
+                    and identity_uid >= 0
+                    and isinstance(identity_pid, int)
+                    and not isinstance(identity_pid, bool)
+                    and identity_pid == pid
+                ):
+                    process_identity = raw_identity
+                # A malformed identity is deliberately treated as legacy PID
+                # evidence.  Only a complete exact identity may dismiss PID
+                # reuse; malformed metadata can never weaken writer proof.
+            records.setdefault(pid, []).append((cluster, process_identity))
+    return records
+
+
+def proc_boot_id(proc_root: Path) -> str:
+    """Read the exact Linux boot identity used by new endpoint records."""
+    value = read_bounded(proc_root / "sys" / "kernel" / "random" / "boot_id")
+    if value is None:
+        fail("cannot read Linux boot identity for endpoint evidence")
+    try:
+        boot_id = value.decode("ascii").strip()
+    except UnicodeDecodeError as error:
+        fail(f"Linux boot identity is invalid: {error}")
+    if not boot_id or len(boot_id) > 128:
+        fail("Linux boot identity is empty or oversized")
+    return boot_id
+
+
+def process_identity_matches(
+    raw_stat: bytes,
+    *,
+    process_pid: int,
+    process_uid: int,
+    boot_id: str,
+    identity: dict[str, object] | None,
+) -> bool:
+    """Match new exact identities; conservatively retain legacy PID evidence."""
+    closing_parenthesis = raw_stat.rfind(b")")
+    fields = raw_stat[closing_parenthesis + 1 :].split()
+    if closing_parenthesis < 0 or len(fields) <= 19:
+        fail("cannot parse live endpoint process generation")
+    if fields[0] == b"Z":
+        return False
+    if identity is None:
+        return True
+    try:
+        start_ticks = int(fields[19])
+    except ValueError as error:
+        fail(f"cannot parse live endpoint start ticks: {error}")
+    return (
+        identity.get("schema_version") == "clio-relay.process-identity.v1"
+        and identity.get("boot_id") == boot_id
+        and identity.get("start_ticks") == start_ticks
+        and identity.get("uid") == process_uid
+        and identity.get("pid") == process_pid
+    )
+
+
+def prove_no_writer(cluster: str, expected_core: str, proc_root: Path) -> None:
+    """Fail if a same-user long-lived process can write the configured core queue."""
+    expected = canonical(expected_core)
+    current_uid = os.getuid() if hasattr(os, "getuid") else None
+    endpoint_pids = endpoint_record_pids(expected)
+    boot_id = proc_boot_id(proc_root) if endpoint_pids else ""
+    total_entries = 0
+    owned_processes = 0
+    try:
+        entries = os.scandir(proc_root)
+    except OSError as error:
+        fail(f"cannot enumerate {proc_root}: {error}")
+    with entries:
+        for entry in entries:
+            if not entry.name.isdecimal():
+                continue
+            total_entries += 1
+            if total_entries > MAX_PROC_ENTRIES:
+                fail(f"{proc_root} exceeds the bounded process-entry count")
+            try:
+                process_uid = entry.stat(follow_symlinks=False).st_uid
+            except OSError as error:
+                if vanished(error):
+                    continue
+                fail(f"cannot identify process owner for {entry.path}: {error}")
+            if current_uid is not None and process_uid != current_uid:
+                continue
+            owned_processes += 1
+            if owned_processes > MAX_OWNED_PROCESSES:
+                fail("same-user process count exceeds the bounded inspection limit")
+            process = Path(entry.path)
+            endpoint_evidence = endpoint_pids.get(int(entry.name))
+            if endpoint_evidence is not None:
+                raw_stat = read_bounded(process / "stat")
+                if raw_stat is None:
+                    continue
+                for endpoint_cluster, process_identity in endpoint_evidence:
+                    if process_identity_matches(
+                        raw_stat,
+                        process_pid=int(entry.name),
+                        process_uid=process_uid,
+                        boot_id=boot_id,
+                        identity=process_identity,
+                    ):
+                        fail(
+                            f"live endpoint pid={entry.name} has exact-core record "
+                            f"cluster={endpoint_cluster!r} while bootstrapping cluster={cluster!r}"
+                        )
+            raw_cmdline = read_bounded(process / "cmdline")
+            if raw_cmdline is None:
+                continue
+            argv = decode_nul_values(raw_cmdline)
+            command = relay_process_invocation(argv)
+            if command is None:
+                continue
+            writer_kind = "clio-relay"
+            options = command
+            if command[:2] == ["endpoint", "start"]:
+                writer_kind = "endpoint"
+                options = command[2:]
+            elif command[:2] == ["api", "start"]:
+                writer_kind = "api"
+                options = command[2:]
+            elif command[:1] == ["mcp-server"]:
+                writer_kind = "mcp-server"
+                options = command[1:]
+            process_cluster = option_value(options, "--cluster")
+            raw_environment = read_bounded(process / "environ")
+            if raw_environment is None:
+                continue
+            candidates = process_core_candidates(
+                process,
+                environment(raw_environment),
+                process_uid,
+            )
+            if candidates is None:
+                continue
+            if expected in candidates:
+                if (
+                    writer_kind == "endpoint"
+                    and option_value(options, "--role") == "worker"
+                    and process_cluster is not None
+                ):
+                    fail(
+                        f"live endpoint pid={entry.name} still owns "
+                        f"cluster={process_cluster!r} core={expected!r} "
+                        f"while bootstrapping cluster={cluster!r}"
+                    )
+                if writer_kind in {"api", "mcp-server"}:
+                    fail(
+                        f"live {writer_kind} writer pid={entry.name} still owns "
+                        f"core={expected!r} while bootstrapping cluster={cluster!r}; "
+                        "stop or detach it before bootstrap"
+                    )
+                fail(
+                    f"live clio-relay process pid={entry.name} still owns "
+                    f"core={expected!r} while bootstrapping cluster={cluster!r}; "
+                    "wait for it to exit before bootstrap"
+                )
+    print("relay_worker_writer_proof=clear")
+
+
+if len(sys.argv) != 4:
+    fail("writer proof requires cluster, canonical core, and proc root")
+prove_no_writer(sys.argv[1], sys.argv[2], Path(sys.argv[3]))
+'''
+
+_WORKER_LIFETIME_EXCLUSIVE_GUARD_PYTHON = r'''from __future__ import annotations
+
+import errno
+import os
+import stat
+import sys
+import time
+from pathlib import Path
+
+
+def fail(message: str) -> "NoReturn":
+    """Fail inherited-FD validation with one operator-facing reason."""
+    raise SystemExit(f"worker lifetime inherited-fd proof failed: {message}")
+
+
+if len(sys.argv) != 4:
+    fail("proof requires canonical core, inherited fd, and lock filename")
+core_value, descriptor_value, lock_name = sys.argv[1:]
+try:
+    import fcntl
+
+    descriptor = int(descriptor_value)
+    if descriptor < 3:
+        fail("inherited descriptor is invalid")
+    core = Path(core_value)
+    core = core.resolve(strict=True)
+    core_stat = os.lstat(core)
+    if not stat.S_ISDIR(core_stat.st_mode) or stat.S_ISLNK(core_stat.st_mode):
+        fail("worker lifetime core is not a real directory")
+    if core_stat.st_uid != os.getuid():
+        fail("worker lifetime core has a foreign owner")
+    if stat.S_IMODE(core_stat.st_mode) & 0o022:
+        fail("worker lifetime core is writable by group or other users")
+
+    lock_path = core / lock_name
+    opened = os.fstat(descriptor)
+    linked = os.lstat(lock_path)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or opened.st_uid != os.getuid()
+        or stat.S_IMODE(opened.st_mode) & 0o077
+        or opened.st_dev != linked.st_dev
+        or opened.st_ino != linked.st_ino
+    ):
+        fail("worker lifetime lock is not one owner-private regular file")
+
+    deadline = time.monotonic() + 30.0
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError as lock_error:
+            if lock_error.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise
+            if time.monotonic() >= deadline:
+                fail("timed out acquiring exclusive worker lifetime lock")
+            time.sleep(0.05)
+    print(f"relay_worker_lifetime_fd=exclusive:{descriptor}:{core}")
+except Exception as error:
+    fail(f"{type(error).__name__}: {error}")
+'''
 
 
 @dataclass(frozen=True)
@@ -138,6 +638,9 @@ def bootstrap_cluster_over_ssh(
     bootstrap_profile: str,
     ssh_host: str,
     source_root: Path,
+    cluster: str | None = None,
+    core_dir: str = DEFAULT_REMOTE_CORE_DIR,
+    spool_dir: str = DEFAULT_REMOTE_SPOOL_DIR,
     relay_wheel: Path | None = None,
     relay_artifact_sha256: str | None = None,
     agent_adapter: str = "exec",
@@ -149,6 +652,10 @@ def bootstrap_cluster_over_ssh(
     """Install relay dependencies and the current source tree on a cluster over SSH."""
     if bootstrap_profile != "linux-user":
         raise ConfigurationError(f"unsupported bootstrap profile: {bootstrap_profile}")
+    if cluster is not None:
+        endpoint_user_service_name(cluster)
+    render_remote_shell_path(core_dir, field="core_dir")
+    render_remote_shell_path(spool_dir, field="spool_dir")
     _validate_ssh_destination(ssh_host)
     if shutil.which("ssh") is None or shutil.which("scp") is None:
         raise ConfigurationError("ssh and scp are required for remote bootstrap")
@@ -193,6 +700,9 @@ def bootstrap_cluster_over_ssh(
             script_path.write_text(
                 render_linux_user_bootstrap_script(
                     frp_version=frp_version,
+                    cluster=cluster,
+                    core_dir=core_dir,
+                    spool_dir=spool_dir,
                     agent_adapter=agent_adapter,
                     agent_npm_package=agent_npm_package,
                     agent_npm_bin=agent_npm_bin,
@@ -221,6 +731,25 @@ def bootstrap_cluster_over_ssh(
         if receipt.get("invocation_id") != invocation_id:
             raise RelayError("bootstrap receipt does not match the completed invocation")
         install_receipt_sha256 = receipt.get("install_receipt_sha256")
+        worker_fence = receipt.get("worker_fence")
+        expected_worker_service = (
+            endpoint_user_service_name(cluster) if cluster is not None else None
+        )
+        managed_fence_valid = expected_worker_service is None
+        if expected_worker_service is not None and isinstance(worker_fence, dict):
+            typed_worker_fence = cast(dict[str, object], worker_fence)
+            worker_was_active = typed_worker_fence.get("was_active")
+            worker_restarted = typed_worker_fence.get("restarted")
+            managed_fence_valid = (
+                typed_worker_fence.get("managed") is True
+                and typed_worker_fence.get("service_name") == expected_worker_service
+                and typed_worker_fence.get("writer_proof") is True
+                and typed_worker_fence.get("writer_recheck") is True
+                and typed_worker_fence.get("lifetime_exclusive") is True
+                and type(worker_was_active) is bool
+                and type(worker_restarted) is bool
+                and worker_restarted is worker_was_active
+            )
         receipt_contract = {
             "schema_version": receipt.get("schema_version") == "clio-relay.bootstrap-receipt.v1",
             "bootstrap_profile": receipt.get("bootstrap_profile") == bootstrap_profile,
@@ -230,6 +759,7 @@ def bootstrap_cluster_over_ssh(
             and all(character in "0123456789abcdef" for character in install_receipt_sha256),
             "completed_at": isinstance(receipt.get("completed_at"), str)
             and bool(receipt.get("completed_at")),
+            "worker_fence": managed_fence_valid,
         }
         failed_contract = sorted(name for name, passed in receipt_contract.items() if not passed)
         if failed_contract:
@@ -256,9 +786,224 @@ def package_source_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _worker_writer_proof_shell(*, rendered_core_dir: str, success_variable: str) -> str:
+    """Render one bounded legacy-writer proof against the configured core."""
+    return "\n".join(
+        [
+            (
+                'if ! python3 - "$WORKER_CLUSTER_NAME" '
+                f"{rendered_core_dir} /proc <<'__CLIO_RELAY_WORKER_WRITER_PROOF__'"
+            ),
+            _WORKER_WRITER_PROOF_PYTHON.rstrip(),
+            "__CLIO_RELAY_WORKER_WRITER_PROOF__",
+            "then",
+            ('  echo "cannot prove exclusive relay writer ownership for $WORKER_CLUSTER_NAME" >&2'),
+            "  exit 1",
+            "fi",
+            f"{success_variable}=1",
+        ]
+    )
+
+
+def _worker_upgrade_fence_script(
+    cluster: str | None,
+    *,
+    rendered_core_dir: str,
+) -> tuple[str, str, str, str]:
+    """Render managed fencing, recheck, migration command, and restart step."""
+    service_name = endpoint_user_service_name(cluster) if cluster is not None else ""
+    declarations = "\n".join(
+        [
+            f"WORKER_SERVICE_NAME={shlex.quote(service_name)}",
+            f"WORKER_CLUSTER_NAME={shlex.quote(cluster or '')}",
+            "WORKER_WAS_ACTIVE=0",
+            "WORKER_STOP_CONFIRMED=0",
+            "WORKER_WRITER_PROOF=0",
+            "WORKER_WRITER_RECHECK=0",
+            "WORKER_LIFETIME_EXCLUSIVE=0",
+            "WORKER_LIFETIME_GUARD_FD=",
+            "WORKER_LIFETIME_LOCK_PATH=",
+            "WORKER_RESTART_ATTEMPTED=0",
+            "WORKER_RESTARTED=0",
+        ]
+    )
+    if not service_name:
+        return declarations, "", "clio-relay init", ""
+    initial_proof = _worker_writer_proof_shell(
+        rendered_core_dir=rendered_core_dir,
+        success_variable="WORKER_WRITER_PROOF",
+    )
+    inherited_fd_check = "\n".join(
+        [
+            (
+                f'python3 - {rendered_core_dir} "$WORKER_LIFETIME_GUARD_FD" '
+                f"{shlex.quote(WORKER_LIFETIME_LOCK_NAME)} "
+                "<<'__CLIO_RELAY_WORKER_LIFETIME_FD__'"
+            ),
+            _WORKER_LIFETIME_EXCLUSIVE_GUARD_PYTHON.rstrip(),
+            "__CLIO_RELAY_WORKER_LIFETIME_FD__",
+        ]
+    )
+    recheck = "\n".join(
+        [
+            "bootstrap_require_worker_lifetime_guard",
+            _worker_writer_proof_shell(
+                rendered_core_dir=rendered_core_dir,
+                success_variable="WORKER_WRITER_RECHECK",
+            ),
+        ]
+    )
+    fence = "\n".join(
+        [
+            declarations,
+            "bootstrap_worker_fence_exit() {",
+            "  status=$?",
+            "  trap - EXIT",
+            '  if [ -n "$WORKER_LIFETIME_GUARD_FD" ]; then',
+            "    exec 8>&- || true",
+            "  fi",
+            (
+                '  if [ "$status" -ne 0 ] && [ "$WORKER_WAS_ACTIVE" = "1" ]'
+                ' && [ "$WORKER_RESTARTED" != "1" ]; then'
+            ),
+            '    if [ "$WORKER_RESTART_ATTEMPTED" = "1" ]; then',
+            (
+                '      if WORKER_EXIT_STATE="$(systemctl --user show '
+                '"$WORKER_SERVICE_NAME" --property=ActiveState --value 2>/dev/null)"; then'
+            ),
+            '        case "$WORKER_EXIT_STATE" in',
+            "          inactive|failed)",
+            (
+                '            echo "bootstrap failed; $WORKER_SERVICE_NAME is confirmed '
+                '$WORKER_EXIT_STATE after restart attempt; operator action is required" >&2'
+            ),
+            "            ;;",
+            "          *)",
+            (
+                '            echo "bootstrap failed after restart attempt; '
+                "$WORKER_SERVICE_NAME state is $WORKER_EXIT_STATE and requires "
+                'operator verification" >&2'
+            ),
+            "            ;;",
+            "        esac",
+            "      else",
+            (
+                '        echo "bootstrap failed after restart attempt; '
+                '$WORKER_SERVICE_NAME state is unknown and requires operator verification" >&2'
+            ),
+            "      fi",
+            '    elif [ "$WORKER_STOP_CONFIRMED" = "1" ]; then',
+            (
+                '      echo "bootstrap failed; $WORKER_SERVICE_NAME remains stopped; '
+                'operator action is required" >&2'
+            ),
+            "    else",
+            (
+                '      echo "bootstrap failed while fencing $WORKER_SERVICE_NAME; '
+                'worker state is unknown and requires operator verification" >&2'
+            ),
+            "    fi",
+            "  fi",
+            '  exit "$status"',
+            "}",
+            "trap bootstrap_worker_fence_exit EXIT",
+            "command -v systemctl >/dev/null 2>&1 || {",
+            '  echo "systemctl is required to fence the configured relay worker" >&2',
+            "  exit 1",
+            "}",
+            (
+                'if ! WORKER_LOAD_STATE="$(systemctl --user show "$WORKER_SERVICE_NAME" '
+                '--property=LoadState --value)"; then'
+            ),
+            '  echo "cannot inspect relay worker unit: $WORKER_SERVICE_NAME" >&2',
+            "  exit 1",
+            "fi",
+            (
+                'if ! WORKER_ACTIVE_STATE="$(systemctl --user show "$WORKER_SERVICE_NAME" '
+                '--property=ActiveState --value)"; then'
+            ),
+            '  echo "cannot inspect relay worker state: $WORKER_SERVICE_NAME" >&2',
+            "  exit 1",
+            "fi",
+            'case "$WORKER_LOAD_STATE:$WORKER_ACTIVE_STATE" in',
+            "  loaded:active|loaded:activating|loaded:reloading|loaded:deactivating)",
+            "    WORKER_WAS_ACTIVE=1",
+            '    systemctl --user stop "$WORKER_SERVICE_NAME"',
+            (
+                '    if ! WORKER_POST_STOP_STATE="$(systemctl --user show '
+                '"$WORKER_SERVICE_NAME" --property=ActiveState --value)"; then'
+            ),
+            '      echo "cannot verify stopped relay worker: $WORKER_SERVICE_NAME" >&2',
+            "      exit 1",
+            "    fi",
+            '    case "$WORKER_POST_STOP_STATE" in',
+            "      inactive|failed) WORKER_STOP_CONFIRMED=1 ;;",
+            "      *)",
+            (
+                '        echo "relay worker stop has unknown state '
+                '$WORKER_POST_STOP_STATE: $WORKER_SERVICE_NAME" >&2'
+            ),
+            "        exit 1",
+            "        ;;",
+            "    esac",
+            "    ;;",
+            "  loaded:inactive|loaded:failed|masked:inactive|not-found:inactive) ;;",
+            "  *)",
+            (
+                '    echo "refusing bootstrap with unknown relay worker state '
+                '$WORKER_LOAD_STATE:$WORKER_ACTIVE_STATE: $WORKER_SERVICE_NAME" >&2'
+            ),
+            "    exit 1",
+            "    ;;",
+            "esac",
+            initial_proof,
+            f"mkdir -p -- {rendered_core_dir}",
+            (
+                f"WORKER_LIFETIME_LOCK_PATH={rendered_core_dir}/"
+                f"{shlex.quote(WORKER_LIFETIME_LOCK_NAME)}"
+            ),
+            'exec 8<>"$WORKER_LIFETIME_LOCK_PATH"',
+            "WORKER_LIFETIME_GUARD_FD=8",
+            "bootstrap_require_worker_lifetime_guard() {",
+            inherited_fd_check,
+            "}",
+            "bootstrap_require_worker_lifetime_guard",
+            "WORKER_LIFETIME_EXCLUSIVE=1",
+        ]
+    )
+    restart = "\n".join(
+        [
+            'if [ "$WORKER_WAS_ACTIVE" = "1" ]; then',
+            "  bootstrap_require_worker_lifetime_guard",
+            "  WORKER_RESTART_ATTEMPTED=1",
+            '  systemctl --user start "$WORKER_SERVICE_NAME"',
+            (
+                '  if ! WORKER_POST_START_STATE="$(systemctl --user show '
+                '"$WORKER_SERVICE_NAME" --property=ActiveState --value)"; then'
+            ),
+            '    echo "cannot verify restarted relay worker: $WORKER_SERVICE_NAME" >&2',
+            "    exit 1",
+            "  fi",
+            '  if [ "$WORKER_POST_START_STATE" != "active" ]; then',
+            (
+                '    echo "relay worker did not become active '
+                '($WORKER_POST_START_STATE): $WORKER_SERVICE_NAME" >&2'
+            ),
+            "    exit 1",
+            "  fi",
+            "  WORKER_RESTARTED=1",
+            "fi",
+        ]
+    )
+    return fence, recheck, "clio-relay init --migrate-legacy-output", restart
+
+
 def render_linux_user_bootstrap_script(
     *,
     frp_version: str = FRP_VERSION,
+    cluster: str | None = None,
+    core_dir: str = DEFAULT_REMOTE_CORE_DIR,
+    spool_dir: str = DEFAULT_REMOTE_SPOOL_DIR,
     agent_adapter: str = "exec",
     agent_npm_package: str | None = None,
     agent_npm_bin: str | None = None,
@@ -272,6 +1017,12 @@ def render_linux_user_bootstrap_script(
     source_archive_sha256: str | None = None,
 ) -> str:
     """Render the idempotent shell script used for the current Linux cluster bootstrap."""
+    rendered_core_dir = render_remote_shell_path(core_dir, field="core_dir")
+    rendered_spool_dir = render_remote_shell_path(spool_dir, field="spool_dir")
+    worker_fence, worker_recheck, init_command, worker_restart = _worker_upgrade_fence_script(
+        cluster,
+        rendered_core_dir=rendered_core_dir,
+    )
     rendered_agent_adapter = shlex.quote(agent_adapter)
     rendered_agent_args = shlex.quote(" ".join(agent_args or []))
     rendered_agent_npm_package = shlex.quote(agent_npm_package or "")
@@ -345,6 +1096,7 @@ if ! flock -n 9; then
   echo "another clio-relay bootstrap is already running" >&2
   exit 1
 fi
+{worker_fence}
 
 cd "$HOME/.local/src"
 FRP_VERSION="{frp_version}"
@@ -787,14 +1539,24 @@ jarvis init \
   "$HOME/.local/share/clio-relay/jarvis-shared"
 jarvis repo add "$DEST/jarvis-packages/clio_relay" --force true
 
-CLIO_RELAY_CORE_DIR="$HOME/.local/share/clio-relay/core" \
-CLIO_RELAY_SPOOL_DIR="$HOME/.local/share/clio-relay/spool" \
+{worker_recheck}
+CLIO_RELAY_CORE_DIR={rendered_core_dir} \
+CLIO_RELAY_SPOOL_DIR={rendered_spool_dir} \
 CLIO_RELAY_JARVIS_BIN="$HOME/.local/bin/jarvis" \
 CLIO_RELAY_FRPC_BIN="$HOME/.local/bin/frpc" \
 CLIO_RELAY_AGENT_BIN="${{AGENT_BIN:-agent}}" \
 CLIO_RELAY_AGENT_ADAPTER={rendered_agent_adapter} \
 CLIO_RELAY_AGENT_ARGS={rendered_agent_args} \
-clio-relay init
+{WORKER_LIFETIME_GUARD_FD_ENV}="$WORKER_LIFETIME_GUARD_FD" \
+{init_command}
+{worker_restart}
+
+export CLIO_RELAY_BOOTSTRAP_WORKER_SERVICE_NAME="$WORKER_SERVICE_NAME"
+export CLIO_RELAY_BOOTSTRAP_WORKER_WAS_ACTIVE="$WORKER_WAS_ACTIVE"
+export CLIO_RELAY_BOOTSTRAP_WORKER_WRITER_PROOF="$WORKER_WRITER_PROOF"
+export CLIO_RELAY_BOOTSTRAP_WORKER_WRITER_RECHECK="$WORKER_WRITER_RECHECK"
+export CLIO_RELAY_BOOTSTRAP_WORKER_LIFETIME_EXCLUSIVE="$WORKER_LIFETIME_EXCLUSIVE"
+export CLIO_RELAY_BOOTSTRAP_WORKER_RESTARTED="$WORKER_RESTARTED"
 
 python3 - <<'__CLIO_RELAY_BOOTSTRAP_RECEIPT__'
 import hashlib
@@ -805,12 +1567,29 @@ from pathlib import Path
 
 install_receipt = Path.home() / ".local/share/clio-relay/install-receipt.json"
 install_receipt_sha256 = hashlib.sha256(install_receipt.read_bytes()).hexdigest()
+worker_service_name = os.environ["CLIO_RELAY_BOOTSTRAP_WORKER_SERVICE_NAME"] or None
+worker_was_active = os.environ["CLIO_RELAY_BOOTSTRAP_WORKER_WAS_ACTIVE"] == "1"
+worker_writer_proof = os.environ["CLIO_RELAY_BOOTSTRAP_WORKER_WRITER_PROOF"] == "1"
+worker_writer_recheck = os.environ["CLIO_RELAY_BOOTSTRAP_WORKER_WRITER_RECHECK"] == "1"
+worker_lifetime_exclusive = (
+    os.environ["CLIO_RELAY_BOOTSTRAP_WORKER_LIFETIME_EXCLUSIVE"] == "1"
+)
+worker_restarted = os.environ["CLIO_RELAY_BOOTSTRAP_WORKER_RESTARTED"] == "1"
 receipt = {{
     "schema_version": "clio-relay.bootstrap-receipt.v1",
     "invocation_id": {invocation_id!r},
     "bootstrap_profile": "linux-user",
     "relay_install_spec": {relay_install_spec!r},
     "install_receipt_sha256": install_receipt_sha256,
+    "worker_fence": {{
+        "managed": worker_service_name is not None,
+        "service_name": worker_service_name,
+        "was_active": worker_was_active,
+        "writer_proof": worker_writer_proof,
+        "writer_recheck": worker_writer_recheck,
+        "lifetime_exclusive": worker_lifetime_exclusive,
+        "restarted": worker_restarted,
+    }},
     "completed_at": datetime.now(timezone.utc).isoformat(),
 }}
 destination = Path.home() / ".local/share/clio-relay/bootstrap-receipt.json"

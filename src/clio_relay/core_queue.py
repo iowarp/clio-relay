@@ -33,6 +33,7 @@ from clio_relay.cluster_config import (
     ensure_private_configuration_path,
     open_private_atomic_file,
 )
+from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError
 from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
 from clio_relay.identifiers import filesystem_key, validate_durable_record_id
@@ -71,6 +72,11 @@ from clio_relay.pagination import (
     validate_response_page_limit,
 )
 from clio_relay.worker_concurrency import KindConcurrencyInput, normalize_kind_concurrency
+from clio_relay.worker_lifetime_lock import (
+    LockedCoreIdentity,
+    exclusive_migration_lifetime,
+    require_active_locked_core,
+)
 
 Record = TypeVar("Record", bound=BaseModel)
 _LeaseExpiryReference = tuple[int, str, JobKind, str, str, str, str]
@@ -79,6 +85,8 @@ _UNSET = object()
 # slower filesystems (notably Windows endpoint storage).  Keep the wait bounded,
 # but allow enough time for a healthy owner to finish its critical section.
 DEFAULT_CORE_LOCK_TIMEOUT_SECONDS = 30.0
+MIN_SCHEDULER_CANCEL_CLAIM_LEASE_SECONDS = 1.0
+MAX_SCHEDULER_CANCEL_CLAIM_LEASE_SECONDS = 300.0
 ATOMIC_REPLACE_ATTEMPTS = 25
 ATOMIC_REPLACE_RETRY_SECONDS = 0.02
 WRITE_STAGING_FAMILY = "write_staging"
@@ -104,6 +112,18 @@ GC_TRASH_SCHEMA = "clio-relay.gc-trash.v1"
 MAX_GC_PURGE_DEPTH = 4_096
 MAX_GC_PURGE_SCAN_ENTRIES = 10_000
 DEFAULT_RECORD_MAX_BYTES = 1_048_576
+LEGACY_OUTPUT_MIGRATION_SCHEMA = "clio-relay.legacy-output-migration.v1"
+LEGACY_OUTPUT_COMPATIBILITY_SCHEMA = "clio-relay.legacy-output-compatibility.v1"
+LEGACY_OUTPUT_RECEIPT_SCHEMA = "clio-relay.legacy-output-receipt.v1"
+# v0.9 wrote one complete subprocess callback twice in every output event: once
+# as ``message`` and once as ``payload.text``.  Keep the compatibility reader
+# bounded independently from the ordinary event limit.  New events remain
+# limited to 256 KiB and endpoint output is split into 64-KiB chunks.
+MAX_LEGACY_OUTPUT_RECORD_BYTES = 16 * 1_048_576
+MAX_LEGACY_OUTPUT_MIGRATION_BYTES = 256 * 1_048_576
+MAX_LEGACY_OUTPUT_MIGRATION_RECORDS = 10_000
+MAX_LEGACY_EVENT_AUDIT_DIRECTORIES = 100_000
+MAX_LEGACY_EVENT_AUDIT_RECORDS = 1_000_000
 RECORD_FAMILY_MAX_BYTES: dict[str, int] = {
     "active_gateway_refs_by_job": 1_048_576,
     "active_gateway_refs_by_session": 65_536,
@@ -128,6 +148,9 @@ RECORD_FAMILY_MAX_BYTES: dict[str, int] = {
     "jobs_active": 1_048_576,
     "jobs_queued": 1_048_576,
     "leases": 65_536,
+    "legacy_output_archives": MAX_LEGACY_OUTPUT_RECORD_BYTES,
+    "legacy_output_receipts": 65_536,
+    "legacy_output_retired": 65_536,
     "leases_by_job": 65_536,
     "lease_indexes": 65_536,
     "migrations": 262_144,
@@ -160,13 +183,21 @@ class _TransientRecordReplacement(RuntimeError):
 class LegacyQueueStateError(QueueConflictError):
     """Machine-readable refusal for unsafe pre-1.0 canonical queue state."""
 
-    def __init__(self, *, family: str, path: Path, reason: str) -> None:
+    def __init__(
+        self,
+        *,
+        family: str,
+        path: Path,
+        reason: str,
+        action: str | None = None,
+    ) -> None:
         self.report: dict[str, str] = {
             "schema_version": "clio-relay.legacy-state-audit.v1",
             "family": family,
             "path": str(logical_filesystem_path(path)),
             "reason": reason,
-            "action": (
+            "action": action
+            or (
                 "move the unsafe state aside or export records with portable durable IDs "
                 "before retrying"
             ),
@@ -309,6 +340,38 @@ class IdempotentSubmissionResolution:
 
 
 @dataclass(frozen=True, slots=True)
+class SchedulerCancelIdentityRegistration:
+    """Atomic result for one durable scheduler-cancellation identity registration."""
+
+    record: SchedulerCancelPending
+    disposition_created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SchedulerCancelAttemptClaim:
+    """Exclusive durable lease for one external scheduler cancellation attempt."""
+
+    claim_id: str
+    scheduler_job_id: str
+    provider: str
+    attempt: int
+    claimed_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class SchedulerCancelConfirmationClaim:
+    """Exclusive durable lease for one scheduler cancellation confirmation poll."""
+
+    claim_id: str
+    scheduler_job_id: str
+    provider: str
+    confirmation_attempt: int
+    claimed_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class _LeaseIndexIdentity:
     """Exact immutable fields used by every operational lease reference."""
 
@@ -318,6 +381,32 @@ class _LeaseIndexIdentity:
     cluster: str
     job_kind: JobKind
     expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyOutputAudit:
+    """Bounded totals established before any legacy-output migration write."""
+
+    marker_complete: bool
+    event_records: int
+    migration_records: int
+    archive_bytes: int
+    migration_keys: tuple[tuple[str, int], ...] = ()
+    receipt_manifest_sha256: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyOutputRecord:
+    """One exact v0.9 output event and its deterministic replacement."""
+
+    original: RelayEvent
+    original_bytes: bytes
+    original_sha256: str
+    archive_relative_path: str
+    replacement: RelayEvent
+    replacement_bytes: bytes
+    replacement_sha256: str
+    representation: Literal["payload_text", "archive"]
 
 
 class ClioCoreQueue:
@@ -333,18 +422,25 @@ class ClioCoreQueue:
             raise ValueError("lock_timeout_seconds must be positive")
         self.root = logical_filesystem_path(root)
         self._storage_root = internal_filesystem_path(self.root, force_extended=True)
+        self._lock_timeout_seconds = lock_timeout_seconds
         self._lock = _FairBoundedFileLock(
             str(self._storage_root / ".lock"),
             timeout=lock_timeout_seconds,
         )
         self._initialized = False
+        self._migration_lifetime_guarded = False
 
-    def _audit_legacy_state_before_initialization(self) -> None:
+    def _audit_legacy_state_before_initialization(self) -> _LegacyOutputAudit:
         """Refuse unsafe v0.9 canonical state before creating or changing files."""
         try:
             root_stat = os.lstat(self._storage_root)
         except FileNotFoundError:
-            return
+            return _LegacyOutputAudit(
+                marker_complete=False,
+                event_records=0,
+                migration_records=0,
+                archive_bytes=0,
+            )
         except OSError as error:
             raise LegacyQueueStateError(
                 family="root",
@@ -392,11 +488,7 @@ class ClioCoreQueue:
                 model=model,
                 identity_field=identity_field,
             )
-        self._audit_legacy_event_family(
-            "events",
-            model=RelayEvent,
-            identity_field="job_id",
-        )
+        legacy_output_audit = self._audit_legacy_output_state_before_initialization()
         self._audit_legacy_event_family(
             "task_events",
             model=TaskTimelineEvent,
@@ -408,6 +500,7 @@ class ClioCoreQueue:
             identity_field="job_id",
         )
         self._audit_legacy_idempotency_family()
+        return legacy_output_audit
 
     def _require_legacy_family_directory(self, family: str) -> Path | None:
         directory = self._storage_root / family
@@ -482,6 +575,1026 @@ class ClioCoreQueue:
                     path=path,
                     reason=f"filename/content identity mismatch for {identity_field}",
                 )
+
+    def _legacy_output_marker_path(self) -> Path:
+        return self._storage_root / "migrations" / "legacy-output-v1.json"
+
+    def _legacy_output_archive_path(self, job_id: str, seq: int) -> Path:
+        return self._storage_root / "legacy_output_archives" / job_id / f"{seq:020d}.json"
+
+    def _legacy_output_receipt_path(self, job_id: str, seq: int) -> Path:
+        return self._storage_root / "legacy_output_receipts" / job_id / f"{seq:020d}.json"
+
+    def _read_legacy_output_marker(self) -> _LegacyOutputAudit | None:
+        marker_path = self._legacy_output_marker_path()
+        if _path_lstat(marker_path) is None:
+            return None
+        migrations = self._require_legacy_family_directory("migrations")
+        if migrations is None:
+            raise LegacyQueueStateError(
+                family="migrations",
+                path=marker_path,
+                reason="legacy-output marker has no owned migrations directory",
+            )
+        try:
+            raw = self._read_json_document(marker_path)
+        except (OSError, ValueError, QueueConflictError) as error:
+            raise LegacyQueueStateError(
+                family="migrations",
+                path=marker_path,
+                reason=f"legacy-output marker is invalid: {type(error).__name__}",
+            ) from error
+        expected_keys = {
+            "schema_version",
+            "complete",
+            "event_records",
+            "migration_records",
+            "archive_bytes",
+            "receipt_manifest_sha256",
+        }
+        if not isinstance(raw, dict):
+            raise LegacyQueueStateError(
+                family="migrations",
+                path=marker_path,
+                reason="legacy-output marker has an unknown schema shape",
+            )
+        marker = cast(dict[str, object], raw)
+        if set(marker) != expected_keys:
+            raise LegacyQueueStateError(
+                family="migrations",
+                path=marker_path,
+                reason="legacy-output marker has an unknown schema shape",
+            )
+        event_records = marker.get("event_records")
+        migration_records = marker.get("migration_records")
+        archive_bytes = marker.get("archive_bytes")
+        receipt_manifest_sha256 = marker.get("receipt_manifest_sha256")
+        if (
+            marker.get("schema_version") != LEGACY_OUTPUT_MIGRATION_SCHEMA
+            or marker.get("complete") is not True
+            or isinstance(event_records, bool)
+            or not isinstance(event_records, int)
+            or not 0 <= event_records <= MAX_LEGACY_EVENT_AUDIT_RECORDS
+            or isinstance(migration_records, bool)
+            or not isinstance(migration_records, int)
+            or not 0 <= migration_records <= MAX_LEGACY_OUTPUT_MIGRATION_RECORDS
+            or isinstance(archive_bytes, bool)
+            or not isinstance(archive_bytes, int)
+            or not 0 <= archive_bytes <= MAX_LEGACY_OUTPUT_MIGRATION_BYTES
+            or not _is_sha256_digest(receipt_manifest_sha256)
+        ):
+            raise LegacyQueueStateError(
+                family="migrations",
+                path=marker_path,
+                reason="legacy-output marker fields are invalid",
+            )
+        for family in (
+            "legacy_output_archives",
+            "legacy_output_receipts",
+            "legacy_output_retired",
+        ):
+            family_path = self._storage_root / family
+            if self._require_legacy_family_directory(family) is None:
+                raise LegacyQueueStateError(
+                    family=family,
+                    path=family_path,
+                    reason=("legacy-output completion marker requires its owned record directory"),
+                )
+        return _LegacyOutputAudit(
+            marker_complete=True,
+            event_records=event_records,
+            migration_records=migration_records,
+            archive_bytes=archive_bytes,
+            receipt_manifest_sha256=cast(str, receipt_manifest_sha256),
+        )
+
+    def _iter_legacy_event_paths(
+        self,
+        family: str,
+        *,
+        max_directories: int,
+        max_records: int,
+    ) -> Iterable[tuple[Path, str, int]]:
+        directory = self._require_legacy_family_directory(family)
+        if directory is None:
+            return
+        directory_count = 0
+        record_count = 0
+        try:
+            with os.scandir(directory) as identity_entries:
+                for identity_entry in identity_entries:
+                    directory_count += 1
+                    identity_directory = Path(identity_entry.path)
+                    if directory_count > max_directories:
+                        raise LegacyQueueStateError(
+                            family=family,
+                            path=directory,
+                            reason=(
+                                "event identity directories exceed the bounded legacy audit "
+                                f"limit of {max_directories}"
+                            ),
+                        )
+                    try:
+                        directory_stat = os.lstat(identity_directory)
+                    except OSError as error:
+                        raise LegacyQueueStateError(
+                            family=family,
+                            path=identity_directory,
+                            reason=(
+                                f"cannot inspect event identity directory: {type(error).__name__}"
+                            ),
+                        ) from error
+                    if not stat.S_ISDIR(directory_stat.st_mode) or _record_is_reparse(
+                        directory_stat
+                    ):
+                        raise LegacyQueueStateError(
+                            family=family,
+                            path=identity_directory,
+                            reason="event identity entry is not an owned directory",
+                        )
+                    identity = self._require_legacy_durable_id(
+                        family,
+                        identity_directory,
+                        identity_directory.name,
+                    )
+                    try:
+                        with os.scandir(identity_directory) as event_entries:
+                            for event_entry in event_entries:
+                                record_count += 1
+                                path = Path(event_entry.path)
+                                if record_count > max_records:
+                                    raise LegacyQueueStateError(
+                                        family=family,
+                                        path=identity_directory,
+                                        reason=(
+                                            "event family exceeds the bounded legacy audit "
+                                            f"limit of {max_records} records"
+                                        ),
+                                    )
+                                self._require_legacy_regular_json(family, path)
+                                sequence_text = path.name.removesuffix(".json")
+                                if (
+                                    len(sequence_text) != 20
+                                    or not sequence_text.isascii()
+                                    or not sequence_text.isdigit()
+                                ):
+                                    raise LegacyQueueStateError(
+                                        family=family,
+                                        path=path,
+                                        reason=(
+                                            "event filename is not a canonical 20-digit sequence"
+                                        ),
+                                    )
+                                yield path, identity, int(sequence_text)
+                    except LegacyQueueStateError:
+                        raise
+                    except OSError as error:
+                        raise LegacyQueueStateError(
+                            family=family,
+                            path=identity_directory,
+                            reason=(
+                                f"cannot scan event identity directory: {type(error).__name__}"
+                            ),
+                        ) from error
+        except LegacyQueueStateError:
+            raise
+        except OSError as error:
+            raise LegacyQueueStateError(
+                family=family,
+                path=directory,
+                reason=f"cannot scan canonical event family: {type(error).__name__}",
+            ) from error
+
+    def _read_v09_legacy_output_record(
+        self,
+        path: Path,
+        *,
+        job_id: str,
+        seq: int,
+    ) -> _LegacyOutputRecord:
+        path_stat = os.lstat(path)
+        ordinary_limit = RECORD_FAMILY_MAX_BYTES["events"]
+        if path_stat.st_size <= ordinary_limit:
+            raise ValueError("legacy output source is not oversized")
+        if path_stat.st_size > MAX_LEGACY_OUTPUT_RECORD_BYTES:
+            raise QueueConflictError(
+                "legacy output event exceeds the bounded compatibility limit of "
+                f"{MAX_LEGACY_OUTPUT_RECORD_BYTES} bytes"
+            )
+        original_bytes = _read_bounded_record_bytes_once(
+            path,
+            limit=MAX_LEGACY_OUTPUT_RECORD_BYTES,
+        )
+        try:
+            raw = json.loads(original_bytes)
+        except json.JSONDecodeError as error:
+            raise ValueError("legacy output event is not valid JSON") from error
+        expected_keys = {
+            "job_id",
+            "seq",
+            "event_type",
+            "message",
+            "level",
+            "created_at",
+            "payload",
+        }
+        if not isinstance(raw, dict):
+            raise ValueError("legacy output event has an unknown top-level shape")
+        document = cast(dict[str, object], raw)
+        if set(document) != expected_keys:
+            raise ValueError("legacy output event has an unknown top-level shape")
+        payload = document.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError("legacy output event payload is not the exact v0.9 shape")
+        typed_payload = cast(dict[str, object], payload)
+        if set(typed_payload) != {"stream", "text"}:
+            raise ValueError("legacy output event payload is not the exact v0.9 shape")
+        event_type = document.get("event_type")
+        stream = typed_payload.get("stream")
+        text = typed_payload.get("text")
+        message = document.get("message")
+        if (
+            event_type not in {"stdout.delta", "stderr.delta"}
+            or stream not in {"stdout", "stderr"}
+            or event_type != f"{stream}.delta"
+            or document.get("level") != "info"
+            or not isinstance(text, str)
+            or not isinstance(message, str)
+            or (text.rstrip("\n") or f"{stream} output") != message
+        ):
+            raise ValueError("legacy output event is not an exact duplicated v0.9 delta")
+        original = RelayEvent.model_validate(document)
+        if original.job_id != job_id or original.seq != seq:
+            raise ValueError("legacy output filename/content identity mismatch")
+        original_sha256 = hashlib.sha256(original_bytes).hexdigest()
+        archive_relative_path = (
+            Path("legacy_output_archives") / job_id / f"{seq:020d}.json"
+        ).as_posix()
+
+        def replacement(representation: Literal["payload_text", "archive"]) -> RelayEvent:
+            compatibility = {
+                "schema_version": LEGACY_OUTPUT_COMPATIBILITY_SCHEMA,
+                "archive_path": archive_relative_path,
+                "archive_sha256": original_sha256,
+                "archive_size_bytes": len(original_bytes),
+                "original_message_utf8_bytes": len(message.encode("utf-8")),
+                "original_payload_text_utf8_bytes": len(text.encode("utf-8")),
+                "representation": representation,
+            }
+            replacement_message = (
+                f"Legacy {stream} output preserved in payload.text "
+                f"({len(text.encode('utf-8'))} UTF-8 bytes)"
+                if representation == "payload_text"
+                else f"Legacy {stream} output archived ({len(text.encode('utf-8'))} UTF-8 bytes)"
+            )
+            replacement_payload: dict[str, object] = {
+                "stream": stream,
+                "legacy_output": compatibility,
+            }
+            if representation == "payload_text":
+                replacement_payload["text"] = text
+            return original.model_copy(
+                update={
+                    "message": replacement_message,
+                    "payload": replacement_payload,
+                }
+            )
+
+        representation: Literal["payload_text", "archive"] = "payload_text"
+        replacement_record = replacement(representation)
+        replacement_bytes = replacement_record.model_dump_json(indent=2).encode("utf-8")
+        if len(replacement_bytes) > ordinary_limit:
+            representation = "archive"
+            replacement_record = replacement(representation)
+            replacement_bytes = replacement_record.model_dump_json(indent=2).encode("utf-8")
+        if len(replacement_bytes) > ordinary_limit:
+            raise QueueConflictError("legacy output compatibility event exceeds the event limit")
+        return _LegacyOutputRecord(
+            original=original,
+            original_bytes=original_bytes,
+            original_sha256=original_sha256,
+            archive_relative_path=archive_relative_path,
+            replacement=replacement_record,
+            replacement_bytes=replacement_bytes,
+            replacement_sha256=hashlib.sha256(replacement_bytes).hexdigest(),
+            representation=representation,
+        )
+
+    @staticmethod
+    def _legacy_output_receipt(record: _LegacyOutputRecord) -> dict[str, object]:
+        return {
+            "schema_version": LEGACY_OUTPUT_RECEIPT_SCHEMA,
+            "job_id": record.original.job_id,
+            "seq": record.original.seq,
+            "event_type": record.original.event_type,
+            "archive_path": record.archive_relative_path,
+            "archive_sha256": record.original_sha256,
+            "archive_size_bytes": len(record.original_bytes),
+            "replacement_sha256": record.replacement_sha256,
+            "replacement_size_bytes": len(record.replacement_bytes),
+            "representation": record.representation,
+        }
+
+    def _validate_legacy_output_archive(
+        self,
+        path: Path,
+        record: _LegacyOutputRecord,
+    ) -> None:
+        try:
+            archived = _read_bounded_record_bytes(path)
+        except (OSError, QueueConflictError) as error:
+            raise LegacyQueueStateError(
+                family="legacy_output_archives",
+                path=path,
+                reason=f"legacy output archive is invalid: {type(error).__name__}",
+            ) from error
+        if archived != record.original_bytes:
+            raise LegacyQueueStateError(
+                family="legacy_output_archives",
+                path=path,
+                reason="legacy output archive does not exactly match its original event",
+            )
+
+    def _validate_legacy_output_receipt(
+        self,
+        path: Path,
+        record: _LegacyOutputRecord,
+    ) -> None:
+        raw = self._read_legacy_output_receipt_document(
+            path,
+            job_id=record.original.job_id,
+            seq=record.original.seq,
+        )
+        if raw != self._legacy_output_receipt(record):
+            raise LegacyQueueStateError(
+                family=_record_family(path),
+                path=path,
+                reason="legacy output receipt does not match archive and replacement",
+            )
+
+    def _read_legacy_output_receipt_document(
+        self,
+        path: Path,
+        *,
+        job_id: str,
+        seq: int,
+    ) -> dict[str, object]:
+        """Read one self-validating active or retired migration receipt."""
+        family = _record_family(path)
+        try:
+            raw = self._read_json_document(path)
+        except (OSError, ValueError, QueueConflictError) as error:
+            raise LegacyQueueStateError(
+                family=family,
+                path=path,
+                reason=f"legacy output receipt is invalid: {type(error).__name__}",
+            ) from error
+        expected_keys = {
+            "schema_version",
+            "job_id",
+            "seq",
+            "event_type",
+            "archive_path",
+            "archive_sha256",
+            "archive_size_bytes",
+            "replacement_sha256",
+            "replacement_size_bytes",
+            "representation",
+        }
+        if not isinstance(raw, dict):
+            raise LegacyQueueStateError(
+                family=family,
+                path=path,
+                reason="legacy output receipt has an unknown schema shape",
+            )
+        receipt = cast(dict[str, object], raw)
+        if set(receipt) != expected_keys:
+            raise LegacyQueueStateError(
+                family=family,
+                path=path,
+                reason="legacy output receipt has an unknown schema shape",
+            )
+        archive_size = receipt.get("archive_size_bytes")
+        replacement_size = receipt.get("replacement_size_bytes")
+        expected_archive_path = (
+            Path("legacy_output_archives") / job_id / f"{seq:020d}.json"
+        ).as_posix()
+        if (
+            receipt.get("schema_version") != LEGACY_OUTPUT_RECEIPT_SCHEMA
+            or receipt.get("job_id") != job_id
+            or receipt.get("seq") != seq
+            or receipt.get("event_type") not in {"stdout.delta", "stderr.delta"}
+            or receipt.get("archive_path") != expected_archive_path
+            or not _is_sha256_digest(receipt.get("archive_sha256"))
+            or isinstance(archive_size, bool)
+            or not isinstance(archive_size, int)
+            or not RECORD_FAMILY_MAX_BYTES["events"] < archive_size
+            or archive_size > MAX_LEGACY_OUTPUT_RECORD_BYTES
+            or not _is_sha256_digest(receipt.get("replacement_sha256"))
+            or isinstance(replacement_size, bool)
+            or not isinstance(replacement_size, int)
+            or not 0 < replacement_size <= RECORD_FAMILY_MAX_BYTES["events"]
+            or receipt.get("representation") not in {"payload_text", "archive"}
+        ):
+            raise LegacyQueueStateError(
+                family=family,
+                path=path,
+                reason="legacy output receipt fields are invalid",
+            )
+        return receipt
+
+    @staticmethod
+    def _legacy_output_receipt_manifest_sha256(
+        receipt_paths: dict[tuple[str, int], Path],
+    ) -> str:
+        """Hash exact immutable receipt bytes independently of active/retired location."""
+        digest = hashlib.sha256()
+        for (job_id, seq), path in sorted(receipt_paths.items()):
+            identity = f"{job_id}\0{seq:020d}\0".encode()
+            receipt_bytes = _read_bounded_record_bytes(path)
+            digest.update(len(identity).to_bytes(8, "big"))
+            digest.update(identity)
+            digest.update(len(receipt_bytes).to_bytes(8, "big"))
+            digest.update(receipt_bytes)
+        return digest.hexdigest()
+
+    def _record_from_legacy_compatibility_event(
+        self,
+        path: Path,
+        event: RelayEvent,
+        event_bytes: bytes,
+        *,
+        job_id: str,
+        seq: int,
+    ) -> _LegacyOutputRecord:
+        payload = event.payload
+        compatibility = payload.get("legacy_output")
+        if not isinstance(compatibility, dict):
+            raise LegacyQueueStateError(
+                family="events",
+                path=path,
+                reason="legacy output compatibility metadata is not an object",
+            )
+        typed_compatibility = cast(dict[str, object], compatibility)
+        expected_keys = {
+            "schema_version",
+            "archive_path",
+            "archive_sha256",
+            "archive_size_bytes",
+            "original_message_utf8_bytes",
+            "original_payload_text_utf8_bytes",
+            "representation",
+        }
+        if (
+            set(typed_compatibility) != expected_keys
+            or typed_compatibility.get("schema_version") != LEGACY_OUTPUT_COMPATIBILITY_SCHEMA
+        ):
+            raise LegacyQueueStateError(
+                family="events",
+                path=path,
+                reason="legacy output compatibility metadata has an unknown schema",
+            )
+        representation = typed_compatibility.get("representation")
+        expected_payload_keys = (
+            {"stream", "text", "legacy_output"}
+            if representation == "payload_text"
+            else {"stream", "legacy_output"}
+        )
+        if (
+            representation not in {"payload_text", "archive"}
+            or set(payload) != expected_payload_keys
+        ):
+            raise LegacyQueueStateError(
+                family="events",
+                path=path,
+                reason="legacy output compatibility payload has an unknown shape",
+            )
+        archive_path = self._legacy_output_archive_path(job_id, seq)
+        if (
+            typed_compatibility.get("archive_path")
+            != archive_path.relative_to(self._storage_root).as_posix()
+        ):
+            raise LegacyQueueStateError(
+                family="events",
+                path=path,
+                reason="legacy output compatibility archive path is not canonical",
+            )
+        try:
+            original = self._read_v09_legacy_output_record(
+                archive_path,
+                job_id=job_id,
+                seq=seq,
+            )
+        except (OSError, ValueError, QueueConflictError) as error:
+            raise LegacyQueueStateError(
+                family="legacy_output_archives",
+                path=archive_path,
+                reason=f"legacy output archive is invalid: {type(error).__name__}",
+            ) from error
+        if event != original.replacement or event_bytes != original.replacement_bytes:
+            raise LegacyQueueStateError(
+                family="events",
+                path=path,
+                reason="legacy output compatibility event does not match its exact archive",
+            )
+        return original
+
+    def _audit_one_legacy_output_event(
+        self,
+        path: Path,
+        *,
+        job_id: str,
+        seq: int,
+    ) -> _LegacyOutputRecord | None:
+        try:
+            path_stat = os.lstat(path)
+            if path_stat.st_size > RECORD_FAMILY_MAX_BYTES["events"]:
+                record = self._read_v09_legacy_output_record(
+                    path,
+                    job_id=job_id,
+                    seq=seq,
+                )
+                archive_path = self._legacy_output_archive_path(job_id, seq)
+                if _path_lstat(archive_path) is not None:
+                    self._validate_legacy_output_archive(archive_path, record)
+                receipt_path = self._legacy_output_receipt_path(job_id, seq)
+                if _path_lstat(receipt_path) is not None:
+                    raise LegacyQueueStateError(
+                        family="legacy_output_receipts",
+                        path=receipt_path,
+                        reason="receipt exists before the compatibility event replacement",
+                    )
+                return record
+            event_bytes = _read_bounded_record_bytes(path)
+            event = RelayEvent.model_validate_json(event_bytes)
+        except LegacyQueueStateError:
+            raise
+        except (OSError, ValueError, QueueConflictError) as error:
+            raise LegacyQueueStateError(
+                family="events",
+                path=path,
+                reason=f"event record is invalid: {type(error).__name__}: {error}",
+            ) from error
+        if event.job_id != job_id:
+            raise LegacyQueueStateError(
+                family="events",
+                path=path,
+                reason="event directory/content identity mismatch for job_id",
+            )
+        if event.seq != seq:
+            raise LegacyQueueStateError(
+                family="events",
+                path=path,
+                reason="event filename/content sequence mismatch",
+            )
+        if "legacy_output" not in event.payload:
+            return None
+        record = self._record_from_legacy_compatibility_event(
+            path,
+            event,
+            event_bytes,
+            job_id=job_id,
+            seq=seq,
+        )
+        receipt_path = self._legacy_output_receipt_path(job_id, seq)
+        if _path_lstat(receipt_path) is not None:
+            self._validate_legacy_output_receipt(receipt_path, record)
+        return record
+
+    def _iter_legacy_output_auxiliary_paths(
+        self,
+        family: Literal[
+            "legacy_output_archives",
+            "legacy_output_receipts",
+            "legacy_output_retired",
+        ],
+    ) -> Iterable[tuple[Path, str, int]]:
+        yield from self._iter_legacy_event_paths(
+            family,
+            max_directories=MAX_LEGACY_OUTPUT_MIGRATION_RECORDS,
+            max_records=MAX_LEGACY_OUTPUT_MIGRATION_RECORDS,
+        )
+
+    def _audit_legacy_output_auxiliary_state(self) -> None:
+        for family in ("legacy_output_archives", "legacy_output_receipts"):
+            for path, job_id, seq in self._iter_legacy_output_auxiliary_paths(family):
+                event_path = self._storage_root / "events" / job_id / f"{seq:020d}.json"
+                if _path_lstat(event_path) is None:
+                    raise LegacyQueueStateError(
+                        family=family,
+                        path=path,
+                        reason="legacy output auxiliary record has no canonical event",
+                    )
+                record = self._audit_one_legacy_output_event(
+                    event_path,
+                    job_id=job_id,
+                    seq=seq,
+                )
+                if record is None:
+                    raise LegacyQueueStateError(
+                        family=family,
+                        path=path,
+                        reason="legacy output auxiliary record points to an ordinary event",
+                    )
+                archive_path = self._legacy_output_archive_path(job_id, seq)
+                if _path_lstat(archive_path) is None:
+                    raise LegacyQueueStateError(
+                        family=family,
+                        path=path,
+                        reason="legacy output archive is missing",
+                    )
+                self._validate_legacy_output_archive(archive_path, record)
+                if family == "legacy_output_receipts":
+                    if event_path.stat().st_size > RECORD_FAMILY_MAX_BYTES["events"]:
+                        raise LegacyQueueStateError(
+                            family=family,
+                            path=path,
+                            reason="receipt exists before the compatibility event replacement",
+                        )
+                    self._validate_legacy_output_receipt(path, record)
+
+        for path, _job_id, _seq in self._iter_legacy_output_auxiliary_paths(
+            "legacy_output_retired"
+        ):
+            raise LegacyQueueStateError(
+                family="legacy_output_retired",
+                path=path,
+                reason="retired receipt exists before legacy-output migration completed",
+            )
+
+    def _validate_retired_legacy_output_receipt(
+        self,
+        path: Path,
+        receipt: dict[str, object],
+        *,
+        job_id: str,
+        seq: int,
+    ) -> None:
+        """Validate durable GC evidence and every canonical component still present."""
+        tombstone = self._read_optional(self._job_tombstone_path(job_id), JobTombstone)
+        if tombstone is None or tombstone.job_id != job_id or not tombstone.records_trash_started:
+            raise LegacyQueueStateError(
+                family="legacy_output_retired",
+                path=path,
+                reason="retired receipt has no authorized terminal-job GC tombstone",
+            )
+        archive_path = self._legacy_output_archive_path(job_id, seq)
+        event_path = self._storage_root / "events" / job_id / f"{seq:020d}.json"
+        archive_present = _path_lstat(archive_path) is not None
+        event_present = _path_lstat(event_path) is not None
+        record: _LegacyOutputRecord | None = None
+        if archive_present:
+            try:
+                record = self._read_v09_legacy_output_record(
+                    archive_path,
+                    job_id=job_id,
+                    seq=seq,
+                )
+            except (OSError, ValueError, QueueConflictError) as error:
+                raise LegacyQueueStateError(
+                    family="legacy_output_archives",
+                    path=archive_path,
+                    reason=f"retired legacy output archive is invalid: {type(error).__name__}",
+                ) from error
+            self._validate_legacy_output_archive(archive_path, record)
+            if receipt != self._legacy_output_receipt(record):
+                raise LegacyQueueStateError(
+                    family="legacy_output_retired",
+                    path=path,
+                    reason="retired receipt does not match its remaining archive",
+                )
+        if not event_present:
+            return
+        try:
+            event_bytes = _read_bounded_record_bytes(event_path)
+            event = RelayEvent.model_validate_json(event_bytes)
+        except (OSError, ValueError, QueueConflictError) as error:
+            raise LegacyQueueStateError(
+                family="events",
+                path=event_path,
+                reason=f"retired legacy output event is invalid: {type(error).__name__}",
+            ) from error
+        if (
+            event.job_id != job_id
+            or event.seq != seq
+            or event.event_type != receipt.get("event_type")
+            or len(event_bytes) != receipt.get("replacement_size_bytes")
+            or hashlib.sha256(event_bytes).hexdigest() != receipt.get("replacement_sha256")
+        ):
+            raise LegacyQueueStateError(
+                family="events",
+                path=event_path,
+                reason="retired legacy output event does not match its receipt",
+            )
+        compatibility = event.payload.get("legacy_output")
+        if not isinstance(compatibility, dict):
+            raise LegacyQueueStateError(
+                family="events",
+                path=event_path,
+                reason="retired legacy output event has no compatibility metadata",
+            )
+        typed_compatibility = cast(dict[str, object], compatibility)
+        if (
+            typed_compatibility.get("schema_version") != LEGACY_OUTPUT_COMPATIBILITY_SCHEMA
+            or typed_compatibility.get("archive_path") != receipt.get("archive_path")
+            or typed_compatibility.get("archive_sha256") != receipt.get("archive_sha256")
+            or typed_compatibility.get("archive_size_bytes") != receipt.get("archive_size_bytes")
+            or typed_compatibility.get("representation") != receipt.get("representation")
+        ):
+            raise LegacyQueueStateError(
+                family="events",
+                path=event_path,
+                reason="retired compatibility metadata does not match its receipt",
+            )
+        if record is not None and (
+            event != record.replacement or event_bytes != record.replacement_bytes
+        ):
+            raise LegacyQueueStateError(
+                family="events",
+                path=event_path,
+                reason="retired compatibility event does not match its remaining archive",
+            )
+
+    def _audit_completed_legacy_output_state(self, marker: _LegacyOutputAudit) -> None:
+        """Boundedly verify every active or GC-retired migration receipt."""
+        receipts: dict[tuple[str, int], tuple[str, Path, dict[str, object]]] = {}
+        receipt_paths: dict[tuple[str, int], Path] = {}
+        archive_bytes = 0
+        for family in ("legacy_output_receipts", "legacy_output_retired"):
+            for path, job_id, seq in self._iter_legacy_output_auxiliary_paths(family):
+                key = (job_id, seq)
+                if key in receipts:
+                    raise LegacyQueueStateError(
+                        family=family,
+                        path=path,
+                        reason="legacy output identity exists in active and retired receipts",
+                    )
+                receipt = self._read_legacy_output_receipt_document(
+                    path,
+                    job_id=job_id,
+                    seq=seq,
+                )
+                receipts[key] = (family, path, receipt)
+                receipt_paths[key] = path
+                archive_bytes += cast(int, receipt["archive_size_bytes"])
+                if len(receipts) > MAX_LEGACY_OUTPUT_MIGRATION_RECORDS:
+                    raise LegacyQueueStateError(
+                        family=family,
+                        path=path,
+                        reason="legacy output receipts exceed the bounded migration limit",
+                    )
+
+        if (
+            len(receipts) != marker.migration_records
+            or archive_bytes != marker.archive_bytes
+            or self._legacy_output_receipt_manifest_sha256(receipt_paths)
+            != marker.receipt_manifest_sha256
+        ):
+            raise LegacyQueueStateError(
+                family="migrations",
+                path=self._legacy_output_marker_path(),
+                reason=("legacy-output marker totals do not match active and retired receipts"),
+            )
+
+        for (job_id, seq), (family, path, receipt) in receipts.items():
+            if family == "legacy_output_retired":
+                self._validate_retired_legacy_output_receipt(
+                    path,
+                    receipt,
+                    job_id=job_id,
+                    seq=seq,
+                )
+                continue
+            event_path = self._storage_root / "events" / job_id / f"{seq:020d}.json"
+            archive_path = self._legacy_output_archive_path(job_id, seq)
+            if _path_lstat(event_path) is None or _path_lstat(archive_path) is None:
+                raise LegacyQueueStateError(
+                    family=family,
+                    path=path,
+                    reason="active receipt is missing its canonical event or archive",
+                )
+            record = self._audit_one_legacy_output_event(
+                event_path,
+                job_id=job_id,
+                seq=seq,
+            )
+            if record is None or event_path.stat().st_size > RECORD_FAMILY_MAX_BYTES["events"]:
+                raise LegacyQueueStateError(
+                    family=family,
+                    path=path,
+                    reason="active receipt does not point to a compatibility event",
+                )
+            self._validate_legacy_output_archive(archive_path, record)
+            self._validate_legacy_output_receipt(path, record)
+
+        for archive_path, job_id, seq in self._iter_legacy_output_auxiliary_paths(
+            "legacy_output_archives"
+        ):
+            if (job_id, seq) not in receipts:
+                raise LegacyQueueStateError(
+                    family="legacy_output_archives",
+                    path=archive_path,
+                    reason="legacy output archive has no active or retired receipt",
+                )
+
+    def _audit_legacy_output_state_before_initialization(self) -> _LegacyOutputAudit:
+        marker = self._read_legacy_output_marker()
+        if marker is not None:
+            with self._lock:
+                locked_marker = self._read_legacy_output_marker()
+                if locked_marker is None or locked_marker != marker:
+                    raise QueueConflictError(
+                        "legacy-output completion marker changed while taking the queue lock"
+                    )
+                self._audit_completed_legacy_output_state(locked_marker)
+                return locked_marker
+        event_records = 0
+        migration_records = 0
+        archive_bytes = 0
+        migration_keys: list[tuple[str, int]] = []
+        for path, job_id, seq in self._iter_legacy_event_paths(
+            "events",
+            max_directories=MAX_LEGACY_EVENT_AUDIT_DIRECTORIES,
+            max_records=MAX_LEGACY_EVENT_AUDIT_RECORDS,
+        ):
+            event_records += 1
+            record = self._audit_one_legacy_output_event(
+                path,
+                job_id=job_id,
+                seq=seq,
+            )
+            if record is None:
+                continue
+            migration_records += 1
+            migration_keys.append((job_id, seq))
+            archive_bytes += len(record.original_bytes)
+            if migration_records > MAX_LEGACY_OUTPUT_MIGRATION_RECORDS:
+                raise LegacyQueueStateError(
+                    family="events",
+                    path=path,
+                    reason=(
+                        "legacy output migration exceeds the bounded record limit of "
+                        f"{MAX_LEGACY_OUTPUT_MIGRATION_RECORDS}"
+                    ),
+                )
+            if archive_bytes > MAX_LEGACY_OUTPUT_MIGRATION_BYTES:
+                raise LegacyQueueStateError(
+                    family="events",
+                    path=path,
+                    reason=(
+                        "legacy output migration exceeds the bounded aggregate byte limit "
+                        f"of {MAX_LEGACY_OUTPUT_MIGRATION_BYTES}"
+                    ),
+                )
+        self._audit_legacy_output_auxiliary_state()
+        return _LegacyOutputAudit(
+            marker_complete=False,
+            event_records=event_records,
+            migration_records=migration_records,
+            archive_bytes=archive_bytes,
+            migration_keys=tuple(migration_keys),
+        )
+
+    def _write_legacy_output_archive(
+        self,
+        path: Path,
+        record: _LegacyOutputRecord,
+    ) -> None:
+        if _path_lstat(path) is not None:
+            self._validate_legacy_output_archive(path, record)
+            return
+        self._write_bytes(
+            path,
+            record.original_bytes,
+            max_bytes=MAX_LEGACY_OUTPUT_RECORD_BYTES,
+        )
+        self._validate_legacy_output_archive(path, record)
+
+    def _write_legacy_output_receipt(
+        self,
+        path: Path,
+        record: _LegacyOutputRecord,
+    ) -> None:
+        if _path_lstat(path) is not None:
+            self._validate_legacy_output_receipt(path, record)
+            return
+        self._write_json(path, self._legacy_output_receipt(record))
+        self._validate_legacy_output_receipt(path, record)
+
+    def _migrate_legacy_output_events_unlocked(
+        self,
+        audit: _LegacyOutputAudit,
+    ) -> None:
+        """Archive and replace exact v0.9 output records after a complete audit."""
+        if audit.marker_complete:
+            return
+        if len(audit.migration_keys) != audit.migration_records:
+            raise QueueConflictError("legacy output migration plan is incomplete")
+        migration_records = 0
+        archive_bytes = 0
+        for job_id, seq in audit.migration_keys:
+            path = self._storage_root / "events" / job_id / f"{seq:020d}.json"
+            if _path_lstat(path) is None:
+                raise QueueConflictError(
+                    f"legacy output event disappeared after its complete audit: {path}"
+                )
+            was_oversized = path.stat().st_size > RECORD_FAMILY_MAX_BYTES["events"]
+            record = self._audit_one_legacy_output_event(
+                path,
+                job_id=job_id,
+                seq=seq,
+            )
+            if record is None:
+                continue
+            migration_records += 1
+            archive_bytes += len(record.original_bytes)
+            archive_path = self._legacy_output_archive_path(job_id, seq)
+            receipt_path = self._legacy_output_receipt_path(job_id, seq)
+            if was_oversized:
+                self._write_legacy_output_archive(archive_path, record)
+                self._after_legacy_output_migration_phase("archive", path)
+                current = _read_bounded_record_bytes_once(
+                    path,
+                    limit=MAX_LEGACY_OUTPUT_RECORD_BYTES,
+                )
+                if current != record.original_bytes:
+                    raise QueueConflictError(
+                        f"legacy output event changed after validation: {path}"
+                    )
+                self._write_bytes(
+                    path,
+                    record.replacement_bytes,
+                    max_bytes=RECORD_FAMILY_MAX_BYTES["events"],
+                )
+                self._after_legacy_output_migration_phase("replacement", path)
+            self._write_legacy_output_receipt(receipt_path, record)
+            self._after_legacy_output_migration_phase("receipt", path)
+        observed = _LegacyOutputAudit(
+            marker_complete=False,
+            event_records=audit.event_records,
+            migration_records=migration_records,
+            archive_bytes=archive_bytes,
+            migration_keys=audit.migration_keys,
+        )
+        if observed != audit:
+            raise QueueConflictError("legacy output state changed after its complete audit")
+        self._audit_legacy_output_auxiliary_state()
+        receipt_paths = {
+            (job_id, seq): path
+            for path, job_id, seq in self._iter_legacy_output_auxiliary_paths(
+                "legacy_output_receipts"
+            )
+        }
+        if len(receipt_paths) != migration_records:
+            raise QueueConflictError("legacy output receipt manifest is incomplete")
+        receipt_manifest_sha256 = self._legacy_output_receipt_manifest_sha256(receipt_paths)
+        marker: dict[str, object] = {
+            "schema_version": LEGACY_OUTPUT_MIGRATION_SCHEMA,
+            "complete": True,
+            "event_records": audit.event_records,
+            "migration_records": migration_records,
+            "archive_bytes": archive_bytes,
+            "receipt_manifest_sha256": receipt_manifest_sha256,
+        }
+        self._write_json(self._legacy_output_marker_path(), marker)
+        self._after_legacy_output_migration_phase(
+            "marker",
+            self._legacy_output_marker_path(),
+        )
+        durable_marker = self._read_legacy_output_marker()
+        if durable_marker is None or durable_marker != _LegacyOutputAudit(
+            marker_complete=True,
+            event_records=audit.event_records,
+            migration_records=migration_records,
+            archive_bytes=archive_bytes,
+            receipt_manifest_sha256=receipt_manifest_sha256,
+        ):
+            raise QueueConflictError("legacy output migration marker was not durable")
+
+    def _require_legacy_output_migration_authorized(
+        self,
+        audit: _LegacyOutputAudit,
+        *,
+        migrate_legacy_output: bool,
+    ) -> None:
+        if audit.marker_complete or audit.migration_records == 0 or migrate_legacy_output:
+            return
+        raise LegacyQueueStateError(
+            family="events",
+            path=self._storage_root / "events",
+            reason=(
+                f"{audit.migration_records} exact v0.9 output event(s) require an explicitly "
+                "authorized compatibility migration"
+            ),
+            action=(
+                "stop and verify every process that can write this queue, then run "
+                "clio-relay init --migrate-legacy-output"
+            ),
+        )
+
+    @staticmethod
+    def _after_legacy_output_migration_phase(_phase: str, _path: Path) -> None:
+        """Fault-injection seam after each durable legacy-output phase."""
 
     def _audit_legacy_event_family(
         self,
@@ -649,13 +1762,39 @@ class ClioCoreQueue:
                 reason=f"canonical identity is not portable: {error}",
             ) from error
 
-    def initialize(self) -> None:
+    def initialize(
+        self,
+        *,
+        migrate_legacy_output: bool = False,
+        locked_core: LockedCoreIdentity | None = None,
+    ) -> None:
         """Create the record families used by the queue."""
+        if locked_core is not None:
+            if not migrate_legacy_output or self._migration_lifetime_guarded:
+                raise ConfigurationError(
+                    "locked-core authority is only valid for the outer migration scope"
+                )
+            require_active_locked_core(locked_core)
+            self._initialize_under_locked_core(locked_core)
+            return
+        if migrate_legacy_output and not self._migration_lifetime_guarded:
+            with exclusive_migration_lifetime(self.root) as locked_core:
+                self.initialize(
+                    migrate_legacy_output=True,
+                    locked_core=locked_core,
+                )
+            return
         if self._initialized:
             with self._lock:
                 self._ensure_extended_migration_state()
             return
-        self._audit_legacy_state_before_initialization()
+        # The first pass is deliberately read-only: an unsafe family must fail
+        # before initialize creates even the migration/archive directories.
+        legacy_output_audit = self._audit_legacy_state_before_initialization()
+        self._require_legacy_output_migration_authorized(
+            legacy_output_audit,
+            migrate_legacy_output=migrate_legacy_output,
+        )
         for family in (
             "endpoints",
             "endpoints_fresh",
@@ -669,6 +1808,9 @@ class ClioCoreQueue:
             "leases_by_cluster_kind",
             "leases_by_expiry",
             "events",
+            "legacy_output_archives",
+            "legacy_output_receipts",
+            "legacy_output_retired",
             "artifacts",
             "progress",
             "task_events",
@@ -720,7 +1862,19 @@ class ClioCoreQueue:
                 exist_ok=True,
             )
         with self._lock:
+            # Revalidate once under the cross-process lock before the one-time
+            # migration.  This closes the audit/write race without retaining an
+            # unbounded path plan in memory; only the independently bounded set of
+            # migration keys is retained, so writes do not require a third history
+            # scan.  The durable completion marker makes both passes skip deep
+            # event history on every later startup.
+            legacy_output_audit = self._audit_legacy_state_before_initialization()
+            self._require_legacy_output_migration_authorized(
+                legacy_output_audit,
+                migrate_legacy_output=migrate_legacy_output,
+            )
             self._purge_write_staging_unlocked()
+            self._migrate_legacy_output_events_unlocked(legacy_output_audit)
             migration_path = self._storage_root / "migrations" / "index-v1.json"
             if not migration_path.exists():
                 has_legacy_jobs = (
@@ -802,7 +1956,44 @@ class ClioCoreQueue:
             else:
                 self._ensure_extended_migration_state()
             self._recover_pending_transitions_unlocked()
-        self._initialized = True
+            self._initialized = True
+
+    def _initialize_under_locked_core(self, locked_core: LockedCoreIdentity) -> None:
+        """Pin all migration I/O to one authenticated locked core identity."""
+        require_active_locked_core(locked_core)
+        original_storage_root = self._storage_root
+        try:
+            queue_root_before = os.stat(original_storage_root)
+        except OSError as exc:
+            raise ConfigurationError(
+                f"migration queue root identity cannot be verified: {exc}"
+            ) from exc
+        expected_identity = (locked_core.device, locked_core.inode)
+        if (queue_root_before.st_dev, queue_root_before.st_ino) != expected_identity:
+            raise ConfigurationError("migration queue root does not match its core lifetime lock")
+        # Pin every migration read and write to the canonical directory whose
+        # inode is locked. A stable mount alias remains accepted, while an
+        # in-flight alias retarget can never redirect writes to an unlocked root.
+        self.root = logical_filesystem_path(locked_core.root)
+        self._storage_root = internal_filesystem_path(
+            locked_core.root,
+            force_extended=True,
+        )
+        self._lock = _FairBoundedFileLock(
+            str(self._storage_root / ".lock"),
+            timeout=self._lock_timeout_seconds,
+        )
+        self._migration_lifetime_guarded = True
+        try:
+            self.initialize(migrate_legacy_output=True)
+        finally:
+            self._migration_lifetime_guarded = False
+        try:
+            queue_root_after = os.stat(original_storage_root)
+        except OSError as exc:
+            raise ConfigurationError(f"migration queue root identity changed: {exc}") from exc
+        if (queue_root_after.st_dev, queue_root_after.st_ino) != expected_identity:
+            raise ConfigurationError("migration queue root identity changed while locked")
 
     def reconcile_pending_transitions(self) -> None:
         """Replay bounded write-ahead transitions left by another process."""
@@ -1049,6 +2240,7 @@ class ClioCoreQueue:
                 finalize["complete"] = not has_more
                 self._write_index_migration_state(state)
                 return state
+            self._reconcile_index_migration_sources_unlocked()
             state["complete"] = True
             self._write_index_migration_state(state)
             return state
@@ -2837,6 +4029,24 @@ class ClioCoreQueue:
         ownership_verified: bool,
     ) -> SchedulerCancelPending:
         """Add a verified pending identity or a terminal refused disposition."""
+        return self.register_scheduler_cancel_identity_once(
+            job_id,
+            cluster=cluster,
+            scheduler_job_id=scheduler_job_id,
+            provider=provider,
+            ownership_verified=ownership_verified,
+        ).record
+
+    def register_scheduler_cancel_identity_once(
+        self,
+        job_id: str,
+        *,
+        cluster: str,
+        scheduler_job_id: str,
+        provider: str | None,
+        ownership_verified: bool,
+    ) -> SchedulerCancelIdentityRegistration:
+        """Register an identity and report whether this call created its disposition."""
         job_id = self._require_durable_record_id(job_id, field="job_id")
         self.initialize()
         with self._lock:
@@ -2871,7 +4081,10 @@ class ClioCoreQueue:
                     existing.state is not SchedulerCancelDispositionState.REFUSED
                     or not ownership_verified
                 ):
-                    return record
+                    return SchedulerCancelIdentityRegistration(
+                        record=record,
+                        disposition_created=False,
+                    )
                 dispositions[existing_index] = candidate.model_copy(
                     update={
                         "attempts": existing.attempts,
@@ -2885,7 +4098,11 @@ class ClioCoreQueue:
                     "updated_at": utc_now(),
                 }
             )
-            return self._persist_scheduler_cancel_record_unlocked(updated)
+            persisted = self._persist_scheduler_cancel_record_unlocked(updated)
+            return SchedulerCancelIdentityRegistration(
+                record=persisted,
+                disposition_created=existing_index is None,
+            )
 
     def finalize_scheduler_cancel_identities(
         self,
@@ -2907,6 +4124,132 @@ class ClioCoreQueue:
             )
             return self._persist_scheduler_cancel_record_unlocked(updated)
 
+    def claim_scheduler_cancel_attempt(
+        self,
+        job_id: str,
+        *,
+        cluster: str,
+        scheduler_job_id: str,
+        provider: str,
+        lease_seconds: float,
+        now: datetime | None = None,
+    ) -> SchedulerCancelAttemptClaim | None:
+        """Atomically claim one due external cancellation attempt.
+
+        The claim is persisted while holding the cross-process queue lock. An
+        unexpired claim excludes every other worker, while an abandoned claim
+        becomes recoverable after its bounded lease expires.
+        """
+        job_id = self._require_durable_record_id(job_id, field="job_id")
+        if not provider:
+            raise ValueError("scheduler cancellation provider must not be empty")
+        if not (
+            MIN_SCHEDULER_CANCEL_CLAIM_LEASE_SECONDS
+            <= lease_seconds
+            <= MAX_SCHEDULER_CANCEL_CLAIM_LEASE_SECONDS
+        ):
+            raise ValueError(
+                "scheduler cancellation claim lease must be between "
+                f"{MIN_SCHEDULER_CANCEL_CLAIM_LEASE_SECONDS:g} and "
+                f"{MAX_SCHEDULER_CANCEL_CLAIM_LEASE_SECONDS:g} seconds"
+            )
+        observed_at = now or utc_now()
+        self.initialize()
+        with self._lock:
+            completed_path = self._scheduler_cancel_record_path(
+                "scheduler_cancel_dispositions",
+                cluster,
+                job_id,
+            )
+            completed = self._read_optional(completed_path, SchedulerCancelPending)
+            if completed is not None:
+                if (
+                    completed.job_id != job_id
+                    or completed.cluster != cluster
+                    or not completed.complete
+                ):
+                    raise QueueConflictError(
+                        f"scheduler cancellation disposition identity mismatch: {completed_path}"
+                    )
+                _unlink_durable_path(
+                    self._scheduler_cancel_record_path(
+                        "scheduler_cancel_pending",
+                        cluster,
+                        job_id,
+                    ),
+                    missing_ok=True,
+                )
+                return None
+            pending_path = self._scheduler_cancel_record_path(
+                "scheduler_cancel_pending",
+                cluster,
+                job_id,
+            )
+            record = self._read_optional(pending_path, SchedulerCancelPending)
+            if record is None:
+                raise QueueConflictError(f"scheduler cancellation is not pending: {job_id}")
+            if record.job_id != job_id or record.cluster != cluster:
+                raise QueueConflictError(
+                    f"scheduler cancellation identity mismatch: {pending_path}"
+                )
+            if record.identity_resolution != "resolved":
+                return None
+            dispositions = list(record.dispositions)
+            index = next(
+                (
+                    position
+                    for position, item in enumerate(dispositions)
+                    if item.scheduler_job_id == scheduler_job_id
+                ),
+                None,
+            )
+            if index is None:
+                raise QueueConflictError(
+                    f"scheduler cancellation identity is not registered: {scheduler_job_id}"
+                )
+            current = dispositions[index]
+            if current.state not in {
+                SchedulerCancelDispositionState.PENDING,
+                SchedulerCancelDispositionState.RETRY_WAIT,
+            }:
+                return None
+            if current.next_attempt_at is not None and current.next_attempt_at > observed_at:
+                return None
+            if (
+                current.attempt_claim_id is not None
+                and current.attempt_claim_expires_at is not None
+                and current.attempt_claim_expires_at > observed_at
+            ):
+                return None
+            if current.provider is not None and current.provider != provider:
+                raise QueueConflictError(
+                    "scheduler cancellation provider changed for "
+                    f"{scheduler_job_id}: {current.provider} != {provider}"
+                )
+            claim_id = validate_durable_record_id(f"cancelclaim_{uuid4().hex}")
+            expires_at = observed_at + timedelta(seconds=lease_seconds)
+            dispositions[index] = current.model_copy(
+                update={
+                    "provider": provider,
+                    "attempt_claim_id": claim_id,
+                    "attempt_claimed_at": observed_at,
+                    "attempt_claim_expires_at": expires_at,
+                    "updated_at": observed_at,
+                }
+            )
+            updated = record.model_copy(
+                update={"dispositions": dispositions, "updated_at": observed_at}
+            )
+            self._persist_scheduler_cancel_record_unlocked(updated)
+            return SchedulerCancelAttemptClaim(
+                claim_id=claim_id,
+                scheduler_job_id=scheduler_job_id,
+                provider=provider,
+                attempt=current.attempts + 1,
+                claimed_at=observed_at,
+                expires_at=expires_at,
+            )
+
     def record_scheduler_cancel_attempt(
         self,
         job_id: str,
@@ -2914,16 +4257,55 @@ class ClioCoreQueue:
         cluster: str,
         scheduler_job_id: str,
         provider: str,
+        claim_id: str,
         accepted: bool,
         error: str | None,
         max_attempts: int,
         retry_delay_seconds: float,
-    ) -> SchedulerCancelPending:
-        """Persist one scheduler cancellation attempt and its next/final disposition."""
+        now: datetime | None = None,
+    ) -> SchedulerCancelPending | None:
+        """Persist a claimed attempt, or ignore a stale claimant idempotently."""
         job_id = self._require_durable_record_id(job_id, field="job_id")
+        claim_id = validate_durable_record_id(claim_id)
+        observed_at = now or utc_now()
         self.initialize()
         with self._lock:
-            record = self._require_scheduler_cancel_pending_unlocked(job_id, cluster=cluster)
+            completed_path = self._scheduler_cancel_record_path(
+                "scheduler_cancel_dispositions",
+                cluster,
+                job_id,
+            )
+            completed = self._read_optional(completed_path, SchedulerCancelPending)
+            if completed is not None:
+                if (
+                    completed.job_id != job_id
+                    or completed.cluster != cluster
+                    or not completed.complete
+                ):
+                    raise QueueConflictError(
+                        f"scheduler cancellation disposition identity mismatch: {completed_path}"
+                    )
+                _unlink_durable_path(
+                    self._scheduler_cancel_record_path(
+                        "scheduler_cancel_pending",
+                        cluster,
+                        job_id,
+                    ),
+                    missing_ok=True,
+                )
+                return None
+            pending_path = self._scheduler_cancel_record_path(
+                "scheduler_cancel_pending",
+                cluster,
+                job_id,
+            )
+            record = self._read_optional(pending_path, SchedulerCancelPending)
+            if record is None:
+                raise QueueConflictError(f"scheduler cancellation is not pending: {job_id}")
+            if record.job_id != job_id or record.cluster != cluster:
+                raise QueueConflictError(
+                    f"scheduler cancellation identity mismatch: {pending_path}"
+                )
             dispositions = list(record.dispositions)
             index = next(
                 (
@@ -2938,33 +4320,166 @@ class ClioCoreQueue:
                     f"scheduler cancellation identity is not registered: {scheduler_job_id}"
                 )
             current = dispositions[index]
+            if current.attempt_claim_id != claim_id:
+                return None
+            if current.provider is not None and current.provider != provider:
+                raise QueueConflictError(
+                    "scheduler cancellation provider changed for "
+                    f"{scheduler_job_id}: {current.provider} != {provider}"
+                )
             attempts = current.attempts + 1
+            bounded_error = bounded_error_detail(error)
             if accepted:
                 state = SchedulerCancelDispositionState.CANCEL_REQUESTED
-                next_attempt_at = utc_now() + timedelta(seconds=retry_delay_seconds)
+                # Make the first confirmation immediately claimable.  The
+                # successful worker still polls eagerly, while a crash between
+                # acceptance and polling leaves due work for another worker.
+                next_attempt_at = observed_at
                 last_error = None
             elif attempts >= max_attempts:
                 state = SchedulerCancelDispositionState.EXHAUSTED
                 next_attempt_at = None
-                last_error = error or "scheduler cancellation failed"
+                last_error = bounded_error or "scheduler cancellation failed"
             else:
                 state = SchedulerCancelDispositionState.RETRY_WAIT
-                next_attempt_at = utc_now() + timedelta(seconds=retry_delay_seconds)
-                last_error = error or "scheduler cancellation failed"
-            dispositions[index] = current.model_copy(
-                update={
+                next_attempt_at = observed_at + timedelta(seconds=retry_delay_seconds)
+                last_error = bounded_error or "scheduler cancellation failed"
+            dispositions[index] = SchedulerCancelDisposition.model_validate(
+                {
+                    **current.model_dump(),
                     "provider": provider,
                     "state": state,
                     "attempts": attempts,
                     "next_attempt_at": next_attempt_at,
                     "last_error": last_error,
-                    "updated_at": utc_now(),
+                    "attempt_claim_id": None,
+                    "attempt_claimed_at": None,
+                    "attempt_claim_expires_at": None,
+                    "updated_at": observed_at,
+                },
+            )
+            updated = record.model_copy(
+                update={"dispositions": dispositions, "updated_at": observed_at}
+            )
+            return self._persist_scheduler_cancel_record_unlocked(updated)
+
+    def claim_scheduler_cancel_confirmation(
+        self,
+        job_id: str,
+        *,
+        cluster: str,
+        scheduler_job_id: str,
+        provider: str,
+        lease_seconds: float,
+        now: datetime | None = None,
+    ) -> SchedulerCancelConfirmationClaim | None:
+        """Atomically claim one due scheduler cancellation confirmation poll."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
+        if not provider:
+            raise ValueError("scheduler cancellation provider must not be empty")
+        if not (
+            MIN_SCHEDULER_CANCEL_CLAIM_LEASE_SECONDS
+            <= lease_seconds
+            <= MAX_SCHEDULER_CANCEL_CLAIM_LEASE_SECONDS
+        ):
+            raise ValueError(
+                "scheduler cancellation confirmation claim lease must be between "
+                f"{MIN_SCHEDULER_CANCEL_CLAIM_LEASE_SECONDS:g} and "
+                f"{MAX_SCHEDULER_CANCEL_CLAIM_LEASE_SECONDS:g} seconds"
+            )
+        observed_at = now or utc_now()
+        self.initialize()
+        with self._lock:
+            completed_path = self._scheduler_cancel_record_path(
+                "scheduler_cancel_dispositions",
+                cluster,
+                job_id,
+            )
+            completed = self._read_optional(completed_path, SchedulerCancelPending)
+            if completed is not None:
+                if (
+                    completed.job_id != job_id
+                    or completed.cluster != cluster
+                    or not completed.complete
+                ):
+                    raise QueueConflictError(
+                        f"scheduler cancellation disposition identity mismatch: {completed_path}"
+                    )
+                _unlink_durable_path(
+                    self._scheduler_cancel_record_path(
+                        "scheduler_cancel_pending",
+                        cluster,
+                        job_id,
+                    ),
+                    missing_ok=True,
+                )
+                return None
+            pending_path = self._scheduler_cancel_record_path(
+                "scheduler_cancel_pending",
+                cluster,
+                job_id,
+            )
+            record = self._read_optional(pending_path, SchedulerCancelPending)
+            if record is None:
+                raise QueueConflictError(f"scheduler cancellation is not pending: {job_id}")
+            if record.job_id != job_id or record.cluster != cluster:
+                raise QueueConflictError(
+                    f"scheduler cancellation identity mismatch: {pending_path}"
+                )
+            if record.identity_resolution != "resolved":
+                return None
+            dispositions = list(record.dispositions)
+            index = next(
+                (
+                    position
+                    for position, item in enumerate(dispositions)
+                    if item.scheduler_job_id == scheduler_job_id
+                ),
+                None,
+            )
+            if index is None:
+                raise QueueConflictError(
+                    f"scheduler cancellation identity is not registered: {scheduler_job_id}"
+                )
+            current = dispositions[index]
+            if current.state is not SchedulerCancelDispositionState.CANCEL_REQUESTED:
+                return None
+            if current.next_attempt_at is not None and current.next_attempt_at > observed_at:
+                return None
+            if (
+                current.confirmation_claim_id is not None
+                and current.confirmation_claim_expires_at is not None
+                and current.confirmation_claim_expires_at > observed_at
+            ):
+                return None
+            if current.provider is not None and current.provider != provider:
+                raise QueueConflictError(
+                    "scheduler cancellation provider changed for "
+                    f"{scheduler_job_id}: {current.provider} != {provider}"
+                )
+            claim_id = validate_durable_record_id(f"confirmclaim_{uuid4().hex}")
+            expires_at = observed_at + timedelta(seconds=lease_seconds)
+            dispositions[index] = current.model_copy(
+                update={
+                    "provider": provider,
+                    "confirmation_claim_id": claim_id,
+                    "confirmation_claimed_at": observed_at,
+                    "confirmation_claim_expires_at": expires_at,
+                    "updated_at": observed_at,
                 }
             )
             updated = record.model_copy(
-                update={"dispositions": dispositions, "updated_at": utc_now()}
+                update={"dispositions": dispositions, "updated_at": observed_at}
             )
-            return self._persist_scheduler_cancel_record_unlocked(updated)
+            self._persist_scheduler_cancel_record_unlocked(updated)
+            return SchedulerCancelConfirmationClaim(
+                claim_id=claim_id,
+                scheduler_job_id=scheduler_job_id,
+                provider=provider,
+                confirmation_attempt=current.confirmation_attempts + 1,
+                claimed_at=observed_at,
+                expires_at=expires_at,
+            )
 
     def record_scheduler_cancel_observation(
         self,
@@ -2972,17 +4487,57 @@ class ClioCoreQueue:
         *,
         cluster: str,
         scheduler_job_id: str,
+        provider: str,
+        claim_id: str,
         phase: SchedulerPhase,
         not_found: bool,
         error: str | None,
         max_confirmation_attempts: int,
         retry_delay_seconds: float,
-    ) -> SchedulerCancelPending:
-        """Persist provider confirmation after a cancellation request was accepted."""
+        now: datetime | None = None,
+    ) -> SchedulerCancelPending | None:
+        """Persist a claimed confirmation, or ignore a stale claimant idempotently."""
         job_id = self._require_durable_record_id(job_id, field="job_id")
+        claim_id = validate_durable_record_id(claim_id)
+        observed_at = now or utc_now()
         self.initialize()
         with self._lock:
-            record = self._require_scheduler_cancel_pending_unlocked(job_id, cluster=cluster)
+            completed_path = self._scheduler_cancel_record_path(
+                "scheduler_cancel_dispositions",
+                cluster,
+                job_id,
+            )
+            completed = self._read_optional(completed_path, SchedulerCancelPending)
+            if completed is not None:
+                if (
+                    completed.job_id != job_id
+                    or completed.cluster != cluster
+                    or not completed.complete
+                ):
+                    raise QueueConflictError(
+                        f"scheduler cancellation disposition identity mismatch: {completed_path}"
+                    )
+                _unlink_durable_path(
+                    self._scheduler_cancel_record_path(
+                        "scheduler_cancel_pending",
+                        cluster,
+                        job_id,
+                    ),
+                    missing_ok=True,
+                )
+                return None
+            pending_path = self._scheduler_cancel_record_path(
+                "scheduler_cancel_pending",
+                cluster,
+                job_id,
+            )
+            record = self._read_optional(pending_path, SchedulerCancelPending)
+            if record is None:
+                raise QueueConflictError(f"scheduler cancellation is not pending: {job_id}")
+            if record.job_id != job_id or record.cluster != cluster:
+                raise QueueConflictError(
+                    f"scheduler cancellation identity mismatch: {pending_path}"
+                )
             dispositions = list(record.dispositions)
             index = next(
                 (
@@ -2997,7 +4552,15 @@ class ClioCoreQueue:
                     f"scheduler cancellation identity is not registered: {scheduler_job_id}"
                 )
             current = dispositions[index]
+            if current.confirmation_claim_id != claim_id:
+                return None
+            if current.provider is not None and current.provider != provider:
+                raise QueueConflictError(
+                    "scheduler cancellation provider changed for "
+                    f"{scheduler_job_id}: {current.provider} != {provider}"
+                )
             confirmations = current.confirmation_attempts + 1
+            bounded_error = bounded_error_detail(error)
             if phase is SchedulerPhase.CANCELED:
                 state = SchedulerCancelDispositionState.CANCELED
                 next_attempt_at = None
@@ -3013,24 +4576,28 @@ class ClioCoreQueue:
             elif confirmations >= max_confirmation_attempts:
                 state = SchedulerCancelDispositionState.EXHAUSTED
                 next_attempt_at = None
-                last_error = error or (
+                last_error = bounded_error or (
                     f"scheduler cancellation was not confirmed terminal: {phase.value}"
                 )
             else:
                 state = SchedulerCancelDispositionState.CANCEL_REQUESTED
-                next_attempt_at = utc_now() + timedelta(seconds=retry_delay_seconds)
-                last_error = error
-            dispositions[index] = current.model_copy(
-                update={
+                next_attempt_at = observed_at + timedelta(seconds=retry_delay_seconds)
+                last_error = bounded_error
+            dispositions[index] = SchedulerCancelDisposition.model_validate(
+                {
+                    **current.model_dump(),
                     "state": state,
                     "confirmation_attempts": confirmations,
                     "next_attempt_at": next_attempt_at,
                     "last_error": last_error,
-                    "updated_at": utc_now(),
-                }
+                    "confirmation_claim_id": None,
+                    "confirmation_claimed_at": None,
+                    "confirmation_claim_expires_at": None,
+                    "updated_at": observed_at,
+                },
             )
             updated = record.model_copy(
-                update={"dispositions": dispositions, "updated_at": utc_now()}
+                update={"dispositions": dispositions, "updated_at": observed_at}
             )
             return self._persist_scheduler_cancel_record_unlocked(updated)
 
@@ -3048,9 +4615,25 @@ class ClioCoreQueue:
             record = self._require_scheduler_cancel_pending_unlocked(job_id, cluster=cluster)
             if record.dispositions and not superseded:
                 return record
+            dispositions = record.dispositions
+            if superseded:
+                dispositions = [
+                    item.model_copy(
+                        update={
+                            "attempt_claim_id": None,
+                            "attempt_claimed_at": None,
+                            "attempt_claim_expires_at": None,
+                            "confirmation_claim_id": None,
+                            "confirmation_claimed_at": None,
+                            "confirmation_claim_expires_at": None,
+                        }
+                    )
+                    for item in dispositions
+                ]
             updated = record.model_copy(
                 update={
                     "identity_resolution": "superseded" if superseded else "none",
+                    "dispositions": dispositions,
                     "updated_at": utc_now(),
                 }
             )
@@ -7564,6 +9147,40 @@ class ClioCoreQueue:
         self._write(self._job_tombstone_path(tombstone.job_id), updated)
         return updated
 
+    def _retire_legacy_output_receipts_unlocked(self, tombstone: JobTombstone) -> bool:
+        """Atomically retain small migration receipts before job data enters GC trash."""
+        if not tombstone.records_trash_started:
+            raise QueueConflictError(
+                f"legacy output receipts cannot retire before GC authorization: {tombstone.job_id}"
+            )
+        job_id = self._durable_key(tombstone.job_id)
+        source = self._storage_root / "legacy_output_receipts" / job_id
+        destination = self._storage_root / "legacy_output_retired" / job_id
+        source_stat = _path_lstat(source)
+        destination_stat = _path_lstat(destination)
+        if source_stat is not None and destination_stat is not None:
+            raise QueueConflictError(
+                f"active and retired legacy output receipts both exist: {tombstone.job_id}"
+            )
+        if source_stat is None:
+            if destination_stat is not None and (
+                not stat.S_ISDIR(destination_stat.st_mode) or _record_is_reparse(destination_stat)
+            ):
+                raise QueueConflictError(
+                    f"retired legacy output receipt root is unsafe: {destination}"
+                )
+            return False
+        if not stat.S_ISDIR(source_stat.st_mode) or _record_is_reparse(source_stat):
+            raise QueueConflictError(f"active legacy output receipt root is unsafe: {source}")
+        moved = _move_gc_path(source, destination)
+        if moved:
+            self._fsync_write_directory(source.parent)
+            self._fsync_write_directory(destination.parent)
+        retired_stat = os.lstat(destination)
+        if not stat.S_ISDIR(retired_stat.st_mode) or _record_is_reparse(retired_stat):
+            raise QueueConflictError(f"retired legacy output receipt root is unsafe: {destination}")
+        return moved
+
     def _trash_job_roots_unlocked(
         self,
         tombstone: JobTombstone,
@@ -7577,6 +9194,7 @@ class ClioCoreQueue:
         trash = self._job_gc_trash_path(job_id)
         directory_families = (
             "events",
+            "legacy_output_archives",
             "tasks_by_job",
             "leases_by_job",
             "artifacts_by_job",
@@ -7611,12 +9229,16 @@ class ClioCoreQueue:
             )
         )
         actions = 0
+        if self._retire_legacy_output_receipts_unlocked(tombstone):
+            actions += 1
         for source, destination in moves:
             if actions >= limit:
                 break
             if _move_gc_path(source, destination):
                 actions += 1
-        complete = all(not source.exists() for source, _destination in moves)
+        complete = not (
+            self._storage_root / "legacy_output_receipts" / safe_job_id
+        ).exists() and all(not source.exists() for source, _destination in moves)
         return actions, complete
 
     def _trash_job_references_unlocked(
@@ -8161,6 +9783,88 @@ class ClioCoreQueue:
             return
         raise QueueConflictError(f"index migration record mismatch: {family}")
 
+    def _reconcile_index_migration_sources_unlocked(self) -> None:
+        """Rebuild every migrated index from one bounded canonical-source snapshot.
+
+        A pre-1.0 writer can add a flat record after a family's cursor has reached
+        the end of that directory.  Migration completion therefore cannot trust
+        cursors alone.  This final pass runs while the queue lock is held, validates
+        every canonical source family against the normal bounded-scan limit, and
+        idempotently projects each record into every index it owns before the
+        completion marker is written.
+        """
+        source_models: dict[str, type[BaseModel]] = {
+            "jobs": RelayJob,
+            "tasks": RelayTask,
+            "leases": Lease,
+            "artifacts": ArtifactRef,
+            "progress": ProgressRecord,
+            "endpoints": EndpointRegistration,
+            "gateway_sessions": GatewaySession,
+            "monitor_rules": MonitorRule,
+        }
+        source_records: dict[str, list[BaseModel]] = {}
+        for family, model in source_models.items():
+            records, truncated = self._scan_many(
+                self._storage_root / family,
+                model,
+                limit=MAX_BOUNDED_SCAN_RECORDS,
+            )
+            if truncated:
+                raise QueueConflictError(
+                    "index migration final reconciliation exceeded its safety bound of "
+                    f"{MAX_BOUNDED_SCAN_RECORDS} records for {family}"
+                )
+            source_records[family] = records
+
+        for family in ("jobs", "tasks", "leases", "artifacts", "progress"):
+            for record in source_records[family]:
+                self._migrate_record_unlocked(family, record)
+
+        for family in _ORDER_FAMILIES:
+            for record in source_records[family]:
+                self._migrate_order_record_unlocked(family, record)
+
+        global_order_identity_fields = {
+            "endpoints": "endpoint_id",
+            "jobs": "job_id",
+            "gateway_sessions": "session_id",
+            "monitor_rules": "rule_id",
+        }
+        for family, identity_field in global_order_identity_fields.items():
+            for record in source_records[family]:
+                record_id = getattr(record, identity_field, None)
+                if not isinstance(record_id, str) or not record_id:
+                    raise QueueConflictError(
+                        f"global-order record identity is invalid: {family}/{identity_field}"
+                    )
+                self._ensure_global_order_entry_unlocked(family, record_id)
+
+        for family in _RETENTION_INDEX_FAMILIES:
+            for record in source_records[family]:
+                self._migrate_retention_record_unlocked(family, record)
+
+        for family in _OPERATIONAL_INDEX_FAMILIES:
+            if family == "leases":
+                continue
+            for record in source_records[family]:
+                self._migrate_operational_record_unlocked(family, record)
+
+        lease_repair_intent = self._write_transition_intent_unlocked(
+            "lease_index_repair",
+            "migration-v1-final-reconcile",
+            {"limit": MAX_LIVE_LEASE_RECORDS},
+        )
+        self._apply_lease_index_repair_intent_unlocked(
+            lease_repair_intent,
+            {"limit": MAX_LIVE_LEASE_RECORDS},
+        )
+
+        for record in source_records["jobs"]:
+            if not isinstance(record, RelayJob):
+                raise QueueConflictError("job finalization record is invalid")
+            self._finalize_job_index_unlocked(record.job_id)
+
     def _migrate_retention_record_unlocked(self, family: str, record: BaseModel) -> None:
         if family == "jobs" and isinstance(record, RelayJob):
             self._initialize_job_index_unlocked(record.job_id)
@@ -8449,7 +10153,14 @@ class ClioCoreQueue:
         return filesystem_key(value, domain=domain)
 
     def _write(self, path: Path, record: BaseModel) -> None:
-        self._write_text(path, record.model_dump_json(indent=2))
+        # Scheduler cancellation records may contain the contract maximum of
+        # 1,000 dispositions.  Claim fields were added after v1.0.7, so writing
+        # six explicit nulls per legacy disposition would make a previously
+        # valid record exceed its durable family limit.  Missing optional fields
+        # retain the same Pydantic defaults; an active claim is still serialized
+        # in full because each of its values is non-null.
+        exclude_none = isinstance(record, SchedulerCancelPending)
+        self._write_text(path, record.model_dump_json(indent=2, exclude_none=exclude_none))
 
     def _write_json(self, path: Path, record: dict[str, object]) -> None:
         self._write_text(path, json.dumps(record))
@@ -8549,16 +10260,22 @@ class ClioCoreQueue:
             self._fsync_write_directory(staging)
 
     def _write_text(self, path: Path, text: str) -> None:
+        self._write_bytes(
+            path,
+            text.encode("utf-8"),
+            max_bytes=_record_max_bytes(path),
+        )
+
+    def _write_bytes(self, path: Path, payload: bytes, *, max_bytes: int) -> None:
+        """Atomically write owner-private bytes below the queue root."""
         try:
             logical_path = logical_filesystem_path(path)
             internal_path = internal_filesystem_path(logical_path, force_extended=True)
         except ValueError as error:
             raise QueueConflictError(f"queue write path is unsupported: {path}") from error
-        payload = text.encode("utf-8")
-        limit = _record_max_bytes(internal_path)
-        if len(payload) > limit:
+        if max_bytes < 1 or len(payload) > max_bytes:
             raise QueueConflictError(
-                f"{_record_family(internal_path)} record exceeds the {limit}-byte limit: "
+                f"{_record_family(internal_path)} record exceeds the {max_bytes}-byte limit: "
                 f"{logical_path}"
             )
         target_parent_stat = self._require_safe_write_directory(internal_path.parent)
@@ -8970,23 +10687,42 @@ def _scheduler_cancel_record_is_due(
         return False
     if record.identity_resolution == "pending":
         return True
-    return any(
-        item.state is SchedulerCancelDispositionState.PENDING
-        or (
-            item.state
-            in {
-                SchedulerCancelDispositionState.RETRY_WAIT,
-                SchedulerCancelDispositionState.CANCEL_REQUESTED,
-            }
-            and (item.next_attempt_at is None or item.next_attempt_at <= now)
-        )
-        for item in record.dispositions
-    )
+    return any(_scheduler_cancel_disposition_is_due(item, now) for item in record.dispositions)
+
+
+def _scheduler_cancel_disposition_is_due(
+    disposition: SchedulerCancelDisposition,
+    now: datetime,
+) -> bool:
+    """Return whether one disposition has work not held by a live attempt claim."""
+    if disposition.state in {
+        SchedulerCancelDispositionState.PENDING,
+        SchedulerCancelDispositionState.RETRY_WAIT,
+    }:
+        if (
+            disposition.attempt_claim_id is not None
+            and disposition.attempt_claim_expires_at is not None
+            and disposition.attempt_claim_expires_at > now
+        ):
+            return False
+        return disposition.next_attempt_at is None or disposition.next_attempt_at <= now
+    if disposition.state is not SchedulerCancelDispositionState.CANCEL_REQUESTED:
+        return False
+    if (
+        disposition.confirmation_claim_id is not None
+        and disposition.confirmation_claim_expires_at is not None
+        and disposition.confirmation_claim_expires_at > now
+    ):
+        return False
+    return disposition.next_attempt_at is None or disposition.next_attempt_at <= now
 
 
 def _scheduler_cancel_due_sort_key(record: SchedulerCancelPending) -> tuple[datetime, str]:
     due_times = [
-        item.next_attempt_at or record.requested_at
+        item.attempt_claim_expires_at
+        or item.confirmation_claim_expires_at
+        or item.next_attempt_at
+        or record.requested_at
         for item in record.dispositions
         if item.state
         in {

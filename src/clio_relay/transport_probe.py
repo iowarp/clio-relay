@@ -26,6 +26,7 @@ from clio_relay.relay_host import (
     render_frpc_config,
     render_frpc_visitor_config,
 )
+from clio_relay.remote_values import render_remote_shell_path, render_remote_shell_value
 from clio_relay.session_lifecycle import (
     CleanupResource,
     SessionLifecycleReport,
@@ -1195,11 +1196,11 @@ def _remote_probe_script(
     return f"""set -euo pipefail
 umask 077
 export PATH="$HOME/.local/bin:$PATH"
-export CLIO_RELAY_CORE_DIR={_shell_double_quote(definition.core_dir)}
-export CLIO_RELAY_SPOOL_DIR={_shell_double_quote(definition.spool_dir)}
-export CLIO_RELAY_JARVIS_BIN={_shell_double_quote(jarvis_bin)}
-export CLIO_RELAY_FRPC_BIN={_shell_double_quote(frpc_bin)}
-export CLIO_RELAY_AGENT_BIN={_shell_double_quote(agent_bin)}
+export CLIO_RELAY_CORE_DIR={render_remote_shell_path(definition.core_dir, field="core_dir")}
+export CLIO_RELAY_SPOOL_DIR={render_remote_shell_path(definition.spool_dir, field="spool_dir")}
+export CLIO_RELAY_JARVIS_BIN={render_remote_shell_value(jarvis_bin, field="jarvis_bin")}
+export CLIO_RELAY_FRPC_BIN={render_remote_shell_value(frpc_bin, field="frpc_bin")}
+export CLIO_RELAY_AGENT_BIN={render_remote_shell_value(agent_bin, field="agent_bin")}
 export CLIO_RELAY_AGENT_ADAPTER={_shell_single_quote(definition.agent_adapter)}
 {token_export}
 tmp="$(mktemp -d)"
@@ -1794,10 +1795,6 @@ def _process_output_message(process: ManagedProcess, fallback: str) -> str:
 
 def _shell_single_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
-
-
-def _shell_double_quote(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _cluster_agent_bin(definition: ClusterDefinition) -> str:

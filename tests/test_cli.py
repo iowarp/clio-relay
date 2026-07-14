@@ -4392,6 +4392,31 @@ def test_cli_init_creates_empty_cluster_registry(
     assert registry.clusters == {}
 
 
+def test_cli_init_threads_explicit_legacy_output_migration_authorization(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
+    observed: list[bool] = []
+
+    def capture_authorization(
+        _settings: object,
+        *,
+        migrate_legacy_output: bool = False,
+    ) -> object:
+        observed.append(migrate_legacy_output)
+        return object()
+
+    monkeypatch.setattr(cli, "storage_managed_queue", capture_authorization)
+
+    result = CliRunner().invoke(app, ["init", "--migrate-legacy-output"])
+
+    assert result.exit_code == 0
+    assert observed == [True]
+
+
 def test_cli_cluster_add_writes_explicit_definition(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

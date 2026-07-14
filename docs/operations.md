@@ -40,6 +40,33 @@ back to an unbounded scan or read a partial index. The generated systemd user un
 uses `ExecStartPre` with `--all`, so a migration error prevents the worker from
 starting and remains visible in the unit journal.
 
+### Upgrade v0.9 output records
+
+Some v0.9 workers stored a complete stdout or stderr callback twice in one
+event. Those records can be larger than the current event limit. A normal
+`clio-relay init` audits this state but does not change it; when migration is
+required, it stops with the exact operator command:
+
+```powershell
+clio-relay init --migrate-legacy-output
+```
+
+Run that command only after every process writing the same queue has stopped.
+This includes endpoint workers, `clio-relay api start`, and any retained
+`clio-relay mcp-server` process.
+It preserves the original bytes in an owner-private archive, replaces the
+oversized event with a bounded compatibility record, and writes durable
+receipts so an interrupted migration resumes safely. Managed `cluster
+bootstrap` performs this sequence itself: it stops the configured worker before
+replacing packages, refuses to continue while any installed `clio-relay`
+process still owns the same physical queue, runs a final bounded source-to-index
+reconciliation under the queue lock, and restarts the service only if it was
+previously active. New managed queues hold shared core ownership for their full
+lifetime, so later migrations cannot overlap an API, MCP server, worker, or new
+queue-backed writer. Explicit migration returns a closed inspection object,
+never an unfenced writable queue. The migration does not delete jobs, logs, or
+scheduler work.
+
 Cluster names are local labels. `ares`, `homelab`, or a later institutional target are registry entries, not hardcoded behavior.
 Use `--scheduler-provider external` when JARVIS or another deployment driver owns
 all scheduler observation and cancellation.

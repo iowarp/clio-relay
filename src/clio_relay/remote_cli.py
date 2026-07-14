@@ -18,6 +18,7 @@ import yaml
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.jarvis_mcp import JARVIS_MCP_SPACK_COMMAND_ENV
+from clio_relay.remote_values import render_remote_shell_path, render_remote_shell_value
 
 _REMOTE_COMMAND_TIMEOUT_SECONDS: ContextVar[float | None] = ContextVar(
     "clio_relay_remote_command_timeout_seconds",
@@ -154,17 +155,22 @@ def remote_env(definition: ClusterDefinition) -> str:
     jarvis_bin = definition.jarvis_bin or "$HOME/.local/bin/jarvis"
     frpc_bin = definition.frpc_bin or "$HOME/.local/bin/frpc"
     agent_bin = _cluster_agent_bin(definition)
+    rendered_core_dir = render_remote_shell_path(definition.core_dir, field="core_dir")
+    rendered_spool_dir = render_remote_shell_path(definition.spool_dir, field="spool_dir")
+    rendered_jarvis_bin = render_remote_shell_value(jarvis_bin, field="jarvis_bin")
+    rendered_frpc_bin = render_remote_shell_value(frpc_bin, field="frpc_bin")
+    rendered_agent_bin = render_remote_shell_value(agent_bin, field="agent_bin")
     exports = [
         'export PATH="$HOME/.local/bin:$PATH";',
         'export UV="$HOME/.local/bin/uv";',
         'export CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE="$HOME/.local/bin/clio-relay";',
         "export CLIO_RELAY_CLI_MODE=local;",
         f"export CLIO_RELAY_REMOTE_CLUSTER={shlex.quote(definition.name)};",
-        f"export CLIO_RELAY_CORE_DIR={_shell_double_quoted(definition.core_dir)};",
-        f"export CLIO_RELAY_SPOOL_DIR={_shell_double_quoted(definition.spool_dir)};",
-        f"export CLIO_RELAY_JARVIS_BIN={_shell_double_quoted(jarvis_bin)};",
-        f"export CLIO_RELAY_FRPC_BIN={_shell_double_quoted(frpc_bin)};",
-        f"export CLIO_RELAY_AGENT_BIN={_shell_double_quoted(agent_bin)};",
+        f"export CLIO_RELAY_CORE_DIR={rendered_core_dir};",
+        f"export CLIO_RELAY_SPOOL_DIR={rendered_spool_dir};",
+        f"export CLIO_RELAY_JARVIS_BIN={rendered_jarvis_bin};",
+        f"export CLIO_RELAY_FRPC_BIN={rendered_frpc_bin};",
+        f"export CLIO_RELAY_AGENT_BIN={rendered_agent_bin};",
         f"export CLIO_RELAY_AGENT_ADAPTER={shlex.quote(definition.agent_adapter)};",
     ]
     if definition.agent_args:
@@ -173,7 +179,8 @@ def remote_env(definition: ClusterDefinition) -> str:
         )
     if definition.spack_executable is not None:
         exports.append(
-            f"export {JARVIS_MCP_SPACK_COMMAND_ENV}={shlex.quote(definition.spack_executable)};"
+            f"export {JARVIS_MCP_SPACK_COMMAND_ENV}="
+            f"{render_remote_shell_value(definition.spack_executable, field='spack_executable')};"
         )
     for name in _VALIDATION_PROVENANCE_ENV:
         value = os.environ.get(name)
@@ -253,10 +260,6 @@ def _cluster_agent_bin(definition: ClusterDefinition) -> str:
     if definition.agent_npm_bin is not None:
         return f"$HOME/.local/bin/{definition.agent_npm_bin}"
     return "agent"
-
-
-def _shell_double_quoted(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _command_error(prefix: str, result: subprocess.CompletedProcess[bytes]) -> str:
