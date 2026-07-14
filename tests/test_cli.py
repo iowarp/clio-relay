@@ -268,6 +268,9 @@ def test_endpoint_worker_with_explicit_provider_does_not_require_remote_registry
         def run_once(self) -> None:
             captured["ran_once"] = True
 
+        def close(self) -> None:
+            captured["closed"] = True
+
     def make_worker(**kwargs: object) -> FakeWorker:
         captured.update(kwargs)
         return FakeWorker()
@@ -298,6 +301,7 @@ def test_endpoint_worker_with_explicit_provider_does_not_require_remote_registry
     assert captured["cluster"] == "homelab"
     assert captured["registered"] is True
     assert captured["ran_once"] is True
+    assert captured["closed"] is True
     provider = cast(SchedulerProvider, captured["scheduler_provider"])
     assert provider.name == "external"
 
@@ -318,6 +322,9 @@ def test_endpoint_worker_without_explicit_provider_uses_cluster_registry(
 
         def run_once(self) -> None:
             captured["ran_once"] = True
+
+        def close(self) -> None:
+            captured["closed"] = True
 
     def make_worker(**kwargs: object) -> FakeWorker:
         captured.update(kwargs)
@@ -345,6 +352,7 @@ def test_endpoint_worker_without_explicit_provider_uses_cluster_registry(
 
     assert result.exit_code == 0
     assert captured["registry_cluster"] == "configured-cluster"
+    assert captured["closed"] is True
     provider = cast(SchedulerProvider, captured["scheduler_provider"])
     assert provider.name == "slurm"
 
