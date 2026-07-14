@@ -33,6 +33,9 @@ REQUIRED_CI_JOBS: tuple[str, ...] = (
     "windows-latest / python 3.14",
 )
 GITHUB_ACTIONS_APP_ID = 15368
+MAIN_REVIEW_POLICY = "single-maintainer"
+REQUIRED_APPROVING_REVIEW_COUNT = 0
+REQUIRE_LAST_PUSH_APPROVAL = False
 REQUIRED_ENVIRONMENTS: tuple[str, ...] = (
     "live-validation",
     "pypi",
@@ -2091,6 +2094,7 @@ def _main_ruleset_protection_receipt(
         "rulesets": [normalized_rulesets[item] for item in sorted(effective_ruleset_ids)],
         "strict_status_checks": status.get("strict_required_status_checks_policy") is True,
         "required_status_checks": status_checks,
+        "review_policy": MAIN_REVIEW_POLICY,
         "required_approving_review_count": _integer(
             reviews.get("required_approving_review_count"), "required approval count"
         ),
@@ -2131,6 +2135,8 @@ def _protected_branch_names(document: object) -> list[str]:
 
 def _verify_main_protection(branch: Mapping[str, object]) -> None:
     checks = branch.get("required_status_checks")
+    approval_count = branch.get("required_approving_review_count")
+    last_push_approval = branch.get("require_last_push_approval")
     expected_checks = [
         {"context": context, "app_id": GITHUB_ACTIONS_APP_ID}
         for context in sorted(REQUIRED_CI_JOBS)
@@ -2141,12 +2147,12 @@ def _verify_main_protection(branch: Mapping[str, object]) -> None:
         and bool(branch.get("ruleset_ids")),
         "strict_status_checks": branch.get("strict_status_checks") is True,
         "required_status_checks": checks == expected_checks,
-        "required_approving_review_count": isinstance(
-            branch.get("required_approving_review_count"), int
-        )
-        and cast(int, branch["required_approving_review_count"]) >= 1,
+        "review_policy": branch.get("review_policy") == MAIN_REVIEW_POLICY,
+        "required_approving_review_count": type(approval_count) is int
+        and approval_count == REQUIRED_APPROVING_REVIEW_COUNT,
         "dismiss_stale_reviews": branch.get("dismiss_stale_reviews") is True,
-        "require_last_push_approval": branch.get("require_last_push_approval") is True,
+        "require_last_push_approval": type(last_push_approval) is bool
+        and last_push_approval == REQUIRE_LAST_PUSH_APPROVAL,
         "required_conversation_resolution": branch.get("required_conversation_resolution") is True,
         "prevents_force_pushes": branch.get("prevents_force_pushes") is True,
         "prevents_deletions": branch.get("prevents_deletions") is True,

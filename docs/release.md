@@ -468,11 +468,16 @@ those optional rules are active.
 
 Repository governance is proved from GitHub's effective rules for `main`, not
 from the legacy branch-protection administration endpoint. The effective rule
-set must enforce strict results from the exact seven GitHub Actions CI jobs, at
-least one approving review, stale-review dismissal, last-push approval,
-conversation resolution, no force pushes, and no deletion. Active tag rules
-must prevent `v*` update and deletion. Detailed ruleset responses must report
-that the current workflow token can never bypass each contributing ruleset.
+set must enforce strict results from the exact seven GitHub Actions CI jobs,
+pull-request-only changes, stale-review dismissal, conversation resolution, no
+force pushes, and no deletion. For 1.0, the receipt records the explicit
+`single-maintainer` review policy: the repository has no second eligible
+collaborator, so the ruleset must require exactly zero approvals and must not
+require an impossible last-pusher approval. Enabling independent review later
+requires a reviewed policy change rather than silently changing the live rule.
+Active tag rules must prevent `v*` update and deletion. Detailed ruleset
+responses must report that the current workflow token can never bypass each
+contributing ruleset.
 GitHub may omit the global `bypass_actors` list for the workflow token; receipts
 record whether that list was visible and never convert an omitted list into a
 false empty-list claim. Global actor policy therefore remains an administrator
