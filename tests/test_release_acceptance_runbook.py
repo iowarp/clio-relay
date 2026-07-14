@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 import tomllib
 from pathlib import Path
 from typing import cast
@@ -73,6 +75,86 @@ def test_spack_json_array_fallback_is_safe_under_powershell_strict_mode() -> Non
     assert "$Record.$Property" not in runbook
     assert "$Candidate = $Record.PSObject.Properties[$Property]" in runbook
     assert "$Value = [string]$Candidate.Value" in runbook
+
+
+def test_owned_session_helper_isolates_command_output_from_its_return_value(
+    tmp_path: Path,
+) -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    function_match = re.search(
+        r"^function Start-OwnedSession \{.*?^\}",
+        runbook,
+        flags=re.DOTALL | re.MULTILINE,
+    )
+    assert function_match is not None
+    function_source = function_match.group(0)
+    assert "--remote-api-port $RemotePort --require-token | Out-Host" in function_source
+
+    powershell = next(
+        (
+            executable
+            for name in ("pwsh", "powershell.exe", "powershell")
+            if (executable := shutil.which(name)) is not None
+        ),
+        None,
+    )
+    assert powershell is not None, "PowerShell is required to validate the release runbook"
+    script_path = tmp_path / "owned-session-output.ps1"
+    script_path.write_text(
+        "\n".join(
+            (
+                "Set-StrictMode -Version Latest",
+                "$global:LASTEXITCODE = 0",
+                "$Relay = {",
+                "  param([Parameter(ValueFromRemainingArguments=$true)] [object[]] $Command)",
+                "  $global:LASTEXITCODE = 0",
+                "  if (($Command -join ' ') -like 'session start *') {",
+                "    'session_started=owned-session'",
+                "    'api_pid=123'",
+                "    'remote_api_port=9001'",
+                "    return",
+                "  }",
+                "  if (($Command -join ' ') -like 'session status *') {",
+                '    \'{"session_generation_id":"generation-123"}\'',
+                "    return",
+                "  }",
+                '  throw "unexpected relay command: $Command"',
+                "}",
+                function_source,
+                "$Generation = @(Start-OwnedSession 'ares' 'owned-session' 9001)",
+                "[pscustomobject]@{",
+                "  count = $Generation.Count",
+                "  value = [string]$Generation[0]",
+                "} | ConvertTo-Json -Compress",
+            )
+        ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            powershell,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    output_lines = [line for line in result.stdout.splitlines() if line.strip()]
+    assert output_lines[:3] == [
+        "session_started=owned-session",
+        "api_pid=123",
+        "remote_api_port=9001",
+    ]
+    assert json.loads(output_lines[-1]) == {"count": 1, "value": "generation-123"}
 
 
 def test_release_helper_scripts_bind_direct_gray_scott_and_private_spack_state() -> None:

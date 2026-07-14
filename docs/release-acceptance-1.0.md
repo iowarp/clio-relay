@@ -848,7 +848,7 @@ valid substitute.
 function Start-OwnedSession {
   param([string] $Cluster, [string] $SessionId, [int] $RemotePort)
   & $Relay session start --cluster $Cluster --session-id $SessionId `
-    --remote-api-port $RemotePort --require-token
+    --remote-api-port $RemotePort --require-token | Out-Host
   if ($LASTEXITCODE -ne 0) { throw "session start failed: $SessionId" }
   $Status = (& $Relay session status --cluster $Cluster --session-id $SessionId | Out-String) | ConvertFrom-Json
   if (-not $Status.session_generation_id) { throw "session generation is absent" }
