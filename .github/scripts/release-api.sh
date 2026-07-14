@@ -14,6 +14,21 @@ relay_release_resolve() {
     "$@"
 }
 
+relay_release_resolve_eventually() {
+  local tag_name="$1" draft_state="$2" output_path="$3" attempt
+  for attempt in $(seq 1 10); do
+    relay_release_resolve "$tag_name" "$draft_state" "$output_path" --allow-absent
+    if jq -e '. != null' "$output_path" >/dev/null; then
+      return 0
+    fi
+    if [ "$attempt" -eq 10 ]; then
+      echo "draft release did not become visible after bounded retries" >&2
+      return 1
+    fi
+    sleep 3
+  done
+}
+
 relay_release_complete_assets() {
   local release_json="$1" output_path="$2"
   local release_id page_one page_two refreshed

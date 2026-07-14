@@ -307,8 +307,9 @@ jobs:
               --title "$TAG_NAME" \
               --notes "Immutable candidate wheel SHA-256: $wheel_sha. Live validation and PyPI promotion are pending."
           fi
+          relay_release_resolve_eventually "$TAG_NAME" true \
+            "$RUNNER_TEMP/release-after-create.json"
           "${authority[@]}" --release-state present --draft true
-          relay_release_resolve "$TAG_NAME" true "$RUNNER_TEMP/release-after-create.json"
 
       - name: revalidate protected main immediately before candidate attestation
         env:

@@ -55,7 +55,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.0.0"
+$Version = "1.0.1"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }
@@ -212,10 +212,10 @@ if ($Stage -eq "candidate") {
   $WheelName = $Wheels[0].Name
   $ManifestLines = @(
     Get-Content -LiteralPath $Manifests[0].FullName |
-      Where-Object { $_ -match "^[0-9A-Fa-f]{64}[ *]$([Regex]::Escape($WheelName))$" }
+      Where-Object { $_ -match "^[0-9A-Fa-f]{64} [ *]$([Regex]::Escape($WheelName))$" }
   )
   if ($ManifestLines.Count -ne 1) { throw "candidate manifest entry is missing or ambiguous" }
-  if ($ManifestLines[0] -notmatch '^([0-9A-Fa-f]{64})[ *](.+)$' -or $Matches[2] -ne $WheelName) {
+  if ($ManifestLines[0] -notmatch '^([0-9A-Fa-f]{64}) [ *](.+)$' -or $Matches[2] -ne $WheelName) {
     throw "candidate manifest entry is malformed"
   }
   $ExpectedWheelSha256 = $Matches[1].ToLowerInvariant()

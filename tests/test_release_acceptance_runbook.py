@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import tomllib
 from pathlib import Path
 from typing import cast
 
@@ -29,6 +31,36 @@ def _matrix_reports() -> list[dict[str, object]]:
     )
     assert document["report_count_per_stage"] == 17
     return cast(list[dict[str, object]], document["reports"])
+
+
+def test_release_identity_is_consistent_across_package_policy_matrix_and_runbook() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    policy = cast(dict[str, object], yaml.safe_load(POLICY.read_text(encoding="utf-8")))
+    matrix = cast(
+        dict[str, object],
+        json.loads((FIXTURES / "report-matrix-1.0.json").read_text(encoding="utf-8")),
+    )
+    version = cast(dict[str, object], project["project"])["version"]
+
+    assert policy["release_version"] == version
+    assert matrix["release_version"] == version
+    assert f'$Version = "{version}"' in RUNBOOK.read_text(encoding="utf-8")
+
+
+def test_candidate_manifest_parser_accepts_the_exact_gnu_checksum_separator() -> None:
+    digest = "a" * 64
+    wheel_name = "clio_relay-1.0.1-py3-none-any.whl"
+    selector = re.compile(rf"^[0-9A-Fa-f]{{64}} [ *]{re.escape(wheel_name)}$")
+    parser = re.compile(r"^([0-9A-Fa-f]{64}) [ *](.+)$")
+
+    for mode in ("*", " "):
+        line = f"{digest} {mode}{wheel_name}"
+        assert selector.fullmatch(line) is not None
+        match = parser.fullmatch(line)
+        assert match is not None
+        assert match.groups() == (digest, wheel_name)
+
+    assert selector.fullmatch(f"{digest}*{wheel_name}") is None
 
 
 def test_release_helper_scripts_bind_direct_gray_scott_and_private_spack_state() -> None:
@@ -314,6 +346,8 @@ def test_release_acceptance_runbook_binds_production_specifics_without_secrets()
     assert "gh release download $Tag --repo $GitHubRepo" in text
     assert "gh api --hostname github.com user" in text
     assert "$ManifestLines.Count -ne 1" in text
+    assert "^[0-9A-Fa-f]{64} [ *]$([Regex]::Escape($WheelName))$" in text
+    assert "^([0-9A-Fa-f]{64}) [ *](.+)$" in text
     assert "$Observed -ne $ExpectedWheelSha256" in text
     assert "gh attestation verify $Wheel --hostname github.com --repo iowarp/clio-relay" in text
     assert "$CheckoutCommit -ne $TagCommit" in text

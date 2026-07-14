@@ -407,6 +407,7 @@ def _report(
     launcher: str = "uv-tool",
     released_artifact: bool = True,
     artifact_identity_verified: bool = True,
+    version: str = "1.0.0",
 ) -> LiveValidationReport:
     now = _timestamp()
     absolute_root = Path(Path.cwd().anchor) / "clio-relay-test"
@@ -423,18 +424,18 @@ def _report(
             invocation_id="run-20260710-0001",
         ),
         software=SoftwareIdentity(
-            version="1.0.0",
+            version=version,
             commit="a" * 40,
-            tag="v1.0.0",
+            tag=f"v{version}",
             dirty=False,
         ),
         install_source=InstallSource(
             kind=kind,
             detected_kind=kind,
-            reference="clio-relay==1.0.0",
+            reference=f"clio-relay=={version}",
             launcher=launcher,
             package_path="/tmp/uv/archive/clio_relay",
-            distribution_version="1.0.0",
+            distribution_version=version,
             artifact_sha256="b" * 64,
             artifact_identity_verified=artifact_identity_verified,
             released_artifact=released_artifact,
@@ -1410,7 +1411,7 @@ def test_actual_release_policy_combines_bootstrap_with_worker_by_physical_target
             )
         )
 
-    bootstrap = _report()
+    bootstrap = _report(version=policy.release_version)
     bootstrap.report_id = "validation_bootstrap"
     bootstrap.scenario = "cluster-bootstrap"
     bootstrap.cluster = "ares"
@@ -1437,7 +1438,7 @@ def test_actual_release_policy_combines_bootstrap_with_worker_by_physical_target
     ]
     attach_target(bootstrap)
 
-    worker = _report()
+    worker = _report(version=policy.release_version)
     worker.report_id = "validation_worker"
     worker.scenario = "cluster-bootstrap"
     worker.cluster = "ares"
@@ -1611,7 +1612,7 @@ def test_default_report_path_sanitizes_cluster_name(tmp_path: Path) -> None:
 def test_repository_release_policy_is_machine_readable() -> None:
     policy = load_release_gate_policy(Path("docs/release-gate-1.0.yaml"))
 
-    assert policy.release_version == "1.0.0"
+    assert policy.release_version == "1.0.1"
     assert policy.acceptance_matrix is not None
     assert policy.acceptance_matrix["report_count_per_stage"] == 17
     assert policy.acceptance_matrix["matrix_sha256"] == policy.acceptance_matrix_sha256
@@ -1857,7 +1858,7 @@ def test_explicit_cancel_release_gate_requires_preserved_unowned_scheduler_senti
 
 def test_repository_policy_target_digests_match_canonical_live_pins() -> None:
     policy = load_release_gate_policy(Path("docs/release-gate-1.0.yaml"))
-    ares = _report()
+    ares = _report(version=policy.release_version)
     ares.cluster = "ares"
     _attach_verified_target_identity(
         ares,
@@ -1877,7 +1878,7 @@ def test_repository_policy_target_digests_match_canonical_live_pins() -> None:
         }
     )
 
-    homelab = _report()
+    homelab = _report(version=policy.release_version)
     homelab.report_id = "validation_homelab"
     homelab.cluster = "homelab"
     _attach_verified_target_identity(
@@ -1930,7 +1931,7 @@ def test_native_application_progress_gate_rejects_legacy_adapter_only_evidence()
             }
         )
     )
-    report = _report()
+    report = _report(version=policy.release_version)
     report.scenario = "remote-mcp"
     report.cluster = "ares"
     now = _timestamp()
@@ -2359,7 +2360,7 @@ def test_spack_producer_evidence_satisfies_real_policy_and_rejects_mutations() -
         item for item in requirement.required_resources if item.kind == "relay_worker"
     )
     reports: list[LiveValidationReport] = []
-    trusted = _report()
+    trusted = _report(version=policy.release_version)
     for index, (tool, arguments, expectation_fields, structured) in enumerate(cases, start=1):
         expectation = RemoteMcpStructuredResultExpectation.model_validate(
             {
@@ -2475,6 +2476,8 @@ def test_spack_producer_evidence_satisfies_real_policy_and_rejects_mutations() -
 
 def _fresh_spack_transition_report(
     requirement: ReleaseGateRequirement,
+    *,
+    release_version: str,
 ) -> LiveValidationReport:
     """Build representative canonical evidence for the typed fresh-install gate."""
     requested_spec = "libsigsegv@2.14"
@@ -2637,7 +2640,7 @@ def _fresh_spack_transition_report(
             "phases_match": True,
         },
     }
-    report = _report()
+    report = _report(version=release_version)
     report.report_id = "validation_ares_spack_fresh_install"
     report.cluster = "ares"
     report.checks = [
@@ -2917,7 +2920,10 @@ def test_fresh_spack_transition_policy_cross_binds_dynamic_evidence(case: str) -
             "targets": {},
         }
     )
-    report = _fresh_spack_transition_report(requirement)
+    report = _fresh_spack_transition_report(
+        requirement,
+        release_version=policy.release_version,
+    )
 
     accepted = _evaluate(policy, [report])
     assert accepted.passed is True
@@ -3165,7 +3171,7 @@ def test_gateway_start_and_stop_reports_combine_for_release_gate() -> None:
         invocation_id: str,
         include_worker: bool,
     ) -> LiveValidationReport:
-        evidence = _report()
+        evidence = _report(version=policy.release_version)
         evidence.report_id = report_id
         evidence.scenario = canonical.scenario
         evidence.cluster = canonical.cluster
