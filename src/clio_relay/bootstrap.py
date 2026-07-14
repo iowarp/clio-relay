@@ -57,6 +57,7 @@ _WORKER_WRITER_PROOF_PYTHON = r'''from __future__ import annotations
 import errno
 import json
 import os
+import posixpath
 import socket
 import stat
 import sys
@@ -164,12 +165,24 @@ def target_home(process_environment: dict[str, str], uid: int | None) -> str:
         fail(f"cannot resolve the inspected process home directory: {error}")
 
 
+def path_is_absolute(value: str) -> bool:
+    """Recognize target Linux roots even when the proof is tested on Windows."""
+    return value.startswith("/") or os.path.isabs(value)
+
+
+def path_join(base: str, *parts: str) -> str:
+    """Join target Linux paths without inheriting a Windows test host's flavor."""
+    if base.startswith("/"):
+        return posixpath.join(base, *parts)
+    return os.path.join(base, *parts)
+
+
 def expand_user(value: str, home: str) -> str:
     """Expand a user path with the inspected process's HOME semantics."""
     if value == "~":
         return home
     if value.startswith("~/"):
-        return os.path.join(home, value[2:])
+        return path_join(home, value[2:])
     if not value.startswith("~"):
         return value
     user, separator, suffix = value[1:].partition("/")
@@ -179,15 +192,20 @@ def expand_user(value: str, home: str) -> str:
         user_home = pwd.getpwnam(user).pw_dir
     except (ImportError, KeyError, OSError) as error:
         fail(f"cannot expand inspected core directory {value!r}: {error}")
-    return os.path.join(user_home, suffix) if separator else user_home
+    return path_join(user_home, suffix) if separator else user_home
 
 
 def canonical(value: str, *, cwd: str | None = None) -> str:
     """Return a non-strict canonical absolute path."""
-    if not os.path.isabs(value):
+    if not path_is_absolute(value):
         if cwd is None:
             fail(f"relative path {value!r} has no inspected working directory")
-        value = os.path.join(cwd, value)
+        value = path_join(cwd, value)
+    if os.name == "nt" and value.startswith("/"):
+        # The embedded proof runs on Linux in production.  Python 3.13 changed
+        # ntpath.isabs('/core') to false, so use the target path flavor when
+        # exercising the exact source in the Windows CI matrix.
+        return posixpath.normpath(value)
     return os.path.realpath(os.path.abspath(value))
 
 
@@ -201,8 +219,8 @@ def process_core_candidates(
     configured = process_environment.get("CLIO_RELAY_CORE_DIR")
     if configured:
         expanded = expand_user(configured, home)
-        cwd = None if os.path.isabs(expanded) else process_cwd(process)
-        if cwd is None and not os.path.isabs(expanded):
+        cwd = None if path_is_absolute(expanded) else process_cwd(process)
+        if cwd is None and not path_is_absolute(expanded):
             return None
         return {canonical(expanded, cwd=cwd)}
 
@@ -213,8 +231,8 @@ def process_core_candidates(
     # its cwd-relative compatibility directory.  /proc cannot prove which one
     # existed at process startup, so both are safety-relevant candidates.
     return {
-        canonical(os.path.join(home, ".local", "share", "clio-relay", "core")),
-        canonical(os.path.join(".clio-relay", "core"), cwd=cwd),
+        canonical(path_join(home, ".local", "share", "clio-relay", "core")),
+        canonical(path_join(".clio-relay", "core"), cwd=cwd),
     }
 
 
