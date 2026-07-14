@@ -48,6 +48,40 @@ if [ ! -x "$spack" ]; then
   echo "Spack executable is absent: $spack" >&2
   exit 66
 fi
+
+adios_prefix=""
+if ! adios_prefix="$("$spack" location -i "/$adios_hash")"; then
+  echo "selected ADIOS2 prefix lookup failed" >&2
+  exit 66
+fi
+readonly adios_prefix
+require_absolute_path "ADIOS2 prefix" "$adios_prefix"
+if [ ! -d "$adios_prefix" ]; then
+  echo "ADIOS2 prefix is absent: $adios_prefix" >&2
+  exit 66
+fi
+
+declare -a adios_configs=()
+mapfile -d '' -t adios_configs < <(
+  find "$adios_prefix" -type f \
+    \( -name ADIOS2Config.cmake -o -name adios2-config.cmake \) -print0
+)
+readonly find_pid="$!"
+if ! wait "$find_pid"; then
+  echo "ADIOS2 CMake package discovery failed" >&2
+  exit 74
+fi
+if [ "${#adios_configs[@]}" -ne 1 ]; then
+  echo "selected ADIOS2 prefix must contain exactly one CMake package config" >&2
+  exit 65
+fi
+readonly adios2_dir="$(dirname -- "${adios_configs[0]}")"
+require_absolute_path "ADIOS2 CMake package directory" "$adios2_dir"
+if [[ "$adios2_dir/" != "$adios_prefix/"* ]]; then
+  echo "ADIOS2 CMake package directory escaped the selected prefix" >&2
+  exit 65
+fi
+
 for path in "$source_root" "$build_root" "$install_root"; do
   if [ -e "$path" ]; then
     echo "refusing to reuse acceptance path: $path" >&2
@@ -68,6 +102,7 @@ test "$(git -C "$source_root" rev-parse HEAD:external/iowarp-gray-scott)" = \
   cmake -S "$source_root/external/iowarp-gray-scott" -B "$build_root" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$install_root" \
+    -DADIOS2_DIR="$adios2_dir" \
     -DENABLE_RPATH=ON \
     -DENABLE_VTK=OFF
 "$spack" build-env "/$adios_hash" -- cmake --build "$build_root" --parallel 4

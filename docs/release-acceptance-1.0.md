@@ -55,7 +55,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.0.4"
+$Version = "1.0.5"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }
@@ -432,7 +432,11 @@ latest reviewed `clio-core` development commit that contains the direct
 `external/iowarp-gray-scott` application. It is not the Coeus adapter and it
 must not resolve Hermes or `adios2-coeus`. The source commit, embedded
 Gray-Scott tree, exact plain-ADIOS2 DAG hash, build directory, and install
-directory are all bound below:
+directory are all bound below. The build helper resolves the selected hash's
+own install prefix, requires exactly one ADIOS2 CMake package configuration
+under that prefix, and passes its directory explicitly as `ADIOS2_DIR`;
+`spack build-env` alone exposes dependencies but not the selected package's own
+installation prefix.
 
 Before invoking this block, set `CLIO_RELAY_ACCEPTANCE_ADIOS_HASH` to the
 reviewed 32-character DAG hash of the plain `adios2` installation selected for
