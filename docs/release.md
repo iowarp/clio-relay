@@ -83,7 +83,7 @@ for the tested Git tree. After the queued PR is merged, create and push an exact
 matching tag at protected `main`:
 
 ```powershell
-$Tag = "v1.0.11"
+$Tag = "v1.1.0"
 git fetch origin main
 $ReviewedMainSha = (git rev-parse refs/remotes/origin/main).Trim()
 if ((git rev-parse HEAD).Trim() -ne $ReviewedMainSha) {
@@ -170,7 +170,7 @@ Download the draft wheel and manifest, verify both the digest and the signed
 protected-main staging provenance, and compute the digest locally:
 
 ```powershell
-$Tag = "v1.0.11"
+$Tag = "v1.1.0"
 New-Item -ItemType Directory -Force .clio-relay\candidate | Out-Null
 gh release download $Tag --pattern "*.whl" --pattern "SHA256SUMS" `
   --dir .clio-relay\candidate
