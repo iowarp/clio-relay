@@ -8,7 +8,7 @@ import importlib
 import os
 import stat
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +40,32 @@ class _FcntlModule(Protocol):
 
     def flock(self, fd: int, operation: int) -> Any:
         """Apply an advisory lock operation to ``fd``."""
+
+
+class _WindowsFunction(Protocol):
+    """Typed callable surface for one dynamically loaded Win32 function."""
+
+    argtypes: list[object]
+    restype: object
+
+    def __call__(self, *args: object) -> int:
+        """Invoke the configured Win32 function."""
+        ...
+
+
+class _WindowsKernel32(Protocol):
+    """Win32 lock functions loaded only on Windows."""
+
+    LockFileEx: _WindowsFunction
+    UnlockFileEx: _WindowsFunction
+
+
+def _runtime_attribute(module: object, name: str) -> object:
+    """Read an OS-specific module attribute without platform-stub narrowing."""
+    try:
+        return vars(module)[name]
+    except KeyError as exc:
+        raise RuntimeError(f"platform runtime attribute is unavailable: {name}") from exc
 
 
 class _WindowsOverlapped(ctypes.Structure):
@@ -297,7 +323,18 @@ def _acquire_windows_lock(
     import msvcrt
     from ctypes import wintypes
 
-    win_dll: Any = ctypes.WinDLL  # pyright: ignore[reportAttributeAccessIssue]
+    win_dll = cast(
+        Callable[..., _WindowsKernel32],
+        _runtime_attribute(ctypes, "WinDLL"),
+    )
+    get_last_error = cast(
+        Callable[[], int],
+        _runtime_attribute(ctypes, "get_last_error"),
+    )
+    get_osfhandle = cast(
+        Callable[[int], int],
+        _runtime_attribute(msvcrt, "get_osfhandle"),
+    )
     kernel32 = win_dll("kernel32", use_last_error=True)
     lock_file_ex = kernel32.LockFileEx
     lock_file_ex.argtypes = [
@@ -309,12 +346,12 @@ def _acquire_windows_lock(
         ctypes.POINTER(_WindowsOverlapped),
     ]
     lock_file_ex.restype = wintypes.BOOL
-    handle = wintypes.HANDLE(msvcrt.get_osfhandle(fd))
+    handle = wintypes.HANDLE(get_osfhandle(fd))
     overlapped = _WindowsOverlapped()
     exclusive_flag = 0x00000002 if exclusive else 0
     if timeout_seconds is None:
         if not lock_file_ex(handle, exclusive_flag, 0, 1, 0, ctypes.byref(overlapped)):
-            error = ctypes.get_last_error()
+            error = get_last_error()
             raise ConfigurationError(f"cannot acquire worker lifetime lock: WinError {error}")
         return overlapped
 
@@ -323,7 +360,7 @@ def _acquire_windows_lock(
         flags = exclusive_flag | 0x00000001
         if lock_file_ex(handle, flags, 0, 1, 0, ctypes.byref(overlapped)):
             return overlapped
-        error = ctypes.get_last_error()
+        error = get_last_error()
         if error != 33:
             raise ConfigurationError(f"cannot acquire worker lifetime lock: WinError {error}")
         if time.monotonic() >= deadline:
@@ -337,13 +374,24 @@ def _release_windows_lock(fd: int, overlapped: _WindowsOverlapped | None) -> Non
     import msvcrt
     from ctypes import wintypes
 
-    win_dll: Any = ctypes.WinDLL  # pyright: ignore[reportAttributeAccessIssue]
+    win_dll = cast(
+        Callable[..., _WindowsKernel32],
+        _runtime_attribute(ctypes, "WinDLL"),
+    )
+    get_last_error = cast(
+        Callable[[], int],
+        _runtime_attribute(ctypes, "get_last_error"),
+    )
+    get_osfhandle = cast(
+        Callable[[int], int],
+        _runtime_attribute(msvcrt, "get_osfhandle"),
+    )
     kernel32 = win_dll("kernel32", use_last_error=True)
     unlock_file_ex = kernel32.UnlockFileEx
     unlock_file_ex.restype = wintypes.BOOL
-    handle = wintypes.HANDLE(msvcrt.get_osfhandle(fd))
+    handle = wintypes.HANDLE(get_osfhandle(fd))
     if not unlock_file_ex(handle, 0, 1, 0, ctypes.byref(overlapped)):
-        error = ctypes.get_last_error()
+        error = get_last_error()
         raise OSError(error, f"cannot release worker lifetime lock: WinError {error}")
 
 

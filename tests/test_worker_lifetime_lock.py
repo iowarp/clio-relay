@@ -458,10 +458,10 @@ def test_external_guard_evidence_validates_real_exclusive_handoff(
         return
     core_dir = tmp_path / "core"
     guard = WorkerLifetimeLock(core_dir, mode="exclusive").acquire()
-    owner_descriptor = guard._fd  # noqa: SLF001
+    owner_descriptor = guard._fd  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     assert owner_descriptor is not None
     inherited_descriptor = os.dup(owner_descriptor)
-    guard._fd = None  # noqa: SLF001
+    guard._fd = None  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     os.close(owner_descriptor)
     monkeypatch.setenv(WORKER_LIFETIME_GUARD_FD_ENV, str(inherited_descriptor))
     try:
