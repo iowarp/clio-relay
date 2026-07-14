@@ -139,6 +139,9 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
         'python -m pip install --isolated --index-url https://pypi.org/simple "$JARVIS_CD_WHEEL"'
     ) in script
     assert "JARVIS-CD was not installed from the verified release wheel" in script
+    assert "from clio_relay.installation import verify_distribution_file_source" in script
+    assert "verify_distribution_file_source(" in script
+    assert 'direct_url.get("url") != wheel.as_uri()' not in script
     assert 'verify_jarvis_cd_distribution "$RELAY_PROVIDER_PYTHON"' in script
     assert 'verify_jarvis_cd_distribution "$JARVIS_VENV/bin/python"' in script
     assert 'entry_point.group == "clio_relay.package_progress_adapters"' not in script
