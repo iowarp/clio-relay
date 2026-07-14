@@ -4,6 +4,7 @@ import json
 import subprocess
 from base64 import b64encode
 from pathlib import Path
+from typing import cast
 
 import pytest
 from pytest import MonkeyPatch
@@ -15,10 +16,59 @@ from clio_relay.live_acceptance import (
     LiveAcceptanceOptions,
     _assert_progress_adapter,  # pyright: ignore[reportPrivateUsage]
     _expected_progress_adapter,  # pyright: ignore[reportPrivateUsage]
+    _expected_progress_package,  # pyright: ignore[reportPrivateUsage]
     _find_agent_child_job,  # pyright: ignore[reportPrivateUsage]
     _verify_live_package_progress,  # pyright: ignore[reportPrivateUsage]
+    _verify_runtime_metadata_artifact,  # pyright: ignore[reportPrivateUsage]
     run_live_acceptance,
 )
+from clio_relay.validation_report import (
+    TransportCleanupResourceEvidence,
+    TransportProbeEvidence,
+    load_validation_report,
+    transport_probe_evidence_line,
+)
+
+
+def _collection_page(record_key: str, records: list[dict[str, object]]) -> dict[str, object]:
+    """Render one complete exact-family CLI page for remote acceptance fakes."""
+    return {
+        record_key: records,
+        "cursor": 1,
+        "limit": 500,
+        "next_cursor": None,
+        "total": len(records),
+    }
+
+
+def _provider_progress_record(
+    *,
+    job_id: str = "job_test",
+    acceptance_validated: bool = True,
+    prediction_status: str = "observed",
+) -> dict[str, object]:
+    """Build one durable worker/provider attestation for acceptance tests."""
+    return {
+        "current": 3.0,
+        "metadata": {
+            "adapter": "site-progress",
+            "source": "jarvis_package",
+            "package_name": "site.simulation",
+            "package_version": "test-plugin",
+            "run_id": job_id,
+            "execution_id": job_id,
+            "provider_entry_point": "site-progress",
+            "provider_entry_point_value": ("tests.plugin_fakes:site_progress_adapter_from_package"),
+            "provider_distribution": "site-progress-plugin",
+            "provider_distribution_version": "3.4.5",
+            "provider_source_authority": "jarvis_stdout_fallback",
+            "application_profile": "site-stack",
+            "provider_validated": True,
+            "acceptance_validated": acceptance_validated,
+            "prediction_status": prediction_status,
+            "eta_seconds": 1.0,
+        },
+    }
 
 
 def test_live_acceptance_requires_configured_workload() -> None:
@@ -31,22 +81,153 @@ def test_live_acceptance_requires_configured_workload() -> None:
         )
 
 
+def test_live_acceptance_reports_structured_runtime_metadata() -> None:
+    runtime_metadata = {
+        "schema_version": "clio-relay.jarvis-runtime.v1",
+        "source": "jarvis_mcp",
+        "scheduler_provider": "slurm",
+        "scheduler_job_id": "21813",
+        "field_sources": {
+            "scheduler_provider": "jarvis_mcp",
+            "scheduler_job_id": "jarvis_mcp",
+        },
+    }
+
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        assert "read-artifact artifact_runtime" in command[-1]
+        return _completed(
+            command,
+            json.dumps(
+                {
+                    "encoding": "base64",
+                    "data": b64encode(json.dumps(runtime_metadata).encode()).decode(),
+                }
+            ),
+        )
+
+    lines: list[str] = []
+    _verify_runtime_metadata_artifact(
+        ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+        [{"artifact_id": "artifact_runtime", "kind": "runtime_metadata"}],
+        line_prefix="acceptance",
+        lines=lines,
+        runner=fake_runner,
+    )
+
+    assert "acceptance.runtime_metadata_artifact=artifact_runtime" in lines
+    assert "acceptance.runtime_metadata_source=jarvis_mcp" in lines
+    assert "acceptance.structured_runtime_metadata=ok" in lines
+    assert "acceptance.runtime_scheduler_provider=slurm" in lines
+    assert "acceptance.runtime_scheduler_job_id=21813" in lines
+    assert "acceptance.runtime_scheduler_job_id_source=jarvis_mcp" in lines
+    assert "acceptance.structured_runtime_scheduler_identity=ok" in lines
+
+
+def test_live_acceptance_does_not_mark_legacy_metadata_as_structured() -> None:
+    runtime_metadata = {
+        "schema_version": "clio-relay.jarvis-runtime.v1",
+        "source": "legacy_stdout",
+        "scheduler_provider": "slurm",
+        "scheduler_job_id": "21813",
+        "field_sources": {"scheduler_job_id": "legacy_stdout"},
+    }
+
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        return _completed(
+            command,
+            json.dumps(
+                {
+                    "encoding": "base64",
+                    "data": b64encode(json.dumps(runtime_metadata).encode()).decode(),
+                }
+            ),
+        )
+
+    lines: list[str] = []
+    _verify_runtime_metadata_artifact(
+        ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+        [{"artifact_id": "artifact_runtime", "kind": "runtime_metadata"}],
+        line_prefix="acceptance",
+        lines=lines,
+        runner=fake_runner,
+    )
+
+    assert "acceptance.structured_runtime_metadata=ok" not in lines
+    assert "acceptance.structured_runtime_scheduler_identity=ok" not in lines
+    assert "runtime_metadata.compatibility=acceptance:legacy_fallback" in lines
+
+
+def test_live_acceptance_does_not_mark_untrusted_metadata_as_structured() -> None:
+    runtime_metadata = {
+        "schema_version": "clio-relay.jarvis-runtime.v1",
+        "source": "untrusted_compatibility",
+        "scheduler_provider": "slurm",
+        "scheduler_job_id": "21813",
+        "field_sources": {
+            "scheduler_provider": "untrusted_compatibility",
+            "scheduler_job_id": "untrusted_compatibility",
+        },
+    }
+
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        return _completed(
+            command,
+            json.dumps(
+                {
+                    "encoding": "base64",
+                    "data": b64encode(json.dumps(runtime_metadata).encode()).decode(),
+                }
+            ),
+        )
+
+    lines: list[str] = []
+    structured = _verify_runtime_metadata_artifact(
+        ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+        [{"artifact_id": "artifact_runtime", "kind": "runtime_metadata"}],
+        line_prefix="acceptance",
+        lines=lines,
+        runner=fake_runner,
+    )
+
+    assert structured is False
+    assert "acceptance.structured_runtime_metadata=ok" not in lines
+    assert "acceptance.structured_runtime_scheduler_identity=ok" not in lines
+    assert "runtime_metadata.compatibility=acceptance:untrusted_compatibility" in lines
+
+
 def test_live_acceptance_stages_files_and_strips_relay_extension(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    input_script = tmp_path / "in.lj"
-    input_script.write_text("run 10\n", encoding="utf-8")
+    input_script = tmp_path / "input.dat"
+    input_script.write_text("site input\n", encoding="utf-8")
     pipeline = tmp_path / "pipeline.yaml"
     pipeline.write_text(
-        "name: lammps\n"
+        "name: external\n"
         "x_clio_relay:\n"
         "  stage_files:\n"
-        "  - local_path: in.lj\n"
-        "    remote_path: .local/share/clio-relay/live-tests/{run_id}/in.lj\n"
+        "  - local_path: input.dat\n"
+        "    remote_path: .local/share/clio-relay/live-tests/{run_id}/input.dat\n"
         "pkgs:\n"
-        "- pkg_type: builtin.lammps\n"
-        "  script: .local/share/clio-relay/live-tests/{run_id}/in.lj\n",
+        "- pkg_type: site.simulation\n"
+        "  input: .local/share/clio-relay/live-tests/{run_id}/input.dat\n"
+        "  progress:\n"
+        "    adapter: site-progress\n",
         encoding="utf-8",
     )
     uploaded: list[tuple[str, bytes | None]] = []
@@ -68,8 +249,8 @@ def test_live_acceptance_stages_files_and_strips_relay_extension(
             return _completed(command, "")
         if "mkdir -p" in script:
             return _completed(command, "")
-        if "builtin.builtin.lammps.pkg" in script:
-            return _completed(command, "/opt/jarvis/builtin/builtin/lammps/pkg.py\n")
+        if "site_simulation.py" in script:
+            return _completed(command, "/opt/site/plugins/site_simulation.py\n")
         if "job submit" in script:
             return _completed(command, "job_abc\n")
         if "job wait" in script:
@@ -110,25 +291,7 @@ def test_live_acceptance_stages_files_and_strips_relay_extension(
         if "job progress" in script:
             return _completed(
                 command,
-                json.dumps(
-                    [
-                        {
-                            "metadata": {
-                                "source": "jarvis_package",
-                                "adapter": "lammps",
-                                "package_name": "builtin.lammps",
-                                "package_version": "builtin",
-                                "run_id": "job_abc",
-                                "execution_id": "job_abc",
-                                "timing_source": "lammps_thermo_cpu",
-                                "prediction_status": "observed_lammps_timing",
-                                "prediction_method": "trimmed_mean_step_time_after_warmup",
-                                "rate_samples": 2,
-                                "eta_seconds": 1.0,
-                            }
-                        }
-                    ]
-                ),
+                json.dumps([_provider_progress_record(job_id="job_abc")]),
             )
         raise AssertionError(f"unexpected command: {command}")
 
@@ -139,89 +302,144 @@ def test_live_acceptance_stages_files_and_strips_relay_extension(
             cluster="test-cluster",
             definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
             jarvis_yaml=pipeline,
+            report_path=tmp_path / "live-report.json",
         ),
         runner=fake_runner,
     )
 
-    assert (
-        "acceptance.jarvis_package=builtin.lammps:/opt/jarvis/builtin/builtin/lammps/pkg.py"
-        in lines
+    assert "acceptance.application_boundary=package_progress_provider" in lines
+    assert "acceptance.package_adapter=site-progress" in lines
+    assert "acceptance.package_owner=site.simulation" in lines
+    assert "package-progress.provider=verified" in lines
+    assert "package-progress.acceptance=verified" in lines
+    report = load_validation_report(tmp_path / "live-report.json")
+    assert {check.check_id for check in report.checks}.issuperset(
+        {"package-progress.provider", "package-progress.acceptance"}
     )
-    assert any(item[1] is not None and b"run 10" in item[1] for item in uploaded)
+    provider_resource = next(
+        resource for resource in report.resources if resource.kind == "package_progress_provider"
+    )
+    assert provider_resource.state == "verified"
+    assert provider_resource.metadata["provider_validated"] is True
+    assert provider_resource.metadata["acceptance_validated"] is True
+    assert any(item[1] is not None and b"site input" in item[1] for item in uploaded)
     pipeline_upload = uploaded[-1][1]
     assert pipeline_upload is not None
     assert b"x_clio_relay" not in pipeline_upload
-    assert b"pkg_type: builtin.lammps" in pipeline_upload
+    assert b"pkg_type: site.simulation" in pipeline_upload
     assert b"{run_id}" not in pipeline_upload
 
 
-def test_live_acceptance_requires_trusted_package_progress() -> None:
-    pipeline_yaml = "name: lammps\npkgs:\n- pkg_type: builtin.lammps\n"
+def test_live_acceptance_requires_worker_provider_attestation_without_local_plugin() -> None:
+    pipeline_yaml = (
+        "name: external\n"
+        "pkgs:\n"
+        "- pkg_type: site.simulation\n"
+        "  progress:\n"
+        "    adapter: site-progress\n"
+    )
 
-    assert _expected_progress_adapter(pipeline_yaml) == "lammps"
+    assert _expected_progress_adapter(pipeline_yaml) == "site-progress"
     with pytest.raises(RelayError, match="expected package progress adapter"):
         _assert_progress_adapter(
             [
                 {
+                    "current": 1.0,
                     "metadata": {
-                        "adapter": "lammps",
+                        "adapter": "site-progress",
                         "source": "external",
-                        "package_name": "builtin.lammps",
-                    }
+                        "package_name": "site.simulation",
+                    },
                 }
             ],
-            "lammps",
+            "site-progress",
             job_id="job_test",
         )
     with pytest.raises(RelayError, match="expected package progress adapter"):
         _assert_progress_adapter(
             [
                 {
+                    "current": 1.0,
                     "metadata": {
-                        "adapter": "lammps",
+                        "adapter": "site-progress",
                         "source": "jarvis_package",
-                        "package_name": "builtin.lammps",
-                        "package_version": "builtin",
+                        "package_name": "site.simulation",
+                        "package_version": "test-plugin",
                         "run_id": "job_test",
                         "execution_id": "job_test",
-                    }
+                    },
                 }
             ],
-            "lammps",
+            "site-progress",
             job_id="job_test",
         )
     _assert_progress_adapter(
-        [
-            {
-                "metadata": {
-                    "adapter": "lammps",
-                    "source": "jarvis_package",
-                    "package_name": "builtin.lammps",
-                    "package_version": "builtin",
-                    "run_id": "job_test",
-                    "execution_id": "job_test",
-                    "timing_source": "lammps_thermo_cpu",
-                    "prediction_status": "observed_lammps_timing",
-                    "prediction_method": "trimmed_mean_step_time_after_warmup",
-                    "rate_samples": 2,
-                    "eta_seconds": 10.0,
-                }
-            }
-        ],
-        "lammps",
+        [_provider_progress_record()],
+        "site-progress",
         job_id="job_test",
     )
 
 
-def test_live_acceptance_requires_single_builtin_lammps_package_for_progress() -> None:
+def test_live_acceptance_selects_explicit_progress_owner_from_multiple_packages() -> None:
     mixed = (
-        "name: mixed\npkgs:\n- pkg_type: builtin.lammps\n- pkg_type: clio_relay.bounded_command\n"
+        "name: mixed\n"
+        "pkgs:\n"
+        "- pkg_type: site.simulation\n"
+        "  progress:\n"
+        "    adapter: site-progress\n"
+        "- pkg_type: clio_relay.bounded_command\n"
+    )
+
+    assert _expected_progress_adapter(mixed) == "site-progress"
+    assert _expected_progress_package(mixed) == "site.simulation"
+
+
+def test_live_acceptance_disables_implicit_multi_package_progress_discovery() -> None:
+    mixed = (
+        "name: implicit-mixed\n"
+        "pkgs:\n"
+        "- pkg_type: site.simulation\n"
+        "- pkg_type: clio_relay.bounded_command\n"
     )
 
     assert _expected_progress_adapter(mixed) is None
+    assert _expected_progress_package(mixed) is None
+
+
+def test_live_acceptance_rejects_multiple_explicit_progress_owners() -> None:
+    ambiguous = (
+        "name: ambiguous-mixed\n"
+        "pkgs:\n"
+        "- pkg_type: site.simulation\n"
+        "  progress:\n"
+        "    adapter: site-progress\n"
+        "- pkg_type: another.simulation\n"
+        "  progress:\n"
+        "    adapter: another-progress\n"
+    )
+
+    with pytest.raises(ConfigurationError, match="multiple pipeline packages declare progress"):
+        _expected_progress_adapter(ambiguous)
+    with pytest.raises(ConfigurationError, match="multiple pipeline packages declare progress"):
+        _expected_progress_package(ambiguous)
+
+
+@pytest.mark.parametrize("adapter", ["''", "1"])
+def test_live_acceptance_rejects_invalid_explicit_progress_adapter(adapter: str) -> None:
+    invalid = (
+        "name: invalid-progress\n"
+        "pkgs:\n"
+        "- pkg_type: site.simulation\n"
+        "  progress:\n"
+        f"    adapter: {adapter}\n"
+    )
+
+    with pytest.raises(ConfigurationError, match="progress.adapter must be a non-empty string"):
+        _expected_progress_adapter(invalid)
 
 
 def test_live_acceptance_accepts_durable_progress_after_terminal_observation() -> None:
+
     def fake_runner(
         command: list[str],
         *,
@@ -246,33 +464,15 @@ def test_live_acceptance_accepts_durable_progress_after_terminal_observation() -
         if "job progress" in script:
             return _completed(
                 command,
-                json.dumps(
-                    [
-                        {
-                            "metadata": {
-                                "adapter": "lammps",
-                                "source": "jarvis_package",
-                                "package_name": "builtin.lammps",
-                                "package_version": "builtin",
-                                "run_id": "job_test",
-                                "execution_id": "job_test",
-                                "timing_source": "lammps_thermo_cpu",
-                                "prediction_status": "observed_lammps_timing",
-                                "prediction_method": "trimmed_mean_step_time_after_warmup",
-                                "rate_samples": 2,
-                                "eta_seconds": 1.0,
-                            }
-                        }
-                    ]
-                ),
+                json.dumps([_provider_progress_record()]),
             )
         raise AssertionError(f"unexpected command: {command}")
 
     _verify_live_package_progress(
         ClusterDefinition(name="test-cluster", ssh_host="test-host"),
         "job_test",
-        "lammps",
-        package_name="builtin.lammps",
+        "site-progress",
+        package_name="site.simulation",
         timeout_seconds=1,
         poll_seconds=0.01,
         runner=fake_runner,
@@ -280,6 +480,7 @@ def test_live_acceptance_accepts_durable_progress_after_terminal_observation() -
 
 
 def test_live_acceptance_rejects_package_progress_before_running_event() -> None:
+
     def fake_runner(
         command: list[str],
         *,
@@ -295,25 +496,7 @@ def test_live_acceptance_rejects_package_progress_before_running_event() -> None
         if "job progress" in script:
             return _completed(
                 command,
-                json.dumps(
-                    [
-                        {
-                            "metadata": {
-                                "adapter": "lammps",
-                                "source": "jarvis_package",
-                                "package_name": "builtin.lammps",
-                                "package_version": "builtin",
-                                "run_id": "job_test",
-                                "execution_id": "job_test",
-                                "timing_source": "lammps_thermo_cpu",
-                                "prediction_status": "observed_lammps_timing",
-                                "prediction_method": "trimmed_mean_step_time_after_warmup",
-                                "rate_samples": 2,
-                                "eta_seconds": 1.0,
-                            }
-                        }
-                    ]
-                ),
+                json.dumps([_provider_progress_record()]),
             )
         raise AssertionError(f"unexpected command: {command}")
 
@@ -321,12 +504,29 @@ def test_live_acceptance_rejects_package_progress_before_running_event() -> None
         _verify_live_package_progress(
             ClusterDefinition(name="test-cluster", ssh_host="test-host"),
             "job_test",
-            "lammps",
-            package_name="builtin.lammps",
+            "site-progress",
+            package_name="site.simulation",
             timeout_seconds=1,
             poll_seconds=0.01,
             runner=fake_runner,
         )
+
+
+def test_progress_adapter_acceptance_skips_unvalidated_durable_records() -> None:
+    progress = [
+        _provider_progress_record(
+            acceptance_validated=False,
+            prediction_status="initializing",
+        ),
+        _provider_progress_record(),
+    ]
+
+    _assert_progress_adapter(
+        progress,
+        "site-progress",
+        job_id="job_test",
+        package_name="site.simulation",
+    )
 
 
 def test_live_acceptance_verifies_transport_when_enabled(
@@ -342,7 +542,7 @@ def test_live_acceptance_verifies_transport_when_enabled(
 
     def fake_transport(**kwargs: object) -> list[str]:
         transport_calls.append(kwargs)
-        return ["transport.healthz=ok"]
+        return ["transport.healthz=ok", "transport.cleanup=passed"]
 
     def fake_runner(
         command: list[str],
@@ -422,6 +622,282 @@ def test_live_acceptance_verifies_transport_when_enabled(
     assert transport_calls[0]["api_token"] == "api-token"
 
 
+def test_live_acceptance_report_records_exact_transport_cleanup_resources(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text("name: generic\npkgs: []\n", encoding="utf-8")
+    report_path = tmp_path / "transport-report.json"
+
+    def fake_transport(**_kwargs: object) -> list[str]:
+        return [
+            "transport.healthz=ok",
+            transport_probe_evidence_line(
+                TransportProbeEvidence(
+                    probe_id="frp-probe-success",
+                    cluster="test-cluster",
+                    cleanup_mode="transport_probe_teardown",
+                    resources=[
+                        TransportCleanupResourceEvidence(
+                            kind="relay_session",
+                            resource_id="frp-probe:success",
+                            role="remote_transport_probe_session",
+                            location="test-host",
+                            action="stop",
+                            ownership_verified=True,
+                            outcome="stopped",
+                            verified_after_operation=True,
+                            observed_state="stopped",
+                            residual=False,
+                            detail=None,
+                        ),
+                        TransportCleanupResourceEvidence(
+                            kind="connector",
+                            resource_id="9124",
+                            role="remote_frpc_connector",
+                            location="test-host",
+                            action="stop",
+                            ownership_verified=True,
+                            outcome="stopped",
+                            verified_after_operation=True,
+                            observed_state="stopped",
+                            residual=False,
+                            detail=None,
+                            metadata={"pid": 9124},
+                        ),
+                        TransportCleanupResourceEvidence(
+                            kind="gateway_session",
+                            resource_id="gateway-live-4",
+                            role="gateway_record:close",
+                            location="test-host",
+                            action="close",
+                            ownership_verified=True,
+                            outcome="closed",
+                            verified_after_operation=True,
+                            observed_state="closed",
+                            residual=False,
+                            detail="owned gateway record closed",
+                        ),
+                    ],
+                )
+            ),
+            "transport.cleanup=passed",
+        ]
+
+    def fake_cluster_doctor(_definition: ClusterDefinition) -> list[str]:
+        return ["cluster: test-cluster"]
+
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.run_cluster_doctor",
+        fake_cluster_doctor,
+    )
+    monkeypatch.setattr("clio_relay.live_acceptance.run_frp_http_probe", fake_transport)
+
+    run_live_acceptance(
+        LiveAcceptanceOptions(
+            cluster="test-cluster",
+            definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            jarvis_yaml=pipeline,
+            verify_transport=True,
+            transport_token="frp-token",
+            transport_secret_key="stcp-secret",
+            report_path=report_path,
+        ),
+        runner=_generic_success_runner(),
+    )
+
+    report = load_validation_report(report_path)
+    assert report.status.value == "passed"
+    assert {(item.kind, item.resource_id) for item in report.resources}.issuperset(
+        {
+            ("relay_session", "frp-probe:success"),
+            ("connector", "9124"),
+            ("gateway_session", "gateway-live-4"),
+        }
+    )
+    connector_action = next(
+        action for action in report.cleanup.actions if action["resource_id"] == "9124"
+    )
+    assert connector_action["ownership_verified"] is True
+    assert connector_action["observed_state"] == "stopped"
+    assert connector_action["residual"] is False
+    assert report.cleanup.remaining_resources == []
+    assert not any(action.get("kind") == "transport_probe" for action in report.cleanup.actions)
+
+
+def test_live_acceptance_report_preserves_partial_transport_cleanup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text("name: generic\npkgs: []\n", encoding="utf-8")
+    report_path = tmp_path / "transport-partial-report.json"
+
+    def fake_transport(**_kwargs: object) -> list[str]:
+        return [
+            "transport.healthz=ok",
+            transport_probe_evidence_line(
+                TransportProbeEvidence(
+                    probe_id="frp-probe-partial",
+                    cluster="test-cluster",
+                    cleanup_mode="transport_probe_teardown",
+                    resources=[
+                        TransportCleanupResourceEvidence(
+                            kind="connector",
+                            resource_id="remote-connector-733",
+                            role="remote_frpc_connector",
+                            location="test-host",
+                            action="stop",
+                            ownership_verified=True,
+                            outcome="failed",
+                            verified_after_operation=False,
+                            observed_state="running",
+                            residual=True,
+                            detail="connector remained after bounded cleanup",
+                            metadata={"pid": 733},
+                        )
+                    ],
+                )
+            ),
+            "transport.cleanup=passed",
+        ]
+
+    def fake_cluster_doctor(_definition: ClusterDefinition) -> list[str]:
+        return ["cluster: test-cluster"]
+
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.run_cluster_doctor",
+        fake_cluster_doctor,
+    )
+    monkeypatch.setattr("clio_relay.live_acceptance.run_frp_http_probe", fake_transport)
+
+    with pytest.raises(RelayError, match="structured residual resources"):
+        run_live_acceptance(
+            LiveAcceptanceOptions(
+                cluster="test-cluster",
+                definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+                jarvis_yaml=pipeline,
+                verify_transport=True,
+                transport_token="frp-token",
+                transport_secret_key="stcp-secret",
+                report_path=report_path,
+            ),
+            runner=_generic_success_runner(),
+        )
+
+    report = load_validation_report(report_path)
+    assert report.status.value == "failed"
+    assert [(item.kind, item.resource_id) for item in report.cleanup.remaining_resources] == [
+        ("connector", "remote-connector-733")
+    ]
+    remaining = report.cleanup.remaining_resources[0]
+    assert remaining.metadata["ownership_verified"] is True
+    assert remaining.metadata["observed_state"] == "running"
+    assert remaining.metadata["detail"] == "connector remained after bounded cleanup"
+    assert report.cleanup.actions[0]["outcome"] == "failed"
+
+
+def test_live_acceptance_report_ingests_cleanup_evidence_attached_to_probe_failure(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text("name: generic\npkgs: []\n", encoding="utf-8")
+    report_path = tmp_path / "transport-exception-report.json"
+    evidence_line = transport_probe_evidence_line(
+        TransportProbeEvidence(
+            probe_id="frp-probe-exception",
+            cluster="test-cluster",
+            cleanup_mode="transport_probe_teardown",
+            resources=[
+                TransportCleanupResourceEvidence(
+                    kind="relay_session",
+                    resource_id="frp-probe:exception",
+                    role="remote_transport_probe_session",
+                    location="test-host",
+                    action="stop",
+                    ownership_verified=False,
+                    outcome="unknown",
+                    verified_after_operation=False,
+                    observed_state="running_or_unknown",
+                    residual=True,
+                    detail="cleanup command returned malformed evidence",
+                )
+            ],
+        )
+    )
+
+    def fake_transport(**_kwargs: object) -> list[str]:
+        error = RelayError("transport probe failed during cleanup")
+        error.__dict__["_clio_relay_transport_evidence_lines"] = [evidence_line]
+        raise error
+
+    def fake_cluster_doctor(_definition: ClusterDefinition) -> list[str]:
+        return ["cluster: test-cluster"]
+
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.run_cluster_doctor",
+        fake_cluster_doctor,
+    )
+    monkeypatch.setattr("clio_relay.live_acceptance.run_frp_http_probe", fake_transport)
+
+    with pytest.raises(RelayError, match="failed during cleanup"):
+        run_live_acceptance(
+            LiveAcceptanceOptions(
+                cluster="test-cluster",
+                definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+                jarvis_yaml=pipeline,
+                verify_transport=True,
+                transport_token="frp-token",
+                transport_secret_key="stcp-secret",
+                report_path=report_path,
+            ),
+            runner=_generic_success_runner(),
+        )
+
+    report = load_validation_report(report_path)
+    assert report.status.value == "failed"
+    assert report.cleanup.actions[0]["resource_id"] == "frp-probe:exception"
+    assert report.cleanup.remaining_resources[0].resource_id == "frp-probe:exception"
+
+
+def test_live_acceptance_rejects_transport_without_verified_cleanup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text("name: generic\npkgs: []\n", encoding="utf-8")
+
+    def fake_cluster_doctor(_definition: ClusterDefinition) -> list[str]:
+        return ["cluster: test-cluster"]
+
+    def fake_transport(**_kwargs: object) -> list[str]:
+        return ["transport.healthz=ok"]
+
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.run_cluster_doctor",
+        fake_cluster_doctor,
+    )
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.run_frp_http_probe",
+        fake_transport,
+    )
+
+    with pytest.raises(RelayError, match="transport cleanup evidence is incomplete"):
+        run_live_acceptance(
+            LiveAcceptanceOptions(
+                cluster="test-cluster",
+                definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+                jarvis_yaml=pipeline,
+                verify_transport=True,
+                transport_token="frp-token",
+                transport_secret_key="stcp-secret",
+            ),
+            runner=_generic_success_runner(),
+        )
+
+
 def test_live_acceptance_transport_requires_secrets(tmp_path: Path) -> None:
     pipeline = tmp_path / "pipeline.yaml"
     pipeline.write_text("name: generic\npkgs: []\n", encoding="utf-8")
@@ -455,6 +931,7 @@ def test_live_acceptance_verifies_direct_transport_when_enabled(
             "transport.proxy_type=xtcp",
             "transport.healthz=ok",
             "transport.http_wait=succeeded",
+            "transport.cleanup=passed",
         ]
 
     monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
@@ -509,6 +986,7 @@ def test_live_acceptance_verifies_configured_direct_transport(
             "transport.proxy_type=xtcp",
             "transport.healthz=ok",
             "transport.http_wait=succeeded",
+            "transport.cleanup=passed",
         ]
 
     monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
@@ -1110,7 +1588,8 @@ def test_live_acceptance_generates_agent_prompt_from_child_pipeline(
         if "mkdir -p" in script:
             return _completed(command, "")
         if "cat >" in " ".join(command):
-            uploads[script.split("cat > ", maxsplit=1)[1].strip("'")] = input
+            remote_path = script.split("cat > ", maxsplit=1)[1].split(" &&", maxsplit=1)[0]
+            uploads[remote_path.strip("'")] = input
             return _completed(command, "")
         if "job submit" in script:
             return _completed(command, f"{primary_job_id}\n")
@@ -1302,6 +1781,24 @@ def test_agent_child_job_must_be_created_by_current_agent_run() -> None:
 
 
 def _completed(command: list[str], stdout: str) -> subprocess.CompletedProcess[bytes]:
+    script = command[-1] if command else ""
+    record_key = None
+    if "job tasks" in script:
+        record_key = "tasks"
+    elif "job progress" in script:
+        record_key = "progress"
+    elif "list-artifacts" in script:
+        record_key = "artifacts"
+    if record_key is not None:
+        decoded = cast(object, json.loads(stdout))
+        if isinstance(decoded, list):
+            records: list[dict[str, object]] = []
+            for item in cast(list[object], decoded):
+                if isinstance(item, dict):
+                    records.append(
+                        {str(key): value for key, value in cast(dict[object, object], item).items()}
+                    )
+            stdout = json.dumps(_collection_page(record_key, records))
     return subprocess.CompletedProcess(command, 0, stdout=stdout.encode(), stderr=b"")
 
 

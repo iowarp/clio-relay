@@ -8,21 +8,70 @@ environment capture, output collection, and provenance.
 from __future__ import annotations
 
 import os
-import shlex
 import shutil
-import signal
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
+from contextlib import suppress
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from queue import Empty, Full, Queue
+from typing import Any, Literal, cast
 
 import yaml
 
+from clio_relay import process_containment
 from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.jarvis_execution import (
+    jarvis_private_credential_channel,
+    named_jarvis_command,
+    scheduled_jarvis_command,
+    yaml_jarvis_command,
+)
 from clio_relay.models import JarvisRunSpec, McpCallSpec, RemoteAgentTaskSpec
 from clio_relay.scheduler_providers import provider_for_scheduler
+
+STREAM_RESULT_TAIL_MAX_CHARACTERS = 1024 * 1024
+STREAM_READ_CHARACTERS = 64 * 1024
+STREAM_THREAD_JOIN_TIMEOUT_SECONDS = 15.0
+STREAM_QUEUE_MAX_CHUNKS = 128
+STREAM_QUEUE_PUT_SECONDS = 0.05
+
+
+@dataclass
+class _BoundedTextTail:
+    """Retain a bounded result tail while callbacks receive the complete stream."""
+
+    limit: int = STREAM_RESULT_TAIL_MAX_CHARACTERS
+    chunks: deque[str] = field(default_factory=lambda: deque[str]())
+    size: int = 0
+
+    def append(self, value: str) -> None:
+        """Append text and discard the oldest characters above the limit."""
+        if not value or self.limit <= 0:
+            return
+        if len(value) >= self.limit:
+            self.chunks.clear()
+            self.chunks.append(value[-self.limit :])
+            self.size = self.limit
+            return
+        self.chunks.append(value)
+        self.size += len(value)
+        while self.size > self.limit:
+            excess = self.size - self.limit
+            oldest = self.chunks[0]
+            if len(oldest) <= excess:
+                self.chunks.popleft()
+                self.size -= len(oldest)
+                continue
+            self.chunks[0] = oldest[excess:]
+            self.size -= excess
+
+    def render(self) -> str:
+        """Return the retained tail."""
+        return "".join(self.chunks)
 
 
 class JarvisCdProvider:
@@ -110,8 +159,11 @@ class JarvisCdProvider:
                     "pkg_name": "mcp_call",
                     "server": spec.server,
                     "server_args": spec.server_args or None,
+                    "env_from": spec.env_from or None,
+                    "expected_server_artifact_digest": spec.expected_server_artifact_digest,
+                    "operation": spec.operation.value,
                     "tool": spec.tool,
-                    "arguments": spec.arguments,
+                    "arguments": spec.arguments or None,
                     "timeout_seconds": spec.timeout_seconds,
                 }
             ],
@@ -133,22 +185,20 @@ class JarvisCdProvider:
         """Invoke JARVIS-CD for an already materialized pipeline."""
         self.require_available()
         command = self.pipeline_command(pipeline_path)
-        try:
-            return subprocess.run(
-                command,
-                cwd=cwd,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-        except OSError as exc:
-            raise RelayError(f"failed to execute JARVIS-CD: {exc}") from exc
+        launch_env, credential_payload = jarvis_private_credential_channel(os.environ)
+        return self.run_command_streaming(
+            command,
+            cwd=cwd,
+            env=launch_env,
+            credential_payload=credential_payload,
+        )
 
     def run_pipeline_streaming(
         self,
         pipeline_path: Path,
         *,
         cwd: Path | None = None,
+        env: dict[str, str] | None = None,
         on_stdout: Callable[[str], None] | None = None,
         on_stderr: Callable[[str], None] | None = None,
         on_start: Callable[[int], None] | None = None,
@@ -160,9 +210,12 @@ class JarvisCdProvider:
         """Invoke JARVIS-CD and stream output chunks while retaining final output."""
         self.require_available()
         command = self.pipeline_command(pipeline_path)
+        launch_env, credential_payload = jarvis_private_credential_channel(env)
         return self.run_command_streaming(
             command,
             cwd=cwd,
+            env=launch_env,
+            credential_payload=credential_payload,
             on_stdout=on_stdout,
             on_stderr=on_stderr,
             on_start=on_start,
@@ -177,6 +230,7 @@ class JarvisCdProvider:
         pipeline_name: str,
         *,
         cwd: Path | None = None,
+        env: dict[str, str] | None = None,
         on_stdout: Callable[[str], None] | None = None,
         on_stderr: Callable[[str], None] | None = None,
         on_start: Callable[[int], None] | None = None,
@@ -187,9 +241,12 @@ class JarvisCdProvider:
     ) -> subprocess.CompletedProcess[str]:
         """Invoke JARVIS-CD for an existing named pipeline and stream output."""
         self.require_available()
+        launch_env, credential_payload = jarvis_private_credential_channel(env)
         return self.run_command_streaming(
             self.named_pipeline_command(pipeline_name),
             cwd=cwd,
+            env=launch_env,
+            credential_payload=credential_payload,
             on_stdout=on_stdout,
             on_stderr=on_stderr,
             on_start=on_start,
@@ -204,6 +261,8 @@ class JarvisCdProvider:
         command: list[str],
         *,
         cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+        credential_payload: str | None = None,
         on_stdout: Callable[[str], None] | None = None,
         on_stderr: Callable[[str], None] | None = None,
         on_start: Callable[[int], None] | None = None,
@@ -214,86 +273,217 @@ class JarvisCdProvider:
     ) -> subprocess.CompletedProcess[str]:
         """Run a command and stream output chunks while retaining final output."""
         try:
-            process = subprocess.Popen(
+            process = process_containment.spawn_owned_process(
                 command,
+                on_ready=(
+                    None if on_start is None else lambda process_id, _metadata: on_start(process_id)
+                ),
                 cwd=cwd,
+                env=process_containment.owner_environment(env),
+                credential_payload=credential_payload,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=1,
-                start_new_session=os.name != "nt",
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
             )
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             raise RelayError(f"failed to execute JARVIS-CD: {exc}") from exc
-        if on_start is not None:
-            on_start(process.pid)
-
-        stdout_chunks: list[str] = []
-        stderr_chunks: list[str] = []
+        stdout_tail = _BoundedTextTail()
+        stderr_tail = _BoundedTextTail()
+        stream_errors: list[BaseException] = []
+        stream_error_lock = threading.Lock()
+        stream_messages: Queue[tuple[Literal["stdout", "stderr"], str]] = Queue(
+            maxsize=STREAM_QUEUE_MAX_CHUNKS
+        )
+        stop_streams = threading.Event()
         stdout_thread = threading.Thread(
             target=_drain_stream,
-            args=(process.stdout, stdout_chunks, on_stdout),
+            args=(
+                process.stdout,
+                "stdout",
+                stdout_tail,
+                stream_messages,
+                stop_streams,
+                stream_errors,
+                stream_error_lock,
+            ),
+            name=f"clio-relay-stdout-{process.pid}",
             daemon=True,
         )
         stderr_thread = threading.Thread(
             target=_drain_stream,
-            args=(process.stderr, stderr_chunks, on_stderr),
+            args=(
+                process.stderr,
+                "stderr",
+                stderr_tail,
+                stream_messages,
+                stop_streams,
+                stream_errors,
+                stream_error_lock,
+            ),
+            name=f"clio-relay-stderr-{process.pid}",
             daemon=True,
         )
-        stdout_thread.start()
-        stderr_thread.start()
+        stream_threads = [stdout_thread, stderr_thread]
+        started_threads: list[threading.Thread] = []
         canceled = False
         timed_out = False
+        return_code: int | None = None
+        primary_error: BaseException | None = None
         deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
-        while True:
-            return_code = process.poll()
-            if return_code is not None:
-                break
-            if deadline is not None and time.monotonic() >= deadline:
-                timed_out = True
-                if on_timeout is not None:
-                    on_timeout()
-                _terminate_process(process)
-                return_code = process.wait()
-                break
-            if should_cancel is not None and should_cancel():
-                canceled = True
-                _terminate_process(process)
-                return_code = process.wait()
-                break
-            if on_poll is not None:
-                on_poll()
-            time.sleep(0.25)
-        stdout_thread.join()
-        stderr_thread.join()
+        try:
+            for thread in stream_threads:
+                thread.start()
+                started_threads.append(thread)
+            while True:
+                _dispatch_stream_messages(
+                    stream_messages,
+                    on_stdout=on_stdout,
+                    on_stderr=on_stderr,
+                )
+                _raise_stream_error(stream_errors, stream_error_lock)
+                return_code = process.poll()
+                if return_code is not None:
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    timed_out = True
+                    if on_timeout is not None:
+                        on_timeout()
+                    _terminate_process(process)
+                    return_code = process.wait()
+                    break
+                if should_cancel is not None and should_cancel():
+                    canceled = True
+                    _terminate_process(process)
+                    return_code = process.wait()
+                    break
+                if on_poll is not None:
+                    on_poll()
+                time.sleep(0.25)
+        except BaseException as exc:
+            primary_error = exc
+            stop_streams.set()
+            if process.poll() is None:
+                try:
+                    _terminate_process(process)
+                except BaseException as cleanup_exc:
+                    primary_error = RelayError(f"{exc}; process cleanup also failed: {cleanup_exc}")
+        finally:
+            join_deadline = time.monotonic() + STREAM_THREAD_JOIN_TIMEOUT_SECONDS
+            while any(thread.is_alive() for thread in started_threads):
+                if primary_error is None:
+                    try:
+                        _dispatch_stream_messages(
+                            stream_messages,
+                            on_stdout=on_stdout,
+                            on_stderr=on_stderr,
+                        )
+                        _raise_stream_error(stream_errors, stream_error_lock)
+                    except BaseException as exc:
+                        primary_error = exc
+                        stop_streams.set()
+                        if process.poll() is None:
+                            try:
+                                _terminate_process(process)
+                            except BaseException as cleanup_exc:
+                                primary_error = RelayError(
+                                    f"{exc}; process cleanup also failed: {cleanup_exc}"
+                                )
+                if time.monotonic() >= join_deadline:
+                    break
+                for thread in started_threads:
+                    thread.join(timeout=0.01)
+            if primary_error is None:
+                try:
+                    _dispatch_stream_messages(
+                        stream_messages,
+                        on_stdout=on_stdout,
+                        on_stderr=on_stderr,
+                    )
+                    _raise_stream_error(stream_errors, stream_error_lock)
+                except BaseException as exc:
+                    primary_error = exc
+            alive_before_close = [thread for thread in started_threads if thread.is_alive()]
+            if alive_before_close:
+                stop_streams.set()
+                if process.poll() is None:
+                    try:
+                        _terminate_process(process)
+                    except BaseException as cleanup_exc:
+                        if primary_error is None:
+                            primary_error = cleanup_exc
+                        else:
+                            primary_error = RelayError(
+                                f"{primary_error}; process cleanup also failed: {cleanup_exc}"
+                            )
+                for pipe in (process.stdout, process.stderr):
+                    if pipe is not None:
+                        with suppress(OSError):
+                            pipe.close()
+                for thread in alive_before_close:
+                    thread.join(timeout=STREAM_THREAD_JOIN_TIMEOUT_SECONDS)
+        alive_streams = [
+            name
+            for name, thread in (("stdout", stdout_thread), ("stderr", stderr_thread))
+            if thread in started_threads and thread.is_alive()
+        ]
+        if alive_streams:
+            join_error = RelayError(
+                f"JARVIS stream readers did not stop within the bound: {alive_streams}"
+            )
+            if primary_error is None:
+                primary_error = join_error
+            else:
+                primary_error = RelayError(f"{primary_error}; {join_error}")
+        with stream_error_lock:
+            if primary_error is None and stream_errors:
+                primary_error = stream_errors[0]
+        if primary_error is None:
+            try:
+                process_containment.ensure_owned_process_tree_empty(process)
+            except RuntimeError as exc:
+                primary_error = RelayError(str(exc))
+        try:
+            process_containment.release_owned_process(process)
+        except RuntimeError as exc:
+            if primary_error is None:
+                primary_error = RelayError(f"could not release process containment: {exc}")
+            else:
+                primary_error = RelayError(
+                    f"{primary_error}; process containment release also failed: {exc}"
+                )
+        if primary_error is not None:
+            raise primary_error
+        if return_code is None:
+            raise RelayError("JARVIS process ended without a return code")
         return subprocess.CompletedProcess(
             command,
             124 if timed_out else return_code if not canceled else -15,
-            stdout="".join(stdout_chunks),
-            stderr="".join(stderr_chunks),
+            stdout=stdout_tail.render(),
+            stderr=stderr_tail.render(),
         )
 
     def named_pipeline_command(self, pipeline_name: str) -> list[str]:
         """Return the command used to execute a named JARVIS pipeline."""
-        if not pipeline_name.strip():
-            raise ConfigurationError("pipeline_name must be non-empty")
-        script = (
-            f"{shlex.quote(self.jarvis_bin)} cd {shlex.quote(pipeline_name)} "
-            f"&& exec {shlex.quote(self.jarvis_bin)} ppl run"
+        return named_jarvis_command(
+            python_bin=_jarvis_python(self.jarvis_bin),
+            pipeline_name=pipeline_name,
         )
-        return ["bash", "-lc", script]
 
     def pipeline_command(self, pipeline_path: Path) -> list[str]:
         """Return the command used to execute a materialized JARVIS pipeline."""
         scheduler_name = _scheduler_name(pipeline_path)
         if scheduler_name is not None:
-            scheduler_provider = provider_for_scheduler(scheduler_name)
-            return scheduler_provider.pipeline_command(
-                _jarvis_python(self.jarvis_bin),
-                pipeline_path,
+            provider_for_scheduler(scheduler_name)
+            return scheduled_jarvis_command(
+                scheduler_name,
+                python_bin=_jarvis_python(self.jarvis_bin),
+                pipeline_path=pipeline_path,
             )
-        return [self.jarvis_bin, "ppl", "run", "yaml", str(pipeline_path)]
+        return yaml_jarvis_command(
+            python_bin=_jarvis_python(self.jarvis_bin),
+            pipeline_path=pipeline_path,
+        )
 
 
 def _drop_none(value: Any) -> Any:
@@ -308,39 +498,61 @@ def _drop_none(value: Any) -> Any:
 
 def _drain_stream(
     stream: Any,
-    chunks: list[str],
-    callback: Callable[[str], None] | None,
+    stream_name: Literal["stdout", "stderr"],
+    tail: _BoundedTextTail,
+    messages: Queue[tuple[Literal["stdout", "stderr"], str]],
+    stop: threading.Event,
+    errors: list[BaseException],
+    error_lock: threading.Lock,
 ) -> None:
     if stream is None:
         return
-    for chunk in stream:
-        chunks.append(chunk)
+    try:
+        while chunk := stream.readline(STREAM_READ_CHARACTERS):
+            tail.append(chunk)
+            while not stop.is_set():
+                try:
+                    messages.put((stream_name, chunk), timeout=STREAM_QUEUE_PUT_SECONDS)
+                    break
+                except Full:
+                    continue
+    except BaseException as exc:
+        with error_lock:
+            errors.append(exc)
+
+
+def _dispatch_stream_messages(
+    messages: Queue[tuple[Literal["stdout", "stderr"], str]],
+    *,
+    on_stdout: Callable[[str], None] | None,
+    on_stderr: Callable[[str], None] | None,
+) -> None:
+    """Invoke output callbacks synchronously on the provider control thread."""
+    while True:
+        try:
+            stream_name, chunk = messages.get_nowait()
+        except Empty:
+            return
+        callback = on_stdout if stream_name == "stdout" else on_stderr
         if callback is not None:
             callback(chunk)
 
 
+def _raise_stream_error(
+    errors: list[BaseException],
+    error_lock: threading.Lock,
+) -> None:
+    """Propagate the first stream-reader failure on the provider control thread."""
+    with error_lock:
+        if errors:
+            raise errors[0]
+
+
 def _terminate_process(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
-    if os.name == "nt":
-        process.send_signal(signal.CTRL_BREAK_EVENT)
-        try:
-            process.wait(timeout=5)
-            return
-        except subprocess.TimeoutExpired:
-            process.kill()
-            return
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
+        process_containment.terminate_owned_process(process)
+    except RuntimeError as exc:
+        raise RelayError(str(exc)) from exc
 
 
 def _scheduler_name(pipeline_path: Path) -> str | None:
@@ -359,7 +571,9 @@ def _document_scheduler_name(document: object) -> str | None:
     if isinstance(scheduler, dict) and scheduler:
         typed_scheduler = cast(dict[str, object], scheduler)
         name = typed_scheduler.get("name")
-        return str(name) if isinstance(name, str) and name.strip() else "slurm"
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigurationError("JARVIS scheduler objects require an explicit provider name")
+        return name
     config = typed.get("config")
     if isinstance(config, dict):
         typed_config = cast(dict[str, object], config)

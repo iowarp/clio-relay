@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import importlib.util
 import json
 import os
 import sys
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
+
+import pytest
 
 
 class ProgressModule(Protocol):
@@ -24,14 +28,14 @@ class Adapter(Protocol):
         ...
 
 
-def test_bounded_command_rejects_lammps_progress_adapter() -> None:
+def test_bounded_command_rejects_external_progress_adapter() -> None:
     module = _load_progress_module()
     try:
-        module.adapter_from_config({"adapter": "lammps", "total_steps": 150})
+        module.adapter_from_config({"adapter": "site-progress", "total_steps": 150})
     except ValueError as exc:
-        assert "unsupported progress adapter: lammps" in str(exc)
+        assert "unsupported progress adapter: site-progress" in str(exc)
     else:
-        raise AssertionError("bounded_command must not own LAMMPS semantics")
+        raise AssertionError("bounded_command must not own external application semantics")
 
 
 def test_regex_progress_adapter_writes_side_channel(tmp_path: Path) -> None:
@@ -51,6 +55,7 @@ def test_regex_progress_adapter_writes_side_channel(tmp_path: Path) -> None:
 
     record = adapter.observe_stdout("iter=4 of 10\n")[0]
     sidecar = tmp_path / "progress.jsonl"
+    _precreate_private_file(sidecar)
     previous = os.environ.get("CLIO_RELAY_PROGRESS_FILE")
     previous_token = os.environ.get("CLIO_RELAY_PROGRESS_TOKEN")
     os.environ["CLIO_RELAY_PROGRESS_FILE"] = str(sidecar)
@@ -68,12 +73,27 @@ def test_regex_progress_adapter_writes_side_channel(tmp_path: Path) -> None:
             os.environ["CLIO_RELAY_PROGRESS_TOKEN"] = previous_token
 
     decoded = json.loads(sidecar.read_text(encoding="utf-8"))
-    assert decoded["label"] == "iteration"
-    assert decoded["current"] == 4
-    assert decoded["total"] == 10
-    assert decoded["metadata"]["source"] == "jarvis_package"
-    assert decoded["metadata"]["package_name"] == "clio_relay.bounded_command"
-    assert decoded["metadata"]["relay_progress_token"] == "test-token"
+    assert decoded["schema_version"] == "clio-relay.progress-sidecar-record.v1"
+    assert decoded["sequence"] == 1
+    progress = decoded["progress"]
+    assert progress["label"] == "iteration"
+    assert progress["current"] == 4
+    assert progress["total"] == 10
+    assert progress["metadata"]["source"] == "jarvis_package"
+    assert progress["metadata"]["package_name"] == "clio_relay.bounded_command"
+    assert "test-token" not in sidecar.read_text(encoding="utf-8")
+    signed = {key: decoded[key] for key in ("schema_version", "sequence", "progress")}
+    canonical = json.dumps(
+        signed,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    assert hmac.compare_digest(
+        decoded["progress_hmac"],
+        hmac.new(b"test-token", canonical, hashlib.sha256).hexdigest(),
+    )
 
 
 def test_regex_progress_adapter_cannot_spoof_package_identity() -> None:
@@ -86,9 +106,9 @@ def test_regex_progress_adapter_cannot_spoof_package_identity() -> None:
                 "pattern": r"step=(?P<current>\d+)",
                 "metadata": {
                     "source": "jarvis_package",
-                    "adapter": "lammps",
-                    "package_name": "builtin.lammps",
-                    "package_version": "builtin",
+                    "adapter": "site-progress",
+                    "package_name": "site.simulation",
+                    "package_version": "2.1",
                     "run_id": "job_spoofed",
                     "user_field": "kept",
                 },
@@ -105,6 +125,79 @@ def test_regex_progress_adapter_cannot_spoof_package_identity() -> None:
     assert metadata["package_version"] == "builtin"
     assert "run_id" not in metadata
     assert metadata["user_field"] == "kept"
+
+
+def test_progress_sidecar_rejects_oversized_records(tmp_path: Path) -> None:
+    module = _load_progress_module()
+    sidecar = tmp_path / "progress.jsonl"
+    _precreate_private_file(sidecar)
+    previous_file = os.environ.get("CLIO_RELAY_PROGRESS_FILE")
+    previous_token = os.environ.get("CLIO_RELAY_PROGRESS_TOKEN")
+    os.environ["CLIO_RELAY_PROGRESS_FILE"] = str(sidecar)
+    os.environ["CLIO_RELAY_PROGRESS_TOKEN"] = "test-token"
+    try:
+        with pytest.raises(ValueError, match="record exceeded its byte limit"):
+            module.append_progress_record(
+                {"label": "oversized", "metadata": {"payload": "x" * 70_000}}
+            )
+    finally:
+        _restore_environment("CLIO_RELAY_PROGRESS_FILE", previous_file)
+        _restore_environment("CLIO_RELAY_PROGRESS_TOKEN", previous_token)
+
+    assert sidecar.read_bytes() == b""
+
+
+def test_progress_sidecar_rejects_non_regular_target(tmp_path: Path) -> None:
+    module = _load_progress_module()
+    sidecar = tmp_path / "progress.jsonl"
+    sidecar.mkdir()
+    previous_file = os.environ.get("CLIO_RELAY_PROGRESS_FILE")
+    previous_token = os.environ.get("CLIO_RELAY_PROGRESS_TOKEN")
+    os.environ["CLIO_RELAY_PROGRESS_FILE"] = str(sidecar)
+    os.environ["CLIO_RELAY_PROGRESS_TOKEN"] = "test-token"
+    try:
+        with pytest.raises(OSError):
+            module.append_progress_record({"label": "invalid"})
+    finally:
+        _restore_environment("CLIO_RELAY_PROGRESS_FILE", previous_file)
+        _restore_environment("CLIO_RELAY_PROGRESS_TOKEN", previous_token)
+
+
+def test_progress_sidecar_enforces_bounded_total_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_progress_module()
+    sidecar = tmp_path / "progress.jsonl"
+    _precreate_private_file(sidecar)
+    sidecar.write_text("x" * 100, encoding="utf-8")
+    monkeypatch.setattr(cast(Any, module), "PROGRESS_SIDECAR_MAX_BYTES", 100)
+    previous_file = os.environ.get("CLIO_RELAY_PROGRESS_FILE")
+    previous_token = os.environ.get("CLIO_RELAY_PROGRESS_TOKEN")
+    os.environ["CLIO_RELAY_PROGRESS_FILE"] = str(sidecar)
+    os.environ["CLIO_RELAY_PROGRESS_TOKEN"] = "test-token"
+    try:
+        with pytest.raises(ValueError, match="sidecar exceeded its byte limit"):
+            module.append_progress_record({"label": "bounded"})
+    finally:
+        _restore_environment("CLIO_RELAY_PROGRESS_FILE", previous_file)
+        _restore_environment("CLIO_RELAY_PROGRESS_TOKEN", previous_token)
+
+
+def _restore_environment(name: str, value: str | None) -> None:
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
+
+
+def _precreate_private_file(path: Path) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        if os.name != "nt":
+            os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
 
 
 def _load_progress_module() -> ProgressModule:

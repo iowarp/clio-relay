@@ -1,0 +1,175 @@
+{
+  "schema_version": "clio-relay.release-acceptance-matrix.v1",
+  "release_version": "1.0.0",
+  "matrix_sha256": "b62a51a57d55fd2928c928d2a6b7892b006c627e5e64bd06cb03874d28602fe2",
+  "report_count_per_stage": 17,
+  "target_labels_are_policy_evidence_instances": true,
+  "stages": [
+    {
+      "name": "candidate",
+      "artifact_stage": "immutable_candidate",
+      "filename_prefix": "validation"
+    },
+    {
+      "name": "released",
+      "artifact_stage": "published",
+      "filename_prefix": "released-validation"
+    }
+  ],
+  "reports": [
+    {
+      "ordinal": 1,
+      "id": "ares-bootstrap",
+      "cluster": "ares",
+      "scenario": "cluster-bootstrap",
+      "command": ["cluster", "bootstrap"],
+      "report_option": "--report"
+    },
+    {
+      "ordinal": 2,
+      "id": "ares-cluster-bootstrap-live-test",
+      "cluster": "ares",
+      "scenario": "cluster-bootstrap",
+      "command": ["live-test"],
+      "report_option": "--report"
+    },
+    {
+      "ordinal": 3,
+      "id": "ares-queue-management",
+      "cluster": "ares",
+      "scenario": "queue-management",
+      "command": ["queue", "validate"],
+      "report_option": "--report"
+    },
+    {
+      "ordinal": 4,
+      "id": "ares-jarvis-gray-scott",
+      "cluster": "ares",
+      "scenario": "remote-mcp",
+      "command": ["jarvis-mcp-validate"],
+      "report_option": "--report",
+      "package": "builtin.gray_scott"
+    },
+    {
+      "ordinal": 5,
+      "id": "ares-jarvis-lammps",
+      "cluster": "ares",
+      "scenario": "remote-mcp",
+      "command": ["jarvis-mcp-validate"],
+      "report_option": "--report",
+      "package": "builtin.lammps"
+    },
+    {
+      "ordinal": 6,
+      "id": "ares-spack-find",
+      "cluster": "ares",
+      "scenario": "remote-mcp",
+      "command": ["remote-mcp", "validate"],
+      "report_option": "--validation-report",
+      "remote_tool": "spack_find",
+      "package": "lammps",
+      "evidence_group": "spack"
+    },
+    {
+      "ordinal": 7,
+      "id": "ares-spack-locate",
+      "cluster": "ares",
+      "scenario": "remote-mcp",
+      "command": ["remote-mcp", "validate"],
+      "report_option": "--validation-report",
+      "remote_tool": "spack_locate",
+      "package": "lammps",
+      "evidence_group": "spack"
+    },
+    {
+      "ordinal": 8,
+      "id": "ares-spack-install",
+      "cluster": "ares",
+      "scenario": "remote-mcp",
+      "command": ["remote-mcp", "validate"],
+      "report_option": "--validation-report",
+      "remote_tool": "spack_install",
+      "package": "libsigsegv@2.14",
+      "evidence_group": "spack-fresh"
+    },
+    {
+      "ordinal": 9,
+      "id": "ares-slurm-lifecycle",
+      "cluster": "ares",
+      "scenario": "scheduler-lifecycle",
+      "command": ["scheduler", "validate-lifecycle"],
+      "report_option": "--report"
+    },
+    {
+      "ordinal": 10,
+      "id": "ares-cleanup-detach",
+      "cluster": "ares",
+      "scenario": "cleanup",
+      "command": ["session", "detach"],
+      "report_option": "--validation-report",
+      "evidence_group": "ares-default-cleanup-session"
+    },
+    {
+      "ordinal": 11,
+      "id": "ares-cleanup-teardown",
+      "cluster": "ares",
+      "scenario": "cleanup",
+      "command": ["session", "teardown"],
+      "report_option": "--validation-report",
+      "evidence_group": "ares-default-cleanup-session"
+    },
+    {
+      "ordinal": 12,
+      "id": "ares-explicit-cancel-teardown",
+      "cluster": "ares",
+      "scenario": "cleanup",
+      "command": ["session", "teardown"],
+      "report_option": "--validation-report",
+      "evidence_group": "ares-explicit-cancel-session"
+    },
+    {
+      "ordinal": 13,
+      "id": "homelab-cleanup-detach",
+      "cluster": "homelab",
+      "scenario": "cleanup",
+      "command": ["session", "detach"],
+      "report_option": "--validation-report",
+      "evidence_group": "homelab-default-cleanup-session"
+    },
+    {
+      "ordinal": 14,
+      "id": "homelab-cleanup-teardown",
+      "cluster": "homelab",
+      "scenario": "cleanup",
+      "command": ["session", "teardown"],
+      "report_option": "--validation-report",
+      "evidence_group": "homelab-default-cleanup-session"
+    },
+    {
+      "ordinal": 15,
+      "id": "homelab-transport",
+      "cluster": "homelab",
+      "scenario": "transport",
+      "command": ["live-test"],
+      "report_option": "--report"
+    },
+    {
+      "ordinal": 16,
+      "id": "ares-gateway-start",
+      "cluster": "ares",
+      "scenario": "gateway-runtime",
+      "command": ["gateway", "start-runtime"],
+      "report_option": "--validation-report",
+      "evidence_group": "ares-dedicated-gateway"
+    },
+    {
+      "ordinal": 17,
+      "id": "ares-gateway-stop",
+      "cluster": "ares",
+      "scenario": "gateway-runtime",
+      "command": ["gateway", "stop-runtime"],
+      "report_option": "--validation-report",
+      "evidence_group": "ares-dedicated-gateway"
+    }
+  ]
+}

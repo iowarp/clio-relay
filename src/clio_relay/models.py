@@ -5,10 +5,50 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from clio_relay.identifiers import DurableRecordId, validate_durable_record_id
+
+RELAY_CREDENTIAL_ENV_NAMES = frozenset(
+    {
+        "CLIO_RELAY_API_TOKEN",
+        "CLIO_RELAY_FRP_TOKEN",
+        "CLIO_RELAY_PROGRESS_TOKEN",
+        "CLIO_RELAY_RUNTIME_METADATA_TOKEN",
+        "CLIO_RELAY_STCP_SECRET",
+    }
+)
+
+
+def validate_mcp_env_from(value: dict[str, str]) -> dict[str, str]:
+    """Validate child-to-source environment references without resolving values."""
+    for child_name, source_name in value.items():
+        if not _valid_environment_name(child_name) or not _valid_environment_name(source_name):
+            raise ValueError("MCP env_from keys and values must be environment names")
+        forbidden = {
+            name
+            for name in (child_name, source_name)
+            if name in RELAY_CREDENTIAL_ENV_NAMES
+            or (
+                name.startswith("CLIO_RELAY_")
+                and (name.endswith("_TOKEN") or name.endswith("_SECRET"))
+            )
+        }
+        if forbidden:
+            credential = sorted(forbidden)[0]
+            raise ValueError(f"MCP env_from cannot expose relay credential {credential}")
+    return value
+
+
+def _valid_environment_name(value: str) -> bool:
+    return (
+        bool(value)
+        and (value[0].isalpha() or value[0] == "_")
+        and all(character.isalnum() or character == "_" for character in value)
+    )
 
 
 def utc_now() -> datetime:
@@ -17,8 +57,8 @@ def utc_now() -> datetime:
 
 
 def new_id(prefix: str) -> str:
-    """Create a readable relay identifier."""
-    return f"{prefix}_{uuid4().hex}"
+    """Create a readable portable relay identifier."""
+    return validate_durable_record_id(f"{prefix}_{uuid4().hex}")
 
 
 class EndpointRole(StrEnum):
@@ -34,6 +74,13 @@ class JobKind(StrEnum):
     JARVIS = "jarvis"
     REMOTE_AGENT = "remote_agent"
     MCP_CALL = "mcp_call"
+
+
+class McpOperation(StrEnum):
+    """Supported durable operations against a remote MCP server."""
+
+    TOOLS_CALL = "tools/call"
+    TOOLS_LIST = "tools/list"
 
 
 class JobState(StrEnum):
@@ -61,6 +108,19 @@ class SchedulerPhase(StrEnum):
     FAILED = "failed"
     CANCELED = "canceled"
     UNKNOWN = "unknown"
+
+
+class SchedulerCancelDispositionState(StrEnum):
+    """Durable disposition for one requested scheduler cancellation."""
+
+    PENDING = "pending"
+    RETRY_WAIT = "retry_wait"
+    CANCEL_REQUESTED = "cancel_requested"
+    CANCELED = "canceled"
+    TERMINAL = "terminal"
+    NOT_FOUND = "not_found"
+    REFUSED = "refused"
+    EXHAUSTED = "exhausted"
 
 
 class MonitorRuleAction(StrEnum):
@@ -110,7 +170,7 @@ class EndpointRegistration(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    endpoint_id: str = Field(default_factory=lambda: new_id("endpoint"))
+    endpoint_id: DurableRecordId = Field(default_factory=lambda: new_id("endpoint"))
     role: EndpointRole
     cluster: str | None = None
     hostname: str
@@ -118,6 +178,80 @@ class EndpointRegistration(BaseModel):
     registered_at: datetime = Field(default_factory=utc_now)
     last_seen_at: datetime = Field(default_factory=utc_now)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SchedulerCancelDisposition(BaseModel):
+    """Retry and terminal evidence for one scheduler job identity."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scheduler_job_id: str = Field(min_length=1, max_length=256)
+    provider: str | None = Field(default=None, min_length=1, max_length=128)
+    state: SchedulerCancelDispositionState = SchedulerCancelDispositionState.PENDING
+    attempts: int = Field(default=0, ge=0, le=100)
+    confirmation_attempts: int = Field(default=0, ge=0, le=100)
+    next_attempt_at: datetime | None = None
+    last_error: str | None = Field(default=None, max_length=16_384)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+def _empty_scheduler_cancel_dispositions() -> list[SchedulerCancelDisposition]:
+    """Return a typed empty scheduler-cancellation disposition collection."""
+    return []
+
+
+class SchedulerCancelPending(BaseModel):
+    """Crash-recoverable scheduler cancellation work for one relay job."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str = "clio-relay.scheduler-cancel-pending.v1"
+    job_id: DurableRecordId
+    cluster: str = Field(min_length=1, max_length=256)
+    requested_at: datetime = Field(default_factory=utc_now)
+    reason: str = Field(default="operator_request", min_length=1, max_length=256)
+    identity_resolution: Literal["pending", "resolved", "none", "superseded"] = "pending"
+    dispositions: list[SchedulerCancelDisposition] = Field(
+        default_factory=_empty_scheduler_cancel_dispositions,
+        max_length=1_000,
+    )
+    updated_at: datetime = Field(default_factory=utc_now)
+
+    @property
+    def complete(self) -> bool:
+        """Return whether no further scheduler cancellation work is due."""
+        if self.identity_resolution in {"none", "superseded"}:
+            return True
+        return (
+            self.identity_resolution == "resolved"
+            and bool(self.dispositions)
+            and all(
+                item.state
+                in {
+                    SchedulerCancelDispositionState.CANCELED,
+                    SchedulerCancelDispositionState.TERMINAL,
+                    SchedulerCancelDispositionState.NOT_FOUND,
+                    SchedulerCancelDispositionState.REFUSED,
+                    SchedulerCancelDispositionState.EXHAUSTED,
+                }
+                for item in self.dispositions
+            )
+        )
+
+
+class OwnerSessionJobMembership(BaseModel):
+    """Durable job membership for one owner-session generation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str = "clio-relay.owner-session-job-membership.v1"
+    owner_session_id: str = Field(min_length=1, max_length=256)
+    session_generation_id: DurableRecordId | None = None
+    job_id: DurableRecordId
+    cluster: str = Field(min_length=1, max_length=256)
+    state: JobState
+    created_at: datetime
+    updated_at: datetime
 
 
 class JarvisRunSpec(BaseModel):
@@ -173,15 +307,50 @@ class RemoteAgentTaskSpec(BaseModel):
 
 
 class McpCallSpec(BaseModel):
-    """A remote MCP tool call request."""
+    """A remote MCP tool call or discovery request."""
 
     model_config = ConfigDict(extra="forbid")
 
     server: str
     server_args: list[str] = Field(default_factory=list)
-    tool: str
+    env_from: dict[str, str] = Field(default_factory=dict)
+    expected_server_artifact_digest: str | None = None
+    operation: McpOperation = McpOperation.TOOLS_CALL
+    tool: str | None = None
     arguments: dict[str, Any] = Field(default_factory=dict)
     timeout_seconds: int | None = Field(default=None, gt=0)
+
+    @field_validator("env_from")
+    @classmethod
+    def validate_environment_references(cls, value: dict[str, str]) -> dict[str, str]:
+        """Reject invalid names and relay-owned credential references."""
+        return validate_mcp_env_from(value)
+
+    @field_validator("expected_server_artifact_digest")
+    @classmethod
+    def validate_expected_server_artifact_digest(cls, value: str | None) -> str | None:
+        """Require a canonical SHA-256 when a call is bound to discovery identity."""
+        if value is None:
+            return None
+        normalized = value.lower()
+        if len(normalized) != 64 or any(
+            character not in "0123456789abcdef" for character in normalized
+        ):
+            raise ValueError("expected_server_artifact_digest must be a SHA-256")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_operation_contract(self) -> McpCallSpec:
+        """Require call-only fields and keep discovery requests unambiguous."""
+        if self.operation == McpOperation.TOOLS_CALL:
+            if self.tool is None or not self.tool:
+                raise ValueError("tool is required for tools/call")
+            return self
+        if self.tool is not None:
+            raise ValueError("tool must be omitted for tools/list")
+        if self.arguments:
+            raise ValueError("arguments must be empty for tools/list")
+        return self
 
 
 JobSpec = Annotated[
@@ -190,22 +359,41 @@ JobSpec = Annotated[
 ]
 
 
+class StorageReservationEstimate(BaseModel):
+    """Validated per-job storage growth reserved before queue admission."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    core_bytes: int = Field(ge=0)
+    spool_bytes: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def require_nonzero_total(self) -> StorageReservationEstimate:
+        """Reject a reservation which provides no bounded growth capacity."""
+        if self.core_bytes + self.spool_bytes <= 0:
+            raise ValueError("storage reservation must contain at least one byte")
+        return self
+
+
 class RelayJob(BaseModel):
     """A durable relay job record."""
 
     model_config = ConfigDict(extra="forbid")
 
-    job_id: str = Field(default_factory=lambda: new_id("job"))
+    job_id: DurableRecordId = Field(default_factory=lambda: new_id("job"))
     cluster: str
     kind: JobKind
     state: JobState = JobState.QUEUED
     spec: JobSpec
     idempotency_key: str
+    submission_digest: str | None = Field(default=None, min_length=64, max_length=64)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     leased_by: str | None = None
     attempts: int = 0
     last_error: str | None = None
+    storage_reservation: StorageReservationEstimate | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class RelayTask(BaseModel):
@@ -213,8 +401,9 @@ class RelayTask(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    task_id: str = Field(default_factory=lambda: new_id("task"))
-    job_id: str
+    task_id: DurableRecordId = Field(default_factory=lambda: new_id("task"))
+    job_id: DurableRecordId
+    sequence: int | None = Field(default=None, ge=1)
     name: str
     state: JobState = JobState.QUEUED
     created_at: datetime = Field(default_factory=utc_now)
@@ -227,9 +416,10 @@ class SchedulerStatus(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    scheduler: str = "slurm"
+    scheduler: str
     scheduler_job_id: str
     phase: SchedulerPhase = SchedulerPhase.UNKNOWN
+    record_found: bool | None = None
     raw_state: str | None = None
     reason: str | None = None
     partition: str | None = None
@@ -255,7 +445,7 @@ class RelayEvent(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    job_id: str
+    job_id: DurableRecordId
     seq: int
     event_type: str
     message: str
@@ -269,14 +459,14 @@ class TaskTimelineEvent(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    task_id: str
+    task_id: DurableRecordId
     seq: int = Field(default=0, ge=0)
     event_type: str
     label: str
     status: TaskEventStatus = TaskEventStatus.RUNNING
     summary: str
     detail: str | None = None
-    artifact_refs: list[str] = Field(default_factory=list)
+    artifact_refs: list[DurableRecordId] = Field(default_factory=list)
     path_refs: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -295,8 +485,9 @@ class ArtifactRef(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    artifact_id: str = Field(default_factory=lambda: new_id("artifact"))
-    job_id: str
+    artifact_id: DurableRecordId = Field(default_factory=lambda: new_id("artifact"))
+    job_id: DurableRecordId
+    sequence: int | None = Field(default=None, ge=1)
     uri: str
     kind: str
     size_bytes: int | None = Field(default=None, ge=0)
@@ -310,8 +501,9 @@ class ProgressRecord(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    progress_id: str = Field(default_factory=lambda: new_id("progress"))
-    job_id: str
+    progress_id: DurableRecordId = Field(default_factory=lambda: new_id("progress"))
+    job_id: DurableRecordId
+    sequence: int | None = Field(default=None, ge=1)
     label: str = "progress"
     current: float | None = None
     total: float | None = Field(default=None, gt=0)
@@ -341,8 +533,8 @@ class MonitorRule(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    rule_id: str = Field(default_factory=lambda: new_id("rule"))
-    job_id: str
+    rule_id: DurableRecordId = Field(default_factory=lambda: new_id("rule"))
+    job_id: DurableRecordId
     pattern: str
     action: MonitorRuleAction = MonitorRuleAction.EMIT_EVENT
     event_types: list[str] = Field(default_factory=list)
@@ -359,11 +551,11 @@ class GatewaySession(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    session_id: str = Field(default_factory=lambda: new_id("gateway"))
+    session_id: DurableRecordId = Field(default_factory=lambda: new_id("gateway"))
     cluster: str
     name: str
     state: GatewaySessionState = GatewaySessionState.CREATED
-    scheduler: str = "slurm"
+    scheduler: str = "external"
     scheduler_job_id: str | None = None
     queue_state: str | None = None
     node: str | None = None
@@ -373,9 +565,9 @@ class GatewaySession(BaseModel):
     expected_expiry: datetime | None = None
     stdout_uri: str | None = None
     stderr_uri: str | None = None
-    log_uris: list[str] = Field(default_factory=list)
+    log_uris: list[str] = Field(default_factory=list, max_length=1_000)
     gateway: dict[str, Any] = Field(default_factory=dict)
-    artifacts: list[str] = Field(default_factory=list)
+    artifacts: list[str] = Field(default_factory=list, max_length=1_000)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -387,6 +579,101 @@ class GatewaySession(BaseModel):
         if value == "":
             raise ValueError("cluster and name must not be empty")
         return value
+
+
+class JobGcPhase(StrEnum):
+    """Crash-resumable phases for retiring one terminal job."""
+
+    PREPARED = "prepared"
+    IDEMPOTENCY_RETIRED = "idempotency_retired"
+    RECORDS_TRASHED = "records_trashed"
+    REFERENCES_TRASHED = "references_trashed"
+    PURGING = "purging"
+    COMPLETE = "complete"
+
+
+class TerminalJobGcPlan(BaseModel):
+    """A fail-closed dry-run decision for one terminal job."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str = "clio-relay.terminal-job-gc-plan.v1"
+    job_id: DurableRecordId
+    expected_updated_at: datetime
+    eligible: bool
+    protections: list[str] = Field(default_factory=list)
+    planned_at: datetime = Field(default_factory=utc_now)
+
+
+class JobTombstone(BaseModel):
+    """Compact durable identity retained after terminal job collection."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str = "clio-relay.job-tombstone.v1"
+    job_id: DurableRecordId
+    cluster: str
+    kind: JobKind
+    final_state: JobState
+    idempotency_key: str
+    job_digest: str
+    created_at: datetime
+    updated_at: datetime
+    attempts: int = Field(default=0, ge=0)
+    last_error: str | None = None
+    external_quarantine_id: str = Field(min_length=1, max_length=512)
+    phase: JobGcPhase = JobGcPhase.PREPARED
+    gc_started_at: datetime = Field(default_factory=utc_now)
+    gc_updated_at: datetime = Field(default_factory=utc_now)
+    removed_records: int = Field(default=0, ge=0)
+    records_trash_started: bool = False
+    monitor_cursor: str | None = None
+    monitor_scan_complete: bool = False
+
+
+class TerminalJobGcResult(BaseModel):
+    """Bounded progress from a dry-run or executable terminal-job GC call."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str = "clio-relay.terminal-job-gc-result.v1"
+    plan: TerminalJobGcPlan
+    dry_run: bool = True
+    phase: JobGcPhase | None = None
+    complete: bool = False
+    actions: int = Field(default=0, ge=0, le=100)
+    tombstone: JobTombstone | None = None
+
+
+class OwnerSessionClosure(BaseModel):
+    """Verified terminal ownership state written only after session teardown."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str = "clio-relay.owner-session-closure.v1"
+    owner_session_id: str = Field(min_length=1, max_length=256)
+    session_generation_id: DurableRecordId | None = None
+    covered_by_session_generation_id: DurableRecordId | None = None
+    covered_legacy_job_ids: list[DurableRecordId] = Field(default_factory=list, max_length=1_000)
+    residual_resource_ids: list[str] = Field(default_factory=list, max_length=1_000)
+    closed_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def validate_generation_coverage(self) -> OwnerSessionClosure:
+        """Keep generation closures and bounded legacy coverage unambiguous."""
+        if self.session_generation_id is not None:
+            if self.covered_by_session_generation_id is not None or self.covered_legacy_job_ids:
+                raise ValueError("generation closures cannot contain legacy coverage")
+            return self
+        if not self.covered_by_session_generation_id:
+            raise ValueError("legacy closure requires a covering generation")
+        if not self.covered_legacy_job_ids:
+            raise ValueError("legacy closure requires at least one exact job id")
+        if self.covered_legacy_job_ids != sorted(set(self.covered_legacy_job_ids)):
+            raise ValueError("legacy closure job ids must be unique and sorted")
+        if self.residual_resource_ids:
+            raise ValueError("legacy closure cannot retain residual resources")
+        return self
 
 
 class ServiceRuntimeSpec(BaseModel):
@@ -401,6 +688,7 @@ class ServiceRuntimeSpec(BaseModel):
     deployment_driver: str = "jarvis"
     service_port: int = Field(gt=0, le=65535)
     health_path: str = "/healthz"
+    health_expected_body: str | None = Field(default=None, max_length=4096)
     stream_mode: str = "push"
     stream_path: str | None = "/stream"
     event_stream_path: str | None = "/events"
@@ -472,6 +760,17 @@ class ServiceRuntimeSpec(BaseModel):
             raise ValueError("service runtime HTTP paths must start with /")
         return value
 
+    @field_validator("health_expected_body")
+    @classmethod
+    def service_runtime_health_body_must_not_be_empty(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        """Reject an empty exact health-response body assertion."""
+        if value == "":
+            raise ValueError("health_expected_body must not be empty")
+        return value
+
     @field_validator("compatibility_paths")
     @classmethod
     def service_runtime_compatibility_paths_must_be_absolute(
@@ -492,7 +791,7 @@ class Cursor(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    job_id: str
+    job_id: DurableRecordId
     next_seq: int = Field(default=1, ge=1)
 
 
@@ -501,9 +800,9 @@ class Lease(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    lease_id: str = Field(default_factory=lambda: new_id("lease"))
-    job_id: str
-    endpoint_id: str
+    lease_id: DurableRecordId = Field(default_factory=lambda: new_id("lease"))
+    job_id: DurableRecordId
+    endpoint_id: DurableRecordId
     acquired_at: datetime = Field(default_factory=utc_now)
     expires_at: datetime
 

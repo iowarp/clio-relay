@@ -1,0 +1,11 @@
+name: ares-scheduler-lifecycle-acceptance
+scheduler:
+  name: slurm
+pkgs:
+  - pkg_type: clio_relay.bounded_command
+    pkg_name: bounded_command
+    command:
+      - bash
+      - -lc
+      - sleep 30
+    timeout_seconds: 120

@@ -5,8 +5,7 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-from jarvis_cd.core.pkg import Application
-
+from clio_relay._jarvis_api import Application
 from clio_relay.mcp_call.runner import run_mcp_call_from_params
 
 

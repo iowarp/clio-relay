@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import platform
 import shlex
@@ -12,14 +14,35 @@ import tempfile
 import zipfile
 from dataclasses import dataclass
 from importlib import resources
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import cast
 from urllib.request import urlretrieve
+from uuid import uuid4
 
 from clio_relay import __version__
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.jarvis_mcp import CLIO_KIT_JARVIS_MCP_VERSION
 
 FRP_VERSION = "0.69.1"
+FRP_WINDOWS_AMD64_SHA256 = "829ac915f8655d4d4e021b8db61b46c3445205ed80d32b04cda7fa89d87c46e0"
+FRP_LINUX_AMD64_SHA256 = "7be257b72dbbc60bcb3e0e25a5afd1dfac7b63f897084864d3c956dd3d5674e1"
+FRPC_LINUX_AMD64_SHA256 = "142f447f43fef286acc8da8a6852dda80631db631d604b2e63634b2db4d6848c"
+FRPS_LINUX_AMD64_SHA256 = "68d2908bb73fe7a03c29d9227d2acc2104bff3fea6b1cece0b8388c1a0660442"
+FRPC_WINDOWS_AMD64_SHA256 = "1d1c4f988b1808bb458a4ba38f00359052d14636023a504520e0afed127d636d"
+FRPS_WINDOWS_AMD64_SHA256 = "bd463ef89370abc6973c86258256fa65776baa5f515ef91ebeabd6070b92e229"
+UV_VERSION = "0.11.28"
+UV_LINUX_AMD64_SHA256 = "e490a6464492183c5d4534a5527fb4440f7f2bb2f228162ad7e4afe076dc0224"
+JARVIS_UTIL_COMMIT = "c91bfdc9bba802e4b03bfb1babe614ffa3e09644"
+JARVIS_CD_VERSION = "1.2.2"
+JARVIS_CD_WHEEL_FILENAME = f"jarvis_cd-{JARVIS_CD_VERSION}-py3-none-any.whl"
+JARVIS_CD_WHEEL_URL = (
+    "https://github.com/grc-iit/jarvis-cd/releases/download/"
+    f"v{JARVIS_CD_VERSION}/{JARVIS_CD_WHEEL_FILENAME}"
+)
+JARVIS_CD_WHEEL_SHA256 = "f05454718a4efe4dadebefb98c83511ba3dcc662238c0c05430a1b621a8ab8b7"
+CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 = (
+    "6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321"
+)
 
 
 @dataclass(frozen=True)
@@ -34,9 +57,9 @@ def install_local_frp(destination: Path) -> Path:
     """Install frpc/frps for the local platform into a user-writable directory."""
     system = platform.system().lower()
     machine = platform.machine().lower()
-    destination.mkdir(parents=True, exist_ok=True)
     if system != "windows" or machine not in {"amd64", "x86_64"}:
         raise ConfigurationError(f"local frp installer does not support {system}/{machine}")
+    destination.mkdir(parents=True, exist_ok=True)
     frpc = destination / "frpc.exe"
     frps = destination / "frps.exe"
     if frpc.exists() and frps.exists():
@@ -44,122 +67,65 @@ def install_local_frp(destination: Path) -> Path:
             _assert_frp_pair(frpc, frps)
             return frpc
         except ConfigurationError:
-            frpc.unlink(missing_ok=True)
-            frps.unlink(missing_ok=True)
-    errors: list[str] = []
-    for installer in (
-        _install_frp_from_scoop,
-        _install_frp_from_source,
-        _install_frp_from_release_archive,
-    ):
-        try:
-            installer(destination, FRP_VERSION)
+            pass
+    cleanup_errors = _remove_local_frp_pair(frpc, frps)
+    if cleanup_errors:
+        raise ConfigurationError(
+            "could not remove an unverified existing frp installation: " + "; ".join(cleanup_errors)
+        )
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=".clio-relay-frp-",
+            dir=destination.parent,
+        ) as temporary_directory:
+            staging = Path(temporary_directory) / "bin"
+            staging.mkdir()
+            _install_frp_from_release_archive(staging, FRP_VERSION)
+            staged_frpc = staging / "frpc.exe"
+            staged_frps = staging / "frps.exe"
+            _assert_frp_pair(staged_frpc, staged_frps)
+            shutil.copy2(staged_frpc, frpc)
+            shutil.copy2(staged_frps, frps)
             _assert_frp_pair(frpc, frps)
-            return frpc
-        except ConfigurationError as exc:
-            errors.append(f"{installer.__name__}: {exc}")
+        _assert_frp_pair(frpc, frps)
+        return frpc
+    except (ConfigurationError, OSError) as exc:
+        cleanup_errors = _remove_local_frp_pair(frpc, frps)
+        cleanup_detail = (
+            ""
+            if not cleanup_errors
+            else "; unverified destination cleanup failed: " + "; ".join(cleanup_errors)
+        )
+        raise ConfigurationError(
+            f"failed to install verified frp release: {exc}{cleanup_detail}"
+        ) from exc
+
+
+def _remove_local_frp_pair(frpc: Path, frps: Path) -> list[str]:
+    """Remove both local frp executables and return any cleanup errors."""
+    errors: list[str] = []
+    for path in (frpc, frps):
+        try:
+            path.unlink(missing_ok=True)
         except OSError as exc:
-            errors.append(f"{installer.__name__}: {exc}")
-    raise ConfigurationError("failed to install frp: " + "; ".join(errors))
-
-
-def _install_frp_from_scoop(destination: Path, version: str) -> None:
-    if shutil.which("scoop") is None:
-        raise ConfigurationError("scoop is not available")
-    result = _run_scoop(["list", "frp"], check=False)
-    if result.returncode != 0 or version not in result.stdout:
-        _run_scoop(["install", "frp"], check=True)
-    frpc_source = _scoop_which("frpc")
-    frps_source = _scoop_which("frps")
-    shutil.copy2(frpc_source, destination / "frpc.exe")
-    shutil.copy2(frps_source, destination / "frps.exe")
-
-
-def _scoop_which(binary: str) -> Path:
-    result = _run_scoop(["which", binary], check=False)
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip()
-        raise ConfigurationError(f"scoop cannot locate {binary}: {detail}")
-    path = Path(result.stdout.strip().splitlines()[-1])
-    if not path.exists():
-        raise ConfigurationError(f"scoop reported missing path for {binary}: {path}")
-    return path
-
-
-def _run_scoop(args: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        [
-            "powershell",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            "scoop " + " ".join(shlex.quote(arg) for arg in args),
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if check and result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip()
-        raise ConfigurationError(f"scoop command failed: {detail}")
-    return result
-
-
-def _install_frp_from_source(destination: Path, version: str) -> None:
-    if shutil.which("git") is None or shutil.which("go") is None:
-        raise ConfigurationError("git and go are required for source build")
-    with tempfile.TemporaryDirectory(prefix="clio-relay-frp-") as temp_dir:
-        source_dir = Path(temp_dir) / "frp"
-        _run(
-            [
-                "git",
-                "clone",
-                "--depth",
-                "1",
-                "--branch",
-                f"v{version}",
-                "https://github.com/fatedier/frp.git",
-                str(source_dir),
-            ]
-        )
-        _run(
-            [
-                "go",
-                "build",
-                "-trimpath",
-                "-tags",
-                "frpc,noweb",
-                "-o",
-                "frpc.exe",
-                "./cmd/frpc",
-            ],
-            cwd=source_dir,
-        )
-        _run(
-            [
-                "go",
-                "build",
-                "-trimpath",
-                "-tags",
-                "frps,noweb",
-                "-o",
-                "frps.exe",
-                "./cmd/frps",
-            ],
-            cwd=source_dir,
-        )
-        shutil.copy2(source_dir / "frpc.exe", destination / "frpc.exe")
-        shutil.copy2(source_dir / "frps.exe", destination / "frps.exe")
+            errors.append(f"{path}: {exc}")
+    return errors
 
 
 def _install_frp_from_release_archive(destination: Path, version: str) -> None:
+    if version != FRP_VERSION:
+        raise ConfigurationError(f"no pinned Windows checksum is registered for frp {version}")
     archive = destination.parent / f"frp_{version}_windows_amd64.zip"
     url = (
         "https://github.com/fatedier/frp/releases/download/"
         f"v{version}/frp_{version}_windows_amd64.zip"
     )
     urlretrieve(url, archive)
+    observed = hashlib.sha256(archive.read_bytes()).hexdigest()
+    if observed != FRP_WINDOWS_AMD64_SHA256:
+        raise ConfigurationError(
+            f"frp archive SHA-256 mismatch: {observed} != {FRP_WINDOWS_AMD64_SHA256}"
+        )
     with zipfile.ZipFile(archive) as zipped:
         zipped.extractall(destination.parent)
     extracted = destination.parent / f"frp_{version}_windows_amd64"
@@ -173,6 +139,7 @@ def bootstrap_cluster_over_ssh(
     ssh_host: str,
     source_root: Path,
     relay_wheel: Path | None = None,
+    relay_artifact_sha256: str | None = None,
     agent_adapter: str = "exec",
     agent_npm_package: str | None = None,
     agent_npm_bin: str | None = None,
@@ -182,121 +149,111 @@ def bootstrap_cluster_over_ssh(
     """Install relay dependencies and the current source tree on a cluster over SSH."""
     if bootstrap_profile != "linux-user":
         raise ConfigurationError(f"unsupported bootstrap profile: {bootstrap_profile}")
+    _validate_ssh_destination(ssh_host)
     if shutil.which("ssh") is None or shutil.which("scp") is None:
         raise ConfigurationError("ssh and scp are required for remote bootstrap")
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
-        archive = temp_path / "clio-relay-head.tar"
-        script_path = temp_path / "clio-relay-bootstrap.sh"
-        deployment = create_bootstrap_archive(
-            source_root=source_root,
-            archive=archive,
-            relay_wheel=relay_wheel,
+    invocation_id = f"bootstrap_{uuid4().hex}"
+    remote_root = f"/tmp/clio-relay-{invocation_id}"
+    remote_archive = f"{remote_root}/clio-relay-head.tar"
+    remote_script = f"{remote_root}/clio-relay-bootstrap.sh"
+    remote_created = False
+    primary_error: BaseException | None = None
+    try:
+        _run(
+            [
+                "ssh",
+                ssh_host,
+                "bash",
+                "-c",
+                f"umask 077; mkdir -- {shlex.quote(remote_root)}; "
+                f"chmod 700 -- {shlex.quote(remote_root)}",
+            ]
         )
-        _run(["scp", str(deployment.archive), f"{ssh_host}:/tmp/clio-relay-head.tar"])
-        script_path.write_text(
-            render_linux_user_bootstrap_script(
-                frp_version=frp_version,
-                agent_adapter=agent_adapter,
-                agent_npm_package=agent_npm_package,
-                agent_npm_bin=agent_npm_bin,
-                agent_args=agent_args or [],
-                relay_install_spec=deployment.install_spec,
-            ),
-            encoding="utf-8",
-            newline="\n",
+        remote_created = True
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            archive = temp_path / "clio-relay-head.tar"
+            script_path = temp_path / "clio-relay-bootstrap.sh"
+            deployment = create_bootstrap_archive(
+                source_root=source_root,
+                archive=archive,
+                relay_wheel=relay_wheel,
+            )
+            expected_relay_sha256 = relay_artifact_sha256
+            if relay_wheel is not None:
+                observed_relay_sha256 = hashlib.sha256(relay_wheel.read_bytes()).hexdigest()
+                if (
+                    expected_relay_sha256 is not None
+                    and expected_relay_sha256 != observed_relay_sha256
+                ):
+                    raise ConfigurationError("relay bootstrap wheel SHA-256 does not match its pin")
+                expected_relay_sha256 = observed_relay_sha256
+            source_archive_sha256 = hashlib.sha256(deployment.archive.read_bytes()).hexdigest()
+            _run(["scp", str(deployment.archive), f"{ssh_host}:{remote_archive}"])
+            script_path.write_text(
+                render_linux_user_bootstrap_script(
+                    frp_version=frp_version,
+                    agent_adapter=agent_adapter,
+                    agent_npm_package=agent_npm_package,
+                    agent_npm_bin=agent_npm_bin,
+                    agent_args=agent_args or [],
+                    relay_install_spec=deployment.install_spec,
+                    relay_artifact_sha256=expected_relay_sha256,
+                    invocation_id=invocation_id,
+                    source_archive=remote_archive,
+                    source_archive_sha256=source_archive_sha256,
+                ),
+                encoding="utf-8",
+                newline="\n",
+            )
+            _run(["scp", str(script_path), f"{ssh_host}:{remote_script}"])
+        result = _run(["ssh", ssh_host, "bash", remote_script])
+        receipt_result = _run(
+            ["ssh", ssh_host, "cat", "$HOME/.local/share/clio-relay/bootstrap-receipt.json"]
         )
-        _run(["scp", str(script_path), f"{ssh_host}:/tmp/clio-relay-bootstrap.sh"])
-    result = _run(["ssh", ssh_host, "bash", "/tmp/clio-relay-bootstrap.sh"])
-    return result.stdout.splitlines()
+        try:
+            raw_receipt = cast(object, json.loads(receipt_result.stdout))
+        except json.JSONDecodeError as exc:
+            raise RelayError(f"bootstrap receipt was not valid JSON: {exc}") from exc
+        if not isinstance(raw_receipt, dict):
+            raise RelayError("bootstrap receipt was not a JSON object")
+        receipt = cast(dict[str, object], raw_receipt)
+        if receipt.get("invocation_id") != invocation_id:
+            raise RelayError("bootstrap receipt does not match the completed invocation")
+        install_receipt_sha256 = receipt.get("install_receipt_sha256")
+        receipt_contract = {
+            "schema_version": receipt.get("schema_version") == "clio-relay.bootstrap-receipt.v1",
+            "bootstrap_profile": receipt.get("bootstrap_profile") == bootstrap_profile,
+            "relay_install_spec": receipt.get("relay_install_spec") == deployment.install_spec,
+            "install_receipt_sha256": isinstance(install_receipt_sha256, str)
+            and len(install_receipt_sha256) == 64
+            and all(character in "0123456789abcdef" for character in install_receipt_sha256),
+            "completed_at": isinstance(receipt.get("completed_at"), str)
+            and bool(receipt.get("completed_at")),
+        }
+        failed_contract = sorted(name for name, passed in receipt_contract.items() if not passed)
+        if failed_contract:
+            raise RelayError(f"bootstrap receipt contract failed: {failed_contract}")
+        return [
+            *result.stdout.splitlines(),
+            "bootstrap_receipt_json=" + json.dumps(receipt, sort_keys=True),
+        ]
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        if remote_created:
+            try:
+                _run(["ssh", ssh_host, "rm", "-rf", "--", remote_root])
+            except RelayError as cleanup_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(f"remote bootstrap staging cleanup failed: {cleanup_error}")
 
 
 def package_source_root() -> Path:
     """Return the project root for editable installs, or the package root for wheels."""
     return Path(__file__).resolve().parents[2]
-
-
-def install_cluster_app_over_ssh(*, ssh_host: str, app_name: str) -> list[str]:
-    """Install an application-specific runtime on a cluster over SSH."""
-    if shutil.which("ssh") is None:
-        raise ConfigurationError("ssh is required for remote app installation")
-    script = render_cluster_app_install_script(app_name=app_name)
-    result = subprocess.run(
-        ["ssh", ssh_host, "bash", "-s"],
-        input=script.encode("utf-8"),
-        capture_output=True,
-        check=False,
-    )
-    stdout = result.stdout.decode("utf-8", errors="replace")
-    stderr = result.stderr.decode("utf-8", errors="replace")
-    if result.returncode != 0:
-        raise RelayError(
-            f"cluster app installation failed on {ssh_host}: {stderr.strip() or stdout.strip()}"
-        )
-    return stdout.splitlines()
-
-
-def render_cluster_app_install_script(*, app_name: str) -> str:
-    """Render an app-specific remote install script."""
-    if app_name != "lammps":
-        raise ConfigurationError(f"unsupported cluster app: {app_name}")
-    return render_lammps_app_install_script()
-
-
-def render_lammps_app_install_script() -> str:
-    """Render the sudo-less LAMMPS installer used by explicit app setup."""
-    script = """set -euo pipefail
-export PATH="$HOME/.local/bin:$PATH"
-mkdir -p "$HOME/.local/bin" "$HOME/.local/src" "$HOME/.local/share/clio-relay/apps/lammps"
-
-if [ ! -d "$HOME/spack/.git" ]; then
-  git clone --depth 1 --branch releases/v1.1 https://github.com/spack/spack.git "$HOME/spack"
-fi
-. "$HOME/spack/share/spack/setup-env.sh"
-spack compiler find || true
-if ! spack find -p lammps >/dev/null 2>&1; then
-  spack install lammps
-fi
-LAMMPS_PREFIX="$(spack location -i lammps)"
-if [ -z "$LAMMPS_PREFIX" ] || [ ! -d "$LAMMPS_PREFIX" ]; then
-  echo "failed to locate installed LAMMPS prefix through Spack" >&2
-  exit 1
-fi
-LAMMPS_BIN=""
-for candidate in \
-  "$LAMMPS_PREFIX/bin/lmp" \
-  "$LAMMPS_PREFIX/bin/lmp_mpi" \
-  "$LAMMPS_PREFIX/bin/lammps"; do
-  if [ -x "$candidate" ]; then
-    LAMMPS_BIN="$candidate"
-    break
-  fi
-done
-if [ -z "$LAMMPS_BIN" ]; then
-  echo "LAMMPS installed at $LAMMPS_PREFIX but no lmp/lmp_mpi/lammps binary was found" >&2
-  exit 1
-fi
-
-cat > "$HOME/.local/share/clio-relay/apps/lammps/env.sh" <<__CLIO_RELAY_LAMMPS_ENV__
-export SPACK_ROOT="$HOME/spack"
-. "$HOME/spack/share/spack/setup-env.sh"
-spack load lammps
-export CLIO_RELAY_LAMMPS_BIN="$LAMMPS_BIN"
-__CLIO_RELAY_LAMMPS_ENV__
-
-cat > "$HOME/.local/bin/lmp" <<'__CLIO_RELAY_LAMMPS_ENTRYPOINT__'
-#!/usr/bin/env bash
-set -euo pipefail
-. "$HOME/.local/share/clio-relay/apps/lammps/env.sh"
-exec "$CLIO_RELAY_LAMMPS_BIN" "$@"
-__CLIO_RELAY_LAMMPS_ENTRYPOINT__
-chmod 0755 "$HOME/.local/bin/lmp"
-
-echo "lammps_prefix=$LAMMPS_PREFIX"
-echo "lammps_bin=$LAMMPS_BIN"
-echo "lmp=$HOME/.local/bin/lmp"
-"""
-    return script.replace("\r\n", "\n")
 
 
 def render_linux_user_bootstrap_script(
@@ -307,7 +264,12 @@ def render_linux_user_bootstrap_script(
     agent_npm_bin: str | None = None,
     agent_args: list[str] | None = None,
     relay_install_spec: str = "$DEST",
+    relay_artifact_sha256: str | None = None,
     jarvis_mcp_install_spec: str | None = None,
+    jarvis_mcp_artifact_sha256: str | None = None,
+    invocation_id: str = "manual",
+    source_archive: str = "/tmp/clio-relay-head.tar",
+    source_archive_sha256: str | None = None,
 ) -> str:
     """Render the idempotent shell script used for the current Linux cluster bootstrap."""
     rendered_agent_adapter = shlex.quote(agent_adapter)
@@ -315,30 +277,106 @@ def render_linux_user_bootstrap_script(
     rendered_agent_npm_package = shlex.quote(agent_npm_package or "")
     rendered_agent_npm_bin = shlex.quote(agent_npm_bin or "")
     rendered_relay_install_spec = _render_relay_install_spec(relay_install_spec)
-    rendered_jarvis_mcp_install_spec = shlex.quote(
-        jarvis_mcp_install_spec
-        or os.environ.get(
-            "CLIO_RELAY_JARVIS_MCP_INSTALL_SPEC",
-            f"clio-kit=={CLIO_KIT_JARVIS_MCP_VERSION}",
+    source_archive_path = PurePosixPath(source_archive)
+    if (
+        not source_archive_path.is_absolute()
+        or ".." in source_archive_path.parts
+        or any(character in source_archive for character in "\x00\r\n")
+    ):
+        raise ConfigurationError("bootstrap source archive must be one safe absolute path")
+    if source_archive_sha256 is not None and (
+        len(source_archive_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in source_archive_sha256)
+    ):
+        raise ConfigurationError("bootstrap source archive SHA-256 must be lowercase hex")
+    rendered_source_archive = shlex.quote(source_archive)
+    rendered_source_archive_sha256 = shlex.quote(source_archive_sha256 or "")
+    if relay_artifact_sha256 is not None and (
+        len(relay_artifact_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in relay_artifact_sha256)
+    ):
+        raise ConfigurationError("relay bootstrap wheel SHA-256 must be lowercase hex")
+    if relay_install_spec.endswith(".whl") and relay_artifact_sha256 is None:
+        raise ConfigurationError("a relay bootstrap wheel requires its expected SHA-256")
+    rendered_relay_artifact_sha256 = shlex.quote(relay_artifact_sha256 or "")
+    if frp_version != FRP_VERSION:
+        raise ConfigurationError(f"no pinned Linux checksum is registered for frp {frp_version}")
+    resolved_jarvis_mcp_install_spec = jarvis_mcp_install_spec or os.environ.get(
+        "CLIO_RELAY_JARVIS_MCP_INSTALL_SPEC",
+        f"clio-kit=={CLIO_KIT_JARVIS_MCP_VERSION}",
+    )
+    resolved_jarvis_mcp_artifact_sha256 = (
+        jarvis_mcp_artifact_sha256
+        or os.environ.get("CLIO_RELAY_JARVIS_MCP_ARTIFACT_SHA256")
+        or (
+            CLIO_KIT_JARVIS_MCP_WHEEL_SHA256
+            if resolved_jarvis_mcp_install_spec == f"clio-kit=={CLIO_KIT_JARVIS_MCP_VERSION}"
+            else None
         )
     )
+    if resolved_jarvis_mcp_artifact_sha256 is None:
+        raise ConfigurationError(
+            "a custom clio-kit bootstrap source requires its expected wheel SHA-256"
+        )
+    if len(resolved_jarvis_mcp_artifact_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in resolved_jarvis_mcp_artifact_sha256
+    ):
+        raise ConfigurationError("clio-kit bootstrap wheel SHA-256 must be lowercase hex")
+    rendered_jarvis_mcp_install_spec = shlex.quote(resolved_jarvis_mcp_install_spec)
+    rendered_jarvis_mcp_artifact_sha256 = shlex.quote(resolved_jarvis_mcp_artifact_sha256)
     script = f"""set -euo pipefail
+umask 077
 export PATH="$HOME/.local/bin:$PATH"
+export UV_TOOL_DIR="$HOME/.local/share/uv/tools"
+export UV_TOOL_BIN_DIR="$HOME/.local/bin"
+while IFS= read -r variable_name; do
+  case "$variable_name" in
+    UV_TOOL_DIR|UV_TOOL_BIN_DIR|UV_CACHE_DIR) ;;
+    UV_*|PIP_*) unset "$variable_name" ;;
+  esac
+done < <(compgen -e)
 mkdir -p "$HOME/.local/bin" "$HOME/.local/src" "$HOME/.local/share/clio-relay"
+command -v flock >/dev/null 2>&1 || {{
+  echo "flock is required to serialize clio-relay bootstrap" >&2
+  exit 1
+}}
+exec 9>"$HOME/.local/share/clio-relay/bootstrap.lock"
+if ! flock -n 9; then
+  echo "another clio-relay bootstrap is already running" >&2
+  exit 1
+fi
 
 cd "$HOME/.local/src"
 FRP_VERSION="{frp_version}"
+FRP_SHA256="{FRP_LINUX_AMD64_SHA256}"
+FRPC_SHA256="{FRPC_LINUX_AMD64_SHA256}"
+FRPS_SHA256="{FRPS_LINUX_AMD64_SHA256}"
 ARCHIVE="frp_${{FRP_VERSION}}_linux_amd64.tar.gz"
-if [ ! -x "$HOME/.local/bin/frpc" ] || [ ! -x "$HOME/.local/bin/frps" ]; then
+if [ ! -x "$HOME/.local/bin/frpc" ] \
+  || [ ! -x "$HOME/.local/bin/frps" ] \
+  || ! echo "$FRPC_SHA256 *$HOME/.local/bin/frpc" | sha256sum --check --status - \
+  || ! echo "$FRPS_SHA256 *$HOME/.local/bin/frps" | sha256sum --check --status -; then
   curl -L --fail --retry 3 -o "$ARCHIVE" \
     "https://github.com/fatedier/frp/releases/download/v${{FRP_VERSION}}/${{ARCHIVE}}"
+  echo "$FRP_SHA256 *$ARCHIVE" | sha256sum --check --strict -
   tar -xzf "$ARCHIVE"
   install -m 0755 "frp_${{FRP_VERSION}}_linux_amd64/frpc" "$HOME/.local/bin/frpc"
   install -m 0755 "frp_${{FRP_VERSION}}_linux_amd64/frps" "$HOME/.local/bin/frps"
+  echo "$FRPC_SHA256 *$HOME/.local/bin/frpc" | sha256sum --check --strict -
+  echo "$FRPS_SHA256 *$HOME/.local/bin/frps" | sha256sum --check --strict -
 fi
 
-if [ ! -x "$HOME/.local/bin/uv" ]; then
-  curl -LsSf https://astral.sh/uv/install.sh | sh
+UV_VERSION="{UV_VERSION}"
+UV_SHA256="{UV_LINUX_AMD64_SHA256}"
+UV_ARCHIVE="uv-x86_64-unknown-linux-gnu.tar.gz"
+if [ ! -x "$HOME/.local/bin/uv" ] \
+  || [ "$("$HOME/.local/bin/uv" --version | awk '{{print $1 " " $2}}')" != "uv $UV_VERSION" ]; then
+  curl -L --fail --retry 3 -o "$UV_ARCHIVE" \
+    "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/$UV_ARCHIVE"
+  echo "$UV_SHA256 *$UV_ARCHIVE" | sha256sum --check --strict -
+  tar -xzf "$UV_ARCHIVE"
+  install -m 0755 "uv-x86_64-unknown-linux-gnu/uv" "$HOME/.local/bin/uv"
+  install -m 0755 "uv-x86_64-unknown-linux-gnu/uvx" "$HOME/.local/bin/uvx"
 fi
 uv python install 3.12
 
@@ -355,32 +393,381 @@ fi
 JARVIS_VENV="$HOME/.local/share/clio-relay/jarvis-venv"
 uv venv --python 3.12 --seed --clear "$JARVIS_VENV"
 . "$JARVIS_VENV/bin/activate"
-python -m pip install --upgrade pip setuptools wheel
+JARVIS_UTIL_COMMIT="{JARVIS_UTIL_COMMIT}"
 if [ ! -d "$HOME/.local/src/jarvis-util/.git" ]; then
-  git clone https://github.com/grc-iit/jarvis-util.git "$HOME/.local/src/jarvis-util"
+  git clone --no-checkout https://github.com/grc-iit/jarvis-util.git \
+    "$HOME/.local/src/jarvis-util"
 fi
-git -C "$HOME/.local/src/jarvis-util" pull --ff-only
-python -m pip install -r "$HOME/.local/src/jarvis-util/requirements.txt"
-python -m pip install -e "$HOME/.local/src/jarvis-util"
-if [ ! -d "$HOME/.local/src/jarvis-cd/.git" ]; then
-  git clone https://github.com/grc-iit/jarvis-cd.git "$HOME/.local/src/jarvis-cd"
+if [ -n "$(
+  git -C "$HOME/.local/src/jarvis-util" status --porcelain=v1 --untracked-files=all
+)" ]; then
+  echo "refusing to replace modified jarvis-util checkout" >&2
+  exit 1
 fi
-git -C "$HOME/.local/src/jarvis-cd" pull --ff-only
-python -m pip install -r "$HOME/.local/src/jarvis-cd/requirements.txt"
-python -m pip install -e "$HOME/.local/src/jarvis-cd"
+git -C "$HOME/.local/src/jarvis-util" fetch --depth 1 origin "$JARVIS_UTIL_COMMIT"
+git -C "$HOME/.local/src/jarvis-util" checkout --detach "$JARVIS_UTIL_COMMIT"
+test "$(git -C "$HOME/.local/src/jarvis-util" rev-parse HEAD)" = "$JARVIS_UTIL_COMMIT"
+python -m pip install --isolated --index-url https://pypi.org/simple \\
+  -r "$HOME/.local/src/jarvis-util/requirements.txt"
+python -m pip install --isolated --no-deps "$HOME/.local/src/jarvis-util"
+JARVIS_CD_VERSION="{JARVIS_CD_VERSION}"
+JARVIS_CD_WHEEL_URL="{JARVIS_CD_WHEEL_URL}"
+JARVIS_CD_WHEEL_SHA256="{JARVIS_CD_WHEEL_SHA256}"
+JARVIS_CD_WHEEL_DIR="$HOME/.local/share/clio-relay/component-wheels/jarvis-cd"
+JARVIS_CD_WHEEL="$JARVIS_CD_WHEEL_DIR/{JARVIS_CD_WHEEL_FILENAME}"
+rm -rf "$JARVIS_CD_WHEEL_DIR"
+mkdir -p "$JARVIS_CD_WHEEL_DIR"
+JARVIS_CD_STAGING="$(mktemp "${{JARVIS_CD_WHEEL}}.XXXXXX")"
+curl -L --fail --retry 3 -o "$JARVIS_CD_STAGING" "$JARVIS_CD_WHEEL_URL"
+echo "$JARVIS_CD_WHEEL_SHA256 *$JARVIS_CD_STAGING" | sha256sum --check --strict -
+mv "$JARVIS_CD_STAGING" "$JARVIS_CD_WHEEL"
+python -m pip install --isolated --index-url https://pypi.org/simple "$JARVIS_CD_WHEEL"
 ln -sf "$JARVIS_VENV/bin/jarvis" "$HOME/.local/bin/jarvis"
+JARVIS_MCP_INSTALL_SPEC={rendered_jarvis_mcp_install_spec}
+JARVIS_MCP_ARTIFACT_SHA256={rendered_jarvis_mcp_artifact_sha256}
+JARVIS_MCP_INSTALL_TARGET="$JARVIS_MCP_INSTALL_SPEC"
+JARVIS_MCP_ARTIFACT_PATH=""
+JARVIS_MCP_REQUESTED_SOURCE="checkout"
+JARVIS_MCP_VERSION=""
+case "$JARVIS_MCP_INSTALL_SPEC" in
+  clio-kit==*)
+    JARVIS_MCP_VERSION="${{JARVIS_MCP_INSTALL_SPEC#clio-kit==}}"
+    COMPONENT_DOWNLOAD_DIR="$HOME/.local/share/clio-relay/component-wheels/clio-kit"
+    rm -rf "$COMPONENT_DOWNLOAD_DIR"
+    mkdir -p "$COMPONENT_DOWNLOAD_DIR"
+    python -m pip download --isolated --disable-pip-version-check --no-cache-dir \
+      --index-url https://pypi.org/simple --no-deps --only-binary=:all: \
+      --dest "$COMPONENT_DOWNLOAD_DIR" "$JARVIS_MCP_INSTALL_SPEC"
+    mapfile -t JARVIS_MCP_WHEELS < <(
+      find "$COMPONENT_DOWNLOAD_DIR" -maxdepth 1 -type f -name 'clio_kit-*.whl' -print
+    )
+    if [ "${{#JARVIS_MCP_WHEELS[@]}}" -ne 1 ]; then
+      echo "expected exactly one downloaded clio-kit wheel" >&2
+      exit 1
+    fi
+    JARVIS_MCP_ARTIFACT_PATH="${{JARVIS_MCP_WHEELS[0]}}"
+    JARVIS_MCP_INSTALL_TARGET="$JARVIS_MCP_ARTIFACT_PATH"
+    JARVIS_MCP_REQUESTED_SOURCE="pypi"
+    ;;
+  *.whl)
+    test -f "$JARVIS_MCP_INSTALL_SPEC"
+    COMPONENT_DOWNLOAD_DIR="$HOME/.local/share/clio-relay/component-wheels/clio-kit"
+    mkdir -p "$(dirname "$COMPONENT_DOWNLOAD_DIR")"
+    COMPONENT_STAGING="$(mktemp "${{COMPONENT_DOWNLOAD_DIR}}.XXXXXX.whl")"
+    cp "$JARVIS_MCP_INSTALL_SPEC" "$COMPONENT_STAGING"
+    rm -rf "$COMPONENT_DOWNLOAD_DIR"
+    mkdir -p "$COMPONENT_DOWNLOAD_DIR"
+    JARVIS_MCP_ARTIFACT_PATH="$COMPONENT_DOWNLOAD_DIR/$(basename "$JARVIS_MCP_INSTALL_SPEC")"
+    mv "$COMPONENT_STAGING" "$JARVIS_MCP_ARTIFACT_PATH"
+    JARVIS_MCP_INSTALL_TARGET="$JARVIS_MCP_ARTIFACT_PATH"
+    JARVIS_MCP_REQUESTED_SOURCE="wheel"
+    ;;
+  *)
+    echo "clio-kit bootstrap source must be an exact version or wheel" >&2
+    exit 1
+    ;;
+esac
+echo "$JARVIS_MCP_ARTIFACT_SHA256 *$JARVIS_MCP_ARTIFACT_PATH" | \
+  sha256sum --check --strict -
 deactivate
-uvx --from {rendered_jarvis_mcp_install_spec} clio-kit --help >/dev/null
+uv tool install --force --python 3.12 --no-config \\
+  --default-index https://pypi.org/simple "$JARVIS_MCP_INSTALL_TARGET"
+JARVIS_MCP_UV_EXECUTABLE="$(command -v uv)"
+test -x "$JARVIS_MCP_UV_EXECUTABLE"
+JARVIS_MCP_EXECUTABLE="$(uv tool dir --bin --no-config)/clio-kit"
+test -x "$JARVIS_MCP_EXECUTABLE"
+JARVIS_MCP_PROVIDER_PYTHON="$(sed -n '1{{s/^#!//;p;}}' "$JARVIS_MCP_EXECUTABLE")"
+test -x "$JARVIS_MCP_PROVIDER_PYTHON"
+JARVIS_MCP_INSTALLED_VERSION="$("$JARVIS_MCP_PROVIDER_PYTHON" -c \
+  'from importlib.metadata import version; print(version("clio-kit"))')"
+if [ -n "$JARVIS_MCP_VERSION" ] && \
+   [ "$JARVIS_MCP_INSTALLED_VERSION" != "$JARVIS_MCP_VERSION" ]; then
+  echo "installed clio-kit tool version does not match the release pin" >&2
+  exit 1
+fi
+JARVIS_MCP_VERSION="$JARVIS_MCP_INSTALLED_VERSION"
+"$JARVIS_MCP_EXECUTABLE" --help >/dev/null
 
 DEST="$HOME/.local/src/clio-relay"
 rm -rf "$DEST"
 mkdir -p "$DEST"
-tar -xf /tmp/clio-relay-head.tar -C "$DEST"
-uv venv --python 3.12 --clear "$HOME/.local/share/clio-relay/relay-venv312"
-. "$HOME/.local/share/clio-relay/relay-venv312/bin/activate"
-uv pip install --refresh-package clio-relay {rendered_relay_install_spec}
-ln -sf "$HOME/.local/share/clio-relay/relay-venv312/bin/clio-relay" "$HOME/.local/bin/clio-relay"
-deactivate
+SOURCE_ARCHIVE={rendered_source_archive}
+SOURCE_ARCHIVE_SHA256={rendered_source_archive_sha256}
+if [ -n "$SOURCE_ARCHIVE_SHA256" ]; then
+  echo "$SOURCE_ARCHIVE_SHA256 *$SOURCE_ARCHIVE" | sha256sum --check --strict -
+fi
+tar -xf "$SOURCE_ARCHIVE" -C "$DEST"
+RELAY_INSTALL_SPEC={rendered_relay_install_spec}
+RELAY_ARTIFACT_SHA256={rendered_relay_artifact_sha256}
+RELAY_INSTALL_TARGET="$RELAY_INSTALL_SPEC"
+RELAY_ARTIFACT_PATH=""
+case "$RELAY_INSTALL_SPEC" in
+  clio-relay==*)
+    DOWNLOAD_DIR="$DEST/downloaded-wheels"
+    rm -rf "$DOWNLOAD_DIR"
+    mkdir -p "$DOWNLOAD_DIR"
+    "$JARVIS_VENV/bin/python" -m pip download --isolated \
+      --disable-pip-version-check --no-cache-dir \
+      --index-url https://pypi.org/simple --no-deps --only-binary=:all: \
+      --dest "$DOWNLOAD_DIR" "$RELAY_INSTALL_SPEC"
+    mapfile -t RELAY_WHEELS < <(
+      find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name 'clio_relay-*.whl' -print
+    )
+    if [ "${{#RELAY_WHEELS[@]}}" -ne 1 ]; then
+      echo "expected exactly one downloaded clio-relay wheel" >&2
+      exit 1
+    fi
+    RELAY_ARTIFACT_PATH="${{RELAY_WHEELS[0]}}"
+    RELAY_INSTALL_TARGET="$RELAY_ARTIFACT_PATH"
+    if [ -z "$RELAY_ARTIFACT_SHA256" ]; then
+      RELAY_VERSION="${{RELAY_INSTALL_SPEC#clio-relay==}}"
+      RELAY_ARTIFACT_SHA256="$(
+        "$JARVIS_VENV/bin/python" - "$RELAY_VERSION" "$(basename "$RELAY_ARTIFACT_PATH")" \
+          <<'__CLIO_RELAY_PYPI_DIGEST__'
+import json
+import re
+import sys
+from urllib.parse import quote
+from urllib.request import urlopen
+
+version, filename = sys.argv[1:]
+with urlopen(
+    f"https://pypi.org/pypi/clio-relay/{{quote(version, safe='')}}/json",
+    timeout=30,
+) as response:
+    content = response.read(4 * 1024 * 1024 + 1)
+if len(content) > 4 * 1024 * 1024:
+    raise SystemExit("PyPI clio-relay metadata exceeds the bounded response size")
+document = json.loads(content)
+matches = [
+    item
+    for item in document.get("urls", [])
+    if item.get("filename") == filename and item.get("packagetype") == "bdist_wheel"
+]
+if len(matches) != 1:
+    raise SystemExit("PyPI did not return one exact clio-relay wheel identity")
+digest = matches[0].get("digests", {{}}).get("sha256")
+if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{{64}}", digest) is None:
+    raise SystemExit("PyPI clio-relay wheel identity omitted a valid SHA-256")
+print(digest)
+__CLIO_RELAY_PYPI_DIGEST__
+      )"
+    fi
+    ;;
+  *.whl)
+    RELAY_ARTIFACT_PATH="$RELAY_INSTALL_SPEC"
+    ;;
+esac
+if [ -n "$RELAY_ARTIFACT_PATH" ]; then
+  test -n "$RELAY_ARTIFACT_SHA256"
+  echo "$RELAY_ARTIFACT_SHA256 *$RELAY_ARTIFACT_PATH" | sha256sum --check --strict -
+fi
+uv tool install --force --python 3.12 --no-config \\
+  --default-index https://pypi.org/simple \\
+  --with "$JARVIS_CD_WHEEL" "$RELAY_INSTALL_TARGET"
+RELAY_UV_EXECUTABLE="$(command -v uv)"
+test -x "$RELAY_UV_EXECUTABLE"
+RELAY_EXECUTABLE="$(uv tool dir --bin --no-config)/clio-relay"
+test -x "$RELAY_EXECUTABLE"
+RELAY_PROVIDER_PYTHON="$(sed -n '1{{s/^#!//;p;}}' "$RELAY_EXECUTABLE")"
+test -x "$RELAY_PROVIDER_PYTHON"
+uv pip install --python "$JARVIS_VENV/bin/python" \\
+  --default-index https://pypi.org/simple \\
+  --refresh-package clio-relay "$RELAY_INSTALL_TARGET"
+"$RELAY_PROVIDER_PYTHON" -c 'import clio_relay, jarvis_cd'
+"$JARVIS_VENV/bin/python" -c 'import clio_relay, jarvis_cd'
+verify_jarvis_cd_distribution() {{
+  local interpreter="$1"
+  "$interpreter" - \\
+    "$JARVIS_CD_WHEEL" \\
+    "$JARVIS_CD_WHEEL_SHA256" \\
+    "$JARVIS_CD_VERSION" \\
+    <<'__CLIO_RELAY_NATIVE_JARVIS_PROBE__'
+import hashlib
+import json
+import sys
+from importlib.metadata import distribution
+from pathlib import Path
+
+wheel = Path(sys.argv[1]).resolve()
+expected_sha256 = sys.argv[2]
+expected_version = sys.argv[3]
+if hashlib.sha256(wheel.read_bytes()).hexdigest() != expected_sha256:
+    raise SystemExit("JARVIS-CD release wheel digest changed after installation")
+installed = distribution("jarvis_cd")
+if installed.version != expected_version:
+    raise SystemExit("JARVIS-CD installed version does not match the release pin")
+direct_url = json.loads(installed.read_text("direct_url.json") or "{{}}")
+if direct_url.get("url") != wheel.as_uri():
+    raise SystemExit("JARVIS-CD was not installed from the verified release wheel")
+print(f"jarvis_cd_distribution={{installed.name}}=={{installed.version}}")
+__CLIO_RELAY_NATIVE_JARVIS_PROBE__
+}}
+verify_jarvis_cd_distribution "$RELAY_PROVIDER_PYTHON"
+verify_jarvis_cd_distribution "$JARVIS_VENV/bin/python"
+export CLIO_RELAY_BOOTSTRAP_INSTALL_SPEC="$RELAY_INSTALL_SPEC"
+export CLIO_RELAY_BOOTSTRAP_ARTIFACT="$RELAY_ARTIFACT_PATH"
+export CLIO_RELAY_BOOTSTRAP_RELAY_EXECUTABLE="$RELAY_EXECUTABLE"
+export CLIO_RELAY_BOOTSTRAP_RELAY_PROVIDER_PYTHON="$RELAY_PROVIDER_PYTHON"
+export CLIO_RELAY_BOOTSTRAP_RELAY_UV_EXECUTABLE="$RELAY_UV_EXECUTABLE"
+export CLIO_RELAY_BOOTSTRAP_JARVIS_UTIL_COMMIT="$JARVIS_UTIL_COMMIT"
+export CLIO_RELAY_BOOTSTRAP_JARVIS_CD_VERSION="$JARVIS_CD_VERSION"
+export CLIO_RELAY_BOOTSTRAP_JARVIS_CD_WHEEL_URL="$JARVIS_CD_WHEEL_URL"
+export CLIO_RELAY_BOOTSTRAP_JARVIS_CD_WHEEL="$JARVIS_CD_WHEEL"
+export CLIO_RELAY_BOOTSTRAP_JARVIS_CD_WHEEL_SHA256="$JARVIS_CD_WHEEL_SHA256"
+export CLIO_RELAY_BOOTSTRAP_JARVIS_CD_EXECUTION_PYTHON="$JARVIS_VENV/bin/python"
+export CLIO_RELAY_BOOTSTRAP_JARVIS_EXECUTABLE="$HOME/.local/bin/jarvis"
+export CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_INSTALL_SPEC="$JARVIS_MCP_INSTALL_SPEC"
+export CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_ARTIFACT="$JARVIS_MCP_ARTIFACT_PATH"
+export CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_ARTIFACT_SHA256="$JARVIS_MCP_ARTIFACT_SHA256"
+export CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_SOURCE="$JARVIS_MCP_REQUESTED_SOURCE"
+export CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_VERSION="$JARVIS_MCP_VERSION"
+export CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_EXECUTABLE="$JARVIS_MCP_EXECUTABLE"
+export CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_PROVIDER_PYTHON="$JARVIS_MCP_PROVIDER_PYTHON"
+export CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_UV_EXECUTABLE="$JARVIS_MCP_UV_EXECUTABLE"
+"$RELAY_PROVIDER_PYTHON" - <<'__CLIO_RELAY_INSTALL_RECEIPT__'
+import os
+import sys
+from importlib.metadata import distribution
+from pathlib import Path
+
+from clio_relay.installation import (
+    ComponentArtifactIdentity,
+    probe_persistent_uv_tool_identity,
+    probe_clio_kit_native_execution_contract,
+    probe_jarvis_native_execution_capability,
+    write_install_receipt,
+)
+from clio_relay.validation_report import sha256_file
+
+artifact_value = os.environ["CLIO_RELAY_BOOTSTRAP_ARTIFACT"]
+relay_artifact = Path(artifact_value).resolve() if artifact_value else None
+relay_distribution = distribution("clio-relay")
+relay_persistent_tool = None
+if relay_artifact is not None:
+    relay_persistent_tool = probe_persistent_uv_tool_identity(
+        uv_executable=os.environ["CLIO_RELAY_BOOTSTRAP_RELAY_UV_EXECUTABLE"],
+        tool_executable=os.environ["CLIO_RELAY_BOOTSTRAP_RELAY_EXECUTABLE"],
+        provider_interpreter=os.environ["CLIO_RELAY_BOOTSTRAP_RELAY_PROVIDER_PYTHON"],
+        source_artifact=relay_artifact,
+        distribution="clio-relay",
+        distribution_version=relay_distribution.version,
+        entry_point="clio-relay",
+    )
+component_artifact_value = os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_ARTIFACT"]
+component_artifact = Path(component_artifact_value).resolve() if component_artifact_value else None
+component_artifact_sha256 = os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_ARTIFACT_SHA256"]
+if component_artifact is None or sha256_file(component_artifact) != component_artifact_sha256:
+    raise SystemExit("clio-kit wheel digest changed after persistent-tool installation")
+component_version = os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_VERSION"] or None
+component_spec = os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_INSTALL_SPEC"]
+jarvis_cd_wheel = Path(os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_CD_WHEEL"]).resolve()
+jarvis_cd_wheel_sha256 = os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_CD_WHEEL_SHA256"]
+if sha256_file(jarvis_cd_wheel) != jarvis_cd_wheel_sha256:
+    raise SystemExit("jarvis-cd receipt wheel digest does not match bootstrap pin")
+jarvis_cd_distribution = distribution("jarvis_cd")
+if jarvis_cd_distribution.version != os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_CD_VERSION"]:
+    raise SystemExit("jarvis-cd receipt version does not match the released wheel pin")
+runtime_command = [
+    os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_EXECUTABLE"],
+    "mcp-server",
+    "jarvis",
+]
+if not runtime_command:
+    raise SystemExit("clio-kit native JARVIS contract requires a persistent uv tool")
+clio_kit_native_execution = probe_clio_kit_native_execution_contract(runtime_command)
+persistent_clio_kit_tool = probe_persistent_uv_tool_identity(
+    uv_executable=os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_UV_EXECUTABLE"],
+    tool_executable=os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_EXECUTABLE"],
+    provider_interpreter=os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_PROVIDER_PYTHON"],
+    source_artifact=component_artifact,
+    distribution="clio-kit",
+    distribution_version=component_version,
+    entry_point="clio-kit",
+)
+jarvis_execution_native_execution = probe_jarvis_native_execution_capability(
+    os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_CD_EXECUTION_PYTHON"]
+)
+receipt = write_install_receipt(
+    install_spec=os.environ["CLIO_RELAY_BOOTSTRAP_INSTALL_SPEC"],
+    artifact_path=Path(artifact_value) if artifact_value else None,
+    components={{
+        "clio-relay": relay_distribution.version,
+        "clio-kit": component_version or component_spec,
+        "jarvis-cd": os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_CD_VERSION"],
+        "jarvis-util": os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_UTIL_COMMIT"],
+    }},
+    component_artifacts={{
+        "clio-relay": ComponentArtifactIdentity(
+            distribution=relay_distribution.name,
+            distribution_version=relay_distribution.version,
+            install_spec=os.environ["CLIO_RELAY_BOOTSTRAP_INSTALL_SPEC"],
+            requested_source=(
+                "pypi"
+                if os.environ["CLIO_RELAY_BOOTSTRAP_INSTALL_SPEC"].startswith("clio-relay==")
+                else ("wheel" if relay_artifact is not None else "checkout")
+            ),
+            artifact_filename=(relay_artifact.name if relay_artifact is not None else None),
+            artifact_sha256=(sha256_file(relay_artifact) if relay_artifact is not None else None),
+            runtime_artifact_path=(str(relay_artifact) if relay_artifact is not None else None),
+            runtime_command=[
+                os.environ["CLIO_RELAY_BOOTSTRAP_RELAY_EXECUTABLE"],
+                "installation-info",
+            ],
+            runtime_interpreters={{
+                "provider": os.environ["CLIO_RELAY_BOOTSTRAP_RELAY_PROVIDER_PYTHON"],
+            }},
+            runtime_executables={{
+                "clio-relay": os.environ["CLIO_RELAY_BOOTSTRAP_RELAY_EXECUTABLE"],
+                "uv": os.environ["CLIO_RELAY_BOOTSTRAP_RELAY_UV_EXECUTABLE"],
+            }},
+            persistent_tool=relay_persistent_tool,
+        ),
+        "clio-kit": ComponentArtifactIdentity(
+            distribution="clio-kit",
+            distribution_version=component_version,
+            install_spec=component_spec,
+            requested_source=os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_SOURCE"],
+            artifact_filename=(component_artifact.name if component_artifact else None),
+            artifact_sha256=component_artifact_sha256,
+            runtime_artifact_path=(str(component_artifact) if component_artifact else None),
+            runtime_command=runtime_command,
+            runtime_interpreters={{
+                "provider": os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_PROVIDER_PYTHON"],
+            }},
+            runtime_executables={{
+                "clio-kit": os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_EXECUTABLE"],
+                "uv": os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_UV_EXECUTABLE"],
+            }},
+            native_execution=clio_kit_native_execution,
+            persistent_tool=persistent_clio_kit_tool,
+        ),
+        "jarvis-cd": ComponentArtifactIdentity(
+            distribution=jarvis_cd_distribution.name,
+            distribution_version=jarvis_cd_distribution.version,
+            install_spec=os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_CD_WHEEL_URL"],
+            requested_source="github_release",
+            artifact_filename=jarvis_cd_wheel.name,
+            artifact_sha256=jarvis_cd_wheel_sha256,
+            runtime_artifact_path=str(jarvis_cd_wheel),
+            runtime_command=[
+                os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_EXECUTABLE"],
+                "--help",
+            ],
+            runtime_interpreters={{
+                "provider": sys.executable,
+                "execution": os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_CD_EXECUTION_PYTHON"],
+            }},
+            runtime_executables={{
+                "jarvis": os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_EXECUTABLE"],
+            }},
+            native_execution=jarvis_execution_native_execution,
+        ),
+    }},
+)
+print(f"relay_install_receipt={{receipt.schema_version}}")
+print(f"relay_artifact_sha256={{receipt.artifact_sha256 or 'none'}}")
+__CLIO_RELAY_INSTALL_RECEIPT__
 
 mkdir -p \
   "$HOME/.local/share/clio-relay/jarvis-config" \
@@ -389,75 +776,8 @@ mkdir -p \
 jarvis init \
   "$HOME/.local/share/clio-relay/jarvis-config" \
   "$HOME/.local/share/clio-relay/jarvis-private" \
-  "$HOME/.local/share/clio-relay/jarvis-shared" || true
+  "$HOME/.local/share/clio-relay/jarvis-shared"
 jarvis repo add "$DEST/jarvis-packages/clio_relay" --force true
-
-cat > "$HOME/.local/bin/mpiexec" <<'__CLIO_RELAY_MPIEXEC_WRAPPER__'
-#!/usr/bin/env bash
-set -euo pipefail
-if command -v mpiexec.real >/dev/null 2>&1; then
-  exec mpiexec.real "$@"
-fi
-if [ "${{1:-}}" = "--version" ] || [ "${{1:-}}" = "-version" ]; then
-  echo "mpich 4.0.0 clio-relay user-space wrapper"
-  exit 0
-fi
-ranks=""
-passthrough=()
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    -n|-np)
-      ranks="${{2:-}}"
-      shift 2
-      ;;
-    -p|-f|--host|--hostfile|-host|-hostfile|--hosts|-hosts|--ppn|-ppn|-npernode)
-      shift 2
-      ;;
-    -genv|--env)
-      shift 3
-      ;;
-    -env)
-      shift 2
-      ;;
-    -x)
-      shift 2
-      ;;
-    --oversubscribe)
-      shift
-      ;;
-    --)
-      shift
-      break
-      ;;
-    -*)
-      passthrough+=("$1")
-      shift
-      ;;
-    *=*)
-      shift
-      ;;
-    [0-9]*)
-      if [ -z "$ranks" ]; then
-        ranks="$1"
-      fi
-      shift
-      ;;
-    *)
-      break
-      ;;
-  esac
-done
-if [ "${{ranks:-1}}" = "1" ]; then
-  exec "$@" "${{passthrough[@]}}"
-fi
-if command -v srun >/dev/null 2>&1; then
-  exec srun -n "$ranks" "$@" "${{passthrough[@]}}"
-fi
-echo "mpiexec wrapper only supports single-rank runs without srun" >&2
-exit 127
-exec "$@"
-__CLIO_RELAY_MPIEXEC_WRAPPER__
-chmod 0755 "$HOME/.local/bin/mpiexec"
 
 CLIO_RELAY_CORE_DIR="$HOME/.local/share/clio-relay/core" \
 CLIO_RELAY_SPOOL_DIR="$HOME/.local/share/clio-relay/spool" \
@@ -467,6 +787,33 @@ CLIO_RELAY_AGENT_BIN="${{AGENT_BIN:-agent}}" \
 CLIO_RELAY_AGENT_ADAPTER={rendered_agent_adapter} \
 CLIO_RELAY_AGENT_ARGS={rendered_agent_args} \
 clio-relay init
+
+python3 - <<'__CLIO_RELAY_BOOTSTRAP_RECEIPT__'
+import hashlib
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+install_receipt = Path.home() / ".local/share/clio-relay/install-receipt.json"
+install_receipt_sha256 = hashlib.sha256(install_receipt.read_bytes()).hexdigest()
+receipt = {{
+    "schema_version": "clio-relay.bootstrap-receipt.v1",
+    "invocation_id": {invocation_id!r},
+    "bootstrap_profile": "linux-user",
+    "relay_install_spec": {relay_install_spec!r},
+    "install_receipt_sha256": install_receipt_sha256,
+    "completed_at": datetime.now(timezone.utc).isoformat(),
+}}
+destination = Path.home() / ".local/share/clio-relay/bootstrap-receipt.json"
+temporary = destination.with_name(f".{{destination.name}}.{{os.getpid()}}.tmp")
+temporary.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+os.chmod(temporary, 0o600)
+os.replace(temporary, destination)
+print(f"bootstrap_receipt={{destination}}")
+print(f"bootstrap_invocation_id={{receipt['invocation_id']}}")
+print(f"bootstrap_install_receipt_sha256={{install_receipt_sha256}}")
+__CLIO_RELAY_BOOTSTRAP_RECEIPT__
 
 echo "frpc=$("$HOME/.local/bin/frpc" --version)"
 echo "frps=$("$HOME/.local/bin/frps" --version)"
@@ -496,8 +843,8 @@ def create_bootstrap_archive(
     """Create the archive used by remote bootstrap.
 
     A clean git checkout deploys that exact committed tree. Installed-package
-    runs deploy packaged JARVIS assets and install clio-relay from PyPI by
-    version, so bootstrap does not require a checkout.
+    runs deploy packaged JARVIS assets and install either the supplied candidate
+    wheel or the exact package version, so bootstrap does not require a checkout.
     """
     if relay_wheel is not None:
         _write_packaged_bootstrap_archive(archive, relay_wheel=relay_wheel)
@@ -580,8 +927,35 @@ def _assert_executable(path: Path) -> None:
 
 
 def _assert_frp_pair(frpc: Path, frps: Path) -> None:
+    _assert_sha256(frpc, FRPC_WINDOWS_AMD64_SHA256)
+    _assert_sha256(frps, FRPS_WINDOWS_AMD64_SHA256)
     _assert_executable(frpc)
     _assert_executable(frps)
+
+
+def _assert_sha256(path: Path, expected: str) -> None:
+    try:
+        observed = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ConfigurationError(f"installed executable cannot be hashed: {path}: {exc}") from exc
+    if observed != expected:
+        raise ConfigurationError(f"installed executable SHA-256 mismatch: {path}: {observed}")
+
+
+def _validate_ssh_destination(value: str) -> None:
+    """Reject SSH destinations that could be parsed as client options."""
+    if (
+        not value
+        or value != value.strip()
+        or value.startswith("-")
+        or any(
+            character.isspace() or ord(character) < 32 or ord(character) == 127
+            for character in value
+        )
+    ):
+        raise ConfigurationError(
+            "ssh host must be one non-option destination without whitespace or controls"
+        )
 
 
 def _run(

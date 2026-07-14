@@ -4,12 +4,22 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
+
+from clio_relay.process_containment import nested_popen_kwargs, terminate_nested_process
+
+CODEX_PROFILE_MAX_BYTES = 1_048_576
+AGENT_PROMPT_MAX_BYTES = 4 * 1_048_576
+RELAY_SIDE_CHANNEL_ENV_NAMES = frozenset(
+    {
+        "CLIO_RELAY_PROGRESS_FILE",
+        "CLIO_RELAY_RUNTIME_METADATA_FILE",
+    }
+)
 
 
 def run_remote_agent_from_params(params: dict[str, Any]) -> int:
@@ -27,13 +37,21 @@ def run_remote_agent_from_params(params: dict[str, Any]) -> int:
     try:
         agent_bin = _required_str(params, "agent_bin")
         prompt_path = Path(_required_str(params, "prompt_path"))
-        prompt_text = prompt_path.read_text(encoding="utf-8")
+        prompt_text = _read_utf8_bounded(
+            prompt_path,
+            limit=AGENT_PROMPT_MAX_BYTES,
+            label="agent prompt",
+        )
         prompt_text = _append_context(prompt_text, params.get("context"))
+        _require_text_within_limit(
+            prompt_text,
+            limit=AGENT_PROMPT_MAX_BYTES,
+            label="agent prompt with context",
+        )
         mcp_config_path = _optional_path(params.get("mcp_config_path"))
         workdir = _optional_path(params.get("workdir"))
         timeout = _optional_int(params.get("timeout_seconds"))
-        model = params.get("model")
-        rendered_model = model if isinstance(model, str) else None
+        rendered_model = model
         agent_args = _string_list(params.get("agent_args"))
 
         if adapter == "codex":
@@ -151,7 +169,35 @@ def _write_codex_profile(mcp_config_path: Path | None) -> Path | None:
     codex_home.mkdir(parents=True, exist_ok=True)
     profile_name = f"clio-relay-agent-{os.getpid()}-{uuid4().hex}"
     profile_path = codex_home / f"{profile_name}.config.toml"
-    profile_path.write_text(mcp_config_path.read_text(encoding="utf-8"), encoding="utf-8")
+    profile_bytes = _read_bytes_bounded(
+        mcp_config_path,
+        limit=CODEX_PROFILE_MAX_BYTES,
+        label="Codex MCP profile",
+    )
+    try:
+        profile_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Codex MCP profile must be UTF-8") from exc
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    flags |= getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOINHERIT", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(profile_path, flags, 0o600)
+        try:
+            _write_all(descriptor, profile_bytes)
+        finally:
+            os.close(descriptor)
+        profile_path.chmod(0o600)
+    except OSError as exc:
+        try:
+            profile_path.unlink(missing_ok=True)
+        except OSError as cleanup_exc:
+            raise OSError(
+                f"private Codex profile setup and cleanup both failed: {cleanup_exc}"
+            ) from exc
+        raise
     return profile_path
 
 
@@ -183,12 +229,13 @@ def _run_process(
     cwd: Path | None,
     timeout: int | None,
 ) -> subprocess.CompletedProcess[str]:
+    child_env = _scrubbed_env()
     process = subprocess.Popen(
         command,
         cwd=cwd,
-        env=_scrubbed_env(),
-        start_new_session=os.name != "nt",
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        env=child_env,
+        text=True,
+        **nested_popen_kwargs(child_env),
     )
     try:
         returncode = process.wait(timeout=timeout)
@@ -199,33 +246,14 @@ def _run_process(
 
 
 def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
-    if os.name == "nt":
-        process.send_signal(signal.CTRL_BREAK_EVENT)
-        try:
-            process.wait(timeout=5)
-            return
-        except subprocess.TimeoutExpired:
-            process.kill()
-            return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
+    terminate_nested_process(process)
 
 
 def _scrubbed_env() -> dict[str, str]:
     env = os.environ.copy()
-    env.pop("CLIO_RELAY_PROGRESS_FILE", None)
-    env.pop("CLIO_RELAY_PROGRESS_TOKEN", None)
+    for name in list(env):
+        if _relay_owned_environment_name(name):
+            env.pop(name, None)
     return env
 
 
@@ -234,7 +262,7 @@ def _write_agent_result(
     result_path: Path,
     agent_bin: str,
     adapter: str,
-    prompt_path: Path,
+    prompt_path: Path | None,
     mcp_config_path: Path | None,
     model: str | None,
     workdir: Path | None,
@@ -249,7 +277,7 @@ def _write_agent_result(
     result = {
         "adapter": adapter,
         "agent_bin": agent_bin,
-        "prompt_path": str(prompt_path),
+        "prompt_path": None if prompt_path is None else str(prompt_path),
         "mcp_config_path": None if mcp_config_path is None else str(mcp_config_path),
         "model": model,
         "workdir": None if workdir is None else str(workdir),
@@ -293,9 +321,12 @@ def _optional_int(value: Any) -> int | None:
 def _string_list(value: Any) -> list[str]:
     if value is None:
         return []
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+    if not isinstance(value, list):
         raise ValueError("agent_args must be a list of strings")
-    return value
+    raw = cast(list[object], value)
+    if not all(isinstance(item, str) for item in raw):
+        raise ValueError("agent_args must be a list of strings")
+    return [cast(str, item) for item in raw]
 
 
 def _append_context(prompt_text: str, context: Any) -> str:
@@ -303,9 +334,49 @@ def _append_context(prompt_text: str, context: Any) -> str:
         return prompt_text
     if not isinstance(context, dict):
         raise ValueError("context must be an object")
+    typed_context = {str(key): value for key, value in cast(dict[object, object], context).items()}
     return (
         prompt_text.rstrip()
         + "\n\nRelay monitor context:\n"
-        + json.dumps(context, indent=2, sort_keys=True)
+        + json.dumps(typed_context, indent=2, sort_keys=True)
         + "\n"
     )
+
+
+def _relay_owned_environment_name(name: str) -> bool:
+    if name in RELAY_SIDE_CHANNEL_ENV_NAMES:
+        return True
+    return name.startswith("CLIO_RELAY_") and (name.endswith("_TOKEN") or name.endswith("_SECRET"))
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    """Write an entire private profile or raise on a short write."""
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("private Codex profile write was incomplete")
+        view = view[written:]
+
+
+def _read_utf8_bounded(path: Path, *, limit: int, label: str) -> str:
+    """Read a UTF-8 file without ever materializing more than its limit."""
+    payload = _read_bytes_bounded(path, limit=limit, label=label)
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{label} must be UTF-8") from exc
+
+
+def _read_bytes_bounded(path: Path, *, limit: int, label: str) -> bytes:
+    """Read at most ``limit`` bytes and reject larger inputs."""
+    with path.open("rb") as stream:
+        payload = stream.read(limit + 1)
+    if len(payload) > limit:
+        raise ValueError(f"{label} exceeded its byte limit")
+    return payload
+
+
+def _require_text_within_limit(value: str, *, limit: int, label: str) -> None:
+    if len(value.encode("utf-8")) > limit:
+        raise ValueError(f"{label} exceeded its byte limit")

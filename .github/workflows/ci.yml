@@ -6,55 +6,116 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
 jobs:
-  test:
-    name: python ${{ matrix.python-version }}
+  workflow-lint:
+    name: GitHub Actions syntax and semantics
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.12", "3.13"]
+    timeout-minutes: 15  # Bound tool download and static workflow analysis.
 
     steps:
       - name: check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: install checksum-pinned actionlint
+        shell: bash
+        run: |
+          archive=actionlint_1.7.12_linux_amd64.tar.gz
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/$archive"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $archive" \
+            | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" actionlint
+
+      - name: lint workflows
+        run: ./actionlint
+
+  test:
+    name: ${{ matrix.os }} / python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60  # The evidence-producing full gate is intentionally comprehensive.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13", "3.14"]
+
+    steps:
+      - name: check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
+          version: "0.11.28"
 
       - name: set up python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: install dependencies
-        run: uv sync --locked --all-groups
+        run: uv sync --python "${{ matrix.python-version }}" --locked --all-groups
 
-      - name: lint
-        run: uv run ruff check
+      - name: verify matrix interpreter
+        run: >-
+          uv run --python "${{ matrix.python-version }}" python -c
+          "import sys; expected = tuple(map(int, '${{ matrix.python-version }}'.split('.'))); assert sys.version_info[:2] == expected, (sys.version, expected)"
 
-      - name: format check
-        run: uv run ruff format --check
+      - name: stage exact clio-kit release wheel
+        shell: bash
+        env:
+          CLIO_KIT_WHEEL_FILENAME: clio_kit-2.3.2-py3-none-any.whl
+          CLIO_KIT_WHEEL_SHA256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
+          CLIO_KIT_WHEEL_URL: https://github.com/iowarp/clio-kit/releases/download/v2.3.2/clio_kit-2.3.2-py3-none-any.whl
+        run: |
+          set -euo pipefail
+          umask 077
+          wheel_dir="$RUNNER_TEMP/clio-kit-v2.3.2"
+          mkdir "$wheel_dir"
+          wheel="$wheel_dir/$CLIO_KIT_WHEEL_FILENAME"
+          temporary="$wheel.part"
+          trap 'rm -f -- "$temporary"' EXIT
+          curl --fail --show-error --silent --location \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 180 \
+            --connect-timeout 20 --max-time 180 \
+            --output "$temporary" "$CLIO_KIT_WHEEL_URL"
+          printf '%s  %s\n' "$CLIO_KIT_WHEEL_SHA256" "$temporary" \
+            | sha256sum --check --strict
+          mv -- "$temporary" "$wheel"
+          trap - EXIT
+          if [ "$RUNNER_OS" = Windows ]; then
+            exported_wheel="$(cygpath --windows --absolute "$wheel")"
+          else
+            exported_wheel="$wheel"
+          fi
+          printf 'CLIO_RELAY_CLIO_KIT_WHEEL=%s\n' "$exported_wheel" >> "$GITHUB_ENV"
+          printf 'CLIO_RELAY_CLIO_KIT_WHEEL_SHA256=%s\n' \
+            "$CLIO_KIT_WHEEL_SHA256" >> "$GITHUB_ENV"
 
-      - name: type check
-        run: uv run pyright
-
-      - name: test
-        run: uv run pytest
-
-      - name: build package
-        run: uv build
-
-      - name: check package metadata
-        run: uvx twine check dist/*
+      - name: run evidence-producing local release gate
+        run: >-
+          uv run --python "${{ matrix.python-version }}"
+          clio-relay release validate-local
+          --project-root .
+          --report dist/validation-local-${{ runner.os }}-${{ matrix.python-version }}.json
+          --artifact-dir dist
 
       - name: upload package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: dist-${{ matrix.python-version }}
+          name: dist-${{ runner.os }}-${{ matrix.python-version }}
           path: |
             dist/*.whl
             dist/*.tar.gz
+            dist/validation-*.json
           if-no-files-found: error

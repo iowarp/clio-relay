@@ -1,0 +1,9 @@
+name: __RUN_ID__-transport-echo
+pkgs:
+  - pkg_type: clio_relay.bounded_command
+    pkg_name: bounded_command
+    command:
+      - bash
+      - -lc
+      - printf 'clio-relay transport acceptance\n'
+    timeout_seconds: 30

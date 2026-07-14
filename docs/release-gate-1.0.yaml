@@ -1,0 +1,1043 @@
+# Cluster labels in this policy are concrete evidence instances for this release,
+# not a runtime allowlist. Operators may add arbitrary targets through the cluster
+# registry and may require them for a later release by adding policy requirements;
+# neither action requires a clio-relay code change.
+schema_version: "1.0"
+release_version: "1.0.0"
+acceptance_matrix_path: examples/release-gate/report-matrix-1.0.json
+acceptance_matrix_sha256: b62a51a57d55fd2928c928d2a6b7892b006c627e5e64bd06cb03874d28602fe2
+artifact_stage: published
+evidence_trust_model: maintainer_sealed_operator_evidence
+require_released_artifact: true
+require_artifact_sha256: true
+require_clean_build: true
+require_commit: true
+require_exact_tag: true
+require_target_identity: true
+required_uv_version: "0.11.28"
+# These labels are release-evidence data, not product allowlists. Replace each
+# independently collected target facts and the digest of those canonical fields.
+# Additional sites are added by extending this mapping and the requirements below;
+# core code is unchanged.
+targets:
+  ares:
+    schema_version: clio-relay.release-target-identity.v1
+    hostnames:
+      - ares.ares.local
+    ssh_host_key_sha256:
+      - SHA256:U5VnrrdDfBluAMQpDQ+PSHU9XyaVc5JeJ+u1oSW3zk4
+      - SHA256:bRLzWxtUOvr7HWapionskS2S74r21SlOArTukSkKrcw
+      - SHA256:rlGpdsBvZOaqcY5d6fKgVCUrAwZhLRGK70v3MNQ/LKA
+    scheduler_provider: slurm
+    scheduler_cluster_name: linux
+    site_marker_sha256: 2162bf2c726235b2d856e1adeaded38c626766245b6e36ef933a0f83cb9d54ea
+    identity_sha256: f114f70f952dad7eccb5c5cfb340feb653e8879080238e5a8465205ff84afa6b
+  homelab:
+    schema_version: clio-relay.release-target-identity.v1
+    hostnames:
+      - server
+    ssh_host_key_sha256:
+      - SHA256:Icn/LmcEIhEg//DW9ClFNxUrP3lawXtiQM7PzuCHUpY
+      - SHA256:wq6LnyUAsrEEe/mK+jHaOlpCF/CLoWa9xxgefvBR1JY
+    scheduler_provider: external
+    scheduler_cluster_name: null
+    site_marker_sha256: 4a966c6fb25b0aef845a064fdb5243269d749c81370ba015172cefde5fd1f32f
+    identity_sha256: 9fd5262ac48834639129670fff504bddc6857bb060f20d9034bbb70d99db281f
+allowed_install_sources:
+  - pypi
+allowed_launchers:
+  - uv-tool
+release_blockers: []
+requirements:
+  - requirement_id: local-release-gate
+    description: lint, format, strict types, full tests, locked dependency audit, package build, artifact metadata, exact-wheel smoke, and unprivileged exact-sdist smoke
+    cluster: local
+    scenarios:
+      - local-release
+    required_checks:
+      - local.ruff-check
+      - local.ruff-format
+      - local.pyright
+      - local.pytest
+      - local.containment-hard-crash
+      - local.sidecar-reclamation
+      - local.retention-storage-pagination
+      - local.dependency-lock-export
+      - local.dependency-audit
+      - local.build-backend
+      - local.build
+      - local.artifact-check
+      - local.runtime-lock-export
+      - local.wheel-smoke
+      - local.sdist-smoke
+    required_resource_kinds:
+      - wheel
+      - source_distribution
+    require_released_artifact: false
+    require_artifact_sha256: false
+    allowed_install_sources:
+      - checkout
+      - editable
+    allowed_launchers:
+      - uv
+
+  - requirement_id: ares-released-bootstrap
+    description: bootstrap and execute the worker on Ares through one persistent released PyPI uv tool install
+    cluster: ares
+    scenarios:
+      - cluster-bootstrap
+    required_checks:
+      - cluster.bootstrap
+      - worker.running
+      - worker.artifact-version
+      - worker.artifact-sha256
+      - worker.source-identity
+      - worker.scheduler-provider
+      - worker.target-identity
+      - worker.component-clio-kit-released
+      - worker.component-clio-kit-native-jarvis-contract
+      - worker.component-jarvis-native-execution
+      - worker.execute
+    required_resource_kinds:
+      - relay_worker
+      - relay_job
+      - cluster_target
+    required_resources:
+      - kind: relay_worker
+        roles: [cluster_worker]
+        states: [running]
+        metadata_equals:
+          components:
+            clio-kit: "2.3.2"
+            jarvis-cd: "1.2.2"
+            jarvis-util: c91bfdc9bba802e4b03bfb1babe614ffa3e09644
+          component_artifacts:
+            clio-kit:
+              distribution: clio-kit
+              distribution_version: "2.3.2"
+              install_spec: clio-kit==2.3.2
+              requested_source: pypi
+              artifact_sha256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
+              native_execution:
+                schema_version: clio-relay.jarvis-native-execution-capability.v1
+                handle_schema: jarvis.execution.handle.v1
+                record_schema: jarvis.execution.record.v1
+                progress_schema: jarvis.execution.progress.v1
+                operations: [jarvis_get_execution, jarvis_run]
+                contract_id: clio-kit-jarvis-user-v3
+                contract_schema_version: clio-kit.mcp-user-contract.v1
+                contract_sha256: c70e350d919e0f3fa0c116d7eaf861e23b4087a18a06b2704ddbf7384f8d1f82
+            jarvis-cd:
+              distribution: jarvis_cd
+              distribution_version: "1.2.2"
+              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v1.2.2/jarvis_cd-1.2.2-py3-none-any.whl
+              requested_source: github_release
+              artifact_filename: jarvis_cd-1.2.2-py3-none-any.whl
+              artifact_sha256: f05454718a4efe4dadebefb98c83511ba3dcc662238c0c05430a1b621a8ab8b7
+              native_execution:
+                schema_version: clio-relay.jarvis-native-execution-capability.v1
+                handle_schema: jarvis.execution.handle.v1
+                record_schema: jarvis.execution.record.v1
+                progress_schema: jarvis.execution.progress.v1
+                operations:
+                  - execution_handle.progress
+                  - pipeline.get_execution
+                  - pipeline.get_execution_progress
+                  - pipeline.run
+      - kind: relay_job
+        states: [succeeded]
+      - kind: cluster_target
+        roles: [physical_cluster_target]
+        states: [verified]
+        providers: [slurm]
+        metadata_equals:
+          verified: true
+    evidence_group_resource_kind: cluster_target
+
+  - requirement_id: ares-queue-management
+    description: validate exact stale cleanup, live scheduler preservation, and enforced per-kind concurrency on Ares
+    cluster: ares
+    scenarios:
+      - queue-management
+    required_checks:
+      - queue.worker-containment-enforced
+      - queue.kind-concurrency-parallel
+      - queue.kind-concurrency-worker-enforced
+      - queue.list-bounded
+      - queue.diagnose-specific-reason
+      - queue.stale-dry-run
+      - queue.stale-cleanup-executed
+      - queue.cancel-running-worker-process
+      - queue.scheduler-preserved-default
+      - worker.artifact-version
+      - worker.artifact-sha256
+      - worker.source-identity
+      - worker.scheduler-provider
+      - worker.target-identity
+      - worker.component-clio-kit-released
+    required_resource_kinds:
+      - relay_job
+      - relay_worker
+      - scheduler_job
+      - cluster_target
+    required_resources:
+      - kind: relay_job
+        roles: [queue-management-target]
+        states: [canceled]
+        metadata_equals:
+          initial_state: queued
+          scheduler_cancel_requested: false
+      - kind: relay_job
+        roles: [queue-management-running-target]
+        states: [canceled]
+        metadata_equals:
+          initial_state: running
+          scheduler_cancel_requested: false
+          worker_cancellation_acknowledged: true
+          execution_canceled_event: true
+          lease_released: true
+          outer_process_exited: true
+          child_process_exited: true
+          residual_process_count: 0
+      - kind: relay_worker
+        roles: [cluster_worker]
+        states: [running]
+        metadata_equals:
+          kind_concurrency_consistent: true
+          process_containment:
+            enforceable: true
+          controlled_probe:
+            kind: jarvis
+            active_before: 0
+            active_at_cap: 2
+            overflow_lease_acquired: false
+      - kind: relay_worker
+        roles: [cluster_worker]
+        states: [running]
+        metadata_equals:
+          components:
+            clio-kit: "2.3.2"
+          component_artifacts:
+            clio-kit:
+              distribution: clio-kit
+              distribution_version: "2.3.2"
+              install_spec: clio-kit==2.3.2
+              requested_source: pypi
+              artifact_sha256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
+      - kind: scheduler_job
+        roles: [queue-preservation-fixture]
+        states: [completed]
+        providers: [slurm]
+        metadata_equals:
+          owned_validation_job: true
+          relay_cancel_requested: true
+          scheduler_cancel_requested: false
+      - kind: cluster_target
+        roles: [physical_cluster_target]
+        states: [verified]
+        providers: [slurm]
+        metadata_equals:
+          verified: true
+
+  - requirement_id: ares-jarvis-virtual-mcp
+    description: run the built-in JARVIS virtual MCP path on Ares
+    cluster: ares
+    scenarios:
+      - remote-mcp
+    required_checks:
+      - remote-mcp.jarvis-discovery
+      - remote-mcp.jarvis-remote-contract
+      - remote-mcp.jarvis-call
+      - remote-mcp.server-artifact
+      - remote-mcp.durable-result
+      - remote-mcp.jarvis-live-progress
+      - remote-mcp.jarvis-execution-query
+      - jarvis.structured-runtime-metadata
+      - worker.artifact-version
+      - worker.artifact-sha256
+      - worker.source-identity
+      - worker.scheduler-provider
+      - worker.target-identity
+      - worker.component-clio-kit-released
+      - worker.component-clio-kit-native-jarvis-contract
+      - worker.component-jarvis-native-execution
+    required_resource_kinds:
+      - relay_job
+      - relay_worker
+      - artifact
+      - mcp_server
+      - jarvis_execution_progress
+      - jarvis_generated_artifact
+    required_resources:
+      - kind: relay_job
+        roles: [virtual_jarvis_mcp_call]
+        states: [succeeded]
+      - kind: relay_job
+        roles: [jarvis_mcp_remote_discovery]
+        states: [succeeded]
+      - kind: relay_job
+        roles: [jarvis_mcp_execution_query]
+        states: [succeeded]
+      - kind: relay_worker
+        roles: [cluster_worker]
+        states: [running]
+        metadata_equals:
+          components:
+            clio-kit: "2.3.2"
+            jarvis-cd: "1.2.2"
+          component_artifacts:
+            clio-kit:
+              distribution: clio-kit
+              distribution_version: "2.3.2"
+              install_spec: clio-kit==2.3.2
+              requested_source: pypi
+              artifact_filename: clio_kit-2.3.2-py3-none-any.whl
+              artifact_sha256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
+              persistent_tool:
+                manager: uv
+                uv_version: "0.11.28"
+                pyvenv_uv_version: "0.11.28"
+                distribution: clio-kit
+                distribution_version: "2.3.2"
+                entry_point: clio-kit
+                source_artifact_sha256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
+              native_execution:
+                schema_version: clio-relay.jarvis-native-execution-capability.v1
+                handle_schema: jarvis.execution.handle.v1
+                record_schema: jarvis.execution.record.v1
+                progress_schema: jarvis.execution.progress.v1
+                operations:
+                  - jarvis_get_execution
+                  - jarvis_run
+                contract_id: clio-kit-jarvis-user-v3
+                contract_schema_version: clio-kit.mcp-user-contract.v1
+                contract_sha256: c70e350d919e0f3fa0c116d7eaf861e23b4087a18a06b2704ddbf7384f8d1f82
+            jarvis-cd:
+              distribution: jarvis_cd
+              distribution_version: "1.2.2"
+              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v1.2.2/jarvis_cd-1.2.2-py3-none-any.whl
+              requested_source: github_release
+              artifact_filename: jarvis_cd-1.2.2-py3-none-any.whl
+              artifact_sha256: f05454718a4efe4dadebefb98c83511ba3dcc662238c0c05430a1b621a8ab8b7
+              native_execution:
+                schema_version: clio-relay.jarvis-native-execution-capability.v1
+                handle_schema: jarvis.execution.handle.v1
+                record_schema: jarvis.execution.record.v1
+                progress_schema: jarvis.execution.progress.v1
+                operations:
+                  - execution_handle.progress
+                  - pipeline.get_execution
+                  - pipeline.get_execution_progress
+                  - pipeline.run
+          component_runtime:
+            clio-kit:
+              launcher: uv tool
+              artifact_identity_verified: true
+              command_matches_receipt: true
+              persistent_tool_verified: true
+              provider_interpreter_verified: true
+              distribution_identity_verified: true
+              source_identity_verified: true
+              uv_tool_environment_verified: true
+              record_closure_verified: true
+              native_execution_capability_verified: true
+            jarvis-cd:
+              verified: true
+              provider_interpreter_verified: true
+              distribution_identity_verified: true
+              runtime_artifact_path_verified: true
+              artifact_sha256_verified: true
+              execution_interpreter_verified: true
+              execution_distribution_identity_verified: true
+              execution_source_verified: true
+              execution_native_execution_capability_verified: true
+              native_execution_capability_verified: true
+              jarvis_executable_verified: true
+      - kind: mcp_server
+        roles: [jarvis_mcp_server]
+        states: [verified]
+        metadata_equals:
+          install_source: uv-tool
+          install_artifact_sha256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
+          python_distribution_runtime:
+            distribution: clio-kit
+            distribution_version: "2.3.2"
+            entry_point: clio-kit
+            runtime_closure_verified: true
+          nested_runtime:
+            server_name: jarvis
+            persistent_tool: true
+            locked_runtime_verified: true
+          server_process_artifact_verified: true
+          verified: true
+      - kind: jarvis_execution_progress
+        roles: [jarvis_mcp_native_progress]
+        states: [verified]
+        providers: [jarvis_cd]
+        metadata_equals:
+          source: jarvis_execution
+          package_name: builtin.gray_scott
+          package_id: gray_scott_bp5
+          progress_schema_version: jarvis.progress.v1
+          provider_source_authority: jarvis_mcp_progress_notification
+          producer_validated: true
+          execution_binding_validated: true
+          live_observed_while_running: true
+          bridge_validated: true
+          runtime_bound: true
+      - kind: jarvis_generated_artifact
+        roles: [output]
+        states: [finalized]
+        providers: [jarvis-cd]
+        metadata_equals:
+          package_id: gray_scott_bp5
+          logical_name: gray-scott-timesteps
+          kind: scientific_dataset
+          role: output
+          structure: collection
+          ownership: shared
+          state: finalized
+          media_type: application/x-adios2-bp
+          format: adios2-bp5
+          location:
+            kind: cluster_path
+          metadata:
+            application: gray_scott
+            io_backend: adios2
+            latest_timestep: 20
+            member_pattern: adios2-steps
+            members_observed: 2
+            completion_signal: process_exit_zero_after_final_output
+
+  - requirement_id: ares-jarvis-native-application-progress
+    description: validate a bounded 20-step Gray-Scott run through JARVIS-owned progress and artifact semantics
+    cluster: ares
+    scenarios:
+      - remote-mcp
+    required_checks:
+      - remote-mcp.jarvis-live-progress
+      - remote-mcp.jarvis-execution-query
+      - jarvis.structured-runtime-metadata
+      - worker.artifact-version
+      - worker.artifact-sha256
+      - worker.source-identity
+      - worker.component-clio-kit-native-jarvis-contract
+      - worker.component-jarvis-native-execution
+    required_resource_kinds:
+      - relay_job
+      - relay_worker
+      - jarvis_execution_progress
+      - jarvis_generated_artifact
+    required_resources:
+      - kind: relay_job
+        roles: [virtual_jarvis_mcp_call]
+        states: [succeeded]
+      - kind: relay_job
+        roles: [jarvis_mcp_execution_query]
+        states: [succeeded]
+      - kind: jarvis_execution_progress
+        roles: [jarvis_mcp_native_progress]
+        states: [verified]
+        providers: [jarvis_cd]
+        metadata_equals:
+          source: jarvis_execution
+          package_name: builtin.gray_scott
+          package_id: gray_scott_bp5
+          progress_schema_version: jarvis.progress.v1
+          provider_source_authority: jarvis_mcp_progress_notification
+          producer_validated: true
+          execution_binding_validated: true
+          live_observed_while_running: true
+          bridge_validated: true
+          runtime_bound: true
+      - kind: jarvis_generated_artifact
+        roles: [output]
+        states: [finalized]
+        providers: [jarvis-cd]
+        metadata_equals:
+          package_id: gray_scott_bp5
+          logical_name: gray-scott-timesteps
+          kind: scientific_dataset
+          role: output
+          structure: collection
+          ownership: shared
+          state: finalized
+          media_type: application/x-adios2-bp
+          format: adios2-bp5
+          location:
+            kind: cluster_path
+          metadata:
+            application: gray_scott
+            io_backend: adios2
+            latest_timestep: 20
+            member_pattern: adios2-steps
+            members_observed: 2
+            completion_signal: process_exit_zero_after_final_output
+      - kind: relay_worker
+        roles: [cluster_worker]
+        states: [running]
+        metadata_equals:
+          components:
+            jarvis-cd: "1.2.2"
+          component_artifacts:
+            jarvis-cd:
+              distribution: jarvis_cd
+              distribution_version: "1.2.2"
+              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v1.2.2/jarvis_cd-1.2.2-py3-none-any.whl
+              requested_source: github_release
+              artifact_filename: jarvis_cd-1.2.2-py3-none-any.whl
+              artifact_sha256: f05454718a4efe4dadebefb98c83511ba3dcc662238c0c05430a1b621a8ab8b7
+              native_execution:
+                schema_version: clio-relay.jarvis-native-execution-capability.v1
+                handle_schema: jarvis.execution.handle.v1
+                record_schema: jarvis.execution.record.v1
+                progress_schema: jarvis.execution.progress.v1
+                operations:
+                  - execution_handle.progress
+                  - pipeline.get_execution
+                  - pipeline.get_execution_progress
+                  - pipeline.run
+          component_runtime:
+            jarvis-cd:
+              verified: true
+              artifact_sha256_verified: true
+              execution_interpreter_verified: true
+              execution_distribution_identity_verified: true
+              execution_source_verified: true
+              execution_native_execution_capability_verified: true
+              native_execution_capability_verified: true
+              jarvis_executable_verified: true
+
+  - requirement_id: ares-jarvis-lammps-package-progress
+    description: validate the post-split builtin LAMMPS path through JARVIS-owned native progress semantics on Ares
+    cluster: ares
+    scenarios:
+      - remote-mcp
+    required_checks:
+      - remote-mcp.jarvis-live-progress
+      - remote-mcp.jarvis-execution-query
+      - jarvis.structured-runtime-metadata
+      - worker.artifact-version
+      - worker.artifact-sha256
+      - worker.source-identity
+      - worker.component-clio-kit-native-jarvis-contract
+      - worker.component-jarvis-native-execution
+    required_resource_kinds:
+      - relay_job
+      - relay_worker
+      - jarvis_execution_progress
+    required_resources:
+      - kind: relay_job
+        roles: [virtual_jarvis_mcp_call]
+        states: [succeeded]
+      - kind: relay_job
+        roles: [jarvis_mcp_execution_query]
+        states: [succeeded]
+      - kind: jarvis_execution_progress
+        roles: [jarvis_mcp_native_progress]
+        states: [verified]
+        providers: [jarvis_cd]
+        metadata_equals:
+          source: jarvis_execution
+          package_name: builtin.lammps
+          package_id: lammps
+          progress_schema_version: jarvis.progress.v1
+          progress_determinate: true
+          provider_source_authority: jarvis_mcp_progress_notification
+          producer_validated: true
+          execution_binding_validated: true
+          live_observed_while_running: true
+          bridge_validated: true
+          runtime_bound: true
+      - kind: relay_worker
+        roles: [cluster_worker]
+        states: [running]
+        metadata_equals:
+          components:
+            jarvis-cd: "1.2.2"
+          component_artifacts:
+            jarvis-cd:
+              distribution: jarvis_cd
+              distribution_version: "1.2.2"
+              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v1.2.2/jarvis_cd-1.2.2-py3-none-any.whl
+              requested_source: github_release
+              artifact_filename: jarvis_cd-1.2.2-py3-none-any.whl
+              artifact_sha256: f05454718a4efe4dadebefb98c83511ba3dcc662238c0c05430a1b621a8ab8b7
+              native_execution:
+                schema_version: clio-relay.jarvis-native-execution-capability.v1
+                handle_schema: jarvis.execution.handle.v1
+                record_schema: jarvis.execution.record.v1
+                progress_schema: jarvis.execution.progress.v1
+                operations:
+                  - execution_handle.progress
+                  - pipeline.get_execution
+                  - pipeline.get_execution_progress
+                  - pipeline.run
+          component_runtime:
+            jarvis-cd:
+              verified: true
+              artifact_sha256_verified: true
+              execution_interpreter_verified: true
+              execution_distribution_identity_verified: true
+              execution_source_verified: true
+              execution_native_execution_capability_verified: true
+              native_execution_capability_verified: true
+              jarvis_executable_verified: true
+
+  - requirement_id: ares-non-jarvis-virtual-mcp
+    description: discover and run a registered non-JARVIS clio-kit MCP on Ares
+    cluster: ares
+    scenarios:
+      - remote-mcp
+    required_checks:
+      - remote-mcp.register
+      - remote-mcp.discover
+      - remote-mcp.tools-list
+      - remote-mcp.call
+      - remote-mcp.server-artifact
+      - remote-mcp.durable-result
+      - worker.artifact-version
+      - worker.artifact-sha256
+      - worker.source-identity
+      - worker.component-clio-kit-released
+    required_resource_kinds:
+      - relay_job
+      - relay_worker
+      - artifact
+      - mcp_server
+    required_resources:
+      - kind: relay_job
+        roles: [virtual_remote_mcp_call]
+        states: [succeeded]
+      - kind: relay_worker
+        roles: [cluster_worker]
+        states: [running]
+      - kind: mcp_server
+        roles: [remote_mcp_server]
+        states: [verified]
+        metadata_equals:
+          install_source: wheel
+          install_artifact_sha256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
+          server_process_artifact_verified: true
+          verified: true
+
+  - requirement_id: ares-spack-virtual-mcp
+    description: discover the complete released Spack MCP user contract and resolve the existing LAMMPS installation on Ares
+    cluster: ares
+    scenarios:
+      - remote-mcp
+    required_checks:
+      - remote-mcp.register
+      - remote-mcp.discover
+      - remote-mcp.tools-list
+      - remote-mcp.spack-user-contract
+      - remote-mcp.call
+      - remote-mcp.server-artifact
+      - remote-mcp.durable-result
+      - remote-mcp.structured-result
+      - worker.artifact-version
+      - worker.artifact-sha256
+      - worker.source-identity
+      - worker.component-clio-kit-released
+    required_resource_kinds:
+      - relay_job
+      - relay_worker
+      - artifact
+      - mcp_server
+    required_resources:
+      - kind: relay_job
+        roles: [virtual_remote_mcp_call]
+        states: [succeeded]
+        metadata_equals:
+          remote_mcp_server_name: spack
+          remote_mcp_tool_name: spack_find
+          spec:
+            arguments:
+              query: lammps
+          structured_result_assertion:
+            contract: clio-kit-spack-user-v2
+            tool: spack_find
+            expected:
+              contract: clio-kit-spack-user-v2
+              tool: spack_find
+              package_name: lammps
+              dag_hash: p5gjmq4rseitqanua7mdd2zdnag4v3u2
+            observed:
+              structured_content_present: true
+              schema_version: spack.mcp.result.v1
+              operation: find
+              query: lammps
+              package_count: 1
+              expected_package_match_count: 1
+              expected_package_name_count: 1
+              package_hashes_for_expected_name: [p5gjmq4rseitqanua7mdd2zdnag4v3u2]
+            failures: []
+      - kind: relay_job
+        roles: [virtual_remote_mcp_call]
+        states: [succeeded]
+        metadata_equals:
+          remote_mcp_server_name: spack
+          remote_mcp_tool_name: spack_locate
+          spec:
+            arguments:
+              spec: lammps
+          structured_result_assertion:
+            contract: clio-kit-spack-user-v2
+            tool: spack_locate
+            expected:
+              contract: clio-kit-spack-user-v2
+              tool: spack_locate
+              package_name: lammps
+              dag_hash: p5gjmq4rseitqanua7mdd2zdnag4v3u2
+              requested_spec: lammps
+              prefix: /mnt/common/jcernudagarcia/spack/opt/spack/linux-ubuntu22.04-skylake_avx512/gcc-11.4.0/lammps-20240829.1-p5gjmq4rseitqanua7mdd2zdnag4v3u2
+            observed:
+              structured_content_present: true
+              schema_version: spack.mcp.result.v1
+              operation: locate
+              requested_spec: lammps
+              load_spec: /p5gjmq4rseitqanua7mdd2zdnag4v3u2
+              prefix: /mnt/common/jcernudagarcia/spack/opt/spack/linux-ubuntu22.04-skylake_avx512/gcc-11.4.0/lammps-20240829.1-p5gjmq4rseitqanua7mdd2zdnag4v3u2
+              prefix_is_canonical_absolute: true
+              prefix_matches_expected: true
+              package:
+                name: lammps
+                dag_hash: p5gjmq4rseitqanua7mdd2zdnag4v3u2
+              expected_package_match_count: 1
+            failures: []
+      - kind: relay_worker
+        roles: [cluster_worker]
+        states: [running]
+      - kind: mcp_server
+        roles: [remote_mcp_server]
+        states: [verified]
+        metadata_equals:
+          server_name: spack
+          remote_tool_names: [spack_find, spack_install, spack_locate]
+          allowlisted_tool_names: [spack_find, spack_install, spack_locate]
+          install_source: wheel
+          install_artifact_sha256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
+          contract_id: clio-kit-spack-user-v2
+          contract_sha256: 3c5412148c770f4844e98eb893c4db0d0afdbf13afe967df67bd5f7d25e1f7db
+          server_process_artifact_verified: true
+          verified: true
+    evidence_group_resource_kind: mcp_server
+
+  - requirement_id: ares-spack-fresh-install
+    description: prove one ordered absent-to-fresh-install-to-locate transition in a disposable Ares Spack store
+    cluster: ares
+    scenarios:
+      - remote-mcp
+    required_checks:
+      - remote-mcp.spack-preinstall-absent
+      - remote-mcp.spack-fresh-install
+      - remote-mcp.spack-postinstall-locate
+      - remote-mcp.spack-disposable-store
+      - remote-mcp.spack-transition-identity
+      - remote-mcp.spack-transition-durable-evidence
+      - remote-mcp.spack-fresh-configuration
+    required_resource_kinds:
+      - relay_job
+      - relay_worker
+      - artifact
+      - configuration_manifest
+      - mcp_server
+    spack_fresh_install_transition:
+      schema_version: clio-relay.release-spack-fresh-install.v1
+      server_name: spack-fresh
+      profile: user
+      package_name: libsigsegv
+      requested_spec: "libsigsegv@2.14"
+      reuse: false
+    required_resources:
+      - kind: relay_job
+        roles: [spack_preinstall_find]
+        states: [succeeded]
+        metadata_equals:
+          remote_mcp_server_name: spack-fresh
+          remote_mcp_tool_name: spack_find
+          profile: user
+          arguments:
+            query: "libsigsegv@2.14"
+          structured_result:
+            schema_version: spack.mcp.result.v1
+            operation: find
+            query: "libsigsegv@2.14"
+            count: 0
+            packages: []
+      - kind: relay_job
+        roles: [spack_fresh_install]
+        states: [succeeded]
+        metadata_equals:
+          remote_mcp_server_name: spack-fresh
+          remote_mcp_tool_name: spack_install
+          profile: user
+          arguments:
+            spec: "libsigsegv@2.14"
+            reuse: false
+          structured_result:
+            schema_version: spack.mcp.result.v1
+            operation: install
+            requested_spec: "libsigsegv@2.14"
+            reuse: false
+            status: installed
+            package_count: 1
+            package:
+              name: libsigsegv
+      - kind: relay_job
+        roles: [spack_postinstall_locate]
+        states: [succeeded]
+        metadata_equals:
+          remote_mcp_server_name: spack-fresh
+          remote_mcp_tool_name: spack_locate
+          profile: user
+          structured_result:
+            schema_version: spack.mcp.result.v1
+            operation: locate
+            package:
+              name: libsigsegv
+      - kind: artifact
+        minimum_count: 12
+      - kind: configuration_manifest
+        roles: [spack_fresh_install_configuration]
+        states: [verified]
+        metadata_equals:
+          preinstall:
+            schema_version: clio-relay.spack-configuration-observation.v1
+            phase: preinstall
+            manifest_regular_file: true
+          postinstall:
+            schema_version: clio-relay.spack-configuration-observation.v1
+            phase: postinstall
+            manifest_regular_file: true
+      - kind: relay_worker
+        roles: [cluster_worker]
+        states: [running]
+      - kind: mcp_server
+        roles: [remote_mcp_server]
+        states: [verified]
+        metadata_equals:
+          server_name: spack-fresh
+          remote_tool_names: [spack_find, spack_install, spack_locate]
+          allowlisted_tool_names: [spack_find, spack_install, spack_locate]
+          install_source: wheel
+          install_artifact_sha256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
+          contract_id: clio-kit-spack-user-v2
+          contract_sha256: 3c5412148c770f4844e98eb893c4db0d0afdbf13afe967df67bd5f7d25e1f7db
+          server_process_artifact_verified: true
+          verified: true
+
+  - requirement_id: ares-slurm-lifecycle
+    description: normalize every required SLURM phase and preserve structured scheduler evidence
+    cluster: ares
+    scenarios:
+      - scheduler-lifecycle
+    required_checks:
+      - scheduler.pending
+      - scheduler.allocation-proven
+      - scheduler.running
+      - scheduler.completed
+      - scheduler.structured-metadata
+      - worker.artifact-version
+      - worker.artifact-sha256
+      - worker.source-identity
+      - worker.component-clio-kit-released
+    required_resource_kinds:
+      - scheduler_job
+      - relay_worker
+    required_resources:
+      - kind: scheduler_job
+        roles: [held_lifecycle_validation]
+        states: [completed]
+        providers: [slurm]
+        metadata_equals:
+          owned_validation_job: true
+      - kind: relay_worker
+        roles: [cluster_worker]
+        states: [running]
+
+  - requirement_id: ares-owned-cleanup
+    description: detach and tear down owned Ares resources while preserving jobs by default
+    cluster: ares
+    scenarios:
+      - cleanup
+    required_checks:
+      - cleanup.detach
+      - cleanup.jobs-preserved-default
+      - cleanup.relay-session
+      - cleanup.connectors
+      - cleanup.gateway-record
+      - cleanup.no-owned-resources
+      - worker.artifact-version
+      - worker.artifact-sha256
+      - worker.source-identity
+      - worker.component-clio-kit-released
+    required_resource_kinds:
+      - relay_session
+      - connector
+      - gateway_session
+      - relay_job
+      - scheduler_job
+      - relay_worker
+    required_resources:
+      - kind: relay_session
+        roles: [remote_relay_api:retain]
+        states: [retained]
+        metadata_equals:
+          ownership_verified: true
+          verified_after_operation: true
+      - kind: relay_session
+        roles: [remote_relay_api:stop]
+        states: [stopped]
+        metadata_equals:
+          ownership_verified: true
+          verified_after_operation: true
+      - kind: relay_worker
+        roles: [cluster_worker]
+        states: [running]
+    evidence_group_resource_kind: relay_session
+
+  - requirement_id: ares-explicit-job-cancel
+    description: cancel only an explicitly owned Ares validation job and its scheduler allocation
+    cluster: ares
+    scenarios:
+      - cleanup
+    required_checks:
+      - cleanup.explicit-job-cancel
+      - worker.artifact-version
+      - worker.artifact-sha256
+      - worker.source-identity
+      - worker.component-clio-kit-released
+    required_resource_kinds:
+      - relay_session
+      - relay_job
+      - scheduler_job
+      - relay_worker
+    required_resources:
+      - kind: relay_job
+        states: [canceled]
+      - kind: scheduler_job
+        states: [canceled]
+        providers: [slurm]
+        metadata_equals:
+          ownership_verified: true
+          verified_after_operation: true
+      - kind: scheduler_job
+        roles: [scheduler_sentinel:retain]
+        states: [retained]
+        providers: [slurm]
+        metadata_equals:
+          ownership_verified: false
+          verified_after_operation: true
+          unowned_sentinel: true
+          active_before_operation: true
+          preservation_verified: true
+      - kind: relay_worker
+        roles: [cluster_worker]
+        states: [running]
+    evidence_group_resource_kind: relay_session
+
+  - requirement_id: homelab-owned-cleanup
+    description: tear down owned homelab relay and connector processes without residual resources
+    cluster: homelab
+    scenarios:
+      - cleanup
+    required_checks:
+      - cleanup.detach
+      - cleanup.jobs-preserved-default
+      - cleanup.relay-session
+      - cleanup.connectors
+      - cleanup.gateway-record
+      - cleanup.no-owned-resources
+      - worker.artifact-version
+      - worker.artifact-sha256
+      - worker.source-identity
+      - worker.component-clio-kit-released
+    required_resource_kinds:
+      - relay_session
+      - connector
+      - relay_job
+      - gateway_session
+      - relay_worker
+    required_resources:
+      - kind: relay_session
+        roles: [remote_relay_api:retain]
+        states: [retained]
+        metadata_equals:
+          ownership_verified: true
+          verified_after_operation: true
+      - kind: relay_session
+        roles: [remote_relay_api:stop]
+        states: [stopped]
+        metadata_equals:
+          ownership_verified: true
+          verified_after_operation: true
+      - kind: relay_worker
+        roles: [cluster_worker]
+        states: [running]
+    evidence_group_resource_kind: relay_session
+
+  - requirement_id: homelab-transport
+    description: exercise the released persistent uv-tool relay and SSH transport paths on homelab
+    cluster: homelab
+    scenarios:
+      - transport
+    required_checks:
+      - transport.relay
+      - transport.ssh
+      - transport.cleanup
+      - worker.artifact-version
+      - worker.artifact-sha256
+      - worker.source-identity
+      - worker.scheduler-provider
+      - worker.target-identity
+      - worker.component-clio-kit-released
+    required_resource_kinds:
+      - connector
+      - relay_worker
+      - cluster_target
+    required_resources:
+      - kind: connector
+        states: [stopped]
+      - kind: relay_worker
+        roles: [cluster_worker]
+        states: [running]
+      - kind: cluster_target
+        roles: [physical_cluster_target]
+        states: [verified]
+        metadata_equals:
+          verified: true
+    evidence_group_resource_kind: cluster_target
+
+  - requirement_id: ares-gateway-runtime
+    description: run and clean a scheduler-backed gateway service lifecycle on Ares
+    cluster: ares
+    scenarios:
+      - gateway-runtime
+    required_checks:
+      - gateway.submit
+      - gateway.allocated
+      - gateway.ready
+      - gateway.connect
+      - gateway.stop-connectors
+      - gateway.jobs-preserved-default
+      - gateway.closed-record
+      - worker.artifact-version
+      - worker.artifact-sha256
+      - worker.source-identity
+      - worker.component-clio-kit-released
+    required_resource_kinds:
+      - gateway_session
+      - connector
+      - scheduler_job
+      - relay_worker
+    required_resources:
+      - kind: gateway_session
+        roles: [service_runtime]
+        states: [closed]
+      - kind: connector
+        states: [stopped]
+      - kind: relay_worker
+        roles: [cluster_worker]
+        states: [running]
+    evidence_group_resource_kind: gateway_session

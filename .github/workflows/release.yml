@@ -1,110 +1,129 @@
-name: release
+name: build unprivileged release candidate payload
 
 on:
   push:
     tags: ["v*"]
-  release:
-    types: [published]
-  workflow_dispatch:
+
+concurrency:
+  group: clio-relay-release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: build package
+    name: build candidate payload without publication authority
     runs-on: ubuntu-latest
+    timeout-minutes: 60  # Includes the complete local release gate and artifact smoke tests.
+    permissions:
+      contents: read
 
     steps:
-      - name: check out repository
-        uses: actions/checkout@v4
+      - name: check out the exact private-repository tag commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: fetch the exact tag with ephemeral read credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          source .github/scripts/authenticated-git.sh
+          relay_authenticated_git_fetch --force --no-tags --depth=1 origin \
+            "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
 
       - name: install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
-          enable-cache: true
+          enable-cache: false
+          version: "0.11.28"
 
       - name: set up python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
-      - name: install dependencies
+      - name: install locked dependencies
         run: uv sync --locked --all-groups
 
-      - name: lint
-        run: uv run ruff check
+      - name: require the tag to match the package version and commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          test "$GITHUB_REF_TYPE" = "tag"
+          source .github/scripts/authenticated-git.sh
+          relay_authenticated_git_fetch --force --no-tags origin \
+            refs/heads/main:refs/remotes/origin/main
+          version="$(uv run --no-sync python -c 'from clio_relay import __version__; print(__version__)')"
+          test "$TAG_NAME" = "v$version"
+          test "$(git rev-list -n 1 "$TAG_NAME")" = "$GITHUB_SHA"
+          test "$(git tag --points-at HEAD --list "$TAG_NAME")" = "$TAG_NAME"
+          test "$GITHUB_SHA" = "$(git rev-parse refs/remotes/origin/main)"
 
-      - name: format check
-        run: uv run ruff format --check
+      - name: stage exact clio-kit release wheel
+        shell: bash
+        env:
+          CLIO_KIT_WHEEL_FILENAME: clio_kit-2.3.2-py3-none-any.whl
+          CLIO_KIT_WHEEL_SHA256: 6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321
+          CLIO_KIT_WHEEL_URL: https://github.com/iowarp/clio-kit/releases/download/v2.3.2/clio_kit-2.3.2-py3-none-any.whl
+        run: |
+          set -euo pipefail
+          umask 077
+          wheel_dir="$RUNNER_TEMP/clio-kit-v2.3.2"
+          mkdir "$wheel_dir"
+          wheel="$wheel_dir/$CLIO_KIT_WHEEL_FILENAME"
+          temporary="$wheel.part"
+          trap 'rm -f -- "$temporary"' EXIT
+          curl --fail --show-error --silent --location \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 180 \
+            --connect-timeout 20 --max-time 180 \
+            --output "$temporary" "$CLIO_KIT_WHEEL_URL"
+          printf '%s  %s\n' "$CLIO_KIT_WHEEL_SHA256" "$temporary" \
+            | sha256sum --check --strict
+          mv -- "$temporary" "$wheel"
+          trap - EXIT
+          printf 'CLIO_RELAY_CLIO_KIT_WHEEL=%s\n' "$wheel" >> "$GITHUB_ENV"
+          printf 'CLIO_RELAY_CLIO_KIT_WHEEL_SHA256=%s\n' \
+            "$CLIO_KIT_WHEEL_SHA256" >> "$GITHUB_ENV"
 
-      - name: type check
-        run: uv run pyright
+      - name: run evidence-producing local release gate
+        run: >-
+          uv run --no-sync clio-relay release validate-local
+          --project-root .
+          --report dist/validation-local.json
+          --artifact-dir dist
 
-      - name: test
-        run: uv run pytest
+      - name: create exact SHA-256 manifest
+        shell: bash
+        run: |
+          mapfile -t wheels < <(find dist -maxdepth 1 -type f -name '*.whl' -printf '%f\n' | sort)
+          mapfile -t sdists < <(find dist -maxdepth 1 -type f -name '*.tar.gz' -printf '%f\n' | sort)
+          test "${#wheels[@]}" -eq 1
+          test "${#sdists[@]}" -eq 1
+          test -f dist/validation-local.json
+          (
+            cd dist
+            sha256sum --binary "${wheels[0]}" "${sdists[0]}" \
+              validation-local.json > SHA256SUMS
+            sha256sum --check --strict SHA256SUMS
+          )
 
-      - name: build package
-        run: uv build
-
-      - name: check package metadata
-        run: uvx twine check dist/*
-
-      - name: upload package artifact
-        uses: actions/upload-artifact@v4
+      - name: upload staged candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: dist
+          name: release-candidate-${{ github.ref_name }}
           path: |
             dist/*.whl
             dist/*.tar.gz
+            dist/validation-local.json
+            dist/SHA256SUMS
           if-no-files-found: error
-
-  attach-release-assets:
-    name: attach release assets
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/')
-    permissions:
-      contents: write
-
-    steps:
-      - name: download package artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist
-
-      - name: attach files to github release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG_NAME: ${{ github.event.release.tag_name || github.ref_name }}
-          REPOSITORY: ${{ github.repository }}
-        run: |
-          if gh release view "$TAG_NAME" --repo "$REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG_NAME" dist/*.whl dist/*.tar.gz --repo "$REPOSITORY" --clobber
-          else
-            gh release create "$TAG_NAME" dist/*.whl dist/*.tar.gz --repo "$REPOSITORY" --title "$TAG_NAME" --notes "Automated release for $TAG_NAME"
-          fi
-
-  publish-pypi:
-    name: publish to pypi
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.repository_owner == 'iowarp' && (github.event_name == 'release' || startsWith(github.ref, 'refs/tags/'))
-    environment:
-      name: pypi
-      url: https://pypi.org/project/clio-relay/
-    permissions:
-      id-token: write
-
-    steps:
-      - name: download package artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist
-
-      - name: publish package
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          skip-existing: true
+          retention-days: 90

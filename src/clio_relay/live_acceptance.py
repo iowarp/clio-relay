@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import posixpath
 import re
 import shlex
@@ -13,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from base64 import b64decode
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -21,10 +23,35 @@ from uuid import uuid4
 
 import yaml
 
+from clio_relay import __version__
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.doctor import run_cluster_doctor
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.transport_probe import run_frp_direct_http_probe, run_frp_http_probe
+from clio_relay.identifiers import DurableRecordId
+from clio_relay.installation import (
+    verify_remote_clio_kit_native_execution_component,
+    verify_remote_native_jarvis_component,
+    verify_remote_worker_info,
+)
+from clio_relay.pagination import MAX_RESPONSE_PAGE_RECORDS
+from clio_relay.progress_provenance import (
+    validate_package_progress_acceptance_metadata,
+)
+from clio_relay.runtime_metadata import RUNTIME_METADATA_SCHEMA, RuntimeMetadataSource
+from clio_relay.transport_probe import (
+    run_frp_direct_http_probe,
+    run_frp_http_probe,
+    run_ssh_forward_http_probe,
+    transport_evidence_lines_from_error,
+)
+from clio_relay.validation_report import (
+    CleanupEvidence,
+    EvidenceReference,
+    ValidationRecorder,
+    ValidationResource,
+    detect_software_identity,
+    new_live_validation_report,
+)
 
 
 class CommandRunner(Protocol):
@@ -38,6 +65,26 @@ class CommandRunner(Protocol):
     ) -> subprocess.CompletedProcess[bytes]:
         """Run a command and return the completed process."""
         ...
+
+
+MAX_ACCEPTANCE_COLLECTION_RECORDS = 10_000
+
+
+class _ValidationLines(list[str]):
+    """List that mirrors every emitted acceptance fact into a report."""
+
+    def __init__(self, recorder: ValidationRecorder | None) -> None:
+        super().__init__()
+        self._recorder = recorder
+
+    def append(self, item: str) -> None:
+        super().append(item)
+        if self._recorder is not None:
+            self._recorder.observe_line(item)
+
+    def extend(self, items: Iterable[str]) -> None:
+        for item in items:
+            self.append(item)
 
 
 def _empty_progress_payload() -> dict[str, object]:
@@ -59,6 +106,7 @@ class LiveAcceptanceOptions:
     require_agent_child_job: bool | None = None
     verify_transport: bool | None = None
     verify_direct_transport: bool | None = None
+    verify_ssh_transport: bool = False
     allow_direct_transport_fallback: bool | None = None
     transport_token: str | None = None
     transport_secret_key: str | None = None
@@ -66,10 +114,22 @@ class LiveAcceptanceOptions:
     transport_local_bind_port: int | None = None
     transport_remote_api_port: int | None = None
     transport_proxy_name: str | None = None
+    ssh_transport_local_bind_port: int | None = None
+    ssh_transport_remote_api_port: int | None = None
+    ssh_transport_session_id: str | None = None
     api_token: str | None = None
     agent_child_jarvis_yaml: Path | None = None
     timeout_seconds: float = 600
     poll_seconds: float = 2
+    report_path: Path | None = None
+    markdown_report_path: Path | None = None
+    validation_launcher: str | None = None
+    validation_install_source: str | None = None
+    validation_artifact_sha256: str | None = None
+    require_structured_runtime_metadata: bool = False
+    validation_scenario: str = "live-test"
+    verify_cluster_deployment: bool = False
+    report_id: DurableRecordId | None = None
 
 
 def run_live_acceptance(
@@ -77,8 +137,80 @@ def run_live_acceptance(
     *,
     runner: CommandRunner | None = None,
 ) -> list[str]:
-    """Run configured live acceptance checks against a cluster deployment."""
+    """Run live checks and persist a report even when acceptance fails."""
     command_runner = runner or _run_command
+    recorder: ValidationRecorder | None = None
+    if options.report_path is not None:
+        transport_modes: list[str] = []
+        verify_transport = (
+            options.definition.live_test.verify_transport
+            if options.verify_transport is None
+            else options.verify_transport
+        )
+        verify_direct = (
+            options.definition.live_test.verify_direct_transport
+            if options.verify_direct_transport is None
+            else options.verify_direct_transport
+        )
+        if verify_transport:
+            transport_modes.append("frp-relay")
+        if verify_direct:
+            transport_modes.append("frp-direct")
+        if options.verify_ssh_transport:
+            transport_modes.append("ssh-forward")
+        recorder = ValidationRecorder(
+            new_live_validation_report(
+                scenario=options.validation_scenario,
+                cluster=options.cluster,
+                transport_modes=transport_modes,
+                launcher=options.validation_launcher,
+                install_source=options.validation_install_source,
+                artifact_sha256=options.validation_artifact_sha256,
+                report_id=options.report_id,
+            )
+        )
+        if transport_modes:
+            recorder.report.cleanup = CleanupEvidence(
+                requested=True,
+                mode="transport_probe_teardown",
+                cancel_scheduler_jobs=False,
+            )
+    try:
+        lines = _run_live_acceptance(options, runner=command_runner, recorder=recorder)
+    except BaseException as exc:
+        if recorder is not None:
+            for evidence_line in transport_evidence_lines_from_error(exc):
+                try:
+                    recorder.observe_line(evidence_line)
+                except Exception as evidence_error:
+                    recorder.record_failure(
+                        "transport.structured-evidence",
+                        "ingest structured transport cleanup evidence",
+                        evidence_error,
+                    )
+            recorder.record_failure(
+                "live-test.completed", "complete configured live acceptance", exc
+            )
+            recorder.finish(exc)
+            assert options.report_path is not None
+            recorder.write(options.report_path, options.markdown_report_path)
+        raise
+    if recorder is not None:
+        recorder.finish()
+        assert options.report_path is not None
+        recorder.write(options.report_path, options.markdown_report_path)
+        lines.append(f"validation.report={options.report_path.resolve()}")
+    return lines
+
+
+def _run_live_acceptance(
+    options: LiveAcceptanceOptions,
+    *,
+    runner: CommandRunner,
+    recorder: ValidationRecorder | None,
+) -> list[str]:
+    """Execute the acceptance workflow while emitting structured facts."""
+    command_runner = runner
     jarvis_yaml = options.jarvis_yaml or _configured_path(options.definition.live_test.jarvis_yaml)
     monitor_pattern = options.monitor_pattern or options.definition.live_test.monitor_pattern
     progress_pattern = options.progress_pattern or options.definition.live_test.progress_pattern
@@ -149,15 +281,29 @@ def run_live_acceptance(
     )
     expected_progress_adapter = _expected_progress_adapter(pipeline_yaml_text)
     expected_progress_package = _expected_progress_package(pipeline_yaml_text)
-    lines: list[str] = []
-    if expected_progress_package == "builtin.lammps":
-        package_path = _verify_builtin_lammps_package_load(
-            options.definition,
-            runner=command_runner,
-        )
-        lines.append(f"acceptance.jarvis_package=builtin.lammps:{package_path}")
+    lines: list[str] = _ValidationLines(recorder)
+    if expected_progress_adapter is not None:
+        if expected_progress_package is None:
+            raise ConfigurationError(
+                "an explicit package progress adapter requires exactly one non-empty pkg_type"
+            )
+        lines.append("acceptance.application_boundary=package_progress_provider")
+        lines.append(f"acceptance.package_adapter={expected_progress_adapter}")
+        lines.append(f"acceptance.package_owner={expected_progress_package}")
 
     lines.extend(run_cluster_doctor(options.definition))
+    lines.append("acceptance.cluster_doctor=passed")
+    if options.verify_cluster_deployment:
+        lines.extend(
+            _verify_cluster_deployment(
+                options.definition,
+                runner=command_runner,
+                expected_artifact_sha256=options.validation_artifact_sha256,
+                expected_install_source=(
+                    recorder.report.install_source.kind.value if recorder is not None else None
+                ),
+            )
+        )
     if verify_transport:
         assert transport_token is not None
         assert transport_secret_key is not None
@@ -186,6 +332,8 @@ def run_live_acceptance(
         if not allow_direct_transport_fallback:
             _assert_direct_xtcp_acceptance(direct_lines)
         lines.extend(direct_lines)
+    if options.verify_ssh_transport:
+        lines.extend(_verify_ssh_transport(options, pipeline_yaml=pipeline_yaml_text))
     remote_yaml = f".local/share/clio-relay/live-tests/{run_id}/pipeline.yaml"
     _remote_write_file(
         options.definition.ssh_host,
@@ -244,6 +392,8 @@ def run_live_acceptance(
         runner=command_runner,
     )
     lines.append("acceptance.job_state=succeeded")
+    if options.verify_cluster_deployment:
+        lines.append("worker.execute=passed")
 
     _verify_completed_job(
         options.definition,
@@ -253,6 +403,8 @@ def run_live_acceptance(
         runner=command_runner,
         expected_progress_adapter=expected_progress_adapter,
         expected_progress_package=expected_progress_package,
+        recorder=recorder,
+        require_structured_runtime_metadata=options.require_structured_runtime_metadata,
     )
 
     if monitor_pattern is not None:
@@ -340,9 +492,30 @@ def run_live_acceptance(
                 runner=command_runner,
                 expected_progress_adapter=expected_progress_adapter,
                 expected_progress_package=expected_progress_package,
+                recorder=recorder,
+                require_structured_runtime_metadata=options.require_structured_runtime_metadata,
             )
 
     lines.append("live acceptance passed")
+    expected_transport_cleanups = sum(
+        [verify_transport, verify_direct_transport, options.verify_ssh_transport]
+    )
+    observed_transport_cleanups = lines.count("transport.cleanup=passed")
+    if observed_transport_cleanups < expected_transport_cleanups:
+        raise RelayError(
+            "transport cleanup evidence is incomplete: "
+            f"expected={expected_transport_cleanups} observed={observed_transport_cleanups}"
+        )
+    if recorder is not None and recorder.transport_probe_count < expected_transport_cleanups:
+        raise RelayError(
+            "structured transport cleanup evidence is incomplete: "
+            f"expected={expected_transport_cleanups} observed={recorder.transport_probe_count}"
+        )
+    if recorder is not None and recorder.report.cleanup.remaining_resources:
+        raise RelayError(
+            "transport cleanup left structured residual resources: "
+            f"count={len(recorder.report.cleanup.remaining_resources)}"
+        )
     return lines
 
 
@@ -391,6 +564,74 @@ def _verify_transport(
             expected_progress_package=expected_progress_package,
         ),
     )
+
+
+def _verify_cluster_deployment(
+    definition: ClusterDefinition,
+    *,
+    runner: CommandRunner,
+    expected_artifact_sha256: str | None,
+    expected_install_source: str | None,
+) -> list[str]:
+    service = f"clio-relay-worker-{definition.name}.service"
+    script = (
+        'export PATH="$HOME/.local/bin:$PATH"\n'
+        f'test "$(systemctl --user is-active {shlex.quote(service)})" = active\n'
+        f"clio-relay endpoint worker-info --cluster {shlex.quote(definition.name)}\n"
+    )
+    raw_info = _remote_shell(definition.ssh_host, script, runner=runner)
+    try:
+        loaded = json.loads(raw_info)
+    except json.JSONDecodeError as exc:
+        raise RelayError(f"remote installation info was not valid JSON: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise RelayError("remote installation info was not an object")
+    info = cast(dict[str, Any], loaded)
+    try:
+        receipt = verify_remote_worker_info(
+            info,
+            expected_cluster=definition.name,
+            expected_version=__version__,
+            expected_software=detect_software_identity(),
+            expected_artifact_sha256=expected_artifact_sha256,
+            expected_source=expected_install_source,
+            require_target_identity=False,
+        )
+    except ConfigurationError as exc:
+        raise RelayError(str(exc)) from exc
+    try:
+        clio_kit_runtime = verify_remote_clio_kit_native_execution_component(info, receipt)
+        native_jarvis_runtime = verify_remote_native_jarvis_component(info, receipt)
+    except ConfigurationError as exc:
+        raise RelayError(str(exc)) from exc
+    software = receipt.software
+    return [
+        "worker.running=passed",
+        f"worker.artifact-version={receipt.distribution_version}",
+        f"worker.artifact-sha256={receipt.artifact_sha256 or 'none'}",
+        "worker.source-identity="
+        f"{software.commit or 'none'}:{software.tag or 'none'}:{software.dirty}",
+        f"worker.scheduler-provider={info.get('scheduler_provider')}",
+        "worker.components=" + json.dumps(receipt.components, sort_keys=True),
+        "worker.component-artifacts="
+        + json.dumps(
+            {
+                name: identity.model_dump(mode="json")
+                for name, identity in receipt.component_artifacts.items()
+            },
+            sort_keys=True,
+        ),
+        "worker.component-runtime="
+        + json.dumps(
+            {
+                "clio-kit": clio_kit_runtime,
+                "jarvis-cd": native_jarvis_runtime,
+            },
+            sort_keys=True,
+        ),
+        "worker.component-clio-kit-native-jarvis-contract=passed",
+        "worker.component-jarvis-native-execution=passed",
+    ]
 
 
 def _verify_direct_transport(
@@ -452,6 +693,34 @@ def _assert_direct_xtcp_acceptance(lines: list[str]) -> None:
     missing = required - set(lines)
     if missing:
         raise RelayError(f"direct transport acceptance did not prove XTCP: {sorted(missing)}")
+
+
+def _verify_ssh_transport(
+    options: LiveAcceptanceOptions,
+    *,
+    pipeline_yaml: str,
+) -> list[str]:
+    run_suffix = uuid4().hex[:12]
+    return run_ssh_forward_http_probe(
+        cluster=options.cluster,
+        definition=options.definition,
+        local_bind_port=options.ssh_transport_local_bind_port or _unique_transport_port(run_suffix),
+        remote_api_port=options.ssh_transport_remote_api_port
+        or _unique_transport_port(run_suffix[::-1]),
+        session_id=options.ssh_transport_session_id or f"relay-ssh-live-test-{run_suffix}",
+        api_token=options.api_token,
+        timeout_seconds=options.timeout_seconds,
+        http_check=lambda local_url: _verify_transport_http_api(
+            local_url,
+            cluster=options.cluster,
+            pipeline_yaml=pipeline_yaml,
+            api_token=options.api_token,
+            timeout_seconds=options.timeout_seconds,
+            poll_seconds=options.poll_seconds,
+            expected_progress_adapter=_expected_progress_adapter(pipeline_yaml),
+            expected_progress_package=_expected_progress_package(pipeline_yaml),
+        ),
+    )
 
 
 def _unique_transport_port(run_suffix: str) -> int:
@@ -555,6 +824,30 @@ def _verify_transport_http_api(
         raise RelayError("transport HTTP provenance artifact id mismatch")
     if provenance["encoding"] != "base64" or str(provenance["data"]) == "":
         raise RelayError("transport HTTP provenance artifact was empty")
+    runtime_facts: list[str] = []
+    runtime_artifact = next(
+        (artifact for artifact in artifacts if artifact.get("kind") == "runtime_metadata"),
+        None,
+    )
+    if runtime_artifact is not None:
+        runtime_artifact_id = runtime_artifact.get("artifact_id")
+        if not isinstance(runtime_artifact_id, str) or not runtime_artifact_id:
+            raise RelayError("transport HTTP runtime metadata artifact has no artifact id")
+        runtime_payload = cast(
+            dict[str, Any],
+            _http_json(
+                local_url,
+                "GET",
+                f"/artifacts/{runtime_artifact_id}/content",
+                api_token=api_token,
+                timeout_seconds=10,
+            ),
+        )
+        runtime_facts = _runtime_metadata_facts(
+            runtime_payload,
+            artifact_id=runtime_artifact_id,
+            line_prefix="transport.http",
+        )
     lines = [
         f"transport.http_job_id={job_id}",
         "transport.http_wait=succeeded",
@@ -563,6 +856,7 @@ def _verify_transport_http_api(
         "transport.http_artifacts=ok",
         "transport.http_provenance=ok",
     ]
+    lines.extend(runtime_facts)
     if expected_progress_adapter is not None:
         progress = cast(
             list[dict[str, Any]],
@@ -773,13 +1067,15 @@ def _verify_live_package_progress(
         events = cast(list[dict[str, Any]], monitor["events"])
         event_types = {str(event.get("event_type")) for event in events}
         saw_running = saw_running or "job.running" in event_types
-        progress = _remote_clio_json(
+        progress = _remote_job_collection(
             definition,
             ["job", "progress", job_id],
+            record_key="progress",
+            label=f"live package progress for {job_id}",
             runner=runner,
         )
         if _has_progress_adapter(
-            cast(list[dict[str, Any]], progress),
+            progress,
             expected_adapter,
             job_id=job_id,
             package_name=package_name,
@@ -825,6 +1121,8 @@ def _verify_completed_job(
     runner: CommandRunner,
     expected_progress_adapter: str | None = None,
     expected_progress_package: str | None = None,
+    recorder: ValidationRecorder | None = None,
+    require_structured_runtime_metadata: bool = False,
 ) -> None:
     monitor = _remote_clio_json(
         definition,
@@ -837,16 +1135,64 @@ def _verify_completed_job(
     if missing_events:
         raise RelayError(f"acceptance job missing events: {sorted(missing_events)}")
     lines.append(f"{line_prefix}.events=ok")
+    for scheduler_phase in ("pending", "allocated", "running", "completed"):
+        if f"scheduler.{scheduler_phase}" in event_types:
+            lines.append(f"scheduler.{scheduler_phase}=observed")
 
-    tasks = _remote_clio_json(
+    task_items = _remote_job_collection(
         definition,
         ["job", "tasks", job_id],
+        record_key="tasks",
+        label=f"completed-job tasks for {job_id}",
         runner=runner,
     )
-    task_items = cast(list[dict[str, Any]], tasks)
     if not task_items or not any(task["state"] == "succeeded" for task in task_items):
         raise RelayError("acceptance job missing succeeded task record")
     lines.append(f"{line_prefix}.tasks={len(task_items)}")
+    if recorder is not None:
+        for task in task_items:
+            task_id = task.get("task_id")
+            if isinstance(task_id, str):
+                recorder.add_resource(
+                    ValidationResource(
+                        kind="relay_task",
+                        resource_id=task_id,
+                        role=line_prefix,
+                        cluster=definition.name,
+                        state=str(task.get("state")) if task.get("state") is not None else None,
+                        metadata=(
+                            cast(dict[str, Any], task["metadata"])
+                            if isinstance(task.get("metadata"), dict)
+                            else {}
+                        ),
+                    )
+                )
+        scheduler_items = monitor.get("scheduler", [])
+        if isinstance(scheduler_items, list):
+            for item in cast(list[object], scheduler_items):
+                if not isinstance(item, dict):
+                    continue
+                scheduler = cast(dict[str, Any], item)
+                scheduler_job_id = scheduler.get("scheduler_job_id")
+                if not isinstance(scheduler_job_id, str):
+                    continue
+                recorder.add_resource(
+                    ValidationResource(
+                        kind="scheduler_job",
+                        resource_id=scheduler_job_id,
+                        role=line_prefix,
+                        cluster=definition.name,
+                        state=(
+                            str(scheduler["phase"]) if scheduler.get("phase") is not None else None
+                        ),
+                        provider=(
+                            str(scheduler["scheduler"])
+                            if scheduler.get("scheduler") is not None
+                            else None
+                        ),
+                        metadata=scheduler,
+                    )
+                )
 
     stdout = _remote_clio_json(
         definition,
@@ -863,16 +1209,47 @@ def _verify_completed_job(
     lines.append(f"{line_prefix}.stdout_bytes={stdout['next_offset']}")
     lines.append(f"{line_prefix}.stderr_bytes={stderr['next_offset']}")
 
-    artifacts = _remote_clio_json(
+    artifact_items = _remote_job_collection(
         definition,
         ["job", "list-artifacts", job_id],
+        record_key="artifacts",
+        label=f"completed-job artifacts for {job_id}",
         runner=runner,
     )
-    artifact_items = cast(list[dict[str, Any]], artifacts)
     artifact_kinds = {str(artifact["kind"]) for artifact in artifact_items}
     if not {"jarvis_pipeline", "stdout", "stderr", "provenance"}.issubset(artifact_kinds):
         raise RelayError(f"acceptance artifacts incomplete: {sorted(artifact_kinds)}")
     lines.append(f"{line_prefix}.artifacts={','.join(sorted(artifact_kinds))}")
+    if recorder is not None:
+        for artifact in artifact_items:
+            artifact_id = artifact.get("artifact_id")
+            if not isinstance(artifact_id, str):
+                continue
+            uri = artifact.get("uri")
+            references = [str(uri)] if isinstance(uri, str) else []
+            recorder.add_resource(
+                ValidationResource(
+                    kind="artifact",
+                    resource_id=artifact_id,
+                    role=str(artifact.get("kind", "unknown")),
+                    cluster=definition.name,
+                    references=references,
+                    metadata=artifact,
+                )
+            )
+            recorder.report.artifacts.append(
+                EvidenceReference(
+                    kind=str(artifact.get("kind", "artifact")),
+                    reference=(
+                        str(uri)
+                        if isinstance(uri, str)
+                        else f"relay-artifact://{definition.name}/{job_id}/{artifact_id}"
+                    ),
+                    sha256=(
+                        str(artifact["sha256"]) if isinstance(artifact.get("sha256"), str) else None
+                    ),
+                )
+            )
 
     stdout_artifact = next(artifact for artifact in artifact_items if artifact["kind"] == "stdout")
     artifact_payload = _remote_clio_json(
@@ -895,96 +1272,207 @@ def _verify_completed_job(
     if provenance_payload.get("encoding") != "base64":
         raise RelayError("acceptance provenance payload was not base64 encoded")
     lines.append(f"{line_prefix}.provenance=ok")
+    structured_runtime_metadata = _verify_runtime_metadata_artifact(
+        definition,
+        artifact_items,
+        line_prefix=line_prefix,
+        lines=lines,
+        runner=runner,
+    )
+    if require_structured_runtime_metadata and not structured_runtime_metadata:
+        raise RelayError(
+            "acceptance requires structured JARVIS runtime metadata, not a missing or "
+            "legacy stdout-derived runtime artifact"
+        )
     if expected_progress_adapter is not None:
-        progress = _remote_clio_json(
+        progress = _remote_job_collection(
             definition,
             ["job", "progress", job_id],
+            record_key="progress",
+            label=f"completed-job progress for {job_id}",
             runner=runner,
         )
-        if not _has_progress_adapter(
-            cast(list[dict[str, Any]], progress),
+        provider_metadata = _progress_provider_attestation(
+            progress,
             expected_progress_adapter,
             job_id=job_id,
             package_name=expected_progress_package,
-        ):
+        )
+        if provider_metadata is None:
             raise RelayError(
                 f"expected package progress adapter was not recorded: {expected_progress_adapter}"
             )
         lines.append(f"{line_prefix}.progress_adapter={expected_progress_adapter}")
+        lines.append("package-progress.provider=verified")
+        lines.append("package-progress.acceptance=verified")
+        lines.append(
+            "package-progress.identity="
+            f"{provider_metadata['provider_distribution']}:"
+            f"{provider_metadata['provider_distribution_version']}:"
+            f"{provider_metadata['provider_entry_point']}:"
+            f"{provider_metadata['adapter']}"
+        )
+        if recorder is not None:
+            recorder.add_resource(
+                ValidationResource(
+                    kind="package_progress_provider",
+                    resource_id=(
+                        f"{provider_metadata['provider_distribution']}:"
+                        f"{provider_metadata['provider_distribution_version']}:"
+                        f"{provider_metadata['provider_entry_point']}:"
+                        f"{provider_metadata['adapter']}"
+                    ),
+                    role="jarvis_package_progress",
+                    cluster=definition.name,
+                    state="verified",
+                    provider=str(provider_metadata["provider_distribution"]),
+                    metadata=dict(provider_metadata),
+                )
+            )
+
+
+def _verify_runtime_metadata_artifact(
+    definition: ClusterDefinition,
+    artifacts: list[dict[str, Any]],
+    *,
+    line_prefix: str,
+    lines: list[str],
+    runner: CommandRunner,
+) -> bool:
+    """Validate and report a normalized runtime metadata artifact when present."""
+    runtime_artifact = next(
+        (artifact for artifact in artifacts if artifact.get("kind") == "runtime_metadata"),
+        None,
+    )
+    if runtime_artifact is None:
+        return False
+    artifact_id = runtime_artifact.get("artifact_id")
+    if not isinstance(artifact_id, str) or not artifact_id:
+        raise RelayError("runtime metadata artifact has no artifact id")
+    payload = _remote_clio_json(
+        definition,
+        ["job", "read-artifact", artifact_id],
+        runner=runner,
+    )
+    facts = _runtime_metadata_facts(
+        payload,
+        artifact_id=artifact_id,
+        line_prefix=line_prefix,
+    )
+    lines.extend(facts)
+    return f"{line_prefix}.structured_runtime_metadata=ok" in facts
+
+
+def _runtime_metadata_facts(
+    payload: dict[str, Any],
+    *,
+    artifact_id: str,
+    line_prefix: str,
+) -> list[str]:
+    """Validate a runtime metadata payload and return report-ready facts."""
+    if payload.get("encoding") != "base64" or not isinstance(payload.get("data"), str):
+        raise RelayError("runtime metadata artifact payload was not base64 encoded")
+    try:
+        decoded = json.loads(b64decode(cast(str, payload["data"])).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RelayError(f"runtime metadata artifact was not valid JSON: {exc}") from exc
+    if not isinstance(decoded, dict):
+        raise RelayError("runtime metadata artifact was not an object")
+    runtime = cast(dict[str, Any], decoded)
+    if runtime.get("schema_version") != RUNTIME_METADATA_SCHEMA:
+        raise RelayError("runtime metadata artifact has an unsupported schema")
+    source = runtime.get("source")
+    allowed_sources = {item.value for item in RuntimeMetadataSource}
+    if not isinstance(source, str) or source not in allowed_sources:
+        raise RelayError("runtime metadata artifact has an invalid source")
+    facts = [
+        f"{line_prefix}.runtime_metadata_artifact={artifact_id}",
+        f"{line_prefix}.runtime_metadata_source={source}",
+    ]
+    structured_sources = {
+        RuntimeMetadataSource.JARVIS_MCP.value,
+        RuntimeMetadataSource.JARVIS_SIDECAR.value,
+    }
+    structured = source in structured_sources
+    if structured:
+        facts.append(f"{line_prefix}.structured_runtime_metadata=ok")
+    else:
+        compatibility_kind = (
+            "legacy_fallback"
+            if source == RuntimeMetadataSource.LEGACY_STDOUT.value
+            else "untrusted_compatibility"
+        )
+        facts.append(f"runtime_metadata.compatibility={line_prefix}:{compatibility_kind}")
+    raw_field_sources = runtime.get("field_sources")
+    field_sources = (
+        cast(dict[str, object], raw_field_sources) if isinstance(raw_field_sources, dict) else {}
+    )
+    provider = runtime.get("scheduler_provider")
+    if isinstance(provider, str) and provider:
+        facts.append(f"{line_prefix}.runtime_scheduler_provider={provider}")
+    scheduler_job_id = runtime.get("scheduler_job_id")
+    if isinstance(scheduler_job_id, str) and scheduler_job_id:
+        facts.append(f"{line_prefix}.runtime_scheduler_job_id={scheduler_job_id}")
+        scheduler_id_source = field_sources.get("scheduler_job_id")
+        if isinstance(scheduler_id_source, str):
+            facts.append(f"{line_prefix}.runtime_scheduler_job_id_source={scheduler_id_source}")
+        provider_source = field_sources.get("scheduler_provider")
+        if (
+            structured
+            and isinstance(provider, str)
+            and provider
+            and provider_source in structured_sources
+            and scheduler_id_source in structured_sources
+        ):
+            facts.append(f"{line_prefix}.structured_runtime_scheduler_identity=ok")
+    return facts
 
 
 def _expected_progress_adapter(pipeline_yaml: str) -> str | None:
+    declaration = _expected_progress_declaration(pipeline_yaml)
+    return declaration[0] if declaration is not None else None
+
+
+def _expected_progress_package(pipeline_yaml: str) -> str | None:
+    declaration = _expected_progress_declaration(pipeline_yaml)
+    return declaration[1] if declaration is not None else None
+
+
+def _expected_progress_declaration(pipeline_yaml: str) -> tuple[str, str | None] | None:
+    """Return the one explicitly selected package progress source, if any."""
     loaded = yaml.safe_load(pipeline_yaml)
     typed_document = cast(dict[str, Any], loaded) if isinstance(loaded, dict) else {}
     packages = typed_document.get("pkgs")
     if not isinstance(packages, list):
         return None
     typed_packages = cast(list[object], packages)
-    if len(typed_packages) != 1:
-        return None
+    declarations: list[tuple[str, str | None]] = []
     for package in typed_packages:
         if not isinstance(package, dict):
             continue
         typed_package = cast(dict[str, Any], package)
-        package_type = typed_package.get("pkg_type")
-        if package_type == "builtin.lammps":
-            return "lammps"
         progress = typed_package.get("progress")
         if not isinstance(progress, dict):
             continue
         typed_progress = cast(dict[str, Any], progress)
         adapter = typed_progress.get("adapter")
-        if isinstance(adapter, str) and adapter not in {"", "none"}:
-            return adapter
-    return None
-
-
-def _expected_progress_package(pipeline_yaml: str) -> str | None:
-    loaded = yaml.safe_load(pipeline_yaml)
-    typed_document = cast(dict[str, Any], loaded) if isinstance(loaded, dict) else {}
-    packages = typed_document.get("pkgs")
-    if not isinstance(packages, list):
-        return None
-    typed_packages = cast(list[object], packages)
-    if len(typed_packages) != 1:
-        return None
-    for package in typed_packages:
-        if not isinstance(package, dict):
+        if adapter is None or adapter == "none":
             continue
-        typed_package = cast(dict[str, Any], package)
-        package_type = typed_package.get("pkg_type")
-        if package_type == "builtin.lammps":
-            return str(package_type)
-    return None
-
-
-def _verify_builtin_lammps_package_load(
-    definition: ClusterDefinition,
-    *,
-    runner: CommandRunner,
-) -> str:
-    jarvis_bin_assignment = (
-        shlex.quote(definition.jarvis_bin)
-        if definition.jarvis_bin is not None
-        else '"$HOME/.local/bin/jarvis"'
-    )
-    script = (
-        "set -euo pipefail\n"
-        f"JARVIS_BIN={jarvis_bin_assignment}\n"
-        "PYTHON_BIN=$(head -n 1 \"$JARVIS_BIN\" | sed 's/^#!//')\n"
-        "\"$PYTHON_BIN\" - <<'PY'\n"
-        "import inspect\n"
-        "from builtin.builtin.lammps.pkg import Lammps\n"
-        "path = inspect.getfile(Lammps)\n"
-        "if Lammps.__module__ != 'builtin.builtin.lammps.pkg':\n"
-        "    raise SystemExit(f'unexpected module: {Lammps.__module__}')\n"
-        "print(path)\n"
-        "PY\n"
-    )
-    output = _remote_shell(definition.ssh_host, script, runner=runner).strip()
-    if not output:
-        raise RelayError("remote JARVIS builtin.lammps package path was empty")
-    return output.splitlines()[-1]
+        if not isinstance(adapter, str) or not adapter:
+            raise ConfigurationError("package progress.adapter must be a non-empty string")
+        package_name = typed_package.get("pkg_type")
+        declarations.append(
+            (
+                adapter,
+                package_name if isinstance(package_name, str) and package_name else None,
+            )
+        )
+    if len(declarations) > 1:
+        raise ConfigurationError(
+            "multiple pipeline packages declare progress; select exactly one package-owned "
+            "progress source"
+        )
+    return declarations[0] if declarations else None
 
 
 def _assert_progress_adapter(
@@ -1006,7 +1494,32 @@ def _has_progress_adapter(
     job_id: str,
     package_name: str | None = None,
 ) -> bool:
+    return (
+        _progress_provider_attestation(
+            progress,
+            expected_adapter,
+            job_id=job_id,
+            package_name=package_name,
+        )
+        is not None
+    )
+
+
+def _progress_provider_attestation(
+    progress: list[dict[str, Any]],
+    expected_adapter: str,
+    *,
+    job_id: str,
+    package_name: str | None = None,
+) -> dict[str, Any] | None:
+    """Return one worker-stamped, provider-approved durable progress record."""
     for item in progress:
+        current = item.get("current")
+        if not isinstance(current, int | float) or isinstance(current, bool):
+            continue
+        numeric_current = float(current)
+        if not math.isfinite(numeric_current) or numeric_current < 0:
+            continue
         metadata = item.get("metadata")
         if not isinstance(metadata, dict):
             continue
@@ -1020,22 +1533,12 @@ def _has_progress_adapter(
             and typed_metadata.get("run_id") == job_id
             and typed_metadata.get("execution_id") == job_id
         ):
-            if expected_adapter == "lammps":
-                if _is_lammps_timed_progress(typed_metadata):
-                    return True
+            try:
+                validate_package_progress_acceptance_metadata(typed_metadata)
+            except ConfigurationError:
                 continue
-            return True
-    return False
-
-
-def _is_lammps_timed_progress(metadata: dict[str, Any]) -> bool:
-    return (
-        metadata.get("timing_source") == "lammps_thermo_cpu"
-        and metadata.get("prediction_status") == "observed_lammps_timing"
-        and metadata.get("prediction_method") == "trimmed_mean_step_time_after_warmup"
-        and isinstance(metadata.get("rate_samples"), int)
-        and isinstance(metadata.get("eta_seconds"), int | float)
-    )
+            return dict(typed_metadata)
+    return None
 
 
 def _verify_progress_monitor(
@@ -1075,12 +1578,13 @@ def _verify_progress_monitor(
     ]
     if not progress_actions:
         raise RelayError(f"acceptance progress pattern did not record progress: {pattern}")
-    progress = _remote_clio_json(
+    progress_items = _remote_job_collection(
         definition,
         ["job", "progress", job_id],
+        record_key="progress",
+        label=f"monitor progress for {job_id}",
         runner=runner,
     )
-    progress_items = cast(list[dict[str, Any]], progress)
     if not progress_items:
         raise RelayError("acceptance progress records missing after monitor evaluation")
     lines.append(f"acceptance.progress={len(progress_items)}")
@@ -1093,12 +1597,13 @@ def _find_agent_child_job(
     agent_created_at: str,
     runner: CommandRunner,
 ) -> str:
-    artifacts = _remote_clio_json(
+    artifact_items = _remote_job_collection(
         definition,
         ["job", "list-artifacts", agent_job_id],
+        record_key="artifacts",
+        label=f"agent artifacts for {agent_job_id}",
         runner=runner,
     )
-    artifact_items = cast(list[dict[str, Any]], artifacts)
     artifact_kinds = {str(artifact["kind"]) for artifact in artifact_items}
     if "agent_result" not in artifact_kinds:
         raise RelayError("acceptance agent job missing agent_result artifact")
@@ -1281,6 +1786,77 @@ def _remote_clio_json(
     if raw_text:
         return output
     return json.loads(output)
+
+
+def _remote_job_collection(
+    definition: ClusterDefinition,
+    command: list[str],
+    *,
+    record_key: str,
+    label: str,
+    runner: CommandRunner,
+) -> list[dict[str, Any]]:
+    """Drain an exact job-family page chain or reject incomplete acceptance evidence."""
+    cursor = 1
+    expected_total: int | None = None
+    records: list[dict[str, Any]] = []
+    while True:
+        raw_payload = _remote_clio_json(
+            definition,
+            [
+                *command,
+                "--cursor",
+                str(cursor),
+                "--limit",
+                str(MAX_RESPONSE_PAGE_RECORDS),
+            ],
+            runner=runner,
+        )
+        if not isinstance(raw_payload, dict):
+            raise RelayError(f"{label} did not return a JSON object")
+        payload = cast(dict[str, Any], raw_payload)
+        raw_records = payload.get(record_key)
+        if not isinstance(raw_records, list):
+            raise RelayError(f"{label} did not return a {record_key} array")
+        page: list[dict[str, Any]] = []
+        for item in cast(list[object], raw_records):
+            if not isinstance(item, dict):
+                raise RelayError(f"{label} returned a non-object {record_key} entry")
+            page.append(
+                {str(key): value for key, value in cast(dict[object, object], item).items()}
+            )
+        total = payload.get("total")
+        returned_cursor = payload.get("cursor")
+        returned_limit = payload.get("limit")
+        next_cursor = payload.get("next_cursor")
+        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            raise RelayError(f"{label} returned an invalid total")
+        if total > MAX_ACCEPTANCE_COLLECTION_RECORDS:
+            raise RelayError(
+                f"{label} exceeds the bounded completeness limit "
+                f"{MAX_ACCEPTANCE_COLLECTION_RECORDS}"
+            )
+        if expected_total is not None and total != expected_total:
+            raise RelayError(f"{label} changed during bounded discovery")
+        expected_total = total
+        if returned_cursor != cursor or returned_limit != MAX_RESPONSE_PAGE_RECORDS:
+            raise RelayError(f"{label} returned inconsistent page metadata")
+        if len(records) + len(page) > total:
+            raise RelayError(f"{label} returned more records than its total")
+        if next_cursor is not None and (
+            isinstance(next_cursor, bool)
+            or not isinstance(next_cursor, int)
+            or not page
+            or next_cursor != cursor + len(page)
+            or next_cursor > total
+        ):
+            raise RelayError(f"{label} returned a non-contiguous next cursor")
+        records.extend(page)
+        if next_cursor is None:
+            if len(records) != total:
+                raise RelayError(f"{label} ended before its declared total")
+            return records
+        cursor = next_cursor
 
 
 def _remote_shell(ssh_host: str, script: str, *, runner: CommandRunner) -> str:

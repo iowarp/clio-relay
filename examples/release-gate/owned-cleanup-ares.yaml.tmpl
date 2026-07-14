@@ -1,0 +1,14 @@
+name: __RUN_ID__-owned-cleanup
+scheduler:
+  name: slurm
+  job_name: __RUN_ID__-owned-cleanup
+  nodes: 1
+  ntasks: 1
+  time: "00:20:00"
+  output: "__REMOTE_ROOT__/owned-cleanup-%j.out"
+  error: "__REMOTE_ROOT__/owned-cleanup-%j.err"
+  pre_cmds:
+    - sleep 900
+pkgs:
+  - pkg_type: builtin.echo
+    pkg_name: echo

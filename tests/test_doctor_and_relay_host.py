@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+import clio_relay.deployment as deployment
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
-from clio_relay.deployment import render_endpoint_user_service
+from clio_relay.deployment import (
+    install_endpoint_user_service_over_ssh,
+    render_endpoint_user_service,
+)
 from clio_relay.doctor import run_doctor
-from clio_relay.errors import ConfigurationError
+from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.relay_host import (
     FrpcConfig,
     FrpcVisitorConfig,
@@ -177,11 +183,17 @@ def test_endpoint_user_service_is_sudo_less_and_configured() -> None:
     )
 
     assert (
+        "ExecStartPre=%h/.local/bin/clio-relay queue migrate-indexes --all --batch-size 500"
+    ) in rendered
+    assert (
         "ExecStart=%h/.local/bin/clio-relay endpoint start --role worker --cluster test-cluster"
     ) in rendered
     assert 'Environment="CLIO_RELAY_CORE_DIR=%h/.local/share/clio-relay/core"' in rendered
     assert 'Environment="CLIO_RELAY_AGENT_BIN=%h/.local/bin/current-agent"' in rendered
     assert 'Environment="CLIO_RELAY_AGENT_ADAPTER=exec"' in rendered
+    assert (
+        'Environment="CLIO_RELAY_INSTALL_RECEIPT=%h/.local/share/clio-relay/install-receipt.json"'
+    ) in rendered
     assert "sudo" not in rendered
 
 
@@ -192,12 +204,14 @@ def test_endpoint_user_service_uses_cluster_executable_overrides() -> None:
             name="test-cluster",
             ssh_host="test-host",
             jarvis_bin="/opt/jarvis/current",
+            spack_executable="/opt/site/spack/bin/spack",
             frpc_bin="/opt/frp/frpc",
             agent_bin="/opt/agents/clio",
         ),
     )
 
     assert 'Environment="CLIO_RELAY_JARVIS_BIN=/opt/jarvis/current"' in rendered
+    assert 'Environment="JARVIS_MCP_SPACK_COMMAND=/opt/site/spack/bin/spack"' in rendered
     assert 'Environment="CLIO_RELAY_FRPC_BIN=/opt/frp/frpc"' in rendered
     assert 'Environment="CLIO_RELAY_AGENT_BIN=/opt/agents/clio"' in rendered
 
@@ -219,3 +233,108 @@ def test_endpoint_user_service_passes_optional_jarvis_mcp_command(
         'Environment="CLIO_RELAY_JARVIS_MCP_COMMAND=[\\"uvx\\",\\"--from\\",'
         '\\"git+https://github.com/iowarp/clio-kit.git@branch\\",\\"clio-kit\\"]"'
     ) in rendered
+
+
+def test_endpoint_user_service_escapes_arbitrary_labels_and_values() -> None:
+    """Systemd rendering cannot turn operator values into directives or unit paths."""
+    rendered = render_endpoint_user_service(
+        cluster='Target GPU %n "quoted"\nExecStart=/bin/false',
+        definition=ClusterDefinition(
+            name="Target GPU",
+            ssh_host="target-gpu",
+            agent_bin='/opt/agent "current"\nEnvironment=FORGED=1',
+        ),
+    )
+
+    assert rendered.count("\nExecStart=") == 1
+    assert rendered.count("\nEnvironment=") == 9
+    assert "\\nExecStart=/bin/false" in rendered
+    assert "%%n" in rendered
+    assert "\\nEnvironment=FORGED=1" in rendered
+
+
+def test_endpoint_service_install_uses_safe_unit_name_and_bounded_ssh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def run(
+        command: list[str],
+        *,
+        input: bytes,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[bytes]:
+        observed.update(command=command, input=input, timeout=timeout)
+        assert capture_output is True
+        assert check is False
+        return subprocess.CompletedProcess(command, 0, b"installed\n", b"")
+
+    monkeypatch.setattr(deployment.subprocess, "run", run)
+
+    lines = install_endpoint_user_service_over_ssh(
+        cluster='Target GPU %n "quoted"',
+        ssh_host="target-gpu",
+        service_text="[Service]\nExecStart=/bin/true\n",
+        start=False,
+        enable=False,
+        timeout_seconds=15,
+    )
+
+    assert lines == ["installed"]
+    assert observed["command"] == ["ssh", "target-gpu", "bash", "-s"]
+    assert observed["timeout"] == 15
+    script = cast(bytes, observed["input"]).decode("utf-8")
+    assert "clio-relay-worker-k2-" in script
+    assert "Target GPU" not in script
+
+
+def test_endpoint_service_install_rejects_unsafe_or_unbounded_ssh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        nonlocal called
+        called = True
+        raise AssertionError("unsafe destination must fail before SSH")
+
+    monkeypatch.setattr(deployment.subprocess, "run", run)
+    with pytest.raises(RelayError, match="non-option destination"):
+        install_endpoint_user_service_over_ssh(
+            cluster="target",
+            ssh_host="-oProxyCommand=evil",
+            service_text="[Service]\nExecStart=/bin/true\n",
+            start=False,
+            enable=False,
+        )
+    with pytest.raises(RelayError, match="finite and positive"):
+        install_endpoint_user_service_over_ssh(
+            cluster="target",
+            ssh_host="target",
+            service_text="[Service]\nExecStart=/bin/true\n",
+            start=False,
+            enable=False,
+            timeout_seconds=float("nan"),
+        )
+    assert called is False
+
+
+def test_endpoint_service_install_reports_ssh_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def timeout(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        raise subprocess.TimeoutExpired(cmd=["ssh"], timeout=2)
+
+    monkeypatch.setattr(deployment.subprocess, "run", timeout)
+
+    with pytest.raises(RelayError, match="exceeded 2 seconds"):
+        install_endpoint_user_service_over_ssh(
+            cluster="target",
+            ssh_host="target",
+            service_text="[Service]\nExecStart=/bin/true\n",
+            start=False,
+            enable=False,
+            timeout_seconds=2,
+        )

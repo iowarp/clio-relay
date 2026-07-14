@@ -1,163 +1,192 @@
 from __future__ import annotations
 
-import os
-import subprocess
 from pathlib import Path
 
-from _pytest.monkeypatch import MonkeyPatch
+import pytest
+from pytest import MonkeyPatch
 
 from clio_relay.config import RelaySettings
 
 
-def test_settings_discover_bootstrap_managed_bins(
+def test_relay_settings_load_log_capture_quotas_from_environment(
+    monkeypatch: MonkeyPatch,
     tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_MAX_LOG_BYTES_PER_STREAM", "1234")
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_MAX_LOG_BYTES_PER_JOB", "2345")
+
+    settings = RelaySettings.from_env()
+
+    assert settings.spool_max_log_bytes_per_stream == 1234
+    assert settings.spool_max_log_bytes_per_job == 2345
+
+
+def test_relay_settings_load_complete_storage_policy_from_environment(
     monkeypatch: MonkeyPatch,
 ) -> None:
-    home = tmp_path / "home"
-    bin_dir = home / ".local" / "bin"
-    bin_dir.mkdir(parents=True)
-    jarvis = bin_dir / "jarvis"
-    frpc = bin_dir / "frpc"
-    jarvis.write_text("#!/bin/sh\n", encoding="utf-8")
-    frpc.write_text("#!/bin/sh\n", encoding="utf-8")
-    monkeypatch.setattr(Path, "home", lambda: home)
-    monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
-    monkeypatch.delenv("CLIO_RELAY_JARVIS_BIN", raising=False)
-    monkeypatch.delenv("CLIO_RELAY_FRPC_BIN", raising=False)
-
-    def always_usable(_name: str, _path: Path) -> bool:
-        return True
-
-    monkeypatch.setattr("clio_relay.config._candidate_is_usable", always_usable)
+    values = {
+        "CLIO_RELAY_SPOOL_MAX_LOG_BYTES_PER_JOB": "100",
+        "CLIO_RELAY_STORAGE_CORE_HIGH_WATER_BYTES": "10000",
+        "CLIO_RELAY_STORAGE_SPOOL_HIGH_WATER_BYTES": "20000",
+        "CLIO_RELAY_STORAGE_TOTAL_HIGH_WATER_BYTES": "30000",
+        "CLIO_RELAY_STORAGE_MINIMUM_FREE_BYTES": "0",
+        "CLIO_RELAY_STORAGE_MAX_JOB_RESERVATION_BYTES": "1000",
+        "CLIO_RELAY_STORAGE_MAX_SCAN_ENTRIES": "101",
+        "CLIO_RELAY_STORAGE_MAX_SCAN_DEPTH": "12",
+        "CLIO_RELAY_STORAGE_MAX_SCAN_ACCOUNTED_BYTES": "40000",
+        "CLIO_RELAY_STORAGE_MAX_LEDGER_BYTES": "50000",
+        "CLIO_RELAY_STORAGE_MAX_RESERVATIONS": "99",
+        "CLIO_RELAY_STORAGE_LOCK_TIMEOUT_SECONDS": "1.5",
+        "CLIO_RELAY_STORAGE_JOB_CORE_ALLOWANCE_BYTES": "20",
+        "CLIO_RELAY_STORAGE_JOB_RESULT_ALLOWANCE_BYTES": "30",
+        "CLIO_RELAY_STORAGE_RUNTIME_CHECK_INTERVAL_SECONDS": "0.25",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
 
     settings = RelaySettings.from_env()
+    limits = settings.storage_limits()
 
-    assert settings.jarvis_bin == str(jarvis)
-    assert settings.frpc_bin == str(frpc)
+    assert limits.core_high_water_bytes == 10_000
+    assert limits.spool_high_water_bytes == 20_000
+    assert limits.total_high_water_bytes == 30_000
+    assert limits.minimum_free_bytes == 0
+    assert limits.max_job_reservation_bytes == 1_000
+    assert limits.max_scan_entries == 101
+    assert limits.max_scan_depth == 12
+    assert limits.max_scan_accounted_bytes == 40_000
+    assert limits.max_ledger_bytes == 50_000
+    assert limits.max_reservations == 99
+    assert limits.lock_timeout_seconds == 1.5
+    assert settings.storage_job_core_allowance_bytes == 20
+    assert settings.storage_job_result_allowance_bytes == 30
+    assert settings.storage_runtime_check_interval_seconds == 0.25
 
 
-def test_settings_discover_bootstrap_managed_data_dirs(
-    tmp_path: Path,
+def test_relay_settings_load_owner_session_generation_from_environment(
     monkeypatch: MonkeyPatch,
 ) -> None:
-    home = tmp_path / "home"
-    core_dir = home / ".local" / "share" / "clio-relay" / "core"
-    spool_dir = home / ".local" / "share" / "clio-relay" / "spool"
-    core_dir.mkdir(parents=True)
-    spool_dir.mkdir(parents=True)
-    monkeypatch.setattr(Path, "home", lambda: home)
-    monkeypatch.delenv("CLIO_RELAY_CORE_DIR", raising=False)
-    monkeypatch.delenv("CLIO_RELAY_SPOOL_DIR", raising=False)
+    monkeypatch.setenv("CLIO_RELAY_OWNER_SESSION_ID", "desktop-session")
+    monkeypatch.setenv("CLIO_RELAY_SESSION_GENERATION_ID", "generation-1")
 
     settings = RelaySettings.from_env()
 
-    assert settings.core_dir == core_dir.resolve()
-    assert settings.spool_dir == spool_dir.resolve()
+    assert settings.owner_session_id == "desktop-session"
+    assert settings.owner_session_generation_id == "generation-1"
 
 
-def test_settings_env_data_dirs_are_absolute(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
+@pytest.mark.parametrize(
+    ("owner_session_id", "owner_session_generation_id"),
+    [("desktop-session", None), (None, "generation-1")],
+)
+def test_relay_settings_reject_partial_owner_session_identity(
+    owner_session_id: str | None,
+    owner_session_generation_id: str | None,
 ) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", "relative-core")
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", "relative-spool")
-
-    settings = RelaySettings.from_env()
-
-    assert settings.core_dir == (tmp_path / "relative-core").resolve()
-    assert settings.spool_dir == (tmp_path / "relative-spool").resolve()
-
-
-def test_settings_env_bins_override_bootstrap_managed_bins(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
-    monkeypatch.setenv("CLIO_RELAY_JARVIS_BIN", "/opt/jarvis")
-    monkeypatch.setenv("CLIO_RELAY_FRPC_BIN", "/opt/frpc")
-
-    settings = RelaySettings.from_env()
-
-    assert settings.jarvis_bin == "/opt/jarvis"
-    assert settings.frpc_bin == "/opt/frpc"
-
-
-def test_settings_agent_defaults_are_provider_neutral(monkeypatch: MonkeyPatch) -> None:
-    monkeypatch.delenv("CLIO_RELAY_AGENT_BIN", raising=False)
-    monkeypatch.delenv("CLIO_RELAY_AGENT_ADAPTER", raising=False)
-
-    settings = RelaySettings.from_env()
-
-    assert settings.agent_bin == "agent"
-    assert settings.agent_adapter == "exec"
-
-
-def test_settings_agent_env_overrides(monkeypatch: MonkeyPatch) -> None:
-    monkeypatch.setenv("CLIO_RELAY_AGENT_BIN", "/opt/agents/codex")
-    monkeypatch.setenv("CLIO_RELAY_AGENT_ADAPTER", "codex")
-
-    settings = RelaySettings.from_env()
-
-    assert settings.agent_bin == "/opt/agents/codex"
-    assert settings.agent_adapter == "codex"
-
-
-def test_settings_discovers_project_local_frp_bins(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    bin_dir = tmp_path / ".tools" / "frp" / "bin"
-    bin_dir.mkdir(parents=True)
-    frpc = bin_dir / ("frpc.exe" if os.name == "nt" else "frpc")
-    frpc.write_text("#!/bin/sh\n", encoding="utf-8")
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
-    monkeypatch.delenv("CLIO_RELAY_FRPC_BIN", raising=False)
-
-    def always_usable(_name: str, _path: Path) -> bool:
-        return True
-
-    monkeypatch.setattr("clio_relay.config._candidate_is_usable", always_usable)
-
-    settings = RelaySettings.from_env()
-
-    assert settings.frpc_bin == str(frpc.resolve())
-
-
-def test_settings_skips_broken_path_frp_shim_for_project_local_bin(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    home = tmp_path / "home"
-    bin_dir = tmp_path / ".tools" / "frp" / "bin"
-    bin_dir.mkdir(parents=True)
-    broken = tmp_path / "broken-frpc.exe"
-    local = bin_dir / ("frpc.exe" if os.name == "nt" else "frpc")
-    broken.write_text("broken\n", encoding="utf-8")
-    local.write_text("local\n", encoding="utf-8")
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(Path, "home", lambda: home)
-    monkeypatch.delenv("CLIO_RELAY_FRPC_BIN", raising=False)
-
-    def fake_which(name: str) -> str | None:
-        return str(broken) if name == "frpc" else None
-
-    monkeypatch.setattr("clio_relay.config.shutil.which", fake_which)
-
-    def fake_run(
-        command: list[str],
-        **_kwargs: object,
-    ) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            command,
-            0 if Path(command[0]) == local else 1,
-            stdout="0.69.1",
-            stderr="",
+    with pytest.raises(ValueError, match="must be configured together"):
+        RelaySettings(
+            owner_session_id=owner_session_id,
+            owner_session_generation_id=owner_session_generation_id,
         )
 
-    monkeypatch.setattr("clio_relay.config.subprocess.run", fake_run)
 
-    settings = RelaySettings.from_env()
+@pytest.mark.parametrize("value", ["0", "-1", "not-an-integer"])
+def test_relay_settings_reject_invalid_log_capture_quota(
+    monkeypatch: MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_MAX_LOG_BYTES_PER_STREAM", value)
 
-    assert settings.frpc_bin == str(local.resolve())
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        RelaySettings.from_env()
+
+
+@pytest.mark.parametrize("value", ["-1", "not-an-integer"])
+def test_relay_settings_reject_invalid_minimum_free_space(
+    monkeypatch: MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("CLIO_RELAY_STORAGE_MINIMUM_FREE_BYTES", value)
+
+    with pytest.raises(ValueError, match="must be a non-negative integer"):
+        RelaySettings.from_env()
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "301", "not-a-number"])
+def test_relay_settings_reject_invalid_storage_interval(
+    monkeypatch: MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("CLIO_RELAY_STORAGE_RUNTIME_CHECK_INTERVAL_SECONDS", value)
+
+    with pytest.raises(ValueError, match="must be"):
+        RelaySettings.from_env()
+
+
+def test_relay_settings_reject_inconsistent_storage_high_water() -> None:
+    with pytest.raises(ValueError, match="at least each individual"):
+        RelaySettings(
+            storage_core_high_water_bytes=100,
+            storage_spool_high_water_bytes=200,
+            storage_total_high_water_bytes=199,
+        )
+
+
+def test_relay_settings_reject_default_reservation_above_per_job_cap() -> None:
+    with pytest.raises(ValueError, match="default storage reservation exceeds"):
+        RelaySettings(
+            spool_max_log_bytes_per_job=100,
+            storage_job_core_allowance_bytes=20,
+            storage_job_result_allowance_bytes=30,
+            storage_max_job_reservation_bytes=249,
+        )
+
+
+def test_relay_settings_reject_scan_bound_below_legal_job_reservation() -> None:
+    with pytest.raises(ValueError, match="max_scan_accounted_bytes must be at least"):
+        RelaySettings(
+            storage_max_job_reservation_bytes=1_000,
+            storage_max_scan_accounted_bytes=999,
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {"storage_core_high_water_bytes": 119},
+            "default core reservation exceeds",
+        ),
+        (
+            {"storage_spool_high_water_bytes": 129},
+            "default spool reservation exceeds",
+        ),
+        (
+            {
+                "storage_core_high_water_bytes": 120,
+                "storage_spool_high_water_bytes": 130,
+                "storage_total_high_water_bytes": 249,
+            },
+            "default storage reservation exceeds storage total",
+        ),
+    ],
+)
+def test_relay_settings_require_default_floors_to_fit_high_water(
+    overrides: dict[str, int],
+    message: str,
+) -> None:
+    values: dict[str, object] = {
+        "spool_max_log_bytes_per_job": 100,
+        "storage_job_core_allowance_bytes": 20,
+        "storage_job_result_allowance_bytes": 30,
+        "storage_core_high_water_bytes": 1_000,
+        "storage_spool_high_water_bytes": 1_000,
+        "storage_total_high_water_bytes": 2_000,
+        "storage_max_job_reservation_bytes": 1_000,
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValueError, match=message):
+        RelaySettings(**values)  # type: ignore[arg-type]

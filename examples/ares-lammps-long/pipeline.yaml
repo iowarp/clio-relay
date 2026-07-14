@@ -14,4 +14,6 @@ pkgs:
     out: $HOME/.local/share/clio-relay/live-tests/{run_id}/lammps-out
     kokkos_gpu: false
     progress:
+      adapter: lammps
+      log_visibility: shared
       total_steps: 10000

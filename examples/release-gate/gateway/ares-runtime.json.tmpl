@@ -1,0 +1,41 @@
+{
+  "kind": "release-validation-http-service",
+  "submit_command": [
+    "bash",
+    "__REMOTE_FIXTURE_ROOT__/gateway/slurm_submit.sh",
+    "__REMOTE_FIXTURE_ROOT__/gateway/http_service.py",
+    "__SERVICE_PORT__",
+    "__REMOTE_STATE_ROOT__",
+    "__RUN_ID__-gateway",
+    "__HEALTH_NONCE__"
+  ],
+  "status_command": [
+    "python3",
+    "__REMOTE_FIXTURE_ROOT__/gateway/slurm_status.py",
+    "{scheduler_job_id}"
+  ],
+  "cancel_command": [
+    "python3",
+    "__REMOTE_FIXTURE_ROOT__/gateway/slurm_cancel.py",
+    "{scheduler_job_id}"
+  ],
+  "deployment_driver": "scheduler",
+  "service_port": __SERVICE_PORT__,
+  "health_path": "/healthz",
+  "health_expected_body": "__HEALTH_NONCE__",
+  "stream_mode": "pull",
+  "stream_path": null,
+  "event_stream_path": null,
+  "state_path": null,
+  "compatibility_paths": {},
+  "desktop_bind_addr": "127.0.0.1",
+  "desktop_bind_port": __DESKTOP_PORT__,
+  "proxy_name": "__RUN_ID__-gateway",
+  "transport_mode": "frp-stcp-wss",
+  "readiness_timeout_seconds": 180,
+  "poll_seconds": 1,
+  "scheduler": "slurm",
+  "metadata": {
+    "acceptance_run_id": "__RUN_ID__"
+  }
+}
