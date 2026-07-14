@@ -70,7 +70,7 @@ Commit the release change with a conventional commit, then create and push an
 exact matching tag:
 
 ```powershell
-$Tag = "v1.0.5"
+$Tag = "v1.0.6"
 git fetch origin main
 $ReviewedMainSha = (git rev-parse refs/remotes/origin/main).Trim()
 if ((git rev-parse HEAD).Trim() -ne $ReviewedMainSha) {
@@ -132,15 +132,13 @@ An existing draft is reusable only when every staged asset is byte-for-byte
 identical and its complete asset-name set equals the six staged candidate
 assets. The workflow never replaces a candidate distribution.
 
-Enable GitHub immutable releases for the repository before the 1.0 release.
-The default workflow token cannot read the repository administration endpoint,
-so configure an `IMMUTABLE_RELEASES_READ_TOKEN` secret on the protected
-`release-finalization` environment. Use a fine-grained token restricted to this
-repository with repository Administration read permission. Finalization calls
-`GET /repos/{owner}/{repo}/immutable-releases`, requires `enabled: true`, and
-records the deterministic result in `RELEASE-CLAIMS.json`. It repeats the same
-admin-read check immediately before changing the draft to public and refuses
-publication if the endpoint is unavailable, disabled, or has changed.
+The 1.0 release line intentionally publishes a normal, mutable GitHub release.
+Finalization still binds the tag to reviewed `main`, verifies the complete
+asset inventory immediately before and after publication, and requires the
+published release to remain non-prerelease and mutable. GitHub immutable
+releases are deferred to the 1.1 release line, where the additional repository
+setting and administration-read preflight can be introduced independently of
+the production 1.0 acceptance path.
 
 ## Live validation of the candidate
 
@@ -155,7 +153,7 @@ Download the draft wheel and manifest, verify both the digest and the signed
 tag-build provenance, and compute the digest locally:
 
 ```powershell
-$Tag = "v1.0.5"
+$Tag = "v1.0.6"
 New-Item -ItemType Directory -Force .clio-relay\candidate | Out-Null
 gh release download $Tag --pattern "*.whl" --pattern "SHA256SUMS" `
   --dir .clio-relay\candidate
@@ -442,8 +440,8 @@ promotion record, manifest, and claims file by exact asset id, name, size, and
 SHA-256 digest, with no additional payloads. Both reads request a 100-record
 first page and an explicit second page; the configured 96-asset ceiling and an
 empty second page are recorded in the inventory, so pagination cannot silently
-truncate the comparison. After publication it requires the
-immutable inventory to remain byte-for-byte and id-for-id identical before the
+truncate the comparison. After publication it requires the captured inventory
+to remain byte-for-byte and id-for-id identical before the
 workflow can succeed. The claims file separates the local quality gate from
 only those live requirements and reports selected through the released-artifact
 path. The workflow attaches and attests

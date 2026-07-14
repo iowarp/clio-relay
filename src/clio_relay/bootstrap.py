@@ -584,10 +584,12 @@ verify_jarvis_cd_distribution() {{
     "$JARVIS_CD_VERSION" \\
     <<'__CLIO_RELAY_NATIVE_JARVIS_PROBE__'
 import hashlib
-import json
 import sys
 from importlib.metadata import distribution
 from pathlib import Path
+
+from clio_relay.errors import ConfigurationError
+from clio_relay.installation import verify_distribution_file_source
 
 wheel = Path(sys.argv[1]).resolve()
 expected_sha256 = sys.argv[2]
@@ -597,9 +599,15 @@ if hashlib.sha256(wheel.read_bytes()).hexdigest() != expected_sha256:
 installed = distribution("jarvis_cd")
 if installed.version != expected_version:
     raise SystemExit("JARVIS-CD installed version does not match the release pin")
-direct_url = json.loads(installed.read_text("direct_url.json") or "{{}}")
-if direct_url.get("url") != wheel.as_uri():
-    raise SystemExit("JARVIS-CD was not installed from the verified release wheel")
+try:
+    verify_distribution_file_source(
+        direct_url_text=installed.read_text("direct_url.json"),
+        expected_artifact=wheel,
+    )
+except ConfigurationError as exc:
+    raise SystemExit(
+        f"JARVIS-CD was not installed from the verified release wheel: {{exc}}"
+    ) from exc
 print(f"jarvis_cd_distribution={{installed.name}}=={{installed.version}}")
 __CLIO_RELAY_NATIVE_JARVIS_PROBE__
 }}

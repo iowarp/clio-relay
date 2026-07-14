@@ -8,7 +8,7 @@
 
 It is a piece of the federation layer for [`clio-agent`](https://github.com/iowarp/clio-agent): a local CLIO experience can delegate work to a remote machine, keep observing it, detach, reconnect, and clean up after itself. The project is also designed for use outside CLIO. Any client that can call the CLI, HTTP API, or MCP tools can use the same relay model.
 
-> The current development candidate is `1.0.5`. The immutable `v1.0.0` candidate
+> The current development candidate is `1.0.6`. The immutable `v1.0.0` candidate
 > was abandoned before publication after its acceptance runbook rejected the
 > staged GNU checksum format; `v1.0.1` was also abandoned before publication
 > after protected-main validation exposed a Windows lease-deletion race;
@@ -19,10 +19,13 @@ It is a piece of the federation layer for [`clio-agent`](https://github.com/iowa
 > into a remote shell fixture; `v1.0.4` was abandoned before any reports were
 > produced when the corrected fixture reached CMake and exposed that the direct
 > Gray-Scott helper did not bind the selected Spack ADIOS2 package's own CMake
-> configuration. The latest released live evidence is `0.9.22`; 1.0.5 is not
-> release-complete until its immutable-candidate
+> configuration; `v1.0.5` was abandoned after one failed bootstrap report when
+> Ares exposed a lexical-versus-canonical home-path mismatch in the JARVIS-CD
+> wheel provenance check. The latest released live evidence is `0.9.22`;
+> 1.0.6 is not release-complete until its immutable-candidate
 > reports pass, its exact candidate is published, and the released-artifact
-> runs pass again. The policy currently selects the `ares` and `homelab`
+> runs pass again. The published 1.0 GitHub release is intentionally mutable;
+> GitHub release immutability is deferred to 1.1. The policy currently selects the `ares` and `homelab`
 > evidence labels; those labels are release configuration, not hardcoded
 > product targets, and operators can select additional or different clusters.
 > The coordinated JARVIS-CD 1.2.2 and clio-kit 2.3.2 artifacts are exact pins;

@@ -667,7 +667,7 @@ def verify_exact_release_asset_inventory(
     )
     if current != expected_receipt:
         raise ProvenanceError(
-            "current immutable release asset inventory differs from the prepublication receipt"
+            "current release asset inventory differs from the prepublication receipt"
         )
 
 
