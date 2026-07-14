@@ -55,7 +55,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.0.2"
+$Version = "1.0.3"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }
@@ -378,7 +378,9 @@ if ($ExpectedAdiosHash -cnotmatch '^[a-z0-9]{32}$') {
 function Get-SpackRecordHash {
   param([Parameter(Mandatory)] $Record)
   foreach ($Property in @("hash", "full_hash", "dag_hash")) {
-    $Value = [string]$Record.$Property
+    $Candidate = $Record.PSObject.Properties[$Property]
+    if ($null -eq $Candidate) { continue }
+    $Value = [string]$Candidate.Value
     if (-not [string]::IsNullOrWhiteSpace($Value)) { return $Value }
   }
   throw "Spack package record omitted its DAG hash"
@@ -389,11 +391,10 @@ $AdiosJson = (
 )
 if ($LASTEXITCODE -ne 0) { throw "selected plain ADIOS2 lookup failed" }
 $AdiosDecoded = $AdiosJson | ConvertFrom-Json
-$AdiosRecords = if ($null -ne $AdiosDecoded.specs) {
-  @($AdiosDecoded.specs)
-} else {
-  @($AdiosDecoded)
-}
+$AdiosSpecs = $AdiosDecoded.PSObject.Properties["specs"]
+$AdiosRecords = @(
+  if ($null -ne $AdiosSpecs) { $AdiosSpecs.Value } else { $AdiosDecoded }
+)
 $PlainAdios = @($AdiosRecords | Where-Object { [string]$_.name -ceq "adios2" })
 if ($PlainAdios.Count -ne 1 -or
     (Get-SpackRecordHash $PlainAdios[0]) -cne $ExpectedAdiosHash) {
@@ -847,7 +848,7 @@ valid substitute.
 function Start-OwnedSession {
   param([string] $Cluster, [string] $SessionId, [int] $RemotePort)
   & $Relay session start --cluster $Cluster --session-id $SessionId `
-    --remote-api-port $RemotePort --require-token
+    --remote-api-port $RemotePort --require-token | Out-Host
   if ($LASTEXITCODE -ne 0) { throw "session start failed: $SessionId" }
   $Status = (& $Relay session status --cluster $Cluster --session-id $SessionId | Out-String) | ConvertFrom-Json
   if (-not $Status.session_generation_id) { throw "session generation is absent" }

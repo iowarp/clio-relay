@@ -451,7 +451,7 @@ def test_actions_artifact_manifest_rejects_replay_or_unbounded_metadata(
     elif mutation == "head":
         run["head_sha"] = "b" * 40
     elif mutation == "name":
-        artifact["name"] = "release-candidate-v1.0.2"
+        artifact["name"] = "release-candidate-v1.0.3"
     elif mutation == "count":
         artifacts["total_count"] = 2
     elif mutation == "expired":
@@ -1009,7 +1009,7 @@ def test_release_identity_rejects_mutable_or_mismatched_identity(mutation: str) 
     tag_commit = COMMIT
     target_commit = COMMIT
     if mutation == "tag_name":
-        release["tag_name"] = "v1.0.2"
+        release["tag_name"] = "v1.0.3"
     elif mutation == "tag_resolution":
         tag_commit = "b" * 40
     elif mutation == "target_resolution":
@@ -1330,7 +1330,7 @@ def test_release_report_asset_manifest_enforces_exact_ordered_matrix() -> None:
     ]
     matrix = validate_release_acceptance_matrix(raw_matrix)
     assert matrix["matrix_sha256"] == (
-        "4adf6567e504c1a2ea9879358466ad0751f9b4bec6a496888267964a10b0de91"
+        "b23a4d0b6f355f697dac4eedf386ee6b64980453858a991b5ba24d2857e2be18"
     )
     reports = cast(list[dict[str, object]], matrix["reports"])
     report_ids = [cast(str, item["id"]) for item in reports]
