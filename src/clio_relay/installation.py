@@ -331,6 +331,10 @@ def probe_persistent_uv_tool_identity(
         provider_location,
         label="tool provider interpreter",
     )
+    provider_environment_location = _resolved_parent_location(
+        provider_location,
+        label="tool provider interpreter",
+    )
     source_path = _required_regular_file(source_artifact, label="tool source artifact")
     uv_version_output = _bounded_identity_command([str(uv_path), "--version"])
     version_match = re.fullmatch(
@@ -505,7 +509,7 @@ print(json.dumps({
         or observed_provider_target != provider_path
     ):
         raise ConfigurationError("persistent uv tool probe used the wrong interpreter")
-    if not _path_within(provider_location, environment_prefix):
+    if not _path_within(provider_environment_location, environment_prefix):
         raise ConfigurationError("persistent uv tool provider is outside its environment")
     if not _path_within(environment_prefix, tool_directory):
         raise ConfigurationError("persistent tool environment is outside uv's tool directory")
@@ -529,9 +533,19 @@ print(json.dumps({
             "persistent uv tool launcher does not match its RECORD-owned entry point"
         )
     direct_url = evidence.get("direct_url")
-    direct_url_mapping = cast(dict[str, object], direct_url) if isinstance(direct_url, dict) else {}
-    if direct_url_mapping.get("url") != source_path.as_uri():
-        raise ConfigurationError("persistent tool was not installed from the receipt wheel")
+    try:
+        direct_url_text = json.dumps(direct_url, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError("persistent tool source metadata is invalid") from exc
+    try:
+        verify_distribution_file_source(
+            direct_url_text=direct_url_text,
+            expected_artifact=source_path,
+        )
+    except ConfigurationError as exc:
+        raise ConfigurationError(
+            "persistent tool was not installed from the receipt wheel"
+        ) from exc
     observed_distribution = str(evidence.get("distribution", "")).lower().replace("_", "-")
     expected_distribution = distribution.lower().replace("_", "-")
     if (
@@ -614,7 +628,7 @@ def _required_regular_file(value: str | Path, *, label: str) -> Path:
     """Resolve one required regular identity file."""
     try:
         path = Path(value).expanduser().resolve(strict=True)
-    except OSError as exc:
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise ConfigurationError(f"{label} is unavailable") from exc
     if not path.is_file():
         raise ConfigurationError(f"{label} is not a regular file")
@@ -631,6 +645,14 @@ def _absolute_path(value: str | Path, *, label: str) -> Path:
     if not absolute.is_absolute():
         raise ConfigurationError(f"{label} path is not absolute")
     return absolute
+
+
+def _resolved_parent_location(path: Path, *, label: str) -> Path:
+    """Resolve a path's parent while preserving its final symlink location."""
+    try:
+        return path.parent.resolve(strict=True) / path.name
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigurationError(f"{label} parent is unavailable") from exc
 
 
 def _verify_uv_tool_receipt(
@@ -700,9 +722,21 @@ def _verify_uv_tool_receipt(
     if len(requirement_matches) != 1:
         raise ConfigurationError("persistent uv tool receipt source requirement is ambiguous")
     requirement_path = requirement_matches[0].get("path")
-    if not isinstance(requirement_path, str) or _lexical_path_key(
-        _absolute_path(requirement_path, label="uv receipt source path")
-    ) != _lexical_path_key(source_path):
+    if not isinstance(requirement_path, str):
+        raise ConfigurationError("persistent uv tool receipt does not bind the source wheel")
+    try:
+        requirement_location = Path(requirement_path).expanduser()
+        if not requirement_location.is_absolute():
+            raise ConfigurationError("persistent uv tool receipt does not bind the source wheel")
+        receipt_source_path = _required_regular_file(
+            requirement_location,
+            label="uv receipt source artifact",
+        )
+    except (ConfigurationError, OSError, RuntimeError, ValueError) as exc:
+        raise ConfigurationError(
+            "persistent uv tool receipt does not bind the source wheel"
+        ) from exc
+    if receipt_source_path != source_path:
         raise ConfigurationError("persistent uv tool receipt does not bind the source wheel")
     return receipt.resolve(strict=True), hashlib.sha256(payload).hexdigest()
 
@@ -1711,12 +1745,15 @@ def _native_jarvis_component_runtime_identity(
     )
     entry_points_visible = set(expected_entry_points).issubset(installed_entry_points)
     provider_python = component.runtime_interpreters.get("provider")
+    provider_source_verified = runtime_path is not None and _direct_url_source_matches(
+        provider_direct_url,
+        expected_artifact=runtime_path,
+    )
     provider_interpreter_verified = (
         provider_python is not None
         and Path(provider_python).expanduser().resolve() == Path(sys.executable).resolve()
         and provider_distribution_identity_verified
-        and runtime_path is not None
-        and provider_direct_url.get("url") == runtime_path.as_uri()
+        and provider_source_verified
     )
     execution_python = component.runtime_interpreters.get("execution")
     execution = _probe_python_distribution(execution_python, component.distribution)
@@ -1730,8 +1767,9 @@ def _native_jarvis_component_runtime_identity(
     execution_entry_points_visible = isinstance(execution_entry_points, list) and set(
         expected_entry_points
     ).issubset({str(value) for value in cast(list[object], execution_entry_points)})
-    execution_source_verified = (
-        runtime_path is not None and execution.get("direct_url") == runtime_path.as_uri()
+    execution_source_verified = runtime_path is not None and _direct_url_source_matches(
+        execution.get("direct_url"),
+        expected_artifact=runtime_path,
     )
     runtime_artifact_path_verified = (
         runtime_path is not None
@@ -1853,6 +1891,20 @@ def _distribution_direct_url(distribution: metadata.Distribution) -> dict[str, o
     return {str(key): value for key, value in cast(dict[object, object], loaded).items()}
 
 
+def _direct_url_source_matches(value: object, *, expected_artifact: Path) -> bool:
+    """Return whether direct-url evidence resolves to one exact local artifact."""
+    document: object = {"url": value} if isinstance(value, str) else value
+    try:
+        direct_url_text = json.dumps(document, sort_keys=True)
+        verify_distribution_file_source(
+            direct_url_text=direct_url_text,
+            expected_artifact=expected_artifact,
+        )
+    except (ConfigurationError, TypeError, ValueError):
+        return False
+    return True
+
+
 def _probe_python_distribution(python: str | None, distribution_name: str) -> dict[str, object]:
     """Inspect a second interpreter without importing provider application code."""
     if python is None:
@@ -1913,13 +1965,15 @@ def _jarvis_executable_matches_interpreter(
     executable_path = Path(executable).expanduser()
     python_path = Path(python).expanduser()
     try:
+        execution_bin_directory = python_path.parent.resolve(strict=True)
         return (
             executable_path.is_file()
             and os.access(executable_path, os.X_OK)
-            and executable_path.resolve().parent == python_path.resolve().parent
-            and Path(runtime_command[0]).expanduser().resolve() == executable_path.resolve()
+            and executable_path.resolve(strict=True).parent == execution_bin_directory
+            and Path(runtime_command[0]).expanduser().resolve(strict=True)
+            == executable_path.resolve(strict=True)
         )
-    except OSError:
+    except (OSError, RuntimeError, ValueError):
         return False
 
 

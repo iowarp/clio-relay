@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 import sys
+from collections.abc import Callable
+from importlib import metadata
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -126,6 +131,160 @@ def test_distribution_file_source_decodes_file_url_percent_escapes_once(
     )
 
     assert resolved == wheel.resolve()
+
+
+def test_native_jarvis_runtime_accepts_canonical_source_aliases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep provider and execution provenance true across one home-mount alias."""
+    canonical_home = tmp_path / "mnt" / "common" / "operator"
+    canonical_home.mkdir(parents=True)
+    wheel = canonical_home / "jarvis_cd-1.2.2-py3-none-any.whl"
+    wheel.write_bytes(b"verified-jarvis-wheel")
+    visible_home = tmp_path / "home" / "operator"
+    visible_home.parent.mkdir()
+    try:
+        visible_home.symlink_to(canonical_home, target_is_directory=True)
+        visible_wheel = visible_home / wheel.name
+    except OSError:
+        alias_directory = canonical_home / "alias"
+        alias_directory.mkdir()
+        visible_wheel = alias_directory / ".." / wheel.name
+    source_url = {"value": visible_wheel.as_uri()}
+
+    def read_direct_url(_name: str) -> str:
+        return json.dumps({"url": source_url["value"]})
+
+    distribution = cast(
+        metadata.Distribution,
+        SimpleNamespace(
+            name="jarvis-cd",
+            version="1.2.2",
+            entry_points=[],
+            read_text=read_direct_url,
+        ),
+    )
+    capability = NativeJarvisExecutionCapability(
+        operations=[
+            "execution_handle.progress",
+            "pipeline.get_execution",
+            "pipeline.get_execution_progress",
+            "pipeline.run",
+        ]
+    )
+
+    def probe_execution(_python: str | None, _distribution: str) -> dict[str, object]:
+        return {
+            "executable": sys.executable,
+            "distribution": "jarvis-cd",
+            "distribution_version": "1.2.2",
+            "direct_url": source_url["value"],
+            "entry_points": [],
+        }
+
+    def find_distribution(_name: str) -> metadata.Distribution:
+        return distribution
+
+    def probe_capability(_python: str | None) -> NativeJarvisExecutionCapability:
+        return capability
+
+    def match_jarvis_executable(
+        _executable: str | None,
+        _python: str | None,
+        *,
+        runtime_command: list[str],
+    ) -> bool:
+        return bool(runtime_command)
+
+    monkeypatch.setattr(installation_module.metadata, "distribution", find_distribution)
+    monkeypatch.setattr(installation_module, "_probe_python_distribution", probe_execution)
+    monkeypatch.setattr(
+        installation_module,
+        "probe_jarvis_native_execution_capability",
+        probe_capability,
+    )
+    monkeypatch.setattr(
+        installation_module,
+        "_jarvis_executable_matches_interpreter",
+        match_jarvis_executable,
+    )
+    runtime_identity_probe_name = "_native_jarvis_component_runtime_identity"
+    runtime_identity_probe = cast(
+        Callable[[ComponentArtifactIdentity], dict[str, object]],
+        getattr(installation_module, runtime_identity_probe_name),
+    )
+    component = ComponentArtifactIdentity(
+        distribution="jarvis-cd",
+        distribution_version="1.2.2",
+        install_spec=str(wheel),
+        requested_source="wheel",
+        artifact_filename=wheel.name,
+        artifact_sha256=hashlib.sha256(wheel.read_bytes()).hexdigest(),
+        runtime_artifact_path=str(wheel.resolve()),
+        runtime_command=[sys.executable, "-m", "jarvis_cd"],
+        runtime_interpreters={"provider": sys.executable, "execution": sys.executable},
+        runtime_executables={"jarvis": sys.executable},
+        native_execution=capability,
+    )
+
+    identity = runtime_identity_probe(component)
+
+    assert identity["provider_interpreter_verified"] is True
+    assert identity["execution_source_verified"] is True
+    assert identity["runtime_artifact_path_verified"] is True
+    assert identity["execution_interpreter_verified"] is True
+    assert identity["verified"] is True
+
+    other = canonical_home / "other" / wheel.name
+    other.parent.mkdir()
+    other.write_bytes(wheel.read_bytes())
+    source_url["value"] = other.as_uri()
+    substituted = runtime_identity_probe(component)
+
+    assert substituted["provider_interpreter_verified"] is False
+    assert substituted["execution_source_verified"] is False
+    assert substituted["runtime_artifact_path_verified"] is False
+    assert substituted["execution_interpreter_verified"] is False
+    assert substituted["verified"] is False
+
+
+def test_jarvis_launcher_matches_a_uv_managed_python_symlink(tmp_path: Path) -> None:
+    """Bind JARVIS to the venv bin directory without following Python out of it."""
+    environment_bin = tmp_path / "environment" / "bin"
+    environment_bin.mkdir(parents=True)
+    python = environment_bin / ("python.exe" if os.name == "nt" else "python")
+    jarvis = environment_bin / ("jarvis.exe" if os.name == "nt" else "jarvis")
+    if os.name == "nt":
+        shutil.copy2(sys.executable, python)
+        shutil.copy2(sys.executable, jarvis)
+        executable = jarvis
+    else:
+        managed_python = tmp_path / "uv" / "python" / "bin" / "python3.12"
+        managed_python.parent.mkdir(parents=True)
+        managed_python.symlink_to(Path(sys.executable).resolve())
+        python.symlink_to(managed_python)
+        jarvis.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        jarvis.chmod(0o755)
+        external_bin = tmp_path / "external-bin"
+        external_bin.mkdir()
+        executable = external_bin / "jarvis"
+        executable.symlink_to(jarvis)
+        assert python.resolve().parent != environment_bin.resolve()
+
+    matcher_name = "_jarvis_executable_matches_interpreter"
+    matcher = cast(Callable[..., bool], getattr(installation_module, matcher_name))
+
+    assert matcher(str(executable), str(python), runtime_command=[str(executable), "--help"])
+
+    other = tmp_path / "other-bin" / executable.name
+    other.parent.mkdir()
+    if os.name == "nt":
+        shutil.copy2(sys.executable, other)
+    else:
+        other.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        other.chmod(0o755)
+    assert not matcher(str(other), str(python), runtime_command=[str(other), "--help"])
 
 
 def test_install_receipt_binds_running_package_to_wheel_bytes(tmp_path: Path) -> None:

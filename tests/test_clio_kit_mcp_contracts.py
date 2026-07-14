@@ -349,6 +349,44 @@ def test_real_uv_tool_install_binds_external_launcher_to_receipt_and_record(
         )
     receipt_path.write_bytes(receipt_payload)
 
+    recorded_source = probe_wheel.as_posix()
+    assert receipt_text.count(recorded_source) == 1
+    other_wheel = tmp_path / "other" / probe_wheel.name
+    other_wheel.parent.mkdir()
+    other_wheel.write_bytes(probe_wheel.read_bytes())
+    for substituted_source in (
+        other_wheel.as_posix(),
+        (tmp_path / "missing" / probe_wheel.name).as_posix(),
+        "relative-wheel.whl",
+        tmp_path.as_posix(),
+    ):
+        receipt_path.write_text(
+            receipt_text.replace(recorded_source, substituted_source),
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigurationError, match="does not bind the source wheel"):
+            probe_persistent_uv_tool_identity(
+                uv_executable=uv,
+                tool_executable=str(executable),
+                provider_interpreter=str(provider),
+                source_artifact=probe_wheel,
+                distribution="clio-kit",
+                distribution_version=UV_TOOL_PROBE_VERSION,
+                entry_point="clio-kit",
+            )
+    receipt_path.write_text("[tool\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="receipt is invalid"):
+        probe_persistent_uv_tool_identity(
+            uv_executable=uv,
+            tool_executable=str(executable),
+            provider_interpreter=str(provider),
+            source_artifact=probe_wheel,
+            distribution="clio-kit",
+            distribution_version=UV_TOOL_PROBE_VERSION,
+            entry_point="clio-kit",
+        )
+    receipt_path.write_bytes(receipt_payload)
+
     module_path = Path(
         subprocess.run(
             [
@@ -374,6 +412,98 @@ def test_real_uv_tool_install_binds_external_launcher_to_receipt_and_record(
             distribution_version=UV_TOOL_PROBE_VERSION,
             entry_point="clio-kit",
         )
+
+
+def test_real_uv_tool_install_accepts_canonical_mount_aliases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accept one uv tool whose visible home path resolves through a mount alias."""
+    uv = shutil.which("uv")
+    assert uv is not None
+    built_wheel = _build_uv_tool_layout_probe_wheel(tmp_path)
+    canonical_root = tmp_path / "canonical-home"
+    canonical_source = canonical_root / "source"
+    canonical_source.mkdir(parents=True)
+    canonical_wheel = canonical_source / built_wheel.name
+    shutil.copy2(built_wheel, canonical_wheel)
+
+    if os.name == "nt":
+        intermediate = canonical_root / "lexical-alias"
+        intermediate.mkdir()
+        visible_root = intermediate / ".."
+    else:
+        visible_root = tmp_path / "visible-home"
+        visible_root.symlink_to(canonical_root, target_is_directory=True)
+        assert visible_root.absolute() != visible_root.resolve()
+
+    visible_wheel = visible_root / "source" / built_wheel.name
+    tool_directory = visible_root / "tools"
+    tool_bin_directory = visible_root / "bin"
+    monkeypatch.setenv("UV_TOOL_DIR", str(tool_directory))
+    monkeypatch.setenv("UV_TOOL_BIN_DIR", str(tool_bin_directory))
+    monkeypatch.setenv("UV_CACHE_DIR", str(visible_root / "cache"))
+    monkeypatch.setenv("UV_LINK_MODE", "copy")
+    completed = subprocess.run(
+        [
+            uv,
+            "tool",
+            "install",
+            "--force",
+            "--python",
+            sys.executable,
+            "--offline",
+            "--no-index",
+            "--no-config",
+            str(visible_wheel),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert completed.returncode == 0, completed.stderr
+    executable = tool_bin_directory / ("clio-kit.exe" if os.name == "nt" else "clio-kit")
+    environment = tool_directory / "clio-kit"
+    provider = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    direct_url = json.loads(
+        subprocess.run(
+            [
+                str(provider),
+                "-I",
+                "-c",
+                (
+                    "from importlib.metadata import distribution; "
+                    "print(distribution('clio-kit').read_text('direct_url.json'))"
+                ),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout
+    )
+    receipt_text = (environment / "uv-receipt.toml").read_text(encoding="utf-8")
+    if os.name != "nt":
+        assert direct_url["url"] == visible_wheel.as_uri()
+        assert visible_wheel.as_posix() in receipt_text
+        assert provider.absolute().is_relative_to(environment.absolute())
+        assert provider.parent.resolve().is_relative_to(environment.resolve())
+
+    identity = probe_persistent_uv_tool_identity(
+        uv_executable=uv,
+        tool_executable=str(executable),
+        provider_interpreter=str(provider),
+        source_artifact=visible_wheel,
+        distribution="clio-kit",
+        distribution_version=UV_TOOL_PROBE_VERSION,
+        entry_point="clio-kit",
+    )
+
+    assert Path(identity.environment_prefix) == environment.resolve()
+    assert Path(identity.provider_interpreter).parent.resolve() == provider.parent.resolve()
+    assert Path(identity.source_artifact_path) == canonical_wheel.resolve()
+    assert Path(identity.uv_receipt_path).is_relative_to(environment.resolve())
 
 
 @pytest.mark.parametrize("server_name", ["jarvis", "spack"])
