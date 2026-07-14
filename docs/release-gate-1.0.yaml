@@ -161,6 +161,7 @@ requirements:
       - queue-management
     required_checks:
       - queue.worker-containment-enforced
+      - queue.lease-capacity-audit-initial
       - queue.kind-concurrency-parallel
       - queue.kind-concurrency-worker-enforced
       - queue.list-bounded
@@ -169,6 +170,7 @@ requirements:
       - queue.stale-cleanup-executed
       - queue.cancel-running-worker-process
       - queue.scheduler-preserved-default
+      - queue.lease-capacity-audit-final
       - worker.artifact-version
       - worker.artifact-sha256
       - worker.source-identity

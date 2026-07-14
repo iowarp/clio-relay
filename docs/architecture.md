@@ -19,11 +19,16 @@ durable queue-admission policy, not thread-local semaphores: active same-cluster
 leases are counted and the next eligible job is selected under the same queue
 lock that creates its lease. This prevents separate slots or worker processes
 from racing past a cap and avoids head-of-line blocking when one kind is full.
-The executable lease scan shares the 10,000-record active-job bound. Canonical
-job, task, lease, and gateway changes first create a bounded transition intent;
-startup replay then converges exact indexes and gateway backlinks after a hard
-exit. Lease deletion is not complete until both the canonical record and its
-per-job reference are absent.
+Steady admission reads a fixed aggregate/checkpoint pair with global and sparse
+cluster-kind lease counts. Every acquisition, renewal, deletion, stale recovery,
+and repair advances that pair through the same durable transition intent as its
+canonical lease and exact indexes, so separate processes cannot race the count
+or retain a torn generation after a hard exit. The 10,000-record bound still
+applies. Full canonical, expiry, identity, endpoint, and cluster-kind validation
+remains available as an explicit audit and is always used for migration and
+repair; it is not repeated on every steady-state admission. Lease deletion is
+not complete until the canonical record, exact references, and aggregate
+generation converge.
 
 Tasks can also have structured timeline events. A remote agent can record discovery, planning, warnings, commands, scheduler decisions, and completion as resumable task-scoped records. These events are separate from raw stdout so a UI can show meaningful work before the final answer exists.
 

@@ -26,6 +26,7 @@ from clio_relay.models import (
 class _CrashQueue(ClioCoreQueue):
     mode: str
     marker: Path
+    current_job_id: str
     armed: bool = False
 
     def _mark_and_exit(self, payload: dict[str, object]) -> None:
@@ -63,6 +64,25 @@ class _CrashQueue(ClioCoreQueue):
     def _after_lease_operational_index_write(self, lease: Lease) -> None:
         if self.armed and self.mode == "lease_after_index":
             self._mark_and_exit({"job_id": lease.job_id, "lease_id": lease.lease_id})
+
+    def _after_lease_capacity_aggregate_write(self, _aggregate: object) -> None:
+        if self.armed and self.mode.endswith("after_capacity_aggregate"):
+            self._mark_and_exit({"job_id": self.current_job_id})
+
+    def _after_lease_capacity_checkpoint_write(self, _checkpoint: object) -> None:
+        if self.armed and self.mode.endswith("after_capacity_checkpoint"):
+            self._mark_and_exit({"job_id": self.current_job_id})
+
+    def _before_lease_capacity_intent_removal(self, kind: str, _path: Path) -> None:
+        expected_kind = {
+            "lease": "lease_acquire",
+            "renew": "lease_sync",
+            "release": "lease_delete",
+            "stale": "stale_lease_recovery",
+            "repair": "lease_index_repair",
+        }.get(self.mode.split("_", 1)[0])
+        if self.armed and self.mode.endswith("before_intent_removal") and kind == expected_kind:
+            self._mark_and_exit({"job_id": self.current_job_id})
 
     def _before_stale_recovery_job_write(
         self,
@@ -110,10 +130,17 @@ def main() -> None:
             idempotency_key=f"hard-crash-{mode}",
         )
     )
+    queue.current_job_id = job.job_id
     queue.armed = True
     if mode == "terminal":
         queue.update_job_state(job.job_id, JobState.SUCCEEDED)
-    elif mode in {"lease", "lease_after_index"}:
+    elif mode in {
+        "lease",
+        "lease_after_index",
+        "lease_after_capacity_aggregate",
+        "lease_after_capacity_checkpoint",
+        "lease_before_intent_removal",
+    }:
         endpoint = queue.register_endpoint(
             EndpointRegistration(
                 role=EndpointRole.WORKER,
@@ -132,6 +159,7 @@ def main() -> None:
             )
         )
     elif mode.startswith("stale_"):
+        queue.armed = False
         endpoint = queue.register_endpoint(
             EndpointRegistration(
                 role=EndpointRole.WORKER,
@@ -164,11 +192,14 @@ def main() -> None:
             second_lease,
             job=queue.get_job(job.job_id),
         )
+        queue.repair_lease_operational_indexes()
+        queue.armed = True
         if mode.endswith("_exact"):
             queue.recover_stale_job(job.job_id, cluster=job.cluster)
         else:
             queue.recover_stale_jobs(cluster=job.cluster)
     elif mode.startswith("release_"):
+        queue.armed = False
         endpoint = queue.register_endpoint(
             EndpointRegistration(
                 role=EndpointRole.WORKER,
@@ -179,7 +210,36 @@ def main() -> None:
         )
         lease = queue.acquire_job(job.job_id, endpoint.endpoint_id, cluster=job.cluster)
         assert lease is not None
+        queue.armed = True
         queue.release_lease(lease.lease_id)
+    elif mode.startswith("renew_"):
+        queue.armed = False
+        endpoint = queue.register_endpoint(
+            EndpointRegistration(
+                role=EndpointRole.WORKER,
+                cluster=job.cluster,
+                hostname="lease-renew-crash-worker",
+                pid=os.getpid(),
+            )
+        )
+        lease = queue.acquire_job(job.job_id, endpoint.endpoint_id, cluster=job.cluster)
+        assert lease is not None
+        queue.armed = True
+        queue.renew_lease(lease.lease_id)
+    elif mode.startswith("repair_"):
+        queue.armed = False
+        endpoint = queue.register_endpoint(
+            EndpointRegistration(
+                role=EndpointRole.WORKER,
+                cluster=job.cluster,
+                hostname="lease-repair-crash-worker",
+                pid=os.getpid(),
+            )
+        )
+        lease = queue.acquire_job(job.job_id, endpoint.endpoint_id, cluster=job.cluster)
+        assert lease is not None
+        queue.armed = True
+        queue.repair_lease_operational_indexes()
     elif mode == "gateway_close":
         session = queue.create_gateway_session(
             GatewaySession(

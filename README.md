@@ -47,6 +47,9 @@ It is a piece of the federation layer for [`clio-agent`](https://github.com/iowa
 - `relay-host`: carries bytes for frp deployments. It does not store jobs or queue state.
 
 The durable boundary is `clio-core`. The filesystem queue in this repository is the development backend for that record contract. Jobs, task timelines, progress, scheduler state, gateway sessions, logs, artifacts, and provenance are recorded there so clients can detach, reconnect, and replay state. JARVIS-CD owns scheduler execution, package behavior, output collection, and provenance.
+Lease admission uses a crash-replayed aggregate for constant-read capacity
+checks, while an explicit full audit retains exact canonical and operational
+index verification for repair and production diagnostics.
 
 Transport is replaceable because it only carries HTTP bytes between endpoints:
 

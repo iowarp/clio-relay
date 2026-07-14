@@ -43,6 +43,7 @@ def test_queue_validation_observes_real_workers_processes_and_scheduler(
     assert report.status is ValidationStatus.PASSED
     assert {check.check_id for check in report.checks} == {
         "queue.worker-containment-enforced",
+        "queue.lease-capacity-audit-initial",
         "queue.kind-concurrency-parallel",
         "queue.kind-concurrency-worker-enforced",
         "queue.list-bounded",
@@ -51,6 +52,7 @@ def test_queue_validation_observes_real_workers_processes_and_scheduler(
         "queue.stale-cleanup-executed",
         "queue.cancel-running-worker-process",
         "queue.scheduler-preserved-default",
+        "queue.lease-capacity-audit-final",
     }
     assert all(check.evidence for check in report.checks)
     stale_target = next(
@@ -216,6 +218,8 @@ def test_release_policy_requires_live_queue_and_worker_identity_evidence() -> No
 
     assert {
         "queue.worker-containment-enforced",
+        "queue.lease-capacity-audit-initial",
+        "queue.lease-capacity-audit-final",
         "queue.kind-concurrency-parallel",
         "queue.kind-concurrency-worker-enforced",
         "queue.diagnose-specific-reason",

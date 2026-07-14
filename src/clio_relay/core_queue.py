@@ -95,9 +95,14 @@ OWNER_SESSION_CLOSURE_WRITE_ATTEMPTS = 3
 JOB_INDEX_SCHEMA = "clio-relay.job-index.v1"
 INDEX_MIGRATION_SCHEMA = "clio-relay.index-migration.v1"
 LEASE_OPERATIONAL_INDEX_SCHEMA = "clio-relay.lease-operational-index.v2"
+LEASE_CAPACITY_AGGREGATE_SCHEMA = "clio-relay.lease-capacity-aggregate.v1"
+LEASE_CAPACITY_CHECKPOINT_SCHEMA = "clio-relay.lease-capacity-checkpoint.v1"
+LEASE_CAPACITY_AUDIT_SCHEMA = "clio-relay.lease-capacity-audit.v1"
 DEFAULT_EXACT_RECORD_LIMIT = 1_000
 MAX_ACTIVE_JOB_RECORDS = 10_000
 MAX_LIVE_LEASE_RECORDS = MAX_ACTIVE_JOB_RECORDS
+MAX_LEASE_CAPACITY_SCOPES = MAX_LIVE_LEASE_RECORDS
+MAX_LEASE_CAPACITY_RECORD_BYTES = 4 * 1_048_576
 MAX_BOUNDED_SCAN_RECORDS = 10_000
 MAX_GATEWAY_INDEX_RECORDS = 10_000
 MAX_SCHEDULER_METADATA_RECORDS = 1_000
@@ -153,6 +158,7 @@ RECORD_FAMILY_MAX_BYTES: dict[str, int] = {
     "legacy_output_retired": 65_536,
     "leases_by_job": 65_536,
     "lease_indexes": 65_536,
+    "lease_capacity": MAX_LEASE_CAPACITY_RECORD_BYTES,
     "migrations": 262_144,
     "monitor_rules": 262_144,
     "monitor_rules_by_job": 262_144,
@@ -381,6 +387,37 @@ class _LeaseIndexIdentity:
     cluster: str
     job_kind: JobKind
     expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _LeaseCapacityAggregate:
+    """Validated O(1) lease admission counts for one durable epoch."""
+
+    epoch_id: str
+    generation: int
+    checkpoint_id: str
+    global_live_leases: int
+    cluster_kind_counts: dict[str, dict[JobKind, int]]
+    document_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _LeaseCapacityCheckpoint:
+    """Independent anchor for one exact lease-capacity aggregate generation."""
+
+    epoch_id: str
+    generation: int
+    checkpoint_id: str
+    aggregate_document_sha256: str
+    document_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _LeaseCapacityPair:
+    """One mutually bound aggregate/checkpoint pair."""
+
+    aggregate: _LeaseCapacityAggregate
+    checkpoint: _LeaseCapacityCheckpoint
 
 
 @dataclass(frozen=True, slots=True)
@@ -1807,6 +1844,7 @@ class ClioCoreQueue:
             "leases_by_endpoint",
             "leases_by_cluster_kind",
             "leases_by_expiry",
+            "lease_capacity",
             "events",
             "legacy_output_archives",
             "legacy_output_receipts",
@@ -1924,6 +1962,27 @@ class ClioCoreQueue:
                     checkpoint["complete"] is not True
                     for checkpoint in operational_checkpoints.values()
                 )
+                has_canonical_leases = (
+                    next((self._storage_root / "leases").glob("*.json"), None) is not None
+                )
+                lease_capacity_complete = (
+                    not has_canonical_leases
+                    and not _lease_operational_records_present(self._storage_root)
+                )
+                lease_capacity_checkpoint: dict[str, object] = {
+                    "complete": lease_capacity_complete,
+                    "schema_version": LEASE_CAPACITY_AGGREGATE_SCHEMA,
+                }
+                if lease_capacity_complete:
+                    empty_capacity = _new_lease_capacity_pair({}, generation=0)
+                    self._write_lease_capacity_pair_unlocked(empty_capacity)
+                    lease_capacity_checkpoint.update(
+                        {
+                            "epoch_id": empty_capacity.aggregate.epoch_id,
+                            "generation": empty_capacity.aggregate.generation,
+                            "record_count": 0,
+                        }
+                    )
                 self._write_json(
                     migration_path,
                     {
@@ -1933,6 +1992,7 @@ class ClioCoreQueue:
                             and not has_legacy_retention
                             and not has_legacy_global_order
                             and not has_legacy_operational
+                            and lease_capacity_complete
                             and not _lease_operational_records_present(self._storage_root)
                         ),
                         "families": {
@@ -1951,9 +2011,14 @@ class ClioCoreQueue:
                             "complete": not _lease_operational_records_present(self._storage_root),
                             "schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA,
                         },
+                        "lease_capacity_aggregate": lease_capacity_checkpoint,
                     },
                 )
             else:
+                # A torn aggregate/checkpoint pair is valid only while its exact
+                # transition intent remains durable. Replay that authorization
+                # before deciding the migration checkpoint itself is corrupt.
+                self._recover_pending_transitions_unlocked()
                 self._ensure_extended_migration_state()
             self._recover_pending_transitions_unlocked()
             self._initialized = True
@@ -2164,19 +2229,43 @@ class ClioCoreQueue:
                 raise QueueConflictError("lease operational-index repair checkpoint is invalid")
             lease_repair = cast(dict[str, object], raw_lease_repair)
             if lease_repair.get("complete") is not True:
-                intent_path = self._write_transition_intent_unlocked(
-                    "lease_index_repair",
-                    "migration-v2",
-                    {"limit": MAX_LIVE_LEASE_RECORDS},
+                intent_path, repair_payload = self._prepare_lease_capacity_rebuild_intent_unlocked(
+                    identity="migration-v2",
+                    limit=MAX_LIVE_LEASE_RECORDS,
                 )
                 repaired = self._apply_lease_index_repair_intent_unlocked(
                     intent_path,
-                    {"limit": MAX_LIVE_LEASE_RECORDS},
+                    repair_payload,
                 )
                 lease_repair.update(
                     {
                         "complete": True,
                         "schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA,
+                        "record_count": repaired,
+                    }
+                )
+                self._write_index_migration_state(state)
+                return state
+            raw_capacity_checkpoint = state.get("lease_capacity_aggregate")
+            if not isinstance(raw_capacity_checkpoint, dict):
+                raise QueueConflictError("lease capacity migration checkpoint is invalid")
+            capacity_checkpoint = cast(dict[str, object], raw_capacity_checkpoint)
+            if capacity_checkpoint.get("complete") is not True:
+                intent_path, repair_payload = self._prepare_lease_capacity_rebuild_intent_unlocked(
+                    identity="migration-capacity-v1",
+                    limit=MAX_LIVE_LEASE_RECORDS,
+                )
+                repaired = self._apply_lease_index_repair_intent_unlocked(
+                    intent_path,
+                    repair_payload,
+                )
+                capacity = self._read_lease_capacity_aggregate_unlocked()
+                capacity_checkpoint.update(
+                    {
+                        "complete": True,
+                        "schema_version": LEASE_CAPACITY_AGGREGATE_SCHEMA,
+                        "epoch_id": capacity.aggregate.epoch_id,
+                        "generation": capacity.aggregate.generation,
                         "record_count": repaired,
                     }
                 )
@@ -2241,6 +2330,19 @@ class ClioCoreQueue:
                 self._write_index_migration_state(state)
                 return state
             self._reconcile_index_migration_sources_unlocked()
+            capacity = self._read_lease_capacity_aggregate_unlocked()
+            raw_capacity_checkpoint = state.get("lease_capacity_aggregate")
+            if not isinstance(raw_capacity_checkpoint, dict):
+                raise QueueConflictError("lease capacity migration checkpoint is invalid")
+            cast(dict[str, object], raw_capacity_checkpoint).update(
+                {
+                    "complete": True,
+                    "schema_version": LEASE_CAPACITY_AGGREGATE_SCHEMA,
+                    "epoch_id": capacity.aggregate.epoch_id,
+                    "generation": capacity.aggregate.generation,
+                    "record_count": capacity.aggregate.global_live_leases,
+                }
+            )
             state["complete"] = True
             self._write_index_migration_state(state)
             return state
@@ -2258,15 +2360,15 @@ class ClioCoreQueue:
         self.initialize()
         with self._lock:
             self._recover_pending_transitions_unlocked()
-            intent_path = self._write_transition_intent_unlocked(
-                "lease_index_repair",
-                "operator",
-                {"limit": limit},
+            intent_path, repair_payload = self._prepare_lease_capacity_rebuild_intent_unlocked(
+                identity="operator",
+                limit=limit,
             )
             record_count = self._apply_lease_index_repair_intent_unlocked(
                 intent_path,
-                {"limit": limit},
+                repair_payload,
             )
+            capacity = self._read_lease_capacity_aggregate_unlocked()
             state = self._read_index_migration_state()
             raw_checkpoint = state.get("lease_operational_repair")
             if not isinstance(raw_checkpoint, dict):
@@ -2278,11 +2380,299 @@ class ClioCoreQueue:
                     "record_count": record_count,
                 }
             )
+            state["lease_capacity_aggregate"] = {
+                "complete": True,
+                "schema_version": LEASE_CAPACITY_AGGREGATE_SCHEMA,
+                "epoch_id": capacity.aggregate.epoch_id,
+                "generation": capacity.aggregate.generation,
+                "record_count": record_count,
+            }
+            state["complete"] = _index_migration_components_complete(state)
             self._write_index_migration_state(state)
         return {
             "schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA,
+            "capacity_schema_version": LEASE_CAPACITY_AGGREGATE_SCHEMA,
+            "capacity_epoch_id": capacity.aggregate.epoch_id,
+            "capacity_generation": capacity.aggregate.generation,
             "record_count": record_count,
             "complete": True,
+        }
+
+    def audit_lease_capacity(
+        self,
+        *,
+        limit: int = MAX_LIVE_LEASE_RECORDS,
+    ) -> dict[str, object]:
+        """Compare canonical leases, every operational index, and the aggregate."""
+        if limit < 1 or limit > MAX_LIVE_LEASE_RECORDS:
+            raise ValueError(
+                f"lease capacity audit limit must be between 1 and {MAX_LIVE_LEASE_RECORDS}"
+            )
+        try:
+            self.initialize()
+            with self._lock:
+                self._recover_pending_transitions_unlocked()
+                self._require_index_migration_complete()
+                return self._audit_lease_capacity_unlocked(limit=limit)
+        except (OSError, QueueConflictError) as exc:
+            return {
+                "schema_version": LEASE_CAPACITY_AUDIT_SCHEMA,
+                "valid": False,
+                "scan_truncated": False,
+                "result_truncated": False,
+                "limit": limit,
+                "checked_at": utc_now().isoformat(),
+                "mismatches": [
+                    {
+                        "type": "audit_error",
+                        "detail": bounded_error_detail(str(exc)) or type(exc).__name__,
+                    }
+                ],
+            }
+
+    def _audit_lease_capacity_unlocked(self, *, limit: int) -> dict[str, object]:
+        indexed, canonical_counts = self._canonical_lease_capacity_records_unlocked(limit=limit)
+        mismatches: list[dict[str, object]] = []
+        result_truncated = False
+
+        def mismatch(kind: str, **details: object) -> None:
+            nonlocal result_truncated
+            if len(mismatches) >= 100:
+                result_truncated = True
+                return
+            mismatches.append({"type": kind, **details})
+
+        expected_by_reference = {
+            _lease_reference(identity): identity for _lease, _job, identity in indexed
+        }
+        expected_references = set(expected_by_reference)
+        expiry_refs, expiry_truncated = self._scan_expiry_refs(limit=limit)
+        identity_refs, identity_truncated = self._scan_lease_identity_refs(limit=limit)
+        scan_truncated = expiry_truncated or identity_truncated
+        observed_expiry_references = {
+            (lease_token, identity_token) for *_, lease_token, identity_token in expiry_refs
+        }
+        observed_identity_references = set(identity_refs)
+        for label, observed in (
+            ("expiry", observed_expiry_references),
+            ("identity", observed_identity_references),
+        ):
+            for reference in sorted(expected_references - observed):
+                mismatch(
+                    "missing_operational_reference",
+                    index=label,
+                    reference=".".join(reference),
+                )
+            for reference in sorted(observed - expected_references):
+                mismatch(
+                    "orphaned_operational_reference",
+                    index=label,
+                    reference=".".join(reference),
+                )
+
+        manifest_paths = self._bounded_json_record_paths(
+            self._storage_root / "lease_indexes",
+            limit=limit,
+            label="lease operational manifest index",
+        )
+        observed_manifest_references: set[tuple[str, str]] = set()
+        for path in manifest_paths:
+            lease_token = path.stem
+            identity = self._read_lease_index_identity_by_token(lease_token)
+            reference = _lease_reference(identity)
+            if reference in observed_manifest_references:
+                mismatch(
+                    "duplicate_operational_manifest",
+                    lease_id=identity.lease_id,
+                    reference=".".join(reference),
+                )
+            observed_manifest_references.add(reference)
+            expected_identity = expected_by_reference.get(reference)
+            if expected_identity != identity:
+                mismatch(
+                    "operational_manifest_mismatch",
+                    lease_id=identity.lease_id,
+                    reference=".".join(reference),
+                )
+        for reference in sorted(expected_references - observed_manifest_references):
+            mismatch("missing_operational_manifest", reference=".".join(reference))
+
+        expected_by_scope: dict[tuple[str, JobKind], set[tuple[str, str]]] = {}
+        cluster_labels: dict[str, str] = {}
+        expected_by_endpoint: dict[str, set[tuple[str, str]]] = {}
+        endpoint_labels: dict[str, str] = {}
+        for reference, identity in expected_by_reference.items():
+            cluster_token = _lease_cluster_token(identity.cluster)
+            cluster_labels[cluster_token] = identity.cluster
+            expected_by_scope.setdefault((cluster_token, identity.job_kind), set()).add(reference)
+            endpoint_token = _lease_endpoint_token(identity.endpoint_id)
+            endpoint_labels[endpoint_token] = identity.endpoint_id
+            expected_by_endpoint.setdefault(endpoint_token, set()).add(reference)
+
+        observed_scope_references: dict[tuple[str, JobKind], set[tuple[str, str]]] = {}
+        scope_root = self._storage_root / "leases_by_cluster_kind"
+        self._require_safe_lease_index_directory(scope_root, create=False)
+        scope_entries = 0
+        with os.scandir(scope_root) as cluster_entries:
+            for cluster_entry in cluster_entries:
+                scope_entries += 1
+                if scope_entries > MAX_LEASE_CAPACITY_SCOPES:
+                    raise QueueConflictError("lease cluster-kind index exceeds its scope bound")
+                cluster_path = Path(cluster_entry.path)
+                cluster_stat = os.lstat(cluster_path)
+                if (
+                    not _is_short_ref_token(cluster_entry.name)
+                    or not stat.S_ISDIR(cluster_stat.st_mode)
+                    or _record_is_reparse(cluster_stat)
+                ):
+                    raise QueueConflictError(
+                        f"lease cluster-kind index contains an unsafe cluster scope: {cluster_path}"
+                    )
+                self._require_safe_lease_index_directory(cluster_path, create=False)
+                with os.scandir(cluster_path) as kind_entries:
+                    for kind_entry in kind_entries:
+                        scope_entries += 1
+                        if scope_entries > MAX_LEASE_CAPACITY_SCOPES * 2:
+                            raise QueueConflictError(
+                                "lease cluster-kind index exceeds its scope bound"
+                            )
+                        try:
+                            kind = JobKind(kind_entry.name)
+                        except ValueError as exc:
+                            raise QueueConflictError(
+                                f"lease cluster-kind index has an invalid kind: {kind_entry.path}"
+                            ) from exc
+                        kind_path = Path(kind_entry.path)
+                        kind_stat = os.lstat(kind_path)
+                        if not stat.S_ISDIR(kind_stat.st_mode) or _record_is_reparse(kind_stat):
+                            raise QueueConflictError(
+                                "lease cluster-kind index contains an unsafe kind scope: "
+                                f"{kind_path}"
+                            )
+                        references, truncated = self._scan_lease_scope_refs(
+                            kind_path,
+                            scope=("cluster-kind", cluster_entry.name, kind.value),
+                            limit=limit,
+                            label=(f"lease cluster-kind index {cluster_entry.name}/{kind.value}"),
+                        )
+                        scan_truncated = scan_truncated or truncated
+                        observed_scope_references[(cluster_entry.name, kind)] = set(references)
+        for scope in sorted(
+            set(expected_by_scope) | set(observed_scope_references),
+            key=lambda item: (item[0], item[1].value),
+        ):
+            expected = expected_by_scope.get(scope, set())
+            observed = observed_scope_references.get(scope, set())
+            if expected != observed:
+                mismatch(
+                    "cluster_kind_scope_mismatch",
+                    cluster_token=scope[0],
+                    cluster=cluster_labels.get(scope[0]),
+                    job_kind=scope[1].value,
+                    expected_count=len(expected),
+                    observed_count=len(observed),
+                )
+
+        endpoint_root = self._storage_root / "leases_by_endpoint"
+        self._require_safe_lease_index_directory(endpoint_root, create=False)
+        observed_endpoint_tokens: set[str] = set()
+        with os.scandir(endpoint_root) as endpoint_entries:
+            for endpoint_entry in endpoint_entries:
+                if len(observed_endpoint_tokens) >= limit:
+                    scan_truncated = True
+                    break
+                endpoint_path = Path(endpoint_entry.path)
+                endpoint_stat = os.lstat(endpoint_path)
+                if (
+                    not _is_short_ref_token(endpoint_entry.name)
+                    or not stat.S_ISDIR(endpoint_stat.st_mode)
+                    or _record_is_reparse(endpoint_stat)
+                ):
+                    raise QueueConflictError(
+                        f"lease endpoint index contains an unsafe scope: {endpoint_path}"
+                    )
+                observed_endpoint_tokens.add(endpoint_entry.name)
+        for endpoint_token in sorted(set(expected_by_endpoint) | observed_endpoint_tokens):
+            endpoint_id = endpoint_labels.get(endpoint_token)
+            if endpoint_id is None:
+                mismatch("orphaned_endpoint_scope", endpoint_token=endpoint_token)
+                continue
+            observed, truncated = self._scan_lease_endpoint_refs(endpoint_id, limit=limit)
+            scan_truncated = scan_truncated or truncated
+            expected = expected_by_endpoint[endpoint_token]
+            if set(observed) != expected:
+                mismatch(
+                    "endpoint_scope_mismatch",
+                    endpoint_token=endpoint_token,
+                    endpoint_id=endpoint_id,
+                    expected_count=len(expected),
+                    observed_count=len(observed),
+                )
+
+        aggregate_pair = self._read_lease_capacity_aggregate_unlocked()
+        aggregate_counts = aggregate_pair.aggregate.cluster_kind_counts
+        all_capacity_scopes = {
+            (cluster_token, kind)
+            for cluster_token, kind_counts in canonical_counts.items()
+            for kind in kind_counts
+        } | {
+            (cluster_token, kind)
+            for cluster_token, kind_counts in aggregate_counts.items()
+            for kind in kind_counts
+        }
+        for cluster_token, kind in sorted(
+            all_capacity_scopes,
+            key=lambda item: (item[0], item[1].value),
+        ):
+            expected_count = canonical_counts.get(cluster_token, {}).get(kind, 0)
+            observed_count = aggregate_counts.get(cluster_token, {}).get(kind, 0)
+            if expected_count != observed_count:
+                mismatch(
+                    "aggregate_scope_mismatch",
+                    cluster_token=cluster_token,
+                    cluster=cluster_labels.get(cluster_token),
+                    job_kind=kind.value,
+                    expected_count=expected_count,
+                    observed_count=observed_count,
+                )
+        if aggregate_pair.aggregate.global_live_leases != len(indexed):
+            mismatch(
+                "aggregate_global_mismatch",
+                expected_count=len(indexed),
+                observed_count=aggregate_pair.aggregate.global_live_leases,
+            )
+        return {
+            "schema_version": LEASE_CAPACITY_AUDIT_SCHEMA,
+            "valid": not mismatches and not scan_truncated,
+            "scan_truncated": scan_truncated,
+            "result_truncated": result_truncated,
+            "limit": limit,
+            "checked_at": utc_now().isoformat(),
+            "canonical": {
+                "global_live_leases": len(indexed),
+                "cluster_kind_counts": _serialized_lease_capacity_counts(canonical_counts),
+            },
+            "operational_indexes": {
+                "manifests": len(observed_manifest_references),
+                "identity_references": len(observed_identity_references),
+                "expiry_references": len(observed_expiry_references),
+                "cluster_kind_references": sum(
+                    len(references) for references in observed_scope_references.values()
+                ),
+                "endpoint_references": sum(
+                    len(references) for references in expected_by_endpoint.values()
+                ),
+            },
+            "aggregate": {
+                "epoch_id": aggregate_pair.aggregate.epoch_id,
+                "generation": aggregate_pair.aggregate.generation,
+                "checkpoint_id": aggregate_pair.aggregate.checkpoint_id,
+                "global_live_leases": aggregate_pair.aggregate.global_live_leases,
+                "cluster_kind_counts": _serialized_lease_capacity_counts(aggregate_counts),
+                "document_sha256": aggregate_pair.aggregate.document_sha256,
+                "checkpoint_document_sha256": aggregate_pair.checkpoint.document_sha256,
+            },
+            "mismatches": mismatches,
         }
 
     def _apply_lease_index_repair_intent_unlocked(
@@ -2298,35 +2688,58 @@ class ClioCoreQueue:
             or limit > MAX_LIVE_LEASE_RECORDS
         ):
             raise QueueConflictError(f"invalid lease index repair intent: {intent_path}")
-        leases, truncated = self._scan_many(self._storage_root / "leases", Lease, limit=limit)
-        if truncated:
+        indexed, counts = self._canonical_lease_capacity_records_unlocked(limit=limit)
+        raw_target = payload.get("lease_capacity_rebuild")
+        if raw_target is None:
+            migration_state = self._read_index_migration_state()
+            raw_capacity_checkpoint = migration_state.get("lease_capacity_aggregate")
+            if (
+                isinstance(raw_capacity_checkpoint, dict)
+                and cast(dict[str, object], raw_capacity_checkpoint).get("complete") is True
+            ):
+                raise QueueConflictError(
+                    f"lease index repair intent has no capacity target: {intent_path}"
+                )
+            target = _new_lease_capacity_pair(counts, generation=1)
+        else:
+            target = _lease_capacity_pair_from_payload(
+                raw_target,
+                label=f"lease index repair capacity target {intent_path}",
+            )
+        if (
+            target.aggregate.cluster_kind_counts != counts
+            or target.aggregate.global_live_leases != len(indexed)
+        ):
             raise QueueConflictError(
-                f"lease index repair exceeded its safety bound of {limit} records"
+                f"lease index repair capacity target disagrees with canonical leases: {intent_path}"
             )
-        indexed: list[tuple[Lease, RelayJob, _LeaseIndexIdentity]] = []
-        references: set[tuple[str, str]] = set()
-        lease_tokens: set[str] = set()
-        for lease in leases:
-            job = self._read_optional(
-                self._storage_root / "jobs" / f"{lease.job_id}.json",
-                RelayJob,
-            )
-            if job is None:
-                raise QueueConflictError(
-                    f"lease index repair cannot resolve job: {lease.lease_id}/{lease.job_id}"
-                )
-            identity = self._lease_index_identity(lease, job=job)
-            reference = _lease_reference(identity)
-            if reference in references or reference[0] in lease_tokens:
-                raise QueueConflictError(
-                    f"lease index repair found an identity collision: {lease.lease_id}"
-                )
-            references.add(reference)
-            lease_tokens.add(reference[0])
-            indexed.append((lease, job, identity))
         self._clear_lease_operational_indexes_unlocked()
         for lease, job, _identity in indexed:
             self._sync_lease_operational_indexes_unlocked(lease, job=job)
+        self._lease_capacity_record_paths_unlocked(allow_missing=True)
+        self._write_lease_capacity_pair_unlocked(target)
+        restore_complete = payload.get("restore_migration_complete", False)
+        if not isinstance(restore_complete, bool):
+            raise QueueConflictError(
+                f"lease index repair migration policy is invalid: {intent_path}"
+            )
+        migration_state = self._read_index_migration_state()
+        migration_state["lease_operational_repair"] = {
+            "complete": True,
+            "schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA,
+            "record_count": len(indexed),
+        }
+        migration_state["lease_capacity_aggregate"] = {
+            "complete": True,
+            "schema_version": LEASE_CAPACITY_AGGREGATE_SCHEMA,
+            "epoch_id": target.aggregate.epoch_id,
+            "generation": target.aggregate.generation,
+            "record_count": len(indexed),
+        }
+        if restore_complete:
+            migration_state["complete"] = _index_migration_components_complete(migration_state)
+        self._write_index_migration_state(migration_state)
+        self._before_lease_capacity_intent_removal("lease_index_repair", intent_path)
         _unlink_durable_path(intent_path, missing_ok=True)
         return len(indexed)
 
@@ -3302,6 +3715,286 @@ class ClioCoreQueue:
             cluster=job.cluster,
             job_kind=job.kind,
             expires_at=lease.expires_at,
+        )
+
+    def _lease_capacity_directory(self) -> Path:
+        return self._storage_root / "lease_capacity"
+
+    def _lease_capacity_record_paths_unlocked(
+        self,
+        *,
+        allow_missing: bool,
+    ) -> dict[str, Path]:
+        """Validate the fixed two-file aggregate inventory without following links."""
+        directory = self._lease_capacity_directory()
+        try:
+            directory_stat = os.lstat(directory)
+        except FileNotFoundError:
+            if allow_missing:
+                return {}
+            raise QueueConflictError(f"lease capacity directory is missing: {directory}") from None
+        if not stat.S_ISDIR(directory_stat.st_mode) or _record_is_reparse(directory_stat):
+            raise QueueConflictError(f"lease capacity directory is unsafe: {directory}")
+        if os.name != "nt" and hasattr(os, "geteuid") and directory_stat.st_uid != os.geteuid():
+            raise QueueConflictError(f"lease capacity directory is not owned: {directory}")
+        allowed = {"aggregate.json", "checkpoint.json"}
+        paths: dict[str, Path] = {}
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if len(paths) >= 2:
+                        raise QueueConflictError(
+                            "lease capacity directory exceeds its fixed two-record inventory"
+                        )
+                    path = Path(entry.path)
+                    entry_stat = os.lstat(path)
+                    if entry.name not in allowed:
+                        raise QueueConflictError(
+                            f"lease capacity directory contains an unexpected record: {path}"
+                        )
+                    _validate_record_stat(entry_stat, path=path)
+                    if entry_stat.st_size > MAX_LEASE_CAPACITY_RECORD_BYTES:
+                        raise QueueConflictError(
+                            f"lease capacity record exceeds its byte bound: {path}"
+                        )
+                    paths[entry.name] = path
+        except QueueConflictError:
+            raise
+        except OSError as exc:
+            raise QueueConflictError(f"cannot inspect lease capacity directory: {exc}") from exc
+        if not allow_missing and set(paths) != allowed:
+            missing = ", ".join(sorted(allowed - set(paths)))
+            raise QueueConflictError(f"lease capacity pair is incomplete; missing {missing}")
+        return paths
+
+    def _read_lease_capacity_components_unlocked(
+        self,
+        *,
+        allow_missing: bool,
+    ) -> tuple[_LeaseCapacityAggregate | None, _LeaseCapacityCheckpoint | None]:
+        paths = self._lease_capacity_record_paths_unlocked(allow_missing=allow_missing)
+        aggregate_path = paths.get("aggregate.json")
+        checkpoint_path = paths.get("checkpoint.json")
+        aggregate = (
+            None
+            if aggregate_path is None
+            else _lease_capacity_aggregate_from_document(
+                _read_unique_json_document(aggregate_path),
+                label=f"lease capacity aggregate {aggregate_path}",
+            )
+        )
+        checkpoint = (
+            None
+            if checkpoint_path is None
+            else _lease_capacity_checkpoint_from_document(
+                _read_unique_json_document(checkpoint_path),
+                label=f"lease capacity checkpoint {checkpoint_path}",
+            )
+        )
+        return aggregate, checkpoint
+
+    def _read_lease_capacity_aggregate_unlocked(self) -> _LeaseCapacityPair:
+        """Read and mutually validate the fixed aggregate/checkpoint pair."""
+        aggregate, checkpoint = self._read_lease_capacity_components_unlocked(allow_missing=False)
+        if aggregate is None or checkpoint is None:
+            raise QueueConflictError("lease capacity pair is incomplete")
+        pair = _LeaseCapacityPair(aggregate=aggregate, checkpoint=checkpoint)
+        _validate_lease_capacity_pair(pair, label="lease capacity pair")
+        return pair
+
+    def _write_lease_capacity_pair_unlocked(self, pair: _LeaseCapacityPair) -> None:
+        """Atomically replace each side of a journal-protected capacity pair."""
+        _validate_lease_capacity_pair(pair, label="lease capacity write")
+        directory = self._lease_capacity_directory()
+        self._require_safe_write_directory(directory)
+        self._write_json(
+            directory / "aggregate.json",
+            _lease_capacity_aggregate_document(pair.aggregate),
+        )
+        self._after_lease_capacity_aggregate_write(pair.aggregate)
+        self._write_json(
+            directory / "checkpoint.json",
+            _lease_capacity_checkpoint_document(pair.checkpoint),
+        )
+        self._after_lease_capacity_checkpoint_write(pair.checkpoint)
+
+    def _after_lease_capacity_aggregate_write(
+        self,
+        _aggregate: _LeaseCapacityAggregate,
+    ) -> None:
+        """Fault-injection seam after the aggregate replacement."""
+
+    def _after_lease_capacity_checkpoint_write(
+        self,
+        _checkpoint: _LeaseCapacityCheckpoint,
+    ) -> None:
+        """Fault-injection seam after the checkpoint replacement."""
+
+    def _before_lease_capacity_intent_removal(self, _kind: str, _path: Path) -> None:
+        """Fault-injection seam after convergence and before journal removal."""
+
+    def _prepare_lease_capacity_transition_unlocked(
+        self,
+        *,
+        scope_deltas: dict[tuple[str, JobKind], int],
+        include_rollback: bool = False,
+    ) -> dict[str, object]:
+        """Create exact before/after generations for one lease transition."""
+        before = self._read_lease_capacity_aggregate_unlocked()
+        counts = {
+            cluster_token: dict(kind_counts)
+            for cluster_token, kind_counts in before.aggregate.cluster_kind_counts.items()
+        }
+        for (cluster, kind), delta in scope_deltas.items():
+            if isinstance(delta, bool) or delta == 0:
+                raise QueueConflictError(
+                    "lease capacity transition delta must be a nonzero integer"
+                )
+            cluster_token = _lease_cluster_token(cluster)
+            kind_counts = counts.setdefault(cluster_token, {})
+            next_count = kind_counts.get(kind, 0) + delta
+            if next_count < 0:
+                raise QueueConflictError(
+                    f"lease capacity transition underflow: {cluster}/{kind.value}"
+                )
+            if next_count == 0:
+                kind_counts.pop(kind, None)
+            else:
+                kind_counts[kind] = next_count
+            if not kind_counts:
+                counts.pop(cluster_token, None)
+        after = _new_lease_capacity_pair(
+            counts,
+            epoch_id=before.aggregate.epoch_id,
+            generation=before.aggregate.generation + 1,
+        )
+        transition: dict[str, object] = {
+            "before": _lease_capacity_pair_payload(before),
+            "after": _lease_capacity_pair_payload(after),
+        }
+        if include_rollback:
+            rollback = _new_lease_capacity_pair(
+                before.aggregate.cluster_kind_counts,
+                epoch_id=before.aggregate.epoch_id,
+                generation=after.aggregate.generation + 1,
+            )
+            transition["rollback"] = _lease_capacity_pair_payload(rollback)
+        return transition
+
+    def _apply_lease_capacity_transition_unlocked(
+        self,
+        transition_value: object,
+        *,
+        target: Literal["after", "rollback"],
+        label: str,
+    ) -> _LeaseCapacityPair:
+        """Converge a possibly torn pair when every component is journal-authorized."""
+        if not isinstance(transition_value, dict):
+            raise QueueConflictError(f"{label} has no lease capacity transition")
+        transition = cast(dict[str, object], transition_value)
+        allowed_fields = {"before", "after", "rollback"}
+        if not {"before", "after"}.issubset(transition) or not set(transition).issubset(
+            allowed_fields
+        ):
+            raise QueueConflictError(f"{label} lease capacity transition is invalid")
+        pairs = {
+            name: _lease_capacity_pair_from_payload(value, label=f"{label} {name}")
+            for name, value in transition.items()
+        }
+        selected = pairs.get(target)
+        if selected is None:
+            raise QueueConflictError(f"{label} has no authorized {target} capacity generation")
+        aggregates = tuple(pair.aggregate for pair in pairs.values())
+        checkpoints = tuple(pair.checkpoint for pair in pairs.values())
+        current_aggregate, current_checkpoint = self._read_lease_capacity_components_unlocked(
+            allow_missing=True
+        )
+        if current_aggregate is not None and not any(
+            current_aggregate == aggregate for aggregate in aggregates
+        ):
+            raise QueueConflictError(f"{label} found an unauthorized aggregate generation")
+        if current_checkpoint is not None and not any(
+            current_checkpoint == checkpoint for checkpoint in checkpoints
+        ):
+            raise QueueConflictError(f"{label} found an unauthorized checkpoint generation")
+        if current_aggregate is None and current_checkpoint is None:
+            raise QueueConflictError(f"{label} found both capacity records missing")
+        self._write_lease_capacity_pair_unlocked(selected)
+        return selected
+
+    def _canonical_lease_capacity_records_unlocked(
+        self,
+        *,
+        limit: int,
+    ) -> tuple[
+        list[tuple[Lease, RelayJob, _LeaseIndexIdentity]],
+        dict[str, dict[JobKind, int]],
+    ]:
+        """Read bounded canonical leases and derive their exact aggregate scopes."""
+        leases, truncated = self._scan_many(
+            self._storage_root / "leases",
+            Lease,
+            limit=limit,
+        )
+        if truncated:
+            raise QueueConflictError(
+                f"lease capacity rebuild exceeded its safety bound of {limit} records"
+            )
+        indexed: list[tuple[Lease, RelayJob, _LeaseIndexIdentity]] = []
+        counts: dict[str, dict[JobKind, int]] = {}
+        clusters_by_token: dict[str, str] = {}
+        references: set[tuple[str, str]] = set()
+        lease_tokens: set[str] = set()
+        for lease in leases:
+            job = self._read_optional(
+                self._storage_root / "jobs" / f"{lease.job_id}.json",
+                RelayJob,
+            )
+            if job is None:
+                raise QueueConflictError(
+                    f"lease capacity rebuild cannot resolve job: {lease.lease_id}/{lease.job_id}"
+                )
+            identity = self._lease_index_identity(lease, job=job)
+            reference = _lease_reference(identity)
+            if reference in references or reference[0] in lease_tokens:
+                raise QueueConflictError(
+                    f"lease capacity rebuild found an identity collision: {lease.lease_id}"
+                )
+            references.add(reference)
+            lease_tokens.add(reference[0])
+            cluster_token = _lease_cluster_token(job.cluster)
+            previous_cluster = clusters_by_token.setdefault(cluster_token, job.cluster)
+            if previous_cluster != job.cluster:
+                raise QueueConflictError(
+                    "lease capacity rebuild found a cluster-token collision: "
+                    f"{previous_cluster}/{job.cluster}"
+                )
+            kind_counts = counts.setdefault(cluster_token, {})
+            kind_counts[job.kind] = kind_counts.get(job.kind, 0) + 1
+            indexed.append((lease, job, identity))
+        return indexed, _normalize_lease_capacity_counts(counts)
+
+    def _prepare_lease_capacity_rebuild_intent_unlocked(
+        self,
+        *,
+        identity: str,
+        limit: int,
+    ) -> tuple[Path, dict[str, object]]:
+        """Persist a deterministic target epoch before any repair-side mutation."""
+        _indexed, counts = self._canonical_lease_capacity_records_unlocked(limit=limit)
+        target = _new_lease_capacity_pair(counts, generation=1)
+        payload: dict[str, object] = {
+            "limit": limit,
+            "lease_capacity_rebuild": _lease_capacity_pair_payload(target),
+            "restore_migration_complete": identity == "operator",
+        }
+        return (
+            self._write_transition_intent_unlocked(
+                "lease_index_repair",
+                identity,
+                payload,
+            ),
+            payload,
         )
 
     def _lease_index_path(self, lease_id: str) -> Path:
@@ -4860,6 +5553,10 @@ class ClioCoreQueue:
                 "updated_at": utc_now(),
             }
         )
+        capacity_transition = self._prepare_lease_capacity_transition_unlocked(
+            scope_deltas={(job.cluster, job.kind): 1},
+            include_rollback=True,
+        )
         intent_path = self._write_transition_intent_unlocked(
             "lease_acquire",
             lease.lease_id,
@@ -4869,6 +5566,7 @@ class ClioCoreQueue:
                 "original_job": job.model_dump(mode="json"),
                 "target_job": leased_job.model_dump(mode="json"),
                 "target_updated_at": leased_job.updated_at.isoformat(),
+                "lease_capacity_transition": capacity_transition,
             },
         )
         self._write_job_unlocked(leased_job)
@@ -4876,6 +5574,12 @@ class ClioCoreQueue:
         self._write(self._job_record_path("leases_by_job", job.job_id, lease.lease_id), lease)
         self._sync_lease_operational_indexes_unlocked(lease, job=leased_job)
         self._after_lease_operational_index_write(lease)
+        self._apply_lease_capacity_transition_unlocked(
+            capacity_transition,
+            target="after",
+            label=f"lease acquisition {lease.lease_id}",
+        )
+        self._before_lease_capacity_intent_removal("lease_acquire", intent_path)
         _unlink_durable_path(intent_path, missing_ok=True)
         self.append_event(
             job.job_id,
@@ -4913,7 +5617,19 @@ class ClioCoreQueue:
         cluster: str,
         expiry_refs: list[_LeaseExpiryReference] | None = None,
     ) -> tuple[dict[JobKind, int], int]:
-        """Return per-cluster counts and the validated global lease population."""
+        """Return O(1) journaled admission counts from two fixed records."""
+        del expiry_refs
+        pair = self._read_lease_capacity_aggregate_unlocked()
+        counts = pair.aggregate.cluster_kind_counts.get(_lease_cluster_token(cluster), {})
+        return dict(counts), pair.aggregate.global_live_leases
+
+    def _exact_lease_capacity_snapshot(
+        self,
+        *,
+        cluster: str,
+        expiry_refs: list[_LeaseExpiryReference] | None = None,
+    ) -> tuple[dict[JobKind, int], int]:
+        """Audit exact expiry, identity, and cluster-kind operational indexes."""
         if expiry_refs is None:
             expiry_refs, expiry_truncated = self._scan_expiry_refs(
                 limit=MAX_LIVE_LEASE_RECORDS,
@@ -4998,6 +5714,7 @@ class ClioCoreQueue:
             job = self.get_job(lease.job_id)
             renewed = Lease.new(lease.job_id, lease.endpoint_id, ttl_seconds)
             renewed = renewed.model_copy(update={"lease_id": lease.lease_id})
+            capacity_transition = self._prepare_lease_capacity_transition_unlocked(scope_deltas={})
             intent_path = self._write_transition_intent_unlocked(
                 "lease_sync",
                 renewed.lease_id,
@@ -5005,6 +5722,7 @@ class ClioCoreQueue:
                     "lease": renewed.model_dump(mode="json"),
                     "previous_lease": lease.model_dump(mode="json"),
                     "job": job.model_dump(mode="json"),
+                    "lease_capacity_transition": capacity_transition,
                 },
             )
             self._write(path, renewed)
@@ -5017,6 +5735,12 @@ class ClioCoreQueue:
                 job=job,
                 previous_lease=lease,
             )
+            self._apply_lease_capacity_transition_unlocked(
+                capacity_transition,
+                target="after",
+                label=f"lease renewal {renewed.lease_id}",
+            )
+            self._before_lease_capacity_intent_removal("lease_sync", intent_path)
             _unlink_durable_path(intent_path, missing_ok=True)
             return renewed
 
@@ -5153,26 +5877,25 @@ class ClioCoreQueue:
             updated.updated_at.isoformat(),
             *sorted(lease_ids),
         )
+        capacity_transition = self._prepare_lease_capacity_transition_unlocked(
+            scope_deltas={(job.cluster, job.kind): -len(expired)}
+        )
+        intent_payload: dict[str, object] = {
+            "job_id": job.job_id,
+            "original_job": job.model_dump(mode="json"),
+            "target_job": updated.model_dump(mode="json"),
+            "leases": [lease.model_dump(mode="json") for lease in expired],
+            "event": event.model_dump(mode="json"),
+            "lease_capacity_transition": capacity_transition,
+        }
         intent_path = self._write_transition_intent_unlocked(
             "stale_lease_recovery",
             transition_identity,
-            {
-                "job_id": job.job_id,
-                "original_job": job.model_dump(mode="json"),
-                "target_job": updated.model_dump(mode="json"),
-                "leases": [lease.model_dump(mode="json") for lease in expired],
-                "event": event.model_dump(mode="json"),
-            },
+            intent_payload,
         )
         return self._apply_stale_lease_recovery_intent_unlocked(
             intent_path,
-            {
-                "job_id": job.job_id,
-                "original_job": job.model_dump(mode="json"),
-                "target_job": updated.model_dump(mode="json"),
-                "leases": [lease.model_dump(mode="json") for lease in expired],
-                "event": event.model_dump(mode="json"),
-            },
+            intent_payload,
         )
 
     def _apply_stale_lease_recovery_intent_unlocked(
@@ -5272,6 +5995,21 @@ class ClioCoreQueue:
                 identity=identity,
                 finalize_intent=False,
             )
+        capacity_transition = payload.get("lease_capacity_transition")
+        if capacity_transition is not None:
+            self._apply_lease_capacity_transition_unlocked(
+                capacity_transition,
+                target="after",
+                label=f"stale lease recovery {original.job_id}",
+            )
+            self._before_lease_capacity_intent_removal(
+                "stale_lease_recovery",
+                intent_path,
+            )
+        elif self._lease_capacity_migration_complete_unlocked():
+            raise QueueConflictError(
+                f"stale recovery intent has no capacity transition: {intent_path}"
+            )
         _unlink_durable_path(intent_path, missing_ok=True)
         return target
 
@@ -5352,7 +6090,11 @@ class ClioCoreQueue:
                 f"lease operational index is missing before deletion: {lease.lease_id}"
             )
         owned_intent = intent_path
+        capacity_transition: object | None = None
         if owned_intent is None:
+            capacity_transition = self._prepare_lease_capacity_transition_unlocked(
+                scope_deltas={(identity.cluster, identity.job_kind): -1}
+            )
             owned_intent = self._write_transition_intent_unlocked(
                 "lease_delete",
                 lease.lease_id,
@@ -5361,6 +6103,7 @@ class ClioCoreQueue:
                     "lease_id": lease.lease_id,
                     "lease": lease.model_dump(mode="json"),
                     "index": _lease_index_document(identity),
+                    "lease_capacity_transition": capacity_transition,
                 },
             )
         _unlink_durable_path(
@@ -5375,6 +6118,16 @@ class ClioCoreQueue:
         self._delete_lease_operational_indexes_unlocked(identity)
         self._after_lease_index_delete(lease)
         if finalize_intent:
+            if capacity_transition is None:
+                raise QueueConflictError(
+                    f"lease deletion has no capacity transition: {lease.lease_id}"
+                )
+            self._apply_lease_capacity_transition_unlocked(
+                capacity_transition,
+                target="after",
+                label=f"lease deletion {lease.lease_id}",
+            )
+            self._before_lease_capacity_intent_removal("lease_delete", owned_intent)
             _unlink_durable_path(owned_intent, missing_ok=True)
 
     def _after_lease_canonical_delete(self, _lease: Lease) -> None:
@@ -8780,6 +9533,18 @@ class ClioCoreQueue:
                     job=job,
                     previous_lease=previous,
                 )
+                capacity_transition = payload.get("lease_capacity_transition")
+                if capacity_transition is not None:
+                    self._apply_lease_capacity_transition_unlocked(
+                        capacity_transition,
+                        target="after",
+                        label=f"lease synchronization {lease.lease_id}",
+                    )
+                    self._before_lease_capacity_intent_removal("lease_sync", path)
+                elif self._lease_capacity_migration_complete_unlocked():
+                    raise QueueConflictError(
+                        f"lease synchronization intent has no capacity transition: {path}"
+                    )
                 _unlink_durable_path(path, missing_ok=True)
                 continue
             if kind == "lease_delete":
@@ -8813,6 +9578,18 @@ class ClioCoreQueue:
                 )
                 if identity is not None:
                     self._delete_lease_operational_indexes_unlocked(identity)
+                capacity_transition = payload.get("lease_capacity_transition")
+                if capacity_transition is not None:
+                    self._apply_lease_capacity_transition_unlocked(
+                        capacity_transition,
+                        target="after",
+                        label=f"lease deletion {lease_id}",
+                    )
+                    self._before_lease_capacity_intent_removal("lease_delete", path)
+                elif self._lease_capacity_migration_complete_unlocked():
+                    raise QueueConflictError(
+                        f"lease deletion intent has no capacity transition: {path}"
+                    )
                 _unlink_durable_path(path, missing_ok=True)
                 continue
             if kind == "stale_lease_recovery":
@@ -8887,14 +9664,16 @@ class ClioCoreQueue:
         lease_path = self._storage_root / "leases" / f"{lease.lease_id}.json"
         indexed_path = self._job_record_path("leases_by_job", lease.job_id, lease.lease_id)
         identity = self._lease_index_identity(lease, job=original_job)
-        if (
+        preserve_acquisition = (
             current is not None
             and not target_is_current
             and (
                 current.state in {JobState.LEASED, JobState.RUNNING}
                 and current.leased_by == lease.endpoint_id
             )
-        ):
+        )
+        if preserve_acquisition:
+            assert current is not None
             self._write(lease_path, lease)
             self._write(indexed_path, lease)
             self._sync_lease_operational_indexes_unlocked(lease, job=current)
@@ -8905,6 +9684,16 @@ class ClioCoreQueue:
                 identity,
                 allow_foreign_manifest=True,
             )
+        capacity_transition = payload.get("lease_capacity_transition")
+        if capacity_transition is not None:
+            self._apply_lease_capacity_transition_unlocked(
+                capacity_transition,
+                target="after" if preserve_acquisition else "rollback",
+                label=f"lease acquisition recovery {lease.lease_id}",
+            )
+            self._before_lease_capacity_intent_removal("lease_acquire", path)
+        elif self._lease_capacity_migration_complete_unlocked():
+            raise QueueConflictError(f"lease acquisition intent has no capacity transition: {path}")
         _unlink_durable_path(path, missing_ok=True)
 
     def _repair_active_job_index_unlocked(self) -> None:
@@ -9723,11 +10512,71 @@ class ClioCoreQueue:
                     }
                 )
                 changed = True
+        pending_transition = (
+            next((self._storage_root / "transition_intents").glob("*.json"), None) is not None
+        )
+        raw_capacity = state.get("lease_capacity_aggregate")
+        if not isinstance(raw_capacity, dict):
+            state["lease_capacity_aggregate"] = {
+                "complete": False,
+                "schema_version": LEASE_CAPACITY_AGGREGATE_SCHEMA,
+            }
+            changed = True
+        else:
+            capacity_checkpoint = cast(dict[str, object], raw_capacity)
+            complete = capacity_checkpoint.get("complete") is True
+            valid_complete_fields = (
+                _is_capacity_identity(capacity_checkpoint.get("epoch_id"))
+                and isinstance(capacity_checkpoint.get("generation"), int)
+                and not isinstance(capacity_checkpoint.get("generation"), bool)
+                and cast(int, capacity_checkpoint.get("generation")) >= 0
+                and isinstance(capacity_checkpoint.get("record_count"), int)
+                and not isinstance(capacity_checkpoint.get("record_count"), bool)
+                and 0
+                <= cast(int, capacity_checkpoint.get("record_count"))
+                <= MAX_LIVE_LEASE_RECORDS
+            )
+            if capacity_checkpoint.get("schema_version") != LEASE_CAPACITY_AGGREGATE_SCHEMA or (
+                complete and not valid_complete_fields
+            ):
+                state["lease_capacity_aggregate"] = {
+                    "complete": False,
+                    "schema_version": LEASE_CAPACITY_AGGREGATE_SCHEMA,
+                }
+                changed = True
+            elif complete:
+                try:
+                    current_capacity = self._read_lease_capacity_aggregate_unlocked()
+                except (OSError, QueueConflictError):
+                    if not pending_transition:
+                        capacity_checkpoint.clear()
+                        capacity_checkpoint.update(
+                            {
+                                "complete": False,
+                                "schema_version": LEASE_CAPACITY_AGGREGATE_SCHEMA,
+                            }
+                        )
+                        changed = True
+                else:
+                    migrated_generation = cast(int, capacity_checkpoint["generation"])
+                    if (
+                        current_capacity.aggregate.epoch_id != capacity_checkpoint.get("epoch_id")
+                        or current_capacity.aggregate.generation < migrated_generation
+                    ) and not pending_transition:
+                        capacity_checkpoint.clear()
+                        capacity_checkpoint.update(
+                            {
+                                "complete": False,
+                                "schema_version": LEASE_CAPACITY_AGGREGATE_SCHEMA,
+                            }
+                        )
+                        changed = True
         raw_order = cast(dict[str, object], state["order_families"])
         raw_retention = cast(dict[str, object], state["retention_families"])
         raw_global_order = cast(dict[str, object], state["global_order_families"])
         raw_operational = cast(dict[str, object], state["operational_families"])
         raw_lease_repair = cast(dict[str, object], state["lease_operational_repair"])
+        raw_capacity = cast(dict[str, object], state["lease_capacity_aggregate"])
         incomplete = False
         for raw_checkpoint in (
             *raw_order.values(),
@@ -9743,6 +10592,8 @@ class ClioCoreQueue:
                 incomplete = True
                 break
         if raw_lease_repair.get("complete") is not True:
+            incomplete = True
+        if raw_capacity.get("complete") is not True:
             incomplete = True
         if incomplete and state.get("complete") is True:
             state["complete"] = False
@@ -9772,6 +10623,14 @@ class ClioCoreQueue:
                 "queue indexes require migration; run `clio-relay queue migrate-indexes` "
                 "before starting workers"
             )
+
+    def _lease_capacity_migration_complete_unlocked(self) -> bool:
+        state = self._read_index_migration_state()
+        raw_checkpoint = state.get("lease_capacity_aggregate")
+        return (
+            isinstance(raw_checkpoint, dict)
+            and cast(dict[str, object], raw_checkpoint).get("complete") is True
+        )
 
     def _migrate_record_unlocked(self, family: str, record: BaseModel) -> None:
         if family == "jobs" and isinstance(record, RelayJob):
@@ -9871,14 +10730,15 @@ class ClioCoreQueue:
             for record in source_records[family]:
                 self._migrate_operational_record_unlocked(family, record)
 
-        lease_repair_intent = self._write_transition_intent_unlocked(
-            "lease_index_repair",
-            "migration-v1-final-reconcile",
-            {"limit": MAX_LIVE_LEASE_RECORDS},
+        lease_repair_intent, lease_repair_payload = (
+            self._prepare_lease_capacity_rebuild_intent_unlocked(
+                identity="migration-v1-final-reconcile",
+                limit=MAX_LIVE_LEASE_RECORDS,
+            )
         )
         self._apply_lease_index_repair_intent_unlocked(
             lease_repair_intent,
-            {"limit": MAX_LIVE_LEASE_RECORDS},
+            lease_repair_payload,
         )
 
         for record in source_records["jobs"]:
@@ -10529,6 +11389,26 @@ class ClioCoreQueue:
             raise QueueConflictError(f"invalid JSON record {path}: {exc}") from exc
 
 
+def _read_unique_json_document(path: Path) -> object:
+    """Read JSON while rejecting duplicate keys at every object depth."""
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        document: dict[str, object] = {}
+        for key, value in pairs:
+            if key in document:
+                raise QueueConflictError(f"duplicate JSON key {key!r} in {path}")
+            document[key] = value
+        return document
+
+    try:
+        return json.loads(
+            _read_bounded_record_bytes(path),
+            object_pairs_hook=unique_object,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise QueueConflictError(f"invalid JSON record {path}: {exc}") from exc
+
+
 def _record_identity_field(model: type[BaseModel]) -> str:
     """Return the filename-bound identity field for a canonical queue model."""
     identity_fields: dict[type[BaseModel], str] = {
@@ -10860,6 +11740,347 @@ def _lease_index_document(identity: _LeaseIndexIdentity) -> dict[str, object]:
         "job_kind": identity.job_kind.value,
         "expires_at": identity.expires_at.isoformat(),
     }
+
+
+def _lease_capacity_aggregate_document(
+    aggregate: _LeaseCapacityAggregate,
+) -> dict[str, object]:
+    """Serialize one validated lease-capacity aggregate."""
+    return {
+        **_lease_capacity_aggregate_digest_payload(
+            epoch_id=aggregate.epoch_id,
+            generation=aggregate.generation,
+            checkpoint_id=aggregate.checkpoint_id,
+            global_live_leases=aggregate.global_live_leases,
+            cluster_kind_counts=aggregate.cluster_kind_counts,
+        ),
+        "document_sha256": aggregate.document_sha256,
+    }
+
+
+def _lease_capacity_aggregate_digest_payload(
+    *,
+    epoch_id: str,
+    generation: int,
+    checkpoint_id: str,
+    global_live_leases: int,
+    cluster_kind_counts: dict[str, dict[JobKind, int]],
+) -> dict[str, object]:
+    serialized_counts = _serialized_lease_capacity_counts(cluster_kind_counts)
+    return {
+        "schema_version": LEASE_CAPACITY_AGGREGATE_SCHEMA,
+        "epoch_id": epoch_id,
+        "generation": generation,
+        "checkpoint_id": checkpoint_id,
+        "global_live_leases": global_live_leases,
+        "cluster_kind_counts": serialized_counts,
+    }
+
+
+def _serialized_lease_capacity_counts(
+    cluster_kind_counts: dict[str, dict[JobKind, int]],
+) -> dict[str, dict[str, int]]:
+    return {
+        cluster_token: {
+            kind.value: kind_counts[kind]
+            for kind in sorted(kind_counts, key=lambda item: item.value)
+        }
+        for cluster_token, kind_counts in sorted(cluster_kind_counts.items())
+    }
+
+
+def _lease_capacity_checkpoint_document(
+    checkpoint: _LeaseCapacityCheckpoint,
+) -> dict[str, object]:
+    """Serialize one validated lease-capacity checkpoint."""
+    return {
+        **_lease_capacity_checkpoint_digest_payload(
+            epoch_id=checkpoint.epoch_id,
+            generation=checkpoint.generation,
+            checkpoint_id=checkpoint.checkpoint_id,
+            aggregate_document_sha256=checkpoint.aggregate_document_sha256,
+        ),
+        "document_sha256": checkpoint.document_sha256,
+    }
+
+
+def _lease_capacity_checkpoint_digest_payload(
+    *,
+    epoch_id: str,
+    generation: int,
+    checkpoint_id: str,
+    aggregate_document_sha256: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": LEASE_CAPACITY_CHECKPOINT_SCHEMA,
+        "epoch_id": epoch_id,
+        "generation": generation,
+        "checkpoint_id": checkpoint_id,
+        "aggregate_document_sha256": aggregate_document_sha256,
+    }
+
+
+def _canonical_document_sha256(document: dict[str, object]) -> str:
+    encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _new_lease_capacity_pair(
+    counts: dict[str, dict[JobKind, int]],
+    *,
+    epoch_id: str | None = None,
+    generation: int = 0,
+    checkpoint_id: str | None = None,
+) -> _LeaseCapacityPair:
+    normalized = _normalize_lease_capacity_counts(counts)
+    selected_epoch = epoch_id or uuid4().hex
+    selected_checkpoint = checkpoint_id or uuid4().hex
+    global_total = sum(sum(by_kind.values()) for by_kind in normalized.values())
+    payload = _lease_capacity_aggregate_digest_payload(
+        epoch_id=selected_epoch,
+        generation=generation,
+        checkpoint_id=selected_checkpoint,
+        global_live_leases=global_total,
+        cluster_kind_counts=normalized,
+    )
+    aggregate_digest = _canonical_document_sha256(payload)
+    aggregate = _LeaseCapacityAggregate(
+        epoch_id=selected_epoch,
+        generation=generation,
+        checkpoint_id=selected_checkpoint,
+        global_live_leases=global_total,
+        cluster_kind_counts=normalized,
+        document_sha256=aggregate_digest,
+    )
+    checkpoint_payload = _lease_capacity_checkpoint_digest_payload(
+        epoch_id=selected_epoch,
+        generation=generation,
+        checkpoint_id=selected_checkpoint,
+        aggregate_document_sha256=aggregate_digest,
+    )
+    checkpoint = _LeaseCapacityCheckpoint(
+        epoch_id=selected_epoch,
+        generation=generation,
+        checkpoint_id=selected_checkpoint,
+        aggregate_document_sha256=aggregate_digest,
+        document_sha256=_canonical_document_sha256(checkpoint_payload),
+    )
+    return _LeaseCapacityPair(aggregate=aggregate, checkpoint=checkpoint)
+
+
+def _normalize_lease_capacity_counts(
+    counts: dict[str, dict[JobKind, int]],
+) -> dict[str, dict[JobKind, int]]:
+    normalized: dict[str, dict[JobKind, int]] = {}
+    scopes = 0
+    total = 0
+    for cluster_token, kind_counts in counts.items():
+        if not _is_short_ref_token(cluster_token):
+            raise QueueConflictError("lease capacity aggregate has an invalid cluster scope")
+        selected: dict[JobKind, int] = {}
+        for kind, count in kind_counts.items():
+            if isinstance(count, bool) or count <= 0:
+                raise QueueConflictError(
+                    "lease capacity aggregate counts must be positive integers"
+                )
+            if kind in selected:
+                raise QueueConflictError("lease capacity aggregate repeats a job kind")
+            selected[kind] = count
+            scopes += 1
+            total += count
+        if not selected:
+            raise QueueConflictError("lease capacity aggregate contains an empty cluster scope")
+        normalized[cluster_token] = selected
+    if scopes > MAX_LEASE_CAPACITY_SCOPES:
+        raise QueueConflictError(
+            "lease capacity aggregate exceeds its nonzero scope bound of "
+            f"{MAX_LEASE_CAPACITY_SCOPES}"
+        )
+    if total > MAX_LIVE_LEASE_RECORDS:
+        raise QueueConflictError(
+            f"lease capacity aggregate exceeds its live lease bound of {MAX_LIVE_LEASE_RECORDS}"
+        )
+    return normalized
+
+
+def _lease_capacity_aggregate_from_document(
+    value: object,
+    *,
+    label: str,
+) -> _LeaseCapacityAggregate:
+    if not isinstance(value, dict):
+        raise QueueConflictError(f"{label} is not an object")
+    document = cast(dict[str, object], value)
+    expected_fields = {
+        "schema_version",
+        "epoch_id",
+        "generation",
+        "checkpoint_id",
+        "global_live_leases",
+        "cluster_kind_counts",
+        "document_sha256",
+    }
+    if set(document) != expected_fields or document.get("schema_version") != (
+        LEASE_CAPACITY_AGGREGATE_SCHEMA
+    ):
+        raise QueueConflictError(f"{label} has an unsupported schema or fields")
+    epoch_id = document.get("epoch_id")
+    generation = document.get("generation")
+    checkpoint_id = document.get("checkpoint_id")
+    global_total = document.get("global_live_leases")
+    raw_counts = document.get("cluster_kind_counts")
+    digest = document.get("document_sha256")
+    if (
+        not _is_capacity_identity(epoch_id)
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 0
+        or not _is_capacity_identity(checkpoint_id)
+        or isinstance(global_total, bool)
+        or not isinstance(global_total, int)
+        or not 0 <= global_total <= MAX_LIVE_LEASE_RECORDS
+        or not isinstance(raw_counts, dict)
+        or not _is_sha256_digest(digest)
+    ):
+        raise QueueConflictError(f"{label} has invalid identity or count fields")
+    counts: dict[str, dict[JobKind, int]] = {}
+    for cluster_token, raw_kind_counts in cast(dict[object, object], raw_counts).items():
+        if not isinstance(cluster_token, str) or not isinstance(raw_kind_counts, dict):
+            raise QueueConflictError(f"{label} has an invalid cluster scope")
+        parsed: dict[JobKind, int] = {}
+        for raw_kind, raw_count in cast(dict[object, object], raw_kind_counts).items():
+            if not isinstance(raw_kind, str):
+                raise QueueConflictError(f"{label} has an invalid job kind")
+            try:
+                kind = JobKind(raw_kind)
+            except ValueError as exc:
+                raise QueueConflictError(f"{label} has an invalid job kind") from exc
+            if kind.value != raw_kind:
+                raise QueueConflictError(f"{label} has a noncanonical job kind")
+            if isinstance(raw_count, bool) or not isinstance(raw_count, int):
+                raise QueueConflictError(f"{label} has an invalid lease count")
+            parsed[kind] = raw_count
+        counts[cluster_token] = parsed
+    normalized = _normalize_lease_capacity_counts(counts)
+    observed_total = sum(sum(by_kind.values()) for by_kind in normalized.values())
+    if observed_total != global_total:
+        raise QueueConflictError(f"{label} global and scoped counts disagree")
+    payload = _lease_capacity_aggregate_digest_payload(
+        epoch_id=cast(str, epoch_id),
+        generation=generation,
+        checkpoint_id=cast(str, checkpoint_id),
+        global_live_leases=global_total,
+        cluster_kind_counts=normalized,
+    )
+    if _canonical_document_sha256(payload) != digest:
+        raise QueueConflictError(f"{label} checksum mismatch")
+    return _LeaseCapacityAggregate(
+        epoch_id=cast(str, epoch_id),
+        generation=generation,
+        checkpoint_id=cast(str, checkpoint_id),
+        global_live_leases=global_total,
+        cluster_kind_counts=normalized,
+        document_sha256=cast(str, digest),
+    )
+
+
+def _lease_capacity_checkpoint_from_document(
+    value: object,
+    *,
+    label: str,
+) -> _LeaseCapacityCheckpoint:
+    if not isinstance(value, dict):
+        raise QueueConflictError(f"{label} is not an object")
+    document = cast(dict[str, object], value)
+    expected_fields = {
+        "schema_version",
+        "epoch_id",
+        "generation",
+        "checkpoint_id",
+        "aggregate_document_sha256",
+        "document_sha256",
+    }
+    if set(document) != expected_fields or document.get("schema_version") != (
+        LEASE_CAPACITY_CHECKPOINT_SCHEMA
+    ):
+        raise QueueConflictError(f"{label} has an unsupported schema or fields")
+    epoch_id = document.get("epoch_id")
+    generation = document.get("generation")
+    checkpoint_id = document.get("checkpoint_id")
+    aggregate_digest = document.get("aggregate_document_sha256")
+    digest = document.get("document_sha256")
+    if (
+        not _is_capacity_identity(epoch_id)
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 0
+        or not _is_capacity_identity(checkpoint_id)
+        or not _is_sha256_digest(aggregate_digest)
+        or not _is_sha256_digest(digest)
+    ):
+        raise QueueConflictError(f"{label} has invalid identity fields")
+    payload = _lease_capacity_checkpoint_digest_payload(
+        epoch_id=cast(str, epoch_id),
+        generation=generation,
+        checkpoint_id=cast(str, checkpoint_id),
+        aggregate_document_sha256=cast(str, aggregate_digest),
+    )
+    if _canonical_document_sha256(payload) != digest:
+        raise QueueConflictError(f"{label} checksum mismatch")
+    return _LeaseCapacityCheckpoint(
+        epoch_id=cast(str, epoch_id),
+        generation=generation,
+        checkpoint_id=cast(str, checkpoint_id),
+        aggregate_document_sha256=cast(str, aggregate_digest),
+        document_sha256=cast(str, digest),
+    )
+
+
+def _validate_lease_capacity_pair(pair: _LeaseCapacityPair, *, label: str) -> None:
+    aggregate = pair.aggregate
+    checkpoint = pair.checkpoint
+    if (
+        checkpoint.epoch_id != aggregate.epoch_id
+        or checkpoint.generation != aggregate.generation
+        or checkpoint.checkpoint_id != aggregate.checkpoint_id
+        or checkpoint.aggregate_document_sha256 != aggregate.document_sha256
+    ):
+        raise QueueConflictError(f"{label} aggregate and checkpoint disagree")
+
+
+def _lease_capacity_pair_payload(pair: _LeaseCapacityPair) -> dict[str, object]:
+    return {
+        "aggregate": _lease_capacity_aggregate_document(pair.aggregate),
+        "checkpoint": _lease_capacity_checkpoint_document(pair.checkpoint),
+    }
+
+
+def _lease_capacity_pair_from_payload(value: object, *, label: str) -> _LeaseCapacityPair:
+    if not isinstance(value, dict):
+        raise QueueConflictError(f"{label} is not a lease capacity pair")
+    payload = cast(dict[str, object], value)
+    if set(payload) != {"aggregate", "checkpoint"}:
+        raise QueueConflictError(f"{label} is not a lease capacity pair")
+    pair = _LeaseCapacityPair(
+        aggregate=_lease_capacity_aggregate_from_document(
+            payload.get("aggregate"),
+            label=f"{label} aggregate",
+        ),
+        checkpoint=_lease_capacity_checkpoint_from_document(
+            payload.get("checkpoint"),
+            label=f"{label} checkpoint",
+        ),
+    )
+    _validate_lease_capacity_pair(pair, label=label)
+    return pair
+
+
+def _is_capacity_identity(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 32
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _lease_index_identity_from_document(
@@ -11497,6 +12718,34 @@ def _index_integer(index: dict[str, object], field: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise QueueConflictError(f"invalid job index integer: {field}")
     return value
+
+
+def _index_migration_components_complete(state: dict[str, object]) -> bool:
+    """Return whether every independently replayable index checkpoint is complete."""
+    for field in (
+        "families",
+        "order_families",
+        "global_order_families",
+        "retention_families",
+        "operational_families",
+    ):
+        raw_family = state.get(field)
+        if not isinstance(raw_family, dict):
+            return False
+        if any(
+            not isinstance(raw_checkpoint, dict)
+            or cast(dict[str, object], raw_checkpoint).get("complete") is not True
+            for raw_checkpoint in cast(dict[str, object], raw_family).values()
+        ):
+            return False
+    for field in ("finalize", "lease_operational_repair", "lease_capacity_aggregate"):
+        raw_checkpoint = state.get(field)
+        if (
+            not isinstance(raw_checkpoint, dict)
+            or cast(dict[str, object], raw_checkpoint).get("complete") is not True
+        ):
+            return False
+    return True
 
 
 def _migration_batch_paths(

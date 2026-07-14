@@ -211,6 +211,12 @@ def run_queue_management_validation(
                 )
             )
         _require_quiet_validation_queue(queue, cluster=cluster)
+        _validate_lease_capacity_audit(
+            recorder,
+            queue,
+            check_id="queue.lease-capacity-audit-initial",
+            cluster=cluster,
+        )
         heartbeat_snapshot = _worker_heartbeat_snapshot(capacity)
         _require(
             len(heartbeat_snapshot) >= VALIDATION_MINIMUM_TOTAL_CONCURRENCY,
@@ -576,9 +582,58 @@ def run_queue_management_validation(
         timeout_seconds=scheduler_timeout_seconds,
         poll_seconds=scheduler_poll_seconds,
     )
-    final_error = _combined_error(primary_error, cleanup_error)
+    capacity_audit_error: Exception | None = None
+    try:
+        _validate_lease_capacity_audit(
+            recorder,
+            queue,
+            check_id="queue.lease-capacity-audit-final",
+            cluster=cluster,
+        )
+    except Exception as exc:
+        capacity_audit_error = exc
+    final_error = _combined_error(
+        _combined_error(primary_error, cleanup_error),
+        capacity_audit_error,
+    )
     recorder.finish(final_error)
     return report
+
+
+def _validate_lease_capacity_audit(
+    recorder: ValidationRecorder,
+    queue: ClioCoreQueue,
+    *,
+    check_id: str,
+    cluster: str,
+) -> None:
+    with recorder.check(
+        check_id,
+        "prove canonical leases, exact operational indexes, and admission counts agree",
+    ) as evidence:
+        audit = queue.audit_lease_capacity()
+        _require(audit.get("valid") is True, "lease capacity audit did not pass")
+        aggregate = _mapping(audit.get("aggregate"), "lease capacity aggregate")
+        canonical = _mapping(audit.get("canonical"), "canonical lease capacity")
+        operational = _mapping(
+            audit.get("operational_indexes"),
+            "lease operational indexes",
+        )
+        evidence.append(
+            _evidence(
+                "lease_capacity_audit",
+                f"relay-queue://{cluster}/lease-capacity",
+                {
+                    "schema_version": audit.get("schema_version"),
+                    "valid": True,
+                    "scan_truncated": audit.get("scan_truncated"),
+                    "result_truncated": audit.get("result_truncated"),
+                    "canonical": canonical,
+                    "operational_indexes": operational,
+                    "aggregate": aggregate,
+                },
+            )
+        )
 
 
 def _cancel_optional_anchor(

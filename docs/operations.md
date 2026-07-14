@@ -33,12 +33,14 @@ Migration holds the queue lock for one bounded batch at a time and resumes from
 durable checkpoints after interruption. Jobs, endpoints, gateway sessions, and
 monitor rules receive stable global sequence indexes; task, artifact, progress,
 active-resource, and terminal-retention indexes are migrated in the same gated
-upgrade. While any checkpoint is incomplete, submission, endpoint registration,
-gateway creation, monitor creation, worker acquisition, paged reads, and terminal
-collection fail with an actionable `queue migrate-indexes` error. They never fall
-back to an unbounded scan or read a partial index. The generated systemd user unit
-uses `ExecStartPre` with `--all`, so a migration error prevents the worker from
-starting and remains visible in the unit journal.
+upgrade. Existing queues also receive a crash-replayed lease-capacity aggregate
+only after canonical leases and every exact operational index have been rebuilt
+and reconciled. While any checkpoint is incomplete, submission, endpoint
+registration, gateway creation, monitor creation, worker acquisition, paged
+reads, and terminal collection fail with an actionable `queue migrate-indexes`
+error. They never fall back to an unbounded scan or read a partial index. The
+generated systemd user unit uses `ExecStartPre` with `--all`, so a migration
+error prevents the worker from starting and remains visible in the unit journal.
 
 ### Upgrade v0.9 output records
 
@@ -299,8 +301,28 @@ The same payloads expose `active_job_capacity` with `limit`, `used`,
 stable `active_job_capacity_reached` error before the durable active population
 can exceed 10,000 records. A queue inherited above that bound remains readable
 and drainable, but accepts no additional work until it is below the limit.
-Live lease ownership and kind-capacity scans use this same 10,000-record bound;
-10,001 records fail closed instead of silently omitting an active lease.
+Live lease admission uses the durable two-record capacity pair for a constant
+number of filesystem reads, then selects the requested cluster-kind count in
+memory. The pair is self-digested and independently checkpointed with one epoch,
+monotonic generation, and checkpoint identity; missing, torn, duplicated,
+hard-linked, oversized, or mismatched records fail closed. It is updated under
+the same cross-process lock and transition journal as canonical leases.
+
+Run the full exact audit whenever diagnosing storage damage, after offline
+maintenance, or before and after a repair:
+
+```powershell
+clio-relay queue audit-lease-capacity --cluster my-cluster
+clio-relay queue repair-lease-indexes --cluster my-cluster
+clio-relay queue audit-lease-capacity --cluster my-cluster
+```
+
+The audit returns `clio-relay.lease-capacity-audit.v1` JSON and exits nonzero
+unless canonical leases, manifests, identity/expiry references, endpoint and
+cluster-kind scopes, and aggregate totals all agree within the explicit
+10,000-record bound. Repair is separately explicit: it rebuilds exact indexes
+from canonical leases, creates a new aggregate epoch, and leaves jobs and
+scheduler work untouched.
 
 Stale cleanup is a dry run by default. Executing it can recover an expired
 lease or stop a stale owned relay task, but it never requests scheduler

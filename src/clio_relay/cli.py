@@ -4827,6 +4827,33 @@ def queue_repair_lease_indexes(
     typer.echo(json.dumps(result, indent=2))
 
 
+@queue_app.command("audit-lease-capacity")
+def queue_audit_lease_capacity(
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to audit over SSH, or local storage."),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option(
+            help="Maximum canonical leases and index records audited.",
+            min=1,
+            max=10_000,
+        ),
+    ] = 10_000,
+) -> None:
+    """Audit canonical leases, exact indexes, and the O(1) capacity aggregate."""
+    args = ["queue", "audit-lease-capacity", "--limit", str(limit)]
+    if cluster is not None:
+        args.extend(["--cluster", cluster])
+    if _try_remote_cluster_passthrough(cluster, args):
+        return
+    report = ClioCoreQueue(RelaySettings.from_env().core_dir).audit_lease_capacity(limit=limit)
+    typer.echo(json.dumps(report, indent=2))
+    if report.get("valid") is not True:
+        raise typer.Exit(code=1)
+
+
 @queue_app.command("diagnose")
 def queue_diagnose(
     job_id: str,
