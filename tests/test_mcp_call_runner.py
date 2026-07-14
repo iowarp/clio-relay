@@ -1425,6 +1425,22 @@ for line in sys.stdin:
         encoding="utf-8",
     )
 
+    server_artifact = cast(Any, runner)._server_artifact_identity(
+        sys.executable,
+        [str(server)],
+    )
+
+    def preflighted_server_artifact(
+        _server: str,
+        _server_args: list[str],
+    ) -> dict[str, Any]:
+        return deepcopy(server_artifact)
+
+    monkeypatch.setattr(
+        cast(Any, runner),
+        "_server_artifact_identity",
+        preflighted_server_artifact,
+    )
     started = time.monotonic()
     return_code = cast(McpCallRunnerModule, runner).run_mcp_call_from_params(
         {
