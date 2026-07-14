@@ -251,6 +251,132 @@ def test_release_lease_retries_windows_sharing_violation(
     assert list((queue.root / "transition_intents").glob("*.json")) == []
 
 
+@pytest.mark.parametrize("reader", ["list", "scan", "job-scan"])
+def test_lease_snapshot_readers_serialize_with_concurrent_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: str,
+) -> None:
+    """A legitimate worker release cannot invalidate an in-flight lease snapshot."""
+    queue = ClioCoreQueue(tmp_path / "core")
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="lease-scan-release-race",
+        )
+    )
+    lease = queue.acquire_next_job("lease-scan-worker", cluster="ares")
+    assert lease is not None
+    observed_path = (
+        queue.root / "leases_by_job" / job.job_id / f"{lease.lease_id}.json"
+        if reader == "job-scan"
+        else queue.root / "leases" / f"{lease.lease_id}.json"
+    )
+    scan_reached_record = threading.Event()
+    release_started = threading.Event()
+    release_finished = threading.Event()
+    release_errors: list[BaseException] = []
+    scan_thread_id = threading.get_ident()
+    original_read = core_queue_module._read_bounded_record_bytes  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def observe_index_read(path: Path) -> bytes:
+        if (
+            logical_filesystem_path(path) == observed_path
+            and threading.get_ident() == scan_thread_id
+        ):
+            assert (
+                queue._lock._owner_thread_id == scan_thread_id  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            )
+            scan_reached_record.set()
+            assert release_started.wait(timeout=5)
+            assert not release_finished.is_set()
+        return original_read(path)
+
+    def release() -> None:
+        try:
+            assert scan_reached_record.wait(timeout=5)
+            release_started.set()
+            queue.release_lease(lease.lease_id)
+        except BaseException as exc:
+            release_errors.append(exc)
+        finally:
+            release_finished.set()
+
+    monkeypatch.setattr(core_queue_module, "_read_bounded_record_bytes", observe_index_read)
+    thread = threading.Thread(target=release, daemon=True)
+    thread.start()
+
+    if reader == "list":
+        leases = queue.list_leases(cluster="ares")
+        truncated = False
+    elif reader == "scan":
+        leases, truncated = queue.scan_leases(limit=10, cluster="ares")
+    else:
+        leases, truncated = queue.scan_job_leases(job.job_id, limit=10)
+    thread.join(timeout=5)
+
+    assert not truncated
+    assert leases == [lease]
+    assert not thread.is_alive()
+    assert release_errors == []
+    assert release_finished.is_set()
+    assert queue.scan_job_leases(job.job_id, limit=10) == ([], False)
+
+
+@pytest.mark.parametrize("reader", ["list", "page", "scan"])
+def test_task_snapshot_readers_hold_queue_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: str,
+) -> None:
+    """Task snapshots cannot race terminal-job GC of their selected record family."""
+    queue = ClioCoreQueue(tmp_path / "core")
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key=f"task-snapshot-lock-{reader}",
+        )
+    )
+    task = queue.append_task(RelayTask(job_id=job.job_id, name="locked-snapshot"))
+    observed = threading.Event()
+    reader_thread_id = threading.get_ident()
+    original_read = core_queue_module._read_bounded_record_bytes  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def require_lock(path: Path) -> bytes:
+        logical = logical_filesystem_path(path)
+        per_job_family = logical.parent.parent.name
+        selected_task_record = (
+            logical.parent.name == "tasks" and logical.name == f"{task.task_id}.json"
+        ) or (per_job_family == "tasks_by_job" and logical.name == f"{task.task_id}.json")
+        selected_order_record = per_job_family == "task_order_by_job"
+        if (
+            selected_task_record or selected_order_record
+        ) and threading.get_ident() == reader_thread_id:
+            assert (
+                queue._lock._owner_thread_id == reader_thread_id  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            )
+            observed.set()
+        return original_read(path)
+
+    monkeypatch.setattr(core_queue_module, "_read_bounded_record_bytes", require_lock)
+    if reader == "list":
+        tasks = queue.list_tasks(job.job_id)
+    elif reader == "page":
+        tasks, next_cursor, total = queue.list_tasks_page(job.job_id, limit=10)
+        assert next_cursor is None
+        assert total == 1
+    else:
+        tasks, truncated = queue.scan_job_tasks(job.job_id, limit=10)
+        assert not truncated
+
+    assert tasks == [task]
+    assert observed.is_set()
+
+
 def test_release_lease_sharing_violation_exhaustion_replays_on_restart(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -3218,24 +3218,26 @@ class ClioCoreQueue:
     def list_leases(self, cluster: str | None = None) -> list[Lease]:
         """Return active and expired leases, optionally filtered by job cluster."""
         self.initialize()
-        leases = list(
-            self._read_many(
-                self._storage_root / "leases",
-                Lease,
-                identity_field="lease_id",
+        with self._lock:
+            self._recover_pending_transitions_unlocked()
+            leases = list(
+                self._read_many(
+                    self._storage_root / "leases",
+                    Lease,
+                    identity_field="lease_id",
+                )
             )
-        )
-        if cluster is not None:
-            matched: list[Lease] = []
-            for lease in leases:
-                try:
-                    job = self.get_job(lease.job_id)
-                except NotFoundError:
-                    continue
-                if job.cluster == cluster:
-                    matched.append(lease)
-            leases = matched
-        return sorted(leases, key=lambda lease: lease.acquired_at)
+            if cluster is not None:
+                matched: list[Lease] = []
+                for lease in leases:
+                    try:
+                        job = self.get_job(lease.job_id)
+                    except NotFoundError:
+                        continue
+                    if job.cluster == cluster:
+                        matched.append(lease)
+                leases = matched
+            return sorted(leases, key=lambda lease: lease.acquired_at)
 
     def scan_leases(
         self,
@@ -3244,33 +3246,39 @@ class ClioCoreQueue:
         cluster: str | None = None,
     ) -> tuple[list[Lease], bool]:
         """Read a bounded durable lease snapshot."""
-        leases, truncated = self._scan_many(
-            self._storage_root / "leases",
-            Lease,
-            limit=limit,
-            identity_field="lease_id",
-        )
-        if cluster is not None:
-            matched: list[Lease] = []
-            for lease in leases:
-                try:
-                    job = self.get_job(lease.job_id)
-                except NotFoundError:
-                    continue
-                if job.cluster == cluster:
-                    matched.append(lease)
-            leases = matched
-        return sorted(leases, key=lambda lease: lease.acquired_at), truncated
+        self.initialize()
+        with self._lock:
+            self._recover_pending_transitions_unlocked()
+            leases, truncated = self._scan_many(
+                self._storage_root / "leases",
+                Lease,
+                limit=limit,
+                identity_field="lease_id",
+            )
+            if cluster is not None:
+                matched: list[Lease] = []
+                for lease in leases:
+                    try:
+                        job = self.get_job(lease.job_id)
+                    except NotFoundError:
+                        continue
+                    if job.cluster == cluster:
+                        matched.append(lease)
+                leases = matched
+            return sorted(leases, key=lambda lease: lease.acquired_at), truncated
 
     def scan_job_leases(self, job_id: str, *, limit: int) -> tuple[list[Lease], bool]:
-        """Read bounded leases from the exact per-job index."""
+        """Read bounded leases from the exact per-job index under writer exclusion."""
         job_id = self._require_durable_record_id(job_id, field="job_id")
-        directory = self._storage_root / "leases_by_job" / self._durable_key(job_id)
-        if self._job_index_exists(job_id):
-            leases, truncated = self._scan_many(directory, Lease, limit=limit)
-            return sorted(leases, key=lambda lease: lease.acquired_at), truncated
-        leases, truncated = self._scan_many(self._storage_root / "leases", Lease, limit=limit)
-        return [lease for lease in leases if lease.job_id == job_id], truncated
+        self.initialize()
+        with self._lock:
+            self._recover_pending_transitions_unlocked()
+            directory = self._storage_root / "leases_by_job" / self._durable_key(job_id)
+            if self._job_index_exists(job_id):
+                leases, truncated = self._scan_many(directory, Lease, limit=limit)
+                return sorted(leases, key=lambda lease: lease.acquired_at), truncated
+            leases, truncated = self._scan_many(self._storage_root / "leases", Lease, limit=limit)
+            return [lease for lease in leases if lease.job_id == job_id], truncated
 
     def _lease_index_identity(
         self,
@@ -5467,21 +5475,27 @@ class ClioCoreQueue:
         if job_id is not None:
             job_id = self._require_durable_record_id(job_id, field="job_id")
         self.initialize()
-        if job_id is not None and self._job_index_exists(job_id):
-            tasks = list(
-                self._read_many(
-                    self._storage_root / "tasks_by_job" / self._durable_key(job_id),
-                    RelayTask,
-                    identity_field="task_id",
+        with self._lock:
+            self._recover_pending_transitions_unlocked()
+            if job_id is not None and self._job_index_exists(job_id):
+                tasks = list(
+                    self._read_many(
+                        self._storage_root / "tasks_by_job" / self._durable_key(job_id),
+                        RelayTask,
+                        identity_field="task_id",
+                    )
                 )
-            )
-        else:
-            tasks = list(
-                self._read_many(self._storage_root / "tasks", RelayTask, identity_field="task_id")
-            )
-            if job_id is not None:
-                tasks = [task for task in tasks if task.job_id == job_id]
-        return sorted(tasks, key=lambda task: task.created_at)
+            else:
+                tasks = list(
+                    self._read_many(
+                        self._storage_root / "tasks",
+                        RelayTask,
+                        identity_field="task_id",
+                    )
+                )
+                if job_id is not None:
+                    tasks = [task for task in tasks if task.job_id == job_id]
+            return sorted(tasks, key=lambda task: task.created_at)
 
     def list_tasks_page(
         self,
@@ -5492,32 +5506,39 @@ class ClioCoreQueue:
     ) -> tuple[list[RelayTask], int | None, int]:
         """Read one stable task page from the per-job sequence index."""
         job_id = self._require_durable_record_id(job_id, field="job_id")
-        return self._read_ordered_job_page(
-            job_id,
-            family="task",
-            model=RelayTask,
-            cursor=cursor,
-            limit=limit,
-            count_field="task_count",
-        )
+        self.initialize()
+        with self._lock:
+            self._recover_pending_transitions_unlocked()
+            return self._read_ordered_job_page(
+                job_id,
+                family="task",
+                model=RelayTask,
+                cursor=cursor,
+                limit=limit,
+                count_field="task_count",
+            )
 
     def scan_job_tasks(self, job_id: str, *, limit: int) -> tuple[list[RelayTask], bool]:
         """Read bounded task records from one exact job index."""
         job_id = self._require_durable_record_id(job_id, field="job_id")
-        directory = (
-            self._storage_root / "tasks_by_job" / self._durable_key(job_id)
-            if self._job_index_exists(job_id)
-            else self._storage_root / "tasks"
-        )
-        tasks, truncated = self._scan_many(
-            directory,
-            RelayTask,
-            limit=limit,
-            identity_field="task_id",
-        )
-        if not self._job_index_exists(job_id):
-            tasks = [task for task in tasks if task.job_id == job_id]
-        return sorted(tasks, key=lambda task: task.created_at), truncated
+        self.initialize()
+        with self._lock:
+            self._recover_pending_transitions_unlocked()
+            indexed = self._job_index_exists(job_id)
+            directory = (
+                self._storage_root / "tasks_by_job" / self._durable_key(job_id)
+                if indexed
+                else self._storage_root / "tasks"
+            )
+            tasks, truncated = self._scan_many(
+                directory,
+                RelayTask,
+                limit=limit,
+                identity_field="task_id",
+            )
+            if not indexed:
+                tasks = [task for task in tasks if task.job_id == job_id]
+            return sorted(tasks, key=lambda task: task.created_at), truncated
 
     def append_task_event(self, event: TaskTimelineEvent) -> TaskTimelineEvent:
         """Append a structured task timeline event with a per-task sequence."""

@@ -786,17 +786,20 @@ jobs:
               json.dumps(claims, indent=2, sort_keys=True) + "\n",
               encoding="utf-8",
           )
-          requirements = "\n".join(
-              f"- `{requirement}`"
-              for requirement in claims["released_artifact_requirements"]
-          )
           notes = (
               f"clio-relay {tag}\n\n"
-              f"Release acceptance passed through one persistent published "
-              f"`uv tool install clio-relay=={version}` path on "
-              f"{', '.join(claims['clusters'])}. Claims are limited to the "
-              "machine-readable requirements and reports in `RELEASE-CLAIMS.json`.\n\n"
-              f"Validated requirements:\n\n{requirements}\n"
+              "Production 1.0 release for durable desktop-to-cluster execution.\n\n"
+              "Highlights:\n\n"
+              "- Generic cluster-aware virtualization of registered remote MCP servers.\n"
+              "- Explicit detach and owned-resource cleanup, with scheduler jobs preserved by default.\n"
+              "- Provider-specific scheduler lifecycle handling and structured JARVIS runtime metadata.\n"
+              "- Machine-readable progress, artifacts, provenance, and live-validation reports.\n\n"
+              f"The exact PyPI artifact was installed with "
+              f"`uv tool install clio-relay=={version}` and validated on "
+              f"{', '.join(claims['clusters'])}. See `RELEASE-CLAIMS.json` and the "
+              "attached candidate/released reports for the complete evidence. "
+              "This 1.0 release is intentionally mutable; GitHub release immutability "
+              "is planned for 1.1.\n"
           )
           (root / "evidence" / "RELEASE-NOTES.md").write_text(notes, encoding="utf-8")
           PY
