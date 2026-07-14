@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import tarfile
 from dataclasses import dataclass
@@ -189,6 +190,29 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert "UV_*|PIP_*) unset" in script
     assert "--index-url https://pypi.org/simple --no-deps --only-binary=:all:" in script
     assert "\r" not in script
+
+
+def test_linux_user_bootstrap_embedded_python_programs_compile() -> None:
+    """Reject escaping defects in every Python heredoc before cluster bootstrap."""
+    script = render_linux_user_bootstrap_script(cluster="test-cluster")
+    pattern = re.compile(
+        r"<<'(?P<marker>__CLIO_RELAY_[A-Z0-9_]+__)'\n"
+        r"(?P<body>.*?)(?=\n(?P=marker)(?:\n|$))",
+        re.DOTALL,
+    )
+    programs = list(pattern.finditer(script))
+
+    assert {program.group("marker") for program in programs} == {
+        "__CLIO_RELAY_BOOTSTRAP_RECEIPT__",
+        "__CLIO_RELAY_INSTALL_RECEIPT__",
+        "__CLIO_RELAY_NATIVE_JARVIS_PROBE__",
+        "__CLIO_RELAY_PYPI_DIGEST__",
+        "__CLIO_RELAY_WORKER_LIFETIME_FD__",
+        "__CLIO_RELAY_WORKER_WRITER_PROOF__",
+    }
+    for program in programs:
+        marker = program.group("marker")
+        compile(program.group("body"), f"bootstrap:{marker}", "exec")
 
 
 def test_custom_clio_kit_bootstrap_wheel_requires_preinstall_digest() -> None:

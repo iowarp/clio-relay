@@ -1612,7 +1612,7 @@ receipt = {{
 }}
 destination = Path.home() / ".local/share/clio-relay/bootstrap-receipt.json"
 temporary = destination.with_name(f".{{destination.name}}.{{os.getpid()}}.tmp")
-temporary.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+temporary.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\\n", encoding="utf-8")
 os.chmod(temporary, 0o600)
 os.replace(temporary, destination)
 print(f"bootstrap_receipt={{destination}}")
