@@ -446,6 +446,44 @@ def test_cli_repairs_lease_operational_indexes(
     assert endpoint_ref.is_file()
 
 
+def test_cli_audits_lease_capacity_and_exits_nonzero_on_mismatch(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="cli-audit-lease-capacity",
+        )
+    )
+    lease = queue.acquire_job(job.job_id, "worker", cluster=job.cluster)
+    assert lease is not None
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+
+    valid = CliRunner().invoke(app, ["queue", "audit-lease-capacity"])
+
+    assert valid.exit_code == 0
+    report = json.loads(valid.output)
+    assert report["schema_version"] == "clio-relay.lease-capacity-audit.v1"
+    assert report["valid"] is True
+
+    aggregate_path = core_dir / "lease_capacity" / "aggregate.json"
+    aggregate = json.loads(aggregate_path.read_text(encoding="utf-8"))
+    aggregate["document_sha256"] = "0" * 64
+    aggregate_path.write_text(json.dumps(aggregate), encoding="utf-8")
+
+    invalid = CliRunner().invoke(app, ["queue", "audit-lease-capacity"])
+
+    assert invalid.exit_code == 1
+    invalid_report = json.loads(invalid.output)
+    assert invalid_report["valid"] is False
+    assert invalid_report["mismatches"][0]["type"] == "audit_error"
+
+
 def test_cli_records_and_reads_task_events(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     core_dir = tmp_path / "core"
     queue = ClioCoreQueue(core_dir)
@@ -749,6 +787,8 @@ def test_cli_queue_validation_writes_canonical_report(
     assert {check["check_id"] for check in report["checks"]} == {
         "queue.kind-concurrency-parallel",
         "queue.kind-concurrency-worker-enforced",
+        "queue.lease-capacity-audit-initial",
+        "queue.lease-capacity-audit-final",
         "queue.list-bounded",
         "queue.diagnose-specific-reason",
         "queue.stale-dry-run",

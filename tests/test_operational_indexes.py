@@ -61,6 +61,16 @@ def _lease_operational_files(queue: ClioCoreQueue) -> list[Path]:
     ]
 
 
+def _audit_mismatches(report: dict[str, object]) -> list[dict[str, object]]:
+    raw = report.get("mismatches")
+    assert isinstance(raw, list)
+    mismatches: list[dict[str, object]] = []
+    for item in cast(list[object], raw):
+        assert isinstance(item, dict)
+        mismatches.append(cast(dict[str, object], item))
+    return mismatches
+
+
 def test_sparse_active_capacity_rejects_before_reading_payloads(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path / "core")
     queue.initialize()
@@ -113,7 +123,10 @@ def test_preexisting_over_capacity_queue_can_still_drain(
     assert lease.job_id == job.job_id
 
 
-def test_live_lease_index_cold_count_and_warm_admission_stay_bounded(tmp_path: Path) -> None:
+def test_live_lease_index_cold_count_and_warm_admission_stay_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     queue = ClioCoreQueue(tmp_path / "core")
     queued = queue.submit_job(_job("capacity-admission-probe"))
     job = _job("capacity-template").model_copy(update={"state": JobState.RUNNING})
@@ -133,7 +146,28 @@ def test_live_lease_index_cold_count_and_warm_admission_stay_bounded(tmp_path: P
         ):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch()
+    transition = queue._prepare_lease_capacity_transition_unlocked(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        scope_deltas={("ares", JobKind.JARVIS): MAX_LIVE_LEASE_RECORDS}
+    )
+    queue._apply_lease_capacity_transition_unlocked(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transition,
+        target="after",
+        label="10k performance fixture",
+    )
 
+    original_lstat = os.lstat
+    lstat_calls = 0
+
+    def count_lstat(
+        path: os.PathLike[str] | str,
+        *args: object,
+        **kwargs: object,
+    ) -> os.stat_result:
+        nonlocal lstat_calls
+        lstat_calls += 1
+        return original_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", count_lstat)
     started = perf_counter()
     counts = queue._active_lease_counts_by_kind(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares"
@@ -141,6 +175,7 @@ def test_live_lease_index_cold_count_and_warm_admission_stay_bounded(tmp_path: P
     elapsed = perf_counter() - started
 
     assert counts == {JobKind.JARVIS: MAX_LIVE_LEASE_RECORDS}
+    assert lstat_calls < 50
     assert elapsed < DEFAULT_CORE_LOCK_TIMEOUT_SECONDS, (
         "10k cold indexed lease count exceeded the queue lock timeout: "
         f"{elapsed:.3f}s >= {DEFAULT_CORE_LOCK_TIMEOUT_SECONDS:.3f}s"
@@ -169,7 +204,7 @@ def test_live_lease_capacity_fails_closed_above_active_bound(
         path.touch()
 
     with pytest.raises(QueueConflictError, match="10000 records"):
-        queue._active_lease_counts_by_kind(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        queue._exact_lease_capacity_snapshot(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cluster="ares"
         )
 
@@ -255,17 +290,17 @@ def test_lease_operational_indexes_fail_closed_on_corrupt_or_missing_ref(
     )
     kind_ref = queue._lease_cluster_kind_ref_path(identity)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     kind_ref.write_text("tampered", encoding="utf-8")
-    with pytest.raises(QueueConflictError, match="unsafe lease reference"):
-        queue._active_lease_counts_by_kind(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cluster="ares"
-        )
+    audit = queue.audit_lease_capacity()
+    assert audit["valid"] is False
+    assert _audit_mismatches(audit)[0]["type"] == "audit_error"
 
     kind_ref.write_text("", encoding="utf-8")
     kind_ref.unlink()
-    with pytest.raises(QueueConflictError, match="indexes disagree"):
-        queue._active_lease_counts_by_kind(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cluster="ares"
-        )
+    audit = queue.audit_lease_capacity()
+    assert audit["valid"] is False
+    assert any(
+        mismatch["type"] == "cluster_kind_scope_mismatch" for mismatch in _audit_mismatches(audit)
+    )
 
 
 def test_lease_indexes_reject_missing_endpoint_and_consistent_kind_relabel(
@@ -305,10 +340,12 @@ def test_lease_indexes_reject_missing_endpoint_and_consistent_kind_relabel(
     ):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
-    with pytest.raises(QueueConflictError, match="identity and expiry indexes disagree"):
-        queue._active_lease_counts_by_kind(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cluster="ares"
-        )
+    audit = queue.audit_lease_capacity()
+    assert audit["valid"] is False
+    assert any(
+        mismatch["type"] in {"orphaned_operational_reference", "missing_operational_reference"}
+        for mismatch in _audit_mismatches(audit)
+    )
 
 
 def test_lease_reference_hardlinks_fail_closed(tmp_path: Path) -> None:
@@ -327,10 +364,9 @@ def test_lease_reference_hardlinks_fail_closed(tmp_path: Path) -> None:
     os.link(source, identity_ref)
     assert os.lstat(identity_ref).st_nlink == 2
 
-    with pytest.raises(QueueConflictError, match="unsafe reference"):
-        queue._active_lease_counts_by_kind(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cluster="ares"
-        )
+    audit = queue.audit_lease_capacity()
+    assert audit["valid"] is False
+    assert _audit_mismatches(audit)[0]["type"] == "audit_error"
 
 
 def test_lease_index_writes_reject_unsafe_operational_parent(tmp_path: Path) -> None:
@@ -451,6 +487,9 @@ def test_idempotent_replay_repairs_crash_gap_after_canonical_job_write(
         "terminal",
         "lease",
         "lease_after_index",
+        "lease_after_capacity_aggregate",
+        "lease_after_capacity_checkpoint",
+        "lease_before_intent_removal",
         "task",
         "stale_before_job_exact",
         "stale_after_job_exact",
@@ -460,8 +499,20 @@ def test_idempotent_replay_repairs_crash_gap_after_canonical_job_write(
         "stale_after_job_bulk",
         "stale_after_canonical_bulk",
         "stale_after_index_bulk",
+        "stale_after_capacity_aggregate",
+        "stale_after_capacity_checkpoint",
+        "stale_before_intent_removal",
         "release_after_canonical",
         "release_after_index",
+        "release_after_capacity_aggregate",
+        "release_after_capacity_checkpoint",
+        "release_before_intent_removal",
+        "renew_after_capacity_aggregate",
+        "renew_after_capacity_checkpoint",
+        "renew_before_intent_removal",
+        "repair_after_capacity_aggregate",
+        "repair_after_capacity_checkpoint",
+        "repair_before_intent_removal",
         "gateway_close",
     ],
 )
@@ -506,6 +557,7 @@ def test_hard_exit_queue_transitions_converge_on_restart(tmp_path: Path, mode: s
         assert (queue.root / "jobs_active" / f"{job_id}.json").is_file()
         assert (queue.root / "jobs_queued" / f"{job_id}.json").is_file()
         assert _lease_operational_files(queue) == []
+        assert queue.audit_lease_capacity()["valid"] is True
     elif mode == "task":
         task_id = identity["task_id"]
         assert isinstance(task_id, str)
@@ -539,6 +591,7 @@ def test_hard_exit_queue_transitions_converge_on_restart(tmp_path: Path, mode: s
         ]
         assert len(recovery_events) == 1
         assert len(recovery_events[0]["payload"]["expired_lease_ids"]) == 2
+        assert queue.audit_lease_capacity()["valid"] is True
     elif mode.startswith("release_"):
         exact_leases, exact_truncated = queue.scan_job_leases(job_id, limit=10)
         global_leases, global_truncated = queue.scan_leases(limit=10)
@@ -546,6 +599,12 @@ def test_hard_exit_queue_transitions_converge_on_restart(tmp_path: Path, mode: s
         assert global_leases == []
         assert exact_truncated is global_truncated is False
         assert _lease_operational_files(queue) == []
+        assert queue.audit_lease_capacity()["valid"] is True
+    elif mode.startswith(("renew_", "repair_")):
+        exact_leases, exact_truncated = queue.scan_job_leases(job_id, limit=10)
+        assert len(exact_leases) == 1
+        assert exact_truncated is False
+        assert queue.audit_lease_capacity()["valid"] is True
     else:
         session_id = identity["session_id"]
         assert isinstance(session_id, str)

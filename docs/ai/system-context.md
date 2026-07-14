@@ -24,6 +24,7 @@ The durable record families are:
 - jobs
 - tasks
 - leases
+- lease-capacity aggregate and checkpoint records
 - events
 - cursors
 - artifacts
@@ -32,6 +33,12 @@ The durable record families are:
 - idempotency records
 
 Each job has monotonic events and cursor-based replay. Logs are readable by byte offset. Artifacts are indexed records that can point to backing files.
+
+Steady lease admission reads one self-validating aggregate/checkpoint pair for
+global and cluster-kind counts. Lease transitions journal the exact before and
+after generations, including a distinct rollback generation for an interrupted
+acquisition. Exact canonical and operational-index scans remain mandatory for
+migration, explicit repair, and `queue audit-lease-capacity`.
 
 ## Execution Semantics
 

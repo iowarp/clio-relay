@@ -36,6 +36,8 @@ Endpoint and job work:
 - `clio-relay queue list`
 - `clio-relay queue migration-status`
 - `clio-relay queue migrate-indexes`
+- `clio-relay queue audit-lease-capacity`
+- `clio-relay queue repair-lease-indexes`
 - `clio-relay queue diagnose <job-id>`
 - `clio-relay queue stale`
 - `clio-relay queue cleanup-stale`
