@@ -14,6 +14,8 @@ from typing import Any, cast
 
 from pytest import MonkeyPatch
 
+_OUTER_RUNNER_READINESS_TIMEOUT_SECONDS = 60.0
+
 
 def test_mcp_call_refuses_artifact_drift_before_launch(
     tmp_path: Path,
@@ -134,43 +136,74 @@ raise SystemExit(
         encoding="utf-8",
     )
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-    outer = subprocess.Popen(
-        [sys.executable, str(outer_path)],
-        cwd=tmp_path,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=os.name != "nt",
-        creationflags=creationflags,
-    )
-    nested_pids: list[int] = []
-    try:
-        _wait_for_file(pid_path, timeout=10)
-        identities = cast(dict[str, int], json.loads(pid_path.read_text(encoding="utf-8")))
-        nested_pids = [identities["server"], identities["grandchild"]]
-        assert all(_process_is_running(pid) for pid in nested_pids)
+    diagnostics_path = tmp_path / "outer-runner.log"
+    with diagnostics_path.open("wb", buffering=0) as diagnostics:
+        outer = subprocess.Popen(
+            [sys.executable, str(outer_path)],
+            cwd=tmp_path,
+            stdout=diagnostics,
+            stderr=subprocess.STDOUT,
+            start_new_session=os.name != "nt",
+            creationflags=creationflags,
+        )
+        nested_pids: list[int] = []
+        try:
+            _wait_for_file_while_running(
+                pid_path,
+                process=outer,
+                diagnostics_path=diagnostics_path,
+                timeout=_OUTER_RUNNER_READINESS_TIMEOUT_SECONDS,
+            )
+            identities = cast(dict[str, int], json.loads(pid_path.read_text(encoding="utf-8")))
+            nested_pids = [identities["server"], identities["grandchild"]]
+            assert all(_process_is_running(pid) for pid in nested_pids)
 
-        if os.name == "nt":
-            outer.send_signal(signal.CTRL_BREAK_EVENT)
-        else:
-            os.killpg(outer.pid, signal.SIGTERM)
-        outer.wait(timeout=12)
+            if os.name == "nt":
+                outer.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                os.killpg(outer.pid, signal.SIGTERM)
+            outer.wait(timeout=12)
 
-        _wait_for_processes_to_exit(nested_pids, timeout=10)
-        assert outer.returncode != 0
-        assert all(not _process_is_running(pid) for pid in nested_pids)
-    finally:
-        _force_stop_process_tree(outer)
-        for pid in nested_pids:
-            _force_stop_pid(pid)
+            _wait_for_processes_to_exit(nested_pids, timeout=10)
+            assert outer.returncode != 0
+            assert all(not _process_is_running(pid) for pid in nested_pids)
+        finally:
+            _force_stop_process_tree(outer)
+            for pid in nested_pids:
+                _force_stop_pid(pid)
 
 
-def _wait_for_file(path: Path, *, timeout: float) -> None:
+def _wait_for_file_while_running(
+    path: Path,
+    *,
+    process: subprocess.Popen[bytes],
+    diagnostics_path: Path,
+    timeout: float,
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.exists():
             return
+        return_code = process.poll()
+        if return_code is not None:
+            raise AssertionError(
+                f"process exited with code {return_code} while waiting for {path}; "
+                f"diagnostics: {_read_diagnostics(diagnostics_path)}"
+            )
         time.sleep(0.05)
-    raise AssertionError(f"timed out waiting for {path}")
+    raise AssertionError(
+        f"timed out after {timeout:.1f}s waiting for {path}; "
+        f"process_state={'running' if process.poll() is None else process.returncode}; "
+        f"diagnostics: {_read_diagnostics(diagnostics_path)}"
+    )
+
+
+def _read_diagnostics(path: Path) -> str:
+    try:
+        contents = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError as error:
+        return f"<unavailable: {error}>"
+    return contents[-4_000:] if contents else "<no output>"
 
 
 def _wait_for_processes_to_exit(pids: list[int], *, timeout: float) -> None:
