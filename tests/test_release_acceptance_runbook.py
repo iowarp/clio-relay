@@ -49,7 +49,7 @@ def test_release_identity_is_consistent_across_package_policy_matrix_and_runbook
 
 def test_candidate_manifest_parser_accepts_the_exact_gnu_checksum_separator() -> None:
     digest = "a" * 64
-    wheel_name = "clio_relay-1.0.1-py3-none-any.whl"
+    wheel_name = "clio_relay-1.0.2-py3-none-any.whl"
     selector = re.compile(rf"^[0-9A-Fa-f]{{64}} [ *]{re.escape(wheel_name)}$")
     parser = re.compile(r"^([0-9A-Fa-f]{64}) [ *](.+)$")
 

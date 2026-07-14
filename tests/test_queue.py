@@ -201,6 +201,97 @@ def test_durable_record_read_retries_wrapped_windows_sharing_denial(
     assert attempts == 2
 
 
+def test_release_lease_retries_windows_sharing_violation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="lease-delete-sharing-race",
+        )
+    )
+    lease = queue.acquire_next_job("sharing-race-worker", cluster="ares")
+    assert lease is not None
+    indexed_path = queue.root / "leases_by_job" / job.job_id / f"{lease.lease_id}.json"
+    original_unlink = Path.unlink
+    attempts = 0
+
+    def transient_unlink(path: Path, missing_ok: bool = False) -> None:
+        nonlocal attempts
+        if logical_filesystem_path(path) == indexed_path and attempts < 2:
+            attempts += 1
+            error = PermissionError(13, "simulated Windows sharing violation", str(path))
+            error.winerror = 32
+            raise error
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", transient_unlink)
+
+    queue.release_lease(lease.lease_id)
+
+    assert attempts == 2
+    assert queue.list_leases(cluster="ares") == []
+    assert queue.scan_job_leases(job.job_id, limit=10) == ([], False)
+    assert not queue._lease_index_path(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        lease.lease_id
+    ).exists()
+    assert list((queue.root / "transition_intents").glob("*.json")) == []
+
+
+def test_release_lease_sharing_violation_exhaustion_replays_on_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "core"
+    queue = ClioCoreQueue(root)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="lease-delete-sharing-replay",
+        )
+    )
+    lease = queue.acquire_next_job("sharing-replay-worker", cluster="ares")
+    assert lease is not None
+    indexed_path = queue.root / "leases_by_job" / job.job_id / f"{lease.lease_id}.json"
+    original_unlink = Path.unlink
+    attempts = 0
+
+    def blocked_unlink(path: Path, missing_ok: bool = False) -> None:
+        nonlocal attempts
+        if logical_filesystem_path(path) == indexed_path:
+            attempts += 1
+            error = PermissionError(13, "simulated persistent sharing violation", str(path))
+            error.winerror = 32
+            raise error
+        original_unlink(path, missing_ok=missing_ok)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", blocked_unlink)
+        patch.setattr(core_queue_module, "ATOMIC_REPLACE_RETRY_SECONDS", 0.0)
+        with pytest.raises(PermissionError, match="persistent sharing violation"):
+            queue.release_lease(lease.lease_id)
+
+    assert attempts == core_queue_module.ATOMIC_REPLACE_ATTEMPTS
+    assert indexed_path.is_file()
+    assert len(list((queue.root / "transition_intents").glob("*.json"))) == 1
+
+    reopened = ClioCoreQueue(root)
+    reopened.initialize()
+
+    assert reopened.list_leases(cluster="ares") == []
+    assert reopened.scan_job_leases(job.job_id, limit=10) == ([], False)
+    assert not reopened._lease_index_path(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        lease.lease_id
+    ).exists()
+    assert list((reopened.root / "transition_intents").glob("*.json")) == []
+
+
 def test_durable_record_read_retries_identity_replacement_before_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
