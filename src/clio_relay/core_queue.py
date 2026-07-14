@@ -9461,7 +9461,7 @@ def _remove_gc_candidate(
         if stat.S_ISDIR(candidate_stat.st_mode):
             os.rmdir(candidate)
         else:
-            _unlink_durable_path(candidate)
+            candidate.unlink()
     except OSError as exc:
         raise QueueConflictError(
             f"GC could not remove quarantined path {candidate}: {exc}"

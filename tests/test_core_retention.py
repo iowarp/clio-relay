@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import pytest
 
+import clio_relay.core_queue as core_queue_module
 from clio_relay.core_queue import (
     RECORD_FAMILY_MAX_BYTES,
     ClioCoreQueue,
@@ -28,6 +29,12 @@ from clio_relay.models import (
     RelayTask,
     StorageReservationEstimate,
 )
+
+
+class _SimulatedWindowsSharingViolation(PermissionError):
+    """Portable WinError 32 fixture for fail-closed GC deletion tests."""
+
+    winerror = 32
 
 
 def _intent(key: str, *, metadata: dict[str, object] | None = None) -> RelayJob:
@@ -711,6 +718,50 @@ def test_gc_purge_is_iterative_and_detects_directory_swap_races(
     with pytest.raises(QueueConflictError, match="changed during traversal"):
         _purge_tree_batch(race_root, limit=1)
     assert (moved_root / "record.json").is_file()
+
+
+def test_gc_windows_delete_does_not_retry_a_replaced_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "trash"
+    root.mkdir()
+    candidate = root / "record.json"
+    candidate.write_text("original", encoding="utf-8")
+    displaced = tmp_path / "original-record.json"
+    root_stat = os.lstat(root)
+    candidate_stat = os.lstat(candidate)
+    original_unlink = Path.unlink
+    attempts = 0
+
+    def swap_then_unlink(path: Path, missing_ok: bool = False) -> None:
+        nonlocal attempts
+        if path == candidate:
+            attempts += 1
+            if attempts == 1:
+                candidate.replace(displaced)
+                candidate.write_text("replacement", encoding="utf-8")
+                raise _SimulatedWindowsSharingViolation(
+                    13,
+                    "simulated Windows sharing violation",
+                    str(path),
+                )
+        original_unlink(path, missing_ok=missing_ok)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(core_queue_module.os, "name", "nt")
+        patch.setattr(Path, "unlink", swap_then_unlink)
+        with pytest.raises(QueueConflictError, match="could not remove quarantined path"):
+            core_queue_module._remove_gc_candidate(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                root,
+                candidate,
+                root_stat=root_stat,
+                candidate_stat=candidate_stat,
+            )
+
+    assert attempts == 1
+    assert displaced.read_text(encoding="utf-8") == "original"
+    assert candidate.read_text(encoding="utf-8") == "replacement"
 
 
 def test_terminal_gc_refuses_symlink_or_reparse_roots_without_following_them(
