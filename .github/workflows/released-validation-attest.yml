@@ -353,11 +353,17 @@ jobs:
               matrix_binding.get("stage") != "released"
               or matrix_binding.get("artifact_stage") != "published"
               or matrix_binding.get("release_version") != version
-              or matrix_binding.get("report_count") != 17
           ):
               raise SystemExit("released acceptance matrix binding does not match the release")
+          matrix_report_count = matrix_binding.get("report_count")
           expected_reports = matrix_binding.get("reports")
-          if not isinstance(expected_reports, list) or len(expected_reports) != 17:
+          if (
+              not isinstance(matrix_report_count, int)
+              or isinstance(matrix_report_count, bool)
+              or matrix_report_count <= 0
+              or not isinstance(expected_reports, list)
+              or len(expected_reports) != matrix_report_count
+          ):
               raise SystemExit("released acceptance matrix report list is incomplete")
           candidate_matrix = candidate.get("acceptance_matrix")
           candidate_decision = json.loads(candidate_gate.read_text(encoding="utf-8"))
@@ -483,7 +489,7 @@ jobs:
                       ),
                   }
               )
-          if len(reports) != matrix_binding["report_count"]:
+          if len(reports) != matrix_report_count:
               raise SystemExit("released acceptance matrix report count changed while sealing")
           binding = {
               "schema_version": "1.0",

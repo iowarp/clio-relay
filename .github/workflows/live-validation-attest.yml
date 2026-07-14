@@ -267,11 +267,17 @@ jobs:
               matrix_binding.get("stage") != "candidate"
               or matrix_binding.get("artifact_stage") != "immutable_candidate"
               or matrix_binding.get("release_version") != version
-              or matrix_binding.get("report_count") != 17
           ):
               raise SystemExit("candidate acceptance matrix binding does not match the release")
+          matrix_report_count = matrix_binding.get("report_count")
           expected_reports = matrix_binding.get("reports")
-          if not isinstance(expected_reports, list) or len(expected_reports) != 17:
+          if (
+              not isinstance(matrix_report_count, int)
+              or isinstance(matrix_report_count, bool)
+              or matrix_report_count <= 0
+              or not isinstance(expected_reports, list)
+              or len(expected_reports) != matrix_report_count
+          ):
               raise SystemExit("candidate acceptance matrix report list is incomplete")
           reports = []
           report_ids = set()
@@ -361,7 +367,7 @@ jobs:
                       "uv_executable_sha256"
                   ),
               })
-          if len(reports) != matrix_binding["report_count"]:
+          if len(reports) != matrix_report_count:
               raise SystemExit("candidate acceptance matrix report count changed while sealing")
           binding = {
               "schema_version": "1.0",

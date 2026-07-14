@@ -399,6 +399,8 @@ jobs:
               if not isinstance(matrix, dict):
                   raise SystemExit(f"{stage} report manifest has no acceptance matrix")
               sealer_id = binding.get("sealer_id")
+              matrix_report_count = matrix.get("report_count")
+              expected_reports = matrix.get("reports")
               checks = {
                   "schema": binding.get("schema_version") == "1.0",
                   "stage": binding.get("artifact_stage") == stage,
@@ -437,19 +439,22 @@ jobs:
                   "matrix_stage": matrix.get("stage") == matrix_stage,
                   "matrix_artifact_stage": matrix.get("artifact_stage") == stage,
                   "matrix_version": matrix.get("release_version") == version,
-                  "matrix_report_count": matrix.get("report_count") == 17,
+                  "matrix_report_count": isinstance(matrix_report_count, int)
+                      and not isinstance(matrix_report_count, bool)
+                      and matrix_report_count > 0
+                      and isinstance(expected_reports, list)
+                      and len(expected_reports) == matrix_report_count,
               }
               failed = sorted(name for name, passed in checks.items() if not passed)
               if failed:
                   raise SystemExit(f"invalid {stage} validation binding: {failed}")
               declared_reports = {}
               declared_report_list = binding.get("reports", [])
-              expected_reports = matrix.get("reports", [])
               if (
                   not isinstance(declared_report_list, list)
                   or not isinstance(expected_reports, list)
-                  or len(declared_report_list) != matrix.get("report_count")
-                  or len(expected_reports) != matrix.get("report_count")
+                  or len(declared_report_list) != matrix_report_count
+                  or len(expected_reports) != matrix_report_count
               ):
                   raise SystemExit(f"{stage} binding does not contain the exact matrix")
               for item in declared_report_list:

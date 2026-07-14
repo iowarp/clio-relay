@@ -78,6 +78,13 @@ def test_release_acceptance_matrix_is_complete_ordered_and_unique() -> None:
     ]
 
 
+def test_release_acceptance_upload_checks_derive_matrix_cardinality() -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+
+    assert "-ne 17" not in runbook
+    assert runbook.count("-ne $Matrix.report_count_per_stage") >= 3
+
+
 def test_release_acceptance_matrix_preserves_evidence_groups() -> None:
     reports = _matrix_reports()
     grouped: dict[str, list[str]] = {}

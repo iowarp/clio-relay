@@ -1348,6 +1348,93 @@ def test_release_report_asset_manifest_enforces_exact_ordered_matrix() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("kind", "prefix", "include_local"),
+    [
+        ("candidate", "validation", True),
+        ("released", "released-validation", False),
+    ],
+)
+def test_release_report_asset_manifest_derives_configurable_matrix_cardinality(
+    kind: str,
+    prefix: str,
+    include_local: bool,
+) -> None:
+    raw_matrix: dict[str, object] = {
+        "schema_version": "clio-relay.release-acceptance-matrix.v1",
+        "release_version": "1.0.0",
+        "matrix_sha256": "",
+        "report_count_per_stage": 2,
+        "target_labels_are_policy_evidence_instances": True,
+        "stages": [
+            {
+                "name": "candidate",
+                "artifact_stage": "immutable_candidate",
+                "filename_prefix": "validation",
+            },
+            {
+                "name": "released",
+                "artifact_stage": "published",
+                "filename_prefix": "released-validation",
+            },
+        ],
+        "reports": [
+            {
+                "ordinal": ordinal,
+                "id": report_id,
+                "cluster": cluster,
+                "scenario": "cleanup",
+                "command": ["clio-relay", "session", "cleanup"],
+                "report_option": "--report",
+            }
+            for ordinal, report_id, cluster in (
+                (1, "site-alpha-cleanup", "site-alpha"),
+                (2, "site-beta-cleanup", "site-beta"),
+            )
+        ],
+    }
+    canonical = dict(raw_matrix)
+    del canonical["matrix_sha256"]
+    raw_matrix["matrix_sha256"] = hashlib.sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    report_assets = [
+        (f"{prefix}-site-alpha-cleanup.json", 3),
+        (f"{prefix}-site-beta-cleanup.json", 4),
+    ]
+    assets = ([("validation-local.json", 2)] if include_local else []) + report_assets
+
+    manifest = build_validation_report_asset_manifest(
+        _release_assets(assets),
+        kind=kind,
+        acceptance_matrix=raw_matrix,
+    )
+
+    binding = cast(dict[str, object], manifest["acceptance_matrix"])
+    assert binding["report_count"] == 2
+    assert [
+        cast(str, report["id"]) for report in cast(list[dict[str, object]], binding["reports"])
+    ] == ["site-alpha-cleanup", "site-beta-cleanup"]
+
+    with pytest.raises(ProvenanceError, match="do not exactly match"):
+        build_validation_report_asset_manifest(
+            _release_assets(assets[:-1]),
+            kind=kind,
+            acceptance_matrix=raw_matrix,
+        )
+    with pytest.raises(ProvenanceError, match="do not exactly match"):
+        build_validation_report_asset_manifest(
+            _release_assets([*assets, (f"{prefix}-site-gamma-cleanup.json", 5)]),
+            kind=kind,
+            acceptance_matrix=raw_matrix,
+        )
+
+
 @pytest.mark.parametrize("mutation", ["count", "single_size", "aggregate", "unsafe", "missing"])
 def test_validation_report_asset_manifest_rejects_unbounded_or_ambiguous_inputs(
     mutation: str,

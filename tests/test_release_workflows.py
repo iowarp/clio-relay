@@ -825,10 +825,18 @@ def test_release_seals_decisions_and_claims_bind_the_exact_matrix() -> None:
     finalization = (WORKFLOWS / "finalize-release.yml").read_text(encoding="utf-8")
 
     assert '"acceptance_matrix": matrix_binding' in candidate
-    assert 'matrix_binding.get("report_count") != 17' in candidate
+    assert 'matrix_report_count = matrix_binding.get("report_count")' in candidate
+    assert "len(expected_reports) != matrix_report_count" in candidate
+    assert 'matrix_binding.get("report_count") != 17' not in candidate
     assert 'decision.get("acceptance_report_ids") == expected_ids' in gate
     assert '"acceptance_matrix": matrix_binding' in released
+    assert 'matrix_report_count = matrix_binding.get("report_count")' in released
+    assert "len(expected_reports) != matrix_report_count" in released
+    assert 'matrix_binding.get("report_count") != 17' not in released
     assert "candidate-to-released matrix binding failed" in released
+    assert 'matrix_report_count = matrix.get("report_count")' in finalization
+    assert "len(expected_reports) == matrix_report_count" in finalization
+    assert 'matrix.get("report_count") == 17' not in finalization
     assert '"ordered_report_ids": released_matrix_ids' in finalization
     assert '"ordered_report_document_ids": ordered_document_ids' in finalization
 

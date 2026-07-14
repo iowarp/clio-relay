@@ -212,11 +212,14 @@ phases, a bounded 20-step JARVIS-native Gray-Scott progress and artifact query,
 safe cleanup and explicit owned-job cancellation, homelab transport and
 cleanup, and the gateway runtime.
 Use the executable [1.0 live acceptance runbook](release-acceptance-1.0.md) and
-its tracked 17-report matrix. The matrix carries a canonical semantic SHA-256,
-the candidate and released filename prefixes, and the ordered logical report
-identities. Candidate and released preflight reject any missing, extra, renamed,
-or reordered logical entry; the policy evaluator then requires every one of the
-17 report documents to participate in a satisfied requirement. Both seals,
+its tracked policy-defined matrix, which contains 17 reports for 1.0. The matrix
+carries a canonical semantic SHA-256, the candidate and released filename
+prefixes, and the ordered logical report identities. Candidate and released
+preflight reject any missing, extra, renamed, or reordered logical entry; the
+policy evaluator then requires every report declared by that matrix to
+participate in a satisfied requirement. Protected workflows derive their report
+cardinality from the self-digested matrix, so extending the release to another
+target changes policy evidence and its digest, not workflow code. Both seals,
 both decisions, and final claims bind the same matrix digest and order. The
 runbook assigns fresh candidate or released pipeline, session, gateway,
 invocation, report, and output identities and keeps the two evidence stages

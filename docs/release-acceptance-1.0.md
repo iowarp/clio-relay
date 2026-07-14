@@ -1324,9 +1324,11 @@ for ($Index = 0; $Index -lt $OrderedMatrix.Count; $Index++) {
     throw "policy report cluster/scenario does not match matrix entry $($Expected.id)"
   }
 }
-if (($Documents.report_id | Sort-Object -Unique).Count -ne 17) { throw "duplicate report id" }
+if (($Documents.report_id | Sort-Object -Unique).Count -ne $Matrix.report_count_per_stage) {
+  throw "duplicate report id"
+}
 $InvocationIds = $Documents | ForEach-Object { $_.evidence_trust.invocation_id }
-if (($InvocationIds | Sort-Object -Unique).Count -ne 17) {
+if (($InvocationIds | Sort-Object -Unique).Count -ne $Matrix.report_count_per_stage) {
   throw "duplicate or missing invocation id"
 }
 if (($Documents | Where-Object status -ne "passed").Count -ne 0) { throw "non-passing report" }
