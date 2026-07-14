@@ -5,6 +5,7 @@ from __future__ import annotations
 from clio_relay.command_evidence import (
     ERROR_DETAIL_MAX_BYTES,
     EVIDENCE_EXCERPT_MAX_BYTES,
+    bounded_error_detail,
     command_evidence,
 )
 
@@ -78,3 +79,13 @@ def test_large_output_without_marker_keeps_start_and_tail() -> None:
     assert evidence.excerpt.startswith("initial command context")
     assert evidence.excerpt.endswith("final failure status")
     assert evidence.metadata["diagnostic_marker"] is None
+
+
+def test_bounded_error_detail_handles_oversized_and_invalid_unicode() -> None:
+    """Provider diagnostics are UTF-8 safe and fit durable record limits."""
+    detail = bounded_error_detail("first cause\ud800" + ("x" * 300_000) + "final status")
+
+    assert detail is not None
+    assert detail.startswith("first cause?")
+    assert detail.endswith("final status")
+    assert len(detail.encode("utf-8")) <= ERROR_DETAIL_MAX_BYTES

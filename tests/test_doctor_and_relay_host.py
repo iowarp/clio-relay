@@ -242,7 +242,7 @@ def test_endpoint_user_service_escapes_arbitrary_labels_and_values() -> None:
         definition=ClusterDefinition(
             name="Target GPU",
             ssh_host="target-gpu",
-            agent_bin='/opt/agent "current"\nEnvironment=FORGED=1',
+            agent_bin='/opt/agent "current" %n',
         ),
     )
 
@@ -250,7 +250,7 @@ def test_endpoint_user_service_escapes_arbitrary_labels_and_values() -> None:
     assert rendered.count("\nEnvironment=") == 9
     assert "\\nExecStart=/bin/false" in rendered
     assert "%%n" in rendered
-    assert "\\nEnvironment=FORGED=1" in rendered
+    assert 'CLIO_RELAY_AGENT_BIN=/opt/agent \\"current\\" %%n' in rendered
 
 
 def test_endpoint_service_install_uses_safe_unit_name_and_bounded_ssh(

@@ -8,7 +8,7 @@
 
 It is a piece of the federation layer for [`clio-agent`](https://github.com/iowarp/clio-agent): a local CLIO experience can delegate work to a remote machine, keep observing it, detach, reconnect, and clean up after itself. The project is also designed for use outside CLIO. Any client that can call the CLI, HTTP API, or MCP tools can use the same relay model.
 
-> The current development candidate is `1.0.7`. The `v1.0.0` candidate
+> The current development candidate is `1.0.8`. The `v1.0.0` candidate
 > was abandoned before publication after its acceptance runbook rejected the
 > staged GNU checksum format; `v1.0.1` was also abandoned before publication
 > after protected-main validation exposed a Windows lease-deletion race;
@@ -23,8 +23,11 @@ It is a piece of the federation layer for [`clio-agent`](https://github.com/iowa
 > Ares exposed a lexical-versus-canonical home-path mismatch in the JARVIS-CD
 > wheel provenance check; `v1.0.6` was abandoned after one failed bootstrap
 > report exposed the same mount-alias boundary in persistent uv-tool provider,
-> distribution-source, and receipt verification. The latest released live
-> evidence is `0.9.22`; `1.0.7` is not release-complete until its digest-bound
+> distribution-source, and receipt verification; `v1.0.7` was abandoned after
+> one failed bootstrap report exposed that the pre-1.0 state audit rejected
+> valid v0.9.22 output events and production-sized event histories before
+> migration. The latest released live evidence is `0.9.22`; `1.0.8` is not
+> release-complete until its digest-bound
 > candidate reports pass, its exact candidate is published, and the released-artifact
 > runs pass again. The published 1.0 GitHub release is intentionally mutable;
 > GitHub release immutability is deferred to 1.1. The policy currently selects the `ares` and `homelab`
@@ -182,7 +185,7 @@ uv run pyright
 uv run pytest
 ```
 
-The tag workflow builds and attests an immutable draft candidate. Independent
+The tag workflow builds and attests a digest-bound draft candidate. Independent
 maintainer sealing verifies its digest and live reports before promotion
 publishes those exact bytes to PyPI. Published-artifact evidence and PyPI
 digests must then pass before final verification publishes the GitHub release.

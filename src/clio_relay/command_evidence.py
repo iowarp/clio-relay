@@ -90,6 +90,21 @@ def command_evidence(
     )
 
 
+def bounded_error_detail(value: str | None) -> str | None:
+    """Return one UTF-8-safe diagnostic bounded for durable error records."""
+    if value is None:
+        return None
+    normalized = value.encode("utf-8", errors="replace").decode("utf-8")
+    _marker, diagnostic_offset = _first_diagnostic(normalized)
+    bounded, _metadata = _bounded_diagnostic_text(
+        normalized,
+        max_bytes=ERROR_DETAIL_MAX_BYTES,
+        tail_bytes=ERROR_DETAIL_SUMMARY_TAIL_BYTES,
+        diagnostic_offset=diagnostic_offset,
+    )
+    return bounded
+
+
 def _first_diagnostic(output: str) -> tuple[str | None, int | None]:
     matches: list[tuple[int, str]] = []
     offset = 0

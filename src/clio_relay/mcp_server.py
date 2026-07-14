@@ -155,28 +155,31 @@ def serve_stdio(
     queue.initialize()
     session = McpSessionState()
     first_line = True
-    for line in stdin:
-        if first_line:
-            line = line.removeprefix("\ufeff")
-            first_line = False
-        if not line.strip():
-            continue
-        try:
-            request = json.loads(line)
-        except JSONDecodeError as exc:
-            response = _error(None, -32700, f"parse error: {exc.msg}")
-        else:
-            response = handle_request(
-                request,
-                queue=queue,
-                settings=resolved,
-                profile=resolved_profile,
-                session=session,
-            )
-        if response is None:
-            continue
-        stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
-        stdout.flush()
+    try:
+        for line in stdin:
+            if first_line:
+                line = line.removeprefix("\ufeff")
+                first_line = False
+            if not line.strip():
+                continue
+            try:
+                request = json.loads(line)
+            except JSONDecodeError as exc:
+                response = _error(None, -32700, f"parse error: {exc.msg}")
+            else:
+                response = handle_request(
+                    request,
+                    queue=queue,
+                    settings=resolved,
+                    profile=resolved_profile,
+                    session=session,
+                )
+            if response is None:
+                continue
+            stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
+            stdout.flush()
+    finally:
+        queue.close()
 
 
 def handle_request(

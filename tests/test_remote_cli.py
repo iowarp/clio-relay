@@ -24,7 +24,7 @@ def test_remote_env_exports_operator_configured_jarvis_spack_executable() -> Non
         )
     )
 
-    assert "export JARVIS_MCP_SPACK_COMMAND=/home/operator/spack/bin/spack;" in rendered
+    assert 'export JARVIS_MCP_SPACK_COMMAND="/home/operator/spack/bin/spack";' in rendered
     assert 'export UV="$HOME/.local/bin/uv";' in rendered
     assert 'export CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE="$HOME/.local/bin/clio-relay";' in rendered
 

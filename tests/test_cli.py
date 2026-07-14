@@ -268,6 +268,9 @@ def test_endpoint_worker_with_explicit_provider_does_not_require_remote_registry
         def run_once(self) -> None:
             captured["ran_once"] = True
 
+        def close(self) -> None:
+            captured["closed"] = True
+
     def make_worker(**kwargs: object) -> FakeWorker:
         captured.update(kwargs)
         return FakeWorker()
@@ -298,6 +301,7 @@ def test_endpoint_worker_with_explicit_provider_does_not_require_remote_registry
     assert captured["cluster"] == "homelab"
     assert captured["registered"] is True
     assert captured["ran_once"] is True
+    assert captured["closed"] is True
     provider = cast(SchedulerProvider, captured["scheduler_provider"])
     assert provider.name == "external"
 
@@ -318,6 +322,9 @@ def test_endpoint_worker_without_explicit_provider_uses_cluster_registry(
 
         def run_once(self) -> None:
             captured["ran_once"] = True
+
+        def close(self) -> None:
+            captured["closed"] = True
 
     def make_worker(**kwargs: object) -> FakeWorker:
         captured.update(kwargs)
@@ -345,6 +352,7 @@ def test_endpoint_worker_without_explicit_provider_uses_cluster_registry(
 
     assert result.exit_code == 0
     assert captured["registry_cluster"] == "configured-cluster"
+    assert captured["closed"] is True
     provider = cast(SchedulerProvider, captured["scheduler_provider"])
     assert provider.name == "slurm"
 
@@ -4390,6 +4398,31 @@ def test_cli_init_creates_empty_cluster_registry(
     assert "ares" not in result.output
     registry = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json")
     assert registry.clusters == {}
+
+
+def test_cli_init_threads_explicit_legacy_output_migration_authorization(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
+    observed: list[bool] = []
+
+    def capture_authorization(
+        _settings: object,
+        *,
+        migrate_legacy_output: bool = False,
+    ) -> object:
+        observed.append(migrate_legacy_output)
+        return object()
+
+    monkeypatch.setattr(cli, "storage_managed_queue", capture_authorization)
+
+    result = CliRunner().invoke(app, ["init", "--migrate-legacy-output"])
+
+    assert result.exit_code == 0
+    assert observed == [True]
 
 
 def test_cli_cluster_add_writes_explicit_definition(

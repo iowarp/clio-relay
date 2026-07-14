@@ -14,6 +14,11 @@ from clio_relay.errors import RelayError
 from clio_relay.identifiers import filesystem_key
 from clio_relay.installation import INSTALL_RECEIPT_PATH_ENV
 from clio_relay.jarvis_mcp import JARVIS_MCP_COMMAND_ENV, JARVIS_MCP_SPACK_COMMAND_ENV
+from clio_relay.remote_values import (
+    remote_value_expands_home,
+    render_systemd_remote_path,
+    render_systemd_remote_value,
+)
 from clio_relay.worker_concurrency import KindConcurrencyInput, kind_concurrency_metadata
 
 _SYSTEMD_UNQUOTED_ARGUMENT = re.compile(r"[A-Za-z0-9_./:@%+=,{}-]+\Z")
@@ -31,11 +36,23 @@ def render_endpoint_user_service(
     """Render a user-level systemd service for a configured worker endpoint."""
     if concurrency < 1:
         raise RelayError("worker concurrency must be at least 1")
-    core_dir = _systemd_home_path(definition.core_dir)
-    spool_dir = _systemd_home_path(definition.spool_dir)
-    jarvis_bin = _systemd_home_path(definition.jarvis_bin or "$HOME/.local/bin/jarvis")
-    frpc_bin = _systemd_home_path(definition.frpc_bin or "$HOME/.local/bin/frpc")
-    agent_bin = _systemd_home_path(_configured_agent_bin(definition))
+    core_source = definition.core_dir
+    spool_source = definition.spool_dir
+    jarvis_source = definition.jarvis_bin or "$HOME/.local/bin/jarvis"
+    frpc_source = definition.frpc_bin or "$HOME/.local/bin/frpc"
+    agent_source = _configured_agent_bin(definition)
+    spack_source = definition.spack_executable
+    core_dir = render_systemd_remote_path(core_source, field="core_dir")
+    spool_dir = render_systemd_remote_path(spool_source, field="spool_dir")
+    jarvis_bin = render_systemd_remote_value(
+        jarvis_source,
+        field="jarvis_bin",
+    )
+    frpc_bin = render_systemd_remote_value(
+        frpc_source,
+        field="frpc_bin",
+    )
+    agent_bin = render_systemd_remote_value(agent_source, field="agent_bin")
     agent_args = " ".join(definition.agent_args)
     kind_limits = kind_concurrency_metadata(kind_concurrency)
     jarvis_mcp_line = _optional_environment_line(
@@ -44,7 +61,15 @@ def render_endpoint_user_service(
     )
     jarvis_mcp_spack_line = _optional_environment_line(
         JARVIS_MCP_SPACK_COMMAND_ENV,
-        definition.spack_executable,
+        (
+            render_systemd_remote_value(
+                spack_source,
+                field="spack_executable",
+            )
+            if spack_source is not None
+            else None
+        ),
+        allow_home_specifier=(spack_source is not None and remote_value_expands_home(spack_source)),
     )
     exec_start_arguments = [
         relay_bin,
@@ -71,6 +96,31 @@ def render_endpoint_user_service(
         )
     )
     description_cluster = _systemd_exec_argument(cluster, allow_home_specifier=False)
+    core_line = _environment_line(
+        "CLIO_RELAY_CORE_DIR",
+        core_dir,
+        allow_home_specifier=remote_value_expands_home(core_source),
+    )
+    spool_line = _environment_line(
+        "CLIO_RELAY_SPOOL_DIR",
+        spool_dir,
+        allow_home_specifier=remote_value_expands_home(spool_source),
+    )
+    jarvis_line = _environment_line(
+        "CLIO_RELAY_JARVIS_BIN",
+        jarvis_bin,
+        allow_home_specifier=remote_value_expands_home(jarvis_source),
+    )
+    frpc_line = _environment_line(
+        "CLIO_RELAY_FRPC_BIN",
+        frpc_bin,
+        allow_home_specifier=remote_value_expands_home(frpc_source),
+    )
+    agent_line = _environment_line(
+        "CLIO_RELAY_AGENT_BIN",
+        agent_bin,
+        allow_home_specifier=remote_value_expands_home(agent_source),
+    )
     return f"""[Unit]
 Description=clio-relay worker endpoint for {description_cluster}
 After=network-online.target
@@ -78,11 +128,11 @@ After=network-online.target
 [Service]
 Type=simple
 Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
-{_environment_line("CLIO_RELAY_CORE_DIR", core_dir, allow_home_specifier=True)}
-{_environment_line("CLIO_RELAY_SPOOL_DIR", spool_dir, allow_home_specifier=True)}
-{_environment_line("CLIO_RELAY_JARVIS_BIN", jarvis_bin, allow_home_specifier=True)}
-{_environment_line("CLIO_RELAY_FRPC_BIN", frpc_bin, allow_home_specifier=True)}
-{_environment_line("CLIO_RELAY_AGENT_BIN", agent_bin, allow_home_specifier=True)}
+{core_line}
+{spool_line}
+{jarvis_line}
+{frpc_line}
+{agent_line}
 {_environment_line("CLIO_RELAY_AGENT_ADAPTER", definition.agent_adapter)}
 {_environment_line("CLIO_RELAY_AGENT_ARGS", agent_args)}
 Environment="{INSTALL_RECEIPT_PATH_ENV}=%h/.local/share/clio-relay/install-receipt.json"
@@ -111,7 +161,7 @@ def install_endpoint_user_service_over_ssh(
     _validate_ssh_destination(ssh_host)
     if not isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise RelayError("endpoint service SSH timeout must be finite and positive")
-    service_name = _systemd_service_name(cluster)
+    service_name = endpoint_user_service_name(cluster)
     remote_script = _remote_install_script(
         service_name=service_name,
         service_text=service_text,
@@ -174,14 +224,15 @@ def write_endpoint_user_service(path: Path, service_text: str) -> Path:
     return path
 
 
-def _systemd_home_path(value: str) -> str:
-    return value.replace("$HOME", "%h")
-
-
-def _optional_environment_line(name: str, value: str | None) -> str:
+def _optional_environment_line(
+    name: str,
+    value: str | None,
+    *,
+    allow_home_specifier: bool = False,
+) -> str:
     if value is None or value == "":
         return ""
-    return _environment_line(name, value)
+    return _environment_line(name, value, allow_home_specifier=allow_home_specifier)
 
 
 def _environment_line(
@@ -195,10 +246,8 @@ def _environment_line(
         not (character.isupper() or character.isdigit() or character == "_") for character in name
     ):
         raise RelayError(f"unsafe systemd environment name: {name!r}")
-    assignment = _systemd_escape(
-        f"{name}={value}",
-        allow_home_specifier=allow_home_specifier,
-    )
+    escaped_value = _systemd_escape(value, allow_home_specifier=allow_home_specifier)
+    assignment = f"{name}={escaped_value}"
     return f'Environment="{assignment}"'
 
 
@@ -214,9 +263,10 @@ def _systemd_escape(value: str, *, allow_home_specifier: bool) -> str:
     """Escape one value using systemd.syntax quoted-string rules."""
     if "\x00" in value:
         raise RelayError("systemd values cannot contain NUL")
-    escaped_specifiers = value.replace("%", "%%")
-    if allow_home_specifier:
-        escaped_specifiers = escaped_specifiers.replace("%%h", "%h")
+    if allow_home_specifier and value.startswith("%h"):
+        escaped_specifiers = "%h" + value.removeprefix("%h").replace("%", "%%")
+    else:
+        escaped_specifiers = value.replace("%", "%%")
     rendered: list[str] = []
     for character in escaped_specifiers:
         if character == "\\":
@@ -236,8 +286,8 @@ def _systemd_escape(value: str, *, allow_home_specifier: bool) -> str:
     return "".join(rendered)
 
 
-def _systemd_service_name(cluster: str) -> str:
-    """Map one logical cluster label to a portable deterministic unit name."""
+def endpoint_user_service_name(cluster: str) -> str:
+    """Map one logical cluster label to its portable deterministic worker unit name."""
     key = filesystem_key(cluster, domain="systemd-cluster")
     return f"clio-relay-worker-{key}.service"
 

@@ -7,7 +7,8 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, TypeVar, cast
 
@@ -376,7 +377,18 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     resolved = settings or RelaySettings.from_env()
     queue = storage_managed_queue(resolved)
     queue.initialize()
-    app = FastAPI(title="clio-relay")
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
+        """Retain shared core ownership for the API process lifetime."""
+        if queue.closed:
+            raise RuntimeError("clio-relay API application cannot restart after shutdown")
+        try:
+            yield
+        finally:
+            queue.close()
+
+    app = FastAPI(title="clio-relay", lifespan=lifespan)
     auth_dependency = Depends(_require_api_token(resolved))
 
     def ensure_intake_open() -> None:

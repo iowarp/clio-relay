@@ -15,10 +15,11 @@ from typing import Any, BinaryIO, Literal, cast
 from uuid import uuid4
 
 from filelock import FileLock
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from clio_relay.errors import ConfigurationError
 from clio_relay.models import validate_mcp_env_from
+from clio_relay.remote_values import validate_remote_path
 
 CLUSTER_REGISTRY_ENV = "CLIO_RELAY_CLUSTER_REGISTRY"
 MAX_CLUSTER_REGISTRY_BYTES = 4 * 1024 * 1024
@@ -410,6 +411,15 @@ class ClusterDefinition(BaseModel):
             )
         return value
 
+    @field_validator("core_dir", "spool_dir")
+    @classmethod
+    def _validate_remote_data_path(cls, value: str, info: ValidationInfo) -> str:
+        try:
+            validate_remote_path(value, field=info.field_name or "remote data path")
+        except ConfigurationError as error:
+            raise ValueError(str(error)) from error
+        return value
+
     @field_validator("remote_mcp_servers")
     @classmethod
     def _remote_mcp_names_must_not_be_blank(
@@ -440,11 +450,16 @@ class ClusterDefinition(BaseModel):
     def _validate_spack_executable(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        if value != value.strip() or any(character in value for character in "\x00\r\n"):
-            raise ValueError("spack_executable must be one absolute remote path")
-        path = PurePosixPath(value)
-        if not path.is_absolute() or ".." in path.parts:
-            raise ValueError("spack_executable must be one absolute remote path")
+        try:
+            validate_remote_path(value, field="spack_executable")
+        except ConfigurationError as error:
+            raise ValueError(
+                "spack_executable must be one absolute remote path or start with $HOME/"
+            ) from error
+        if value != value.strip() or ".." in PurePosixPath(value).parts:
+            raise ValueError(
+                "spack_executable must be one absolute remote path or start with $HOME/"
+            )
         return value
 
     @model_validator(mode="after")
