@@ -5,7 +5,7 @@ import os
 import socket
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any
 
@@ -152,7 +152,10 @@ def _fixture_uid() -> int:
 
 
 def _run_writer_proof(
-    proc_root: Path, *, cluster: str, core_dir: Path
+    proc_root: Path,
+    *,
+    cluster: str,
+    core_dir: Path | PurePosixPath,
 ) -> subprocess.CompletedProcess[str]:
     """Execute the exact Python source embedded in managed bootstrap scripts."""
     return subprocess.run(
@@ -447,7 +450,11 @@ def test_embedded_writer_proof_matches_empty_home_semantics(tmp_path: Path) -> N
         environment={"HOME": "", "CLIO_RELAY_CORE_DIR": "~/core"},
     )
 
-    result = _run_writer_proof(proc_root, cluster="custom", core_dir=Path("/core"))
+    result = _run_writer_proof(
+        proc_root,
+        cluster="custom",
+        core_dir=PurePosixPath("/core"),
+    )
 
     assert result.returncode != 0
     assert "live endpoint pid=1743" in result.stderr
