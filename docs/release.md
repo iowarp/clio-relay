@@ -100,9 +100,10 @@ the protected workflow checkout are identical.
 The tag-push workflow rejects a tag that does not match the package version,
 checked-out commit, and freshly fetched `origin/main` commit. It runs the
 complete local gate, builds exactly one wheel and one source distribution, and
-creates `SHA256SUMS`, but has zero `GITHUB_TOKEN` permissions. It fetches the
-public tag without repository credentials and can upload only an Actions
-artifact. It cannot mint an OIDC identity, attest evidence, or create a release.
+creates `SHA256SUMS`, but grants `GITHUB_TOKEN` only read-only repository
+contents access. Checkout credentials are not persisted, and the workflow can
+upload only an Actions artifact. It cannot mint an OIDC identity, attest
+evidence, or create a release.
 
 After that read-only workflow succeeds, stage the payload by dispatching only
 from protected `main`:

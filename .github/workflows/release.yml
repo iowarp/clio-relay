@@ -20,7 +20,7 @@ jobs:
       contents: read
 
     steps:
-      - name: check out the exact private-repository tag commit
+      - name: check out the exact repository tag commit
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ github.sha }}
