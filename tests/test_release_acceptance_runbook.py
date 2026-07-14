@@ -51,7 +51,7 @@ def test_release_identity_is_consistent_across_package_policy_matrix_and_runbook
 
 def test_candidate_manifest_parser_accepts_the_exact_gnu_checksum_separator() -> None:
     digest = "a" * 64
-    wheel_name = "clio_relay-1.0.3-py3-none-any.whl"
+    wheel_name = "clio_relay-1.0.4-py3-none-any.whl"
     selector = re.compile(rf"^[0-9A-Fa-f]{{64}} [ *]{re.escape(wheel_name)}$")
     parser = re.compile(r"^([0-9A-Fa-f]{64}) [ *](.+)$")
 
@@ -75,6 +75,214 @@ def test_spack_json_array_fallback_is_safe_under_powershell_strict_mode() -> Non
     assert "$Record.$Property" not in runbook
     assert "$Candidate = $Record.PSObject.Properties[$Property]" in runbook
     assert "$Value = [string]$Candidate.Value" in runbook
+
+
+def test_remote_release_text_fixtures_are_lf_attributed_and_normalized_before_scp() -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8").splitlines()
+    remote_text_fixtures = {
+        "examples/release-gate/gray-scott-direct-build.sh",
+        "examples/release-gate/spack-fresh-store.sh",
+        "examples/release-gate/gateway/slurm_submit.sh",
+        "examples/release-gate/gateway/http_service.py",
+        "examples/release-gate/gateway/external_runtime.py",
+        "examples/release-gate/gateway/slurm_status.py",
+        "examples/release-gate/gateway/slurm_cancel.py",
+        "examples/release-gate/lammps-bounded.in",
+    }
+    staged_sources = set(
+        re.findall(
+            r'^\s*-Source "(examples/release-gate/[^"]+)"',
+            runbook,
+            flags=re.MULTILINE,
+        )
+    )
+
+    assert "*.sh text eol=lf" in attributes
+    assert "examples/release-gate/**/*.py text eol=lf" in attributes
+    assert "examples/release-gate/**/*.in text eol=lf" in attributes
+    assert "examples/release-gate/**/*.tmpl text eol=lf" in attributes
+    assert staged_sources == remote_text_fixtures
+    assert runbook.count("& $OpenScp") == 1
+    assert "function New-LfTextStagingCopy" in runbook
+    assert "function Copy-RemoteTextFile" in runbook
+    assert '& $OpenScp $StagingPath "${SshHost}:$RemotePath" | Out-Host' in runbook
+    assert '$Text.Replace("`r`n", "`n").Replace("`r", "`n")' in runbook
+    assert "$StagedBytes -contains [byte]0x0D" in runbook
+    assert "$StagedBytes -contains [byte]0x00" in runbook
+    assert "$Text = Read-LfUtf8TextFile $Source" in runbook
+    assert '$Text = ConvertTo-LfText $Text "rendered template $Destination"' in runbook
+
+
+def test_lf_text_staging_and_rendering_normalize_windows_bytes_under_powershell(
+    tmp_path: Path,
+) -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    function_sources: list[str] = []
+    for name in (
+        "ConvertTo-LfText",
+        "Read-LfUtf8TextFile",
+        "Render-Template",
+        "New-LfTextStagingCopy",
+    ):
+        function_match = re.search(
+            rf"^function {re.escape(name)} \{{.*?^\}}",
+            runbook,
+            flags=re.DOTALL | re.MULTILINE,
+        )
+        assert function_match is not None
+        function_sources.append(function_match.group(0))
+    template = tmp_path / "windows-template.yaml.tmpl"
+    template.write_bytes(b"\xef\xbb\xbfvalue: __VALUE__\r\n")
+    rendered_root = tmp_path / "rendered"
+    powershell = next(
+        (
+            executable
+            for name in ("powershell.exe", "pwsh", "powershell")
+            if (executable := shutil.which(name)) is not None
+        ),
+        None,
+    )
+    assert powershell is not None, "PowerShell is required to validate the release runbook"
+    script_path = tmp_path / "normalize-shell-script.ps1"
+    script_path.write_text(
+        "\n".join(
+            (
+                (
+                    "param([string] $Source, [string] $OutputRoot, "
+                    "[string] $Template, [string] $StagingName)"
+                ),
+                "Set-StrictMode -Version Latest",
+                "$ErrorActionPreference = 'Stop'",
+                "$RenderedRoot = $OutputRoot",
+                *function_sources,
+                "$Staged = New-LfTextStagingCopy $Source $StagingName",
+                "$Rendered = Join-Path $RenderedRoot 'rendered.yaml'",
+                "Render-Template $Template $Rendered @{ VALUE = 'ready' }",
+                "$StagedBytes = [IO.File]::ReadAllBytes($Staged)",
+                "$RenderedBytes = [IO.File]::ReadAllBytes($Rendered)",
+                "$StrictUtf8 = [Text.UTF8Encoding]::new($false, $true)",
+                "[pscustomobject]@{",
+                "  staged_hex = [BitConverter]::ToString($StagedBytes)",
+                "  staged_text = $StrictUtf8.GetString($StagedBytes)",
+                "  rendered_hex = [BitConverter]::ToString($RenderedBytes)",
+                "  rendered_text = $StrictUtf8.GetString($RenderedBytes)",
+                "} | ConvertTo-Json -Compress",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    def invoke(source: Path, staging_name: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                powershell,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script_path),
+                str(source),
+                str(rendered_root),
+                str(template),
+                staging_name,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    cases = (
+        (
+            "fixture.sh",
+            b"\xef\xbb\xbf#!/usr/bin/env bash\r\nprintf '%s\\n' ready\r\n",
+            "#!/usr/bin/env bash\nprintf '%s\\n' ready\n",
+        ),
+        ("fixture.py", b"print('ready')\r", "print('ready')\n"),
+        ("fixture.in", b"\xef\xbb\xbfunits lj\r\nrun 1", "units lj\nrun 1\n"),
+    )
+    for name, original, expected in cases:
+        source = tmp_path / name
+        source.write_bytes(original)
+        result = invoke(source, f"normalized-{name}")
+
+        assert result.returncode == 0, result.stderr
+        document = json.loads(result.stdout)
+        assert "EF-BB-BF" not in document["staged_hex"]
+        assert "-0D-" not in f"-{document['staged_hex']}-"
+        assert "-00-" not in f"-{document['staged_hex']}-"
+        assert document["staged_text"] == expected
+        assert document["rendered_hex"].startswith("76-61-")
+        assert "EF-BB-BF" not in document["rendered_hex"]
+        assert "-0D-" not in f"-{document['rendered_hex']}-"
+        assert document["rendered_text"] == "value: ready\n"
+        assert source.read_bytes() == original
+        if name.endswith(".py"):
+            compile(document["staged_text"], name, "exec")
+
+    bash = shutil.which("bash")
+    if bash is not None:
+        syntax = subprocess.run(
+            [bash, "-n"],
+            check=False,
+            capture_output=True,
+            input=(rendered_root / "remote-text" / "normalized-fixture.sh").read_bytes(),
+            timeout=30,
+        )
+        assert syntax.returncode == 0, syntax.stderr.decode(errors="replace")
+    assert template.read_bytes() == b"\xef\xbb\xbfvalue: __VALUE__\r\n"
+
+    collision = invoke(tmp_path / "fixture.sh", "normalized-fixture.sh")
+    assert collision.returncode != 0
+    assert "refusing to replace normalized text staging copy" in collision.stderr
+
+    nul_source = tmp_path / "contains-nul.py"
+    nul_source.write_bytes(b"print('before')\r\n\x00print('after')\r\n")
+    nul_rejected = invoke(nul_source, "contains-nul.py")
+    assert nul_rejected.returncode != 0
+    assert "contains a NUL byte" in nul_rejected.stderr
+
+    invalid_source = tmp_path / "invalid-utf8.in"
+    invalid_source.write_bytes(b"valid\r\n\xffinvalid")
+    utf8_rejected = invoke(invalid_source, "invalid-utf8.in")
+    assert utf8_rejected.returncode != 0
+    assert "is not valid UTF-8" in utf8_rejected.stderr
+
+
+def test_remote_release_programs_parse_after_lf_normalization() -> None:
+    python_programs = sorted((FIXTURES / "gateway").glob("*.py"))
+    assert [path.name for path in python_programs] == [
+        "external_runtime.py",
+        "http_service.py",
+        "slurm_cancel.py",
+        "slurm_status.py",
+    ]
+    for path in python_programs:
+        normalized = path.read_bytes().decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+        compile(normalized, str(path), "exec")
+
+    bash = shutil.which("bash")
+    if bash is None:
+        return
+    shell_programs = sorted(FIXTURES.rglob("*.sh"))
+    assert [path.relative_to(FIXTURES).as_posix() for path in shell_programs] == [
+        "gateway/slurm_submit.sh",
+        "gray-scott-direct-build.sh",
+        "spack-fresh-store.sh",
+    ]
+    for path in shell_programs:
+        normalized = path.read_bytes().decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+        result = subprocess.run(
+            [bash, "-n"],
+            input=normalized.encode("utf-8"),
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, f"{path}: {result.stderr.decode(errors='replace')}"
 
 
 def test_owned_session_helper_isolates_command_output_from_its_return_value(

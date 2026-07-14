@@ -1,0 +1,4 @@
+*.sh text eol=lf
+examples/release-gate/**/*.py text eol=lf
+examples/release-gate/**/*.in text eol=lf
+examples/release-gate/**/*.tmpl text eol=lf

@@ -55,7 +55,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.0.3"
+$Version = "1.0.4"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }
@@ -293,18 +293,96 @@ function Invoke-RelayReport {
   [pscustomobject]@{ Path = (Resolve-Path $Path).Path; Output = ($Output -join "`n"); Report = $Report }
 }
 
+function ConvertTo-LfText {
+  param(
+    [Parameter(Mandatory)] [AllowEmptyString()] [string] $Text,
+    [Parameter(Mandatory)] [string] $Description
+  )
+  if ($Text.Length -gt 0 -and [int]$Text[0] -eq 0xFEFF) {
+    $Text = $Text.Substring(1)
+  }
+  if ($Text.IndexOf([char]0) -ge 0) {
+    throw "$Description contains a NUL byte"
+  }
+  $Text = $Text.Replace("`r`n", "`n").Replace("`r", "`n")
+  if (-not $Text.EndsWith("`n", [StringComparison]::Ordinal)) {
+    $Text += "`n"
+  }
+  $Text
+}
+
+function Read-LfUtf8TextFile {
+  param([Parameter(Mandatory)] [string] $Source)
+  $ResolvedSource = (Resolve-Path -LiteralPath $Source -ErrorAction Stop).Path
+  if (-not (Test-Path -LiteralPath $ResolvedSource -PathType Leaf)) {
+    throw "text staging source is not a file: $Source"
+  }
+  $StrictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+  try {
+    $Text = $StrictUtf8.GetString([IO.File]::ReadAllBytes($ResolvedSource))
+  } catch {
+    throw "text staging source is not valid UTF-8: $Source"
+  }
+  ConvertTo-LfText $Text "text staging source $Source"
+}
+
 function Render-Template {
   param(
     [Parameter(Mandatory)] [string] $Source,
     [Parameter(Mandatory)] [string] $Destination,
     [Parameter(Mandatory)] [hashtable] $Values
   )
-  $Text = Get-Content -Raw $Source
+  $Text = Read-LfUtf8TextFile $Source
   foreach ($Key in $Values.Keys) { $Text = $Text.Replace("__${Key}__", [string]$Values[$Key]) }
   if ($Text -match '__[A-Z_]+__') { throw "unresolved template token in $Destination" }
+  $Text = ConvertTo-LfText $Text "rendered template $Destination"
   $Parent = Split-Path -Parent $Destination
   New-Item -ItemType Directory -Force $Parent | Out-Null
   [IO.File]::WriteAllText((Join-Path (Resolve-Path $Parent) (Split-Path -Leaf $Destination)), $Text, [Text.UTF8Encoding]::new($false))
+}
+
+function New-LfTextStagingCopy {
+  param(
+    [Parameter(Mandatory)] [string] $Source,
+    [Parameter(Mandatory)] [string] $StagingName
+  )
+  if ($StagingName -cnotmatch '^[A-Za-z0-9._-]+$') {
+    throw "text staging name is unsafe: $StagingName"
+  }
+  $Text = Read-LfUtf8TextFile $Source
+  $StagingDirectory = Join-Path $RenderedRoot "remote-text"
+  New-Item -ItemType Directory -Force $StagingDirectory | Out-Null
+  $StagingPath = Join-Path $StagingDirectory $StagingName
+  if (Test-Path -LiteralPath $StagingPath) {
+    throw "refusing to replace normalized text staging copy: $StagingPath"
+  }
+  [IO.File]::WriteAllText($StagingPath, $Text, [Text.UTF8Encoding]::new($false))
+  $StagedBytes = [IO.File]::ReadAllBytes($StagingPath)
+  $HasUtf8Bom = (
+    $StagedBytes.Length -ge 3 -and
+    $StagedBytes[0] -eq 0xEF -and
+    $StagedBytes[1] -eq 0xBB -and
+    $StagedBytes[2] -eq 0xBF
+  )
+  if ($HasUtf8Bom -or
+      $StagedBytes -contains [byte]0x0D -or
+      $StagedBytes -contains [byte]0x00) {
+    throw "normalized text staging copy is not LF-only, NUL-free UTF-8: $StagingPath"
+  }
+  $StagingPath
+}
+
+function Copy-RemoteTextFile {
+  param(
+    [Parameter(Mandatory)] [string] $Source,
+    [Parameter(Mandatory)] [string] $StagingName,
+    [Parameter(Mandatory)] [string] $SshHost,
+    [Parameter(Mandatory)] [string] $RemotePath,
+    [Parameter(Mandatory)] [string] $Description
+  )
+  $StagingPath = New-LfTextStagingCopy $Source $StagingName
+  & $OpenScp $StagingPath "${SshHost}:$RemotePath" | Out-Host
+  if ($LASTEXITCODE -ne 0) { throw "$Description staging failed" }
 }
 ```
 
@@ -407,9 +485,12 @@ if ($LASTEXITCODE -ne 0 -or $AdiosPrefix -notmatch '^/[A-Za-z0-9._+/-]+$') {
   throw "selected plain ADIOS2 prefix is unavailable"
 }
 
-& $OpenScp examples/release-gate/gray-scott-direct-build.sh `
-  "${AresSshHost}:$AresRemoteRoot/gray-scott-direct-build.sh"
-if ($LASTEXITCODE -ne 0) { throw "Gray-Scott build-script staging failed" }
+Copy-RemoteTextFile `
+  -Source "examples/release-gate/gray-scott-direct-build.sh" `
+  -StagingName "gray-scott-direct-build.sh" `
+  -SshHost $AresSshHost `
+  -RemotePath "$AresRemoteRoot/gray-scott-direct-build.sh" `
+  -Description "Gray-Scott build script"
 & $OpenSsh $AresSshHost "chmod 700 '$AresRemoteRoot/gray-scott-direct-build.sh' && '$AresRemoteRoot/gray-scott-direct-build.sh' '$AresSpack' '$AresCoreRoot' '$GrayBuildRoot' '$GrayInstallRoot' '$ExpectedCoreCommit' '$ExpectedGrayTree' '$ExpectedAdiosHash'"
 if ($LASTEXITCODE -ne 0) { throw "direct IOWarp Gray-Scott build failed" }
 if ((& $OpenSsh $AresSshHost "git -C '$AresCoreRoot' rev-parse HEAD").Trim() -ne $ExpectedCoreCommit) {
@@ -557,22 +638,42 @@ foreach ($Port in @(
 }
 
 foreach ($Target in @(
-  @{ Host = $AresSshHost; Root = $AresFixtureRoot; State = $AresStateRoot },
-  @{ Host = $HomelabSshHost; Root = $HomelabFixtureRoot; State = $HomelabStateRoot }
+  @{ Name = $AresCluster; Host = $AresSshHost; Root = $AresFixtureRoot; State = $AresStateRoot },
+  @{ Name = $HomelabCluster; Host = $HomelabSshHost; Root = $HomelabFixtureRoot; State = $HomelabStateRoot }
 )) {
   & $OpenSsh $Target.Host "install -d -m 700 '$($Target.Root)/gateway' '$($Target.State)'"
   if ($LASTEXITCODE -ne 0) { throw "remote fixture directory creation failed" }
-  $Destination = "$($Target.Host):$($Target.Root)/gateway/"
-  & $OpenScp examples/release-gate/gateway/http_service.py `
-    examples/release-gate/gateway/external_runtime.py `
-    $Destination
-  if ($LASTEXITCODE -ne 0) { throw "gateway fixture staging failed" }
+  Copy-RemoteTextFile `
+    -Source "examples/release-gate/gateway/http_service.py" `
+    -StagingName "$($Target.Name)-gateway-http-service.py" `
+    -SshHost $Target.Host `
+    -RemotePath "$($Target.Root)/gateway/http_service.py" `
+    -Description "gateway HTTP fixture"
+  Copy-RemoteTextFile `
+    -Source "examples/release-gate/gateway/external_runtime.py" `
+    -StagingName "$($Target.Name)-gateway-external-runtime.py" `
+    -SshHost $Target.Host `
+    -RemotePath "$($Target.Root)/gateway/external_runtime.py" `
+    -Description "gateway external-runtime fixture"
 }
-& $OpenScp examples/release-gate/gateway/slurm_submit.sh `
-  examples/release-gate/gateway/slurm_status.py `
-  examples/release-gate/gateway/slurm_cancel.py `
-  "${AresSshHost}:$AresFixtureRoot/gateway/"
-if ($LASTEXITCODE -ne 0) { throw "SLURM gateway fixture staging failed" }
+Copy-RemoteTextFile `
+  -Source "examples/release-gate/gateway/slurm_status.py" `
+  -StagingName "gateway-slurm-status.py" `
+  -SshHost $AresSshHost `
+  -RemotePath "$AresFixtureRoot/gateway/slurm_status.py" `
+  -Description "SLURM gateway status fixture"
+Copy-RemoteTextFile `
+  -Source "examples/release-gate/gateway/slurm_cancel.py" `
+  -StagingName "gateway-slurm-cancel.py" `
+  -SshHost $AresSshHost `
+  -RemotePath "$AresFixtureRoot/gateway/slurm_cancel.py" `
+  -Description "SLURM gateway cancel fixture"
+Copy-RemoteTextFile `
+  -Source "examples/release-gate/gateway/slurm_submit.sh" `
+  -StagingName "gateway-slurm-submit.sh" `
+  -SshHost $AresSshHost `
+  -RemotePath "$AresFixtureRoot/gateway/slurm_submit.sh" `
+  -Description "SLURM gateway shell fixture"
 
 $AresRuntime = Join-Path $RenderedRoot "ares-runtime.json"
 Render-Template "examples/release-gate/gateway/ares-runtime.json.tmpl" $AresRuntime @{
@@ -667,8 +768,12 @@ Invoke-RelayReport -Id "ares-jarvis-gray-scott" -ReportOption "--report" -Comman
 
 $RemoteLammpsInput = "$AresRemoteRoot/lammps/in.lj"
 & $OpenSsh $AresSshHost "install -d -m 700 '$AresRemoteRoot/lammps'"
-& $OpenScp examples/release-gate/lammps-bounded.in "${AresSshHost}:$RemoteLammpsInput"
-if ($LASTEXITCODE -ne 0) { throw "LAMMPS input staging failed" }
+Copy-RemoteTextFile `
+  -Source "examples/release-gate/lammps-bounded.in" `
+  -StagingName "lammps-bounded.in" `
+  -SshHost $AresSshHost `
+  -RemotePath $RemoteLammpsInput `
+  -Description "LAMMPS input"
 $LammpsPipeline = "$RunId-lammps"
 Invoke-JarvisSetupTool "jarvis_create_pipeline" "lammps-create" @{
   pipeline_id = $LammpsPipeline
@@ -759,9 +864,12 @@ $FreshSpackStore = "$FreshSpackRoot/store"
 $FreshSpackWrapper = "$FreshSpackRoot/bin/spack"
 $FreshSpackConfigurationManifest = "$FreshSpackRoot/acceptance-manifest.sha256"
 $FreshSpackSpec = "libsigsegv@2.14"
-& $OpenScp examples/release-gate/spack-fresh-store.sh `
-  "${AresSshHost}:$AresRemoteRoot/spack-fresh-store.sh"
-if ($LASTEXITCODE -ne 0) { throw "fresh Spack setup-script staging failed" }
+Copy-RemoteTextFile `
+  -Source "examples/release-gate/spack-fresh-store.sh" `
+  -StagingName "spack-fresh-store.sh" `
+  -SshHost $AresSshHost `
+  -RemotePath "$AresRemoteRoot/spack-fresh-store.sh" `
+  -Description "fresh Spack setup script"
 & $OpenSsh $AresSshHost "chmod 700 '$AresRemoteRoot/spack-fresh-store.sh' && '$AresRemoteRoot/spack-fresh-store.sh' '$FreshSpackRoot' '$AresFreshBaseSpack'"
 if ($LASTEXITCODE -ne 0) { throw "disposable Spack store setup failed" }
 $ExpectedFreshSpackConfigurationSha256 = (

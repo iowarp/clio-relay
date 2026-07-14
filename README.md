@@ -8,14 +8,16 @@
 
 It is a piece of the federation layer for [`clio-agent`](https://github.com/iowarp/clio-agent): a local CLIO experience can delegate work to a remote machine, keep observing it, detach, reconnect, and clean up after itself. The project is also designed for use outside CLIO. Any client that can call the CLI, HTTP API, or MCP tools can use the same relay model.
 
-> The current development candidate is `1.0.3`. The immutable `v1.0.0` candidate
+> The current development candidate is `1.0.4`. The immutable `v1.0.0` candidate
 > was abandoned before publication after its acceptance runbook rejected the
 > staged GNU checksum format; `v1.0.1` was also abandoned before publication
 > after protected-main validation exposed a Windows lease-deletion race;
 > `v1.0.2` was abandoned before publication when candidate acceptance found a
-> strict-mode Spack JSON-array parsing defect in the reviewed runbook. The
-> latest released live evidence is `0.9.22`;
-> 1.0.3 is not release-complete until its immutable-candidate
+> strict-mode Spack JSON-array parsing defect in the reviewed runbook;
+> `v1.0.3` was abandoned before any reports were produced when candidate
+> acceptance found that Windows checkout CRLF bytes had been copied directly
+> into a remote shell fixture. The latest released live evidence is `0.9.22`;
+> 1.0.4 is not release-complete until its immutable-candidate
 > reports pass, its exact candidate is published, and the released-artifact
 > runs pass again. The policy currently selects the `ares` and `homelab`
 > evidence labels; those labels are release configuration, not hardcoded
