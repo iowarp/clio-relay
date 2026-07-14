@@ -2046,7 +2046,10 @@ def test_concurrent_jobs_receive_isolated_sidecar_environments(
                 for worker, lease in zip(workers, resolved_leases, strict=True)
             ]
             for future in futures:
-                future.result(timeout=10)
+                # The provider's five-second barrier is the semantic overlap proof.
+                # This outer bound only detects a hung durable setup/cleanup path and
+                # must accommodate the queue's bounded Windows filesystem latency.
+                future.result(timeout=60)
     finally:
         for lease in resolved_leases:
             queue.release_lease(lease.lease_id)
