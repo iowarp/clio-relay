@@ -51,7 +51,7 @@ def test_release_identity_is_consistent_across_package_policy_matrix_and_runbook
 
 def test_candidate_manifest_parser_accepts_the_exact_gnu_checksum_separator() -> None:
     digest = "a" * 64
-    wheel_name = "clio_relay-1.0.4-py3-none-any.whl"
+    wheel_name = "clio_relay-1.0.5-py3-none-any.whl"
     selector = re.compile(rf"^[0-9A-Fa-f]{{64}} [ *]{re.escape(wheel_name)}$")
     parser = re.compile(r"^([0-9A-Fa-f]{64}) [ *](.+)$")
 
@@ -372,6 +372,11 @@ def test_release_helper_scripts_bind_direct_gray_scott_and_private_spack_state()
     assert "https://github.com/iowarp/clio-core.git" in gray
     assert "rev-parse HEAD:external/iowarp-gray-scott" in gray
     assert 'build-env "/$adios_hash"' in gray
+    assert 'location -i "/$adios_hash"' in gray
+    assert 'if ! adios_prefix="$("$spack" location -i "/$adios_hash")"; then' in gray
+    assert 'if ! wait "$find_pid"; then' in gray
+    assert "selected ADIOS2 prefix must contain exactly one CMake package config" in gray
+    assert '-DADIOS2_DIR="$adios2_dir"' in gray
     assert '[[ "$value" == *//* ]]' in gray
     assert '[[ "$value" == *"/./"* ]]' in gray
     assert "coeus" not in gray.lower()
@@ -385,6 +390,94 @@ def test_release_helper_scripts_bind_direct_gray_scott_and_private_spack_state()
     assert "sha256sum --check --strict" in fresh_spack
     assert '[[ "$value" == *//* ]]' in fresh_spack
     assert '[[ "$value" == *"/./"* ]]' in fresh_spack
+
+
+def test_gray_scott_helper_fails_closed_on_spack_and_config_discovery_errors(
+    tmp_path: Path,
+) -> None:
+    bash = shutil.which("bash")
+    assert bash is not None, "Bash is required to validate the remote release helper"
+    helper = (FIXTURES / "gray-scott-direct-build.sh").read_bytes()
+    helper = helper.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    commit = "e2fedd8847f8deb71f041f692e405023a712ca44"
+    tree = "072d6eab3df3bde92e48ae2f4823305af831535e"
+    adios_hash = "wqc5dwbj7vx4i3oekrembw6irpo5h7g6"
+
+    def invoke(
+        name: str,
+        *,
+        location_exit: int = 0,
+        find_program: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        root = tmp_path / name
+        config = root / "adios" / "lib" / "cmake" / "adios2" / "adios2-config.cmake"
+        config.parent.mkdir(parents=True)
+        config.write_bytes(b"# test config\n")
+        (root / "helper.sh").write_bytes(helper)
+        (root / "spack").write_bytes(
+            (
+                "#!/usr/bin/env bash\n"
+                'if [ "$1" = location ]; then\n'
+                "  printf '%s\\n' \"$PWD/adios\"\n"
+                f"  exit {location_exit}\n"
+                "fi\n"
+                "exit 64\n"
+            ).encode()
+        )
+        fake_bin = root / "fake-bin"
+        fake_bin.mkdir()
+        if find_program is not None:
+            (fake_bin / "find").write_bytes(find_program.encode("utf-8"))
+        command = (
+            'chmod 700 "$PWD/helper.sh" "$PWD/spack"; '
+            'if [ -f "$PWD/fake-bin/find" ]; then '
+            'chmod 700 "$PWD/fake-bin/find"; fi; '
+            'export PATH="$PWD/fake-bin:$PATH"; '
+            '"$PWD/helper.sh" "$PWD/spack" "$PWD/source" "$PWD/build" '
+            f'"$PWD/install" "{commit}" "{tree}" "{adios_hash}"'
+        )
+        return subprocess.run(
+            [bash, "-c", command],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    location_failure = invoke("location-failure", location_exit=23)
+    assert location_failure.returncode == 66
+    assert "selected ADIOS2 prefix lookup failed" in location_failure.stderr
+
+    partial_find_failure = invoke(
+        "find-failure",
+        find_program=(
+            "#!/usr/bin/env bash\n"
+            "printf '%s\\0' \"$PWD/adios/lib/cmake/adios2/adios2-config.cmake\"\n"
+            "exit 19\n"
+        ),
+    )
+    assert partial_find_failure.returncode == 74
+    assert "ADIOS2 CMake package discovery failed" in partial_find_failure.stderr
+
+    empty_find = invoke(
+        "find-empty",
+        find_program="#!/usr/bin/env bash\nexit 0\n",
+    )
+    assert empty_find.returncode == 65
+    assert "must contain exactly one CMake package config" in empty_find.stderr
+
+    ambiguous_find = invoke(
+        "find-ambiguous",
+        find_program=(
+            "#!/usr/bin/env bash\n"
+            "printf '%s\\0%s\\0' "
+            '"$PWD/adios/lib/cmake/adios2/adios2-config.cmake" '
+            '"$PWD/adios/lib/cmake/adios2/ADIOS2Config.cmake"\n'
+        ),
+    )
+    assert ambiguous_find.returncode == 65
+    assert "must contain exactly one CMake package config" in ambiguous_find.stderr
 
 
 def test_release_acceptance_matrix_is_complete_ordered_and_unique() -> None:
@@ -608,6 +701,7 @@ def test_release_acceptance_runbook_binds_production_specifics_without_secrets()
     assert "$ExpectedAdiosHash = [string]$env:CLIO_RELAY_ACCEPTANCE_ADIOS_HASH" in text
     assert "find --json '/$ExpectedAdiosHash'" in text
     assert "find --json adios2" not in text
+    assert "ADIOS2_DIR" in text
     assert 'spack_specs = @("/$ExpectedAdiosHash")' in text
     assert 'spack_specs = @("/$ExpectedLammpsHash")' in text
     assert 'spack_specs = @("adios2-coeus")' not in text
