@@ -1135,7 +1135,7 @@ class ClioCoreQueue:
         self._clear_lease_operational_indexes_unlocked()
         for lease, job, _identity in indexed:
             self._sync_lease_operational_indexes_unlocked(lease, job=job)
-        intent_path.unlink(missing_ok=True)
+        _unlink_durable_path(intent_path, missing_ok=True)
         return len(indexed)
 
     def _clear_lease_operational_indexes_unlocked(self) -> None:
@@ -1191,7 +1191,7 @@ class ClioCoreQueue:
         for root in roots:
             inspect(root, depth=0)
         for path in files:
-            path.unlink()
+            _unlink_durable_path(path)
         for path in sorted(directories, key=lambda item: len(item.parts), reverse=True):
             path.rmdir()
 
@@ -2260,7 +2260,7 @@ class ClioCoreQueue:
                         stale_path.parent,
                         create=False,
                     )
-                    stale_path.unlink(missing_ok=True)
+                    _unlink_durable_path(stale_path, missing_ok=True)
         self._write_lease_index_identity_unlocked(identity)
         for path in (
             self._lease_identity_ref_path(identity),
@@ -2300,7 +2300,7 @@ class ClioCoreQueue:
             self._lease_identity_ref_path(identity),
         ):
             self._require_safe_lease_index_directory(path.parent, create=False)
-            path.unlink(missing_ok=True)
+            _unlink_durable_path(path, missing_ok=True)
         endpoint_directory = self._lease_endpoint_directory(identity.endpoint_id)
         if endpoint_directory.exists():
             with os.scandir(endpoint_directory) as entries:
@@ -2308,7 +2308,7 @@ class ClioCoreQueue:
             if endpoint_empty:
                 endpoint_directory.rmdir()
         if owns_manifest and os.path.lexists(index_path):
-            index_path.unlink()
+            _unlink_durable_path(index_path)
 
     def _require_safe_lease_index_directory(
         self,
@@ -2811,11 +2811,14 @@ class ClioCoreQueue:
                         raise QueueConflictError(
                             f"scheduler cancellation disposition is not terminal: {completed_path}"
                         )
-                    self._scheduler_cancel_record_path(
-                        "scheduler_cancel_pending",
-                        record.cluster,
-                        record.job_id,
-                    ).unlink(missing_ok=True)
+                    _unlink_durable_path(
+                        self._scheduler_cancel_record_path(
+                            "scheduler_cancel_pending",
+                            record.cluster,
+                            record.job_id,
+                        ),
+                        missing_ok=True,
+                    )
                     continue
                 active_records.append(record)
             records = active_records
@@ -3282,7 +3285,7 @@ class ClioCoreQueue:
         self._write(self._job_record_path("leases_by_job", job.job_id, lease.lease_id), lease)
         self._sync_lease_operational_indexes_unlocked(lease, job=leased_job)
         self._after_lease_operational_index_write(lease)
-        intent_path.unlink(missing_ok=True)
+        _unlink_durable_path(intent_path, missing_ok=True)
         self.append_event(
             job.job_id,
             "job.leased",
@@ -3423,7 +3426,7 @@ class ClioCoreQueue:
                 job=job,
                 previous_lease=lease,
             )
-            intent_path.unlink(missing_ok=True)
+            _unlink_durable_path(intent_path, missing_ok=True)
             return renewed
 
     def recover_stale_jobs(self, *, cluster: str, max_attempts: int = 3) -> list[RelayJob]:
@@ -3678,7 +3681,7 @@ class ClioCoreQueue:
                 identity=identity,
                 finalize_intent=False,
             )
-        intent_path.unlink(missing_ok=True)
+        _unlink_durable_path(intent_path, missing_ok=True)
         return target
 
     def _write_recovery_event_unlocked(self, event: RelayEvent) -> None:
@@ -3769,13 +3772,19 @@ class ClioCoreQueue:
                     "index": _lease_index_document(identity),
                 },
             )
-        (self._storage_root / "leases" / f"{lease.lease_id}.json").unlink(missing_ok=True)
+        _unlink_durable_path(
+            self._storage_root / "leases" / f"{lease.lease_id}.json",
+            missing_ok=True,
+        )
         self._after_lease_canonical_delete(lease)
-        self._job_record_path("leases_by_job", lease.job_id, lease.lease_id).unlink(missing_ok=True)
+        _unlink_durable_path(
+            self._job_record_path("leases_by_job", lease.job_id, lease.lease_id),
+            missing_ok=True,
+        )
         self._delete_lease_operational_indexes_unlocked(identity)
         self._after_lease_index_delete(lease)
         if finalize_intent:
-            owned_intent.unlink(missing_ok=True)
+            _unlink_durable_path(owned_intent, missing_ok=True)
 
     def _after_lease_canonical_delete(self, _lease: Lease) -> None:
         """Fault-injection seam after the canonical lease record is removed."""
@@ -4114,7 +4123,7 @@ class ClioCoreQueue:
             self._sync_task_retention_indexes_unlocked(updated)
             self._after_execution_cleanup_canonical_ack(updated)
             pending_path = self._execution_cleanup_path(cluster, job_id, task_id)
-            pending_path.unlink(missing_ok=True)
+            _unlink_durable_path(pending_path, missing_ok=True)
             self._fsync_execution_cleanup_directory(pending_path.parent)
             try:
                 pending_path.parent.rmdir()
@@ -4460,7 +4469,7 @@ class ClioCoreQueue:
                     raise QueueConflictError(
                         f"execution cleanup migration target conflicts: {target}"
                     )
-                legacy_path.unlink()
+                _unlink_durable_path(legacy_path)
             else:
                 legacy_path.replace(target)
             self._fsync_execution_cleanup_directory(target.parent)
@@ -5253,7 +5262,7 @@ class ClioCoreQueue:
                         f"{owner_session_id}"
                     )
                 previous_generation_id = closing_generation
-                closing_path.unlink(missing_ok=True)
+                _unlink_durable_path(closing_path, missing_ok=True)
                 closing_generation = None
             if (
                 self.get_owner_session_closed(
@@ -5405,7 +5414,7 @@ class ClioCoreQueue:
                             f"owner session has an unfinished generation transition: "
                             f"{owner_session_id}"
                         )
-                    closing_path.unlink(missing_ok=True)
+                    _unlink_durable_path(closing_path, missing_ok=True)
                     return active_generation
                 if recorded_generation_id not in {None, active_generation}:
                     previous_generation = (
@@ -5468,7 +5477,7 @@ class ClioCoreQueue:
                 },
             )
             if closing_generation is not None:
-                closing_path.unlink(missing_ok=True)
+                _unlink_durable_path(closing_path, missing_ok=True)
             return selected_generation
 
     def clear_owner_session_closing(
@@ -5625,7 +5634,10 @@ class ClioCoreQueue:
                     self._owner_session_closed_path(owner_session_id),
                     legacy_closure,
                 )
-            self._owner_session_active_path(owner_session_id).unlink(missing_ok=True)
+            _unlink_durable_path(
+                self._owner_session_active_path(owner_session_id),
+                missing_ok=True,
+            )
             if not closing_path.is_file():
                 raise QueueConflictError(
                     f"owner session closing proof disappeared: {owner_session_id}"
@@ -6069,7 +6081,7 @@ class ClioCoreQueue:
             task.task_id,
         )
         if task.state in TERMINAL_STATES:
-            active_path.unlink(missing_ok=True)
+            _unlink_durable_path(active_path, missing_ok=True)
         else:
             self._write(active_path, task)
         self._sync_scheduler_source_unlocked(
@@ -6093,7 +6105,7 @@ class ClioCoreQueue:
         if rule.enabled and rule.triggered_at is None:
             self._write(active_path, rule)
         else:
-            active_path.unlink(missing_ok=True)
+            _unlink_durable_path(active_path, missing_ok=True)
 
     def _sync_scheduler_source_unlocked(
         self,
@@ -6130,8 +6142,9 @@ class ClioCoreQueue:
                 raise QueueConflictError(f"scheduler reference is invalid: {manifest_path}")
             old_ids = set(cast(list[str], raw_old_ids))
         for scheduler_id in old_ids - scheduler_ids:
-            self._scheduler_reverse_ref_path(scheduler_id, job_id, source_id).unlink(
-                missing_ok=True
+            _unlink_durable_path(
+                self._scheduler_reverse_ref_path(scheduler_id, job_id, source_id),
+                missing_ok=True,
             )
             gateway_paths = self._bounded_json_record_paths(
                 self._gateway_reverse_directory("scheduler", scheduler_id),
@@ -6158,14 +6171,14 @@ class ClioCoreQueue:
                 },
             )
         else:
-            manifest_path.unlink(missing_ok=True)
+            _unlink_durable_path(manifest_path, missing_ok=True)
         if ambiguous:
             self._write_json(
                 protection_path,
                 {"job_id": job_id, "source_id": source_id, "ambiguous": True},
             )
         else:
-            protection_path.unlink(missing_ok=True)
+            _unlink_durable_path(protection_path, missing_ok=True)
         for scheduler_id in scheduler_ids:
             self._write_json(
                 self._scheduler_reverse_ref_path(scheduler_id, job_id, source_id),
@@ -6291,13 +6304,14 @@ class ClioCoreQueue:
             record_name = job_ref.get("record_name")
             if not isinstance(job_id, str) or not isinstance(record_name, str):
                 raise QueueConflictError(f"gateway job reference is invalid: {path}")
-            (
+            _unlink_durable_path(
                 self._storage_root
                 / "active_gateway_refs_by_job"
                 / self._durable_key(job_id)
-                / record_name
-            ).unlink(missing_ok=True)
-            path.unlink(missing_ok=True)
+                / record_name,
+                missing_ok=True,
+            )
+            _unlink_durable_path(path, missing_ok=True)
         reverse_backlinks = (
             self._storage_root / "gateway_reverse_refs_by_session" / self._durable_key(session_id)
         )
@@ -6322,10 +6336,11 @@ class ClioCoreQueue:
                 or not isinstance(record_name, str)
             ):
                 raise QueueConflictError(f"gateway reverse reference is invalid: {path}")
-            (self._gateway_reverse_directory(cast(str, family), key) / record_name).unlink(
-                missing_ok=True
+            _unlink_durable_path(
+                self._gateway_reverse_directory(cast(str, family), key) / record_name,
+                missing_ok=True,
             )
-            path.unlink(missing_ok=True)
+            _unlink_durable_path(path, missing_ok=True)
 
     def _write_gateway_reverse_ref_unlocked(
         self,
@@ -6420,18 +6435,20 @@ class ClioCoreQueue:
         record_name = (
             f"{_stable_ref_token(session_id, relation_kind, relation_key, source_id or '')}.json"
         )
-        (
+        _unlink_durable_path(
             self._storage_root
             / "active_gateway_refs_by_job"
             / self._durable_key(job_id)
-            / record_name
-        ).unlink(missing_ok=True)
-        (
+            / record_name,
+            missing_ok=True,
+        )
+        _unlink_durable_path(
             self._storage_root
             / "active_gateway_refs_by_session"
             / self._durable_key(session_id)
-            / f"{_stable_ref_token(job_id, record_name)}.json"
-        ).unlink(missing_ok=True)
+            / f"{_stable_ref_token(job_id, record_name)}.json",
+            missing_ok=True,
+        )
 
     def _gateway_reverse_directory(self, relation_kind: str, relation_key: str) -> Path:
         if relation_kind not in {"artifact", "scheduler"}:
@@ -6883,7 +6900,7 @@ class ClioCoreQueue:
             record.job_id,
         )
         self._write(completed_path, record)
-        pending_path.unlink(missing_ok=True)
+        _unlink_durable_path(pending_path, missing_ok=True)
         return record
 
     def _ensure_active_job_capacity_unlocked(self, job: RelayJob) -> None:
@@ -6974,7 +6991,7 @@ class ClioCoreQueue:
                 / f"{endpoint.endpoint_id}.json"
             )
             if previous_target != target:
-                previous_target.unlink(missing_ok=True)
+                _unlink_durable_path(previous_target, missing_ok=True)
         self._write(target, endpoint)
         self._write_json(
             mapping_path,
@@ -7004,7 +7021,7 @@ class ClioCoreQueue:
         )
         self._write(self._storage_root / "jobs" / f"{job.job_id}.json", job)
         self._sync_job_derived_unlocked(job)
-        intent_path.unlink(missing_ok=True)
+        _unlink_durable_path(intent_path, missing_ok=True)
 
     def _sync_job_derived_unlocked(self, job: RelayJob) -> None:
         """Converge every mutable job index from one canonical job record."""
@@ -7017,14 +7034,14 @@ class ClioCoreQueue:
         active_path = self._storage_root / "jobs_active" / f"{job.job_id}.json"
         queued_path = self._storage_root / "jobs_queued" / f"{job.job_id}.json"
         if job.state in TERMINAL_STATES:
-            active_path.unlink(missing_ok=True)
-            queued_path.unlink(missing_ok=True)
+            _unlink_durable_path(active_path, missing_ok=True)
+            _unlink_durable_path(queued_path, missing_ok=True)
             return
         self._write(active_path, job)
         if job.state is JobState.QUEUED:
             self._write(queued_path, job)
         else:
-            queued_path.unlink(missing_ok=True)
+            _unlink_durable_path(queued_path, missing_ok=True)
 
     def _write_task_unlocked(self, task: RelayTask) -> None:
         """Write one task and make its per-job and scheduler indexes replayable."""
@@ -7035,7 +7052,7 @@ class ClioCoreQueue:
         )
         self._write(self._storage_root / "tasks" / f"{task.task_id}.json", task)
         self._sync_task_derived_unlocked(task)
-        intent_path.unlink(missing_ok=True)
+        _unlink_durable_path(intent_path, missing_ok=True)
 
     def _sync_task_derived_unlocked(self, task: RelayTask) -> None:
         """Converge task indexes and scheduler references from the canonical task."""
@@ -7064,7 +7081,7 @@ class ClioCoreQueue:
         )
         self._after_gateway_canonical_write(session)
         self._sync_gateway_session_derived_unlocked(session.session_id)
-        intent_path.unlink(missing_ok=True)
+        _unlink_durable_path(intent_path, missing_ok=True)
 
     def _after_gateway_canonical_write(self, _session: GatewaySession) -> None:
         """Fault-injection seam after a canonical gateway transition."""
@@ -7159,7 +7176,7 @@ class ClioCoreQueue:
                     job=job,
                     previous_lease=previous,
                 )
-                path.unlink(missing_ok=True)
+                _unlink_durable_path(path, missing_ok=True)
                 continue
             if kind == "lease_delete":
                 lease_id = payload.get("lease_id")
@@ -7182,11 +7199,17 @@ class ClioCoreQueue:
                     self._validate_lease_index_identity(lease, identity)
                     if lease_id != lease.lease_id or job_id != lease.job_id:
                         raise QueueConflictError(f"lease deletion intent identity mismatch: {path}")
-                (self._storage_root / "leases" / f"{lease_id}.json").unlink(missing_ok=True)
-                self._job_record_path("leases_by_job", job_id, lease_id).unlink(missing_ok=True)
+                _unlink_durable_path(
+                    self._storage_root / "leases" / f"{lease_id}.json",
+                    missing_ok=True,
+                )
+                _unlink_durable_path(
+                    self._job_record_path("leases_by_job", job_id, lease_id),
+                    missing_ok=True,
+                )
                 if identity is not None:
                     self._delete_lease_operational_indexes_unlocked(identity)
-                path.unlink(missing_ok=True)
+                _unlink_durable_path(path, missing_ok=True)
                 continue
             if kind == "stale_lease_recovery":
                 recovered_stale_jobs.append(
@@ -7200,7 +7223,7 @@ class ClioCoreQueue:
                 job = self._read_optional(self._storage_root / "jobs" / f"{job_id}.json", RelayJob)
                 if job is not None:
                     self._sync_job_derived_unlocked(job)
-                path.unlink(missing_ok=True)
+                _unlink_durable_path(path, missing_ok=True)
                 continue
             if kind == "task_sync":
                 task_id = payload.get("task_id")
@@ -7211,14 +7234,14 @@ class ClioCoreQueue:
                 )
                 if task is not None:
                     self._sync_task_derived_unlocked(task)
-                path.unlink(missing_ok=True)
+                _unlink_durable_path(path, missing_ok=True)
                 continue
             if kind == "gateway_sync":
                 session_id = payload.get("session_id")
                 if not isinstance(session_id, str) or not session_id:
                     raise QueueConflictError(f"invalid gateway transition intent: {path}")
                 self._sync_gateway_session_derived_unlocked(session_id)
-                path.unlink(missing_ok=True)
+                _unlink_durable_path(path, missing_ok=True)
                 continue
             raise QueueConflictError(f"unsupported queue transition intent kind {kind!r}: {path}")
         return recovered_stale_jobs
@@ -7272,13 +7295,13 @@ class ClioCoreQueue:
             self._write(indexed_path, lease)
             self._sync_lease_operational_indexes_unlocked(lease, job=current)
         else:
-            lease_path.unlink(missing_ok=True)
-            indexed_path.unlink(missing_ok=True)
+            _unlink_durable_path(lease_path, missing_ok=True)
+            _unlink_durable_path(indexed_path, missing_ok=True)
             self._delete_lease_operational_indexes_unlocked(
                 identity,
                 allow_foreign_manifest=True,
             )
-        path.unlink(missing_ok=True)
+        _unlink_durable_path(path, missing_ok=True)
 
     def _repair_active_job_index_unlocked(self) -> None:
         """Remove stale capacity entries and refresh every indexed active job."""
@@ -7294,9 +7317,10 @@ class ClioCoreQueue:
                 RelayJob,
             )
             if canonical is None or canonical.state in TERMINAL_STATES:
-                path.unlink(missing_ok=True)
-                (self._storage_root / "jobs_queued" / f"{indexed.job_id}.json").unlink(
-                    missing_ok=True
+                _unlink_durable_path(path, missing_ok=True)
+                _unlink_durable_path(
+                    self._storage_root / "jobs_queued" / f"{indexed.job_id}.json",
+                    missing_ok=True,
                 )
                 continue
             self._write(path, canonical)
@@ -7304,7 +7328,7 @@ class ClioCoreQueue:
             if canonical.state is JobState.QUEUED:
                 self._write(queued_path, canonical)
             else:
-                queued_path.unlink(missing_ok=True)
+                _unlink_durable_path(queued_path, missing_ok=True)
 
     def _terminal_job_gc_protections(self, job: RelayJob) -> list[str]:
         protections: list[str] = []
@@ -7651,11 +7675,14 @@ class ClioCoreQueue:
             for scheduler_id in cast(list[object], raw_ids):
                 if not isinstance(scheduler_id, str):
                     raise QueueConflictError(f"scheduler reference is invalid: {path}")
-                self._scheduler_reverse_ref_path(
-                    scheduler_id,
-                    tombstone.job_id,
-                    source_id,
-                ).unlink(missing_ok=True)
+                _unlink_durable_path(
+                    self._scheduler_reverse_ref_path(
+                        scheduler_id,
+                        tombstone.job_id,
+                        source_id,
+                    ),
+                    missing_ok=True,
+                )
             _move_gc_path(path, trash / "processed" / "scheduler_refs_by_job" / path.name)
             actions += 1
         references_empty = all(
@@ -8517,7 +8544,7 @@ class ClioCoreQueue:
         except OSError as error:
             raise QueueConflictError(f"cannot scan queue write staging: {staging}") from error
         for path in leftovers:
-            path.unlink()
+            _unlink_durable_path(path)
         if leftovers:
             self._fsync_write_directory(staging)
 
@@ -8573,7 +8600,7 @@ class ClioCoreQueue:
                         raise
                     time.sleep(ATOMIC_REPLACE_RETRY_SECONDS)
         finally:
-            temporary.unlink(missing_ok=True)
+            _unlink_durable_path(temporary, missing_ok=True)
         self._fsync_write_directory(staging)
         self._fsync_write_directory(internal_path.parent)
 
@@ -9666,6 +9693,21 @@ def _transient_record_access_conflict(error: QueueConflictError) -> bool:
         or cause.errno in {errno.EACCES, errno.EPERM}
         or getattr(cause, "winerror", None) in {5, 32, 33}
     )
+
+
+def _unlink_durable_path(path: Path, *, missing_ok: bool = False) -> None:
+    """Delete one durable path after bounded Windows sharing-violation retries."""
+    for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
+        try:
+            path.unlink(missing_ok=missing_ok)
+            return
+        except OSError as error:
+            if (
+                getattr(error, "winerror", None) not in {5, 32, 33}
+                or attempt + 1 >= ATOMIC_REPLACE_ATTEMPTS
+            ):
+                raise
+            time.sleep(ATOMIC_REPLACE_RETRY_SECONDS)
 
 
 def _job_idempotency_digest(job: RelayJob) -> str:

@@ -1086,13 +1086,6 @@ def endpoint_target_info(
     """Report physical host and scheduler identity from the cluster process context."""
 
     def action() -> None:
-        machine_id_path = Path("/etc/machine-id")
-        try:
-            machine_id = machine_id_path.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            raise ConfigurationError(f"could not read physical site marker: {exc}") from exc
-        if not machine_id:
-            raise ConfigurationError("physical site marker is empty")
         provider = provider_for_scheduler(scheduler_provider)
         scheduler_cluster_name = provider.scheduler_cluster_name()
         typer.echo(
@@ -1101,7 +1094,7 @@ def endpoint_target_info(
                     "schema_version": "clio-relay.cluster-target-info.v1",
                     "hostname": socket.gethostname(),
                     "fqdn": socket.getfqdn(),
-                    "site_marker_sha256": hashlib.sha256(machine_id.encode()).hexdigest(),
+                    "site_marker_sha256": _physical_site_marker_sha256(Path("/etc/machine-id")),
                     "scheduler_provider": provider.name,
                     "scheduler_cluster_name": scheduler_cluster_name,
                 },
@@ -1110,6 +1103,17 @@ def endpoint_target_info(
         )
 
     _run_or_exit(action)
+
+
+def _physical_site_marker_sha256(path: Path) -> str:
+    """Hash the exact physical-site marker bytes used by operator pinning tools."""
+    try:
+        marker = path.read_bytes()
+    except OSError as exc:
+        raise ConfigurationError(f"could not read physical site marker: {exc}") from exc
+    if not marker.strip():
+        raise ConfigurationError("physical site marker is empty")
+    return hashlib.sha256(marker).hexdigest()
 
 
 @cluster_app.command("list")
