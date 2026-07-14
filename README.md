@@ -24,7 +24,8 @@ It is a piece of the federation layer for [`clio-agent`](https://github.com/iowa
 > wheel provenance check. The latest released live evidence is `0.9.22`;
 > 1.0.6 is not release-complete until its immutable-candidate
 > reports pass, its exact candidate is published, and the released-artifact
-> runs pass again. The policy currently selects the `ares` and `homelab`
+> runs pass again. The published 1.0 GitHub release is intentionally mutable;
+> GitHub release immutability is deferred to 1.1. The policy currently selects the `ares` and `homelab`
 > evidence labels; those labels are release configuration, not hardcoded
 > product targets, and operators can select additional or different clusters.
 > The coordinated JARVIS-CD 1.2.2 and clio-kit 2.3.2 artifacts are exact pins;

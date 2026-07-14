@@ -144,33 +144,7 @@ jobs:
             --matrix examples/release-gate/report-matrix-1.0.json \
             --output finalization/evidence/released-report-assets-before.json
 
-      - name: prove immutable releases are enabled before publication
-        env:
-          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-        shell: bash
-        run: |
-          test -n "$IMMUTABLE_RELEASES_READ_TOKEN"
-          GH_TOKEN="$IMMUTABLE_RELEASES_READ_TOKEN" \
-            gh api "repos/$REPOSITORY/immutable-releases" \
-            > "$RUNNER_TEMP/immutable-releases-api.json"
-          jq -e '
-            type == "object"
-            and .enabled == true
-            and (.enforced_by_owner | type == "boolean")
-          ' "$RUNNER_TEMP/immutable-releases-api.json" >/dev/null
-          jq -n \
-            --arg repository "$REPOSITORY" \
-            --slurpfile settings "$RUNNER_TEMP/immutable-releases-api.json" \
-            '{
-              schema_version: "clio-relay.immutable-releases-receipt.v1",
-              repository: $repository,
-              endpoint: ("repos/" + $repository + "/immutable-releases"),
-              enabled: $settings[0].enabled,
-              enforced_by_owner: $settings[0].enforced_by_owner
-            }' > finalization/evidence/IMMUTABLE-RELEASES.json
-
-      - name: download the complete immutable release evidence chain
+      - name: download the complete release evidence chain
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
@@ -326,7 +300,6 @@ jobs:
           released_gate_path = root / "evidence" / "released-release-gate-1.0.json"
           ci_status_path = root / "evidence" / "CI-STATUS.json"
           governance_path = root / "evidence" / "REPOSITORY-GOVERNANCE.json"
-          immutable_releases_path = root / "evidence" / "IMMUTABLE-RELEASES.json"
           candidate_report_manifest = json.loads(
               (root / "evidence" / "candidate-report-assets-after.json").read_text(
                   encoding="utf-8"
@@ -742,19 +715,6 @@ jobs:
               raise SystemExit("final decision does not separate local and released gates")
           ci_status = json.loads(ci_status_path.read_text(encoding="utf-8"))
           governance = json.loads(governance_path.read_text(encoding="utf-8"))
-          immutable_releases = json.loads(
-              immutable_releases_path.read_text(encoding="utf-8")
-          )
-          if immutable_releases != {
-              "schema_version": "clio-relay.immutable-releases-receipt.v1",
-              "repository": os.environ["GITHUB_REPOSITORY"],
-              "endpoint": (
-                  "repos/" + os.environ["GITHUB_REPOSITORY"] + "/immutable-releases"
-              ),
-              "enabled": True,
-              "enforced_by_owner": immutable_releases.get("enforced_by_owner"),
-          } or not isinstance(immutable_releases.get("enforced_by_owner"), bool):
-              raise SystemExit("immutable releases receipt is invalid or disabled")
           claims = {
               "schema_version": "1.0",
               "artifact_stage": "published",
@@ -793,7 +753,10 @@ jobs:
                   ),
                   "environments": governance.get("environments"),
               },
-              "immutable_releases": immutable_releases,
+              "release_publication": {
+                  "github_release_immutable": False,
+                  "immutability_deferred_to_version": "1.1",
+              },
               "local_quality_requirements": local_requirements,
               "released_artifact_requirements": released_requirements,
               "released_reports": used_reports,
@@ -917,10 +880,9 @@ jobs:
           --source-digest "$SOURCE_COMMIT"
           --deny-self-hosted-runners
 
-      - name: bind exact final assets, publish once, and verify immutable equality
+      - name: bind exact final assets, publish once, and verify published equality
         env:
           GH_TOKEN: ${{ github.token }}
-          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           REVIEWED_MAIN_SHA: ${{ inputs.reviewed_main_sha }}
           SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
@@ -985,27 +947,6 @@ jobs:
             --page-size 100 \
             "${asset_args[@]}" \
             --output "$RUNNER_TEMP/EXACT-FINAL-ASSETS.json"
-          test -n "$IMMUTABLE_RELEASES_READ_TOKEN"
-          GH_TOKEN="$IMMUTABLE_RELEASES_READ_TOKEN" \
-            gh api "repos/$REPOSITORY/immutable-releases" \
-            > "$RUNNER_TEMP/immutable-releases-before-publish-api.json"
-          jq -e '
-            type == "object"
-            and .enabled == true
-            and (.enforced_by_owner | type == "boolean")
-          ' "$RUNNER_TEMP/immutable-releases-before-publish-api.json" >/dev/null
-          jq -n \
-            --arg repository "$REPOSITORY" \
-            --slurpfile settings "$RUNNER_TEMP/immutable-releases-before-publish-api.json" \
-            '{
-              schema_version: "clio-relay.immutable-releases-receipt.v1",
-              repository: $repository,
-              endpoint: ("repos/" + $repository + "/immutable-releases"),
-              enabled: $settings[0].enabled,
-              enforced_by_owner: $settings[0].enforced_by_owner
-            }' > "$RUNNER_TEMP/IMMUTABLE-RELEASES-before-publish.json"
-          cmp --silent finalization/evidence/IMMUTABLE-RELEASES.json \
-            "$RUNNER_TEMP/IMMUTABLE-RELEASES-before-publish.json"
           if test "$is_draft" = "true"; then
             jq -n --rawfile body "$notes" \
               '{body: $body, draft: false, prerelease: false}' \
@@ -1017,13 +958,13 @@ jobs:
             expected="$(cat "$notes")"
             test "$actual" = "$expected"
           fi
-          capture_release_assets immutable
+          capture_release_assets published
           python src/clio_relay/ci_validation.py exact-release-assets \
-            --release "$RUNNER_TEMP/final-release-assets-immutable.json" \
-            --next-assets-page "$RUNNER_TEMP/final-assets-immutable-page-2.json" \
+            --release "$RUNNER_TEMP/final-release-assets-published.json" \
+            --next-assets-page "$RUNNER_TEMP/final-assets-published-page-2.json" \
             --page-size 100 \
             "${asset_args[@]}" \
             --verify-existing "$RUNNER_TEMP/EXACT-FINAL-ASSETS.json"
-          test "$(jq -r .draft "$RUNNER_TEMP/final-release-immutable.json")" = "false"
-          test "$(jq -r .immutable "$RUNNER_TEMP/final-release-immutable.json")" = "true"
-          gh release verify "$TAG_NAME" --repo "$REPOSITORY"
+          test "$(jq -r .draft "$RUNNER_TEMP/final-release-published.json")" = "false"
+          test "$(jq -r .prerelease "$RUNNER_TEMP/final-release-published.json")" = "false"
+          test "$(jq -r .immutable "$RUNNER_TEMP/final-release-published.json")" = "false"

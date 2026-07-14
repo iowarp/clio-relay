@@ -947,7 +947,7 @@ def test_every_release_mutation_rechecks_live_identity_immediately_before_write(
     assert "mutation-authority" in str(publish_steps[publish_index - 1].get("run"))
 
 
-def test_final_publication_rechecks_exact_assets_before_and_after_immutability() -> None:
+def test_final_publication_rechecks_exact_assets_before_and_after_publication() -> None:
     workflow = _workflow("finalize-release.yml")
     jobs = cast(dict[str, dict[str, Any]], workflow["jobs"])
     steps = cast(list[dict[str, Any]], jobs["finalize"]["steps"])
@@ -959,16 +959,19 @@ def test_final_publication_rechecks_exact_assets_before_and_after_immutability()
     receipt = script.index('--output "$RUNNER_TEMP/EXACT-FINAL-ASSETS.json"', preflight)
     publish = script.index("relay_release_patch", receipt)
     postflight = script.index("ci_validation.py exact-release-assets", publish)
-    immutable_receipt = script.index(
+    published_receipt = script.index(
         '--verify-existing "$RUNNER_TEMP/EXACT-FINAL-ASSETS.json"',
         postflight,
     )
-    immutable_check = script.index(
-        '.immutable "$RUNNER_TEMP/final-release-immutable.json"', immutable_receipt
+    mutable_check = script.index(
+        '.immutable "$RUNNER_TEMP/final-release-published.json"', published_receipt
     )
 
     assert authority < preflight < receipt < publish
-    assert publish < postflight < immutable_receipt < immutable_check
+    assert publish < postflight < published_receipt < mutable_check
+    assert (
+        'test "$(jq -r .immutable "$RUNNER_TEMP/final-release-published.json")" = "false"' in script
+    )
     assert '"${asset_args[@]}"' in script
     assert script.count("relay_release_complete_assets") == 1
     assert script.count("--next-assets-page") == 2
@@ -1035,17 +1038,18 @@ def test_privileged_release_jobs_never_execute_candidate_or_pypi_code() -> None:
                     assert "uv run --no-sync clio-relay release gate" in script
 
 
-def test_finalization_proves_immutable_mode_before_publishing() -> None:
+def test_finalization_intentionally_publishes_a_normal_mutable_release() -> None:
     text = (WORKFLOWS / "finalize-release.yml").read_text(encoding="utf-8")
 
-    endpoint = 'gh api "repos/$REPOSITORY/immutable-releases"'
-    publish = "relay_release_patch"
-    assert text.count(endpoint) == 2
-    assert "secrets.IMMUTABLE_RELEASES_READ_TOKEN" in text
-    assert 'test -n "$IMMUTABLE_RELEASES_READ_TOKEN"' in text
-    assert ".enabled == true" in text
-    assert "clio-relay.immutable-releases-receipt.v1" in text
-    assert text.rindex(endpoint) < text.rindex(publish)
+    assert 'gh api "repos/$REPOSITORY/immutable-releases"' not in text
+    assert "IMMUTABLE_RELEASES_READ_TOKEN" not in text
+    assert '"github_release_immutable": False' in text
+    assert '"immutability_deferred_to_version": "1.1"' in text
+    assert '.immutable "$RUNNER_TEMP/final-release-published.json"' in text
+    assert (
+        'test "$(jq -r .immutable "$RUNNER_TEMP/final-release-published.json")" = "false"' in text
+    )
+    assert "gh release verify" not in text
 
 
 def test_final_claims_resolve_all_decision_reports_and_bind_target_policy() -> None:
