@@ -3,9 +3,9 @@
 # registry and may require them for a later release by adding policy requirements;
 # neither action requires a clio-relay code change.
 schema_version: "1.0"
-release_version: "1.0.9"
+release_version: "1.0.10"
 acceptance_matrix_path: examples/release-gate/report-matrix-1.0.json
-acceptance_matrix_sha256: d23cddf47e67bdfcb3df637800daf37ed9aa4cedf4bb2a1ee66345ae30bd9ab9
+acceptance_matrix_sha256: 79a73322c5efaeee888ae2e447884ed5034f5cbc317937a4020851e24583b7ef
 artifact_stage: published
 evidence_trust_model: maintainer_sealed_operator_evidence
 require_released_artifact: true
