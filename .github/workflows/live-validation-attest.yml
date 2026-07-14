@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing digest-bound candidate draft tag, such as v1.0.10
+        description: Existing digest-bound candidate draft tag, such as v1.0.11
         required: true
         type: string
 
