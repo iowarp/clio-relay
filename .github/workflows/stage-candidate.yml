@@ -305,7 +305,7 @@ jobs:
               --target "$SOURCE_COMMIT" \
               --draft \
               --title "$TAG_NAME" \
-              --notes "Candidate wheel SHA-256: $wheel_sha. Live validation and PyPI promotion are pending. GitHub release immutability is deferred to 1.1."
+              --notes "Production 1.0 candidate. Exact wheel SHA-256: $wheel_sha. Candidate and released-artifact validation are pending; GitHub release immutability is planned for 1.1."
           fi
           relay_release_resolve_eventually "$TAG_NAME" true \
             "$RUNNER_TEMP/release-after-create.json"

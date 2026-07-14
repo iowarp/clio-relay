@@ -70,7 +70,7 @@ Commit the release change with a conventional commit, then create and push an
 exact matching tag:
 
 ```powershell
-$Tag = "v1.0.8"
+$Tag = "v1.0.9"
 git fetch origin main
 $ReviewedMainSha = (git rev-parse refs/remotes/origin/main).Trim()
 if ((git rev-parse HEAD).Trim() -ne $ReviewedMainSha) {
@@ -154,7 +154,7 @@ Download the draft wheel and manifest, verify both the digest and the signed
 tag-build provenance, and compute the digest locally:
 
 ```powershell
-$Tag = "v1.0.8"
+$Tag = "v1.0.9"
 New-Item -ItemType Directory -Force .clio-relay\candidate | Out-Null
 gh release download $Tag --pattern "*.whl" --pattern "SHA256SUMS" `
   --dir .clio-relay\candidate

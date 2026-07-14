@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing draft release tag, such as v1.0.8
+        description: Existing draft release tag, such as v1.0.9
         required: true
         type: string
       reviewed_main_sha:
