@@ -13,6 +13,7 @@ from typing import cast
 import pytest
 
 from clio_relay.core_queue import (
+    DEFAULT_CORE_LOCK_TIMEOUT_SECONDS,
     LEASE_OPERATIONAL_INDEX_SCHEMA,
     MAX_ACTIVE_JOB_RECORDS,
     MAX_LIVE_LEASE_RECORDS,
@@ -112,7 +113,7 @@ def test_preexisting_over_capacity_queue_can_still_drain(
     assert lease.job_id == job.job_id
 
 
-def test_live_lease_index_counts_10k_real_files_below_lock_timeout(tmp_path: Path) -> None:
+def test_live_lease_index_cold_count_and_warm_admission_stay_bounded(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path / "core")
     queued = queue.submit_job(_job("capacity-admission-probe"))
     job = _job("capacity-template").model_copy(update={"state": JobState.RUNNING})
@@ -140,12 +141,15 @@ def test_live_lease_index_counts_10k_real_files_below_lock_timeout(tmp_path: Pat
     elapsed = perf_counter() - started
 
     assert counts == {JobKind.JARVIS: MAX_LIVE_LEASE_RECORDS}
-    assert elapsed < 2.0, f"10k indexed lease count exceeded lock budget: {elapsed:.3f}s"
+    assert elapsed < DEFAULT_CORE_LOCK_TIMEOUT_SECONDS, (
+        "10k cold indexed lease count exceeded the queue lock timeout: "
+        f"{elapsed:.3f}s >= {DEFAULT_CORE_LOCK_TIMEOUT_SECONDS:.3f}s"
+    )
     started = perf_counter()
     assert queue.acquire_job(queued.job_id, "10k-capacity-probe", cluster="ares") is None
     acquire_elapsed = perf_counter() - started
     assert acquire_elapsed < 2.0, (
-        f"10k indexed lease acquisition exceeded lock budget: {acquire_elapsed:.3f}s"
+        f"10k warm indexed lease acquisition exceeded lock budget: {acquire_elapsed:.3f}s"
     )
 
 
