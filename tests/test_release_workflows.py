@@ -38,6 +38,7 @@ def test_tag_workflow_validates_identity_without_blocking_publication() -> None:
         "pull-requests": "read",
     }
     assert jobs["bind"]["if"] == "github.event_name == 'push'"
+    assert cast(dict[str, Any], workflow["on"]) == {"push": {"tags": ["v*"]}}
     steps = cast(list[dict[str, Any]], jobs["bind"]["steps"])
     checkout = next(step for step in steps if "actions/checkout@" in str(step.get("uses")))
     assert cast(dict[str, str], checkout["with"])["persist-credentials"] == "false"
@@ -53,16 +54,14 @@ def test_tag_workflow_validates_identity_without_blocking_publication() -> None:
     assert "release-candidate-" not in text
 
 
-def test_published_release_uploads_exact_attached_distributions_asynchronously() -> None:
+def test_tag_push_uploads_exact_release_distributions_asynchronously() -> None:
     workflow = _workflow("release.yml")
-    release_trigger = cast(dict[str, Any], cast(dict[str, Any], workflow["on"])["release"])
     jobs = cast(dict[str, dict[str, Any]], workflow["jobs"])
     publish = jobs["publish-pypi"]
     text = str(publish)
 
-    assert release_trigger["types"] == ["published"]
     assert publish["if"] == (
-        "github.event_name == 'release' && github.repository == 'iowarp/clio-relay'"
+        "github.event_name == 'push' && github.repository == 'iowarp/clio-relay'"
     )
     assert cast(dict[str, str], publish["environment"])["name"] == "pypi"
     assert publish["permissions"] == {
@@ -70,8 +69,11 @@ def test_published_release_uploads_exact_attached_distributions_asynchronously()
         "contents": "read",
         "id-token": "write",
     }
-    assert "github.event.release.tag_name" in text
-    assert "github.event.release.id" in text
+    assert "github.ref_name" in text
+    assert "github.sha" in text
+    assert "releases/tags/$TAG_NAME" in text
+    assert "for attempt in $(seq 1 20)" in text
+    assert "sleep 3" in text
     assert "releases/assets/$asset_id" in text
     assert "sha256sum --check --strict SHA256SUMS" in text
     assert "distribution-archives" in text
@@ -84,6 +86,7 @@ def test_published_release_uploads_exact_attached_distributions_asynchronously()
     assert "actions/create-github-app-token@" not in text
     assert "IMMUTABLE_RELEASES" not in text
     assert "merge_queue" not in text
+    assert "github.event.release" not in text
 
 
 def test_same_tag_release_stages_share_one_non_canceling_concurrency_group() -> None:
