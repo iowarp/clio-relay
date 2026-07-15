@@ -757,8 +757,8 @@ def _stop_gateway(
 
 def _jarvis_contract_discovery(
     **_kwargs: object,
-) -> tuple[str, dict[str, object], list[dict[str, object]]]:
-    return "discovery-job", {}, []
+) -> tuple[str, dict[str, object], list[dict[str, object]], bytes]:
+    return "discovery-job", {}, [], b"{}"
 
 
 def _persist_jarvis_contract(**_kwargs: object) -> None:

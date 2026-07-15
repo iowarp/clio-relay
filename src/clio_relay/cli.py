@@ -7429,7 +7429,7 @@ def jarvis_mcp_refresh(
     def action() -> None:
         queue = _managed_queue_from_env()
         queue.initialize()
-        job_id, result, artifacts = _run_jarvis_remote_contract_discovery(
+        job_id, result, artifacts, artifact_payload = _run_jarvis_remote_contract_discovery(
             cluster=cluster,
             definition=definition,
             queue=queue,
@@ -7441,6 +7441,7 @@ def jarvis_mcp_refresh(
             discovery_job_id=job_id,
             result=result,
             artifacts=artifacts,
+            artifact_payload=artifact_payload,
         )
         typer.echo(
             json.dumps(
@@ -7550,6 +7551,7 @@ def jarvis_mcp_validate(
             remote_discovery_job_id,
             remote_tools_list_result,
             remote_discovery_artifacts,
+            remote_discovery_payload,
         ) = _run_jarvis_remote_contract_discovery(
             cluster=cluster,
             definition=definition,
@@ -7562,6 +7564,7 @@ def jarvis_mcp_validate(
             discovery_job_id=remote_discovery_job_id,
             result=remote_tools_list_result,
             artifacts=remote_discovery_artifacts,
+            artifact_payload=remote_discovery_payload,
         )
         stdio_session = run_packaged_mcp_stdio_session(
             profile=profile,
@@ -10283,7 +10286,7 @@ def _run_jarvis_remote_contract_discovery(
     queue: ClioCoreQueue,
     wait_timeout_seconds: float,
     poll_seconds: float,
-) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+) -> tuple[str, dict[str, Any], list[dict[str, Any]], bytes]:
     """Discover the actual cluster-side JARVIS MCP before accepting its virtual route."""
     idempotency_key = f"mcp:jarvis-contract:{cluster}:{uuid4().hex}"
     if should_execute_on_cluster(definition):
@@ -10314,7 +10317,7 @@ def _run_jarvis_remote_contract_discovery(
         )
         _require_discovery_success(terminal, job_id)
         artifacts = _remote_artifact_records(definition, job_id)
-        result = _read_remote_json_artifact_kind(
+        artifact_payload = _read_remote_artifact_kind_bytes(
             definition,
             artifacts,
             kind="mcp_result",
@@ -10345,10 +10348,15 @@ def _run_jarvis_remote_contract_discovery(
         )
         _require_discovery_success(terminal_job.model_dump(mode="json"), job_id)
         artifacts = _complete_local_artifact_records(queue, job_id)
-        result = _read_local_json_artifact_kind(queue, artifacts, kind="mcp_result")
-    if result is None:
+        artifact_payload = _read_local_artifact_kind_bytes(
+            queue,
+            artifacts,
+            kind="mcp_result",
+        )
+    if artifact_payload is None:
         raise RelayError("JARVIS MCP discovery did not produce an mcp_result artifact")
-    return job_id, result, artifacts
+    result = _decode_json_artifact(artifact_payload, kind="mcp_result")
+    return job_id, result, artifacts, artifact_payload
 
 
 def _persist_jarvis_remote_contract_discovery(
@@ -10357,6 +10365,7 @@ def _persist_jarvis_remote_contract_discovery(
     discovery_job_id: str,
     result: dict[str, Any],
     artifacts: list[dict[str, Any]],
+    artifact_payload: bytes,
 ) -> tuple[RemoteMcpSchemaCacheEntry, str]:
     """Persist and verify the exact discovery identity used by built-in JARVIS calls."""
     server = result.get("server")
@@ -10403,7 +10412,7 @@ def _persist_jarvis_remote_contract_discovery(
         discovery_job_id=discovery_job_id,
         artifact_id=artifact_id,
         artifact_sha256=artifact_sha256,
-        artifact_payload=json.dumps(result, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        artifact_payload=artifact_payload,
     )
     if entry.schema_digest != CLIO_KIT_JARVIS_USER_CONTRACT_SHA256:
         raise RelayError(
@@ -10462,6 +10471,17 @@ def _read_remote_json_artifact_kind(
     *,
     kind: str,
 ) -> dict[str, Any] | None:
+    payload = _read_remote_artifact_kind_bytes(definition, artifacts, kind=kind)
+    return _decode_json_artifact(payload, kind=kind) if payload is not None else None
+
+
+def _read_remote_artifact_kind_bytes(
+    definition: ClusterDefinition,
+    artifacts: list[dict[str, Any]],
+    *,
+    kind: str,
+) -> bytes | None:
+    """Read the exact remote artifact bytes recorded by the durable queue."""
     artifact = _artifact_record(artifacts, kind=kind)
     if artifact is None:
         return None
@@ -10472,7 +10492,7 @@ def _read_remote_json_artifact_kind(
         run_remote_clio(definition, ["job", "read-artifact", artifact_id]),
         f"remote {kind} artifact payload",
     )
-    return _decode_json_artifact(_decode_artifact_envelope(envelope), kind=kind)
+    return _decode_artifact_envelope(envelope)
 
 
 def _read_local_json_artifact_kind(
@@ -10481,6 +10501,17 @@ def _read_local_json_artifact_kind(
     *,
     kind: str,
 ) -> dict[str, Any] | None:
+    payload = _read_local_artifact_kind_bytes(queue, artifacts, kind=kind)
+    return _decode_json_artifact(payload, kind=kind) if payload is not None else None
+
+
+def _read_local_artifact_kind_bytes(
+    queue: ClioCoreQueue,
+    artifacts: list[dict[str, Any]],
+    *,
+    kind: str,
+) -> bytes | None:
+    """Read the exact local artifact bytes recorded by the durable queue."""
     artifact = _artifact_record(artifacts, kind=kind)
     if artifact is None:
         return None
@@ -10488,7 +10519,7 @@ def _read_local_json_artifact_kind(
     if not isinstance(artifact_id, str) or not artifact_id:
         raise RelayError(f"local {kind} artifact has no artifact_id")
     envelope = read_artifact_bytes(queue, artifact_id)
-    return _decode_json_artifact(_decode_artifact_envelope(envelope), kind=kind)
+    return _decode_artifact_envelope(envelope)
 
 
 def _decode_json_artifact(payload: bytes, *, kind: str) -> dict[str, Any]:

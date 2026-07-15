@@ -25,6 +25,10 @@ from clio_relay.cluster_config import (
 )
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
+from clio_relay.jarvis_mcp import (
+    CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
+    jarvis_user_contract,
+)
 from clio_relay.models import (
     ArtifactRef,
     Cursor,
@@ -5164,6 +5168,75 @@ def test_cli_jarvis_mcp_call_uses_builtin_cluster_command(
     assert job.spec.env_from == {"JARVIS_MCP_SPACK_COMMAND": "JARVIS_MCP_SPACK_COMMAND"}
     assert job.spec.tool == "jarvis_describe"
     assert job.spec.arguments == {"target": "packages"}
+
+
+def test_jarvis_discovery_persists_exact_durable_artifact_bytes(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Keep the discovery hash bound to stored bytes, not a JSON reserialization."""
+    monkeypatch.chdir(tmp_path)
+    contract = jarvis_user_contract()
+    server_artifact: dict[str, object] = {
+        "verified": True,
+        "server_process_artifact_verified": True,
+        "executable": {
+            "path": "/opt/clio-kit/bin/clio-kit",
+            "sha256": "a" * 64,
+        },
+    }
+    result: dict[str, object] = {
+        "server": "clio-kit",
+        "server_args": ["mcp-server", "jarvis"],
+        "env_from": {},
+        "operation": "tools/list",
+        "tool": None,
+        "arguments": {},
+        "protocol_result": {
+            "tools": [
+                {
+                    "name": name,
+                    "description": definition["description"],
+                    "inputSchema": definition["inputSchema"],
+                    "outputSchema": definition["outputSchema"],
+                    "annotations": definition["annotations"],
+                }
+                for name, definition in contract.items()
+            ]
+        },
+        "structured_result": None,
+        "protocol_version": "2024-11-05",
+        "server_info": {"name": "clio-kit", "version": "2.4.2"},
+        "server_artifact": server_artifact,
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
+        "timed_out": False,
+        "protocol_error": None,
+    }
+    artifact_payload = (json.dumps(result, indent=2) + "\n").encode()
+    compact_payload = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
+    artifact_sha256 = hashlib.sha256(artifact_payload).hexdigest()
+
+    assert artifact_payload != compact_payload
+
+    entry, binding = cli._persist_jarvis_remote_contract_discovery(  # pyright: ignore[reportPrivateUsage]
+        cluster="ares",
+        discovery_job_id="job_discovery",
+        result=result,
+        artifacts=[
+            {
+                "artifact_id": "artifact_discovery",
+                "kind": "mcp_result",
+                "sha256": artifact_sha256,
+            }
+        ],
+        artifact_payload=artifact_payload,
+    )
+
+    assert entry.schema_digest == CLIO_KIT_JARVIS_USER_CONTRACT_SHA256
+    assert entry.provenance.artifact_sha256 == artifact_sha256
+    assert binding
 
 
 def test_cli_remote_jarvis_call_defers_artifact_selection_to_target(
