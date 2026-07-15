@@ -229,6 +229,56 @@ for line in sys.stdin:
     assert "distribution RECORD closure" in result["server_artifact"]["identity_error"]
 
 
+def test_mcp_session_runs_inside_jarvis_worker_thread(tmp_path: Path) -> None:
+    """A durable JARVIS package may execute the MCP session off the main thread."""
+    runner = _load_runner()
+    server_path = tmp_path / "threaded_stdio_server.py"
+    server_path.write_text(
+        """import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "threaded-test-server", "version": "1.0"},
+            },
+        }), flush=True)
+    elif method == "tools/list":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "result": {"tools": []},
+        }), flush=True)
+        break
+""",
+        encoding="utf-8",
+    )
+
+    def run_in_worker() -> subprocess.CompletedProcess[str]:
+        return cast(Any, runner)._run_mcp_session(
+            [sys.executable, str(server_path)],
+            tool=None,
+            arguments={},
+            timeout=10,
+            operation="tools/list",
+            env_from={},
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(run_in_worker).result(timeout=20)
+
+    assert result.returncode == 0
+    assert "threaded-test-server" in result.stdout
+    assert result.stderr == ""
+
+
 def test_direct_console_launcher_binds_real_distribution_record_and_detects_mutation(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

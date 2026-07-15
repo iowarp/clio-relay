@@ -4398,6 +4398,12 @@ def _install_parent_termination_handlers(
     process: subprocess.Popen[str],
 ) -> dict[int, _SignalHandler]:
     """Ensure outer JARVIS termination cleans the separately-owned MCP group."""
+    # Python signal handlers are process-global and may only be installed by the
+    # main interpreter thread. Durable JARVIS executions invoke package start
+    # hooks from a worker thread, where the session's ``finally`` block and the
+    # relay containment boundary own child cleanup instead.
+    if threading.current_thread() is not threading.main_thread():
+        return {}
     previous: dict[int, _SignalHandler] = {}
     terminating = False
 
