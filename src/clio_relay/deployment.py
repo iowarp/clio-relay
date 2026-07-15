@@ -59,6 +59,7 @@ def render_endpoint_user_service(
         JARVIS_MCP_COMMAND_ENV,
         os.environ.get(JARVIS_MCP_COMMAND_ENV),
     )
+    jarvis_mcp_unset_line = "" if jarvis_mcp_line else f"UnsetEnvironment={JARVIS_MCP_COMMAND_ENV}"
     jarvis_mcp_spack_line = _optional_environment_line(
         JARVIS_MCP_SPACK_COMMAND_ENV,
         (
@@ -70,6 +71,9 @@ def render_endpoint_user_service(
             else None
         ),
         allow_home_specifier=(spack_source is not None and remote_value_expands_home(spack_source)),
+    )
+    jarvis_mcp_spack_unset_line = (
+        "" if jarvis_mcp_spack_line else f"UnsetEnvironment={JARVIS_MCP_SPACK_COMMAND_ENV}"
     )
     exec_start_arguments = [
         relay_bin,
@@ -138,6 +142,8 @@ Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="{INSTALL_RECEIPT_PATH_ENV}=%h/.local/share/clio-relay/install-receipt.json"
 {jarvis_mcp_line}
 {jarvis_mcp_spack_line}
+{jarvis_mcp_unset_line}
+{jarvis_mcp_spack_unset_line}
 ExecStartPre={exec_start_pre}
 ExecStart={exec_start}
 Restart=on-failure
