@@ -82,11 +82,11 @@ gh pr create --title "fix: ..." --body-file PR.md
 gh pr merge --squash --delete-branch
 git switch main
 git pull --ff-only origin main
-$Tag = "v1.2.7"
+$Tag = "v1.2.8"
 $Commit = (git rev-parse HEAD).Trim()
 git tag $Tag $Commit
 git push origin $Tag
-gh release create $Tag --draft --target $Commit --title "clio-relay 1.2.7" `
+gh release create $Tag --draft --target $Commit --title "clio-relay 1.2.8" `
   dist/*.whl dist/*.tar.gz dist/SHA256SUMS --notes-file RELEASE.md
 gh release edit $Tag --draft=false
 ```
