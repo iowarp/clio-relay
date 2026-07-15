@@ -49,9 +49,9 @@ CONTRACT_PROJECTION = "mcp-agent-tool-schema-v1"
 MAX_CONTRACT_BYTES = 4 * 1024 * 1024
 MAX_PROBE_OUTPUT_BYTES = 16 * 1024 * 1024
 EXPECTED_CONTRACTS = {
-    "clio-kit-jarvis-user-v3": {
+    "clio-kit-jarvis-user-v3.1": {
         "server_name": "jarvis",
-        "artifact": "jarvis-user-v3.json",
+        "artifact": "jarvis-user-v3.1.json",
         "contract_sha256": CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
         "tool_names": {
             "jarvis_add_step",
@@ -62,13 +62,48 @@ EXPECTED_CONTRACTS = {
             "jarvis_run",
         },
     },
+    "clio-kit-slurm-user-v3": {
+        "server_name": "slurm",
+        "artifact": "slurm-user-v3.json",
+        "contract_sha256": "8557f6dbbf5d88ca0a617e06581056d61a363e21ec7fac01f8e31f65e66736a8",
+        "tool_names": {
+            "slurm_cancel",
+            "slurm_cluster",
+            "slurm_describe",
+            "slurm_list",
+            "slurm_submit",
+        },
+    },
     "clio-kit-spack-user-v2": {
         "server_name": "spack",
         "artifact": "spack-user-v2.json",
         "contract_sha256": CLIO_KIT_SPACK_USER_CONTRACT_SHA256,
         "tool_names": {"spack_find", "spack_install", "spack_locate"},
     },
+    "clio-kit-scientific-catalog-user-v1": {
+        "server_name": "scientific-catalog",
+        "artifact": "scientific-catalog-user-v1.json",
+        "contract_sha256": "a53006f24f4698f659f0a7c8bf61fc7bd7ad23274b06d2eed2ccfca68b9ecb0a",
+        "tool_names": {
+            "scientific_dataset_describe",
+            "scientific_dataset_search",
+        },
+    },
+    "clio-kit-jarvis-user-v3": {
+        "server_name": "jarvis",
+        "artifact": "jarvis-user-v3.json",
+        "contract_sha256": "c70e350d919e0f3fa0c116d7eaf861e23b4087a18a06b2704ddbf7384f8d1f82",
+        "tool_names": {
+            "jarvis_add_step",
+            "jarvis_create_pipeline",
+            "jarvis_describe",
+            "jarvis_edit_step",
+            "jarvis_get_execution",
+            "jarvis_run",
+        },
+    },
 }
+ACTIVE_CONTRACT_IDS = frozenset(EXPECTED_CONTRACTS) - {"clio-kit-jarvis-user-v3"}
 UV_TOOL_PROBE_VERSION = "0.0.0"
 
 
@@ -154,7 +189,7 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
         assert artifact["contract_sha256"] == expected["contract_sha256"]
         assert set(cast(list[str], artifact["tool_names"])) == expected["tool_names"]
 
-    jarvis_tools = _tools_by_name(shipped_contracts["clio-kit-jarvis-user-v3"])
+    jarvis_tools = _tools_by_name(shipped_contracts["clio-kit-jarvis-user-v3.1"])
     artifact_projection = {
         name: {
             "description": tool.get("description"),
@@ -179,6 +214,7 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
         "pipeline_id",
         "execution_id",
         "include_progress",
+        "include_service_runtimes",
         "artifacts",
     }
     assert query_properties["include_progress"] == {"default": True, "type": "boolean"}
@@ -215,8 +251,17 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
         "runtime_metadata",
         "progress",
         "artifact_page",
+        "service_runtimes",
     }
-    assert shipped_contracts["clio-kit-jarvis-user-v3"]["wire_sha256"] == (
+    assert query_output["properties"]["schema_version"] == {
+        "const": "clio-kit.jarvis-execution.v2",
+        "type": "string",
+    }
+    assert query_properties["include_service_runtimes"] == {
+        "default": False,
+        "type": "boolean",
+    }
+    assert shipped_contracts["clio-kit-jarvis-user-v3.1"]["wire_sha256"] == (
         CLIO_KIT_JARVIS_USER_WIRE_SHA256
     )
 
@@ -226,6 +271,16 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
     locate_properties = cast(JSON, locate_output["properties"])
     assert locate_properties["load_spec"] == {"type": "string"}
     assert "load_spec" in cast(list[str], locate_output["required"])
+
+    scientific_tools = _tools_by_name(shipped_contracts["clio-kit-scientific-catalog-user-v1"])
+    assert set(scientific_tools) == {
+        "scientific_dataset_describe",
+        "scientific_dataset_search",
+    }
+    assert all(
+        cast(JSON, tool["annotations"])["readOnlyHint"] is True
+        for tool in scientific_tools.values()
+    )
 
 
 def test_real_uv_tool_install_binds_external_launcher_to_receipt_and_record(
@@ -596,7 +651,7 @@ def test_runner_launches_exact_wheel_only_through_verified_snapshot(
     assert "clio-relay-mcp-wheel-" not in result_payload
 
 
-@pytest.mark.parametrize("contract_id", sorted(EXPECTED_CONTRACTS))
+@pytest.mark.parametrize("contract_id", sorted(ACTIVE_CONTRACT_IDS))
 def test_live_locked_stdio_matches_shipped_contract_artifact(
     contract_id: str,
     clio_kit_wheel: Path,

@@ -3,33 +3,54 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import math
 import os
 import secrets
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import httpx
 
+from clio_relay.browser_gateway import (
+    CAPABILITY_ENV,
+    BrowserAttachmentGrant,
+    BrowserAttachmentRecord,
+    BrowserDetachmentResult,
+    BrowserGatewayConfig,
+)
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
+from clio_relay.jarvis_service_runtime import (
+    JarvisDatasetDescriptor,
+    VerifiedJarvisServiceRuntime,
+    reverify_jarvis_service_runtime,
+)
 from clio_relay.models import (
     GatewaySession,
     GatewaySessionState,
+    SchedulerConnectorPlacement,
+    SchedulerConnectorStepIdentity,
+    SchedulerConnectorStepStatus,
     SchedulerStatus,
     ServiceRuntimeSpec,
     utc_now,
 )
+from clio_relay.public_records import public_gateway_payload
 from clio_relay.relay_host import (
     FrpcConfig,
     FrpcVisitorConfig,
@@ -39,7 +60,10 @@ from clio_relay.relay_host import (
 )
 from clio_relay.remote_cli import remote_env
 from clio_relay.remote_values import render_remote_shell_value
-from clio_relay.scheduler_providers import provider_for_scheduler
+from clio_relay.scheduler_providers import (
+    SchedulerAllocationConnectorProvider,
+    provider_for_scheduler,
+)
 from clio_relay.session_lifecycle import CleanupResource
 
 if TYPE_CHECKING:
@@ -70,6 +94,8 @@ _OWNERSHIP_INTENT_SCHEMA = "clio-relay.gateway-ownership-intent.v1"
 _MAX_SUBMISSION_OUTPUT_BYTES = 262_144
 _REMOTE_RUNTIME_COMMAND_TIMEOUT_SECONDS = 120.0
 _LOCAL_CLEANUP_COMMAND_TIMEOUT_SECONDS = 30.0
+_CONNECTOR_STEP_CLEANUP_TIMEOUT_SECONDS = 30.0
+_CONNECTOR_STEP_CLEANUP_POLL_SECONDS = 0.25
 _TERMINAL_RUNTIME_STATES = {
     "canceled",
     "cancelled",
@@ -238,6 +264,8 @@ class ServiceRuntimeStartResult:
     stream_url: str | None
     compatibility_urls: dict[str, str]
     events_url: str | None
+    state_url: str | None = None
+    command_url: str | None = None
 
     def to_live_validation_report(
         self,
@@ -312,12 +340,14 @@ class ServiceRuntimeStartResult:
         for connector_role in ("remote_connector", "desktop_connector"):
             connector = _object(transport.get(connector_role, {}))
             pid = _optional_int(connector.get("pid"))
-            if pid is None:
+            scheduler_step_id = _optional_str(connector.get("scheduler_step_id"))
+            resource_id = str(pid) if pid is not None else scheduler_step_id
+            if resource_id is None:
                 continue
             report.resources.append(
                 ValidationResource(
                     kind="connector",
-                    resource_id=str(pid),
+                    resource_id=resource_id,
                     role=connector_role,
                     cluster=self.session.cluster,
                     state="running",
@@ -353,19 +383,21 @@ class ServiceRuntimeStopResult:
 
     def json_payload(self) -> dict[str, object]:
         """Return a machine-readable cleanup report."""
-        return {
-            "session": self.session.model_dump(mode="json"),
-            "resources": [resource.model_dump(mode="json") for resource in self.resources],
-            "residual_resources": [
-                resource.model_dump(mode="json") for resource in self.residual_resources
-            ],
-            "validation_resources": [
-                resource.model_dump(mode="json") for resource in self.validation_resources()
-            ],
-            "cleanup_evidence": self.to_cleanup_evidence().model_dump(mode="json"),
-            "errors": self.errors,
-            "ok": not self.errors and not self.residual_resources,
-        }
+        return public_gateway_payload(
+            {
+                "session": self.session.model_dump(mode="json"),
+                "resources": [resource.model_dump(mode="json") for resource in self.resources],
+                "residual_resources": [
+                    resource.model_dump(mode="json") for resource in self.residual_resources
+                ],
+                "validation_resources": [
+                    resource.model_dump(mode="json") for resource in self.validation_resources()
+                ],
+                "cleanup_evidence": self.to_cleanup_evidence().model_dump(mode="json"),
+                "errors": self.errors,
+                "ok": not self.errors and not self.residual_resources,
+            }
+        )
 
     def validation_resources(self) -> list[ValidationResource]:
         """Return cleanup resources in the shared validation-report shape."""
@@ -662,6 +694,11 @@ class ServiceRuntimeSupervisor:
         owner_session_admission_id: str | None = None,
     ) -> ServiceRuntimeStartResult:
         """Start a scheduler-backed remote service and bind it to a desktop port."""
+        if spec.deployment_driver == "jarvis-bound":
+            raise ConfigurationError("jarvis-bound runtimes must use bind_verified_jarvis_runtime")
+        if spec.submit_command is None:
+            raise ConfigurationError("submitted runtimes require a submit command")
+        submit_command = spec.submit_command
         if (owner_session_id is None) != (owner_session_generation_id is None):
             raise ConfigurationError(
                 "owner_session_id and owner_session_generation_id must be provided together"
@@ -731,7 +768,7 @@ class ServiceRuntimeSupervisor:
             )
             submit_output = self._ssh(
                 _submit_script(
-                    spec.submit_command,
+                    submit_command,
                     session_id=session.session_id,
                     submission_id=submission_id,
                     scheduler_provider=spec.scheduler,
@@ -825,7 +862,8 @@ class ServiceRuntimeSupervisor:
                 session_id=session.session_id,
             )
             health_url = (
-                f"http://{spec.desktop_bind_addr}:{spec.desktop_bind_port}{spec.health_path}"
+                f"{spec.protocol}://{spec.desktop_bind_addr}:"
+                f"{spec.desktop_bind_port}{spec.health_path}"
             )
             self._wait_for_local_health(
                 health_url,
@@ -834,17 +872,31 @@ class ServiceRuntimeSupervisor:
                 expected_body=spec.health_expected_body,
             )
             events_url = (
-                f"http://{spec.desktop_bind_addr}:{spec.desktop_bind_port}{spec.event_stream_path}"
+                f"{spec.protocol}://{spec.desktop_bind_addr}:"
+                f"{spec.desktop_bind_port}{spec.event_stream_path}"
                 if spec.event_stream_path is not None
                 else None
             )
             stream_url = (
-                f"http://{spec.desktop_bind_addr}:{spec.desktop_bind_port}{spec.stream_path}"
+                f"{spec.protocol}://{spec.desktop_bind_addr}:"
+                f"{spec.desktop_bind_port}{spec.stream_path}"
                 if spec.stream_path is not None
                 else None
             )
+            state_url = (
+                f"{spec.protocol}://{spec.desktop_bind_addr}:"
+                f"{spec.desktop_bind_port}{spec.state_path}"
+                if spec.state_path is not None
+                else None
+            )
+            command_url = (
+                f"{spec.protocol}://{spec.desktop_bind_addr}:"
+                f"{spec.desktop_bind_port}{spec.command_path}"
+                if spec.command_path is not None
+                else None
+            )
             compatibility_urls = {
-                name: f"http://{spec.desktop_bind_addr}:{spec.desktop_bind_port}{path}"
+                name: (f"{spec.protocol}://{spec.desktop_bind_addr}:{spec.desktop_bind_port}{path}")
                 for name, path in spec.compatibility_paths.items()
             }
             session = self._update(
@@ -859,6 +911,8 @@ class ServiceRuntimeSupervisor:
                     "stream_url": stream_url,
                     "compatibility_urls": compatibility_urls,
                     "events_url": events_url,
+                    "state_url": state_url,
+                    "command_url": command_url,
                     "service": {
                         "host": node,
                         "port": spec.service_port,
@@ -868,6 +922,8 @@ class ServiceRuntimeSupervisor:
                         "compatibility_paths": spec.compatibility_paths,
                         "state_path": spec.state_path,
                         "event_stream_path": spec.event_stream_path,
+                        "command_path": spec.command_path,
+                        "protocol": spec.protocol,
                         "deployment_driver": spec.deployment_driver,
                     },
                     "transport": {
@@ -888,9 +944,28 @@ class ServiceRuntimeSupervisor:
                 stream_url=stream_url,
                 compatibility_urls=compatibility_urls,
                 events_url=events_url,
+                state_url=state_url,
+                command_url=command_url,
             )
         except Exception as exc:
             cleanup_errors: list[str] = []
+            if remote_connector is None:
+                try:
+                    recovered = self._reconcile_ownership_intents(
+                        self.queue.get_gateway_session(session.session_id)
+                    )
+                    recovered_remote = _object(
+                        _object(recovered.gateway.get("transport", {})).get(
+                            "remote_connector",
+                            {},
+                        )
+                    )
+                    if recovered_remote:
+                        remote_connector = recovered_remote
+                except (ConfigurationError, RelayError) as recovery_exc:
+                    cleanup_errors.append(
+                        f"remote connector rollback reconciliation failed: {recovery_exc}"
+                    )
             if local_connector is not None:
                 _, local_rollback = self._stop_local_connector(
                     session_id=session.session_id,
@@ -941,6 +1016,690 @@ class ServiceRuntimeSupervisor:
             )
             raise
 
+    def bind_verified_jarvis_runtime(
+        self,
+        *,
+        name: str,
+        verified: VerifiedJarvisServiceRuntime,
+        desktop_bind_port: int | None = None,
+        owner_session_id: str | None = None,
+        owner_session_generation_id: str | None = None,
+        transport_mode: str = "frp-stcp-wss",
+        readiness_timeout_seconds: float = 300.0,
+        poll_seconds: float = 2.0,
+    ) -> ServiceRuntimeStartResult:
+        """Bind connectors to a ready JARVIS-owned service without submitting work."""
+        runtime = verified.runtime
+        binding = verified.binding
+        if runtime.lifecycle != "ready":
+            raise ConfigurationError("only a ready JARVIS service runtime can be bound")
+        if (owner_session_id is None) != (owner_session_generation_id is None):
+            raise ConfigurationError(
+                "owner_session_id and owner_session_generation_id must be provided together"
+            )
+        if readiness_timeout_seconds <= 0 or poll_seconds <= 0:
+            raise ConfigurationError("runtime readiness intervals must be positive")
+        allocation_provider = binding.scheduler_provider
+        allocation_job_id = binding.scheduler_native_id
+        if allocation_job_id is not None:
+            if allocation_provider is None:
+                raise ConfigurationError(
+                    "scheduler-backed JARVIS runtime omitted its scheduler provider"
+                )
+            if runtime.host not in {"127.0.0.1", "::1", "localhost"}:
+                raise ConfigurationError(
+                    "scheduler-backed JARVIS services must advertise a loopback-only endpoint"
+                )
+        local_port = desktop_bind_port or runtime.port
+        if local_port < 1 or local_port > 65_535:
+            raise ConfigurationError("desktop bind port must be between 1 and 65535")
+        scheduler = binding.scheduler_provider or "external"
+        spec = ServiceRuntimeSpec(
+            kind="jarvis-service-runtime",
+            submit_command=None,
+            deployment_driver="jarvis-bound",
+            service_port=runtime.port,
+            protocol=runtime.protocol,
+            health_path=runtime.health_path,
+            stream_mode="push",
+            stream_path=runtime.live_data_path,
+            event_stream_path=runtime.events_path,
+            state_path=runtime.state_path,
+            command_path=runtime.command_path,
+            desktop_bind_addr="127.0.0.1",
+            desktop_bind_port=local_port,
+            transport_mode=transport_mode,
+            readiness_timeout_seconds=readiness_timeout_seconds,
+            poll_seconds=poll_seconds,
+            scheduler=scheduler,
+            connect_url_template=f"{runtime.protocol}://{{bind_addr}}:{{bind_port}}",
+            metadata={
+                "source": "verified_jarvis_service_runtime",
+                "service_instance_id": runtime.service_instance_id,
+                "service_revision": runtime.revision,
+            },
+        )
+        owner_metadata: dict[str, object] = {
+            "owner": "clio-relay",
+            "runtime_kind": spec.kind,
+            "binding_source": "jarvis_mcp_result",
+            "source_relay_job_id": binding.source_relay_job_id,
+            "source_relay_artifact_id": binding.source_relay_artifact_id,
+            "jarvis_execution_id": binding.jarvis_execution_id,
+        }
+        if owner_session_id is not None and owner_session_generation_id is not None:
+            owner_metadata.update(
+                {
+                    "owner_session_id": owner_session_id,
+                    "owner_session_generation_id": owner_session_generation_id,
+                }
+            )
+        self.queue.initialize()
+        session = self.queue.create_gateway_session(
+            GatewaySession(
+                cluster=self.cluster,
+                name=name,
+                state=GatewaySessionState.CREATED,
+                scheduler=scheduler,
+                scheduler_job_id=binding.scheduler_native_id,
+                requested_resources={"service_port": runtime.port},
+                gateway={
+                    "runtime_spec": spec.model_dump(mode="json"),
+                    "jarvis_runtime_binding": binding.model_dump(mode="json"),
+                    "transport": {"mode": transport_mode},
+                    "ownership_intents": {
+                        "scheduler_submission": _new_ownership_intent(
+                            "absent_verified",
+                            source="verified_jarvis_runtime_binding",
+                        ),
+                        "remote_connector": _new_ownership_intent("not_started"),
+                        "desktop_connector": _new_ownership_intent("not_started"),
+                    },
+                },
+                metadata=owner_metadata,
+            )
+        )
+        remote_connector: dict[str, object] | None = None
+        local_connector: dict[str, object] | None = None
+        try:
+            session = self._update(
+                session,
+                state=GatewaySessionState.STARTING,
+                queue_state=runtime.lifecycle,
+                node=runtime.host,
+                metadata={"binding_started_at": utc_now().isoformat()},
+            )
+            proxy_name = f"{session.session_id}-service"
+            remote_intent = _new_ownership_intent(
+                "starting",
+                owner_token=secrets.token_hex(32),
+                connector_generation_id=secrets.token_hex(16),
+            )
+            session = self._set_ownership_intent(session, "remote_connector", remote_intent)
+            remote_connector = self._start_remote_connector(
+                session=session,
+                spec=spec,
+                node=runtime.host,
+                proxy_name=proxy_name,
+                ownership_intent=remote_intent,
+                allocation_provider=allocation_provider,
+                allocation_job_id=allocation_job_id,
+            )
+            session = self._update(
+                session,
+                gateway=self._gateway_with_ownership_intent(
+                    session,
+                    "remote_connector",
+                    _new_ownership_intent("recorded", **remote_connector),
+                    transport={
+                        **_object(session.gateway.get("transport", {})),
+                        "remote_connector": remote_connector,
+                    },
+                ),
+            )
+            local_intent = self._local_connector_intent(session)
+            session = self._set_ownership_intent(session, "desktop_connector", local_intent)
+            local_connector = self._start_local_visitor(
+                session=session,
+                spec=spec,
+                proxy_name=proxy_name,
+                ownership_intent=local_intent,
+            )
+            session = self._update(
+                session,
+                gateway=self._gateway_with_ownership_intent(
+                    session,
+                    "desktop_connector",
+                    _new_ownership_intent("recorded", **local_connector),
+                    transport={
+                        **_object(session.gateway.get("transport", {})),
+                        "remote_connector": remote_connector,
+                        "desktop_connector": local_connector,
+                    },
+                ),
+            )
+            base_url = f"{runtime.protocol}://127.0.0.1:{local_port}"
+            connect_url = base_url
+            health_url = f"{base_url}{runtime.health_path}"
+            stream_url = f"{base_url}{runtime.live_data_path}"
+            events_url = f"{base_url}{runtime.events_path}"
+            state_url = f"{base_url}{runtime.state_path}"
+            command_url = f"{base_url}{runtime.command_path}"
+            health_revision = self._wait_for_jarvis_health(
+                health_url,
+                timeout_seconds=readiness_timeout_seconds,
+                poll_seconds=poll_seconds,
+                service_instance_id=runtime.service_instance_id,
+            )
+            self._wait_for_jarvis_state(
+                state_url,
+                timeout_seconds=readiness_timeout_seconds,
+                poll_seconds=poll_seconds,
+                service_instance_id=runtime.service_instance_id,
+                execution_id=binding.jarvis_execution_id,
+                health_revision=health_revision,
+                dataset_descriptor_sha256=binding.dataset_descriptor_sha256,
+            )
+            session = self._update(
+                session,
+                state=GatewaySessionState.READY,
+                queue_state=runtime.lifecycle,
+                node=runtime.host,
+                gateway={
+                    **session.gateway,
+                    "connect_url": connect_url,
+                    "health_url": health_url,
+                    "stream_url": stream_url,
+                    "events_url": events_url,
+                    "state_url": state_url,
+                    "command_url": command_url,
+                    "compatibility_urls": {},
+                    "service": {
+                        "host": runtime.host,
+                        "port": runtime.port,
+                        "protocol": runtime.protocol,
+                        "health_path": runtime.health_path,
+                        "stream_mode": runtime.delivery_mode,
+                        "stream_path": runtime.live_data_path,
+                        "event_stream_path": runtime.events_path,
+                        "state_path": runtime.state_path,
+                        "command_path": runtime.command_path,
+                        "deployment_driver": "jarvis-bound",
+                        "placement": remote_connector.get("placement"),
+                    },
+                    "transport": {
+                        "mode": transport_mode,
+                        "proxy_name": proxy_name,
+                        "remote_connector": remote_connector,
+                        "desktop_connector": local_connector,
+                        "remote_target": f"{runtime.host}:{runtime.port}",
+                        "desktop_bind": f"127.0.0.1:{local_port}",
+                    },
+                },
+                metadata={"ready_at": utc_now().isoformat()},
+            )
+            return ServiceRuntimeStartResult(
+                session=session,
+                connect_url=connect_url,
+                health_url=health_url,
+                stream_url=stream_url,
+                compatibility_urls={},
+                events_url=events_url,
+                state_url=state_url,
+                command_url=command_url,
+            )
+        except Exception as exc:
+            cleanup_errors: list[str] = []
+            if local_connector is not None:
+                _, local_rollback = self._stop_local_connector(
+                    session_id=session.session_id,
+                    connector=local_connector,
+                    require_record=True,
+                )
+                if local_rollback.residual or not local_rollback.verified_after_operation:
+                    cleanup_errors.append(
+                        local_rollback.detail or "desktop connector rollback was not proven"
+                    )
+            if remote_connector is not None:
+                if remote_connector.get("execution_scope") == "scheduler_allocation":
+                    try:
+                        rollback = self._stop_allocation_connector(
+                            session_id=session.session_id,
+                            connector=remote_connector,
+                        )
+                        if rollback.residual or not rollback.verified_after_operation:
+                            cleanup_errors.append(
+                                rollback.detail
+                                or "allocation connector rollback absence was not proven"
+                            )
+                    except (ConfigurationError, RelayError) as rollback_exc:
+                        cleanup_errors.append(str(rollback_exc))
+                else:
+                    remote_pid = _optional_int(remote_connector.get("pid"))
+                    if remote_pid is None:
+                        cleanup_errors.append("remote connector rollback has no recorded pid")
+                    else:
+                        try:
+                            result = _last_json_object(
+                                self._ssh(
+                                    _remote_stop_script(
+                                        session_id=session.session_id,
+                                        pid=remote_pid,
+                                    )
+                                )
+                            )
+                            if not _remote_cleanup_proven(result):
+                                cleanup_errors.append(
+                                    "remote connector rollback did not prove process-group absence"
+                                )
+                        except RelayError as rollback_exc:
+                            cleanup_errors.append(str(rollback_exc))
+            self._update(
+                session,
+                state=GatewaySessionState.FAILED,
+                metadata={
+                    "failed_at": utc_now().isoformat(),
+                    "last_error": str(exc),
+                    "cleanup_error": "; ".join(dict.fromkeys(cleanup_errors)) or None,
+                },
+            )
+            raise
+
+    def browser_attach(
+        self,
+        *,
+        session_id: str,
+        ttl_seconds: int = 1_800,
+        bind_port: int | None = None,
+    ) -> BrowserAttachmentGrant:
+        """Issue one short-lived sandbox capability through an owned loopback proxy."""
+        if ttl_seconds < 60 or ttl_seconds > 28_800:
+            raise ConfigurationError("browser attachment TTL must be between 60 and 28800 seconds")
+        session = self.queue.get_gateway_session(session_id)
+        if session.cluster != self.cluster:
+            raise ConfigurationError(
+                f"gateway session {session_id} belongs to cluster {session.cluster}, "
+                f"not {self.cluster}"
+            )
+        if session.metadata.get("owner") != "clio-relay":
+            raise ConfigurationError("browser attachment requires an owned clio-relay runtime")
+        if session.state is not GatewaySessionState.READY:
+            raise ConfigurationError("browser attachment requires a ready gateway session")
+        if session.gateway.get("teardown_intent") is not None:
+            raise ConfigurationError("a gateway committed to teardown cannot issue attachments")
+        binding_document = session.gateway.get("jarvis_runtime_binding")
+        if binding_document is None:
+            raise ConfigurationError("browser attachment requires a verified JARVIS binding")
+        try:
+            verified_runtime = reverify_jarvis_service_runtime(
+                queue=self.queue,
+                definition=self.definition,
+                binding_document=binding_document,
+            )
+        except ValueError as exc:
+            raise RelayError(
+                f"JARVIS service runtime binding re-verification failed: {exc}"
+            ) from exc
+        try:
+            spec = ServiceRuntimeSpec.model_validate(session.gateway.get("runtime_spec"))
+        except ValueError as exc:
+            raise RelayError("owned runtime has no valid service runtime specification") from exc
+        if spec.deployment_driver != "jarvis-bound" or spec.command_path is None:
+            raise ConfigurationError("browser attachment requires a JARVIS-bound command contract")
+        existing_document = session.gateway.get("browser_attachment")
+        if existing_document is not None:
+            try:
+                existing = BrowserAttachmentRecord.model_validate(existing_document)
+            except ValueError as exc:
+                raise RelayError("gateway contains an invalid browser attachment record") from exc
+            if existing.state != "revoked":
+                expiry = _utc_timestamp(existing.expires_at)
+                if expiry > utc_now() and not Path(existing.revocation_path).exists():
+                    raise ConfigurationError(
+                        "gateway already has an active browser attachment; "
+                        "detach it before rotating"
+                    )
+                session, _result, cleanup = self._revoke_browser_attachment(
+                    session,
+                    attachment_id=existing.attachment_id,
+                )
+                if cleanup.residual:
+                    raise RelayError(cleanup.detail or "expired browser proxy cleanup failed")
+
+        public_port = bind_port or _available_loopback_port(exclude={spec.desktop_bind_port})
+        if public_port < 1 or public_port > 65_535:
+            raise ConfigurationError("browser attachment bind port must be between 1 and 65535")
+        if public_port == spec.desktop_bind_port:
+            raise ConfigurationError("browser attachment port must differ from the direct port")
+        attachment_id = f"browser-{secrets.token_hex(16)}"
+        capability = secrets.token_urlsafe(32)
+        issued_at = utc_now()
+        expires_at = issued_at + timedelta(seconds=ttl_seconds)
+        runtime_dir = (
+            self.settings.core_dir.parent / "runtime-sessions" / session.session_id
+        ).resolve()
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        config_path = runtime_dir / f"{attachment_id}.browser-gateway.json"
+        revocation_path = runtime_dir / f"{attachment_id}.revoked"
+        stdout_path = runtime_dir / f"{attachment_id}.browser-gateway.out"
+        stderr_path = runtime_dir / f"{attachment_id}.browser-gateway.err"
+        metadata_path = runtime_dir / f"{attachment_id}.browser-gateway-owner.json"
+        token_sha256 = hashlib.sha256(capability.encode("utf-8")).hexdigest()
+        paths = list(
+            dict.fromkeys(
+                [
+                    "/",
+                    spec.health_path,
+                    spec.stream_path,
+                    spec.event_stream_path,
+                    spec.state_path,
+                    spec.command_path,
+                ]
+            )
+        )
+        if any(path is None for path in paths):
+            raise ConfigurationError("JARVIS browser attachment requires all six endpoint paths")
+        config = BrowserGatewayConfig(
+            attachment_id=attachment_id,
+            token_sha256=token_sha256,
+            bind_port=public_port,
+            upstream_protocol=spec.protocol,
+            upstream_port=spec.desktop_bind_port,
+            allowed_paths=cast(list[str], paths),
+            command_path=spec.command_path,
+            expires_at=expires_at.isoformat(),
+            revocation_path=str(revocation_path),
+        )
+        intent = _new_ownership_intent(
+            "starting",
+            owner_token=secrets.token_hex(32),
+            connector_generation_id=secrets.token_hex(16),
+            config_path=str(config_path),
+            stdout_path=str(stdout_path),
+            stderr_path=str(stderr_path),
+            metadata_path=str(metadata_path),
+            attachment_id=attachment_id,
+        )
+        record = BrowserAttachmentRecord(
+            attachment_id=attachment_id,
+            state="starting",
+            issued_at=issued_at.isoformat(),
+            expires_at=expires_at.isoformat(),
+            token_sha256=token_sha256,
+            bind_port=public_port,
+            revocation_path=str(revocation_path),
+        )
+        session = self.queue.prepare_gateway_browser_attachment(
+            session.session_id,
+            attachment=record,
+            browser_proxy_intent=intent,
+        )
+        proxy: dict[str, object] | None = None
+        try:
+            proxy = self._start_browser_proxy(
+                session=session,
+                config=config,
+                capability=capability,
+                ownership_intent=intent,
+            )
+            active = record.model_copy(update={"state": "active", "proxy_process_id": proxy["pid"]})
+            session = self.queue.complete_gateway_browser_attachment(
+                session.session_id,
+                attachment=active,
+                browser_proxy=proxy,
+                browser_proxy_intent=_new_ownership_intent("recorded", **proxy),
+            )
+            grant = _browser_attachment_grant(
+                record=active,
+                capability=capability,
+                spec=spec,
+            )
+            browser_health_revision = self._wait_for_browser_health(
+                grant.health_url,
+                timeout_seconds=min(spec.readiness_timeout_seconds, 60.0),
+                poll_seconds=min(spec.poll_seconds, 1.0),
+                service_instance_id=verified_runtime.runtime.service_instance_id,
+            )
+            self._wait_for_jarvis_state(
+                grant.state_url,
+                timeout_seconds=min(spec.readiness_timeout_seconds, 60.0),
+                poll_seconds=min(spec.poll_seconds, 1.0),
+                service_instance_id=verified_runtime.runtime.service_instance_id,
+                execution_id=verified_runtime.binding.jarvis_execution_id,
+                health_revision=browser_health_revision,
+                dataset_descriptor_sha256=(verified_runtime.binding.dataset_descriptor_sha256),
+                browser_origin=True,
+            )
+            return grant
+        except Exception as exc:
+            cleanup_detail: str | None = None
+            try:
+                latest = self.queue.get_gateway_session(session.session_id)
+                _latest, _result, cleanup = self._revoke_browser_attachment(
+                    latest,
+                    attachment_id=attachment_id,
+                )
+                if cleanup.residual:
+                    cleanup_detail = cleanup.detail
+            except RelayError as cleanup_exc:
+                cleanup_detail = str(cleanup_exc)
+            if proxy is not None:
+                _stopped_pid, direct_cleanup = self._stop_local_connector(
+                    session_id=session.session_id,
+                    connector=proxy,
+                    require_record=True,
+                )
+                if direct_cleanup.residual:
+                    cleanup_detail = direct_cleanup.detail or cleanup_detail
+            if cleanup_detail is not None:
+                latest = self.queue.get_gateway_session(session.session_id)
+                self.queue.update_gateway_session(
+                    latest.session_id,
+                    metadata={
+                        "browser_attachment_error": str(exc),
+                        "browser_attachment_cleanup_error": cleanup_detail,
+                    },
+                )
+            raise
+
+    def browser_detach(
+        self,
+        *,
+        session_id: str,
+        attachment_id: str,
+    ) -> BrowserDetachmentResult:
+        """Revoke one exact browser capability and stop its owned loopback proxy."""
+        session = self.queue.get_gateway_session(session_id)
+        if session.cluster != self.cluster:
+            raise ConfigurationError(
+                f"gateway session {session_id} belongs to cluster {session.cluster}, "
+                f"not {self.cluster}"
+            )
+        session, result, cleanup = self._revoke_browser_attachment(
+            session,
+            attachment_id=attachment_id,
+        )
+        del session
+        if cleanup.residual:
+            raise RelayError(cleanup.detail or "browser attachment proxy cleanup failed")
+        return result
+
+    def _revoke_browser_attachment(
+        self,
+        session: GatewaySession,
+        *,
+        attachment_id: str,
+    ) -> tuple[GatewaySession, BrowserDetachmentResult, CleanupResource]:
+        try:
+            session = self.queue.begin_gateway_browser_attachment_revoke(
+                session.session_id,
+                attachment_id=attachment_id,
+            )
+        except QueueConflictError as exc:
+            if "changed before revocation" in str(exc):
+                raise ConfigurationError(
+                    "browser attachment id does not match the gateway record"
+                ) from exc
+            raise
+        raw_record = session.gateway.get("browser_attachment")
+        try:
+            record = BrowserAttachmentRecord.model_validate(raw_record)
+        except ValueError as exc:
+            raise RelayError("gateway contains an invalid browser attachment record") from exc
+        if record.state == "revoked":
+            result = BrowserDetachmentResult(
+                attachment_id=record.attachment_id,
+                revoked_at=cast(str, record.revoked_at),
+                already_revoked=True,
+                proxy_process_id=record.proxy_process_id,
+                proxy_stopped=False,
+            )
+            return (
+                session,
+                result,
+                CleanupResource(
+                    kind="browser_proxy",
+                    resource_id=str(record.proxy_process_id or record.attachment_id),
+                    location="desktop",
+                    action="stop",
+                    ownership_verified=True,
+                    outcome="missing",
+                    verified_after_operation=True,
+                    metadata={"gateway_session_id": session.session_id},
+                ),
+            )
+        revocation_path = _owned_browser_runtime_path(
+            self.settings,
+            session.session_id,
+            record.revocation_path,
+        )
+        _write_browser_revocation_marker(revocation_path, record.attachment_id)
+        transport = _object(session.gateway.get("transport", {}))
+        proxy = _object(transport.get("browser_proxy", {}))
+        intents = _object(session.gateway.get("ownership_intents", {}))
+        intent = _object(intents.get("browser_proxy", {}))
+        absence_verified = False
+        if not proxy:
+            proxy, absence_verified = _discover_local_connector(
+                intent,
+                session_id=session.session_id,
+            )
+            proxy = proxy or {}
+        stopped_pid, cleanup = self._stop_local_connector(
+            session_id=session.session_id,
+            connector=proxy,
+            require_record=True,
+            absence_verified=absence_verified,
+        )
+        cleanup = cleanup.model_copy(
+            update={
+                "kind": "browser_proxy",
+                "metadata": {
+                    **cleanup.metadata,
+                    "gateway_session_id": session.session_id,
+                    "attachment_id": attachment_id,
+                },
+            }
+        )
+        revoked_at = utc_now().isoformat()
+        if cleanup.residual:
+            failed = record.model_copy(update={"state": "failed"})
+            session = self.queue.finish_gateway_browser_attachment_revoke(
+                session.session_id,
+                attachment=failed,
+                metadata={"browser_detach_error": cleanup.detail},
+            )
+            result = BrowserDetachmentResult(
+                attachment_id=attachment_id,
+                revoked_at=revoked_at,
+                already_revoked=False,
+                proxy_process_id=record.proxy_process_id,
+                proxy_stopped=False,
+            )
+            return session, result, cleanup
+        revoked = record.model_copy(update={"state": "revoked", "revoked_at": revoked_at})
+        intents["browser_proxy"] = _new_ownership_intent(
+            "absent_verified",
+            attachment_id=attachment_id,
+            owner_token=intent.get("owner_token"),
+            connector_generation_id=intent.get("connector_generation_id"),
+            config_path=intent.get("config_path"),
+        )
+        session = self.queue.finish_gateway_browser_attachment_revoke(
+            session.session_id,
+            attachment=revoked,
+            browser_proxy_absent_intent=_object(intents["browser_proxy"]),
+            metadata={"browser_detached_at": revoked_at},
+        )
+        persisted_revoked = BrowserAttachmentRecord.model_validate(
+            session.gateway.get("browser_attachment")
+        )
+        effective_revoked_at = cast(str, persisted_revoked.revoked_at)
+        return (
+            session,
+            BrowserDetachmentResult(
+                attachment_id=attachment_id,
+                revoked_at=effective_revoked_at,
+                already_revoked=effective_revoked_at != revoked_at,
+                proxy_process_id=record.proxy_process_id,
+                proxy_stopped=stopped_pid is not None,
+            ),
+            cleanup,
+        )
+
+    def _revoke_browser_for_runtime_cleanup(
+        self,
+        session: GatewaySession,
+    ) -> tuple[GatewaySession, CleanupResource | None, str | None]:
+        """Revoke any active browser attachment as part of detach or teardown."""
+        raw_record = session.gateway.get("browser_attachment")
+        if raw_record is None:
+            return session, None, None
+        try:
+            record = BrowserAttachmentRecord.model_validate(raw_record)
+        except ValueError as exc:
+            detail = f"browser attachment record is invalid: {exc}"
+            return (
+                session,
+                CleanupResource(
+                    kind="browser_proxy",
+                    resource_id=session.session_id,
+                    location="desktop",
+                    action="stop",
+                    ownership_verified=False,
+                    outcome="refused",
+                    residual=True,
+                    detail=detail,
+                    metadata={"gateway_session_id": session.session_id},
+                ),
+                detail,
+            )
+        if record.state == "revoked":
+            return session, None, None
+        try:
+            session, _result, cleanup = self._revoke_browser_attachment(
+                session,
+                attachment_id=record.attachment_id,
+            )
+        except (ConfigurationError, RelayError) as exc:
+            detail = str(exc)
+            return (
+                session,
+                CleanupResource(
+                    kind="browser_proxy",
+                    resource_id=str(record.proxy_process_id or record.attachment_id),
+                    location="desktop",
+                    action="stop",
+                    ownership_verified=False,
+                    outcome="failed",
+                    residual=True,
+                    detail=detail,
+                    metadata={"gateway_session_id": session.session_id},
+                ),
+                detail,
+            )
+        return session, cleanup, cleanup.detail if cleanup.residual else None
+
     def stop(
         self,
         *,
@@ -964,6 +1723,7 @@ class ServiceRuntimeSupervisor:
             session,
             cancel_scheduler_job=cancel_scheduler_job,
         )
+        session, browser_resource, browser_error = self._revoke_browser_for_runtime_cleanup(session)
         teardown_intent = _object(session.gateway.get("teardown_intent", {}))
         ownership_intents = _object(session.gateway.get("ownership_intents", {}))
         transport = _object(session.gateway.get("transport", {}))
@@ -971,6 +1731,10 @@ class ServiceRuntimeSupervisor:
         remote_connector = _object(transport.get("remote_connector", {}))
         resources: list[CleanupResource] = []
         errors: list[str] = []
+        if browser_resource is not None:
+            resources.append(browser_resource)
+        if browser_error is not None:
+            errors.append(browser_error)
         stopped_local_pid, local_resource = self._stop_local_connector(
             session_id=session.session_id,
             connector=desktop_connector,
@@ -986,11 +1750,34 @@ class ServiceRuntimeSupervisor:
             errors.append(local_resource.detail or "desktop connector cleanup failed")
         stopped_remote_pid = None
         remote_pid = _optional_int(remote_connector.get("pid"))
+        allocation_scoped = remote_connector.get("execution_scope") == "scheduler_allocation"
         remote_owned = (
             remote_connector.get("owner") == "clio-relay"
             and remote_connector.get("session_id") == session.session_id
         )
-        if remote_pid is None:
+        if allocation_scoped:
+            try:
+                remote_resource = self._stop_allocation_connector(
+                    session_id=session.session_id,
+                    connector=remote_connector,
+                )
+            except (ConfigurationError, RelayError) as exc:
+                remote_resource = CleanupResource(
+                    kind="remote_connector",
+                    resource_id=(
+                        _optional_str(remote_connector.get("scheduler_step_id"))
+                        or session.session_id
+                    ),
+                    location=self.definition.ssh_host,
+                    provider=_optional_str(remote_connector.get("scheduler_provider")),
+                    action="stop",
+                    ownership_verified=False,
+                    outcome="refused",
+                    residual=True,
+                    detail=str(exc),
+                )
+                errors.append(str(exc))
+        elif remote_pid is None:
             absence_verified = _intent_proves_absence(
                 ownership_intents,
                 "remote_connector",
@@ -1301,6 +2088,7 @@ class ServiceRuntimeSupervisor:
                 f"gateway session {session_id} is committed to teardown and cannot detach"
             )
         session = self._reconcile_ownership_intents(session)
+        session, browser_resource, browser_error = self._revoke_browser_for_runtime_cleanup(session)
         transport = _object(session.gateway.get("transport", {}))
         desktop_connector = _object(transport.get("desktop_connector", {}))
         stopped_local_pid, local_resource = self._stop_local_connector(
@@ -1310,12 +2098,48 @@ class ServiceRuntimeSupervisor:
         )
         local_resource = _bind_cleanup_resource_to_gateway(local_resource, session.session_id)
         resources = [local_resource]
+        if browser_resource is not None:
+            resources.insert(0, browser_resource)
         errors = (
             [local_resource.detail] if local_resource.residual and local_resource.detail else []
         )
+        if browser_error is not None:
+            errors.append(browser_error)
         remote_connector = _object(transport.get("remote_connector", {}))
         remote_pid = _optional_int(remote_connector.get("pid"))
-        if remote_pid is not None:
+        if remote_connector.get("execution_scope") == "scheduler_allocation":
+            try:
+                allocation_resource = self._retained_allocation_connector_resource(
+                    session_id=session.session_id,
+                    connector=remote_connector,
+                )
+            except (ConfigurationError, RelayError) as exc:
+                allocation_resource = CleanupResource(
+                    kind="remote_connector",
+                    resource_id=(
+                        _optional_str(remote_connector.get("scheduler_step_id"))
+                        or session.session_id
+                    ),
+                    location=self.definition.ssh_host,
+                    provider=_optional_str(remote_connector.get("scheduler_provider")),
+                    action="retain",
+                    ownership_verified=False,
+                    outcome="failed",
+                    residual=True,
+                    detail=str(exc),
+                )
+            resources.append(
+                _bind_cleanup_resource_to_gateway(
+                    allocation_resource,
+                    session.session_id,
+                )
+            )
+            if allocation_resource.residual:
+                errors.append(
+                    allocation_resource.detail
+                    or "allocation connector retention could not be proven"
+                )
+        elif remote_pid is not None:
             remote_owned = (
                 remote_connector.get("owner") == "clio-relay"
                 and remote_connector.get("session_id") == session.session_id
@@ -1522,7 +2346,8 @@ class ServiceRuntimeSupervisor:
                 session_id=session.session_id,
             )
             health_url = (
-                f"http://{spec.desktop_bind_addr}:{spec.desktop_bind_port}{spec.health_path}"
+                f"{spec.protocol}://{spec.desktop_bind_addr}:"
+                f"{spec.desktop_bind_port}{spec.health_path}"
             )
             self._wait_for_local_health(
                 health_url,
@@ -1552,17 +2377,31 @@ class ServiceRuntimeSupervisor:
             raise
         try:
             stream_url = (
-                f"http://{spec.desktop_bind_addr}:{spec.desktop_bind_port}{spec.stream_path}"
+                f"{spec.protocol}://{spec.desktop_bind_addr}:"
+                f"{spec.desktop_bind_port}{spec.stream_path}"
                 if spec.stream_path is not None
                 else None
             )
             events_url = (
-                f"http://{spec.desktop_bind_addr}:{spec.desktop_bind_port}{spec.event_stream_path}"
+                f"{spec.protocol}://{spec.desktop_bind_addr}:"
+                f"{spec.desktop_bind_port}{spec.event_stream_path}"
                 if spec.event_stream_path is not None
                 else None
             )
+            state_url = (
+                f"{spec.protocol}://{spec.desktop_bind_addr}:"
+                f"{spec.desktop_bind_port}{spec.state_path}"
+                if spec.state_path is not None
+                else None
+            )
+            command_url = (
+                f"{spec.protocol}://{spec.desktop_bind_addr}:"
+                f"{spec.desktop_bind_port}{spec.command_path}"
+                if spec.command_path is not None
+                else None
+            )
             compatibility_urls = {
-                name: f"http://{spec.desktop_bind_addr}:{spec.desktop_bind_port}{path}"
+                name: (f"{spec.protocol}://{spec.desktop_bind_addr}:{spec.desktop_bind_port}{path}")
                 for name, path in spec.compatibility_paths.items()
             }
             updated = self.queue.update_gateway_session(
@@ -1604,6 +2443,8 @@ class ServiceRuntimeSupervisor:
             stream_url=stream_url,
             compatibility_urls=compatibility_urls,
             events_url=events_url,
+            state_url=state_url,
+            command_url=command_url,
         )
 
     def _set_ownership_intent(
@@ -1731,17 +2572,70 @@ class ServiceRuntimeSupervisor:
             generation_id = _optional_str(remote_intent.get("connector_generation_id"))
             if owner_token is not None and generation_id is not None:
                 try:
+                    allocation_placement = _object(remote_intent.get("placement", {}))
                     result = _last_json_object(
                         self._ssh(
                             _remote_connector_discovery_script(
                                 session_id=session.session_id,
                                 owner_token=owner_token,
                                 connector_generation_id=generation_id,
+                                allocation_provider=_optional_str(
+                                    remote_intent.get("scheduler_provider")
+                                ),
+                                allocation_job_id=_optional_str(
+                                    remote_intent.get("scheduler_native_id")
+                                ),
+                                allocation_step_marker=_optional_str(
+                                    remote_intent.get("scheduler_step_marker")
+                                ),
+                                allocation_placement_host=_optional_str(
+                                    allocation_placement.get("placement_host")
+                                ),
                             )
                         )
                     )
                     connector = result.get("connector")
-                    if (
+                    if remote_intent.get("execution_scope") == "scheduler_allocation":
+                        if result.get("ownership_verified") is not True:
+                            detail = result.get("error")
+                            raise RelayError(
+                                detail
+                                if isinstance(detail, str)
+                                else "allocation connector sidecar could not be verified"
+                            )
+                        typed_connector, absence_verified = (
+                            self._reconcile_allocation_connector_intent(
+                                session_id=session.session_id,
+                                intent=remote_intent,
+                                connector_base=(
+                                    cast(dict[str, object], connector)
+                                    if isinstance(connector, dict)
+                                    else None
+                                ),
+                            )
+                        )
+                        if typed_connector is not None:
+                            transport["remote_connector"] = typed_connector
+                            intents["remote_connector"] = _new_ownership_intent(
+                                "recorded",
+                                reconciled=True,
+                                **typed_connector,
+                            )
+                            changed = True
+                        elif absence_verified:
+                            intents["remote_connector"] = _new_ownership_intent(
+                                "absent_verified",
+                                owner_token=owner_token,
+                                connector_generation_id=generation_id,
+                                execution_scope="scheduler_allocation",
+                                scheduler_provider=remote_intent.get("scheduler_provider"),
+                                scheduler_native_id=remote_intent.get("scheduler_native_id"),
+                                scheduler_step_marker=remote_intent.get("scheduler_step_marker"),
+                                placement=remote_intent.get("placement"),
+                                reconciled=True,
+                            )
+                            changed = True
+                    elif (
                         result.get("ownership_verified") is True
                         and result.get("present") is True
                         and isinstance(connector, dict)
@@ -1825,6 +2719,92 @@ class ServiceRuntimeSupervisor:
             )
         return self._update(session, gateway=gateway)
 
+    def _reconcile_allocation_connector_intent(
+        self,
+        *,
+        session_id: str,
+        intent: dict[str, object],
+        connector_base: dict[str, object] | None,
+    ) -> tuple[dict[str, object] | None, bool]:
+        """Recover or disprove an allocation connector by its provider marker."""
+        provider_name = _required_intent_str(intent, "scheduler_provider")
+        scheduler_job_id = _required_intent_str(intent, "scheduler_native_id")
+        step_marker = _required_intent_str(intent, "scheduler_step_marker")
+        generation_id = _required_intent_str(intent, "connector_generation_id")
+        try:
+            placement = SchedulerConnectorPlacement.model_validate_json(
+                json.dumps(intent.get("placement"), separators=(",", ":"), allow_nan=False)
+            )
+        except (TypeError, ValueError) as exc:
+            raise RelayError("allocation connector intent has invalid placement") from exc
+        if (
+            intent.get("execution_scope") != "scheduler_allocation"
+            or placement.scheduler != provider_name
+            or placement.scheduler_job_id != scheduler_job_id
+            or step_marker != _connector_step_marker(session_id, generation_id)
+        ):
+            raise RelayError("allocation connector recovery identity does not match its intent")
+        if connector_base is not None and (
+            connector_base.get("owner") != "clio-relay"
+            or connector_base.get("session_id") != session_id
+            or connector_base.get("execution_scope") != "scheduler_allocation"
+            or connector_base.get("scheduler_provider") != provider_name
+            or connector_base.get("scheduler_native_id") != scheduler_job_id
+            or connector_base.get("scheduler_step_marker") != step_marker
+            or connector_base.get("connector_generation_id") != generation_id
+            or connector_base.get("owner_token") != intent.get("owner_token")
+            or connector_base.get("placement") != intent.get("placement")
+            or _optional_str(connector_base.get("config_path")) is None
+            or _optional_str(connector_base.get("log_path")) is None
+            or connector_base.get("pid") is not None
+        ):
+            raise RelayError("allocation connector sidecar identity does not match its intent")
+        record = _last_json_object(
+            self._ssh(
+                _remote_connector_step_reconcile_script(
+                    definition=self.definition,
+                    provider=provider_name,
+                    scheduler_job_id=scheduler_job_id,
+                    step_marker=step_marker,
+                    placement_host=placement.placement_host,
+                )
+            )
+        )
+        if (
+            record.get("schema_version") != "clio-relay.scheduler-connector-step-reconciliation.v1"
+            or record.get("scheduler") != provider_name
+            or record.get("scheduler_job_id") != scheduler_job_id
+            or record.get("step_marker") != step_marker
+            or record.get("placement_host") != placement.placement_host
+            or not isinstance(record.get("found"), bool)
+        ):
+            raise RelayError("scheduler step reconciliation returned mismatched identity")
+        if record.get("found") is False:
+            if record.get("step") is not None:
+                raise RelayError("scheduler step reconciliation contradicted step absence")
+            return None, True
+        if connector_base is None:
+            raise RelayError("active scheduler connector step has no durable allocation sidecar")
+        try:
+            step = SchedulerConnectorStepIdentity.model_validate_json(
+                json.dumps(record.get("step"), separators=(",", ":"), allow_nan=False)
+            )
+        except (TypeError, ValueError) as exc:
+            raise RelayError("scheduler step reconciliation returned invalid identity") from exc
+        connector = {
+            **connector_base,
+            "scheduler_step_id": step.scheduler_step_id,
+            "scheduler_step": step.model_dump(mode="json"),
+        }
+        self._allocation_connector_identity(
+            session_id=session_id,
+            connector=connector,
+        )
+        status = self._poll_allocation_connector_step(step)
+        if status.state == "absent":
+            return None, True
+        return connector, False
+
     def _verified_scheduler_submission(
         self,
         session: GatewaySession,
@@ -1837,6 +2817,34 @@ class ServiceRuntimeSupervisor:
             spec = ServiceRuntimeSpec.model_validate(session.gateway.get("runtime_spec"))
         except ValueError as exc:
             raise RelayError("owned runtime has no valid service runtime specification") from exc
+        binding_document = session.gateway.get("jarvis_runtime_binding")
+        if binding_document is not None:
+            try:
+                verified = reverify_jarvis_service_runtime(
+                    queue=self.queue,
+                    definition=self.definition,
+                    binding_document=binding_document,
+                )
+            except ValueError as exc:
+                raise RelayError(
+                    f"JARVIS service runtime binding re-verification failed: {exc}"
+                ) from exc
+            binding = verified.binding
+            if (
+                binding.scheduler_provider is None
+                or binding.scheduler_native_id is None
+                or binding.scheduler_provider != session.scheduler
+                or binding.scheduler_native_id != scheduler_job_id
+                or spec.scheduler != session.scheduler
+            ):
+                raise RelayError(
+                    "scheduler identity disagrees with the verified JARVIS runtime binding"
+                )
+            return _VerifiedSchedulerSubmission(
+                provider=binding.scheduler_provider,
+                scheduler_job_id=binding.scheduler_native_id,
+                spec=spec,
+            )
         intents = _object(session.gateway.get("ownership_intents", {}))
         scheduler_intent = _object(intents.get("scheduler_submission", {}))
         if (
@@ -2314,7 +3322,74 @@ class ServiceRuntimeSupervisor:
         node: str,
         proxy_name: str,
         ownership_intent: dict[str, object],
+        allocation_provider: str | None = None,
+        allocation_job_id: str | None = None,
     ) -> dict[str, object]:
+        if (allocation_provider is None) != (allocation_job_id is None):
+            raise ConfigurationError(
+                "allocation_provider and allocation_job_id must be provided together"
+            )
+        placement: SchedulerConnectorPlacement | None = None
+        step_marker: str | None = None
+        if allocation_provider is not None and allocation_job_id is not None:
+            provider = provider_for_scheduler(allocation_provider)
+            if not isinstance(provider, SchedulerAllocationConnectorProvider):
+                raise ConfigurationError(
+                    f"scheduler provider {allocation_provider!r} cannot launch an "
+                    "allocation-scoped connector"
+                )
+            raw_placement = _last_json_object(
+                self._ssh(
+                    _remote_scheduler_script(
+                        definition=self.definition,
+                        operation="connector-placement",
+                        provider=allocation_provider,
+                        scheduler_job_id=allocation_job_id,
+                    )
+                )
+            )
+            try:
+                placement = SchedulerConnectorPlacement.model_validate_json(
+                    json.dumps(raw_placement, separators=(",", ":"), allow_nan=False)
+                )
+            except ValueError as exc:
+                raise RelayError(
+                    "scheduler provider returned invalid connector placement evidence"
+                ) from exc
+            if (
+                placement.scheduler != allocation_provider
+                or placement.scheduler_job_id != allocation_job_id
+                or placement.allocation_node_count != 1
+                or placement.verified is not True
+            ):
+                raise RelayError("scheduler connector placement identity did not match binding")
+            step_marker = _connector_step_marker(
+                session.session_id,
+                _required_intent_str(
+                    ownership_intent,
+                    "connector_generation_id",
+                ),
+            )
+            ownership_intent = _new_ownership_intent(
+                "starting",
+                owner_token=_required_intent_str(ownership_intent, "owner_token"),
+                connector_generation_id=_required_intent_str(
+                    ownership_intent,
+                    "connector_generation_id",
+                ),
+                execution_scope="scheduler_allocation",
+                scheduler_provider=allocation_provider,
+                scheduler_native_id=allocation_job_id,
+                scheduler_step_marker=step_marker,
+                placement=placement.model_dump(mode="json"),
+            )
+            # Persist the allocation, placement, and unique step marker before
+            # A detached ``srun`` can create a scheduler-side process.
+            self._set_ownership_intent(
+                session,
+                "remote_connector",
+                ownership_intent,
+            )
         transport = self.definition.frp_transport
         server_addr = _require_server_addr(transport.server_addr, self.cluster)
         config = render_frpc_config(
@@ -2330,30 +3405,320 @@ class ServiceRuntimeSupervisor:
                 secret_key=self.secret_key,
             )
         )
+        owner_token = _required_intent_str(ownership_intent, "owner_token")
+        connector_generation_id = _required_intent_str(
+            ownership_intent,
+            "connector_generation_id",
+        )
+        if allocation_provider is not None and allocation_job_id is not None:
+            if placement is None or step_marker is None:
+                raise AssertionError("allocation placement and step marker were not resolved")
+            output = self._ssh(
+                _remote_allocation_frpc_start_script(
+                    definition=self.definition,
+                    session_id=session.session_id,
+                    config_text=config,
+                    owner_token=owner_token,
+                    connector_generation_id=connector_generation_id,
+                    allocation_provider=allocation_provider,
+                    allocation_job_id=allocation_job_id,
+                    placement=placement,
+                    step_marker=step_marker,
+                )
+            )
+            start_result = _last_json_object(output)
+            if start_result.get("schema_version") != "clio-relay.allocation-connector-start.v1":
+                raise RelayError("allocation connector start returned the wrong schema")
+            if (
+                start_result.get("session_id") != session.session_id
+                or start_result.get("connector_generation_id") != connector_generation_id
+            ):
+                raise RelayError("allocation connector start identity did not match its intent")
+            raw_step = start_result.get("step_identity")
+            try:
+                step_identity = SchedulerConnectorStepIdentity.model_validate_json(
+                    json.dumps(raw_step, separators=(",", ":"), allow_nan=False)
+                )
+            except (TypeError, ValueError) as exc:
+                raise RelayError(
+                    "allocation connector start returned invalid scheduler step identity"
+                ) from exc
+            if (
+                step_identity.scheduler != allocation_provider
+                or step_identity.scheduler_job_id != allocation_job_id
+                or step_identity.placement_host != placement.placement_host
+                or step_identity.step_marker != step_marker
+                or step_identity.verified is not True
+            ):
+                raise RelayError("allocation connector scheduler step identity did not match")
+            config_path = _optional_str(start_result.get("config_path"))
+            log_path = _optional_str(start_result.get("log_path"))
+            if config_path is None or log_path is None:
+                raise RelayError("allocation connector start omitted its owned paths")
+            return {
+                "owner": "clio-relay",
+                "session_id": session.session_id,
+                "execution_scope": "scheduler_allocation",
+                "scheduler_provider": allocation_provider,
+                "scheduler_native_id": allocation_job_id,
+                "scheduler_step_id": step_identity.scheduler_step_id,
+                "scheduler_step_marker": step_marker,
+                "scheduler_step": step_identity.model_dump(mode="json"),
+                "connector_generation_id": connector_generation_id,
+                "owner_token": owner_token,
+                "config_path": config_path,
+                "log_path": log_path,
+                "placement": placement.model_dump(mode="json"),
+            }
         output = self._ssh(
             _remote_frpc_start_script(
                 definition=self.definition,
                 session_id=session.session_id,
                 config_text=config,
-                owner_token=_required_intent_str(ownership_intent, "owner_token"),
-                connector_generation_id=_required_intent_str(
-                    ownership_intent,
-                    "connector_generation_id",
-                ),
+                owner_token=owner_token,
+                connector_generation_id=connector_generation_id,
             )
         )
         metadata = _key_value_output(output)
         pid = int(metadata["remote_frpc_pid"])
-        return {
+        connector: dict[str, object] = {
             "owner": "clio-relay",
             "session_id": session.session_id,
             "pid": pid,
             "process_group_id": int(metadata["remote_frpc_pgid"]),
             "connector_generation_id": metadata["connector_generation_id"],
-            "owner_token": _required_intent_str(ownership_intent, "owner_token"),
+            "owner_token": owner_token,
             "config_path": metadata["remote_frpc_config"],
             "log_path": metadata["remote_frpc_log"],
         }
+        return connector
+
+    def _allocation_connector_identity(
+        self,
+        *,
+        session_id: str,
+        connector: dict[str, object],
+    ) -> SchedulerConnectorStepIdentity:
+        """Validate exact provider, allocation, placement, and step ownership."""
+        if (
+            connector.get("owner") != "clio-relay"
+            or connector.get("session_id") != session_id
+            or connector.get("execution_scope") != "scheduler_allocation"
+            or connector.get("pid") is not None
+            or connector.get("process_group_id") is not None
+        ):
+            raise RelayError("allocation connector ownership record is invalid")
+        try:
+            step = SchedulerConnectorStepIdentity.model_validate_json(
+                json.dumps(
+                    connector.get("scheduler_step"),
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            )
+            placement = SchedulerConnectorPlacement.model_validate_json(
+                json.dumps(
+                    connector.get("placement"),
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise RelayError("allocation connector has invalid provider-native identity") from exc
+        generation_id = _optional_str(connector.get("connector_generation_id"))
+        provider_name = _optional_str(connector.get("scheduler_provider"))
+        scheduler_job_id = _optional_str(connector.get("scheduler_native_id"))
+        scheduler_step_id = _optional_str(connector.get("scheduler_step_id"))
+        step_marker = _optional_str(connector.get("scheduler_step_marker"))
+        config_path = _optional_str(connector.get("config_path"))
+        log_path = _optional_str(connector.get("log_path"))
+        if None in {
+            generation_id,
+            provider_name,
+            scheduler_job_id,
+            scheduler_step_id,
+            step_marker,
+            config_path,
+            log_path,
+        }:
+            raise RelayError("allocation connector ownership record is incomplete")
+        assert generation_id is not None
+        assert provider_name is not None
+        assert scheduler_job_id is not None
+        assert scheduler_step_id is not None
+        assert step_marker is not None
+        try:
+            provider = provider_for_scheduler(provider_name)
+        except ConfigurationError as exc:
+            raise RelayError(f"allocation connector provider is invalid: {exc}") from exc
+        if not isinstance(provider, SchedulerAllocationConnectorProvider):
+            raise RelayError("allocation connector provider lacks step lifecycle semantics")
+        if (
+            provider.name != provider_name
+            or step.scheduler != provider_name
+            or step.scheduler_job_id != scheduler_job_id
+            or step.scheduler_step_id != scheduler_step_id
+            or step.step_marker != step_marker
+            or step_marker != _connector_step_marker(session_id, generation_id)
+            or placement.scheduler != provider_name
+            or placement.scheduler_job_id != scheduler_job_id
+            or placement.placement_host != step.placement_host
+            or placement.allocation_node_count != 1
+            or step.verified is not True
+            or placement.verified is not True
+        ):
+            raise RelayError("allocation connector identities disagree")
+        return step
+
+    def _poll_allocation_connector_step(
+        self,
+        identity: SchedulerConnectorStepIdentity,
+    ) -> SchedulerConnectorStepStatus:
+        """Poll one exact provider-native connector step over the cluster boundary."""
+        output = self._ssh(
+            _remote_connector_step_status_script(
+                definition=self.definition,
+                provider=identity.scheduler,
+                scheduler_job_id=identity.scheduler_job_id,
+                scheduler_step_id=identity.scheduler_step_id,
+                placement_host=identity.placement_host,
+            )
+        )
+        try:
+            status = SchedulerConnectorStepStatus.model_validate_json(
+                json.dumps(
+                    _last_json_object(output),
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise RelayError("scheduler returned invalid connector step status") from exc
+        if (
+            status.scheduler != identity.scheduler
+            or status.scheduler_job_id != identity.scheduler_job_id
+            or status.scheduler_step_id != identity.scheduler_step_id
+            or status.placement_host != identity.placement_host
+            or status.verified is not True
+        ):
+            raise RelayError("scheduler connector step status identity did not match")
+        return status
+
+    def _stop_allocation_connector(
+        self,
+        *,
+        session_id: str,
+        connector: dict[str, object],
+    ) -> CleanupResource:
+        """Cancel one exact scheduler step and prove its compute-node absence."""
+        identity = self._allocation_connector_identity(
+            session_id=session_id,
+            connector=connector,
+        )
+        status = self._poll_allocation_connector_step(identity)
+        cancel_error: str | None = None
+        canceled = False
+        if status.state == "active":
+            try:
+                result = _last_json_object(
+                    self._ssh(
+                        _remote_connector_step_cancel_script(
+                            definition=self.definition,
+                            provider=identity.scheduler,
+                            scheduler_job_id=identity.scheduler_job_id,
+                            scheduler_step_id=identity.scheduler_step_id,
+                        )
+                    )
+                )
+                if (
+                    result.get("scheduler") != identity.scheduler
+                    or result.get("scheduler_job_id") != identity.scheduler_job_id
+                    or result.get("scheduler_step_id") != identity.scheduler_step_id
+                    or result.get("cancel_requested") is not True
+                    or result.get("accepted") is not True
+                    or result.get("returncode") != 0
+                ):
+                    raise RelayError("scheduler did not accept exact connector-step cancellation")
+                canceled = True
+            except RelayError as exc:
+                cancel_error = str(exc)
+            attempts = max(
+                1,
+                math.ceil(
+                    _CONNECTOR_STEP_CLEANUP_TIMEOUT_SECONDS / _CONNECTOR_STEP_CLEANUP_POLL_SECONDS
+                ),
+            )
+            for attempt in range(attempts):
+                status = self._poll_allocation_connector_step(identity)
+                if status.state == "absent":
+                    break
+                if attempt + 1 < attempts:
+                    self.sleep(_CONNECTOR_STEP_CLEANUP_POLL_SECONDS)
+        if status.state != "absent":
+            detail = "scheduler connector step remains active after exact-step cancellation"
+            if cancel_error is not None:
+                detail = f"{detail}: {cancel_error}"
+            raise RelayError(detail)
+        return CleanupResource(
+            kind="remote_connector",
+            resource_id=identity.scheduler_step_id,
+            location=identity.placement_host,
+            provider=identity.scheduler,
+            action="stop",
+            ownership_verified=True,
+            outcome="stopped" if canceled else "missing",
+            verified_after_operation=True,
+            observed_state="absent",
+            detail=(
+                "exact scheduler connector step absence confirmed"
+                + (f" after cancellation error: {cancel_error}" if cancel_error else "")
+            ),
+            metadata={
+                "scheduler_job_id": identity.scheduler_job_id,
+                "scheduler_step_id": identity.scheduler_step_id,
+                "scheduler_step_marker": identity.step_marker,
+                "placement_host": identity.placement_host,
+                "parent_scheduler_job_retained": True,
+            },
+        )
+
+    def _retained_allocation_connector_resource(
+        self,
+        *,
+        session_id: str,
+        connector: dict[str, object],
+    ) -> CleanupResource:
+        """Prove that a detached allocation-scoped connector remains active."""
+        identity = self._allocation_connector_identity(
+            session_id=session_id,
+            connector=connector,
+        )
+        status = self._poll_allocation_connector_step(identity)
+        retained = status.state == "active"
+        return CleanupResource(
+            kind="remote_connector",
+            resource_id=identity.scheduler_step_id,
+            location=identity.placement_host,
+            provider=identity.scheduler,
+            action="retain",
+            ownership_verified=True,
+            outcome="retained" if retained else "failed",
+            verified_after_operation=True,
+            observed_state=status.state,
+            residual=not retained,
+            detail=(
+                "exact scheduler connector step retained for reattachment"
+                if retained
+                else "scheduler confirms the allocation connector step is absent"
+            ),
+            metadata={
+                "scheduler_job_id": identity.scheduler_job_id,
+                "scheduler_step_id": identity.scheduler_step_id,
+                "scheduler_step_marker": identity.step_marker,
+                "placement_host": identity.placement_host,
+                "parent_scheduler_job_retained": True,
+            },
+        )
 
     def _start_local_visitor(
         self,
@@ -2441,6 +3806,215 @@ class ServiceRuntimeSupervisor:
         _write_local_connector_sidecar(metadata_path, connector)
         return connector
 
+    def _start_browser_proxy(
+        self,
+        *,
+        session: GatewaySession,
+        config: BrowserGatewayConfig,
+        capability: str,
+        ownership_intent: dict[str, object],
+    ) -> dict[str, object]:
+        """Start one owned capability proxy without placing its secret on disk."""
+        runtime_dir = (
+            self.settings.core_dir.parent / "runtime-sessions" / session.session_id
+        ).resolve()
+        config_path = Path(_required_intent_str(ownership_intent, "config_path")).resolve()
+        stdout_path = Path(_required_intent_str(ownership_intent, "stdout_path")).resolve()
+        stderr_path = Path(_required_intent_str(ownership_intent, "stderr_path")).resolve()
+        metadata_path = Path(_required_intent_str(ownership_intent, "metadata_path")).resolve()
+        if any(
+            path.parent != runtime_dir
+            for path in (config_path, stdout_path, stderr_path, metadata_path)
+        ):
+            raise RelayError("browser proxy ownership intent escaped its runtime directory")
+        temporary = config_path.with_suffix(f"{config_path.suffix}.{os.getpid()}.tmp")
+        temporary.write_text(config.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        temporary.chmod(0o600)
+        os.replace(temporary, config_path)
+        owner_token = _required_intent_str(ownership_intent, "owner_token")
+        generation_id = _required_intent_str(ownership_intent, "connector_generation_id")
+        environment = os.environ.copy()
+        environment[CAPABILITY_ENV] = capability
+        environment["CLIO_RELAY_CONNECTOR_OWNER_TOKEN"] = owner_token
+        environment["CLIO_RELAY_CONNECTOR_GENERATION_ID"] = generation_id
+        process = self.runner.popen(
+            [
+                sys.executable,
+                "-c",
+                _LOCAL_CONNECTOR_WRAPPER_CODE,
+                owner_token,
+                generation_id,
+                sys.executable,
+                "-m",
+                "clio_relay.browser_gateway",
+                "--config",
+                str(config_path),
+                "--process-label",
+                "clio-relay-browser-frpc-proxy",
+            ],
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            env=environment,
+            isolate_process_group=True,
+        )
+        try:
+            identity = self.runner.local_process_identity(
+                pid=process.pid,
+                owner_token=owner_token,
+                expected_config=str(config_path),
+            )
+        except BaseException:
+            _terminate_just_started_process_group(process.pid)
+            raise
+        proxy: dict[str, object] = {
+            "owner": "clio-relay",
+            "session_id": session.session_id,
+            "attachment_id": config.attachment_id,
+            "pid": process.pid,
+            "process_group_id": identity.process_group_id,
+            "process_start_marker": identity.process_start_marker,
+            "owner_token": identity.owner_token,
+            "connector_generation_id": generation_id,
+            "config_path": str(config_path),
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "metadata_path": str(metadata_path),
+        }
+        _write_local_connector_sidecar(metadata_path, proxy)
+        return proxy
+
+    def _wait_for_jarvis_health(
+        self,
+        health_url: str,
+        *,
+        timeout_seconds: float,
+        poll_seconds: float,
+        service_instance_id: str,
+    ) -> int:
+        """Require exact ParaView service identity instead of accepting an arbitrary 2xx."""
+        deadline = time.time() + timeout_seconds
+        last_error = "no response"
+        while time.time() < deadline:
+            try:
+                response = httpx.get(health_url, timeout=5.0)
+                raw_document: object = response.json()
+                document = (
+                    cast(dict[str, object], raw_document)
+                    if isinstance(raw_document, dict)
+                    else None
+                )
+                if (
+                    200 <= response.status_code < 300
+                    and document is not None
+                    and set(document)
+                    == {"schema_version", "status", "service_instance_id", "revision"}
+                    and document.get("schema_version") == "jarvis.paraview.health.v1"
+                    and document.get("status") == "ready"
+                    and document.get("service_instance_id") == service_instance_id
+                    and isinstance(document.get("revision"), int)
+                    and not isinstance(document.get("revision"), bool)
+                    and cast(int, document["revision"]) > 0
+                ):
+                    return cast(int, document["revision"])
+                last_error = (
+                    f"unexpected status or identity: status={response.status_code} "
+                    f"body={response.text[:512]!r}"
+                )
+            except (httpx.HTTPError, ValueError) as exc:
+                last_error = str(exc)
+            self.sleep(poll_seconds)
+        raise RelayError(f"JARVIS service health identity was not ready: {last_error}")
+
+    def _wait_for_browser_health(
+        self,
+        health_url: str,
+        *,
+        timeout_seconds: float,
+        poll_seconds: float,
+        service_instance_id: str,
+    ) -> int:
+        """Prove the capability proxy authorizes only the sandbox origin and forwards."""
+        deadline = time.time() + timeout_seconds
+        last_error = "no response"
+        while time.time() < deadline:
+            try:
+                response = httpx.get(
+                    health_url,
+                    headers={"Origin": "null"},
+                    timeout=5.0,
+                )
+                raw_document: object = response.json()
+                document = (
+                    cast(dict[str, object], raw_document)
+                    if isinstance(raw_document, dict)
+                    else None
+                )
+                if (
+                    200 <= response.status_code < 300
+                    and response.headers.get("access-control-allow-origin") == "null"
+                    and "*" not in response.headers.get("access-control-allow-origin", "")
+                    and document is not None
+                    and set(document)
+                    == {"schema_version", "status", "service_instance_id", "revision"}
+                    and document.get("schema_version") == "jarvis.paraview.health.v1"
+                    and document.get("status") == "ready"
+                    and document.get("service_instance_id") == service_instance_id
+                    and isinstance(document.get("revision"), int)
+                    and not isinstance(document.get("revision"), bool)
+                    and cast(int, document["revision"]) > 0
+                ):
+                    return cast(int, document["revision"])
+                last_error = f"status={response.status_code}"
+            except (httpx.HTTPError, ValueError) as exc:
+                last_error = str(exc)
+            self.sleep(poll_seconds)
+        raise RelayError(f"browser capability gateway did not become ready: {last_error}")
+
+    def _wait_for_jarvis_state(
+        self,
+        state_url: str,
+        *,
+        timeout_seconds: float,
+        poll_seconds: float,
+        service_instance_id: str,
+        execution_id: str,
+        health_revision: int,
+        dataset_descriptor_sha256: str,
+        browser_origin: bool = False,
+    ) -> None:
+        """Validate the identity-bearing initial service state and bound dataset."""
+        deadline = time.time() + timeout_seconds
+        last_error = "no response"
+        headers = {"Origin": "null"} if browser_origin else None
+        while time.time() < deadline:
+            try:
+                response = httpx.get(state_url, headers=headers, timeout=5.0)
+                raw_document: object = response.json()
+                document = (
+                    cast(dict[str, object], raw_document)
+                    if isinstance(raw_document, dict)
+                    else None
+                )
+                if 200 <= response.status_code < 300 and document is not None:
+                    _validate_jarvis_service_state(
+                        document,
+                        service_instance_id=service_instance_id,
+                        execution_id=execution_id,
+                        health_revision=health_revision,
+                        dataset_descriptor_sha256=dataset_descriptor_sha256,
+                    )
+                    if (
+                        browser_origin
+                        and response.headers.get("access-control-allow-origin") != "null"
+                    ):
+                        raise ValueError("browser state response omitted exact null-origin CORS")
+                    return
+                last_error = f"status={response.status_code}"
+            except (httpx.HTTPError, ValueError) as exc:
+                last_error = str(exc)
+            self.sleep(poll_seconds)
+        raise RelayError(f"JARVIS service state identity was not ready: {last_error}")
+
     def _wait_for_local_health(
         self,
         health_url: str,
@@ -2496,6 +4070,192 @@ class ServiceRuntimeSupervisor:
             detail = result.stderr.strip() or result.stdout.strip()
             raise RelayError(f"remote service runtime command failed: {detail}")
         return result.stdout
+
+
+def _available_loopback_port(*, exclude: set[int] | None = None) -> int:
+    """Select one currently free loopback TCP port outside an explicit exclusion set."""
+    excluded = exclude or set()
+    for _ in range(20):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = cast(int, listener.getsockname()[1])
+        if port not in excluded:
+            return port
+    raise RelayError("could not select a distinct loopback port for browser attachment")
+
+
+def _validate_jarvis_service_state(
+    document: dict[str, object],
+    *,
+    service_instance_id: str,
+    execution_id: str,
+    health_revision: int,
+    dataset_descriptor_sha256: str,
+) -> None:
+    """Validate exact ParaView state identity while leaving scene semantics to VIGIL."""
+    if set(document) != {
+        "schema_version",
+        "service_instance_id",
+        "revision",
+        "execution_id",
+        "dataset",
+        "pipeline",
+    }:
+        raise ValueError("JARVIS ParaView state top-level shape is invalid")
+    revision = document.get("revision")
+    if (
+        document.get("schema_version") != "jarvis.paraview.service-state.v1"
+        or document.get("service_instance_id") != service_instance_id
+        or document.get("execution_id") != execution_id
+        or not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision <= 0
+        or revision != health_revision
+    ):
+        raise ValueError("JARVIS ParaView state identity disagrees with health or binding")
+    dataset = document.get("dataset")
+    if not isinstance(dataset, dict):
+        raise ValueError("JARVIS ParaView state dataset is invalid")
+    typed_dataset = cast(dict[str, object], dataset)
+    if set(typed_dataset) != {"descriptor", "discovery"}:
+        raise ValueError("JARVIS ParaView state dataset shape is invalid")
+    discovery = typed_dataset.get("discovery")
+    if not isinstance(discovery, dict) or set(cast(dict[str, object], discovery)) != {
+        "arrays",
+        "bounds",
+        "timestep_values",
+    }:
+        raise ValueError("JARVIS ParaView state discovery shape is invalid")
+    descriptor = JarvisDatasetDescriptor.model_validate(typed_dataset.get("descriptor"))
+    descriptor_digest = hashlib.sha256(
+        json.dumps(
+            descriptor.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    if not secrets.compare_digest(descriptor_digest, dataset_descriptor_sha256):
+        raise ValueError("JARVIS ParaView state dataset descriptor disagrees with binding")
+    pipeline = document.get("pipeline")
+    if not isinstance(pipeline, dict):
+        raise ValueError("JARVIS ParaView state pipeline is invalid")
+    typed_pipeline = cast(dict[str, object], pipeline)
+    if set(typed_pipeline) != {
+        "timestep",
+        "active_field",
+        "filters",
+        "colormap",
+        "camera",
+        "selection",
+        "artifacts",
+    }:
+        raise ValueError("JARVIS ParaView state pipeline shape is invalid")
+    timestep = typed_pipeline.get("timestep")
+    if not isinstance(timestep, dict):
+        raise ValueError("JARVIS ParaView timestep is invalid")
+    typed_timestep = cast(dict[str, object], timestep)
+    index = typed_timestep.get("index")
+    count = typed_timestep.get("count")
+    value = typed_timestep.get("value")
+    if (
+        set(typed_timestep) != {"index", "value", "count"}
+        or not isinstance(index, int)
+        or isinstance(index, bool)
+        or index < 0
+        or not isinstance(count, int)
+        or isinstance(count, bool)
+        or count < 1
+        or index >= count
+        or (
+            value is not None
+            and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            )
+        )
+    ):
+        raise ValueError("JARVIS ParaView timestep shape is invalid")
+
+
+def _browser_attachment_grant(
+    *,
+    record: BrowserAttachmentRecord,
+    capability: str,
+    spec: ServiceRuntimeSpec,
+) -> BrowserAttachmentGrant:
+    """Build the one-time capability URLs without copying them into gateway state."""
+    if spec.command_path is None or spec.stream_path is None or spec.event_stream_path is None:
+        raise ConfigurationError("browser attachment requires stream, events, and command paths")
+    if spec.state_path is None:
+        raise ConfigurationError("browser attachment requires a state path")
+    base = f"http://{record.bind_addr}:{record.bind_port}"
+
+    def capability_url(path: str) -> str:
+        encoded = urllib.parse.urlencode({"capability": capability})
+        return f"{base}{path}?{encoded}"
+
+    return BrowserAttachmentGrant(
+        attachment_id=record.attachment_id,
+        expires_at=record.expires_at,
+        connect_url=capability_url("/"),
+        health_url=capability_url(spec.health_path),
+        stream_url=capability_url(spec.stream_path),
+        events_url=capability_url(spec.event_stream_path),
+        state_url=capability_url(spec.state_path),
+        command_url=capability_url(spec.command_path),
+    )
+
+
+def _utc_timestamp(value: str) -> datetime:
+    """Parse one explicitly UTC persisted timestamp."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RelayError("browser attachment timestamp is invalid") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
+        raise RelayError("browser attachment timestamp is not UTC")
+    return parsed
+
+
+def _owned_browser_runtime_path(
+    settings: RelaySettings,
+    session_id: str,
+    raw_path: str,
+) -> Path:
+    """Resolve a browser attachment path only inside its owned runtime directory."""
+    expected = (settings.core_dir.parent / "runtime-sessions" / session_id).resolve()
+    path = Path(raw_path).resolve()
+    if path.parent != expected:
+        raise RelayError("browser attachment revocation path escaped its runtime directory")
+    return path
+
+
+def _write_browser_revocation_marker(path: Path, attachment_id: str) -> None:
+    """Durably revoke a browser capability before process cleanup begins."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "schema_version": "clio-relay.browser-capability-revocation.v1",
+                        "attachment_id": attachment_id,
+                        "revoked_at": utc_now().isoformat(),
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _submit_script(
@@ -2930,7 +4690,7 @@ def _template_command_script(command: Sequence[str], scheduler_job_id: str) -> s
 def _remote_scheduler_script(
     *,
     definition: ClusterDefinition,
-    operation: Literal["status", "cancel"],
+    operation: Literal["status", "cancel", "connector-placement"],
     provider: str,
     scheduler_job_id: str,
 ) -> str:
@@ -2943,6 +4703,78 @@ def _remote_scheduler_script(
         definition.name,
         "--provider",
         provider,
+    ]
+    return f"set -euo pipefail\n{remote_env(definition)} {shlex.join(command)}\n"
+
+
+def _remote_connector_step_status_script(
+    *,
+    definition: ClusterDefinition,
+    provider: str,
+    scheduler_job_id: str,
+    scheduler_step_id: str,
+    placement_host: str,
+) -> str:
+    command = [
+        "clio-relay",
+        "scheduler",
+        "connector-step-status",
+        scheduler_step_id,
+        "--scheduler-job-id",
+        scheduler_job_id,
+        "--cluster",
+        definition.name,
+        "--provider",
+        provider,
+        "--placement-host",
+        placement_host,
+    ]
+    return f"set -euo pipefail\n{remote_env(definition)} {shlex.join(command)}\n"
+
+
+def _remote_connector_step_cancel_script(
+    *,
+    definition: ClusterDefinition,
+    provider: str,
+    scheduler_job_id: str,
+    scheduler_step_id: str,
+) -> str:
+    command = [
+        "clio-relay",
+        "scheduler",
+        "connector-step-cancel",
+        scheduler_step_id,
+        "--scheduler-job-id",
+        scheduler_job_id,
+        "--cluster",
+        definition.name,
+        "--provider",
+        provider,
+    ]
+    return f"set -euo pipefail\n{remote_env(definition)} {shlex.join(command)}\n"
+
+
+def _remote_connector_step_reconcile_script(
+    *,
+    definition: ClusterDefinition,
+    provider: str,
+    scheduler_job_id: str,
+    step_marker: str,
+    placement_host: str,
+) -> str:
+    command = [
+        "clio-relay",
+        "scheduler",
+        "connector-step-reconcile",
+        scheduler_job_id,
+        "--cluster",
+        definition.name,
+        "--provider",
+        provider,
+        "--placement-host",
+        placement_host,
+        "--step-marker",
+        step_marker,
     ]
     return f"set -euo pipefail\n{remote_env(definition)} {shlex.join(command)}\n"
 
@@ -2984,6 +4816,296 @@ except (OSError, http.client.HTTPException) as exc:
     print(f"service_health=unreachable")
     print(f"service_error={{exc}}")
 __CLIO_SERVICE_HEALTH__
+"""
+
+
+def _remote_allocation_frpc_start_script(
+    *,
+    definition: ClusterDefinition,
+    session_id: str,
+    config_text: str,
+    owner_token: str,
+    connector_generation_id: str,
+    allocation_provider: str,
+    allocation_job_id: str,
+    placement: SchedulerConnectorPlacement,
+    step_marker: str,
+) -> str:
+    """Launch frpc as a durable scheduler step, never as a login-node child PID."""
+    encoded = base64.b64encode(config_text.encode("utf-8")).decode("ascii")
+    frpc_bin = definition.frpc_bin or "$HOME/.local/bin/frpc"
+    if (
+        placement.scheduler != allocation_provider
+        or placement.scheduler_job_id != allocation_job_id
+    ):
+        raise ConfigurationError("connector placement does not match its allocation")
+    placement_host = placement.placement_host
+    placement_json = placement.model_dump_json()
+    return f"""set -euo pipefail
+umask 077
+{remote_env(definition)}
+session_id={shlex.quote(session_id)}
+session_dir="$HOME/.local/share/clio-relay/service-sessions/$session_id"
+mkdir -p "$session_dir"
+chmod 700 "$session_dir"
+exec 9>"$session_dir/transition.lock"
+flock -w 10 -x 9 || {{ echo "connector start lock timed out" >&2; exit 75; }}
+config_file="$session_dir/remote-frpc.toml"
+log_file="$session_dir/remote-frpc.log"
+metadata_file="$session_dir/metadata.json"
+step_file="$session_dir/scheduler-connector-step.json"
+pending_file="$session_dir/scheduler-connector-step.pending.json"
+reconcile_file="$session_dir/scheduler-connector-step.reconcile.json"
+reconcile_state_file="$session_dir/scheduler-connector-step.reconcile-state"
+python3 - "$config_file" <<'__CLIO_WRITE_ALLOCATION_FRPC__'
+import base64
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+temporary = path.with_name(f".{{path.name}}.{{os.getpid()}}.tmp")
+with temporary.open("w", encoding="utf-8") as handle:
+    handle.write(base64.b64decode({encoded!r}).decode("utf-8"))
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(temporary, 0o600)
+os.replace(temporary, path)
+directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+__CLIO_WRITE_ALLOCATION_FRPC__
+python3 - "$metadata_file" "$session_id" "$config_file" "$log_file" \
+  {shlex.quote(owner_token)} {shlex.quote(connector_generation_id)} \
+  {shlex.quote(allocation_provider)} {shlex.quote(allocation_job_id)} \
+  {shlex.quote(placement_host)} {shlex.quote(step_marker)} \
+  {shlex.quote(placement_json)} <<'__CLIO_ALLOCATION_INTENT__'
+import json
+import os
+import stat
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+(
+    metadata_raw,
+    session_id,
+    config_path,
+    log_path,
+    owner_token,
+    generation_id,
+    provider,
+    job_id,
+    placement_host,
+    step_marker,
+    placement_raw,
+) = sys.argv[1:]
+path = Path(metadata_raw)
+expected = {{
+    "schema_version": "clio-relay.allocation-connector-sidecar.v1",
+    "owner": "clio-relay",
+    "session_id": session_id,
+    "owner_token": owner_token,
+    "connector_generation_id": generation_id,
+    "execution_scope": "scheduler_allocation",
+    "scheduler_provider": provider,
+    "scheduler_native_id": job_id,
+    "scheduler_step_marker": step_marker,
+    "placement": json.loads(placement_raw),
+    "remote_frpc_config": config_path,
+    "remote_frpc_log": log_path,
+}}
+try:
+    before = os.lstat(path)
+except FileNotFoundError:
+    current = None
+else:
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_mode & 0o077:
+        raise RuntimeError("allocation connector sidecar is not a private regular file")
+    if before.st_size > 65536:
+        raise RuntimeError("allocation connector sidecar exceeds its size bound")
+    current = json.loads(path.read_text(encoding="utf-8"))
+    after = os.lstat(path)
+    if (before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise RuntimeError("allocation connector sidecar changed while reading")
+    if not isinstance(current, dict) or any(
+        current.get(key) != value for key, value in expected.items()
+    ):
+        raise RuntimeError("allocation connector sidecar identity does not match launch intent")
+payload = {{
+    **expected,
+    "state": "starting",
+    "scheduler_step": current.get("scheduler_step") if isinstance(current, dict) else None,
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+}}
+temporary = path.with_name(f".{{path.name}}.{{os.getpid()}}.tmp")
+with temporary.open("w", encoding="utf-8") as handle:
+    json.dump(payload, handle, sort_keys=True)
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(temporary, 0o600)
+os.replace(temporary, path)
+directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+__CLIO_ALLOCATION_INTENT__
+clio-relay scheduler connector-step-reconcile \
+  {shlex.quote(allocation_job_id)} \
+  --cluster {shlex.quote(definition.name)} \
+  --provider {shlex.quote(allocation_provider)} \
+  --placement-host {shlex.quote(placement_host)} \
+  --step-marker {shlex.quote(step_marker)} >"$reconcile_file"
+python3 - "$reconcile_file" \
+  {shlex.quote(allocation_provider)} {shlex.quote(allocation_job_id)} \
+  {shlex.quote(placement_host)} {shlex.quote(step_marker)} \
+  >"$reconcile_state_file" \
+  <<'__CLIO_RECONCILE_STATE__'
+import json
+import sys
+from pathlib import Path
+
+path, provider, job_id, placement_host, step_marker = sys.argv[1:]
+record = json.loads(Path(path).read_text(encoding="utf-8"))
+valid = (
+    isinstance(record, dict)
+    and record.get("schema_version")
+    == "clio-relay.scheduler-connector-step-reconciliation.v1"
+    and record.get("scheduler") == provider
+    and record.get("scheduler_job_id") == job_id
+    and record.get("placement_host") == placement_host
+    and record.get("step_marker") == step_marker
+    and isinstance(record.get("found"), bool)
+)
+if not valid:
+    raise RuntimeError("connector step reconciliation identity is invalid")
+print("found" if record["found"] else "absent")
+__CLIO_RECONCILE_STATE__
+reconcile_state=""
+IFS= read -r reconcile_state <"$reconcile_state_file"
+if [ "$reconcile_state" != "found" ] && [ "$reconcile_state" != "absent" ]; then
+  echo "connector step reconciliation returned an invalid state" >&2
+  exit 75
+fi
+candidate_file="$reconcile_file"
+candidate_kind="reconciliation"
+if [ "$reconcile_state" = "absent" ]; then
+  frpc_bin={render_remote_shell_value(frpc_bin, field="frpc_bin")}
+  clio-relay scheduler connector-step-start \
+    {shlex.quote(allocation_job_id)} \
+    --cluster {shlex.quote(definition.name)} \
+    --provider {shlex.quote(allocation_provider)} \
+    --placement-host {shlex.quote(placement_host)} \
+    --step-marker {shlex.quote(step_marker)} \
+    --output-path "$log_file" -- \
+    "$frpc_bin" -c "$config_file" >"$pending_file"
+  candidate_file="$pending_file"
+  candidate_kind="launch"
+fi
+python3 - "$candidate_file" "$candidate_kind" "$metadata_file" "$step_file" \
+  "$session_id" "$config_file" "$log_file" \
+  {shlex.quote(owner_token)} {shlex.quote(connector_generation_id)} \
+  {shlex.quote(allocation_provider)} {shlex.quote(allocation_job_id)} \
+  {shlex.quote(placement_host)} {shlex.quote(step_marker)} \
+  <<'__CLIO_RECORD_ALLOCATION_STEP__'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+(
+    candidate_raw,
+    candidate_kind,
+    metadata_raw,
+    step_raw,
+    session_id,
+    config_path,
+    log_path,
+    owner_token,
+    generation_id,
+    provider,
+    job_id,
+    placement_host,
+    step_marker,
+) = sys.argv[1:]
+candidate = json.loads(Path(candidate_raw).read_text(encoding="utf-8"))
+step = candidate.get("step") if candidate_kind == "reconciliation" else candidate
+if not isinstance(step, dict):
+    raise RuntimeError("scheduler connector launch omitted its step identity")
+expected_step_prefix = f"{{job_id}}."
+step_id = step.get("scheduler_step_id")
+valid_step = (
+    step.get("schema_version") == "clio-relay.scheduler-connector-step.v1"
+    and step.get("scheduler") == provider
+    and step.get("scheduler_job_id") == job_id
+    and isinstance(step_id, str)
+    and step_id.startswith(expected_step_prefix)
+    and step_id[len(expected_step_prefix):].isdecimal()
+    and step.get("step_marker") == step_marker
+    and step.get("placement_host") == placement_host
+    and step.get("source")
+    in {{"slurm-srun-detached-marker", "slurm-squeue-step-marker"}}
+    and step.get("verified") is True
+)
+if not valid_step:
+    raise RuntimeError("scheduler connector step identity does not match launch intent")
+metadata_path = Path(metadata_raw)
+metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+expected_metadata = {{
+    "schema_version": "clio-relay.allocation-connector-sidecar.v1",
+    "owner": "clio-relay",
+    "session_id": session_id,
+    "owner_token": owner_token,
+    "connector_generation_id": generation_id,
+    "execution_scope": "scheduler_allocation",
+    "scheduler_provider": provider,
+    "scheduler_native_id": job_id,
+    "scheduler_step_marker": step_marker,
+    "remote_frpc_config": config_path,
+    "remote_frpc_log": log_path,
+}}
+if not isinstance(metadata, dict) or any(
+    metadata.get(key) != value for key, value in expected_metadata.items()
+):
+    raise RuntimeError("allocation connector sidecar changed before step recording")
+
+def atomic_json(path, payload):
+    temporary = path.with_name(f".{{path.name}}.{{os.getpid()}}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+atomic_json(Path(step_raw), step)
+metadata["state"] = "recorded"
+metadata["scheduler_step"] = step
+metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
+atomic_json(metadata_path, metadata)
+directory = os.open(metadata_path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+print(json.dumps({{
+    "schema_version": "clio-relay.allocation-connector-start.v1",
+    "session_id": session_id,
+    "connector_generation_id": generation_id,
+    "config_path": config_path,
+    "log_path": log_path,
+    "step_identity": step,
+}}))
+__CLIO_RECORD_ALLOCATION_STEP__
+rm -f -- "$pending_file" "$reconcile_file" "$reconcile_state_file"
 """
 
 
@@ -3230,6 +5352,10 @@ def _remote_connector_discovery_script(
     session_id: str,
     owner_token: str,
     connector_generation_id: str,
+    allocation_provider: str | None = None,
+    allocation_job_id: str | None = None,
+    allocation_step_marker: str | None = None,
+    allocation_placement_host: str | None = None,
 ) -> str:
     """Discover one remote connector by its pre-recorded unforgeable identity."""
     return f"""set -euo pipefail
@@ -3238,19 +5364,129 @@ owner_token={shlex.quote(owner_token)}
 generation_id={shlex.quote(connector_generation_id)}
 session_dir="$HOME/.local/share/clio-relay/service-sessions/$session_id"
 python3 - "$session_dir" "$session_id" "$owner_token" "$generation_id" \
+  {shlex.quote(allocation_provider or "")} {shlex.quote(allocation_job_id or "")} \
+  {shlex.quote(allocation_step_marker or "")} \
+  {shlex.quote(allocation_placement_host or "")} \
   <<'__CLIO_DISCOVER_CONNECTOR__'
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
-session_dir, session_id, owner_token, generation_id = sys.argv[1:]
+(
+    session_dir,
+    session_id,
+    owner_token,
+    generation_id,
+    expected_provider,
+    expected_job_id,
+    expected_step_marker,
+    expected_placement_host,
+) = sys.argv[1:]
 directory = Path(session_dir)
 metadata_path = directory / "metadata.json"
 try:
+    metadata_before = os.lstat(metadata_path)
+    if (
+        not stat.S_ISREG(metadata_before.st_mode)
+        or metadata_before.st_nlink != 1
+        or metadata_before.st_mode & 0o077
+        or metadata_before.st_size > 65536
+    ):
+        raise RuntimeError("remote connector sidecar is not a private bounded file")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata_after = os.lstat(metadata_path)
+    if (
+        metadata_before.st_ino,
+        metadata_before.st_size,
+        metadata_before.st_mtime_ns,
+    ) != (
+        metadata_after.st_ino,
+        metadata_after.st_size,
+        metadata_after.st_mtime_ns,
+    ):
+        raise RuntimeError("remote connector sidecar changed while reading")
 except (FileNotFoundError, json.JSONDecodeError, OSError):
     metadata = None
+if isinstance(metadata, dict) and metadata.get("schema_version") == (
+    "clio-relay.allocation-connector-sidecar.v1"
+):
+    placement = metadata.get("placement")
+    expected_identity = (
+        bool(expected_provider)
+        and bool(expected_job_id)
+        and bool(expected_step_marker)
+        and bool(expected_placement_host)
+        and metadata.get("owner") == "clio-relay"
+        and metadata.get("session_id") == session_id
+        and metadata.get("owner_token") == owner_token
+        and metadata.get("connector_generation_id") == generation_id
+        and metadata.get("execution_scope") == "scheduler_allocation"
+        and metadata.get("scheduler_provider") == expected_provider
+        and metadata.get("scheduler_native_id") == expected_job_id
+        and metadata.get("scheduler_step_marker") == expected_step_marker
+        and isinstance(placement, dict)
+        and placement.get("scheduler") == expected_provider
+        and placement.get("scheduler_job_id") == expected_job_id
+        and placement.get("placement_host") == expected_placement_host
+        and placement.get("allocation_node_count") == 1
+        and placement.get("verified") is True
+        and isinstance(metadata.get("remote_frpc_config"), str)
+        and isinstance(metadata.get("remote_frpc_log"), str)
+    )
+    if not expected_identity:
+        print(json.dumps({{
+            "present": False,
+            "ownership_verified": False,
+            "error": "allocation connector sidecar identity does not match its intent",
+        }}))
+        raise SystemExit(0)
+    step = metadata.get("scheduler_step")
+    if not isinstance(step, dict):
+        for candidate_path in (
+            directory / "scheduler-connector-step.json",
+            directory / "scheduler-connector-step.pending.json",
+            directory / "scheduler-connector-step.reconcile.json",
+        ):
+            try:
+                candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                continue
+            if isinstance(candidate, dict) and isinstance(candidate.get("step"), dict):
+                candidate = candidate["step"]
+            if isinstance(candidate, dict):
+                step = candidate
+                break
+    connector = {{
+        "owner": "clio-relay",
+        "session_id": session_id,
+        "execution_scope": "scheduler_allocation",
+        "scheduler_provider": expected_provider,
+        "scheduler_native_id": expected_job_id,
+        "scheduler_step_marker": expected_step_marker,
+        "connector_generation_id": generation_id,
+        "owner_token": owner_token,
+        "config_path": metadata["remote_frpc_config"],
+        "log_path": metadata["remote_frpc_log"],
+        "placement": placement,
+    }}
+    if isinstance(step, dict):
+        connector["scheduler_step"] = step
+        connector["scheduler_step_id"] = step.get("scheduler_step_id")
+        print(json.dumps({{
+            "present": True,
+            "ownership_verified": True,
+            "connector": connector,
+        }}))
+    else:
+        print(json.dumps({{
+            "present": False,
+            "ownership_verified": True,
+            "reconciliation_required": True,
+            "connector": connector,
+        }}))
+    raise SystemExit(0)
 token_marker = f"CLIO_RELAY_CONNECTOR_OWNER_TOKEN={{owner_token}}".encode()
 generation_marker = f"CLIO_RELAY_CONNECTOR_GENERATION_ID={{generation_id}}".encode()
 matches = []
@@ -3681,6 +5917,12 @@ def _key_value_output(output: str) -> dict[str, str]:
         if separator:
             values[key.strip()] = value.strip()
     return values
+
+
+def _connector_step_marker(session_id: str, connector_generation_id: str) -> str:
+    """Derive one bounded provider marker from durable connector ownership."""
+    digest = hashlib.sha256(f"{session_id}\x00{connector_generation_id}".encode()).hexdigest()[:32]
+    return f"clio-relay-connector-{digest}"
 
 
 def _new_ownership_intent(state: str, **identity: object) -> dict[str, object]:

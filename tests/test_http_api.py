@@ -549,6 +549,7 @@ def test_http_gateway_session_lifecycle(tmp_path: Path) -> None:
         {"scheduler": "slurm"},
         {"scheduler_job_id": "12345"},
         {"gateway": {"runtime_spec": {"kind": "forged"}}},
+        {"gateway": {"jarvis_runtime_binding": {"schema_version": "forged"}}},
         {"gateway": {"scheduler_job_id": "12345"}},
         {"gateway": {"ownership_intents": {"scheduler_submission": {}}}},
         {"gateway": {"transport": {"remote_connector": {"pid": 42}}}},
@@ -577,6 +578,7 @@ def test_http_generic_gateway_create_rejects_relay_runtime_ownership_fields(
     [
         {"scheduler_job_id": "12345"},
         {"gateway": {"runtime_spec": {"kind": "forged"}}},
+        {"gateway": {"jarvis_runtime_binding": {"schema_version": "forged"}}},
         {"gateway": {"transport": {"desktop_connector": {"pid": 42}}}},
         {"metadata": {"owner_session_id": "forged-session"}},
     ],

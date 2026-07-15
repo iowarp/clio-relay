@@ -214,7 +214,7 @@ For the legacy clio-kit 2.2.6 compatibility path, a successful synchronous
 `jarvis_run` MCP return is normalized to a terminal `completed` record even
 though that release labels the result `status=running`; the original status and
 completion basis remain in `details.completion_normalization` for auditability.
-The pinned clio-kit 2.3.2 production path removes that ambiguity upstream and
+The pinned clio-kit 2.4.2 production path removes that ambiguity upstream and
 returns a structured completed result directly. The legacy normalization is
 diagnostic compatibility evidence and cannot satisfy the 1.0 gate. Scheduler
 submissions remain non-terminal unless JARVIS was asked to wait.
@@ -445,7 +445,7 @@ Use timeline events for UI-visible agent work such as repository scans, dataset 
 Install the cluster-side server once, then launch its persistent executable:
 
 ```bash
-uv tool install --python 3.12 --no-config clio-kit==2.3.2
+uv tool install --python 3.12 --no-config clio-kit==2.4.2
 clio-kit mcp-server jarvis
 ```
 
@@ -650,6 +650,83 @@ clio-relay gateway detach-runtime <session-id> --cluster my-cluster
 clio-relay gateway attach-runtime <session-id> --cluster my-cluster
 clio-relay gateway stop-runtime <session-id> --cluster my-cluster --keep-scheduler-job
 ```
+
+When JARVIS already owns the application execution, an agent must not construct a
+second runtime specification or submit another scheduler job. The user MCP profile
+exposes `relay_bind_jarvis_runtime` for this case. Give it the configured cluster,
+the completed relay-routed `jarvis_get_execution` job, called with
+`include_service_runtimes=true`, its result artifact, and the exact JARVIS package
+identity:
+
+```json
+{
+  "cluster": "my-cluster",
+  "source_job_id": "<relay-job-id>",
+  "source_artifact_id": "<mcp-result-artifact-id>",
+  "package_id": "paraview-1",
+  "package_name": "builtin.paraview",
+  "name": "paraview-live"
+}
+```
+
+The bind operation accepts no host, port, endpoint path, dataset descriptor,
+scheduler identity, or lifecycle command from the caller. It verifies the exact
+completed relay job, artifact SHA-256, installed MCP-server artifact digest,
+structured protocol result, native JARVIS execution identity, scheduler-provider
+boundary, ready `jarvis.service-runtime.v1` report, and dataset fingerprint. It
+accepts only `clio-kit.jarvis-execution.v2` from the configured artifact-bound
+clio-kit JARVIS MCP; `jarvis_run` and historical execution v1 results are not
+reinterpreted as containing service runtimes. It then starts only the remote frp
+connector and desktop visitor and persists an
+immutable `clio-relay.jarvis-service-runtime-binding.v1` provenance record in the
+gateway session. The result returns the gateway session plus `connect_url`,
+`health_url`, `stream_url`, `events_url`, `state_url`, and `command_url`.
+
+Detach stops only the owned desktop connector. Stop removes the owned relay
+connectors while retaining the JARVIS scheduler job by default. An explicit
+scheduler cancellation is fail-closed: the relay re-reads and re-verifies the
+source artifact and exact provider/native identity immediately before requesting
+provider cancellation. Generic gateway create/update/close calls cannot modify or
+erase the binding.
+
+JARVIS service endpoints remain loopback-only inside the allocation. For SLURM,
+relay resolves the exact job with the configured scheduler provider, requires
+`NumNodes=1`, verifies that `BatchHost` is the sole expansion of `NodeList`, and
+launches a detached `srun --jobid ... --overlap --exact --nodes=1 --ntasks=1
+--nodelist=<verified-BatchHost>` with private launcher output, then boundedly resolves
+its exact `job.step` by a unique step marker and host. That step identity is durably
+stored with the placement evidence; the login-node `srun` launcher is never recorded
+as the connector PID. Failed registration terminates the launcher. Missing,
+ambiguous, or multi-node placement and ambiguous marker recovery are rejected.
+Detach checks that exact step with `squeue --steps=job.step`. Stop cancels only
+`scancel job.step`, waits for provider-confirmed step absence, and retains the
+parent scheduler job by default. Relay readiness also requires the exact
+`jarvis.paraview.health.v1` service identity and a matching initial
+`jarvis.paraview.service-state.v1` execution, state revision, and canonical dataset
+descriptor digest; an arbitrary HTTP 2xx cannot satisfy binding.
+
+Sandboxed MCP-UI iframes have the browser origin `null` and cannot attach headers
+to `EventSource`. Do not add broad CORS to the remote application and do not put a
+browser capability in the normal bind or gateway record. After verifying the exact
+ready gateway and `gateway.jarvis_runtime_binding`, the trusted desktop viewer
+issues an explicit short-lived attachment:
+
+```powershell
+clio-relay gateway browser-attach <session-id> --cluster my-cluster --ttl-seconds 1800
+clio-relay gateway browser-detach <session-id> --cluster my-cluster --attachment-id <attachment-id>
+```
+
+`browser-attach` returns one `clio-relay.browser-attachment.v1` document containing
+the attachment id, expiry, and capability-bearing connect, health, stream, events,
+state, and command URLs. This is the only output containing the raw 256-bit
+capability. The gateway record stores only the digest, expiry, local proxy identity,
+and revocation metadata. The loopback proxy requires the exact capability and
+`Origin: null` on every request, emits only `Access-Control-Allow-Origin: null`,
+never emits a wildcard, accepts only the advertised paths and narrow
+GET/POST/OPTIONS contract, bounds request bodies and upstream idle time, and strips
+the capability before forwarding. Detach durably writes a revocation marker before
+stopping the owned proxy; same-id retries return an idempotent revoked result, while
+a different attachment id is refused.
 
 Use `transport_mode: "frp-stcp-wss"` for the relay path and `transport_mode: "frp-xtcp-wss"` for direct NAT-bypass attempts. The application stream still flows through the relay/bypass transport to the desktop-local bind port, not through an SSH port forward.
 

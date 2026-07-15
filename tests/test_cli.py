@@ -5689,6 +5689,11 @@ def test_cli_generic_gateway_commands_have_no_scheduler_identity_arguments(
         ("--gateway-json", '{"runtime_spec":{"kind":"forged"}}', "gateway.runtime_spec"),
         (
             "--gateway-json",
+            '{"jarvis_runtime_binding":{"schema_version":"forged"}}',
+            "gateway.jarvis_runtime_binding",
+        ),
+        (
+            "--gateway-json",
             '{"transport":{"remote_connector":{"pid":42}}}',
             "gateway.transport.remote_connector",
         ),

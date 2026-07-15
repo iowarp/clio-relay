@@ -105,6 +105,7 @@ from clio_relay.pagination import (
     MAX_RESPONSE_PAGE_RECORDS,
 )
 from clio_relay.progress_provenance import external_progress_metadata
+from clio_relay.public_records import public_gateway_session
 from clio_relay.queue_management import (
     DEFAULT_RESULT_LIMIT,
     DEFAULT_SCAN_LIMIT,
@@ -170,6 +171,7 @@ from clio_relay.remote_mcp import (
 )
 from clio_relay.retention import TerminalRetentionCoordinator
 from clio_relay.scheduler_providers import (
+    allocation_connector_provider_for_scheduler,
     provider_for_scheduler,
     validation_provider_for_scheduler,
 )
@@ -3345,7 +3347,7 @@ def session_detach(
         canonical_report[0] = canonical
         _write_remote_verified_report(canonical, definition, canonical_report_path)
         payload["validation_report"] = str(canonical_report_path.resolve())
-        typer.echo(json.dumps(payload, indent=2))
+        typer.echo(_public_json(payload))
         canonical_ok = canonical.status is ValidationStatus.PASSED
         if payload.get("ok") is not True or not canonical_ok:
             raise typer.Exit(code=1)
@@ -4022,7 +4024,7 @@ def session_teardown(
             )
         _write_remote_verified_report(canonical, definition, canonical_report_path)
         payload["validation_report"] = str(canonical_report_path.resolve())
-        typer.echo(json.dumps(payload, indent=2))
+        typer.echo(_public_json(payload))
         canonical_ok = canonical.status is ValidationStatus.PASSED
         if payload.get("ok") is not True or not canonical_ok:
             raise typer.Exit(code=1)
@@ -5459,6 +5461,267 @@ def scheduler_cancel_command(
     _run_or_exit(action)
 
 
+@scheduler_app.command("connector-placement", hidden=True)
+def scheduler_connector_placement_command(
+    scheduler_job_id: str,
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    provider: Annotated[
+        str | None,
+        typer.Option(help="Override the cluster's explicit scheduler provider."),
+    ] = None,
+) -> None:
+    """Resolve one provider-verified host for an allocation-scoped connector."""
+    definition = _require_cluster(cluster)
+    selected = provider or definition.scheduler_provider
+    args = [
+        "scheduler",
+        "connector-placement",
+        scheduler_job_id,
+        "--cluster",
+        cluster,
+        "--provider",
+        selected,
+    ]
+    if should_execute_on_cluster(definition):
+        _run_remote_or_exit(definition, args)
+        return
+    _run_or_exit(
+        lambda: typer.echo(
+            allocation_connector_provider_for_scheduler(selected)
+            .connector_placement(scheduler_job_id)
+            .model_dump_json(indent=2)
+        )
+    )
+
+
+@scheduler_app.command(
+    "connector-step-start",
+    hidden=True,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def scheduler_connector_step_start_command(
+    ctx: typer.Context,
+    scheduler_job_id: str,
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    placement_host: Annotated[
+        str,
+        typer.Option(help="Provider-verified allocation host."),
+    ],
+    step_marker: Annotated[
+        str,
+        typer.Option(help="Crash-reconciliation marker for the connector step."),
+    ],
+    output_path: Annotated[
+        str,
+        typer.Option(help="Absolute cluster-side connector output path."),
+    ],
+    provider: Annotated[
+        str | None,
+        typer.Option(help="Override the cluster's explicit scheduler provider."),
+    ] = None,
+) -> None:
+    """Launch one asynchronous provider-owned connector step."""
+    definition = _require_cluster(cluster)
+    selected = provider or definition.scheduler_provider
+    connector_command = list(ctx.args)
+    if connector_command and connector_command[0] == "--":
+        connector_command = connector_command[1:]
+    args = [
+        "scheduler",
+        "connector-step-start",
+        scheduler_job_id,
+        "--cluster",
+        cluster,
+        "--provider",
+        selected,
+        "--placement-host",
+        placement_host,
+        "--step-marker",
+        step_marker,
+        "--output-path",
+        output_path,
+        "--",
+        *connector_command,
+    ]
+    if should_execute_on_cluster(definition):
+        _run_remote_or_exit(definition, args)
+        return
+    _run_or_exit(
+        lambda: typer.echo(
+            allocation_connector_provider_for_scheduler(selected)
+            .launch_connector_step(
+                scheduler_job_id,
+                placement_host=placement_host,
+                step_marker=step_marker,
+                command=connector_command,
+                output_path=output_path,
+            )
+            .model_dump_json(indent=2)
+        )
+    )
+
+
+@scheduler_app.command("connector-step-status", hidden=True)
+def scheduler_connector_step_status_command(
+    scheduler_step_id: str,
+    scheduler_job_id: Annotated[str, typer.Option(help="Owning scheduler allocation id.")],
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    placement_host: Annotated[
+        str,
+        typer.Option(help="Provider-verified allocation host."),
+    ],
+    provider: Annotated[
+        str | None,
+        typer.Option(help="Override the cluster's explicit scheduler provider."),
+    ] = None,
+) -> None:
+    """Observe one exact allocation connector step."""
+    definition = _require_cluster(cluster)
+    selected = provider or definition.scheduler_provider
+    args = [
+        "scheduler",
+        "connector-step-status",
+        scheduler_step_id,
+        "--scheduler-job-id",
+        scheduler_job_id,
+        "--cluster",
+        cluster,
+        "--provider",
+        selected,
+        "--placement-host",
+        placement_host,
+    ]
+    if should_execute_on_cluster(definition):
+        _run_remote_or_exit(definition, args)
+        return
+    _run_or_exit(
+        lambda: typer.echo(
+            allocation_connector_provider_for_scheduler(selected)
+            .poll_connector_step(
+                scheduler_job_id,
+                scheduler_step_id=scheduler_step_id,
+                placement_host=placement_host,
+            )
+            .model_dump_json(indent=2)
+        )
+    )
+
+
+@scheduler_app.command("connector-step-cancel", hidden=True)
+def scheduler_connector_step_cancel_command(
+    scheduler_step_id: str,
+    scheduler_job_id: Annotated[str, typer.Option(help="Owning scheduler allocation id.")],
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    provider: Annotated[
+        str | None,
+        typer.Option(help="Override the cluster's explicit scheduler provider."),
+    ] = None,
+) -> None:
+    """Cancel one exact connector step without canceling its allocation."""
+    definition = _require_cluster(cluster)
+    selected = provider or definition.scheduler_provider
+    args = [
+        "scheduler",
+        "connector-step-cancel",
+        scheduler_step_id,
+        "--scheduler-job-id",
+        scheduler_job_id,
+        "--cluster",
+        cluster,
+        "--provider",
+        selected,
+    ]
+    if should_execute_on_cluster(definition):
+        _run_remote_or_exit(definition, args)
+        return
+
+    def action() -> None:
+        result = allocation_connector_provider_for_scheduler(selected).cancel_connector_step(
+            scheduler_job_id,
+            scheduler_step_id=scheduler_step_id,
+        )
+        typer.echo(
+            json.dumps(
+                {
+                    "scheduler": selected,
+                    "scheduler_job_id": scheduler_job_id,
+                    "scheduler_step_id": scheduler_step_id,
+                    "cancel_requested": True,
+                    "accepted": result.returncode == 0,
+                    "returncode": result.returncode,
+                    "stdout": result.stdout.strip(),
+                    "stderr": result.stderr.strip(),
+                },
+                indent=2,
+            )
+        )
+        if result.returncode != 0:
+            raise typer.Exit(code=1)
+
+    _run_or_exit(action)
+
+
+@scheduler_app.command("connector-step-reconcile", hidden=True)
+def scheduler_connector_step_reconcile_command(
+    scheduler_job_id: str,
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    placement_host: Annotated[
+        str,
+        typer.Option(help="Provider-verified allocation host."),
+    ],
+    step_marker: Annotated[
+        str,
+        typer.Option(help="Exact connector step reconciliation marker."),
+    ],
+    provider: Annotated[
+        str | None,
+        typer.Option(help="Override the cluster's explicit scheduler provider."),
+    ] = None,
+) -> None:
+    """Find an interrupted connector launch by exact provider marker."""
+    definition = _require_cluster(cluster)
+    selected = provider or definition.scheduler_provider
+    args = [
+        "scheduler",
+        "connector-step-reconcile",
+        scheduler_job_id,
+        "--cluster",
+        cluster,
+        "--provider",
+        selected,
+        "--placement-host",
+        placement_host,
+        "--step-marker",
+        step_marker,
+    ]
+    if should_execute_on_cluster(definition):
+        _run_remote_or_exit(definition, args)
+        return
+
+    def action() -> None:
+        step = allocation_connector_provider_for_scheduler(selected).find_connector_step(
+            scheduler_job_id,
+            step_marker=step_marker,
+            placement_host=placement_host,
+        )
+        typer.echo(
+            json.dumps(
+                {
+                    "schema_version": "clio-relay.scheduler-connector-step-reconciliation.v1",
+                    "scheduler": selected,
+                    "scheduler_job_id": scheduler_job_id,
+                    "step_marker": step_marker,
+                    "placement_host": placement_host,
+                    "found": step is not None,
+                    "step": step.model_dump(mode="json") if step is not None else None,
+                },
+                indent=2,
+            )
+        )
+
+    _run_or_exit(action)
+
+
 @scheduler_app.command("submit-held-validation", hidden=True)
 def scheduler_submit_held_validation(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
@@ -5709,6 +5972,8 @@ def job_cancel(
 _GENERIC_GATEWAY_RUNTIME_KEYS = frozenset(
     {
         "runtime_spec",
+        "jarvis_runtime_binding",
+        "browser_attachment",
         "ownership_intents",
         "teardown_intent",
         "teardown",
@@ -5718,7 +5983,9 @@ _GENERIC_GATEWAY_RUNTIME_KEYS = frozenset(
         "scheduler_native_id",
     }
 )
-_GENERIC_GATEWAY_CONNECTOR_KEYS = frozenset({"desktop_connector", "remote_connector"})
+_GENERIC_GATEWAY_CONNECTOR_KEYS = frozenset(
+    {"browser_proxy", "desktop_connector", "remote_connector"}
+)
 _GENERIC_GATEWAY_OWNER_METADATA_KEYS = frozenset(
     {
         "owner",
@@ -5726,6 +5993,10 @@ _GENERIC_GATEWAY_OWNER_METADATA_KEYS = frozenset(
         "owner_session_generation_id",
         "owner_session_admission_id",
         "runtime_kind",
+        "binding_source",
+        "source_relay_job_id",
+        "source_relay_artifact_id",
+        "jarvis_execution_id",
         "scheduler_provider",
         "scheduler_job_id",
         "scheduler_native_id",
@@ -5839,7 +6110,7 @@ def gateway_create(
         remote_args.extend(["--log-uri", value])
     for value in artifact or []:
         remote_args.extend(["--artifact", value])
-    if _try_remote_cluster_passthrough(cluster, remote_args):
+    if _try_remote_gateway_session_passthrough(cluster, remote_args):
         return
     session = ClioCoreQueue(RelaySettings.from_env().core_dir).create_gateway_session(
         GatewaySession(
@@ -5857,7 +6128,7 @@ def gateway_create(
             metadata=metadata_payload,
         )
     )
-    typer.echo(_public_json(session.model_dump(mode="json")))
+    typer.echo(_public_json(public_gateway_session(session)))
 
 
 def _local_gateway_session(
@@ -5956,7 +6227,7 @@ def gateway_list(
         typer.echo(
             _public_json(
                 {
-                    "gateway_sessions": [session.model_dump(mode="json") for session in sessions],
+                    "gateway_sessions": [public_gateway_session(session) for session in sessions],
                     "source_cursor": cursor,
                     "source_limit": limit,
                     "source_next_cursor": (
@@ -6048,13 +6319,13 @@ def gateway_get(
     """Read a gateway service session."""
     local_session = _local_gateway_session(session_id, cluster=cluster)
     if local_session is not None:
-        typer.echo(_public_json(local_session.model_dump(mode="json")))
+        typer.echo(_public_json(public_gateway_session(local_session)))
         return
     remote_args = ["gateway", "get", session_id]
-    if _try_remote_cluster_passthrough(cluster, remote_args):
+    if _try_remote_gateway_session_passthrough(cluster, remote_args):
         return
     session = ClioCoreQueue(RelaySettings.from_env().core_dir).get_gateway_session(session_id)
-    typer.echo(_public_json(session.model_dump(mode="json")))
+    typer.echo(_public_json(public_gateway_session(session)))
 
 
 @gateway_app.command("update")
@@ -6144,7 +6415,7 @@ def gateway_update(
         remote_args.extend(["--gateway-json", gateway_source])
     remote_args.extend(["--metadata-json", metadata_source])
     local_session = _local_gateway_session(session_id, cluster=cluster)
-    if local_session is None and _try_remote_cluster_passthrough(cluster, remote_args):
+    if local_session is None and _try_remote_gateway_session_passthrough(cluster, remote_args):
         return
     updates: dict[str, object] = {}
     if queue_state is not None:
@@ -6166,15 +6437,15 @@ def gateway_update(
     _run_or_exit(
         lambda: typer.echo(
             _public_json(
-                ClioCoreQueue(RelaySettings.from_env().core_dir)
-                .update_gateway_session(
-                    session_id,
-                    state=state,
-                    metadata=metadata_payload,
-                    reject_relay_managed_fields=True,
-                    **updates,
+                public_gateway_session(
+                    ClioCoreQueue(RelaySettings.from_env().core_dir).update_gateway_session(
+                        session_id,
+                        state=state,
+                        metadata=metadata_payload,
+                        reject_relay_managed_fields=True,
+                        **updates,
+                    )
                 )
-                .model_dump(mode="json")
             )
         )
     )
@@ -6190,16 +6461,18 @@ def gateway_close(
 ) -> None:
     """Mark a gateway service session closed."""
     local_session = _local_gateway_session(session_id, cluster=cluster)
-    if local_session is None and _try_remote_cluster_passthrough(
+    if local_session is None and _try_remote_gateway_session_passthrough(
         cluster, ["gateway", "close", session_id]
     ):
         return
     _run_or_exit(
         lambda: typer.echo(
             _public_json(
-                ClioCoreQueue(RelaySettings.from_env().core_dir)
-                .close_gateway_session(session_id)
-                .model_dump(mode="json")
+                public_gateway_session(
+                    ClioCoreQueue(RelaySettings.from_env().core_dir).close_gateway_session(
+                        session_id
+                    )
+                )
             )
         )
     )
@@ -6375,7 +6648,7 @@ def gateway_start_runtime(
         )
         report_id[0] = canonical.report_id
         _write_remote_verified_report(canonical, definition, canonical_report_path)
-        payload = result.session.model_dump(mode="json")
+        payload = public_gateway_session(result.session)
         payload["validation_report"] = str(canonical_report_path.resolve())
         typer.echo(_public_json(payload))
 
@@ -6412,6 +6685,70 @@ def gateway_start_runtime(
             raise
 
     _run_or_exit(guarded_action)
+
+
+@gateway_app.command("browser-attach", hidden=True)
+def gateway_browser_attach(
+    session_id: str,
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    ttl_seconds: Annotated[
+        int,
+        typer.Option(help="Short-lived browser capability lifetime in seconds."),
+    ] = 1_800,
+    bind_port: Annotated[
+        int | None,
+        typer.Option(help="Optional desktop loopback proxy port."),
+    ] = None,
+) -> None:
+    """Issue one sandbox-browser attachment capability for a verified gateway."""
+
+    def action() -> None:
+        definition = _require_cluster(cluster)
+        settings = RelaySettings.from_env()
+        result = ServiceRuntimeSupervisor(
+            settings=settings,
+            queue=storage_managed_queue(settings),
+            cluster=cluster,
+            definition=definition,
+            token="",
+            secret_key="",
+        ).browser_attach(
+            session_id=session_id,
+            ttl_seconds=ttl_seconds,
+            bind_port=bind_port,
+        )
+        # This is the sole one-time capability output. Do not route it through
+        # routine gateway serialization or persist it in the gateway record.
+        typer.echo(result.model_dump_json(indent=2))
+
+    _run_or_exit(action)
+
+
+@gateway_app.command("browser-detach", hidden=True)
+def gateway_browser_detach(
+    session_id: str,
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    attachment_id: Annotated[
+        str,
+        typer.Option(help="Exact browser attachment identity to revoke."),
+    ],
+) -> None:
+    """Revoke one exact browser capability and stop its owned proxy."""
+
+    def action() -> None:
+        definition = _require_cluster(cluster)
+        settings = RelaySettings.from_env()
+        result = ServiceRuntimeSupervisor(
+            settings=settings,
+            queue=storage_managed_queue(settings),
+            cluster=cluster,
+            definition=definition,
+            token="",
+            secret_key="",
+        ).browser_detach(session_id=session_id, attachment_id=attachment_id)
+        typer.echo(_public_json(result.model_dump(mode="json")))
+
+    _run_or_exit(action)
 
 
 @gateway_app.command("detach-runtime")
@@ -6486,6 +6823,7 @@ def gateway_detach_runtime(
         canonical_report[0] = canonical
         _write_remote_verified_report(canonical, definition, canonical_report_path)
         payload = result.json_payload()
+        payload["session"] = public_gateway_session(result.session)
         payload["validation_report"] = str(canonical_report_path.resolve())
         typer.echo(_public_json(payload))
         if (
@@ -6549,7 +6887,7 @@ def gateway_attach_runtime(
             ),
         )
         typer.echo(
-            _public_json(supervisor.attach(session_id=session_id).session.model_dump(mode="json"))
+            _public_json(public_gateway_session(supervisor.attach(session_id=session_id).session))
         )
 
     _run_or_exit(action)
@@ -6637,6 +6975,7 @@ def gateway_stop_runtime(
         canonical_report[0] = canonical
         _write_remote_verified_report(canonical, definition, canonical_report_path)
         payload = result.json_payload()
+        payload["session"] = public_gateway_session(result.session)
         payload["validation_report"] = str(canonical_report_path.resolve())
         typer.echo(_public_json(payload))
         canonical_ok = canonical.status is ValidationStatus.PASSED
@@ -11332,6 +11671,34 @@ def _job_event_cursor(cursor: int) -> int:
 def _console_safe_text(value: str) -> str:
     encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
     return value.encode(encoding, errors="replace").decode(encoding, errors="replace")
+
+
+def _try_remote_gateway_session_passthrough(cluster: str | None, args: list[str]) -> bool:
+    """Render a validated remote gateway record through the local public projection."""
+    if cluster is None:
+        return False
+    if os.getenv("CLIO_RELAY_CLI_MODE", "auto").strip().lower() == "local":
+        return False
+    definition = _require_cluster(cluster)
+    if not should_execute_on_cluster(definition):
+        return False
+
+    def action() -> None:
+        payload = run_remote_clio(definition, args)
+        try:
+            decoded = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise RelayError("remote gateway command did not return valid JSON") from exc
+        try:
+            session = GatewaySession.model_validate(decoded)
+        except ValidationError as exc:
+            raise RelayError("remote gateway command returned an invalid session") from exc
+        if session.cluster != cluster:
+            raise RelayError("remote gateway command returned a different cluster")
+        typer.echo(_public_json(public_gateway_session(session)))
+
+    _run_or_exit(action)
+    return True
 
 
 def _try_remote_cluster_passthrough(cluster: str | None, args: list[str]) -> bool:

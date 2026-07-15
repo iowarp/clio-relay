@@ -2008,6 +2008,9 @@ def test_mcp_call_runner_validates_unified_execution_progress_and_artifact_page(
         "execution_id": "native-execution",
         "include_progress": True,
         "progress_included": True,
+        "include_service_runtimes": False,
+        "service_runtimes_included": False,
+        "service_runtime_count": 0,
         "artifacts_requested": True,
         "artifact_filters": {
             "package_id": "gray-scott",
@@ -2090,6 +2093,29 @@ def test_mcp_call_runner_accepts_explicit_execution_query_opt_outs() -> None:
     assert validation["progress_included"] is False
     assert validation["artifacts_requested"] is False
     assert validation["returned_artifact_count"] == 0
+
+
+def test_mcp_call_runner_validates_requested_service_runtime_envelope() -> None:
+    runner = _load_runner()
+    result = _jarvis_execution_query_result(
+        include_progress=False,
+        include_artifacts=False,
+        include_services=True,
+    )
+
+    validation = cast(Any, runner)._validated_jarvis_execution_query_result(
+        result,
+        arguments={
+            "pipeline_id": "pipeline-a",
+            "execution_id": "native-execution",
+            "include_progress": False,
+            "include_service_runtimes": True,
+        },
+    )
+
+    assert validation["include_service_runtimes"] is True
+    assert validation["service_runtimes_included"] is True
+    assert validation["service_runtime_count"] == 0
 
 
 @mark.parametrize(
@@ -2281,6 +2307,7 @@ def _jarvis_execution_query_result(
     *,
     include_progress: bool,
     include_artifacts: bool,
+    include_services: bool = False,
 ) -> dict[str, Any]:
     documents = deepcopy(_native_execution_documents(state="completed", terminal=True))
     progress = documents.pop("progress") if include_progress else None
@@ -2324,13 +2351,25 @@ def _jarvis_execution_query_result(
             "next_cursor": None,
         }
     return {
-        "schema_version": "clio-kit.jarvis-execution.v1",
+        "schema_version": "clio-kit.jarvis-execution.v2",
         "pipeline_id": "pipeline-a",
         "execution_id": "native-execution",
         **documents,
         "runtime_metadata": {"package_provenance": [{"pkg_id": "gray-scott"}]},
         "progress": progress,
         "artifact_page": artifact_page,
+        "service_runtimes": (
+            {
+                "schema_version": "jarvis.execution.service-runtimes.v1",
+                "execution_id": "native-execution",
+                "pipeline_id": "pipeline-a",
+                "execution_state": "completed",
+                "terminal": True,
+                "service_runtimes": [],
+            }
+            if include_services
+            else None
+        ),
     }
 
 

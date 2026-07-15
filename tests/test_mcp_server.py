@@ -153,6 +153,7 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         "relay_queue_diagnose",
         "relay_queue_stale",
         "relay_storage_status",
+        "relay_bind_jarvis_runtime",
         "jarvis_create_pipeline",
         "jarvis_describe",
         "jarvis_add_step",
@@ -1119,6 +1120,7 @@ def test_mcp_gateway_session_lifecycle(tmp_path: Path) -> None:
         {"scheduler": "slurm"},
         {"scheduler_job_id": "12345"},
         {"gateway": {"runtime_spec": {"kind": "forged"}}},
+        {"gateway": {"jarvis_runtime_binding": {"schema_version": "forged"}}},
         {"gateway": {"ownership_intents": {"scheduler_submission": {}}}},
         {"gateway": {"scheduler_provider": "slurm"}},
         {"gateway": {"scheduler_job_id": "12345"}},
@@ -1162,6 +1164,7 @@ def test_mcp_generic_gateway_create_rejects_runtime_ownership_fields(
     [
         {"scheduler_job_id": "12345"},
         {"gateway": {"runtime_spec": {"kind": "forged"}}},
+        {"gateway": {"jarvis_runtime_binding": {"schema_version": "forged"}}},
         {"gateway": {"scheduler_provider": "slurm"}},
         {"gateway": {"scheduler_job_id": "12345"}},
         {"gateway": {"scheduler_native_id": "12345"}},

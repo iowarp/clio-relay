@@ -22,7 +22,8 @@ from clio_relay.remote_mcp import (
 if TYPE_CHECKING:
     from clio_relay.installation import ComponentArtifactIdentity, InstallReceipt
 
-CLIO_KIT_JARVIS_MCP_VERSION = "2.3.2"
+CLIO_KIT_JARVIS_MCP_VERSION = "2.4.2"
+CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.1"
 DEFAULT_JARVIS_MCP_COMMAND = [
     "clio-kit",
     "mcp-server",
@@ -36,12 +37,12 @@ JARVIS_MCP_CACHE_SERVER_NAME = "__builtin_jarvis__"
 JSON = dict[str, Any]
 
 CLIO_KIT_JARVIS_USER_CONTRACT_SHA256 = (
-    "c70e350d919e0f3fa0c116d7eaf861e23b4087a18a06b2704ddbf7384f8d1f82"
+    "adc7756025fbcc90b0695bd4eaac00bda5c6cff4eb2f248fd7be263bd90b9b8b"
 )
 CLIO_KIT_JARVIS_USER_WIRE_SHA256 = (
-    "756c1a7233b9d843c931e7d539644fac61d88d147b53b535fc6340b16562a108"
+    "b2a6e531399c5a24678adf55e5133c1234718363661bde0636d81d0b1ae5db11"
 )
-_JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.json"
+_JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.1.json"
 _EXPECTED_JARVIS_USER_TOOLS = {
     "jarvis_add_step",
     "jarvis_create_pipeline",
@@ -81,7 +82,7 @@ def _load_bundled_jarvis_user_contract() -> dict[str, JSON]:
     artifact = cast(JSON, decoded)
     if (
         artifact.get("schema_version") != "clio-kit.mcp-user-contract.v1"
-        or artifact.get("contract_id") != "clio-kit-jarvis-user-v3"
+        or artifact.get("contract_id") != CLIO_KIT_JARVIS_USER_CONTRACT_ID
         or artifact.get("profile") != "user"
         or artifact.get("contract_sha256") != CLIO_KIT_JARVIS_USER_CONTRACT_SHA256
     ):

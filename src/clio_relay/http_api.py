@@ -264,6 +264,8 @@ class TaskTimelineEventRequest(BaseModel):
 _RELAY_RUNTIME_GATEWAY_KEYS = frozenset(
     {
         "runtime_spec",
+        "jarvis_runtime_binding",
+        "browser_attachment",
         "ownership_intents",
         "teardown_intent",
         "teardown",
@@ -273,7 +275,9 @@ _RELAY_RUNTIME_GATEWAY_KEYS = frozenset(
         "scheduler_native_id",
     }
 )
-_RELAY_RUNTIME_CONNECTOR_KEYS = frozenset({"desktop_connector", "remote_connector"})
+_RELAY_RUNTIME_CONNECTOR_KEYS = frozenset(
+    {"browser_proxy", "desktop_connector", "remote_connector"}
+)
 _RELAY_OWNERSHIP_METADATA_KEYS = frozenset(
     {
         "owner",
@@ -281,6 +285,10 @@ _RELAY_OWNERSHIP_METADATA_KEYS = frozenset(
         "owner_session_generation_id",
         "owner_session_admission_id",
         "runtime_kind",
+        "binding_source",
+        "source_relay_job_id",
+        "source_relay_artifact_id",
+        "jarvis_execution_id",
         "scheduler_provider",
         "scheduler_job_id",
         "scheduler_native_id",

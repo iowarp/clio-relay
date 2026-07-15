@@ -303,18 +303,18 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
         if resource["kind"] == "relay_worker"
     )
     clio_kit_component = worker["metadata_equals"]["component_artifacts"]["clio-kit"]
-    assert clio_kit_component["distribution_version"] == "2.3.2"
+    assert clio_kit_component["distribution_version"] == "2.4.2"
     assert clio_kit_component["persistent_tool"]["manager"] == "uv"
     assert clio_kit_component["persistent_tool"]["uv_version"] == "0.11.28"
     assert clio_kit_component["persistent_tool"]["source_artifact_sha256"] == (
-        "6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321"
+        "655db7d63a64d0220f3fdfe70eaf7d6a654ce06918b04c4b4e0f7db608116363"
     )
     jarvis_component = worker["metadata_equals"]["component_artifacts"]["jarvis-cd"]
-    assert jarvis_component["distribution_version"] == "1.2.2"
+    assert jarvis_component["distribution_version"] == "1.3.1"
     assert jarvis_component["requested_source"] == "github_release"
-    assert jarvis_component["install_spec"].endswith("/v1.2.2/jarvis_cd-1.2.2-py3-none-any.whl")
+    assert jarvis_component["install_spec"].endswith("/v1.3.1/jarvis_cd-1.3.1-py3-none-any.whl")
     assert jarvis_component["artifact_sha256"] == (
-        "f05454718a4efe4dadebefb98c83511ba3dcc662238c0c05430a1b621a8ab8b7"
+        "08411d49f8d457ec8a1a73ad9eacc71416a17919733682acee7e28e0011d8cea"
     )
     runtime = worker["metadata_equals"]["component_runtime"]["jarvis-cd"]
     assert runtime["provider_interpreter_verified"] is True
@@ -362,10 +362,10 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
         for resource in cast(list[dict[str, Any]], lammps["required_resources"])
         if resource["kind"] == "relay_worker"
     )
-    assert lammps_worker["metadata_equals"]["components"] == {"jarvis-cd": "1.2.2"}
+    assert lammps_worker["metadata_equals"]["components"] == {"jarvis-cd": "1.3.1"}
     assert (
         lammps_worker["metadata_equals"]["component_artifacts"]["jarvis-cd"]["artifact_sha256"]
-        == "f05454718a4efe4dadebefb98c83511ba3dcc662238c0c05430a1b621a8ab8b7"
+        == "08411d49f8d457ec8a1a73ad9eacc71416a17919733682acee7e28e0011d8cea"
     )
     assert lammps.get("evidence_group_resource_kind") is None
 
@@ -470,7 +470,7 @@ def test_spack_release_requirements_split_existing_resolution_from_fresh_install
     )
     assert fresh_server["metadata_equals"]["server_name"] == "spack-fresh"
     assert fresh_server["metadata_equals"]["install_artifact_sha256"] == (
-        "6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321"
+        "655db7d63a64d0220f3fdfe70eaf7d6a654ce06918b04c4b4e0f7db608116363"
     )
     assert fresh_server["metadata_equals"]["contract_id"] == "clio-kit-spack-user-v2"
     assert fresh_server["metadata_equals"]["contract_sha256"] == (
@@ -698,13 +698,14 @@ def test_released_reports_require_actual_pypi_uv_tool_source_before_final_gate()
     assert "released-release-gate-1.0.json" in text
 
 
-def test_released_validation_commands_reuse_one_persistent_uv_tool() -> None:
+def test_release_process_uses_persistent_tools_and_never_uvx() -> None:
     release_document = (ROOT / "docs" / "release.md").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert release_document.count("uv tool install --force --refresh --no-config `") == 1
-    assert release_document.count("--default-index https://pypi.org/simple `") == 1
-    assert release_document.count("& $Relay ") >= 3
     assert "uvx" not in release_document
+    assert "Live released-artifact validation can begin" in release_document
+    assert "install the released package once as a persistent uv tool" in readme
+    assert "uv tool install --python 3.12 --no-config clio-relay" in readme
 
 
 def test_github_release_finalization_depends_on_sealed_released_evidence() -> None:
@@ -1116,7 +1117,8 @@ def test_distribution_archives_are_parsed_but_never_executed_in_privileged_jobs(
     assert "DISTRIBUTION-ARCHIVES.json" in gate
     assert "local.sdist-smoke" not in gate
     assert "release validate-local" not in release
-    assert "CANDIDATE-BUILD.json" in release
+    assert "CANDIDATE-BUILD.json" not in release
+    assert "distribution-archives" in release
 
 
 def test_privileged_release_jobs_never_execute_candidate_or_pypi_code() -> None:
