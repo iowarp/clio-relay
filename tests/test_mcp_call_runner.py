@@ -398,6 +398,47 @@ def test_persistent_uv_tool_clio_kit_runtime_is_receipt_bindable(
     assert identity["verified"] is True
 
 
+def test_external_console_probe_preserves_logical_provider_path(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A symlink-style tool interpreter path must retain its venv context."""
+    runner = _load_runner()
+    provider = tmp_path / "tool" / "bin" / "python"
+    provider.parent.mkdir(parents=True)
+    provider.write_bytes(b"provider")
+    logical_provider = provider.parent / ".." / "bin" / provider.name
+    launcher = tmp_path / "science-mcp"
+    launcher.write_text(f"#!{logical_provider}\n", encoding="utf-8")
+    captured: dict[str, list[str]] = {}
+
+    def run_probe(
+        command: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        captured["command"] = command
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps({"matches": []}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(cast(Any, runner).subprocess, "run", run_probe)
+
+    evidence = cast(Any, runner)._external_python_console_distribution_identity(
+        launcher,
+        command_name="science-mcp",
+    )
+
+    assert captured["command"][0] == str(logical_provider)
+    assert captured["command"][0] != str(logical_provider.resolve())
+    assert (
+        evidence["error"]
+        == "persistent tool launcher has no unique installed console-script distribution"
+    )
+
+
 def test_mcp_call_runner_supports_server_arguments(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

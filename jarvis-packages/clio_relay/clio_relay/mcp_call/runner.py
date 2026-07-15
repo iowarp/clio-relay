@@ -3134,8 +3134,13 @@ def _external_python_console_distribution_identity(
     if not shebang.startswith("#!") or not shebang[2:]:
         evidence["error"] = "persistent tool launcher has no direct Python interpreter shebang"
         return evidence
+    provider_launcher = Path(shebang[2:]).expanduser()
+    if not provider_launcher.is_absolute():
+        evidence["error"] = "persistent tool provider interpreter path is not absolute"
+        return evidence
     try:
-        provider = Path(shebang[2:]).expanduser().resolve(strict=True)
+        provider_launcher_identity = _file_descriptor_identity(provider_launcher.lstat())
+        provider = provider_launcher.resolve(strict=True)
     except OSError as exc:
         evidence["error"] = f"persistent tool provider interpreter is unavailable: {exc}"
         return evidence
@@ -3200,7 +3205,7 @@ print(json.dumps({"matches": matches}, sort_keys=True))
 """
     try:
         completed = subprocess.run(
-            [str(provider), "-I", "-c", probe, command_name, str(executable)],
+            [str(provider_launcher), "-I", "-c", probe, command_name, str(executable)],
             check=False,
             capture_output=True,
             text=True,
@@ -3208,6 +3213,19 @@ print(json.dumps({"matches": matches}, sort_keys=True))
         )
     except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
         evidence["error"] = f"persistent tool distribution probe failed: {exc}"
+        return evidence
+    try:
+        launcher_after = _file_descriptor_identity(provider_launcher.lstat())
+        provider_after = provider_launcher.resolve(strict=True)
+    except OSError as exc:
+        evidence["error"] = f"persistent tool provider interpreter changed: {exc}"
+        return evidence
+    if (
+        launcher_after != provider_launcher_identity
+        or provider_after != provider
+        or _file_identity(provider) != provider_identity
+    ):
+        evidence["error"] = "persistent tool provider interpreter changed during inspection"
         return evidence
     stdout_bytes = completed.stdout.encode("utf-8")
     if (
