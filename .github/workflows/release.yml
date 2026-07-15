@@ -1,8 +1,10 @@
-name: bind release tag to tested merge-queue candidate
+name: validate release tag asynchronously
 
 on:
   push:
     tags: ["v*"]
+  release:
+    types: [published]
 
 concurrency:
   group: clio-relay-release-${{ github.ref_name }}
@@ -15,20 +17,21 @@ permissions:
 
 jobs:
   bind:
-    name: bind tag without rebuilding or executing candidate code
+    name: validate tag identity without blocking publication
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: check out the exact repository tag commit
+      - name: check out the exact tagged commit
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
-      - name: bind tag, main, version, and tree
-        id: source
+      - name: validate tag, package version, and current main
         env:
           GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
           TAG_NAME: ${{ github.ref_name }}
         shell: bash
         run: |
@@ -39,7 +42,99 @@ jobs:
             "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
           test "$(git rev-list -n 1 "$TAG_NAME")" = "$GITHUB_SHA"
           test "$GITHUB_SHA" = "$(git rev-parse refs/remotes/origin/main)"
-          python - "$TAG_NAME" <<'PY'
+          python - "$TAG_NAME" "$REPOSITORY" "$GITHUB_SHA" <<'PY'
+          import json
+          import re
+          import subprocess
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          tag, repository, source_commit = sys.argv[1:]
+          project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          version = project["project"]["version"]
+          init_source = Path("src/clio_relay/__init__.py").read_text(encoding="utf-8")
+          match = re.search(r'^__version__ = "([^"]+)"$', init_source, re.MULTILINE)
+          if match is None or match.group(1) != version or tag != f"v{version}":
+              raise SystemExit("tag and package version identities differ")
+          source_tree = subprocess.check_output(
+              ["git", "rev-parse", "HEAD^{tree}"], text=True
+          ).strip()
+          Path("TAG-BINDING.json").write_text(
+              json.dumps(
+                  {
+                      "schema_version": "clio-relay.tag-binding.v2",
+                      "repository": repository,
+                      "tag": tag,
+                      "version": version,
+                      "source_commit": source_commit,
+                      "source_tree": source_tree,
+                  },
+                  indent=2,
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+      - name: upload the asynchronous tag identity receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-binding-${{ github.ref_name }}
+          path: TAG-BINDING.json
+          if-no-files-found: error
+          retention-days: 90
+
+  publish-pypi:
+    name: publish exact GitHub Release distributions to PyPI
+    if: github.event_name == 'release' && github.repository == 'iowarp/clio-relay'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/project/clio-relay/${{ steps.identity.outputs.version }}/
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - name: check out the exact release tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: verify the published release identity and download exact assets
+        id: identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_DRAFT: ${{ github.event.release.draft }}
+          RELEASE_ID: ${{ github.event.release.id }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_TARGET: ${{ github.event.release.target_commitish }}
+          REPOSITORY: ${{ github.repository }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_ACTION" = "published"
+          test "$RELEASE_DRAFT" = "false"
+          test "$RELEASE_PRERELEASE" = "false"
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+
+          gh api "repos/$REPOSITORY/releases/$RELEASE_ID" > "$RUNNER_TEMP/release.json"
+          test "$(jq -r .id "$RUNNER_TEMP/release.json")" = "$RELEASE_ID"
+          test "$(jq -r .tag_name "$RUNNER_TEMP/release.json")" = "$TAG_NAME"
+          test "$(jq -r .draft "$RUNNER_TEMP/release.json")" = "false"
+          test "$(jq -r .prerelease "$RUNNER_TEMP/release.json")" = "false"
+
+          source_commit="$(gh api "repos/$REPOSITORY/commits/$TAG_NAME" --jq .sha)"
+          test "$source_commit" = "$(git rev-parse HEAD)"
+          test "$RELEASE_TARGET" = "$source_commit"
+          test "$(jq -r .target_commitish "$RUNNER_TEMP/release.json")" = "$source_commit"
+
+          version="$(python - "$TAG_NAME" <<'PY'
           import re
           import sys
           import tomllib
@@ -51,90 +146,45 @@ jobs:
           init_source = Path("src/clio_relay/__init__.py").read_text(encoding="utf-8")
           match = re.search(r'^__version__ = "([^"]+)"$', init_source, re.MULTILINE)
           if match is None or match.group(1) != version or tag != f"v{version}":
-              raise SystemExit("tag and package version identities differ")
+              raise SystemExit("release tag and package version identities differ")
+          print(version)
           PY
-          tree="$(git rev-parse 'HEAD^{tree}')"
-          {
-            echo "source_commit=$GITHUB_SHA"
-            echo "source_tree=$tree"
-          } >> "$GITHUB_OUTPUT"
-      - name: select the sole sealed candidate for the tested tree
-        id: candidate
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          SOURCE_TREE: ${{ steps.source.outputs.source_tree }}
-          TAG_NAME: ${{ github.ref_name }}
-        shell: bash
-        run: |
-          name="release-candidate-$SOURCE_TREE"
-          gh api "repos/$REPOSITORY/actions/artifacts?name=$name&per_page=100" \
-            > "$RUNNER_TEMP/candidate-artifacts.json"
-          test "$(jq -r .total_count "$RUNNER_TEMP/candidate-artifacts.json")" -eq 1
-          run_id="$(jq -r '.artifacts[0].workflow_run.id' \
-            "$RUNNER_TEMP/candidate-artifacts.json")"
-          [[ "$run_id" =~ ^[1-9][0-9]*$ ]]
-          gh api "repos/$REPOSITORY/actions/runs/$run_id" \
-            > "$RUNNER_TEMP/candidate-run.json"
-          run_attempt="$(jq -r .run_attempt "$RUNNER_TEMP/candidate-run.json")"
-          tested_commit="$(jq -r .head_sha "$RUNNER_TEMP/candidate-run.json")"
-          python src/clio_relay/ci_validation.py actions-artifact-manifest \
-            --run "$RUNNER_TEMP/candidate-run.json" \
-            --artifacts "$RUNNER_TEMP/candidate-artifacts.json" \
-            --repository "$REPOSITORY" \
-            --source-commit "$tested_commit" \
-            --source-tree "$SOURCE_TREE" \
-            --tag "$TAG_NAME" \
-            --run-id "$run_id" \
-            --run-attempt "$run_attempt" \
-            --artifact-name "$name" \
-            --artifact-kind candidate \
-            --output "$RUNNER_TEMP/CANDIDATE-ARTIFACT.json"
-          artifact_id="$(jq -r .artifact.id "$RUNNER_TEMP/CANDIDATE-ARTIFACT.json")"
-          {
-            echo "artifact_id=$artifact_id"
-            echo "manifest=$RUNNER_TEMP/CANDIDATE-ARTIFACT.json"
-          } >> "$GITHUB_OUTPUT"
-      - name: download and verify the sealed candidate by numeric artifact id
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          ARTIFACT_ID: ${{ steps.candidate.outputs.artifact_id }}
-          ARTIFACT_MANIFEST: ${{ steps.candidate.outputs.manifest }}
-        shell: bash
-        run: |
-          gh api "repos/$REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" \
-            > "$RUNNER_TEMP/candidate.zip"
-          python src/clio_relay/ci_validation.py extract-actions-artifact \
-            --manifest "$ARTIFACT_MANIFEST" \
-            --archive "$RUNNER_TEMP/candidate.zip" \
-            --output-dir candidate
-      - name: bind the tested tree to the merged pull request and release tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
-          SOURCE_TREE: ${{ steps.source.outputs.source_tree }}
-          TAG_NAME: ${{ github.ref_name }}
-          CANDIDATE_ARTIFACT: ${{ steps.candidate.outputs.manifest }}
-        shell: bash
-        run: |
-          gh api -H 'Accept: application/vnd.github+json' \
-            "repos/$REPOSITORY/commits/$SOURCE_COMMIT/pulls?per_page=100" \
-            > "$RUNNER_TEMP/pulls.json"
-          python src/clio_relay/ci_validation.py tag-binding \
-            --candidate-build candidate/CANDIDATE-BUILD.json \
-            --candidate-artifact "$CANDIDATE_ARTIFACT" \
-            --pulls "$RUNNER_TEMP/pulls.json" \
-            --repository "$REPOSITORY" \
-            --source-commit "$SOURCE_COMMIT" \
-            --source-tree "$SOURCE_TREE" \
-            --tag "$TAG_NAME" \
-            --output TAG-BINDING.json
-      - name: upload the lightweight tag binding
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+          )"
+          wheel="clio_relay-${version}-py3-none-any.whl"
+          sdist="clio_relay-${version}.tar.gz"
+
+          gh api "repos/$REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" \
+            > "$RUNNER_TEMP/assets.json"
+          test "$(jq length "$RUNNER_TEMP/assets.json")" -le 100
+          mkdir -p dist
+          for name in "$wheel" "$sdist" SHA256SUMS; do
+            count="$(jq --arg name "$name" '[.[] | select(.name == $name)] | length' \
+              "$RUNNER_TEMP/assets.json")"
+            test "$count" -eq 1
+            asset_id="$(jq -r --arg name "$name" '.[] | select(.name == $name) | .id' \
+              "$RUNNER_TEMP/assets.json")"
+            asset_size="$(jq -r --arg name "$name" '.[] | select(.name == $name) | .size' \
+              "$RUNNER_TEMP/assets.json")"
+            [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
+            [[ "$asset_size" =~ ^[1-9][0-9]*$ ]]
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/$REPOSITORY/releases/assets/$asset_id" > "dist/$name"
+            test "$(stat --format '%s' "dist/$name")" = "$asset_size"
+          done
+          (
+            cd dist
+            sha256sum --check --strict SHA256SUMS
+          )
+          rm dist/SHA256SUMS
+          python src/clio_relay/ci_validation.py distribution-archives \
+            --wheel "dist/$wheel" \
+            --sdist "dist/$sdist" \
+            --project clio-relay \
+            --version "$version" \
+            --output "$RUNNER_TEMP/DISTRIBUTION-ARCHIVES.json"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - name: publish the exact attached wheel and source distribution
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
-          name: release-binding-${{ github.ref_name }}
-          path: TAG-BINDING.json
-          if-no-files-found: error
-          retention-days: 90
+          packages-dir: dist/
+          skip-existing: true
