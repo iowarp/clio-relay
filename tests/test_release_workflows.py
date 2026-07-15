@@ -22,23 +22,22 @@ def _workflow(name: str) -> dict[str, Any]:
     return cast(dict[str, Any], document)
 
 
-def test_tag_workflow_only_binds_the_unprivileged_merge_queue_payload() -> None:
+def test_tag_workflow_validates_identity_without_blocking_publication() -> None:
     workflow = _workflow("release.yml")
     jobs = cast(dict[str, dict[str, Any]], workflow["jobs"])
     text = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
 
-    assert "gh-action-pypi-publish" not in text
     assert "actions/attest@" not in text
     assert "gh release create" not in text
     assert "gh release upload" not in text
-    assert "environment:" not in text
     assert "--clobber" not in text
-    assert set(jobs) == {"bind"}
+    assert set(jobs) == {"bind", "publish-pypi"}
     assert workflow["permissions"] == {
         "actions": "read",
         "contents": "read",
         "pull-requests": "read",
     }
+    assert jobs["bind"]["if"] == "github.event_name == 'push'"
     steps = cast(list[dict[str, Any]], jobs["bind"]["steps"])
     checkout = next(step for step in steps if "actions/checkout@" in str(step.get("uses")))
     assert cast(dict[str, str], checkout["with"])["persist-credentials"] == "false"
@@ -50,7 +49,41 @@ def test_tag_workflow_only_binds_the_unprivileged_merge_queue_payload() -> None:
     assert "release validate-local" not in text
     assert "uv build" not in text
     assert "TAG-BINDING.json" in text
-    assert "--artifact-kind candidate" in text
+    assert "merge_queue" not in text
+    assert "release-candidate-" not in text
+
+
+def test_published_release_uploads_exact_attached_distributions_asynchronously() -> None:
+    workflow = _workflow("release.yml")
+    release_trigger = cast(dict[str, Any], cast(dict[str, Any], workflow["on"])["release"])
+    jobs = cast(dict[str, dict[str, Any]], workflow["jobs"])
+    publish = jobs["publish-pypi"]
+    text = str(publish)
+
+    assert release_trigger["types"] == ["published"]
+    assert publish["if"] == (
+        "github.event_name == 'release' && github.repository == 'iowarp/clio-relay'"
+    )
+    assert cast(dict[str, str], publish["environment"])["name"] == "pypi"
+    assert publish["permissions"] == {
+        "actions": "read",
+        "contents": "read",
+        "id-token": "write",
+    }
+    assert "github.event.release.tag_name" in text
+    assert "github.event.release.id" in text
+    assert "releases/assets/$asset_id" in text
+    assert "sha256sum --check --strict SHA256SUMS" in text
+    assert "distribution-archives" in text
+    publish_step = next(
+        step
+        for step in cast(list[dict[str, Any]], publish["steps"])
+        if str(step.get("uses", "")).startswith("pypa/gh-action-pypi-publish@")
+    )
+    assert cast(dict[str, str], publish_step["with"])["packages-dir"] == "dist/"
+    assert "actions/create-github-app-token@" not in text
+    assert "IMMUTABLE_RELEASES" not in text
+    assert "merge_queue" not in text
 
 
 def test_same_tag_release_stages_share_one_non_canceling_concurrency_group() -> None:
@@ -872,9 +905,10 @@ def test_privileged_dispatches_run_only_from_protected_main() -> None:
             )
             assert cast(dict[str, str], checkout["with"])["ref"] == checkout_refs[job_name]
             assert cast(dict[str, str], checkout["with"])["ref"] != "${{ inputs.tag }}"
-    candidate = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
-    assert "environment:" not in candidate
-    assert "gh-action-pypi-publish" not in candidate
+    workflow = _workflow("release.yml")
+    jobs = cast(dict[str, dict[str, Any]], workflow["jobs"])
+    assert "environment" not in jobs["bind"]
+    assert "gh-action-pypi-publish" not in str(jobs["bind"])
 
 
 def test_release_workflows_preflight_bounded_report_assets() -> None:
