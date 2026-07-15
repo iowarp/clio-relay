@@ -5600,7 +5600,12 @@ def test_cli_remote_gateway_passthrough_uses_cluster_core(
         commands.append(command)
         assert capture_output is True
         assert check is False
-        return subprocess.CompletedProcess(command, 0, b'{"session_id":"gateway_remote"}\n', b"")
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            (b'{"session_id":"gateway_remote","cluster":"ares","name":"live-service-example"}\n'),
+            b"",
+        )
 
     monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
 
