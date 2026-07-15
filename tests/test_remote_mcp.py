@@ -79,6 +79,14 @@ def test_remote_mcp_registration_is_deny_by_default_and_validated() -> None:
     assert registration.call_timeout_seconds == 300
     assert registration.allows_tool("inspect") is False
 
+    catalog_registration = RemoteMcpServerConfig(
+        command="clio-kit",
+        allow_tools=["scientific_dataset_search", "scientific_dataset_describe"],
+        profiles=["user"],
+        contract="clio-kit-scientific-catalog-user-v1",
+    )
+    assert catalog_registration.contract == "clio-kit-scientific-catalog-user-v1"
+
     with pytest.raises(ValidationError, match="exact names or '\\*' only"):
         RemoteMcpServerConfig(command="science-mcp", allow_tools=["inspect*"])
     with pytest.raises(ValidationError, match="must not be empty"):
@@ -121,6 +129,71 @@ def test_remote_mcp_registration_is_deny_by_default_and_validated() -> None:
                 )
             },
         )
+
+
+def test_scientific_catalog_contract_is_read_only_and_exact(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The released catalog contract must be registrable and fail closed on drift."""
+    expected_names = ["scientific_dataset_describe", "scientific_dataset_search"]
+    registration = RemoteMcpServerConfig(
+        command="uvx",
+        args=[
+            "--from",
+            "/opt/clio/clio_kit-2.4.2-py3-none-any.whl",
+            "clio-kit",
+            "mcp-server",
+            "scientific-catalog",
+        ],
+        allow_tools=expected_names,
+        profiles=["user"],
+        contract="clio-kit-scientific-catalog-user-v1",
+    )
+    tools = [_scientific_catalog_tool(name) for name in expected_names]
+    entry = _entry(
+        registration,
+        cluster="alpha",
+        server_name="scientific-catalog",
+        tools=tools,
+    )
+    monkeypatch.setattr(
+        remote_mcp,
+        "CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256",
+        entry.schema_digest,
+    )
+
+    exact = remote_mcp._declared_contract_check(  # pyright: ignore[reportPrivateUsage]
+        entry, registration
+    )
+
+    assert exact.passed is True
+    assert exact.name == "remote-mcp.scientific-catalog-user-contract"
+    assert exact.evidence["remote_tool_names"] == expected_names
+    assert exact.evidence["allowlisted_tool_names"] == expected_names
+
+    drifted_tools = deepcopy(tools)
+    cast(dict[str, object], drifted_tools[1]["annotations"])["openWorldHint"] = True
+    drifted_entry = _entry(
+        registration,
+        cluster="alpha",
+        server_name="scientific-catalog",
+        tools=drifted_tools,
+    )
+    monkeypatch.setattr(
+        remote_mcp,
+        "CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256",
+        drifted_entry.schema_digest,
+    )
+
+    drifted = remote_mcp._declared_contract_check(  # pyright: ignore[reportPrivateUsage]
+        drifted_entry, registration
+    )
+
+    assert drifted.passed is False
+    assert drifted.evidence["annotations_match"] == {
+        "scientific_dataset_describe": True,
+        "scientific_dataset_search": False,
+    }
 
 
 def test_discovery_artifact_creates_fresh_provenance_cache_entry(tmp_path: Path) -> None:
@@ -1838,6 +1911,62 @@ def test_cli_registers_and_submits_durable_tools_list_job(
     assert job.spec.env_from == {}
     assert job.spec.tool is None
     assert job.spec.arguments == {}
+
+
+def test_cli_registers_released_scientific_catalog_contract(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The operator CLI accepts the catalog contract and preserves its shell-free argv."""
+    monkeypatch.chdir(tmp_path)
+    ClusterRegistry(clusters={"alpha": ClusterDefinition(name="alpha", ssh_host="localhost")}).save(
+        tmp_path / ".clio-relay" / "clusters.json"
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "remote-mcp",
+            "register",
+            "--cluster",
+            "alpha",
+            "--name",
+            "scientific-catalog",
+            "--command",
+            "clio-kit",
+            "--arg",
+            "mcp-server",
+            "--arg",
+            "scientific-catalog",
+            "--arg=--",
+            "--arg=--catalog-file",
+            "--arg",
+            "/srv/catalog/scientific-catalog.json",
+            "--allow-tool",
+            "scientific_dataset_search",
+            "--allow-tool",
+            "scientific_dataset_describe",
+            "--profile",
+            "user",
+            "--contract",
+            "clio-kit-scientific-catalog-user-v1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    registration = (
+        ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json")
+        .require("alpha")
+        .remote_mcp_servers["scientific-catalog"]
+    )
+    assert registration.contract == "clio-kit-scientific-catalog-user-v1"
+    assert registration.args == [
+        "mcp-server",
+        "scientific-catalog",
+        "--",
+        "--catalog-file",
+        "/srv/catalog/scientific-catalog.json",
+    ]
 
 
 def test_cli_refresh_ingests_only_terminal_discovery_artifact(
@@ -4369,6 +4498,101 @@ def _spack_result_schema(name: str) -> dict[str, object]:
             "additionalProperties": False,
         }
     raise AssertionError(f"unexpected Spack tool: {name}")
+
+
+def _scientific_catalog_tool(name: str) -> dict[str, object]:
+    """Return the bounded schema shape required by the scientific catalog contract check."""
+    annotations = {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+    if name == "scientific_dataset_describe":
+        return {
+            "name": name,
+            "description": "Return one exact operator catalog record.",
+            "annotations": annotations,
+            "inputSchema": {
+                "type": "object",
+                "properties": {"dataset_id": {"type": "string"}},
+                "required": ["dataset_id"],
+                "additionalProperties": False,
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "schema_version": {
+                        "const": "clio-kit.scientific-dataset-description.v1",
+                        "default": "clio-kit.scientific-dataset-description.v1",
+                        "type": "string",
+                    },
+                    "dataset": {
+                        "type": "object",
+                        "properties": {
+                            "descriptor": {
+                                "type": "object",
+                                "properties": {
+                                    "schema_version": {
+                                        "const": "jarvis.dataset-descriptor.v1",
+                                        "type": "string",
+                                    }
+                                },
+                                "additionalProperties": False,
+                            }
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+                "additionalProperties": False,
+            },
+        }
+    if name != "scientific_dataset_search":
+        raise AssertionError(f"unsupported scientific catalog test tool: {name}")
+    nullable_string = {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None}
+    return {
+        "name": name,
+        "description": "Search operator-registered scientific datasets.",
+        "annotations": annotations,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": nullable_string,
+                "tags": {
+                    "anyOf": [
+                        {"items": {"type": "string"}, "type": "array"},
+                        {"type": "null"},
+                    ],
+                    "default": None,
+                },
+                "kind": nullable_string,
+                "format": nullable_string,
+                "page_size": {
+                    "default": 20,
+                    "maximum": 100,
+                    "minimum": 1,
+                    "type": "integer",
+                },
+                "cursor": nullable_string,
+            },
+            "additionalProperties": False,
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "schema_version": {
+                    "const": "clio-kit.scientific-dataset-search.v1",
+                    "default": "clio-kit.scientific-dataset-search.v1",
+                    "type": "string",
+                },
+                "datasets": {
+                    "type": "array",
+                    "items": {"type": "object", "additionalProperties": False},
+                },
+            },
+            "additionalProperties": False,
+        },
+    }
 
 
 def _spack_tool(name: str) -> dict[str, object]:

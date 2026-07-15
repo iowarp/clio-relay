@@ -34,6 +34,7 @@ from clio_relay.jarvis_mcp import (
     jarvis_user_contract,
 )
 from clio_relay.remote_mcp import (
+    CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256,
     CLIO_KIT_SPACK_USER_CONTRACT_SHA256,
     CLIO_KIT_SPACK_USER_WHEEL_VERSION,
     RemoteMcpToolSchema,
@@ -83,7 +84,7 @@ EXPECTED_CONTRACTS = {
     "clio-kit-scientific-catalog-user-v1": {
         "server_name": "scientific-catalog",
         "artifact": "scientific-catalog-user-v1.json",
-        "contract_sha256": "a53006f24f4698f659f0a7c8bf61fc7bd7ad23274b06d2eed2ccfca68b9ecb0a",
+        "contract_sha256": CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256,
         "tool_names": {
             "scientific_dataset_describe",
             "scientific_dataset_search",

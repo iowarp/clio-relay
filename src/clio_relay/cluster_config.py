@@ -256,7 +256,10 @@ class ClusterTargetIdentity(BaseModel):
 
 
 RemoteMcpProfile = Literal["user", "admin", "operator"]
-RemoteMcpContract = Literal["clio-kit-spack-user-v2"]
+RemoteMcpContract = Literal[
+    "clio-kit-spack-user-v2",
+    "clio-kit-scientific-catalog-user-v1",
+]
 
 
 def _validated_cluster_label(value: str, *, field: str) -> str:
