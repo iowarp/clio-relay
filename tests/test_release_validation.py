@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -264,6 +265,96 @@ def test_local_release_validation_runs_all_checks_and_records_artifacts(
         "tests/test_surface_pagination.py::test_sparse_job_filters_return_empty_source_page_with_next_cursor",
     ]
     assert load_validation_report(report_path).status is ValidationStatus.PASSED
+
+
+def test_prebuilt_release_validation_reuses_exact_bytes_without_any_build(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n", encoding="utf-8")
+    prebuilt = tmp_path / "prebuilt"
+    prebuilt.mkdir()
+    wheel = prebuilt / "clio_relay-1.0.0-py3-none-any.whl"
+    sdist = prebuilt / "clio_relay-1.0.0.tar.gz"
+    wheel.write_bytes(b"one tested wheel")
+    sdist.write_bytes(b"one tested sdist")
+    manifest = "".join(
+        f"{hashlib.sha256(path.read_bytes()).hexdigest()} *{path.name}\n"
+        for path in sorted((wheel, sdist), key=lambda item: item.name)
+    )
+    (prebuilt / "SHA256SUMS").write_text(manifest, encoding="ascii", newline="\n")
+    commands: list[list[str]] = []
+
+    def runner(
+        command: list[str],
+        *,
+        cwd: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        assert cwd == tmp_path.resolve()
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="passed", stderr="")
+
+    report = run_local_release_validation(
+        LocalReleaseValidationOptions(
+            project_root=tmp_path,
+            report_path=tmp_path / "prebuilt-report.json",
+            artifact_dir=tmp_path / "validation-output",
+            prebuilt_artifact_dir=prebuilt,
+        ),
+        runner=runner,
+    )
+
+    check_ids = {check.check_id for check in report.checks}
+    assert report.status is ValidationStatus.PASSED
+    assert "local.prebuilt-artifacts" in check_ids
+    assert "local.build" not in check_ids
+    assert "local.sdist-smoke" not in check_ids
+    assert not any(command[:2] == ["uv", "build"] for command in commands)
+    assert {resource.metadata["sha256"] for resource in report.resources} == {
+        hashlib.sha256(wheel.read_bytes()).hexdigest(),
+        hashlib.sha256(sdist.read_bytes()).hexdigest(),
+    }
+
+
+@pytest.mark.parametrize("mutation", ["extra", "digest"])
+def test_prebuilt_release_validation_rejects_extra_or_changed_files(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n", encoding="utf-8")
+    prebuilt = tmp_path / "prebuilt"
+    prebuilt.mkdir()
+    wheel = prebuilt / "clio_relay-1.0.0-py3-none-any.whl"
+    sdist = prebuilt / "clio_relay-1.0.0.tar.gz"
+    wheel.write_bytes(b"wheel")
+    sdist.write_bytes(b"sdist")
+    manifest = "".join(
+        f"{hashlib.sha256(path.read_bytes()).hexdigest()} *{path.name}\n"
+        for path in sorted((wheel, sdist), key=lambda item: item.name)
+    )
+    (prebuilt / "SHA256SUMS").write_text(manifest, encoding="ascii", newline="\n")
+    if mutation == "extra":
+        (prebuilt / "unexpected.txt").write_text("no", encoding="utf-8")
+    else:
+        wheel.write_bytes(b"changed")
+
+    def runner(
+        command: list[str],
+        *,
+        cwd: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd
+        return subprocess.CompletedProcess(command, 0, stdout="passed", stderr="")
+
+    with pytest.raises(ConfigurationError):
+        run_local_release_validation(
+            LocalReleaseValidationOptions(
+                project_root=tmp_path,
+                report_path=tmp_path / "rejected.json",
+                artifact_dir=tmp_path / "validation-output",
+                prebuilt_artifact_dir=prebuilt,
+            ),
+            runner=runner,
+        )
 
 
 def test_local_release_validation_persists_structured_pytest_gate_failure(

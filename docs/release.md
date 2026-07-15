@@ -1,13 +1,16 @@
-# Release
+# release
 
-`clio-relay` uses `uv`, hatchling, and a staged GitHub Actions release. A tag
-creates an inert candidate payload in an unprivileged job. Protected-main code
-normalizes and attests that payload, maintainer-sealed operator live evidence
-gates publication to PyPI, released-artifact evidence then exercises the
-published persistent `uv tool` path, and only the final evidence-verifying workflow publishes
-the GitHub release.
+`clio-relay` uses `uv`, hatchling, and a staged GitHub Actions release. The
+merge queue builds one wheel and one source distribution and validates those
+same bytes across the complete operating-system and Python matrix. A later tag
+only binds the protected `main` commit and its Git tree to that sealed candidate;
+it never rebuilds or reruns the full matrix. Protected-main code attests the
+candidate, maintainer-sealed live evidence gates PyPI, and released-artifact
+evidence exercises the public persistent `uv tool` path. Finalization publishes
+the draft once, waits for GitHub release immutability, and verifies the release
+attestation and every asset.
 
-## Local checks
+## local checks
 
 Run the same checks as the release builder before tagging:
 
@@ -27,14 +30,22 @@ validates both with the lock-installed Twine, and installs the exact wheel into
 a clean environment containing only hash-checked production dependencies from
 `uv.lock`. It also builds the exact source distribution back into a wheel and
 installs and launches that result in a second clean, hash-locked runtime
-environment. This executable sdist smoke runs only in the unprivileged local,
-CI, and tag-build gate; no write-, OIDC-, environment-, attestation-, or
+environment. This executable sdist smoke runs only in the unprivileged local
+and primary merge-queue build gate; no write-, OIDC-, environment-, attestation-, or
 promotion-capable job executes candidate distribution code. Its report records
 the distribution paths, sizes, SHA-256 digests,
 backend identity, commands, resolved freeze, and bounded outputs.
 Protected promotion jobs instead inflate the gzip source distribution into a
 private regular temporary file under a hard uncompressed-tar byte ceiling,
 then parse the bounded tar and wheel topology without invoking either archive.
+
+CI's primary Ubuntu/Python 3.12 leg runs this artifact-building path once. The
+other five matrix legs use `--prebuilt-artifact-dir`, which requires exactly one
+wheel, one source distribution, and a canonical `SHA256SUMS`. Any extra,
+missing, or changed byte fails before smoke validation, and those legs never
+run `uv build` or rebuild the source distribution. The seal records all six
+report digests and their common distribution digests in
+`CANDIDATE-BUILD.json`.
 
 The 1.0 policy has an explicit `release_blockers` list. The evaluator fails
 closed even when all acceptance reports pass while any declared blocker
@@ -46,7 +57,7 @@ new blocker immediately if review discovers work that cannot be represented by
 an existing acceptance requirement, and remove it only after implementation
 and evidence are present on the reviewed release commit.
 
-## Bootstrap source
+## bootstrap source
 
 `cluster bootstrap` supports two deployment sources:
 
@@ -59,18 +70,20 @@ Before tagging, verify the wheel contains
 `clio_relay/assets/jarvis-packages/clio_relay/`. Bootstrap uses that packaged
 asset path and must not depend on a local checkout.
 
-## Version and tag
+## version and tag
 
 Update both version declarations:
 
 - `pyproject.toml`: `[project].version`
 - `src/clio_relay/__init__.py`: `__version__`
 
-Commit the release change with a conventional commit, then create and push an
-exact matching tag:
+Merge the release change through the configured merge queue. Its
+`merge_group` run must complete the six-leg matrix and create a sealed candidate
+for the tested Git tree. After the queued PR is merged, create and push an exact
+matching tag at protected `main`:
 
 ```powershell
-$Tag = "v1.0.11"
+$Tag = "v1.1.0"
 git fetch origin main
 $ReviewedMainSha = (git rev-parse refs/remotes/origin/main).Trim()
 if ((git rev-parse HEAD).Trim() -ne $ReviewedMainSha) {
@@ -90,20 +103,20 @@ particular, advancing `main` after PyPI publication would prevent the immutable
 evidence chain from being finalized, because published package versions cannot
 be replaced.
 
-All six same-tag release workflows use the shared
+All same-tag release workflows use the shared
 `clio-relay-release-<tag>` concurrency group with cancellation disabled. This
-serializes tag build, staging, both evidence seals, PyPI promotion, and final
+serializes tag binding, staging, both evidence seals, PyPI promotion, and final
 publication. It does not replace the freeze: every privileged stage still
 fetches live `origin/main` and fails unless main, the reviewed SHA, the tag, and
 the protected workflow checkout are identical.
 
 The tag-push workflow rejects a tag that does not match the package version,
-checked-out commit, and freshly fetched `origin/main` commit. It runs the
-complete local gate, builds exactly one wheel and one source distribution, and
-creates `SHA256SUMS`, but grants `GITHUB_TOKEN` only read-only repository
-contents access. Checkout credentials are not persisted, and the workflow can
-upload only an Actions artifact. It cannot mint an OIDC identity, attest
-evidence, or create a release.
+checked-out commit, and freshly fetched `origin/main`. It resolves the merged
+pull request, requires its merge commit to equal the tag, requires the tag's Git
+tree to equal the tested merge-group tree, and downloads the original candidate
+by numeric Actions artifact id and API digest. Its only output is
+`TAG-BINDING.json`. It does not install dependencies, fetch clio-kit, execute
+candidate code, run tests, or build distributions.
 
 After that read-only workflow succeeds, stage the payload by dispatching only
 from protected `main`:
@@ -113,16 +126,14 @@ gh workflow run stage-candidate.yml --ref main -f tag=$Tag `
   -f reviewed_main_sha=$ReviewedMainSha
 ```
 
-The `live-validation` environment admits the staging job only from protected
-`main`. The job selects the sole successful tag-push run for the exact tag and
-commit. Before download, it binds the sole nonexpired artifact to the exact run
-id, attempt, head SHA, name, byte count, and API SHA-256 digest; it downloads by
-artifact id, verifies the archive digest, rejects unsafe or extra members, and
-extracts bounded inert files. Protected-main code then builds current CI and
-repository-governance receipts, replaces the tag manifest with a canonical
-manifest, attests the bytes, and creates the draft with an explicit target of
-the reviewed commit. Tag-supplied workflow code never receives release-write or
-OIDC authority.
+The `live-validation` environment admits staging only from protected `main`.
+Staging verifies the tag-binding artifact first, then downloads the original
+sealed candidate directly by its bound numeric run and artifact ids. It verifies
+the API digest, tested merge-group commit and tree, all eight required jobs,
+merged PR, tag, and protected-main commit before creating `CI-STATUS.json`.
+Protected-main code then records current repository governance, attests the
+bytes, and creates the draft. Neither merge-group nor tag-supplied workflow code receives
+release-write or OIDC authority.
 
 GitHub's release list can lag immediately after draft creation. Staging retries
 only a conclusively absent draft through the same numeric-ID resolver, ten times
@@ -133,15 +144,20 @@ An existing draft is reusable only when every staged asset is byte-for-byte
 identical and its complete asset-name set equals the six staged candidate
 assets. The workflow never replaces a candidate distribution.
 
-The 1.0 release line intentionally publishes a normal, mutable GitHub release.
-Finalization still binds the tag to reviewed `main`, verifies the complete
-asset inventory immediately before and after publication, and requires the
-published release to remain non-prerelease and mutable. GitHub immutable
-releases are deferred to the 1.1 release line, where the additional repository
-setting and administration-read preflight can be introduced independently of
-the production 1.0 acceptance path.
+The 1.1 release line requires repository-enforced immutable releases. Drafts
+remain mutable while evidence is attached. Every release mutation immediately
+rechecks `enabled=true` and `enforced_by_owner=true` through a repository-scoped
+GitHub App token with only Administration read permission. Finalization adds
+`RELEASE-CLAIMS.json` before publication, publishes once, waits for the same
+release id, tag, target, and asset inventory to become immutable, then runs
+`gh release verify` and `gh release verify-asset` for every attached file. A
+rerun after publication performs reads and verification only.
 
-## Live validation of the candidate
+Release workflows never call `PUT` or `DELETE` on the immutable-release setting.
+Changing that repository policy is an owner governance action, not release-job
+authority.
+
+## live validation of the candidate
 
 The cluster labels named in `release-gate-1.0.yaml` are the concrete evidence
 instances selected for this release, not an allowlist in the product. Any
@@ -151,10 +167,10 @@ Adding a target or changing the evidence matrix requires configuration and
 policy updates only, with no target-name branch in relay code.
 
 Download the draft wheel and manifest, verify both the digest and the signed
-tag-build provenance, and compute the digest locally:
+protected-main staging provenance, and compute the digest locally:
 
 ```powershell
-$Tag = "v1.0.11"
+$Tag = "v1.1.0"
 New-Item -ItemType Directory -Force .clio-relay\candidate | Out-Null
 gh release download $Tag --pattern "*.whl" --pattern "SHA256SUMS" `
   --dir .clio-relay\candidate
@@ -300,7 +316,7 @@ cannot authorize a 1.0 claim or publication of the GitHub release.
 Diagnostic checkout runs and wheels from any other build may find defects, but
 they cannot satisfy the release gate.
 
-## Publish the candidate to PyPI
+## publish the candidate to PyPI
 
 Run the `publish validated candidate to PyPI` workflow with the draft tag:
 
@@ -353,7 +369,7 @@ byte-identical to a record regenerated from the current PyPI filename, URL, and
 digest map. These checks run in the gate and again immediately before the PyPI
 state decision.
 
-## Live validation of the released artifact
+## live validation of the released artifact
 
 After `PYPI-PROMOTION.json` is attached, rerun every required Ares and homelab
 scenario through the actual index-resolved package. Do not pass a wheel path or
@@ -420,7 +436,7 @@ published digest. The workflow signs every released
 report, `RELEASED-VALIDATION-BINDING.json`, and
 `released-release-gate-1.0.json`.
 
-## Finalize the GitHub release
+## finalize the GitHub release
 
 Only after released evidence is sealed, dispatch:
 
@@ -449,7 +465,42 @@ path. The workflow attaches and attests
 the claim set before making the GitHub release public. A retry after publication
 succeeds only when the claim asset and generated release notes are unchanged and
 the claim digest has an authorized `finalize-release.yml` attestation from the
-exact protected-main commit.
+exact protected-main commit. It declares immutable publication in the claims
+before publishing. No asset is created, replaced, or attached after the draft
+becomes public. A published rerun requires `immutable=true`, verifies unchanged
+notes and inventory, and executes only release and asset verification reads.
+
+## owner setup for 1.1
+
+The following setup is intentionally outside workflow authority:
+
+1. Create a GitHub App installed only on `iowarp/clio-relay` with repository
+   Administration **read** permission and no write permissions. Store its app id
+   in the repository variable `IMMUTABLE_RELEASES_APP_ID` and its private key in
+   the repository secret `IMMUTABLE_RELEASES_PRIVATE_KEY`.
+2. Enable immutable releases for the repository and require owner enforcement.
+   The read endpoint must return exactly `enabled=true` and
+   `enforced_by_owner=true` with API version `2026-03-10`.
+3. Exercise a disposable merge-queue canary before changing the production
+   ruleset. The canary must prove the observed `merge_group` head/base refs, the
+   merge-group anchor PR number, the final squash-merged PR commit, identical
+   tested/release Git trees, artifact retention, and rerun behavior, including
+   a group containing more than one PR.
+4. After that canary passes, configure the `main` ruleset with the existing
+   review, conversation, deletion, force-push, and exact status-check controls,
+   plus this merge queue contract:
+
+   - `check_response_timeout_minutes: 60`
+   - `grouping_strategy: ALLGREEN`
+   - `max_entries_to_build: 5`
+   - `max_entries_to_merge: 5`
+   - `merge_method: SQUASH`
+   - `min_entries_to_merge: 1`
+   - `min_entries_to_merge_wait_minutes: 0`
+
+The release governance receipt fails closed until all four steps are complete.
+No workflow in this repository creates the app, enables immutable releases, or
+changes repository rules.
 
 ## PyPI trusted publishing
 
@@ -472,7 +523,8 @@ those optional rules are active.
 
 Repository governance is proved from GitHub's effective rules for `main`, not
 from the legacy branch-protection administration endpoint. The effective rule
-set must enforce strict results from the exact seven GitHub Actions CI jobs,
+set must enforce strict results from actionlint, the exact six matrix jobs, and
+the candidate seal; require the exact merge-queue parameters above;
 pull-request-only changes, stale-review dismissal, conversation resolution, no
 force pushes, and no deletion. For 1.0, the receipt records the explicit
 `single-maintainer` review policy: the repository has no second eligible

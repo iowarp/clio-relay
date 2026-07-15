@@ -80,6 +80,22 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: mint repository-scoped administration-read token
+        id: admin_read
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ vars.IMMUTABLE_RELEASES_APP_ID }}
+          private-key: ${{ secrets.IMMUTABLE_RELEASES_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-administration: read
+
+      - name: expose administration-read token to governance checks
+        env:
+          ADMIN_READ_TOKEN: ${{ steps.admin_read.outputs.token }}
+        shell: bash
+        run: echo "GH_ADMIN_READ_TOKEN=$ADMIN_READ_TOKEN" >> "$GITHUB_ENV"
+
       - name: require protected-main dispatch and an exact-tag release
         id: release
         env:
@@ -716,7 +732,7 @@ jobs:
           ci_status = json.loads(ci_status_path.read_text(encoding="utf-8"))
           governance = json.loads(governance_path.read_text(encoding="utf-8"))
           claims = {
-              "schema_version": "1.0",
+              "schema_version": "1.1",
               "artifact_stage": "published",
               "tag": tag,
               "source_commit": commit,
@@ -752,10 +768,11 @@ jobs:
                       "environment_reviewers_available"
                   ),
                   "environments": governance.get("environments"),
+                  "immutable_releases": governance.get("immutable_releases"),
               },
               "release_publication": {
-                  "github_release_immutable": False,
-                  "immutability_deferred_to_version": "1.1",
+                  "github_release_immutable": True,
+                  "verification": ["gh release verify", "gh release verify-asset"],
               },
               "local_quality_requirements": local_requirements,
               "released_artifact_requirements": released_requirements,
@@ -788,7 +805,7 @@ jobs:
           )
           notes = (
               f"clio-relay {tag}\n\n"
-              "Production 1.0 release for durable desktop-to-cluster execution.\n\n"
+              "Production release for durable desktop-to-cluster execution.\n\n"
               "Highlights:\n\n"
               "- Generic cluster-aware virtualization of registered remote MCP servers.\n"
               "- Explicit detach and owned-resource cleanup, with scheduler jobs preserved by default.\n"
@@ -798,8 +815,7 @@ jobs:
               f"`uv tool install clio-relay=={version}` and validated on "
               f"{', '.join(claims['clusters'])}. See `RELEASE-CLAIMS.json` and the "
               "attached candidate/released reports for the complete evidence. "
-              "This 1.0 release is intentionally mutable; GitHub release immutability "
-              "is planned for 1.1.\n"
+              "The published GitHub release and every attached asset are immutable.\n"
           )
           (root / "evidence" / "RELEASE-NOTES.md").write_text(notes, encoding="utf-8")
           PY
@@ -908,15 +924,30 @@ jobs:
           relay_release_resolve "$TAG_NAME" any "$RUNNER_TEMP/final-release-current.json"
           is_draft="$(jq -r .draft "$RUNNER_TEMP/final-release-current.json")"
           [[ "$is_draft" == "true" || "$is_draft" == "false" ]]
-          python src/clio_relay/ci_validation.py mutation-authority \
-            --governance-receipt finalization/evidence/REPOSITORY-GOVERNANCE.json \
-            --repository "$REPOSITORY" \
-            --source-commit "$SOURCE_COMMIT" \
-            --tag "$TAG_NAME" \
-            --workflow-ref "$GITHUB_REF" \
-            --workflow-sha "$GITHUB_SHA" \
-            --release-state present \
-            --draft "$is_draft"
+          if test "$is_draft" = "true"; then
+            python src/clio_relay/ci_validation.py mutation-authority \
+              --governance-receipt finalization/evidence/REPOSITORY-GOVERNANCE.json \
+              --repository "$REPOSITORY" \
+              --source-commit "$SOURCE_COMMIT" \
+              --tag "$TAG_NAME" \
+              --workflow-ref "$GITHUB_REF" \
+              --workflow-sha "$GITHUB_SHA" \
+              --release-state present \
+              --draft true
+          else
+            python src/clio_relay/ci_validation.py verify-live-governance \
+              --receipt finalization/evidence/REPOSITORY-GOVERNANCE.json \
+              --repository "$REPOSITORY" \
+              --source-commit "$SOURCE_COMMIT" \
+              --tag "$TAG_NAME"
+            python src/clio_relay/ci_validation.py verify-live-release \
+              --repository "$REPOSITORY" \
+              --tag "$TAG_NAME" \
+              --source-commit "$SOURCE_COMMIT" \
+              --draft false \
+              --prerelease false \
+              --immutable true
+          fi
           final_assets=(
             finalization/packages/*.whl
             finalization/packages/*.tar.gz
@@ -951,6 +982,15 @@ jobs:
             "${asset_args[@]}" \
             --output "$RUNNER_TEMP/EXACT-FINAL-ASSETS.json"
           if test "$is_draft" = "true"; then
+            python src/clio_relay/ci_validation.py mutation-authority \
+              --governance-receipt finalization/evidence/REPOSITORY-GOVERNANCE.json \
+              --repository "$REPOSITORY" \
+              --source-commit "$SOURCE_COMMIT" \
+              --tag "$TAG_NAME" \
+              --workflow-ref "$GITHUB_REF" \
+              --workflow-sha "$GITHUB_SHA" \
+              --release-state present \
+              --draft true
             jq -n --rawfile body "$notes" \
               '{body: $body, draft: false, prerelease: false}' \
               > "$RUNNER_TEMP/publish-release.json"
@@ -961,6 +1001,23 @@ jobs:
             expected="$(cat "$notes")"
             test "$actual" = "$expected"
           fi
+          release_id="$(jq -r .id "$RUNNER_TEMP/final-release-before-publish.json")"
+          release_target="$(jq -r .target_commitish \
+            "$RUNNER_TEMP/final-release-before-publish.json")"
+          for attempt in $(seq 1 20); do
+            relay_release_resolve "$TAG_NAME" false \
+              "$RUNNER_TEMP/final-release-immutable.json"
+            test "$(jq -r .id "$RUNNER_TEMP/final-release-immutable.json")" = "$release_id"
+            test "$(jq -r .tag_name "$RUNNER_TEMP/final-release-immutable.json")" = "$TAG_NAME"
+            test "$(jq -r .target_commitish \
+              "$RUNNER_TEMP/final-release-immutable.json")" = "$release_target"
+            if test "$(jq -r .immutable \
+              "$RUNNER_TEMP/final-release-immutable.json")" = "true"; then
+              break
+            fi
+            test "$attempt" -lt 20
+            sleep 3
+          done
           capture_release_assets published
           python src/clio_relay/ci_validation.py exact-release-assets \
             --release "$RUNNER_TEMP/final-release-assets-published.json" \
@@ -970,4 +1027,14 @@ jobs:
             --verify-existing "$RUNNER_TEMP/EXACT-FINAL-ASSETS.json"
           test "$(jq -r .draft "$RUNNER_TEMP/final-release-published.json")" = "false"
           test "$(jq -r .prerelease "$RUNNER_TEMP/final-release-published.json")" = "false"
-          test "$(jq -r .immutable "$RUNNER_TEMP/final-release-published.json")" = "false"
+          test "$(jq -r .immutable "$RUNNER_TEMP/final-release-published.json")" = "true"
+          for attempt in $(seq 1 20); do
+            if gh release verify "$TAG_NAME" --repo "$REPOSITORY"; then
+              break
+            fi
+            test "$attempt" -lt 20
+            sleep 3
+          done
+          for asset in "${final_assets[@]}"; do
+            gh release verify-asset "$TAG_NAME" "$asset" --repo "$REPOSITORY"
+          done

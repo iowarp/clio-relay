@@ -322,6 +322,15 @@ def release_validate_local(
         Path | None,
         typer.Option(help="Optional empty output directory for wheel and sdist artifacts."),
     ] = None,
+    prebuilt_artifact_dir: Annotated[
+        Path | None,
+        typer.Option(
+            help=(
+                "Reuse an exact build-once wheel, sdist, and SHA256SUMS directory; "
+                "never build artifacts in this validation run."
+            )
+        ),
+    ] = None,
 ) -> None:
     """Run the complete local release gate and persist evidence on failure."""
     report_path = report or default_report_path("local")
@@ -339,6 +348,7 @@ def release_validate_local(
                     report_path=report_path,
                     markdown_report_path=markdown_report,
                     artifact_dir=artifact_dir,
+                    prebuilt_artifact_dir=prebuilt_artifact_dir,
                     report_id=seed_report.report_id,
                 )
             )

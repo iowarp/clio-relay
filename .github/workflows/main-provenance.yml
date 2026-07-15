@@ -1,0 +1,25 @@
+name: main provenance
+
+on:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  provenance:
+    name: record merged-main provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: check out merged main without credentials
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: record the merged commit and tree
+        shell: bash
+        run: |
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git rev-parse 'HEAD^{tree}'
