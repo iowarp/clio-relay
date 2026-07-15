@@ -1,6 +1,6 @@
 [project]
 name = "clio-relay"
-version = "1.2.1"
+version = "1.2.2"
 description = "Cluster relay endpoints backed by clio-core and JARVIS-CD."
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
@@ -40,6 +40,10 @@ packages = ["src/clio_relay"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "jarvis-packages" = "clio_relay/assets/jarvis-packages"
+"jarvis-packages/clio_relay/clio_relay/_jarvis_api.py" = "clio_relay/_jarvis_api.py"
+"jarvis-packages/clio_relay/clio_relay/bounded_command" = "clio_relay/bounded_command"
+"jarvis-packages/clio_relay/clio_relay/mcp_call" = "clio_relay/mcp_call"
+"jarvis-packages/clio_relay/clio_relay/remote_agent" = "clio_relay/remote_agent"
 
 [tool.hatch.build.targets.sdist]
 include = [

@@ -4,6 +4,7 @@ import json
 import re
 import subprocess
 import tarfile
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -157,7 +158,9 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
         "  --default-index https://pypi.org/simple \\\n"
         '  --refresh-package clio-relay "$RELAY_INSTALL_TARGET"'
     ) in script
-    assert "\"$JARVIS_VENV/bin/python\" -c 'import clio_relay, jarvis_cd'" in script
+    assert "import clio_relay.bounded_command.pkg" in script
+    assert "clio_relay.mcp_call.pkg" in script
+    assert "clio_relay.remote_agent.pkg" in script
     assert "write_install_receipt" in script
     assert '"schema_version": "clio-relay.bootstrap-receipt.v1"' in script
     assert "\"invocation_id\": 'manual'" in script
@@ -190,6 +193,21 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert "UV_*|PIP_*) unset" in script
     assert "--index-url https://pypi.org/simple --no-deps --only-binary=:all:" in script
     assert "\r" not in script
+
+
+def test_wheel_embeds_jarvis_package_modules_in_the_installed_namespace() -> None:
+    """JARVIS must import relay packages after the relay distribution is installed."""
+    with Path("pyproject.toml").open("rb") as stream:
+        project = tomllib.load(stream)
+    force_include = project["tool"]["hatch"]["build"]["targets"]["wheel"]["force-include"]
+
+    assert force_include == {
+        "jarvis-packages": "clio_relay/assets/jarvis-packages",
+        "jarvis-packages/clio_relay/clio_relay/_jarvis_api.py": "clio_relay/_jarvis_api.py",
+        "jarvis-packages/clio_relay/clio_relay/bounded_command": "clio_relay/bounded_command",
+        "jarvis-packages/clio_relay/clio_relay/mcp_call": "clio_relay/mcp_call",
+        "jarvis-packages/clio_relay/clio_relay/remote_agent": "clio_relay/remote_agent",
+    }
 
 
 def test_linux_user_bootstrap_embedded_python_programs_compile() -> None:
