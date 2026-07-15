@@ -16,6 +16,7 @@ ROOT = Path(__file__).parents[1]
 FIXTURES = ROOT / "examples" / "release-gate"
 RUNBOOK = ROOT / "docs" / "release-acceptance-1.0.md"
 POLICY = ROOT / "docs" / "release-gate-1.0.yaml"
+RELEASE_PROCESS = ROOT / "docs" / "release.md"
 
 
 def _render(path: Path, replacements: dict[str, str]) -> str:
@@ -37,21 +38,39 @@ def _matrix_reports() -> list[dict[str, object]]:
 
 def test_release_identity_is_consistent_across_package_policy_matrix_and_runbook() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
     policy = cast(dict[str, object], yaml.safe_load(POLICY.read_text(encoding="utf-8")))
     matrix = cast(
         dict[str, object],
         json.loads((FIXTURES / "report-matrix-1.0.json").read_text(encoding="utf-8")),
     )
     version = cast(dict[str, object], project["project"])["version"]
+    relay_lock = next(
+        package
+        for package in cast(list[dict[str, object]], lock["package"])
+        if package["name"] == "clio-relay"
+    )
+    init_source = (ROOT / "src" / "clio_relay" / "__init__.py").read_text(encoding="utf-8")
+    release_process = RELEASE_PROCESS.read_text(encoding="utf-8")
 
+    assert version == "1.1.3"
+    assert relay_lock["version"] == version
+    assert f'__version__ = "{version}"' in init_source
     assert policy["release_version"] == version
     assert matrix["release_version"] == version
     assert f'$Version = "{version}"' in RUNBOOK.read_text(encoding="utf-8")
+    assert f'$Tag = "v{version}"' in release_process
+    assert f'--title "clio-relay {version}"' in release_process
+    assert f"> Version `{version}` uses a release-first patch process." in (
+        ROOT / "README.md"
+    ).read_text(encoding="utf-8")
 
 
 def test_candidate_manifest_parser_accepts_the_exact_gnu_checksum_separator() -> None:
     digest = "a" * 64
-    wheel_name = "clio_relay-1.1.2-py3-none-any.whl"
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    version = cast(dict[str, object], project["project"])["version"]
+    wheel_name = f"clio_relay-{version}-py3-none-any.whl"
     selector = re.compile(rf"^[0-9A-Fa-f]{{64}} [ *]{re.escape(wheel_name)}$")
     parser = re.compile(r"^([0-9A-Fa-f]{64}) [ *](.+)$")
 

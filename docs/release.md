@@ -32,8 +32,9 @@ Update the release version in:
 - `examples/release-gate/report-matrix-1.0.json`
 - the version-specific acceptance examples and assertions
 
-After editing the matrix, replace `acceptance_matrix_sha256` in the policy with
-the SHA-256 of the exact matrix file.
+After editing the matrix, recompute its canonical SHA-256 with the
+`matrix_sha256` field omitted, then store that digest in both `matrix_sha256`
+and the policy's `acceptance_matrix_sha256` field.
 
 ## Focused validation
 
@@ -81,11 +82,11 @@ gh pr create --title "fix: ..." --body-file PR.md
 gh pr merge --squash --delete-branch
 git switch main
 git pull --ff-only origin main
-$Tag = "v1.1.2"
+$Tag = "v1.1.3"
 $Commit = (git rev-parse HEAD).Trim()
 git tag $Tag $Commit
 git push origin $Tag
-gh release create $Tag --draft --target $Commit --title "clio-relay 1.1.2" `
+gh release create $Tag --draft --target $Commit --title "clio-relay 1.1.3" `
   dist/*.whl dist/*.tar.gz dist/SHA256SUMS --notes-file RELEASE.md
 gh release edit $Tag --draft=false
 ```
