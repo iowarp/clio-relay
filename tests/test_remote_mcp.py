@@ -2031,6 +2031,8 @@ def test_cli_refresh_ingests_only_terminal_discovery_artifact(
 
 def test_acceptance_report_has_canonical_checks_and_durable_provenance() -> None:
     registration = _registration(namespace="science", profiles=["user"])
+    server_artifact = _server_artifact(registration)
+    server_artifact_digest = remote_mcp_server_artifact_digest(server_artifact)
     registry = ClusterRegistry(clusters={"alpha": _cluster("alpha", {"spack": registration})})
     cache = RemoteMcpSchemaCache(
         entries=[_entry(registration, cluster="alpha", server_name="spack")]
@@ -2047,6 +2049,7 @@ def test_acceptance_report_has_canonical_checks_and_durable_provenance() -> None
             "operation": "tools/call",
             "tool": "inspect",
             "arguments": {"path": "/data/run"},
+            "expected_server_artifact_digest": server_artifact_digest,
         },
     }
     artifacts = [
@@ -2072,7 +2075,9 @@ def test_acceptance_report_has_canonical_checks_and_durable_provenance() -> None
             "arguments": {"path": "/data/run"},
             "returncode": 0,
             "protocol_result": {"content": [{"type": "text", "text": "ok"}]},
-            "server_artifact": _server_artifact(registration),
+            "server_artifact": server_artifact,
+            "expected_server_artifact_digest": server_artifact_digest,
+            "observed_server_artifact_digest": server_artifact_digest,
             "protocol_error": None,
         },
         provenance={"job": job},
@@ -2105,6 +2110,139 @@ def test_acceptance_report_has_canonical_checks_and_durable_provenance() -> None
     assert server_resource.metadata["install_source"] == "wheel"
 
 
+@pytest.mark.parametrize(
+    (
+        "runtime_closure_verified",
+        "locked_runtime_verified",
+        "artifact_digest_bound",
+        "expected",
+    ),
+    [
+        (True, True, True, True),
+        (False, True, True, False),
+        (True, False, True, False),
+        (True, True, False, False),
+    ],
+)
+def test_acceptance_report_requires_verified_persistent_uv_tool_runtime(
+    runtime_closure_verified: bool,
+    locked_runtime_verified: bool,
+    artifact_digest_bound: bool,
+    expected: bool,
+) -> None:
+    registration = RemoteMcpServerConfig(
+        command="clio-kit",
+        args=["mcp-server", "scientific-catalog"],
+        allow_tools=["scientific_dataset_search"],
+        profiles=["user"],
+        namespace="scientific_catalog",
+    )
+    server_artifact: dict[str, object] = {
+        "requested_command": "clio-kit",
+        "resolved_executable": "/opt/clio-kit/bin/clio-kit",
+        "executable": {
+            "path": "/opt/clio-kit/bin/clio-kit",
+            "filename": "clio-kit",
+            "sha256": "a" * 64,
+            "size_bytes": 256,
+        },
+        "install_spec": "/opt/wheels/clio_kit-2.4.2-py3-none-any.whl",
+        "install_source": "uv-tool",
+        "install_artifact_sha256": "b" * 64,
+        "python_distribution_runtime": {
+            "runtime_closure_verified": runtime_closure_verified,
+        },
+        "nested_launcher": True,
+        "nested_runtime": {
+            "persistent_tool": True,
+            "locked_runtime_verified": locked_runtime_verified,
+        },
+        "launcher_artifact_verified": True,
+        "server_process_artifact_verified": True,
+        "identity_error": None,
+        "verified": True,
+    }
+    server_artifact_digest = remote_mcp_server_artifact_digest(server_artifact)
+    result_server_artifact_digest = server_artifact_digest if artifact_digest_bound else "c" * 64
+    discovery_payload = _discovery_artifact(
+        registration,
+        tools=[_tool("scientific_dataset_search")],
+        server_artifact=server_artifact,
+    )
+    entry = cache_entry_from_discovery_artifact(
+        cluster="alpha",
+        server_name="scientific-catalog",
+        registration=registration,
+        discovery_job_id="job_discovery",
+        artifact_id="artifact_discovery",
+        artifact_sha256=hashlib.sha256(discovery_payload).hexdigest(),
+        artifact_payload=discovery_payload,
+        discovered_at=NOW,
+    )
+    job_id = "job_catalog_search"
+    job: dict[str, object] = {
+        "job_id": job_id,
+        "cluster": "alpha",
+        "kind": "mcp_call",
+        "state": "succeeded",
+        "spec": {
+            "server": registration.command,
+            "server_args": registration.args,
+            "operation": "tools/call",
+            "tool": "scientific_dataset_search",
+            "arguments": {},
+            "expected_server_artifact_digest": server_artifact_digest,
+        },
+    }
+    report = build_remote_mcp_acceptance_report(
+        registry=ClusterRegistry(
+            clusters={
+                "alpha": _cluster(
+                    "alpha",
+                    {"scientific-catalog": registration},
+                )
+            }
+        ),
+        cache=RemoteMcpSchemaCache(entries=[entry]),
+        cluster="alpha",
+        server_name="scientific-catalog",
+        remote_tool_name="scientific_dataset_search",
+        profile="user",
+        call_job_id=job_id,
+        call_status={"job": job, "terminal": True},
+        artifacts=[
+            {
+                "artifact_id": f"artifact_{kind}",
+                "job_id": job_id,
+                "kind": kind,
+                "sha256": kind,
+            }
+            for kind in ("stdout", "stderr", "mcp_result", "provenance")
+        ],
+        mcp_result={
+            "server": registration.command,
+            "server_args": registration.args,
+            "operation": "tools/call",
+            "tool": "scientific_dataset_search",
+            "arguments": {},
+            "returncode": 0,
+            "protocol_result": {"content": [{"type": "text", "text": "ok"}]},
+            "server_artifact": server_artifact,
+            "expected_server_artifact_digest": result_server_artifact_digest,
+            "observed_server_artifact_digest": result_server_artifact_digest,
+            "protocol_error": None,
+        },
+        provenance={"job": job},
+        now=NOW,
+    )
+
+    server_check = next(
+        check for check in report.checks if check.name == "remote-mcp.server-artifact"
+    )
+    assert server_check.passed is expected
+    assert report.passed is expected
+
+
 def test_spack_acceptance_enforces_exact_stateless_user_contract(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -2125,6 +2263,8 @@ def test_spack_acceptance_enforces_exact_stateless_user_contract(
     registry = ClusterRegistry(
         clusters={"alpha": _cluster("alpha", {"site-software": registration})}
     )
+    server_artifact = _server_artifact(registration)
+    server_artifact_digest = remote_mcp_server_artifact_digest(server_artifact)
     job_id = "job_spack_find"
     job: dict[str, object] = {
         "job_id": job_id,
@@ -2138,6 +2278,7 @@ def test_spack_acceptance_enforces_exact_stateless_user_contract(
             "operation": "tools/call",
             "tool": "spack_find",
             "arguments": {},
+            "expected_server_artifact_digest": server_artifact_digest,
         },
     }
     artifacts = [
@@ -2181,7 +2322,9 @@ def test_spack_acceptance_enforces_exact_stateless_user_contract(
                 "arguments": {},
                 "returncode": 0,
                 "protocol_result": protocol_result or {"content": [{"type": "text", "text": "ok"}]},
-                "server_artifact": _server_artifact(registration),
+                "server_artifact": server_artifact,
+                "expected_server_artifact_digest": server_artifact_digest,
+                "observed_server_artifact_digest": server_artifact_digest,
                 "protocol_error": None,
             },
             provenance={"job": job},
@@ -4627,6 +4770,7 @@ def _discovery_artifact(
     registration: RemoteMcpServerConfig,
     *,
     tools: list[dict[str, object]],
+    server_artifact: dict[str, object] | None = None,
 ) -> bytes:
     return json.dumps(
         {
@@ -4640,7 +4784,9 @@ def _discovery_artifact(
             "structured_result": None,
             "protocol_version": "2024-11-05",
             "server_info": {"name": "science", "version": "1.2.3"},
-            "server_artifact": _server_artifact(registration),
+            "server_artifact": (
+                server_artifact if server_artifact is not None else _server_artifact(registration)
+            ),
             "returncode": 0,
             "stdout": "",
             "stderr": "",

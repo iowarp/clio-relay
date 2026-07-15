@@ -1776,6 +1776,9 @@ def build_remote_mcp_acceptance_report(
     stdio_call_passed = mcp_stdio_evidence is None or (
         stdio_initialize_passed and stdio_call_job_id == call_job_id
     )
+    expected_server_artifact_digest = (
+        selected_route.expected_server_artifact_digest if selected_route is not None else None
+    )
     call_passed = (
         job.get("job_id") == call_job_id
         and job.get("cluster") == cluster
@@ -1786,6 +1789,8 @@ def build_remote_mcp_acceptance_report(
         and spec.get("env_from", {}) == registration.env_from
         and spec.get("operation") == "tools/call"
         and spec.get("tool") == remote_tool_name
+        and _is_sha256(expected_server_artifact_digest)
+        and spec.get("expected_server_artifact_digest") == expected_server_artifact_digest
         and stdio_call_passed
     )
     checks.append(
@@ -1802,6 +1807,7 @@ def build_remote_mcp_acceptance_report(
                 "cluster": job.get("cluster"),
                 "kind": job.get("kind"),
                 "spec": spec,
+                "selected_route_server_artifact_digest": expected_server_artifact_digest,
                 "stdio_call_job_id": stdio_call_job_id,
                 "packaged_stdio": mcp_stdio_evidence or {},
             },
@@ -1814,14 +1820,23 @@ def build_remote_mcp_acceptance_report(
         else None
     )
     discovery_server_artifact = entry.provenance.server_artifact if entry is not None else None
+    computed_server_artifact_digest = (
+        remote_mcp_server_artifact_digest(call_server_artifact)
+        if call_server_artifact is not None
+        else None
+    )
     server_artifact_passed = (
         call_server_artifact is not None
         and call_server_artifact.get("verified") is True
         and call_server_artifact.get("server_process_artifact_verified") is True
         and bool(call_server_artifact.get("executable"))
-        and call_server_artifact.get("install_source") == "wheel"
+        and _immutable_remote_mcp_install_verified(call_server_artifact)
         and _is_sha256(call_server_artifact.get("install_artifact_sha256"))
         and call_server_artifact == discovery_server_artifact
+        and computed_server_artifact_digest == expected_server_artifact_digest
+        and mcp_result is not None
+        and mcp_result.get("expected_server_artifact_digest") == expected_server_artifact_digest
+        and mcp_result.get("observed_server_artifact_digest") == expected_server_artifact_digest
     )
     checks.append(
         RemoteMcpAcceptanceCheck(
@@ -1835,6 +1850,18 @@ def build_remote_mcp_acceptance_report(
             evidence={
                 "discovery_server_artifact": discovery_server_artifact or {},
                 "call_server_artifact": call_server_artifact or {},
+                "selected_route_server_artifact_digest": expected_server_artifact_digest,
+                "computed_server_artifact_digest": computed_server_artifact_digest,
+                "result_expected_server_artifact_digest": (
+                    mcp_result.get("expected_server_artifact_digest")
+                    if mcp_result is not None
+                    else None
+                ),
+                "result_observed_server_artifact_digest": (
+                    mcp_result.get("observed_server_artifact_digest")
+                    if mcp_result is not None
+                    else None
+                ),
             },
         )
     )
@@ -3902,6 +3929,32 @@ def _server_artifact_verified(server_artifact: JSON) -> bool:
         server_artifact.get("verified") is True
         and server_artifact.get("server_process_artifact_verified") is True
         and isinstance(server_artifact.get("executable"), dict)
+    )
+
+
+def _immutable_remote_mcp_install_verified(server_artifact: JSON) -> bool:
+    """Accept immutable wheel launches and wheel-backed persistent uv tools."""
+    install_source = server_artifact.get("install_source")
+    if install_source == "wheel":
+        return True
+    if install_source != "uv-tool":
+        return False
+    install_spec = server_artifact.get("install_spec")
+    python_runtime = server_artifact.get("python_distribution_runtime")
+    if (
+        not isinstance(install_spec, str)
+        or not install_spec.lower().endswith(".whl")
+        or not isinstance(python_runtime, dict)
+        or cast(JSON, python_runtime).get("runtime_closure_verified") is not True
+    ):
+        return False
+    if server_artifact.get("nested_launcher") is not True:
+        return True
+    nested_runtime = server_artifact.get("nested_runtime")
+    return (
+        isinstance(nested_runtime, dict)
+        and cast(JSON, nested_runtime).get("persistent_tool") is True
+        and cast(JSON, nested_runtime).get("locked_runtime_verified") is True
     )
 
 
