@@ -845,6 +845,7 @@ def ensure_private_configuration_directory(path: Path) -> None:
                 directory,
                 directory=True,
                 kernel32=kernel32,
+                write_owner=True,
             )
             try:
                 _set_private_windows_acl(
@@ -903,6 +904,7 @@ def _open_windows_configuration_handle(
     *,
     directory: bool,
     kernel32: Any,
+    write_owner: bool = False,
 ) -> ctypes.c_void_p:
     create_file = kernel32.CreateFileW
     create_file.argtypes = [
@@ -918,9 +920,12 @@ def _open_windows_configuration_handle(
     flags = _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT
     if directory:
         flags |= _WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
+    desired_access = _WINDOWS_GENERIC_READ | _WINDOWS_READ_CONTROL | _WINDOWS_WRITE_DAC
+    if write_owner:
+        desired_access |= _WINDOWS_WRITE_OWNER
     raw_handle = create_file(
         str(path),
-        _WINDOWS_GENERIC_READ | _WINDOWS_READ_CONTROL | _WINDOWS_WRITE_DAC | _WINDOWS_WRITE_OWNER,
+        desired_access,
         _WINDOWS_FILE_SHARE_READ,
         None,
         _WINDOWS_OPEN_EXISTING,
@@ -1403,6 +1408,28 @@ def _set_private_windows_acl(
         if descriptor_owner.value is None:
             raise ConfigurationError(f"private Windows configuration owner has no SID: {path}")
         normalize_owner = owner_sid != user_sid
+        if normalize_owner and owns_handle:
+            _close_windows_handle(handle, kernel32=kernel32)
+            handle = None
+            handle = _open_windows_configuration_handle(
+                path,
+                directory=directory,
+                kernel32=kernel32,
+                write_owner=True,
+            )
+            owner_sid = _windows_object_owner_sid(
+                handle,
+                advapi32=advapi32,
+                kernel32=kernel32,
+                path=path,
+            )
+            _require_current_windows_owner(
+                owner_sid=owner_sid,
+                user_sid=user_sid,
+                default_owner_sid=default_owner_sid,
+                path=path,
+            )
+            normalize_owner = owner_sid != user_sid
         set_security = advapi32.SetSecurityInfo
         set_security.argtypes = [
             ctypes.c_void_p,

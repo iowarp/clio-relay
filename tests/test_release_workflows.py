@@ -226,13 +226,15 @@ def test_ci_matrix_pins_sync_probe_and_release_gate_to_each_declared_python() ->
     assert "--prebuilt-artifact-dir" not in primary
 
 
-def test_merge_queue_builds_once_and_main_or_tag_never_repeat_the_full_gate() -> None:
+def test_merge_queue_builds_once_main_skips_gate_and_tags_run_regression() -> None:
+    workflow = _workflow("ci.yml")
+    triggers = cast(dict[str, Any], workflow["on"])
     ci = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
     main = (WORKFLOWS / "main-provenance.yml").read_text(encoding="utf-8")
     tag = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
 
     assert "merge_group:" in ci
-    assert "push:" not in ci
+    assert cast(dict[str, list[str]], triggers["push"])["tags"] == ["v*"]
     assert "push:" in main
     assert "record merged-main provenance" in main
     assert "validate-local" not in main

@@ -237,9 +237,11 @@ def test_windows_nested_configuration_creation_retains_hardened_handles(
         *,
         directory: bool,
         kernel32: object,
+        write_owner: bool,
     ) -> Any:
         nonlocal next_handle
         assert directory
+        assert write_owner
         assert kernel32 is not None
         next_handle += 1
         handle = SimpleNamespace(value=next_handle)
@@ -288,6 +290,59 @@ def test_windows_nested_configuration_creation_retains_hardened_handles(
         ("close", 101),
     ]
     assert open_handles == set()
+
+
+def test_windows_configuration_open_only_requests_owner_change_when_needed(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    requested_access: list[int] = []
+
+    class RecordingCreateFile:
+        argtypes: list[object]
+        restype: object
+
+        def __call__(
+            self,
+            _path: str,
+            desired_access: int,
+            *_args: object,
+        ) -> int:
+            requested_access.append(desired_access)
+            return 100 + len(requested_access)
+
+    kernel32 = SimpleNamespace(CreateFileW=RecordingCreateFile())
+
+    def accept_handle(
+        _handle: ctypes.c_void_p,
+        *,
+        directory: bool,
+        kernel32: object,
+        path: Path,
+    ) -> None:
+        del directory, kernel32, path
+
+    monkeypatch.setattr(
+        cluster_config,
+        "_validate_windows_configuration_handle",
+        accept_handle,
+    )
+
+    cluster_config._open_windows_configuration_handle(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        tmp_path,
+        directory=True,
+        kernel32=kernel32,
+    )
+    cluster_config._open_windows_configuration_handle(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        tmp_path,
+        directory=True,
+        kernel32=kernel32,
+        write_owner=True,
+    )
+
+    assert requested_access[0] & cluster_config._WINDOWS_WRITE_DAC  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert not requested_access[0] & cluster_config._WINDOWS_WRITE_OWNER  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert requested_access[1] & cluster_config._WINDOWS_WRITE_OWNER  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def test_configuration_read_rejects_foreign_or_group_writable_posix_file(
