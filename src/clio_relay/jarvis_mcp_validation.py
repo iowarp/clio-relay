@@ -9,6 +9,10 @@ from typing import Any, TypeGuard, cast
 
 from pydantic import ValidationError
 
+from clio_relay.installation import (
+    CLIO_KIT_JARVIS_EXECUTION_SCHEMA,
+    JARVIS_EXECUTION_SERVICE_RUNTIMES_SCHEMA,
+)
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_MCP_VERSION,
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
@@ -711,6 +715,7 @@ def _jarvis_execution_query_evidence(
     record = _mapping(structured.get("execution_record")) if structured else None
     progress = _mapping(structured.get("progress")) if structured else None
     artifact_page = _mapping(structured.get("artifact_page")) if structured else None
+    service_runtimes = _mapping(structured.get("service_runtimes")) if structured else None
     runtime = _mapping(structured.get("runtime_metadata")) if structured else None
     raw_generated = artifact_page.get("artifacts") if artifact_page else None
     generated_artifacts = (
@@ -727,16 +732,18 @@ def _jarvis_execution_query_evidence(
         "runtime_metadata",
         "progress",
         "artifact_page",
+        "service_runtimes",
     }
     envelope_passed = (
         structured is not None
         and set(structured) == expected_envelope
-        and structured.get("schema_version") == "clio-kit.jarvis-execution.v1"
+        and structured.get("schema_version") == CLIO_KIT_JARVIS_EXECUTION_SCHEMA
         and runtime is not None
         and handle is not None
         and record is not None
         and progress is not None
         and artifact_page is not None
+        and service_runtimes is None
     )
     identity_fields = (
         "execution_id",
@@ -817,6 +824,9 @@ def _jarvis_execution_query_evidence(
         and runner_validation.get("execution_id") == execution_id
         and runner_validation.get("include_progress") is True
         and runner_validation.get("progress_included") is True
+        and runner_validation.get("include_service_runtimes") is False
+        and runner_validation.get("service_runtimes_included") is False
+        and runner_validation.get("service_runtime_count") == 0
         and runner_validation.get("artifacts_requested") is True
         and runner_validation.get("artifact_filters") == expected_filters
         and runner_validation.get("returned_artifact_count") == returned
@@ -1176,6 +1186,9 @@ def _execution_query_contract_evidence(tool: JSON | None) -> tuple[JSON, bool]:
     include_progress = (
         _mapping(input_properties.get("include_progress")) if input_properties else None
     )
+    include_service_runtimes = (
+        _mapping(input_properties.get("include_service_runtimes")) if input_properties else None
+    )
     artifact_selector = _mapping(input_properties.get("artifacts")) if input_properties else None
     artifact_query = _schema_option(artifact_selector, expected_type="object")
     artifact_filters = _mapping(artifact_query.get("properties")) if artifact_query else None
@@ -1194,7 +1207,20 @@ def _execution_query_contract_evidence(tool: JSON | None) -> tuple[JSON, bool]:
     )
     artifact_item = _mapping(artifacts_schema.get("items")) if artifacts_schema else None
     artifact_item_properties = _mapping(artifact_item.get("properties")) if artifact_item else None
-    expected_inputs = {"pipeline_id", "execution_id", "include_progress", "artifacts"}
+    service_selector = (
+        _mapping(output_properties.get("service_runtimes")) if output_properties else None
+    )
+    service_runtimes = _schema_option(service_selector, expected_type="object")
+    service_runtime_properties = (
+        _mapping(service_runtimes.get("properties")) if service_runtimes else None
+    )
+    expected_inputs = {
+        "pipeline_id",
+        "execution_id",
+        "include_progress",
+        "include_service_runtimes",
+        "artifacts",
+    }
     expected_filters = {
         "package_id",
         "role",
@@ -1212,6 +1238,7 @@ def _execution_query_contract_evidence(tool: JSON | None) -> tuple[JSON, bool]:
         "runtime_metadata",
         "progress",
         "artifact_page",
+        "service_runtimes",
     }
     passed = bool(
         input_schema is not None
@@ -1221,6 +1248,7 @@ def _execution_query_contract_evidence(tool: JSON | None) -> tuple[JSON, bool]:
         and isinstance(required, list)
         and set(cast(list[object], required)) == {"pipeline_id", "execution_id"}
         and include_progress == {"default": True, "type": "boolean"}
+        and include_service_runtimes == {"default": False, "type": "boolean"}
         and artifact_selector is not None
         and artifact_selector.get("default") is None
         and artifact_query is not None
@@ -1242,7 +1270,7 @@ def _execution_query_contract_evidence(tool: JSON | None) -> tuple[JSON, bool]:
         and isinstance(output_required, list)
         and set(cast(list[object], output_required)) == expected_outputs
         and output_properties.get("schema_version")
-        == {"const": "clio-kit.jarvis-execution.v1", "type": "string"}
+        == {"const": CLIO_KIT_JARVIS_EXECUTION_SCHEMA, "type": "string"}
         and progress_properties is not None
         and progress_properties.get("schema_version")
         == {"const": "jarvis.execution.progress.v1", "type": "string"}
@@ -1252,6 +1280,9 @@ def _execution_query_contract_evidence(tool: JSON | None) -> tuple[JSON, bool]:
         and artifact_item_properties is not None
         and artifact_item_properties.get("schema_version")
         == {"const": "jarvis.artifact.v1", "type": "string"}
+        and service_runtime_properties is not None
+        and service_runtime_properties.get("schema_version")
+        == {"const": JARVIS_EXECUTION_SERVICE_RUNTIMES_SCHEMA, "type": "string"}
     )
     return (
         {
@@ -1260,6 +1291,7 @@ def _execution_query_contract_evidence(tool: JSON | None) -> tuple[JSON, bool]:
             if isinstance(required, list)
             else [],
             "include_progress_schema": include_progress or {},
+            "include_service_runtimes_schema": include_service_runtimes or {},
             "artifact_filter_fields": sorted(artifact_filters) if artifact_filters else [],
             "artifact_page_size_schema": page_size or {},
             "output_fields": sorted(output_properties) if output_properties else [],
@@ -1273,6 +1305,11 @@ def _execution_query_contract_evidence(tool: JSON | None) -> tuple[JSON, bool]:
             ),
             "artifact_schema_version": (
                 artifact_item_properties.get("schema_version") if artifact_item_properties else None
+            ),
+            "service_runtimes_schema_version": (
+                service_runtime_properties.get("schema_version")
+                if service_runtime_properties
+                else None
             ),
         },
         passed,

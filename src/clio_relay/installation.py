@@ -40,8 +40,9 @@ JARVIS_EXECUTION_RECORD_SCHEMA = "jarvis.execution.record.v1"
 JARVIS_EXECUTION_PROGRESS_SCHEMA = "jarvis.execution.progress.v1"
 JARVIS_EXECUTION_ARTIFACTS_SCHEMA = "jarvis.execution.artifacts.v1"
 JARVIS_ARTIFACT_SCHEMA = "jarvis.artifact.v1"
-CLIO_KIT_JARVIS_EXECUTION_SCHEMA = "clio-kit.jarvis-execution.v1"
-CLIO_KIT_JARVIS_CONTRACT_ID = "clio-kit-jarvis-user-v3"
+JARVIS_EXECUTION_SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
+CLIO_KIT_JARVIS_EXECUTION_SCHEMA = "clio-kit.jarvis-execution.v2"
+CLIO_KIT_JARVIS_CONTRACT_ID = "clio-kit-jarvis-user-v3.1"
 CLIO_KIT_MCP_CONTRACT_SCHEMA = "clio-kit.mcp-user-contract.v1"
 CLIO_KIT_NATIVE_OPERATIONS = (
     "jarvis_get_execution",
@@ -1383,11 +1384,17 @@ def _require_native_execution_query_contract(tool: dict[str, object]) -> None:
         "pipeline_id",
         "execution_id",
         "include_progress",
+        "include_service_runtimes",
         "artifacts",
     }:
         raise ConfigurationError("clio-kit native JARVIS query surface did not match")
     if input_properties.get("include_progress") != {"default": True, "type": "boolean"}:
         raise ConfigurationError("clio-kit native JARVIS progress selector did not match")
+    if input_properties.get("include_service_runtimes") != {
+        "default": False,
+        "type": "boolean",
+    }:
+        raise ConfigurationError("clio-kit native JARVIS service selector did not match")
     raw_artifacts = input_properties.get("artifacts")
     if (
         not isinstance(raw_artifacts, dict)
@@ -1456,6 +1463,7 @@ def _require_native_execution_query_contract(tool: dict[str, object]) -> None:
         "runtime_metadata",
         "progress",
         "artifact_page",
+        "service_runtimes",
     }
     if (
         typed_output.get("additionalProperties") is not False
@@ -1491,6 +1499,20 @@ def _require_native_execution_query_contract(tool: dict[str, object]) -> None:
         field_name="schema_version",
         schema_version=JARVIS_EXECUTION_PROGRESS_SCHEMA,
         label="progress output",
+    )
+    raw_service_runtimes = output_properties.get("service_runtimes")
+    if not isinstance(raw_service_runtimes, dict):
+        raise ConfigurationError("clio-kit native JARVIS query omitted nullable services")
+    service_runtimes = _nullable_schema_option(
+        cast(dict[str, object], raw_service_runtimes),
+        expected_type="object",
+        label="service runtimes output",
+    )
+    _require_schema_identity(
+        service_runtimes,
+        field_name="schema_version",
+        schema_version=JARVIS_EXECUTION_SERVICE_RUNTIMES_SCHEMA,
+        label="service runtimes output",
     )
     raw_artifact_page = output_properties.get("artifact_page")
     if not isinstance(raw_artifact_page, dict):

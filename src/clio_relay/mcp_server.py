@@ -43,6 +43,7 @@ from clio_relay.jarvis_mcp import (
     virtual_jarvis_call_arguments,
     virtual_jarvis_tool_definitions,
 )
+from clio_relay.jarvis_service_runtime import resolve_jarvis_service_runtime
 from clio_relay.models import (
     Cursor,
     GatewaySession,
@@ -66,6 +67,7 @@ from clio_relay.pagination import (
     validate_response_page_limit,
 )
 from clio_relay.progress_provenance import external_progress_metadata
+from clio_relay.public_records import public_gateway_session
 from clio_relay.queue_management import (
     DEFAULT_STALE_SCAN_LIMIT,
     cancel_queue_job,
@@ -98,6 +100,7 @@ from clio_relay.remote_mcp import (
     unavailable_virtual_remote_mcp_catalog,
 )
 from clio_relay.retention import TerminalRetentionCoordinator
+from clio_relay.service_runtime import ServiceRuntimeSupervisor
 from clio_relay.spool import MAX_LOG_READ_BYTES
 from clio_relay.storage_runtime import (
     StorageAdmissionError,
@@ -119,6 +122,7 @@ USER_MCP_TOOL_NAMES = {
     "relay_queue_diagnose",
     "relay_queue_stale",
     "relay_storage_status",
+    "relay_bind_jarvis_runtime",
 }
 
 
@@ -1088,6 +1092,78 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             },
         },
         {
+            "name": "relay_bind_jarvis_runtime",
+            "description": (
+                "Bind local relay connectors to one ready service reported by a completed, "
+                "artifact-bound JARVIS execution query with service runtimes included. "
+                "Runtime host, paths, scheduler identity, and dataset metadata are read "
+                "only from the durable JARVIS result."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cluster": {
+                        "type": "string",
+                        **({"enum": sorted(clusters)} if clusters is not None else {}),
+                    },
+                    "source_job_id": durable_record_id_json_schema(),
+                    "source_artifact_id": durable_record_id_json_schema(),
+                    "package_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "package_name": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "name": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "desktop_bind_port": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 65535,
+                    },
+                    "readiness_timeout_seconds": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "maximum": 3600,
+                        "default": 300,
+                    },
+                    "poll_seconds": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "maximum": 60,
+                        "default": 2,
+                    },
+                },
+                "required": [
+                    "cluster",
+                    "source_job_id",
+                    "source_artifact_id",
+                    "package_id",
+                    "package_name",
+                ],
+                "additionalProperties": False,
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "gateway_session": {"type": "object"},
+                    "connect_url": {"type": "string"},
+                    "health_url": {"type": "string"},
+                    "stream_url": {"type": "string"},
+                    "events_url": {"type": "string"},
+                    "state_url": {"type": "string"},
+                    "command_url": {"type": "string"},
+                    "scheduler_cancel_requested": {"const": False},
+                },
+                "required": [
+                    "gateway_session",
+                    "connect_url",
+                    "health_url",
+                    "stream_url",
+                    "events_url",
+                    "state_url",
+                    "command_url",
+                    "scheduler_cancel_requested",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "relay_storage_status",
             "description": "Return machine-readable relay storage admission readiness.",
             "inputSchema": {
@@ -1456,6 +1532,8 @@ def _call_tool(
         }
     elif name == "relay_evaluate_monitor_rules":
         result = {"actions": evaluate_monitor_rules(queue, limit=_response_page_limit(arguments))}
+    elif name == "relay_bind_jarvis_runtime":
+        result = _bind_jarvis_runtime(arguments, queue=queue, settings=settings)
     elif name == "relay_create_gateway_session":
         result = _create_gateway_session(arguments, queue=queue)
     elif name == "relay_list_gateway_sessions":
@@ -1467,7 +1545,7 @@ def _call_tool(
             cluster=_optional_str(arguments, "cluster"),
         )
         result = {
-            "gateway_sessions": [session.model_dump(mode="json") for session in sessions],
+            "gateway_sessions": [public_gateway_session(session) for session in sessions],
             "source_cursor": cursor,
             "source_limit": limit,
             "source_next_cursor": next_cursor,
@@ -1476,15 +1554,15 @@ def _call_tool(
             "filters_apply_within_source_window": True,
         }
     elif name == "relay_get_gateway_session":
-        result = queue.get_gateway_session(
-            _required_durable_record_id(arguments, "session_id")
-        ).model_dump(mode="json")
+        result = public_gateway_session(
+            queue.get_gateway_session(_required_durable_record_id(arguments, "session_id"))
+        )
     elif name == "relay_update_gateway_session":
         result = _update_gateway_session(arguments, queue=queue)
     elif name == "relay_close_gateway_session":
-        result = queue.close_gateway_session(
-            _required_durable_record_id(arguments, "session_id")
-        ).model_dump(mode="json")
+        result = public_gateway_session(
+            queue.close_gateway_session(_required_durable_record_id(arguments, "session_id"))
+        )
     else:
         raise ValueError(f"unknown tool: {name}")
     return {
@@ -2906,7 +2984,109 @@ def _create_gateway_session(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
             metadata=_object(arguments.get("metadata", {})),
         )
     )
-    return session.model_dump(mode="json")
+    return public_gateway_session(session)
+
+
+def _bind_jarvis_runtime(
+    arguments: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> JSON:
+    """Bind only connector resources derived from one verified JARVIS result."""
+    allowed = {
+        "cluster",
+        "source_job_id",
+        "source_artifact_id",
+        "package_id",
+        "package_name",
+        "name",
+        "desktop_bind_port",
+        "readiness_timeout_seconds",
+        "poll_seconds",
+    }
+    unexpected = sorted(set(arguments) - allowed)
+    if unexpected:
+        raise ValueError(
+            "relay_bind_jarvis_runtime does not accept caller-supplied runtime metadata: "
+            + ", ".join(unexpected)
+        )
+    cluster = _required_str(arguments, "cluster")
+    definition = _remote_cluster_definition(cluster)
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=_required_durable_record_id(arguments, "source_job_id"),
+        source_artifact_id=_required_durable_record_id(arguments, "source_artifact_id"),
+        package_id=_required_str(arguments, "package_id"),
+        package_name=_required_str(arguments, "package_name"),
+    )
+    raw_desktop_bind_port = arguments.get("desktop_bind_port")
+    if raw_desktop_bind_port is not None and (
+        isinstance(raw_desktop_bind_port, bool) or not isinstance(raw_desktop_bind_port, int)
+    ):
+        raise ValueError("desktop_bind_port must be an integer")
+    desktop_bind_port = raw_desktop_bind_port
+    if desktop_bind_port is not None and not 1 <= desktop_bind_port <= 65_535:
+        raise ValueError("desktop_bind_port must be between 1 and 65535")
+    readiness_timeout_seconds = _positive_float_argument(
+        arguments,
+        "readiness_timeout_seconds",
+        default=300.0,
+        maximum=3_600.0,
+    )
+    poll_seconds = _positive_float_argument(
+        arguments,
+        "poll_seconds",
+        default=2.0,
+        maximum=60.0,
+    )
+    runtime_name = _optional_str(arguments, "name") or (
+        f"{verified.runtime.package_name}-{verified.runtime.service_instance_id}"
+    )
+    if len(runtime_name) > 256:
+        raise ValueError("name must not exceed 256 characters")
+    transport = definition.frp_transport
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster=cluster,
+        definition=definition,
+        token=_required_environment_secret(transport.token_env, "frp token"),
+        secret_key=_required_environment_secret(
+            transport.stcp_secret_env,
+            "stcp secret",
+        ),
+    )
+    started = supervisor.bind_verified_jarvis_runtime(
+        name=runtime_name,
+        verified=verified,
+        desktop_bind_port=desktop_bind_port,
+        owner_session_id=settings.owner_session_id,
+        owner_session_generation_id=settings.owner_session_generation_id,
+        readiness_timeout_seconds=readiness_timeout_seconds,
+        poll_seconds=poll_seconds,
+    )
+    if any(
+        value is None
+        for value in (
+            started.stream_url,
+            started.events_url,
+            started.state_url,
+            started.command_url,
+        )
+    ):
+        raise ValueError("verified JARVIS runtime did not produce the complete URL contract")
+    return {
+        "gateway_session": public_gateway_session(started.session),
+        "connect_url": started.connect_url,
+        "health_url": started.health_url,
+        "stream_url": started.stream_url,
+        "events_url": started.events_url,
+        "state_url": started.state_url,
+        "command_url": started.command_url,
+        "scheduler_cancel_requested": False,
+    }
 
 
 def _update_gateway_session(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
@@ -2936,12 +3116,14 @@ def _update_gateway_session(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
         reject_relay_managed_fields=True,
         **updates,
     )
-    return session.model_dump(mode="json")
+    return public_gateway_session(session)
 
 
 _RELAY_RUNTIME_GATEWAY_KEYS = frozenset(
     {
         "runtime_spec",
+        "jarvis_runtime_binding",
+        "browser_attachment",
         "ownership_intents",
         "teardown_intent",
         "teardown",
@@ -2951,7 +3133,9 @@ _RELAY_RUNTIME_GATEWAY_KEYS = frozenset(
         "scheduler_native_id",
     }
 )
-_RELAY_RUNTIME_CONNECTOR_KEYS = frozenset({"desktop_connector", "remote_connector"})
+_RELAY_RUNTIME_CONNECTOR_KEYS = frozenset(
+    {"browser_proxy", "desktop_connector", "remote_connector"}
+)
 _RELAY_OWNERSHIP_METADATA_KEYS = frozenset(
     {
         "owner",
@@ -2959,6 +3143,10 @@ _RELAY_OWNERSHIP_METADATA_KEYS = frozenset(
         "owner_session_generation_id",
         "owner_session_admission_id",
         "runtime_kind",
+        "binding_source",
+        "source_relay_job_id",
+        "source_relay_artifact_id",
+        "jarvis_execution_id",
         "scheduler_provider",
         "scheduler_job_id",
         "scheduler_native_id",
@@ -3074,6 +3262,31 @@ def _bounded_integer_limit(
         raise ValueError(f"{field_name} must be an integer")
     if value < 1 or value > maximum:
         raise ValueError(f"{field_name} must be between 1 and {maximum}")
+    return value
+
+
+def _positive_float_argument(
+    arguments: JSON,
+    field_name: str,
+    *,
+    default: float,
+    maximum: float,
+) -> float:
+    """Read a positive bounded numeric MCP argument without accepting booleans."""
+    raw = arguments.get(field_name, default)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError(f"{field_name} must be a number")
+    value = float(raw)
+    if value <= 0 or value > maximum:
+        raise ValueError(f"{field_name} must be greater than 0 and at most {maximum:g}")
+    return value
+
+
+def _required_environment_secret(name: str, label: str) -> str:
+    """Resolve one configured transport secret without exposing it in records."""
+    value = os.environ.get(name)
+    if value is None or not value:
+        raise ValueError(f"{label} is required in environment variable {name}")
     return value
 
 

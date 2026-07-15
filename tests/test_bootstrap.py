@@ -100,7 +100,7 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     ) in script
     assert "pull --ff-only" not in script
     assert 'python -m pip install -e "$HOME/.local/src/jarvis' not in script
-    assert "JARVIS_MCP_INSTALL_SPEC=clio-kit==2.3.2" in script
+    assert "JARVIS_MCP_INSTALL_SPEC=clio-kit==2.4.2" in script
     assert f"JARVIS_MCP_ARTIFACT_SHA256={CLIO_KIT_JARVIS_MCP_WHEEL_SHA256}" in script
     assert "python -m pip download --isolated --disable-pip-version-check --no-cache-dir" in script
     assert '"$JARVIS_VENV/bin/python" -m pip download' in script

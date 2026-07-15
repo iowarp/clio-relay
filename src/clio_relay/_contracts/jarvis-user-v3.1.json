@@ -1,7 +1,7 @@
 {
   "canonicalization": "json-sort-keys-compact-utf8-v1",
-  "contract_id": "clio-kit-jarvis-user-v3",
-  "contract_sha256": "c70e350d919e0f3fa0c116d7eaf861e23b4087a18a06b2704ddbf7384f8d1f82",
+  "contract_id": "clio-kit-jarvis-user-v3.1",
+  "contract_sha256": "adc7756025fbcc90b0695bd4eaac00bda5c6cff4eb2f248fd7be263bd90b9b8b",
   "profile": "user",
   "projection": "mcp-agent-tool-schema-v1",
   "schema_version": "clio-kit.mcp-user-contract.v1",
@@ -483,7 +483,7 @@
         "idempotentHint": true,
         "readOnlyHint": true
       },
-      "description": "Query one JARVIS execution handle, durable lifecycle record, and runtime metadata. Progress is included by default and can be omitted. Set artifacts to {} or filters to include one bounded artifact page; omit artifacts to avoid querying the artifact manifest.",
+      "description": "Query one JARVIS execution handle, durable lifecycle record, and runtime metadata. Progress is included by default and can be omitted. Set include_service_runtimes=true to include execution-owned network services such as an interactive ParaView runtime. Set artifacts to {} or filters to include one bounded artifact page; omit artifacts to avoid querying the artifact manifest.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -590,6 +590,10 @@
           },
           "include_progress": {
             "default": true,
+            "type": "boolean"
+          },
+          "include_service_runtimes": {
+            "default": false,
             "type": "boolean"
           },
           "pipeline_id": {
@@ -1222,8 +1226,374 @@
             "type": "object"
           },
           "schema_version": {
-            "const": "clio-kit.jarvis-execution.v1",
+            "const": "clio-kit.jarvis-execution.v2",
             "type": "string"
+          },
+          "service_runtimes": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "description": "Execution-bound current service runtimes returned by JARVIS.",
+                "properties": {
+                  "execution_id": {
+                    "maxLength": 256,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "execution_state": {
+                    "enum": [
+                      "preparing",
+                      "scripted",
+                      "submitting",
+                      "submitted",
+                      "running",
+                      "completed",
+                      "failed",
+                      "canceled",
+                      "unknown"
+                    ],
+                    "type": "string"
+                  },
+                  "pipeline_id": {
+                    "maxLength": 256,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "schema_version": {
+                    "const": "jarvis.execution.service-runtimes.v1",
+                    "type": "string"
+                  },
+                  "service_runtimes": {
+                    "items": {
+                      "additionalProperties": false,
+                      "description": "Latest durable observation of one execution-owned service.",
+                      "properties": {
+                        "command_path": {
+                          "maxLength": 256,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "dataset_descriptor": {
+                          "additionalProperties": false,
+                          "description": "Intrinsic, recipe-free dataset identity owned by JARVIS.",
+                          "properties": {
+                            "arrays": {
+                              "items": {
+                                "additionalProperties": false,
+                                "description": "One intrinsic array exposed by a JARVIS-owned service.",
+                                "properties": {
+                                  "association": {
+                                    "enum": [
+                                      "point",
+                                      "cell",
+                                      "field"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  "components": {
+                                    "maximum": 64,
+                                    "minimum": 1,
+                                    "type": "integer"
+                                  },
+                                  "name": {
+                                    "maxLength": 512,
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "units": {
+                                    "anyOf": [
+                                      {
+                                        "maxLength": 256,
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ],
+                                    "default": null
+                                  }
+                                },
+                                "required": [
+                                  "name",
+                                  "association",
+                                  "components"
+                                ],
+                                "type": "object"
+                              },
+                              "maxItems": 256,
+                              "type": "array"
+                            },
+                            "bounds": {
+                              "anyOf": [
+                                {
+                                  "items": {
+                                    "type": "number"
+                                  },
+                                  "maxItems": 6,
+                                  "minItems": 6,
+                                  "type": "array"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "default": null
+                            },
+                            "dataset_id": {
+                              "maxLength": 256,
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "fingerprint": {
+                              "additionalProperties": false,
+                              "description": "Canonical identity digest for one bounded dataset descriptor.",
+                              "properties": {
+                                "algorithm": {
+                                  "const": "sha256",
+                                  "type": "string"
+                                },
+                                "digest": {
+                                  "pattern": "^[0-9a-f]{64}$",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "algorithm",
+                                "digest"
+                              ],
+                              "type": "object"
+                            },
+                            "format": {
+                              "maxLength": 256,
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "kind": {
+                              "maxLength": 256,
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "members": {
+                              "items": {
+                                "additionalProperties": false,
+                                "description": "One ordered member in a JARVIS service dataset descriptor.",
+                                "properties": {
+                                  "index": {
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "location": {
+                                    "maxLength": 4096,
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "timestep": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ],
+                                    "default": null
+                                  }
+                                },
+                                "required": [
+                                  "index",
+                                  "location"
+                                ],
+                                "type": "object"
+                              },
+                              "maxItems": 512,
+                              "minItems": 1,
+                              "type": "array"
+                            },
+                            "schema_version": {
+                              "const": "jarvis.dataset-descriptor.v1",
+                              "type": "string"
+                            },
+                            "source_artifact": {
+                              "anyOf": [
+                                {
+                                  "additionalProperties": false,
+                                  "description": "Optional content identity of a JARVIS-generated source artifact.",
+                                  "properties": {
+                                    "artifact_id": {
+                                      "pattern": "^art_[A-Za-z0-9_-]{22,86}$",
+                                      "type": "string"
+                                    },
+                                    "sha256": {
+                                      "pattern": "^[0-9a-f]{64}$",
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "artifact_id",
+                                    "sha256"
+                                  ],
+                                  "type": "object"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "schema_version",
+                            "dataset_id",
+                            "kind",
+                            "format",
+                            "members",
+                            "arrays",
+                            "fingerprint",
+                            "source_artifact"
+                          ],
+                          "type": "object"
+                        },
+                        "delivery_mode": {
+                          "const": "push",
+                          "type": "string"
+                        },
+                        "events_path": {
+                          "maxLength": 256,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "execution_id": {
+                          "maxLength": 256,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "health_path": {
+                          "maxLength": 256,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "host": {
+                          "maxLength": 255,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "lifecycle": {
+                          "enum": [
+                            "starting",
+                            "ready",
+                            "degraded",
+                            "stopping",
+                            "stopped",
+                            "failed"
+                          ],
+                          "type": "string"
+                        },
+                        "live_data_path": {
+                          "maxLength": 256,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "message": {
+                          "anyOf": [
+                            {
+                              "maxLength": 4096,
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "default": null
+                        },
+                        "observed_at_epoch": {
+                          "minimum": 0,
+                          "type": "number"
+                        },
+                        "package_id": {
+                          "maxLength": 256,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "package_name": {
+                          "maxLength": 256,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "port": {
+                          "maximum": 65535,
+                          "minimum": 1,
+                          "type": "integer"
+                        },
+                        "protocol": {
+                          "enum": [
+                            "http",
+                            "https"
+                          ],
+                          "type": "string"
+                        },
+                        "revision": {
+                          "minimum": 1,
+                          "type": "integer"
+                        },
+                        "schema_version": {
+                          "const": "jarvis.service-runtime.v1",
+                          "type": "string"
+                        },
+                        "service_instance_id": {
+                          "maxLength": 256,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "state_path": {
+                          "maxLength": 256,
+                          "minLength": 1,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "schema_version",
+                        "execution_id",
+                        "package_name",
+                        "package_id",
+                        "service_instance_id",
+                        "revision",
+                        "lifecycle",
+                        "host",
+                        "port",
+                        "protocol",
+                        "health_path",
+                        "live_data_path",
+                        "events_path",
+                        "state_path",
+                        "command_path",
+                        "delivery_mode",
+                        "dataset_descriptor",
+                        "observed_at_epoch"
+                      ],
+                      "type": "object"
+                    },
+                    "maxItems": 4096,
+                    "type": "array"
+                  },
+                  "terminal": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "schema_version",
+                  "execution_id",
+                  "pipeline_id",
+                  "execution_state",
+                  "terminal",
+                  "service_runtimes"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -1234,7 +1604,8 @@
           "execution_record",
           "runtime_metadata",
           "progress",
-          "artifact_page"
+          "artifact_page",
+          "service_runtimes"
         ],
         "type": "object"
       }
@@ -1985,5 +2356,5 @@
       }
     }
   ],
-  "wire_sha256": "756c1a7233b9d843c931e7d539644fac61d88d147b53b535fc6340b16562a108"
+  "wire_sha256": "b2a6e531399c5a24678adf55e5133c1234718363661bde0636d81d0b1ae5db11"
 }

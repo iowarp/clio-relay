@@ -98,6 +98,37 @@ An owner-session gateway without the exact active generation is ambiguous: detac
 or teardown reports it as a residual resource and does not use the session id alone
 to authorize connector or gateway cleanup.
 
+A JARVIS-owned live service uses a connector-only gateway. The user MCP operation
+`relay_bind_jarvis_runtime` resolves one ready `jarvis.service-runtime.v1` solely
+from an authenticated completed relay-routed MCP result and persists
+`gateway.jarvis_runtime_binding`. That record binds the source relay job and
+artifact SHA-256 to the JARVIS execution, optional scheduler provider/native id,
+package/service revision, and exact dataset descriptor. Caller-provided runtime
+metadata and lifecycle commands are rejected. Binding starts no application or
+scheduler work; it starts only the relay connectors. Any later explicit scheduler
+cancellation re-verifies the immutable source before invoking the provider.
+
+Scheduler-owned loopback services require allocation-scoped connector placement.
+The SLURM provider proves one exact `BatchHost`, requires a single-node allocation
+and exact one-host `NodeList` expansion, then launches frpc through a detached
+`srun --jobid ... --overlap --exact` pinned to that host. The provider boundedly
+resolves the actual `job.step` by its unique marker and host and terminates the
+launcher if registration cannot be proven. Relay never treats the login-node `srun`
+launcher PID as frpc. Detach proves the exact step remains active with
+`squeue --steps`, while stop uses `scancel job.step` and confirms step absence.
+The parent job remains retained unless scheduler-job cancellation is separately
+and explicitly requested. Placement or step ambiguity fails closed.
+Readiness is identity-bearing: ParaView health and initial state must match the
+service instance, execution, state revision, and bound dataset descriptor digest.
+
+The browser security boundary is a separate desktop-local capability proxy. Normal
+bind/get records contain no raw browser token. Explicit internal browser attach
+returns one short-lived capability URL set; every request and preflight requires
+that unexpired/unrevoked capability plus exact sandbox `Origin: null`. The proxy
+allows no wildcard CORS, strips the capability upstream, and forwards only exact
+advertised paths and narrow methods/headers. Explicit browser detach, runtime
+detach, and teardown write the revocation marker before stopping the owned proxy.
+
 ## Scheduler provider boundary
 
 Every cluster has an explicit `scheduler_provider`. `external` is the generic
@@ -105,6 +136,9 @@ default for package-owned or nonscheduler runtimes; a SLURM site selects `slurm`
 in its cluster definition. Missing provider metadata must never silently become
 SLURM. Structured JARVIS runtime metadata is preferred for provider and job ids,
 and must agree with the worker's configured provider before polling or canceling.
+For `jarvis.service-runtime.v1` bindings, provider/native identity and the complete
+binding are re-verified from the original durable MCP artifact before any explicit
+scheduler cancellation. Default detach and stop paths retain scheduler work.
 
 ## Configurability
 

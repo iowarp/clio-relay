@@ -495,6 +495,75 @@ class SchedulerStatus(BaseModel):
     observed_at: datetime = Field(default_factory=utc_now)
 
 
+class SchedulerConnectorPlacement(BaseModel):
+    """Provider-verified host for a connector inside one exact allocation."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["clio-relay.scheduler-connector-placement.v1"] = (
+        "clio-relay.scheduler-connector-placement.v1"
+    )
+    scheduler: str = Field(min_length=1, max_length=256)
+    scheduler_job_id: str = Field(min_length=1, max_length=256)
+    placement_host: str = Field(min_length=1, max_length=1_024)
+    allocation_node_count: Literal[1]
+    source: Literal["slurm-scontrol-batch-host"]
+    verified: Literal[True]
+    observed_at: datetime = Field(default_factory=utc_now)
+
+
+class SchedulerConnectorStepIdentity(BaseModel):
+    """Provider-native identity for one connector task inside an allocation."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["clio-relay.scheduler-connector-step.v1"] = (
+        "clio-relay.scheduler-connector-step.v1"
+    )
+    scheduler: str = Field(min_length=1, max_length=256)
+    scheduler_job_id: str = Field(min_length=1, max_length=256)
+    scheduler_step_id: str = Field(min_length=3, max_length=512)
+    step_marker: str = Field(min_length=1, max_length=64)
+    placement_host: str = Field(min_length=1, max_length=1_024)
+    source: Literal[
+        "slurm-srun-detached-marker",
+        "slurm-squeue-step-marker",
+    ]
+    verified: Literal[True]
+    observed_at: datetime = Field(default_factory=utc_now)
+
+
+class SchedulerConnectorStepStatus(BaseModel):
+    """Exact provider observation of one allocation-scoped connector step."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["clio-relay.scheduler-connector-step-status.v1"] = (
+        "clio-relay.scheduler-connector-step-status.v1"
+    )
+    scheduler: str = Field(min_length=1, max_length=256)
+    scheduler_job_id: str = Field(min_length=1, max_length=256)
+    scheduler_step_id: str = Field(min_length=3, max_length=512)
+    placement_host: str = Field(min_length=1, max_length=1_024)
+    record_found: bool
+    state: Literal["active", "absent"]
+    observed_host: str | None = Field(default=None, min_length=1, max_length=1_024)
+    source: Literal["slurm-squeue-steps"] = "slurm-squeue-steps"
+    verified: Literal[True]
+    observed_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def status_fields_are_consistent(self) -> SchedulerConnectorStepStatus:
+        """Reject contradictory active/absent and placement observations."""
+        if self.record_found != (self.state == "active"):
+            raise ValueError("connector step state does not match record_found")
+        if self.record_found and self.observed_host != self.placement_host:
+            raise ValueError("active connector step host does not match placement")
+        if not self.record_found and self.observed_host is not None:
+            raise ValueError("absent connector step cannot report an observed host")
+        return self
+
+
 class RelayEvent(BaseModel):
     """A per-job monotonic event."""
 
@@ -737,17 +806,19 @@ class ServiceRuntimeSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kind: str
-    submit_command: list[str]
+    submit_command: list[str] | None
     status_command: list[str] | None = None
     cancel_command: list[str] | None = None
     deployment_driver: str = "jarvis"
     service_port: int = Field(gt=0, le=65535)
+    protocol: Literal["http", "https"] = "http"
     health_path: str = "/healthz"
     health_expected_body: str | None = Field(default=None, max_length=4096)
     stream_mode: str = "push"
     stream_path: str | None = "/stream"
     event_stream_path: str | None = "/events"
     state_path: str | None = "/state"
+    command_path: str | None = None
     compatibility_paths: dict[str, str] = Field(default_factory=dict)
     desktop_bind_addr: str = "127.0.0.1"
     desktop_bind_port: int = Field(gt=0, le=65535)
@@ -769,9 +840,12 @@ class ServiceRuntimeSpec(BaseModel):
 
     @field_validator("submit_command")
     @classmethod
-    def service_runtime_command_must_not_be_empty(cls, value: list[str]) -> list[str]:
+    def service_runtime_command_must_not_be_empty(
+        cls,
+        value: list[str] | None,
+    ) -> list[str] | None:
         """Reject empty scheduler submission commands."""
-        if not value:
+        if value == []:
             raise ValueError("submit_command must not be empty")
         return value
 
@@ -790,9 +864,21 @@ class ServiceRuntimeSpec(BaseModel):
     @classmethod
     def service_runtime_deployment_driver_must_be_known(cls, value: str) -> str:
         """Restrict deployment driver labels to supported supervisor contracts."""
-        if value not in {"jarvis", "scheduler", "custom"}:
-            raise ValueError("deployment_driver must be jarvis, scheduler, or custom")
+        if value not in {"jarvis", "jarvis-bound", "scheduler", "custom"}:
+            raise ValueError("deployment_driver must be jarvis, jarvis-bound, scheduler, or custom")
         return value
+
+    @model_validator(mode="after")
+    def service_runtime_commands_match_driver(self) -> ServiceRuntimeSpec:
+        """Keep verified bindings command-free and submitted runtimes explicit."""
+        commands = (self.submit_command, self.status_command, self.cancel_command)
+        if self.deployment_driver == "jarvis-bound":
+            if any(command is not None for command in commands):
+                raise ValueError("jarvis-bound runtimes cannot contain lifecycle commands")
+            return self
+        if self.submit_command is None:
+            raise ValueError("submitted service runtimes require submit_command")
+        return self
 
     @field_validator("stream_mode")
     @classmethod
@@ -807,6 +893,7 @@ class ServiceRuntimeSpec(BaseModel):
         "stream_path",
         "event_stream_path",
         "state_path",
+        "command_path",
     )
     @classmethod
     def service_runtime_paths_must_be_absolute(cls, value: str | None) -> str | None:

@@ -16,6 +16,7 @@ import pytest
 import clio_relay.installation as installation_module
 from clio_relay.errors import ConfigurationError
 from clio_relay.installation import (
+    CLIO_KIT_JARVIS_CONTRACT_ID,
     INSTALL_RECEIPT_PATH_ENV,
     INSTALL_RECEIPT_SCHEMA,
     ComponentArtifactIdentity,
@@ -439,7 +440,7 @@ def test_remote_clio_kit_component_requires_receipt_bound_native_contract(
             "jarvis_get_execution",
             "jarvis_run",
         ],
-        contract_id="clio-kit-jarvis-user-v3",
+        contract_id=CLIO_KIT_JARVIS_CONTRACT_ID,
         contract_schema_version="clio-kit.mcp-user-contract.v1",
         contract_sha256="b" * 64,
     )
@@ -763,7 +764,7 @@ def _clio_kit_jarvis_contract_document() -> dict[str, object]:
     ]
     return {
         "schema_version": "clio-kit.mcp-user-contract.v1",
-        "contract_id": "clio-kit-jarvis-user-v3",
+        "contract_id": CLIO_KIT_JARVIS_CONTRACT_ID,
         "contract_sha256": CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
         "tools": tools,
     }

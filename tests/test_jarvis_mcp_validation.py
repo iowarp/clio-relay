@@ -72,6 +72,7 @@ def test_jarvis_mcp_validation_accepts_structured_durable_run() -> None:
         "artifacts",
         "execution_id",
         "include_progress",
+        "include_service_runtimes",
         "pipeline_id",
     ]
     assert query["artifact_filter_fields"] == [
@@ -84,6 +85,9 @@ def test_jarvis_mcp_validation_accepts_structured_durable_run() -> None:
     ]
     assert query["progress_schema_version"]["const"] == "jarvis.execution.progress.v1"
     assert query["artifact_page_schema_version"]["const"] == ("jarvis.execution.artifacts.v1")
+    assert query["service_runtimes_schema_version"]["const"] == (
+        "jarvis.execution.service-runtimes.v1"
+    )
     execution_query = next(
         check for check in report.checks if check.check_id == "remote-mcp.jarvis-execution-query"
     )
@@ -643,7 +647,7 @@ def _execution_query_mcp_result(
         "metadata": {},
     }
     structured = {
-        "schema_version": "clio-kit.jarvis-execution.v1",
+        "schema_version": "clio-kit.jarvis-execution.v2",
         "pipeline_id": "acceptance",
         "execution_id": execution_id,
         "execution_handle": native["execution_handle"],
@@ -661,6 +665,7 @@ def _execution_query_mcp_result(
             "returned_artifact_count": 1,
             "next_cursor": None,
         },
+        "service_runtimes": None,
     }
     return {
         "returncode": 0,
@@ -677,6 +682,9 @@ def _execution_query_mcp_result(
             "execution_id": execution_id,
             "include_progress": True,
             "progress_included": True,
+            "include_service_runtimes": False,
+            "service_runtimes_included": False,
+            "service_runtime_count": 0,
             "artifacts_requested": True,
             "artifact_filters": {
                 "package_id": None,

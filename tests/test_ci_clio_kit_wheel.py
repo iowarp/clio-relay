@@ -10,9 +10,9 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
-WHEEL_FILENAME = "clio_kit-2.3.2-py3-none-any.whl"
-WHEEL_SHA256 = "6763c500db777428edc57ed2e1157cefdbe54f9504f2374e9fdc8055870b7321"
-WHEEL_URL = f"https://github.com/iowarp/clio-kit/releases/download/v2.3.2/{WHEEL_FILENAME}"
+WHEEL_FILENAME = "clio_kit-2.4.2-py3-none-any.whl"
+WHEEL_SHA256 = "655db7d63a64d0220f3fdfe70eaf7d6a654ce06918b04c4b4e0f7db608116363"
+WHEEL_URL = f"https://github.com/iowarp/clio-kit/releases/download/v2.4.2/{WHEEL_FILENAME}"
 
 
 def _ci_workflow() -> dict[str, Any]:

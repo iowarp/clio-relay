@@ -53,7 +53,7 @@ def test_release_identity_is_consistent_across_package_policy_matrix_and_runbook
     init_source = (ROOT / "src" / "clio_relay" / "__init__.py").read_text(encoding="utf-8")
     release_process = RELEASE_PROCESS.read_text(encoding="utf-8")
 
-    assert version == "1.1.3"
+    assert version == "1.2.0"
     assert relay_lock["version"] == version
     assert f'__version__ = "{version}"' in init_source
     assert policy["release_version"] == version
@@ -819,12 +819,13 @@ def test_release_acceptance_creates_remote_output_roots_before_first_pipeline() 
     assert root_creation < first_pipeline
 
 
-def test_release_runbooks_require_main_to_remain_frozen_through_finalization() -> None:
+def test_release_process_continues_after_publication_without_a_main_freeze() -> None:
     release = (ROOT / "docs" / "release.md").read_text(encoding="utf-8")
     acceptance = RUNBOOK.read_text(encoding="utf-8")
 
-    assert "keep `main` frozen" in release
-    assert "advancing `main` after PyPI publication" in release
+    assert "Do not wait for pull-request, `main`, tag, or release workflows." in release
+    assert "continue live testing while they run" in release
+    assert "keep `main` frozen" not in release
     assert "confirm that maintainers have frozen" in acceptance
     assert "candidate tag commit through finalization" in acceptance
     assert "moving the protected tag" in acceptance

@@ -49,9 +49,10 @@ MCP_JARVIS_EXECUTION_HANDLE_SCHEMA = "jarvis.execution.handle.v1"
 MCP_JARVIS_EXECUTION_RECORD_SCHEMA = "jarvis.execution.record.v1"
 MCP_JARVIS_EXECUTION_PROGRESS_SCHEMA = "jarvis.execution.progress.v1"
 MCP_JARVIS_PROGRESS_EVENT_SCHEMA = "jarvis.progress.v1"
-MCP_JARVIS_EXECUTION_QUERY_SCHEMA = "clio-kit.jarvis-execution.v1"
+MCP_JARVIS_EXECUTION_QUERY_SCHEMA = "clio-kit.jarvis-execution.v2"
 MCP_JARVIS_EXECUTION_ARTIFACTS_SCHEMA = "jarvis.execution.artifacts.v1"
 MCP_JARVIS_ARTIFACT_SCHEMA = "jarvis.artifact.v1"
+MCP_JARVIS_EXECUTION_SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 MCP_JARVIS_NATIVE_PROGRESS_BRIDGE_SCHEMA = "clio-relay.mcp-jarvis-progress-bridge.v1"
 MCP_PACKAGE_PROGRESS_MAX_NOTIFICATION_BYTES = 64 * 1024
 MCP_PACKAGE_PROGRESS_MAX_NOTIFICATIONS = 10_000
@@ -877,7 +878,13 @@ def _validated_jarvis_execution_query_result(
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
     """Validate one unified JARVIS execution, progress, and artifact result."""
-    allowed_arguments = {"pipeline_id", "execution_id", "include_progress", "artifacts"}
+    allowed_arguments = {
+        "pipeline_id",
+        "execution_id",
+        "include_progress",
+        "include_service_runtimes",
+        "artifacts",
+    }
     if not set(arguments).issubset(allowed_arguments):
         raise _McpProtocolFailure("MCP JARVIS execution query contained unknown arguments")
     pipeline_id = _native_identity(arguments.get("pipeline_id"), "pipeline_id")
@@ -885,6 +892,9 @@ def _validated_jarvis_execution_query_result(
     include_progress = arguments.get("include_progress", True)
     if not isinstance(include_progress, bool):
         raise _McpProtocolFailure("MCP JARVIS include_progress must be boolean")
+    include_service_runtimes = arguments.get("include_service_runtimes", False)
+    if not isinstance(include_service_runtimes, bool):
+        raise _McpProtocolFailure("MCP JARVIS include_service_runtimes must be boolean")
     artifact_query = _validated_jarvis_artifact_query(arguments.get("artifacts"))
     if value is None:
         raise _McpProtocolFailure("MCP JARVIS execution query omitted its structured result")
@@ -897,6 +907,7 @@ def _validated_jarvis_execution_query_result(
         "runtime_metadata",
         "progress",
         "artifact_page",
+        "service_runtimes",
     }
     if set(value) != expected_fields or value.get("schema_version") != (
         MCP_JARVIS_EXECUTION_QUERY_SCHEMA
@@ -941,6 +952,47 @@ def _validated_jarvis_execution_query_result(
     elif raw_progress is not None:
         raise _McpProtocolFailure("MCP JARVIS query returned progress after it was omitted")
 
+    raw_service_runtimes = value.get("service_runtimes")
+    service_runtime_count = 0
+    if include_service_runtimes:
+        if not isinstance(raw_service_runtimes, dict):
+            raise _McpProtocolFailure("MCP JARVIS query omitted requested service runtimes")
+        service_document = cast(dict[str, Any], raw_service_runtimes)
+        expected_service_fields = {
+            "schema_version",
+            "execution_id",
+            "pipeline_id",
+            "execution_state",
+            "terminal",
+            "service_runtimes",
+        }
+        raw_services = service_document.get("service_runtimes")
+        if not isinstance(raw_services, list):
+            raise _McpProtocolFailure("MCP JARVIS query service runtime envelope was invalid")
+        typed_services = cast(list[object], raw_services)
+        if (
+            set(service_document) != expected_service_fields
+            or service_document.get("schema_version")
+            != MCP_JARVIS_EXECUTION_SERVICE_RUNTIMES_SCHEMA
+            or service_document.get("execution_id") != execution_id
+            or service_document.get("pipeline_id") != pipeline_id
+            or service_document.get("execution_state") != record["state"]
+            or service_document.get("terminal") is not record["terminal"]
+            or len(typed_services) > 4_096
+            or not all(isinstance(item, dict) for item in typed_services)
+        ):
+            raise _McpProtocolFailure("MCP JARVIS query service runtime envelope was invalid")
+        _bounded_finite_json(
+            service_document,
+            "JARVIS execution service runtimes",
+            4 * 1024 * 1024,
+        )
+        service_runtime_count = len(typed_services)
+    elif raw_service_runtimes is not None:
+        raise _McpProtocolFailure(
+            "MCP JARVIS query returned service runtimes after they were omitted"
+        )
+
     raw_artifact_page = value.get("artifact_page")
     artifact_page: dict[str, Any] | None = None
     if artifact_query is None:
@@ -963,6 +1015,9 @@ def _validated_jarvis_execution_query_result(
         "execution_id": execution_id,
         "include_progress": include_progress,
         "progress_included": progress is not None,
+        "include_service_runtimes": include_service_runtimes,
+        "service_runtimes_included": raw_service_runtimes is not None,
+        "service_runtime_count": service_runtime_count,
         "artifacts_requested": artifact_query is not None,
         "artifact_filters": artifact_query or {},
         "returned_artifact_count": (

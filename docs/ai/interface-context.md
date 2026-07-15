@@ -63,6 +63,12 @@ Endpoint and job work:
 - `clio-relay gateway get`
 - `clio-relay gateway update`
 - `clio-relay gateway close`
+- `clio-relay gateway start-runtime`
+- `clio-relay gateway detach-runtime`
+- `clio-relay gateway attach-runtime`
+- `clio-relay gateway stop-runtime`
+- `clio-relay gateway browser-attach` (internal trusted-viewer boundary)
+- `clio-relay gateway browser-detach` (internal trusted-viewer boundary)
 
 Agent and monitor work:
 
@@ -128,8 +134,29 @@ The MCP server exposes relay tools for:
 - diagnose one relay job with queue, lease, worker, scheduler, event, and progress evidence
 - discover stale jobs without mutation
 - clean stale jobs from the admin profile with dry-run and relay-only defaults
+- bind connector-only gateways to authenticated, ready JARVIS service-runtime
+  reports without accepting caller-supplied runtime or scheduler fields
 
 MCP tools operate on the same durable records as CLI and HTTP calls.
+
+`relay_bind_jarvis_runtime` is in the user profile. It takes a configured cluster,
+one completed relay-routed `jarvis_get_execution` source job with
+`include_service_runtimes=true`, its `mcp_result` artifact, and an exact package
+id/name. Its output includes the
+durable gateway session and six local URLs: connect, health, stream, events, state,
+and command. The gateway stores the immutable source job/artifact digest,
+execution and scheduler identities, service revision/report digest, and exact
+dataset descriptor/digest. The tool does not accept submit, status, cancel, host,
+port, path, or descriptor overrides.
+
+Normal bind and gateway-get results never contain a browser capability. A trusted
+desktop viewer calls `gateway browser-attach` only after exact binding verification
+and receives the one-time `clio-relay.browser-attachment.v1` six-URL contract. It
+must call `gateway browser-detach` with the exact attachment id on viewer close.
+Only safe `clio-relay.browser-attachment-record.v1` digest, expiry, process, and
+revocation metadata remains in the gateway record. Browser requests require both
+the URL capability and exact `Origin: null`; successful CORS is exactly `null`,
+never `*`.
 
 Task, artifact, and progress collections use exact one-based `cursor`, `limit`,
 `next_cursor`, and `total` fields. Global job, endpoint, gateway, and monitor-rule

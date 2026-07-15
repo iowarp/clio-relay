@@ -523,6 +523,464 @@ def test_poll_slurm_status_uses_scontrol_when_accounting_is_disabled(
     assert status.queue_position_note == ("historical scheduler status from scontrol; ExitCode=0:0")
 
 
+def test_slurm_connector_placement_pins_verified_single_batch_host(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    def fake_run(
+        command: list[str],
+        *,
+        text: bool,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del text, capture_output, check, timeout
+        if command == ["scontrol", "show", "job", "21835", "-o"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "JobId=21835 JobState=RUNNING BatchHost=compute-07 "
+                "NumNodes=1 NodeList=compute-07\n",
+                "",
+            )
+        if command == ["scontrol", "show", "hostnames", "compute-07"]:
+            return subprocess.CompletedProcess(command, 0, "compute-07\n", "")
+        raise AssertionError(command)
+
+    monkeypatch.setattr("clio_relay.scheduler_providers.subprocess.run", fake_run)
+    provider = SlurmSchedulerProvider()
+
+    placement = provider.connector_placement("21835")
+
+    assert placement.model_dump(mode="json") == {
+        "schema_version": "clio-relay.scheduler-connector-placement.v1",
+        "scheduler": "slurm",
+        "scheduler_job_id": "21835",
+        "placement_host": "compute-07",
+        "allocation_node_count": 1,
+        "source": "slurm-scontrol-batch-host",
+        "verified": True,
+        "observed_at": placement.observed_at.isoformat().replace("+00:00", "Z"),
+    }
+
+
+def test_slurm_connector_placement_rejects_multinode_or_ambiguous_host(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    def fake_run(
+        command: list[str],
+        *,
+        text: bool,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del text, capture_output, check, timeout
+        assert command == ["scontrol", "show", "job", "21835", "-o"]
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "JobId=21835 JobState=RUNNING BatchHost=compute-07 "
+            "NumNodes=2 NodeList=compute-[07-08]\n",
+            "",
+        )
+
+    monkeypatch.setattr("clio_relay.scheduler_providers.subprocess.run", fake_run)
+
+    with pytest.raises(RelayError, match="single-node"):
+        SlurmSchedulerProvider().connector_placement("21835")
+
+
+def test_slurm_connector_step_launch_detaches_and_resolves_exact_marker_identity(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    marker = "clio-relay-connector-0123456789abcdef0123456789abcdef"
+    expected = [
+        "srun",
+        "--jobid=21835",
+        "--overlap",
+        "--exact",
+        "--nodes=1",
+        "--ntasks=1",
+        "--nodelist=compute-07",
+        f"--job-name={marker}",
+        "--input=none",
+        "--output=/home/alice/.local/share/clio-relay/connector.log",
+        "--error=/home/alice/.local/share/clio-relay/connector.log",
+        "--open-mode=append",
+        "--",
+        "/home/alice/.local/bin/frpc",
+        "-c",
+        "/home/alice/.local/share/clio-relay/frpc.toml",
+    ]
+    popen_calls: list[tuple[list[str], dict[str, object]]] = []
+    registered_launchers: list[object] = []
+
+    class DetachedLauncher:
+        """Minimal running launcher used to verify provider process semantics."""
+
+        pid = 4242
+
+        def poll(self) -> int | None:
+            """Keep the launcher running while the scheduler registers its step."""
+            return None
+
+    launcher = DetachedLauncher()
+
+    def fake_popen(command: list[str], **kwargs: object) -> DetachedLauncher:
+        popen_calls.append((command, kwargs))
+        return launcher
+
+    def fake_register(process: object) -> None:
+        registered_launchers.append(process)
+
+    def fake_run(
+        command: list[str],
+        *,
+        text: bool,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del text, capture_output, check, timeout
+        assert popen_calls
+        assert cast(Any, popen_calls[0][1]["stdout"]).closed is False
+        assert command == [
+            "squeue",
+            "--noheader",
+            "--steps",
+            "--jobs=21835",
+            f"--name={marker}",
+            "--format=%i|%j|%N",
+        ]
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            f"21835.7|{marker}|compute-07\n",
+            "",
+        )
+
+    monkeypatch.setattr("clio_relay.scheduler_providers.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("clio_relay.scheduler_providers.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "clio_relay.scheduler_providers._register_connector_launcher_for_reaping",
+        fake_register,
+    )
+
+    identity = SlurmSchedulerProvider().launch_connector_step(
+        "21835",
+        placement_host="compute-07",
+        step_marker=marker,
+        command=[
+            "/home/alice/.local/bin/frpc",
+            "-c",
+            "/home/alice/.local/share/clio-relay/frpc.toml",
+        ],
+        output_path="/home/alice/.local/share/clio-relay/connector.log",
+    )
+
+    assert identity.scheduler_step_id == "21835.7"
+    assert identity.step_marker == marker
+    assert identity.placement_host == "compute-07"
+    assert identity.source == "slurm-srun-detached-marker"
+    assert len(popen_calls) == 1
+    launch_command, launch_kwargs = popen_calls[0]
+    assert launch_command == expected
+    assert launch_kwargs["stdin"] is subprocess.DEVNULL
+    assert launch_kwargs["stdout"] not in {None, subprocess.PIPE}
+    assert launch_kwargs["stderr"] is subprocess.STDOUT
+    assert launch_kwargs["start_new_session"] is True
+    assert launch_kwargs["close_fds"] is True
+    assert cast(Any, launch_kwargs["stdout"]).closed is True
+    assert registered_launchers == [launcher]
+
+
+def test_slurm_connector_step_launch_terminates_unregistered_launcher(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    marker = "clio-relay-connector-0123456789abcdef0123456789abcdef"
+
+    class DetachedLauncher:
+        """Running launcher that records bounded provider cleanup."""
+
+        pid = 4242
+
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.terminate_calls = 0
+            self.kill_calls = 0
+
+        def poll(self) -> int | None:
+            """Return the current fake launcher state."""
+            return self.returncode
+
+        def terminate(self) -> None:
+            """Record graceful provider cleanup."""
+            self.terminate_calls += 1
+            self.returncode = -15
+
+        def wait(self, timeout: float | None = None) -> int:
+            """Return the terminal fake launcher state."""
+            del timeout
+            assert self.returncode is not None
+            return self.returncode
+
+        def kill(self) -> None:
+            """Record forced provider cleanup if graceful cleanup fails."""
+            self.kill_calls += 1
+            self.returncode = -9
+
+    launcher = DetachedLauncher()
+
+    def fake_popen(command: list[str], **kwargs: object) -> DetachedLauncher:
+        del command, kwargs
+        return launcher
+
+    def fake_run(
+        command: list[str],
+        *,
+        text: bool,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del text, capture_output, check, timeout
+        assert command[0] == "squeue"
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("clio_relay.scheduler_providers.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("clio_relay.scheduler_providers.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "clio_relay.scheduler_providers.CONNECTOR_STEP_REGISTRATION_TIMEOUT_SECONDS",
+        0.0,
+    )
+    monkeypatch.setattr(
+        "clio_relay.scheduler_providers.CONNECTOR_STEP_FAILED_RECONCILIATION_OBSERVATIONS",
+        1,
+    )
+
+    with pytest.raises(RelayError, match="bounded provider timeout"):
+        SlurmSchedulerProvider().launch_connector_step(
+            "21835",
+            placement_host="compute-07",
+            step_marker=marker,
+            command=["/home/alice/.local/bin/frpc", "-c", "/home/alice/frpc.toml"],
+            output_path="/home/alice/connector.log",
+        )
+
+    assert launcher.terminate_calls == 1
+    assert launcher.kill_calls == 0
+
+
+def test_slurm_connector_step_failed_registration_cancels_late_exact_step(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    marker = "clio-relay-connector-0123456789abcdef0123456789abcdef"
+    commands: list[list[str]] = []
+    marker_queries = 0
+
+    class DetachedLauncher:
+        """Running launcher used to expose a registration/termination race."""
+
+        pid = 4242
+
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.terminate_calls = 0
+
+        def poll(self) -> int | None:
+            """Return the current fake launcher state."""
+            return self.returncode
+
+        def terminate(self) -> None:
+            """Record graceful provider cleanup."""
+            self.terminate_calls += 1
+            self.returncode = -15
+
+        def wait(self, timeout: float | None = None) -> int:
+            """Return the terminal fake launcher state."""
+            del timeout
+            assert self.returncode is not None
+            return self.returncode
+
+        def kill(self) -> None:
+            """Provide the Popen fallback contract."""
+            self.returncode = -9
+
+    launcher = DetachedLauncher()
+
+    def fake_popen(command: list[str], **kwargs: object) -> DetachedLauncher:
+        del command, kwargs
+        return launcher
+
+    def fake_run(
+        command: list[str],
+        *,
+        text: bool,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal marker_queries
+        del text, capture_output, check, timeout
+        commands.append(command)
+        if command[0] == "scancel":
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if "--steps=21835.7" in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        marker_queries += 1
+        stdout = "" if marker_queries == 1 else f"21835.7|{marker}|compute-07\n"
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    monkeypatch.setattr("clio_relay.scheduler_providers.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("clio_relay.scheduler_providers.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "clio_relay.scheduler_providers.CONNECTOR_STEP_REGISTRATION_TIMEOUT_SECONDS",
+        0.0,
+    )
+
+    with pytest.raises(RelayError, match="bounded provider timeout"):
+        SlurmSchedulerProvider().launch_connector_step(
+            "21835",
+            placement_host="compute-07",
+            step_marker=marker,
+            command=["/home/alice/.local/bin/frpc", "-c", "/home/alice/frpc.toml"],
+            output_path="/home/alice/connector.log",
+        )
+
+    assert launcher.terminate_calls == 1
+    assert ["scancel", "21835.7"] in commands
+    assert ["scancel", "21835"] not in commands
+    assert ["squeue", "--noheader", "--steps=21835.7", "--format=%i|%N"] in commands
+
+
+def test_slurm_connector_step_status_and_cancel_are_exact_step_scoped(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+    status_outputs = iter(["21835.7|compute-07\n", ""])
+
+    def fake_run(
+        command: list[str],
+        *,
+        text: bool,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del text, capture_output, check, timeout
+        commands.append(command)
+        if command[0] == "squeue":
+            return subprocess.CompletedProcess(command, 0, next(status_outputs), "")
+        if command[0] == "scancel":
+            return subprocess.CompletedProcess(command, 0, "", "")
+        raise AssertionError(command)
+
+    monkeypatch.setattr("clio_relay.scheduler_providers.subprocess.run", fake_run)
+    provider = SlurmSchedulerProvider()
+
+    active = provider.poll_connector_step(
+        "21835",
+        scheduler_step_id="21835.7",
+        placement_host="compute-07",
+    )
+    canceled = provider.cancel_connector_step(
+        "21835",
+        scheduler_step_id="21835.7",
+    )
+    absent = provider.poll_connector_step(
+        "21835",
+        scheduler_step_id="21835.7",
+        placement_host="compute-07",
+    )
+
+    assert active.state == "active"
+    assert canceled.returncode == 0
+    assert absent.state == "absent"
+    assert commands == [
+        ["squeue", "--noheader", "--steps=21835.7", "--format=%i|%N"],
+        ["scancel", "21835.7"],
+        ["squeue", "--noheader", "--steps=21835.7", "--format=%i|%N"],
+    ]
+    assert ["scancel", "21835"] not in commands
+    with pytest.raises(ConfigurationError, match="exact numeric step"):
+        provider.cancel_connector_step("21835", scheduler_step_id="21835")
+
+
+def test_slurm_connector_step_status_rejects_wrong_compute_host(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    def fake_run(
+        command: list[str],
+        *,
+        text: bool,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del text, capture_output, check, timeout
+        return subprocess.CompletedProcess(command, 0, "21835.7|compute-08\n", "")
+
+    monkeypatch.setattr("clio_relay.scheduler_providers.subprocess.run", fake_run)
+
+    with pytest.raises(RelayError, match="provider-verified placement host"):
+        SlurmSchedulerProvider().poll_connector_step(
+            "21835",
+            scheduler_step_id="21835.7",
+            placement_host="compute-07",
+        )
+
+
+def test_slurm_connector_step_reconciliation_uses_exact_marker_and_host(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    marker = "clio-relay-connector-0123456789abcdef0123456789abcdef"
+    outputs = iter(
+        [
+            f"21835.7|{marker}|compute-07\n",
+            f"21835.7|{marker}|compute-07\n21835.8|{marker}|compute-07\n",
+        ]
+    )
+
+    def fake_run(
+        command: list[str],
+        *,
+        text: bool,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del text, capture_output, check, timeout
+        assert command == [
+            "squeue",
+            "--noheader",
+            "--steps",
+            "--jobs=21835",
+            f"--name={marker}",
+            "--format=%i|%j|%N",
+        ]
+        return subprocess.CompletedProcess(command, 0, next(outputs), "")
+
+    monkeypatch.setattr("clio_relay.scheduler_providers.subprocess.run", fake_run)
+    provider = SlurmSchedulerProvider()
+
+    identity = provider.find_connector_step(
+        "21835",
+        step_marker=marker,
+        placement_host="compute-07",
+    )
+
+    assert identity is not None
+    assert identity.scheduler_step_id == "21835.7"
+    assert identity.source == "slurm-squeue-step-marker"
+    with pytest.raises(RelayError, match="multiple active SLURM steps"):
+        provider.find_connector_step(
+            "21835",
+            step_marker=marker,
+            placement_host="compute-07",
+        )
+
+
 def test_poll_slurm_status_is_unknown_when_history_backends_have_no_record(
     monkeypatch: MonkeyPatch,
 ) -> None:

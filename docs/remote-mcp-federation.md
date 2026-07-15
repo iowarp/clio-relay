@@ -243,7 +243,8 @@ and persisted by JARVIS immediately before execution.
 `jarvis_get_execution` is the unified durable query for the JARVIS handle,
 lifecycle record, runtime metadata, optional progress, and an optional bounded
 artifact page. It takes `cluster`, `pipeline_id`, and `execution_id`, plus
-`include_progress` and an `artifacts` filter object when needed. The relay
+`include_progress`, `include_service_runtimes`, and an `artifacts` filter object
+when needed. The relay
 removes only local routing controls before submitting the durable remote call;
 all JARVIS query and cursor fields pass through unchanged.
 
@@ -251,7 +252,8 @@ Virtual JARVIS mutations and runs receive a fresh relay job by default. Supply
 an explicit `idempotency_key` only when retry de-duplication is intentional; an
 identical second `jarvis_run` is otherwise a new execution.
 
-The released clio-kit 2.3.2 artifact is the pinned six-tool contract. Bootstrap
+The released clio-kit 2.4.2 artifact is the pinned six-tool JARVIS v3.1 contract.
+Bootstrap
 downloads and hashes the exact coordinated wheel, installs it once with
 `uv tool install`, and persists the wheel plus the direct JARVIS command in the
 worker receipt. The receipt also binds the exact uv executable/version and
@@ -261,7 +263,7 @@ that persistent executable directly. clio-kit's child launcher still uses its
 wheel-owned server source and lock with `uv run --frozen --no-editable`, so the
 live MCP response binds both the installed outer tool and the locked child
 server rather than trusting an unobserved nested resolution. The release gate
-requires that exact 2.3.2 artifact to be rerun on every target selected by the
+requires that exact 2.4.2 artifact to be rerun on every target selected by the
 release policy. Other servers use the operator registry and generated
 `remote_...` aliases.
 
@@ -275,6 +277,34 @@ environment application belongs to `jarvis_run(spack_specs=[...])`.
 The semantic check is enabled explicitly with the
 `clio-kit-spack-user-v2` contract identifier; registration names remain
 operator-defined and do not select behavior.
+
+## Register the scientific catalog MCP
+
+clio-kit 2.4.2 also ships the two-tool
+`clio-kit-scientific-catalog-user-v1` contract. It separates dataset discovery
+from visualization control: `scientific_dataset_search` finds operator catalog
+records and `scientific_dataset_describe` returns one exact
+`jarvis.dataset-descriptor.v1`. Register it through the same generic federation
+layer; the relay does not add dataset names, scene recipes, or site-specific
+semantics:
+
+```powershell
+clio-relay remote-mcp register `
+  --cluster my-cluster `
+  --name scientific-catalog `
+  --command clio-kit `
+  --arg mcp-server `
+  --arg scientific-catalog `
+  --allow-tool scientific_dataset_search `
+  --allow-tool scientific_dataset_describe `
+  --profile user
+clio-relay remote-mcp refresh --cluster my-cluster --name scientific-catalog
+```
+
+The released wheel contract and its hashes are checked by the relay release
+gate. At runtime, the operator registration and refreshed schema cache remain
+the authority, so adding a different catalog or cluster requires no relay code
+change.
 
 For an unreleased candidate, use an exact wheel path for the remote command and
 record its digest in the validation report. Replace the placeholder only after
