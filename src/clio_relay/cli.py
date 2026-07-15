@@ -1425,7 +1425,10 @@ def remote_mcp_register(
     contract: Annotated[
         str | None,
         typer.Option(
-            help=("Optional audited semantic contract. Supported: clio-kit-spack-user-v2.")
+            help=(
+                "Optional audited semantic contract. Supported: clio-kit-spack-user-v2, "
+                "clio-kit-scientific-catalog-user-v1."
+            )
         ),
     ] = None,
     schema_cache_ttl_seconds: Annotated[

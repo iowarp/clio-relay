@@ -81,6 +81,10 @@ CLIO_KIT_SPACK_USER_CONTRACT_ID = "clio-kit-spack-user-v2"
 CLIO_KIT_SPACK_USER_CONTRACT_SHA256 = (
     "3c5412148c770f4844e98eb893c4db0d0afdbf13afe967df67bd5f7d25e1f7db"
 )
+CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID = "clio-kit-scientific-catalog-user-v1"
+CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256 = (
+    "a53006f24f4698f659f0a7c8bf61fc7bd7ad23274b06d2eed2ccfca68b9ecb0a"
+)
 _COMPOSED_SCHEMA_KEYS = {
     "$dynamicRef",
     "$recursiveRef",
@@ -3312,6 +3316,141 @@ def _spack_user_contract_check(
     )
 
 
+def _scientific_catalog_user_contract_check(
+    entry: RemoteMcpSchemaCacheEntry | None,
+    registration: RemoteMcpServerConfig | None,
+) -> RemoteMcpAcceptanceCheck:
+    """Require the exact read-only scientific catalog surface approved for agents."""
+    expected_names = {"scientific_dataset_describe", "scientific_dataset_search"}
+    tools = {tool.name: tool for tool in entry.tools} if entry is not None else {}
+    actual_names = set(tools)
+    allowlisted_names: set[str] = (
+        set(registration.allow_tools) if registration is not None else set()
+    )
+    observed_contract_digest = remote_mcp_schema_digest(list(tools.values()))
+
+    annotation_matches: dict[str, bool] = {}
+    expected_annotations = {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+    for name in expected_names:
+        tool = tools.get(name)
+        annotations = tool.annotations if tool is not None else None
+        annotation_matches[name] = annotations is not None and all(
+            annotations.get(key) is value for key, value in expected_annotations.items()
+        )
+
+    describe = tools.get("scientific_dataset_describe")
+    describe_input = describe.input_schema if describe is not None else {}
+    describe_input_properties = _as_json(describe_input.get("properties")) or {}
+    describe_required = describe_input.get("required")
+    describe_input_matches = (
+        describe_input.get("type") == "object"
+        and describe_input.get("additionalProperties") is False
+        and set(describe_input_properties) == {"dataset_id"}
+        and _as_json(describe_input_properties.get("dataset_id")) == {"type": "string"}
+        and isinstance(describe_required, list)
+        and cast(list[object], describe_required) == ["dataset_id"]
+    )
+
+    search = tools.get("scientific_dataset_search")
+    search_input = search.input_schema if search is not None else {}
+    search_input_properties = _as_json(search_input.get("properties")) or {}
+    page_size = _as_json(search_input_properties.get("page_size")) or {}
+    search_input_matches = (
+        search_input.get("type") == "object"
+        and search_input.get("additionalProperties") is False
+        and set(search_input_properties)
+        == {"query", "tags", "kind", "format", "page_size", "cursor"}
+        and page_size == {"default": 20, "maximum": 100, "minimum": 1, "type": "integer"}
+        and search_input.get("required", []) == []
+    )
+
+    describe_output = describe.output_schema if describe is not None else None
+    describe_output_properties = (
+        _as_json(describe_output.get("properties")) if describe_output is not None else None
+    ) or {}
+    dataset_schema = _as_json(describe_output_properties.get("dataset")) or {}
+    dataset_properties = _as_json(dataset_schema.get("properties")) or {}
+    descriptor_schema = _as_json(dataset_properties.get("descriptor")) or {}
+    descriptor_properties = _as_json(descriptor_schema.get("properties")) or {}
+    describe_output_matches = (
+        describe_output is not None
+        and describe_output.get("type") == "object"
+        and describe_output.get("additionalProperties") is False
+        and _as_json(describe_output_properties.get("schema_version"))
+        == {
+            "const": "clio-kit.scientific-dataset-description.v1",
+            "default": "clio-kit.scientific-dataset-description.v1",
+            "type": "string",
+        }
+        and descriptor_schema.get("type") == "object"
+        and descriptor_schema.get("additionalProperties") is False
+        and _as_json(descriptor_properties.get("schema_version"))
+        == {"const": "jarvis.dataset-descriptor.v1", "type": "string"}
+    )
+
+    search_output = search.output_schema if search is not None else None
+    search_output_properties = (
+        _as_json(search_output.get("properties")) if search_output is not None else None
+    ) or {}
+    datasets_schema = _as_json(search_output_properties.get("datasets")) or {}
+    dataset_item_schema = _as_json(datasets_schema.get("items")) or {}
+    search_output_matches = (
+        search_output is not None
+        and search_output.get("type") == "object"
+        and search_output.get("additionalProperties") is False
+        and _as_json(search_output_properties.get("schema_version"))
+        == {
+            "const": "clio-kit.scientific-dataset-search.v1",
+            "default": "clio-kit.scientific-dataset-search.v1",
+            "type": "string",
+        }
+        and datasets_schema.get("type") == "array"
+        and dataset_item_schema.get("type") == "object"
+        and dataset_item_schema.get("additionalProperties") is False
+    )
+
+    schema_matches = {
+        "scientific_dataset_describe": describe_input_matches and describe_output_matches,
+        "scientific_dataset_search": search_input_matches and search_output_matches,
+    }
+    passed = (
+        actual_names == expected_names
+        and allowlisted_names == expected_names
+        and registration is not None
+        and registration.contract == CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID
+        and "user" in registration.profiles
+        and all(annotation_matches.values())
+        and all(schema_matches.values())
+        and observed_contract_digest == CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256
+    )
+    return RemoteMcpAcceptanceCheck(
+        name="remote-mcp.scientific-catalog-user-contract",
+        passed=passed,
+        message=(
+            "Scientific catalog exposes only read-only search and exact descriptor lookup"
+            if passed
+            else "Scientific catalog tools, allowlist, schemas, or safety annotations drifted"
+        ),
+        evidence={
+            "expected_tool_names": sorted(expected_names),
+            "remote_tool_names": sorted(actual_names),
+            "allowlisted_tool_names": sorted(allowlisted_names),
+            "profiles": registration.profiles if registration is not None else [],
+            "declared_contract": registration.contract if registration is not None else None,
+            "annotations_match": annotation_matches,
+            "schemas_match": schema_matches,
+            "expected_contract_sha256": CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256,
+            "expected_clio_kit_version": CLIO_KIT_SPACK_USER_WHEEL_VERSION,
+            "observed_contract_sha256": observed_contract_digest,
+        },
+    )
+
+
 def _declared_contract_check(
     entry: RemoteMcpSchemaCacheEntry | None,
     registration: RemoteMcpServerConfig,
@@ -3319,6 +3458,8 @@ def _declared_contract_check(
     """Evaluate the semantic contract explicitly declared by an operator."""
     if registration.contract == CLIO_KIT_SPACK_USER_CONTRACT_ID:
         return _spack_user_contract_check(entry, registration)
+    if registration.contract == CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID:
+        return _scientific_catalog_user_contract_check(entry, registration)
     raise ValueError(f"unsupported remote MCP semantic contract: {registration.contract}")
 
 
