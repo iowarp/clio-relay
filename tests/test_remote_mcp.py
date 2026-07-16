@@ -143,7 +143,7 @@ def test_scientific_catalog_contract_is_read_only_and_exact(
         command="uvx",
         args=[
             "--from",
-            "/opt/clio/clio_kit-2.4.9-py3-none-any.whl",
+            "/opt/clio/clio_kit-2.5.0-py3-none-any.whl",
             "clio-kit",
             "mcp-server",
             "scientific-catalog",
@@ -2311,7 +2311,7 @@ def test_acceptance_report_requires_verified_persistent_uv_tool_runtime(
             "sha256": "a" * 64,
             "size_bytes": 256,
         },
-        "install_spec": "/opt/wheels/clio_kit-2.4.9-py3-none-any.whl",
+        "install_spec": "/opt/wheels/clio_kit-2.5.0-py3-none-any.whl",
         "install_source": "uv-tool",
         "install_artifact_sha256": "b" * 64,
         "python_distribution_runtime": {

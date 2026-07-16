@@ -63,6 +63,16 @@ def build_jarvis_mcp_validation_report(
     remote_discovery_artifacts: list[JSON] | None = None,
     initialize_response: JSON | None = None,
     stdio_evidence: JSON | None = None,
+    package_search_query: str,
+    package_search_tools_list_response: JSON | None,
+    package_search_call_response: JSON | None,
+    package_search_call_job_id: str,
+    package_search_call_status: JSON,
+    package_search_artifacts: list[JSON],
+    package_search_mcp_result: JSON | None,
+    package_search_provenance: JSON | None,
+    package_search_initialize_response: JSON | None,
+    package_search_stdio_evidence: JSON | None,
     query_tools_list_response: JSON | None,
     query_call_response: JSON | None,
     query_call_job_id: str,
@@ -90,7 +100,12 @@ def build_jarvis_mcp_validation_report(
     tool_definition = _listed_tool(tools_list_response, tool)
     input_schema = _mapping(tool_definition.get("inputSchema")) if tool_definition else None
     properties = _mapping(input_schema.get("properties")) if input_schema else None
-    required = input_schema.get("required") if input_schema else None
+    required = cast(object, input_schema.get("required")) if input_schema else None
+    required_fields: set[str] = (
+        {item for item in cast(list[object], required) if isinstance(item, str)}
+        if isinstance(required, list)
+        else set[str]()
+    )
     local_contract_evidence, local_contract_passed = _local_jarvis_contract(
         tool_definition,
         tool,
@@ -103,8 +118,7 @@ def build_jarvis_mcp_validation_report(
         tool_definition is not None
         and properties is not None
         and isinstance(properties.get("cluster"), dict)
-        and isinstance(required, list)
-        and "cluster" in required
+        and "cluster" in required_fields
         and local_contract_passed
         and stdio_boundary_passed
     )
@@ -137,6 +151,35 @@ def build_jarvis_mcp_validation_report(
             report.started_at,
             observed_at,
             remote_contract_evidence,
+        )
+    )
+
+    package_search_evidence, package_search_passed = _jarvis_package_search_evidence(
+        cluster=cluster,
+        query=package_search_query,
+        expected_server_artifact=(
+            _mapping(remote_tools_list_result.get("server_artifact"))
+            if remote_tools_list_result
+            else None
+        ),
+        tools_list_response=package_search_tools_list_response,
+        call_response=package_search_call_response,
+        call_job_id=package_search_call_job_id,
+        call_status=package_search_call_status,
+        artifacts=package_search_artifacts,
+        mcp_result=package_search_mcp_result,
+        provenance=package_search_provenance,
+        initialize_response=package_search_initialize_response,
+        stdio_evidence=package_search_stdio_evidence,
+    )
+    report.checks.append(
+        _check(
+            "remote-mcp.jarvis-package-search",
+            "bounded JARVIS package discovery returned a durable summary page",
+            package_search_passed,
+            report.started_at,
+            observed_at,
+            package_search_evidence,
         )
     )
 
@@ -464,6 +507,22 @@ def build_jarvis_mcp_validation_report(
                 metadata={**query_job, "execution_id": execution_id},
             )
         )
+    package_search_job = _mapping(package_search_call_status.get("job")) or {}
+    if isinstance(package_search_job.get("job_id"), str):
+        report.resources.append(
+            ValidationResource(
+                kind="relay_job",
+                resource_id=cast(str, package_search_job["job_id"]),
+                role="jarvis_mcp_package_search",
+                cluster=cluster,
+                state=(
+                    str(package_search_job.get("state"))
+                    if package_search_job.get("state") is not None
+                    else None
+                ),
+                metadata=package_search_job,
+            )
+        )
     if remote_discovery_job_id is not None:
         report.resources.append(
             ValidationResource(
@@ -551,6 +610,21 @@ def build_jarvis_mcp_validation_report(
                 metadata=artifact,
             )
         )
+    for artifact in package_search_artifacts:
+        artifact_id = artifact.get("artifact_id")
+        if not isinstance(artifact_id, str):
+            continue
+        uri = artifact.get("uri")
+        report.resources.append(
+            ValidationResource(
+                kind="artifact",
+                resource_id=artifact_id,
+                role=f"jarvis_package_search_{artifact.get('kind', 'artifact')}",
+                cluster=cluster,
+                references=[str(uri)] if isinstance(uri, str) else [],
+                metadata=artifact,
+            )
+        )
     for artifact in generated_artifacts:
         artifact_id = artifact.get("artifact_id")
         if not isinstance(artifact_id, str):
@@ -617,6 +691,208 @@ def _artifact_location_references(artifact: dict[str, object]) -> list[str]:
     if isinstance(kind, str) and kind and isinstance(value, str) and value:
         return [f"{kind}:{value}"]
     return []
+
+
+def _jarvis_package_search_evidence(
+    *,
+    cluster: str,
+    query: str,
+    expected_server_artifact: JSON | None,
+    tools_list_response: JSON | None,
+    call_response: JSON | None,
+    call_job_id: str,
+    call_status: JSON,
+    artifacts: list[JSON],
+    mcp_result: JSON | None,
+    provenance: JSON | None,
+    initialize_response: JSON | None,
+    stdio_evidence: JSON | None,
+) -> tuple[JSON, bool]:
+    """Validate one durable, bounded package-search result from JARVIS."""
+    tool = _listed_tool(tools_list_response, "jarvis_describe")
+    input_schema = _mapping(tool.get("inputSchema")) if tool else None
+    properties = _mapping(input_schema.get("properties")) if input_schema else None
+    required = cast(object, input_schema.get("required")) if input_schema else None
+    required_fields: set[str] = (
+        {item for item in cast(list[object], required) if isinstance(item, str)}
+        if isinstance(required, list)
+        else set[str]()
+    )
+    local_contract, local_contract_passed = _local_jarvis_contract(
+        tool,
+        "jarvis_describe",
+    )
+    stdio_passed = _stdio_initialize_passed(
+        initialize_response=initialize_response,
+        evidence=stdio_evidence,
+    )
+    local_surface_passed = bool(
+        properties is not None
+        and isinstance(properties.get("cluster"), dict)
+        and {"cluster", "target"}.issubset(required_fields)
+        and local_contract_passed
+        and stdio_passed
+    )
+
+    job = _mapping(call_status.get("job")) or {}
+    spec = _mapping(job.get("spec")) or {}
+    arguments = _mapping(spec.get("arguments")) or {}
+    page_size = cast(object, arguments.get("page_size"))
+    page_size_value: int | None = page_size if _positive_int(page_size) else None
+    request_bounded = bool(
+        bool(query)
+        and len(query) <= 256
+        and set(arguments) == {"target", "query", "page_size"}
+        and arguments.get("target") == "package_search"
+        and arguments.get("query") == query
+        and page_size_value is not None
+        and page_size_value <= 25
+    )
+    response_job_id = _response_job_id(call_response)
+    durable_artifacts = {
+        str(artifact.get("kind")): artifact
+        for artifact in artifacts
+        if isinstance(artifact.get("kind"), str)
+    }
+    required_artifacts = {"stdout", "stderr", "mcp_result", "provenance"}
+    provenance_job = _mapping(provenance.get("job")) if provenance else None
+    job_passed = bool(
+        response_job_id == call_job_id
+        and job.get("job_id") == call_job_id
+        and job.get("cluster") == cluster
+        and job.get("kind") == "mcp_call"
+        and job.get("state") == "succeeded"
+        and call_status.get("terminal") is True
+        and spec.get("operation") == "tools/call"
+        and spec.get("tool") == "jarvis_describe"
+        and request_bounded
+        and required_artifacts.issubset(durable_artifacts)
+        and provenance_job is not None
+        and provenance_job.get("job_id") == call_job_id
+    )
+
+    expected_server_artifact_digest = (
+        remote_mcp_server_artifact_digest(expected_server_artifact)
+        if expected_server_artifact is not None
+        else None
+    )
+    result_server_artifact = _mapping(mcp_result.get("server_artifact")) if mcp_result else None
+    server_binding_passed = bool(
+        _is_sha256(expected_server_artifact_digest)
+        and spec.get("expected_server_artifact_digest") == expected_server_artifact_digest
+        and mcp_result is not None
+        and mcp_result.get("expected_server_artifact_digest") == expected_server_artifact_digest
+        and mcp_result.get("observed_server_artifact_digest") == expected_server_artifact_digest
+        and result_server_artifact == expected_server_artifact
+    )
+
+    structured = _mapping(mcp_result.get("structured_result")) if mcp_result else None
+    raw_packages = structured.get("packages") if structured else None
+    packages = cast(list[object], raw_packages) if isinstance(raw_packages, list) else []
+    summaries_valid = bool(packages) and all(
+        _valid_package_search_summary(package) for package in packages
+    )
+    total_matches = cast(object, structured.get("total_matches")) if structured else None
+    returned_count = cast(object, structured.get("returned_count")) if structured else None
+    total_matches_value: int | None = total_matches if _positive_int(total_matches) else None
+    returned_count_value: int | None = returned_count if _positive_int(returned_count) else None
+    next_cursor = cast(object, structured.get("next_cursor")) if structured else None
+    encoded_bytes = (
+        len(
+            json.dumps(
+                structured,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+        if structured is not None
+        else None
+    )
+    result_bounded = bool(
+        structured is not None
+        and set(structured)
+        == {
+            "schema_version",
+            "target",
+            "query",
+            "inventory_revision",
+            "packages",
+            "total_matches",
+            "returned_count",
+            "next_cursor",
+        }
+        and structured.get("schema_version") == "jarvis.package-search.v1"
+        and structured.get("target") == "package_search"
+        and structured.get("query") == query
+        and _is_sha256(structured.get("inventory_revision"))
+        and summaries_valid
+        and returned_count_value is not None
+        and total_matches_value is not None
+        and page_size_value is not None
+        and returned_count_value == len(packages)
+        and returned_count_value <= page_size_value
+        and total_matches_value >= returned_count_value
+        and (
+            next_cursor is None or (isinstance(next_cursor, str) and 1 <= len(next_cursor) <= 1024)
+        )
+        and encoded_bytes is not None
+        and encoded_bytes <= 64 * 1024
+    )
+    protocol_passed = bool(
+        mcp_result is not None
+        and mcp_result.get("returncode") == 0
+        and mcp_result.get("operation") == "tools/call"
+        and mcp_result.get("tool") == "jarvis_describe"
+        and mcp_result.get("protocol_error") is None
+    )
+    assertions = {
+        "local_surface": local_surface_passed,
+        "durable_call": job_passed,
+        "server_artifact_binding": server_binding_passed,
+        "protocol_result": protocol_passed,
+        "bounded_summary_page": result_bounded,
+    }
+    return (
+        {
+            "query": query,
+            "page_size": page_size_value,
+            "response_job_id": response_job_id,
+            "job_id": job.get("job_id"),
+            "artifact_kinds": sorted(durable_artifacts),
+            "required_artifact_kinds": sorted(required_artifacts),
+            "expected_server_artifact_digest": expected_server_artifact_digest,
+            "returned_count": returned_count_value,
+            "total_matches": total_matches_value,
+            "next_cursor_present": isinstance(next_cursor, str),
+            "serialized_result_bytes": encoded_bytes,
+            "result": structured or {},
+            "local_contract": local_contract,
+            "packaged_stdio": stdio_evidence or {},
+            "assertions": assertions,
+        },
+        all(assertions.values()),
+    )
+
+
+def _valid_package_search_summary(value: object) -> bool:
+    """Return whether one package-search item is summary-only and bounded."""
+    summary = _mapping(value)
+    if summary is None:
+        return False
+    if not {"name", "short_name", "repository"}.issubset(summary):
+        return False
+    if not set(summary).issubset({"name", "short_name", "repository", "description"}):
+        return False
+    for key in ("name", "short_name", "repository"):
+        item = summary.get(key)
+        if not isinstance(item, str) or not item:
+            return False
+    description = summary.get("description")
+    return description is None or (
+        isinstance(description, str) and len(description.encode("utf-8")) <= 4096
+    )
 
 
 def _jarvis_execution_query_evidence(
@@ -1145,6 +1421,9 @@ def _remote_jarvis_contract(document: JSON | None) -> tuple[JSON, bool]:
     query_evidence, query_passed = _execution_query_contract_evidence(
         by_name.get("jarvis_get_execution")
     )
+    package_search_evidence, package_search_passed = _package_search_contract_evidence(
+        by_name.get("jarvis_describe")
+    )
     observed_digest: str | None = None
     contract_error: str | None = None
     try:
@@ -1160,6 +1439,7 @@ def _remote_jarvis_contract(document: JSON | None) -> tuple[JSON, bool]:
         and operation.get("enum") == ["edit", "remove"]
         and spack_specs is not None
         and query_passed
+        and package_search_passed
         and observed_digest == CLIO_KIT_JARVIS_USER_CONTRACT_SHA256
     )
     return (
@@ -1168,11 +1448,67 @@ def _remote_jarvis_contract(document: JSON | None) -> tuple[JSON, bool]:
             "expected_tool_names": sorted(expected),
             "edit_operation_schema": operation or {},
             "spack_specs_schema": spack_specs or {},
+            "package_search": package_search_evidence,
             "execution_query": query_evidence,
             "expected_contract_sha256": CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
             "expected_clio_kit_version": CLIO_KIT_JARVIS_MCP_VERSION,
             "observed_contract_sha256": observed_digest,
             "contract_error": contract_error,
+        },
+        passed,
+    )
+
+
+def _package_search_contract_evidence(tool: JSON | None) -> tuple[JSON, bool]:
+    """Summarize the bounded package-discovery surface from live tools/list."""
+    input_schema = _mapping(tool.get("inputSchema")) if tool else None
+    properties = _mapping(input_schema.get("properties")) if input_schema else None
+    required = input_schema.get("required") if input_schema else None
+    target = _mapping(properties.get("target")) if properties else None
+    query_selector = _mapping(properties.get("query")) if properties else None
+    query = _schema_option(query_selector, expected_type="string")
+    page_size = _mapping(properties.get("page_size")) if properties else None
+    cursor_selector = _mapping(properties.get("cursor")) if properties else None
+    cursor = _schema_option(cursor_selector, expected_type="string")
+    expected_fields = {
+        "target",
+        "package_name",
+        "query",
+        "page_size",
+        "cursor",
+        "pipeline_id",
+        "step_id",
+        "include_yaml",
+    }
+    target_values = (
+        cast(list[object], target.get("enum"))
+        if target is not None and isinstance(target.get("enum"), list)
+        else []
+    )
+    passed = (
+        input_schema is not None
+        and input_schema.get("additionalProperties") is False
+        and properties is not None
+        and set(properties) == expected_fields
+        and required == ["target"]
+        and target_values == ["packages", "package_search", "package", "pipeline", "step"]
+        and query == {"maxLength": 256, "minLength": 1, "type": "string"}
+        and page_size is not None
+        and page_size.get("default") == 10
+        and page_size.get("minimum") == 1
+        and page_size.get("maximum") == 25
+        and page_size.get("type") == "integer"
+        and cursor == {"maxLength": 1024, "minLength": 1, "type": "string"}
+    )
+    return (
+        {
+            "input_fields": sorted(properties) if properties is not None else [],
+            "required": required if isinstance(required, list) else [],
+            "target_values": target_values,
+            "query_schema": query or {},
+            "page_size_schema": page_size or {},
+            "cursor_schema": cursor or {},
+            "bounded": passed,
         },
         passed,
     )

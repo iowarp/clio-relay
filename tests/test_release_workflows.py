@@ -283,6 +283,7 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
     jarvis = requirements["ares-jarvis-virtual-mcp"]
 
     assert "remote-mcp.jarvis-remote-contract" in jarvis["required_checks"]
+    assert "remote-mcp.jarvis-package-search" in jarvis["required_checks"]
     assert "remote-mcp.jarvis-execution-query" in jarvis["required_checks"]
     assert "jarvis.spack-runtime-environment" not in jarvis["required_checks"]
     server = next(
@@ -303,11 +304,11 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
         if resource["kind"] == "relay_worker"
     )
     clio_kit_component = worker["metadata_equals"]["component_artifacts"]["clio-kit"]
-    assert clio_kit_component["distribution_version"] == "2.4.9"
+    assert clio_kit_component["distribution_version"] == "2.5.0"
     assert clio_kit_component["persistent_tool"]["manager"] == "uv"
     assert clio_kit_component["persistent_tool"]["uv_version"] == "0.11.28"
     assert clio_kit_component["persistent_tool"]["source_artifact_sha256"] == (
-        "a9d771bcd40ec98de2626ac2a8706fcc614a2eaac462defb10f8d7bec13693e3"
+        "acc13d7924045f2b636a8ceededf4816cfb3b936512b7e5d3dd0d50055540f5f"
     )
     jarvis_component = worker["metadata_equals"]["component_artifacts"]["jarvis-cd"]
     assert jarvis_component["distribution_version"] == "1.3.6"
@@ -470,7 +471,7 @@ def test_spack_release_requirements_split_existing_resolution_from_fresh_install
     )
     assert fresh_server["metadata_equals"]["server_name"] == "spack-fresh"
     assert fresh_server["metadata_equals"]["install_artifact_sha256"] == (
-        "a9d771bcd40ec98de2626ac2a8706fcc614a2eaac462defb10f8d7bec13693e3"
+        "acc13d7924045f2b636a8ceededf4816cfb3b936512b7e5d3dd0d50055540f5f"
     )
     assert fresh_server["metadata_equals"]["contract_id"] == "clio-kit-spack-user-v2"
     assert fresh_server["metadata_equals"]["contract_sha256"] == (

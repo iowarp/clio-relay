@@ -5235,6 +5235,97 @@ def test_cli_jarvis_mcp_call_uses_builtin_cluster_command(
     assert job.spec.arguments == {"target": "packages"}
 
 
+def test_jarvis_package_search_query_uses_bounded_virtual_call(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+    session = SimpleNamespace(
+        tools_list_response={"result": {"tools": []}},
+        tools_call_response={"result": {"job_id": "job-search"}},
+        initialize_response={"result": {"protocolVersion": "2024-11-05"}},
+        evidence=lambda: {"transport": "stdio"},
+    )
+
+    def run_session(**kwargs: object) -> SimpleNamespace:
+        calls.append(dict(kwargs))
+        return session
+
+    def response_job_id(_response: object) -> str:
+        return "job-search"
+
+    def execute_locally(_definition: ClusterDefinition) -> bool:
+        return False
+
+    def wait_for_local_terminal(
+        _queue: ClioCoreQueue,
+        _job_id: str,
+        *,
+        timeout_seconds: float,
+        poll_seconds: float,
+    ) -> dict[str, object]:
+        assert timeout_seconds == 30
+        assert poll_seconds == 0.1
+        return {"job": {"job_id": "job-search"}, "terminal": True}
+
+    def complete_artifacts(
+        _queue: ClioCoreQueue,
+        _job_id: str,
+    ) -> list[dict[str, object]]:
+        return artifacts
+
+    monkeypatch.setattr(cli, "run_packaged_mcp_stdio_session", run_session)
+    monkeypatch.setattr(cli, "_mcp_response_job_id", response_job_id)
+    monkeypatch.setattr(cli, "should_execute_on_cluster", execute_locally)
+    monkeypatch.setattr(
+        cli,
+        "_wait_for_local_job_terminal",
+        wait_for_local_terminal,
+    )
+    artifacts: list[dict[str, object]] = [
+        {"artifact_id": "artifact-result", "kind": "mcp_result"},
+        {"artifact_id": "artifact-provenance", "kind": "provenance"},
+    ]
+    monkeypatch.setattr(cli, "_complete_local_artifact_records", complete_artifacts)
+
+    def read_artifact(
+        _queue: ClioCoreQueue,
+        _artifacts: list[dict[str, object]],
+        *,
+        kind: str,
+    ) -> dict[str, object]:
+        return {"kind": kind}
+
+    monkeypatch.setattr(cli, "_read_local_json_artifact_kind", read_artifact)
+
+    result = cli._run_jarvis_package_search_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster="ares",
+        definition=ClusterDefinition(name="ares", ssh_host="ares"),
+        queue=ClioCoreQueue(tmp_path / "core"),
+        profile="user",
+        query="parallel visualization",
+        wait_timeout_seconds=30,
+        poll_seconds=0.1,
+    )
+
+    assert calls == [
+        {
+            "profile": "user",
+            "tool": "jarvis_describe",
+            "arguments": {
+                "cluster": "ares",
+                "target": "package_search",
+                "query": "parallel visualization",
+                "page_size": 5,
+            },
+        }
+    ]
+    assert result.call_job_id == "job-search"
+    assert result.artifacts == artifacts
+    assert result.mcp_result == {"kind": "mcp_result"}
+    assert result.provenance == {"kind": "provenance"}
+
+
 def test_jarvis_discovery_persists_exact_durable_artifact_bytes(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -5271,7 +5362,7 @@ def test_jarvis_discovery_persists_exact_durable_artifact_bytes(
         },
         "structured_result": None,
         "protocol_version": "2024-11-05",
-        "server_info": {"name": "clio-kit", "version": "2.4.9"},
+        "server_info": {"name": "clio-kit", "version": "2.5.0"},
         "server_artifact": server_artifact,
         "returncode": 0,
         "stdout": "",

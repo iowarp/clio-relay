@@ -214,7 +214,7 @@ For the legacy clio-kit 2.2.6 compatibility path, a successful synchronous
 `jarvis_run` MCP return is normalized to a terminal `completed` record even
 though that release labels the result `status=running`; the original status and
 completion basis remain in `details.completion_normalization` for auditability.
-The pinned clio-kit 2.4.9 production path removes that ambiguity upstream and
+The pinned clio-kit 2.5.0 production path removes that ambiguity upstream and
 returns a structured completed result directly. The legacy normalization is
 diagnostic compatibility evidence and cannot satisfy the 1.0 gate. Scheduler
 submissions remain non-terminal unless JARVIS was asked to wait.
@@ -225,10 +225,13 @@ result, and non-legacy runtime artifact in one canonical acceptance run:
 ```powershell
 clio-relay jarvis-mcp-validate `
   --cluster my-cluster `
+  --package-search-query lammps `
   --arguments-json-file .\jarvis-run.json `
   --report .\validation\jarvis-mcp.json
 ```
 
+The package-search query must identify at least one installed application; its
+bounded summary page is retained in the same machine-readable report.
 `jarvis-run.json` must contain the remote `pipeline_id` and any `execution`,
 `submit`, or `wait` fields accepted by the cluster-local JARVIS MCP. The local
 `cluster` selector is injected by clio-relay and is never forwarded to JARVIS.
@@ -446,7 +449,7 @@ Install the cluster-side server once, then launch its persistent executable:
 
 ```bash
 uv tool install --python 3.12 --no-config \
-  https://github.com/iowarp/clio-kit/releases/download/v2.4.9/clio_kit-2.4.9-py3-none-any.whl
+  https://github.com/iowarp/clio-kit/releases/download/v2.5.0/clio_kit-2.5.0-py3-none-any.whl
 clio-kit mcp-server jarvis
 ```
 
@@ -482,8 +485,19 @@ environment inside JARVIS rather than relying on a process-local load command.
 The expected workflow is to create or load a pipeline through those JARVIS
 tools, use `jarvis_describe` for package and pipeline inspection, and call
 `jarvis_run` to submit the configured pipeline through the cluster-local JARVIS
-environment. `relay_observe` and `relay_wait` are the agent-facing monitor loop
-for progress, stdout, stderr, and terminal output.
+environment. Discover an application with
+`jarvis_describe(target="package_search", query="visualization", page_size=10)`.
+The query is required and limited to 256 characters; `page_size` defaults to 10
+and is bounded from 1 through 25. Results contain lightweight package summaries
+rather than package settings and never exceed 64 KiB. When `next_cursor` is
+present, repeat the same query with that opaque cursor to read the next page.
+The cursor is limited to 1,024 characters and is bound to both the query and the
+current package inventory, so a different query or a changed inventory fails
+closed. After selecting a result, use `target="package"` with its canonical
+`name` as `package_name` to retrieve the package-owned settings. The exhaustive
+`target="packages"` inventory remains available for explicit legacy use, but it
+is not the normal discovery path. `relay_observe` and `relay_wait` are the
+agent-facing monitor loop for progress, stdout, stderr, and terminal output.
 After submission, `jarvis_get_execution` is the single durable query. It always
 returns the execution handle, lifecycle record, and runtime metadata; progress
 is included by default and can be disabled with `include_progress=false`.

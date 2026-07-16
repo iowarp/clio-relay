@@ -179,6 +179,21 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     )
     assert create_pipeline_tool["inputSchema"]["required"] == ["cluster", "pipeline_id"]
     assert "pipeline_id" in create_pipeline_tool["inputSchema"]["properties"]
+    describe_tool = next(
+        tool for tool in response["result"]["tools"] if tool["name"] == "jarvis_describe"
+    )
+    describe_properties = describe_tool["inputSchema"]["properties"]
+    assert describe_tool["inputSchema"]["required"] == ["cluster", "target"]
+    assert describe_properties["target"]["enum"] == [
+        "packages",
+        "package_search",
+        "package",
+        "pipeline",
+        "step",
+    ]
+    assert describe_properties["page_size"]["maximum"] == 25
+    assert describe_properties["query"]["anyOf"][0]["maxLength"] == 256
+    assert describe_properties["cursor"]["anyOf"][0]["maxLength"] == 1024
     edit_step_tool = next(
         tool for tool in response["result"]["tools"] if tool["name"] == "jarvis_edit_step"
     )
@@ -1453,7 +1468,9 @@ def test_remote_virtual_jarvis_call_defers_artifact_selection_to_cluster(
                 "name": "jarvis_describe",
                 "arguments": {
                     "cluster": "ares",
-                    "target": "packages",
+                    "target": "package_search",
+                    "query": "parallel visualization",
+                    "page_size": 7,
                     "idempotency_key": "remote-receipt-bound-jarvis",
                 },
             },
@@ -1471,7 +1488,11 @@ def test_remote_virtual_jarvis_call_defers_artifact_selection_to_cluster(
     assert structured["catalog_revision"] == session.observed_remote_mcp_catalog_revision(
         profile="user"
     )
-    assert writes and json.loads(writes[0][1]) == {"target": "packages"}
+    assert writes and json.loads(writes[0][1]) == {
+        "target": "package_search",
+        "query": "parallel visualization",
+        "page_size": 7,
+    }
     assert removals == [writes[0][0]]
     assert commands[0][0] == "jarvis-mcp-call"
     assert "--server" not in commands[0]

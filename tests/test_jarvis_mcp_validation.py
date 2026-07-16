@@ -42,6 +42,7 @@ def test_jarvis_mcp_validation_accepts_structured_durable_run() -> None:
     assert {check.check_id for check in report.checks} == {
         "remote-mcp.jarvis-discovery",
         "remote-mcp.jarvis-remote-contract",
+        "remote-mcp.jarvis-package-search",
         "remote-mcp.jarvis-call",
         "remote-mcp.server-artifact",
         "remote-mcp.durable-result",
@@ -67,6 +68,36 @@ def test_jarvis_mcp_validation_accepts_structured_durable_run() -> None:
     contract = next(
         check for check in report.checks if check.check_id == "remote-mcp.jarvis-remote-contract"
     )
+    package_search = contract.evidence[0].metadata["package_search"]
+    assert package_search["target_values"] == [
+        "packages",
+        "package_search",
+        "package",
+        "pipeline",
+        "step",
+    ]
+    assert package_search["query_schema"] == {
+        "maxLength": 256,
+        "minLength": 1,
+        "type": "string",
+    }
+    assert package_search["page_size_schema"]["maximum"] == 25
+    assert package_search["cursor_schema"]["maxLength"] == 1024
+    assert package_search["bounded"] is True
+    package_search_call = next(
+        check for check in report.checks if check.check_id == "remote-mcp.jarvis-package-search"
+    )
+    package_search_evidence = package_search_call.evidence[0].metadata
+    assert package_search_evidence["returned_count"] == 1
+    assert package_search_evidence["total_matches"] == 1
+    assert package_search_evidence["result"]["packages"][0]["name"] == "builtin.lammps"
+    assert package_search_evidence["assertions"] == {
+        "local_surface": True,
+        "durable_call": True,
+        "server_artifact_binding": True,
+        "protocol_result": True,
+        "bounded_summary_page": True,
+    }
     query = contract.evidence[0].metadata["execution_query"]
     assert query["input_fields"] == [
         "artifacts",
@@ -227,6 +258,46 @@ def test_jarvis_mcp_validation_rejects_split_or_unbounded_execution_query() -> N
     assert evidence["execution_query"]["artifact_filter_fields"] == []
 
 
+def test_jarvis_mcp_validation_rejects_unbounded_package_search() -> None:
+    inputs = _acceptance_inputs()
+    discovery = cast(dict[str, Any], inputs["remote_tools_list_result"])
+    protocol = cast(dict[str, Any], discovery["protocol_result"])
+    tools = cast(list[dict[str, Any]], protocol["tools"])
+    describe = next(tool for tool in tools if tool["name"] == "jarvis_describe")
+    describe_input = cast(dict[str, Any], describe["inputSchema"])
+    describe_properties = cast(dict[str, Any], describe_input["properties"])
+    page_size = cast(dict[str, Any], describe_properties["page_size"])
+    page_size["maximum"] = 10_000
+
+    report = build_jarvis_mcp_validation_report(**inputs)
+
+    contract = next(
+        check for check in report.checks if check.check_id == "remote-mcp.jarvis-remote-contract"
+    )
+    assert report.status == ValidationStatus.FAILED
+    assert contract.status == ValidationStatus.FAILED
+    evidence = contract.evidence[0].metadata
+    assert evidence["package_search"]["bounded"] is False
+    assert evidence["package_search"]["page_size_schema"]["maximum"] == 10_000
+
+
+def test_jarvis_mcp_validation_rejects_package_search_result_with_settings() -> None:
+    inputs = _acceptance_inputs()
+    result = cast(dict[str, Any], inputs["package_search_mcp_result"])
+    structured = cast(dict[str, Any], result["structured_result"])
+    packages = cast(list[dict[str, Any]], structured["packages"])
+    packages[0]["settings"] = {"deploy_mode": "default"}
+
+    report = build_jarvis_mcp_validation_report(**inputs)
+
+    package_search = next(
+        check for check in report.checks if check.check_id == "remote-mcp.jarvis-package-search"
+    )
+    assert report.status == ValidationStatus.FAILED
+    assert package_search.status == ValidationStatus.FAILED
+    assert package_search.evidence[0].metadata["assertions"]["bounded_summary_page"] is False
+
+
 def test_jarvis_mcp_validation_rejects_unattributed_scheduler_identity() -> None:
     inputs = _acceptance_inputs()
     runtime = cast(dict[str, Any], inputs["runtime_metadata"])
@@ -341,6 +412,11 @@ def _acceptance_inputs() -> dict[str, Any]:
         tool
         for tool in virtual_jarvis_tool_definitions(clusters=["ares"])
         if tool["name"] == "jarvis_get_execution"
+    )
+    local_describe = next(
+        tool
+        for tool in virtual_jarvis_tool_definitions(clusters=["ares"])
+        if tool["name"] == "jarvis_describe"
     )
     artifacts = [
         {
@@ -549,6 +625,82 @@ def _acceptance_inputs() -> dict[str, Any]:
         "query_provenance": {"job": {"job_id": "job-jarvis-query"}},
         "query_initialize_response": None,
         "query_stdio_evidence": None,
+        "package_search_query": "lammps",
+        "package_search_tools_list_response": {
+            "jsonrpc": "2.0",
+            "id": "package-search-list",
+            "result": {"tools": [local_describe]},
+        },
+        "package_search_call_response": {
+            "jsonrpc": "2.0",
+            "id": "package-search-call",
+            "result": {
+                "structuredContent": {
+                    "job_id": "job-jarvis-package-search",
+                    "state": "queued",
+                }
+            },
+        },
+        "package_search_call_job_id": "job-jarvis-package-search",
+        "package_search_call_status": {
+            "job": {
+                "job_id": "job-jarvis-package-search",
+                "cluster": "ares",
+                "kind": "mcp_call",
+                "state": "succeeded",
+                "spec": {
+                    "server": jarvis_mcp_server(),
+                    "server_args": jarvis_mcp_server_args(),
+                    "operation": "tools/call",
+                    "tool": "jarvis_describe",
+                    "arguments": {
+                        "target": "package_search",
+                        "query": "lammps",
+                        "page_size": 5,
+                    },
+                    "expected_server_artifact_digest": server_artifact_digest,
+                },
+            },
+            "terminal": True,
+        },
+        "package_search_artifacts": [
+            {
+                "artifact_id": f"artifact-package-search-{kind}",
+                "kind": kind,
+                "uri": f"file:///spool/package-search-{kind}.json",
+                "sha256": "c" * 64,
+            }
+            for kind in ("stdout", "stderr", "mcp_result", "provenance")
+        ],
+        "package_search_mcp_result": {
+            "returncode": 0,
+            "operation": "tools/call",
+            "tool": "jarvis_describe",
+            "protocol_error": None,
+            "expected_server_artifact_digest": server_artifact_digest,
+            "observed_server_artifact_digest": server_artifact_digest,
+            "server_artifact": server_artifact,
+            "structured_result": {
+                "schema_version": "jarvis.package-search.v1",
+                "target": "package_search",
+                "query": "lammps",
+                "inventory_revision": "d" * 64,
+                "packages": [
+                    {
+                        "name": "builtin.lammps",
+                        "short_name": "lammps",
+                        "repository": "builtin",
+                        "description": "Run LAMMPS workloads.",
+                    }
+                ],
+                "total_matches": 1,
+                "returned_count": 1,
+                "next_cursor": None,
+            },
+        },
+        "package_search_provenance": {"job": {"job_id": "job-jarvis-package-search"}},
+        "package_search_initialize_response": None,
+        "package_search_stdio_evidence": None,
     }
 
 

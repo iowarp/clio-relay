@@ -7521,6 +7521,12 @@ def jarvis_mcp_refresh(
 @_acceptance_report_command
 def jarvis_mcp_validate(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    package_search_query: Annotated[
+        str,
+        typer.Option(
+            help=("Non-blank application query used to prove bounded JARVIS package discovery."),
+        ),
+    ] = "",
     arguments_json: Annotated[
         str,
         typer.Option(help="JSON object arguments for the virtual jarvis_run tool."),
@@ -7566,9 +7572,14 @@ def jarvis_mcp_validate(
     report_path = report or default_report_path(cluster)
     report_written = [False]
 
-    def preflight() -> tuple[dict[str, Any], ClusterDefinition]:
+    def preflight() -> tuple[dict[str, Any], ClusterDefinition, str]:
         if profile not in {"user", "admin", "operator", "all"}:
             raise typer.BadParameter("--profile must be user, admin, operator, or all")
+        normalized_package_search_query = " ".join(package_search_query.split())
+        if not normalized_package_search_query:
+            raise typer.BadParameter("--package-search-query must not be blank")
+        if len(normalized_package_search_query) > 256:
+            raise typer.BadParameter("--package-search-query must not exceed 256 characters")
         arguments_source = _json_text_from_option(arguments_json, arguments_json_file)
         arguments = _json_object(arguments_source)
         if "cluster" in arguments:
@@ -7577,10 +7588,10 @@ def jarvis_mcp_validate(
             )
         if not isinstance(arguments.get("pipeline_id"), str):
             raise typer.BadParameter("jarvis-mcp-validate requires a string pipeline_id argument")
-        return arguments, _require_cluster(cluster)
+        return arguments, _require_cluster(cluster), normalized_package_search_query
 
     try:
-        arguments, definition = preflight()
+        arguments, definition, normalized_package_search_query = preflight()
     except BaseException as exc:
         _write_failed_acceptance_report(
             path=report_path,
@@ -7617,6 +7628,15 @@ def jarvis_mcp_validate(
             result=remote_tools_list_result,
             artifacts=remote_discovery_artifacts,
             artifact_payload=remote_discovery_payload,
+        )
+        package_search = _run_jarvis_package_search_query(
+            cluster=cluster,
+            definition=definition,
+            queue=queue,
+            profile=profile,
+            query=normalized_package_search_query,
+            wait_timeout_seconds=wait_timeout_seconds,
+            poll_seconds=poll_seconds,
         )
         stdio_session = run_packaged_mcp_stdio_session(
             profile=profile,
@@ -7688,6 +7708,16 @@ def jarvis_mcp_validate(
             remote_discovery_artifacts=remote_discovery_artifacts,
             initialize_response=stdio_session.initialize_response,
             stdio_evidence=stdio_session.evidence(),
+            package_search_query=normalized_package_search_query,
+            package_search_tools_list_response=package_search.tools_list_response,
+            package_search_call_response=package_search.call_response,
+            package_search_call_job_id=package_search.call_job_id,
+            package_search_call_status=package_search.call_status,
+            package_search_artifacts=package_search.artifacts,
+            package_search_mcp_result=package_search.mcp_result,
+            package_search_provenance=package_search.provenance,
+            package_search_initialize_response=package_search.initialize_response,
+            package_search_stdio_evidence=package_search.stdio_evidence,
             query_tools_list_response=execution_query.tools_list_response,
             query_call_response=execution_query.call_response,
             query_call_job_id=execution_query.call_job_id,
@@ -10635,6 +10665,84 @@ def _decode_artifact_envelope(envelope: dict[str, object]) -> bytes:
         return base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise RelayError("remote MCP result artifact contains invalid base64") from exc
+
+
+@dataclass(frozen=True)
+class _JarvisPackageSearchAcceptance:
+    """Durable evidence from one bounded JARVIS package-discovery query."""
+
+    tools_list_response: dict[str, Any]
+    call_response: dict[str, Any]
+    call_job_id: str
+    call_status: dict[str, Any]
+    artifacts: list[dict[str, Any]]
+    mcp_result: dict[str, Any] | None
+    provenance: dict[str, Any] | None
+    initialize_response: dict[str, Any]
+    stdio_evidence: dict[str, Any]
+
+
+def _run_jarvis_package_search_query(
+    *,
+    cluster: str,
+    definition: ClusterDefinition,
+    queue: ClioCoreQueue,
+    profile: str,
+    query: str,
+    wait_timeout_seconds: float,
+    poll_seconds: float,
+) -> _JarvisPackageSearchAcceptance:
+    """Exercise bounded package discovery through the local virtual MCP surface."""
+    session = run_packaged_mcp_stdio_session(
+        profile=profile,
+        tool="jarvis_describe",
+        arguments={
+            "cluster": cluster,
+            "target": "package_search",
+            "query": query,
+            "page_size": 5,
+        },
+    )
+    call_job_id = _mcp_response_job_id(session.tools_call_response)
+    if should_execute_on_cluster(definition):
+        call_status = _wait_for_remote_job_terminal(
+            definition,
+            call_job_id,
+            timeout_seconds=wait_timeout_seconds,
+            poll_seconds=poll_seconds,
+        )
+        artifacts = _remote_artifact_records(definition, call_job_id)
+        mcp_result = _read_remote_json_artifact_kind(
+            definition,
+            artifacts,
+            kind="mcp_result",
+        )
+        provenance = _read_remote_json_artifact_kind(
+            definition,
+            artifacts,
+            kind="provenance",
+        )
+    else:
+        call_status = _wait_for_local_job_terminal(
+            queue,
+            call_job_id,
+            timeout_seconds=wait_timeout_seconds,
+            poll_seconds=poll_seconds,
+        )
+        artifacts = _complete_local_artifact_records(queue, call_job_id)
+        mcp_result = _read_local_json_artifact_kind(queue, artifacts, kind="mcp_result")
+        provenance = _read_local_json_artifact_kind(queue, artifacts, kind="provenance")
+    return _JarvisPackageSearchAcceptance(
+        tools_list_response=session.tools_list_response,
+        call_response=session.tools_call_response,
+        call_job_id=call_job_id,
+        call_status=cast(dict[str, Any], call_status),
+        artifacts=artifacts,
+        mcp_result=mcp_result,
+        provenance=provenance,
+        initialize_response=session.initialize_response,
+        stdio_evidence=session.evidence(),
+    )
 
 
 @dataclass(frozen=True)
