@@ -3878,6 +3878,65 @@ def test_owned_relay_job_refuses_scheduler_identity_without_bound_proof() -> Non
     assert refused.residual is True
 
 
+def test_owner_session_teardown_keeps_missing_scheduler_job_without_residual(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Default teardown succeeds when an owned job naturally leaves the active queue."""
+
+    owned = cli._OwnedRelayJob(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        job_id="relay-1",
+        relay_state=JobState.SUCCEEDED,
+        scheduler_job_ids=("21947",),
+        scheduler_provider="slurm",
+        owner_session_generation_id="generation-1",
+    )
+
+    def missing_phase(
+        *_args: object,
+        **_kwargs: object,
+    ) -> tuple[str | None, str | None]:
+        return "missing", None
+
+    monkeypatch.setattr(
+        cli,
+        "_scheduler_phase_after_operation",
+        missing_phase,
+    )
+    resources = cli._owned_job_cleanup_resources(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        [owned],
+        definition=ClusterDefinition(
+            name="ares",
+            ssh_host="ares",
+            scheduler_provider="slurm",
+        ),
+        location="ares",
+        cancel_jobs=False,
+        cancel_scheduler_jobs=False,
+    )
+    report = _verified_teardown_report(
+        resources=[*_verified_teardown_report().resources, *resources]
+    )
+
+    cli._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report,
+        session_id="session-1",
+        session_generation_id="generation-1",
+        stop_worker=False,
+    )
+
+    scheduler = next(resource for resource in resources if resource.kind == "scheduler_job")
+    checks = {
+        check.check_id: check.status.value for check in report.to_live_validation_report().checks
+    }
+    assert scheduler.action == "retain"
+    assert scheduler.outcome == "missing"
+    assert scheduler.observed_state == "missing"
+    assert scheduler.verified_after_operation is True
+    assert scheduler.residual is False
+    assert report.residual_resources == []
+    assert checks["cleanup.jobs-preserved-default"] == "passed"
+
+
 def test_cli_session_rejects_scheduler_cancel_without_relay_cancel(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -5236,6 +5295,64 @@ def test_cli_cluster_install_app_uses_explicit_app_installer(
     assert result.exit_code == 0
     assert calls == [("delta", "site-stack")]
     assert "site_stack=ready" in result.output
+
+
+def test_cli_endpoint_service_requires_persistence_unless_explicitly_opted_out(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The operator-facing install defaults to persistent and names the diagnostic escape."""
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path, name="delta")
+    persistence_requests: list[bool] = []
+
+    def fake_install_endpoint_user_service_over_ssh(
+        *,
+        cluster: str,
+        ssh_host: str,
+        service_text: str,
+        start: bool,
+        enable: bool,
+        require_persistent: bool,
+        timeout_seconds: float = 120.0,
+    ) -> list[str]:
+        del service_text, timeout_seconds
+        assert cluster == "delta"
+        assert ssh_host == "delta"
+        assert start is True
+        assert enable is True
+        persistence_requests.append(require_persistent)
+        return [
+            "endpoint_service.persistence="
+            + ("systemd-user-linger" if require_persistent else "login-scoped")
+        ]
+
+    monkeypatch.setattr(
+        cli,
+        "install_endpoint_user_service_over_ssh",
+        fake_install_endpoint_user_service_over_ssh,
+    )
+
+    persistent = CliRunner().invoke(
+        app,
+        ["cluster", "install-endpoint-service", "--cluster", "delta"],
+    )
+    login_scoped = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "install-endpoint-service",
+            "--cluster",
+            "delta",
+            "--allow-login-scoped",
+        ],
+    )
+
+    assert persistent.exit_code == 0, persistent.output
+    assert login_scoped.exit_code == 0, login_scoped.output
+    assert persistence_requests == [True, False]
+    assert "endpoint_service.persistence=systemd-user-linger" in persistent.output
+    assert "endpoint_service.persistence=login-scoped" in login_scoped.output
 
 
 def test_cli_cluster_install_app_rejects_option_like_ssh_override(

@@ -45,6 +45,7 @@ from clio_relay.jarvis_mcp import (
 )
 from clio_relay.jarvis_service_runtime import resolve_jarvis_service_runtime
 from clio_relay.models import (
+    ArtifactUse,
     Cursor,
     GatewaySession,
     GatewaySessionState,
@@ -102,7 +103,11 @@ from clio_relay.remote_mcp import (
 )
 from clio_relay.retention import TerminalRetentionCoordinator
 from clio_relay.service_runtime import ServiceRuntimeSupervisor
-from clio_relay.session_api import OwnedSessionApiClient, submit_owned_session_job
+from clio_relay.session_api import (
+    OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS,
+    OwnedSessionApiClient,
+    submit_owned_session_job,
+)
 from clio_relay.spool import MAX_LOG_READ_BYTES
 from clio_relay.storage_runtime import (
     StorageAdmissionError,
@@ -129,7 +134,26 @@ USER_MCP_TOOL_NAMES = {
     "relay_queue_stale",
     "relay_storage_status",
     "relay_bind_jarvis_runtime",
+    "relay_artifact_lineage",
 }
+
+
+def _artifact_use_refs_json_schema() -> JSON:
+    """Return the shared content-pinned artifact dependency schema."""
+    return {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "artifact_id": durable_record_id_json_schema(),
+                "sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+            },
+            "required": ["artifact_id", "sha256"],
+            "additionalProperties": False,
+        },
+        "maxItems": 1_000,
+        "default": [],
+    }
 
 
 @dataclass
@@ -374,6 +398,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     "workdir": {"type": "string"},
                     "timeout_seconds": {"type": "integer", "minimum": 1},
                     "idempotency_key": {"type": "string"},
+                    "used_artifact_refs": _artifact_use_refs_json_schema(),
                     "wait_for_terminal": {"type": "boolean", "default": False},
                     "wait_timeout_seconds": {"type": "number", "default": 600},
                     "poll_seconds": {"type": "number", "default": 2},
@@ -491,6 +516,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     "cluster": {"type": "string"},
                     "pipeline_yaml": {"type": "string"},
                     "idempotency_key": {"type": "string"},
+                    "used_artifact_refs": _artifact_use_refs_json_schema(),
                     "wait_for_terminal": {"type": "boolean", "default": False},
                     "timeout_seconds": {"type": "number", "default": 600},
                     "poll_seconds": {"type": "number", "default": 2},
@@ -510,6 +536,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     "cluster": {"type": "string"},
                     "pipeline_name": {"type": "string"},
                     "idempotency_key": {"type": "string"},
+                    "used_artifact_refs": _artifact_use_refs_json_schema(),
                     "wait_for_terminal": {"type": "boolean", "default": False},
                     "timeout_seconds": {"type": "number", "default": 600},
                     "poll_seconds": {"type": "number", "default": 2},
@@ -531,6 +558,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     "workdir": {"type": "string"},
                     "timeout_seconds": {"type": "integer", "minimum": 1},
                     "idempotency_key": {"type": "string"},
+                    "used_artifact_refs": _artifact_use_refs_json_schema(),
                     "wait_for_terminal": {"type": "boolean", "default": False},
                     "wait_timeout_seconds": {"type": "number", "default": 600},
                     "poll_seconds": {"type": "number", "default": 2},
@@ -565,6 +593,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     "arguments": {"type": "object", "default": {}},
                     "timeout_seconds": {"type": "integer", "minimum": 1},
                     "idempotency_key": {"type": "string"},
+                    "used_artifact_refs": _artifact_use_refs_json_schema(),
                     "wait_for_terminal": {"type": "boolean", "default": False},
                     "wait_timeout_seconds": {"type": "number", "default": 600},
                     "poll_seconds": {"type": "number", "default": 2},
@@ -587,6 +616,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     "arguments": {"type": "object", "default": {}},
                     "timeout_seconds": {"type": "integer", "minimum": 1},
                     "idempotency_key": {"type": "string"},
+                    "used_artifact_refs": _artifact_use_refs_json_schema(),
                     "wait_for_terminal": {"type": "boolean", "default": False},
                     "wait_timeout_seconds": {"type": "number", "default": 600},
                     "poll_seconds": {"type": "number", "default": 2},
@@ -759,6 +789,38 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     },
                 },
                 "required": ["job_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "relay_artifact_lineage",
+            "description": (
+                "Query artifact lineage in either direction: pass job_id for the artifacts "
+                "that job used, or artifact_id for the jobs that used that artifact."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": durable_record_id_json_schema(),
+                    "artifact_id": durable_record_id_json_schema(),
+                    "cluster": {"type": "string"},
+                    "route_revision": cluster_route_revision_json_schema(),
+                    "cursor": durable_record_id_json_schema(),
+                    "limit": {
+                        "type": "integer",
+                        "default": DEFAULT_RESPONSE_PAGE_RECORDS,
+                        "minimum": 1,
+                        "maximum": MAX_RESPONSE_PAGE_RECORDS,
+                    },
+                },
+                "oneOf": [
+                    {"required": ["job_id"]},
+                    {"required": ["artifact_id"]},
+                ],
+                "dependentRequired": {
+                    "cluster": ["route_revision"],
+                    "route_revision": ["cluster"],
+                },
                 "additionalProperties": False,
             },
         },
@@ -1452,6 +1514,16 @@ def _call_tool(
             next_cursor=next_cursor,
             total=total,
         )
+    elif name == "relay_artifact_lineage":
+        has_job = arguments.get("job_id") is not None
+        has_artifact = arguments.get("artifact_id") is not None
+        if has_job == has_artifact:
+            raise ValueError("pass exactly one of job_id or artifact_id")
+        result = (
+            _used_artifacts_tool(arguments, queue=queue, settings=settings)
+            if has_job
+            else _used_by_tool(arguments, queue=queue, settings=settings)
+        )
     elif name == "relay_read_artifact":
         result = read_artifact_bytes(
             queue,
@@ -1747,6 +1819,107 @@ def _status_job(
         return result
     _require_local_job_cluster(queue, job_id, target)
     result = job_status(queue, job_id)
+    if target is not None:
+        result["cluster"] = target.name
+        result["route_revision"] = _route_revision(target)
+    return result
+
+
+def _used_artifacts_tool(
+    arguments: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> JSON:
+    """Query a job's immutable artifact dependencies through its bound route."""
+    job_id = _required_durable_record_id(arguments, "job_id")
+    cursor = _optional_durable_record_id(arguments, "cursor")
+    limit = _response_page_limit(arguments)
+    target = _job_target(arguments)
+    if target is not None and should_execute_on_cluster(target):
+        query: dict[str, object] = {"limit": limit}
+        command = ["job", "used-artifacts", job_id, "--limit", str(limit)]
+        if cursor is not None:
+            query["cursor"] = cursor
+            command.extend(["--cursor", cursor])
+        if settings.owner_session_id is not None:
+            with OwnedSessionApiClient(definition=target, settings=settings) as client:
+                result = _owned_json(
+                    client,
+                    method="GET",
+                    path=f"/jobs/{job_id}/used-artifacts",
+                    query=query,
+                    label="owned remote used-artifact query",
+                )
+        else:
+            result = _remote_json(target, command, "remote used-artifact query")
+        result["cluster"] = target.name
+        result["route_revision"] = _route_revision(target)
+        return result
+    _require_local_job_cluster(queue, job_id, target)
+    records, next_cursor, total = queue.list_used_artifacts_page(
+        job_id,
+        cursor=cursor,
+        limit=limit,
+    )
+    result: JSON = {
+        "used_artifacts": [record.model_dump(mode="json") for record in records],
+        "cursor": cursor,
+        "limit": limit,
+        "next_cursor": next_cursor,
+        "total": total,
+    }
+    if target is not None:
+        result["cluster"] = target.name
+        result["route_revision"] = _route_revision(target)
+    return result
+
+
+def _used_by_tool(
+    arguments: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> JSON:
+    """Query downstream consumers of an artifact through its bound route."""
+    artifact_id = _required_durable_record_id(arguments, "artifact_id")
+    cursor = _optional_durable_record_id(arguments, "cursor")
+    limit = _response_page_limit(arguments)
+    target = _job_target(arguments)
+    if target is not None and should_execute_on_cluster(target):
+        query: dict[str, object] = {"limit": limit}
+        command = ["job", "used-by", artifact_id, "--limit", str(limit)]
+        if cursor is not None:
+            query["cursor"] = cursor
+            command.extend(["--cursor", cursor])
+        if settings.owner_session_id is not None:
+            with OwnedSessionApiClient(definition=target, settings=settings) as client:
+                result = _owned_json(
+                    client,
+                    method="GET",
+                    path=f"/artifacts/{artifact_id}/used-by",
+                    query=query,
+                    label="owned remote artifact-consumer query",
+                )
+        else:
+            result = _remote_json(target, command, "remote artifact-consumer query")
+        result["cluster"] = target.name
+        result["route_revision"] = _route_revision(target)
+        return result
+    artifact = queue.get_artifact(artifact_id)
+    _require_local_job_cluster(queue, artifact.job_id, target)
+    records, next_cursor, total = queue.list_artifact_users_page(
+        artifact_id,
+        cursor=cursor,
+        limit=limit,
+    )
+    result = {
+        "used_by": [record.model_dump(mode="json") for record in records],
+        "cursor": cursor,
+        "limit": limit,
+        "next_cursor": next_cursor,
+        "total": total,
+    }
     if target is not None:
         result["cluster"] = target.name
         result["route_revision"] = _route_revision(target)
@@ -2227,9 +2400,19 @@ def _owned_json(
     label: str,
     query: dict[str, object] | None = None,
     body: dict[str, object] | None = None,
+    response_timeout_seconds: float | None = None,
 ) -> JSON:
     """Read one object from an exact-generation, identity-proven session API."""
-    value = client.request_json(method=method, path=path, query=query, body=body)
+    if response_timeout_seconds is None:
+        value = client.request_json(method=method, path=path, query=query, body=body)
+    else:
+        value = client.request_json(
+            method=method,
+            path=path,
+            query=query,
+            body=body,
+            response_timeout_seconds=response_timeout_seconds,
+        )
     if not isinstance(value, dict):
         raise ValueError(f"{label} must return a JSON object")
     return cast(JSON, value)
@@ -2862,6 +3045,10 @@ def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings)
                         "poll_seconds": float(arguments.get("poll_seconds", 2)),
                     },
                     label="owned remote job wait",
+                    response_timeout_seconds=(
+                        float(arguments.get("timeout_seconds", 600))
+                        + OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS
+                    ),
                 )
                 if waited.get("job_id") != job_id or waited.get("cluster") != target.name:
                     raise ValueError("owned remote wait returned a different job")
@@ -3031,8 +3218,15 @@ def _submit_jarvis_pipeline(
 ) -> JSON:
     cluster = _required_str(arguments, "cluster")
     pipeline_yaml = _required_str(arguments, "pipeline_yaml")
+    used_artifact_refs = _artifact_use_refs(arguments)
     digest = hashlib.sha256(pipeline_yaml.encode("utf-8")).hexdigest()
-    idempotency_key = str(arguments.get("idempotency_key") or f"mcp:jarvis:{cluster}:{digest}")
+    dependency_digest = _stable_digest(
+        {"used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs]}
+    )
+    dependency_suffix = f":{dependency_digest}" if used_artifact_refs else ""
+    idempotency_key = str(
+        arguments.get("idempotency_key") or f"mcp:jarvis:{cluster}:{digest}{dependency_suffix}"
+    )
     definition = _optional_cluster_definition(cluster)
     if (
         definition is not None
@@ -3047,6 +3241,7 @@ def _submit_jarvis_pipeline(
                 "cluster": cluster,
                 "pipeline_yaml": pipeline_yaml,
                 "idempotency_key": idempotency_key,
+                "used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs],
             },
         )
         return _owned_session_submission_result(
@@ -3064,6 +3259,7 @@ def _submit_jarvis_pipeline(
             kind=JobKind.JARVIS,
             spec=JarvisRunSpec(pipeline_yaml=pipeline_yaml),
             idempotency_key=idempotency_key,
+            used_artifact_refs=used_artifact_refs,
         ),
         settings=settings,
     )
@@ -3089,11 +3285,17 @@ def _submit_jarvis_job(
     settings: RelaySettings,
 ) -> JSON:
     cluster = _required_str(arguments, "cluster")
+    used_artifact_refs = _artifact_use_refs(arguments)
+    dependency_digest = _stable_digest(
+        {"used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs]}
+    )
+    dependency_suffix = f":{dependency_digest}" if used_artifact_refs else ""
     definition = _optional_cluster_definition(cluster)
     if definition is not None and should_execute_on_cluster(definition):
         pipeline_name = _required_str(arguments, "pipeline_name")
         idempotency_key = str(
-            arguments.get("idempotency_key") or f"mcp:jarvis-job:{cluster}:{pipeline_name}"
+            arguments.get("idempotency_key")
+            or f"mcp:jarvis-job:{cluster}:{pipeline_name}{dependency_suffix}"
         )
         if settings.owner_session_id is not None:
             job = submit_owned_session_job(
@@ -3104,6 +3306,9 @@ def _submit_jarvis_job(
                     "cluster": cluster,
                     "pipeline_name": pipeline_name,
                     "idempotency_key": idempotency_key,
+                    "used_artifact_refs": [
+                        item.model_dump(mode="json") for item in used_artifact_refs
+                    ],
                 },
             )
             return _owned_session_submission_result(
@@ -3124,11 +3329,14 @@ def _submit_jarvis_job(
             "--idempotency-key",
             str(idempotency_key),
         ]
+        for item in used_artifact_refs:
+            remote_args.extend(["--used-artifact", f"{item.artifact_id}={item.sha256}"])
         output = run_remote_clio(definition, remote_args)
         return _remote_submission_result(output, kind=JobKind.JARVIS, definition=definition)
     pipeline_name = _required_str(arguments, "pipeline_name")
     idempotency_key = str(
-        arguments.get("idempotency_key") or f"mcp:jarvis-job:{cluster}:{pipeline_name}"
+        arguments.get("idempotency_key")
+        or f"mcp:jarvis-job:{cluster}:{pipeline_name}{dependency_suffix}"
     )
     job = _submit_local_job(
         queue,
@@ -3137,6 +3345,7 @@ def _submit_jarvis_job(
             kind=JobKind.JARVIS,
             spec=JarvisRunSpec(pipeline_name=pipeline_name),
             idempotency_key=idempotency_key,
+            used_artifact_refs=used_artifact_refs,
         ),
         settings=settings,
     )
@@ -3150,24 +3359,26 @@ def _submit_remote_agent(
     settings: RelaySettings,
 ) -> JSON:
     cluster = _required_str(arguments, "cluster")
+    used_artifact_refs = _artifact_use_refs(arguments)
     prompt_path = _required_str(arguments, "prompt_path")
     mcp_config_path = _optional_str(arguments, "mcp_config_path")
     model = _optional_str(arguments, "model")
     workdir = _optional_str(arguments, "workdir")
     timeout_seconds = _optional_int(arguments, "timeout_seconds")
+    identity: dict[str, object] = {
+        "cluster": cluster,
+        "prompt_path": prompt_path,
+        "mcp_config_path": mcp_config_path,
+        "model": model,
+        "workdir": workdir,
+        "timeout_seconds": timeout_seconds,
+    }
+    if used_artifact_refs:
+        identity["used_artifact_refs"] = [
+            item.model_dump(mode="json") for item in used_artifact_refs
+        ]
     idempotency_key = str(
-        arguments.get("idempotency_key")
-        or "mcp:remote-agent:"
-        + _stable_digest(
-            {
-                "cluster": cluster,
-                "prompt_path": prompt_path,
-                "mcp_config_path": mcp_config_path,
-                "model": model,
-                "workdir": workdir,
-                "timeout_seconds": timeout_seconds,
-            }
-        )
+        arguments.get("idempotency_key") or "mcp:remote-agent:" + _stable_digest(identity)
     )
     definition = _optional_cluster_definition(cluster)
     if (
@@ -3179,6 +3390,7 @@ def _submit_remote_agent(
             "cluster": cluster,
             "prompt_path": prompt_path,
             "idempotency_key": idempotency_key,
+            "used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs],
         }
         for key, value in {
             "mcp_config_path": mcp_config_path,
@@ -3215,6 +3427,7 @@ def _submit_remote_agent(
                 timeout_seconds=timeout_seconds,
             ),
             idempotency_key=idempotency_key,
+            used_artifact_refs=used_artifact_refs,
         ),
         settings=settings,
     )
@@ -3228,6 +3441,7 @@ def _submit_mcp_call(
     settings: RelaySettings,
 ) -> JSON:
     cluster = _required_str(arguments, "cluster")
+    used_artifact_refs = _artifact_use_refs(arguments)
     server = _required_str(arguments, "server")
     server_args = _string_list(arguments.get("server_args", []), "server_args")
     env_from = _string_mapping(arguments.get("env_from", {}), "env_from")
@@ -3241,21 +3455,22 @@ def _submit_mcp_call(
     digest = hashlib.sha256(
         json.dumps(tool_arguments, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+    identity: dict[str, object] = {
+        "cluster": cluster,
+        "server": server,
+        "server_args": server_args,
+        "env_from": env_from,
+        "expected_server_artifact_digest": expected_server_artifact_digest,
+        "tool": tool,
+        "arguments_digest": digest,
+        "timeout_seconds": timeout_seconds,
+    }
+    if used_artifact_refs:
+        identity["used_artifact_refs"] = [
+            item.model_dump(mode="json") for item in used_artifact_refs
+        ]
     idempotency_key = str(
-        arguments.get("idempotency_key")
-        or "mcp:mcp-call:"
-        + _stable_digest(
-            {
-                "cluster": cluster,
-                "server": server,
-                "server_args": server_args,
-                "env_from": env_from,
-                "expected_server_artifact_digest": expected_server_artifact_digest,
-                "tool": tool,
-                "arguments_digest": digest,
-                "timeout_seconds": timeout_seconds,
-            }
-        )
+        arguments.get("idempotency_key") or "mcp:mcp-call:" + _stable_digest(identity)
     )
     registered_route = arguments.get("registered_route") is True
     registered_remote_mcp_route = arguments.get("registered_remote_mcp_route") is True
@@ -3314,6 +3529,7 @@ def _submit_mcp_call(
                 "tool": tool,
                 "arguments": tool_arguments,
                 "idempotency_key": idempotency_key,
+                "used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs],
             }
             if timeout_seconds is not None:
                 payload["timeout_seconds"] = timeout_seconds
@@ -3365,6 +3581,8 @@ def _submit_mcp_call(
             remote_args.extend(
                 ["--expected-server-artifact-digest", expected_server_artifact_digest]
             )
+        for item in used_artifact_refs:
+            remote_args.extend(["--used-artifact", f"{item.artifact_id}={item.sha256}"])
         try:
             write_remote_file(
                 definition,
@@ -3394,6 +3612,7 @@ def _submit_mcp_call(
                 timeout_seconds=timeout_seconds,
             ),
             idempotency_key=idempotency_key,
+            used_artifact_refs=used_artifact_refs,
         ),
         settings=settings,
     )
@@ -3525,6 +3744,9 @@ def _owned_session_submission_result(
                     "poll_seconds": poll_seconds,
                 },
                 label="owned remote submitted job wait",
+                response_timeout_seconds=(
+                    wait_timeout_seconds + OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS
+                ),
             )
             waited = RelayJob.model_validate(document)
             if include_terminal_mcp_result:
@@ -3615,13 +3837,23 @@ def _submit_jarvis_mcp_call(
 ) -> JSON:
     forwarded = dict(arguments)
     cluster = _required_str(arguments, "cluster")
+    used_artifact_refs = _artifact_use_refs(arguments)
     tool = _required_str(arguments, "tool")
     tool_arguments = _object(arguments.get("arguments", {}))
     digest = hashlib.sha256(
         json.dumps(tool_arguments, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+    dependency_suffix = (
+        ":"
+        + _stable_digest(
+            {"used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs]}
+        )
+        if used_artifact_refs
+        else ""
+    )
     idempotency_key = str(
-        forwarded.get("idempotency_key") or f"mcp:{cluster}:jarvis:{tool}:{digest}"
+        forwarded.get("idempotency_key")
+        or f"mcp:{cluster}:jarvis:{tool}:{digest}{dependency_suffix}"
     )
     forwarded["idempotency_key"] = idempotency_key
     registered_route = arguments.get("registered_route") is True
@@ -3676,6 +3908,7 @@ def _submit_jarvis_mcp_call(
                 "arguments": tool_arguments,
                 "expected_server_artifact_digest": expected_server_artifact_digest,
                 "idempotency_key": idempotency_key,
+                "used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs],
             }
             timeout_seconds = _optional_int(arguments, "timeout_seconds")
             if timeout_seconds is not None:
@@ -3720,6 +3953,8 @@ def _submit_jarvis_mcp_call(
             remote_args.extend(
                 ["--expected-server-artifact-digest", expected_server_artifact_digest]
             )
+        for item in used_artifact_refs:
+            remote_args.extend(["--used-artifact", f"{item.artifact_id}={item.sha256}"])
         try:
             write_remote_file(
                 definition,
@@ -4110,6 +4345,24 @@ def _string_mapping(value: Any, name: str) -> dict[str, str]:
     if not all(isinstance(key, str) and isinstance(item, str) for key, item in mapping.items()):
         raise ValueError(f"{name} must be a string object")
     return cast(dict[str, str], mapping)
+
+
+def _artifact_use_refs(arguments: JSON) -> list[ArtifactUse]:
+    """Parse and canonicalize content-pinned artifact dependencies."""
+    raw = arguments.get("used_artifact_refs", [])
+    if not isinstance(raw, list):
+        raise ValueError("used_artifact_refs must be an array")
+    values = cast(list[object], raw)
+    if len(values) > 1_000:
+        raise ValueError("used_artifact_refs must contain at most 1000 records")
+    try:
+        refs = [ArtifactUse.model_validate(value) for value in values]
+    except ValidationError as exc:
+        raise ValueError(f"used_artifact_refs is invalid: {exc}") from exc
+    artifact_ids = [ref.artifact_id for ref in refs]
+    if len(artifact_ids) != len(set(artifact_ids)):
+        raise ValueError("used_artifact_refs must contain unique artifact_id values")
+    return sorted(refs, key=lambda ref: ref.artifact_id)
 
 
 def _log_limit(arguments: JSON) -> int:

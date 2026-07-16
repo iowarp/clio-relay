@@ -56,6 +56,8 @@ Endpoint and job work:
 - `clio-relay job record-task-event`
 - `clio-relay job read-log`
 - `clio-relay job list-artifacts`
+- `clio-relay job used-artifacts`
+- `clio-relay job used-by`
 - `clio-relay job read-artifact`
 - `clio-relay job progress`
 - `clio-relay gateway create`
@@ -99,6 +101,7 @@ The HTTP API exposes:
 - task timeline SSE and WebSocket streams
 - stdout and stderr reads by offset
 - artifact listing and reads
+- content-pinned used-artifact and reverse used-by lineage reads
 - progress reads
 - gateway session create, list, read, update, and close
 - cancellation
@@ -132,6 +135,7 @@ The MCP server exposes relay tools for:
 - record and watch task timeline events
 - read logs
 - list and read artifacts
+- query content-pinned artifact lineage in either direction
 - record and list progress
 - create, read, update, and close gateway sessions
 - create monitor rules
@@ -144,6 +148,13 @@ The MCP server exposes relay tools for:
   reports without accepting caller-supplied runtime or scheduler fields
 
 MCP tools operate on the same durable records as CLI and HTTP calls.
+
+`relay_artifact_lineage` is the single user-profile lineage query. Pass `job_id`
+to list that job's immutable input edges or `artifact_id` to list downstream
+consumer jobs; cluster routes use the normal `cluster` plus `route_revision`
+pair. Submission tools accept `used_artifact_refs` as unique artifact-id/SHA-256
+pairs, and owned-session routes enforce an exact producer/consumer session
+generation match.
 
 `relay_bind_jarvis_runtime` is in the user profile. It takes a configured cluster,
 one completed relay-routed `jarvis_get_execution` source job with

@@ -311,11 +311,11 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
         "e2710b915e1b77d758f25118ed5cdf522687d2a813bdbf1abd3891164b9676d1"
     )
     jarvis_component = worker["metadata_equals"]["component_artifacts"]["jarvis-cd"]
-    assert jarvis_component["distribution_version"] == "1.3.8"
+    assert jarvis_component["distribution_version"] == "1.3.9"
     assert jarvis_component["requested_source"] == "github_release"
-    assert jarvis_component["install_spec"].endswith("/v1.3.8/jarvis_cd-1.3.8-py3-none-any.whl")
+    assert jarvis_component["install_spec"].endswith("/v1.3.9/jarvis_cd-1.3.9-py3-none-any.whl")
     assert jarvis_component["artifact_sha256"] == (
-        "2b15fc74bb586724a8c714cabc02102fe2695afe08edc4521b7ec049c85a0c04"
+        "6d7891e133a7c39c33a52da57d59a1950de3e5d8c271cc3274f37f7e809485fe"
     )
     runtime = worker["metadata_equals"]["component_runtime"]["jarvis-cd"]
     assert runtime["provider_interpreter_verified"] is True
@@ -363,10 +363,10 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
         for resource in cast(list[dict[str, Any]], lammps["required_resources"])
         if resource["kind"] == "relay_worker"
     )
-    assert lammps_worker["metadata_equals"]["components"] == {"jarvis-cd": "1.3.8"}
+    assert lammps_worker["metadata_equals"]["components"] == {"jarvis-cd": "1.3.9"}
     assert (
         lammps_worker["metadata_equals"]["component_artifacts"]["jarvis-cd"]["artifact_sha256"]
-        == "2b15fc74bb586724a8c714cabc02102fe2695afe08edc4521b7ec049c85a0c04"
+        == "6d7891e133a7c39c33a52da57d59a1950de3e5d8c271cc3274f37f7e809485fe"
     )
     assert lammps.get("evidence_group_resource_kind") is None
 

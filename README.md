@@ -8,7 +8,7 @@
 
 It is a piece of the federation layer for [`clio-agent`](https://github.com/iowarp/clio-agent): a local CLIO experience can delegate work to a remote machine, keep observing it, detach, reconnect, and clean up after itself. The project is also designed for use outside CLIO. Any client that can call the CLI, HTTP API, or MCP tools can use the same relay model.
 
-> Version `1.3.6` uses a release-first patch process. A maintainer builds the
+> Version `1.3.7` uses a release-first patch process. A maintainer builds the
 > wheel and source distribution once, attaches those exact bytes and their
 > checksums to a GitHub Release, and publishes the release immediately. Tag
 > regression jobs and the trusted PyPI upload then run asynchronously; they do
@@ -59,6 +59,14 @@ clio-relay cluster bootstrap --cluster my-cluster
 clio-relay cluster install-endpoint-service --cluster my-cluster --concurrency 4 --kind-concurrency remote_agent=2 --kind-concurrency mcp_call=1 --start --enable
 ```
 
+The enabled worker is an always-on cluster service, not a desktop-session
+process. Its installer therefore requires `loginctl` to report `Linger=yes`
+before it writes or starts the unit. Enable lingering once on the cluster when
+site policy permits (`loginctl enable-linger "$USER"`), or ask the site
+administrator to enable it. `--allow-login-scoped` is an explicit diagnostic
+opt-out for sites that forbid lingering; that service may stop after the final
+login exits and cannot satisfy release validation.
+
 ## Submit Work
 
 Submit a JARVIS pipeline:
@@ -69,6 +77,13 @@ clio-relay job watch <job-id> --cluster my-cluster
 clio-relay job read-log <job-id> --cluster my-cluster --stream stdout
 clio-relay job list-artifacts <job-id> --cluster my-cluster
 ```
+
+Pin consumed artifacts at submission with repeatable
+`--used-artifact <artifact-id>=<sha256>` arguments. The job then exposes its
+immutable inputs with `job used-artifacts`, while `job used-by` follows the
+reverse edge from an artifact to downstream jobs. The same bidirectional
+lineage is available through HTTP and the single agent-facing
+`relay_artifact_lineage` MCP tool.
 
 Expose relay tools to an agent:
 

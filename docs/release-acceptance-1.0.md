@@ -55,7 +55,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.3.6"
+$Version = "1.3.7"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }
@@ -555,7 +555,10 @@ expose a `spack_load` agent tool.
 Report 1 is the Ares bootstrap report. Homelab bootstrap is deployment
 preparation and its report is diagnostic. Both persistent worker services must
 then be reinstalled and restarted with at least three slots and a JARVIS cap of
-two.
+two. Before this run, `loginctl show-user "$USER" -p Linger --value` must return
+`yes` on each target. When site policy permits, configure that once with
+`loginctl enable-linger "$USER"`; otherwise ask the site administrator. The
+login-scoped installer opt-out is diagnostic and cannot satisfy this gate.
 
 ```powershell
 $Bootstrap = Invoke-RelayReport -Id "ares-bootstrap" -NoArtifactOption `
@@ -569,7 +572,7 @@ $HomelabBootstrap = Invoke-RelayReport -Id "homelab-bootstrap-preparation" -Diag
 foreach ($Cluster in @($AresCluster, $HomelabCluster)) {
   & $Relay cluster install-endpoint-service --cluster $Cluster --concurrency 3 `
     --kind-concurrency jarvis=2 --kind-concurrency remote_agent=2 `
-    --kind-concurrency mcp_call=1 --start --enable
+    --kind-concurrency mcp_call=1 --start --enable --require-persistent
   if ($LASTEXITCODE -ne 0) { throw "worker service installation failed: $Cluster" }
 }
 

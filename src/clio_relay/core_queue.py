@@ -41,6 +41,7 @@ from clio_relay.identifiers import filesystem_key, validate_durable_record_id
 from clio_relay.models import (
     TERMINAL_STATES,
     ArtifactRef,
+    ArtifactUserOrderHead,
     Cursor,
     EndpointRegistration,
     GatewaySession,
@@ -64,6 +65,7 @@ from clio_relay.models import (
     TaskTimelineEvent,
     TerminalJobGcPlan,
     TerminalJobGcResult,
+    UsedArtifactRef,
     utc_now,
 )
 from clio_relay.pagination import (
@@ -108,6 +110,10 @@ MAX_BOUNDED_SCAN_RECORDS = 10_000
 MAX_GATEWAY_INDEX_RECORDS = 10_000
 MAX_SCHEDULER_METADATA_RECORDS = 1_000
 MAX_TRANSITION_INTENT_RECORDS = 10_000
+MAX_ARTIFACT_USES_PER_JOB = 1_000
+MAX_ARTIFACT_CONSUMERS = 10_000
+ARTIFACT_USER_CURSOR_PREFIX = "edge_"
+ARTIFACT_USER_CURSOR_DIGITS = 20
 ENDPOINT_FRESH_BUCKET_SECONDS = 60
 MAX_ENDPOINT_FRESH_SECONDS = 3_600
 MAX_ENDPOINT_FRESH_CLUSTER_ROOTS = 1_000
@@ -137,6 +143,8 @@ RECORD_FAMILY_MAX_BYTES: dict[str, int] = {
     "active_tasks_by_job": 1_048_576,
     "artifacts": 262_144,
     "artifacts_by_job": 262_144,
+    "artifact_user_order": 262_144,
+    "artifact_users": 262_144,
     "artifact_order_by_job": 262_144,
     "endpoints_fresh": 65_536,
     "endpoints_fresh_by_id": 65_536,
@@ -180,6 +188,7 @@ RECORD_FAMILY_MAX_BYTES: dict[str, int] = {
     "tasks_by_job": 1_048_576,
     "task_order_by_job": 1_048_576,
     "transition_intents": 16_777_216,
+    "used_artifacts_by_job": 262_144,
 }
 
 
@@ -1851,6 +1860,8 @@ class ClioCoreQueue:
             "legacy_output_receipts",
             "legacy_output_retired",
             "artifacts",
+            "artifact_user_order",
+            "artifact_users",
             "progress",
             "task_events",
             "gateway_sessions",
@@ -1870,6 +1881,7 @@ class ClioCoreQueue:
             "tasks_by_job",
             "leases_by_job",
             "artifacts_by_job",
+            "used_artifacts_by_job",
             "progress_by_job",
             "jobs_active",
             "jobs_queued",
@@ -2937,6 +2949,8 @@ class ClioCoreQueue:
         job = job.model_copy(update={"submission_digest": job_digest})
         with self._lock:
             self._recover_pending_transitions_unlocked()
+            if not key_path.exists():
+                self._artifact_use_records_unlocked(job, allocate_sequences=False)
             if key_path.exists():
                 raw_existing = self._read_json_document(key_path)
                 if not isinstance(raw_existing, dict):
@@ -2984,6 +2998,7 @@ class ClioCoreQueue:
                         )
                     self._ensure_global_order_entry_unlocked("jobs", existing_job.job_id)
                     self._initialize_job_index_unlocked(existing_job.job_id)
+                    self._ensure_artifact_use_indexes_unlocked(existing_job)
                     self._write_job_unlocked(existing_job)
                     existing_request = _scheduler_cancellation_request(existing_job)
                     if (
@@ -3023,8 +3038,9 @@ class ClioCoreQueue:
                     },
                 )
             self._ensure_global_order_entry_unlocked("jobs", job.job_id)
-            self._write_job_unlocked(job)
             self._initialize_job_index_unlocked(job.job_id)
+            self._ensure_artifact_use_indexes_unlocked(job)
+            self._write_job_unlocked(job)
             self._write_json(
                 key_path,
                 _committed_idempotency_record(job, job_digest),
@@ -6995,6 +7011,11 @@ class ClioCoreQueue:
                 self._job_record_path("artifacts_by_job", saved.job_id, saved.artifact_id),
                 saved,
             )
+            (self._storage_root / "artifact_users" / saved.artifact_id).mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            self._initialize_artifact_user_order_unlocked(saved.artifact_id)
             self._write_ordered_job_record("artifact", saved.job_id, sequence, saved)
             self._link_gateways_for_artifact_unlocked(saved)
             self._increment_job_index_unlocked(artifact.job_id, "artifact_count")
@@ -7071,6 +7092,381 @@ class ClioCoreQueue:
         if artifact.artifact_id != artifact_id:
             raise QueueConflictError(f"canonical artifact identity mismatch: {path}")
         return artifact
+
+    def list_used_artifacts_page(
+        self,
+        job_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> tuple[list[UsedArtifactRef], str | None, int]:
+        """Return one bounded stable page of artifacts consumed by a job."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
+        if cursor is not None:
+            cursor = self._require_durable_record_id(cursor, field="cursor")
+        limit = validate_response_page_limit(limit)
+        self.initialize()
+        job = self.get_job(job_id)
+        records, next_cursor, total = self._read_artifact_use_page(
+            self._storage_root / "used_artifacts_by_job" / job_id,
+            cursor=cursor,
+            limit=limit,
+            capacity=MAX_ARTIFACT_USES_PER_JOB,
+            identity_field="artifact_id",
+            label=f"used artifacts for job {job_id}",
+        )
+        expected = {item.artifact_id: item.sha256 for item in job.used_artifact_refs}
+        if total != len(expected):
+            raise QueueConflictError(f"used-artifact index is incomplete for job: {job_id}")
+        for record in records:
+            expected_sha256 = expected.get(record.artifact_id)
+            if record.consumer_job_id != job_id or expected_sha256 != record.sha256:
+                raise QueueConflictError(f"used-artifact index identity mismatch for job: {job_id}")
+            self._validate_artifact_use_record(record)
+        return records, next_cursor, total
+
+    def list_artifact_users_page(
+        self,
+        artifact_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> tuple[list[UsedArtifactRef], str | None, int]:
+        """Return one bounded stable page of jobs that consumed an artifact."""
+        artifact_id = self._require_durable_record_id(artifact_id, field="artifact_id")
+        cursor_sequence = 0 if cursor is None else _artifact_user_cursor_sequence(cursor)
+        limit = validate_response_page_limit(limit)
+        self.initialize()
+        self.get_artifact(artifact_id)
+        order_root = self._artifact_user_order_root(artifact_id)
+        entry_paths = self._bounded_json_record_paths(
+            order_root / "entries",
+            limit=MAX_ARTIFACT_CONSUMERS,
+            label=f"ordered consumers of artifact {artifact_id}",
+        )
+        reverse_paths = self._bounded_json_record_paths(
+            self._storage_root / "artifact_users" / artifact_id,
+            limit=MAX_ARTIFACT_CONSUMERS,
+            label=f"consumers of artifact {artifact_id}",
+        )
+        mapping_paths = self._bounded_json_record_paths(
+            order_root / "by_consumer",
+            limit=MAX_ARTIFACT_CONSUMERS,
+            label=f"consumer order mappings for artifact {artifact_id}",
+        )
+        if len(entry_paths) != len(reverse_paths) or len(mapping_paths) < len(entry_paths):
+            raise QueueConflictError(
+                f"artifact-user ordered index is incomplete for artifact: {artifact_id}"
+            )
+        latest_sequence = self._read_artifact_user_order_head(artifact_id)
+        ordered_paths: list[tuple[int, Path]] = []
+        for path in entry_paths:
+            sequence = _artifact_user_entry_sequence(path)
+            if sequence > latest_sequence:
+                raise QueueConflictError(
+                    f"artifact-user order entry exceeds its head: {artifact_id}"
+                )
+            ordered_paths.append((sequence, path))
+        ordered_paths.sort(key=lambda item: item[0])
+        remaining = [item for item in ordered_paths if item[0] > cursor_sequence]
+        window = remaining[: limit + 1]
+        has_more = len(window) > limit
+        records: list[UsedArtifactRef] = []
+        for sequence, path in window[:limit]:
+            record = self._read_json_file(path, UsedArtifactRef)
+            if record.artifact_id != artifact_id or record.sequence != sequence:
+                raise QueueConflictError(
+                    f"artifact-user order identity mismatch for artifact: {artifact_id}"
+                )
+            reverse = self._read_optional(
+                self._storage_root
+                / "artifact_users"
+                / artifact_id
+                / f"{record.consumer_job_id}.json",
+                UsedArtifactRef,
+            )
+            mapping = self._read_optional(
+                order_root / "by_consumer" / f"{record.consumer_job_id}.json",
+                UsedArtifactRef,
+            )
+            if reverse != record or mapping != record:
+                raise QueueConflictError(
+                    f"artifact-user ordered index disagrees for artifact: {artifact_id}"
+                )
+            records.append(record)
+        for record in records:
+            self._validate_artifact_use_record(record)
+        next_cursor = _artifact_user_cursor(records[-1].sequence) if has_more and records else None
+        return records, next_cursor, len(ordered_paths)
+
+    def _read_artifact_use_page(
+        self,
+        directory: Path,
+        *,
+        cursor: str | None,
+        limit: int,
+        capacity: int,
+        identity_field: Literal["artifact_id", "consumer_job_id"],
+        label: str,
+    ) -> tuple[list[UsedArtifactRef], str | None, int]:
+        paths = self._bounded_json_record_paths(
+            directory,
+            limit=capacity,
+            label=label,
+        )
+        paths.sort(key=lambda path: path.name)
+        total = len(paths)
+        if cursor is not None:
+            paths = [path for path in paths if path.stem > cursor]
+        window = paths[: limit + 1]
+        has_more = len(window) > limit
+        records: list[UsedArtifactRef] = []
+        for path in window[:limit]:
+            record = self._read_json_file(path, UsedArtifactRef)
+            identity = getattr(record, identity_field)
+            if identity != path.stem:
+                raise QueueConflictError(f"{label} filename/content identity mismatch: {path}")
+            records.append(record)
+        next_cursor = getattr(records[-1], identity_field) if has_more and records else None
+        return records, next_cursor, total
+
+    def _ensure_artifact_use_indexes_unlocked(self, job: RelayJob) -> None:
+        """Validate and idempotently persist all immutable consumed-artifact edges."""
+        records = self._artifact_use_records_unlocked(job, allocate_sequences=True)
+        forward_directory = self._storage_root / "used_artifacts_by_job" / job.job_id
+        for record in records:
+            order_root = self._artifact_user_order_root(record.artifact_id)
+            self._write_immutable_artifact_use_record(
+                order_root / "by_consumer" / f"{record.consumer_job_id}.json",
+                record,
+            )
+            self._write_immutable_artifact_use_record(
+                forward_directory / f"{record.artifact_id}.json",
+                record,
+            )
+            reverse_directory = self._storage_root / "artifact_users" / record.artifact_id
+            reverse_directory.mkdir(parents=True, exist_ok=True)
+            self._write_immutable_artifact_use_record(
+                reverse_directory / f"{record.consumer_job_id}.json",
+                record,
+            )
+            self._write_immutable_artifact_use_record(
+                order_root / "entries" / f"{record.sequence:020d}.json",
+                record,
+            )
+
+    def _artifact_use_records_unlocked(
+        self,
+        job: RelayJob,
+        *,
+        allocate_sequences: bool,
+    ) -> list[UsedArtifactRef]:
+        """Resolve dependencies, optionally reserving their durable edge sequences."""
+        expected_ids = {item.artifact_id for item in job.used_artifact_refs}
+        forward_directory = self._storage_root / "used_artifacts_by_job" / job.job_id
+        existing_paths = self._bounded_json_record_paths(
+            forward_directory,
+            limit=MAX_ARTIFACT_USES_PER_JOB,
+            label=f"used artifacts for job {job.job_id}",
+        )
+        unexpected = {path.stem for path in existing_paths}.difference(expected_ids)
+        if unexpected:
+            raise QueueConflictError(
+                f"used-artifact edge set changed for job {job.job_id}: {sorted(unexpected)[0]}"
+            )
+        records: list[UsedArtifactRef] = []
+        for use in job.used_artifact_refs:
+            artifact = self._read_optional(
+                self._storage_root / "artifacts" / f"{use.artifact_id}.json",
+                ArtifactRef,
+            )
+            if artifact is None:
+                raise QueueConflictError(f"used artifact not found: {use.artifact_id}")
+            if artifact.artifact_id != use.artifact_id:
+                raise QueueConflictError(f"canonical artifact identity mismatch: {use.artifact_id}")
+            canonical_sha256 = artifact.sha256
+            if not _is_sha256_digest(canonical_sha256):
+                raise QueueConflictError(
+                    f"used artifact is not content-addressed: {use.artifact_id}"
+                )
+            canonical_sha256 = cast(str, canonical_sha256)
+            if canonical_sha256 != use.sha256:
+                raise QueueConflictError(f"used artifact digest mismatch: {use.artifact_id}")
+            producer = self._read_optional(
+                self._storage_root / "jobs" / f"{artifact.job_id}.json",
+                RelayJob,
+            )
+            if producer is None or producer.job_id != artifact.job_id:
+                raise QueueConflictError(
+                    f"used artifact producer is not retained: {use.artifact_id}"
+                )
+            _require_artifact_lineage_owner_match(consumer=job, producer=producer)
+            existing_forward = self._read_optional(
+                forward_directory / f"{artifact.artifact_id}.json",
+                UsedArtifactRef,
+            )
+            reverse_directory = self._storage_root / "artifact_users" / artifact.artifact_id
+            reverse_path = reverse_directory / f"{job.job_id}.json"
+            existing_reverse = self._read_optional(reverse_path, UsedArtifactRef)
+            order_root = self._artifact_user_order_root(artifact.artifact_id)
+            order_head = self._read_artifact_user_order_head(artifact.artifact_id)
+            mapping_path = order_root / "by_consumer" / f"{job.job_id}.json"
+            existing_mapping = self._read_optional(mapping_path, UsedArtifactRef)
+            reverse_paths = self._bounded_json_record_paths(
+                reverse_directory,
+                limit=MAX_ARTIFACT_CONSUMERS,
+                label=f"consumers of artifact {artifact.artifact_id}",
+            )
+            mapping_paths = self._bounded_json_record_paths(
+                order_root / "by_consumer",
+                limit=MAX_ARTIFACT_CONSUMERS,
+                label=f"consumer order mappings for artifact {artifact.artifact_id}",
+            )
+            existing_records = [
+                record
+                for record in (existing_forward, existing_reverse, existing_mapping)
+                if record is not None
+            ]
+            if not existing_records and max(len(reverse_paths), len(mapping_paths)) >= (
+                MAX_ARTIFACT_CONSUMERS
+            ):
+                raise QueueConflictError(
+                    f"artifact consumer capacity is exhausted: {artifact.artifact_id}"
+                )
+            if existing_records:
+                record = existing_records[0]
+                if any(existing != record for existing in existing_records[1:]) or (
+                    record.artifact_id != artifact.artifact_id
+                    or record.consumer_job_id != job.job_id
+                    or record.producer_job_id != artifact.job_id
+                    or record.sha256 != canonical_sha256
+                ):
+                    raise QueueConflictError(
+                        f"immutable used-artifact edge identity changed: {artifact.artifact_id}"
+                    )
+                if order_head < record.sequence:
+                    raise QueueConflictError(
+                        f"artifact-user order head is behind its edge: {artifact.artifact_id}"
+                    )
+                entry = self._read_optional(
+                    order_root / "entries" / f"{record.sequence:020d}.json",
+                    UsedArtifactRef,
+                )
+                if entry is not None and entry != record:
+                    raise QueueConflictError(
+                        f"artifact-user order entry changed: {artifact.artifact_id}"
+                    )
+                records.append(record)
+                continue
+            if not allocate_sequences:
+                continue
+            record = self._reserve_artifact_user_order_unlocked(
+                artifact_id=artifact.artifact_id,
+                consumer_job_id=job.job_id,
+                producer_job_id=artifact.job_id,
+                sha256=canonical_sha256,
+                created_at=job.created_at,
+            )
+            records.append(record)
+        return records
+
+    def _artifact_user_order_root(self, artifact_id: str) -> Path:
+        return self._storage_root / "artifact_user_order" / artifact_id
+
+    def _initialize_artifact_user_order_unlocked(self, artifact_id: str) -> None:
+        root = self._artifact_user_order_root(artifact_id)
+        root_existed = root.exists()
+        head_path = root / "head.json"
+        if not root_existed:
+            self._write(
+                head_path,
+                ArtifactUserOrderHead(
+                    artifact_id=artifact_id,
+                    latest_sequence=0,
+                ),
+            )
+        elif not head_path.exists():
+            raise QueueConflictError(
+                f"artifact-user order head is missing from initialized index: {artifact_id}"
+            )
+        (root / "entries").mkdir(parents=True, exist_ok=True)
+        (root / "by_consumer").mkdir(parents=True, exist_ok=True)
+
+    def _read_artifact_user_order_head(self, artifact_id: str) -> int:
+        path = self._artifact_user_order_root(artifact_id) / "head.json"
+        head = self._read_optional(path, ArtifactUserOrderHead)
+        if head is None:
+            if path.parent.exists():
+                raise QueueConflictError(f"artifact-user order head is missing: {path}")
+            return 0
+        if head.artifact_id != artifact_id:
+            raise QueueConflictError(f"artifact-user order head identity mismatch: {path}")
+        return head.latest_sequence
+
+    def _reserve_artifact_user_order_unlocked(
+        self,
+        *,
+        artifact_id: str,
+        consumer_job_id: str,
+        producer_job_id: str,
+        sha256: str,
+        created_at: datetime,
+    ) -> UsedArtifactRef:
+        """Reserve one monotonic edge identity, leaving safe gaps after crashes."""
+        root = self._artifact_user_order_root(artifact_id)
+        self._initialize_artifact_user_order_unlocked(artifact_id)
+        mapping_path = root / "by_consumer" / f"{consumer_job_id}.json"
+        existing = self._read_optional(mapping_path, UsedArtifactRef)
+        if existing is not None:
+            return existing
+        latest_sequence = self._read_artifact_user_order_head(artifact_id)
+        if latest_sequence >= 2**63 - 1:
+            raise QueueConflictError(f"artifact-user sequence exhausted: {artifact_id}")
+        sequence = latest_sequence + 1
+        record = UsedArtifactRef(
+            artifact_id=artifact_id,
+            consumer_job_id=consumer_job_id,
+            producer_job_id=producer_job_id,
+            sequence=sequence,
+            sha256=sha256,
+            created_at=created_at,
+        )
+        self._write(
+            root / "head.json",
+            ArtifactUserOrderHead(
+                artifact_id=artifact_id,
+                latest_sequence=sequence,
+            ),
+        )
+        self._write_immutable_artifact_use_record(mapping_path, record)
+        return record
+
+    def _write_immutable_artifact_use_record(
+        self,
+        path: Path,
+        record: UsedArtifactRef,
+    ) -> None:
+        existing = self._read_optional(path, UsedArtifactRef)
+        if existing is not None:
+            if existing != record:
+                raise QueueConflictError(f"immutable used-artifact edge changed: {path}")
+            return
+        self._write(path, record)
+
+    def _validate_artifact_use_record(self, record: UsedArtifactRef) -> None:
+        artifact = self.get_artifact(record.artifact_id)
+        if artifact.job_id != record.producer_job_id or artifact.sha256 != record.sha256:
+            raise QueueConflictError(
+                f"used-artifact edge no longer matches canonical artifact: {record.artifact_id}"
+            )
+        consumer = self.get_job(record.consumer_job_id)
+        producer = self.get_job(record.producer_job_id)
+        _require_artifact_lineage_owner_match(consumer=consumer, producer=producer)
+        pinned = {item.artifact_id: item.sha256 for item in consumer.used_artifact_refs}
+        if pinned.get(record.artifact_id) != record.sha256:
+            raise QueueConflictError(
+                f"used-artifact edge no longer matches consumer job: {record.consumer_job_id}"
+            )
 
     def append_progress(self, progress: ProgressRecord) -> ProgressRecord:
         """Record a structured job progress observation."""
@@ -10088,7 +10484,50 @@ class ClioCoreQueue:
                 protections.append(ambiguous_protection)
             elif present:
                 protections.append(present_protection)
+        protections.extend(self._artifact_lineage_gc_protections(job))
         return list(dict.fromkeys(protections))
+
+    def _artifact_lineage_gc_protections(self, job: RelayJob) -> list[str]:
+        """Protect producer artifacts while any retained consumer still uses them."""
+        try:
+            artifacts = self.list_artifacts(job.job_id)
+            for artifact in artifacts:
+                reverse_paths = self._bounded_json_record_paths(
+                    self._storage_root / "artifact_users" / artifact.artifact_id,
+                    limit=MAX_ARTIFACT_CONSUMERS,
+                    label=f"consumers of artifact {artifact.artifact_id}",
+                )
+                order_root = self._artifact_user_order_root(artifact.artifact_id)
+                self._read_artifact_user_order_head(artifact.artifact_id)
+                entry_paths = self._bounded_json_record_paths(
+                    order_root / "entries",
+                    limit=MAX_ARTIFACT_CONSUMERS,
+                    label=f"ordered consumers of artifact {artifact.artifact_id}",
+                )
+                mapping_paths = self._bounded_json_record_paths(
+                    order_root / "by_consumer",
+                    limit=MAX_ARTIFACT_CONSUMERS,
+                    label=f"consumer order mappings for artifact {artifact.artifact_id}",
+                )
+                if (
+                    len(reverse_paths) != len(entry_paths)
+                    or len(mapping_paths) < len(entry_paths)
+                    or (mapping_paths and not reverse_paths)
+                ):
+                    return ["artifact_lineage_state_ambiguous"]
+                for path in reverse_paths:
+                    record = self._read_json_file(path, UsedArtifactRef)
+                    if (
+                        record.artifact_id != artifact.artifact_id
+                        or record.producer_job_id != job.job_id
+                        or record.consumer_job_id != path.stem
+                    ):
+                        return ["artifact_lineage_state_ambiguous"]
+                    self._validate_artifact_use_record(record)
+                    return ["artifact_used_by_retained_job"]
+        except (OSError, ValueError, NotFoundError, QueueConflictError):
+            return ["artifact_lineage_state_ambiguous"]
+        return []
 
     def _indexed_gc_entry_state(self, family: str, job_id: str) -> tuple[bool, bool]:
         directory = self._storage_root / family / self._durable_key(job_id)
@@ -10263,6 +10702,7 @@ class ClioCoreQueue:
             "tasks_by_job",
             "leases_by_job",
             "artifacts_by_job",
+            "used_artifacts_by_job",
             "progress_by_job",
             "task_order_by_job",
             "artifact_order_by_job",
@@ -10341,6 +10781,47 @@ class ClioCoreQueue:
                 actions += 1
             if actions >= limit:
                 return actions, False, tombstone
+        used_source_dir = trash / "owned" / "used_artifacts_by_job"
+        while actions < limit:
+            paths, _has_more = _migration_batch_paths(
+                used_source_dir,
+                cursor=None,
+                limit=1,
+            )
+            if not paths:
+                break
+            path = paths[0]
+            record = self._read_json_file(path, UsedArtifactRef)
+            if record.consumer_job_id != tombstone.job_id or record.artifact_id != path.stem:
+                raise QueueConflictError(f"used-artifact reference is invalid: {path}")
+            reverse_path = (
+                self._storage_root
+                / "artifact_users"
+                / record.artifact_id
+                / f"{record.consumer_job_id}.json"
+            )
+            order_root = self._artifact_user_order_root(record.artifact_id)
+            mapping_path = order_root / "by_consumer" / f"{record.consumer_job_id}.json"
+            entry_path = order_root / "entries" / f"{record.sequence:020d}.json"
+            reverse = self._read_optional(reverse_path, UsedArtifactRef)
+            if reverse is not None and reverse != record:
+                raise QueueConflictError(f"used-artifact reverse reference changed: {reverse_path}")
+            mapping = self._read_optional(mapping_path, UsedArtifactRef)
+            if mapping is not None and mapping != record:
+                raise QueueConflictError(f"used-artifact order mapping changed: {mapping_path}")
+            entry = self._read_optional(entry_path, UsedArtifactRef)
+            if entry is not None and entry != record:
+                raise QueueConflictError(f"used-artifact order entry changed: {entry_path}")
+            _unlink_durable_path(reverse_path, missing_ok=True)
+            _unlink_durable_path(entry_path, missing_ok=True)
+            _unlink_durable_path(mapping_path, missing_ok=True)
+            _move_gc_path(
+                path,
+                trash / "processed" / "used_artifacts_by_job" / path.name,
+            )
+            actions += 1
+        if actions >= limit:
+            return actions, False, tombstone
         scheduler_source_dir = trash / "owned" / "scheduler_refs_by_job"
         while actions < limit:
             paths, _has_more = _migration_batch_paths(
@@ -10376,8 +10857,13 @@ class ClioCoreQueue:
             next((trash / "owned" / family).glob("*.json"), None) is None
             for family, _model in references
         )
+        used_references_empty = next(used_source_dir.glob("*.json"), None) is None
         scheduler_references_empty = next(scheduler_source_dir.glob("*.json"), None) is None
-        return actions, references_empty and scheduler_references_empty, tombstone
+        return (
+            actions,
+            references_empty and used_references_empty and scheduler_references_empty,
+            tombstone,
+        )
 
     def _trash_primary_record_unlocked(self, record: BaseModel, *, trash: Path) -> None:
         if isinstance(record, RelayTask):
@@ -10401,9 +10887,40 @@ class ClioCoreQueue:
             )
             return
         if isinstance(record, ArtifactRef):
+            reverse_directory = self._storage_root / "artifact_users" / record.artifact_id
+            order_root = self._artifact_user_order_root(record.artifact_id)
+            self._read_artifact_user_order_head(record.artifact_id)
+            if self._bounded_json_record_paths(
+                reverse_directory,
+                limit=MAX_ARTIFACT_CONSUMERS,
+                label=f"consumers of artifact {record.artifact_id}",
+            ):
+                raise QueueConflictError(
+                    f"artifact still has retained consumers: {record.artifact_id}"
+                )
+            if self._bounded_json_record_paths(
+                order_root / "entries",
+                limit=MAX_ARTIFACT_CONSUMERS,
+                label=f"ordered consumers of artifact {record.artifact_id}",
+            ) or self._bounded_json_record_paths(
+                order_root / "by_consumer",
+                limit=MAX_ARTIFACT_CONSUMERS,
+                label=f"consumer order mappings for artifact {record.artifact_id}",
+            ):
+                raise QueueConflictError(
+                    f"artifact still has ordered consumer state: {record.artifact_id}"
+                )
             _move_gc_path(
                 self._storage_root / "artifacts" / f"{record.artifact_id}.json",
                 trash / "primary" / "artifacts" / f"{record.artifact_id}.json",
+            )
+            _move_gc_path(
+                reverse_directory,
+                trash / "primary" / "artifact_users" / record.artifact_id,
+            )
+            _move_gc_path(
+                order_root,
+                trash / "primary" / "artifact_user_order" / record.artifact_id,
             )
             return
         if isinstance(record, ProgressRecord):
@@ -10890,6 +11407,7 @@ class ClioCoreQueue:
     def _migrate_record_unlocked(self, family: str, record: BaseModel) -> None:
         if family == "jobs" and isinstance(record, RelayJob):
             self._initialize_job_index_unlocked(record.job_id)
+            self._ensure_artifact_use_indexes_unlocked(record)
             self._write_job_unlocked(record)
             return
         if family == "tasks" and isinstance(record, RelayTask):
@@ -10909,6 +11427,11 @@ class ClioCoreQueue:
                 self._job_record_path("artifacts_by_job", record.job_id, record.artifact_id),
                 record,
             )
+            (self._storage_root / "artifact_users" / record.artifact_id).mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            self._initialize_artifact_user_order_unlocked(record.artifact_id)
             return
         if family == "progress" and isinstance(record, ProgressRecord):
             self._write(
@@ -11091,6 +11614,7 @@ class ClioCoreQueue:
             "tasks_by_job",
             "leases_by_job",
             "artifacts_by_job",
+            "used_artifacts_by_job",
             "progress_by_job",
             "task_order_by_job",
             "artifact_order_by_job",
@@ -11246,6 +11770,11 @@ class ClioCoreQueue:
                 self._job_record_path("artifacts_by_job", saved.job_id, saved.artifact_id),
                 saved,
             )
+            (self._storage_root / "artifact_users" / saved.artifact_id).mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            self._initialize_artifact_user_order_unlocked(saved.artifact_id)
             self._write_ordered_job_record("artifact", saved.job_id, sequence, saved)
             return
         if family == "progress" and isinstance(record, ProgressRecord):
@@ -11909,6 +12438,28 @@ def _owner_session_identity(
             "owner_session_generation_id must be a portable durable identifier"
         ) from error
     return owner_session_id, generation_id
+
+
+def _require_artifact_lineage_owner_match(
+    *,
+    consumer: RelayJob,
+    producer: RelayJob,
+) -> None:
+    """Forbid lineage edges across exact owner-session generation boundaries."""
+    consumer_identity = _owner_session_identity(consumer.metadata, allow_legacy=True)
+    producer_identity = _owner_session_identity(producer.metadata, allow_legacy=True)
+    if consumer_identity is None and producer_identity is None:
+        return
+    if (
+        consumer_identity is None
+        or producer_identity is None
+        or consumer_identity[1] is None
+        or producer_identity[1] is None
+        or consumer_identity != producer_identity
+    ):
+        raise QueueConflictError(
+            "used artifact owner session generation does not match the consuming job"
+        )
 
 
 def _safe_owner_legacy_job_id(job_id: object) -> bool:
@@ -13073,6 +13624,11 @@ def _job_idempotency_digest(job: RelayJob) -> str:
         "submission_digest",
     }:
         payload.pop(generated_field, None)
+    # Preserve the pre-lineage digest for submissions without dependencies so
+    # existing idempotency records remain replayable after this additive schema
+    # upgrade. Non-empty dependency pins remain part of the canonical identity.
+    if not payload.get("used_artifact_refs"):
+        payload.pop("used_artifact_refs", None)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -13083,6 +13639,40 @@ def _is_sha256_digest(value: object) -> bool:
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _artifact_user_cursor(sequence: int) -> str:
+    if sequence < 1 or sequence >= 2**63:
+        raise QueueConflictError("artifact-user cursor sequence is outside its durable range")
+    return f"{ARTIFACT_USER_CURSOR_PREFIX}{sequence:0{ARTIFACT_USER_CURSOR_DIGITS}d}"
+
+
+def _artifact_user_cursor_sequence(cursor: str) -> int:
+    try:
+        validate_durable_record_id(cursor)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"invalid cursor: {error}") from error
+    digits = cursor.removeprefix(ARTIFACT_USER_CURSOR_PREFIX)
+    if (
+        not cursor.startswith(ARTIFACT_USER_CURSOR_PREFIX)
+        or len(digits) != ARTIFACT_USER_CURSOR_DIGITS
+        or not digits.isdecimal()
+    ):
+        raise ValueError("invalid cursor: expected an artifact-user edge cursor")
+    sequence = int(digits)
+    if sequence < 1 or sequence >= 2**63:
+        raise ValueError("invalid cursor: artifact-user edge sequence is outside its range")
+    return sequence
+
+
+def _artifact_user_entry_sequence(path: Path) -> int:
+    stem = path.stem
+    if len(stem) != ARTIFACT_USER_CURSOR_DIGITS or not stem.isdecimal():
+        raise QueueConflictError(f"artifact-user order entry filename is invalid: {path}")
+    sequence = int(stem)
+    if sequence < 1 or sequence >= 2**63 or stem != f"{sequence:020d}":
+        raise QueueConflictError(f"artifact-user order entry sequence is invalid: {path}")
+    return sequence
 
 
 def _index_integer(index: dict[str, object], field: str) -> int:

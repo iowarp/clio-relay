@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import http.client
 import json
+import math
 import secrets
 import socket
 import subprocess
@@ -22,6 +23,7 @@ from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.models import (
+    ArtifactUse,
     JarvisRunSpec,
     JobKind,
     McpCallSpec,
@@ -37,6 +39,9 @@ OWNER_SESSION_ID_HEADER: Final = "X-Clio-Relay-Owner-Session-Id"
 SESSION_GENERATION_ID_HEADER: Final = "X-Clio-Relay-Session-Generation-Id"
 SESSION_IDENTITY_SCHEMA: Final = "clio-relay.session-identity.v1"
 MAX_SESSION_API_RESPONSE_BYTES: Final = 8 * 1024 * 1024
+# Leave part of clio-agent's ordinary 30-second transport budget available for
+# propagating the completed MCP result after this inner long-poll returns.
+OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS: Final = 10.0
 
 _JOB_SUBMISSION_PATHS = frozenset(
     {
@@ -134,9 +139,20 @@ class OwnedSessionApiClient:
         path: str,
         query: dict[str, object] | None = None,
         body: dict[str, object] | None = None,
+        response_timeout_seconds: float | None = None,
     ) -> object:
-        """Issue one authenticated JSON request on the already proven TCP stream."""
+        """Issue one authenticated JSON request on the already proven TCP stream.
+
+        ``response_timeout_seconds`` changes only the response deadline for this
+        request. It does not relax the bounded SSH-forward or identity-proof
+        deadlines, and the connection's ordinary timeout is restored before a
+        later request reuses the same proven stream.
+        """
         normalized_method = _validate_request(method=method, path=path)
+        if response_timeout_seconds is not None and (
+            not math.isfinite(response_timeout_seconds) or response_timeout_seconds <= 0
+        ):
+            raise ValueError("response_timeout_seconds must be positive and finite")
         connection = self._connection
         session_id = self._session_id
         generation_id = self._generation_id
@@ -152,6 +168,7 @@ class OwnedSessionApiClient:
             api_token=api_token,
             session_id=session_id,
             generation_id=generation_id,
+            response_timeout_seconds=response_timeout_seconds,
         )
 
 
@@ -268,6 +285,18 @@ def _validate_submission_receipt(
     """Reject a validly shaped receipt that does not match the exact submitted request."""
     if job.idempotency_key != payload.get("idempotency_key"):
         raise RelayError("owned session API returned a different idempotency identity")
+    raw_uses = payload.get("used_artifact_refs", [])
+    if not isinstance(raw_uses, list):
+        raise RelayError("owned session submission has invalid artifact dependencies")
+    try:
+        expected_uses = sorted(
+            (ArtifactUse.model_validate(item) for item in cast(list[object], raw_uses)),
+            key=lambda item: item.artifact_id,
+        )
+    except ValidationError as exc:
+        raise RelayError("owned session submission has invalid artifact dependencies") from exc
+    if job.used_artifact_refs != expected_uses:
+        raise RelayError("owned session API did not retain exact artifact dependencies")
     if path == "/jobs/mcp-call":
         if job.kind is not JobKind.MCP_CALL or not isinstance(job.spec, McpCallSpec):
             raise RelayError("owned session API returned the wrong job kind")
@@ -452,11 +481,23 @@ def _request_json_on_connection(
     api_token: str,
     session_id: str,
     generation_id: str,
+    response_timeout_seconds: float | None,
 ) -> object:
     """Issue one request without permitting HTTPConnection to reconnect."""
     encoded_query = "" if query is None else "?" + urllib.parse.urlencode(query)
     encoded_body = None if body is None else json.dumps(body).encode("utf-8")
+    proven_socket = connection.sock
+    prior_connection_timeout = connection.timeout
+    prior_socket_timeout: float | None = None
+    response_timeout_applied = False
     try:
+        if response_timeout_seconds is not None:
+            if proven_socket is None:
+                raise RelayError("owned session API identity-proven connection is not open")
+            prior_socket_timeout = proven_socket.gettimeout()
+            connection.timeout = response_timeout_seconds
+            proven_socket.settimeout(response_timeout_seconds)
+            response_timeout_applied = True
         headers = {
             "Accept": "application/json",
             "Authorization": f"Bearer {api_token}",
@@ -484,6 +525,20 @@ def _request_json_on_connection(
         raise RelayError(
             f"owned session API identity-bound request failed for {method} {path}: {exc}"
         ) from exc
+    finally:
+        if response_timeout_seconds is not None:
+            connection.timeout = prior_connection_timeout
+            if (
+                response_timeout_applied
+                and connection.sock is proven_socket
+                and proven_socket is not None
+            ):
+                try:
+                    proven_socket.settimeout(prior_socket_timeout)
+                except OSError:
+                    # The response may have closed the proven socket. Never let
+                    # HTTPConnection reconnect it under the authenticated client.
+                    connection.close()
 
 
 def _read_json_response(response: http.client.HTTPResponse, *, label: str) -> object:

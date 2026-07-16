@@ -397,7 +397,7 @@ class SessionLifecycleReport(BaseModel):
                 if resource.kind == "gateway_record"
             }
             allowed_retention_outcomes = (
-                {"retained"} if self.mode == "detach" else {"retained", "terminal"}
+                {"retained"} if self.mode == "detach" else {"retained", "terminal", "missing"}
             )
             checks.append(
                 (

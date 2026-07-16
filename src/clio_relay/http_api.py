@@ -38,6 +38,7 @@ from clio_relay.jarvis_mcp import (
 )
 from clio_relay.models import (
     ArtifactRef,
+    ArtifactUse,
     Cursor,
     GatewaySession,
     GatewaySessionState,
@@ -307,6 +308,11 @@ def _owned_queue_page(
     }
 
 
+def _empty_artifact_uses() -> list[ArtifactUse]:
+    """Return a typed empty artifact dependency collection."""
+    return []
+
+
 class JarvisSubmitRequest(BaseModel):
     """HTTP request to submit a JARVIS pipeline YAML document."""
 
@@ -315,6 +321,10 @@ class JarvisSubmitRequest(BaseModel):
     cluster: str
     pipeline_yaml: str
     idempotency_key: str
+    used_artifact_refs: list[ArtifactUse] = Field(
+        default_factory=_empty_artifact_uses,
+        max_length=1_000,
+    )
 
 
 class JarvisPipelineSubmitRequest(BaseModel):
@@ -325,6 +335,10 @@ class JarvisPipelineSubmitRequest(BaseModel):
     cluster: str
     pipeline_name: str
     idempotency_key: str
+    used_artifact_refs: list[ArtifactUse] = Field(
+        default_factory=_empty_artifact_uses,
+        max_length=1_000,
+    )
 
 
 class RemoteAgentSubmitRequest(BaseModel):
@@ -339,6 +353,10 @@ class RemoteAgentSubmitRequest(BaseModel):
     workdir: str | None = None
     timeout_seconds: int | None = Field(default=None, gt=0)
     idempotency_key: str
+    used_artifact_refs: list[ArtifactUse] = Field(
+        default_factory=_empty_artifact_uses,
+        max_length=1_000,
+    )
 
 
 class McpCallSubmitRequest(BaseModel):
@@ -358,6 +376,10 @@ class McpCallSubmitRequest(BaseModel):
     arguments: dict[str, object] = Field(default_factory=dict)
     timeout_seconds: int | None = Field(default=None, gt=0)
     idempotency_key: str
+    used_artifact_refs: list[ArtifactUse] = Field(
+        default_factory=_empty_artifact_uses,
+        max_length=1_000,
+    )
 
     @field_validator("env_from")
     @classmethod
@@ -380,6 +402,10 @@ class JarvisMcpCallSubmitRequest(BaseModel):
     )
     timeout_seconds: int | None = Field(default=None, gt=0)
     idempotency_key: str
+    used_artifact_refs: list[ArtifactUse] = Field(
+        default_factory=_empty_artifact_uses,
+        max_length=1_000,
+    )
 
 
 class QueueCancelRequest(BaseModel):
@@ -653,6 +679,8 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 ),
             )
         if resolved.owner_session_id is not None:
+            for use in job.used_artifact_refs:
+                require_owned_artifact(use.artifact_id)
             metadata.update(
                 {
                     "owner": "clio-relay",
@@ -731,6 +759,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 kind=JobKind.JARVIS,
                 spec=JarvisRunSpec(pipeline_yaml=request.pipeline_yaml),
                 idempotency_key=request.idempotency_key,
+                used_artifact_refs=request.used_artifact_refs,
             )
         )
 
@@ -746,6 +775,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 kind=JobKind.JARVIS,
                 spec=JarvisRunSpec(pipeline_name=request.pipeline_name),
                 idempotency_key=request.idempotency_key,
+                used_artifact_refs=request.used_artifact_refs,
             )
         )
 
@@ -767,6 +797,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                     timeout_seconds=request.timeout_seconds,
                 ),
                 idempotency_key=request.idempotency_key,
+                used_artifact_refs=request.used_artifact_refs,
             )
         )
 
@@ -790,6 +821,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                     timeout_seconds=request.timeout_seconds,
                 ),
                 idempotency_key=request.idempotency_key,
+                used_artifact_refs=request.used_artifact_refs,
             )
         )
 
@@ -837,6 +869,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                     timeout_seconds=request.timeout_seconds,
                 ),
                 idempotency_key=request.idempotency_key,
+                used_artifact_refs=request.used_artifact_refs,
             )
         )
 
@@ -1153,6 +1186,66 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 next_cursor=next_cursor,
                 total=total,
             )
+        )
+
+    @app.get(
+        "/jobs/{job_id}/used-artifacts",
+        dependencies=[auth_dependency],
+    )
+    def get_used_artifacts(
+        job_id: DurableRecordId,
+        cursor: DurableRecordId | None = None,
+        limit: Annotated[int, Query(ge=1, le=MAX_RESPONSE_PAGE_RECORDS)] = (
+            DEFAULT_RESPONSE_PAGE_RECORDS
+        ),
+    ) -> dict[str, object]:
+        """Return one page of immutable artifact dependencies for a job."""
+        require_owned_job(job_id)
+        records, next_cursor, total = queue.list_used_artifacts_page(
+            job_id,
+            cursor=cursor,
+            limit=limit,
+        )
+        for record in records:
+            require_owned_artifact(record.artifact_id)
+        return _public_payload(
+            {
+                "used_artifacts": [record.model_dump(mode="json") for record in records],
+                "cursor": cursor,
+                "limit": limit,
+                "next_cursor": next_cursor,
+                "total": total,
+            }
+        )
+
+    @app.get(
+        "/artifacts/{artifact_id}/used-by",
+        dependencies=[auth_dependency],
+    )
+    def get_artifact_users(
+        artifact_id: DurableRecordId,
+        cursor: DurableRecordId | None = None,
+        limit: Annotated[int, Query(ge=1, le=MAX_RESPONSE_PAGE_RECORDS)] = (
+            DEFAULT_RESPONSE_PAGE_RECORDS
+        ),
+    ) -> dict[str, object]:
+        """Return one page of jobs that consumed a content-pinned artifact."""
+        require_owned_artifact(artifact_id)
+        records, next_cursor, total = queue.list_artifact_users_page(
+            artifact_id,
+            cursor=cursor,
+            limit=limit,
+        )
+        for record in records:
+            require_owned_job(record.consumer_job_id)
+        return _public_payload(
+            {
+                "used_by": [record.model_dump(mode="json") for record in records],
+                "cursor": cursor,
+                "limit": limit,
+                "next_cursor": next_cursor,
+                "total": total,
+            }
         )
 
     @app.get(

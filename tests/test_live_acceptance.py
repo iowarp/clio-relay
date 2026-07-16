@@ -20,6 +20,7 @@ from clio_relay.live_acceptance import (
     _expected_progress_package,  # pyright: ignore[reportPrivateUsage]
     _find_agent_child_job,  # pyright: ignore[reportPrivateUsage]
     _http_json,  # pyright: ignore[reportPrivateUsage]
+    _verify_cluster_deployment,  # pyright: ignore[reportPrivateUsage]
     _verify_live_package_progress,  # pyright: ignore[reportPrivateUsage]
     _verify_runtime_metadata_artifact,  # pyright: ignore[reportPrivateUsage]
     run_live_acceptance,
@@ -129,6 +130,40 @@ def test_live_acceptance_requires_configured_workload() -> None:
                 definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
             )
         )
+
+
+def test_cluster_deployment_verifier_requires_linger_enabled_and_active() -> None:
+    """Release evidence cannot be emitted without all three persistence proofs."""
+    observed: list[str] = []
+
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        observed.append(command[-1])
+        return subprocess.CompletedProcess(
+            command,
+            78,
+            stdout=b"",
+            stderr=b"persistent worker requires systemd user lingering (Linger=yes)",
+        )
+
+    with pytest.raises(RelayError, match="requires systemd user lingering"):
+        _verify_cluster_deployment(
+            ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            runner=fake_runner,
+            expected_artifact_sha256=None,
+            expected_install_source=None,
+        )
+
+    assert len(observed) == 1
+    assert 'loginctl show-user "$relay_user" -p Linger --value' in observed[0]
+    assert "systemctl --user is-enabled clio-relay-worker-test-cluster.service" in observed[0]
+    assert "systemctl --user is-active clio-relay-worker-test-cluster.service" in observed[0]
+    assert observed[0].index("is-enabled") < observed[0].index("is-active")
+    assert observed[0].index("is-active") < observed[0].index("endpoint worker-info")
 
 
 def test_live_acceptance_reports_structured_runtime_metadata() -> None:

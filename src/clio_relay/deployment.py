@@ -161,9 +161,15 @@ def install_endpoint_user_service_over_ssh(
     service_text: str,
     start: bool,
     enable: bool,
+    require_persistent: bool = True,
     timeout_seconds: float = 120.0,
 ) -> list[str]:
-    """Install a user-level systemd service on a remote cluster without sudo."""
+    """Install a user-level systemd service on a remote cluster without sudo.
+
+    Persistent installs require systemd user lingering so the worker remains
+    available after the operator's final login session exits. The caller must
+    explicitly opt into a login-scoped service when site policy forbids linger.
+    """
     _validate_ssh_destination(ssh_host)
     if not isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise RelayError("endpoint service SSH timeout must be finite and positive")
@@ -173,6 +179,7 @@ def install_endpoint_user_service_over_ssh(
         service_text=service_text,
         start=start,
         enable=enable,
+        require_persistent=require_persistent,
     )
     try:
         result = subprocess.run(
@@ -200,23 +207,65 @@ def _remote_install_script(
     service_text: str,
     start: bool,
     enable: bool,
+    require_persistent: bool,
 ) -> str:
     if _SYSTEMD_SERVICE_NAME.fullmatch(service_name) is None:
         raise RelayError(f"unsafe endpoint systemd service name: {service_name!r}")
     service_literal = shlex.quote(service_text)
+    persistent_literal = "1" if require_persistent else "0"
     command = "systemctl --user daemon-reload\n"
     if enable:
         command += f"systemctl --user enable {shlex.quote(service_name)}\n"
     if start:
         command += f"systemctl --user restart {shlex.quote(service_name)}\n"
     command += (
+        'service_enabled="$(systemctl --user is-enabled '
+        f'{shlex.quote(service_name)} 2>/dev/null || true)"\n'
+        'service_active="$(systemctl --user is-active '
+        f'{shlex.quote(service_name)} 2>/dev/null || true)"\n'
+    )
+    if enable:
+        command += (
+            'if [ "$service_enabled" != "enabled" ]; then\n'
+            f'  echo "endpoint service is not enabled: {service_name} '
+            '$service_enabled" >&2\n'
+            "  exit 1\n"
+            "fi\n"
+        )
+    if start:
+        command += (
+            'if [ "$service_active" != "active" ]; then\n'
+            f'  echo "endpoint service is not active: {service_name} '
+            '$service_active" >&2\n'
+            "  exit 1\n"
+            "fi\n"
+        )
+    command += (
         "echo user_systemd=$(systemctl --user is-system-running || true)\n"
-        'echo linger=$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)\n'
+        'echo linger="$linger"\n'
+        'echo endpoint_service.persistence="$persistence_mode"\n'
+        'echo endpoint_service.enabled="${service_enabled:-unknown}"\n'
+        'echo endpoint_service.active="${service_active:-unknown}"\n'
         "export SYSTEMD_COLORS=0 LANG=C LC_ALL=C\n"
         f"systemctl --user --no-pager --plain --full status "
         f"{shlex.quote(service_name)} || true\n"
     )
     script = f"""set -euo pipefail
+require_persistent={persistent_literal}
+relay_user="${{USER:-$(id -un)}}"
+linger="$(loginctl show-user "$relay_user" -p Linger --value 2>/dev/null || true)"
+if [ "$linger" = "yes" ]; then
+  persistence_mode=systemd-user-linger
+elif [ "$require_persistent" = "1" ]; then
+  echo "persistent endpoint service requires systemd user lingering (Linger=yes)" >&2
+  echo "run 'loginctl enable-linger $relay_user' once, or ask the site administrator" >&2
+  echo "to enable lingering for this account" >&2
+  echo "use --allow-login-scoped only when logout-time shutdown is explicitly acceptable" >&2
+  exit 78
+else
+  persistence_mode=login-scoped
+  echo "warning: endpoint service is login-scoped and may stop after the final login exits" >&2
+fi
 mkdir -p "$HOME/.config/systemd/user"
 printf '%s' {service_literal} > "$HOME/.config/systemd/user/{service_name}"
 {command}"""
