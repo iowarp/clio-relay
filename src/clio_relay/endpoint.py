@@ -2107,6 +2107,14 @@ class EndpointWorker:
                 },
             )
             return
+        current_runtime = state[0]
+        superseded_transport_runtime = (
+            current_runtime
+            if current_runtime is not None
+            and current_runtime.execution_id != metadata.execution_id
+            and _runtime_metadata_is_mcp_transport_wrapper(current_runtime)
+            else None
+        )
         self._persist_runtime_metadata(
             job,
             task_id=task_id,
@@ -2114,6 +2122,7 @@ class EndpointWorker:
             state=state,
             digests=digests,
             scheduler_job_ids=scheduler_job_ids,
+            superseded_transport_runtime=superseded_transport_runtime,
         )
 
     def _persist_runtime_metadata(
@@ -2125,6 +2134,7 @@ class EndpointWorker:
         state: list[JarvisRuntimeMetadata | None],
         digests: set[str],
         scheduler_job_ids: list[str],
+        superseded_transport_runtime: JarvisRuntimeMetadata | None = None,
     ) -> None:
         """Persist one normalized runtime observation to job, task, and events."""
         task = self.queue.get_task(task_id)
@@ -2151,8 +2161,12 @@ class EndpointWorker:
                 },
             )
             return
-        if _task_direct_execution_pinned(task) and (
-            metadata.scheduler_provider is not None or metadata.scheduler_job_id is not None
+        if superseded_transport_runtime is not None and state[0] != superseded_transport_runtime:
+            raise ConfigurationError("MCP transport runtime changed before it could be superseded")
+        if (
+            superseded_transport_runtime is None
+            and _task_direct_execution_pinned(task)
+            and (metadata.scheduler_provider is not None or metadata.scheduler_job_id is not None)
         ):
             self.queue.append_event(
                 job.job_id,
@@ -2175,7 +2189,7 @@ class EndpointWorker:
         if digest in digests:
             return
         digests.add(digest)
-        previous = state[0]
+        previous = None if superseded_transport_runtime is not None else state[0]
         if (
             _runtime_metadata_is_native(metadata)
             and previous is not None
@@ -2263,6 +2277,10 @@ class EndpointWorker:
             "scheduler_job_ids": list(scheduler_job_ids),
             "scheduler_job_ownership": scheduler_ownership,
         }
+        if superseded_transport_runtime is not None:
+            durable_metadata["mcp_transport_runtime_metadata"] = (
+                superseded_transport_runtime.model_dump(mode="json")
+            )
         native_execution = merged.details.get("native_execution")
         if isinstance(native_execution, dict):
             typed_native = cast(dict[str, object], native_execution)
@@ -2277,6 +2295,18 @@ class EndpointWorker:
         durable_metadata["scheduler"] = merged.scheduler_provider
         self.queue.update_job_metadata(job.job_id, durable_metadata)
         self.queue.update_task_metadata(task_id, durable_metadata)
+        if superseded_transport_runtime is not None:
+            self.queue.append_event(
+                job.job_id,
+                "runtime.transport_metadata_superseded",
+                "Trusted JARVIS MCP runtime superseded its direct transport wrapper",
+                payload={
+                    "transport_execution_id": superseded_transport_runtime.execution_id,
+                    "owned_execution_id": merged.execution_id,
+                    "owned_scheduler_job_id": merged.scheduler_job_id,
+                    "ownership_verified": scheduler_ownership_verified,
+                },
+            )
         if failed_channel and exact_marker_reconciliation is not None:
             self._resolve_runtime_sidecar_failure_by_reconciliation(
                 job,
@@ -5818,6 +5848,31 @@ def _runtime_metadata_is_native(metadata: JarvisRuntimeMetadata) -> bool:
         isinstance(producer_contract, dict)
         and cast(dict[str, object], producer_contract).get("contract_kind") == "native_execution"
         and isinstance(native_execution, dict)
+    )
+
+
+def _runtime_metadata_is_mcp_transport_wrapper(metadata: JarvisRuntimeMetadata) -> bool:
+    """Return whether metadata describes the direct wrapper around one MCP call."""
+    if (
+        metadata.source is not RuntimeMetadataSource.JARVIS_SIDECAR
+        or metadata.scheduler_provider is not None
+        or metadata.scheduler_job_id is not None
+    ):
+        return False
+    native_execution = metadata.details.get("native_execution")
+    if isinstance(native_execution, dict):
+        handle = cast(dict[str, object], native_execution).get("execution_handle")
+        record = cast(dict[str, object], native_execution).get("execution_record")
+        return (
+            isinstance(handle, dict)
+            and cast(dict[str, object], handle).get("mode") == "direct"
+            and isinstance(record, dict)
+            and cast(dict[str, object], record).get("submitted") is False
+        )
+    nested_details = metadata.details.get("details")
+    return metadata.details.get("execution_mode") == "direct" or (
+        isinstance(nested_details, dict)
+        and cast(dict[str, object], nested_details).get("execution_mode") == "direct"
     )
 
 

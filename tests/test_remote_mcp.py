@@ -509,6 +509,107 @@ def test_cluster_injection_flattens_simple_schema_and_wraps_composed_contracts()
     assert property_constrained["properties"]["arguments"]["maxProperties"] == 1
 
 
+def test_virtual_remote_mcp_relay_envelope_is_local_and_collision_safe() -> None:
+    """Relay wait and log controls never become arbitrary server arguments."""
+
+    remote_schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+    rendered = inject_cluster_argument(remote_schema, clusters=["alpha"])
+    properties = cast(dict[str, object], rendered["properties"])
+    assert {
+        "cluster",
+        "query",
+        "wait_for_terminal",
+        "wait_timeout_seconds",
+        "poll_seconds",
+        "include_logs",
+        "log_limit",
+    }.issubset(properties)
+    invocation = {
+        "cluster": "alpha",
+        "query": "asteroid",
+        "wait_for_terminal": True,
+        "wait_timeout_seconds": 45,
+        "poll_seconds": 0.25,
+        "include_logs": True,
+        "log_limit": 1_024,
+    }
+    cast(_SchemaValidator, Draft202012Validator(rendered)).validate(invocation)
+    virtual = remote_mcp.VirtualRemoteMcpTool(
+        alias="remote_science_search",
+        namespace="science",
+        remote_tool=RemoteMcpToolSchema(name="search", input_schema=remote_schema),
+        routes={},
+        arguments_wrapped=False,
+    )
+
+    assert virtual.forwarded_arguments(invocation) == {"query": "asteroid"}
+    assert virtual.relay_arguments(invocation) == {
+        "wait_for_terminal": True,
+        "wait_timeout_seconds": 45,
+        "poll_seconds": 0.25,
+        "include_logs": True,
+        "log_limit": 1_024,
+    }
+    with pytest.raises(ValueError, match="wait_for_terminal must be a boolean"):
+        virtual.relay_arguments({"wait_for_terminal": "yes"})
+
+    colliding_schema: dict[str, object] = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "wait_for_terminal": {"type": "boolean"},
+        },
+        "required": ["query", "wait_for_terminal"],
+        "additionalProperties": False,
+    }
+    colliding = inject_cluster_argument(colliding_schema, clusters=["alpha"])
+    assert colliding["required"] == ["cluster", "arguments"]
+    cast(_SchemaValidator, Draft202012Validator(colliding)).validate(
+        {
+            "cluster": "alpha",
+            "arguments": {"query": "asteroid", "wait_for_terminal": False},
+            "wait_for_terminal": True,
+        }
+    )
+    wrapped = remote_mcp.VirtualRemoteMcpTool(
+        alias="remote_science_colliding_search",
+        namespace="science",
+        remote_tool=RemoteMcpToolSchema(name="search", input_schema=colliding_schema),
+        routes={},
+        arguments_wrapped=True,
+    )
+    wrapped_invocation = {
+        "cluster": "alpha",
+        "arguments": {"query": "asteroid", "wait_for_terminal": False},
+        "wait_for_terminal": True,
+    }
+    assert wrapped.forwarded_arguments(wrapped_invocation) == {
+        "query": "asteroid",
+        "wait_for_terminal": False,
+    }
+    assert wrapped.relay_arguments(wrapped_invocation) == {"wait_for_terminal": True}
+
+    open_schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+    }
+    open_rendered = inject_cluster_argument(open_schema, clusters=["alpha"])
+    assert open_rendered["required"] == ["cluster", "arguments"]
+    cast(_SchemaValidator, Draft202012Validator(open_rendered)).validate(
+        {
+            "cluster": "alpha",
+            "arguments": {"query": "asteroid", "wait_for_terminal": "remote value"},
+            "wait_for_terminal": True,
+        }
+    )
+
+
 def test_cluster_injection_wraps_nonempty_root_id_without_changing_remote_schema() -> None:
     remote_schema: dict[str, object] = {
         "$schema": "https://json-schema.org/draft/2020-12/schema",

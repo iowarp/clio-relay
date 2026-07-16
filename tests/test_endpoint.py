@@ -1575,6 +1575,65 @@ def _write_direct_runtime_sidecar(env: dict[str, str] | None) -> None:
     )
 
 
+def _write_native_mcp_transport_runtime_sidecar(env: dict[str, str] | None) -> None:
+    """Write the native direct JARVIS record used to transport one MCP call."""
+    assert env is not None
+    intent = cast(
+        dict[str, object],
+        json.loads(env["CLIO_RELAY_RUNTIME_SUBMISSION_INTENT"]),
+    )
+    execution_id = cast(str, intent["execution_id"])
+    pipeline_id = "clio-relay-mcp-call"
+    runtime_metadata: dict[str, object] = {
+        "execution_handle": {
+            "schema_version": "jarvis.execution.handle.v1",
+            "execution_id": execution_id,
+            "pipeline_id": pipeline_id,
+            "mode": "direct",
+            "scheduler_provider": None,
+            "scheduler_native_id": None,
+            "cluster": None,
+        },
+        "execution_record": {
+            "schema_version": "jarvis.execution.record.v1",
+            "execution_id": execution_id,
+            "pipeline_id": pipeline_id,
+            "pipeline_name": pipeline_id,
+            "mode": "direct",
+            "scheduler_provider": None,
+            "scheduler_native_id": None,
+            "cluster": None,
+            "state": "completed",
+            "submitted": False,
+            "terminal": True,
+            "created_at": "2026-07-16T14:00:00Z",
+            "updated_at": "2026-07-16T14:00:01Z",
+            "return_code": 0,
+            "error": None,
+            "metadata": {},
+        },
+        "progress": {
+            "schema_version": "jarvis.execution.progress.v1",
+            "execution_id": execution_id,
+            "pipeline_id": pipeline_id,
+            "execution_state": "completed",
+            "terminal": True,
+            "packages": [],
+        },
+    }
+    Path(env["CLIO_RELAY_RUNTIME_METADATA_FILE"]).write_text(
+        json.dumps(
+            runtime_sidecar_record(
+                runtime_metadata,
+                key=env["CLIO_RELAY_RUNTIME_METADATA_TOKEN"],
+                sequence=1,
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _signed_progress_sidecar_record(
     progress: Mapping[str, object],
     *,
@@ -5588,6 +5647,7 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
             del on_stderr, should_cancel, on_poll, timeout_seconds, on_timeout
             self.runs.append(pipeline_path)
             assert cwd is not None
+            _write_native_mcp_transport_runtime_sidecar(env)
             if on_start is not None:
                 on_start(700)
             if on_stdout is not None:
@@ -5695,6 +5755,16 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
     detected = [event for event in events if event.event_type == "scheduler.job_detected"]
     assert [event.payload["metadata_source"] for event in detected] == ["jarvis_mcp"]
     assert task.metadata["scheduler_job_ownership"][0]["ownership_verified"] is True
+    transport_runtime = cast(
+        dict[str, object],
+        task.metadata["mcp_transport_runtime_metadata"],
+    )
+    assert transport_runtime["source"] == "jarvis_sidecar"
+    assert transport_runtime["scheduler_job_id"] is None
+    assert transport_runtime["execution_id"] != runtime["execution_id"]
+    event_types = {event.event_type for event in events}
+    assert "runtime.transport_metadata_superseded" in event_types
+    assert "runtime.metadata_refused" not in event_types
 
 
 def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(

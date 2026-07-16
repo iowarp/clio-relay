@@ -71,6 +71,7 @@ MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES = 64 * 1024
 MAX_VIRTUAL_REMOTE_MCP_CANDIDATES = 10_000
 MAX_REMOTE_MCP_CATALOG_ISSUES = 10_000
 MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH = 64
+MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES = 32_768
 REMOTE_MCP_REPLACE_ATTEMPTS = 25
 REMOTE_MCP_REPLACE_RETRY_SECONDS = 0.02
 CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.5.1"
@@ -134,6 +135,46 @@ _JSON_SCHEMA_VALIDATORS.update(
     }
 )
 
+VIRTUAL_REMOTE_MCP_RELAY_CONTROL_SCHEMAS: dict[str, JSON] = {
+    "wait_for_terminal": {
+        "type": "boolean",
+        "default": False,
+        "description": (
+            "Wait for this relay job to finish and return its bounded MCP result in the "
+            "same tool response. This field is consumed by clio-relay and is never "
+            "forwarded to the remote MCP server."
+        ),
+    },
+    "wait_timeout_seconds": {
+        "type": "number",
+        "default": 600,
+        "exclusiveMinimum": 0,
+        "description": "Maximum local relay wait; never forwarded to the remote MCP server.",
+    },
+    "poll_seconds": {
+        "type": "number",
+        "default": 2,
+        "exclusiveMinimum": 0,
+        "description": "Local relay wait polling interval; never forwarded remotely.",
+    },
+    "include_logs": {
+        "type": "boolean",
+        "default": False,
+        "description": (
+            "Include bounded stdout and stderr when waiting for a terminal result. "
+            "This field is never forwarded to the remote MCP server."
+        ),
+    },
+    "log_limit": {
+        "type": "integer",
+        "default": MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES,
+        "minimum": 1,
+        "maximum": MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES,
+        "description": "Maximum bytes per returned log stream; never forwarded remotely.",
+    },
+}
+VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS = frozenset(VIRTUAL_REMOTE_MCP_RELAY_CONTROL_SCHEMAS)
+
 
 class _NonFiniteJsonError(ValueError):
     """Non-standard NaN or infinity token in a purported JSON artifact."""
@@ -187,6 +228,7 @@ VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA: JSON = {
         "last_error": {"type": ["string", "null"]},
         "mcp_result": {"type": "object"},
         "mcp_result_artifact": {"type": "object"},
+        "logs": {"type": "object"},
     },
     "required": [
         "cluster",
@@ -1088,6 +1130,36 @@ class RemoteMcpRoute:
     registration_revision: str
 
 
+def _virtual_remote_mcp_relay_arguments(arguments: JSON) -> JSON:
+    """Validate and copy relay-only controls from an agent-facing invocation."""
+
+    controls: JSON = {}
+    for field_name in ("wait_for_terminal", "include_logs"):
+        if field_name not in arguments:
+            continue
+        value = arguments[field_name]
+        if not isinstance(value, bool):
+            raise ValueError(f"{field_name} must be a boolean")
+        controls[field_name] = value
+    for field_name in ("wait_timeout_seconds", "poll_seconds"):
+        if field_name not in arguments:
+            continue
+        value = arguments[field_name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{field_name} must be a number")
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{field_name} must be positive and finite")
+        controls[field_name] = value
+    if "log_limit" in arguments:
+        log_limit = arguments["log_limit"]
+        if isinstance(log_limit, bool) or not isinstance(log_limit, int):
+            raise ValueError("log_limit must be an integer")
+        if log_limit < 1 or log_limit > MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES:
+            raise ValueError(f"log_limit must be between 1 and {MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES}")
+        controls["log_limit"] = log_limit
+    return controls
+
+
 @dataclass(frozen=True)
 class VirtualRemoteMcpTool:
     """One agent-facing alias backed by equivalent remote schemas."""
@@ -1108,8 +1180,9 @@ class VirtualRemoteMcpTool:
             "description": (
                 f"{description} Routed through registered remote MCP namespace "
                 f"'{self.namespace}' on the selected cluster. The call is submitted "
-                "as a durable relay job; use relay job tools to retrieve the remote "
-                "tool result."
+                "as a durable relay job. Set wait_for_terminal=true to return the "
+                "bounded remote MCP result in this same call; otherwise use relay job "
+                "tools with the returned handle."
             ),
             "inputSchema": input_schema,
             "outputSchema": deepcopy(VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA),
@@ -1121,10 +1194,16 @@ class VirtualRemoteMcpTool:
         return definition
 
     def forwarded_arguments(self, arguments: JSON) -> JSON:
-        """Remove local routing fields and return the exact remote arguments object."""
+        """Remove the relay envelope and return the exact remote arguments object."""
         if not self.arguments_wrapped:
-            return {key: value for key, value in arguments.items() if key != "cluster"}
-        unexpected = sorted(set(arguments) - {"cluster", "arguments"})
+            return {
+                key: value
+                for key, value in arguments.items()
+                if key != "cluster" and key not in VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS
+            }
+        unexpected = sorted(
+            set(arguments) - {"cluster", "arguments"} - VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS
+        )
         if unexpected:
             raise ValueError(
                 "wrapped virtual remote MCP arguments contain unexpected local fields: "
@@ -1134,6 +1213,11 @@ class VirtualRemoteMcpTool:
         if not isinstance(remote_arguments, dict):
             raise ValueError("wrapped virtual remote MCP call requires an arguments object")
         return deepcopy(cast(JSON, remote_arguments))
+
+    def relay_arguments(self, arguments: JSON) -> JSON:
+        """Return validated local controls without any remote tool arguments."""
+
+        return _virtual_remote_mcp_relay_arguments(arguments)
 
 
 @dataclass(frozen=True)
@@ -1174,6 +1258,15 @@ class VirtualRemoteMcpCatalog:
         except KeyError as exc:
             raise ValueError(f"unknown or unavailable virtual remote MCP tool: {alias}") from exc
         return tool.forwarded_arguments(arguments)
+
+    def relay_arguments(self, alias: str, arguments: JSON) -> JSON:
+        """Return the validated relay envelope for one virtual tool invocation."""
+
+        try:
+            tool = self.tools[alias]
+        except KeyError as exc:
+            raise ValueError(f"unknown or unavailable virtual remote MCP tool: {alias}") from exc
+        return tool.relay_arguments(arguments)
 
 
 @dataclass(frozen=True)
@@ -3595,11 +3688,11 @@ def _fsync_cache_directory(path: Path) -> None:
 
 
 def inject_cluster_argument(input_schema: JSON, *, clusters: list[str]) -> JSON:
-    """Copy a remote input schema and add a local-only cluster selector.
+    """Copy a remote input schema and add the local-only relay envelope.
 
-    Plain object contracts remain flat for agent ergonomics. Contracts whose
-    root composition or own ``cluster`` field makes flat augmentation unsafe
-    are preserved under an ``arguments`` object instead.
+    Closed plain-object contracts remain flat for agent ergonomics. Contracts
+    whose open root, composition, or own local-control field makes flat
+    augmentation unsafe are preserved under an ``arguments`` object instead.
     """
     _require_bounded_json_structure(input_schema, label="inputSchema")
     error = virtual_schema_error(input_schema)
@@ -3630,6 +3723,7 @@ def inject_cluster_argument(input_schema: JSON, *, clusters: list[str]) -> JSON:
             "properties": {
                 "cluster": cluster_schema,
                 "arguments": nested_schema,
+                **deepcopy(VIRTUAL_REMOTE_MCP_RELAY_CONTROL_SCHEMAS),
             },
             "required": ["cluster", "arguments"],
             "additionalProperties": False,
@@ -3641,6 +3735,7 @@ def inject_cluster_argument(input_schema: JSON, *, clusters: list[str]) -> JSON:
     rendered = deepcopy(input_schema)
     properties = cast(JSON, rendered.setdefault("properties", {}))
     properties["cluster"] = cluster_schema
+    properties.update(deepcopy(VIRTUAL_REMOTE_MCP_RELAY_CONTROL_SCHEMAS))
     required = cast(list[str], rendered.setdefault("required", []))
     rendered["required"] = ["cluster", *required]
     rendered["type"] = "object"
@@ -3667,18 +3762,25 @@ def virtual_schema_error(input_schema: JSON) -> str | None:
 
 
 def remote_input_schema_requires_wrapper(input_schema: JSON) -> bool:
-    """Return whether a remote schema must be nested below local routing fields."""
+    """Return whether a remote schema must be nested below local relay fields."""
     _require_bounded_json_structure(input_schema, label="inputSchema")
     properties = input_schema.get("properties", {})
     required = input_schema.get("required", [])
+    property_names = (
+        set(cast(dict[str, object], properties)) if isinstance(properties, dict) else set[str]()
+    )
+    required_names = set(cast(list[str], required)) if isinstance(required, list) else set[str]()
     root_identifier = input_schema.get("$id")
     return (
         (isinstance(root_identifier, str) and bool(root_identifier))
+        or input_schema.get("additionalProperties", True) is not False
         or any(key in input_schema for key in _COMPOSED_SCHEMA_KEYS)
         or bool(set(input_schema) - _FLAT_SCHEMA_KEYS)
         or _contains_document_root_reference(input_schema)
         or (isinstance(properties, dict) and "cluster" in properties)
         or (isinstance(required, list) and "cluster" in required)
+        or bool(property_names.intersection(VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS))
+        or bool(required_names.intersection(VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS))
     )
 
 
