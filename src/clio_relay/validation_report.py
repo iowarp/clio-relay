@@ -8,14 +8,18 @@ import csv
 import ctypes
 import hashlib
 import io
+import ipaddress
 import json
 import math
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
+import tomllib
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -49,6 +53,12 @@ MAX_TRANSPORT_PROBE_JSON_DEPTH = 16
 MAX_TRANSPORT_PROBE_JSON_NODES = 4096
 MAX_LAUNCHER_PROCESS_ANCESTORS = 64
 MAX_PYVENV_CONFIG_BYTES = 64 * 1024
+MAX_UV_TOOL_RECEIPT_BYTES = 256 * 1024
+MAX_DISTRIBUTION_WHEEL_BYTES = 128 * 1024 * 1024
+_OFFICIAL_RELEASE_WHEEL_PATH = re.compile(
+    r"/iowarp/clio-relay/releases/download/v(?P<version>[0-9A-Za-z][0-9A-Za-z.+-]*)/"
+    r"clio_relay-(?P=version)-py3-none-any\.whl"
+)
 SPACK_FRESH_INSTALL_TRANSITION_CHECK_IDS = (
     "remote-mcp.spack-preinstall-absent",
     "remote-mcp.spack-fresh-install",
@@ -205,17 +215,21 @@ class InstallSource(BaseModel):
     launcher_receipt: dict[str, Any] = Field(default_factory=dict[str, Any])
 
     @model_validator(mode="after")
-    def released_source_requires_verified_pypi_identity(self) -> InstallSource:
+    def released_source_requires_verified_artifact_identity(self) -> InstallSource:
         """Reject internally inconsistent released-artifact claims."""
+        released_source = self.kind is InstallSourceKind.PYPI or (
+            self.kind is InstallSourceKind.WHEEL
+            and _is_official_github_release_wheel(self.direct_url, self.distribution_version)
+        )
         if self.released_artifact and not (
-            self.kind is InstallSourceKind.PYPI
-            and self.detected_kind is InstallSourceKind.PYPI
+            self.kind is self.detected_kind
+            and released_source
             and self.launcher == "uv-tool"
             and self.artifact_sha256 is not None
             and self.artifact_identity_verified
             and self.launcher_verified
         ):
-            raise ValueError("released artifact requires verified PyPI uv-tool artifact identity")
+            raise ValueError("released artifact requires verified uv-tool artifact identity")
         return self
 
 
@@ -1119,8 +1133,14 @@ def detect_install_source(
     launcher: str | None = None,
     source_override: str | None = None,
     artifact_sha256: str | None = None,
+    infer_artifact_sha256: bool = False,
 ) -> InstallSource:
-    """Inspect PEP 610 metadata and explicit acceptance provenance overrides."""
+    """Inspect PEP 610 metadata and explicit acceptance provenance overrides.
+
+    Validation callers should supply an independently computed artifact digest.
+    ``infer_artifact_sha256`` exists for installation inspection, where the
+    exact wheel URL is already bound by uv's persistent-tool receipt.
+    """
     distribution = metadata.distribution("clio-relay")
     package_path = str(resources.files("clio_relay"))
     direct_url = _distribution_direct_url(distribution)
@@ -1130,13 +1150,21 @@ def detect_install_source(
         kind, reference = _parse_source_override(source_override)
     resolved_launcher = launcher or os.environ.get("CLIO_RELAY_VALIDATION_LAUNCHER", "unknown")
     resolved_hash = artifact_sha256 or os.environ.get("CLIO_RELAY_VALIDATION_ARTIFACT_SHA256")
-    artifact_identity_verified = _verify_running_artifact_identity(
-        distribution,
-        detected_kind=detected_kind,
-        direct_url=direct_url,
-        artifact_sha256=resolved_hash,
-        launcher=resolved_launcher,
-    )
+    if resolved_hash is None and infer_artifact_sha256:
+        resolved_hash, artifact_identity_verified = _infer_running_artifact_identity(
+            distribution,
+            detected_kind=detected_kind,
+            direct_url=direct_url,
+            launcher=resolved_launcher,
+        )
+    else:
+        artifact_identity_verified = _verify_running_artifact_identity(
+            distribution,
+            detected_kind=detected_kind,
+            direct_url=direct_url,
+            artifact_sha256=resolved_hash,
+            launcher=resolved_launcher,
+        )
     launcher_verified, launcher_receipt = _detect_launcher_receipt(
         resolved_launcher,
         detected_kind=detected_kind,
@@ -1144,8 +1172,14 @@ def detect_install_source(
         distribution=distribution,
     )
     released = (
-        kind is InstallSourceKind.PYPI
-        and detected_kind is InstallSourceKind.PYPI
+        kind is detected_kind
+        and (
+            kind is InstallSourceKind.PYPI
+            or (
+                kind is InstallSourceKind.WHEEL
+                and _is_official_github_release_wheel(direct_url, distribution.version)
+            )
+        )
         and resolved_launcher == "uv-tool"
         and artifact_identity_verified
         and launcher_verified
@@ -1265,7 +1299,7 @@ def _detect_persistent_uv_tool_receipt(
     distribution: metadata.Distribution,
 ) -> tuple[bool, dict[str, Any]]:
     """Capture structural evidence for an install-once uv tool invocation."""
-    uv_executable = os.environ.get("UV")
+    uv_executable = os.environ.get("UV") or shutil.which("uv")
     uv_path = Path(uv_executable) if uv_executable is not None else None
     uv_identity_before = _regular_file_identity(uv_path) if uv_path is not None else None
     uv_path_verified, uv_version, uv_executable_sha256 = _uv_executable_identity(uv_executable)
@@ -1316,6 +1350,11 @@ def _detect_persistent_uv_tool_receipt(
     )
     project_environment = (Path.cwd() / ".venv").resolve()
     isolated_environment = prefix != base_prefix and prefix != project_environment
+    uv_receipt_identity = _persistent_uv_tool_receipt_identity(
+        environment_prefix=prefix,
+        tool_executable=tool_path_absolute,
+        distribution=distribution,
+    )
     verified = (
         detected_kind in {InstallSourceKind.WHEEL, InstallSourceKind.PYPI}
         and uv_path_verified
@@ -1329,6 +1368,7 @@ def _detect_persistent_uv_tool_receipt(
         and tool_bin_bound
         and tool_target_bound
         and record_identity.get("verified") is True
+        and uv_receipt_identity.get("verified") is True
         and isolated_environment
     )
     return verified, {
@@ -1360,9 +1400,149 @@ def _detect_persistent_uv_tool_receipt(
         "pyvenv_matches_uv": pyvenv_matches_uv,
         "isolated_environment": isolated_environment,
         "distribution_record": record_identity,
+        "uv_tool_receipt": uv_receipt_identity,
         "detected_install_source": detected_kind.value,
         "verified": verified,
     }
+
+
+def _persistent_uv_tool_receipt_identity(
+    *,
+    environment_prefix: Path,
+    tool_executable: Path | None,
+    distribution: metadata.Distribution,
+) -> dict[str, Any]:
+    """Bind uv's launcher and requirement records to the running distribution."""
+    receipt_path = environment_prefix / "uv-receipt.toml"
+    identity = _regular_file_identity(receipt_path)
+    if identity is None or not 1 <= identity[2] <= MAX_UV_TOOL_RECEIPT_BYTES:
+        return {"verified": False, "error": "uv tool receipt is missing or invalid"}
+    payload = _read_open_regular_file(
+        receipt_path,
+        identity,
+        maximum_bytes=MAX_UV_TOOL_RECEIPT_BYTES,
+    )
+    if payload is None:
+        return {"verified": False, "error": "uv tool receipt changed while reading"}
+    try:
+        document = tomllib.loads(payload.decode("utf-8"))
+    except (UnicodeError, tomllib.TOMLDecodeError):
+        return {"verified": False, "error": "uv tool receipt is not valid TOML"}
+    tool = document.get("tool")
+    if not isinstance(tool, dict):
+        return {"verified": False, "error": "uv tool receipt omitted its tool record"}
+    tool_record = cast(dict[str, object], tool)
+    entrypoints = tool_record.get("entrypoints")
+    requirements = tool_record.get("requirements")
+    if not isinstance(entrypoints, list) or not isinstance(requirements, list):
+        return {"verified": False, "error": "uv tool receipt omitted its mappings"}
+
+    launcher_matches: list[dict[str, object]] = []
+    for raw_entrypoint in cast(list[object], entrypoints):
+        if not isinstance(raw_entrypoint, dict):
+            return {"verified": False, "error": "uv tool receipt entry point is invalid"}
+        entrypoint = cast(dict[str, object], raw_entrypoint)
+        source = entrypoint.get("from")
+        if isinstance(source, str) and _normalized_distribution_name(source) == "clio-relay":
+            launcher_matches.append(entrypoint)
+    launcher_bound = False
+    if len(launcher_matches) == 1 and tool_executable is not None:
+        install_path = launcher_matches[0].get("install-path")
+        install_location = (
+            Path(install_path).expanduser() if isinstance(install_path, str) else None
+        )
+        launcher_bound = (
+            install_location is not None
+            and install_location.is_absolute()
+            and _lexical_path_key(install_location) == _lexical_path_key(tool_executable)
+        )
+
+    requirement_matches: list[dict[str, object]] = []
+    for raw_requirement in cast(list[object], requirements):
+        if not isinstance(raw_requirement, dict):
+            return {"verified": False, "error": "uv tool receipt requirement is invalid"}
+        requirement = cast(dict[str, object], raw_requirement)
+        name = requirement.get("name")
+        if isinstance(name, str) and _normalized_distribution_name(name) == "clio-relay":
+            requirement_matches.append(requirement)
+    direct_url = _distribution_direct_url(distribution)
+    source_bound = len(requirement_matches) == 1 and _uv_requirement_matches_distribution_source(
+        requirement_matches[0] if requirement_matches else {},
+        direct_url=direct_url,
+        distribution_version=distribution.version,
+    )
+    requirement = requirement_matches[0] if len(requirement_matches) == 1 else {}
+    source_url = requirement.get("url")
+    source_path = requirement.get("path")
+    source_specifier = requirement.get("specifier")
+    verified = launcher_bound and source_bound
+    return {
+        "schema_version": "clio-relay.uv-tool-receipt.v1",
+        "path": str(receipt_path.resolve()),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "launcher_bound": launcher_bound,
+        "requirement_name": requirement.get("name"),
+        "requirement_url": _redact_url(source_url) if isinstance(source_url, str) else None,
+        "requirement_path": source_path if isinstance(source_path, str) else None,
+        "requirement_specifier": source_specifier if isinstance(source_specifier, str) else None,
+        "distribution_url": direct_url.get("url") if direct_url is not None else None,
+        "source_bound": source_bound,
+        "verified": verified,
+    }
+
+
+def _uv_requirement_matches_distribution_source(
+    requirement: dict[str, object],
+    *,
+    direct_url: dict[str, Any] | None,
+    distribution_version: str,
+) -> bool:
+    """Match one uv requirement to the exact PEP 610 installation source."""
+    source_url = requirement.get("url")
+    source_path = requirement.get("path")
+    source_specifier = requirement.get("specifier")
+    if direct_url is None:
+        return (
+            source_url is None
+            and source_path is None
+            and source_specifier in {None, f"=={distribution_version}"}
+        )
+    distribution_url = direct_url.get("url")
+    if not isinstance(distribution_url, str):
+        return False
+    parsed = urllib.parse.urlsplit(distribution_url)
+    if parsed.scheme.casefold() == "file":
+        if not isinstance(source_path, str):
+            return False
+        direct_path = _local_wheel_archive_path(direct_url)
+        if direct_path is None:
+            return False
+        try:
+            return Path(source_path).expanduser().resolve(strict=True) == direct_path.resolve(
+                strict=True
+            )
+        except (OSError, RuntimeError, ValueError):
+            return False
+    return (
+        parsed.scheme.casefold() == "https"
+        and not parsed.username
+        and not parsed.password
+        and not parsed.query
+        and not parsed.fragment
+        and isinstance(source_url, str)
+        and source_url == distribution_url
+        and _redact_url(source_url) == source_url
+    )
+
+
+def _normalized_distribution_name(value: str) -> str:
+    """Return the canonical comparison key for one Python distribution name."""
+    return re.sub(r"[-_.]+", "-", value).casefold()
+
+
+def _lexical_path_key(path: Path) -> str:
+    """Return a platform-normalized lexical path key."""
+    return os.path.normcase(os.path.normpath(str(path)))
 
 
 def _uv_tool_dir(executable: Path | None, *, bin_directory: bool) -> Path | None:
@@ -3510,10 +3690,182 @@ def _verify_running_artifact_identity(
     if launcher not in {"uv-tool", "uvx"}:
         return False
     if detected_kind is InstallSourceKind.WHEEL:
-        return _local_wheel_matches_install(distribution, direct_url, expected)
+        if _local_wheel_archive_path(direct_url) is not None:
+            return _local_wheel_matches_install(distribution, direct_url, expected)
+        return _wheel_url_matches_install(distribution, direct_url, expected)
     if detected_kind is InstallSourceKind.PYPI:
         return _pypi_wheel_matches_install(distribution, expected)
     return False
+
+
+def _infer_running_artifact_identity(
+    distribution: metadata.Distribution,
+    *,
+    detected_kind: InstallSourceKind,
+    direct_url: dict[str, Any] | None,
+    launcher: str,
+) -> tuple[str | None, bool]:
+    """Inspect one exact direct wheel for human-facing installation information."""
+    if launcher != "uv-tool" or detected_kind is not InstallSourceKind.WHEEL:
+        return None, False
+    wheel_bytes = _direct_wheel_bytes(direct_url)
+    if wheel_bytes is None:
+        return None, False
+    digest = hashlib.sha256(wheel_bytes).hexdigest()
+    direct_hashes = _direct_url_sha256_hashes(direct_url)
+    if direct_hashes and digest not in direct_hashes:
+        return digest, False
+    try:
+        return digest, _installed_files_match_wheel(distribution, wheel_bytes)
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return digest, False
+
+
+def _wheel_url_matches_install(
+    distribution: metadata.Distribution,
+    direct_url: dict[str, Any] | None,
+    expected_sha256: str,
+) -> bool:
+    """Verify exact local or HTTPS wheel bytes and their installed RECORD closure."""
+    wheel_bytes = _direct_wheel_bytes(direct_url)
+    if wheel_bytes is None:
+        return False
+    direct_hashes = _direct_url_sha256_hashes(direct_url)
+    if direct_hashes and expected_sha256 not in direct_hashes:
+        return False
+    if hashlib.sha256(wheel_bytes).hexdigest() != expected_sha256:
+        return False
+    try:
+        return _installed_files_match_wheel(distribution, wheel_bytes)
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return False
+
+
+def _direct_wheel_bytes(direct_url: dict[str, Any] | None) -> bytes | None:
+    """Read one bounded wheel from its exact local-file or clean HTTPS URL."""
+    if direct_url is None:
+        return None
+    raw_url = direct_url.get("url")
+    if not isinstance(raw_url, str):
+        return None
+    parsed = urllib.parse.urlsplit(raw_url)
+    if not parsed.path.casefold().endswith(".whl"):
+        return None
+    if parsed.scheme.casefold() == "file":
+        path = _local_wheel_archive_path(direct_url)
+        if path is None:
+            return None
+        identity = _regular_file_identity(path)
+        if identity is None or identity[2] > MAX_DISTRIBUTION_WHEEL_BYTES:
+            return None
+        return _read_open_regular_file(
+            path,
+            identity,
+            maximum_bytes=MAX_DISTRIBUTION_WHEEL_BYTES,
+        )
+    if not _is_official_release_wheel_url(raw_url) or not _url_host_resolves_publicly(raw_url):
+        return None
+    try:
+        opener = urllib.request.build_opener(_ReleaseWheelRedirectHandler())
+        with opener.open(raw_url, timeout=60) as response:  # noqa: S310
+            final_url = urllib.parse.urlsplit(str(response.geturl()))
+            final_url_text = urllib.parse.urlunsplit(final_url)
+            if not (
+                _is_official_release_wheel_url(final_url_text)
+                or _is_github_release_asset_url(final_url_text)
+            ):
+                return None
+            content = response.read(MAX_DISTRIBUTION_WHEEL_BYTES + 1)
+    except (OSError, ValueError, urllib.error.HTTPError):
+        return None
+    return content if len(content) <= MAX_DISTRIBUTION_WHEEL_BYTES else None
+
+
+class _ReleaseWheelRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject a release download redirect before it can reach an unsafe host."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        if not _is_github_release_asset_url(newurl) or not _url_host_resolves_publicly(newurl):
+            raise urllib.error.HTTPError(
+                newurl,
+                403,
+                "unsafe wheel download redirect",
+                headers,
+                fp,
+            )
+        return super().redirect_request(
+            req,
+            fp,
+            code,
+            msg,
+            headers,
+            newurl,
+        )
+
+
+def _is_official_release_wheel_url(value: str) -> bool:
+    """Allow only one credential-free canonical clio-relay GitHub release URL."""
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.casefold() == "https"
+        and parsed.hostname == "github.com"
+        and port in {None, 443}
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+        and _OFFICIAL_RELEASE_WHEEL_PATH.fullmatch(parsed.path) is not None
+    )
+
+
+def _is_github_release_asset_url(value: str) -> bool:
+    """Allow only GitHub's credential-free HTTPS release-asset redirect target."""
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.casefold() == "https"
+        and parsed.hostname == "release-assets.githubusercontent.com"
+        and port in {None, 443}
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.fragment
+        and parsed.path.startswith("/github-production-release-asset/")
+    )
+
+
+def _url_host_resolves_publicly(value: str) -> bool:
+    """Fail closed unless every resolved address for one HTTPS URL is globally routable."""
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        hostname = parsed.hostname
+        if parsed.scheme.casefold() != "https" or hostname is None:
+            return False
+        answers = socket.getaddrinfo(hostname, parsed.port or 443, type=socket.SOCK_STREAM)
+        addresses = {
+            str(answer[4][0]).split("%", maxsplit=1)[0]
+            for answer in answers
+            if answer[0] in {socket.AF_INET, socket.AF_INET6}
+        }
+        return bool(addresses) and all(
+            ipaddress.ip_address(address).is_global for address in addresses
+        )
+    except (OSError, ValueError):
+        return False
 
 
 def _local_wheel_matches_install(
@@ -3522,28 +3874,9 @@ def _local_wheel_matches_install(
     expected_sha256: str,
 ) -> bool:
     """Verify a local wheel archive and the installed files derived from its RECORD."""
-    path = _local_wheel_archive_path(direct_url)
-    if path is None:
+    if _local_wheel_archive_path(direct_url) is None:
         return False
-    direct_hashes = _direct_url_sha256_hashes(direct_url)
-    if direct_hashes and expected_sha256 not in direct_hashes:
-        return False
-    try:
-        if path.suffix.casefold() != ".whl":
-            return False
-        identity = _regular_file_identity(path)
-        if identity is None or identity[2] > 128 * 1024 * 1024:
-            return False
-        wheel_bytes = _read_open_regular_file(
-            path,
-            identity,
-            maximum_bytes=128 * 1024 * 1024,
-        )
-        if wheel_bytes is None or hashlib.sha256(wheel_bytes).hexdigest() != expected_sha256:
-            return False
-        return _installed_files_match_wheel(distribution, wheel_bytes)
-    except (OSError, ValueError, zipfile.BadZipFile):
-        return False
+    return _wheel_url_matches_install(distribution, direct_url, expected_sha256)
 
 
 def _local_wheel_archive_path(direct_url: dict[str, Any] | None) -> Path | None:
@@ -3722,6 +4055,23 @@ def _classify_install_source(
     if url is not None and url.startswith("file:"):
         return InstallSourceKind.CHECKOUT, url
     return InstallSourceKind.UNKNOWN, url
+
+
+def _is_official_github_release_wheel(
+    direct_url: dict[str, Any] | None,
+    distribution_version: str,
+) -> bool:
+    """Recognize the canonical clio-relay wheel URL for one GitHub release."""
+    if direct_url is None:
+        return False
+    value = direct_url.get("url")
+    if not isinstance(value, str):
+        return False
+    expected = (
+        "https://github.com/iowarp/clio-relay/releases/download/"
+        f"v{distribution_version}/clio_relay-{distribution_version}-py3-none-any.whl"
+    )
+    return value == expected
 
 
 def _parse_source_override(value: str) -> tuple[InstallSourceKind, str | None]:
