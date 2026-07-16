@@ -53,7 +53,7 @@ def test_release_identity_is_consistent_across_package_policy_matrix_and_runbook
     init_source = (ROOT / "src" / "clio_relay" / "__init__.py").read_text(encoding="utf-8")
     release_process = RELEASE_PROCESS.read_text(encoding="utf-8")
 
-    assert version == "1.2.14"
+    assert version == "1.2.15"
     assert relay_lock["version"] == version
     assert f'__version__ = "{version}"' in init_source
     assert policy["release_version"] == version
@@ -785,8 +785,12 @@ def test_release_acceptance_runbook_binds_production_specifics_without_secrets()
     assert "health_expected_body" not in text
     assert "HEALTH_NONCE = $AresDefaultHealthNonce" in text
     assert "desktop acceptance port is already occupied" in text
-    assert '"ExitOnForwardFailure=yes"' in text
-    assert "$Forward.HasExited" in text
+    assert "[string] $SessionId, [string] $Generation," in text
+    assert "$Relay session submit-jarvis --cluster $Cluster" in text
+    assert "--session-generation-id $Generation" in text
+    assert "/jobs/jarvis" not in text
+    assert 'Authorization = "Bearer' not in text
+    assert "$Forward.HasExited" not in text
     assert "$AresDefaultLocalPort, $CancelLocalPort, $HomelabDefaultLocalPort" in text
     assert "$HomelabTransportLocalPort, $HomelabSshTransportLocalPort" in text
     assert "$SentinelStatus.phase" in text

@@ -10,6 +10,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.errors import ConfigurationError
 from clio_relay.http_api import create_app
 from clio_relay.models import (
     ArtifactRef,
@@ -29,6 +30,12 @@ from clio_relay.models import (
     TaskTimelineEvent,
     utc_now,
 )
+from clio_relay.session_api import (
+    OWNER_SESSION_ID_HEADER,
+    SESSION_GENERATION_ID_HEADER,
+    session_identity_document,
+)
+from clio_relay.storage_runtime import StorageManagedQueue
 
 
 def test_http_monitor_logs_and_artifact_content(tmp_path: Path) -> None:
@@ -630,14 +637,66 @@ def test_http_generic_gateway_update_cannot_replace_relay_managed_runtime_state(
     assert queue.get_gateway_session(runtime.session_id).gateway == runtime.gateway
 
 
+def test_owned_session_api_fails_closed_without_cluster_or_owner_token(tmp_path: Path) -> None:
+    common = {
+        "core_dir": tmp_path / "core",
+        "spool_dir": tmp_path / "spool",
+        "api_token": "session-api-token",
+        "owner_session_id": "desktop-session-1",
+        "owner_session_generation_id": "generation-1",
+    }
+
+    with pytest.raises(ConfigurationError, match="REMOTE_CLUSTER"):
+        create_app(RelaySettings(**common))
+    with pytest.raises(ConfigurationError, match="SESSION_OWNER_TOKEN"):
+        create_app(RelaySettings(**common, remote_cluster="test-cluster"))
+    with pytest.raises(ConfigurationError, match="at least 32 bytes"):
+        create_app(
+            RelaySettings(
+                **common,
+                remote_cluster="test-cluster",
+                session_owner_token="weak-token",
+            )
+        )
+
+
+def test_owned_session_identity_challenge_is_public_and_exact(tmp_path: Path) -> None:
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="test-cluster",
+        session_owner_token="o" * 32,
+    )
+    client = cast(Any, TestClient(create_app(settings)))
+    nonce = "1" * 64
+
+    response = client.get("/session-identity", params={"nonce": nonce})
+
+    assert response.status_code == 200
+    assert response.json() == session_identity_document(
+        owner_token="o" * 32,
+        cluster="test-cluster",
+        session_id="desktop-session-1",
+        generation_id="generation-1",
+        nonce=nonce,
+    )
+    assert client.get("/session-identity", params={"nonce": "not-a-nonce"}).status_code == 422
+
+
 def test_owned_session_api_stamps_jobs_and_gateways_with_server_ownership(
     tmp_path: Path,
 ) -> None:
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
         owner_session_id="desktop-session-1",
         owner_session_generation_id="generation-1",
+        remote_cluster="test-cluster",
+        session_owner_token="o" * 32,
     )
     queue = ClioCoreQueue(settings.core_dir)
     assert (
@@ -648,16 +707,33 @@ def test_owned_session_api_stamps_jobs_and_gateways_with_server_ownership(
         )
         == "generation-1"
     )
-    client = cast(Any, TestClient(create_app(settings)))
+    client = cast(
+        Any,
+        TestClient(
+            create_app(settings),
+            headers={
+                "Authorization": "Bearer session-api-token",
+                OWNER_SESSION_ID_HEADER: "desktop-session-1",
+                SESSION_GENERATION_ID_HEADER: "generation-1",
+            },
+        ),
+    )
     raw_job = RelayJob(
         cluster="test-cluster",
         kind=JobKind.JARVIS,
         spec=JarvisRunSpec(command=["sleep", "60"]),
         idempotency_key="owned-http-job",
-        metadata={"owner": "untrusted-client", "owner_session_id": "forged-session"},
     )
 
     submitted = client.post("/jobs", json=raw_job.model_dump(mode="json"))
+    forged_payload = raw_job.model_dump(mode="json")
+    forged_payload["metadata"] = {
+        "owner": "untrusted-client",
+        "owner_session_id": "forged-session",
+        "owner_session_generation_id": "forged-generation",
+        "owner_session_admission_id": "forged-admission",
+    }
+    forged = client.post("/jobs", json=forged_payload)
     gateway = client.post(
         "/gateway-sessions",
         json={
@@ -672,6 +748,8 @@ def test_owned_session_api_stamps_jobs_and_gateways_with_server_ownership(
     )
 
     assert submitted.status_code == 200
+    assert forged.status_code == 422
+    assert "server-managed" in forged.json()["detail"]
     assert submitted.json()["metadata"] == {
         "owner": "clio-relay",
         "owner_session_id": "desktop-session-1",
@@ -687,12 +765,264 @@ def test_owned_session_api_stamps_jobs_and_gateways_with_server_ownership(
     assert patched.json()["metadata"]["phase"] == "ready"
 
 
+def test_session_job_submission_rejects_missing_stale_and_unbound_identity(
+    tmp_path: Path,
+) -> None:
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="test-cluster",
+        session_owner_token="o" * 32,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    queue.prepare_owner_session_start(
+        "desktop-session-1",
+        recorded_generation_id=None,
+        candidate_generation_id="generation-1",
+    )
+    client = cast(Any, TestClient(create_app(settings)))
+    payload = {
+        "cluster": "test-cluster",
+        "pipeline_name": "pipeline",
+        "idempotency_key": "session-header-adversarial",
+    }
+    authorization = {"Authorization": "Bearer session-api-token"}
+
+    missing = client.post("/jobs/jarvis-pipeline", headers=authorization, json=payload)
+    stale = client.post(
+        "/jobs/jarvis-pipeline",
+        headers={
+            **authorization,
+            OWNER_SESSION_ID_HEADER: "desktop-session-1",
+            SESSION_GENERATION_ID_HEADER: "generation-0",
+        },
+        json=payload,
+    )
+    wrong_session = client.post(
+        "/jobs/jarvis-pipeline",
+        headers={
+            **authorization,
+            OWNER_SESSION_ID_HEADER: "desktop-session-2",
+            SESSION_GENERATION_ID_HEADER: "generation-1",
+        },
+        json=payload,
+    )
+    gateway_payload = {"cluster": "test-cluster", "name": "bound-gateway"}
+    missing_gateway = client.post(
+        "/gateway-sessions",
+        headers=authorization,
+        json=gateway_payload,
+    )
+    stale_gateway = client.post(
+        "/gateway-sessions",
+        headers={
+            **authorization,
+            OWNER_SESSION_ID_HEADER: "desktop-session-1",
+            SESSION_GENERATION_ID_HEADER: "generation-0",
+        },
+        json=gateway_payload,
+    )
+    wrong_cluster_gateway = client.post(
+        "/gateway-sessions",
+        headers={
+            **authorization,
+            OWNER_SESSION_ID_HEADER: "desktop-session-1",
+            SESSION_GENERATION_ID_HEADER: "generation-1",
+        },
+        json={"cluster": "other-cluster", "name": "wrong-cluster"},
+    )
+
+    assert missing.status_code == 409
+    assert stale.status_code == 409
+    assert wrong_session.status_code == 409
+    assert missing_gateway.status_code == 409
+    assert stale_gateway.status_code == 409
+    assert wrong_cluster_gateway.status_code == 409
+    assert queue.list_jobs() == []
+    assert queue.list_gateway_sessions() == []
+
+    unbound_settings = RelaySettings(
+        core_dir=tmp_path / "unbound-core",
+        spool_dir=tmp_path / "unbound-spool",
+        api_token="session-api-token",
+    )
+    unbound = cast(Any, TestClient(create_app(unbound_settings))).post(
+        "/jobs/jarvis-pipeline",
+        headers={
+            **authorization,
+            OWNER_SESSION_ID_HEADER: "desktop-session-1",
+            SESSION_GENERATION_ID_HEADER: "generation-1",
+        },
+        json=payload,
+    )
+    assert unbound.status_code == 409
+    assert "not bound" in unbound.json()["detail"]
+
+
+def test_owned_jarvis_mcp_submission_binds_digest_membership_and_exact_cancel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_digest = "a" * 64
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="test-cluster",
+        session_owner_token="o" * 32,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    queue.prepare_owner_session_start(
+        "desktop-session-1",
+        recorded_generation_id=None,
+        candidate_generation_id="generation-1",
+    )
+    unrelated = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["sleep", "60"]),
+            idempotency_key="unrelated-sentinel-job",
+        )
+    )
+
+    def artifact_binding(_cluster: str) -> str:
+        return expected_digest
+
+    monkeypatch.setattr(
+        "clio_relay.http_api.jarvis_mcp_artifact_binding",
+        artifact_binding,
+    )
+    client = cast(
+        Any,
+        TestClient(
+            create_app(settings),
+            headers={
+                "Authorization": "Bearer session-api-token",
+                OWNER_SESSION_ID_HEADER: "desktop-session-1",
+                SESSION_GENERATION_ID_HEADER: "generation-1",
+            },
+        ),
+    )
+    payload = {
+        "cluster": "test-cluster",
+        "tool": "jarvis_get_execution",
+        "arguments": {
+            "pipeline_id": "pipeline",
+            "execution_id": "execution-1",
+            "include_service_runtimes": True,
+        },
+        "idempotency_key": "owned-artifact-source",
+    }
+
+    omitted = client.post("/jobs/jarvis-mcp-call", json=payload)
+    mismatched = client.post(
+        "/jobs/jarvis-mcp-call",
+        json={**payload, "expected_server_artifact_digest": "b" * 64},
+    )
+    accepted = client.post(
+        "/jobs/jarvis-mcp-call",
+        json={**payload, "expected_server_artifact_digest": expected_digest},
+    )
+
+    assert omitted.status_code == 422
+    assert mismatched.status_code == 409
+    assert accepted.status_code == 200
+    job = queue.get_job(accepted.json()["job_id"])
+    assert isinstance(job.spec, McpCallSpec)
+    assert job.spec.expected_server_artifact_digest == expected_digest
+    assert job.metadata == {
+        "owner": "clio-relay",
+        "owner_session_id": "desktop-session-1",
+        "owner_session_generation_id": "generation-1",
+    }
+    memberships, next_cursor, total, scanned = queue.list_owner_session_jobs_page(
+        "desktop-session-1",
+        session_generation_id="generation-1",
+        limit=100,
+    )
+    assert [membership.job_id for membership in memberships] == [job.job_id]
+    assert next_cursor is None
+    assert total == 1
+    assert scanned == 1
+
+    canceled = client.post(
+        f"/jobs/{job.job_id}/cancel",
+        json={"cluster": "test-cluster", "cancel_scheduler_job": True},
+    )
+    assert canceled.status_code == 200
+    assert canceled.json()["state"] == "canceled"
+    assert queue.get_job(unrelated.job_id).state is JobState.QUEUED
+
+
+def test_owned_session_submission_race_with_quiesce_returns_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="test-cluster",
+        session_owner_token="o" * 32,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    queue.prepare_owner_session_start(
+        "desktop-session-1",
+        recorded_generation_id=None,
+        candidate_generation_id="generation-1",
+    )
+    original_submit = StorageManagedQueue.submit_job
+
+    def quiesce_before_commit(self: StorageManagedQueue, job: RelayJob) -> RelayJob:
+        self.set_owner_session_closing(
+            "desktop-session-1",
+            session_generation_id="generation-1",
+        )
+        return original_submit(self, job)
+
+    monkeypatch.setattr(StorageManagedQueue, "submit_job", quiesce_before_commit)
+    client = cast(
+        Any,
+        TestClient(
+            create_app(settings),
+            headers={
+                "Authorization": "Bearer session-api-token",
+                OWNER_SESSION_ID_HEADER: "desktop-session-1",
+                SESSION_GENERATION_ID_HEADER: "generation-1",
+            },
+        ),
+    )
+
+    response = client.post(
+        "/jobs/jarvis-pipeline",
+        json={
+            "cluster": "test-cluster",
+            "pipeline_name": "pipeline",
+            "idempotency_key": "quiesce-race",
+        },
+    )
+
+    assert response.status_code == 409
+    assert queue.list_jobs() == []
+
+
 def test_owned_session_api_cannot_take_over_or_close_other_gateways(tmp_path: Path) -> None:
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
         owner_session_id="desktop-session-1",
         owner_session_generation_id="generation-1",
+        remote_cluster="test-cluster",
+        session_owner_token="o" * 32,
     )
     queue = ClioCoreQueue(settings.core_dir)
     assert (
@@ -751,7 +1081,17 @@ def test_owned_session_api_cannot_take_over_or_close_other_gateways(tmp_path: Pa
         == "generation-1"
     )
     unowned = queue.create_gateway_session(GatewaySession(cluster="test-cluster", name="unowned"))
-    client = cast(Any, TestClient(create_app(settings)))
+    client = cast(
+        Any,
+        TestClient(
+            create_app(settings),
+            headers={
+                "Authorization": "Bearer session-api-token",
+                OWNER_SESSION_ID_HEADER: "desktop-session-1",
+                SESSION_GENERATION_ID_HEADER: "generation-1",
+            },
+        ),
+    )
 
     for session in (other_owned, prior_generation, unowned):
         patched = client.patch(
@@ -773,8 +1113,11 @@ def test_owned_session_api_filters_jobs_redacts_capabilities_and_quiesces_intake
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
         owner_session_id="desktop-session-1",
         owner_session_generation_id="generation-1",
+        remote_cluster="test-cluster",
+        session_owner_token="o" * 32,
     )
     queue = ClioCoreQueue(settings.core_dir)
     owned = queue.submit_job(
@@ -817,7 +1160,17 @@ def test_owned_session_api_filters_jobs_redacts_capabilities_and_quiesces_intake
             },
         )
     )
-    client = cast(Any, TestClient(create_app(settings)))
+    client = cast(
+        Any,
+        TestClient(
+            create_app(settings),
+            headers={
+                "Authorization": "Bearer session-api-token",
+                OWNER_SESSION_ID_HEADER: "desktop-session-1",
+                SESSION_GENERATION_ID_HEADER: "generation-1",
+            },
+        ),
+    )
 
     owned_response = client.get(f"/jobs/{owned.job_id}")
     other_response = client.get(f"/jobs/{other.job_id}")

@@ -30,7 +30,11 @@ from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError
 from clio_relay.identifiers import DurableRecordId
-from clio_relay.jarvis_mcp import jarvis_mcp_server, jarvis_mcp_server_args
+from clio_relay.jarvis_mcp import (
+    jarvis_mcp_artifact_binding,
+    jarvis_mcp_server,
+    jarvis_mcp_server_args,
+)
 from clio_relay.models import (
     ArtifactRef,
     Cursor,
@@ -80,6 +84,11 @@ from clio_relay.relay_ops import (
     job_status as get_job_status_operation,
 )
 from clio_relay.retention import TerminalRetentionCoordinator
+from clio_relay.session_api import (
+    OWNER_SESSION_ID_HEADER,
+    SESSION_GENERATION_ID_HEADER,
+    session_identity_document,
+)
 from clio_relay.storage_runtime import StorageAdmissionError, storage_managed_queue
 from clio_relay.validation_report import redact_sensitive_values
 
@@ -146,6 +155,157 @@ def _restore_environment_references(original: object, redacted: object) -> objec
     return redacted
 
 
+def _list_owned_session_queue(
+    queue: ClioCoreQueue,
+    *,
+    owner_session_id: str,
+    session_generation_id: str,
+    cluster: str | None,
+    state: JobState | None,
+    kind: JobKind | None,
+    include_terminal: bool,
+    cursor: int,
+    limit: int,
+    scan_limit: int,
+) -> dict[str, object]:
+    """List only one exact generation's membership without a global source window."""
+    membership_cursor: str | None = None
+    source_position = 1
+    source_total: int | None = None
+    while source_position < cursor:
+        skip_limit = min(MAX_RESPONSE_PAGE_RECORDS, cursor - source_position)
+        _, next_membership_cursor, source_total, scanned = queue.list_owner_session_jobs_page(
+            owner_session_id,
+            session_generation_id=session_generation_id,
+            cursor=membership_cursor,
+            limit=skip_limit,
+            include_terminal=True,
+        )
+        source_position += scanned
+        if scanned < skip_limit or next_membership_cursor is None:
+            membership_cursor = None
+            break
+        membership_cursor = next_membership_cursor
+    if source_total is not None and (source_position < cursor or cursor > source_total + 1):
+        return _owned_queue_page(
+            [],
+            cluster=cluster,
+            state=state,
+            kind=kind,
+            include_terminal=include_terminal,
+            cursor=cursor,
+            limit=limit,
+            next_cursor=None,
+            source_total=source_total,
+            scan_limit=scan_limit,
+            scanned=0,
+        )
+
+    selected: list[RelayJob] = []
+    scanned_total = 0
+    reached_end = source_total is not None and source_position > source_total
+    while not reached_end and scanned_total < scan_limit and len(selected) < limit:
+        page_limit = min(MAX_RESPONSE_PAGE_RECORDS, scan_limit - scanned_total)
+        jobs, next_membership_cursor, observed_total, scanned = queue.list_owner_session_jobs_page(
+            owner_session_id,
+            session_generation_id=session_generation_id,
+            cursor=membership_cursor,
+            limit=page_limit,
+            include_terminal=True,
+        )
+        if source_total is None:
+            source_total = observed_total
+        elif observed_total != source_total:
+            raise QueueConflictError("owner-session membership changed during queue paging")
+        consumed = 0
+        for job in jobs:
+            consumed += 1
+            if cluster is not None and job.cluster != cluster:
+                continue
+            if state is not None and job.state is not state:
+                continue
+            if kind is not None and job.kind is not kind:
+                continue
+            if (
+                not include_terminal
+                and state is None
+                and job.state in {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELED}
+            ):
+                continue
+            selected.append(job)
+            if len(selected) == limit:
+                break
+        scanned_total += consumed
+        source_position += consumed
+        if consumed < scanned:
+            break
+        membership_cursor = next_membership_cursor
+        reached_end = membership_cursor is None
+        if scanned == 0:
+            reached_end = True
+    resolved_total = source_total or 0
+    next_cursor = source_position if source_position <= resolved_total else None
+    return _owned_queue_page(
+        selected,
+        cluster=cluster,
+        state=state,
+        kind=kind,
+        include_terminal=include_terminal,
+        cursor=cursor,
+        limit=limit,
+        next_cursor=next_cursor,
+        source_total=resolved_total,
+        scan_limit=scan_limit,
+        scanned=scanned_total,
+    )
+
+
+def _owned_queue_page(
+    jobs: list[RelayJob],
+    *,
+    cluster: str | None,
+    state: JobState | None,
+    kind: JobKind | None,
+    include_terminal: bool,
+    cursor: int,
+    limit: int,
+    next_cursor: int | None,
+    source_total: int,
+    scan_limit: int,
+    scanned: int,
+) -> dict[str, object]:
+    """Render a generation-scoped queue page without cross-session position evidence."""
+    return {
+        "jobs": [
+            {
+                "job": job.model_dump(mode="json"),
+                "relay_queue": {
+                    "state": job.state.value,
+                    "jobs_ahead": None,
+                    "position": None,
+                },
+            }
+            for job in jobs
+        ],
+        "count": len(jobs),
+        "cluster": cluster,
+        "state": None if state is None else state.value,
+        "kind": None if kind is None else kind.value,
+        "include_terminal": include_terminal,
+        "source_cursor": cursor,
+        "source_limit": limit,
+        "source_next_cursor": next_cursor,
+        "source_total": source_total,
+        "source_total_semantics": "owner_session_generation_membership",
+        "filters_apply_within_source_window": True,
+        "visibility_filter": "exact_owner_session_generation",
+        "result_truncated": next_cursor is not None,
+        "scan_limit": scan_limit,
+        "scan_count": scanned,
+        "scan_truncated": next_cursor is not None and scanned >= scan_limit,
+    }
+
+
 class JarvisSubmitRequest(BaseModel):
     """HTTP request to submit a JARVIS pipeline YAML document."""
 
@@ -189,6 +349,10 @@ class McpCallSubmitRequest(BaseModel):
     server: str
     server_args: list[str] = Field(default_factory=list)
     env_from: dict[str, str] = Field(default_factory=dict)
+    expected_server_artifact_digest: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     tool: str
     arguments: dict[str, object] = Field(default_factory=dict)
     timeout_seconds: int | None = Field(default=None, gt=0)
@@ -209,6 +373,10 @@ class JarvisMcpCallSubmitRequest(BaseModel):
     cluster: str
     tool: str
     arguments: dict[str, object] = Field(default_factory=dict)
+    expected_server_artifact_digest: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     timeout_seconds: int | None = Field(default=None, gt=0)
     idempotency_key: str
 
@@ -383,6 +551,19 @@ class GatewaySessionUpdateRequest(BaseModel):
 def create_app(settings: RelaySettings | None = None) -> FastAPI:
     """Create the FastAPI relay surface."""
     resolved = settings or RelaySettings.from_env()
+    if resolved.owner_session_id is not None:
+        if not resolved.remote_cluster:
+            raise ConfigurationError("owned relay session API requires CLIO_RELAY_REMOTE_CLUSTER")
+        if not resolved.session_owner_token:
+            raise ConfigurationError(
+                "owned relay session API requires CLIO_RELAY_SESSION_OWNER_TOKEN"
+            )
+        if len(resolved.session_owner_token.encode("utf-8")) < 32:
+            raise ConfigurationError(
+                "owned relay session API requires a session owner token of at least 32 bytes"
+            )
+        if not resolved.api_token:
+            raise ConfigurationError("owned relay session API requires CLIO_RELAY_API_TOKEN")
     queue = storage_managed_queue(resolved)
     queue.initialize()
 
@@ -398,14 +579,25 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
 
     app = FastAPI(title="clio-relay", lifespan=lifespan)
     auth_dependency = Depends(_require_api_token(resolved))
+    session_submission_dependency = Depends(_require_session_submission_binding(resolved))
 
     def ensure_intake_open() -> None:
-        if resolved.owner_session_id is not None and queue.owner_session_is_closing(
-            resolved.owner_session_id
-        ):
+        if resolved.owner_session_id is None:
+            return
+        generation_id = resolved.owner_session_generation_id
+        if generation_id is None:
             raise HTTPException(
                 status_code=409,
-                detail="relay session is closing and no longer accepts new work",
+                detail="relay session has no exact generation identity",
+            )
+        admission = queue.owner_session_generation_status(
+            resolved.owner_session_id,
+            session_generation_id=generation_id,
+        )
+        if admission.get("open") is not True:
+            raise HTTPException(
+                status_code=409,
+                detail="relay session generation is not open for new work",
             )
 
     def owns_job(job: RelayJob) -> bool:
@@ -434,7 +626,28 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
 
     def submit_owned(job: RelayJob) -> RelayJob:
         ensure_intake_open()
+        if resolved.remote_cluster is not None and job.cluster != resolved.remote_cluster:
+            raise HTTPException(
+                status_code=409,
+                detail="job cluster does not match this owned relay session",
+            )
         metadata = dict(job.metadata)
+        protected = sorted(
+            {
+                "owner",
+                "owner_session_id",
+                "owner_session_generation_id",
+                "owner_session_admission_id",
+            }.intersection(metadata)
+        )
+        if protected:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "job ownership metadata is server-managed and cannot be supplied: "
+                    + ", ".join(protected)
+                ),
+            )
         if resolved.owner_session_id is not None:
             metadata.update(
                 {
@@ -446,6 +659,8 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 metadata["owner_session_generation_id"] = resolved.owner_session_generation_id
         try:
             return _public_record(queue.submit_job(job.model_copy(update={"metadata": metadata})))
+        except QueueConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except StorageAdmissionError as exc:
             raise HTTPException(status_code=507, detail=exc.decision.to_dict()) from exc
 
@@ -469,16 +684,42 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     def healthz() -> dict[str, object]:
         return {"ok": True, "auth": resolved.api_token is not None}
 
+    @app.get("/session-identity")
+    def session_identity(nonce: Annotated[str, Query(pattern=r"^[0-9a-f]{64}$")]) -> dict[str, str]:
+        """Prove the exact owned session identity without accepting credentials."""
+        if (
+            resolved.owner_session_id is None
+            or resolved.owner_session_generation_id is None
+            or resolved.remote_cluster is None
+            or resolved.session_owner_token is None
+        ):
+            raise HTTPException(status_code=404, detail="owned session identity is unavailable")
+        return session_identity_document(
+            owner_token=resolved.session_owner_token,
+            cluster=resolved.remote_cluster,
+            session_id=resolved.owner_session_id,
+            generation_id=resolved.owner_session_generation_id,
+            nonce=nonce,
+        )
+
     @app.get("/storage/status", dependencies=[auth_dependency])
     def storage_status() -> dict[str, object]:
         """Return the machine-readable queue admission and storage decision."""
         return _public_payload(queue.storage_runtime.status())
 
-    @app.post("/jobs", response_model=RelayJob, dependencies=[auth_dependency])
+    @app.post(
+        "/jobs",
+        response_model=RelayJob,
+        dependencies=[auth_dependency, session_submission_dependency],
+    )
     def submit_job(job: RelayJob) -> RelayJob:
         return submit_owned(job)
 
-    @app.post("/jobs/jarvis", response_model=RelayJob, dependencies=[auth_dependency])
+    @app.post(
+        "/jobs/jarvis",
+        response_model=RelayJob,
+        dependencies=[auth_dependency, session_submission_dependency],
+    )
     def submit_jarvis(request: JarvisSubmitRequest) -> RelayJob:
         return submit_owned(
             RelayJob(
@@ -489,7 +730,11 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             )
         )
 
-    @app.post("/jobs/jarvis-pipeline", response_model=RelayJob, dependencies=[auth_dependency])
+    @app.post(
+        "/jobs/jarvis-pipeline",
+        response_model=RelayJob,
+        dependencies=[auth_dependency, session_submission_dependency],
+    )
     def submit_jarvis_pipeline(request: JarvisPipelineSubmitRequest) -> RelayJob:
         return submit_owned(
             RelayJob(
@@ -500,7 +745,11 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             )
         )
 
-    @app.post("/jobs/remote-agent", response_model=RelayJob, dependencies=[auth_dependency])
+    @app.post(
+        "/jobs/remote-agent",
+        response_model=RelayJob,
+        dependencies=[auth_dependency, session_submission_dependency],
+    )
     def submit_remote_agent(request: RemoteAgentSubmitRequest) -> RelayJob:
         return submit_owned(
             RelayJob(
@@ -517,7 +766,11 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             )
         )
 
-    @app.post("/jobs/mcp-call", response_model=RelayJob, dependencies=[auth_dependency])
+    @app.post(
+        "/jobs/mcp-call",
+        response_model=RelayJob,
+        dependencies=[auth_dependency, session_submission_dependency],
+    )
     def submit_mcp_call(request: McpCallSubmitRequest) -> RelayJob:
         return submit_owned(
             RelayJob(
@@ -527,6 +780,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                     server=request.server,
                     server_args=request.server_args,
                     env_from=request.env_from,
+                    expected_server_artifact_digest=(request.expected_server_artifact_digest),
                     tool=request.tool,
                     arguments=request.arguments,
                     timeout_seconds=request.timeout_seconds,
@@ -535,8 +789,30 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             )
         )
 
-    @app.post("/jobs/jarvis-mcp-call", response_model=RelayJob, dependencies=[auth_dependency])
+    @app.post(
+        "/jobs/jarvis-mcp-call",
+        response_model=RelayJob,
+        dependencies=[auth_dependency, session_submission_dependency],
+    )
     def submit_jarvis_mcp_call(request: JarvisMcpCallSubmitRequest) -> RelayJob:
+        expected_digest = request.expected_server_artifact_digest
+        if resolved.owner_session_id is not None and expected_digest is None:
+            raise HTTPException(
+                status_code=422,
+                detail=("owned JARVIS MCP submission requires expected_server_artifact_digest"),
+            )
+        if expected_digest is not None:
+            try:
+                observed_digest = jarvis_mcp_artifact_binding(request.cluster)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if not secrets.compare_digest(expected_digest, observed_digest):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "JARVIS MCP artifact identity changed; refresh discovery before submission"
+                    ),
+                )
         return submit_owned(
             RelayJob(
                 cluster=request.cluster,
@@ -544,6 +820,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 spec=McpCallSpec(
                     server=jarvis_mcp_server(),
                     server_args=jarvis_mcp_server_args(),
+                    expected_server_artifact_digest=expected_digest,
                     tool=request.tool,
                     arguments=request.arguments,
                     timeout_seconds=request.timeout_seconds,
@@ -898,10 +1175,15 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     @app.post(
         "/gateway-sessions",
         response_model=GatewaySession,
-        dependencies=[auth_dependency],
+        dependencies=[auth_dependency, session_submission_dependency],
     )
     def create_gateway_session(request: GatewaySessionCreateRequest) -> GatewaySession:
         ensure_intake_open()
+        if resolved.remote_cluster is not None and request.cluster != resolved.remote_cluster:
+            raise HTTPException(
+                status_code=409,
+                detail="gateway cluster does not match this owned relay session",
+            )
         metadata = dict(request.metadata)
         if resolved.owner_session_id is not None:
             metadata.update(
@@ -912,23 +1194,26 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             )
             if resolved.owner_session_generation_id is not None:
                 metadata["owner_session_generation_id"] = resolved.owner_session_generation_id
-        return _public_record(
-            queue.create_gateway_session(
-                GatewaySession(
-                    cluster=request.cluster,
-                    name=request.name,
-                    state=request.state,
-                    queue_state=request.queue_state,
-                    node=request.node,
-                    requested_resources=request.requested_resources,
-                    stdout_uri=request.stdout_uri,
-                    stderr_uri=request.stderr_uri,
-                    log_uris=request.log_uris,
-                    gateway=request.gateway,
-                    metadata=metadata,
+        try:
+            return _public_record(
+                queue.create_gateway_session(
+                    GatewaySession(
+                        cluster=request.cluster,
+                        name=request.name,
+                        state=request.state,
+                        queue_state=request.queue_state,
+                        node=request.node,
+                        requested_resources=request.requested_resources,
+                        stdout_uri=request.stdout_uri,
+                        stderr_uri=request.stderr_uri,
+                        log_uris=request.log_uris,
+                        gateway=request.gateway,
+                        metadata=metadata,
+                    )
                 )
             )
-        )
+        except QueueConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get(
         "/gateway-sessions",
@@ -1135,6 +1420,34 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 job_state = JobState(state)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=f"unknown job state: {state}") from exc
+        if scan_limit < limit:
+            raise HTTPException(
+                status_code=422,
+                detail="scan_limit must be greater than or equal to limit",
+            )
+        if resolved.owner_session_id is not None:
+            generation_id = resolved.owner_session_generation_id
+            if generation_id is None:
+                raise HTTPException(status_code=409, detail="owned session generation is missing")
+            try:
+                return _public_payload(
+                    _list_owned_session_queue(
+                        queue,
+                        owner_session_id=resolved.owner_session_id,
+                        session_generation_id=generation_id,
+                        cluster=cluster,
+                        state=job_state,
+                        kind=kind,
+                        include_terminal=include_terminal,
+                        cursor=cursor,
+                        limit=limit,
+                        scan_limit=scan_limit,
+                    )
+                )
+            except QueueConflictError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
         try:
             payload = list_queue_jobs(
                 queue,
@@ -1152,23 +1465,6 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        if resolved.owner_session_id is not None:
-            raw_jobs = payload.get("jobs")
-            jobs: list[dict[str, object]] = []
-            raw_job_items = cast(list[object], raw_jobs) if isinstance(raw_jobs, list) else []
-            for raw_item in raw_job_items:
-                if not isinstance(raw_item, dict):
-                    continue
-                item = cast(dict[str, object], raw_item)
-                raw_job = item.get("job")
-                if not isinstance(raw_job, dict):
-                    continue
-                job_payload = cast(dict[str, object], raw_job)
-                if owns_job(RelayJob.model_validate(job_payload)):
-                    jobs.append(item)
-            payload["jobs"] = jobs
-            payload["count"] = len(jobs)
-            payload["visibility_filter"] = "owner_session_within_source_window"
         return _public_payload(payload)
 
     @app.get("/queue/jobs/{job_id}/diagnose", dependencies=[auth_dependency])
@@ -1523,14 +1819,101 @@ def _require_api_token(settings: RelaySettings) -> Callable[..., Awaitable[None]
     async def dependency(
         authorization: Annotated[str | None, Header()] = None,
         x_clio_relay_token: Annotated[str | None, Header()] = None,
+        x_clio_relay_owner_session_id: Annotated[
+            str | None,
+            Header(alias=OWNER_SESSION_ID_HEADER),
+        ] = None,
+        x_clio_relay_session_generation_id: Annotated[
+            str | None,
+            Header(alias=SESSION_GENERATION_ID_HEADER),
+        ] = None,
     ) -> None:
-        if settings.api_token is None:
+        if settings.api_token is not None:
+            supplied = _extract_token(authorization, x_clio_relay_token)
+            if supplied is None or not secrets.compare_digest(supplied, settings.api_token):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="missing or invalid relay API token",
+                )
+        expected_session_id = settings.owner_session_id
+        expected_generation_id = settings.owner_session_generation_id
+        if expected_session_id is None:
+            if (
+                x_clio_relay_owner_session_id is not None
+                or x_clio_relay_session_generation_id is not None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="relay API is not bound to an owner session",
+                )
             return
-        supplied = _extract_token(authorization, x_clio_relay_token)
-        if supplied is None or not secrets.compare_digest(supplied, settings.api_token):
+        if x_clio_relay_owner_session_id is None or x_clio_relay_session_generation_id is None:
             raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="missing or invalid relay API token",
+                status_code=409,
+                detail="exact owner session and generation headers are required",
+            )
+        if expected_generation_id is None or not (
+            secrets.compare_digest(x_clio_relay_owner_session_id, expected_session_id)
+            and secrets.compare_digest(
+                x_clio_relay_session_generation_id,
+                expected_generation_id,
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="owner session or generation does not match this API process",
+            )
+
+    return dependency
+
+
+def _require_session_submission_binding(
+    settings: RelaySettings,
+) -> Callable[..., Awaitable[None]]:
+    """Require exact client intent before a session-scoped API stamps job ownership."""
+
+    async def dependency(
+        x_clio_relay_owner_session_id: Annotated[
+            str | None,
+            Header(alias=OWNER_SESSION_ID_HEADER),
+        ] = None,
+        x_clio_relay_session_generation_id: Annotated[
+            str | None,
+            Header(alias=SESSION_GENERATION_ID_HEADER),
+        ] = None,
+    ) -> None:
+        expected_session_id = settings.owner_session_id
+        expected_generation_id = settings.owner_session_generation_id
+        if expected_session_id is None:
+            if (
+                x_clio_relay_owner_session_id is not None
+                or x_clio_relay_session_generation_id is not None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="relay API is not bound to an owner session",
+                )
+            return
+        if settings.api_token is None:
+            raise HTTPException(
+                status_code=503,
+                detail="owned relay session submissions require API token authentication",
+            )
+        if x_clio_relay_owner_session_id is None or x_clio_relay_session_generation_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail="exact owner session and generation headers are required",
+            )
+        if expected_generation_id is None or not (
+            secrets.compare_digest(x_clio_relay_owner_session_id, expected_session_id)
+            and secrets.compare_digest(
+                x_clio_relay_session_generation_id,
+                expected_generation_id,
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="owner session or generation does not match this API process",
             )
 
     return dependency
@@ -1550,6 +1933,18 @@ def _require_websocket_token(settings: RelaySettings, websocket: WebSocket) -> N
     if supplied is None:
         supplied = _extract_token(websocket.headers.get("authorization"), None)
     if supplied is None or not secrets.compare_digest(supplied, settings.api_token):
+        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
+    if settings.owner_session_id is None:
+        return
+    session_id = websocket.headers.get(OWNER_SESSION_ID_HEADER)
+    generation_id = websocket.headers.get(SESSION_GENERATION_ID_HEADER)
+    if (
+        session_id is None
+        or generation_id is None
+        or settings.owner_session_generation_id is None
+        or not secrets.compare_digest(session_id, settings.owner_session_id)
+        or not secrets.compare_digest(generation_id, settings.owner_session_generation_id)
+    ):
         raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
 
 

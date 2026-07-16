@@ -19,6 +19,7 @@ from clio_relay.session_lifecycle import (
     CleanupResource,
     RemoteSessionStateEvidence,
     SessionLifecycleReport,
+    challenge_remote_session_identity,
     detach_remote_session,
     start_remote_session,
     status_remote_session,
@@ -301,6 +302,57 @@ def test_status_remote_session_returns_json(monkeypatch: MonkeyPatch) -> None:
 
     assert status == {"session_id": "session-1", "running": True}
     assert 'metadata.pop("owner_token", None)' in scripts[0]
+
+
+def test_remote_session_identity_challenge_binds_process_cluster_and_nonce(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    scripts: list[str] = []
+    nonce = "1" * 64
+    expected = {
+        "schema_version": "clio-relay.session-identity.v1",
+        "cluster": "ares",
+        "session_id": "session-1",
+        "session_generation_id": "generation-1",
+        "nonce": nonce,
+        "hmac_sha256": "a" * 64,
+    }
+
+    def fake_run(
+        command: list[str],
+        *,
+        input: bytes,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del capture_output, check, timeout
+        scripts.append(input.decode("utf-8"))
+        return subprocess.CompletedProcess(command, 0, json.dumps(expected).encode(), b"")
+
+    monkeypatch.setattr("clio_relay.session_lifecycle.subprocess.run", fake_run)
+
+    observed = challenge_remote_session_identity(
+        definition=ClusterDefinition(name="ares", ssh_host="ares"),
+        session_id="session-1",
+        session_generation_id="generation-1",
+        nonce=nonce,
+    )
+
+    assert observed == expected
+    script = scripts[0]
+    assert "metadata_path, cluster, session_id, generation_id, nonce" in script
+    assert "CLIO_RELAY_REMOTE_CLUSTER={cluster}" in script
+    assert "os.getpgid(pid) != pid" in script
+    assert "hmac.new(token.encode" in script
+    assert "clio-relay.session-identity.v1" in script
+    with pytest.raises(ValueError, match="256-bit"):
+        challenge_remote_session_identity(
+            definition=ClusterDefinition(name="ares", ssh_host="ares"),
+            session_id="session-1",
+            session_generation_id="generation-1",
+            nonce="weak",
+        )
 
 
 def test_remote_session_command_timeout_is_reported(monkeypatch: MonkeyPatch) -> None:

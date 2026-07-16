@@ -106,6 +106,8 @@ class RelaySettings(BaseModel):
     api_token: str | None = None
     owner_session_id: str | None = None
     owner_session_generation_id: DurableRecordId | None = None
+    remote_cluster: str | None = None
+    session_owner_token: str | None = None
     agent_bin: str = "agent"
     agent_adapter: str = "exec"
     agent_args: list[str] = Field(default_factory=list)
@@ -235,6 +237,8 @@ class RelaySettings(BaseModel):
             api_token=os.getenv("CLIO_RELAY_API_TOKEN"),
             owner_session_id=os.getenv("CLIO_RELAY_OWNER_SESSION_ID"),
             owner_session_generation_id=os.getenv("CLIO_RELAY_SESSION_GENERATION_ID"),
+            remote_cluster=os.getenv("CLIO_RELAY_REMOTE_CLUSTER"),
+            session_owner_token=os.getenv("CLIO_RELAY_SESSION_OWNER_TOKEN"),
             agent_bin=os.getenv(
                 "CLIO_RELAY_AGENT_BIN",
                 "agent",

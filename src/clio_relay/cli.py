@@ -177,6 +177,7 @@ from clio_relay.scheduler_providers import (
 )
 from clio_relay.scheduler_validation import run_scheduler_lifecycle_validation
 from clio_relay.service_runtime import ServiceRuntimeStartResult, ServiceRuntimeSupervisor
+from clio_relay.session_api import submit_owned_session_job
 from clio_relay.session_lifecycle import (
     CleanupResource,
     SessionLifecycleReport,
@@ -3014,6 +3015,57 @@ def session_status(
             )
         )
     )
+
+
+@session_app.command("submit-jarvis")
+def session_submit_jarvis(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    session_id: Annotated[str, typer.Option(help="Exact owned relay session id.")],
+    session_generation_id: Annotated[
+        str,
+        typer.Option(help="Exact owned relay session generation id."),
+    ],
+    pipeline_yaml_file: Annotated[
+        Path,
+        typer.Option(
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Local JARVIS pipeline YAML file.",
+        ),
+    ],
+    idempotency_key: Annotated[str, typer.Option(help="Durable submission identity.")],
+    timeout_seconds: Annotated[
+        float,
+        typer.Option(min=1, max=300, help="Bounded session API transport timeout."),
+    ] = 30,
+) -> None:
+    """Submit JARVIS through the identity-proven exact-generation session API."""
+    settings = RelaySettings.from_env().model_copy(
+        update={
+            "owner_session_id": session_id,
+            "owner_session_generation_id": session_generation_id,
+            "remote_cluster": cluster,
+        }
+    )
+    definition = _require_cluster(cluster)
+
+    def action() -> None:
+        job = submit_owned_session_job(
+            definition=definition,
+            settings=settings,
+            path="/jobs/jarvis",
+            payload={
+                "cluster": cluster,
+                "pipeline_yaml": pipeline_yaml_file.read_text(encoding="utf-8"),
+                "idempotency_key": idempotency_key,
+            },
+            timeout_seconds=timeout_seconds,
+        )
+        typer.echo(json.dumps(job.model_dump(mode="json"), indent=2))
+
+    _run_or_exit(action)
 
 
 @session_app.command("quiesce-intake", hidden=True)

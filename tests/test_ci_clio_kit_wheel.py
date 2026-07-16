@@ -17,14 +17,14 @@ from clio_relay.jarvis_mcp import (
 ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
-WHEEL_FILENAME = "clio_kit-2.4.8-py3-none-any.whl"
-WHEEL_SHA256 = "d1d9cd101472dfdbcc37682f8dc16063cd9a038ef5eeb3819e692ad2823b17de"
-WHEEL_URL = f"https://github.com/iowarp/clio-kit/releases/download/v2.4.8/{WHEEL_FILENAME}"
+WHEEL_FILENAME = "clio_kit-2.4.9-py3-none-any.whl"
+WHEEL_SHA256 = "a9d771bcd40ec98de2626ac2a8706fcc614a2eaac462defb10f8d7bec13693e3"
+WHEEL_URL = f"https://github.com/iowarp/clio-kit/releases/download/v2.4.9/{WHEEL_FILENAME}"
 
 
 def test_runtime_and_ci_share_one_exact_clio_kit_release_pin() -> None:
     """Keep bootstrap, JARVIS MCP, and CI on the same exact release wheel bytes."""
-    assert CLIO_KIT_JARVIS_MCP_VERSION == "2.4.8"
+    assert CLIO_KIT_JARVIS_MCP_VERSION == "2.4.9"
     assert CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME == WHEEL_FILENAME
     assert CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 == WHEEL_SHA256
     assert CLIO_KIT_JARVIS_MCP_WHEEL_URL == WHEEL_URL

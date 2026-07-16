@@ -1334,6 +1334,7 @@ class ServiceRuntimeSupervisor:
             verified_runtime = reverify_jarvis_service_runtime(
                 queue=self.queue,
                 definition=self.definition,
+                settings=self.settings,
                 binding_document=binding_document,
             )
         except ValueError as exc:
@@ -2823,6 +2824,7 @@ class ServiceRuntimeSupervisor:
                 verified = reverify_jarvis_service_runtime(
                     queue=self.queue,
                     definition=self.definition,
+                    settings=self.settings,
                     binding_document=binding_document,
                 )
             except ValueError as exc:

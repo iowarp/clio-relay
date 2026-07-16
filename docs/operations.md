@@ -214,7 +214,7 @@ For the legacy clio-kit 2.2.6 compatibility path, a successful synchronous
 `jarvis_run` MCP return is normalized to a terminal `completed` record even
 though that release labels the result `status=running`; the original status and
 completion basis remain in `details.completion_normalization` for auditability.
-The pinned clio-kit 2.4.8 production path removes that ambiguity upstream and
+The pinned clio-kit 2.4.9 production path removes that ambiguity upstream and
 returns a structured completed result directly. The legacy normalization is
 diagnostic compatibility evidence and cannot satisfy the 1.0 gate. Scheduler
 submissions remain non-terminal unless JARVIS was asked to wait.
@@ -446,7 +446,7 @@ Install the cluster-side server once, then launch its persistent executable:
 
 ```bash
 uv tool install --python 3.12 --no-config \
-  https://github.com/iowarp/clio-kit/releases/download/v2.4.8/clio_kit-2.4.8-py3-none-any.whl
+  https://github.com/iowarp/clio-kit/releases/download/v2.4.9/clio_kit-2.4.9-py3-none-any.whl
 clio-kit mcp-server jarvis
 ```
 
@@ -851,15 +851,20 @@ clio-relay session teardown --cluster my-cluster --session-id desktop-session --
 ```
 
 Jobs submitted through the owned session API are stamped with the server-side
-`owner_session_id`. Teardown discovers active jobs with that exact ownership
-record, plus terminal relay submission jobs that still carry an owned scheduler
-identity. It never treats all jobs on a cluster as session-owned. A scheduler id
-is cancelable only when an authenticated JARVIS ownership record binds it to the
-exact relay job and task and agrees with the cluster's configured provider. Raw
-runtime fields and legacy stdout ids are reported as refused residuals. The
-scheduler flag is rejected unless `--cancel-jobs` is also present; relay jobs are
-canceled relay-only, followed by one exact scheduler cancellation and verification
-path so duplicate provider cancellation requests cannot race. Release acceptance
+`owner_session_id` and `owner_session_generation_id`; clients cannot supply those
+metadata fields. Every owned job submission must authenticate with the relay API
+token and send `X-Clio-Relay-Owner-Session-Id` and
+`X-Clio-Relay-Session-Generation-Id` matching the API process exactly. Missing,
+stale, or mismatched bindings are rejected before queue admission. Teardown
+discovers active jobs with that exact ownership record, plus terminal relay
+submission jobs that still carry an owned scheduler identity. It never treats all
+jobs on a cluster as session-owned. A scheduler id is cancelable only when an
+authenticated JARVIS ownership record binds it to the exact relay job and task and
+agrees with the cluster's configured provider. Raw runtime fields and legacy stdout
+ids are reported as refused residuals. The scheduler flag is rejected unless
+`--cancel-jobs` is also present; relay jobs are canceled relay-only, followed by one
+exact scheduler cancellation and verification path so duplicate provider
+cancellation requests cannot race. Release acceptance
 also supplies one or more repeatable `--preserve-scheduler-job-id` values. Each
 sentinel must be active and absent from both owned and unowned scheduler identities
 for the target session generation before cancellation. After owned cancellation it
