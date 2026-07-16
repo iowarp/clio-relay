@@ -8,6 +8,7 @@ import shlex
 import stat
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Protocol, cast
@@ -27,7 +28,9 @@ from clio_relay.cluster_config import (
     ClusterRegistry,
     FrpTransportConfig,
     RemoteMcpServerConfig,
+    cluster_route_revision,
 )
+from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.jarvis_mcp import (
@@ -35,7 +38,7 @@ from clio_relay.jarvis_mcp import (
     JARVIS_MCP_CACHE_SERVER_NAME,
     jarvis_user_contract,
 )
-from clio_relay.mcp_server import McpSessionState, handle_request
+from clio_relay.mcp_server import McpSessionState, handle_request, serve_stdio
 from clio_relay.models import JobKind, JobState, McpCallSpec, McpOperation, RelayJob
 from clio_relay.remote_mcp import (
     MAX_REMOTE_MCP_CACHE_BYTES,
@@ -1040,6 +1043,149 @@ def test_mcp_server_reloads_catalog_and_routes_without_forwarding_cluster(
     )
 
 
+def test_mcp_server_executes_cached_alias_on_fresh_session(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A lazy MCP client may execute a cached tool without listing on its new connection."""
+    monkeypatch.chdir(tmp_path)
+    registration = _registration(profiles=["user"])
+    ClusterRegistry(clusters={"alpha": _cluster("alpha", {"science": registration})}).save(
+        tmp_path / ".clio-relay" / "clusters.json"
+    )
+    discovered_at = datetime.now(UTC)
+    entry = _entry(registration, cluster="alpha", server_name="science").model_copy(
+        update={
+            "discovered_at": discovered_at,
+            "expires_at": discovered_at + timedelta(hours=1),
+        }
+    )
+    RemoteMcpSchemaCache.update_entry(
+        tmp_path / ".clio-relay" / "remote-mcp-cache.json",
+        entry,
+    )
+    discovery_queue = ClioCoreQueue(tmp_path / "discovery-core")
+    discovery_queue.initialize()
+
+    discovery_session = McpSessionState()
+    listed = handle_request(
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        queue=discovery_queue,
+        profile="user",
+        session=discovery_session,
+    )
+    assert listed is not None
+    assert "remote_science_inspect" in {tool["name"] for tool in listed["result"]["tools"]}
+    cached_revision = listed["result"]["_meta"]["clio-relay/remote-mcp-catalog-revision"]
+
+    stdout = StringIO()
+    requests = [
+        {"jsonrpc": "2.0", "id": 2, "method": "initialize"},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "remote_science_inspect",
+                "arguments": {"cluster": "alpha", "path": "/data/run"},
+            },
+        },
+    ]
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    serve_stdio(
+        stdin=StringIO("".join(f"{json.dumps(request)}\n" for request in requests)),
+        stdout=stdout,
+        settings=settings,
+        profile="user",
+    )
+
+    responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    assert [response["id"] for response in responses] == [2, 3]
+    response = responses[1]
+    structured = response["result"]["structuredContent"]
+    assert structured["catalog_revision"] == cached_revision
+    assert structured["route_revision"] == cluster_route_revision(
+        _cluster("alpha", {"science": registration})
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    queue.initialize()
+    job = queue.get_job(structured["job_id"])
+    assert isinstance(job.spec, McpCallSpec)
+    assert job.spec.expected_server_artifact_digest == remote_mcp_server_artifact_digest(
+        _server_artifact(registration)
+    )
+    assert job.spec.arguments == {"path": "/data/run"}
+
+
+def test_mcp_server_fresh_session_rejects_alias_removed_from_current_catalog(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A cached alias fails closed when its registration no longer matches discovery."""
+    monkeypatch.chdir(tmp_path)
+    registration = _registration(profiles=["user"])
+    registry_path = tmp_path / ".clio-relay" / "clusters.json"
+    ClusterRegistry(clusters={"alpha": _cluster("alpha", {"science": registration})}).save(
+        registry_path
+    )
+    discovered_at = datetime.now(UTC)
+    entry = _entry(registration, cluster="alpha", server_name="science").model_copy(
+        update={
+            "discovered_at": discovered_at,
+            "expires_at": discovered_at + timedelta(hours=1),
+        }
+    )
+    RemoteMcpSchemaCache.update_entry(
+        tmp_path / ".clio-relay" / "remote-mcp-cache.json",
+        entry,
+    )
+    queue = ClioCoreQueue(tmp_path / "core")
+    queue.initialize()
+
+    discovery_session = McpSessionState()
+    listed = handle_request(
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        queue=queue,
+        profile="user",
+        session=discovery_session,
+    )
+    assert listed is not None
+    assert "remote_science_inspect" in {tool["name"] for tool in listed["result"]["tools"]}
+
+    changed_registration = _registration(command="science-mcp-v2", profiles=["user"])
+    ClusterRegistry(clusters={"alpha": _cluster("alpha", {"science": changed_registration})}).save(
+        registry_path
+    )
+    execution_session = McpSessionState()
+    initialized = handle_request(
+        {"jsonrpc": "2.0", "id": 2, "method": "initialize"},
+        queue=queue,
+        profile="user",
+        session=execution_session,
+    )
+    assert initialized is not None
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "remote_science_inspect",
+                "arguments": {"cluster": "alpha", "path": "/data/run"},
+            },
+        },
+        queue=queue,
+        profile="user",
+        session=execution_session,
+    )
+
+    assert response is not None
+    assert "tool is not available in MCP profile 'user'" in response["error"]["message"]
+    assert queue.list_jobs() == []
+
+
 def test_mcp_server_rejects_stable_alias_after_schema_revision_changes(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -1631,10 +1777,29 @@ def test_mcp_session_binds_user_and_operator_catalogs_independently(
         if tool["name"].startswith("remote_user_science_")
     )
 
-    unlisted_operator_call = handle_request(
+    cross_profile_call = handle_request(
         {
             "jsonrpc": "2.0",
             "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": user_alias,
+                "arguments": {"cluster": "alpha", "path": "/user"},
+            },
+        },
+        queue=queue,
+        profile="operator",
+        session=session,
+    )
+    assert cross_profile_call is not None
+    assert (
+        "tool is not available in MCP profile 'operator'" in cross_profile_call["error"]["message"]
+    )
+
+    cached_operator_call = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
             "method": "tools/call",
             "params": {
                 "name": "remote_operator_science_inspect",
@@ -1645,11 +1810,11 @@ def test_mcp_session_binds_user_and_operator_catalogs_independently(
         profile="operator",
         session=session,
     )
-    assert unlisted_operator_call is not None
-    assert "must be discovered with tools/list" in unlisted_operator_call["error"]["message"]
+    assert cached_operator_call is not None
+    assert "result" in cached_operator_call
 
     operator_list = handle_request(
-        {"jsonrpc": "2.0", "id": 3, "method": "tools/list"},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/list"},
         queue=queue,
         profile="operator",
         session=session,
@@ -1681,7 +1846,7 @@ def test_mcp_session_binds_user_and_operator_catalogs_independently(
     user_call = handle_request(
         {
             "jsonrpc": "2.0",
-            "id": 4,
+            "id": 5,
             "method": "tools/call",
             "params": {
                 "name": user_alias,
@@ -1698,7 +1863,7 @@ def test_mcp_session_binds_user_and_operator_catalogs_independently(
     stale_operator_call = handle_request(
         {
             "jsonrpc": "2.0",
-            "id": 5,
+            "id": 6,
             "method": "tools/call",
             "params": {
                 "name": operator_alias,
