@@ -62,6 +62,22 @@ def _script_assignment(script: str, name: str) -> str:
     raise AssertionError(f"generated script has no exact {name} assignment")
 
 
+def test_detached_remote_connector_closes_transition_lock_descriptor() -> None:
+    """A long-lived frpc child must not inherit the connector transition lock."""
+
+    script = service_runtime._remote_frpc_start_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        definition=_definition(),
+        session_id="gateway_test",
+        config_text="serverAddr = 'relay.example.org'\n",
+        owner_token="owner-token",
+        connector_generation_id="generation-1",
+    )
+
+    assert "flock -w 10 -x 9" in script
+    assert "nohup setsid env" in script
+    assert '>"$log_file" 2>&1 9>&- &' in script
+
+
 @pytest.fixture(autouse=True)
 def _fake_connector_process_absent(  # pyright: ignore[reportUnusedFunction]
     monkeypatch: pytest.MonkeyPatch,

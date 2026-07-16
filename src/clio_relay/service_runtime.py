@@ -5284,7 +5284,7 @@ trap cleanup_incomplete_start EXIT
 nohup setsid env \
   "CLIO_RELAY_CONNECTOR_OWNER_TOKEN=$owner_token" \
   "CLIO_RELAY_CONNECTOR_GENERATION_ID=$connector_generation_id" \
-  "$frpc_bin" -c "$config_file" >"$log_file" 2>&1 &
+  "$frpc_bin" -c "$config_file" >"$log_file" 2>&1 9>&- &
 pid="$!"
 echo "$pid" > "$pid_file"
 python3 - "$metadata_file" "$pid" "$config_file" "$log_file" \
