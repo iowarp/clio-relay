@@ -336,6 +336,101 @@ def test_install_receipt_labels_exact_version_spec_as_pypi(tmp_path: Path) -> No
     assert receipt.requested_source == "pypi"
 
 
+def test_released_component_accepts_canonical_hashed_github_release() -> None:
+    component = ComponentArtifactIdentity(
+        distribution="clio-kit",
+        distribution_version="2.4.7",
+        install_spec=(
+            "https://github.com/iowarp/clio-kit/releases/download/"
+            "v2.4.7/clio_kit-2.4.7-py3-none-any.whl"
+        ),
+        requested_source="github_release",
+        artifact_filename="clio_kit-2.4.7-py3-none-any.whl",
+        artifact_sha256="a" * 64,
+        runtime_artifact_path="/opt/clio/clio_kit-2.4.7-py3-none-any.whl",
+        runtime_command=["/home/operator/.local/bin/clio-kit", "mcp-server", "jarvis"],
+    )
+    matcher = cast(
+        Callable[[ComponentArtifactIdentity], bool],
+        installation_module._is_released_component,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    assert matcher(component)
+
+
+def test_released_component_preserves_exact_hashed_pypi_release() -> None:
+    component = ComponentArtifactIdentity(
+        distribution="clio-kit",
+        distribution_version="2.4.7",
+        install_spec="clio-kit==2.4.7",
+        requested_source="pypi",
+        artifact_filename="clio_kit-2.4.7-py3-none-any.whl",
+        artifact_sha256="a" * 64,
+        runtime_artifact_path="/opt/clio/clio_kit-2.4.7-py3-none-any.whl",
+        runtime_command=["/home/operator/.local/bin/clio-kit", "mcp-server", "jarvis"],
+    )
+    matcher = cast(
+        Callable[[ComponentArtifactIdentity], bool],
+        installation_module._is_released_component,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    assert matcher(component)
+
+
+@pytest.mark.parametrize(
+    ("override", "value"),
+    [
+        (
+            "install_spec",
+            "https://github.com/iowarp/clio-kit/releases/latest/download/"
+            "clio_kit-2.4.7-py3-none-any.whl",
+        ),
+        (
+            "install_spec",
+            "https://github.com/other/clio-kit/releases/download/"
+            "v2.4.7/clio_kit-2.4.7-py3-none-any.whl",
+        ),
+        (
+            "install_spec",
+            "https://github.com/iowarp/clio-kit/releases/download/"
+            "v2.4.8/clio_kit-2.4.7-py3-none-any.whl",
+        ),
+        (
+            "install_spec",
+            "https://github.com/iowarp/clio-kit/releases/download/"
+            "v2.4.7/clio_kit-2.4.7-py3-none-any.whl?download=1",
+        ),
+        ("artifact_filename", "clio_kit-latest-py3-none-any.whl"),
+        ("artifact_sha256", "A" * 64),
+        ("artifact_sha256", "a" * 63),
+    ],
+)
+def test_released_component_rejects_unbound_github_release(
+    override: str,
+    value: str,
+) -> None:
+    payload: dict[str, object] = {
+        "distribution": "clio-kit",
+        "distribution_version": "2.4.7",
+        "install_spec": (
+            "https://github.com/iowarp/clio-kit/releases/download/"
+            "v2.4.7/clio_kit-2.4.7-py3-none-any.whl"
+        ),
+        "requested_source": "github_release",
+        "artifact_filename": "clio_kit-2.4.7-py3-none-any.whl",
+        "artifact_sha256": "a" * 64,
+        "runtime_artifact_path": "/opt/clio/clio_kit-2.4.7-py3-none-any.whl",
+        "runtime_command": ["/home/operator/.local/bin/clio-kit", "mcp-server", "jarvis"],
+    }
+    payload[override] = value
+    matcher = cast(
+        Callable[[ComponentArtifactIdentity], bool],
+        installation_module._is_released_component,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    assert not matcher(ComponentArtifactIdentity.model_validate(payload))
+
+
 def test_installation_info_uses_verified_uv_tool_receipt_without_bootstrap_receipt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

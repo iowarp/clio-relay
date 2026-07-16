@@ -51,6 +51,10 @@ CLIO_KIT_NATIVE_OPERATIONS = (
     "jarvis_get_execution",
     "jarvis_run",
 )
+OFFICIAL_COMPONENT_RELEASE_REPOSITORIES = {
+    "clio-kit": ("iowarp", "clio-kit"),
+    "jarvis-cd": ("grc-iit", "jarvis-cd"),
+}
 JARVIS_CD_NATIVE_OPERATIONS = (
     "execution_handle.progress",
     "pipeline.get_execution",
@@ -1144,7 +1148,10 @@ def attach_verified_worker_identity(
                     excerpt=(
                         "clio-kit component artifact is exact and released"
                         if component_valid
-                        else "clio-kit component artifact is missing or not a hashed PyPI wheel"
+                        else (
+                            "clio-kit component artifact is missing or not an exact "
+                            "hashed released wheel"
+                        )
                     ),
                     metadata={
                         "component": (
@@ -1157,7 +1164,7 @@ def attach_verified_worker_identity(
             error=(
                 None
                 if component_valid
-                else "worker clio-kit component is not bound to an exact hashed PyPI artifact"
+                else "worker clio-kit component is not bound to an exact hashed released artifact"
             ),
         )
     )
@@ -1165,7 +1172,7 @@ def attach_verified_worker_identity(
         report.status = ValidationStatus.FAILED
         report.error = "worker component artifact verification failed"
         raise ConfigurationError(
-            "worker clio-kit component is not bound to an exact hashed PyPI artifact"
+            "worker clio-kit component is not bound to an exact hashed released artifact"
         )
     clio_kit_native_runtime = runtime_identity
     try:
@@ -2091,16 +2098,8 @@ def verify_remote_package_progress_component(
         raise ConfigurationError(
             f"worker installation omitted package progress component {component_name}"
         )
-    version = component.distribution_version
-    digest = component.artifact_sha256
     if (
-        component.requested_source != "github_release"
-        or version is None
-        or not component.install_spec.startswith("https://github.com/")
-        or "/releases/download/" not in component.install_spec
-        or digest is None
-        or len(digest) != 64
-        or any(character not in "0123456789abcdef" for character in digest.lower())
+        not _is_official_github_release_component(component, component_name="jarvis-cd")
         or component.runtime_artifact_path is None
         or set(component.runtime_interpreters) != {"provider", "execution"}
         or set(component.runtime_executables) != {"jarvis"}
@@ -2180,14 +2179,11 @@ def verify_remote_native_jarvis_component(
         raise ConfigurationError(
             f"worker installation omitted native JARVIS component {component_name}"
         )
-    version = component.distribution_version
-    digest = component.artifact_sha256
     if (
-        component.requested_source != "github_release"
-        or version is None
-        or not component.install_spec.startswith("https://github.com/")
-        or "/releases/download/" not in component.install_spec
-        or not _is_sha256_text(digest)
+        not _is_official_github_release_component(
+            component,
+            component_name=component_name,
+        )
         or component.runtime_artifact_path is None
         or "execution" not in component.runtime_interpreters
         or set(component.runtime_executables) != {"jarvis"}
@@ -2222,17 +2218,46 @@ def verify_remote_native_jarvis_component(
 
 def _is_released_component(component: ComponentArtifactIdentity) -> bool:
     version = component.distribution_version
-    digest = component.artifact_sha256
-    return (
-        component.requested_source == "pypi"
-        and version is not None
-        and component.install_spec == f"{component.distribution}=={version}"
-        and digest is not None
-        and len(digest) == 64
-        and all(character in "0123456789abcdef" for character in digest.lower())
-        and component.runtime_artifact_path is not None
-        and bool(component.runtime_command)
+    if (
+        version is None
+        or not _is_sha256_text(component.artifact_sha256)
+        or component.runtime_artifact_path is None
+        or not component.runtime_command
+    ):
+        return False
+    if component.requested_source == "pypi":
+        return component.install_spec == f"{component.distribution}=={version}"
+    return _is_official_github_release_component(
+        component,
+        component_name="clio-kit",
     )
+
+
+def _is_official_github_release_component(
+    component: ComponentArtifactIdentity,
+    *,
+    component_name: str,
+) -> bool:
+    """Return whether provenance names one canonical, hash-bound release wheel."""
+    normalized_name = _normalized_distribution_name(component_name)
+    repository = OFFICIAL_COMPONENT_RELEASE_REPOSITORIES.get(normalized_name)
+    version = component.distribution_version
+    if (
+        repository is None
+        or version is None
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", version) is None
+        or _normalized_distribution_name(component.distribution) != normalized_name
+        or component.requested_source != "github_release"
+        or not _is_sha256_text(component.artifact_sha256)
+    ):
+        return False
+    owner, repository_name = repository
+    wheel_distribution = normalized_name.replace("-", "_")
+    filename = f"{wheel_distribution}-{version}-py3-none-any.whl"
+    expected_url = (
+        f"https://github.com/{owner}/{repository_name}/releases/download/v{version}/{filename}"
+    )
+    return component.artifact_filename == filename and component.install_spec == expected_url
 
 
 def _worker_process_matches(pid: int) -> bool:
