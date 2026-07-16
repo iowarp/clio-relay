@@ -875,7 +875,7 @@ def test_session_job_submission_rejects_missing_stale_and_unbound_identity(
     assert "not bound" in unbound.json()["detail"]
 
 
-def test_owned_jarvis_mcp_submission_binds_digest_membership_and_exact_cancel(
+def test_owned_jarvis_mcp_submission_forwards_desktop_binding_without_remote_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -904,12 +904,12 @@ def test_owned_jarvis_mcp_submission_binds_digest_membership_and_exact_cancel(
         )
     )
 
-    def artifact_binding(_cluster: str) -> str:
-        return expected_digest
+    def fail_on_cluster_cache(_cluster: str) -> str:
+        pytest.fail("owned API must not consult its cluster-local cache")
 
     monkeypatch.setattr(
         "clio_relay.http_api.jarvis_mcp_artifact_binding",
-        artifact_binding,
+        fail_on_cluster_cache,
     )
     client = cast(
         Any,
@@ -934,17 +934,12 @@ def test_owned_jarvis_mcp_submission_binds_digest_membership_and_exact_cancel(
     }
 
     omitted = client.post("/jobs/jarvis-mcp-call", json=payload)
-    mismatched = client.post(
-        "/jobs/jarvis-mcp-call",
-        json={**payload, "expected_server_artifact_digest": "b" * 64},
-    )
     accepted = client.post(
         "/jobs/jarvis-mcp-call",
         json={**payload, "expected_server_artifact_digest": expected_digest},
     )
 
     assert omitted.status_code == 422
-    assert mismatched.status_code == 409
     assert accepted.status_code == 200
     job = queue.get_job(accepted.json()["job_id"])
     assert isinstance(job.spec, McpCallSpec)
@@ -971,6 +966,54 @@ def test_owned_jarvis_mcp_submission_binds_digest_membership_and_exact_cancel(
     assert canceled.status_code == 200
     assert canceled.json()["state"] == "canceled"
     assert queue.get_job(unrelated.job_id).state is JobState.QUEUED
+
+
+def test_unowned_jarvis_mcp_submission_still_validates_operator_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-owned API continues to enforce its own operator discovery cache."""
+
+    expected_digest = "a" * 64
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+
+    def artifact_binding(_cluster: str) -> str:
+        return expected_digest
+
+    monkeypatch.setattr(
+        "clio_relay.http_api.jarvis_mcp_artifact_binding",
+        artifact_binding,
+    )
+    client = cast(Any, TestClient(create_app(settings)))
+    payload = {
+        "cluster": "test-cluster",
+        "tool": "jarvis_describe",
+        "arguments": {"target": "packages"},
+    }
+
+    mismatched = client.post(
+        "/jobs/jarvis-mcp-call",
+        json={
+            **payload,
+            "idempotency_key": "unowned-mismatched-binding",
+            "expected_server_artifact_digest": "b" * 64,
+        },
+    )
+    accepted = client.post(
+        "/jobs/jarvis-mcp-call",
+        json={
+            **payload,
+            "idempotency_key": "unowned-exact-binding",
+            "expected_server_artifact_digest": expected_digest,
+        },
+    )
+
+    assert mismatched.status_code == 409
+    assert accepted.status_code == 200
+    job = queue.get_job(accepted.json()["job_id"])
+    assert isinstance(job.spec, McpCallSpec)
+    assert job.spec.expected_server_artifact_digest == expected_digest
 
 
 def test_owned_session_submission_race_with_quiesce_returns_conflict(
