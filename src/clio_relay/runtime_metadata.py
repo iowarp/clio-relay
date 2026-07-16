@@ -405,7 +405,7 @@ class _JarvisRuntimeProjectionDocument(BaseModel):
     cluster: str | None
     scheduler_type: str | None
     scheduler_job_id: str | None
-    scheduler_phase: str
+    scheduler_phase: str | None
     script_path: str | None
     hostfile_path: str | None
     output_path: str | None
@@ -520,7 +520,7 @@ def runtime_metadata_from_native_documents(
         scheduler_provider=record.scheduler_provider,
         scheduler_type=record.scheduler_provider,
         scheduler_job_id=record.scheduler_native_id,
-        scheduler_phase=record.state,
+        scheduler_phase=_native_scheduler_phase(record),
         script_path=_first_str(record.metadata, "script_path")
         or (_first_str(submission, "script_path") if submission is not None else None),
         hostfile_path=(_first_str(submission, "hostfile_path") if submission is not None else None),
@@ -558,6 +558,19 @@ def runtime_metadata_from_native_documents(
     return metadata.model_copy(update={"field_sources": _field_sources(metadata, source)})
 
 
+def _native_scheduler_phase(record: JarvisExecutionRecordDocument) -> str | None:
+    """Return lifecycle state only when a scheduler owns a submitted native job."""
+
+    if (
+        record.mode != "scheduler"
+        or record.submitted is not True
+        or record.scheduler_provider is None
+        or record.scheduler_native_id is None
+    ):
+        return None
+    return record.state
+
+
 def _merge_native_runtime_projection(
     metadata: JarvisRuntimeMetadata,
     documents: JarvisNativeExecutionDocuments,
@@ -578,7 +591,7 @@ def _merge_native_runtime_projection(
         "cluster": record.cluster,
         "scheduler_type": record.scheduler_provider,
         "scheduler_job_id": record.scheduler_native_id,
-        "scheduler_phase": record.state,
+        "scheduler_phase": _native_scheduler_phase(record),
     }
     for field_name, expected in authoritative.items():
         if getattr(projection, field_name) != expected:
