@@ -101,6 +101,7 @@ from clio_relay.remote_mcp import (
 )
 from clio_relay.retention import TerminalRetentionCoordinator
 from clio_relay.service_runtime import ServiceRuntimeSupervisor
+from clio_relay.session_api import OwnedSessionApiClient, submit_owned_session_job
 from clio_relay.spool import MAX_LOG_READ_BYTES
 from clio_relay.storage_runtime import (
     StorageAdmissionError,
@@ -1265,7 +1266,7 @@ def _call_tool(
             )
     arguments = _object(params.get("arguments", {}))
     if name == "relay_submit_jarvis_pipeline":
-        result = _submit_jarvis_pipeline(arguments, queue=queue)
+        result = _submit_jarvis_pipeline(arguments, queue=queue, settings=settings)
     elif name == "relay_storage_status":
         if not isinstance(queue, StorageManagedQueue):
             raise ValueError("MCP queue is not storage managed")
@@ -1279,23 +1280,23 @@ def _call_tool(
             "catalog_issues": [issue.model_dump(mode="json") for issue in catalog.issues],
         }
     elif name == "relay_submit_agent":
-        result = _submit_remote_agent(arguments, queue=queue)
+        result = _submit_remote_agent(arguments, queue=queue, settings=settings)
     elif name == "relay_status":
-        result = _status_job(arguments, queue=queue)
+        result = _status_job(arguments, queue=queue, settings=settings)
     elif name == "relay_cancel":
-        result = _cancel_job(arguments, queue=queue)
+        result = _cancel_job(arguments, queue=queue, settings=settings)
     elif name == "relay_observe":
         result = _observe_job(arguments, queue=queue, settings=settings)
     elif name == "relay_wait":
         result = _wait_job(arguments, queue=queue, settings=settings)
     elif name == "relay_submit_jarvis_job":
-        result = _submit_jarvis_job(arguments, queue=queue)
+        result = _submit_jarvis_job(arguments, queue=queue, settings=settings)
     elif name == "relay_submit_remote_agent":
-        result = _submit_remote_agent(arguments, queue=queue)
+        result = _submit_remote_agent(arguments, queue=queue, settings=settings)
     elif name == "relay_submit_mcp_call":
-        result = _submit_mcp_call(arguments, queue=queue)
+        result = _submit_mcp_call(arguments, queue=queue, settings=settings)
     elif name == "relay_call_jarvis_mcp":
-        result = _submit_jarvis_mcp_call(arguments, queue=queue)
+        result = _submit_jarvis_mcp_call(arguments, queue=queue, settings=settings)
     elif is_virtual_jarvis_tool(name):
         call_arguments = virtual_jarvis_call_arguments(name, arguments)
         if require_advertised_remote_mcp_catalog:
@@ -1315,7 +1316,7 @@ def _call_tool(
                 )
             call_arguments["expected_cluster_route_revision"] = expected_route_revision
             call_arguments["catalog_expected_server_artifact_digest"] = expected_artifact_digest
-        result = _submit_jarvis_mcp_call(call_arguments, queue=queue)
+        result = _submit_jarvis_mcp_call(call_arguments, queue=queue, settings=settings)
         if catalog is None:
             raise ValueError("JARVIS virtual tool catalog was not resolved")
         result["catalog_revision"] = catalog.revision
@@ -1344,6 +1345,7 @@ def _call_tool(
                 ),
             },
             queue=queue,
+            settings=settings,
         )
         result["catalog_revision"] = catalog.revision
     elif name == "relay_get_job":
@@ -1451,15 +1453,15 @@ def _call_tool(
             total=total,
         )
     elif name == "relay_cancel_job":
-        result = _queue_cancel_tool(arguments, queue=queue)
+        result = _queue_cancel_tool(arguments, queue=queue, settings=settings)
     elif name == "relay_queue_list":
-        result = _queue_list_tool(arguments, queue=queue)
+        result = _queue_list_tool(arguments, queue=queue, settings=settings)
     elif name == "relay_queue_diagnose":
-        result = _queue_diagnose_tool(arguments, queue=queue)
+        result = _queue_diagnose_tool(arguments, queue=queue, settings=settings)
     elif name == "relay_queue_stale":
-        result = _queue_stale_tool(arguments, queue=queue)
+        result = _queue_stale_tool(arguments, queue=queue, settings=settings)
     elif name == "relay_queue_cleanup_stale":
-        result = _queue_cleanup_stale_tool(arguments, queue=queue)
+        result = _queue_cleanup_stale_tool(arguments, queue=queue, settings=settings)
     elif name == "relay_retention_plan":
         plan = TerminalRetentionCoordinator(queue, settings.spool_dir).plan(
             _required_durable_record_id(arguments, "job_id"),
@@ -1679,11 +1681,26 @@ def _require_local_job_cluster(
         )
 
 
-def _status_job(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+def _status_job(
+    arguments: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> JSON:
     job_id = _required_durable_record_id(arguments, "job_id")
     target = _job_target(arguments)
     if target is not None and should_execute_on_cluster(target):
-        result = _remote_json(target, ["job", "status", job_id], "remote job status")
+        if settings.owner_session_id is not None:
+            with OwnedSessionApiClient(definition=target, settings=settings) as client:
+                result = _owned_json(
+                    client,
+                    method="GET",
+                    path=f"/jobs/{job_id}/status",
+                    label="owned remote job status",
+                )
+            _validate_owned_job_status(result, job_id=job_id, cluster=target.name)
+        else:
+            result = _remote_json(target, ["job", "status", job_id], "remote job status")
         result["cluster"] = target.name
         result["route_revision"] = _route_revision(target)
         return result
@@ -1695,13 +1712,32 @@ def _status_job(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     return result
 
 
-def _queue_cancel_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+def _queue_cancel_tool(
+    arguments: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> JSON:
     """Cancel one queue job through the same local-or-SSH route as the CLI."""
     job_id = _required_durable_record_id(arguments, "job_id")
     target = _queue_tool_target(arguments)
     cluster = _optional_str(arguments, "cluster")
     cancel_scheduler = _boolean_argument(arguments, "cancel_scheduler_job", default=False)
     if target is not None and should_execute_on_cluster(target):
+        if settings.owner_session_id is not None:
+            with OwnedSessionApiClient(definition=target, settings=settings) as client:
+                payload = _owned_json(
+                    client,
+                    method="POST",
+                    path=f"/queue/jobs/{job_id}/cancel",
+                    body={
+                        "cluster": target.name,
+                        "cancel_scheduler_job": cancel_scheduler,
+                    },
+                    label="owned remote queue cancellation",
+                )
+            _validate_owned_job_status(payload, job_id=job_id, cluster=target.name)
+            return _queue_route_result(payload, target=target, remote=True)
         command = ["queue", "cancel", job_id, "--cluster", target.name]
         command.append("--cancel-scheduler-job" if cancel_scheduler else "--keep-scheduler-job")
         return _queue_route_result(
@@ -1721,7 +1757,12 @@ def _queue_cancel_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     return _queue_route_result(result, target=target, remote=False)
 
 
-def _queue_list_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+def _queue_list_tool(
+    arguments: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> JSON:
     """List the selected cluster queue locally or through its configured SSH route."""
     target = _queue_tool_target(arguments)
     cluster = _optional_str(arguments, "cluster")
@@ -1745,6 +1786,27 @@ def _queue_list_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     if scan_limit < limit:
         raise ValueError("scan_limit must be greater than or equal to limit")
     if target is not None and should_execute_on_cluster(target):
+        if settings.owner_session_id is not None:
+            query: dict[str, object] = {
+                "cluster": target.name,
+                "include_terminal": include_terminal,
+                "cursor": cursor,
+                "limit": limit,
+                "scan_limit": scan_limit,
+            }
+            if state is not None:
+                query["state"] = state.value
+            if kind is not None:
+                query["kind"] = kind.value
+            with OwnedSessionApiClient(definition=target, settings=settings) as client:
+                payload = _owned_json(
+                    client,
+                    method="GET",
+                    path="/queue",
+                    query=query,
+                    label="owned remote queue listing",
+                )
+            return _queue_route_result(payload, target=target, remote=True)
         command = [
             "queue",
             "list",
@@ -1784,7 +1846,12 @@ def _queue_list_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     return _queue_route_result(result, target=target, remote=False)
 
 
-def _queue_diagnose_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+def _queue_diagnose_tool(
+    arguments: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> JSON:
     """Diagnose one exact queue job on its configured local or SSH route."""
     job_id = _required_durable_record_id(arguments, "job_id")
     target = _queue_tool_target(arguments)
@@ -1801,6 +1868,21 @@ def _queue_diagnose_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
         maximum=10_000,
     )
     if target is not None and should_execute_on_cluster(target):
+        if settings.owner_session_id is not None:
+            with OwnedSessionApiClient(definition=target, settings=settings) as client:
+                payload = _owned_json(
+                    client,
+                    method="GET",
+                    path=f"/queue/jobs/{job_id}/diagnose",
+                    query={
+                        "cluster": target.name,
+                        "older_than_seconds": older_than_seconds,
+                        "scan_limit": scan_limit,
+                    },
+                    label="owned remote queue diagnosis",
+                )
+            _validate_owned_job_status(payload, job_id=job_id, cluster=target.name)
+            return _queue_route_result(payload, target=target, remote=True)
         return _queue_route_result(
             _remote_json(
                 target,
@@ -1833,7 +1915,12 @@ def _queue_diagnose_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     return _queue_route_result(result, target=target, remote=False)
 
 
-def _queue_stale_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+def _queue_stale_tool(
+    arguments: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> JSON:
     """Discover stale jobs on the selected local or SSH-backed cluster queue."""
     target = _queue_tool_target(arguments)
     cluster = _required_str(arguments, "cluster")
@@ -1857,6 +1944,11 @@ def _queue_stale_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     if scan_limit < limit:
         raise ValueError("scan_limit must be greater than or equal to limit")
     if target is not None and should_execute_on_cluster(target):
+        if settings.owner_session_id is not None:
+            raise ValueError(
+                "stale discovery is unavailable for an owned relay session because it requires "
+                "global queue visibility; diagnose an exact owned job instead"
+            )
         command = [
             "queue",
             "stale",
@@ -1893,7 +1985,12 @@ def _queue_stale_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     return _queue_route_result(result, target=target, remote=False)
 
 
-def _queue_cleanup_stale_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+def _queue_cleanup_stale_tool(
+    arguments: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> JSON:
     """Preview or execute stale cleanup on the selected cluster queue route."""
     target = _queue_tool_target(arguments)
     cluster = _required_str(arguments, "cluster")
@@ -1920,6 +2017,11 @@ def _queue_cleanup_stale_tool(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     if scan_limit < limit:
         raise ValueError("scan_limit must be greater than or equal to limit")
     if target is not None and should_execute_on_cluster(target):
+        if settings.owner_session_id is not None:
+            raise ValueError(
+                "stale cleanup is unavailable for an owned relay session because it requires "
+                "global queue mutation authority"
+            )
         command = [
             "queue",
             "cleanup-stale",
@@ -2076,6 +2178,31 @@ def _remote_json_value(
         raise ValueError(f"{label} returned invalid JSON") from exc
 
 
+def _owned_json(
+    client: OwnedSessionApiClient,
+    *,
+    method: str,
+    path: str,
+    label: str,
+    query: dict[str, object] | None = None,
+    body: dict[str, object] | None = None,
+) -> JSON:
+    """Read one object from an exact-generation, identity-proven session API."""
+    value = client.request_json(method=method, path=path, query=query, body=body)
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must return a JSON object")
+    return cast(JSON, value)
+
+
+def _validate_owned_job_status(payload: JSON, *, job_id: str, cluster: str) -> None:
+    raw_job = payload.get("job")
+    if not isinstance(raw_job, dict):
+        raise ValueError("owned session job response is missing its durable job record")
+    job = cast(JSON, raw_job)
+    if job.get("job_id") != job_id or job.get("cluster") != cluster:
+        raise ValueError("owned session job response does not match the requested handle")
+
+
 def _complete_local_artifacts(queue: ClioCoreQueue, job_id: str) -> list[JSON]:
     """Read all artifacts under an explicit cap or reject incomplete evidence."""
     cursor = 1
@@ -2164,6 +2291,60 @@ def _complete_remote_collection(
         cursor = next_cursor
 
 
+def _complete_owned_collection(
+    client: OwnedSessionApiClient,
+    *,
+    path: str,
+    record_key: str,
+    label: str,
+) -> list[JSON]:
+    """Drain an owned HTTP collection on one already identity-proven connection."""
+    cursor = 1
+    expected_total: int | None = None
+    records: list[JSON] = []
+    while True:
+        payload = _owned_json(
+            client,
+            method="GET",
+            path=path,
+            query={"cursor": cursor, "limit": MAX_RESPONSE_PAGE_RECORDS},
+            label=label,
+        )
+        raw_records = payload.get(record_key)
+        if not isinstance(raw_records, list):
+            raise ValueError(f"{label} must contain a {record_key} array")
+        page: list[JSON] = []
+        for item in cast(list[object], raw_records):
+            if not isinstance(item, dict):
+                raise ValueError(f"{label} returned a non-object {record_key} entry")
+            page.append(cast(JSON, item))
+        total = payload.get("total")
+        returned_cursor = payload.get("cursor")
+        returned_limit = payload.get("limit")
+        next_cursor = payload.get("next_cursor")
+        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            raise ValueError(f"{label} returned an invalid total")
+        if returned_cursor != cursor or returned_limit != MAX_RESPONSE_PAGE_RECORDS:
+            raise ValueError(f"{label} returned inconsistent page metadata")
+        if next_cursor is not None and (
+            isinstance(next_cursor, bool) or not isinstance(next_cursor, int)
+        ):
+            raise ValueError(f"{label} returned an invalid next_cursor")
+        expected_total = _validate_complete_collection_page(
+            label=label,
+            cursor=cursor,
+            page_count=len(page),
+            next_cursor=next_cursor,
+            total=total,
+            expected_total=expected_total,
+            collected_count=len(records),
+        )
+        records.extend(page)
+        if next_cursor is None:
+            return records
+        cursor = next_cursor
+
+
 def _validate_complete_collection_page(
     *,
     label: str,
@@ -2218,6 +2399,24 @@ def _remote_job_logs(
     }
 
 
+def _owned_job_logs(
+    client: OwnedSessionApiClient,
+    job_id: str,
+    *,
+    limit: int,
+) -> JSON:
+    return {
+        stream: _owned_json(
+            client,
+            method="GET",
+            path=f"/jobs/{job_id}/logs/{stream}",
+            query={"offset": 0, "limit": limit},
+            label=f"owned remote {stream} log",
+        )
+        for stream in ("stdout", "stderr")
+    }
+
+
 def _verified_mcp_result(
     definition: ClusterDefinition,
     job_id: str,
@@ -2240,6 +2439,33 @@ def _verified_mcp_result(
         definition,
         ["job", "read-artifact", artifact_id],
         "remote MCP result artifact",
+    )
+    return _decode_verified_mcp_result(envelope, artifact=artifact, job_id=job_id)
+
+
+def _verified_owned_mcp_result(
+    client: OwnedSessionApiClient,
+    job_id: str,
+    artifacts: list[JSON],
+) -> JSON | None:
+    artifact = next(
+        (
+            item
+            for item in artifacts
+            if item.get("kind") == "mcp_result" and item.get("job_id") == job_id
+        ),
+        None,
+    )
+    if artifact is None:
+        return None
+    artifact_id = artifact.get("artifact_id")
+    if not isinstance(artifact_id, str) or not artifact_id:
+        raise ValueError("owned remote MCP result artifact has no artifact_id")
+    envelope = _owned_json(
+        client,
+        method="GET",
+        path=f"/artifacts/{artifact_id}/content",
+        label="owned remote MCP result artifact",
     )
     return _decode_verified_mcp_result(envelope, artifact=artifact, job_id=job_id)
 
@@ -2326,12 +2552,36 @@ def _render_remote_mcp_context(catalog: VirtualRemoteMcpCatalog) -> str:
     return render_virtual_jarvis_agent_context() + generic + available
 
 
-def _cancel_job(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+def _cancel_job(
+    arguments: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> JSON:
     target = _job_target(arguments)
     if target is not None and should_execute_on_cluster(target):
         job_id = _required_durable_record_id(arguments, "job_id")
-        command = ["job", "cancel", job_id]
         cancel_scheduler = arguments.get("cancel_scheduler_job") is True
+        if settings.owner_session_id is not None:
+            with OwnedSessionApiClient(definition=target, settings=settings) as client:
+                result = _owned_json(
+                    client,
+                    method="POST",
+                    path=f"/queue/jobs/{job_id}/cancel",
+                    body={
+                        "cluster": target.name,
+                        "cancel_scheduler_job": cancel_scheduler,
+                    },
+                    label="owned remote job cancellation",
+                )
+            _validate_owned_job_status(result, job_id=job_id, cluster=target.name)
+            job = _object(result["job"])
+            result["job_id"] = job["job_id"]
+            result["state"] = job["state"]
+            result["cluster"] = target.name
+            result["route_revision"] = _route_revision(target)
+            return result
+        command = ["job", "cancel", job_id]
         if cancel_scheduler:
             command.append("--cancel-scheduler-job")
         run_remote_clio(target, command)
@@ -2370,12 +2620,30 @@ def _observe_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettin
     cursor = int(arguments.get("cursor", 1))
     limit = _response_page_limit(arguments)
     target = _job_target(arguments)
+    owned_logs: JSON | None = None
     if target is not None and should_execute_on_cluster(target):
-        observed = _remote_json(
-            target,
-            ["job", "monitor", job_id, "--cursor", str(cursor), "--limit", str(limit)],
-            "remote job monitor",
-        )
+        if settings.owner_session_id is not None:
+            with OwnedSessionApiClient(definition=target, settings=settings) as client:
+                observed = _owned_json(
+                    client,
+                    method="GET",
+                    path=f"/jobs/{job_id}/monitor",
+                    query={"cursor": cursor, "limit": limit},
+                    label="owned remote job monitor",
+                )
+                _validate_owned_job_status(observed, job_id=job_id, cluster=target.name)
+                if arguments.get("include_logs", True) is not False:
+                    owned_logs = _owned_job_logs(
+                        client,
+                        job_id,
+                        limit=_log_limit(arguments),
+                    )
+        else:
+            observed = _remote_json(
+                target,
+                ["job", "monitor", job_id, "--cursor", str(cursor), "--limit", str(limit)],
+                "remote job monitor",
+            )
     else:
         _require_local_job_cluster(queue, job_id, target)
         observed = monitor_job(queue, job_id, cursor=cursor, limit=limit)
@@ -2384,11 +2652,15 @@ def _observe_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettin
     logs: JSON | None = None
     if arguments.get("include_logs", True) is not False:
         log_limit = _log_limit(arguments)
-        logs = (
-            _remote_job_logs(target, job_id, limit=log_limit)
-            if target is not None and should_execute_on_cluster(target)
-            else _job_logs(queue, settings, job_id, limit=log_limit)
-        )
+        if target is not None and should_execute_on_cluster(target):
+            if settings.owner_session_id is not None:
+                if owned_logs is None:
+                    raise ValueError("owned remote log retrieval did not complete")
+                logs = owned_logs
+            else:
+                logs = _remote_job_logs(target, job_id, limit=log_limit)
+        else:
+            logs = _job_logs(queue, settings, job_id, limit=log_limit)
     if pattern is not None:
         compiled = re.compile(pattern)
         for event in cast(list[JSON], observed.get("events", [])):
@@ -2433,6 +2705,46 @@ def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings)
     job_id = _required_durable_record_id(arguments, "job_id")
     target = _job_target(arguments)
     if target is not None and should_execute_on_cluster(target):
+        if settings.owner_session_id is not None:
+            with OwnedSessionApiClient(definition=target, settings=settings) as client:
+                waited = _owned_json(
+                    client,
+                    method="POST",
+                    path=f"/jobs/{job_id}/wait",
+                    query={
+                        "timeout_seconds": float(arguments.get("timeout_seconds", 600)),
+                        "poll_seconds": float(arguments.get("poll_seconds", 2)),
+                    },
+                    label="owned remote job wait",
+                )
+                if waited.get("job_id") != job_id or waited.get("cluster") != target.name:
+                    raise ValueError("owned remote wait returned a different job")
+                result = _owned_json(
+                    client,
+                    method="GET",
+                    path=f"/jobs/{job_id}/status",
+                    label="owned remote job status",
+                )
+                _validate_owned_job_status(result, job_id=job_id, cluster=target.name)
+                if arguments.get("include_logs", True) is not False:
+                    result["logs"] = _owned_job_logs(
+                        client,
+                        job_id,
+                        limit=_log_limit(arguments),
+                    )
+                artifact_records = _complete_owned_collection(
+                    client,
+                    path=f"/jobs/{job_id}/artifacts",
+                    record_key="artifacts",
+                    label=f"owned remote artifacts for {job_id}",
+                )
+                result["artifacts"] = artifact_records
+                parsed_result = _verified_owned_mcp_result(client, job_id, artifact_records)
+                if parsed_result is not None:
+                    result["mcp_result"] = parsed_result
+            result["cluster"] = target.name
+            result["route_revision"] = _route_revision(target)
+            return result
         run_remote_clio(
             target,
             [
@@ -2520,18 +2832,49 @@ def _event_match_candidates(event: JSON) -> list[str]:
     return candidates
 
 
-def _submit_jarvis_pipeline(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+def _submit_jarvis_pipeline(
+    arguments: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> JSON:
     cluster = _required_str(arguments, "cluster")
     pipeline_yaml = _required_str(arguments, "pipeline_yaml")
     digest = hashlib.sha256(pipeline_yaml.encode("utf-8")).hexdigest()
     idempotency_key = str(arguments.get("idempotency_key") or f"mcp:jarvis:{cluster}:{digest}")
-    job = queue.submit_job(
+    definition = _optional_cluster_definition(cluster)
+    if (
+        definition is not None
+        and should_execute_on_cluster(definition)
+        and settings.owner_session_id is not None
+    ):
+        job = submit_owned_session_job(
+            definition=definition,
+            settings=settings,
+            path="/jobs/jarvis",
+            payload={
+                "cluster": cluster,
+                "pipeline_yaml": pipeline_yaml,
+                "idempotency_key": idempotency_key,
+            },
+        )
+        return _owned_session_submission_result(
+            job,
+            definition=definition,
+            settings=settings,
+            wait_for_terminal_result=bool(arguments.get("wait_for_terminal", False)),
+            wait_timeout_seconds=float(arguments.get("timeout_seconds", 600)),
+            poll_seconds=float(arguments.get("poll_seconds", 2)),
+        )
+    job = _submit_local_job(
+        queue,
         RelayJob(
             cluster=cluster,
             kind=JobKind.JARVIS,
             spec=JarvisRunSpec(pipeline_yaml=pipeline_yaml),
             idempotency_key=idempotency_key,
-        )
+        ),
+        settings=settings,
     )
     if bool(arguments.get("wait_for_terminal", False)):
         job = wait_for_terminal(
@@ -2548,22 +2891,47 @@ def _submit_jarvis_pipeline(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     }
 
 
-def _submit_jarvis_job(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+def _submit_jarvis_job(
+    arguments: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> JSON:
     cluster = _required_str(arguments, "cluster")
     definition = _optional_cluster_definition(cluster)
     if definition is not None and should_execute_on_cluster(definition):
+        pipeline_name = _required_str(arguments, "pipeline_name")
+        idempotency_key = str(
+            arguments.get("idempotency_key") or f"mcp:jarvis-job:{cluster}:{pipeline_name}"
+        )
+        if settings.owner_session_id is not None:
+            job = submit_owned_session_job(
+                definition=definition,
+                settings=settings,
+                path="/jobs/jarvis-pipeline",
+                payload={
+                    "cluster": cluster,
+                    "pipeline_name": pipeline_name,
+                    "idempotency_key": idempotency_key,
+                },
+            )
+            return _owned_session_submission_result(
+                job,
+                definition=definition,
+                settings=settings,
+                wait_for_terminal_result=bool(arguments.get("wait_for_terminal", False)),
+                wait_timeout_seconds=float(arguments.get("timeout_seconds", 600)),
+                poll_seconds=float(arguments.get("poll_seconds", 2)),
+            )
         remote_args = [
             "job",
             "submit-pipeline",
             "--cluster",
             cluster,
             "--pipeline-name",
-            _required_str(arguments, "pipeline_name"),
+            pipeline_name,
             "--idempotency-key",
-            str(
-                arguments.get("idempotency_key")
-                or f"mcp:jarvis-job:{cluster}:{_required_str(arguments, 'pipeline_name')}"
-            ),
+            str(idempotency_key),
         ]
         output = run_remote_clio(definition, remote_args)
         return _remote_submission_result(output, kind=JobKind.JARVIS, definition=definition)
@@ -2571,18 +2939,25 @@ def _submit_jarvis_job(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     idempotency_key = str(
         arguments.get("idempotency_key") or f"mcp:jarvis-job:{cluster}:{pipeline_name}"
     )
-    job = queue.submit_job(
+    job = _submit_local_job(
+        queue,
         RelayJob(
             cluster=cluster,
             kind=JobKind.JARVIS,
             spec=JarvisRunSpec(pipeline_name=pipeline_name),
             idempotency_key=idempotency_key,
-        )
+        ),
+        settings=settings,
     )
     return _submission_result(job, arguments, queue=queue, definition=definition)
 
 
-def _submit_remote_agent(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+def _submit_remote_agent(
+    arguments: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> JSON:
     cluster = _required_str(arguments, "cluster")
     prompt_path = _required_str(arguments, "prompt_path")
     mcp_config_path = _optional_str(arguments, "mcp_config_path")
@@ -2603,7 +2978,41 @@ def _submit_remote_agent(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
             }
         )
     )
-    job = queue.submit_job(
+    definition = _optional_cluster_definition(cluster)
+    if (
+        definition is not None
+        and should_execute_on_cluster(definition)
+        and settings.owner_session_id is not None
+    ):
+        payload: dict[str, object] = {
+            "cluster": cluster,
+            "prompt_path": prompt_path,
+            "idempotency_key": idempotency_key,
+        }
+        for key, value in {
+            "mcp_config_path": mcp_config_path,
+            "model": model,
+            "workdir": workdir,
+            "timeout_seconds": timeout_seconds,
+        }.items():
+            if value is not None:
+                payload[key] = value
+        job = submit_owned_session_job(
+            definition=definition,
+            settings=settings,
+            path="/jobs/remote-agent",
+            payload=payload,
+        )
+        return _owned_session_submission_result(
+            job,
+            definition=definition,
+            settings=settings,
+            wait_for_terminal_result=bool(arguments.get("wait_for_terminal", False)),
+            wait_timeout_seconds=float(arguments.get("wait_timeout_seconds", 600)),
+            poll_seconds=float(arguments.get("poll_seconds", 2)),
+        )
+    job = _submit_local_job(
+        queue,
         RelayJob(
             cluster=cluster,
             kind=JobKind.REMOTE_AGENT,
@@ -2615,12 +3024,18 @@ def _submit_remote_agent(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
                 timeout_seconds=timeout_seconds,
             ),
             idempotency_key=idempotency_key,
-        )
+        ),
+        settings=settings,
     )
     return _submission_result(job, arguments, queue=queue)
 
 
-def _submit_mcp_call(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+def _submit_mcp_call(
+    arguments: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> JSON:
     cluster = _required_str(arguments, "cluster")
     server = _required_str(arguments, "server")
     server_args = _string_list(arguments.get("server_args", []), "server_args")
@@ -2699,6 +3114,34 @@ def _submit_mcp_call(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
                 "call tools/list again before submission"
             )
     if definition is not None and should_execute_on_cluster(definition):
+        if settings.owner_session_id is not None:
+            payload: dict[str, object] = {
+                "cluster": cluster,
+                "server": server,
+                "server_args": server_args,
+                "env_from": env_from,
+                "tool": tool,
+                "arguments": tool_arguments,
+                "idempotency_key": idempotency_key,
+            }
+            if timeout_seconds is not None:
+                payload["timeout_seconds"] = timeout_seconds
+            if expected_server_artifact_digest is not None:
+                payload["expected_server_artifact_digest"] = expected_server_artifact_digest
+            job = submit_owned_session_job(
+                definition=definition,
+                settings=settings,
+                path="/jobs/mcp-call",
+                payload=payload,
+            )
+            return _owned_session_submission_result(
+                job,
+                definition=definition,
+                settings=settings,
+                wait_for_terminal_result=bool(arguments.get("wait_for_terminal", False)),
+                wait_timeout_seconds=float(arguments.get("wait_timeout_seconds", 600)),
+                poll_seconds=float(arguments.get("poll_seconds", 2)),
+            )
         remote_args_path = (
             ".local/share/clio-relay/desktop-submissions/"
             f"mcp-{_stable_digest({'cluster': cluster, 'tool': tool, 'arguments': tool_arguments})}"
@@ -2738,7 +3181,8 @@ def _submit_mcp_call(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
         finally:
             remove_remote_file(definition, remote_args_path, remove_empty_parent=True)
         return _remote_submission_result(output, kind=JobKind.MCP_CALL, definition=definition)
-    job = queue.submit_job(
+    job = _submit_local_job(
+        queue,
         RelayJob(
             cluster=cluster,
             kind=JobKind.MCP_CALL,
@@ -2752,7 +3196,8 @@ def _submit_mcp_call(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
                 timeout_seconds=timeout_seconds,
             ),
             idempotency_key=idempotency_key,
-        )
+        ),
+        settings=settings,
     )
     return _submission_result(job, arguments, queue=queue, definition=definition)
 
@@ -2790,7 +3235,90 @@ def _remote_submission_result(
     }
 
 
-def _submit_jarvis_mcp_call(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
+def _owned_session_submission_result(
+    job: RelayJob,
+    *,
+    definition: ClusterDefinition,
+    settings: RelaySettings,
+    wait_for_terminal_result: bool,
+    wait_timeout_seconds: float,
+    poll_seconds: float,
+) -> JSON:
+    """Return an owned receipt, optionally waiting through the same protected API."""
+    if wait_for_terminal_result:
+        with OwnedSessionApiClient(definition=definition, settings=settings) as client:
+            document = _owned_json(
+                client,
+                method="POST",
+                path=f"/jobs/{job.job_id}/wait",
+                query={
+                    "timeout_seconds": wait_timeout_seconds,
+                    "poll_seconds": poll_seconds,
+                },
+                label="owned remote submitted job wait",
+            )
+        waited = RelayJob.model_validate(document)
+        if (
+            waited.job_id != job.job_id
+            or waited.cluster != definition.name
+            or waited.metadata.get("owner_session_id") != settings.owner_session_id
+            or waited.metadata.get("owner_session_generation_id")
+            != settings.owner_session_generation_id
+        ):
+            raise ValueError("owned remote wait returned a different submission receipt")
+        job = waited
+    return {
+        "cluster": definition.name,
+        "job_id": job.job_id,
+        "state": job.state.value,
+        "kind": job.kind.value,
+        "terminal": job.state in {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELED},
+        "remote": True,
+        "route_revision": _route_revision(definition),
+    }
+
+
+def _submit_local_job(
+    queue: ClioCoreQueue,
+    job: RelayJob,
+    *,
+    settings: RelaySettings,
+) -> RelayJob:
+    """Stamp local session ownership only after exact durable admission is open."""
+    session_id = settings.owner_session_id
+    generation_id = settings.owner_session_generation_id
+    if session_id is None or generation_id is None:
+        return queue.submit_job(job)
+    admission = queue.owner_session_generation_status(
+        session_id,
+        session_generation_id=generation_id,
+    )
+    if admission.get("open") is not True:
+        raise ValueError("owner session generation is not open for local MCP submission")
+    metadata = dict(job.metadata)
+    if {
+        "owner",
+        "owner_session_id",
+        "owner_session_generation_id",
+        "owner_session_admission_id",
+    }.intersection(metadata):
+        raise ValueError("local MCP job cannot supply relay-managed ownership metadata")
+    metadata.update(
+        {
+            "owner": "clio-relay",
+            "owner_session_id": session_id,
+            "owner_session_generation_id": generation_id,
+        }
+    )
+    return queue.submit_job(job.model_copy(update={"metadata": metadata}))
+
+
+def _submit_jarvis_mcp_call(
+    arguments: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> JSON:
     forwarded = dict(arguments)
     cluster = _required_str(arguments, "cluster")
     tool = _required_str(arguments, "tool")
@@ -2822,7 +3350,9 @@ def _submit_jarvis_mcp_call(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
                 f"cluster route changed for {cluster}; call tools/list again before submission"
             )
     expected_server_artifact_digest = (
-        jarvis_mcp_artifact_binding(cluster) if registered_route else None
+        jarvis_mcp_artifact_binding(cluster)
+        if registered_route or settings.owner_session_id is not None
+        else None
     )
     catalog_expected_server_artifact_digest = _optional_str(
         arguments,
@@ -2841,6 +3371,35 @@ def _submit_jarvis_mcp_call(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     if expected_server_artifact_digest is not None:
         forwarded["expected_server_artifact_digest"] = expected_server_artifact_digest
     if definition is not None and should_execute_on_cluster(definition):
+        if settings.owner_session_id is not None:
+            if expected_server_artifact_digest is None:
+                raise ValueError(
+                    "owned JARVIS MCP submission requires a discovered server artifact binding"
+                )
+            payload: dict[str, object] = {
+                "cluster": cluster,
+                "tool": tool,
+                "arguments": tool_arguments,
+                "expected_server_artifact_digest": expected_server_artifact_digest,
+                "idempotency_key": idempotency_key,
+            }
+            timeout_seconds = _optional_int(arguments, "timeout_seconds")
+            if timeout_seconds is not None:
+                payload["timeout_seconds"] = timeout_seconds
+            job = submit_owned_session_job(
+                definition=definition,
+                settings=settings,
+                path="/jobs/jarvis-mcp-call",
+                payload=payload,
+            )
+            return _owned_session_submission_result(
+                job,
+                definition=definition,
+                settings=settings,
+                wait_for_terminal_result=bool(arguments.get("wait_for_terminal", False)),
+                wait_timeout_seconds=float(arguments.get("wait_timeout_seconds", 600)),
+                poll_seconds=float(arguments.get("poll_seconds", 2)),
+            )
         routing_digest = _stable_digest(
             {"cluster": cluster, "tool": tool, "arguments": tool_arguments}
         )
@@ -2880,7 +3439,7 @@ def _submit_jarvis_mcp_call(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:
     server_args = jarvis_mcp_server_args()
     forwarded["server"] = server
     forwarded["server_args"] = server_args
-    return _submit_mcp_call(forwarded, queue=queue)
+    return _submit_mcp_call(forwarded, queue=queue, settings=settings)
 
 
 def _submission_result(
@@ -3016,6 +3575,7 @@ def _bind_jarvis_runtime(
     verified = resolve_jarvis_service_runtime(
         queue=queue,
         definition=definition,
+        settings=settings,
         source_job_id=_required_durable_record_id(arguments, "source_job_id"),
         source_artifact_id=_required_durable_record_id(arguments, "source_artifact_id"),
         package_id=_required_str(arguments, "package_id"),

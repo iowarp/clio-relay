@@ -39,6 +39,10 @@ from clio_relay.progress_provenance import (
 )
 from clio_relay.remote_values import render_remote_shell_path, render_remote_shell_value
 from clio_relay.runtime_metadata import RUNTIME_METADATA_SCHEMA, RuntimeMetadataSource
+from clio_relay.session_api import (
+    OWNER_SESSION_ID_HEADER,
+    SESSION_GENERATION_ID_HEADER,
+)
 from clio_relay.transport_probe import (
     run_frp_direct_http_probe,
     run_frp_http_probe,
@@ -711,11 +715,13 @@ def _verify_ssh_transport(
         session_id=options.ssh_transport_session_id or f"relay-ssh-live-test-{run_suffix}",
         api_token=options.api_token,
         timeout_seconds=options.timeout_seconds,
-        http_check=lambda local_url: _verify_transport_http_api(
+        http_check=lambda local_url, session_id, generation_id: _verify_transport_http_api(
             local_url,
             cluster=options.cluster,
             pipeline_yaml=pipeline_yaml,
             api_token=options.api_token,
+            owner_session_id=session_id,
+            session_generation_id=generation_id,
             timeout_seconds=options.timeout_seconds,
             poll_seconds=options.poll_seconds,
             expected_progress_adapter=_expected_progress_adapter(pipeline_yaml),
@@ -734,6 +740,8 @@ def _verify_transport_http_api(
     cluster: str,
     pipeline_yaml: str,
     api_token: str | None,
+    owner_session_id: str | None = None,
+    session_generation_id: str | None = None,
     timeout_seconds: float,
     poll_seconds: float,
     expected_progress_adapter: str | None,
@@ -753,6 +761,8 @@ def _verify_transport_http_api(
                 "pipeline_yaml": pipeline_yaml,
                 "idempotency_key": idempotency_key,
             },
+            owner_session_id=owner_session_id,
+            session_generation_id=session_generation_id,
             timeout_seconds=10,
         ),
     )
@@ -885,10 +895,14 @@ def _http_json(
     path: str,
     *,
     api_token: str | None,
+    owner_session_id: str | None = None,
+    session_generation_id: str | None = None,
     body: dict[str, object] | None = None,
     query: dict[str, str] | None = None,
     timeout_seconds: float,
 ) -> dict[str, Any] | list[dict[str, Any]]:
+    if (owner_session_id is None) != (session_generation_id is None):
+        raise ValueError("owner session and generation HTTP bindings must be provided together")
     encoded_query = "" if not query else "?" + urllib.parse.urlencode(query)
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = urllib.request.Request(
@@ -899,6 +913,9 @@ def _http_json(
     )
     if api_token is not None:
         request.add_header("Authorization", f"Bearer {api_token}")
+    if owner_session_id is not None and session_generation_id is not None:
+        request.add_header(OWNER_SESSION_ID_HEADER, owner_session_id)
+        request.add_header(SESSION_GENERATION_ID_HEADER, session_generation_id)
     attempts = 3
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):

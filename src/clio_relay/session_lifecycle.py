@@ -668,6 +668,30 @@ def status_remote_session(
     return cast(dict[str, object], json.loads(output))
 
 
+def challenge_remote_session_identity(
+    *,
+    definition: ClusterDefinition,
+    session_id: str,
+    session_generation_id: DurableRecordId,
+    nonce: str,
+) -> dict[str, object]:
+    """Return an SSH-authenticated HMAC challenge for one live session API."""
+    _validate_session(session_id=session_id, remote_api_port=1)
+    validate_durable_record_id(session_generation_id)
+    if len(nonce) != 64 or any(character not in "0123456789abcdef" for character in nonce):
+        raise ValueError("session identity nonce must be a lowercase 256-bit hexadecimal value")
+    output = _ssh_script(
+        definition,
+        _owned_identity_challenge_script(
+            cluster=definition.name,
+            session_id=session_id,
+            session_generation_id=session_generation_id,
+            nonce=nonce,
+        ),
+    )
+    return cast(dict[str, object], json.loads(output))
+
+
 def teardown_remote_session(
     *,
     definition: ClusterDefinition,
@@ -1297,6 +1321,82 @@ metadata["api_pid"] = pid if isinstance(pid, int) else None
 metadata["ownership_token_present"] = bool(metadata.pop("owner_token", None))
 print(json.dumps(metadata))
 __CLIO_RELAY_OWNED_STATUS__
+"""
+
+
+def _owned_identity_challenge_script(
+    *,
+    cluster: str,
+    session_id: str,
+    session_generation_id: str,
+    nonce: str,
+) -> str:
+    return f"""set -euo pipefail
+session_id={shlex.quote(session_id)}
+metadata_file="$HOME/.local/share/clio-relay/sessions/$session_id/metadata.json"
+python3 - "$metadata_file" {shlex.quote(cluster)} {shlex.quote(session_id)} \
+  {shlex.quote(session_generation_id)} {shlex.quote(nonce)} <<'__CLIO_RELAY_IDENTITY_CHALLENGE__'
+import hashlib
+import hmac
+import json
+import os
+import sys
+from pathlib import Path
+
+metadata_path, cluster, session_id, generation_id, nonce = sys.argv[1:]
+metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+pid = metadata.get("api_pid")
+token = metadata.get("owner_token")
+if (
+    metadata.get("owner") != "clio-relay"
+    or metadata.get("cluster") != cluster
+    or metadata.get("session_id") != session_id
+    or metadata.get("session_generation_id") != generation_id
+    or not isinstance(pid, int)
+    or not isinstance(token, str)
+    or not token
+):
+    raise SystemExit("owned session identity does not match the requested generation")
+proc = Path("/proc") / str(pid)
+stat_fields = (proc / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+observed_start = stat_fields[19]
+command = (proc / "cmdline").read_bytes().replace(bytes([0]), b" ").decode(
+    "utf-8", errors="replace"
+)
+environment = (proc / "environ").read_bytes().split(bytes([0]))
+if (
+    stat_fields[0] == "Z"
+    or os.getpgid(pid) != pid
+    or metadata.get("api_pgid") != pid
+    or metadata.get("process_start_ticks") != observed_start
+    or f"CLIO_RELAY_SESSION_OWNER_TOKEN={{token}}".encode() not in environment
+    or f"CLIO_RELAY_SESSION_GENERATION_ID={{generation_id}}".encode() not in environment
+    or f"CLIO_RELAY_OWNER_SESSION_ID={{session_id}}".encode() not in environment
+    or f"CLIO_RELAY_REMOTE_CLUSTER={{cluster}}".encode() not in environment
+    or "clio-relay" not in command
+    or " api " not in f" {{command}} "
+    or " start" not in command
+):
+    raise SystemExit("owned session API process identity is not verified")
+message = "\\n".join(
+    (
+        "clio-relay.session-identity.v1",
+        cluster,
+        session_id,
+        generation_id,
+        nonce,
+    )
+).encode("utf-8")
+signature = hmac.new(token.encode("utf-8"), message, hashlib.sha256).hexdigest()
+print(json.dumps({{
+    "schema_version": "clio-relay.session-identity.v1",
+    "cluster": cluster,
+    "session_id": session_id,
+    "session_generation_id": generation_id,
+    "nonce": nonce,
+    "hmac_sha256": signature,
+}}, sort_keys=True, separators=(",", ":")))
+__CLIO_RELAY_IDENTITY_CHALLENGE__
 """
 
 

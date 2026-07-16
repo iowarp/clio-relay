@@ -125,6 +125,7 @@ class ManagedProcess(Protocol):
 
 ProcessFactory = Callable[..., ManagedProcess]
 HttpCheck = Callable[[str], list[str]]
+OwnedSessionHttpCheck = Callable[[str, str, str], list[str]]
 
 
 def transport_evidence_lines_from_error(error: BaseException) -> list[str]:
@@ -410,7 +411,7 @@ def run_ssh_forward_http_probe(
     api_token: str | None = None,
     timeout_seconds: float = 30.0,
     process_factory: ProcessFactory | None = None,
-    http_check: HttpCheck | None = None,
+    http_check: OwnedSessionHttpCheck | None = None,
     detach_remote: bool = False,
     replace_remote: bool = True,
 ) -> list[str]:
@@ -512,7 +513,13 @@ def run_ssh_forward_http_probe(
             *start_lines,
         ]
         if http_check is not None:
-            lines.extend(http_check(f"http://127.0.0.1:{local_bind_port}"))
+            lines.extend(
+                http_check(
+                    f"http://127.0.0.1:{local_bind_port}",
+                    session_id,
+                    session_generation_id,
+                )
+            )
     except BaseException as exc:
         primary_error = exc
 

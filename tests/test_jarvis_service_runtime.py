@@ -78,6 +78,132 @@ def test_resolve_jarvis_service_runtime_binds_only_exact_durable_result(
     assert len(verified.binding.dataset_descriptor_sha256) == 64
 
 
+def test_owned_remote_source_uses_identity_bound_api_for_every_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue, local_definition, job, artifact, envelope = _source_result(tmp_path)
+    definition = local_definition.model_copy(update={"ssh_host": "relay.example.test"})
+    owner_settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster=definition.name,
+    )
+    requests: list[tuple[str, str]] = []
+    lifecycle: list[str] = []
+
+    class FakeOwnedSessionApiClient:
+        def __init__(
+            self,
+            *,
+            definition: ClusterDefinition,
+            settings: RelaySettings,
+        ) -> None:
+            assert definition == local_definition.model_copy(
+                update={"ssh_host": "relay.example.test"}
+            )
+            assert settings == owner_settings
+
+        def __enter__(self) -> FakeOwnedSessionApiClient:
+            lifecycle.append("entered")
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            lifecycle.append("exited")
+
+        def request_json(self, *, method: str, path: str) -> object:
+            requests.append((method, path))
+            if path == f"/jobs/{job.job_id}/status":
+                return {"job": job.model_dump(mode="json")}
+            if path == f"/artifacts/{artifact.artifact_id}/content":
+                return envelope
+            raise AssertionError(f"unexpected owned session API path: {path}")
+
+    def direct_ssh_forbidden(
+        _definition: ClusterDefinition,
+        _arguments: list[str],
+    ) -> str:
+        raise AssertionError("owned source must not use direct SSH")
+
+    def local_artifact_forbidden(_queue: ClioCoreQueue, _artifact_id: str) -> dict[str, object]:
+        raise AssertionError("owned remote source must not read desktop artifact storage")
+
+    def source_is_remote(_definition: ClusterDefinition) -> bool:
+        return True
+
+    monkeypatch.setattr(runtime_binding, "should_execute_on_cluster", source_is_remote)
+    monkeypatch.setattr(runtime_binding, "OwnedSessionApiClient", FakeOwnedSessionApiClient)
+    monkeypatch.setattr(runtime_binding, "run_remote_clio", direct_ssh_forbidden)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", local_artifact_forbidden)
+
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        settings=owner_settings,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    reverified = reverify_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        settings=owner_settings,
+        binding_document=verified.binding.model_dump(mode="json"),
+    )
+
+    assert verified.binding.source_relay_artifact_sha256 == artifact.sha256
+    assert reverified.binding == verified.binding
+    assert lifecycle == ["entered", "exited", "entered", "exited"]
+    assert requests == [
+        ("GET", f"/jobs/{job.job_id}/status"),
+        ("GET", f"/artifacts/{artifact.artifact_id}/content"),
+        ("GET", f"/jobs/{job.job_id}/status"),
+        ("GET", f"/artifacts/{artifact.artifact_id}/content"),
+    ]
+
+
+def test_owned_remote_source_fails_closed_without_session_api_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue, local_definition, job, artifact, _envelope = _source_result(tmp_path)
+    definition = local_definition.model_copy(update={"ssh_host": "relay.example.test"})
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster=definition.name,
+    )
+
+    def direct_ssh_forbidden(
+        _definition: ClusterDefinition,
+        _arguments: list[str],
+    ) -> str:
+        raise AssertionError("owned source must not fall back to direct SSH")
+
+    def source_is_remote(_definition: ClusterDefinition) -> bool:
+        return True
+
+    monkeypatch.setattr(runtime_binding, "should_execute_on_cluster", source_is_remote)
+    monkeypatch.setattr(runtime_binding, "run_remote_clio", direct_ssh_forbidden)
+
+    with pytest.raises(ConfigurationError, match="CLIO_RELAY_API_TOKEN"):
+        resolve_jarvis_service_runtime(
+            queue=queue,
+            definition=definition,
+            settings=settings,
+            source_job_id=job.job_id,
+            source_artifact_id=artifact.artifact_id,
+            package_id="paraview-1",
+            package_name="builtin.paraview",
+        )
+
+
 def test_resolve_jarvis_service_runtime_rejects_unbound_or_ambiguous_sources(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -463,11 +589,13 @@ def test_bound_runtime_detach_and_teardown_preserve_scheduler_by_default(
         retained_scheduler_resource,
     )
     reverified: list[str] = []
+    reverified_settings: list[RelaySettings | None] = []
     original_reverify = service_runtime_module.reverify_jarvis_service_runtime
 
     def tracked_reverify(**kwargs: Any) -> Any:
         observed = original_reverify(**kwargs)
         reverified.append(observed.binding.service_instance_id)
+        reverified_settings.append(kwargs.get("settings"))
         return observed
 
     monkeypatch.setattr(
@@ -597,6 +725,7 @@ def test_bound_runtime_detach_and_teardown_preserve_scheduler_by_default(
     assert sum("connector-step-status" in command for command in allocation_commands) == 3
     assert sum("connector-step-cancel" in command for command in allocation_commands) == 1
     assert reverified == ["paraview-live-1", "paraview-live-1"]
+    assert reverified_settings == [supervisor.settings, supervisor.settings]
 
 
 def test_bound_runtime_scheduler_cancel_requires_fresh_binding_reverification(

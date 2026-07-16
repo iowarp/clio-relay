@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import urllib.request
 from base64 import b64encode
 from pathlib import Path
 from typing import cast
@@ -18,6 +19,7 @@ from clio_relay.live_acceptance import (
     _expected_progress_adapter,  # pyright: ignore[reportPrivateUsage]
     _expected_progress_package,  # pyright: ignore[reportPrivateUsage]
     _find_agent_child_job,  # pyright: ignore[reportPrivateUsage]
+    _http_json,  # pyright: ignore[reportPrivateUsage]
     _verify_live_package_progress,  # pyright: ignore[reportPrivateUsage]
     _verify_runtime_metadata_artifact,  # pyright: ignore[reportPrivateUsage]
     run_live_acceptance,
@@ -28,6 +30,17 @@ from clio_relay.validation_report import (
     load_validation_report,
     transport_probe_evidence_line,
 )
+
+
+class _HttpResponse:
+    def __enter__(self) -> _HttpResponse:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return b'{"ok": true}'
 
 
 def _collection_page(record_key: str, records: list[dict[str, object]]) -> dict[str, object]:
@@ -69,6 +82,43 @@ def _provider_progress_record(
             "eta_seconds": 1.0,
         },
     }
+
+
+def test_transport_http_client_sends_exact_owned_session_binding(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    captured: dict[str, str] = {}
+
+    def urlopen(request: urllib.request.Request, *, timeout: float) -> _HttpResponse:
+        assert timeout == 5
+        captured.update({name.lower(): value for name, value in request.header_items()})
+        return _HttpResponse()
+
+    monkeypatch.setattr("clio_relay.live_acceptance.urllib.request.urlopen", urlopen)
+
+    assert _http_json(
+        "http://127.0.0.1:18000",
+        "POST",
+        "/jobs/jarvis",
+        api_token="api-token",
+        owner_session_id="desktop-session-1",
+        session_generation_id="generation-1",
+        body={"cluster": "ares"},
+        timeout_seconds=5,
+    ) == {"ok": True}
+    assert captured["authorization"] == "Bearer api-token"
+    assert captured["x-clio-relay-owner-session-id"] == "desktop-session-1"
+    assert captured["x-clio-relay-session-generation-id"] == "generation-1"
+
+    with pytest.raises(ValueError, match="must be provided together"):
+        _http_json(
+            "http://127.0.0.1:18000",
+            "POST",
+            "/jobs/jarvis",
+            api_token="api-token",
+            owner_session_id="desktop-session-1",
+            timeout_seconds=5,
+        )
 
 
 def test_live_acceptance_requires_configured_workload() -> None:

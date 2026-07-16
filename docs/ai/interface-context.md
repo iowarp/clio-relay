@@ -113,6 +113,12 @@ owner-session-scoped APIs.
 
 When `CLIO_RELAY_API_TOKEN` is set and the API is started with `--require-token`, clients must send either `Authorization: Bearer <token>` or `X-Clio-Relay-Token: <token>`. `/healthz` stays open for local process checks.
 
+Job POSTs to an owner-session-scoped API additionally require
+`X-Clio-Relay-Owner-Session-Id` and
+`X-Clio-Relay-Session-Generation-Id` for the exact live generation. The API
+rejects missing, stale, or mismatched bindings and rejects client-supplied
+ownership metadata; ownership is stamped only from the authenticated API process.
+
 ## MCP Surfaces
 
 The MCP server exposes relay tools for:

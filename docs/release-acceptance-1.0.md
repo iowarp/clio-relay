@@ -55,7 +55,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.2.14"
+$Version = "1.2.15"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }
@@ -969,37 +969,17 @@ function Start-OwnedSession {
 
 function Submit-OwnedPipeline {
   param(
-    [string] $Cluster, [string] $SshHost, [string] $SessionId,
-    [int] $RemotePort, [int] $LocalPort, [string] $PipelineYaml
+    [string] $Cluster, [string] $SessionId, [string] $Generation,
+    [string] $PipelineYaml
   )
-  $Forward = Start-Process -FilePath $OpenSsh -WindowStyle Hidden -PassThru -ArgumentList @(
-    "-o", "ExitOnForwardFailure=yes", "-o", "BatchMode=yes",
-    "-o", "ConnectTimeout=10", "-N", "-L",
-    "127.0.0.1:${LocalPort}:127.0.0.1:${RemotePort}", $SshHost
-  )
-  try {
-    $Deadline = (Get-Date).AddSeconds(30)
-    do {
-      if ($Forward.HasExited) {
-        throw "owned-session SSH forward exited before readiness: $SessionId"
-      }
-      try { Invoke-RestMethod "http://127.0.0.1:$LocalPort/healthz" -TimeoutSec 2 | Out-Null; break }
-      catch { if ((Get-Date) -ge $Deadline) { throw }; Start-Sleep -Milliseconds 250 }
-    } while ($true)
-    $Body = @{
-      cluster = $Cluster
-      pipeline_yaml = (Get-Content -Raw $PipelineYaml)
-      idempotency_key = "$RunId-$SessionId-$([guid]::NewGuid().ToString('N'))"
-    } | ConvertTo-Json -Depth 20
-    $Headers = @{ Authorization = "Bearer $($env:CLIO_RELAY_API_TOKEN)" }
-    $Job = Invoke-RestMethod "http://127.0.0.1:$LocalPort/jobs/jarvis" `
-      -Method Post -Headers $Headers -ContentType "application/json" -Body $Body
-    if (-not $Job.job_id) { throw "owned submission returned no job id" }
-    $Job.job_id
-  } finally {
-    if (-not $Forward.HasExited) { Stop-Process -Id $Forward.Id -Force }
-    $Forward.WaitForExit()
-  }
+  $IdempotencyKey = "$RunId-$SessionId-$([guid]::NewGuid().ToString('N'))"
+  $JobJson = (& $Relay session submit-jarvis --cluster $Cluster `
+    --session-id $SessionId --session-generation-id $Generation `
+    --pipeline-yaml-file $PipelineYaml --idempotency-key $IdempotencyKey | Out-String)
+  if ($LASTEXITCODE -ne 0) { throw "owned submission failed: $SessionId" }
+  $Job = $JobJson | ConvertFrom-Json
+  if (-not $Job.job_id) { throw "owned submission returned no job id" }
+  $Job.job_id
 }
 
 function Wait-OwnedSchedulerIdentity {
@@ -1135,8 +1115,8 @@ $AresDefaultCleanupError = $null
 try {
   $AresDefaultGeneration = Start-OwnedSession $AresCluster $AresDefaultSession `
     $AresDefaultApiPort
-  $AresDefaultJob = Submit-OwnedPipeline $AresCluster $AresSshHost $AresDefaultSession `
-    $AresDefaultApiPort $AresDefaultLocalPort $AresCleanupYaml
+  $AresDefaultJob = Submit-OwnedPipeline $AresCluster $AresDefaultSession `
+    $AresDefaultGeneration $AresCleanupYaml
   Wait-OwnedSchedulerIdentity $AresCluster $AresDefaultJob | Out-Null
   $AresOwnedGateway = Start-OwnedGatewayFixture $AresCluster $AresDefaultSession `
     $AresDefaultGeneration $AresRuntime "ares-default"
@@ -1191,8 +1171,8 @@ $CancelPrimaryError = $null
 $CancelCleanupErrors = [System.Collections.Generic.List[string]]::new()
 try {
   $CancelGeneration = Start-OwnedSession $AresCluster $CancelSession $CancelApiPort
-  $CancelJob = Submit-OwnedPipeline $AresCluster $AresSshHost $CancelSession `
-    $CancelApiPort $CancelLocalPort $AresCancelYaml
+  $CancelJob = Submit-OwnedPipeline $AresCluster $CancelSession `
+    $CancelGeneration $AresCancelYaml
   Wait-OwnedSchedulerIdentity $AresCluster $CancelJob | Out-Null
   $SentinelRaw = (& $Relay scheduler submit-held-validation --cluster $AresCluster `
     --provider slurm --job-name $SentinelName --run-seconds 30 | Out-String).Trim()
@@ -1303,9 +1283,8 @@ $HomelabDefaultCleanupError = $null
 try {
   $HomelabDefaultGeneration = Start-OwnedSession $HomelabCluster $HomelabDefaultSession `
     $HomelabDefaultApiPort
-  $HomelabDefaultJob = Submit-OwnedPipeline $HomelabCluster $HomelabSshHost `
-    $HomelabDefaultSession $HomelabDefaultApiPort $HomelabDefaultLocalPort `
-    $HomelabCleanupYaml
+  $HomelabDefaultJob = Submit-OwnedPipeline $HomelabCluster `
+    $HomelabDefaultSession $HomelabDefaultGeneration $HomelabCleanupYaml
   $HomelabOwnedGateway = Start-OwnedGatewayFixture $HomelabCluster `
     $HomelabDefaultSession $HomelabDefaultGeneration $HomelabRuntime "homelab-default"
   Invoke-RelayReport -Id "homelab-cleanup-detach" `

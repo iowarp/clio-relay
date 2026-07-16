@@ -517,6 +517,7 @@ def test_ssh_forward_http_probe_starts_owned_remote_api_and_local_forward(
 ) -> None:
     processes: list[FakeProcess] = []
     teardowns: list[str] = []
+    http_bindings: list[tuple[str, str, str]] = []
 
     def fake_start(**kwargs: object) -> list[str]:
         assert kwargs["session_id"] == "session-1"
@@ -570,6 +571,10 @@ def test_ssh_forward_http_probe_starts_owned_remote_api_and_local_forward(
         assert url == "http://127.0.0.1:19001/healthz"
         assert timeout_seconds == 4
 
+    def fake_http_check(local_url: str, session_id: str, generation_id: str) -> list[str]:
+        http_bindings.append((local_url, session_id, generation_id))
+        return ["transport.http_binding=verified"]
+
     monkeypatch.setattr("clio_relay.transport_probe.start_remote_session", fake_start)
     monkeypatch.setattr("clio_relay.transport_probe.teardown_remote_session", fake_teardown)
     monkeypatch.setattr("clio_relay.transport_probe._wait_for_healthz", fake_healthz)
@@ -583,10 +588,12 @@ def test_ssh_forward_http_probe_starts_owned_remote_api_and_local_forward(
         api_token="token",
         timeout_seconds=4,
         process_factory=fake_process_factory,
+        http_check=fake_http_check,
     )
 
     assert "transport.protocol=ssh_forward" in lines
     assert "transport.healthz=ok" in lines
+    assert "transport.http_binding=verified" in lines
     assert "transport.cleanup=passed" in lines
     assert "session_started=session-1" in lines
     assert processes[0].command == [
@@ -597,6 +604,7 @@ def test_ssh_forward_http_probe_starts_owned_remote_api_and_local_forward(
         "test-host",
     ]
     assert teardowns == ["session-1"]
+    assert http_bindings == [("http://127.0.0.1:19001", "session-1", "generation-1")]
 
 
 def test_ssh_forward_http_probe_can_detach_remote_session(monkeypatch: MonkeyPatch) -> None:

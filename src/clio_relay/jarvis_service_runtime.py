@@ -13,6 +13,7 @@ from typing import Any, Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.models import (
     ArtifactRef,
@@ -25,6 +26,7 @@ from clio_relay.models import (
 from clio_relay.relay_ops import read_artifact_bytes
 from clio_relay.remote_cli import run_remote_clio, should_execute_on_cluster
 from clio_relay.runtime_metadata import JarvisNativeExecutionDocuments, native_execution_documents
+from clio_relay.session_api import OwnedSessionApiClient
 
 JSON = dict[str, Any]
 JARVIS_SERVICE_RUNTIME_SCHEMA = "jarvis.service-runtime.v1"
@@ -341,6 +343,7 @@ def resolve_jarvis_service_runtime(
     *,
     queue: ClioCoreQueue,
     definition: ClusterDefinition,
+    settings: RelaySettings | None = None,
     source_job_id: str,
     source_artifact_id: str,
     package_id: str,
@@ -350,6 +353,7 @@ def resolve_jarvis_service_runtime(
     job, artifact, document = _load_source(
         queue=queue,
         definition=definition,
+        settings=settings,
         source_job_id=source_job_id,
         source_artifact_id=source_artifact_id,
     )
@@ -400,6 +404,7 @@ def reverify_jarvis_service_runtime(
     *,
     queue: ClioCoreQueue,
     definition: ClusterDefinition,
+    settings: RelaySettings | None = None,
     binding_document: object,
 ) -> VerifiedJarvisServiceRuntime:
     """Re-read an exact source artifact and require its persisted binding to remain unchanged."""
@@ -407,6 +412,7 @@ def reverify_jarvis_service_runtime(
     observed = resolve_jarvis_service_runtime(
         queue=queue,
         definition=definition,
+        settings=settings,
         source_job_id=expected.source_relay_job_id,
         source_artifact_id=expected.source_relay_artifact_id,
         package_id=expected.package_id,
@@ -424,21 +430,40 @@ def _load_source(
     *,
     queue: ClioCoreQueue,
     definition: ClusterDefinition,
+    settings: RelaySettings | None,
     source_job_id: str,
     source_artifact_id: str,
 ) -> tuple[RelayJob, ArtifactRef, JSON]:
     if should_execute_on_cluster(definition):
-        status = _remote_json(
-            definition,
-            ["job", "status", source_job_id],
-            "JARVIS service source job",
-        )
-        raw_job = status.get("job")
-        envelope = _remote_json(
-            definition,
-            ["job", "read-artifact", source_artifact_id],
-            "JARVIS service source artifact",
-        )
+        if settings is not None and settings.owner_session_id is not None:
+            with OwnedSessionApiClient(definition=definition, settings=settings) as client:
+                status = _json_object(
+                    client.request_json(
+                        method="GET",
+                        path=f"/jobs/{source_job_id}/status",
+                    ),
+                    "JARVIS service source job",
+                )
+                envelope = _json_object(
+                    client.request_json(
+                        method="GET",
+                        path=f"/artifacts/{source_artifact_id}/content",
+                    ),
+                    "JARVIS service source artifact",
+                )
+            raw_job = status.get("job")
+        else:
+            status = _remote_json(
+                definition,
+                ["job", "status", source_job_id],
+                "JARVIS service source job",
+            )
+            raw_job = status.get("job")
+            envelope = _remote_json(
+                definition,
+                ["job", "read-artifact", source_artifact_id],
+                "JARVIS service source artifact",
+            )
     else:
         raw_job = queue.get_job(source_job_id).model_dump(mode="json")
         envelope = cast(JSON, read_artifact_bytes(queue, source_artifact_id))
@@ -603,6 +628,12 @@ def _remote_json(
         value = json.loads(output)
     except json.JSONDecodeError as exc:
         raise ValueError(f"{label} returned invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} did not return a JSON object")
+    return cast(JSON, value)
+
+
+def _json_object(value: object, label: str) -> JSON:
     if not isinstance(value, dict):
         raise ValueError(f"{label} did not return a JSON object")
     return cast(JSON, value)

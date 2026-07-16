@@ -13,7 +13,12 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from clio_relay import mcp_server as mcp_server_module
-from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
+from clio_relay.cluster_config import (
+    ClusterDefinition,
+    ClusterRegistry,
+    RemoteMcpServerConfig,
+    cluster_route_revision,
+)
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.filesystem_paths import internal_filesystem_path
@@ -38,6 +43,13 @@ from clio_relay.models import (
     RelayTask,
     RemoteAgentTaskSpec,
     utc_now,
+)
+from clio_relay.remote_mcp import (
+    RemoteMcpRoute,
+    RemoteMcpToolSchema,
+    VirtualRemoteMcpCatalog,
+    VirtualRemoteMcpTool,
+    remote_mcp_registration_revision,
 )
 from clio_relay.spool import JobSpool
 
@@ -1464,6 +1476,477 @@ def test_remote_virtual_jarvis_call_defers_artifact_selection_to_cluster(
     assert commands[0][0] == "jarvis-mcp-call"
     assert "--server" not in commands[0]
     assert commands[0][commands[0].index("--tool") + 1] == "jarvis_describe"
+
+
+def test_owned_remote_virtual_jarvis_call_uses_authenticated_session_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = ClusterDefinition(name="ares", ssh_host="ares-login")
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(clusters={"ares": definition}).save(registry_path)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    _bind_virtual_jarvis_catalog(monkeypatch, cluster="ares")
+
+    def artifact_binding(_cluster: str) -> str:
+        return "a" * 64
+
+    monkeypatch.setattr(
+        "clio_relay.mcp_server.jarvis_mcp_artifact_binding",
+        artifact_binding,
+    )
+    captured: dict[str, object] = {}
+
+    def submit_owned(**kwargs: object) -> RelayJob:
+        captured.update(kwargs)
+        payload = cast(dict[str, object], kwargs["payload"])
+        selected_settings = cast(RelaySettings, kwargs["settings"])
+        return RelayJob(
+            cluster="ares",
+            kind=JobKind.MCP_CALL,
+            spec=McpCallSpec(
+                server="clio-kit",
+                server_args=["mcp-server", "jarvis"],
+                expected_server_artifact_digest=cast(
+                    str,
+                    payload["expected_server_artifact_digest"],
+                ),
+                tool=cast(str, payload["tool"]),
+                arguments=cast(dict[str, object], payload["arguments"]),
+            ),
+            idempotency_key=cast(str, payload["idempotency_key"]),
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": selected_settings.owner_session_id,
+                "owner_session_generation_id": (selected_settings.owner_session_generation_id),
+            },
+        )
+
+    monkeypatch.setattr("clio_relay.mcp_server.submit_owned_session_job", submit_owned)
+
+    def fail_remote(_definition: ClusterDefinition, _args: list[str]) -> str:
+        raise AssertionError("owned virtual call bypassed the session API")
+
+    monkeypatch.setattr("clio_relay.mcp_server.run_remote_clio", fail_remote)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="ares",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    session = McpSessionState()
+    listed = handle_request(
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        queue=queue,
+        settings=settings,
+        profile="user",
+        session=session,
+    )
+    assert listed is not None
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "jarvis_get_execution",
+                "arguments": {
+                    "cluster": "ares",
+                    "pipeline_id": "pipeline",
+                    "execution_id": "execution-1",
+                    "include_service_runtimes": True,
+                },
+            },
+        },
+        queue=queue,
+        settings=settings,
+        profile="user",
+        session=session,
+    )
+
+    assert response is not None
+    assert "result" in response, response
+    result = response["result"]["structuredContent"]
+    assert result["remote"] is True
+    assert captured["path"] == "/jobs/jarvis-mcp-call"
+    payload = cast(dict[str, object], captured["payload"])
+    assert payload["expected_server_artifact_digest"] == "a" * 64
+    assert payload["arguments"] == {
+        "pipeline_id": "pipeline",
+        "execution_id": "execution-1",
+        "include_service_runtimes": True,
+    }
+    assert queue.list_jobs() == []
+
+
+def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registration = RemoteMcpServerConfig(
+        command="science-mcp",
+        args=["--stdio"],
+        namespace="science",
+        allow_tools=["inspect"],
+        profiles=["user"],
+    )
+    definition = ClusterDefinition(
+        name="ares",
+        ssh_host="ares-login",
+        remote_mcp_servers={"science": registration},
+    )
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(clusters={"ares": definition}).save(registry_path)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    route = RemoteMcpRoute(
+        cluster="ares",
+        server_name="science",
+        command="science-mcp",
+        args=("--stdio",),
+        env_from=(),
+        expected_server_artifact_digest="c" * 64,
+        remote_tool_name="inspect",
+        timeout_seconds=300,
+        contract=None,
+        cluster_route_revision=cluster_route_revision(definition),
+        registration_revision=remote_mcp_registration_revision(registration),
+    )
+    virtual_tool = VirtualRemoteMcpTool(
+        alias="science_inspect",
+        namespace="science",
+        remote_tool=RemoteMcpToolSchema(
+            name="inspect",
+            input_schema={
+                "type": "object",
+                "properties": {"dataset": {"type": "string"}},
+                "required": ["dataset"],
+                "additionalProperties": False,
+            },
+        ),
+        routes={"ares": route},
+        arguments_wrapped=False,
+    )
+    catalog = VirtualRemoteMcpCatalog(
+        revision="catalog-revision-1",
+        tools={"science_inspect": virtual_tool},
+        issues=(),
+        cluster_route_revisions={"ares": cluster_route_revision(definition)},
+    )
+
+    def selected_catalog(*, profile: str, reserved_names: set[str]) -> VirtualRemoteMcpCatalog:
+        del profile, reserved_names
+        return catalog
+
+    monkeypatch.setattr(mcp_server_module, "_remote_mcp_catalog", selected_catalog)
+    captured: dict[str, object] = {}
+
+    def submit_owned(**kwargs: object) -> RelayJob:
+        captured.update(kwargs)
+        payload = cast(dict[str, object], kwargs["payload"])
+        selected_settings = cast(RelaySettings, kwargs["settings"])
+        return RelayJob(
+            cluster="ares",
+            kind=JobKind.MCP_CALL,
+            spec=McpCallSpec(
+                server=cast(str, payload["server"]),
+                server_args=cast(list[str], payload["server_args"]),
+                expected_server_artifact_digest=cast(
+                    str,
+                    payload["expected_server_artifact_digest"],
+                ),
+                tool=cast(str, payload["tool"]),
+                arguments=cast(dict[str, object], payload["arguments"]),
+            ),
+            idempotency_key=cast(str, payload["idempotency_key"]),
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": selected_settings.owner_session_id,
+                "owner_session_generation_id": (selected_settings.owner_session_generation_id),
+            },
+        )
+
+    monkeypatch.setattr("clio_relay.mcp_server.submit_owned_session_job", submit_owned)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    session = McpSessionState()
+    assert (
+        handle_request(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            queue=queue,
+            settings=settings,
+            profile="user",
+            session=session,
+        )
+        is not None
+    )
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "science_inspect",
+                "arguments": {"cluster": "ares", "dataset": "asteroid2018"},
+            },
+        },
+        queue=queue,
+        settings=settings,
+        profile="user",
+        session=session,
+    )
+
+    assert response is not None
+    assert "result" in response, response
+    assert captured["path"] == "/jobs/mcp-call"
+    payload = cast(dict[str, object], captured["payload"])
+    assert payload["server"] == "science-mcp"
+    assert payload["expected_server_artifact_digest"] == "c" * 64
+    assert payload["arguments"] == {"dataset": "asteroid2018"}
+    assert queue.list_jobs() == []
+
+
+def test_owned_remote_agent_submission_uses_authenticated_session_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = ClusterDefinition(name="ares", ssh_host="ares-login")
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(clusters={"ares": definition}).save(registry_path)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    captured: dict[str, object] = {}
+
+    def submit_owned(**kwargs: object) -> RelayJob:
+        captured.update(kwargs)
+        payload = cast(dict[str, object], kwargs["payload"])
+        selected_settings = cast(RelaySettings, kwargs["settings"])
+        return RelayJob(
+            cluster="ares",
+            kind=JobKind.REMOTE_AGENT,
+            spec=RemoteAgentTaskSpec(
+                prompt_path=cast(str, payload["prompt_path"]),
+                workdir=cast(str, payload["workdir"]),
+                timeout_seconds=cast(int, payload["timeout_seconds"]),
+            ),
+            idempotency_key=cast(str, payload["idempotency_key"]),
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": selected_settings.owner_session_id,
+                "owner_session_generation_id": (selected_settings.owner_session_generation_id),
+            },
+        )
+
+    monkeypatch.setattr("clio_relay.mcp_server.submit_owned_session_job", submit_owned)
+
+    def fail_remote(_definition: ClusterDefinition, _args: list[str]) -> str:
+        raise AssertionError("owned agent submission bypassed the session API")
+
+    monkeypatch.setattr("clio_relay.mcp_server.run_remote_clio", fail_remote)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_submit_agent",
+                "arguments": {
+                    "cluster": "ares",
+                    "prompt_path": "/remote/demo/prompt.md",
+                    "workdir": "/remote/demo",
+                    "timeout_seconds": 120,
+                },
+            },
+        },
+        queue=queue,
+        settings=settings,
+        profile="user",
+    )
+
+    assert response is not None
+    assert "result" in response, response
+    assert captured["path"] == "/jobs/remote-agent"
+    payload = cast(dict[str, object], captured["payload"])
+    assert payload["prompt_path"] == "/remote/demo/prompt.md"
+    assert payload["workdir"] == "/remote/demo"
+    assert payload["timeout_seconds"] == 120
+    assert queue.list_jobs() == []
+
+
+def test_owned_remote_followups_use_session_api_and_never_direct_ssh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = ClusterDefinition(name="ares", ssh_host="ares-login")
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(clusters={"ares": definition}).save(registry_path)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    running = RelayJob(
+        cluster="ares",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(pipeline_name="pipeline"),
+        idempotency_key="owned-followup",
+        metadata={
+            "owner": "clio-relay",
+            "owner_session_id": "desktop-session-1",
+            "owner_session_generation_id": "generation-1",
+        },
+    )
+    terminal = running.model_copy(update={"state": JobState.SUCCEEDED})
+    requests: list[dict[str, object]] = []
+    client_instances: list[int] = []
+
+    class FakeOwnedSessionApiClient:
+        def __init__(self, **_kwargs: object) -> None:
+            self.instance = len(client_instances) + 1
+            client_instances.append(self.instance)
+
+        def __enter__(self) -> FakeOwnedSessionApiClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def request_json(
+            self,
+            *,
+            method: str,
+            path: str,
+            query: dict[str, object] | None = None,
+            body: dict[str, object] | None = None,
+        ) -> object:
+            requests.append(
+                {
+                    "instance": self.instance,
+                    "method": method,
+                    "path": path,
+                    "query": query,
+                    "body": body,
+                }
+            )
+            if path == f"/jobs/{running.job_id}/status":
+                return {
+                    "job": terminal.model_dump(mode="json"),
+                    "relay_queue": {},
+                    "scheduler": [],
+                    "terminal": True,
+                }
+            if path == f"/queue/jobs/{running.job_id}/cancel":
+                return {
+                    "job": terminal.model_dump(mode="json"),
+                    "scheduler_policy": "relay-only",
+                }
+            if path == f"/jobs/{running.job_id}/monitor":
+                return {
+                    "job": running.model_dump(mode="json"),
+                    "relay_queue": {},
+                    "scheduler": [],
+                    "terminal": False,
+                    "events": [],
+                    "next_cursor": 1,
+                }
+            if path == "/queue":
+                return {"jobs": [], "count": 0, "visibility_filter": "exact_owner"}
+            if path == f"/queue/jobs/{running.job_id}/diagnose":
+                return {"job": running.model_dump(mode="json"), "reason": "running"}
+            if path == f"/jobs/{running.job_id}/wait":
+                return terminal.model_dump(mode="json")
+            if path == f"/jobs/{running.job_id}/artifacts":
+                return {
+                    "artifacts": [],
+                    "cursor": 1,
+                    "limit": 500,
+                    "next_cursor": None,
+                    "total": 0,
+                }
+            raise AssertionError(f"unexpected owned session request: {method} {path}")
+
+    def direct_ssh_forbidden(_definition: ClusterDefinition, _args: list[str]) -> str:
+        raise AssertionError("owned follow-up bypassed the session API")
+
+    monkeypatch.setattr(mcp_server_module, "OwnedSessionApiClient", FakeOwnedSessionApiClient)
+    monkeypatch.setattr(mcp_server_module, "run_remote_clio", direct_ssh_forbidden)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="ares",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    route = {"cluster": "ares", "job_id": running.job_id}
+    calls = [
+        ("relay_status", route),
+        ("relay_cancel", route),
+        ("relay_observe", {**route, "include_logs": False}),
+        ("relay_queue_list", {"cluster": "ares", "limit": 10, "scan_limit": 20}),
+        ("relay_queue_diagnose", route),
+        ("relay_wait", {**route, "include_logs": False}),
+    ]
+
+    responses = [
+        handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": index,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+            queue=queue,
+            settings=settings,
+            profile="user",
+        )
+        for index, (name, arguments) in enumerate(calls, start=1)
+    ]
+    stale = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_queue_stale",
+                "arguments": {"cluster": "ares", "older_than_seconds": 60},
+            },
+        },
+        queue=queue,
+        settings=settings,
+        profile="user",
+    )
+
+    assert all(response is not None and "error" not in response for response in responses)
+    assert stale is not None and "error" in stale
+    assert "global queue visibility" in stale["error"]["message"]
+    cancel_request = next(item for item in requests if item["path"].endswith("/cancel"))
+    assert cancel_request["body"] == {
+        "cluster": "ares",
+        "cancel_scheduler_job": False,
+    }
+    assert not any("/logs/" in cast(str, item["path"]) for item in requests)
+    wait_paths = [item["path"] for item in requests if item["instance"] == max(client_instances)]
+    assert wait_paths == [
+        f"/jobs/{running.job_id}/wait",
+        f"/jobs/{running.job_id}/status",
+        f"/jobs/{running.job_id}/artifacts",
+    ]
 
 
 def test_mcp_virtual_jarvis_edit_routes_remove_operation(

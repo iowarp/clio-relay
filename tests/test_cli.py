@@ -1488,6 +1488,66 @@ def test_cli_session_start_does_not_reopen_intake_when_process_start_fails(
     assert remote_calls == []
 
 
+def test_cli_session_submit_jarvis_uses_identity_proven_client(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text("name: acceptance\npkgs: []\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def submit_owned(**kwargs: object) -> RelayJob:
+        captured.update(kwargs)
+        selected_settings = cast(cli.RelaySettings, kwargs["settings"])
+        payload = cast(dict[str, object], kwargs["payload"])
+        return RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml=cast(str, payload["pipeline_yaml"])),
+            idempotency_key=cast(str, payload["idempotency_key"]),
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": selected_settings.owner_session_id,
+                "owner_session_generation_id": selected_settings.owner_session_generation_id,
+            },
+        )
+
+    monkeypatch.setattr(cli, "submit_owned_session_job", submit_owned)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "submit-jarvis",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--session-generation-id",
+            "generation-1",
+            "--pipeline-yaml-file",
+            str(pipeline),
+            "--idempotency-key",
+            "acceptance-submit",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    document = json.loads(result.output)
+    assert document["metadata"]["owner_session_generation_id"] == "generation-1"
+    settings = cast(cli.RelaySettings, captured["settings"])
+    assert settings.api_token == "api-token"
+    assert settings.remote_cluster == "ares"
+    assert settings.owner_session_id == "session-1"
+    assert settings.owner_session_generation_id == "generation-1"
+    assert cast(dict[str, object], captured["payload"])["pipeline_yaml"] == (
+        "name: acceptance\npkgs: []\n"
+    )
+
+
 def test_cli_session_detach_never_records_owner_session_closure(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -5206,7 +5266,7 @@ def test_jarvis_discovery_persists_exact_durable_artifact_bytes(
         },
         "structured_result": None,
         "protocol_version": "2024-11-05",
-        "server_info": {"name": "clio-kit", "version": "2.4.8"},
+        "server_info": {"name": "clio-kit", "version": "2.4.9"},
         "server_artifact": server_artifact,
         "returncode": 0,
         "stdout": "",
