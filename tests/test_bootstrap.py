@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
 import tarfile
 import tomllib
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,6 +41,60 @@ from clio_relay.bootstrap import (
 )
 from clio_relay.errors import ConfigurationError, RelayError
 from tests.plugin_fakes import FakeEntryPoint, FakeEntryPoints
+
+
+def _write_test_relay_wheel(
+    path: Path,
+    *,
+    metadata_name: str = "clio-relay",
+    metadata_version: str = __version__,
+) -> None:
+    """Write a minimal wheel with explicit core metadata for bootstrap tests."""
+    dist_info = f"clio_relay-{__version__}.dist-info"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            f"{dist_info}/METADATA",
+            (f"Metadata-Version: 2.4\nName: {metadata_name}\nVersion: {metadata_version}\n\n"),
+        )
+        archive.writestr(
+            f"{dist_info}/WHEEL",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+        archive.writestr(f"{dist_info}/RECORD", "")
+
+
+def _assert_bootstrap_rejected_before_remote_call(
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wheel: Path,
+    expected_error: str,
+    relay_artifact_sha256: str | None = None,
+) -> None:
+    """Require local wheel validation to fail before any remote command."""
+    from clio_relay import bootstrap
+
+    remote_calls: list[list[str]] = []
+
+    def record_remote_call(
+        command: list[str],
+        *,
+        cwd: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd
+        remote_calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(bootstrap, "_run", record_remote_call)
+    with pytest.raises(ConfigurationError, match=expected_error):
+        bootstrap.bootstrap_cluster_over_ssh(
+            bootstrap_profile="linux-user",
+            ssh_host="ares",
+            source_root=tmp_path,
+            relay_wheel=wheel,
+            relay_artifact_sha256=relay_artifact_sha256,
+        )
+    assert remote_calls == []
 
 
 @dataclass(frozen=True)
@@ -487,6 +543,106 @@ def test_bootstrap_over_ssh_rejects_option_like_destination(tmp_path: Path) -> N
         )
 
 
+def test_bootstrap_over_ssh_rejects_invalid_relay_wheel_filename_before_ssh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel = tmp_path / f"clio_relay-{__version__}-release-check.whl"
+    _write_test_relay_wheel(wheel)
+    _assert_bootstrap_rejected_before_remote_call(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        wheel=wheel,
+        expected_error="wheel filename is not canonical",
+    )
+
+
+def test_bootstrap_over_ssh_rejects_relay_wheel_digest_mismatch_before_ssh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel = tmp_path / f"clio_relay-{__version__}-py3-none-any.whl"
+    _write_test_relay_wheel(wheel)
+    _assert_bootstrap_rejected_before_remote_call(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        wheel=wheel,
+        expected_error="SHA-256 does not match its pin",
+        relay_artifact_sha256="0" * 64,
+    )
+
+
+def test_bootstrap_over_ssh_rejects_foreign_wheel_distribution_before_ssh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel = tmp_path / f"other_project-{__version__}-py3-none-any.whl"
+    _write_test_relay_wheel(wheel, metadata_name="other-project")
+    _assert_bootstrap_rejected_before_remote_call(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        wheel=wheel,
+        expected_error="distribution must be clio-relay",
+    )
+
+
+@pytest.mark.parametrize(
+    ("metadata_name", "metadata_version", "expected_error"),
+    [
+        ("other-project", __version__, "METADATA Name does not match"),
+        ("clio-relay", "9.9.9", "METADATA Version does not match"),
+    ],
+)
+def test_bootstrap_over_ssh_rejects_relay_wheel_metadata_mismatch_before_ssh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_name: str,
+    metadata_version: str,
+    expected_error: str,
+) -> None:
+    wheel = tmp_path / f"clio_relay-{__version__}-py3-none-any.whl"
+    _write_test_relay_wheel(
+        wheel,
+        metadata_name=metadata_name,
+        metadata_version=metadata_version,
+    )
+    _assert_bootstrap_rejected_before_remote_call(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        wheel=wheel,
+        expected_error=expected_error,
+    )
+
+
+def test_relay_wheel_preflight_accepts_canonical_filename_and_matching_metadata(
+    tmp_path: Path,
+) -> None:
+    from clio_relay import bootstrap
+
+    wheel = tmp_path / f"clio_relay-{__version__}-py3-none-any.whl"
+    _write_test_relay_wheel(wheel)
+
+    observed = bootstrap._validate_relay_bootstrap_wheel(  # pyright: ignore[reportPrivateUsage]
+        wheel
+    )
+
+    assert observed == hashlib.sha256(wheel.read_bytes()).hexdigest()
+
+
+def test_bootstrap_over_ssh_rejects_non_regular_relay_wheel_before_ssh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel = tmp_path / f"clio_relay-{__version__}-py3-none-any.whl"
+    wheel.mkdir()
+    _assert_bootstrap_rejected_before_remote_call(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        wheel=wheel,
+        expected_error="must be one regular file",
+    )
+
+
 def test_local_frp_install_publishes_only_a_verified_staged_pair(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -652,8 +808,8 @@ def test_bootstrap_archive_uses_packaged_assets_without_git_checkout(tmp_path: P
 
 
 def test_bootstrap_archive_can_include_local_relay_wheel(tmp_path: Path) -> None:
-    wheel = tmp_path / "clio_relay-0.0.0-py3-none-any.whl"
-    wheel.write_bytes(b"wheel")
+    wheel = tmp_path / f"clio_relay-{__version__}-py3-none-any.whl"
+    _write_test_relay_wheel(wheel)
 
     deployment = create_bootstrap_archive(
         source_root=tmp_path / "not-a-repo",
