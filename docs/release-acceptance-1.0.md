@@ -22,8 +22,8 @@ machine-readable inventory.
 | 1 | `ares-bootstrap` | `cluster bootstrap` | exact artifact deployment |
 | 2 | `ares-cluster-bootstrap-live-test` | `live-test` | separate worker execution proof |
 | 3 | `ares-queue-management` | `queue validate` | must precede lifecycle fixtures |
-| 4 | `ares-jarvis-gray-scott` | `jarvis-mcp-validate` | Gray-Scott run, progress, query, and artifacts |
-| 5 | `ares-jarvis-lammps` | `jarvis-mcp-validate` | separate LAMMPS progress run |
+| 4 | `ares-jarvis-gray-scott` | `jarvis-mcp-validate` | bounded package search, Gray-Scott run, progress, query, and artifacts |
+| 5 | `ares-jarvis-lammps` | `jarvis-mcp-validate` | bounded package search and separate LAMMPS progress run |
 | 6 | `ares-spack-find` | `remote-mcp validate` | `spack_find` |
 | 7 | `ares-spack-locate` | `remote-mcp validate` | `spack_locate` |
 | 8 | `ares-spack-install` | `remote-mcp validate` | absent -> fresh install -> exact locate transition |
@@ -55,7 +55,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.2.18"
+$Version = "1.3.0"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }
@@ -767,6 +767,7 @@ $GrayRun = Write-JsonFile "gray-run.json" @{
 }
 Invoke-RelayReport -Id "ares-jarvis-gray-scott" -ReportOption "--report" -Command @(
   "jarvis-mcp-validate", "--cluster", $AresCluster, "--arguments-json-file", $GrayRun,
+  "--package-search-query", "gray scott",
   "--wait-timeout-seconds", "900", "--poll-seconds", "0.05"
 )
 
@@ -804,6 +805,7 @@ $LammpsRun = Write-JsonFile "lammps-run.json" @{
 }
 Invoke-RelayReport -Id "ares-jarvis-lammps" -ReportOption "--report" -Command @(
   "jarvis-mcp-validate", "--cluster", $AresCluster, "--arguments-json-file", $LammpsRun,
+  "--package-search-query", "lammps",
   "--wait-timeout-seconds", "900", "--poll-seconds", "0.05"
 )
 ```

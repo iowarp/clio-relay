@@ -1940,7 +1940,7 @@ def test_default_report_path_sanitizes_cluster_name(tmp_path: Path) -> None:
 def test_repository_release_policy_is_machine_readable() -> None:
     policy = load_release_gate_policy(Path("docs/release-gate-1.0.yaml"))
 
-    assert policy.release_version == "1.2.18"
+    assert policy.release_version == "1.3.0"
     assert policy.acceptance_matrix is not None
     assert policy.acceptance_matrix["report_count_per_stage"] == 17
     assert policy.acceptance_matrix["matrix_sha256"] == policy.acceptance_matrix_sha256
@@ -3096,7 +3096,7 @@ def _fresh_spack_transition_report(
             ),
             ValidationResource(
                 kind="mcp_server",
-                resource_id="spack-fresh:clio-kit-2.4.9",
+                resource_id="spack-fresh:clio-kit-2.5.0",
                 role="remote_mcp_server",
                 cluster="ares",
                 state="verified",

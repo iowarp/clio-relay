@@ -248,11 +248,23 @@ when needed. The relay
 removes only local routing controls before submitting the durable remote call;
 all JARVIS query and cursor fields pass through unchanged.
 
+Application discovery stays inside the same compact tool. Call
+`jarvis_describe(target="package_search", query="visualization")` for a ranked,
+summary-only page, then call `target="package"` with the selected canonical
+`name` as `package_name` for its settings. `query` is required and bounded to 256 characters;
+`page_size` defaults to 10 and is limited to 25. Each page is capped at 64 KiB
+and reports `total_matches`, `returned_count`, and an opaque `next_cursor`.
+Continue with the identical query and cursor. Cursors are limited to 1,024
+characters and bind both the normalized query and package-inventory revision,
+so using one with another query or after the inventory changes fails closed.
+The legacy `target="packages"` response remains exhaustive and potentially
+large; agents should not use it for ordinary discovery.
+
 Virtual JARVIS mutations and runs receive a fresh relay job by default. Supply
 an explicit `idempotency_key` only when retry de-duplication is intentional; an
 identical second `jarvis_run` is otherwise a new execution.
 
-The released clio-kit 2.4.9 artifact is the pinned six-tool JARVIS v3.1 contract.
+The released clio-kit 2.5.0 artifact is the pinned six-tool JARVIS v3.2 contract.
 Bootstrap
 downloads and hashes the exact coordinated wheel, installs it once with
 `uv tool install`, and persists the wheel plus the direct JARVIS command in the
@@ -263,9 +275,17 @@ that persistent executable directly. clio-kit's child launcher still uses its
 wheel-owned server source and lock with `uv run --frozen --no-editable`, so the
 live MCP response binds both the installed outer tool and the locked child
 server rather than trusting an unobserved nested resolution. The release gate
-requires that exact 2.4.9 artifact to be rerun on every target selected by the
+requires that exact 2.5.0 artifact to be rerun on every target selected by the
 release policy. Other servers use the operator registry and generated
 `remote_...` aliases.
+
+The exact release wheel is
+`clio_kit-2.5.0-py3-none-any.whl` with SHA-256
+`acc13d7924045f2b636a8ceededf4816cfb3b936512b7e5d3dd0d50055540f5f`.
+Its canonical contract is `clio-kit-jarvis-user-v3.2`, with contract SHA-256
+`12f6d349c9d44d8ce3594943dcd4018ec9b6e01ebb0e59d468bb1bb783a1ad5d`
+and canonical tools-wire SHA-256
+`bda0abe2b57d5e52ef639bf530e967c3b65072ebc4761d25cd9cbbcf0cd934e9`.
 
 ## Register the Spack MCP
 
@@ -280,7 +300,7 @@ operator-defined and do not select behavior.
 
 ## Register the scientific catalog MCP
 
-clio-kit 2.4.9 also ships the two-tool
+clio-kit 2.5.0 also ships the two-tool
 `clio-kit-scientific-catalog-user-v1` contract. It separates dataset discovery
 from visualization control: `scientific_dataset_search` finds operator catalog
 records and `scientific_dataset_describe` returns one exact

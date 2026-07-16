@@ -22,16 +22,16 @@ from clio_relay.remote_mcp import (
 if TYPE_CHECKING:
     from clio_relay.installation import ComponentArtifactIdentity, InstallReceipt
 
-CLIO_KIT_JARVIS_MCP_VERSION = "2.4.9"
+CLIO_KIT_JARVIS_MCP_VERSION = "2.5.0"
 CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME = f"clio_kit-{CLIO_KIT_JARVIS_MCP_VERSION}-py3-none-any.whl"
 CLIO_KIT_JARVIS_MCP_WHEEL_URL = (
     "https://github.com/iowarp/clio-kit/releases/download/"
     f"v{CLIO_KIT_JARVIS_MCP_VERSION}/{CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME}"
 )
 CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 = (
-    "a9d771bcd40ec98de2626ac2a8706fcc614a2eaac462defb10f8d7bec13693e3"
+    "acc13d7924045f2b636a8ceededf4816cfb3b936512b7e5d3dd0d50055540f5f"
 )
-CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.1"
+CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.2"
 DEFAULT_JARVIS_MCP_COMMAND = [
     "clio-kit",
     "mcp-server",
@@ -45,12 +45,12 @@ JARVIS_MCP_CACHE_SERVER_NAME = "__builtin_jarvis__"
 JSON = dict[str, Any]
 
 CLIO_KIT_JARVIS_USER_CONTRACT_SHA256 = (
-    "adc7756025fbcc90b0695bd4eaac00bda5c6cff4eb2f248fd7be263bd90b9b8b"
+    "12f6d349c9d44d8ce3594943dcd4018ec9b6e01ebb0e59d468bb1bb783a1ad5d"
 )
 CLIO_KIT_JARVIS_USER_WIRE_SHA256 = (
-    "b2a6e531399c5a24678adf55e5133c1234718363661bde0636d81d0b1ae5db11"
+    "bda0abe2b57d5e52ef639bf530e967c3b65072ebc4761d25cd9cbbcf0cd934e9"
 )
-_JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.1.json"
+_JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.2.json"
 _EXPECTED_JARVIS_USER_TOOLS = {
     "jarvis_add_step",
     "jarvis_create_pipeline",
@@ -562,7 +562,9 @@ def render_virtual_jarvis_agent_context() -> str:
         "argument. clio-relay routes each call to the JARVIS MCP server running "
         "on that cluster and returns a durable relay job_id. jarvis_get_execution "
         "includes progress by default and can optionally return a bounded artifact "
-        "page without adding another agent tool. Available "
+        "page without adding another agent tool. Use jarvis_describe with "
+        "target='package_search' for bounded package discovery, then describe the "
+        "selected canonical package name. Available "
         f"virtual JARVIS tools: {tool_names}."
     )
 

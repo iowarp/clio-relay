@@ -50,10 +50,23 @@ CONTRACT_PROJECTION = "mcp-agent-tool-schema-v1"
 MAX_CONTRACT_BYTES = 4 * 1024 * 1024
 MAX_PROBE_OUTPUT_BYTES = 16 * 1024 * 1024
 EXPECTED_CONTRACTS = {
+    "clio-kit-jarvis-user-v3.2": {
+        "server_name": "jarvis",
+        "artifact": "jarvis-user-v3.2.json",
+        "contract_sha256": CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
+        "tool_names": {
+            "jarvis_add_step",
+            "jarvis_create_pipeline",
+            "jarvis_describe",
+            "jarvis_edit_step",
+            "jarvis_get_execution",
+            "jarvis_run",
+        },
+    },
     "clio-kit-jarvis-user-v3.1": {
         "server_name": "jarvis",
         "artifact": "jarvis-user-v3.1.json",
-        "contract_sha256": CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
+        "contract_sha256": "adc7756025fbcc90b0695bd4eaac00bda5c6cff4eb2f248fd7be263bd90b9b8b",
         "tool_names": {
             "jarvis_add_step",
             "jarvis_create_pipeline",
@@ -104,7 +117,10 @@ EXPECTED_CONTRACTS = {
         },
     },
 }
-ACTIVE_CONTRACT_IDS = frozenset(EXPECTED_CONTRACTS) - {"clio-kit-jarvis-user-v3"}
+ACTIVE_CONTRACT_IDS = frozenset(EXPECTED_CONTRACTS) - {
+    "clio-kit-jarvis-user-v3",
+    "clio-kit-jarvis-user-v3.1",
+}
 UV_TOOL_PROBE_VERSION = "0.0.0"
 
 
@@ -190,7 +206,7 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
         assert artifact["contract_sha256"] == expected["contract_sha256"]
         assert set(cast(list[str], artifact["tool_names"])) == expected["tool_names"]
 
-    jarvis_tools = _tools_by_name(shipped_contracts["clio-kit-jarvis-user-v3.1"])
+    jarvis_tools = _tools_by_name(shipped_contracts["clio-kit-jarvis-user-v3.2"])
     artifact_projection = {
         name: {
             "description": tool.get("description"),
@@ -206,6 +222,49 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
     edit_input = cast(JSON, jarvis_tools["jarvis_edit_step"]["inputSchema"])
     edit_properties = cast(JSON, edit_input["properties"])
     assert cast(JSON, edit_properties["operation"])["enum"] == ["edit", "remove"]
+
+    describe_input = cast(JSON, jarvis_tools["jarvis_describe"]["inputSchema"])
+    describe_properties = cast(JSON, describe_input["properties"])
+    assert set(describe_properties) == {
+        "target",
+        "package_name",
+        "query",
+        "page_size",
+        "cursor",
+        "pipeline_id",
+        "step_id",
+        "include_yaml",
+    }
+    assert cast(JSON, describe_properties["target"])["enum"] == [
+        "packages",
+        "package_search",
+        "package",
+        "pipeline",
+        "step",
+    ]
+    assert describe_properties["page_size"] == {
+        "default": 10,
+        "description": (
+            "Maximum summary matches returned by target='package_search'; bounded to 25."
+        ),
+        "maximum": 25,
+        "minimum": 1,
+        "type": "integer",
+    }
+    query = cast(JSON, describe_properties["query"])
+    query_string = next(
+        cast(JSON, option)
+        for option in cast(list[object], query["anyOf"])
+        if isinstance(option, dict) and cast(JSON, option).get("type") == "string"
+    )
+    assert query_string == {"maxLength": 256, "minLength": 1, "type": "string"}
+    cursor = cast(JSON, describe_properties["cursor"])
+    cursor_string = next(
+        cast(JSON, option)
+        for option in cast(list[object], cursor["anyOf"])
+        if isinstance(option, dict) and cast(JSON, option).get("type") == "string"
+    )
+    assert cursor_string == {"maxLength": 1024, "minLength": 1, "type": "string"}
 
     query = jarvis_tools["jarvis_get_execution"]
     query_input = cast(JSON, query["inputSchema"])
@@ -262,7 +321,7 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
         "default": False,
         "type": "boolean",
     }
-    assert shipped_contracts["clio-kit-jarvis-user-v3.1"]["wire_sha256"] == (
+    assert shipped_contracts["clio-kit-jarvis-user-v3.2"]["wire_sha256"] == (
         CLIO_KIT_JARVIS_USER_WIRE_SHA256
     )
 

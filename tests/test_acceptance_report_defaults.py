@@ -346,6 +346,8 @@ ACCEPTANCE_COMMANDS = (
             "jarvis-mcp-validate",
             "--cluster",
             "test-cluster",
+            "--package-search-query",
+            "lammps",
             "--arguments-json",
             '{"pipeline_id":"pipeline"}',
         ),
@@ -353,6 +355,8 @@ ACCEPTANCE_COMMANDS = (
             "jarvis-mcp-validate",
             "--cluster",
             "missing",
+            "--package-search-query",
+            "lammps",
             "--arguments-json",
             '{"pipeline_id":"pipeline"}',
         ),
@@ -786,6 +790,20 @@ def _post_run_jarvis_query(**_kwargs: object) -> SimpleNamespace:
     )
 
 
+def _jarvis_package_search(**_kwargs: object) -> SimpleNamespace:
+    return SimpleNamespace(
+        tools_list_response={},
+        call_response={},
+        call_job_id="package-search-job",
+        call_status={"terminal": True},
+        artifacts=[],
+        mcp_result={},
+        provenance={},
+        initialize_response={},
+        stdio_evidence={},
+    )
+
+
 def _successful_jarvis_validation(**_kwargs: object) -> LiveValidationReport:
     return _passed_report(scenario="remote-mcp", cluster="test-cluster")
 
@@ -916,6 +934,11 @@ def _install_success_fakes(
             cli,
             "_run_post_run_jarvis_execution_query",
             _post_run_jarvis_query,
+        )
+        monkeypatch.setattr(
+            cli,
+            "_run_jarvis_package_search_query",
+            _jarvis_package_search,
         )
         monkeypatch.setattr(
             cli,
