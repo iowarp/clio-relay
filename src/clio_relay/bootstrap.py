@@ -8,16 +8,23 @@ import os
 import platform
 import shlex
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
 import zipfile
 from dataclasses import dataclass
+from email.message import Message
+from email.parser import BytesParser
+from email.policy import default
 from importlib import resources
 from pathlib import Path, PurePosixPath
 from typing import cast
 from urllib.request import urlretrieve
 from uuid import uuid4
+
+from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
+from packaging.version import InvalidVersion, Version
 
 from clio_relay import __version__
 from clio_relay.deployment import endpoint_user_service_name
@@ -53,6 +60,7 @@ JARVIS_CD_WHEEL_URL = (
 JARVIS_CD_WHEEL_SHA256 = "2b15fc74bb586724a8c714cabc02102fe2695afe08edc4521b7ec049c85a0c04"
 DEFAULT_REMOTE_CORE_DIR = "$HOME/.local/share/clio-relay/core"
 DEFAULT_REMOTE_SPOOL_DIR = "$HOME/.local/share/clio-relay/spool"
+MAX_RELAY_WHEEL_METADATA_BYTES = 1024 * 1024
 
 _WORKER_WRITER_PROOF_PYTHON = r'''from __future__ import annotations
 
@@ -677,6 +685,11 @@ def bootstrap_cluster_over_ssh(
     render_remote_shell_path(core_dir, field="core_dir")
     render_remote_shell_path(spool_dir, field="spool_dir")
     _validate_ssh_destination(ssh_host)
+    observed_relay_sha256: str | None = None
+    if relay_wheel is not None:
+        observed_relay_sha256 = _validate_relay_bootstrap_wheel(relay_wheel)
+        if relay_artifact_sha256 is not None and relay_artifact_sha256 != observed_relay_sha256:
+            raise ConfigurationError("relay bootstrap wheel SHA-256 does not match its pin")
     if shutil.which("ssh") is None or shutil.which("scp") is None:
         raise ConfigurationError("ssh and scp are required for remote bootstrap")
     invocation_id = f"bootstrap_{uuid4().hex}"
@@ -708,12 +721,7 @@ def bootstrap_cluster_over_ssh(
             )
             expected_relay_sha256 = relay_artifact_sha256
             if relay_wheel is not None:
-                observed_relay_sha256 = hashlib.sha256(relay_wheel.read_bytes()).hexdigest()
-                if (
-                    expected_relay_sha256 is not None
-                    and expected_relay_sha256 != observed_relay_sha256
-                ):
-                    raise ConfigurationError("relay bootstrap wheel SHA-256 does not match its pin")
+                assert observed_relay_sha256 is not None
                 expected_relay_sha256 = observed_relay_sha256
             source_archive_sha256 = hashlib.sha256(deployment.archive.read_bytes()).hexdigest()
             _run(["scp", str(deployment.archive), f"{ssh_host}:{remote_archive}"])
@@ -1660,6 +1668,83 @@ def _render_relay_install_spec(relay_install_spec: str) -> str:
     if relay_install_spec.startswith("$DEST/"):
         return '"$DEST"/' + shlex.quote(relay_install_spec.removeprefix("$DEST/"))
     return shlex.quote(relay_install_spec)
+
+
+def _validate_relay_bootstrap_wheel(path: Path) -> str:
+    """Validate one local relay wheel before any remote bootstrap mutation."""
+    try:
+        details = path.lstat()
+    except OSError as exc:
+        raise ConfigurationError(f"could not inspect relay bootstrap wheel {path}: {exc}") from exc
+    if path.is_symlink() or not stat.S_ISREG(details.st_mode):
+        raise ConfigurationError(f"relay bootstrap wheel must be one regular file: {path}")
+
+    try:
+        project, version, _build, _tags = parse_wheel_filename(path.name)
+    except InvalidWheelFilename as exc:
+        raise ConfigurationError(
+            f"relay bootstrap wheel filename is not canonical: {path.name}: {exc}"
+        ) from exc
+    if project != canonicalize_name("clio-relay"):
+        raise ConfigurationError(
+            f"relay bootstrap wheel distribution must be clio-relay, got {project}"
+        )
+
+    metadata = _read_relay_wheel_metadata(path)
+    names = metadata.get_all("Name", [])
+    versions = metadata.get_all("Version", [])
+    if len(names) != 1 or not str(names[0]).strip():
+        raise ConfigurationError("relay bootstrap wheel METADATA must contain exactly one Name")
+    if len(versions) != 1 or not str(versions[0]).strip():
+        raise ConfigurationError("relay bootstrap wheel METADATA must contain exactly one Version")
+    metadata_name = str(names[0]).strip()
+    metadata_version = str(versions[0]).strip()
+    if canonicalize_name(metadata_name) != project:
+        raise ConfigurationError("relay bootstrap wheel METADATA Name does not match its filename")
+    try:
+        parsed_metadata_version = Version(metadata_version)
+    except InvalidVersion as exc:
+        raise ConfigurationError(
+            f"relay bootstrap wheel METADATA Version is invalid: {metadata_version}"
+        ) from exc
+    if parsed_metadata_version != version:
+        raise ConfigurationError(
+            "relay bootstrap wheel METADATA Version does not match its filename"
+        )
+    try:
+        with path.open("rb") as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+    except OSError as exc:
+        raise ConfigurationError(f"could not hash relay bootstrap wheel {path}: {exc}") from exc
+
+
+def _read_relay_wheel_metadata(path: Path) -> Message:
+    """Read bounded core metadata from one wheel without executing package code."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            candidates = [
+                member
+                for member in archive.infolist()
+                if not member.is_dir()
+                and member.filename.count("/") == 1
+                and member.filename.endswith(".dist-info/METADATA")
+            ]
+            if len(candidates) != 1:
+                raise ConfigurationError(
+                    "relay bootstrap wheel must contain exactly one top-level METADATA file"
+                )
+            member = candidates[0]
+            if not 1 <= member.file_size <= MAX_RELAY_WHEEL_METADATA_BYTES:
+                raise ConfigurationError("relay bootstrap wheel METADATA size is invalid")
+            with archive.open(member) as stream:
+                content = stream.read(MAX_RELAY_WHEEL_METADATA_BYTES + 1)
+    except ConfigurationError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile, NotImplementedError) as exc:
+        raise ConfigurationError(f"could not inspect relay bootstrap wheel {path}: {exc}") from exc
+    if len(content) > MAX_RELAY_WHEEL_METADATA_BYTES:
+        raise ConfigurationError("relay bootstrap wheel METADATA exceeds the size limit")
+    return BytesParser(policy=default).parsebytes(content, headersonly=True)
 
 
 def create_bootstrap_archive(
