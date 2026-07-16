@@ -1935,7 +1935,7 @@ def test_owned_remote_followups_use_session_api_and_never_direct_ssh(
     assert all(response is not None and "error" not in response for response in responses)
     assert stale is not None and "error" in stale
     assert "global queue visibility" in stale["error"]["message"]
-    cancel_request = next(item for item in requests if item["path"].endswith("/cancel"))
+    cancel_request = next(item for item in requests if cast(str, item["path"]).endswith("/cancel"))
     assert cancel_request["body"] == {
         "cluster": "ares",
         "cancel_scheduler_job": False,

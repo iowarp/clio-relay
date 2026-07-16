@@ -154,7 +154,7 @@ def _install_transport(
     )
 
     def challenge(**_kwargs: object) -> dict[str, object]:
-        return expected_identity
+        return dict(expected_identity)
 
     captured: list[dict[str, object]] = []
     connections: list[_Connection] = []
@@ -172,10 +172,16 @@ def _install_transport(
     def forward(**_kwargs: Any) -> Generator[int, None, None]:
         yield 18_766
 
+    def token_hex(_size: int) -> str:
+        return nonce
+
+    def readiness_client(**_kwargs: object) -> _ReadinessClient:
+        return _ReadinessClient()
+
     monkeypatch.setattr("clio_relay.session_api.status_remote_session", status)
     monkeypatch.setattr("clio_relay.session_api.challenge_remote_session_identity", challenge)
-    monkeypatch.setattr("clio_relay.session_api.secrets.token_hex", lambda _size: nonce)
-    monkeypatch.setattr("clio_relay.session_api.httpx.Client", lambda **_kwargs: _ReadinessClient())
+    monkeypatch.setattr("clio_relay.session_api.secrets.token_hex", token_hex)
+    monkeypatch.setattr("clio_relay.session_api.httpx.Client", readiness_client)
     monkeypatch.setattr("clio_relay.session_api.http.client.HTTPConnection", connection_factory)
     monkeypatch.setattr("clio_relay.session_api._ssh_forward", forward)
     return captured, connections
