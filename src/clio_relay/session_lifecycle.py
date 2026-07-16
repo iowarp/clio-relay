@@ -34,6 +34,7 @@ SESSION_SCHEDULER_RETAINED_CHECK_ID = "cleanup.jobs-preserved-default"
 SESSION_RELAY_CANCELED_CHECK_ID = "cleanup.relay-jobs-canceled"
 SESSION_SCHEDULER_CANCELED_CHECK_ID = "cleanup.explicit-job-cancel"
 _REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS = 120.0
+_REMOTE_API_READINESS_TIMEOUT_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -1121,11 +1122,19 @@ api_pid = int(sys.argv[1])
 port = int(sys.argv[2])
 url = f"http://127.0.0.1:{{port}}/healthz"
 last_error = "API did not become ready"
-for _ in range(100):
+readiness_timeout_seconds = {_REMOTE_API_READINESS_TIMEOUT_SECONDS!r}
+readiness_started = time.monotonic()
+readiness_deadline = readiness_started + readiness_timeout_seconds
+attempts = 0
+while time.monotonic() < readiness_deadline:
+    attempts += 1
     try:
         os.kill(api_pid, 0)
     except OSError as exc:
-        raise RuntimeError("owned API process exited before readiness") from exc
+        elapsed = time.monotonic() - readiness_started
+        raise RuntimeError(
+            f"owned API process exited before readiness after {{elapsed:.3f}} seconds"
+        ) from exc
     try:
         with urllib.request.urlopen(url, timeout=0.25) as response:
             payload = json.load(response)
@@ -1136,7 +1145,12 @@ for _ in range(100):
         last_error = str(exc)
     time.sleep(0.1)
 else:
-    raise RuntimeError(f"owned API did not become ready: {{last_error}}")
+    elapsed = time.monotonic() - readiness_started
+    raise RuntimeError(
+        "owned API did not become ready within "
+        f"{{readiness_timeout_seconds:.1f}} seconds after {{attempts}} attempts: {{last_error}}"
+    )
+print(f"remote_api_ready_seconds={{time.monotonic() - readiness_started:.3f}}")
 __CLIO_RELAY_API_READY__
 clio-relay session resume-intake \
   --session-id "$session_id" \
