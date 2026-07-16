@@ -1030,7 +1030,7 @@ nohup setsid env \\
   "CLIO_RELAY_SESSION_GENERATION_ID=$session_generation_id" \\
   "CLIO_RELAY_OWNER_SESSION_ID=$session_id" \\
   "${{api_command[@]}}" \\
-  >"$log_file" 2>&1 &
+  >"$log_file" 2>&1 9>&- &
 api_pid="$!"
 echo "$api_pid" > "$pid_file"
 python3 - \

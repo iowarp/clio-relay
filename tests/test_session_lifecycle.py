@@ -249,6 +249,7 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
     assert "CLIO_RELAY_OWNER_SESSION_ID=$session_id" in script
     assert "process_start_ticks" in script
     assert "nohup setsid" in script
+    assert '>"$log_file" 2>&1 9>&- &' in script
     assert "umask 077" in script
     assert "trap cleanup_incomplete_start EXIT" in script
     assert "flock -w 10 -x 9" in script
