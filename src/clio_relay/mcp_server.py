@@ -94,6 +94,7 @@ from clio_relay.remote_cli import (
 from clio_relay.remote_mcp import (
     RemoteMcpSchemaCache,
     VirtualRemoteMcpCatalog,
+    cluster_route_revision_json_schema,
     default_remote_mcp_cache_path,
     load_virtual_remote_mcp_catalog,
     remote_mcp_registration_revision,
@@ -112,6 +113,10 @@ from clio_relay.storage_runtime import (
 JSON = dict[str, Any]
 MCP_PROFILE_ENV = "CLIO_RELAY_MCP_PROFILE"
 MAX_INTERNAL_COLLECTION_RECORDS = 10_000
+MAX_AGENT_LOG_READ_BYTES = 32_768
+MAX_INLINE_MCP_RESULT_BYTES = 65_536
+MAX_OBSERVE_MATCHES = 100
+MAX_OBSERVE_MATCH_TEXT_CHARS = 1_024
 USER_MCP_TOOL_NAMES = {
     "relay_remote_mcp_context",
     "relay_submit_agent",
@@ -385,9 +390,13 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                 "properties": {
                     "job_id": durable_record_id_json_schema(),
                     "cluster": {"type": "string"},
-                    "route_revision": {"type": "string"},
+                    "route_revision": cluster_route_revision_json_schema(),
                 },
                 "required": ["job_id"],
+                "dependentRequired": {
+                    "cluster": ["route_revision"],
+                    "route_revision": ["cluster"],
+                },
                 "additionalProperties": False,
             },
         },
@@ -399,10 +408,14 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                 "properties": {
                     "job_id": durable_record_id_json_schema(),
                     "cluster": {"type": "string"},
-                    "route_revision": {"type": "string"},
+                    "route_revision": cluster_route_revision_json_schema(),
                     "cancel_scheduler_job": {"type": "boolean", "default": False},
                 },
                 "required": ["job_id"],
+                "dependentRequired": {
+                    "cluster": ["route_revision"],
+                    "route_revision": ["cluster"],
+                },
                 "additionalProperties": False,
             },
         },
@@ -417,7 +430,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                 "properties": {
                     "job_id": durable_record_id_json_schema(),
                     "cluster": {"type": "string"},
-                    "route_revision": {"type": "string"},
+                    "route_revision": cluster_route_revision_json_schema(),
                     "cursor": {"type": "integer", "default": 1, "minimum": 1},
                     "limit": {
                         "type": "integer",
@@ -429,12 +442,16 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     "include_logs": {"type": "boolean", "default": True},
                     "log_limit": {
                         "type": "integer",
-                        "default": 65536,
+                        "default": MAX_AGENT_LOG_READ_BYTES,
                         "minimum": 1,
-                        "maximum": MAX_LOG_READ_BYTES,
+                        "maximum": MAX_AGENT_LOG_READ_BYTES,
                     },
                 },
                 "required": ["job_id"],
+                "dependentRequired": {
+                    "cluster": ["route_revision"],
+                    "route_revision": ["cluster"],
+                },
                 "additionalProperties": False,
             },
         },
@@ -446,18 +463,22 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                 "properties": {
                     "job_id": durable_record_id_json_schema(),
                     "cluster": {"type": "string"},
-                    "route_revision": {"type": "string"},
+                    "route_revision": cluster_route_revision_json_schema(),
                     "timeout_seconds": {"type": "number", "default": 600},
                     "poll_seconds": {"type": "number", "default": 2},
                     "include_logs": {"type": "boolean", "default": True},
                     "log_limit": {
                         "type": "integer",
-                        "default": 65536,
+                        "default": MAX_AGENT_LOG_READ_BYTES,
                         "minimum": 1,
-                        "maximum": MAX_LOG_READ_BYTES,
+                        "maximum": MAX_AGENT_LOG_READ_BYTES,
                     },
                 },
                 "required": ["job_id"],
+                "dependentRequired": {
+                    "cluster": ["route_revision"],
+                    "route_revision": ["cluster"],
+                },
                 "additionalProperties": False,
             },
         },
@@ -799,7 +820,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                 "properties": {
                     "job_id": durable_record_id_json_schema(),
                     "cluster": {"type": "string"},
-                    "route_revision": {"type": "string"},
+                    "route_revision": cluster_route_revision_json_schema(),
                     "cancel_scheduler_job": {"type": "boolean", "default": False},
                 },
                 "required": ["job_id"],
@@ -813,7 +834,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                 "type": "object",
                 "properties": {
                     "cluster": {"type": "string"},
-                    "route_revision": {"type": "string"},
+                    "route_revision": cluster_route_revision_json_schema(),
                     "state": {
                         "type": "string",
                         "enum": ["queued", "leased", "running", "succeeded", "failed", "canceled"],
@@ -843,7 +864,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                 "properties": {
                     "job_id": durable_record_id_json_schema(),
                     "cluster": {"type": "string"},
-                    "route_revision": {"type": "string"},
+                    "route_revision": cluster_route_revision_json_schema(),
                     "older_than_seconds": {
                         "type": "integer",
                         "minimum": 1,
@@ -867,7 +888,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                 "type": "object",
                 "properties": {
                     "cluster": {"type": "string"},
-                    "route_revision": {"type": "string"},
+                    "route_revision": cluster_route_revision_json_schema(),
                     "job_id": durable_record_id_json_schema(),
                     "older_than_seconds": {"type": "integer", "minimum": 1},
                     "kind": {
@@ -895,7 +916,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                 "type": "object",
                 "properties": {
                     "cluster": {"type": "string"},
-                    "route_revision": {"type": "string"},
+                    "route_revision": cluster_route_revision_json_schema(),
                     "job_id": durable_record_id_json_schema(),
                     "older_than_seconds": {
                         "type": "integer",
@@ -974,7 +995,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                 "type": "object",
                 "properties": {
                     "cluster": {"type": "string"},
-                    "route_revision": {"type": "string"},
+                    "route_revision": cluster_route_revision_json_schema(),
                 },
                 "additionalProperties": False,
             },
@@ -1652,6 +1673,17 @@ def _route_revision(definition: ClusterDefinition) -> str:
     return cluster_route_revision(definition)
 
 
+def _validated_route_revision(value: object) -> str:
+    """Validate one opaque route token before comparing or routing with it."""
+
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(
+            "route_revision must be the 64-character lowercase hexadecimal token "
+            "copied from the same relay job receipt"
+        )
+    return value
+
+
 def _job_target(arguments: JSON) -> ClusterDefinition | None:
     """Resolve and verify an optional self-routing cluster job handle."""
     raw_cluster = arguments.get("cluster")
@@ -1662,9 +1694,12 @@ def _job_target(arguments: JSON) -> ClusterDefinition | None:
         return None
     if not isinstance(raw_cluster, str) or not raw_cluster:
         raise ValueError("cluster must be a non-empty string")
+    if raw_revision is None:
+        raise ValueError("route_revision is required when cluster routes an existing job handle")
+    revision = _validated_route_revision(raw_revision)
     definition = _remote_cluster_definition(raw_cluster)
     expected_revision = _route_revision(definition)
-    if raw_revision is not None and raw_revision != expected_revision:
+    if not hmac.compare_digest(revision, expected_revision):
         raise ValueError(
             f"cluster route changed for {raw_cluster}; refuse to route an existing job handle"
         )
@@ -2098,8 +2133,8 @@ def _queue_tool_target(arguments: JSON) -> ClusterDefinition | None:
         return None
     if not isinstance(raw_cluster, str) or not raw_cluster:
         raise ValueError("cluster must be a non-empty string")
-    if raw_revision is not None and (not isinstance(raw_revision, str) or not raw_revision):
-        raise ValueError("route_revision must be a non-empty string")
+    if raw_revision is not None:
+        _validated_route_revision(raw_revision)
     registry_path = default_registry_path()
     if not registry_path.exists():
         if raw_revision is not None:
@@ -2111,7 +2146,7 @@ def _queue_tool_target(arguments: JSON) -> ClusterDefinition | None:
             raise ValueError(f"cluster route is not configured: {raw_cluster}")
         return None
     expected_revision = _route_revision(definition)
-    if raw_revision is not None and raw_revision != expected_revision:
+    if raw_revision is not None and not hmac.compare_digest(raw_revision, expected_revision):
         raise ValueError(
             f"cluster route changed for {raw_cluster}; refuse to use stale queue routing"
         )
@@ -2543,12 +2578,111 @@ def _decode_verified_mcp_result(envelope: JSON, *, artifact: JSON, job_id: str) 
     }
 
 
+def _mcp_result_artifact(artifacts: list[JSON], *, job_id: str) -> JSON | None:
+    """Return the unique durable MCP-result artifact for one job, if present."""
+
+    matches = [
+        artifact
+        for artifact in artifacts
+        if artifact.get("job_id") == job_id and artifact.get("kind") == "mcp_result"
+    ]
+    if len(matches) > 1:
+        raise ValueError(f"job {job_id} has multiple MCP result artifacts")
+    return matches[0] if matches else None
+
+
+def _bounded_mcp_result(result: JSON) -> JSON:
+    """Inline a complete MCP result when small, otherwise return a bounded summary."""
+
+    encoded = json.dumps(
+        result,
+        allow_nan=False,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(encoded) <= MAX_INLINE_MCP_RESULT_BYTES:
+        return result
+
+    preferred = (
+        "operation",
+        "tool",
+        "returncode",
+        "timed_out",
+        "protocol_error",
+        "protocol_version",
+        "server_info",
+        "structured_result",
+        "result_validation",
+        "protocol_result",
+    )
+    summary: JSON = {}
+    omitted: list[str] = []
+    for key in preferred:
+        candidate = {**summary, key: result.get(key)}
+        candidate_size = len(
+            json.dumps(
+                candidate,
+                allow_nan=False,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        if candidate_size <= MAX_INLINE_MCP_RESULT_BYTES - 2_048:
+            summary[key] = result.get(key)
+        else:
+            omitted.append(key)
+    summary["content_truncated"] = True
+    summary["omitted_fields"] = omitted
+    return summary
+
+
+def _public_mcp_result_artifact(artifact: JSON) -> JSON:
+    """Return the compact immutable binding for a durable MCP result artifact."""
+
+    return {
+        key: artifact.get(key)
+        for key in (
+            "artifact_id",
+            "job_id",
+            "kind",
+            "size_bytes",
+            "sha256",
+            "created_at",
+        )
+    }
+
+
+def _attach_terminal_mcp_evidence(
+    receipt: JSON,
+    *,
+    job_id: str,
+    last_error: str | None,
+    artifacts: list[JSON],
+    parsed_result: JSON | None,
+) -> None:
+    """Attach bounded terminal MCP evidence to a waited submission receipt."""
+
+    receipt["last_error"] = last_error
+    if parsed_result is None:
+        return
+    artifact = _mcp_result_artifact(artifacts, job_id=job_id)
+    if artifact is None:
+        raise ValueError(f"verified MCP result for {job_id} has no durable artifact")
+    receipt["mcp_result"] = _bounded_mcp_result(parsed_result)
+    receipt["mcp_result_artifact"] = _public_mcp_result_artifact(artifact)
+
+
 def _render_remote_mcp_context(catalog: VirtualRemoteMcpCatalog) -> str:
     generic = (
         " Registered remote MCP tools are exposed with remote_<server>_<tool> aliases; "
         "their cluster argument selects the execution target and is not forwarded to the "
         "remote tool. Operators explicitly refresh the durable schema cache before new or "
-        "changed tools appear."
+        "changed tools appear. Treat cluster, job_id, and the opaque 64-character "
+        "route_revision returned by one submission as an indivisible handle. A route "
+        "revision is never interchangeable with this tool catalog's revision or a "
+        "scientific dataset's catalog revision."
     )
     available = ""
     if catalog.tools:
@@ -2653,6 +2787,7 @@ def _observe_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettin
         observed = monitor_job(queue, job_id, cursor=cursor, limit=limit)
     pattern = _optional_str(arguments, "pattern")
     matches: list[JSON] = []
+    matches_truncated = False
     logs: JSON | None = None
     if arguments.get("include_logs", True) is not False:
         log_limit = _log_limit(arguments)
@@ -2669,34 +2804,39 @@ def _observe_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettin
         compiled = re.compile(pattern)
         for event in cast(list[JSON], observed.get("events", [])):
             for text in _event_match_candidates(event):
-                for match in compiled.finditer(text):
-                    matches.append(
-                        {
-                            "event_seq": event.get("seq"),
-                            "event_type": event.get("event_type"),
-                            "text": text,
-                            "match": match.group(0),
-                            "groups": list(match.groups()),
-                            "groupdict": match.groupdict(),
-                        }
-                    )
+                matches_truncated = _append_bounded_observe_matches(
+                    matches,
+                    compiled=compiled,
+                    text=text,
+                    identity={
+                        "event_seq": event.get("seq"),
+                        "event_type": event.get("event_type"),
+                    },
+                )
+                if matches_truncated:
+                    break
+            if matches_truncated:
+                break
         if logs is not None:
             for stream_name in ("stdout", "stderr"):
+                if matches_truncated:
+                    break
                 stream = _object(logs[stream_name])
                 text = stream.get("text")
                 if not isinstance(text, str):
                     continue
-                for match in compiled.finditer(text):
-                    matches.append(
-                        {
-                            "source": stream_name,
-                            "text": text,
-                            "match": match.group(0),
-                            "groups": list(match.groups()),
-                            "groupdict": match.groupdict(),
-                        }
-                    )
-    result: JSON = {**observed, "matched": bool(matches), "matches": matches}
+                matches_truncated = _append_bounded_observe_matches(
+                    matches,
+                    compiled=compiled,
+                    text=text,
+                    identity={"source": stream_name},
+                )
+    result: JSON = {
+        **observed,
+        "matched": bool(matches),
+        "matches": matches,
+        "matches_truncated": matches_truncated,
+    }
     if logs is not None:
         result["logs"] = logs
     if target is not None:
@@ -2834,6 +2974,51 @@ def _event_match_candidates(event: JSON) -> list[str]:
             if isinstance(value, str):
                 candidates.append(value)
     return candidates
+
+
+def _bounded_observe_value(value: str | None) -> str | None:
+    """Bound one regex-derived value before returning it to an agent."""
+
+    if value is None or len(value) <= MAX_OBSERVE_MATCH_TEXT_CHARS:
+        return value
+    return value[:MAX_OBSERVE_MATCH_TEXT_CHARS]
+
+
+def _append_bounded_observe_matches(
+    matches: list[JSON],
+    *,
+    compiled: re.Pattern[str],
+    text: str,
+    identity: JSON,
+) -> bool:
+    """Append bounded regex matches and report whether more matches were omitted."""
+
+    for match in compiled.finditer(text):
+        if len(matches) >= MAX_OBSERVE_MATCHES:
+            return True
+        start, end = match.span()
+        context_start = max(0, start - MAX_OBSERVE_MATCH_TEXT_CHARS // 4)
+        context_end = min(len(text), context_start + MAX_OBSERVE_MATCH_TEXT_CHARS)
+        if context_end - context_start < MAX_OBSERVE_MATCH_TEXT_CHARS:
+            context_start = max(0, context_end - MAX_OBSERVE_MATCH_TEXT_CHARS)
+        raw_match = match.group(0)
+        groups = [_bounded_observe_value(value) for value in match.groups()]
+        groupdict = {key: _bounded_observe_value(value) for key, value in match.groupdict().items()}
+        matches.append(
+            {
+                **identity,
+                "text": text[context_start:context_end],
+                "text_start": context_start,
+                "text_truncated": context_start != 0 or context_end != len(text),
+                "match": _bounded_observe_value(raw_match),
+                "match_start": start,
+                "match_end": end,
+                "match_truncated": len(raw_match) > MAX_OBSERVE_MATCH_TEXT_CHARS,
+                "groups": groups,
+                "groupdict": groupdict,
+            }
+        )
+    return False
 
 
 def _submit_jarvis_pipeline(
@@ -3145,6 +3330,7 @@ def _submit_mcp_call(
                 wait_for_terminal_result=bool(arguments.get("wait_for_terminal", False)),
                 wait_timeout_seconds=float(arguments.get("wait_timeout_seconds", 600)),
                 poll_seconds=float(arguments.get("poll_seconds", 2)),
+                include_terminal_mcp_result=True,
             )
         remote_args_path = (
             ".local/share/clio-relay/desktop-submissions/"
@@ -3184,7 +3370,11 @@ def _submit_mcp_call(
             output = run_remote_clio(definition, remote_args)
         finally:
             remove_remote_file(definition, remote_args_path, remove_empty_parent=True)
-        return _remote_submission_result(output, kind=JobKind.MCP_CALL, definition=definition)
+        return _remote_mcp_submission_result(
+            output,
+            definition=definition,
+            arguments=arguments,
+        )
     job = _submit_local_job(
         queue,
         RelayJob(
@@ -3203,7 +3393,13 @@ def _submit_mcp_call(
         ),
         settings=settings,
     )
-    return _submission_result(job, arguments, queue=queue, definition=definition)
+    return _submission_result(
+        job,
+        arguments,
+        queue=queue,
+        definition=definition,
+        include_terminal_mcp_result=True,
+    )
 
 
 def _remote_cluster_definition(cluster: str) -> ClusterDefinition:
@@ -3239,6 +3435,58 @@ def _remote_submission_result(
     }
 
 
+def _remote_mcp_submission_result(
+    output: str,
+    *,
+    definition: ClusterDefinition,
+    arguments: JSON,
+) -> JSON:
+    """Return a remote MCP receipt and bounded result when the caller waited."""
+
+    result = _remote_submission_result(output, kind=JobKind.MCP_CALL, definition=definition)
+    if not bool(arguments.get("wait_for_terminal", False)):
+        return result
+    job_id = _required_durable_record_id(result, "job_id")
+    run_remote_clio(
+        definition,
+        [
+            "job",
+            "wait",
+            job_id,
+            "--timeout-seconds",
+            str(float(arguments.get("wait_timeout_seconds", 600))),
+            "--poll-seconds",
+            str(float(arguments.get("poll_seconds", 2))),
+        ],
+    )
+    status = _remote_json(definition, ["job", "status", job_id], "remote job status")
+    job = _object(status.get("job"))
+    if job.get("job_id") != job_id or job.get("cluster") != definition.name:
+        raise ValueError("remote MCP wait returned a different job")
+    state = job.get("state")
+    if state not in {"succeeded", "failed", "canceled"} or status.get("terminal") is not True:
+        raise ValueError("remote MCP wait did not return one terminal job")
+    artifacts = _complete_remote_collection(
+        definition,
+        ["job", "list-artifacts", job_id],
+        record_key="artifacts",
+        label=f"remote artifacts for {job_id}",
+    )
+    parsed_result = _verified_mcp_result(definition, job_id, artifacts)
+    result.update({"state": state, "terminal": True})
+    last_error = job.get("last_error")
+    if last_error is not None and not isinstance(last_error, str):
+        raise ValueError("remote MCP job returned an invalid last_error")
+    _attach_terminal_mcp_evidence(
+        result,
+        job_id=job_id,
+        last_error=last_error,
+        artifacts=artifacts,
+        parsed_result=parsed_result,
+    )
+    return result
+
+
 def _owned_session_submission_result(
     job: RelayJob,
     *,
@@ -3247,8 +3495,11 @@ def _owned_session_submission_result(
     wait_for_terminal_result: bool,
     wait_timeout_seconds: float,
     poll_seconds: float,
+    include_terminal_mcp_result: bool = False,
 ) -> JSON:
     """Return an owned receipt, optionally waiting through the same protected API."""
+    artifacts: list[JSON] = []
+    parsed_result: JSON | None = None
     if wait_for_terminal_result:
         with OwnedSessionApiClient(definition=definition, settings=settings) as client:
             document = _owned_json(
@@ -3261,7 +3512,15 @@ def _owned_session_submission_result(
                 },
                 label="owned remote submitted job wait",
             )
-        waited = RelayJob.model_validate(document)
+            waited = RelayJob.model_validate(document)
+            if include_terminal_mcp_result:
+                artifacts = _complete_owned_collection(
+                    client,
+                    path=f"/jobs/{job.job_id}/artifacts",
+                    record_key="artifacts",
+                    label=f"owned remote artifacts for {job.job_id}",
+                )
+                parsed_result = _verified_owned_mcp_result(client, job.job_id, artifacts)
         if (
             waited.job_id != job.job_id
             or waited.cluster != definition.name
@@ -3271,7 +3530,7 @@ def _owned_session_submission_result(
         ):
             raise ValueError("owned remote wait returned a different submission receipt")
         job = waited
-    return {
+    result: JSON = {
         "cluster": definition.name,
         "job_id": job.job_id,
         "state": job.state.value,
@@ -3280,6 +3539,15 @@ def _owned_session_submission_result(
         "remote": True,
         "route_revision": _route_revision(definition),
     }
+    if wait_for_terminal_result and include_terminal_mcp_result:
+        _attach_terminal_mcp_evidence(
+            result,
+            job_id=job.job_id,
+            last_error=job.last_error,
+            artifacts=artifacts,
+            parsed_result=parsed_result,
+        )
+    return result
 
 
 def _submit_local_job(
@@ -3403,6 +3671,7 @@ def _submit_jarvis_mcp_call(
                 wait_for_terminal_result=bool(arguments.get("wait_for_terminal", False)),
                 wait_timeout_seconds=float(arguments.get("wait_timeout_seconds", 600)),
                 poll_seconds=float(arguments.get("poll_seconds", 2)),
+                include_terminal_mcp_result=True,
             )
         routing_digest = _stable_digest(
             {"cluster": cluster, "tool": tool, "arguments": tool_arguments}
@@ -3438,7 +3707,11 @@ def _submit_jarvis_mcp_call(
             output = run_remote_clio(definition, remote_args)
         finally:
             remove_remote_file(definition, remote_args_path, remove_empty_parent=True)
-        return _remote_submission_result(output, kind=JobKind.MCP_CALL, definition=definition)
+        return _remote_mcp_submission_result(
+            output,
+            definition=definition,
+            arguments=arguments,
+        )
     server = jarvis_mcp_server()
     server_args = jarvis_mcp_server_args()
     forwarded["server"] = server
@@ -3452,8 +3725,10 @@ def _submission_result(
     *,
     queue: ClioCoreQueue,
     definition: ClusterDefinition | None = None,
+    include_terminal_mcp_result: bool = False,
 ) -> JSON:
-    if bool(arguments.get("wait_for_terminal", False)):
+    waited = bool(arguments.get("wait_for_terminal", False))
+    if waited:
         job = wait_for_terminal(
             queue,
             job.job_id,
@@ -3469,6 +3744,15 @@ def _submission_result(
     }
     if definition is not None:
         result["route_revision"] = _route_revision(definition)
+    if waited and include_terminal_mcp_result:
+        artifacts = _complete_local_artifacts(queue, job.job_id)
+        _attach_terminal_mcp_evidence(
+            result,
+            job_id=job.job_id,
+            last_error=job.last_error,
+            artifacts=artifacts,
+            parsed_result=_verified_local_mcp_result(queue, job.job_id),
+        )
     return result
 
 
@@ -3800,8 +4084,8 @@ def _log_limit(arguments: JSON) -> int:
     return _bounded_integer_limit(
         arguments,
         field_name="log_limit",
-        default=65_536,
-        maximum=MAX_LOG_READ_BYTES,
+        default=MAX_AGENT_LOG_READ_BYTES,
+        maximum=MAX_AGENT_LOG_READ_BYTES,
     )
 
 
