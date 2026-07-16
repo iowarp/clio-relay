@@ -3299,7 +3299,7 @@ def _native_mcp_result_document(
             "cluster": None,
             "scheduler_type": None,
             "scheduler_job_id": None,
-            "scheduler_phase": "completed",
+            "scheduler_phase": None,
             "script_path": None,
             "hostfile_path": None,
             "output_path": f"/runs/{pipeline_id}/stdout.log",
@@ -5772,6 +5772,7 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
     assert runtime["execution_id"] == "native-direct-execution"
     assert runtime["scheduler_provider"] is None
     assert runtime["scheduler_job_id"] is None
+    assert runtime["scheduler_phase"] is None
     assert runtime["output_path"] == "/runs/native-direct/stdout.log"
     assert runtime["error_path"] == "/runs/native-direct/stderr.log"
     assert runtime["packages"] == [
@@ -5793,6 +5794,16 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
     assert task.metadata["scheduler"] is None
     assert task.metadata["scheduler_job_ids"] == []
     assert task.metadata["scheduler_job_ownership"] == []
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=100)
+    event_types = {event.event_type for event in events}
+    assert event_types.isdisjoint(
+        {
+            "scheduler.pending",
+            "scheduler.allocated",
+            "scheduler.running",
+            "scheduler.completed",
+        }
+    )
     assert task.metadata["jarvis_execution_handle"]["schema_version"] == (
         "jarvis.execution.handle.v1"
     )

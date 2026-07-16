@@ -169,6 +169,7 @@ def test_mcp_runtime_metadata_prefers_exact_native_execution_documents() -> None
     assert metadata.pipeline_id == "pipeline-a"
     assert metadata.scheduler_provider is None
     assert metadata.scheduler_job_id is None
+    assert metadata.scheduler_phase is None
     assert metadata.terminal.state == "completed"
     assert metadata.terminal.terminal is True
     assert metadata.terminal.returncode == 0
@@ -720,7 +721,7 @@ def _native_execution_envelope(*, mode: str, state: str) -> dict[str, object]:
         "cluster": cluster,
         "scheduler_type": provider,
         "scheduler_job_id": native_id,
-        "scheduler_phase": state,
+        "scheduler_phase": state if scheduler else None,
         "script_path": "/tmp/submit.sh" if scheduler else None,
         "hostfile_path": "/tmp/hosts" if scheduler else None,
         "output_path": None,
