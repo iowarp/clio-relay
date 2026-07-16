@@ -638,7 +638,7 @@ def test_http_generic_gateway_update_cannot_replace_relay_managed_runtime_state(
 
 
 def test_owned_session_api_fails_closed_without_cluster_or_owner_token(tmp_path: Path) -> None:
-    with pytest.raises(ConfigurationError, match="REMOTE_CLUSTER"):
+    with pytest.raises(ConfigurationError, match="OWNER_SESSION_CLUSTER"):
         create_app(
             RelaySettings(
                 core_dir=tmp_path / "core",
@@ -656,7 +656,7 @@ def test_owned_session_api_fails_closed_without_cluster_or_owner_token(tmp_path:
                 api_token="session-api-token",
                 owner_session_id="desktop-session-1",
                 owner_session_generation_id="generation-1",
-                remote_cluster="test-cluster",
+                owner_session_cluster="test-cluster",
             )
         )
     with pytest.raises(ConfigurationError, match="at least 32 bytes"):
@@ -667,7 +667,7 @@ def test_owned_session_api_fails_closed_without_cluster_or_owner_token(tmp_path:
                 api_token="session-api-token",
                 owner_session_id="desktop-session-1",
                 owner_session_generation_id="generation-1",
-                remote_cluster="test-cluster",
+                owner_session_cluster="test-cluster",
                 session_owner_token="weak-token",
             )
         )

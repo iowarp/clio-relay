@@ -551,9 +551,12 @@ class GatewaySessionUpdateRequest(BaseModel):
 def create_app(settings: RelaySettings | None = None) -> FastAPI:
     """Create the FastAPI relay surface."""
     resolved = settings or RelaySettings.from_env()
+    owner_session_cluster = resolved.resolved_owner_session_cluster()
     if resolved.owner_session_id is not None:
-        if not resolved.remote_cluster:
-            raise ConfigurationError("owned relay session API requires CLIO_RELAY_REMOTE_CLUSTER")
+        if not owner_session_cluster:
+            raise ConfigurationError(
+                "owned relay session API requires CLIO_RELAY_OWNER_SESSION_CLUSTER"
+            )
         if not resolved.session_owner_token:
             raise ConfigurationError(
                 "owned relay session API requires CLIO_RELAY_SESSION_OWNER_TOKEN"
@@ -626,7 +629,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
 
     def submit_owned(job: RelayJob) -> RelayJob:
         ensure_intake_open()
-        if resolved.remote_cluster is not None and job.cluster != resolved.remote_cluster:
+        if owner_session_cluster is not None and job.cluster != owner_session_cluster:
             raise HTTPException(
                 status_code=409,
                 detail="job cluster does not match this owned relay session",
@@ -690,13 +693,13 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         if (
             resolved.owner_session_id is None
             or resolved.owner_session_generation_id is None
-            or resolved.remote_cluster is None
+            or owner_session_cluster is None
             or resolved.session_owner_token is None
         ):
             raise HTTPException(status_code=404, detail="owned session identity is unavailable")
         return session_identity_document(
             owner_token=resolved.session_owner_token,
-            cluster=resolved.remote_cluster,
+            cluster=owner_session_cluster,
             session_id=resolved.owner_session_id,
             generation_id=resolved.owner_session_generation_id,
             nonce=nonce,
@@ -1179,7 +1182,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     )
     def create_gateway_session(request: GatewaySessionCreateRequest) -> GatewaySession:
         ensure_intake_open()
-        if resolved.remote_cluster is not None and request.cluster != resolved.remote_cluster:
+        if owner_session_cluster is not None and request.cluster != owner_session_cluster:
             raise HTTPException(
                 status_code=409,
                 detail="gateway cluster does not match this owned relay session",

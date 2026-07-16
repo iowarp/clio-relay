@@ -836,6 +836,11 @@ unbounded shutdown.
 `session start` requires `CLIO_RELAY_API_TOKEN` by default and fails before opening
 the remote API when it is absent. An unauthenticated API requires the explicit
 `--no-require-token` operator choice and must not be used for release acceptance.
+Owner-bound desktop clients set `CLIO_RELAY_OWNER_SESSION_CLUSTER` to the selected
+cluster. `CLIO_RELAY_REMOTE_CLUSTER` identifies the cluster where the current
+process is running and must not be set on the desktop merely to select an owned
+session route. When both variables are present, they must identify the same
+cluster; a mismatch is rejected before admission.
 
 To clean up the persistent worker too:
 

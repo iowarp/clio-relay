@@ -106,6 +106,7 @@ class RelaySettings(BaseModel):
     api_token: str | None = None
     owner_session_id: str | None = None
     owner_session_generation_id: DurableRecordId | None = None
+    owner_session_cluster: str | None = None
     remote_cluster: str | None = None
     session_owner_token: str | None = None
     agent_bin: str = "agent"
@@ -119,7 +120,23 @@ class RelaySettings(BaseModel):
             raise ValueError(
                 "owner_session_id and owner_session_generation_id must be configured together"
             )
+        if self.owner_session_cluster is not None and self.owner_session_id is None:
+            raise ValueError(
+                "owner_session_cluster requires owner_session_id and owner_session_generation_id"
+            )
+        if (
+            self.owner_session_cluster is not None
+            and self.remote_cluster is not None
+            and self.owner_session_cluster != self.remote_cluster
+        ):
+            raise ValueError(
+                "owner_session_cluster and remote_cluster must match when both are configured"
+            )
         return self
+
+    def resolved_owner_session_cluster(self) -> str | None:
+        """Return the explicit owner destination or a safe legacy locality binding."""
+        return self.owner_session_cluster or self.remote_cluster
 
     @model_validator(mode="after")
     def validate_storage_policy(self) -> Self:
@@ -237,6 +254,7 @@ class RelaySettings(BaseModel):
             api_token=os.getenv("CLIO_RELAY_API_TOKEN"),
             owner_session_id=os.getenv("CLIO_RELAY_OWNER_SESSION_ID"),
             owner_session_generation_id=os.getenv("CLIO_RELAY_SESSION_GENERATION_ID"),
+            owner_session_cluster=os.getenv("CLIO_RELAY_OWNER_SESSION_CLUSTER"),
             remote_cluster=os.getenv("CLIO_RELAY_REMOTE_CLUSTER"),
             session_owner_token=os.getenv("CLIO_RELAY_SESSION_OWNER_TOKEN"),
             agent_bin=os.getenv(

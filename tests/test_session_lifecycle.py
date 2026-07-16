@@ -248,6 +248,7 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
     assert "/proc/{pid}/cmdline" in script
     assert "CLIO_RELAY_SESSION_OWNER_TOKEN" in script
     assert "CLIO_RELAY_OWNER_SESSION_ID=$session_id" in script
+    assert "CLIO_RELAY_OWNER_SESSION_CLUSTER=ares" in script
     assert "process_start_ticks" in script
     assert "nohup setsid" in script
     assert '>"$log_file" 2>&1 9>&- &' in script
@@ -343,6 +344,8 @@ def test_remote_session_identity_challenge_binds_process_cluster_and_nonce(
     script = scripts[0]
     assert "metadata_path, cluster, session_id, generation_id, nonce" in script
     assert "CLIO_RELAY_REMOTE_CLUSTER={cluster}" in script
+    assert "CLIO_RELAY_OWNER_SESSION_CLUSTER={cluster}" in script
+    assert "owner_cluster_verified" in script
     assert "os.getpgid(pid) != pid" in script
     assert "hmac.new(token.encode" in script
     assert "clio-relay.session-identity.v1" in script

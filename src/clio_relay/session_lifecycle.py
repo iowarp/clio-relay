@@ -1054,6 +1054,7 @@ nohup setsid env \\
   "CLIO_RELAY_SESSION_OWNER_TOKEN=$owner_token" \\
   "CLIO_RELAY_SESSION_GENERATION_ID=$session_generation_id" \\
   "CLIO_RELAY_OWNER_SESSION_ID=$session_id" \\
+  "CLIO_RELAY_OWNER_SESSION_CLUSTER={shlex.quote(cluster)}" \\
   "${{api_command[@]}}" \\
   >"$log_file" 2>&1 9>&- &
 api_pid="$!"
@@ -1364,6 +1365,11 @@ command = (proc / "cmdline").read_bytes().replace(bytes([0]), b" ").decode(
     "utf-8", errors="replace"
 )
 environment = (proc / "environ").read_bytes().split(bytes([0]))
+owner_cluster_marker = f"CLIO_RELAY_OWNER_SESSION_CLUSTER={{cluster}}".encode()
+owner_cluster_entries = [
+    item for item in environment if item.startswith(b"CLIO_RELAY_OWNER_SESSION_CLUSTER=")
+]
+owner_cluster_verified = owner_cluster_marker in environment or not owner_cluster_entries
 if (
     stat_fields[0] == "Z"
     or os.getpgid(pid) != pid
@@ -1373,6 +1379,7 @@ if (
     or f"CLIO_RELAY_SESSION_GENERATION_ID={{generation_id}}".encode() not in environment
     or f"CLIO_RELAY_OWNER_SESSION_ID={{session_id}}".encode() not in environment
     or f"CLIO_RELAY_REMOTE_CLUSTER={{cluster}}".encode() not in environment
+    or not owner_cluster_verified
     or "clio-relay" not in command
     or " api " not in f" {{command}} "
     or " start" not in command

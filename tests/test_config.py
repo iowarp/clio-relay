@@ -70,11 +70,25 @@ def test_relay_settings_load_owner_session_generation_from_environment(
 ) -> None:
     monkeypatch.setenv("CLIO_RELAY_OWNER_SESSION_ID", "desktop-session")
     monkeypatch.setenv("CLIO_RELAY_SESSION_GENERATION_ID", "generation-1")
+    monkeypatch.setenv("CLIO_RELAY_OWNER_SESSION_CLUSTER", "ares")
 
     settings = RelaySettings.from_env()
 
     assert settings.owner_session_id == "desktop-session"
     assert settings.owner_session_generation_id == "generation-1"
+    assert settings.owner_session_cluster == "ares"
+    assert settings.resolved_owner_session_cluster() == "ares"
+    assert settings.remote_cluster is None
+
+
+def test_relay_settings_reject_mismatched_owner_and_process_clusters() -> None:
+    with pytest.raises(ValueError, match="must match"):
+        RelaySettings(
+            owner_session_id="desktop-session",
+            owner_session_generation_id="generation-1",
+            owner_session_cluster="ares",
+            remote_cluster="homelab",
+        )
 
 
 @pytest.mark.parametrize(

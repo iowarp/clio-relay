@@ -1540,7 +1540,8 @@ def test_cli_session_submit_jarvis_uses_identity_proven_client(
     assert document["metadata"]["owner_session_generation_id"] == "generation-1"
     settings = cast(cli.RelaySettings, captured["settings"])
     assert settings.api_token == "api-token"
-    assert settings.remote_cluster == "ares"
+    assert settings.owner_session_cluster == "ares"
+    assert settings.remote_cluster is None
     assert settings.owner_session_id == "session-1"
     assert settings.owner_session_generation_id == "generation-1"
     assert cast(dict[str, object], captured["payload"])["pipeline_yaml"] == (
@@ -2144,7 +2145,11 @@ def test_cli_remote_teardown_writes_closure_only_in_remote_authoritative_core(
     _write_test_cluster(tmp_path)
     local_core_dir = tmp_path / "desktop-core"
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(local_core_dir))
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+    monkeypatch.setenv("CLIO_RELAY_OWNER_SESSION_ID", "session-1")
+    monkeypatch.setenv("CLIO_RELAY_SESSION_GENERATION_ID", "generation-1")
+    monkeypatch.setenv("CLIO_RELAY_OWNER_SESSION_CLUSTER", "ares")
+    monkeypatch.delenv("CLIO_RELAY_REMOTE_CLUSTER", raising=False)
+    monkeypatch.delenv("CLIO_RELAY_CLI_MODE", raising=False)
     remote_calls: list[list[str]] = []
     monkeypatch.setattr(
         cli,
