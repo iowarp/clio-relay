@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -64,15 +65,105 @@ def test_managed_bootstrap_fences_worker_around_migration() -> None:
     assert f"WORKER_SERVICE_NAME={service_name}" in script
     assert script.index(stop) < first_proof < script.index(install)
     assert script.index(install) < relay_replacement < second_proof
-    assert second_proof < script.index(migrate) < script.index(restart)
+    assert (
+        second_proof
+        < script.index(migrate)
+        < script.rindex("if ! bootstrap_bounded_worker_restart; then")
+    )
+    assert restart in script
     assert "WORKER_WRITER_PROOF=1" in script
     assert 'exec 9>"$HOME/.local/share/clio-relay/bootstrap.lock"' in script
     assert "if ! flock -n 9; then" in script
     assert 'exec 8<>"$WORKER_LIFETIME_LOCK_PATH"' in script
     assert "WORKER_LIFETIME_GUARD_FD=8" in script
     assert 'exec 9<>"$WORKER_LIFETIME_LOCK_PATH"' not in script
-    assert "remains stopped" in script
+    assert "bootstrap_bounded_worker_restart" in script
+    assert "worker_recovery=restored" in script
     assert "worker state is unknown and requires operator verification" in script
+
+
+@pytest.mark.parametrize("restart_succeeds", [True, False])
+def test_failed_managed_bootstrap_restores_previously_active_worker(
+    restart_succeeds: bool,
+) -> None:
+    """A sabotaged post-stop step preserves its error and boundedly restores the worker."""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.fail("bash is required to validate the Linux bootstrap recovery trap")
+    worker_fence, _recheck, _init, _restart = bootstrap._worker_upgrade_fence_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "ares",
+        rendered_core_dir='"$test_root/core"',
+    )
+    restart_result = (
+        'echo active > "$BOOTSTRAP_TEST_STATE"\nexit 0' if restart_succeeds else "exit 1"
+    )
+    harness = f"""set -euo pipefail
+test_root="$(mktemp -d)"
+mkdir -p "$test_root/bin"
+export BOOTSTRAP_TEST_STATE="$test_root/worker-state"
+export BOOTSTRAP_TEST_STARTED="$test_root/start-attempted"
+echo active > "$BOOTSTRAP_TEST_STATE"
+cat > "$test_root/bin/python3" <<'__FAKE_PYTHON__'
+#!/usr/bin/env bash
+cat >/dev/null
+__FAKE_PYTHON__
+cat > "$test_root/bin/systemctl" <<'__FAKE_SYSTEMCTL__'
+#!/usr/bin/env bash
+set -u
+case "${{2:-}}" in
+  show)
+    case " $* " in
+      *" --property=LoadState "*) echo loaded ;;
+      *" --property=ActiveState "*)
+        state="$(cat "$BOOTSTRAP_TEST_STATE")"
+        echo "$state"
+        if [ -f "$BOOTSTRAP_TEST_STARTED" ]; then
+          rm -rf -- "$(dirname "$BOOTSTRAP_TEST_STATE")"
+        fi
+        ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  stop)
+    echo "fake-systemctl=stop" >&2
+    echo inactive > "$BOOTSTRAP_TEST_STATE"
+    ;;
+  start)
+    echo "fake-systemctl=start" >&2
+    : > "$BOOTSTRAP_TEST_STARTED"
+    {restart_result}
+    ;;
+  *) exit 2 ;;
+esac
+__FAKE_SYSTEMCTL__
+chmod +x "$test_root/bin/python3" "$test_root/bin/systemctl"
+export PATH="$test_root/bin:$PATH"
+{worker_fence}
+echo "remote-bootstrap-step=sabotaged" >&2
+exit 37
+"""
+
+    result = subprocess.run(
+        [bash, "-s"],
+        input=harness.encode("utf-8"),
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 37
+    assert "remote-bootstrap-step=sabotaged" in stderr
+    assert stderr.count("fake-systemctl=stop") == 1
+    assert "fake-systemctl=start" in stderr
+    if restart_succeeds:
+        assert stderr.count("fake-systemctl=start") == 1
+        assert "worker_recovery=restored" in stderr
+        assert "worker_recovery=failed" not in stderr
+    else:
+        assert stderr.count("fake-systemctl=start") == 1
+        assert "worker_recovery=failed" in stderr
+        assert "state=inactive" in stderr
 
 
 def test_standalone_bootstrap_cannot_mutate_legacy_output() -> None:

@@ -269,6 +269,10 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
     assert 'kill -0 -- "-$api_pid"' in script
     assert "os.replace(temporary, path)" in script
     assert 'url = f"http://127.0.0.1:{port}/healthz"' in script
+    assert "readiness_timeout_seconds = 60.0" in script
+    assert "while time.monotonic() < readiness_deadline" in script
+    assert "remote_api_ready_seconds=" in script
+    assert "for _ in range(100)" not in script
     assert "owned API did not become ready" in script
     assert "\x00" not in script
     assert "pkill" not in script

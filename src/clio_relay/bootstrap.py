@@ -884,6 +884,26 @@ def _worker_upgrade_fence_script(
     fence = "\n".join(
         [
             declarations,
+            "bootstrap_bounded_worker_restart() {",
+            "  WORKER_RESTART_ATTEMPTED=1",
+            (
+                "  if ! timeout --signal=TERM --kill-after=5s 30s systemctl --user start "
+                '"$WORKER_SERVICE_NAME"; then'
+            ),
+            "    return 1",
+            "  fi",
+            (
+                '  if ! WORKER_POST_START_STATE="$(timeout --signal=TERM --kill-after=2s 5s '
+                'systemctl --user show "$WORKER_SERVICE_NAME" '
+                '--property=ActiveState --value)"; then'
+            ),
+            "    return 1",
+            "  fi",
+            '  if [ "$WORKER_POST_START_STATE" != "active" ]; then',
+            "    return 1",
+            "  fi",
+            "  WORKER_RESTARTED=1",
+            "}",
             "bootstrap_worker_fence_exit() {",
             "  status=$?",
             "  trap - EXIT",
@@ -894,37 +914,46 @@ def _worker_upgrade_fence_script(
                 '  if [ "$status" -ne 0 ] && [ "$WORKER_WAS_ACTIVE" = "1" ]'
                 ' && [ "$WORKER_RESTARTED" != "1" ]; then'
             ),
-            '    if [ "$WORKER_RESTART_ATTEMPTED" = "1" ]; then',
+            '    if [ "$WORKER_STOP_CONFIRMED" = "1" ]; then',
             (
-                '      if WORKER_EXIT_STATE="$(systemctl --user show '
-                '"$WORKER_SERVICE_NAME" --property=ActiveState --value 2>/dev/null)"; then'
+                '      echo "bootstrap failed; attempting bounded recovery of '
+                '$WORKER_SERVICE_NAME" >&2'
             ),
-            '        case "$WORKER_EXIT_STATE" in',
-            "          inactive|failed)",
+            "      if bootstrap_bounded_worker_restart; then",
             (
-                '            echo "bootstrap failed; $WORKER_SERVICE_NAME is confirmed '
-                '$WORKER_EXIT_STATE after restart attempt; operator action is required" >&2'
+                '        echo "bootstrap worker_recovery=restored '
+                'service=$WORKER_SERVICE_NAME state=active" >&2'
             ),
-            "            ;;",
-            "          *)",
-            (
-                '            echo "bootstrap failed after restart attempt; '
-                "$WORKER_SERVICE_NAME state is $WORKER_EXIT_STATE and requires "
-                'operator verification" >&2'
-            ),
-            "            ;;",
-            "        esac",
             "      else",
             (
-                '        echo "bootstrap failed after restart attempt; '
-                '$WORKER_SERVICE_NAME state is unknown and requires operator verification" >&2'
+                '        if WORKER_EXIT_STATE="$(timeout --signal=TERM --kill-after=2s 5s '
+                'systemctl --user show "$WORKER_SERVICE_NAME" '
+                '--property=ActiveState --value 2>/dev/null)"; then'
             ),
-            "      fi",
-            '    elif [ "$WORKER_STOP_CONFIRMED" = "1" ]; then',
+            '          case "$WORKER_EXIT_STATE" in',
+            "            inactive|failed)",
             (
-                '      echo "bootstrap failed; $WORKER_SERVICE_NAME remains stopped; '
+                '              echo "bootstrap worker_recovery=failed '
+                "service=$WORKER_SERVICE_NAME state=$WORKER_EXIT_STATE; "
                 'operator action is required" >&2'
             ),
+            "              ;;",
+            "            *)",
+            (
+                '              echo "bootstrap worker_recovery=unverified '
+                "service=$WORKER_SERVICE_NAME state=$WORKER_EXIT_STATE; "
+                'operator verification is required" >&2'
+            ),
+            "              ;;",
+            "          esac",
+            "        else",
+            (
+                '          echo "bootstrap worker_recovery=unverified '
+                "service=$WORKER_SERVICE_NAME state=unknown; "
+                'operator verification is required" >&2'
+            ),
+            "        fi",
+            "      fi",
             "    else",
             (
                 '      echo "bootstrap failed while fencing $WORKER_SERVICE_NAME; '
@@ -937,6 +966,10 @@ def _worker_upgrade_fence_script(
             "trap bootstrap_worker_fence_exit EXIT",
             "command -v systemctl >/dev/null 2>&1 || {",
             '  echo "systemctl is required to fence the configured relay worker" >&2',
+            "  exit 1",
+            "}",
+            "command -v timeout >/dev/null 2>&1 || {",
+            '  echo "timeout is required to bound relay worker recovery" >&2',
             "  exit 1",
             "}",
             (
@@ -1003,23 +1036,13 @@ def _worker_upgrade_fence_script(
         [
             'if [ "$WORKER_WAS_ACTIVE" = "1" ]; then',
             "  bootstrap_require_worker_lifetime_guard",
-            "  WORKER_RESTART_ATTEMPTED=1",
-            '  systemctl --user start "$WORKER_SERVICE_NAME"',
-            (
-                '  if ! WORKER_POST_START_STATE="$(systemctl --user show '
-                '"$WORKER_SERVICE_NAME" --property=ActiveState --value)"; then'
-            ),
-            '    echo "cannot verify restarted relay worker: $WORKER_SERVICE_NAME" >&2',
-            "    exit 1",
-            "  fi",
-            '  if [ "$WORKER_POST_START_STATE" != "active" ]; then',
+            "  if ! bootstrap_bounded_worker_restart; then",
             (
                 '    echo "relay worker did not become active '
-                '($WORKER_POST_START_STATE): $WORKER_SERVICE_NAME" >&2'
+                '(${WORKER_POST_START_STATE:-unknown}): $WORKER_SERVICE_NAME" >&2'
             ),
             "    exit 1",
             "  fi",
-            "  WORKER_RESTARTED=1",
             "fi",
         ]
     )
