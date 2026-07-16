@@ -20,11 +20,14 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from clio_relay.errors import ConfigurationError
 from clio_relay.validation_report import (
     EvidenceReference,
+    InstallSource,
+    InstallSourceKind,
     LiveValidationReport,
     SoftwareIdentity,
     ValidationCheck,
     ValidationResource,
     ValidationStatus,
+    detect_install_source,
     detect_software_identity,
     sha256_file,
 )
@@ -811,7 +814,14 @@ def _path_within(path: Path, root: Path) -> bool:
 
 def installation_info(path: Path | None = None) -> dict[str, object]:
     """Return current package identity together with its durable install receipt."""
-    receipt = load_install_receipt(path)
+    receipt_path = path or default_install_receipt_path()
+    receipt_origin = "bootstrap"
+    install_source: InstallSource | None = None
+    if receipt_path.exists() or path is not None or os.environ.get(INSTALL_RECEIPT_PATH_ENV):
+        receipt = load_install_receipt(receipt_path)
+    else:
+        receipt, install_source = _persistent_uv_tool_install_receipt()
+        receipt_origin = "uv-tool"
     current_software = detect_software_identity()
     current_version = metadata.version("clio-relay")
     component_runtime = _component_runtime_identity(receipt)
@@ -820,11 +830,58 @@ def installation_info(path: Path | None = None) -> dict[str, object]:
         "distribution_version": current_version,
         "software": current_software.model_dump(mode="json"),
         "receipt": receipt.model_dump(mode="json"),
+        "receipt_origin": receipt_origin,
+        "install_source": (
+            install_source.model_dump(mode="json") if install_source is not None else None
+        ),
         "receipt_matches_install": (
             receipt.distribution_version == current_version and receipt.software == current_software
         ),
         "component_runtime": component_runtime,
     }
+
+
+def _persistent_uv_tool_install_receipt() -> tuple[InstallReceipt, InstallSource]:
+    """Derive a compatible receipt from uv's exact persistent-tool identity."""
+    source = detect_install_source(
+        launcher="uv-tool",
+        infer_artifact_sha256=True,
+    )
+    if source.kind not in {InstallSourceKind.WHEEL, InstallSourceKind.PYPI}:
+        raise ConfigurationError("running clio-relay is not installed as a persistent uv tool")
+    if not source.launcher_verified:
+        raise ConfigurationError("persistent uv tool launcher identity could not be verified")
+    if not source.artifact_identity_verified or source.artifact_sha256 is None:
+        raise ConfigurationError("persistent uv tool wheel identity could not be verified")
+    raw_uv_receipt = source.launcher_receipt.get("uv_tool_receipt")
+    if not isinstance(raw_uv_receipt, dict):
+        raise ConfigurationError("persistent uv tool receipt could not be verified")
+    uv_receipt = cast(dict[str, object], raw_uv_receipt)
+    if uv_receipt.get("verified") is not True:
+        raise ConfigurationError("persistent uv tool receipt could not be verified")
+    receipt_path_value = uv_receipt.get("path")
+    if not isinstance(receipt_path_value, str):
+        raise ConfigurationError("persistent uv tool receipt path is missing")
+    try:
+        installed_at = datetime.fromtimestamp(Path(receipt_path_value).stat().st_mtime, tz=UTC)
+    except OSError as exc:
+        raise ConfigurationError("persistent uv tool receipt path is unavailable") from exc
+    reference = source.reference
+    artifact_filename: str | None = None
+    if reference is not None:
+        parsed = urlsplit(reference)
+        if parsed.path:
+            artifact_filename = Path(unquote(parsed.path)).name or None
+    receipt = InstallReceipt(
+        installed_at=installed_at,
+        install_spec=reference or f"clio-relay=={source.distribution_version}",
+        requested_source=source.kind.value,
+        artifact_filename=artifact_filename,
+        artifact_sha256=source.artifact_sha256,
+        distribution_version=source.distribution_version,
+        software=detect_software_identity(),
+    )
+    return receipt, source
 
 
 def worker_runtime_info(

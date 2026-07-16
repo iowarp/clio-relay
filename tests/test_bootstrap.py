@@ -18,7 +18,10 @@ from clio_relay.application_profiles import (
     render_cluster_app_install_script,
 )
 from clio_relay.bootstrap import (
+    CLIO_KIT_JARVIS_MCP_VERSION,
+    CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME,
     CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
+    CLIO_KIT_JARVIS_MCP_WHEEL_URL,
     FRP_LINUX_AMD64_SHA256,
     FRPC_LINUX_AMD64_SHA256,
     FRPS_LINUX_AMD64_SHA256,
@@ -101,10 +104,16 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     ) in script
     assert "pull --ff-only" not in script
     assert 'python -m pip install -e "$HOME/.local/src/jarvis' not in script
-    assert "JARVIS_MCP_INSTALL_SPEC=clio-kit==2.4.2" in script
+    assert f"JARVIS_MCP_INSTALL_SPEC={CLIO_KIT_JARVIS_MCP_WHEEL_URL}" in script
     assert f"JARVIS_MCP_ARTIFACT_SHA256={CLIO_KIT_JARVIS_MCP_WHEEL_SHA256}" in script
-    assert "python -m pip download --isolated --disable-pip-version-check --no-cache-dir" in script
-    assert '"$JARVIS_VENV/bin/python" -m pip download' in script
+    assert f'"{CLIO_KIT_JARVIS_MCP_WHEEL_URL}")' in script
+    assert f'JARVIS_MCP_VERSION="{CLIO_KIT_JARVIS_MCP_VERSION}"' in script
+    assert (
+        f'JARVIS_MCP_ARTIFACT_PATH="$COMPONENT_DOWNLOAD_DIR/{CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME}"'
+    ) in script
+    assert "--proto '=https' --proto-redir '=https' --tlsv1.2" in script
+    assert "--retry 3 --retry-all-errors --retry-max-time 180" in script
+    assert 'JARVIS_MCP_REQUESTED_SOURCE="github_release"' in script
     assert "uv tool install --force --python 3.12 --no-config \\" in script
     assert '--default-index https://pypi.org/simple "$JARVIS_MCP_INSTALL_TARGET"' in script
     digest_check = (
@@ -247,6 +256,13 @@ def test_custom_clio_kit_bootstrap_wheel_requires_preinstall_digest() -> None:
     assert script.index("JARVIS_MCP_ARTIFACT_SHA256 *$JARVIS_MCP_ARTIFACT_PATH") < (
         script.index("uv tool install --force")
     )
+
+
+def test_clio_kit_exact_version_override_requires_its_own_digest() -> None:
+    with pytest.raises(ConfigurationError, match="requires its expected wheel SHA-256"):
+        render_linux_user_bootstrap_script(
+            jarvis_mcp_install_spec=f"clio-kit=={CLIO_KIT_JARVIS_MCP_VERSION}"
+        )
 
 
 def test_bootstrap_uv_pin_matches_release_policy() -> None:

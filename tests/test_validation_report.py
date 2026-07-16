@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import zipfile
@@ -209,6 +211,332 @@ def test_local_wheel_identity_rejects_forged_direct_url_hash(tmp_path: Path) -> 
         artifact_sha256=forged_digest,
         launcher="uvx",
     )
+
+
+def test_released_https_wheel_binds_url_sha_record_and_uv_tool(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    wheel, _, digest, installed = _test_wheel(tmp_path)
+    wheel_bytes = wheel.read_bytes()
+    source_url = (
+        "https://github.com/iowarp/clio-relay/releases/download/"
+        "v1.0.0/clio_relay-1.0.0-py3-none-any.whl"
+    )
+
+    class RemoteDistribution(_FakeWheelDistribution):
+        version = "1.0.0"
+
+        def read_text(self, filename: str) -> str | None:
+            if filename == "direct_url.json":
+                return json.dumps({"url": source_url, "archive_info": {}})
+            return None
+
+    class WheelResponse(io.BytesIO):
+        def __enter__(self) -> WheelResponse:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.close()
+
+        def geturl(self) -> str:
+            return (
+                "https://release-assets.githubusercontent.com/"
+                "github-production-release-asset/exact-wheel?token=test"
+            )
+
+    class WheelOpener:
+        def open(self, *_args: object, **_kwargs: object) -> WheelResponse:
+            return WheelResponse(wheel_bytes)
+
+    installed_root = cast(_FakeWheelDistribution, installed).root
+    distribution = cast(metadata.Distribution, RemoteDistribution(installed_root))
+
+    def find_distribution(_name: str) -> metadata.Distribution:
+        return distribution
+
+    def package_files(_name: str) -> Path:
+        return tmp_path
+
+    def verified_launcher(
+        *_args: object,
+        **_kwargs: object,
+    ) -> tuple[bool, dict[str, object]]:
+        return True, {"verified": True}
+
+    def build_opener(*_args: object, **_kwargs: object) -> WheelOpener:
+        return WheelOpener()
+
+    def publicly_resolved(_url: str) -> bool:
+        return True
+
+    monkeypatch.setattr(
+        validation_report_module.metadata,
+        "distribution",
+        find_distribution,
+    )
+    monkeypatch.setattr(validation_report_module.resources, "files", package_files)
+    monkeypatch.setattr(
+        validation_report_module,
+        "_detect_launcher_receipt",
+        verified_launcher,
+    )
+    monkeypatch.setattr(
+        validation_report_module.urllib.request,
+        "build_opener",
+        build_opener,
+    )
+    monkeypatch.setattr(
+        validation_report_module,
+        "_url_host_resolves_publicly",
+        publicly_resolved,
+    )
+
+    source = validation_report_module.detect_install_source(
+        launcher="uv-tool",
+        artifact_sha256=digest,
+    )
+
+    assert source.kind is InstallSourceKind.WHEEL
+    assert source.reference == source_url
+    assert source.artifact_identity_verified is True
+    assert source.launcher_verified is True
+    assert source.released_artifact is True
+
+    rejected = validation_report_module.detect_install_source(
+        launcher="uv-tool",
+        artifact_sha256="f" * 64,
+    )
+    assert rejected.artifact_identity_verified is False
+    assert rejected.released_artifact is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user@github.com/iowarp/clio-relay/releases/download/v1.0.0/"
+        "clio_relay-1.0.0-py3-none-any.whl",
+        "https://github.com/iowarp/clio-relay/releases/download/v1.0.0/"
+        "clio_relay-1.0.0-py3-none-any.whl?redirect=https://127.0.0.1",
+        "https://github.com/other/clio-relay/releases/download/v1.0.0/"
+        "clio_relay-1.0.0-py3-none-any.whl",
+        "https://github.com/iowarp/clio-relay/releases/download/v1.0.0/"
+        "clio_relay-1.0.1-py3-none-any.whl",
+        "https://127.0.0.1/clio_relay-1.0.0-py3-none-any.whl",
+        "https://github.com:invalid/iowarp/clio-relay/releases/download/v1.0.0/"
+        "clio_relay-1.0.0-py3-none-any.whl",
+    ],
+)
+def test_remote_wheel_fetch_rejects_noncanonical_sources(url: str) -> None:
+    assert validation_report_module._is_official_release_wheel_url(url) is False  # pyright: ignore[reportPrivateUsage]
+    assert (
+        validation_report_module._direct_wheel_bytes(  # pyright: ignore[reportPrivateUsage]
+            {"url": url, "archive_info": {}}
+        )
+        is None
+    )
+
+
+def test_release_wheel_fetch_rejects_private_dns_and_unsafe_redirects(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source_url = (
+        "https://github.com/iowarp/clio-relay/releases/download/"
+        "v1.0.0/clio_relay-1.0.0-py3-none-any.whl"
+    )
+
+    def private_dns(
+        _host: str,
+        _port: int,
+        *,
+        type: socket.SocketKind,
+    ) -> list[tuple[socket.AddressFamily, socket.SocketKind, int, str, tuple[str, int]]]:
+        assert type is socket.SOCK_STREAM
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
+
+    monkeypatch.setattr(validation_report_module.socket, "getaddrinfo", private_dns)
+
+    assert validation_report_module._is_official_release_wheel_url(source_url) is True  # pyright: ignore[reportPrivateUsage]
+    assert validation_report_module._url_host_resolves_publicly(source_url) is False  # pyright: ignore[reportPrivateUsage]
+    handler = validation_report_module._ReleaseWheelRedirectHandler()  # pyright: ignore[reportPrivateUsage]
+    request = validation_report_module.urllib.request.Request(source_url)
+    with pytest.raises(validation_report_module.urllib.error.HTTPError):
+        handler.redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://127.0.0.1/private-wheel.whl",
+        )
+
+
+def test_uv_tool_receipt_binds_exact_remote_url_and_launcher(tmp_path: Path) -> None:
+    environment = tmp_path / "tools" / "clio-relay"
+    environment.mkdir(parents=True)
+    launcher = tmp_path / "bin" / "clio-relay.exe"
+    launcher.parent.mkdir()
+    launcher.write_bytes(b"launcher")
+    source_url = "https://example.invalid/releases/clio_relay-1.0.0-py3-none-any.whl"
+    (environment / "uv-receipt.toml").write_text(
+        "\n".join(
+            [
+                "[tool]",
+                f'requirements = [{{ name = "clio-relay", url = "{source_url}" }}]',
+                "entrypoints = [",
+                (
+                    '  { name = "clio-relay", '
+                    f'install-path = "{launcher.as_posix()}", from = "clio-relay" }},'
+                ),
+                "]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class Distribution:
+        version = "1.0.0"
+
+        def read_text(self, filename: str) -> str | None:
+            if filename == "direct_url.json":
+                return json.dumps({"url": source_url, "archive_info": {}})
+            return None
+
+    identity = validation_report_module._persistent_uv_tool_receipt_identity(  # pyright: ignore[reportPrivateUsage]
+        environment_prefix=environment,
+        tool_executable=launcher.absolute(),
+        distribution=cast(metadata.Distribution, Distribution()),
+    )
+
+    assert identity["launcher_bound"] is True
+    assert identity["source_bound"] is True
+    assert identity["requirement_url"] == source_url
+    assert identity["verified"] is True
+
+    changed = (
+        (environment / "uv-receipt.toml")
+        .read_text(encoding="utf-8")
+        .replace(
+            source_url,
+            f"{source_url}.changed",
+        )
+    )
+    (environment / "uv-receipt.toml").write_text(changed, encoding="utf-8")
+    rejected = validation_report_module._persistent_uv_tool_receipt_identity(  # pyright: ignore[reportPrivateUsage]
+        environment_prefix=environment,
+        tool_executable=launcher.absolute(),
+        distribution=cast(metadata.Distribution, Distribution()),
+    )
+    assert rejected["source_bound"] is False
+    assert rejected["verified"] is False
+
+
+def test_persistent_uv_tool_discovers_uv_from_path_and_requires_receipt(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    tool_directory = tmp_path / "uv" / "tools"
+    environment = tool_directory / "clio-relay"
+    tool_bin = tmp_path / "uv" / "bin"
+    package = environment / "Lib" / "site-packages" / "clio_relay"
+    interpreter = environment / "Scripts" / "python.exe"
+    launcher = tool_bin / "clio-relay.exe"
+    uv = tmp_path / "bin" / "uv.exe"
+    base_prefix = tmp_path / "python"
+    for directory in (package, interpreter.parent, tool_bin, uv.parent, base_prefix):
+        directory.mkdir(parents=True, exist_ok=True)
+    interpreter.write_bytes(b"python")
+    launcher.write_bytes(b"launcher")
+    uv.write_bytes(b"uv")
+    source_url = (
+        "https://github.com/iowarp/clio-relay/releases/download/"
+        "v1.0.0/clio_relay-1.0.0-py3-none-any.whl"
+    )
+    (environment / "uv-receipt.toml").write_text(
+        "\n".join(
+            [
+                "[tool]",
+                f'requirements = [{{ name = "clio-relay", url = "{source_url}" }}]',
+                "entrypoints = [",
+                (
+                    '  { name = "clio-relay", '
+                    f'install-path = "{launcher.as_posix()}", from = "clio-relay" }},'
+                ),
+                "]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class Distribution:
+        version = "1.0.0"
+
+        def read_text(self, filename: str) -> str | None:
+            if filename == "direct_url.json":
+                return json.dumps({"url": source_url, "archive_info": {}})
+            return None
+
+    launcher_digest = hashlib.sha256(launcher.read_bytes()).hexdigest()
+
+    def find_executable(name: str) -> str:
+        return str(uv) if name == "uv" else str(launcher)
+
+    def uv_identity(_path: str | None) -> tuple[bool, str | None, str | None]:
+        return True, "0.11.28", hashlib.sha256(uv.read_bytes()).hexdigest()
+
+    def uv_tool_directory(_path: Path | None, *, bin_directory: bool) -> Path:
+        return tool_bin if bin_directory else tool_directory
+
+    def pyvenv_version(_prefix: Path) -> str:
+        return "0.11.28"
+
+    def record_identity(_distribution: metadata.Distribution) -> dict[str, object]:
+        return {
+            "verified": True,
+            "console_script_sha256": [launcher_digest],
+            "record_sha256": "a" * 64,
+        }
+
+    monkeypatch.delenv("UV", raising=False)
+    monkeypatch.setattr(
+        validation_report_module.shutil,
+        "which",
+        find_executable,
+    )
+    monkeypatch.setattr(validation_report_module.sys, "prefix", str(environment))
+    monkeypatch.setattr(validation_report_module.sys, "base_prefix", str(base_prefix))
+    monkeypatch.setattr(validation_report_module.sys, "executable", str(interpreter))
+    monkeypatch.setattr(
+        validation_report_module,
+        "_uv_executable_identity",
+        uv_identity,
+    )
+    monkeypatch.setattr(
+        validation_report_module,
+        "_uv_tool_dir",
+        uv_tool_directory,
+    )
+    monkeypatch.setattr(
+        validation_report_module,
+        "_pyvenv_uv_version",
+        pyvenv_version,
+    )
+    monkeypatch.setattr(
+        validation_report_module,
+        "_installed_record_identity",
+        record_identity,
+    )
+
+    verified, receipt = validation_report_module._detect_persistent_uv_tool_receipt(  # pyright: ignore[reportPrivateUsage]
+        detected_kind=InstallSourceKind.WHEEL,
+        package_path=str(package),
+        distribution=cast(metadata.Distribution, Distribution()),
+    )
+
+    assert verified is True
+    assert receipt["uv_executable"] == str(uv)
+    assert receipt["uv_tool_receipt"]["verified"] is True
+    assert receipt["verified"] is True
 
 
 def test_uv_launcher_identity_hashes_exact_regular_executable(
@@ -1612,7 +1940,7 @@ def test_default_report_path_sanitizes_cluster_name(tmp_path: Path) -> None:
 def test_repository_release_policy_is_machine_readable() -> None:
     policy = load_release_gate_policy(Path("docs/release-gate-1.0.yaml"))
 
-    assert policy.release_version == "1.2.8"
+    assert policy.release_version == "1.2.9"
     assert policy.acceptance_matrix is not None
     assert policy.acceptance_matrix["report_count_per_stage"] == 17
     assert policy.acceptance_matrix["matrix_sha256"] == policy.acceptance_matrix_sha256
@@ -2768,7 +3096,7 @@ def _fresh_spack_transition_report(
             ),
             ValidationResource(
                 kind="mcp_server",
-                resource_id="spack-fresh:clio-kit-2.4.2",
+                resource_id="spack-fresh:clio-kit-2.4.5",
                 role="remote_mcp_server",
                 cluster="ares",
                 state="verified",

@@ -37,7 +37,7 @@ from clio_relay.jarvis_mcp import (
     jarvis_mcp_command,
     jarvis_user_contract,
 )
-from clio_relay.validation_report import SoftwareIdentity
+from clio_relay.validation_report import InstallSource, InstallSourceKind, SoftwareIdentity
 
 
 def test_distribution_file_source_accepts_a_canonical_filesystem_alias(
@@ -334,6 +334,71 @@ def test_install_receipt_labels_exact_version_spec_as_pypi(tmp_path: Path) -> No
     )
 
     assert receipt.requested_source == "pypi"
+
+
+def test_installation_info_uses_verified_uv_tool_receipt_without_bootstrap_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing_bootstrap = tmp_path / "missing-install-receipt.json"
+    uv_receipt = tmp_path / "tools" / "clio-relay" / "uv-receipt.toml"
+    uv_receipt.parent.mkdir(parents=True)
+    uv_receipt.write_text("[tool]\n", encoding="utf-8")
+    version = metadata.version("clio-relay")
+    source_url = (
+        "https://github.com/iowarp/clio-relay/releases/download/"
+        f"v{version}/clio_relay-{version}-py3-none-any.whl"
+    )
+    source = InstallSource(
+        kind=InstallSourceKind.WHEEL,
+        detected_kind=InstallSourceKind.WHEEL,
+        reference=source_url,
+        launcher="uv-tool",
+        package_path=str(tmp_path / "site-packages" / "clio_relay"),
+        distribution_version=version,
+        artifact_sha256="a" * 64,
+        direct_url={"url": source_url, "archive_info": {}},
+        artifact_identity_verified=True,
+        released_artifact=True,
+        launcher_verified=True,
+        launcher_receipt={
+            "verified": True,
+            "uv_tool_receipt": {
+                "path": str(uv_receipt),
+                "verified": True,
+            },
+        },
+    )
+
+    monkeypatch.delenv(INSTALL_RECEIPT_PATH_ENV, raising=False)
+    monkeypatch.setattr(
+        installation_module,
+        "default_install_receipt_path",
+        lambda: missing_bootstrap,
+    )
+
+    def detect_source(**_kwargs: object) -> InstallSource:
+        return source
+
+    monkeypatch.setattr(
+        installation_module,
+        "detect_install_source",
+        detect_source,
+    )
+
+    info = installation_info()
+    receipt = cast(dict[str, object], info["receipt"])
+    install_source = cast(dict[str, object], info["install_source"])
+
+    assert info["receipt_origin"] == "uv-tool"
+    assert info["receipt_matches_install"] is True
+    assert receipt["install_spec"] == source_url
+    assert receipt["requested_source"] == "wheel"
+    assert receipt["artifact_sha256"] == "a" * 64
+    assert install_source["artifact_identity_verified"] is True
+    assert install_source["launcher_verified"] is True
+    assert install_source["released_artifact"] is True
+    assert info["component_runtime"] == {}
 
 
 def test_remote_native_jarvis_component_requires_runtime_capability_provenance(

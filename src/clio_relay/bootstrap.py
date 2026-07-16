@@ -22,7 +22,12 @@ from uuid import uuid4
 from clio_relay import __version__
 from clio_relay.deployment import endpoint_user_service_name
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.jarvis_mcp import CLIO_KIT_JARVIS_MCP_VERSION
+from clio_relay.jarvis_mcp import (
+    CLIO_KIT_JARVIS_MCP_VERSION,
+    CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME,
+    CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
+    CLIO_KIT_JARVIS_MCP_WHEEL_URL,
+)
 from clio_relay.remote_values import render_remote_shell_path
 from clio_relay.worker_lifetime_lock import (
     WORKER_LIFETIME_GUARD_FD_ENV,
@@ -46,9 +51,6 @@ JARVIS_CD_WHEEL_URL = (
     f"v{JARVIS_CD_VERSION}/{JARVIS_CD_WHEEL_FILENAME}"
 )
 JARVIS_CD_WHEEL_SHA256 = "2e5c994b1b21caf44eecb62c1d631c5ce3886d9282549589520c1d9b49961277"
-CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 = (
-    "655db7d63a64d0220f3fdfe70eaf7d6a654ce06918b04c4b4e0f7db608116363"
-)
 DEFAULT_REMOTE_CORE_DIR = "$HOME/.local/share/clio-relay/core"
 DEFAULT_REMOTE_SPOOL_DIR = "$HOME/.local/share/clio-relay/spool"
 
@@ -1072,14 +1074,14 @@ def render_linux_user_bootstrap_script(
         raise ConfigurationError(f"no pinned Linux checksum is registered for frp {frp_version}")
     resolved_jarvis_mcp_install_spec = jarvis_mcp_install_spec or os.environ.get(
         "CLIO_RELAY_JARVIS_MCP_INSTALL_SPEC",
-        f"clio-kit=={CLIO_KIT_JARVIS_MCP_VERSION}",
+        CLIO_KIT_JARVIS_MCP_WHEEL_URL,
     )
     resolved_jarvis_mcp_artifact_sha256 = (
         jarvis_mcp_artifact_sha256
         or os.environ.get("CLIO_RELAY_JARVIS_MCP_ARTIFACT_SHA256")
         or (
             CLIO_KIT_JARVIS_MCP_WHEEL_SHA256
-            if resolved_jarvis_mcp_install_spec == f"clio-kit=={CLIO_KIT_JARVIS_MCP_VERSION}"
+            if resolved_jarvis_mcp_install_spec == CLIO_KIT_JARVIS_MCP_WHEEL_URL
             else None
         )
     )
@@ -1200,6 +1202,23 @@ JARVIS_MCP_ARTIFACT_PATH=""
 JARVIS_MCP_REQUESTED_SOURCE="checkout"
 JARVIS_MCP_VERSION=""
 case "$JARVIS_MCP_INSTALL_SPEC" in
+  "{CLIO_KIT_JARVIS_MCP_WHEEL_URL}")
+    JARVIS_MCP_VERSION="{CLIO_KIT_JARVIS_MCP_VERSION}"
+    COMPONENT_DOWNLOAD_DIR="$HOME/.local/share/clio-relay/component-wheels/clio-kit"
+    rm -rf "$COMPONENT_DOWNLOAD_DIR"
+    mkdir -p "$COMPONENT_DOWNLOAD_DIR"
+    JARVIS_MCP_ARTIFACT_PATH="$COMPONENT_DOWNLOAD_DIR/{CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME}"
+    COMPONENT_STAGING="$(mktemp "${{JARVIS_MCP_ARTIFACT_PATH}}.XXXXXX")"
+    curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+      --retry 3 --retry-all-errors --retry-max-time 180 \
+      --connect-timeout 20 --max-time 180 \
+      --output "$COMPONENT_STAGING" "$JARVIS_MCP_INSTALL_SPEC"
+    echo "$JARVIS_MCP_ARTIFACT_SHA256 *$COMPONENT_STAGING" | \
+      sha256sum --check --strict -
+    mv "$COMPONENT_STAGING" "$JARVIS_MCP_ARTIFACT_PATH"
+    JARVIS_MCP_INSTALL_TARGET="$JARVIS_MCP_ARTIFACT_PATH"
+    JARVIS_MCP_REQUESTED_SOURCE="github_release"
+    ;;
   clio-kit==*)
     JARVIS_MCP_VERSION="${{JARVIS_MCP_INSTALL_SPEC#clio-kit==}}"
     COMPONENT_DOWNLOAD_DIR="$HOME/.local/share/clio-relay/component-wheels/clio-kit"
@@ -1233,7 +1252,7 @@ case "$JARVIS_MCP_INSTALL_SPEC" in
     JARVIS_MCP_REQUESTED_SOURCE="wheel"
     ;;
   *)
-    echo "clio-kit bootstrap source must be an exact version or wheel" >&2
+    echo "clio-kit source must be the pinned URL, an exact version, or a local wheel" >&2
     exit 1
     ;;
 esac
