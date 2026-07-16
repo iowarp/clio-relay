@@ -804,7 +804,13 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 status_code=422,
                 detail=("owned JARVIS MCP submission requires expected_server_artifact_digest"),
             )
-        if expected_digest is not None:
+        # An owned cluster-side API receives the discovery binding from its
+        # authenticated desktop owner. Its operator cache is intentionally
+        # process-local and may not contain the desktop's discovery entry. Do
+        # not substitute a second, unrelated cache as authority here: preserve
+        # the supplied digest in the durable spec and let the MCP runner compare
+        # it with the server artifact observed immediately before launch.
+        if expected_digest is not None and resolved.owner_session_id is None:
             try:
                 observed_digest = jarvis_mcp_artifact_binding(request.cluster)
             except ValueError as exc:
