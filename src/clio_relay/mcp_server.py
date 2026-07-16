@@ -1345,6 +1345,7 @@ def _call_tool(
         cluster = _required_str(arguments, "cluster")
         route = catalog.resolve(name, cluster)
         forwarded_arguments = catalog.forwarded_arguments(name, arguments)
+        relay_arguments = catalog.relay_arguments(name, arguments)
         result = _submit_mcp_call(
             {
                 "cluster": cluster,
@@ -1360,6 +1361,7 @@ def _call_tool(
                 "tool": route.remote_tool_name,
                 "arguments": forwarded_arguments,
                 "timeout_seconds": route.timeout_seconds,
+                **relay_arguments,
                 "idempotency_key": (
                     f"mcp:virtual:{cluster}:{route.server_name}:"
                     f"{route.remote_tool_name}:{uuid4().hex}"
@@ -3331,6 +3333,8 @@ def _submit_mcp_call(
                 wait_timeout_seconds=float(arguments.get("wait_timeout_seconds", 600)),
                 poll_seconds=float(arguments.get("poll_seconds", 2)),
                 include_terminal_mcp_result=True,
+                include_terminal_logs=bool(arguments.get("include_logs", False)),
+                terminal_log_limit=_log_limit(arguments),
             )
         remote_args_path = (
             ".local/share/clio-relay/desktop-submissions/"
@@ -3397,6 +3401,7 @@ def _submit_mcp_call(
         job,
         arguments,
         queue=queue,
+        settings=settings,
         definition=definition,
         include_terminal_mcp_result=True,
     )
@@ -3474,6 +3479,12 @@ def _remote_mcp_submission_result(
     )
     parsed_result = _verified_mcp_result(definition, job_id, artifacts)
     result.update({"state": state, "terminal": True})
+    if arguments.get("include_logs", False) is True:
+        result["logs"] = _remote_job_logs(
+            definition,
+            job_id,
+            limit=_log_limit(arguments),
+        )
     last_error = job.get("last_error")
     if last_error is not None and not isinstance(last_error, str):
         raise ValueError("remote MCP job returned an invalid last_error")
@@ -3496,10 +3507,13 @@ def _owned_session_submission_result(
     wait_timeout_seconds: float,
     poll_seconds: float,
     include_terminal_mcp_result: bool = False,
+    include_terminal_logs: bool = False,
+    terminal_log_limit: int = MAX_AGENT_LOG_READ_BYTES,
 ) -> JSON:
     """Return an owned receipt, optionally waiting through the same protected API."""
     artifacts: list[JSON] = []
     parsed_result: JSON | None = None
+    logs: JSON | None = None
     if wait_for_terminal_result:
         with OwnedSessionApiClient(definition=definition, settings=settings) as client:
             document = _owned_json(
@@ -3521,6 +3535,12 @@ def _owned_session_submission_result(
                     label=f"owned remote artifacts for {job.job_id}",
                 )
                 parsed_result = _verified_owned_mcp_result(client, job.job_id, artifacts)
+            if include_terminal_logs:
+                logs = _owned_job_logs(
+                    client,
+                    job.job_id,
+                    limit=terminal_log_limit,
+                )
         if (
             waited.job_id != job.job_id
             or waited.cluster != definition.name
@@ -3547,6 +3567,8 @@ def _owned_session_submission_result(
             artifacts=artifacts,
             parsed_result=parsed_result,
         )
+    if wait_for_terminal_result and logs is not None:
+        result["logs"] = logs
     return result
 
 
@@ -3724,6 +3746,7 @@ def _submission_result(
     arguments: JSON,
     *,
     queue: ClioCoreQueue,
+    settings: RelaySettings | None = None,
     definition: ClusterDefinition | None = None,
     include_terminal_mcp_result: bool = False,
 ) -> JSON:
@@ -3752,6 +3775,15 @@ def _submission_result(
             last_error=job.last_error,
             artifacts=artifacts,
             parsed_result=_verified_local_mcp_result(queue, job.job_id),
+        )
+    if waited and arguments.get("include_logs", False) is True:
+        if settings is None:
+            raise ValueError("local waited log retrieval requires relay settings")
+        result["logs"] = _job_logs(
+            queue,
+            settings,
+            job.job_id,
+            limit=_log_limit(arguments),
         )
     return result
 

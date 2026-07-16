@@ -2135,6 +2135,194 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
     assert queue.list_jobs() == []
 
 
+def test_virtual_remote_mcp_wait_envelope_returns_same_call_result_without_leaking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduce the live catalog failure and prove relay controls stay local."""
+
+    registration = RemoteMcpServerConfig(
+        command="science-mcp",
+        args=["--stdio"],
+        namespace="science",
+        allow_tools=["scientific_dataset_search"],
+        profiles=["user"],
+    )
+    definition = ClusterDefinition(
+        name="ares",
+        ssh_host="ares-login",
+        remote_mcp_servers={"science": registration},
+    )
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(clusters={"ares": definition}).save(registry_path)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
+    route = RemoteMcpRoute(
+        cluster="ares",
+        server_name="science",
+        command="science-mcp",
+        args=("--stdio",),
+        env_from=(),
+        expected_server_artifact_digest="c" * 64,
+        remote_tool_name="scientific_dataset_search",
+        timeout_seconds=300,
+        contract=None,
+        cluster_route_revision=cluster_route_revision(definition),
+        registration_revision=remote_mcp_registration_revision(registration),
+    )
+    remote_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "page_size": {"type": "integer", "minimum": 1, "maximum": 100},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+    virtual_tool = VirtualRemoteMcpTool(
+        alias="science_scientific_dataset_search",
+        namespace="science",
+        remote_tool=RemoteMcpToolSchema(
+            name="scientific_dataset_search",
+            input_schema=remote_schema,
+        ),
+        routes={"ares": route},
+        arguments_wrapped=False,
+    )
+    catalog = VirtualRemoteMcpCatalog(
+        revision="d" * 64,
+        tools={virtual_tool.alias: virtual_tool},
+        issues=(),
+        cluster_route_revisions={"ares": cluster_route_revision(definition)},
+    )
+
+    def selected_catalog(*, profile: str, reserved_names: set[str]) -> VirtualRemoteMcpCatalog:
+        del profile, reserved_names
+        return catalog
+
+    monkeypatch.setattr(mcp_server_module, "_remote_mcp_catalog", selected_catalog)
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    wait_observation: dict[str, object] = {}
+
+    def complete_wait(
+        selected_queue: ClioCoreQueue,
+        job_id: str,
+        *,
+        timeout_seconds: float,
+        poll_seconds: float,
+    ) -> RelayJob:
+        wait_observation.update(
+            {
+                "queue": selected_queue,
+                "job_id": job_id,
+                "timeout_seconds": timeout_seconds,
+                "poll_seconds": poll_seconds,
+            }
+        )
+        return selected_queue.get_job(job_id).model_copy(update={"state": JobState.SUCCEEDED})
+
+    def artifacts(_queue: ClioCoreQueue, job_id: str) -> list[dict[str, object]]:
+        return [
+            {
+                "artifact_id": "artifact_virtual_search_result",
+                "job_id": job_id,
+                "kind": "mcp_result",
+                "size_bytes": 128,
+                "sha256": "e" * 64,
+                "created_at": "2026-07-16T15:00:00Z",
+            }
+        ]
+
+    def verified_result(_queue: ClioCoreQueue, _job_id: str) -> dict[str, object]:
+        return {
+            "operation": "tools/call",
+            "tool": "scientific_dataset_search",
+            "returncode": 0,
+            "structured_result": {"datasets": [{"dataset_id": "asteroid-first-five"}]},
+        }
+
+    def bounded_logs(
+        selected_queue: ClioCoreQueue,
+        selected_settings: RelaySettings,
+        job_id: str,
+        *,
+        limit: int,
+    ) -> dict[str, object]:
+        assert selected_queue is queue
+        assert selected_settings is settings
+        assert limit == 1_024
+        return {
+            "stdout": {"job_id": job_id, "text": "catalog complete", "eof": True},
+            "stderr": {"job_id": job_id, "text": "", "eof": True},
+        }
+
+    monkeypatch.setattr(mcp_server_module, "wait_for_terminal", complete_wait)
+    monkeypatch.setattr(mcp_server_module, "_complete_local_artifacts", artifacts)
+    monkeypatch.setattr(mcp_server_module, "_verified_local_mcp_result", verified_result)
+    monkeypatch.setattr(mcp_server_module, "_job_logs", bounded_logs)
+    session = McpSessionState()
+    listed = handle_request(
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        queue=queue,
+        settings=settings,
+        profile="user",
+        session=session,
+    )
+    assert listed is not None
+    advertised = next(
+        tool
+        for tool in listed["result"]["tools"]
+        if tool["name"] == "science_scientific_dataset_search"
+    )
+    invocation = {
+        "cluster": "ares",
+        "query": "2018 asteroid impact",
+        "page_size": 20,
+        "wait_for_terminal": True,
+        "wait_timeout_seconds": 45,
+        "poll_seconds": 0.25,
+        "include_logs": True,
+        "log_limit": 1_024,
+    }
+    cast(_SchemaValidator, Draft202012Validator(advertised["inputSchema"])).validate(invocation)
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": virtual_tool.alias, "arguments": invocation},
+        },
+        queue=queue,
+        settings=settings,
+        profile="user",
+        session=session,
+    )
+
+    assert response is not None and "error" not in response, response
+    result = response["result"]["structuredContent"]
+    cast(_SchemaValidator, Draft202012Validator(advertised["outputSchema"])).validate(result)
+    assert result["terminal"] is True
+    assert result["state"] == "succeeded"
+    assert result["mcp_result"]["structured_result"]["datasets"][0]["dataset_id"] == (
+        "asteroid-first-five"
+    )
+    assert result["logs"]["stdout"]["text"] == "catalog complete"
+    submitted = queue.list_jobs()[0]
+    assert isinstance(submitted.spec, McpCallSpec)
+    assert submitted.spec.arguments == {
+        "query": "2018 asteroid impact",
+        "page_size": 20,
+    }
+    assert wait_observation == {
+        "queue": queue,
+        "job_id": submitted.job_id,
+        "timeout_seconds": 45.0,
+        "poll_seconds": 0.25,
+    }
+
+
 def test_owned_remote_agent_submission_uses_authenticated_session_api(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

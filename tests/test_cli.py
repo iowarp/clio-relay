@@ -5,6 +5,7 @@ import hashlib
 import json
 import subprocess
 import sys
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -5052,6 +5053,109 @@ def test_remote_worker_info_binds_worker_to_operator_pinned_physical_target(
     target_scheduler_provider[0] = "external"
     with pytest.raises(ConfigurationError, match="physical target scheduler provider"):
         cli._remote_worker_info(definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+
+def test_remote_worker_info_uses_one_total_observation_deadline(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    definition = ClusterDefinition(
+        name="ares",
+        ssh_host="ares",
+        scheduler_provider="slurm",
+        target_identity=ClusterTargetIdentity(
+            hostnames=["ares.example.test"],
+            ssh_host_key_sha256=["SHA256:operator-pinned-fingerprint"],
+            scheduler_cluster_name="ares",
+            site_marker_sha256="a" * 64,
+        ),
+    )
+    clock = iter((100.0, 101.0, 105.0))
+    observed_timeouts: list[float] = []
+    observed_deadlines: list[float | None] = []
+
+    def fake_remote(_definition: ClusterDefinition, arguments: list[str]) -> str:
+        if arguments[1] == "worker-info":
+            return json.dumps({"scheduler_provider": "slurm"})
+        return json.dumps(
+            {
+                "schema_version": "clio-relay.cluster-target-info.v1",
+                "hostname": "ares.example.test",
+                "fqdn": "ares.example.test",
+                "site_marker_sha256": "a" * 64,
+                "scheduler_provider": "slurm",
+                "scheduler_cluster_name": "ares",
+            }
+        )
+
+    def fake_timeout(timeout_seconds: float) -> object:
+        observed_timeouts.append(timeout_seconds)
+        return nullcontext()
+
+    def fake_fingerprints(
+        _ssh_host: str,
+        *,
+        deadline: float | None = None,
+    ) -> list[str]:
+        observed_deadlines.append(deadline)
+        return ["SHA256:operator-pinned-fingerprint"]
+
+    monkeypatch.setattr(cli, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(cli, "run_remote_clio", fake_remote)
+    monkeypatch.setattr(cli, "remote_command_timeout", fake_timeout)
+    monkeypatch.setattr(cli, "_ssh_host_key_fingerprints", fake_fingerprints)
+
+    info = cli._remote_worker_info(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        definition,
+        timeout_seconds=20,
+    )
+
+    assert info["scheduler_provider"] == "slurm"
+    assert observed_timeouts == [19.0, 15.0]
+    assert observed_deadlines == [120.0]
+
+
+def test_cleanup_worker_observation_is_bounded_and_never_retried_after_cleanup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+    definition = ClusterDefinition(name="ares", ssh_host="ares")
+    observations: list[float | None] = []
+
+    def timed_out_worker_info(
+        _definition: ClusterDefinition,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, object]:
+        observations.append(timeout_seconds)
+        raise RelayError("remote worker identity observation timed out")
+
+    monkeypatch.setattr(cli, "_remote_worker_info", timed_out_worker_info)
+    observed_info, observation_error = cli._observe_worker_before_cleanup(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        definition
+    )
+    report = new_live_validation_report(scenario="cleanup", cluster="ares")
+    recorder = ValidationRecorder(report)
+    with recorder.check("cleanup.relay-session", "remote API stopped") as evidence:
+        evidence.append(EvidenceReference(kind="cleanup", excerpt="remote API stopped"))
+    recorder.finish()
+    report_path = tmp_path / "bounded-cleanup-report.json"
+
+    with pytest.raises(RelayError, match="identity observation timed out"):
+        cli._write_remote_verified_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            report,
+            definition,
+            report_path,
+            observed_worker_info=observed_info,
+            worker_observation_error=observation_error,
+        )
+
+    assert observations == [cli.REMOTE_CLEANUP_WORKER_INFO_TIMEOUT_SECONDS]
+    saved = json.loads(report_path.read_text(encoding="utf-8"))
+    assert saved["status"] == "failed"
+    assert saved["completed_at"] is not None
+    assert all(check["completed_at"] is not None for check in saved["checks"])
+    assert saved["checks"][-1]["check_id"] == "worker.installation-info"
 
 
 def test_cli_cluster_add_persists_direct_transport_optimization(

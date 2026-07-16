@@ -222,6 +222,7 @@ DEFAULT_RELAY_CANCEL_TIMEOUT_SECONDS = 30.0
 DEFAULT_RELAY_CANCEL_POLL_SECONDS = 0.25
 MAX_RELAY_CANCEL_TIMEOUT_SECONDS = 3_600.0
 REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS = 120.0
+REMOTE_CLEANUP_WORKER_INFO_TIMEOUT_SECONDS = 20.0
 SPACK_CONFIGURATION_OBSERVATION_TIMEOUT_SECONDS = 60.0
 MAX_SPACK_CONFIGURATION_OBSERVATION_OUTPUT_BYTES = 128 * 1024
 MAX_SPACK_CONFIGURATION_TREE_ENTRIES = 1_024
@@ -3304,6 +3305,7 @@ def session_detach(
     def action() -> None:
         remote_execution = should_execute_on_cluster(definition)
         queue = _managed_queue_from_env()
+        cleanup_worker_info, cleanup_worker_error = _observe_worker_before_cleanup(definition)
         pre_detach_report = detach_remote_session(
             definition=definition,
             session_id=session_id,
@@ -3400,7 +3402,13 @@ def session_detach(
             update={"report_id": seed_report.report_id, "started_at": seed_report.started_at}
         )
         canonical_report[0] = canonical
-        _write_remote_verified_report(canonical, definition, canonical_report_path)
+        _write_remote_verified_report(
+            canonical,
+            definition,
+            canonical_report_path,
+            observed_worker_info=cleanup_worker_info,
+            worker_observation_error=cleanup_worker_error,
+        )
         payload["validation_report"] = str(canonical_report_path.resolve())
         typer.echo(_public_json(payload))
         canonical_ok = canonical.status is ValidationStatus.PASSED
@@ -3556,6 +3564,7 @@ def session_teardown(
     def action() -> None:
         remote_execution = should_execute_on_cluster(definition)
         queue = _managed_queue_from_env()
+        cleanup_worker_info, cleanup_worker_error = _observe_worker_before_cleanup(definition)
         pre_teardown_status = status_remote_session(
             definition=definition,
             session_id=session_id,
@@ -4077,7 +4086,13 @@ def session_teardown(
                     state="canceled",
                 )
             )
-        _write_remote_verified_report(canonical, definition, canonical_report_path)
+        _write_remote_verified_report(
+            canonical,
+            definition,
+            canonical_report_path,
+            observed_worker_info=cleanup_worker_info,
+            worker_observation_error=cleanup_worker_error,
+        )
         payload["validation_report"] = str(canonical_report_path.resolve())
         typer.echo(_public_json(payload))
         canonical_ok = canonical.status is ValidationStatus.PASSED
@@ -11208,12 +11223,20 @@ def _validate_complete_page(
     return total
 
 
-def _remote_worker_info(definition: ClusterDefinition) -> dict[str, object]:
-    """Read fresh process-bound worker identity over the configured transport."""
+def _remote_worker_info(
+    definition: ClusterDefinition,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, object]:
+    """Read fresh process-bound worker identity over one optional total deadline."""
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    deadline = None if timeout_seconds is None else monotonic() + timeout_seconds
     info = _json_output(
-        run_remote_clio(
+        _run_remote_clio_before_deadline(
             definition,
             ["endpoint", "worker-info", "--cluster", definition.name],
+            deadline=deadline,
         ),
         "remote clio-relay worker runtime info",
     )
@@ -11223,11 +11246,31 @@ def _remote_worker_info(definition: ClusterDefinition) -> dict[str, object]:
             "remote worker scheduler provider does not match the cluster definition: "
             f"{actual_provider!r} != {definition.scheduler_provider!r}"
         )
-    info["target_identity"] = _remote_target_identity(definition)
+    info["target_identity"] = _remote_target_identity(definition, deadline=deadline)
     return info
 
 
-def _remote_target_identity(definition: ClusterDefinition) -> dict[str, object]:
+def _run_remote_clio_before_deadline(
+    definition: ClusterDefinition,
+    args: list[str],
+    *,
+    deadline: float | None,
+) -> str:
+    """Run one remote observation without exceeding a shared monotonic deadline."""
+    if deadline is None:
+        return run_remote_clio(definition, args)
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise RelayError("remote worker identity observation timed out")
+    with remote_command_timeout(remaining):
+        return run_remote_clio(definition, args)
+
+
+def _remote_target_identity(
+    definition: ClusterDefinition,
+    *,
+    deadline: float | None = None,
+) -> dict[str, object]:
     """Verify and return one operator-pinned physical cluster identity."""
     target = definition.target_identity
     if target is None:
@@ -11235,7 +11278,7 @@ def _remote_target_identity(definition: ClusterDefinition) -> dict[str, object]:
             f"cluster {definition.name} has no operator-pinned target_identity"
         )
     remote_target = _json_output(
-        run_remote_clio(
+        _run_remote_clio_before_deadline(
             definition,
             [
                 "endpoint",
@@ -11243,6 +11286,7 @@ def _remote_target_identity(definition: ClusterDefinition) -> dict[str, object]:
                 "--scheduler-provider",
                 definition.scheduler_provider,
             ],
+            deadline=deadline,
         ),
         "remote physical cluster target info",
     )
@@ -11272,7 +11316,11 @@ def _remote_target_identity(definition: ClusterDefinition) -> dict[str, object]:
         and remote_target.get("scheduler_cluster_name") != target.scheduler_cluster_name
     ):
         raise ConfigurationError("scheduler-native cluster name does not match target identity")
-    fingerprints = _ssh_host_key_fingerprints(definition.ssh_host)
+    fingerprints = (
+        _ssh_host_key_fingerprints(definition.ssh_host)
+        if deadline is None
+        else _ssh_host_key_fingerprints(definition.ssh_host, deadline=deadline)
+    )
     if not set(fingerprints).intersection(target.ssh_host_key_sha256):
         raise ConfigurationError(
             "live SSH host keys do not match the operator-pinned cluster target identity"
@@ -11289,7 +11337,11 @@ def _remote_target_identity(definition: ClusterDefinition) -> dict[str, object]:
     }
 
 
-def _ssh_host_key_fingerprints(ssh_host: str) -> list[str]:
+def _ssh_host_key_fingerprints(
+    ssh_host: str,
+    *,
+    deadline: float | None = None,
+) -> list[str]:
     """Return trusted SHA-256 host-key fingerprints for a configured SSH target."""
     resolved_host = ssh_host
     resolved_port = "22"
@@ -11302,7 +11354,7 @@ def _ssh_host_key_fingerprints(ssh_host: str) -> list[str]:
             capture_output=True,
             text=True,
             check=False,
-            timeout=10,
+            timeout=_remote_observation_subprocess_timeout(10, deadline=deadline),
         )
     except subprocess.TimeoutExpired:
         diagnostics.append("ssh -G timed out")
@@ -11340,7 +11392,7 @@ def _ssh_host_key_fingerprints(ssh_host: str) -> list[str]:
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=10,
+                timeout=_remote_observation_subprocess_timeout(10, deadline=deadline),
             )
         except subprocess.TimeoutExpired:
             diagnostics.append(f"ssh-keygen timed out for {known_hosts_path}")
@@ -11358,7 +11410,7 @@ def _ssh_host_key_fingerprints(ssh_host: str) -> list[str]:
             capture_output=True,
             text=True,
             check=False,
-            timeout=15,
+            timeout=_remote_observation_subprocess_timeout(15, deadline=deadline),
         )
     except subprocess.TimeoutExpired:
         diagnostics.append("ssh-keyscan timed out")
@@ -11374,6 +11426,20 @@ def _ssh_host_key_fingerprints(ssh_host: str) -> list[str]:
         detail = "; ".join(item for item in diagnostics if item) or "no host keys returned"
         raise ConfigurationError(f"could not observe SSH host keys for {ssh_host}: {detail}")
     return sorted(fingerprints)
+
+
+def _remote_observation_subprocess_timeout(
+    default_seconds: float,
+    *,
+    deadline: float | None,
+) -> float:
+    """Return a positive subprocess timeout inside one shared observation budget."""
+    if deadline is None:
+        return default_seconds
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise ConfigurationError("remote worker identity observation timed out")
+    return min(default_seconds, remaining)
 
 
 def _split_ssh_config_values(value: str) -> list[str]:
@@ -11708,22 +11774,64 @@ def _run_frpc_connection_validation(
 def _attach_verified_remote_worker(
     report: LiveValidationReport,
     definition: ClusterDefinition,
+    *,
+    observed_worker_info: dict[str, object] | None = None,
 ) -> None:
     """Attach exact remote installation identity when the target executes over SSH."""
     if not should_execute_on_cluster(definition):
         return
-    remote_info = _remote_worker_info(definition)
+    remote_info = (
+        observed_worker_info
+        if observed_worker_info is not None
+        else _remote_worker_info(definition)
+    )
     attach_verified_worker_identity(report, remote_info)
+
+
+def _observe_worker_before_cleanup(
+    definition: ClusterDefinition,
+) -> tuple[dict[str, object] | None, Exception | None]:
+    """Capture bounded worker evidence before cleanup can stop remote services."""
+    if not should_execute_on_cluster(definition):
+        return None, None
+    try:
+        return (
+            _remote_worker_info(
+                definition,
+                timeout_seconds=REMOTE_CLEANUP_WORKER_INFO_TIMEOUT_SECONDS,
+            ),
+            None,
+        )
+    except Exception as exc:
+        return None, exc
 
 
 def _write_remote_verified_report(
     report: LiveValidationReport,
     definition: ClusterDefinition,
     path: Path,
+    *,
+    observed_worker_info: dict[str, object] | None = None,
+    worker_observation_error: Exception | None = None,
 ) -> None:
     """Persist a report only after recording remote installation verification."""
+    if observed_worker_info is not None and worker_observation_error is not None:
+        raise ValueError("worker observation cannot contain both info and an error")
     try:
-        _attach_verified_remote_worker(report, definition)
+        if worker_observation_error is not None:
+            raise worker_observation_error
+        _attach_verified_remote_worker(
+            report,
+            definition,
+            observed_worker_info=observed_worker_info,
+        )
+        if observed_worker_info is not None:
+            for resource in report.resources:
+                if (
+                    resource.kind == "relay_worker"
+                    and resource.resource_id == f"worker:{definition.name}"
+                ):
+                    resource.metadata["observation_phase"] = "before_cleanup"
     except BaseException as exc:
         recorder = ValidationRecorder(report)
         recorder.record_failure(
