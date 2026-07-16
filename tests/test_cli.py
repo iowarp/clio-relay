@@ -5206,7 +5206,7 @@ def test_jarvis_discovery_persists_exact_durable_artifact_bytes(
         },
         "structured_result": None,
         "protocol_version": "2024-11-05",
-        "server_info": {"name": "clio-kit", "version": "2.4.7"},
+        "server_info": {"name": "clio-kit", "version": "2.4.8"},
         "server_artifact": server_artifact,
         "returncode": 0,
         "stdout": "",
