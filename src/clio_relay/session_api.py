@@ -353,9 +353,10 @@ def _owned_session_credentials(
             "owned remote request requires CLIO_RELAY_OWNER_SESSION_ID and "
             "CLIO_RELAY_SESSION_GENERATION_ID"
         )
-    if settings.remote_cluster != definition.name:
+    if settings.resolved_owner_session_cluster() != definition.name:
         raise ConfigurationError(
-            "owned remote request requires CLIO_RELAY_REMOTE_CLUSTER to match the selected route"
+            "owned remote request requires CLIO_RELAY_OWNER_SESSION_CLUSTER to match the "
+            "selected route"
         )
     if not api_token:
         raise ConfigurationError(

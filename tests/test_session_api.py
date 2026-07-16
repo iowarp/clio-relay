@@ -100,7 +100,7 @@ def _settings(tmp_path: Path) -> RelaySettings:
         api_token="session-api-token",
         owner_session_id="desktop-session-1",
         owner_session_generation_id="generation-1",
-        remote_cluster="ares",
+        owner_session_cluster="ares",
     )
 
 

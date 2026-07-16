@@ -3046,7 +3046,7 @@ def session_submit_jarvis(
         update={
             "owner_session_id": session_id,
             "owner_session_generation_id": session_generation_id,
-            "remote_cluster": cluster,
+            "owner_session_cluster": cluster,
         }
     )
     definition = _require_cluster(cluster)

@@ -1602,6 +1602,14 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
     registry_path = tmp_path / "clusters.json"
     ClusterRegistry(clusters={"ares": definition}).save(registry_path)
     monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
+    monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "session-api-token")
+    monkeypatch.setenv("CLIO_RELAY_OWNER_SESSION_ID", "desktop-session-1")
+    monkeypatch.setenv("CLIO_RELAY_SESSION_GENERATION_ID", "generation-1")
+    monkeypatch.setenv("CLIO_RELAY_OWNER_SESSION_CLUSTER", "ares")
+    monkeypatch.delenv("CLIO_RELAY_REMOTE_CLUSTER", raising=False)
+    monkeypatch.delenv("CLIO_RELAY_CLI_MODE", raising=False)
     route = RemoteMcpRoute(
         cluster="ares",
         server_name="science",
@@ -1670,13 +1678,9 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
         )
 
     monkeypatch.setattr("clio_relay.mcp_server.submit_owned_session_job", submit_owned)
-    settings = RelaySettings(
-        core_dir=tmp_path / "core",
-        spool_dir=tmp_path / "spool",
-        api_token="session-api-token",
-        owner_session_id="desktop-session-1",
-        owner_session_generation_id="generation-1",
-    )
+    settings = RelaySettings.from_env()
+    assert settings.owner_session_cluster == "ares"
+    assert settings.remote_cluster is None
     queue = ClioCoreQueue(settings.core_dir)
     session = McpSessionState()
     assert (
