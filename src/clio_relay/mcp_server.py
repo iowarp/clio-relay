@@ -1249,7 +1249,7 @@ def _call_tool(
             raise ValueError(f"tool is not available in MCP profile {profile!r}: {name}")
     else:
         catalog = _remote_mcp_catalog(profile=profile, reserved_names=static_names)
-        _require_observed_remote_mcp_catalog(
+        _require_compatible_remote_mcp_catalog(
             profile=profile,
             observed_revision=observed_remote_mcp_catalog_revision,
             current_revision=catalog.revision,
@@ -1259,7 +1259,7 @@ def _call_tool(
     if is_virtual_jarvis_tool(name):
         catalog = _remote_mcp_catalog(profile=profile, reserved_names=static_names)
         if require_advertised_remote_mcp_catalog:
-            _require_observed_remote_mcp_catalog(
+            _require_compatible_remote_mcp_catalog(
                 profile=profile,
                 observed_revision=observed_remote_mcp_catalog_revision,
                 current_revision=catalog.revision,
@@ -1574,18 +1574,22 @@ def _call_tool(
     }
 
 
-def _require_observed_remote_mcp_catalog(
+def _require_compatible_remote_mcp_catalog(
     *,
     profile: str,
     observed_revision: str | None,
     current_revision: str,
 ) -> None:
-    """Reject virtual calls that are not bound to the current listed catalog."""
+    """Reject catalog churn on a connection that advertised an older revision.
+
+    MCP clients may cache a prior ``tools/list`` result and open a fresh stdio
+    connection only when they execute a tool.  In that case there is no
+    connection-local revision to compare, so dispatch uses the current durable,
+    profile-filtered catalog as the authority.  The caller still requires the
+    alias to exist in that catalog before selecting its immutable route.
+    """
     if observed_revision is None:
-        raise ValueError(
-            "virtual remote MCP tools must be discovered with tools/list in this "
-            f"MCP session for profile {profile!r} before they can be called"
-        )
+        return
     if observed_revision != current_revision:
         raise ValueError(
             "remote MCP catalog changed after tools/list for profile "
