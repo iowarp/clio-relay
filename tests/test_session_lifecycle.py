@@ -628,9 +628,15 @@ def test_teardown_remote_session_kills_owned_pid_and_optional_worker(
     assert "process_start_ticks" in scripts[0]
     assert "ownership proof failed" in scripts[0]
     assert "token_group_processes" in scripts[0]
-    token_scan = scripts[0].split("def token_group_processes():", 1)[1].split("pid =", 1)[0]
+    token_scan = (
+        scripts[0].split("def token_group_processes():", 1)[1].split("\npid = metadata.get", 1)[0]
+    )
     assert "process_group ==" not in token_scan
     assert "proc.stat().st_uid != os.geteuid()" in token_scan
+    assert 'export PATH="$HOME/.local/bin:$PATH"' in scripts[0]
+    assert "observed_pgid = int(fields[2])" in token_scan
+    assert "observed_pgid != recorded_pgid" in token_scan
+    assert "cannot verify protected session process" in token_scan
     assert "os.pidfd_open(owned_pid, 0)" in scripts[0]
     assert "signal.pidfd_send_signal(process_fd, sig, None, 0)" in scripts[0]
     assert "signal_token_processes(signal.SIGTERM)" in scripts[0]
@@ -662,6 +668,7 @@ def test_teardown_remote_session_kills_owned_pid_and_optional_worker(
 
 def test_owned_teardown_revalidates_exact_pidfd_identity_after_leader_pid_reuse() -> None:
     script = session_lifecycle._owned_teardown_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        definition=ClusterDefinition(name="ares", ssh_host="ares"),
         session_id="session-1",
         expected_session_generation_id="generation-1",
         stop_worker=False,

@@ -693,6 +693,7 @@ def teardown_remote_session(
     output = _ssh_script(
         definition,
         _owned_teardown_script(
+            definition=definition,
             session_id=session_id,
             expected_session_generation_id=expected_session_generation_id,
             stop_worker=stop_worker,
@@ -1301,6 +1302,7 @@ __CLIO_RELAY_OWNED_STATUS__
 
 def _owned_teardown_script(
     *,
+    definition: ClusterDefinition,
     session_id: str,
     expected_session_generation_id: str,
     stop_worker: bool,
@@ -1320,6 +1322,7 @@ def _owned_teardown_script(
     if cancel_scheduler_jobs:
         cleanup_policy_flags += " --cleanup-cancel-scheduler-jobs"
     return f"""set -euo pipefail
+{remote_env(definition)}
 session_id={shlex.quote(session_id)}
 session_dir="$HOME/.local/share/clio-relay/sessions/$session_id"
 mkdir -p "$session_dir"
@@ -1408,11 +1411,32 @@ def token_group_processes():
         try:
             if proc.stat().st_uid != os.geteuid():
                 continue
-            environment = (proc / "environ").read_bytes().split(bytes([0]))
-            state = (proc / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()[0]
+            fields = (proc / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+            state = fields[0]
         except (FileNotFoundError, ProcessLookupError):
             continue
         except (OSError, IndexError, ValueError) as exc:
+            raise RuntimeError(
+                f"cannot verify owned session process {{proc.name}}: {{exc}}"
+            ) from exc
+        try:
+            environment = (proc / "environ").read_bytes().split(bytes([0]))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError as exc:
+            recorded_pgid = metadata.get("api_pgid")
+            try:
+                observed_pgid = int(fields[2])
+            except (IndexError, ValueError) as parse_exc:
+                raise RuntimeError(
+                    f"cannot verify protected session process {{proc.name}}: {{parse_exc}}"
+                ) from parse_exc
+            if isinstance(recorded_pgid, int) and observed_pgid != recorded_pgid:
+                continue
+            raise RuntimeError(
+                f"cannot verify protected session process {{proc.name}}: {{exc}}"
+            ) from exc
+        except OSError as exc:
             raise RuntimeError(
                 f"cannot verify owned session process {{proc.name}}: {{exc}}"
             ) from exc
