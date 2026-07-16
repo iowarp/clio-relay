@@ -564,8 +564,13 @@ def render_virtual_jarvis_agent_context() -> str:
         "includes progress by default and can optionally return a bounded artifact "
         "page without adding another agent tool. Use jarvis_describe with "
         "target='package_search' for bounded package discovery, then describe the "
-        "selected canonical package name. Available "
-        f"virtual JARVIS tools: {tool_names}."
+        "selected canonical package name. "
+        "When wait_for_terminal=true, the same JARVIS tool returns a bounded, "
+        "artifact-bound mcp_result instead of requiring a second status or log call. "
+        "For later job queries, preserve cluster, job_id, and the opaque 64-character "
+        "route_revision from one receipt as a single handle; never substitute a catalog "
+        "or dataset revision. "
+        f"Available virtual JARVIS tools: {tool_names}."
     )
 
 

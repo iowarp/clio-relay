@@ -32,6 +32,7 @@ from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictEr
 from clio_relay.identifiers import DurableRecordId
 from clio_relay.jarvis_mcp import (
     jarvis_mcp_artifact_binding,
+    jarvis_mcp_env_from,
     jarvis_mcp_server,
     jarvis_mcp_server_args,
 )
@@ -829,6 +830,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 spec=McpCallSpec(
                     server=jarvis_mcp_server(),
                     server_args=jarvis_mcp_server_args(),
+                    env_from=jarvis_mcp_env_from(),
                     expected_server_artifact_digest=expected_digest,
                     tool=request.tool,
                     arguments=request.arguments,

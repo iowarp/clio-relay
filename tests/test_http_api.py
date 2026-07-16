@@ -345,6 +345,39 @@ def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
     assert jarvis_mcp.spec.arguments == {"target": "packages"}
 
 
+def test_owned_jarvis_mcp_submission_inherits_operator_spack_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cluster API, not the desktop process, binds the site Spack executable."""
+
+    monkeypatch.setenv(
+        "JARVIS_MCP_SPACK_COMMAND",
+        "/opt/site-profiles/ares/bin/spack",
+    )
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    client = cast(Any, TestClient(create_app(settings)))
+
+    response = client.post(
+        "/jobs/jarvis-mcp-call",
+        json={
+            "cluster": "test-cluster",
+            "tool": "jarvis_run",
+            "arguments": {
+                "pipeline_id": "simulation",
+                "spack_specs": ["lammps"],
+            },
+            "idempotency_key": "http-site-spack-reference",
+        },
+    )
+
+    assert response.status_code == 200
+    job = queue.get_job(response.json()["job_id"])
+    assert isinstance(job.spec, McpCallSpec)
+    assert job.spec.env_from == {"JARVIS_MCP_SPACK_COMMAND": "JARVIS_MCP_SPACK_COMMAND"}
+
+
 def test_http_progress_endpoints_record_and_list_progress(tmp_path: Path) -> None:
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)

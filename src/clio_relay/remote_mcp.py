@@ -148,6 +148,21 @@ class _JsonSchemaInstanceValidator(Protocol):
 
 
 _SAFE_NAME_PATTERN = re.compile(r"[^a-z0-9_]+")
+
+
+def cluster_route_revision_json_schema() -> JSON:
+    """Return the agent-facing schema for an opaque cluster route revision."""
+
+    return {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$",
+        "description": (
+            "Opaque cluster-route revision copied exactly from a relay job receipt. "
+            "This is not a scientific-dataset catalog revision."
+        ),
+    }
+
+
 VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA: JSON = {
     "type": "object",
     "properties": {
@@ -160,8 +175,18 @@ VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA: JSON = {
         "kind": {"type": "string", "const": "mcp_call"},
         "terminal": {"type": "boolean"},
         "remote": {"type": "boolean"},
-        "route_revision": {"type": "string"},
-        "catalog_revision": {"type": "string"},
+        "route_revision": cluster_route_revision_json_schema(),
+        "catalog_revision": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": (
+                "Opaque revision of the locally advertised remote-MCP tool catalog; "
+                "this is not a scientific-dataset catalog revision."
+            ),
+        },
+        "last_error": {"type": ["string", "null"]},
+        "mcp_result": {"type": "object"},
+        "mcp_result_artifact": {"type": "object"},
     },
     "required": [
         "cluster",
