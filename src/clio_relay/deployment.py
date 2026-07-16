@@ -146,7 +146,9 @@ Environment="{INSTALL_RECEIPT_PATH_ENV}=%h/.local/share/clio-relay/install-recei
 {jarvis_mcp_spack_unset_line}
 ExecStartPre={exec_start_pre}
 ExecStart={exec_start}
-Restart=on-failure
+# Keep an enabled persistent endpoint available after clean or failed process
+# exits. Explicit systemd stop operations are not restarted by this policy.
+Restart=always
 RestartSec=5
 
 [Install]

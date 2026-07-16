@@ -8,13 +8,14 @@ from typing import cast
 import pytest
 
 import clio_relay.deployment as deployment
+import clio_relay.doctor as doctor
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.deployment import (
     install_endpoint_user_service_over_ssh,
     render_endpoint_user_service,
 )
-from clio_relay.doctor import run_doctor
+from clio_relay.doctor import run_cluster_doctor, run_doctor
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.relay_host import (
     FrpcConfig,
@@ -195,7 +196,67 @@ def test_endpoint_user_service_is_sudo_less_and_configured() -> None:
     assert (
         'Environment="CLIO_RELAY_INSTALL_RECEIPT=%h/.local/share/clio-relay/install-receipt.json"'
     ) in rendered
+    assert "Restart=always" in rendered
+    assert "Restart=on-failure" not in rendered
+    assert "RestartSec=5" in rendered
     assert "sudo" not in rendered
+
+
+def test_cluster_doctor_rejects_enabled_but_inactive_endpoint_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Doctor reports the persistent-worker stall before unrelated tool checks."""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.fail("bash is required to validate the cluster doctor service check")
+    rendered = doctor._cluster_doctor_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        ClusterDefinition(
+            name="test-cluster",
+            ssh_host="test-host",
+            jarvis_bin="jarvis-test",
+            frpc_bin="frpc-test",
+        )
+    )
+    harness = f"""set -u
+systemctl() {{
+  case "${{2:-}}" in
+    is-enabled) echo enabled ;;
+    is-active) echo inactive ;;
+  esac
+}}
+{rendered}
+"""
+    original_run = subprocess.run
+
+    def run(
+        command: list[str],
+        *,
+        input: bytes,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[bytes]:
+        assert command == ["ssh", "test-host", "bash", "-s"]
+        assert capture_output is True
+        assert check is False
+        return original_run(
+            [bash, "-s"],
+            input=harness.encode("utf-8"),
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+
+    monkeypatch.setattr(doctor.subprocess, "run", run)
+
+    with pytest.raises(RelayError, match="endpoint service is enabled but not active"):
+        run_cluster_doctor(
+            ClusterDefinition(
+                name="test-cluster",
+                ssh_host="test-host",
+                jarvis_bin="jarvis-test",
+                frpc_bin="frpc-test",
+            )
+        )
 
 
 def test_endpoint_user_service_uses_cluster_executable_overrides() -> None:

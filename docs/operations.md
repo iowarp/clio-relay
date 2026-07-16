@@ -29,7 +29,9 @@ and fails before writing the unit otherwise. If site policy intentionally
 forbids lingering, `--allow-login-scoped` installs a diagnostic, login-scoped
 worker. It may stop after the last login and is not eligible for live release
 claims. Desktop detach and default teardown never stop either service; only an
-explicit `session teardown --stop-worker` does.
+explicit `session teardown --stop-worker` does. The persistent unit restarts
+after both clean and failed worker-process exits; an explicit systemd stop is
+still respected and remains stopped until an operator starts it again.
 
 ### Upgrade durable queue indexes
 

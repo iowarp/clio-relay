@@ -2051,7 +2051,10 @@ def test_gateway_start_runtime_cli_uses_service_runtime_spec(
     def fake_worker_identity(
         report: LiveValidationReport,
         definition: ClusterDefinition,
+        *,
+        observed_worker_info: dict[str, object] | None = None,
     ) -> None:
+        assert observed_worker_info is None
         assert definition.name == "test-cluster"
         recorder = ValidationRecorder(report)
         with recorder.check("worker.artifact-version", "verified remote worker") as evidence:
@@ -2289,7 +2292,10 @@ def test_owned_gateway_start_holds_transition_lock_through_runtime_start(
     def skip_worker_identity(
         _report: LiveValidationReport,
         _definition: ClusterDefinition,
+        *,
+        observed_worker_info: dict[str, object] | None = None,
     ) -> None:
+        assert observed_worker_info is None
         return
 
     monkeypatch.setattr(relay_cli, "_attach_verified_remote_worker", skip_worker_identity)
@@ -2577,7 +2583,10 @@ def test_gateway_detach_runtime_default_report_requires_verified_retention(
     def record_worker_verification(
         _report: LiveValidationReport,
         definition: ClusterDefinition,
+        *,
+        observed_worker_info: dict[str, object] | None = None,
     ) -> None:
+        assert observed_worker_info is None
         worker_verifications.append(definition.name)
 
     def return_detach_result(
@@ -2631,7 +2640,10 @@ def test_gateway_report_fails_when_remote_worker_identity_does_not_match(
     def fail_identity(
         _report: LiveValidationReport,
         _definition: ClusterDefinition,
+        *,
+        observed_worker_info: dict[str, object] | None = None,
     ) -> None:
+        assert observed_worker_info is None
         raise RelayError("remote installation receipt mismatch")
 
     monkeypatch.setattr(relay_cli, "_attach_verified_remote_worker", fail_identity)

@@ -8,6 +8,7 @@ import subprocess
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
+from clio_relay.deployment import endpoint_user_service_name
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.remote_values import render_remote_shell_value
 
@@ -43,6 +44,23 @@ def run_doctor(
 
 def run_cluster_doctor(definition: ClusterDefinition) -> list[str]:
     """Run live cluster-side checks over SSH and return status lines."""
+    script = _cluster_doctor_script(definition)
+    result = subprocess.run(
+        ["ssh", definition.ssh_host, "bash", "-s"],
+        input=script.encode("utf-8"),
+        capture_output=True,
+        check=False,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+    if result.returncode != 0:
+        detail = stderr.strip() or stdout.strip()
+        raise RelayError(f"cluster doctor failed for {definition.name}: {detail}")
+    return stdout.splitlines()
+
+
+def _cluster_doctor_script(definition: ClusterDefinition) -> str:
+    """Render the bounded remote checks used by the cluster doctor."""
     jarvis_bin = render_remote_shell_value(
         definition.jarvis_bin or "$HOME/.local/bin/jarvis",
         field="jarvis_bin",
@@ -53,10 +71,22 @@ def run_cluster_doctor(definition: ClusterDefinition) -> list[str]:
     )
     agent_bin = render_remote_shell_value(definition.agent_bin or "", field="agent_bin")
     agent_npm_bin = shlex.quote(definition.agent_npm_bin or "")
-    script = f"""set -euo pipefail
+    endpoint_service = shlex.quote(endpoint_user_service_name(definition.name))
+    return f"""set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 echo "cluster: {definition.name}"
 echo "ssh_host: {definition.ssh_host}"
+ENDPOINT_SERVICE={endpoint_service}
+ENDPOINT_SERVICE_ENABLED="$(systemctl --user is-enabled "$ENDPOINT_SERVICE" 2>/dev/null || true)"
+ENDPOINT_SERVICE_ACTIVE="$(systemctl --user is-active "$ENDPOINT_SERVICE" 2>/dev/null || true)"
+echo "endpoint_service.name=$ENDPOINT_SERVICE"
+echo "endpoint_service.enabled=${{ENDPOINT_SERVICE_ENABLED:-unknown}}"
+echo "endpoint_service.active=${{ENDPOINT_SERVICE_ACTIVE:-unknown}}"
+if [ "$ENDPOINT_SERVICE_ENABLED" = enabled ] && [ "$ENDPOINT_SERVICE_ACTIVE" != active ]; then
+  echo "endpoint service is enabled but not active: $ENDPOINT_SERVICE" \
+    "(${{ENDPOINT_SERVICE_ACTIVE:-unknown}})" >&2
+  exit 1
+fi
 FRPC_BIN={frpc_bin}
 JARVIS_BIN={jarvis_bin}
 AGENT_BIN="${{CLIO_RELAY_AGENT_BIN:-}}"
@@ -80,15 +110,3 @@ if [ -n "$AGENT_BIN" ]; then
 fi
 echo "clio_relay=$(clio-relay --help | head -n 1)"
 """
-    result = subprocess.run(
-        ["ssh", definition.ssh_host, "bash", "-s"],
-        input=script.encode("utf-8"),
-        capture_output=True,
-        check=False,
-    )
-    stdout = result.stdout.decode("utf-8", errors="replace")
-    stderr = result.stderr.decode("utf-8", errors="replace")
-    if result.returncode != 0:
-        detail = stderr.strip() or stdout.strip()
-        raise RelayError(f"cluster doctor failed for {definition.name}: {detail}")
-    return stdout.splitlines()

@@ -1178,7 +1178,10 @@ def test_cli_tests_http_transport_and_writes_canonical_report(
     def fake_worker_identity(
         report: LiveValidationReport,
         definition: ClusterDefinition,
+        *,
+        observed_worker_info: dict[str, object] | None = None,
     ) -> None:
+        assert observed_worker_info is None
         assert definition.name == "ares"
         recorder = ValidationRecorder(report)
         with recorder.check("worker.artifact-version", "verified remote worker") as evidence:
@@ -1338,7 +1341,10 @@ def test_cli_transport_worker_identity_failure_fails_canonical_report(
     def fail_worker_identity(
         _report: LiveValidationReport,
         _definition: ClusterDefinition,
+        *,
+        observed_worker_info: dict[str, object] | None = None,
     ) -> None:
+        assert observed_worker_info is None
         raise ConfigurationError("remote wheel hash does not match")
 
     monkeypatch.setattr(cli, "run_frp_http_probe", fake_probe)
@@ -2234,10 +2240,18 @@ def test_cli_remote_teardown_writes_closure_only_in_remote_authoritative_core(
     def skip_worker_verification(
         _report: LiveValidationReport,
         _definition: ClusterDefinition,
+        *,
+        observed_worker_info: dict[str, object] | None = None,
     ) -> None:
+        del observed_worker_info
         return
 
     monkeypatch.setattr(cli, "_attach_verified_remote_worker", skip_worker_verification)
+    monkeypatch.setattr(
+        cli,
+        "_observe_worker_before_cleanup",
+        lambda _definition: (None, None),
+    )
 
     result = CliRunner().invoke(
         app,
