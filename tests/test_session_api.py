@@ -38,6 +38,19 @@ class _Response:
         return self._payload
 
 
+class _Socket:
+    def __init__(self, timeout: float | None) -> None:
+        self.timeout = timeout
+        self.timeout_changes: list[float | None] = []
+
+    def gettimeout(self) -> float | None:
+        return self.timeout
+
+    def settimeout(self, timeout: float | None) -> None:
+        self.timeout = timeout
+        self.timeout_changes.append(timeout)
+
+
 class _Connection:
     def __init__(
         self,
@@ -45,16 +58,19 @@ class _Connection:
         captured: list[dict[str, object]],
         *,
         fail_authenticated_request: bool = False,
+        timeout: float = 30.0,
     ) -> None:
         self._responses = responses
         self._captured = captured
         self._fail_authenticated_request = fail_authenticated_request
         self.auto_open = 1
         self.sock: object | None = None
+        self.timeout = timeout
+        self.socket = _Socket(timeout)
         self.closed = False
 
     def connect(self) -> None:
-        self.sock = object()
+        self.sock = self.socket
 
     def request(
         self,
@@ -160,10 +176,14 @@ def _install_transport(
     connections: list[_Connection] = []
 
     def connection_factory(*_args: object, **_kwargs: object) -> _Connection:
+        timeout_value = _kwargs.get("timeout", 30.0)
+        if isinstance(timeout_value, bool) or not isinstance(timeout_value, (int, float)):
+            raise AssertionError("HTTP connection timeout must be numeric")
         connection = _Connection(
             responses,
             captured,
             fail_authenticated_request=fail_authenticated_request,
+            timeout=float(timeout_value),
         )
         connections.append(connection)
         return connection
@@ -237,6 +257,42 @@ def test_owned_session_client_proves_identity_before_sending_credentials(
     assert captured[1]["auto_open"] == 0
 
 
+def test_owned_session_submission_rejects_dropped_artifact_dependencies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_digest = "a" * 64
+    identity = session_identity_document(
+        owner_token="owner-token",
+        cluster="ares",
+        session_id="desktop-session-1",
+        generation_id="generation-1",
+        nonce="1" * 64,
+    )
+    _install_transport(
+        monkeypatch,
+        responses=[
+            _Response(identity),
+            _Response(_job(expected_digest).model_dump(mode="json")),
+        ],
+    )
+
+    with pytest.raises(RelayError, match="did not retain exact artifact dependencies"):
+        submit_owned_session_job(
+            definition=ClusterDefinition(name="ares", ssh_host="ares-login"),
+            settings=_settings(tmp_path),
+            path="/jobs/jarvis-mcp-call",
+            payload={
+                "cluster": "ares",
+                "tool": "jarvis_get_execution",
+                "arguments": {"execution_id": "execution-1"},
+                "expected_server_artifact_digest": expected_digest,
+                "idempotency_key": "owned-session-client",
+                "used_artifact_refs": [{"artifact_id": "artifact_input", "sha256": "b" * 64}],
+            },
+        )
+
+
 def test_owned_session_client_reuses_one_proven_connection_for_composite_requests(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -264,6 +320,39 @@ def test_owned_session_client_reuses_one_proven_connection_for_composite_request
 
     assert len(connections) == 1
     assert [request["method"] for request in captured] == ["GET", "GET", "GET"]
+
+
+def test_owned_session_client_scopes_long_response_timeout_to_one_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = session_identity_document(
+        owner_token="owner-token",
+        cluster="ares",
+        session_id="desktop-session-1",
+        generation_id="generation-1",
+        nonce="1" * 64,
+    )
+    _captured, connections = _install_transport(
+        monkeypatch,
+        responses=[_Response(identity), _Response({"state": "succeeded"}), _Response({})],
+    )
+
+    with OwnedSessionApiClient(
+        definition=ClusterDefinition(name="ares", ssh_host="ares-login"),
+        settings=_settings(tmp_path),
+    ) as client:
+        assert client.request_json(
+            method="POST",
+            path="/jobs/job_1/wait",
+            response_timeout_seconds=610,
+        ) == {"state": "succeeded"}
+        assert connections[0].timeout == 30
+        assert connections[0].socket.timeout == 30
+        assert client.request_json(method="GET", path="/jobs/job_1/status") == {}
+
+    assert len(connections) == 1
+    assert connections[0].socket.timeout_changes == [610, 30]
 
 
 def test_owned_session_client_never_reconnects_after_identity_proof(

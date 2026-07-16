@@ -581,7 +581,16 @@ def _verify_cluster_deployment(
     service = f"clio-relay-worker-{definition.name}.service"
     script = (
         'export PATH="$HOME/.local/bin:$PATH"\n'
-        f'test "$(systemctl --user is-active {shlex.quote(service)})" = active\n'
+        'relay_user="${USER:-$(id -un)}"\n'
+        'linger="$(loginctl show-user "$relay_user" -p Linger --value 2>/dev/null || true)"\n'
+        'test "$linger" = yes || { '
+        'echo "persistent worker requires systemd user lingering (Linger=yes)" >&2; exit 78; }\n'
+        f'test "$(systemctl --user is-enabled {shlex.quote(service)})" = enabled || {{ '
+        f'echo "persistent worker service is not enabled: {shlex.quote(service)}" >&2; '
+        "exit 1; }\n"
+        f'test "$(systemctl --user is-active {shlex.quote(service)})" = active || {{ '
+        f'echo "persistent worker service is not active: {shlex.quote(service)}" >&2; '
+        "exit 1; }\n"
         f"clio-relay endpoint worker-info --cluster {shlex.quote(definition.name)}\n"
     )
     raw_info = _remote_shell(definition.ssh_host, script, runner=runner)
@@ -612,6 +621,8 @@ def _verify_cluster_deployment(
     software = receipt.software
     return [
         "worker.running=passed",
+        "worker.service-enabled=verified",
+        "worker.service-persistence=verified",
         f"worker.artifact-version={receipt.distribution_version}",
         f"worker.artifact-sha256={receipt.artifact_sha256 or 'none'}",
         "worker.source-identity="

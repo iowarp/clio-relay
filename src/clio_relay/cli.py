@@ -82,6 +82,7 @@ from clio_relay.mcp_server import (
 )
 from clio_relay.mcp_stdio_validation import PackagedMcpStdioSession, run_packaged_mcp_stdio_session
 from clio_relay.models import (
+    ArtifactUse,
     Cursor,
     EndpointRole,
     GatewaySession,
@@ -96,6 +97,7 @@ from clio_relay.models import (
     ProgressRecord,
     RelayJob,
     RemoteAgentTaskSpec,
+    SchedulerPhase,
     ServiceRuntimeSpec,
     TaskEventStatus,
     TaskTimelineEvent,
@@ -2943,6 +2945,16 @@ def cluster_install_endpoint_service(
             help="Per-kind worker limit as KIND=LIMIT; repeat for multiple kinds.",
         ),
     ] = None,
+    require_persistent: Annotated[
+        bool,
+        typer.Option(
+            "--require-persistent/--allow-login-scoped",
+            help=(
+                "Require systemd user lingering so the enabled worker survives all logouts. "
+                "The login-scoped opt-out is diagnostic and not release-gate eligible."
+            ),
+        ),
+    ] = True,
 ) -> None:
     """Install and optionally start a sudo-less worker endpoint service over SSH."""
     definition = _require_cluster(cluster)
@@ -2960,6 +2972,7 @@ def cluster_install_endpoint_service(
                 service_text=service_text,
                 start=start,
                 enable=enable,
+                require_persistent=require_persistent,
             )
         )
     )
@@ -4148,6 +4161,13 @@ def job_submit(
         str | None,
         typer.Option(help="Submit/retry idempotency key."),
     ] = None,
+    used_artifact: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--used-artifact",
+            help="Content-pinned dependency as ARTIFACT_ID=SHA256. Repeatable.",
+        ),
+    ] = None,
     exclusive: Annotated[
         bool,
         typer.Option("--exclusive/--shared", help="Request exclusive scheduler allocation."),
@@ -4158,7 +4178,11 @@ def job_submit(
     yaml_text = jarvis_yaml.read_text(encoding="utf-8")
     if exclusive:
         yaml_text = _with_exclusive_scheduler(yaml_text, definition.scheduler_provider)
-    key = idempotency_key or _file_idempotency_key(jarvis_yaml, yaml_text)
+    artifact_uses = _artifact_use_refs(used_artifact)
+    key = idempotency_key or (
+        _file_idempotency_key(jarvis_yaml, yaml_text)
+        + _artifact_use_idempotency_suffix(artifact_uses)
+    )
     if should_execute_on_cluster(definition):
         remote_yaml = stage_jarvis_yaml(
             definition,
@@ -4166,19 +4190,22 @@ def job_submit(
             pipeline_yaml_text=yaml_text,
             idempotency_key=key,
         )
+        remote_command = [
+            "job",
+            "submit",
+            "--cluster",
+            cluster,
+            "--jarvis-yaml",
+            remote_yaml,
+            "--idempotency-key",
+            key,
+            "--exclusive" if exclusive else "--shared",
+        ]
+        for value in used_artifact or []:
+            remote_command.extend(["--used-artifact", value])
         _run_remote_or_exit(
             definition,
-            [
-                "job",
-                "submit",
-                "--cluster",
-                cluster,
-                "--jarvis-yaml",
-                remote_yaml,
-                "--idempotency-key",
-                key,
-                "--exclusive" if exclusive else "--shared",
-            ],
+            remote_command,
         )
         return
     job = RelayJob(
@@ -4186,6 +4213,7 @@ def job_submit(
         kind=JobKind.JARVIS,
         spec=JarvisRunSpec(pipeline_yaml=yaml_text),
         idempotency_key=key,
+        used_artifact_refs=artifact_uses,
     )
     saved = _submit_managed_job(job)
     typer.echo(saved.job_id)
@@ -4199,23 +4227,37 @@ def job_submit_pipeline(
         str | None,
         typer.Option(help="Submit/retry idempotency key."),
     ] = None,
+    used_artifact: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--used-artifact",
+            help="Content-pinned dependency as ARTIFACT_ID=SHA256. Repeatable.",
+        ),
+    ] = None,
 ) -> None:
     """Submit an existing JARVIS pipeline by name on the target cluster."""
     definition = _require_cluster(cluster)
-    key = idempotency_key or f"jarvis-pipeline:{cluster}:{pipeline_name}"
+    artifact_uses = _artifact_use_refs(used_artifact)
+    key = idempotency_key or (
+        f"jarvis-pipeline:{cluster}:{pipeline_name}"
+        + _artifact_use_idempotency_suffix(artifact_uses)
+    )
     if should_execute_on_cluster(definition):
+        remote_command = [
+            "job",
+            "submit-pipeline",
+            "--cluster",
+            cluster,
+            "--pipeline-name",
+            pipeline_name,
+            "--idempotency-key",
+            key,
+        ]
+        for value in used_artifact or []:
+            remote_command.extend(["--used-artifact", value])
         _run_remote_or_exit(
             definition,
-            [
-                "job",
-                "submit-pipeline",
-                "--cluster",
-                cluster,
-                "--pipeline-name",
-                pipeline_name,
-                "--idempotency-key",
-                key,
-            ],
+            remote_command,
         )
         return
     job = RelayJob(
@@ -4223,6 +4265,7 @@ def job_submit_pipeline(
         kind=JobKind.JARVIS,
         spec=JarvisRunSpec(pipeline_name=pipeline_name),
         idempotency_key=key,
+        used_artifact_refs=artifact_uses,
     )
     saved = _submit_managed_job(job)
     typer.echo(saved.job_id)
@@ -4597,6 +4640,92 @@ def job_list_artifacts(
                 next_cursor=next_cursor,
                 total=total,
             ),
+            indent=2,
+        )
+    )
+
+
+@job_app.command("used-artifacts")
+def job_used_artifacts(
+    job_id: str,
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH."),
+    ] = None,
+    cursor: Annotated[
+        str | None,
+        typer.Option(help="Artifact ID cursor returned by the previous page."),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option(
+            help="Maximum used-artifact records returned.",
+            min=1,
+            max=MAX_RESPONSE_PAGE_RECORDS,
+        ),
+    ] = DEFAULT_RESPONSE_PAGE_RECORDS,
+) -> None:
+    """List content-pinned artifacts consumed by a job as JSON."""
+    remote_args = ["job", "used-artifacts", job_id, "--limit", str(limit)]
+    if cursor is not None:
+        remote_args.extend(["--cursor", cursor])
+    if _try_remote_cluster_passthrough(cluster, remote_args):
+        return
+    records, next_cursor, total = ClioCoreQueue(
+        RelaySettings.from_env().core_dir
+    ).list_used_artifacts_page(job_id, cursor=cursor, limit=limit)
+    typer.echo(
+        json.dumps(
+            {
+                "used_artifacts": [record.model_dump(mode="json") for record in records],
+                "cursor": cursor,
+                "limit": limit,
+                "next_cursor": next_cursor,
+                "total": total,
+            },
+            indent=2,
+        )
+    )
+
+
+@job_app.command("used-by")
+def job_used_by(
+    artifact_id: str,
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH."),
+    ] = None,
+    cursor: Annotated[
+        str | None,
+        typer.Option(help="Opaque edge cursor returned by the previous page."),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option(
+            help="Maximum consuming-job records returned.",
+            min=1,
+            max=MAX_RESPONSE_PAGE_RECORDS,
+        ),
+    ] = DEFAULT_RESPONSE_PAGE_RECORDS,
+) -> None:
+    """List jobs that consumed a content-pinned artifact as JSON."""
+    remote_args = ["job", "used-by", artifact_id, "--limit", str(limit)]
+    if cursor is not None:
+        remote_args.extend(["--cursor", cursor])
+    if _try_remote_cluster_passthrough(cluster, remote_args):
+        return
+    records, next_cursor, total = ClioCoreQueue(
+        RelaySettings.from_env().core_dir
+    ).list_artifact_users_page(artifact_id, cursor=cursor, limit=limit)
+    typer.echo(
+        json.dumps(
+            {
+                "used_by": [record.model_dump(mode="json") for record in records],
+                "cursor": cursor,
+                "limit": limit,
+                "next_cursor": next_cursor,
+                "total": total,
+            },
             indent=2,
         )
     )
@@ -7173,10 +7302,20 @@ def agent_run(
         str | None,
         typer.Option(help="Submit/retry idempotency key."),
     ] = None,
+    used_artifact: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--used-artifact",
+            help="Content-pinned dependency as ARTIFACT_ID=SHA256. Repeatable.",
+        ),
+    ] = None,
 ) -> None:
     """Submit a remote agent task on a configured cluster."""
     definition = _require_cluster(cluster)
-    key = idempotency_key or f"agent:{cluster}:{prompt}:{mcp_config}"
+    artifact_uses = _artifact_use_refs(used_artifact)
+    key = idempotency_key or (
+        f"agent:{cluster}:{prompt}:{mcp_config}" + _artifact_use_idempotency_suffix(artifact_uses)
+    )
     if should_execute_on_cluster(definition):
         args = [
             "agent",
@@ -7190,6 +7329,8 @@ def agent_run(
         ]
         if mcp_config is not None:
             args.extend(["--mcp-config", mcp_config])
+        for value in used_artifact or []:
+            args.extend(["--used-artifact", value])
         _run_remote_or_exit(definition, args)
         return
     job = RelayJob(
@@ -7197,6 +7338,7 @@ def agent_run(
         kind=JobKind.REMOTE_AGENT,
         spec=RemoteAgentTaskSpec(prompt_path=prompt, mcp_config_path=mcp_config),
         idempotency_key=key,
+        used_artifact_refs=artifact_uses,
     )
     saved = _submit_managed_job(job)
     typer.echo(saved.job_id)
@@ -7239,6 +7381,13 @@ def mcp_call(
         str | None,
         typer.Option(help="Submit/retry idempotency key."),
     ] = None,
+    used_artifact: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--used-artifact",
+            help="Content-pinned dependency as ARTIFACT_ID=SHA256. Repeatable.",
+        ),
+    ] = None,
     timeout_seconds: Annotated[
         int | None,
         typer.Option(help="Optional timeout for the remote MCP call."),
@@ -7272,6 +7421,7 @@ def mcp_call(
     ).hexdigest()
     server_args = server_arg or []
     environment_references = _environment_references(env_from)
+    artifact_uses = _artifact_use_refs(used_artifact)
     server_digest = hashlib.sha256(
         json.dumps(
             {
@@ -7284,7 +7434,10 @@ def mcp_call(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
-    key = idempotency_key or f"mcp:{cluster}:{server_digest}:{operation.value}:{tool}:{digest}"
+    key = idempotency_key or (
+        f"mcp:{cluster}:{server_digest}:{operation.value}:{tool}:{digest}"
+        + _artifact_use_idempotency_suffix(artifact_uses)
+    )
     if should_execute_on_cluster(definition):
         remote_arguments_path: str | None = None
         remote_command = [
@@ -7310,6 +7463,8 @@ def mcp_call(
             remote_command.extend(
                 ["--expected-server-artifact-digest", expected_server_artifact_digest]
             )
+        for value in used_artifact or []:
+            remote_command.extend(["--used-artifact", value])
         try:
             if remote_arguments_path is not None:
                 write_remote_file(
@@ -7349,6 +7504,7 @@ def mcp_call(
             timeout_seconds=timeout_seconds,
         ),
         idempotency_key=key,
+        used_artifact_refs=artifact_uses,
     )
     saved = _submit_managed_job(job)
     typer.echo(saved.job_id)
@@ -7376,6 +7532,13 @@ def jarvis_mcp_call(
     idempotency_key: Annotated[
         str | None,
         typer.Option(help="Submit/retry idempotency key."),
+    ] = None,
+    used_artifact: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--used-artifact",
+            help="Content-pinned dependency as ARTIFACT_ID=SHA256. Repeatable.",
+        ),
     ] = None,
     timeout_seconds: Annotated[
         int | None,
@@ -7412,9 +7575,11 @@ def jarvis_mcp_call(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+    artifact_uses = _artifact_use_refs(used_artifact)
     key = idempotency_key or (
         f"mcp:{cluster}:jarvis:{operation.value}:{tool}:{digest}:"
         f"{expected_server_artifact_digest or 'unbound'}"
+        + _artifact_use_idempotency_suffix(artifact_uses)
     )
     if definition is not None and should_execute_on_cluster(definition):
         remote_args: str | None = None
@@ -7437,6 +7602,8 @@ def jarvis_mcp_call(
             remote_command.extend(
                 ["--expected-server-artifact-digest", expected_server_artifact_digest]
             )
+        for value in used_artifact or []:
+            remote_command.extend(["--used-artifact", value])
         try:
             if remote_args is not None:
                 write_remote_file(
@@ -7473,6 +7640,7 @@ def jarvis_mcp_call(
             timeout_seconds=timeout_seconds,
         ),
         idempotency_key=key,
+        used_artifact_refs=artifact_uses,
     )
     saved = _submit_managed_job(job)
     typer.echo(saved.job_id)
@@ -9417,8 +9585,9 @@ def _owned_job_cleanup_resources(
                     "completed",
                     "failed",
                     "canceled",
+                    "missing",
                 }
-            scheduler_terminal = phase in {"completed", "failed", "canceled"}
+            scheduler_terminal = phase in {"completed", "failed", "canceled", "missing"}
             resources.append(
                 CleanupResource(
                     kind="scheduler_job",
@@ -9427,7 +9596,9 @@ def _owned_job_cleanup_resources(
                     action="retain",
                     ownership_verified=True,
                     outcome=(
-                        "terminal"
+                        "missing"
+                        if phase == "missing"
+                        else "terminal"
                         if scheduler_verified and scheduler_terminal
                         else "retained"
                         if scheduler_verified
@@ -9438,7 +9609,13 @@ def _owned_job_cleanup_resources(
                     observed_state=phase,
                     residual=not scheduler_verified,
                     detail=(
-                        f"scheduler cancellation was not requested; post-operation phase={phase}"
+                        "scheduler cancellation was not requested; no active scheduler record "
+                        "remained after the operation"
+                        if phase == "missing"
+                        else (
+                            "scheduler cancellation was not requested; "
+                            f"post-operation phase={phase}"
+                        )
                         if scheduler_verified
                         else "scheduler preservation was not verified"
                         + (f": {status_error}" if status_error else "")
@@ -9495,9 +9672,14 @@ def _scheduler_phase_after_operation(
             if not isinstance(raw_status, dict):
                 raise RelayError("scheduler status did not return a JSON object")
             phase = cast(dict[str, object], raw_status).get("phase")
+            active_record_found = cast(dict[str, object], raw_status).get("active_record_found")
+            if phase == SchedulerPhase.UNKNOWN.value and active_record_found is False:
+                return "missing", None
             return (str(phase), None) if isinstance(phase, str) else (None, None)
-        phase = provider_for_scheduler(provider).poll(scheduler_job_id).phase.value
-        return phase, None
+        status = provider_for_scheduler(provider).poll(scheduler_job_id)
+        if status.phase is SchedulerPhase.UNKNOWN and status.active_record_found is False:
+            return "missing", None
+        return status.phase.value, None
     except (RelayError, json.JSONDecodeError) as exc:
         return None, str(exc)
 
@@ -10213,7 +10395,7 @@ def _verify_owner_session_teardown(
             ) or (isinstance(linked_gateway_id, str) and linked_gateway_id in gateway_resource_ids)
             retained = (
                 resource.action == "retain"
-                and resource.outcome in {"retained", "terminal"}
+                and resource.outcome in {"retained", "terminal", "missing"}
                 and resource.observed_state
                 in {
                     "submitted",
@@ -10223,6 +10405,7 @@ def _verify_owner_session_teardown(
                     "completed",
                     "failed",
                     "canceled",
+                    "missing",
                 }
             )
             canceled = resource.action == "cancel" and (
@@ -12105,6 +12288,41 @@ def _environment_references(items: list[str] | None) -> dict[str, str]:
             raise typer.BadParameter(f"--env-from child name is repeated: {child_name}")
         references[child_name] = source_name
     return references
+
+
+def _artifact_use_refs(items: list[str] | None) -> list[ArtifactUse]:
+    """Parse repeatable ``ARTIFACT_ID=SHA256`` dependency bindings."""
+    refs: list[ArtifactUse] = []
+    for item in items or []:
+        artifact_id, separator, sha256 = item.partition("=")
+        if not separator or not artifact_id or not sha256:
+            raise typer.BadParameter(
+                "--used-artifact must use ARTIFACT_ID=SHA256",
+                param_hint="--used-artifact",
+            )
+        try:
+            refs.append(ArtifactUse(artifact_id=artifact_id, sha256=sha256))
+        except ValueError as exc:
+            raise typer.BadParameter(
+                str(exc),
+                param_hint="--used-artifact",
+            ) from exc
+    artifact_ids = [ref.artifact_id for ref in refs]
+    if len(artifact_ids) != len(set(artifact_ids)):
+        raise typer.BadParameter(
+            "--used-artifact values must have unique artifact IDs",
+            param_hint="--used-artifact",
+        )
+    return sorted(refs, key=lambda ref: ref.artifact_id)
+
+
+def _artifact_use_idempotency_suffix(refs: list[ArtifactUse]) -> str:
+    """Return a stable suffix only when a submission has artifact dependencies."""
+    if not refs:
+        return ""
+    payload = [ref.model_dump(mode="json") for ref in refs]
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f":uses-{hashlib.sha256(encoded).hexdigest()}"
 
 
 def _run_or_exit(action: Callable[[], None]) -> None:

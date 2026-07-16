@@ -1074,6 +1074,8 @@ def test_recorder_converts_lines_to_resources_and_artifacts() -> None:
     recorder.observe_line("scheduler.pending=observed")
     recorder.observe_line("cluster.bootstrap=verified")
     recorder.observe_line("worker.running=passed")
+    recorder.observe_line("worker.service-enabled=verified")
+    recorder.observe_line("worker.service-persistence=verified")
     recorder.observe_line("worker.artifact-version=1.0.0")
     recorder.observe_line('worker.components={"clio-kit":"2.2.6"}')
     recorder.observe_line("worker.execute=passed")
@@ -1088,6 +1090,8 @@ def test_recorder_converts_lines_to_resources_and_artifacts() -> None:
     assert {
         "cluster.bootstrap",
         "worker.running",
+        "worker.service-enabled",
+        "worker.service-persistence",
         "worker.artifact-version",
         "worker.execute",
     }.issubset({check.check_id for check in report.checks})
@@ -1940,7 +1944,7 @@ def test_default_report_path_sanitizes_cluster_name(tmp_path: Path) -> None:
 def test_repository_release_policy_is_machine_readable() -> None:
     policy = load_release_gate_policy(Path("docs/release-gate-1.0.yaml"))
 
-    assert policy.release_version == "1.3.6"
+    assert policy.release_version == "1.3.7"
     assert policy.acceptance_matrix is not None
     assert policy.acceptance_matrix["report_count_per_stage"] == 17
     assert policy.acceptance_matrix["matrix_sha256"] == policy.acceptance_matrix_sha256
@@ -1958,6 +1962,11 @@ def test_repository_release_policy_is_machine_readable() -> None:
     assert "ares-jarvis-native-application-progress" in requirement_ids
     assert "ares-jarvis-lammps-package-progress" in requirement_ids
     assert "homelab-owned-cleanup" in requirement_ids
+    ares_bootstrap = next(
+        item for item in policy.requirements if item.requirement_id == "ares-released-bootstrap"
+    )
+    assert "worker.service-enabled" in ares_bootstrap.required_checks
+    assert "worker.service-persistence" in ares_bootstrap.required_checks
     homelab_cleanup = next(
         item for item in policy.requirements if item.requirement_id == "homelab-owned-cleanup"
     )
@@ -2288,7 +2297,7 @@ def test_native_application_progress_gate_rejects_legacy_adapter_only_evidence()
         "provider_entry_point": "lammps",
         "provider_entry_point_value": "jarvis_cd.progress.lammps:adapter_from_package",
         "provider_distribution": "jarvis_cd",
-        "provider_distribution_version": "1.3.8",
+        "provider_distribution_version": "1.3.9",
         "provider_source_authority": "package_log",
         "provider_validated": True,
         "acceptance_validated": True,
@@ -2307,14 +2316,14 @@ def test_native_application_progress_gate_rejects_legacy_adapter_only_evidence()
     }
     jarvis_component = {
         "distribution": "jarvis_cd",
-        "distribution_version": "1.3.8",
+        "distribution_version": "1.3.9",
         "install_spec": (
             "https://github.com/grc-iit/jarvis-cd/releases/download/"
-            "v1.3.8/jarvis_cd-1.3.8-py3-none-any.whl"
+            "v1.3.9/jarvis_cd-1.3.9-py3-none-any.whl"
         ),
         "requested_source": "github_release",
-        "artifact_filename": "jarvis_cd-1.3.8-py3-none-any.whl",
-        "artifact_sha256": "2b15fc74bb586724a8c714cabc02102fe2695afe08edc4521b7ec049c85a0c04",
+        "artifact_filename": "jarvis_cd-1.3.9-py3-none-any.whl",
+        "artifact_sha256": "6d7891e133a7c39c33a52da57d59a1950de3e5d8c271cc3274f37f7e809485fe",
         "native_execution": native_capability,
     }
     report.resources = [
@@ -2333,7 +2342,7 @@ def test_native_application_progress_gate_rejects_legacy_adapter_only_evidence()
             cluster="ares",
             state="running",
             metadata={
-                "components": {"jarvis-cd": "1.3.8"},
+                "components": {"jarvis-cd": "1.3.9"},
                 "component_artifacts": {"jarvis-cd": jarvis_component},
                 "component_runtime": {
                     "jarvis-cd": {
@@ -2354,7 +2363,7 @@ def test_native_application_progress_gate_rejects_legacy_adapter_only_evidence()
         ),
         ValidationResource(
             kind="package_progress_provider",
-            resource_id="jarvis_cd:1.3.8:lammps:lammps",
+            resource_id="jarvis_cd:1.3.9:lammps:lammps",
             role="jarvis_package_progress",
             cluster="ares",
             state="verified",

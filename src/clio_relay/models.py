@@ -309,6 +309,63 @@ class OwnerSessionJobMembership(BaseModel):
     updated_at: datetime
 
 
+class ArtifactUse(BaseModel):
+    """A content-pinned artifact dependency supplied with a job submission."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    artifact_id: DurableRecordId
+    sha256: str = Field(min_length=64, max_length=64)
+
+    @field_validator("sha256")
+    @classmethod
+    def sha256_must_be_canonical(cls, value: str) -> str:
+        """Normalize and validate the immutable content identity."""
+        normalized = value.lower()
+        if any(character not in "0123456789abcdef" for character in normalized):
+            raise ValueError("sha256 must be a SHA-256 digest")
+        return normalized
+
+
+def _empty_artifact_uses() -> list[ArtifactUse]:
+    """Return a typed empty artifact dependency collection."""
+    return []
+
+
+class UsedArtifactRef(BaseModel):
+    """A durable W3C-PROV-style ``used`` edge between a job and an artifact."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["clio-relay.used-artifact-ref.v1"] = "clio-relay.used-artifact-ref.v1"
+    artifact_id: DurableRecordId
+    consumer_job_id: DurableRecordId
+    producer_job_id: DurableRecordId
+    sequence: int = Field(ge=1, lt=2**63)
+    sha256: str = Field(min_length=64, max_length=64)
+    created_at: datetime
+
+    @field_validator("sha256")
+    @classmethod
+    def sha256_must_be_canonical(cls, value: str) -> str:
+        """Require the stored edge to contain a canonical SHA-256 digest."""
+        if any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("sha256 must be a canonical SHA-256 digest")
+        return value
+
+
+class ArtifactUserOrderHead(BaseModel):
+    """Durable high-water mark for one artifact's ordered consumer edges."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["clio-relay.artifact-user-order-head.v1"] = (
+        "clio-relay.artifact-user-order-head.v1"
+    )
+    artifact_id: DurableRecordId
+    latest_sequence: int = Field(ge=0, lt=2**63)
+
+
 class JarvisRunSpec(BaseModel):
     """A JARVIS-CD run intent submitted through the relay."""
 
@@ -441,6 +498,10 @@ class RelayJob(BaseModel):
     state: JobState = JobState.QUEUED
     spec: JobSpec
     idempotency_key: str
+    used_artifact_refs: list[ArtifactUse] = Field(
+        default_factory=_empty_artifact_uses,
+        max_length=1_000,
+    )
     submission_digest: str | None = Field(default=None, min_length=64, max_length=64)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -449,6 +510,18 @@ class RelayJob(BaseModel):
     last_error: str | None = None
     storage_reservation: StorageReservationEstimate | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("used_artifact_refs")
+    @classmethod
+    def used_artifact_refs_must_be_unique_and_sorted(
+        cls,
+        value: list[ArtifactUse],
+    ) -> list[ArtifactUse]:
+        """Canonicalize dependency order and reject ambiguous duplicate edges."""
+        artifact_ids = [item.artifact_id for item in value]
+        if len(artifact_ids) != len(set(artifact_ids)):
+            raise ValueError("used_artifact_refs must contain unique artifact_id values")
+        return sorted(value, key=lambda item: item.artifact_id)
 
 
 class RelayTask(BaseModel):
@@ -475,6 +548,7 @@ class SchedulerStatus(BaseModel):
     scheduler_job_id: str
     phase: SchedulerPhase = SchedulerPhase.UNKNOWN
     record_found: bool | None = None
+    active_record_found: bool | None = None
     raw_state: str | None = None
     reason: str | None = None
     partition: str | None = None

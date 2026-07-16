@@ -15,6 +15,22 @@ clio-relay cluster bootstrap --cluster my-cluster
 clio-relay cluster install-endpoint-service --cluster my-cluster --start --enable
 ```
 
+An enabled endpoint worker is expected to survive every desktop disconnect and
+the operator's final cluster logout. Before installing it, verify the cluster's
+systemd user manager is persistent:
+
+```bash
+loginctl show-user "$USER" -p Linger --value
+loginctl enable-linger "$USER"  # one-time; site authorization may be required
+```
+
+`install-endpoint-service` requires the first command to return exactly `yes`
+and fails before writing the unit otherwise. If site policy intentionally
+forbids lingering, `--allow-login-scoped` installs a diagnostic, login-scoped
+worker. It may stop after the last login and is not eligible for live release
+claims. Desktop detach and default teardown never stop either service; only an
+explicit `session teardown --stop-worker` does.
+
 ### Upgrade durable queue indexes
 
 The worker service runs this preflight before it accepts work:
@@ -167,6 +183,32 @@ clio-relay job list-artifacts <job-id> --cluster my-cluster
 ```
 
 Submissions are asynchronous by default. CLI, HTTP, and MCP callers get a `job_id` and can monitor events and logs by cursor or byte offset.
+
+### Record consumed artifact lineage
+
+Every submission surface accepts a bounded list of content-pinned dependencies.
+On the CLI, repeat `--used-artifact ARTIFACT_ID=SHA256`:
+
+```powershell
+clio-relay job submit --cluster my-cluster --jarvis-yaml .\pipeline.yaml `
+  --used-artifact artifact_input=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+clio-relay job used-artifacts <consumer-job-id> --cluster my-cluster
+clio-relay job used-by artifact_input --cluster my-cluster
+```
+
+The relay verifies each digest before reserving the submission, stores one
+immutable `used` edge, and maintains the reverse `used_by` index. A retained
+consumer protects its producer artifact from garbage collection. Owned-session
+APIs require producer and consumer to belong to the exact same session
+generation. HTTP exposes `/jobs/{job_id}/used-artifacts` and
+`/artifacts/{artifact_id}/used-by`; MCP exposes both directions through
+`relay_artifact_lineage` by accepting exactly one of `job_id` or `artifact_id`.
+
+For inline YAML, path, and command JARVIS runs, the endpoint captures and hashes
+the exact materialized pipeline bytes before launching that same spool file.
+Named JARVIS pipelines currently retain a name reference rather than a resolved,
+content-hashed pipeline snapshot; a name alone must not be claimed as
+artifact-backed replay evidence.
 
 ### inspect structured runtime metadata
 

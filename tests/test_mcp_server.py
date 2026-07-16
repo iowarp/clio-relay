@@ -1785,7 +1785,7 @@ def test_waited_owned_jarvis_call_returns_bounded_artifact_bound_failure(
         "sha256": hashlib.sha256(payload).hexdigest(),
         "created_at": "2026-07-16T12:38:30Z",
     }
-    requests: list[tuple[str, str]] = []
+    requests: list[tuple[str, str, float | None]] = []
 
     class FakeOwnedSessionApiClient:
         def __init__(self, **_kwargs: object) -> None:
@@ -1804,9 +1804,10 @@ def test_waited_owned_jarvis_call_returns_bounded_artifact_bound_failure(
             path: str,
             query: dict[str, object] | None = None,
             body: dict[str, object] | None = None,
+            response_timeout_seconds: float | None = None,
         ) -> object:
             del query, body
-            requests.append((method, path))
+            requests.append((method, path, response_timeout_seconds))
             if path == f"/jobs/{queued.job_id}/wait":
                 return terminal.model_dump(mode="json")
             if path == f"/jobs/{queued.job_id}/artifacts":
@@ -1855,6 +1856,7 @@ def test_waited_owned_jarvis_call_returns_bounded_artifact_bound_failure(
                     "cluster": "ares",
                     "pipeline_id": "simulation",
                     "wait_for_terminal": True,
+                    "wait_timeout_seconds": 600,
                 },
             },
         },
@@ -1873,9 +1875,9 @@ def test_waited_owned_jarvis_call_returns_bounded_artifact_bound_failure(
     assert result["mcp_result"]["structured_result"]["error"]["code"] == ("jarvis_run_failed")
     assert result["mcp_result_artifact"]["artifact_id"] == artifact["artifact_id"]
     assert requests == [
-        ("POST", f"/jobs/{queued.job_id}/wait"),
-        ("GET", f"/jobs/{queued.job_id}/artifacts"),
-        ("GET", f"/artifacts/{artifact['artifact_id']}/content"),
+        ("POST", f"/jobs/{queued.job_id}/wait", 610),
+        ("GET", f"/jobs/{queued.job_id}/artifacts", None),
+        ("GET", f"/artifacts/{artifact['artifact_id']}/content", None),
     ]
 
 
@@ -2439,6 +2441,7 @@ def test_owned_remote_followups_use_session_api_and_never_direct_ssh(
             path: str,
             query: dict[str, object] | None = None,
             body: dict[str, object] | None = None,
+            response_timeout_seconds: float | None = None,
         ) -> object:
             requests.append(
                 {
@@ -2447,6 +2450,7 @@ def test_owned_remote_followups_use_session_api_and_never_direct_ssh(
                     "path": path,
                     "query": query,
                     "body": body,
+                    "response_timeout_seconds": response_timeout_seconds,
                 }
             )
             if path == f"/jobs/{running.job_id}/status":
@@ -2558,6 +2562,8 @@ def test_owned_remote_followups_use_session_api_and_never_direct_ssh(
         f"/jobs/{running.job_id}/status",
         f"/jobs/{running.job_id}/artifacts",
     ]
+    wait_request = next(item for item in requests if item["path"] == f"/jobs/{running.job_id}/wait")
+    assert wait_request["response_timeout_seconds"] == 610
 
 
 def test_mcp_virtual_jarvis_edit_routes_remove_operation(

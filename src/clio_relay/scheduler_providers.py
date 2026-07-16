@@ -486,7 +486,9 @@ class SlurmSchedulerProvider:
         _validate_scheduler_job_id(scheduler_job_id)
         current = self._squeue_one(scheduler_job_id)
         if current is not None:
-            status = _status_from_squeue_row(current).model_copy(update={"record_found": True})
+            status = _status_from_squeue_row(current).model_copy(
+                update={"record_found": True, "active_record_found": True}
+            )
             if status.phase == SchedulerPhase.PENDING:
                 return _with_queue_position(status, self._squeue_pending_jobs())
             return status
@@ -498,7 +500,7 @@ class SlurmSchedulerProvider:
             history_errors.append(str(exc))
         if historical is not None:
             return _status_from_sacct_row(scheduler_job_id, historical).model_copy(
-                update={"record_found": True}
+                update={"record_found": True, "active_record_found": False}
             )
         try:
             controller_record = self._scontrol_one(scheduler_job_id)
@@ -509,7 +511,7 @@ class SlurmSchedulerProvider:
             return _status_from_scontrol_record(
                 scheduler_job_id,
                 controller_record,
-            ).model_copy(update={"record_found": True})
+            ).model_copy(update={"record_found": True, "active_record_found": False})
         diagnostic = "; ".join(history_errors)
         note = "scheduler job was not found by squeue, sacct, or scontrol"
         if diagnostic:
@@ -519,6 +521,7 @@ class SlurmSchedulerProvider:
             scheduler_job_id=scheduler_job_id,
             phase=SchedulerPhase.UNKNOWN,
             record_found=False if not history_errors else None,
+            active_record_found=False,
             queue_position_note=note,
         )
 
@@ -655,6 +658,8 @@ class SlurmSchedulerProvider:
             ["squeue", "-h", "-j", scheduler_job_id, "-o", SQUEUE_FIELDS],
         )
         if result.returncode != 0:
+            if _slurm_job_absent_from_active_queue(result):
+                return None
             raise _scheduler_command_error("squeue", result)
         for line in result.stdout.splitlines():
             row = _split_row(line, 13)
@@ -1127,6 +1132,17 @@ def _run_scheduler_command(command: list[str]) -> subprocess.CompletedProcess[st
         ) from exc
     except OSError as exc:
         raise RelayError(f"scheduler provider command failed: {command[0]}: {exc}") from exc
+
+
+def _slurm_job_absent_from_active_queue(
+    result: subprocess.CompletedProcess[str],
+) -> bool:
+    """Recognize SLURM's nonzero response for a job no longer visible to ``squeue``."""
+    return (
+        result.returncode != 0
+        and not result.stdout.strip()
+        and "invalid job id specified" in result.stderr.casefold()
+    )
 
 
 def _scheduler_command_error(

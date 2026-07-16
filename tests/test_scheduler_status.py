@@ -470,6 +470,98 @@ def test_poll_slurm_status_uses_sacct_when_squeue_is_empty(monkeypatch: MonkeyPa
     assert status.raw_state == "COMPLETED"
 
 
+def test_poll_slurm_status_uses_sacct_when_squeue_reports_completed_job_invalid(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Ares reports completed ids as invalid to squeue; accounting remains authoritative."""
+
+    def fake_run(
+        command: list[str],
+        *,
+        text: bool,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del text, capture_output, check, timeout
+        if command[:4] == ["squeue", "-h", "-j", "21947"]:
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                "",
+                "squeue: slurm_load_jobs error: Invalid job id specified\n",
+            )
+        if command[:4] == ["sacct", "-n", "-P", "-j"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                (
+                    "21947|FAILED|compute|normal|2026-07-16T12:04:38|"
+                    "2026-07-16T12:04:41|00:00:03|1|16|0\n"
+                ),
+                "",
+            )
+        raise AssertionError(command)
+
+    monkeypatch.setattr("clio_relay.scheduler_providers.subprocess.run", fake_run)
+
+    status = SlurmSchedulerProvider().poll("21947")
+
+    assert status.record_found is True
+    assert status.active_record_found is False
+    assert status.phase == SchedulerPhase.FAILED
+    assert status.raw_state == "FAILED"
+    assert status.queue_position_note == "historical scheduler status from sacct"
+
+
+def test_poll_slurm_status_preserves_active_absence_when_history_is_unavailable(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Ares can prove a job left squeue even when accounting history is disabled."""
+
+    def fake_run(
+        command: list[str],
+        *,
+        text: bool,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del text, capture_output, check, timeout
+        if command[0] == "squeue":
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                "",
+                "squeue: slurm_load_jobs error: Invalid job id specified\n",
+            )
+        if command[0] == "sacct":
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                "",
+                "sacct: Slurm accounting storage is disabled\n",
+            )
+        if command[0] == "scontrol":
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                "",
+                "slurm_load_jobs error: Invalid job id specified\n",
+            )
+        raise AssertionError(command)
+
+    monkeypatch.setattr("clio_relay.scheduler_providers.subprocess.run", fake_run)
+
+    status = SlurmSchedulerProvider().poll("21947")
+
+    assert status.phase is SchedulerPhase.UNKNOWN
+    assert status.record_found is None
+    assert status.active_record_found is False
+    assert status.queue_position_note is not None
+    assert "accounting storage is disabled" in status.queue_position_note
+
+
 def test_poll_slurm_status_uses_scontrol_when_accounting_is_disabled(
     monkeypatch: MonkeyPatch,
 ) -> None:

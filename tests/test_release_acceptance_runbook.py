@@ -53,7 +53,7 @@ def test_release_identity_is_consistent_across_package_policy_matrix_and_runbook
     init_source = (ROOT / "src" / "clio_relay" / "__init__.py").read_text(encoding="utf-8")
     release_process = RELEASE_PROCESS.read_text(encoding="utf-8")
 
-    assert version == "1.3.6"
+    assert version == "1.3.7"
     assert relay_lock["version"] == version
     assert f'__version__ = "{version}"' in init_source
     assert policy["release_version"] == version
@@ -712,6 +712,8 @@ def test_release_acceptance_runbook_binds_production_specifics_without_secrets()
     assert "CLIO_RELAY_VALIDATION_INVOCATION_ID" in text
     assert '--validation-scenario", "cluster-bootstrap' in text
     assert "--verify-cluster-deployment" in text
+    assert "loginctl enable-linger" in text
+    assert "--start --enable --require-persistent" in text
     assert "--require-structured-runtime-metadata" in text
     assert '$GrayExecutable = "$GrayInstallRoot/bin/gray-scott"' in text
     assert "examples/release-gate/gray-scott-direct-build.sh" in text

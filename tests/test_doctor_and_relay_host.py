@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 from typing import cast
@@ -305,6 +306,162 @@ def test_endpoint_service_install_uses_safe_unit_name_and_bounded_ssh(
     script = cast(bytes, observed["input"]).decode("utf-8")
     assert "clio-relay-worker-k2-" in script
     assert "Target GPU" not in script
+
+
+def test_endpoint_service_install_requires_linger_before_any_mutation() -> None:
+    """A persistent install cannot write or control a unit under a login-scoped manager."""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.fail("bash is required to validate the remote endpoint installer")
+    script = deployment._remote_install_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        service_name="clio-relay-worker-test.service",
+        service_text="[Service]\nExecStart=/bin/true\n",
+        start=True,
+        enable=True,
+        require_persistent=True,
+    )
+    harness = f"""set -u
+test_root="$(mktemp -d)"
+trap 'rm -rf "$test_root"' EXIT
+export HOME="$test_root/home" USER=test-user
+loginctl() {{ echo no; }}
+systemctl() {{ echo "unexpected-systemctl=$*" >&2; return 99; }}
+{script}
+"""
+
+    result = subprocess.run(
+        [bash, "-s"],
+        input=harness.encode("utf-8"),
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 78
+    assert "persistent endpoint service requires systemd user lingering" in stderr
+    assert "loginctl enable-linger test-user" in stderr
+    assert "unexpected-systemctl" not in stderr
+    assert script.index('if [ "$linger" = "yes" ]') < script.index('mkdir -p "$HOME')
+
+
+@pytest.mark.parametrize(
+    ("linger", "require_persistent", "expected_mode", "expected_warning"),
+    [
+        ("yes", True, "systemd-user-linger", None),
+        (
+            "no",
+            False,
+            "login-scoped",
+            "endpoint service is login-scoped and may stop after the final login exits",
+        ),
+    ],
+)
+def test_endpoint_service_install_verifies_enabled_active_and_persistence_mode(
+    linger: str,
+    require_persistent: bool,
+    expected_mode: str,
+    expected_warning: str | None,
+) -> None:
+    """Successful installs report exact persistence, enabled, and active states."""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.fail("bash is required to validate the remote endpoint installer")
+    script = deployment._remote_install_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        service_name="clio-relay-worker-test.service",
+        service_text="[Service]\nExecStart=/bin/true\n",
+        start=True,
+        enable=True,
+        require_persistent=require_persistent,
+    )
+    harness = f"""set -u
+test_root="$(mktemp -d)"
+trap 'rm -rf "$test_root"' EXIT
+export HOME="$test_root/home" USER=test-user FAKE_LINGER={linger}
+loginctl() {{ echo "$FAKE_LINGER"; }}
+systemctl() {{
+  echo "systemctl=$*" >&2
+  case "${{2:-}}" in
+    is-enabled) echo enabled ;;
+    is-active) echo active ;;
+    is-system-running) echo running ;;
+  esac
+}}
+{script}
+"""
+
+    result = subprocess.run(
+        [bash, "-s"],
+        input=harness.encode("utf-8"),
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 0, stderr
+    assert f"linger={linger}" in stdout
+    assert f"endpoint_service.persistence={expected_mode}" in stdout
+    assert "endpoint_service.enabled=enabled" in stdout
+    assert "endpoint_service.active=active" in stdout
+    assert "systemctl=--user daemon-reload" in stderr
+    assert "systemctl=--user enable clio-relay-worker-test.service" in stderr
+    assert "systemctl=--user restart clio-relay-worker-test.service" in stderr
+    if expected_warning is None:
+        assert "login-scoped" not in stderr
+    else:
+        assert expected_warning in stderr
+
+
+@pytest.mark.parametrize(
+    ("enabled_state", "active_state", "expected_error"),
+    [
+        ("disabled", "active", "endpoint service is not enabled"),
+        ("enabled", "inactive", "endpoint service is not active"),
+    ],
+)
+def test_endpoint_service_install_rejects_unverified_service_state(
+    enabled_state: str,
+    active_state: str,
+    expected_error: str,
+) -> None:
+    """A requested enabled/running deployment fails when systemd disproves either state."""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.fail("bash is required to validate the remote endpoint installer")
+    script = deployment._remote_install_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        service_name="clio-relay-worker-test.service",
+        service_text="[Service]\nExecStart=/bin/true\n",
+        start=True,
+        enable=True,
+        require_persistent=True,
+    )
+    harness = f"""set -u
+test_root="$(mktemp -d)"
+trap 'rm -rf "$test_root"' EXIT
+export HOME="$test_root/home" USER=test-user
+loginctl() {{ echo yes; }}
+systemctl() {{
+  case "${{2:-}}" in
+    is-enabled) echo {enabled_state} ;;
+    is-active) echo {active_state} ;;
+    is-system-running) echo running ;;
+  esac
+}}
+{script}
+"""
+
+    result = subprocess.run(
+        [bash, "-s"],
+        input=harness.encode("utf-8"),
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert expected_error in result.stderr.decode("utf-8", errors="replace")
 
 
 def test_endpoint_service_install_rejects_unsafe_or_unbounded_ssh(
