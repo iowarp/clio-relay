@@ -49,13 +49,42 @@ Formatting or package construction required by the changed surface is not a
 substitute for the focused behavioral test. Do not run the full regression
 suite locally as part of the patch release loop.
 
+## Merge and create the exact local tag
+
+Push and merge the focused patch, then update the local `main` checkout and
+create the package-version tag locally. The tag must exist before Hatch builds
+the release artifacts because the build hook embeds the exact tag in both
+distributions.
+
+```powershell
+git push -u origin HEAD
+gh pr create --title "fix: ..." --body-file PR.md
+gh pr merge --squash --delete-branch
+git switch main
+git pull --ff-only origin main
+$Tag = "v1.3.15"
+$Commit = (git rev-parse HEAD).Trim()
+if (git status --porcelain) { throw "release checkout is dirty" }
+if (git tag --list $Tag) { throw "release tag already exists locally: $Tag" }
+git tag $Tag $Commit
+```
+
+Do not push the tag yet. Building before the local tag exists produces an
+artifact without an exact source-tag identity.
+
 ## Build exact distributions
 
 Build once from the merged release commit:
 
 ```powershell
 Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
-uv build --out-dir dist
+$env:CLIO_RELAY_RELEASE_BUILD = "1"
+try {
+  uv build --out-dir dist
+  if ($LASTEXITCODE -ne 0) { throw "release distribution build failed" }
+} finally {
+  Remove-Item Env:CLIO_RELAY_RELEASE_BUILD -ErrorAction SilentlyContinue
+}
 uv run twine check dist/*
 $files = Get-ChildItem dist -File | Where-Object {
   $_.Name.EndsWith(".whl") -or $_.Name.EndsWith(".tar.gz")
@@ -68,25 +97,24 @@ $lines = foreach ($file in $files | Sort-Object Name) {
 Set-Content -Encoding ascii -Path dist/SHA256SUMS -Value $lines
 ```
 
+`CLIO_RELAY_RELEASE_BUILD=1` makes the build hook require a commit, a clean
+tree, and the exact `v<project.version>` tag. An untagged, differently tagged,
+or dirty source tree fails the build instead of creating a release artifact
+with incomplete provenance. Ordinary untagged CI candidate builds remain
+supported because they do not set release-build mode.
+
 Do not rebuild between GitHub publication and PyPI publication. PyPI receives
 the distributions downloaded from the published GitHub Release, not a second
 CI build.
 
-## Push, merge, tag, and publish
+## Push the tag and publish
 
-The normal order is:
+After the exact distributions have passed their local checks, push the tag and
+publish those already-built bytes:
 
 ```powershell
-git push -u origin HEAD
-gh pr create --title "fix: ..." --body-file PR.md
-gh pr merge --squash --delete-branch
-git switch main
-git pull --ff-only origin main
-$Tag = "v1.3.14"
-$Commit = (git rev-parse HEAD).Trim()
-git tag $Tag $Commit
 git push origin $Tag
-gh release create $Tag --draft --target $Commit --title "clio-relay 1.3.14" `
+gh release create $Tag --draft --target $Commit --title "clio-relay 1.3.15" `
   dist/*.whl dist/*.tar.gz dist/SHA256SUMS --notes-file RELEASE.md
 gh release edit $Tag --draft=false
 ```
