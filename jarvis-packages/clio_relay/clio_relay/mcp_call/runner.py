@@ -1801,6 +1801,10 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
             if expected_jarvis_cd_lock_binding is not None
             else _server_artifact_identity(server, server_args)
         )
+        _reject_verified_nested_runtime_path_remap(
+            server_artifact=server_artifact,
+            env_from=env_from,
+        )
         observed_server_artifact_digest = _server_artifact_digest(server_artifact)
         if expected_jarvis_cd_lock_binding is not None:
             _require_locked_jarvis_cd_binding(
@@ -3247,7 +3251,13 @@ def _external_python_console_distribution_identity(
             launcher_bytes,
             executable_name=executable.name,
         )
-    except (UnicodeDecodeError, ValueError, zipfile.BadZipFile) as exc:
+    except (
+        NotImplementedError,
+        RuntimeError,
+        UnicodeDecodeError,
+        ValueError,
+        zipfile.BadZipFile,
+    ) as exc:
         evidence["error"] = f"could not read persistent tool launcher: {exc}"
         return evidence
     if not shebang.startswith("#!") or not shebang[2:]:
@@ -3752,6 +3762,27 @@ def _server_artifact_digest(server_artifact: dict[str, Any]) -> str:
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _reject_verified_nested_runtime_path_remap(
+    *,
+    server_artifact: dict[str, Any],
+    env_from: dict[str, str],
+) -> None:
+    """Keep a locked clio-kit child on the PATH/PATHEXT identity just verified."""
+    nested_runtime = server_artifact.get("nested_runtime")
+    if (
+        not isinstance(nested_runtime, dict)
+        or cast(dict[str, Any], nested_runtime).get("locked_runtime_verified") is not True
+    ):
+        return
+    forbidden = sorted(
+        child_name for child_name in env_from if child_name.casefold() in {"path", "pathext"}
+    )
+    if forbidden:
+        raise ValueError(
+            "verified nested clio-kit runtime cannot remap PATH or PATHEXT through env_from"
+        )
 
 
 def _nested_clio_kit_server_name(

@@ -731,6 +731,40 @@ def test_windows_uv_trampoline_requires_unique_bounded_main_script(tmp_path: Pat
         )
 
 
+def test_windows_uv_trampoline_fails_closed_on_unsupported_zip(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    launcher = tmp_path / "science-mcp.exe"
+    launcher.write_bytes(b"MZ-bounded-launcher")
+
+    def unsupported_launcher_shebang(
+        _payload: bytes,
+        *,
+        executable_name: str,
+    ) -> str:
+        del executable_name
+        raise NotImplementedError("unsupported ZIP compression method")
+
+    monkeypatch.setattr(
+        runner,
+        "_persistent_tool_launcher_shebang",
+        unsupported_launcher_shebang,
+    )
+
+    evidence = cast(Any, runner)._external_python_console_distribution_identity(
+        launcher,
+        command_name="science-mcp",
+    )
+
+    assert evidence["runtime_closure_verified"] is False
+    assert evidence["launcher_copy_verified"] is False
+    assert evidence["error"] == (
+        "could not read persistent tool launcher: unsupported ZIP compression method"
+    )
+
+
 def test_mcp_call_runner_supports_server_arguments(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -1916,6 +1950,53 @@ def test_mcp_call_runner_rejects_relay_credential_references() -> None:
 
     with raises(ValueError, match="cannot expose relay credential"):
         cast(Any, runner)._environment_references({"REMOTE_TOKEN": "CLIO_RELAY_API_TOKEN"})
+
+
+def test_verified_nested_runtime_rejects_path_environment_remap(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UNVERIFIED_MCP_PATH", str(tmp_path))
+    artifact = _verified_jarvis_server_artifact()
+
+    def server_artifact_identity(
+        _server: str,
+        _server_args: list[str],
+        *,
+        verify_relay_jarvis_cd_lock: bool = False,
+    ) -> dict[str, Any]:
+        assert verify_relay_jarvis_cd_lock is True
+        return artifact
+
+    launched = False
+
+    def fail_if_launched(
+        _command: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal launched
+        launched = True
+        raise AssertionError("verified nested runtime must reject a remapped PATH")
+
+    monkeypatch.setattr(runner, "_server_artifact_identity", server_artifact_identity)
+    monkeypatch.setattr(runner, "_run_mcp_session", fail_if_launched)
+
+    return_code = cast(McpCallRunnerModule, runner).run_mcp_call_from_params(
+        {
+            "server": "clio-kit",
+            "server_args": ["mcp-server", "jarvis"],
+            "tool": "jarvis_describe",
+            "env_from": {"Path": "UNVERIFIED_MCP_PATH"},
+            "expected_jarvis_cd_lock_binding": _jarvis_cd_lock_expectation(),
+        }
+    )
+    result = json.loads((tmp_path / "mcp-result.json").read_text(encoding="utf-8"))
+
+    assert return_code == 1
+    assert launched is False
+    assert "cannot remap PATH or PATHEXT" in result["protocol_error"]
 
 
 def test_mcp_call_result_persists_environment_references_not_values(
