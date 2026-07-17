@@ -1028,7 +1028,11 @@ class ServiceRuntimeSupervisor:
         readiness_timeout_seconds: float = 300.0,
         poll_seconds: float = 2.0,
     ) -> ServiceRuntimeStartResult:
-        """Bind connectors to a ready JARVIS-owned service without submitting work."""
+        """Bind connectors to a ready JARVIS-owned service without submitting work.
+
+        ``desktop_bind_port`` is an internal operator override. Agent-facing calls
+        omit it so the relay allocates a distinct free loopback port.
+        """
         runtime = verified.runtime
         binding = verified.binding
         if runtime.lifecycle != "ready":
@@ -1050,9 +1054,11 @@ class ServiceRuntimeSupervisor:
                 raise ConfigurationError(
                     "scheduler-backed JARVIS services must advertise a loopback-only endpoint"
                 )
-        local_port = desktop_bind_port or runtime.port
-        if local_port < 1 or local_port > 65_535:
-            raise ConfigurationError("desktop bind port must be between 1 and 65535")
+        local_port = (
+            _available_loopback_port(exclude={runtime.port})
+            if desktop_bind_port is None
+            else _validated_available_loopback_port(desktop_bind_port)
+        )
         scheduler = binding.scheduler_provider or "external"
         spec = ServiceRuntimeSpec(
             kind="jarvis-service-runtime",
@@ -4083,7 +4089,21 @@ def _available_loopback_port(*, exclude: set[int] | None = None) -> int:
             port = cast(int, listener.getsockname()[1])
         if port not in excluded:
             return port
-    raise RelayError("could not select a distinct loopback port for browser attachment")
+    raise RelayError("could not select a distinct loopback port")
+
+
+def _validated_available_loopback_port(port: object) -> int:
+    """Validate and availability-test an explicit operator-selected loopback port."""
+    if isinstance(port, bool) or not isinstance(port, int):
+        raise ConfigurationError("desktop bind port must be an integer")
+    if port < 1 or port > 65_535:
+        raise ConfigurationError("desktop bind port must be between 1 and 65535")
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", port))
+    except OSError as exc:
+        raise ConfigurationError(f"desktop bind port is already occupied: {port}") from exc
+    return port
 
 
 def _validate_jarvis_service_state(

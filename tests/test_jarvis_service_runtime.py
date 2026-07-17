@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import socket
 import urllib.parse
 from collections.abc import Callable
 from pathlib import Path
@@ -501,7 +502,6 @@ def test_agent_bind_persists_urls_and_rejects_runtime_commands(
                     "source_artifact_id": artifact.artifact_id,
                     "package_id": "paraview-1",
                     "package_name": "builtin.paraview",
-                    "desktop_bind_port": 28777,
                 },
             },
         },
@@ -511,13 +511,17 @@ def test_agent_bind_persists_urls_and_rejects_runtime_commands(
     )
 
     assert response is not None and "error" not in response
-    result = response["result"]["structuredContent"]
-    assert result["connect_url"] == "http://127.0.0.1:28777"
-    assert result["health_url"] == "http://127.0.0.1:28777/healthz"
-    assert result["stream_url"] == "http://127.0.0.1:28777/live-data"
-    assert result["events_url"] == "http://127.0.0.1:28777/events"
-    assert result["state_url"] == "http://127.0.0.1:28777/state"
-    assert result["command_url"] == "http://127.0.0.1:28777/commands"
+    result = cast(dict[str, Any], response["result"]["structuredContent"])
+    connect_url = cast(str, result["connect_url"])
+    local_port = urllib.parse.urlparse(connect_url).port
+    assert local_port is not None
+    assert local_port != 18777
+    assert result["connect_url"] == f"http://127.0.0.1:{local_port}"
+    assert result["health_url"] == f"http://127.0.0.1:{local_port}/healthz"
+    assert result["stream_url"] == f"http://127.0.0.1:{local_port}/live-data"
+    assert result["events_url"] == f"http://127.0.0.1:{local_port}/events"
+    assert result["state_url"] == f"http://127.0.0.1:{local_port}/state"
+    assert result["command_url"] == f"http://127.0.0.1:{local_port}/commands"
     assert result["scheduler_cancel_requested"] is False
     gateway = result["gateway_session"]
     assert gateway["state"] == "ready"
@@ -533,6 +537,9 @@ def test_agent_bind_persists_urls_and_rejects_runtime_commands(
     assert owner_tokens
     assert all(token not in public_document for token in owner_tokens)
     assert "?capability=" not in public_document
+    runtime_spec = ServiceRuntimeSpec.model_validate(persisted.gateway["runtime_spec"])
+    assert runtime_spec.desktop_bind_port == local_port
+    assert runtime_spec.service_port == 18777
     persisted_transport = cast(dict[str, Any], persisted.gateway["transport"])
     for connector_name in ("remote_connector", "desktop_connector"):
         persisted_connector = cast(dict[str, Any], persisted_transport[connector_name])
@@ -548,10 +555,34 @@ def test_agent_bind_persists_urls_and_rejects_runtime_commands(
             gateway["gateway"]["ownership_intents"][connector_name]["owner_token"] == "<redacted>"
         )
 
-    refused = handle_request(
+    port_refused = handle_request(
         {
             "jsonrpc": "2.0",
             "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_bind_jarvis_runtime",
+                "arguments": {
+                    "cluster": definition.name,
+                    "source_job_id": job.job_id,
+                    "source_artifact_id": artifact.artifact_id,
+                    "package_id": "paraview-1",
+                    "package_name": "builtin.paraview",
+                    "desktop_bind_port": 28777,
+                },
+            },
+        },
+        queue=queue,
+        settings=settings,
+        profile="user",
+    )
+    assert port_refused is not None
+    assert "does not accept caller-supplied runtime metadata" in port_refused["error"]["message"]
+
+    refused = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
             "method": "tools/call",
             "params": {
                 "name": "relay_bind_jarvis_runtime",
@@ -575,7 +606,7 @@ def test_agent_bind_persists_urls_and_rejects_runtime_commands(
     replaced = handle_request(
         {
             "jsonrpc": "2.0",
-            "id": 3,
+            "id": 4,
             "method": "tools/call",
             "params": {
                 "name": "relay_update_gateway_session",
@@ -592,7 +623,7 @@ def test_agent_bind_persists_urls_and_rejects_runtime_commands(
     closed = handle_request(
         {
             "jsonrpc": "2.0",
-            "id": 4,
+            "id": 5,
             "method": "tools/call",
             "params": {
                 "name": "relay_close_gateway_session",
@@ -608,6 +639,45 @@ def test_agent_bind_persists_urls_and_rejects_runtime_commands(
     assert closed is not None
     assert "must be closed with stop-runtime" in closed["error"]["message"]
     assert queue.get_gateway_session(gateway["session_id"]).gateway["jarvis_runtime_binding"]
+
+
+def test_internal_bind_override_rejects_occupied_loopback_port(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An internal/operator override must fail before creating connector state on collision."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    supervisor = ServiceRuntimeSupervisor(
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+        queue=queue,
+        cluster=definition.name,
+        definition=definition,
+        token="token",
+        secret_key="secret",
+    )
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        occupied_port = cast(int, listener.getsockname()[1])
+        with pytest.raises(
+            ConfigurationError,
+            match=f"desktop bind port is already occupied: {occupied_port}",
+        ):
+            supervisor.bind_verified_jarvis_runtime(
+                name="paraview-live",
+                verified=verified,
+                desktop_bind_port=occupied_port,
+            )
 
 
 def test_bound_runtime_detach_and_teardown_preserve_scheduler_by_default(
