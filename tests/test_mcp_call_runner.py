@@ -125,15 +125,15 @@ def _jarvis_cd_lock_expectation() -> dict[str, str]:
     }
 
 
-def _verified_jarvis_server_artifact() -> dict[str, Any]:
+def _verified_jarvis_server_artifact(*, executable_path: str = "clio-kit") -> dict[str, Any]:
     """Return the minimal verified built-in JARVIS artifact boundary."""
     expected = _jarvis_cd_lock_expectation()
     return {
         "verified": True,
-        "resolved_executable": "clio-kit",
+        "resolved_executable": executable_path,
         "executable": {
-            "path": "clio-kit",
-            "filename": "clio-kit",
+            "path": executable_path,
+            "filename": Path(executable_path).name,
             "sha256": "d" * 64,
             "size_bytes": 1,
         },
@@ -3116,7 +3116,7 @@ def test_mcp_call_runner_persists_query_validation_in_durable_result(
         tmp_path,
         _jarvis_execution_query_result(include_progress=True, include_artifacts=True),
     )
-    artifact = _verified_jarvis_server_artifact()
+    artifact = _verified_jarvis_server_artifact(executable_path=sys.executable)
 
     def server_identity(
         _server: str,
@@ -3168,7 +3168,7 @@ def test_registered_jarvis_execution_query_keeps_operator_result_schema(
         tmp_path,
         {"operator_contract": "custom", "status": "ready"},
     )
-    artifact = _verified_jarvis_server_artifact()
+    artifact = _verified_jarvis_server_artifact(executable_path=sys.executable)
 
     def server_artifact_identity(
         _server: str,

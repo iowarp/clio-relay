@@ -89,6 +89,21 @@ def test_tag_push_uploads_exact_release_distributions_asynchronously() -> None:
     assert "github.event.release" not in text
 
 
+def test_release_build_requires_local_exact_tag_before_distribution_construction() -> None:
+    process = (ROOT / "docs" / "release.md").read_text(encoding="utf-8")
+
+    tag = process.index("git tag $Tag $Commit")
+    release_mode = process.index('$env:CLIO_RELAY_RELEASE_BUILD = "1"')
+    build = process.index("uv build --out-dir dist")
+    push = process.index("git push origin $Tag")
+
+    assert tag < release_mode < build < push
+    assert "Remove-Item Env:CLIO_RELAY_RELEASE_BUILD" in process
+    assert "An untagged, differently tagged, or dirty source tree fails the build" in " ".join(
+        process.split()
+    )
+
+
 def test_same_tag_release_stages_share_one_non_canceling_concurrency_group() -> None:
     workflows = (
         ("release.yml", "${{ github.ref_name }}"),
