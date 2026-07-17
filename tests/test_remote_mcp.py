@@ -48,6 +48,7 @@ from clio_relay.remote_mcp import (
     MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES,
     MAX_REMOTE_MCP_TOOLS_PER_SERVER,
     VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA,
+    VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS,
     RemoteMcpAcceptanceReport,
     RemoteMcpDiscoveryProvenance,
     RemoteMcpSchemaCache,
@@ -65,6 +66,7 @@ from clio_relay.remote_mcp import (
     remote_mcp_server_artifact_digest,
 )
 from clio_relay.spool import JobSpool
+from tests.jarvis_mcp_fakes import verified_jarvis_server_artifact
 
 NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
 
@@ -1326,7 +1328,11 @@ def test_mcp_server_rejects_stable_alias_after_schema_revision_changes(
         for tool in original_list["result"]["tools"]
         if tool["name"] == "remote_science_inspect"
     )
-    assert set(original_definition["inputSchema"]["properties"]) == {"cluster", "path"}
+    assert set(original_definition["inputSchema"]["properties"]) == {
+        "cluster",
+        "path",
+        *VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS,
+    }
     assert "catalog_revision" not in original_definition["inputSchema"]["properties"]
     original_revision = session.observed_remote_mcp_catalog_revision(profile="user")
     assert original_revision is not None
@@ -1386,6 +1392,7 @@ def test_mcp_server_rejects_stable_alias_after_schema_revision_changes(
         "cluster",
         "path",
         "mode",
+        *VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS,
     }
     assert "catalog_revision" not in refreshed_definition["inputSchema"]["properties"]
     refreshed_revision = session.observed_remote_mcp_catalog_revision(profile="user")
@@ -4375,6 +4382,8 @@ def test_cli_validate_calls_virtual_alias_and_writes_report(
         tmp_path / ".clio-relay" / "remote-mcp-cache.json",
         discovery_entry,
     )
+    server_artifact = _server_artifact(registration)
+    server_artifact_digest = remote_mcp_server_artifact_digest(server_artifact)
 
     def complete_virtual_call(
         queue: ClioCoreQueue,
@@ -4388,6 +4397,7 @@ def test_cli_validate_calls_virtual_alias_and_writes_report(
         assert isinstance(job.spec, McpCallSpec)
         assert job.spec.operation == McpOperation.TOOLS_CALL
         assert job.spec.arguments == expected_remote_arguments
+        assert job.spec.expected_server_artifact_digest == server_artifact_digest
         spool = JobSpool(tmp_path / "spool", job)
         spool.initialize()
         mcp_result_path = spool.path / "mcp-result.json"
@@ -4401,7 +4411,9 @@ def test_cli_validate_calls_virtual_alias_and_writes_report(
                     "arguments": expected_remote_arguments,
                     "returncode": 0,
                     "protocol_result": {"content": [{"type": "text", "text": "ok"}]},
-                    "server_artifact": _server_artifact(registration),
+                    "server_artifact": server_artifact,
+                    "expected_server_artifact_digest": server_artifact_digest,
+                    "observed_server_artifact_digest": server_artifact_digest,
                     "protocol_error": None,
                     "timed_out": False,
                 }
@@ -5139,14 +5151,9 @@ def _jarvis_cache_entry(
     """Return one fresh built-in JARVIS discovery entry and its bound artifact."""
     contract = jarvis_user_contract()
     now = datetime.now(UTC)
-    server_artifact: dict[str, object] = {
-        "verified": True,
-        "server_process_artifact_verified": True,
-        "executable": {
-            "path": "/opt/clio-kit/bin/clio-kit",
-            "sha256": executable_sha,
-        },
-    }
+    server_artifact = verified_jarvis_server_artifact()
+    executable = cast(dict[str, object], server_artifact["executable"])
+    executable["sha256"] = executable_sha
     entry = RemoteMcpSchemaCacheEntry(
         cluster=cluster,
         server_name=JARVIS_MCP_CACHE_SERVER_NAME,

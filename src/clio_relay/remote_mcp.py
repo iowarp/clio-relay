@@ -74,7 +74,7 @@ MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH = 64
 MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES = 32_768
 REMOTE_MCP_REPLACE_ATTEMPTS = 25
 REMOTE_MCP_REPLACE_RETRY_SECONDS = 0.02
-CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.5.5"
+CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.5.6"
 CLIO_KIT_SPACK_USER_CONTRACT_ID = "clio-kit-spack-user-v2"
 # Digest the MCP wire ``tools/list`` result. FastMCP's in-process FunctionTool
 # schemas retain ``$defs`` that its protocol serializer dereferences, so their
