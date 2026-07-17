@@ -1647,6 +1647,83 @@ def test_cli_session_detach_never_records_owner_session_closure(
     assert queue.get_owner_session_closed("session-1") is None
 
 
+def test_cli_session_detach_reports_success_when_optional_worker_observation_times_out(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    core_dir = tmp_path / "core"
+    report_path = tmp_path / "detach-worker-timeout.json"
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    monkeypatch.setenv("CLIO_RELAY_VALIDATION_ARTIFACT_SHA256", "a" * 64)
+    _activate_owner_session(ClioCoreQueue(core_dir))
+
+    def retained_session(**_kwargs: object) -> SessionLifecycleReport:
+        return SessionLifecycleReport(
+            cluster="ares",
+            session_id="session-1",
+            session_generation_id="generation-1",
+            mode="detach",
+            resources=[
+                CleanupResource(
+                    kind="remote_relay_api",
+                    resource_id="123",
+                    location="ares",
+                    action="retain",
+                    ownership_verified=True,
+                    outcome="retained",
+                    verified_after_operation=True,
+                )
+            ],
+        )
+
+    def timed_out_worker_observation(
+        _definition: ClusterDefinition,
+    ) -> tuple[None, RelayError]:
+        return None, RelayError("remote command timed out after 20 seconds: ares")
+
+    monkeypatch.setattr(cli, "detach_remote_session", retained_session)
+    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
+    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", timed_out_worker_observation)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "detach",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--validation-report",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["validation_status"] == "failed"
+    assert payload["validation_provenance_warning"] is True
+    assert payload["residual_resources"] == []
+    assert payload["resources"][0]["action"] == "retain"
+    assert payload["resources"][0]["outcome"] == "retained"
+    queue = ClioCoreQueue(core_dir)
+    assert queue.owner_session_is_closing("session-1") is False
+    assert queue.get_owner_session_closed("session-1") is None
+
+    validation_report = json.loads(report_path.read_text(encoding="utf-8"))
+    worker_check = next(
+        check
+        for check in validation_report["checks"]
+        if check["check_id"] == "worker.installation-info"
+    )
+    assert validation_report["status"] == "failed"
+    assert worker_check["status"] == "failed"
+    assert "timed out after 20 seconds" in worker_check["error"]
+
+
 def test_cli_session_detach_default_report_failure_controls_exit(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -2077,12 +2154,130 @@ def test_cli_session_teardown_retries_same_policy_after_closure(
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
+    assert payload["validation_status"] == "passed"
+    assert payload["validation_provenance_warning"] is False
     assert payload["cleanup_operation_id"] == intent["operation_id"]
     assert payload["cleanup_policy"] == {
         "stop_worker": False,
         "cancel_jobs": False,
         "cancel_scheduler_jobs": False,
     }
+
+
+def test_cli_session_teardown_reports_success_when_optional_worker_observation_times_out(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path, scheduler_provider="slurm")
+    core_dir = tmp_path / "core"
+    report_path = tmp_path / "teardown-worker-timeout.json"
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    monkeypatch.setenv("CLIO_RELAY_VALIDATION_ARTIFACT_SHA256", "a" * 64)
+    queue = ClioCoreQueue(core_dir)
+    _activate_owner_session(queue)
+    kept_job = cli._OwnedRelayJob(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        job_id="job-kept",
+        relay_state=JobState.SUCCEEDED,
+        scheduler_job_ids=("21958",),
+        scheduler_provider="slurm",
+        owner_session_generation_id="generation-1",
+    )
+
+    def list_owned_jobs(
+        *_args: object,
+        owner_session_generation_id: str | None = None,
+        **_kwargs: object,
+    ) -> list[object]:
+        return [] if owner_session_generation_id is None else [kept_job]
+
+    def running_scheduler_job(
+        _definition: ClusterDefinition,
+        scheduler_job_id: str,
+        *,
+        provider: str,
+    ) -> tuple[str, None]:
+        assert scheduler_job_id == "21958"
+        assert provider == "slurm"
+        return "running", None
+
+    def timed_out_worker_observation(
+        _definition: ClusterDefinition,
+    ) -> tuple[None, RelayError]:
+        return None, RelayError("remote command timed out after 20 seconds: ares")
+
+    def forbid_cancellation(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("default teardown must not request cancellation")
+
+    monkeypatch.setattr(cli, "status_remote_session", _fake_owned_session_status)
+    monkeypatch.setattr(cli, "teardown_remote_session", _fake_verified_teardown)
+    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
+    monkeypatch.setattr(cli, "_list_owned_active_cluster_jobs", list_owned_jobs)
+    monkeypatch.setattr(cli, "_scheduler_phase_after_operation", running_scheduler_job)
+    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", timed_out_worker_observation)
+    monkeypatch.setattr(cli, "_cancel_local_owned_jobs", forbid_cancellation)
+    monkeypatch.setattr(cli, "_cancel_owned_scheduler_jobs", forbid_cancellation)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "teardown",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--no-stop-worker",
+            "--keep-jobs",
+            "--keep-scheduler-jobs",
+            "--validation-report",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    scheduler_resource = next(
+        resource for resource in payload["resources"] if resource["kind"] == "scheduler_job"
+    )
+    owner_resource = next(
+        resource for resource in payload["resources"] if resource["kind"] == "owner_session"
+    )
+    assert payload["ok"] is True
+    assert payload["validation_status"] == "failed"
+    assert payload["validation_provenance_warning"] is True
+    assert payload["residual_resources"] == []
+    assert payload["cleanup_policy"] == {
+        "stop_worker": False,
+        "cancel_jobs": False,
+        "cancel_scheduler_jobs": False,
+    }
+    assert payload["relay_cancel_requested"] is False
+    assert payload["scheduler_cancel_requested"] is False
+    assert scheduler_resource["resource_id"] == "21958"
+    assert scheduler_resource["action"] == "retain"
+    assert scheduler_resource["outcome"] == "retained"
+    assert scheduler_resource["observed_state"] == "running"
+    assert scheduler_resource["residual"] is False
+    assert owner_resource["outcome"] == "closed"
+    closure = queue.get_owner_session_closed(
+        "session-1",
+        session_generation_id="generation-1",
+    )
+    assert closure is not None
+    assert closure.residual_resource_ids == []
+
+    validation_report = json.loads(report_path.read_text(encoding="utf-8"))
+    worker_check = next(
+        check
+        for check in validation_report["checks"]
+        if check["check_id"] == "worker.installation-info"
+    )
+    assert validation_report["status"] == "failed"
+    assert validation_report["cleanup"]["remaining_resources"] == []
+    assert worker_check["status"] == "failed"
+    assert "timed out after 20 seconds" in worker_check["error"]
+    assert not any(check["check_id"] == "session.teardown" for check in validation_report["checks"])
 
 
 def test_cli_session_teardown_failure_preserves_stopped_api_evidence(
@@ -5323,6 +5518,37 @@ def test_cleanup_with_artifact_digest_keeps_worker_identity_verification_strict(
     assert saved["status"] == "failed"
     assert saved["install_source"]["artifact_sha256"] == "a" * 64
     assert saved["checks"][-1]["check_id"] == "worker.installation-info"
+
+
+def test_cleanup_with_artifact_digest_records_optional_worker_observation_failure(
+    tmp_path: Path,
+) -> None:
+    report = new_live_validation_report(
+        scenario="cleanup",
+        cluster="ares",
+        artifact_sha256="a" * 64,
+    )
+    recorder = ValidationRecorder(report)
+    with recorder.check("cleanup.relay-session", "remote API stopped") as evidence:
+        evidence.append(EvidenceReference(kind="cleanup", excerpt="remote API stopped"))
+    recorder.finish()
+    report_path = tmp_path / "optional-worker-observation.json"
+    observation_error = RelayError("remote command timed out after 20 seconds: ares")
+
+    provenance_warning = cli._write_cleanup_validation_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report,
+        ClusterDefinition(name="ares", ssh_host="ares"),
+        report_path,
+        worker_observation_error=observation_error,
+    )
+
+    saved = json.loads(report_path.read_text(encoding="utf-8"))
+    assert provenance_warning is True
+    assert saved["status"] == "failed"
+    assert saved["checks"][0]["status"] == "passed"
+    assert saved["checks"][-1]["check_id"] == "worker.installation-info"
+    assert saved["checks"][-1]["status"] == "failed"
+    assert "timed out after 20 seconds" in saved["checks"][-1]["error"]
 
 
 def test_cli_cluster_add_persists_direct_transport_optimization(

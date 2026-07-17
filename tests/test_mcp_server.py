@@ -276,6 +276,28 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert len(bind_runtime_tool["inputSchema"]["oneOf"]) == 2
     assert binding_schema["properties"]["source_job_id"] == durable_record_id_json_schema()
     assert binding_schema["properties"]["source_artifact_id"] == durable_record_id_json_schema()
+    bind_output_schema = bind_runtime_tool["outputSchema"]
+    assert bind_output_schema["properties"]["gateway_session_id"] == {
+        **durable_record_id_json_schema(),
+        "pattern": r"^gateway_[0-9a-f]{32}$",
+        "description": (
+            "Exact relay gateway identity to pass unchanged to a viewer-opening tool. "
+            "It is equal to gateway_session.session_id."
+        ),
+    }
+    assert bind_output_schema["required"] == [
+        "gateway_session_id",
+        "gateway_session",
+        "connect_url",
+        "health_url",
+        "stream_url",
+        "events_url",
+        "state_url",
+        "command_url",
+        "scheduler_cancel_requested",
+    ]
+    assert "top-level gateway_session_id" in bind_runtime_tool["description"]
+    assert "service_instance_id is not a gateway identity" in bind_runtime_tool["description"]
     create_pipeline_tool = next(
         tool for tool in response["result"]["tools"] if tool["name"] == "jarvis_create_pipeline"
     )
