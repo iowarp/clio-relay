@@ -461,9 +461,10 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
         {
             "name": "relay_status",
             "description": (
-                "Read relay job state, relay queue position, and scheduler status. A remote "
-                "job_id returned earlier on this MCP connection is self-routing; after a "
-                "reconnect, also pass cluster and route_revision from its receipt."
+                "Read relay job state, relay queue position, and scheduler status. For a "
+                "remote job, copy cluster, job_id, and route_revision unchanged from its "
+                "submission receipt on every follow-up call, including on the same MCP "
+                "connection. job_id alone is only for a local relay job."
             ),
             "inputSchema": {
                 "type": "object",
@@ -483,9 +484,10 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
         {
             "name": "relay_cancel",
             "description": (
-                "Request cancellation for a relay job. A remote job_id returned earlier on "
-                "this MCP connection is self-routing; after a reconnect, also pass cluster "
-                "and route_revision from its receipt."
+                "Request cancellation for a relay job. For a remote job, copy cluster, "
+                "job_id, and route_revision unchanged from its submission receipt on every "
+                "follow-up call, including on the same MCP connection. job_id alone is only "
+                "for a local relay job."
             ),
             "inputSchema": {
                 "type": "object",
@@ -507,9 +509,10 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "name": "relay_observe",
             "description": (
                 "Read job events from a cursor and optionally return when a regex pattern "
-                "matches stdout, stderr, or event text. A remote job_id returned earlier on "
-                "this MCP connection is self-routing; after a reconnect, also pass cluster "
-                "and route_revision from its receipt."
+                "matches stdout, stderr, or event text. For a remote job, copy cluster, "
+                "job_id, and route_revision unchanged from its submission receipt on every "
+                "follow-up call, including on the same MCP connection. job_id alone is only "
+                "for a local relay job."
             ),
             "inputSchema": {
                 "type": "object",
@@ -544,9 +547,14 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
         {
             "name": "relay_wait",
             "description": (
-                "Wait for a relay job to finish and return final status and logs. A remote "
-                "job_id returned earlier on this MCP connection is self-routing; after a "
-                "reconnect, also pass cluster and route_revision from its receipt."
+                "Wait for a relay job to finish and return final status, verified MCP result "
+                "evidence, and optional logs. For a remote job, copy cluster, job_id, and "
+                "route_revision unchanged from its submission receipt on every follow-up "
+                "call, including on the same MCP connection. job_id alone is only for a "
+                "local relay job. A terminal jarvis_get_execution requested with "
+                "include_service_runtimes=true returns service_runtime_bindings; pass one "
+                "unchanged to relay_bind_jarvis_runtime, then use that bind result's "
+                "gateway_session_id. Never use a JARVIS execution_id as gateway_session_id."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1245,8 +1253,10 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "description": (
                 "Bind local relay connectors to one ready service reported by a completed, "
                 "artifact-bound JARVIS execution query with service runtimes included. "
-                "Pass one service_runtime_bindings item from a waited jarvis_get_execution "
-                "call unchanged as binding. jarvis_run is not a valid binding source. "
+                "Pass one service_runtime_bindings item returned either by a "
+                "wait_for_terminal jarvis_get_execution call or by relay_wait for its exact "
+                "remote job handle unchanged as binding. jarvis_run is not a valid binding "
+                "source, and a JARVIS execution_id is not a gateway_session_id. "
                 "Runtime host, paths, scheduler identity, and dataset metadata are read "
                 "only from the durable JARVIS result. The relay allocates the desktop "
                 "loopback port."
@@ -1762,7 +1772,30 @@ def _call_tool(
 def _serialize_tool_result(result: JSON) -> str:
     """Keep compact service handoffs ahead of a potentially large MCP result."""
     if "service_runtime_bindings" in result:
-        return json.dumps(result)
+        compact_keys = (
+            "service_runtime_bindings",
+            "mcp_result_artifact",
+            "cluster",
+            "job_id",
+            "route_revision",
+            "state",
+            "kind",
+            "terminal",
+            "remote",
+            "last_error",
+        )
+        bulk_keys = ("job", "mcp_result", "logs", "artifacts")
+        ordered: JSON = {}
+        for key in compact_keys:
+            if key in result:
+                ordered[key] = result[key]
+        for key, value in result.items():
+            if key not in compact_keys and key not in bulk_keys:
+                ordered[key] = value
+        for key in bulk_keys:
+            if key in result:
+                ordered[key] = result[key]
+        return json.dumps(ordered)
     return json.dumps(result, sort_keys=True)
 
 
@@ -2836,11 +2869,16 @@ def _verified_owned_mcp_result(
 def _verified_local_mcp_result(
     queue: ClioCoreQueue,
     job_id: str,
+    *,
+    artifacts: list[JSON] | None = None,
 ) -> _VerifiedMcpResult | None:
+    artifact_records = (
+        artifacts if artifacts is not None else _complete_local_artifacts(queue, job_id)
+    )
     artifact = next(
         (
             item
-            for item in _complete_local_artifacts(queue, job_id)
+            for item in artifact_records
             if item.get("kind") == "mcp_result" and item.get("job_id") == job_id
         ),
         None,
@@ -3197,6 +3235,7 @@ def _observe_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettin
 def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -> JSON:
     job_id = _required_durable_record_id(arguments, "job_id")
     target = _job_target(arguments)
+    logs: JSON | None = None
     if target is not None and should_execute_on_cluster(target):
         if settings.owner_session_id is not None:
             with OwnedSessionApiClient(definition=target, settings=settings) as client:
@@ -3223,8 +3262,13 @@ def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings)
                     label="owned remote job status",
                 )
                 _validate_owned_job_status(result, job_id=job_id, cluster=target.name)
+                source_job = _terminal_remote_wait_job(
+                    result,
+                    job_id=job_id,
+                    cluster=target.name,
+                )
                 if arguments.get("include_logs", True) is not False:
-                    result["logs"] = _owned_job_logs(
+                    logs = _owned_job_logs(
                         client,
                         job_id,
                         limit=_log_limit(arguments),
@@ -3235,68 +3279,96 @@ def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings)
                     record_key="artifacts",
                     label=f"owned remote artifacts for {job_id}",
                 )
-                result["artifacts"] = artifact_records
                 parsed_result = _verified_owned_mcp_result(client, job_id, artifact_records)
-                if parsed_result is not None:
-                    result["mcp_result"] = parsed_result.public
-            result["cluster"] = target.name
-            result["route_revision"] = _route_revision(target)
-            return result
-        run_remote_clio(
-            target,
-            [
-                "job",
-                "wait",
-                job_id,
-                "--timeout-seconds",
-                str(float(arguments.get("timeout_seconds", 600))),
-                "--poll-seconds",
-                str(float(arguments.get("poll_seconds", 2))),
-            ],
-        )
-        result = _remote_json(target, ["job", "status", job_id], "remote job status")
-        if arguments.get("include_logs", True) is not False:
-            result["logs"] = _remote_job_logs(
+        else:
+            run_remote_clio(
                 target,
-                job_id,
+                [
+                    "job",
+                    "wait",
+                    job_id,
+                    "--timeout-seconds",
+                    str(float(arguments.get("timeout_seconds", 600))),
+                    "--poll-seconds",
+                    str(float(arguments.get("poll_seconds", 2))),
+                ],
+            )
+            result = _remote_json(target, ["job", "status", job_id], "remote job status")
+            source_job = _terminal_remote_wait_job(
+                result,
+                job_id=job_id,
+                cluster=target.name,
+            )
+            if arguments.get("include_logs", True) is not False:
+                logs = _remote_job_logs(
+                    target,
+                    job_id,
+                    limit=_log_limit(arguments),
+                )
+            artifact_records = _complete_remote_collection(
+                target,
+                ["job", "list-artifacts", job_id],
+                record_key="artifacts",
+                label=f"remote artifacts for {job_id}",
+            )
+            parsed_result = _verified_mcp_result(target, job_id, artifact_records)
+    else:
+        _require_local_job_cluster(queue, job_id, target)
+        source_job = wait_for_terminal(
+            queue,
+            job_id,
+            timeout_seconds=float(arguments.get("timeout_seconds", 600)),
+            poll_seconds=float(arguments.get("poll_seconds", 2)),
+        )
+        result = job_status(queue, source_job.job_id)
+        if arguments.get("include_logs", True) is not False:
+            logs = _job_logs(
+                queue,
+                settings,
+                source_job.job_id,
                 limit=_log_limit(arguments),
             )
-        artifact_records = _complete_remote_collection(
-            target,
-            ["job", "list-artifacts", job_id],
-            record_key="artifacts",
-            label=f"remote artifacts for {job_id}",
-        )
-        result["artifacts"] = artifact_records
-        parsed_result = _verified_mcp_result(target, job_id, artifact_records)
-        if parsed_result is not None:
-            result["mcp_result"] = parsed_result.public
-        result["cluster"] = target.name
-        result["route_revision"] = _route_revision(target)
-        return result
-    _require_local_job_cluster(queue, job_id, target)
-    job = wait_for_terminal(
-        queue,
-        job_id,
-        timeout_seconds=float(arguments.get("timeout_seconds", 600)),
-        poll_seconds=float(arguments.get("poll_seconds", 2)),
-    )
-    result = job_status(queue, job.job_id)
-    if arguments.get("include_logs", True) is not False:
-        result["logs"] = _job_logs(
+        artifact_records = _complete_local_artifacts(queue, source_job.job_id)
+        parsed_result = _verified_local_mcp_result(
             queue,
-            settings,
-            job.job_id,
-            limit=_log_limit(arguments),
+            source_job.job_id,
+            artifacts=artifact_records,
         )
-    result["artifacts"] = _complete_local_artifacts(queue, job.job_id)
-    parsed_result = _verified_local_mcp_result(queue, job.job_id)
-    if parsed_result is not None:
-        result["mcp_result"] = parsed_result.public
+
     if target is not None:
         result["cluster"] = target.name
         result["route_revision"] = _route_revision(target)
+    if parsed_result is not None:
+        _attach_terminal_mcp_evidence(
+            result,
+            source_job=source_job,
+            last_error=source_job.last_error,
+            artifacts=artifact_records,
+            parsed_result=parsed_result,
+        )
+    if logs is not None:
+        result["logs"] = logs
+    result["artifacts"] = artifact_records
     return result
+
+
+def _terminal_remote_wait_job(
+    result: JSON,
+    *,
+    job_id: str,
+    cluster: str,
+) -> RelayJob:
+    """Validate the exact terminal remote job backing a generic wait result."""
+
+    source_job = RelayJob.model_validate(_object(result.get("job")))
+    if source_job.job_id != job_id or source_job.cluster != cluster:
+        raise ValueError("remote wait returned a different job")
+    if (
+        source_job.state not in {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELED}
+        or result.get("terminal") is not True
+    ):
+        raise ValueError("remote wait did not return one terminal job")
+    return source_job
 
 
 def _job_logs(
@@ -3874,8 +3946,9 @@ def _remote_mcp_submission_result(
     )
     parsed_result = _verified_mcp_result(definition, job_id, artifacts)
     result.update({"state": state, "terminal": True})
+    logs: JSON | None = None
     if arguments.get("include_logs", False) is True:
-        result["logs"] = _remote_job_logs(
+        logs = _remote_job_logs(
             definition,
             job_id,
             limit=_log_limit(arguments),
@@ -3891,6 +3964,8 @@ def _remote_mcp_submission_result(
         artifacts=artifacts,
         parsed_result=parsed_result,
     )
+    if logs is not None:
+        result["logs"] = logs
     return result
 
 

@@ -374,6 +374,23 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     for name in ("relay_observe", "relay_wait"):
         log_tool = next(tool for tool in response["result"]["tools"] if tool["name"] == name)
         assert log_tool["inputSchema"]["properties"]["log_limit"]["maximum"] == 32_768
+    for name in ("relay_status", "relay_cancel", "relay_observe", "relay_wait"):
+        followup_tool = next(tool for tool in response["result"]["tools"] if tool["name"] == name)
+        description = followup_tool["description"]
+        assert "cluster, job_id, and route_revision unchanged" in description
+        assert "on every follow-up call" in description
+        assert "job_id alone is only for a local relay job" in description
+    wait_tool = next(tool for tool in response["result"]["tools"] if tool["name"] == "relay_wait")
+    assert "service_runtime_bindings" in wait_tool["description"]
+    assert "Never use a JARVIS execution_id as gateway_session_id" in wait_tool["description"]
+    assert "JARVIS execution_id is not a gateway_session_id" in bind_runtime_tool["description"]
+    assert "Never use execution_id as gateway_session_id" in query_tool["description"]
+    add_step_tool = next(
+        tool for tool in response["result"]["tools"] if tool["name"] == "jarvis_add_step"
+    )
+    assert "package_search is discovery only" in add_step_tool["description"]
+    assert "target='package'" in add_step_tool["description"]
+    assert "package-owned settings contract rather than guessing" in add_step_tool["description"]
 
 
 def test_mcp_admin_profile_lists_operational_tools(tmp_path: Path) -> None:
@@ -893,6 +910,14 @@ def test_mcp_compact_job_handle_routes_remote_lifecycle_and_verifies_result(
     queue = ClioCoreQueue(tmp_path / "desktop-core")
     settings = RelaySettings(core_dir=tmp_path / "desktop-core", spool_dir=tmp_path / "spool")
     job_id = "remote-job-1"
+    remote_job = RelayJob(
+        job_id=job_id,
+        cluster="ares",
+        kind=JobKind.MCP_CALL,
+        state=JobState.SUCCEEDED,
+        spec=McpCallSpec(server="science", tool="inspect"),
+        idempotency_key="remote-science-inspect",
+    )
     payload = json.dumps(
         {
             "operation": "tools/call",
@@ -922,12 +947,7 @@ def test_mcp_compact_job_handle_routes_remote_lifecycle_and_verifies_result(
         if args[:2] == ["job", "status"]:
             return json.dumps(
                 {
-                    "job": {
-                        "job_id": job_id,
-                        "cluster": "ares",
-                        "kind": "mcp_call",
-                        "state": "succeeded",
-                    },
+                    "job": remote_job.model_dump(mode="json"),
                     "terminal": True,
                 }
             )
