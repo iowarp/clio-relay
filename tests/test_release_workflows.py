@@ -315,7 +315,7 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
     assert lock_binding["schema_version"] == "clio-relay.jarvis-cd-lock-binding.v1"
     assert lock_binding["dependency"] == "jarvis-cd"
     assert lock_binding["error"] is None
-    assert lock_binding["expected_version"] == "1.3.12"
+    assert lock_binding["expected_version"] == "1.3.13"
     assert lock_binding["expected_url"] == lock_binding["observed_source_url"]
     assert lock_binding["expected_url"] == lock_binding["observed_wheel_url"]
     assert lock_binding["expected_sha256"] == lock_binding["observed_wheel_sha256"]
@@ -337,18 +337,18 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
         if resource["kind"] == "relay_worker"
     )
     clio_kit_component = worker["metadata_equals"]["component_artifacts"]["clio-kit"]
-    assert clio_kit_component["distribution_version"] == "2.5.5"
+    assert clio_kit_component["distribution_version"] == "2.5.6"
     assert clio_kit_component["persistent_tool"]["manager"] == "uv"
     assert clio_kit_component["persistent_tool"]["uv_version"] == "0.11.28"
     assert clio_kit_component["persistent_tool"]["source_artifact_sha256"] == (
-        "622344b951d39f35b0952d2bf056d83040b81ad52e4aca4794fa486026eab278"
+        "3c9d58b471abc2032ba0a63c875b12d2c2fc9245f42fd9ca4c41c68a5bfde9d4"
     )
     jarvis_component = worker["metadata_equals"]["component_artifacts"]["jarvis-cd"]
-    assert jarvis_component["distribution_version"] == "1.3.12"
+    assert jarvis_component["distribution_version"] == "1.3.13"
     assert jarvis_component["requested_source"] == "github_release"
-    assert jarvis_component["install_spec"].endswith("/v1.3.12/jarvis_cd-1.3.12-py3-none-any.whl")
+    assert jarvis_component["install_spec"].endswith("/v1.3.13/jarvis_cd-1.3.13-py3-none-any.whl")
     assert jarvis_component["artifact_sha256"] == (
-        "67541dde02e13842ab7a1581717a3577869f3d6ff7db4faf0238fd8c6319d3e3"
+        "0c041a145eaa94a0176e6e7fa9fc60cc5b3143b2070237d5c9ee0950bb4931e8"
     )
     runtime = worker["metadata_equals"]["component_runtime"]["jarvis-cd"]
     assert runtime["provider_interpreter_verified"] is True
@@ -397,10 +397,10 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
         for resource in cast(list[dict[str, Any]], lammps["required_resources"])
         if resource["kind"] == "relay_worker"
     )
-    assert lammps_worker["metadata_equals"]["components"] == {"jarvis-cd": "1.3.12"}
+    assert lammps_worker["metadata_equals"]["components"] == {"jarvis-cd": "1.3.13"}
     assert (
         lammps_worker["metadata_equals"]["component_artifacts"]["jarvis-cd"]["artifact_sha256"]
-        == "67541dde02e13842ab7a1581717a3577869f3d6ff7db4faf0238fd8c6319d3e3"
+        == "0c041a145eaa94a0176e6e7fa9fc60cc5b3143b2070237d5c9ee0950bb4931e8"
     )
     assert lammps.get("evidence_group_resource_kind") is None
 
@@ -505,7 +505,7 @@ def test_spack_release_requirements_split_existing_resolution_from_fresh_install
     )
     assert fresh_server["metadata_equals"]["server_name"] == "spack-fresh"
     assert fresh_server["metadata_equals"]["install_artifact_sha256"] == (
-        "622344b951d39f35b0952d2bf056d83040b81ad52e4aca4794fa486026eab278"
+        "3c9d58b471abc2032ba0a63c875b12d2c2fc9245f42fd9ca4c41c68a5bfde9d4"
     )
     assert fresh_server["metadata_equals"]["contract_id"] == "clio-kit-spack-user-v2"
     assert fresh_server["metadata_equals"]["contract_sha256"] == (

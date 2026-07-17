@@ -162,12 +162,12 @@ _JARVIS_CD_LOCK_BINDING_SCHEMA = "clio-relay.jarvis-cd-lock-binding.v1"
 # prevents either copy from moving independently. The JARVIS package also runs as
 # a standalone repository package, where importing the installed relay bootstrap
 # module is not a valid dependency boundary.
-JARVIS_CD_VERSION = "1.3.12"
+JARVIS_CD_VERSION = "1.3.13"
 JARVIS_CD_WHEEL_URL = (
     "https://github.com/grc-iit/jarvis-cd/releases/download/"
     f"v{JARVIS_CD_VERSION}/jarvis_cd-{JARVIS_CD_VERSION}-py3-none-any.whl"
 )
-JARVIS_CD_WHEEL_SHA256 = "67541dde02e13842ab7a1581717a3577869f3d6ff7db4faf0238fd8c6319d3e3"
+JARVIS_CD_WHEEL_SHA256 = "0c041a145eaa94a0176e6e7fa9fc60cc5b3143b2070237d5c9ee0950bb4931e8"
 _CLIO_KIT_RUNTIME_PROJECT_EXCLUDED_NAMES = frozenset(
     {
         ".git",

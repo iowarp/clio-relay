@@ -19,9 +19,9 @@ from clio_relay.jarvis_mcp import (
     jarvis_cd_lock_binding_expectation,
     jarvis_mcp_server_artifact_verified,
     jarvis_user_contract,
+    virtual_jarvis_job_output_schema,
 )
 from clio_relay.remote_mcp import (
-    VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA,
     RemoteMcpToolSchema,
     remote_mcp_schema_digest,
     remote_mcp_server_artifact_digest,
@@ -1748,6 +1748,9 @@ def _local_jarvis_contract(tool: JSON | None, name: str) -> tuple[JSON, bool]:
     properties = _mapping(remote_input.get("properties"))
     if properties is None:
         return ({"tool": name, "error": "tool has no property map"}, False)
+    cluster_property = _mapping(properties.get("cluster"))
+    cluster_values = cluster_property.get("enum") if cluster_property is not None else None
+    clusters = cluster_values if _is_string_list(cluster_values) else None
     for key in (
         "cluster",
         "timeout_seconds",
@@ -1767,7 +1770,7 @@ def _local_jarvis_contract(tool: JSON | None, name: str) -> tuple[JSON, bool]:
     actual_description = tool.get("description")
     input_matches = remote_input == expected.get("inputSchema")
     annotations_match = actual_annotations == expected.get("annotations")
-    output_matches = actual_output == VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA
+    output_matches = actual_output == virtual_jarvis_job_output_schema(name, clusters=clusters)
     description_matches = (
         isinstance(expected_description, str)
         and isinstance(actual_description, str)
