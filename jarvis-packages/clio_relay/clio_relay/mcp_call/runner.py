@@ -3840,8 +3840,14 @@ def _reject_verified_runtime_environment_remap(
                 python_runtime_verified
                 and (
                     child_name.casefold() == "__pyvenv_launcher__"
-                    or child_name.casefold() in {"libpath", "shlib_path"}
-                    or child_name.casefold().startswith(("dyld_", "ld_", "python"))
+                    or child_name.casefold().startswith("python")
+                )
+            )
+            or (
+                (python_runtime_verified or nested_runtime_verified)
+                and (
+                    child_name.casefold() in {"libpath", "shlib_path"}
+                    or child_name.casefold().startswith(("dyld_", "ld_"))
                 )
             )
             or (
