@@ -1060,6 +1060,10 @@ def test_agent_bind_persists_urls_and_rejects_runtime_commands(
     assert result["command_url"] == f"http://127.0.0.1:{local_port}/commands"
     assert result["scheduler_cancel_requested"] is False
     gateway = result["gateway_session"]
+    assert result["gateway_session_id"] == gateway["session_id"]
+    agent_visible = json.loads(response["result"]["content"][0]["text"])
+    assert agent_visible["gateway_session_id"] == gateway["session_id"]
+    assert agent_visible["gateway_session_id"] == agent_visible["gateway_session"]["session_id"]
     assert gateway["state"] == "ready"
     assert gateway["gateway"]["jarvis_runtime_binding"]["source_relay_job_id"] == job.job_id
     assert (

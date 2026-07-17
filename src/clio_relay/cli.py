@@ -3416,7 +3416,7 @@ def session_detach(
             update={"report_id": seed_report.report_id, "started_at": seed_report.started_at}
         )
         canonical_report[0] = canonical
-        _write_cleanup_validation_report(
+        provenance_warning = _write_cleanup_validation_report(
             canonical,
             definition,
             canonical_report_path,
@@ -3424,9 +3424,11 @@ def session_detach(
             worker_observation_error=cleanup_worker_error,
         )
         payload["validation_report"] = str(canonical_report_path.resolve())
+        payload["validation_status"] = canonical.status.value
+        payload["validation_provenance_warning"] = provenance_warning
         typer.echo(_public_json(payload))
         canonical_ok = canonical.status is ValidationStatus.PASSED
-        if payload.get("ok") is not True or not canonical_ok:
+        if payload.get("ok") is not True or (not canonical_ok and not provenance_warning):
             raise typer.Exit(code=1)
 
     def guarded_action() -> None:
@@ -4100,7 +4102,7 @@ def session_teardown(
                     state="canceled",
                 )
             )
-        _write_cleanup_validation_report(
+        provenance_warning = _write_cleanup_validation_report(
             canonical,
             definition,
             canonical_report_path,
@@ -4108,9 +4110,11 @@ def session_teardown(
             worker_observation_error=cleanup_worker_error,
         )
         payload["validation_report"] = str(canonical_report_path.resolve())
+        payload["validation_status"] = canonical.status.value
+        payload["validation_provenance_warning"] = provenance_warning
         typer.echo(_public_json(payload))
         canonical_ok = canonical.status is ValidationStatus.PASSED
-        if payload.get("ok") is not True or not canonical_ok:
+        if payload.get("ok") is not True or (not canonical_ok and not provenance_warning):
             raise typer.Exit(code=1)
 
     def guarded_action() -> None:
@@ -12046,7 +12050,7 @@ def _write_cleanup_validation_report(
     *,
     observed_worker_info: dict[str, object] | None = None,
     worker_observation_error: Exception | None = None,
-) -> None:
+) -> bool:
     """Persist operational cleanup without manufacturing release provenance.
 
     Ordinary detach and teardown commands do not require a candidate wheel.  When
@@ -12055,10 +12059,25 @@ def _write_cleanup_validation_report(
     without verified-worker checks.  The release gate therefore cannot consume it
     as released-artifact evidence.  If a digest is supplied, remote worker
     verification remains strict and any mismatch still fails the acceptance run.
+
+    A bounded pre-cleanup worker observation is optional operational metadata.  Its
+    failure is recorded as failed provenance evidence, but it must not hide a
+    completed cleanup receipt or change the cleanup command's operational result.
+    Return ``True`` only when that optional provenance warning was recorded.
     """
     if report.install_source.artifact_sha256 is None:
         write_validation_report(report, path)
-        return
+        return False
+    if worker_observation_error is not None:
+        recorder = ValidationRecorder(report)
+        recorder.record_failure(
+            "worker.installation-info",
+            "verify remote worker installation identity",
+            worker_observation_error,
+        )
+        recorder.finish(worker_observation_error)
+        recorder.write(path)
+        return True
     _write_remote_verified_report(
         report,
         definition,
@@ -12066,6 +12085,7 @@ def _write_cleanup_validation_report(
         observed_worker_info=observed_worker_info,
         worker_observation_error=worker_observation_error,
     )
+    return False
 
 
 def _new_cleanup_acceptance_report(

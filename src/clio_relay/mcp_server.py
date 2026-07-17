@@ -1259,7 +1259,9 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                 "source, and a JARVIS execution_id is not a gateway_session_id. "
                 "Runtime host, paths, scheduler identity, and dataset metadata are read "
                 "only from the durable JARVIS result. The relay allocates the desktop "
-                "loopback port."
+                "loopback port. On success, copy the top-level gateway_session_id "
+                "unchanged into the viewer-opening tool; service_instance_id is not a "
+                "gateway identity."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1316,6 +1318,14 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "outputSchema": {
                 "type": "object",
                 "properties": {
+                    "gateway_session_id": {
+                        **durable_record_id_json_schema(),
+                        "pattern": r"^gateway_[0-9a-f]{32}$",
+                        "description": (
+                            "Exact relay gateway identity to pass unchanged to a viewer-opening "
+                            "tool. It is equal to gateway_session.session_id."
+                        ),
+                    },
                     "gateway_session": {"type": "object"},
                     "connect_url": {"type": "string"},
                     "health_url": {"type": "string"},
@@ -1326,6 +1336,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     "scheduler_cancel_requested": {"const": False},
                 },
                 "required": [
+                    "gateway_session_id",
                     "gateway_session",
                     "connect_url",
                     "health_url",
@@ -4444,8 +4455,13 @@ def _bind_jarvis_runtime(
         )
     ):
         raise ValueError("verified JARVIS runtime did not produce the complete URL contract")
+    gateway_session = public_gateway_session(started.session)
+    gateway_session_id = gateway_session.get("session_id")
+    if gateway_session_id != started.session.session_id:
+        raise ValueError("public gateway session identity did not match the bound runtime")
     return {
-        "gateway_session": public_gateway_session(started.session),
+        "gateway_session_id": gateway_session_id,
+        "gateway_session": gateway_session,
         "connect_url": started.connect_url,
         "health_url": started.health_url,
         "stream_url": started.stream_url,
