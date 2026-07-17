@@ -258,7 +258,7 @@ For the legacy clio-kit 2.2.6 compatibility path, a successful synchronous
 `jarvis_run` MCP return is normalized to a terminal `completed` record even
 though that release labels the result `status=running`; the original status and
 completion basis remain in `details.completion_normalization` for auditability.
-The pinned clio-kit 2.5.1 production path removes that ambiguity upstream and
+The pinned clio-kit 2.5.3 production path removes that ambiguity upstream and
 returns a structured completed result directly. The legacy normalization is
 diagnostic compatibility evidence and cannot satisfy the 1.0 gate. Scheduler
 submissions remain non-terminal unless JARVIS was asked to wait.
@@ -493,7 +493,7 @@ Install the cluster-side server once, then launch its persistent executable:
 
 ```bash
 uv tool install --python 3.12 --no-config \
-  https://github.com/iowarp/clio-kit/releases/download/v2.5.1/clio_kit-2.5.1-py3-none-any.whl
+  https://github.com/iowarp/clio-kit/releases/download/v2.5.3/clio_kit-2.5.3-py3-none-any.whl
 clio-kit mcp-server jarvis
 ```
 

@@ -34,10 +34,44 @@ from clio_relay.installation import (
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
     JARVIS_MCP_COMMAND_ENV,
+    jarvis_cd_lock_binding_expectation,
     jarvis_mcp_command,
     jarvis_user_contract,
 )
 from clio_relay.validation_report import InstallSource, InstallSourceKind, SoftwareIdentity
+
+
+def _verified_locked_jarvis_runtime() -> dict[str, object]:
+    """Return complete receipt evidence for the relay's built-in JARVIS child."""
+    expected = jarvis_cd_lock_binding_expectation()
+    return {
+        "schema_version": "clio-kit.locked-server.v4",
+        "server_name": "jarvis",
+        "locked_runtime_verified": True,
+        "jarvis_cd_lock_binding": {
+            "schema_version": "clio-relay.jarvis-cd-lock-binding.v1",
+            "dependency": "jarvis-cd",
+            "verified": True,
+            "error": None,
+            "expected_version": expected["version"],
+            "expected_url": expected["url"],
+            "expected_sha256": expected["sha256"],
+            "observed_version": expected["version"],
+            "observed_source_url": expected["url"],
+            "observed_wheel_url": expected["url"],
+            "observed_wheel_sha256": expected["sha256"],
+            "jarvis_mcp_package_entry_count": 1,
+            "resolved_dependency_entry_count": 1,
+            "observed_resolved_dependency_entries": [{"name": "jarvis-cd"}],
+            "metadata_requirement_entry_count": 1,
+            "observed_metadata_requirement_entries": [
+                {"name": "jarvis-cd", "url": expected["url"]}
+            ],
+            "observed_metadata_requirement_urls": [expected["url"]],
+            "package_entry_count": 1,
+            "wheel_entry_count": 1,
+        },
+    }
 
 
 def test_distribution_file_source_accepts_a_canonical_filesystem_alias(
@@ -630,12 +664,17 @@ def test_remote_clio_kit_component_requires_receipt_bound_native_contract(
     runtime = {
         "artifact_identity_verified": True,
         "command_matches_receipt": True,
+        "locked_server_runtime_verified": True,
         "native_execution_capability_verified": True,
         "native_execution_capability": capability.model_dump(mode="json"),
     }
     info: dict[str, object] = {"installation": {"component_runtime": {"clio-kit": runtime}}}
 
     assert verify_remote_clio_kit_native_execution_component(info, receipt) == runtime
+    runtime["locked_server_runtime_verified"] = False
+    with pytest.raises(ConfigurationError, match="locked_server_runtime_verified"):
+        verify_remote_clio_kit_native_execution_component(info, receipt)
+    runtime["locked_server_runtime_verified"] = True
     runtime["native_execution_capability"] = {
         **capability.model_dump(mode="json"),
         "contract_sha256": "d" * 64,
@@ -810,6 +849,7 @@ def test_jarvis_mcp_defaults_to_persistent_receipt_bound_clio_kit_tool(
                 runtime_interpreters={"provider": sys.executable},
                 runtime_executables={"clio-kit": str(tool), "uv": str(uv)},
                 persistent_tool=persistent_tool,
+                locked_server_runtime=_verified_locked_jarvis_runtime(),
             )
         },
     )
@@ -830,6 +870,52 @@ def test_jarvis_mcp_defaults_to_persistent_receipt_bound_clio_kit_tool(
     assert runtime["clio-kit"]["command_matches_receipt"] is True
     assert runtime["clio-kit"]["launcher"] == "uv tool"
     assert runtime["clio-kit"]["persistent_tool_verified"] is True
+
+
+def test_component_runtime_identity_does_not_probe_unverified_clio_kit_launcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Doctor must not execute a launcher whose receipt identity failed."""
+    receipt = write_install_receipt(
+        install_spec="checkout",
+        path=tmp_path / "install-receipt.json",
+        component_artifacts={
+            "clio-kit": ComponentArtifactIdentity(
+                distribution="clio-kit",
+                install_spec="tampered-clio-kit.whl",
+                requested_source="wheel",
+                runtime_command=["tampered-clio-kit", "mcp-server", "jarvis"],
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "clio_relay.jarvis_mcp.jarvis_mcp_runtime_identity",
+        lambda _receipt: {
+            "artifact_identity_verified": False,
+            "error": "locked JARVIS dependency did not verify",
+        },
+    )
+    probed = False
+
+    def fail_if_probed(_command: list[str]) -> NativeJarvisExecutionCapability:
+        nonlocal probed
+        probed = True
+        raise AssertionError("unverified clio-kit launcher must not execute")
+
+    monkeypatch.setattr(
+        installation_module,
+        "probe_clio_kit_native_execution_contract",
+        fail_if_probed,
+    )
+
+    identities = installation_module._component_runtime_identity(receipt)
+    runtime = cast(dict[str, object], identities["clio-kit"])
+
+    assert probed is False
+    assert runtime["native_execution_capability"] is None
+    assert runtime["native_execution_capability_verified"] is False
+    assert runtime["native_execution_error"] == "locked JARVIS dependency did not verify"
 
 
 def test_receipt_bound_jarvis_mcp_refuses_changed_clio_kit_wheel(

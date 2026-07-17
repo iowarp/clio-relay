@@ -194,6 +194,7 @@ class ComponentArtifactIdentity(BaseModel):
     entry_points: list[str] = Field(default_factory=list)
     native_execution: NativeJarvisExecutionCapability | None = None
     persistent_tool: PersistentUvToolIdentity | None = None
+    locked_server_runtime: dict[str, object] | None = None
 
 
 class InstallReceipt(BaseModel):
@@ -1134,6 +1135,7 @@ def attach_verified_worker_identity(
         and _is_released_component(component)
         and runtime_identity.get("artifact_identity_verified") is True
         and runtime_identity.get("command_matches_receipt") is True
+        and runtime_identity.get("locked_server_runtime_verified") is True
     )
     report.checks.append(
         ValidationCheck(
@@ -1764,13 +1766,20 @@ def _component_runtime_identity(receipt: InstallReceipt) -> dict[str, object]:
         component = receipt.component_artifacts["clio-kit"]
         runtime_identity = jarvis_mcp_runtime_identity(receipt)
         expected_capability = component.native_execution
-        try:
-            observed_capability = probe_clio_kit_native_execution_contract(
-                component.runtime_command
-            )
-        except ConfigurationError as exc:
+        if runtime_identity.get("artifact_identity_verified") is not True:
             observed_capability = None
-            runtime_identity["native_execution_error"] = str(exc)
+            runtime_identity["native_execution_error"] = str(
+                runtime_identity.get("error")
+                or "receipt-bound clio-kit runtime identity did not verify"
+            )
+        else:
+            try:
+                observed_capability = probe_clio_kit_native_execution_contract(
+                    component.runtime_command
+                )
+            except ConfigurationError as exc:
+                observed_capability = None
+                runtime_identity["native_execution_error"] = str(exc)
         runtime_identity.update(
             {
                 "native_execution_capability": (
@@ -2146,6 +2155,7 @@ def verify_remote_clio_kit_native_execution_component(
     for field in (
         "artifact_identity_verified",
         "command_matches_receipt",
+        "locked_server_runtime_verified",
         "native_execution_capability_verified",
     ):
         if runtime.get(field) is not True:

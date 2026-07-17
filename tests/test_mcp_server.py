@@ -1405,6 +1405,51 @@ def test_mcp_submit_mcp_call_creates_real_job_with_arguments(tmp_path: Path) -> 
     assert job.spec.timeout_seconds == 60
 
 
+def test_generic_mcp_default_idempotency_key_excludes_builtin_jarvis_marker(
+    tmp_path: Path,
+) -> None:
+    """Keep generic MCP call identity stable when the built-in marker is absent."""
+    queue = ClioCoreQueue(tmp_path / "core")
+    tool_arguments = {"case": "site-simulation", "steps": 100}
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 221,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_submit_mcp_call",
+                "arguments": {
+                    "cluster": "test-cluster",
+                    "server": "remote-tool-server",
+                    "server_args": ["--stdio"],
+                    "tool": "run",
+                    "arguments": tool_arguments,
+                },
+            },
+        },
+        queue=queue,
+    )
+
+    assert response is not None
+    job = queue.get_job(response["result"]["structuredContent"]["job_id"])
+    argument_digest = hashlib.sha256(
+        json.dumps(tool_arguments, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    expected_identity: dict[str, object] = {
+        "cluster": "test-cluster",
+        "server": "remote-tool-server",
+        "server_args": ["--stdio"],
+        "env_from": {},
+        "expected_server_artifact_digest": None,
+        "tool": "run",
+        "arguments_digest": argument_digest,
+        "timeout_seconds": None,
+    }
+    assert job.idempotency_key == (
+        "mcp:mcp-call:" + mcp_server_module._stable_digest(expected_identity)
+    )
+
+
 def test_mcp_call_jarvis_mcp_uses_builtin_cluster_command(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path / "core")
 
@@ -1434,6 +1479,9 @@ def test_mcp_call_jarvis_mcp_uses_builtin_cluster_command(tmp_path: Path) -> Non
     assert job.spec.server_args == ["mcp-server", "jarvis"]
     assert job.spec.tool == "jarvis_describe"
     assert job.spec.arguments == {"target": "packages"}
+    assert job.spec.expected_jarvis_cd_lock_binding == (
+        mcp_server_module.jarvis_cd_lock_binding_expectation()
+    )
 
 
 def test_mcp_virtual_jarvis_tool_routes_to_cluster_mcp(

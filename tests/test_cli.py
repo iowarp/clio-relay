@@ -27,7 +27,10 @@ from clio_relay.cluster_config import (
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
 from clio_relay.jarvis_mcp import (
+    CLIO_KIT_JARVIS_MCP_VERSION,
+    CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
+    jarvis_cd_lock_binding_expectation,
     jarvis_user_contract,
 )
 from clio_relay.models import (
@@ -88,6 +91,40 @@ def _write_test_cluster(
             )
         }
     ).save(root / ".clio-relay" / "clusters.json")
+
+
+def _verified_jarvis_nested_runtime() -> dict[str, object]:
+    """Return complete discovery evidence for the relay's built-in JARVIS child."""
+    expected = jarvis_cd_lock_binding_expectation()
+    return {
+        "schema_version": "clio-kit.locked-server.v4",
+        "server_name": "jarvis",
+        "persistent_tool": True,
+        "locked_runtime_verified": True,
+        "jarvis_cd_lock_binding": {
+            "schema_version": "clio-relay.jarvis-cd-lock-binding.v1",
+            "dependency": "jarvis-cd",
+            "verified": True,
+            "error": None,
+            "expected_version": expected["version"],
+            "expected_url": expected["url"],
+            "expected_sha256": expected["sha256"],
+            "observed_version": expected["version"],
+            "observed_source_url": expected["url"],
+            "observed_wheel_url": expected["url"],
+            "observed_wheel_sha256": expected["sha256"],
+            "jarvis_mcp_package_entry_count": 1,
+            "resolved_dependency_entry_count": 1,
+            "observed_resolved_dependency_entries": [{"name": "jarvis-cd"}],
+            "metadata_requirement_entry_count": 1,
+            "observed_metadata_requirement_entries": [
+                {"name": "jarvis-cd", "url": expected["url"]}
+            ],
+            "observed_metadata_requirement_urls": [expected["url"]],
+            "package_entry_count": 1,
+            "wheel_entry_count": 1,
+        },
+    }
 
 
 def _write_passing_validation_report(
@@ -2247,11 +2284,13 @@ def test_cli_remote_teardown_writes_closure_only_in_remote_authoritative_core(
         return
 
     monkeypatch.setattr(cli, "_attach_verified_remote_worker", skip_worker_verification)
-    monkeypatch.setattr(
-        cli,
-        "_observe_worker_before_cleanup",
-        lambda _definition: (None, None),
-    )
+
+    def observe_no_worker(
+        _definition: ClusterDefinition,
+    ) -> tuple[None, None]:
+        return None, None
+
+    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", observe_no_worker)
 
     result = CliRunner().invoke(
         app,
@@ -5467,6 +5506,7 @@ def test_cli_jarvis_mcp_call_uses_builtin_cluster_command(
     assert job.spec.server_args == ["mcp-server", "jarvis"]
     assert job.spec.env_from == {"JARVIS_MCP_SPACK_COMMAND": "JARVIS_MCP_SPACK_COMMAND"}
     assert job.spec.tool == "jarvis_describe"
+    assert job.spec.expected_jarvis_cd_lock_binding == jarvis_cd_lock_binding_expectation()
     assert job.spec.arguments == {"target": "packages"}
 
 
@@ -5571,10 +5611,19 @@ def test_jarvis_discovery_persists_exact_durable_artifact_bytes(
     server_artifact: dict[str, object] = {
         "verified": True,
         "server_process_artifact_verified": True,
+        "install_source": "uv-tool",
+        "install_artifact_sha256": CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
         "executable": {
             "path": "/opt/clio-kit/bin/clio-kit",
             "sha256": "a" * 64,
         },
+        "python_distribution_runtime": {
+            "distribution": "clio-kit",
+            "distribution_version": CLIO_KIT_JARVIS_MCP_VERSION,
+            "entry_point": "clio-kit",
+            "runtime_closure_verified": True,
+        },
+        "nested_runtime": _verified_jarvis_nested_runtime(),
     }
     result: dict[str, object] = {
         "server": "clio-kit",
@@ -5599,6 +5648,7 @@ def test_jarvis_discovery_persists_exact_durable_artifact_bytes(
         "protocol_version": "2024-11-05",
         "server_info": {"name": "clio-kit", "version": "2.5.0"},
         "server_artifact": server_artifact,
+        "expected_jarvis_cd_lock_binding": jarvis_cd_lock_binding_expectation(),
         "returncode": 0,
         "stdout": "",
         "stderr": "",
@@ -5628,6 +5678,112 @@ def test_jarvis_discovery_persists_exact_durable_artifact_bytes(
     assert entry.schema_digest == CLIO_KIT_JARVIS_USER_CONTRACT_SHA256
     assert entry.provenance.artifact_sha256 == artifact_sha256
     assert binding
+
+    unmarked = dict(result)
+    unmarked.pop("expected_jarvis_cd_lock_binding")
+    unmarked_payload = (json.dumps(unmarked, indent=2) + "\n").encode()
+    with pytest.raises(RelayError, match="did not enforce the relay JARVIS-CD lock pin"):
+        cli._persist_jarvis_remote_contract_discovery(  # pyright: ignore[reportPrivateUsage]
+            cluster="ares",
+            discovery_job_id="job_unmarked",
+            result=unmarked,
+            artifacts=[
+                {
+                    "artifact_id": "artifact_unmarked",
+                    "kind": "mcp_result",
+                    "sha256": hashlib.sha256(unmarked_payload).hexdigest(),
+                }
+            ],
+            artifact_payload=unmarked_payload,
+        )
+
+    mismatched_payload = unmarked_payload
+    with pytest.raises(RelayError, match="did not match its durable mcp_result artifact"):
+        cli._persist_jarvis_remote_contract_discovery(  # pyright: ignore[reportPrivateUsage]
+            cluster="ares",
+            discovery_job_id="job_mismatched_payload",
+            result=result,
+            artifacts=[
+                {
+                    "artifact_id": "artifact_mismatched_payload",
+                    "kind": "mcp_result",
+                    "sha256": hashlib.sha256(mismatched_payload).hexdigest(),
+                }
+            ],
+            artifact_payload=mismatched_payload,
+        )
+
+    stale = entry.model_copy(deep=True)
+    nested = cast(
+        dict[str, object],
+        stale.provenance.server_artifact["nested_runtime"],
+    )
+    nested.pop("jarvis_cd_lock_binding")
+    with pytest.raises(ValueError, match="run jarvis-mcp-refresh"):
+        cli.jarvis_mcp_artifact_binding_from_entry(stale)
+
+    wrong_outer_version = entry.model_copy(deep=True)
+    python_runtime = cast(
+        dict[str, object],
+        wrong_outer_version.provenance.server_artifact["python_distribution_runtime"],
+    )
+    python_runtime["distribution_version"] = "0.0.0"
+    with pytest.raises(ValueError, match="run jarvis-mcp-refresh"):
+        cli.jarvis_mcp_artifact_binding_from_entry(wrong_outer_version)
+
+    wrong_outer_hash = entry.model_copy(deep=True)
+    wrong_outer_hash.provenance.server_artifact["install_artifact_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="run jarvis-mcp-refresh"):
+        cli.jarvis_mcp_artifact_binding_from_entry(wrong_outer_hash)
+
+
+def test_jarvis_discovery_rejects_ambiguous_mcp_result_artifacts(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A retry cannot make an earlier MCP result the implicit discovery authority."""
+    definition = ClusterDefinition(name="configured-target", ssh_host="cluster.example")
+
+    def duplicate_results(
+        _definition: ClusterDefinition,
+        _job_id: str,
+    ) -> list[dict[str, object]]:
+        return [
+            {"artifact_id": "artifact-first", "kind": "mcp_result"},
+            {"artifact_id": "artifact-retry", "kind": "mcp_result"},
+        ]
+
+    monkeypatch.setattr(cli, "_remote_artifact_records", duplicate_results)
+
+    with pytest.raises(RelayError, match="durable artifact authority is ambiguous"):
+        cli._read_remote_mcp_result_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            definition,
+            "job-retried-discovery",
+        )
+
+
+def test_local_jarvis_discovery_rejects_ambiguous_mcp_result_artifacts(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Local mode applies the same unique durable authority as remote mode."""
+    queue = ClioCoreQueue(tmp_path / "core")
+
+    def duplicate_results(
+        _queue: ClioCoreQueue,
+        _job_id: str,
+    ) -> list[dict[str, object]]:
+        return [
+            {"artifact_id": "artifact-first", "kind": "mcp_result"},
+            {"artifact_id": "artifact-retry", "kind": "mcp_result"},
+        ]
+
+    monkeypatch.setattr(cli, "_complete_local_artifact_records", duplicate_results)
+
+    with pytest.raises(RelayError, match="durable artifact authority is ambiguous"):
+        cli._read_local_mcp_result_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            queue,
+            "job-retried-local-discovery",
+        )
 
 
 def test_cli_remote_jarvis_call_defers_artifact_selection_to_target(
@@ -5719,6 +5875,7 @@ def test_target_side_jarvis_discovery_uses_receipt_without_cluster_registry(
     assert isinstance(job.spec, McpCallSpec)
     assert job.spec.operation.value == "tools/list"
     assert job.spec.tool is None
+    assert job.spec.expected_jarvis_cd_lock_binding == jarvis_cd_lock_binding_expectation()
 
 
 def test_cli_mcp_call_reads_arguments_json_file(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

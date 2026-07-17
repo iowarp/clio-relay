@@ -15,6 +15,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.jarvis_mcp import (
+    jarvis_cd_lock_binding_expectation,
+    jarvis_mcp_server_artifact_binding_verified,
+)
 from clio_relay.models import (
     ArtifactRef,
     JobKind,
@@ -518,6 +522,8 @@ def _validate_source_job(job: RelayJob, *, definition: ClusterDefinition) -> Mcp
         raise ValueError(
             "jarvis_get_execution service source must set include_service_runtimes=true"
         )
+    if job.spec.expected_jarvis_cd_lock_binding != jarvis_cd_lock_binding_expectation():
+        raise ValueError("JARVIS service source did not enforce the relay JARVIS-CD lock pin")
     if job.spec.expected_server_artifact_digest is None:
         raise ValueError("JARVIS service source is not bound to a discovered server artifact")
     return job.spec
@@ -538,11 +544,18 @@ def _validate_mcp_result(
         or document.get("env_from") != spec.env_from
     ):
         raise ValueError("JARVIS MCP result route did not match its durable relay job")
+    if document.get("expected_jarvis_cd_lock_binding") != spec.expected_jarvis_cd_lock_binding:
+        raise ValueError("JARVIS MCP result JARVIS-CD lock pin did not match")
     if (
         document.get("expected_server_artifact_digest") != spec.expected_server_artifact_digest
         or document.get("observed_server_artifact_digest") != spec.expected_server_artifact_digest
     ):
         raise ValueError("JARVIS MCP result server artifact binding did not match")
+    if not jarvis_mcp_server_artifact_binding_verified(
+        document.get("server_artifact"),
+        expected_digest=spec.expected_server_artifact_digest,
+    ):
+        raise ValueError("JARVIS MCP result server artifact identity is not the exact release pin")
     if (
         document.get("returncode") != 0
         or document.get("timed_out") is True

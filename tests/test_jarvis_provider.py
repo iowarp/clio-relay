@@ -21,6 +21,7 @@ from clio_relay import jarvis_provider
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.jarvis_execution import sanitized_jarvis_environment
+from clio_relay.jarvis_mcp import jarvis_cd_lock_binding_expectation
 from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.models import JarvisRunSpec, JobKind, McpCallSpec, RelayJob, RemoteAgentTaskSpec
 
@@ -466,6 +467,7 @@ def test_mcp_call_yaml_generation() -> None:
                 "jarvis",
             ],
             env_from={"SCIENCE_TOKEN": "SITE_SCIENCE_TOKEN"},
+            expected_jarvis_cd_lock_binding=jarvis_cd_lock_binding_expectation(),
             tool="inspect",
             arguments={"path": "x"},
         )
@@ -483,6 +485,7 @@ def test_mcp_call_yaml_generation() -> None:
         "jarvis",
     ]
     assert package["env_from"] == {"SCIENCE_TOKEN": "SITE_SCIENCE_TOKEN"}
+    assert package["expected_jarvis_cd_lock_binding"] == jarvis_cd_lock_binding_expectation()
     assert package["tool"] == "inspect"
     assert package["arguments"] == {"path": "x"}
 

@@ -161,6 +161,7 @@ class JarvisCdProvider:
                     "server_args": spec.server_args or None,
                     "env_from": spec.env_from or None,
                     "expected_server_artifact_digest": spec.expected_server_artifact_digest,
+                    "expected_jarvis_cd_lock_binding": spec.expected_jarvis_cd_lock_binding,
                     "operation": spec.operation.value,
                     "tool": spec.tool,
                     "arguments": spec.arguments or None,

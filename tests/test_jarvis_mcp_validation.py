@@ -6,7 +6,10 @@ from typing import Any, cast
 import pytest
 
 from clio_relay.jarvis_mcp import (
+    CLIO_KIT_JARVIS_MCP_VERSION,
+    CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
+    jarvis_cd_lock_binding_expectation,
     jarvis_mcp_server,
     jarvis_mcp_server_args,
     jarvis_user_contract,
@@ -216,6 +219,57 @@ def test_jarvis_mcp_validation_rejects_unattested_nested_server_process() -> Non
     assert server_check.status == ValidationStatus.FAILED
 
 
+def test_jarvis_mcp_validation_rejects_missing_builtin_lock_marker() -> None:
+    """The release gate must prove pre-launch JARVIS-CD enforcement was active."""
+    inputs = _acceptance_inputs()
+    mcp_result = cast(dict[str, Any], inputs["mcp_result"])
+    mcp_result.pop("expected_jarvis_cd_lock_binding")
+
+    report = build_jarvis_mcp_validation_report(**inputs)
+
+    server_check = next(
+        check for check in report.checks if check.check_id == "remote-mcp.server-artifact"
+    )
+    assert report.status == ValidationStatus.FAILED
+    assert server_check.status == ValidationStatus.FAILED
+
+
+@pytest.mark.parametrize("binding_state", ["missing", "unverified"])
+def test_jarvis_mcp_validation_rejects_invalid_nested_lock_binding(
+    binding_state: str,
+) -> None:
+    """A coherent outer artifact digest cannot replace independent nested pin proof."""
+    inputs = _acceptance_inputs()
+    mcp_result = cast(dict[str, Any], inputs["mcp_result"])
+    server_artifact = cast(dict[str, Any], mcp_result["server_artifact"])
+    nested_runtime = cast(dict[str, Any], server_artifact["nested_runtime"])
+    if binding_state == "missing":
+        nested_runtime.pop("jarvis_cd_lock_binding")
+    else:
+        binding = cast(dict[str, Any], nested_runtime["jarvis_cd_lock_binding"])
+        binding["verified"] = False
+        binding["error"] = "synthetic nested binding failure"
+    _rebind_acceptance_server_artifact(inputs, server_artifact)
+
+    report = build_jarvis_mcp_validation_report(**inputs)
+
+    server_check = next(
+        check for check in report.checks if check.check_id == "remote-mcp.server-artifact"
+    )
+    package_search = next(
+        check for check in report.checks if check.check_id == "remote-mcp.jarvis-package-search"
+    )
+    execution_query = next(
+        check for check in report.checks if check.check_id == "remote-mcp.jarvis-execution-query"
+    )
+    assert server_check.status == ValidationStatus.FAILED
+    assert package_search.evidence[0].metadata["assertions"]["server_artifact_binding"] is False
+    assert (
+        execution_query.evidence[0].metadata["assertions"]["server_artifact_binding_verified"]
+        is False
+    )
+
+
 def test_jarvis_mcp_validation_rejects_released_contract_drift() -> None:
     inputs = _acceptance_inputs()
     discovery = cast(dict[str, Any], inputs["remote_tools_list_result"])
@@ -403,6 +457,7 @@ def _acceptance_inputs() -> dict[str, Any]:
     execution_id = "jarvis-execution-acceptance"
     server_artifact = _jarvis_server_artifact()
     server_artifact_digest = remote_mcp_server_artifact_digest(server_artifact)
+    expected_jarvis_cd_lock_binding = jarvis_cd_lock_binding_expectation()
     local_run = next(
         tool
         for tool in virtual_jarvis_tool_definitions(clusters=["ares"])
@@ -464,6 +519,7 @@ def _acceptance_inputs() -> dict[str, Any]:
                         "spack_specs": ["lammps"],
                     },
                     "expected_server_artifact_digest": server_artifact_digest,
+                    "expected_jarvis_cd_lock_binding": expected_jarvis_cd_lock_binding,
                 },
             },
             "terminal": True,
@@ -474,6 +530,7 @@ def _acceptance_inputs() -> dict[str, Any]:
             "operation": "tools/call",
             "tool": "jarvis_run",
             "expected_server_artifact_digest": server_artifact_digest,
+            "expected_jarvis_cd_lock_binding": expected_jarvis_cd_lock_binding,
             "observed_server_artifact_digest": server_artifact_digest,
             "server_artifact": server_artifact,
             "package_progress_bridge": {
@@ -604,6 +661,7 @@ def _acceptance_inputs() -> dict[str, Any]:
                         "artifacts": {"page_size": 25},
                     },
                     "expected_server_artifact_digest": server_artifact_digest,
+                    "expected_jarvis_cd_lock_binding": expected_jarvis_cd_lock_binding,
                 },
             },
             "terminal": True,
@@ -659,6 +717,7 @@ def _acceptance_inputs() -> dict[str, Any]:
                         "page_size": 5,
                     },
                     "expected_server_artifact_digest": server_artifact_digest,
+                    "expected_jarvis_cd_lock_binding": expected_jarvis_cd_lock_binding,
                 },
             },
             "terminal": True,
@@ -678,6 +737,7 @@ def _acceptance_inputs() -> dict[str, Any]:
             "tool": "jarvis_describe",
             "protocol_error": None,
             "expected_server_artifact_digest": server_artifact_digest,
+            "expected_jarvis_cd_lock_binding": expected_jarvis_cd_lock_binding,
             "observed_server_artifact_digest": server_artifact_digest,
             "server_artifact": server_artifact,
             "structured_result": {
@@ -702,6 +762,30 @@ def _acceptance_inputs() -> dict[str, Any]:
         "package_search_initialize_response": None,
         "package_search_stdio_evidence": None,
     }
+
+
+def _rebind_acceptance_server_artifact(
+    inputs: dict[str, Any],
+    server_artifact: dict[str, Any],
+) -> None:
+    """Keep every synthetic digest coherent after mutating shared server evidence."""
+    digest = remote_mcp_server_artifact_digest(server_artifact)
+    for status_name in ("call_status", "package_search_call_status", "query_call_status"):
+        status = cast(dict[str, Any], inputs[status_name])
+        job = cast(dict[str, Any], status["job"])
+        spec = cast(dict[str, Any], job["spec"])
+        spec["expected_server_artifact_digest"] = digest
+    for result_name in ("mcp_result", "package_search_mcp_result", "query_mcp_result"):
+        result = cast(dict[str, Any], inputs[result_name])
+        result["expected_server_artifact_digest"] = digest
+        result["observed_server_artifact_digest"] = digest
+    main_result = cast(dict[str, Any], inputs["mcp_result"])
+    bridge = cast(dict[str, Any], main_result["package_progress_bridge"])
+    bridge["expected_server_artifact_digest"] = digest
+    bridge["observed_server_artifact_digest"] = digest
+    for raw_record in cast(list[dict[str, Any]], inputs["progress"]):
+        metadata = cast(dict[str, Any], raw_record["metadata"])
+        metadata["server_artifact_digest"] = digest
 
 
 def _mcp_progress_records(
@@ -826,6 +910,7 @@ def _execution_query_mcp_result(
         "protocol_error": None,
         "structured_result": structured,
         "expected_server_artifact_digest": server_artifact_digest,
+        "expected_jarvis_cd_lock_binding": jarvis_cd_lock_binding_expectation(),
         "observed_server_artifact_digest": server_artifact_digest,
         "server_artifact": server_artifact,
         "result_validation": {
@@ -915,7 +1000,8 @@ def _native_execution_documents(execution_id: str) -> dict[str, object]:
 
 
 def _jarvis_server_artifact() -> dict[str, object]:
-    install_spec = "/opt/wheels/clio_kit-2.3.1-py3-none-any.whl"
+    install_spec = f"/opt/wheels/clio_kit-{CLIO_KIT_JARVIS_MCP_VERSION}-py3-none-any.whl"
+    expected = jarvis_cd_lock_binding_expectation()
     return {
         "requested_command": jarvis_mcp_server(),
         "resolved_executable": "/home/user/.local/bin/clio-kit",
@@ -927,12 +1013,12 @@ def _jarvis_server_artifact() -> dict[str, object]:
         },
         "install_spec": install_spec,
         "install_source": "uv-tool",
-        "install_artifact_sha256": "d" * 64,
+        "install_artifact_sha256": CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
         "input_files": [
             {
                 "path": install_spec,
-                "filename": "clio_kit-2.3.1-py3-none-any.whl",
-                "sha256": "d" * 64,
+                "filename": f"clio_kit-{CLIO_KIT_JARVIS_MCP_VERSION}-py3-none-any.whl",
+                "sha256": CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
                 "size_bytes": 3,
             }
         ],
@@ -940,10 +1026,10 @@ def _jarvis_server_artifact() -> dict[str, object]:
         "python_distribution_runtime": {
             "schema_version": "clio-relay.python-distribution-runtime.v1",
             "distribution": "clio-kit",
-            "distribution_version": "2.3.1",
+            "distribution_version": CLIO_KIT_JARVIS_MCP_VERSION,
             "entry_point": "clio-kit",
             "runtime_closure_verified": True,
-            "direct_url": {"url": "file:///opt/wheels/clio_kit-2.3.1-py3-none-any.whl"},
+            "direct_url": {"url": f"file://{install_spec}"},
         },
         "nested_launcher": True,
         "nested_runtime": {
@@ -951,6 +1037,29 @@ def _jarvis_server_artifact() -> dict[str, object]:
             "server_name": "jarvis",
             "persistent_tool": True,
             "locked_runtime_verified": True,
+            "jarvis_cd_lock_binding": {
+                "schema_version": "clio-relay.jarvis-cd-lock-binding.v1",
+                "dependency": "jarvis-cd",
+                "verified": True,
+                "error": None,
+                "expected_version": expected["version"],
+                "expected_url": expected["url"],
+                "expected_sha256": expected["sha256"],
+                "observed_version": expected["version"],
+                "observed_source_url": expected["url"],
+                "observed_wheel_url": expected["url"],
+                "observed_wheel_sha256": expected["sha256"],
+                "jarvis_mcp_package_entry_count": 1,
+                "resolved_dependency_entry_count": 1,
+                "observed_resolved_dependency_entries": [{"name": "jarvis-cd"}],
+                "metadata_requirement_entry_count": 1,
+                "observed_metadata_requirement_entries": [
+                    {"name": "jarvis-cd", "url": expected["url"]}
+                ],
+                "observed_metadata_requirement_urls": [expected["url"]],
+                "package_entry_count": 1,
+                "wheel_entry_count": 1,
+            },
         },
         "server_process_artifact_verified": True,
         "identity_error": None,

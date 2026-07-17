@@ -49,7 +49,9 @@ from clio_relay.models import (
 from clio_relay.progress_adapters import package_progress_adapter_from_pipeline
 from clio_relay.queue_management import cleanup_stale_jobs, diagnose_job
 from clio_relay.relay_ops import cancel_job
+from clio_relay.remote_mcp import remote_mcp_server_artifact_digest
 from clio_relay.runtime_metadata import runtime_sidecar_record
+from tests.jarvis_mcp_fakes import verified_jarvis_server_artifact
 from tests.plugin_fakes import SiteSimulationProgressAdapter, install_site_progress_plugin
 
 
@@ -2972,6 +2974,9 @@ def test_virtual_jarvis_progress_is_visible_while_outer_job_is_running(
                 server=command[0],
                 server_args=command[1:],
                 expected_server_artifact_digest=digest,
+                expected_jarvis_cd_lock_binding=(
+                    endpoint_module.jarvis_cd_lock_binding_expectation()
+                ),
                 tool="jarvis_run",
                 arguments={"pipeline_id": "pipeline-live"},
             ),
@@ -3069,6 +3074,9 @@ def test_virtual_jarvis_progress_rejects_provider_identity_mismatch(
                 server=command[0],
                 server_args=command[1:],
                 expected_server_artifact_digest=digest,
+                expected_jarvis_cd_lock_binding=(
+                    endpoint_module.jarvis_cd_lock_binding_expectation()
+                ),
                 tool="jarvis_run",
                 arguments={"pipeline_id": "pipeline-live"},
             ),
@@ -3158,6 +3166,9 @@ def test_virtual_jarvis_native_progress_accepts_indeterminate_event_without_adap
                 server=command[0],
                 server_args=command[1:],
                 expected_server_artifact_digest=digest,
+                expected_jarvis_cd_lock_binding=(
+                    endpoint_module.jarvis_cd_lock_binding_expectation()
+                ),
                 tool="jarvis_run",
                 arguments={"pipeline_id": "pipeline-live"},
             ),
@@ -3306,6 +3317,7 @@ def _native_mcp_result_document(
     command: list[str],
     digest: str,
     pipeline_id: str,
+    server_artifact: dict[str, Any],
 ) -> dict[str, object]:
     execution_id = f"{pipeline_id}-execution"
     handle: dict[str, object] = {
@@ -3397,7 +3409,9 @@ def _native_mcp_result_document(
         "server": command[0],
         "server_args": command[1:],
         "expected_server_artifact_digest": digest,
+        "expected_jarvis_cd_lock_binding": (endpoint_module.jarvis_cd_lock_binding_expectation()),
         "observed_server_artifact_digest": digest,
+        "server_artifact": server_artifact,
         "operation": "tools/call",
         "tool": "jarvis_run",
         "arguments": {"pipeline_id": pipeline_id},
@@ -5601,27 +5615,26 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
 ) -> None:
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
-    server_args = [
-        "--from",
-        "clio-kit==2.3.1",
-        "clio-kit",
-        "mcp-server",
-        "jarvis",
-    ]
-    digest = "c" * 64
+    command = ["clio-kit", "mcp-server", "jarvis"]
+    server_args = command[1:]
+    server_artifact = verified_jarvis_server_artifact()
+    digest = remote_mcp_server_artifact_digest(server_artifact)
     monkeypatch.setattr(
         endpoint_module,
         "jarvis_mcp_command",
-        lambda: ["uvx", *server_args],
+        lambda: command,
     )
     job = queue.submit_job(
         RelayJob(
             cluster="research-cluster",
             kind=JobKind.MCP_CALL,
             spec=McpCallSpec(
-                server="uvx",
+                server=command[0],
                 server_args=server_args,
                 expected_server_artifact_digest=digest,
+                expected_jarvis_cd_lock_binding=(
+                    endpoint_module.jarvis_cd_lock_binding_expectation()
+                ),
                 tool="jarvis_run",
                 arguments={"pipeline_id": "runtime-test"},
             ),
@@ -5655,10 +5668,14 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
             (cwd / "mcp-result.json").write_text(
                 json.dumps(
                     {
-                        "server": "uvx",
+                        "server": command[0],
                         "server_args": server_args,
                         "expected_server_artifact_digest": digest,
+                        "expected_jarvis_cd_lock_binding": (
+                            endpoint_module.jarvis_cd_lock_binding_expectation()
+                        ),
                         "observed_server_artifact_digest": digest,
+                        "server_artifact": server_artifact,
                         "operation": "tools/call",
                         "tool": "jarvis_run",
                         "arguments": {"pipeline_id": "runtime-test"},
@@ -5774,7 +5791,8 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     command = ["locked-clio-kit", "mcp-server", "jarvis"]
-    digest = "d" * 64
+    server_artifact = verified_jarvis_server_artifact()
+    digest = remote_mcp_server_artifact_digest(server_artifact)
     monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
     job = queue.submit_job(
         RelayJob(
@@ -5784,6 +5802,9 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
                 server=command[0],
                 server_args=command[1:],
                 expected_server_artifact_digest=digest,
+                expected_jarvis_cd_lock_binding=(
+                    endpoint_module.jarvis_cd_lock_binding_expectation()
+                ),
                 tool="jarvis_run",
                 arguments={"pipeline_id": "native-direct"},
             ),
@@ -5819,6 +5840,7 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
                         command=command,
                         digest=digest,
                         pipeline_id="native-direct",
+                        server_artifact=server_artifact,
                     )
                 ),
                 encoding="utf-8",
@@ -5922,6 +5944,190 @@ def test_worker_refuses_runtime_identity_from_unconfigured_jarvis_named_tool() -
     assert reason == "MCP command does not match the configured JARVIS server"
 
 
+def test_generic_jarvis_named_mcp_result_is_ignored_before_native_validation(
+    tmp_path: Path,
+) -> None:
+    """Operator MCP tools do not acquire built-in JARVIS parsing semantics by name."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="research-cluster",
+            kind=JobKind.MCP_CALL,
+            spec=McpCallSpec(
+                server="operator-mcp",
+                tool="jarvis_run",
+                arguments={"pipeline_id": "operator-pipeline"},
+            ),
+            idempotency_key="generic-jarvis-shaped-result",
+        )
+    )
+
+    class GenericProvider(RecordingProvider):
+        def run_pipeline_streaming(
+            self,
+            pipeline_path: Path,
+            *,
+            cwd: Path | None = None,
+            env: dict[str, str] | None = None,
+            on_stdout: Callable[[str], None] | None = None,
+            on_stderr: Callable[[str], None] | None = None,
+            on_start: Callable[[int], None] | None = None,
+            should_cancel: Callable[[], bool] | None = None,
+            on_poll: Callable[[], None] | None = None,
+            timeout_seconds: int | None = None,
+            on_timeout: Callable[[], None] | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            del pipeline_path, env, on_stdout, on_stderr, should_cancel, on_poll
+            del timeout_seconds, on_timeout
+            assert cwd is not None
+            if on_start is not None:
+                on_start(702)
+            (cwd / "mcp-result.json").write_text(
+                json.dumps(
+                    {
+                        "server": "operator-mcp",
+                        "server_args": [],
+                        "operation": "tools/call",
+                        "tool": "jarvis_run",
+                        "arguments": {"pipeline_id": "operator-pipeline"},
+                        "structured_result": {
+                            "runtime_metadata": {"schema_version": "not-a-jarvis-runtime"}
+                        },
+                        "returncode": 0,
+                        "timed_out": False,
+                        "protocol_error": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(["operator-mcp"], 0, "", "")
+
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="research-cluster",
+        queue=queue,
+        provider=GenericProvider(),
+    )
+
+    result = worker.run_once()
+    task = queue.list_tasks(job.job_id)[0]
+    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=100)
+
+    assert result is not None
+    assert result.state is JobState.SUCCEEDED
+    assert "runtime_metadata" not in task.metadata
+    assert "runtime.metadata_refused" not in {event.event_type for event in events}
+
+
+def test_trusted_jarvis_mcp_result_requires_content_derived_server_digest(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Self-reported digests cannot substitute for the persisted artifact document."""
+    command = ["clio-kit", "mcp-server", "jarvis"]
+    claimed_digest = "f" * 64
+    expected_lock = endpoint_module.jarvis_cd_lock_binding_expectation()
+    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    job = RelayJob(
+        cluster="research-cluster",
+        kind=JobKind.MCP_CALL,
+        spec=McpCallSpec(
+            server=command[0],
+            server_args=command[1:],
+            expected_server_artifact_digest=claimed_digest,
+            expected_jarvis_cd_lock_binding=expected_lock,
+            tool="jarvis_run",
+            arguments={"pipeline_id": "owned"},
+        ),
+        idempotency_key="self-reported-server-digest",
+    )
+    document: dict[str, object] = {
+        "server": command[0],
+        "server_args": command[1:],
+        "env_from": {},
+        "expected_jarvis_cd_lock_binding": expected_lock,
+        "expected_server_artifact_digest": claimed_digest,
+        "observed_server_artifact_digest": claimed_digest,
+        "server_artifact": verified_jarvis_server_artifact(),
+        "operation": "tools/call",
+        "tool": "jarvis_run",
+        "arguments": {"pipeline_id": "owned"},
+        "returncode": 0,
+        "timed_out": False,
+        "protocol_error": None,
+        "protocol_result": {"structuredContent": {"runtime_metadata": {}}},
+    }
+
+    trusted, reason = cast(Any, endpoint_module)._trusted_jarvis_mcp_result(job, document)
+
+    assert trusted is False
+    assert reason == "MCP result server artifact identity is not the exact relay release pin"
+
+
+def test_worker_refuses_builtin_semantics_without_jarvis_lock_marker(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A generic JARVIS call cannot unlock built-in progress/runtime handling."""
+    command = ["clio-kit", "mcp-server", "jarvis"]
+    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    job = RelayJob(
+        cluster="research-cluster",
+        kind=JobKind.MCP_CALL,
+        spec=McpCallSpec(
+            server=command[0],
+            server_args=command[1:],
+            expected_server_artifact_digest="a" * 64,
+            tool="jarvis_run",
+            arguments={"pipeline_id": "operator-pipeline"},
+        ),
+        idempotency_key="generic-jarvis-route",
+    )
+
+    trusted, reason = cast(Any, endpoint_module)._trusted_jarvis_mcp_route(job)
+
+    assert trusted is False
+    assert reason == "MCP call did not enforce the relay JARVIS-CD lock pin"
+
+
+def test_worker_refuses_result_with_mismatched_jarvis_lock_marker(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Built-in result evidence must carry the same lock marker as its job."""
+    command = ["clio-kit", "mcp-server", "jarvis"]
+    expected = endpoint_module.jarvis_cd_lock_binding_expectation()
+    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    job = RelayJob(
+        cluster="research-cluster",
+        kind=JobKind.MCP_CALL,
+        spec=McpCallSpec(
+            server=command[0],
+            server_args=command[1:],
+            expected_server_artifact_digest="a" * 64,
+            expected_jarvis_cd_lock_binding=expected,
+            tool="jarvis_run",
+            arguments={"pipeline_id": "owned"},
+        ),
+        idempotency_key="mismatched-jarvis-lock-result",
+    )
+
+    trusted, reason = cast(Any, endpoint_module)._trusted_jarvis_mcp_result(
+        job,
+        {
+            "server": command[0],
+            "server_args": command[1:],
+            "env_from": {},
+            "expected_jarvis_cd_lock_binding": None,
+            "operation": "tools/call",
+            "tool": "jarvis_run",
+            "arguments": {"pipeline_id": "owned"},
+        },
+    )
+
+    assert trusted is False
+    assert reason == "MCP result JARVIS-CD lock pin does not match the durable job spec"
+
+
 def test_worker_refuses_runtime_identity_when_result_arguments_do_not_match(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -5945,6 +6151,7 @@ def test_worker_refuses_runtime_identity_when_result_arguments_do_not_match(
             server="uvx",
             server_args=server_args,
             expected_server_artifact_digest=digest,
+            expected_jarvis_cd_lock_binding=(endpoint_module.jarvis_cd_lock_binding_expectation()),
             tool="jarvis_run",
             arguments={"pipeline_id": "owned"},
         ),
@@ -5960,6 +6167,9 @@ def test_worker_refuses_runtime_identity_when_result_arguments_do_not_match(
                 "server_args": server_args,
                 "env_from": {},
                 "expected_server_artifact_digest": digest,
+                "expected_jarvis_cd_lock_binding": (
+                    endpoint_module.jarvis_cd_lock_binding_expectation()
+                ),
                 "observed_server_artifact_digest": digest,
                 "operation": "tools/call",
                 "tool": "jarvis_run",
@@ -6000,6 +6210,7 @@ def test_worker_refuses_stdout_only_jarvis_mcp_runtime_identity(
             server="uvx",
             server_args=server_args,
             expected_server_artifact_digest=digest,
+            expected_jarvis_cd_lock_binding=(endpoint_module.jarvis_cd_lock_binding_expectation()),
             tool="jarvis_run",
             arguments=arguments,
         ),
@@ -6013,6 +6224,9 @@ def test_worker_refuses_stdout_only_jarvis_mcp_runtime_identity(
             "server_args": server_args,
             "env_from": {},
             "expected_server_artifact_digest": digest,
+            "expected_jarvis_cd_lock_binding": (
+                endpoint_module.jarvis_cd_lock_binding_expectation()
+            ),
             "observed_server_artifact_digest": digest,
             "operation": "tools/call",
             "tool": "jarvis_run",

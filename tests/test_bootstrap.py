@@ -185,6 +185,19 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert 'JARVIS_MCP_UV_EXECUTABLE="$(command -v uv)"' in script
     assert '"$JARVIS_MCP_EXECUTABLE" --help' in script
     assert 'JARVIS_MCP_INSTALL_TARGET="$JARVIS_MCP_ARTIFACT_PATH"' in script
+    assert "from clio_relay.mcp_call.runner import mcp_server_artifact_identity" in script
+    assert "clio_kit_server_artifact = mcp_server_artifact_identity(" in script
+    assert "verify_relay_jarvis_cd_lock=True" in script
+    assert 'locked_server_runtime.get("server_name") == "jarvis"' in script
+    assert 'jarvis_cd_lock_binding.get("resolved_dependency_entry_count") == 1' in script
+    assert 'jarvis_cd_lock_binding.get("observed_resolved_dependency_entries")' in script
+    assert 'jarvis_cd_lock_binding.get("observed_version") == expected_jarvis_cd_version' in script
+    assert 'jarvis_cd_lock_binding.get("observed_source_url") == expected_jarvis_cd_url' in script
+    assert (
+        'jarvis_cd_lock_binding.get("observed_wheel_sha256") == expected_jarvis_cd_sha256' in script
+    )
+    assert 'jarvis_cd_lock_binding.get("observed_metadata_requirement_entries")' in script
+    assert "locked_server_runtime=locked_server_runtime" in script
     assert (
         "runtime_artifact_path=(str(component_artifact) if component_artifact else None)" in script
     )
@@ -298,17 +311,23 @@ def test_linux_user_bootstrap_embedded_python_programs_compile() -> None:
         compile(program.group("body"), f"bootstrap:{marker}", "exec")
 
 
-def test_custom_clio_kit_bootstrap_wheel_requires_preinstall_digest() -> None:
+def test_local_clio_kit_bootstrap_wheel_must_match_release_pin() -> None:
     with pytest.raises(ConfigurationError, match="requires its expected wheel SHA-256"):
         render_linux_user_bootstrap_script(
             jarvis_mcp_install_spec="/tmp/clio_kit-2.3.1-py3-none-any.whl"
         )
 
+    with pytest.raises(ConfigurationError, match="requires the released clio-kit wheel"):
+        render_linux_user_bootstrap_script(
+            jarvis_mcp_install_spec="/tmp/clio_kit-2.3.1-py3-none-any.whl",
+            jarvis_mcp_artifact_sha256="d" * 64,
+        )
+
     script = render_linux_user_bootstrap_script(
-        jarvis_mcp_install_spec="/tmp/clio_kit-2.3.1-py3-none-any.whl",
-        jarvis_mcp_artifact_sha256="d" * 64,
+        jarvis_mcp_install_spec=f"/tmp/{CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME}",
+        jarvis_mcp_artifact_sha256=CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
     )
-    assert "JARVIS_MCP_ARTIFACT_SHA256=" + "d" * 64 in script
+    assert "JARVIS_MCP_ARTIFACT_SHA256=" + CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 in script
     assert script.index("JARVIS_MCP_ARTIFACT_SHA256 *$JARVIS_MCP_ARTIFACT_PATH") < (
         script.index("uv tool install --force")
     )
@@ -318,6 +337,12 @@ def test_clio_kit_exact_version_override_requires_its_own_digest() -> None:
     with pytest.raises(ConfigurationError, match="requires its expected wheel SHA-256"):
         render_linux_user_bootstrap_script(
             jarvis_mcp_install_spec=f"clio-kit=={CLIO_KIT_JARVIS_MCP_VERSION}"
+        )
+
+    with pytest.raises(ConfigurationError, match="requires the released clio-kit version"):
+        render_linux_user_bootstrap_script(
+            jarvis_mcp_install_spec="clio-kit==0.0.0",
+            jarvis_mcp_artifact_sha256=CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
         )
 
 

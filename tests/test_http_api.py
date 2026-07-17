@@ -12,6 +12,7 @@ from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError
 from clio_relay.http_api import create_app
+from clio_relay.jarvis_mcp import jarvis_cd_lock_binding_expectation
 from clio_relay.models import (
     ArtifactRef,
     Cursor,
@@ -977,6 +978,7 @@ def test_owned_jarvis_mcp_submission_forwards_desktop_binding_without_remote_cac
     job = queue.get_job(accepted.json()["job_id"])
     assert isinstance(job.spec, McpCallSpec)
     assert job.spec.expected_server_artifact_digest == expected_digest
+    assert job.spec.expected_jarvis_cd_lock_binding == jarvis_cd_lock_binding_expectation()
     assert job.metadata == {
         "owner": "clio-relay",
         "owner_session_id": "desktop-session-1",
@@ -1047,6 +1049,7 @@ def test_unowned_jarvis_mcp_submission_still_validates_operator_cache(
     job = queue.get_job(accepted.json()["job_id"])
     assert isinstance(job.spec, McpCallSpec)
     assert job.spec.expected_server_artifact_digest == expected_digest
+    assert job.spec.expected_jarvis_cd_lock_binding == jarvis_cd_lock_binding_expectation()
 
 
 def test_owned_session_submission_race_with_quiesce_returns_conflict(
