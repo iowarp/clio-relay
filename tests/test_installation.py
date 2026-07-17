@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 from collections.abc import Callable
+from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from clio_relay.installation import (
     INSTALL_RECEIPT_PATH_ENV,
     INSTALL_RECEIPT_SCHEMA,
     ComponentArtifactIdentity,
+    InstallReceipt,
     NativeJarvisExecutionCapability,
     PersistentUvToolIdentity,
     installation_info,
@@ -38,7 +40,12 @@ from clio_relay.jarvis_mcp import (
     jarvis_mcp_command,
     jarvis_user_contract,
 )
-from clio_relay.validation_report import InstallSource, InstallSourceKind, SoftwareIdentity
+from clio_relay.validation_report import (
+    InstallSource,
+    InstallSourceKind,
+    LiveValidationReport,
+    SoftwareIdentity,
+)
 
 
 def _verified_locked_jarvis_runtime() -> dict[str, object]:
@@ -785,6 +792,97 @@ def test_remote_worker_identity_is_bound_to_fresh_running_endpoint(tmp_path: Pat
             expected_software=SoftwareIdentity.model_validate(installation["software"]),
             expected_artifact_sha256=receipt.artifact_sha256,
             expected_source="wheel",
+        )
+
+
+def test_cleanup_report_accepts_exact_pypi_worker_for_wheel_operator() -> None:
+    version = "1.3.12"
+    digest = "d" * 64
+    software = SoftwareIdentity(
+        version=version,
+        commit="8" * 40,
+        tag=f"v{version}",
+        dirty=False,
+    )
+    receipt = InstallReceipt(
+        installed_at=datetime.now(UTC),
+        install_spec=f"clio-relay=={version}",
+        requested_source="pypi",
+        artifact_filename=f"clio_relay-{version}-py3-none-any.whl",
+        artifact_sha256=digest,
+        distribution_version=version,
+        software=software,
+    )
+
+    def worker_info(worker_receipt: InstallReceipt) -> dict[str, object]:
+        installation = {
+            "schema_version": "clio-relay.installation-info.v1",
+            "distribution_version": version,
+            "software": software.model_dump(mode="json"),
+            "receipt": worker_receipt.model_dump(mode="json"),
+            "receipt_origin": "bootstrap",
+            "install_source": None,
+            "receipt_matches_install": True,
+            "component_runtime": {},
+        }
+        return {
+            "schema_version": "clio-relay.worker-runtime-info.v1",
+            "cluster": "ares",
+            "fresh": True,
+            "process_running": True,
+            "identity_matches_current": True,
+            "running": True,
+            "scheduler_provider": "slurm",
+            "endpoint": {
+                "role": "worker",
+                "cluster": "ares",
+                "pid": 123,
+                "metadata": {"scheduler_provider": "slurm"},
+            },
+            "installation": installation,
+            "endpoint_installation": installation,
+            "target_identity": {"verified": True},
+        }
+
+    wheel_url = (
+        "https://github.com/iowarp/clio-relay/releases/download/"
+        f"v{version}/clio_relay-{version}-py3-none-any.whl"
+    )
+    cleanup_report = LiveValidationReport(
+        scenario="cleanup",
+        cluster="ares",
+        software=software,
+        install_source=InstallSource(
+            kind=InstallSourceKind.WHEEL,
+            detected_kind=InstallSourceKind.WHEEL,
+            reference=wheel_url,
+            package_path="/desktop/uv/tools/clio-relay",
+            distribution_version=version,
+            artifact_sha256=digest,
+            direct_url={"url": wheel_url, "archive_info": {}},
+        ),
+    )
+
+    verified = installation_module._verify_report_worker_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cleanup_report,
+        worker_info(receipt),
+    )
+
+    assert verified.requested_source == "pypi"
+    assert verified.artifact_sha256 == cleanup_report.install_source.artifact_sha256
+
+    unpinned = receipt.model_copy(update={"install_spec": f"clio-relay>={version}"})
+    with pytest.raises(ConfigurationError, match="not pinned to the exact release version"):
+        installation_module._verify_report_worker_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cleanup_report,
+            worker_info(unpinned),
+        )
+
+    changed_artifact = receipt.model_copy(update={"artifact_sha256": "e" * 64})
+    with pytest.raises(ConfigurationError, match="wheel SHA-256 does not match"):
+        installation_module._verify_report_worker_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cleanup_report,
+            worker_info(changed_artifact),
         )
 
 
