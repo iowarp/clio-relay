@@ -543,12 +543,28 @@ def virtual_jarvis_tool_definitions(*, clusters: list[str] | None = None) -> lis
                 "items": jarvis_service_runtime_handoff_json_schema(clusters=clusters),
                 "maxItems": 4_096,
             }
+        tool_guidance = ""
+        if remote_tool == "jarvis_get_execution":
+            tool_guidance = (
+                " If this call returns queued, call relay_wait with its exact cluster, job_id, "
+                "and route_revision. The terminal wait returns service_runtime_bindings when "
+                "include_service_runtimes=true; bind one with relay_bind_jarvis_runtime before "
+                "opening a viewer. Never use execution_id as gateway_session_id."
+            )
+        elif remote_tool == "jarvis_add_step":
+            tool_guidance = (
+                " package_search is discovery only. Before add_step, call jarvis_describe with "
+                "target='package' and package_name set to the selected canonical name, then use "
+                "that package-owned settings contract rather than guessing settings."
+            )
         tools.append(
             {
                 "name": virtual_jarvis_tool_name(remote_tool),
                 "description": (
                     f"{definition['description']} Routed through the verified cluster-local "
-                    "clio-kit JARVIS MCP and returned as a durable relay job."
+                    "clio-kit JARVIS MCP and returned as a durable relay job. Preserve the "
+                    "returned cluster, job_id, and route_revision unchanged for every remote "
+                    f"follow-up.{tool_guidance}"
                 ),
                 "inputSchema": input_schema,
                 "outputSchema": output_schema,
@@ -716,9 +732,12 @@ def render_virtual_jarvis_agent_context() -> str:
         "selected canonical package name. "
         "When wait_for_terminal=true, the same JARVIS tool returns a bounded, "
         "artifact-bound mcp_result instead of requiring a second status or log call. "
-        "A completed jarvis_get_execution call with include_service_runtimes=true also "
-        "returns service_runtime_bindings. Pass one item unchanged as the binding argument "
-        "to relay_bind_jarvis_runtime; jarvis_run does not produce these handoffs. "
+        "If a JARVIS call returns queued, call relay_wait with its exact cluster, job_id, and "
+        "route_revision. A completed jarvis_get_execution call with "
+        "include_service_runtimes=true returns service_runtime_bindings either directly or "
+        "from that terminal relay_wait. Pass one item unchanged as the binding argument to "
+        "relay_bind_jarvis_runtime before opening a viewer; jarvis_run does not produce these "
+        "handoffs, and a JARVIS execution_id is never a gateway_session_id. "
         "For later job queries, preserve cluster, job_id, and the opaque 64-character "
         "route_revision from one receipt as a single handle; never substitute a catalog "
         "or dataset revision. "

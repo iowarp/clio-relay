@@ -128,10 +128,334 @@ def test_waited_execution_exposes_compact_verified_binding_before_large_result(
     serialized = mcp_server_module._serialize_tool_result(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         receipt
     )
-    assert serialized.index('"mcp_result_artifact":') < serialized.index(
-        '"service_runtime_bindings":'
+    assert serialized.index('"service_runtime_bindings":') < serialized.index(
+        '"mcp_result_artifact":'
     )
+    assert serialized.index('"mcp_result_artifact":') < serialized.index('"mcp_result":')
+
+
+def test_async_relay_wait_exposes_same_compact_verified_service_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later relay_wait preserves the same artifact-bound bind handoff as an inline wait."""
+    queue, _definition, job, _artifact, envelope = _source_result(tmp_path)
+    queue.update_job_metadata(job.job_id, {"padding": "j" * 90_000})
+    document = json.loads(base64.b64decode(envelope["data"], validate=True).decode("utf-8"))
+    document["structured_result"]["runtime_metadata"] = {"padding": "x" * 90_000}
+    document["protocol_result"]["structuredContent"] = document["structured_result"]
+    _replace_envelope_document(envelope, document)
+    artifact = ArtifactRef.model_validate(envelope["artifact"])
+    artifact_record = artifact.model_dump(mode="json")
+    parsed = mcp_server_module._decode_verified_mcp_result(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        envelope,
+        artifact=artifact_record,
+        job_id=job.job_id,
+    )
+
+    def complete_artifacts(
+        _queue: ClioCoreQueue,
+        _job_id: str,
+    ) -> list[dict[str, Any]]:
+        return [artifact_record]
+
+    def verified_result(
+        _queue: ClioCoreQueue,
+        _job_id: str,
+        *,
+        artifacts: list[dict[str, Any]] | None = None,
+    ) -> mcp_server_module._VerifiedMcpResult:  # pyright: ignore[reportPrivateUsage]
+        del artifacts
+        return parsed
+
+    def large_logs(
+        _queue: ClioCoreQueue,
+        _settings: RelaySettings,
+        _job_id: str,
+        *,
+        limit: int,
+    ) -> dict[str, Any]:
+        assert limit == 32_768
+        return {
+            "stdout": {"text": "l" * limit, "eof": True},
+            "stderr": {"text": "", "eof": True},
+        }
+
+    monkeypatch.setattr(
+        mcp_server_module,
+        "_complete_local_artifacts",
+        complete_artifacts,
+    )
+    monkeypatch.setattr(
+        mcp_server_module,
+        "_verified_local_mcp_result",
+        verified_result,
+    )
+    monkeypatch.setattr(mcp_server_module, "_job_logs", large_logs)
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_wait",
+                "arguments": {"job_id": job.job_id, "include_logs": True},
+            },
+        },
+        queue=queue,
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+        profile="user",
+    )
+
+    assert response is not None and "error" not in response, response
+    receipt = response["result"]["structuredContent"]
+    expected = {
+        "cluster": job.cluster,
+        "source_job_id": job.job_id,
+        "source_artifact_id": artifact.artifact_id,
+        "package_id": "paraview-1",
+        "package_name": "builtin.paraview",
+        "service_instance_id": "paraview-live-1",
+    }
+    assert receipt["service_runtime_bindings"] == [expected]
+    assert receipt["mcp_result_artifact"]["artifact_id"] == artifact.artifact_id
+    assert receipt["artifacts"] == [artifact_record]
+    keys = list(receipt)
+    assert keys.index("service_runtime_bindings") < keys.index("mcp_result")
+    assert keys.index("mcp_result") < keys.index("artifacts")
+    serialized = response["result"]["content"][0]["text"]
+    assert serialized.count('"mcp_result":') == 1
+    assert serialized.startswith('{"service_runtime_bindings":')
+    assert serialized.index('"service_runtime_bindings":') < serialized.index('"job":')
     assert serialized.index('"service_runtime_bindings":') < serialized.index('"mcp_result":')
+    assert serialized.index('"service_runtime_bindings":') < serialized.index('"logs":')
+    assert serialized.index('"service_runtime_bindings":') < serialized.index('"artifacts":')
+    assert serialized.index('"mcp_result_artifact":') < serialized.index('"job":')
+    assert serialized.index('"mcp_result":') < serialized.index('"artifacts":')
+
+
+def test_ssh_remote_async_relay_wait_exposes_verified_service_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SSH transport returns the same exact bind handoff from a later relay_wait."""
+    queue, source_definition, job, _artifact, envelope = _source_result(tmp_path)
+    definition = source_definition.model_copy(update={"ssh_host": "cluster-login"})
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(clusters={definition.name: definition}).save(registry_path)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    artifact = ArtifactRef.model_validate(envelope["artifact"])
+    artifact_record = artifact.model_dump(mode="json")
+    parsed = mcp_server_module._decode_verified_mcp_result(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        envelope,
+        artifact=artifact_record,
+        job_id=job.job_id,
+    )
+    wait_commands: list[list[str]] = []
+
+    def run_remote(_definition: ClusterDefinition, command: list[str]) -> str:
+        wait_commands.append(command)
+        return ""
+
+    def remote_json(
+        _definition: ClusterDefinition,
+        command: list[str],
+        _label: str,
+    ) -> dict[str, Any]:
+        assert command == ["job", "status", job.job_id]
+        return {
+            "job": job.model_dump(mode="json"),
+            "relay_queue": {},
+            "scheduler": [],
+            "terminal": True,
+        }
+
+    def complete_remote_collection(
+        _definition: ClusterDefinition,
+        command: list[str],
+        *,
+        record_key: str,
+        label: str,
+    ) -> list[dict[str, Any]]:
+        assert command == ["job", "list-artifacts", job.job_id]
+        assert record_key == "artifacts"
+        assert label == f"remote artifacts for {job.job_id}"
+        return [artifact_record]
+
+    def verified_result(
+        _definition: ClusterDefinition,
+        selected_job_id: str,
+        artifacts: list[dict[str, Any]],
+    ) -> mcp_server_module._VerifiedMcpResult:  # pyright: ignore[reportPrivateUsage]
+        assert selected_job_id == job.job_id
+        assert artifacts == [artifact_record]
+        return parsed
+
+    monkeypatch.setattr(mcp_server_module, "run_remote_clio", run_remote)
+    monkeypatch.setattr(mcp_server_module, "_remote_json", remote_json)
+    monkeypatch.setattr(
+        mcp_server_module,
+        "_complete_remote_collection",
+        complete_remote_collection,
+    )
+    monkeypatch.setattr(mcp_server_module, "_verified_mcp_result", verified_result)
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_wait",
+                "arguments": {
+                    "cluster": definition.name,
+                    "job_id": job.job_id,
+                    "route_revision": mcp_server_module._route_revision(definition),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                    "include_logs": False,
+                },
+            },
+        },
+        queue=queue,
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+        profile="user",
+    )
+
+    assert response is not None and "error" not in response, response
+    receipt = response["result"]["structuredContent"]
+    assert receipt["service_runtime_bindings"][0]["source_job_id"] == job.job_id
+    assert receipt["service_runtime_bindings"][0]["source_artifact_id"] == artifact.artifact_id
+    assert receipt["mcp_result_artifact"]["artifact_id"] == artifact.artifact_id
+    assert list(receipt).index("service_runtime_bindings") < list(receipt).index("artifacts")
+    assert wait_commands == [
+        [
+            "job",
+            "wait",
+            job.job_id,
+            "--timeout-seconds",
+            "600.0",
+            "--poll-seconds",
+            "2.0",
+        ]
+    ]
+
+
+def test_owned_remote_async_relay_wait_exposes_verified_service_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The owned-session transport returns the same exact bind handoff from relay_wait."""
+    queue, source_definition, job, _artifact, envelope = _source_result(tmp_path)
+    definition = source_definition.model_copy(update={"ssh_host": "cluster-login"})
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(clusters={definition.name: definition}).save(registry_path)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    artifact = ArtifactRef.model_validate(envelope["artifact"])
+    artifact_record = artifact.model_dump(mode="json")
+    parsed = mcp_server_module._decode_verified_mcp_result(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        envelope,
+        artifact=artifact_record,
+        job_id=job.job_id,
+    )
+    requests: list[tuple[str, str]] = []
+
+    class FakeOwnedSessionApiClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> FakeOwnedSessionApiClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def request_json(
+            self,
+            *,
+            method: str,
+            path: str,
+            query: dict[str, object] | None = None,
+            body: dict[str, object] | None = None,
+            response_timeout_seconds: float | None = None,
+        ) -> object:
+            del query, body, response_timeout_seconds
+            requests.append((method, path))
+            if method == "POST" and path == f"/jobs/{job.job_id}/wait":
+                return job.model_dump(mode="json")
+            if method == "GET" and path == f"/jobs/{job.job_id}/status":
+                return {
+                    "job": job.model_dump(mode="json"),
+                    "relay_queue": {},
+                    "scheduler": [],
+                    "terminal": True,
+                }
+            raise AssertionError(f"unexpected owned request: {method} {path}")
+
+    def complete_owned_collection(
+        _client: object,
+        *,
+        path: str,
+        record_key: str,
+        label: str,
+    ) -> list[dict[str, Any]]:
+        assert path == f"/jobs/{job.job_id}/artifacts"
+        assert record_key == "artifacts"
+        assert label == f"owned remote artifacts for {job.job_id}"
+        return [artifact_record]
+
+    def verified_result(
+        _client: object,
+        selected_job_id: str,
+        artifacts: list[dict[str, Any]],
+    ) -> mcp_server_module._VerifiedMcpResult:  # pyright: ignore[reportPrivateUsage]
+        assert selected_job_id == job.job_id
+        assert artifacts == [artifact_record]
+        return parsed
+
+    monkeypatch.setattr(mcp_server_module, "OwnedSessionApiClient", FakeOwnedSessionApiClient)
+    monkeypatch.setattr(
+        mcp_server_module,
+        "_complete_owned_collection",
+        complete_owned_collection,
+    )
+    monkeypatch.setattr(mcp_server_module, "_verified_owned_mcp_result", verified_result)
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_wait",
+                "arguments": {
+                    "cluster": definition.name,
+                    "job_id": job.job_id,
+                    "route_revision": mcp_server_module._route_revision(definition),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                    "include_logs": False,
+                },
+            },
+        },
+        queue=queue,
+        settings=RelaySettings(
+            core_dir=tmp_path / "core",
+            spool_dir=tmp_path / "spool",
+            api_token="owner-token",
+            owner_session_id="desktop-session",
+            owner_session_generation_id="generation-1",
+        ),
+        profile="user",
+    )
+
+    assert response is not None and "error" not in response, response
+    receipt = response["result"]["structuredContent"]
+    assert receipt["service_runtime_bindings"][0]["source_job_id"] == job.job_id
+    assert receipt["service_runtime_bindings"][0]["source_artifact_id"] == artifact.artifact_id
+    assert receipt["mcp_result_artifact"]["artifact_id"] == artifact.artifact_id
+    assert list(receipt).index("service_runtime_bindings") < list(receipt).index("artifacts")
+    assert requests == [
+        ("POST", f"/jobs/{job.job_id}/wait"),
+        ("GET", f"/jobs/{job.job_id}/status"),
+    ]
 
 
 def test_multiple_ready_services_have_exact_unchanged_bindings(
