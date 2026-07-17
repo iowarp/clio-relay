@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import time
+import warnings
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
@@ -476,7 +477,9 @@ def test_persistent_uv_tool_clio_kit_runtime_is_receipt_bindable(
 ) -> None:
     runner = _load_runner()
     tool = tmp_path / ("clio-kit.exe" if os.name == "nt" else "clio-kit")
-    uv = tmp_path / ("uv.exe" if os.name == "nt" else "uv")
+    uv_bin = tmp_path / "uv-bin"
+    uv_bin.mkdir()
+    uv = uv_bin / ("uv.exe" if os.name == "nt" else "uv")
     wheel = tmp_path / "clio_kit-2.3.1-py3-none-any.whl"
     source = tmp_path / "clio_kit" / "__init__.py"
     lock = tmp_path / "share" / "clio-kit-mcp-servers" / "jarvis" / "uv.lock"
@@ -484,6 +487,8 @@ def test_persistent_uv_tool_clio_kit_runtime_is_receipt_bindable(
     lock.parent.mkdir(parents=True)
     tool.write_bytes(b"persistent-clio-kit-tool")
     uv.write_bytes(b"pinned-uv")
+    uv.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{uv_bin}{os.pathsep}{os.environ.get('PATH', '')}")
     wheel.write_bytes(b"released-clio-kit-wheel")
     source.write_text(_locked_clio_kit_v4_launcher_source(), encoding="utf-8")
     lock.write_bytes(_jarvis_cd_uv_lock())
@@ -527,6 +532,7 @@ def test_persistent_uv_tool_clio_kit_runtime_is_receipt_bindable(
     )
     assert identity["nested_launcher"] is True
     assert identity["nested_runtime"]["persistent_tool"] is True
+    assert identity["nested_runtime"]["uv_executable"]["path"] == str(uv.resolve())
     assert identity["nested_runtime"]["jarvis_cd_lock_binding"]["verified"] is True
     assert identity["nested_runtime"]["locked_runtime_verified"] is True
     assert identity["server_process_artifact_verified"] is True
@@ -572,6 +578,157 @@ def test_external_console_probe_preserves_logical_provider_path(
         evidence["error"]
         == "persistent tool launcher has no unique installed console-script distribution"
     )
+
+
+def test_windows_uv_trampoline_binds_digest_equal_record_launcher(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    provider = tmp_path / "tool" / "Scripts" / "python.exe"
+    provider.parent.mkdir(parents=True)
+    provider.write_bytes(b"provider")
+    public_launcher = tmp_path / "bin" / "science-mcp.exe"
+    public_launcher.parent.mkdir()
+    launcher_bytes = _write_uv_windows_trampoline(public_launcher, provider=provider)
+    record_launcher = provider.parent / public_launcher.name
+    record_launcher.write_bytes(launcher_bytes)
+    module = tmp_path / "tool" / "science_mcp" / "__init__.py"
+    module.parent.mkdir()
+    module.write_bytes(b"VALUE = 1\n")
+    record = tmp_path / "tool" / "science_mcp-1.0.0.dist-info" / "RECORD"
+    record.parent.mkdir()
+    record.write_bytes(b"record\n")
+
+    def record_member(name: str, path: Path) -> dict[str, object]:
+        content = path.read_bytes()
+        digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).decode().rstrip("=")
+        return {
+            "name": name,
+            "path": str(path.resolve()),
+            "hash_mode": "sha256",
+            "hash_value": digest,
+            "size": len(content),
+        }
+
+    raw_files: list[dict[str, object]] = [
+        record_member("../../../Scripts/science-mcp.exe", record_launcher),
+        record_member("science_mcp/__init__.py", module),
+        {
+            "name": "science_mcp-1.0.0.dist-info/RECORD",
+            "path": str(record.resolve()),
+            "hash_mode": None,
+            "hash_value": None,
+            "size": None,
+        },
+    ]
+
+    def run_probe(
+        command: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        assert command[-1] == hashlib.sha256(launcher_bytes).hexdigest()
+        identity: dict[str, object] = {
+            "executable": str(provider.resolve()),
+            "distribution_console_script": str(record_launcher.resolve()),
+            "distribution_console_script_sha256": hashlib.sha256(launcher_bytes).hexdigest(),
+            "distribution": "science-mcp",
+            "distribution_version": "1.0.0",
+            "entry_point": "science-mcp",
+            "entry_point_value": "science_mcp:main",
+            "direct_url": None,
+            "files": raw_files,
+            "contract_source_path": None,
+            "server_lock_paths": {},
+        }
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps({"matches": [identity]}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(cast(Any, runner).subprocess, "run", run_probe)
+
+    evidence = cast(Any, runner)._external_python_console_distribution_identity(
+        public_launcher,
+        command_name="science-mcp",
+    )
+
+    assert evidence["error"] is None
+    assert evidence["runtime_closure_verified"] is True
+    assert evidence["launcher_copy_verified"] is True
+    assert (
+        evidence["external_launcher_identity"]["sha256"]
+        == evidence["distribution_console_script"]["sha256"]
+    )
+    assert evidence["distribution_console_script"]["path"] == str(record_launcher.resolve())
+
+
+def test_windows_uv_trampoline_rejects_nonmatching_record_launcher(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    provider = tmp_path / "tool" / "Scripts" / "python.exe"
+    provider.parent.mkdir(parents=True)
+    provider.write_bytes(b"provider")
+    public_launcher = tmp_path / "science-mcp.exe"
+    public_bytes = _write_uv_windows_trampoline(public_launcher, provider=provider)
+    record_launcher = provider.parent / public_launcher.name
+    record_launcher.write_bytes(public_bytes + b"different")
+
+    def run_probe(
+        command: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps({"matches": []}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(cast(Any, runner).subprocess, "run", run_probe)
+
+    evidence = cast(Any, runner)._external_python_console_distribution_identity(
+        public_launcher,
+        command_name="science-mcp",
+    )
+
+    assert evidence["runtime_closure_verified"] is False
+    assert evidence["launcher_copy_verified"] is False
+    assert (
+        evidence["error"]
+        == "persistent tool launcher has no unique installed console-script distribution"
+    )
+
+
+def test_windows_uv_trampoline_requires_unique_bounded_main_script(tmp_path: Path) -> None:
+    runner = _load_runner()
+    launcher = tmp_path / "science-mcp.exe"
+    launcher.write_bytes(b"MZ-test-stub")
+    with zipfile.ZipFile(launcher, "a") as archive:
+        archive.writestr("not-main.py", b"print('wrong')\n")
+
+    with raises(ValueError, match="no unique __main__"):
+        cast(Any, runner)._persistent_tool_launcher_shebang(
+            launcher.read_bytes(),
+            executable_name=launcher.name,
+        )
+
+    duplicate = tmp_path / "duplicate-science-mcp.exe"
+    duplicate.write_bytes(b"MZ-test-stub")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(duplicate, "a") as archive:
+            archive.writestr("__main__.py", b"#!/first/python\n")
+            archive.writestr("__main__.py", b"#!/second/python\n")
+    with raises(ValueError, match="no unique __main__"):
+        cast(Any, runner)._persistent_tool_launcher_shebang(
+            duplicate.read_bytes(),
+            executable_name=duplicate.name,
+        )
 
 
 def test_mcp_call_runner_supports_server_arguments(
@@ -643,12 +800,17 @@ def test_mcp_call_runner_supports_server_arguments(
 
 def test_mcp_call_runner_verifies_locked_clio_kit_child_runtime(
     tmp_path: Path,
+    monkeypatch: MonkeyPatch,
 ) -> None:
     runner = _load_runner()
     uvx = tmp_path / ("uvx.exe" if os.name == "nt" else "uvx")
-    uv = tmp_path / ("uv.exe" if os.name == "nt" else "uv")
+    uv_bin = tmp_path / "uv-bin"
+    uv_bin.mkdir()
+    uv = uv_bin / ("uv.exe" if os.name == "nt" else "uv")
     uvx.write_bytes(b"pinned-uv-launcher")
     uv.write_bytes(b"pinned-uv-runtime")
+    uv.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{uv_bin}{os.pathsep}{os.environ.get('PATH', '')}")
     wheel = tmp_path / "clio_kit-2.3.1-py3-none-any.whl"
     prefix = "clio_kit-2.3.1.data/data/clio-kit-mcp-servers/spack/"
     launcher_source = _locked_clio_kit_v4_launcher_source()
@@ -684,7 +846,7 @@ def test_mcp_call_runner_verifies_locked_clio_kit_child_runtime(
     assert identity["nested_runtime"]["runtime_file_count"] == len(project)
     assert identity["nested_runtime"]["runtime_bytes"] == sum(map(len, project.values()))
     assert identity["nested_runtime"]["contract_source_verified"] is True
-    assert identity["nested_runtime"]["uv_executable"]["sha256"]
+    assert identity["nested_runtime"]["uv_executable"]["path"] == str(uv.resolve())
     assert identity["nested_runtime"]["locked_runtime_verified"] is True
     assert identity["server_process_artifact_verified"] is True
     assert identity["verified"] is True
@@ -939,10 +1101,20 @@ def test_mcp_call_runner_refuses_unverified_builtin_jarvis_launcher_before_launc
     artifact = _verified_jarvis_server_artifact()
     artifact["verified"] = False
     artifact["identity_error"] = "launcher digest did not verify"
+
+    def server_artifact_identity(
+        _server: str,
+        _server_args: list[str],
+        *,
+        verify_relay_jarvis_cd_lock: bool = False,
+    ) -> dict[str, Any]:
+        del verify_relay_jarvis_cd_lock
+        return artifact
+
     monkeypatch.setattr(
         runner,
         "_server_artifact_identity",
-        lambda *_args, **_kwargs: artifact,
+        server_artifact_identity,
     )
     opened = False
 
@@ -2677,8 +2849,21 @@ def test_registered_jarvis_execution_query_keeps_operator_result_schema(
         {"operator_contract": "custom", "status": "ready"},
     )
     artifact = _verified_jarvis_server_artifact()
-    monkeypatch.setattr(runner, "_server_artifact_identity", lambda *_args: artifact)
-    monkeypatch.setattr(runner, "_server_artifact_digest", lambda _artifact: "a" * 64)
+
+    def server_artifact_identity(
+        _server: str,
+        _server_args: list[str],
+        *,
+        verify_relay_jarvis_cd_lock: bool = False,
+    ) -> dict[str, Any]:
+        del verify_relay_jarvis_cd_lock
+        return artifact
+
+    def server_artifact_digest(_artifact: dict[str, Any]) -> str:
+        return "a" * 64
+
+    monkeypatch.setattr(runner, "_server_artifact_identity", server_artifact_identity)
+    monkeypatch.setattr(runner, "_server_artifact_digest", server_artifact_digest)
 
     returncode = cast(Any, runner).run_mcp_call_from_params(
         {
@@ -3156,6 +3341,17 @@ def _minimal_console_wheel(tmp_path: Path) -> Path:
             archive.writestr(name, content)
         archive.writestr(record_name, "\n".join(record_lines) + "\n")
     return wheel
+
+
+def _write_uv_windows_trampoline(path: Path, *, provider: Path) -> bytes:
+    """Write a representative uv PE-plus-ZIP console trampoline."""
+    path.write_bytes(b"MZ-test-uv-trampoline")
+    with zipfile.ZipFile(path, "a", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr(
+            "__main__.py",
+            f"#!{provider.resolve()}\nfrom science_mcp import main\nmain()\n".encode(),
+        )
+    return path.read_bytes()
 
 
 def _load_runner() -> ModuleType:

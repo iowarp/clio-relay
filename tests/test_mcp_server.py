@@ -1446,7 +1446,10 @@ def test_generic_mcp_default_idempotency_key_excludes_builtin_jarvis_marker(
         "timeout_seconds": None,
     }
     assert job.idempotency_key == (
-        "mcp:mcp-call:" + mcp_server_module._stable_digest(expected_identity)
+        "mcp:mcp-call:"
+        + mcp_server_module._stable_digest(  # pyright: ignore[reportPrivateUsage]
+            expected_identity
+        )
     )
 
 

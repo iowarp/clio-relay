@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import io
 import json
 import math
 import os
@@ -3169,6 +3170,36 @@ def _direct_distribution_source_identity(
     return _file_identity(source)
 
 
+def _persistent_tool_launcher_shebang(payload: bytes, *, executable_name: str) -> str:
+    """Return the provider shebang from a script or Windows uv trampoline."""
+    script = payload
+    if not payload.startswith(b"#!"):
+        if Path(executable_name).suffix.casefold() != ".exe":
+            raise ValueError("persistent tool launcher has no Python shebang")
+        with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
+            candidates = [
+                member for member in archive.infolist() if member.filename == "__main__.py"
+            ]
+            if len(candidates) != 1 or not _zip_member_is_regular(candidates[0]):
+                raise ValueError("Windows persistent tool launcher has no unique __main__.py")
+            if candidates[0].flag_bits & 0x1:
+                raise ValueError("Windows persistent tool launcher script is encrypted")
+            script = _read_bounded_zip_member(
+                archive,
+                candidates[0].filename,
+                max_bytes=CLIO_KIT_WHEEL_MAX_LAUNCHER_BYTES,
+            )
+    first_line = script.split(b"\n", 1)[0]
+    if len(first_line) > 4096:
+        raise ValueError("persistent tool launcher shebang exceeded its byte limit")
+    shebang = first_line.decode("utf-8", errors="strict").rstrip("\r")
+    if not shebang.startswith("#!") or not shebang[2:]:
+        raise ValueError("persistent tool launcher has no direct Python interpreter shebang")
+    if "\x00" in shebang:
+        raise ValueError("persistent tool launcher shebang contains a null byte")
+    return shebang
+
+
 def _external_python_console_distribution_identity(
     executable: Path,
     *,
@@ -3189,15 +3220,34 @@ def _external_python_console_distribution_identity(
         "direct_url": None,
         "provider_interpreter": None,
         "provider_interpreter_identity": None,
+        "external_launcher_identity": None,
+        "distribution_console_script": None,
+        "launcher_copy_verified": False,
         "contract_source_path": None,
         "server_lock_paths": {},
         "error": None,
     }
+    launcher_snapshot = _bounded_regular_file_snapshot(
+        executable,
+        max_bytes=PYTHON_TOOL_IDENTITY_MAX_BYTES,
+    )
+    if launcher_snapshot is None:
+        evidence["error"] = "persistent tool launcher is not one stable bounded file"
+        return evidence
+    launcher_bytes, launcher_descriptor = launcher_snapshot
+    launcher_sha256 = hashlib.sha256(launcher_bytes).hexdigest()
+    evidence["external_launcher_identity"] = {
+        "path": str(executable),
+        "filename": executable.name,
+        "sha256": launcher_sha256,
+        "size_bytes": len(launcher_bytes),
+    }
     try:
-        with executable.open("rb") as stream:
-            first_line = stream.readline(4096)
-        shebang = first_line.decode("utf-8", errors="strict").strip()
-    except (OSError, UnicodeDecodeError) as exc:
+        shebang = _persistent_tool_launcher_shebang(
+            launcher_bytes,
+            executable_name=executable.name,
+        )
+    except (UnicodeDecodeError, ValueError, zipfile.BadZipFile) as exc:
         evidence["error"] = f"could not read persistent tool launcher: {exc}"
         return evidence
     if not shebang.startswith("#!") or not shebang[2:]:
@@ -3218,25 +3268,62 @@ def _external_python_console_distribution_identity(
         evidence["error"] = "persistent tool provider interpreter has no file identity"
         return evidence
     probe = r"""
+import hashlib
 import json
 import sys
 from importlib import metadata
 from pathlib import Path
 
 command_name = sys.argv[1]
-launcher = Path(sys.argv[2]).resolve()
+external_launcher_sha256 = sys.argv[2]
 matches = []
+distribution_count = 0
+entry_point_count = 0
+candidate_names = {command_name.casefold(), f"{command_name}.exe".casefold()}
 for distribution in metadata.distributions():
+    distribution_count += 1
+    if distribution_count > 10_000:
+        raise SystemExit("installed Python distribution count exceeded its limit")
     files = distribution.files or []
-    owns_launcher = any(
-        Path(str(distribution.locate_file(member))).resolve() == launcher
-        for member in files
-    )
-    if not owns_launcher:
-        continue
+    if len(files) > 100_000:
+        raise SystemExit("installed Python distribution file count exceeded its limit")
+    entry_points = []
     for entry_point in distribution.entry_points:
-        if entry_point.group != "console_scripts" or entry_point.name != command_name:
+        entry_point_count += 1
+        if entry_point_count > 100_000:
+            raise SystemExit("installed Python entry-point count exceeded its limit")
+        if entry_point.group == "console_scripts" and entry_point.name == command_name:
+            entry_points.append(entry_point)
+    if len(entry_points) != 1:
+        continue
+    for launcher_member in files:
+        located_launcher = Path(str(distribution.locate_file(launcher_member))).resolve()
+        if located_launcher.name.casefold() not in candidate_names:
             continue
+        launcher_stat = located_launcher.stat()
+        if not located_launcher.is_file() or not 1 <= launcher_stat.st_size <= 8 * 1024 * 1024:
+            continue
+        launcher_hash = hashlib.sha256()
+        with located_launcher.open("rb") as launcher_stream:
+            while launcher_chunk := launcher_stream.read(1024 * 1024):
+                launcher_hash.update(launcher_chunk)
+        launcher_after = located_launcher.stat()
+        launcher_key = (
+            launcher_stat.st_dev,
+            launcher_stat.st_ino,
+            launcher_stat.st_size,
+            launcher_stat.st_mtime_ns,
+        )
+        if (
+            launcher_after.st_dev,
+            launcher_after.st_ino,
+            launcher_after.st_size,
+            launcher_after.st_mtime_ns,
+        ) != launcher_key:
+            raise SystemExit("persistent tool RECORD-owned launcher changed during inspection")
+        if launcher_hash.hexdigest() != external_launcher_sha256:
+            continue
+        entry_point = entry_points[0]
         direct_url_text = distribution.read_text("direct_url.json")
         direct_url = json.loads(direct_url_text) if direct_url_text else None
         serialized_files = []
@@ -3261,6 +3348,8 @@ for distribution in metadata.distributions():
                 server_lock_paths[server_name] = located
         matches.append({
             "executable": sys.executable,
+            "distribution_console_script": str(located_launcher),
+            "distribution_console_script_sha256": launcher_hash.hexdigest(),
             "distribution": distribution.metadata.get("Name"),
             "distribution_version": distribution.version,
             "entry_point": entry_point.name,
@@ -3274,7 +3363,7 @@ print(json.dumps({"matches": matches}, sort_keys=True))
 """
     try:
         completed = subprocess.run(
-            [str(provider_launcher), "-I", "-c", probe, command_name, str(executable)],
+            [str(provider_launcher), "-I", "-c", probe, command_name, launcher_sha256],
             check=False,
             capture_output=True,
             text=True,
@@ -3334,7 +3423,54 @@ print(json.dumps({"matches": matches}, sort_keys=True))
     if observed_provider != provider:
         evidence["error"] = "persistent tool probe executed under the wrong interpreter"
         return evidence
+    console_script_value = identity.get("distribution_console_script")
+    if not isinstance(console_script_value, str):
+        evidence["error"] = "persistent tool distribution omitted its RECORD-owned launcher"
+        return evidence
+    try:
+        console_script = Path(console_script_value).resolve(strict=True)
+        provider_environment_bin = provider_launcher.parent.resolve(strict=True)
+    except OSError as exc:
+        evidence["error"] = f"persistent tool RECORD-owned launcher is unavailable: {exc}"
+        return evidence
+    console_script_snapshot = _bounded_regular_file_snapshot(
+        console_script,
+        max_bytes=PYTHON_TOOL_IDENTITY_MAX_BYTES,
+    )
+    if console_script_snapshot is None:
+        evidence["error"] = "persistent tool RECORD-owned launcher is not one bounded file"
+        return evidence
+    console_script_bytes, console_script_descriptor = console_script_snapshot
+    console_script_sha256 = hashlib.sha256(console_script_bytes).hexdigest()
+    if (
+        console_script.parent != provider_environment_bin
+        or identity.get("distribution_console_script_sha256") != launcher_sha256
+        or not hmac.compare_digest(console_script_sha256, launcher_sha256)
+        or not hmac.compare_digest(console_script_bytes, launcher_bytes)
+    ):
+        evidence["error"] = (
+            "persistent tool launcher does not match its RECORD-owned console script"
+        )
+        return evidence
     closure = _verify_external_distribution_record_closure(cast(list[object], raw_files))
+    launcher_after = _bounded_regular_file_snapshot(
+        executable,
+        max_bytes=PYTHON_TOOL_IDENTITY_MAX_BYTES,
+    )
+    console_script_after = _bounded_regular_file_snapshot(
+        console_script,
+        max_bytes=PYTHON_TOOL_IDENTITY_MAX_BYTES,
+    )
+    if (
+        launcher_after is None
+        or console_script_after is None
+        or launcher_after[1] != launcher_descriptor
+        or console_script_after[1] != console_script_descriptor
+        or not hmac.compare_digest(launcher_after[0], launcher_bytes)
+        or not hmac.compare_digest(console_script_after[0], console_script_bytes)
+    ):
+        evidence["error"] = "persistent tool launcher changed during inspection"
+        return evidence
     evidence.update(
         {
             "distribution": identity.get("distribution"),
@@ -3344,6 +3480,13 @@ print(json.dumps({"matches": matches}, sort_keys=True))
             "direct_url": identity.get("direct_url"),
             "provider_interpreter": str(provider),
             "provider_interpreter_identity": provider_identity,
+            "distribution_console_script": {
+                "path": str(console_script),
+                "filename": console_script.name,
+                "sha256": console_script_sha256,
+                "size_bytes": len(console_script_bytes),
+            },
+            "launcher_copy_verified": True,
             "contract_source_path": identity.get("contract_source_path"),
             "server_lock_paths": identity.get("server_lock_paths", {}),
             **closure,
@@ -3651,8 +3794,7 @@ def _installed_clio_kit_runtime_identity(
     verify_relay_jarvis_cd_lock: bool,
 ) -> dict[str, Any]:
     """Verify clio-kit's locked child launcher from a persistent tool environment."""
-    uv_name = "uv.exe" if resolved_executable.suffix.lower() == ".exe" else "uv"
-    uv_identity = _file_identity(resolved_executable.with_name(uv_name))
+    uv_identity = _file_identity(Path(_resolve_executable("uv")).expanduser())
     evidence: dict[str, Any] = {
         "schema_version": _CLIO_KIT_LOCKED_SERVER_SCHEMA,
         "server_name": server_name,
@@ -3767,6 +3909,16 @@ def _is_sha256_text(value: object) -> bool:
 
 def _bounded_regular_file_bytes(path: Path, *, max_bytes: int) -> bytes | None:
     """Read one stable non-link regular file under an explicit byte limit."""
+    snapshot = _bounded_regular_file_snapshot(path, max_bytes=max_bytes)
+    return snapshot[0] if snapshot is not None else None
+
+
+def _bounded_regular_file_snapshot(
+    path: Path,
+    *,
+    max_bytes: int,
+) -> tuple[bytes, tuple[int, int, int, int]] | None:
+    """Read one stable regular file and return the descriptor identity read."""
     try:
         before = path.lstat()
     except OSError:
@@ -3800,7 +3952,7 @@ def _bounded_regular_file_bytes(path: Path, *, max_bytes: int) -> bytes | None:
         return None
     if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != identity:
         return None
-    return payload
+    return payload, identity
 
 
 def _locked_clio_kit_runtime_identity(
@@ -3816,8 +3968,7 @@ def _locked_clio_kit_runtime_identity(
         if install_artifact is not None and isinstance(install_artifact.get("path"), str)
         else None
     )
-    uv_name = "uv.exe" if resolved_executable.suffix.lower() == ".exe" else "uv"
-    uv_identity = _file_identity(resolved_executable.with_name(uv_name))
+    uv_identity = _file_identity(Path(_resolve_executable("uv")).expanduser())
     evidence: dict[str, Any] = {
         "schema_version": _CLIO_KIT_LOCKED_SERVER_SCHEMA,
         "server_name": server_name,
@@ -4774,10 +4925,10 @@ def _resolve_executable(executable: str) -> str:
     resolved = shutil.which(executable)
     if resolved is not None:
         return resolved
-    if executable == "uvx":
-        user_local_uvx = Path.home() / ".local" / "bin" / "uvx"
-        if user_local_uvx.exists():
-            return str(user_local_uvx)
+    if executable in {"uv", "uvx"}:
+        user_local_executable = Path.home() / ".local" / "bin" / executable
+        if user_local_executable.exists():
+            return str(user_local_executable)
     return executable
 
 
