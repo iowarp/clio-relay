@@ -1944,7 +1944,7 @@ def test_default_report_path_sanitizes_cluster_name(tmp_path: Path) -> None:
 def test_repository_release_policy_is_machine_readable() -> None:
     policy = load_release_gate_policy(Path("docs/release-gate-1.0.yaml"))
 
-    assert policy.release_version == "1.3.13"
+    assert policy.release_version == "1.3.14"
     assert policy.acceptance_matrix is not None
     assert policy.acceptance_matrix["report_count_per_stage"] == 17
     assert policy.acceptance_matrix["matrix_sha256"] == policy.acceptance_matrix_sha256
@@ -2297,7 +2297,7 @@ def test_native_application_progress_gate_rejects_legacy_adapter_only_evidence()
         "provider_entry_point": "lammps",
         "provider_entry_point_value": "jarvis_cd.progress.lammps:adapter_from_package",
         "provider_distribution": "jarvis_cd",
-        "provider_distribution_version": "1.3.11",
+        "provider_distribution_version": "1.3.12",
         "provider_source_authority": "package_log",
         "provider_validated": True,
         "acceptance_validated": True,
@@ -2316,14 +2316,14 @@ def test_native_application_progress_gate_rejects_legacy_adapter_only_evidence()
     }
     jarvis_component = {
         "distribution": "jarvis_cd",
-        "distribution_version": "1.3.11",
+        "distribution_version": "1.3.12",
         "install_spec": (
             "https://github.com/grc-iit/jarvis-cd/releases/download/"
-            "v1.3.11/jarvis_cd-1.3.11-py3-none-any.whl"
+            "v1.3.12/jarvis_cd-1.3.12-py3-none-any.whl"
         ),
         "requested_source": "github_release",
-        "artifact_filename": "jarvis_cd-1.3.11-py3-none-any.whl",
-        "artifact_sha256": "ebd6ca162bd15f25d80c2ea4e0f5928b0b1575cd811b146f7cd6ef5a61045474",
+        "artifact_filename": "jarvis_cd-1.3.12-py3-none-any.whl",
+        "artifact_sha256": "67541dde02e13842ab7a1581717a3577869f3d6ff7db4faf0238fd8c6319d3e3",
         "native_execution": native_capability,
     }
     report.resources = [
@@ -2342,7 +2342,7 @@ def test_native_application_progress_gate_rejects_legacy_adapter_only_evidence()
             cluster="ares",
             state="running",
             metadata={
-                "components": {"jarvis-cd": "1.3.11"},
+                "components": {"jarvis-cd": "1.3.12"},
                 "component_artifacts": {"jarvis-cd": jarvis_component},
                 "component_runtime": {
                     "jarvis-cd": {
@@ -2363,7 +2363,7 @@ def test_native_application_progress_gate_rejects_legacy_adapter_only_evidence()
         ),
         ValidationResource(
             kind="package_progress_provider",
-            resource_id="jarvis_cd:1.3.11:lammps:lammps",
+            resource_id="jarvis_cd:1.3.12:lammps:lammps",
             role="jarvis_package_progress",
             cluster="ares",
             state="verified",

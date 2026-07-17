@@ -26,7 +26,7 @@ from clio_relay.cluster_config import (
 )
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import ConfigurationError
+from clio_relay.errors import ConfigurationError, NotFoundError
 from clio_relay.filesystem_paths import logical_filesystem_text
 from clio_relay.identifiers import (
     durable_record_id_json_schema,
@@ -137,6 +137,14 @@ USER_MCP_TOOL_NAMES = {
     "relay_bind_jarvis_runtime",
     "relay_artifact_lineage",
 }
+_REMOTE_JOB_FOLLOWUP_TOOL_NAMES = frozenset(
+    {
+        "relay_status",
+        "relay_cancel",
+        "relay_observe",
+        "relay_wait",
+    }
+)
 
 
 def _artifact_use_refs_json_schema() -> JSON:
@@ -159,13 +167,17 @@ def _artifact_use_refs_json_schema() -> JSON:
 
 @dataclass
 class McpSessionState:
-    """Catalog revisions advertised to one connected MCP client."""
+    """Catalog and remote-job routes observed by one connected MCP client."""
 
     remote_mcp_catalog_revisions: dict[str, str] = field(default_factory=lambda: dict[str, str]())
+    remote_job_routes: dict[str, set[tuple[str, str]]] = field(
+        default_factory=lambda: dict[str, set[tuple[str, str]]]()
+    )
 
     def reset(self) -> None:
-        """Forget catalogs advertised before a new MCP initialization."""
+        """Forget catalogs and job routes observed before a new MCP initialization."""
         self.remote_mcp_catalog_revisions.clear()
+        self.remote_job_routes.clear()
 
     def observe_remote_mcp_catalog(self, *, profile: str, revision: str) -> None:
         """Record the exact remote-tool catalog rendered by ``tools/list``."""
@@ -174,6 +186,29 @@ class McpSessionState:
     def observed_remote_mcp_catalog_revision(self, *, profile: str) -> str | None:
         """Return the catalog revision advertised for one MCP profile."""
         return self.remote_mcp_catalog_revisions.get(profile)
+
+    def observe_remote_job_result(self, result: JSON) -> None:
+        """Remember the exact route from one remote submission receipt."""
+        if result.get("remote") is not True or "job_id" not in result:
+            return
+        job_id = validate_durable_record_id(result["job_id"])
+        cluster = result.get("cluster")
+        if not isinstance(cluster, str) or not cluster:
+            raise ValueError("remote job receipt omitted its cluster route")
+        route_revision = _validated_route_revision(result.get("route_revision"))
+        self.remote_job_routes.setdefault(job_id, set()).add((cluster, route_revision))
+
+    def remote_job_route(self, job_id: str) -> tuple[str, str] | None:
+        """Return one unambiguous route learned for a remote job in this session."""
+        routes = self.remote_job_routes.get(job_id, set())
+        if not routes:
+            return None
+        if len(routes) != 1:
+            raise ValueError(
+                f"remote job_id {job_id} is ambiguous in this MCP session; pass cluster and "
+                "route_revision from the intended receipt"
+            )
+        return next(iter(routes))
 
 
 def serve_stdio(
@@ -259,6 +294,7 @@ def handle_request(
                 queue=queue,
                 settings=settings or RelaySettings.from_env(),
                 profile=resolved_profile,
+                session=session,
                 observed_remote_mcp_catalog_revision=(
                     session.observed_remote_mcp_catalog_revision(profile=resolved_profile)
                     if session is not None
@@ -410,7 +446,11 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
         },
         {
             "name": "relay_status",
-            "description": "Read relay job state, relay queue position, and scheduler status.",
+            "description": (
+                "Read relay job state, relay queue position, and scheduler status. A remote "
+                "job_id returned earlier on this MCP connection is self-routing; after a "
+                "reconnect, also pass cluster and route_revision from its receipt."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -428,7 +468,11 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
         },
         {
             "name": "relay_cancel",
-            "description": "Request cancellation for a relay job.",
+            "description": (
+                "Request cancellation for a relay job. A remote job_id returned earlier on "
+                "this MCP connection is self-routing; after a reconnect, also pass cluster "
+                "and route_revision from its receipt."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -449,7 +493,9 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "name": "relay_observe",
             "description": (
                 "Read job events from a cursor and optionally return when a regex pattern "
-                "matches stdout, stderr, or event text."
+                "matches stdout, stderr, or event text. A remote job_id returned earlier on "
+                "this MCP connection is self-routing; after a reconnect, also pass cluster "
+                "and route_revision from its receipt."
             ),
             "inputSchema": {
                 "type": "object",
@@ -483,7 +529,11 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
         },
         {
             "name": "relay_wait",
-            "description": "Wait for a relay job to finish and return final status and logs.",
+            "description": (
+                "Wait for a relay job to finish and return final status and logs. A remote "
+                "job_id returned earlier on this MCP connection is self-routing; after a "
+                "reconnect, also pass cluster and route_revision from its receipt."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1318,6 +1368,7 @@ def _call_tool(
     queue: ClioCoreQueue,
     settings: RelaySettings,
     profile: str,
+    session: McpSessionState | None,
     observed_remote_mcp_catalog_revision: str | None,
     require_advertised_remote_mcp_catalog: bool,
 ) -> JSON:
@@ -1345,6 +1396,12 @@ def _call_tool(
                 current_revision=catalog.revision,
             )
     arguments = _object(params.get("arguments", {}))
+    arguments = _restore_session_remote_job_route(
+        name=name,
+        arguments=arguments,
+        queue=queue,
+        session=session,
+    )
     if name == "relay_submit_jarvis_pipeline":
         result = _submit_jarvis_pipeline(arguments, queue=queue, settings=settings)
     elif name == "relay_storage_status":
@@ -1659,10 +1716,54 @@ def _call_tool(
         )
     else:
         raise ValueError(f"unknown tool: {name}")
+    if session is not None:
+        session.observe_remote_job_result(result)
     return {
         "content": [{"type": "text", "text": json.dumps(result, sort_keys=True)}],
         "structuredContent": result,
         "isError": False,
+    }
+
+
+def _restore_session_remote_job_route(
+    *,
+    name: str,
+    arguments: JSON,
+    queue: ClioCoreQueue,
+    session: McpSessionState | None,
+) -> JSON:
+    """Restore an omitted remote route learned on this MCP connection.
+
+    Explicit handles remain authoritative and reconnecting clients must still
+    preserve the complete ``cluster + job_id + route_revision`` receipt. This
+    connection-local convenience only prevents a returned remote job ID from
+    being mistaken for a desktop-queue job on the immediate follow-up call.
+    """
+    if (
+        session is None
+        or name not in _REMOTE_JOB_FOLLOWUP_TOOL_NAMES
+        or "cluster" in arguments
+        or "route_revision" in arguments
+    ):
+        return arguments
+    raw_job_id = arguments.get("job_id")
+    if not isinstance(raw_job_id, str):
+        return arguments
+    job_id = validate_durable_record_id(raw_job_id)
+    try:
+        queue.get_job(job_id)
+    except NotFoundError:
+        pass
+    else:
+        return arguments
+    route = session.remote_job_route(job_id)
+    if route is None:
+        return arguments
+    cluster, route_revision = route
+    return {
+        **arguments,
+        "cluster": cluster,
+        "route_revision": route_revision,
     }
 
 
