@@ -40,12 +40,18 @@ from clio_relay.jarvis_mcp import (
     jarvis_mcp_artifact_binding_from_entry,
     jarvis_mcp_server,
     jarvis_mcp_server_args,
+    jarvis_service_runtime_handoff_json_schema,
     render_virtual_jarvis_agent_context,
     virtual_jarvis_call_arguments,
     virtual_jarvis_tool_definitions,
 )
-from clio_relay.jarvis_service_runtime import resolve_jarvis_service_runtime
+from clio_relay.jarvis_service_runtime import (
+    JarvisServiceRuntimeHandoff,
+    derive_jarvis_service_runtime_handoffs,
+    resolve_jarvis_service_runtime,
+)
 from clio_relay.models import (
+    ArtifactRef,
     ArtifactUse,
     Cursor,
     GatewaySession,
@@ -209,6 +215,14 @@ class McpSessionState:
                 "route_revision from the intended receipt"
             )
         return next(iter(routes))
+
+
+@dataclass(frozen=True)
+class _VerifiedMcpResult:
+    """SHA-verified full MCP artifact plus its bounded public projection."""
+
+    document: JSON
+    public: JSON
 
 
 def serve_stdio(
@@ -1231,6 +1245,8 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "description": (
                 "Bind local relay connectors to one ready service reported by a completed, "
                 "artifact-bound JARVIS execution query with service runtimes included. "
+                "Pass one service_runtime_bindings item from a waited jarvis_get_execution "
+                "call unchanged as binding. jarvis_run is not a valid binding source. "
                 "Runtime host, paths, scheduler identity, and dataset metadata are read "
                 "only from the durable JARVIS result. The relay allocates the desktop "
                 "loopback port."
@@ -1238,6 +1254,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "binding": jarvis_service_runtime_handoff_json_schema(clusters=clusters),
                     "cluster": {
                         "type": "string",
                         **({"enum": sorted(clusters)} if clusters is not None else {}),
@@ -1260,12 +1277,29 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                         "default": 2,
                     },
                 },
-                "required": [
-                    "cluster",
-                    "source_job_id",
-                    "source_artifact_id",
-                    "package_id",
-                    "package_name",
+                "oneOf": [
+                    {
+                        "required": ["binding"],
+                        "not": {
+                            "anyOf": [
+                                {"required": ["cluster"]},
+                                {"required": ["source_job_id"]},
+                                {"required": ["source_artifact_id"]},
+                                {"required": ["package_id"]},
+                                {"required": ["package_name"]},
+                            ]
+                        },
+                    },
+                    {
+                        "required": [
+                            "cluster",
+                            "source_job_id",
+                            "source_artifact_id",
+                            "package_id",
+                            "package_name",
+                        ],
+                        "not": {"required": ["binding"]},
+                    },
                 ],
                 "additionalProperties": False,
             },
@@ -1719,10 +1753,17 @@ def _call_tool(
     if session is not None:
         session.observe_remote_job_result(result)
     return {
-        "content": [{"type": "text", "text": json.dumps(result, sort_keys=True)}],
+        "content": [{"type": "text", "text": _serialize_tool_result(result)}],
         "structuredContent": result,
         "isError": False,
     }
+
+
+def _serialize_tool_result(result: JSON) -> str:
+    """Keep compact service handoffs ahead of a potentially large MCP result."""
+    if "service_runtime_bindings" in result:
+        return json.dumps(result)
+    return json.dumps(result, sort_keys=True)
 
 
 def _restore_session_remote_job_route(
@@ -2743,7 +2784,7 @@ def _verified_mcp_result(
     definition: ClusterDefinition,
     job_id: str,
     artifacts: list[JSON],
-) -> JSON | None:
+) -> _VerifiedMcpResult | None:
     artifact = next(
         (
             item
@@ -2769,7 +2810,7 @@ def _verified_owned_mcp_result(
     client: OwnedSessionApiClient,
     job_id: str,
     artifacts: list[JSON],
-) -> JSON | None:
+) -> _VerifiedMcpResult | None:
     artifact = next(
         (
             item
@@ -2792,7 +2833,10 @@ def _verified_owned_mcp_result(
     return _decode_verified_mcp_result(envelope, artifact=artifact, job_id=job_id)
 
 
-def _verified_local_mcp_result(queue: ClioCoreQueue, job_id: str) -> JSON | None:
+def _verified_local_mcp_result(
+    queue: ClioCoreQueue,
+    job_id: str,
+) -> _VerifiedMcpResult | None:
     artifact = next(
         (
             item
@@ -2814,7 +2858,12 @@ def _verified_local_mcp_result(queue: ClioCoreQueue, job_id: str) -> JSON | None
     )
 
 
-def _decode_verified_mcp_result(envelope: JSON, *, artifact: JSON, job_id: str) -> JSON:
+def _decode_verified_mcp_result(
+    envelope: JSON,
+    *,
+    artifact: JSON,
+    job_id: str,
+) -> _VerifiedMcpResult:
     envelope_artifact = envelope.get("artifact")
     if not isinstance(envelope_artifact, dict):
         raise ValueError("MCP result artifact envelope is missing durable metadata")
@@ -2844,7 +2893,7 @@ def _decode_verified_mcp_result(envelope: JSON, *, artifact: JSON, job_id: str) 
     if not isinstance(document, dict):
         raise ValueError("MCP result artifact must contain a JSON object")
     typed = cast(JSON, document)
-    return {
+    public = {
         key: typed.get(key)
         for key in (
             "operation",
@@ -2859,6 +2908,7 @@ def _decode_verified_mcp_result(envelope: JSON, *, artifact: JSON, job_id: str) 
             "result_validation",
         )
     }
+    return _VerifiedMcpResult(document=typed, public=public)
 
 
 def _mcp_result_artifact(artifacts: list[JSON], *, job_id: str) -> JSON | None:
@@ -2940,21 +2990,37 @@ def _public_mcp_result_artifact(artifact: JSON) -> JSON:
 def _attach_terminal_mcp_evidence(
     receipt: JSON,
     *,
-    job_id: str,
+    source_job: RelayJob,
     last_error: str | None,
     artifacts: list[JSON],
-    parsed_result: JSON | None,
+    parsed_result: _VerifiedMcpResult | None,
 ) -> None:
     """Attach bounded terminal MCP evidence to a waited submission receipt."""
 
     receipt["last_error"] = last_error
     if parsed_result is None:
         return
-    artifact = _mcp_result_artifact(artifacts, job_id=job_id)
+    artifact = _mcp_result_artifact(artifacts, job_id=source_job.job_id)
     if artifact is None:
-        raise ValueError(f"verified MCP result for {job_id} has no durable artifact")
-    receipt["mcp_result"] = _bounded_mcp_result(parsed_result)
+        raise ValueError(f"verified MCP result for {source_job.job_id} has no durable artifact")
     receipt["mcp_result_artifact"] = _public_mcp_result_artifact(artifact)
+    if (
+        source_job.state is JobState.SUCCEEDED
+        and isinstance(source_job.spec, McpCallSpec)
+        and source_job.spec.tool == "jarvis_get_execution"
+        and source_job.spec.arguments.get("include_service_runtimes") is True
+    ):
+        source_artifact = ArtifactRef.model_validate(artifact)
+        receipt["service_runtime_bindings"] = [
+            handoff.model_dump(mode="json")
+            for handoff in derive_jarvis_service_runtime_handoffs(
+                cluster=source_job.cluster,
+                source_job=source_job,
+                source_artifact=source_artifact,
+                document=parsed_result.document,
+            )
+        ]
+    receipt["mcp_result"] = _bounded_mcp_result(parsed_result.public)
 
 
 def _render_remote_mcp_context(catalog: VirtualRemoteMcpCatalog) -> str:
@@ -3172,7 +3238,7 @@ def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings)
                 result["artifacts"] = artifact_records
                 parsed_result = _verified_owned_mcp_result(client, job_id, artifact_records)
                 if parsed_result is not None:
-                    result["mcp_result"] = parsed_result
+                    result["mcp_result"] = parsed_result.public
             result["cluster"] = target.name
             result["route_revision"] = _route_revision(target)
             return result
@@ -3204,7 +3270,7 @@ def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings)
         result["artifacts"] = artifact_records
         parsed_result = _verified_mcp_result(target, job_id, artifact_records)
         if parsed_result is not None:
-            result["mcp_result"] = parsed_result
+            result["mcp_result"] = parsed_result.public
         result["cluster"] = target.name
         result["route_revision"] = _route_revision(target)
         return result
@@ -3226,7 +3292,7 @@ def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings)
     result["artifacts"] = _complete_local_artifacts(queue, job.job_id)
     parsed_result = _verified_local_mcp_result(queue, job.job_id)
     if parsed_result is not None:
-        result["mcp_result"] = parsed_result
+        result["mcp_result"] = parsed_result.public
     if target is not None:
         result["cluster"] = target.name
         result["route_revision"] = _route_revision(target)
@@ -3817,9 +3883,10 @@ def _remote_mcp_submission_result(
     last_error = job.get("last_error")
     if last_error is not None and not isinstance(last_error, str):
         raise ValueError("remote MCP job returned an invalid last_error")
+    source_job = RelayJob.model_validate(job)
     _attach_terminal_mcp_evidence(
         result,
-        job_id=job_id,
+        source_job=source_job,
         last_error=last_error,
         artifacts=artifacts,
         parsed_result=parsed_result,
@@ -3841,7 +3908,7 @@ def _owned_session_submission_result(
 ) -> JSON:
     """Return an owned receipt, optionally waiting through the same protected API."""
     artifacts: list[JSON] = []
-    parsed_result: JSON | None = None
+    parsed_result: _VerifiedMcpResult | None = None
     logs: JSON | None = None
     if wait_for_terminal_result:
         with OwnedSessionApiClient(definition=definition, settings=settings) as client:
@@ -3894,7 +3961,7 @@ def _owned_session_submission_result(
     if wait_for_terminal_result and include_terminal_mcp_result:
         _attach_terminal_mcp_evidence(
             result,
-            job_id=job.job_id,
+            source_job=job,
             last_error=job.last_error,
             artifacts=artifacts,
             parsed_result=parsed_result,
@@ -4117,7 +4184,7 @@ def _submission_result(
         artifacts = _complete_local_artifacts(queue, job.job_id)
         _attach_terminal_mcp_evidence(
             result,
-            job_id=job.job_id,
+            source_job=job,
             last_error=job.last_error,
             artifacts=artifacts,
             parsed_result=_verified_local_mcp_result(queue, job.job_id),
@@ -4220,6 +4287,7 @@ def _bind_jarvis_runtime(
 ) -> JSON:
     """Bind only connector resources derived from one verified JARVIS result."""
     allowed = {
+        "binding",
         "cluster",
         "source_job_id",
         "source_artifact_id",
@@ -4235,16 +4303,24 @@ def _bind_jarvis_runtime(
             "relay_bind_jarvis_runtime does not accept caller-supplied runtime metadata: "
             + ", ".join(unexpected)
         )
-    cluster = _required_str(arguments, "cluster")
+    (
+        cluster,
+        source_job_id,
+        source_artifact_id,
+        package_id,
+        package_name,
+        service_instance_id,
+    ) = _jarvis_runtime_binding_selectors(arguments)
     definition = _remote_cluster_definition(cluster)
     verified = resolve_jarvis_service_runtime(
         queue=queue,
         definition=definition,
         settings=settings,
-        source_job_id=_required_durable_record_id(arguments, "source_job_id"),
-        source_artifact_id=_required_durable_record_id(arguments, "source_artifact_id"),
-        package_id=_required_str(arguments, "package_id"),
-        package_name=_required_str(arguments, "package_name"),
+        source_job_id=source_job_id,
+        source_artifact_id=source_artifact_id,
+        package_id=package_id,
+        package_name=package_name,
+        service_instance_id=service_instance_id,
     )
     readiness_timeout_seconds = _positive_float_argument(
         arguments,
@@ -4303,6 +4379,46 @@ def _bind_jarvis_runtime(
         "command_url": started.command_url,
         "scheduler_cancel_requested": False,
     }
+
+
+def _jarvis_runtime_binding_selectors(
+    arguments: JSON,
+) -> tuple[str, str, str, str, str, str | None]:
+    """Accept one exact handoff object or the legacy scalar selector contract."""
+    scalar_fields = {
+        "cluster",
+        "source_job_id",
+        "source_artifact_id",
+        "package_id",
+        "package_name",
+    }
+    if "binding" in arguments:
+        mixed = sorted(scalar_fields.intersection(arguments))
+        if mixed:
+            raise ValueError(
+                "relay_bind_jarvis_runtime binding cannot be mixed with legacy selectors: "
+                + ", ".join(mixed)
+            )
+        try:
+            handoff = JarvisServiceRuntimeHandoff.model_validate(arguments["binding"])
+        except ValidationError as exc:
+            raise ValueError(f"relay_bind_jarvis_runtime binding is invalid: {exc}") from exc
+        return (
+            handoff.cluster,
+            validate_durable_record_id(handoff.source_job_id),
+            validate_durable_record_id(handoff.source_artifact_id),
+            handoff.package_id,
+            handoff.package_name,
+            handoff.service_instance_id,
+        )
+    return (
+        _required_str(arguments, "cluster"),
+        _required_durable_record_id(arguments, "source_job_id"),
+        _required_durable_record_id(arguments, "source_artifact_id"),
+        _required_str(arguments, "package_id"),
+        _required_str(arguments, "package_name"),
+        None,
+    )
 
 
 def _update_gateway_session(arguments: JSON, *, queue: ClioCoreQueue) -> JSON:

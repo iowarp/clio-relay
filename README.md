@@ -8,7 +8,7 @@
 
 It is a piece of the federation layer for [`clio-agent`](https://github.com/iowarp/clio-agent): a local CLIO experience can delegate work to a remote machine, keep observing it, detach, reconnect, and clean up after itself. The project is also designed for use outside CLIO. Any client that can call the CLI, HTTP API, or MCP tools can use the same relay model.
 
-> Version `1.3.15` uses a release-first patch process. A maintainer builds the
+> Version `1.3.16` uses a release-first patch process. A maintainer builds the
 > wheel and source distribution once, attaches those exact bytes and their
 > checksums to a GitHub Release, and publishes the release immediately. Tag
 > regression jobs and the trusted PyPI upload then run asynchronously; they do
@@ -140,7 +140,10 @@ These generic gateway operations manage ordinary endpoint metadata only. They ca
 When JARVIS already owns a live application, agents use the user-profile
 `relay_bind_jarvis_runtime` MCP tool instead of supplying a runtime specification.
 The relay verifies a completed `jarvis_get_execution` MCP result produced with
-`include_service_runtimes=true`, persists its execution, service, scheduler, and
+`include_service_runtimes=true`. A waited query returns compact
+`service_runtime_bindings`; the agent passes one entry unchanged as
+`relay_bind_jarvis_runtime.binding` instead of guessing opaque job, artifact, or
+service identifiers. The relay persists its execution, service, scheduler, and
 dataset identities, starts only
 the connector path, and returns local connect, health, stream, events, state, and
 command URLs. Detach and stop retain the scheduler job unless cancellation is

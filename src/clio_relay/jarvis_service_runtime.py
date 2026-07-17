@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.identifiers import DurableRecordId
 from clio_relay.jarvis_mcp import (
     jarvis_cd_lock_binding_expectation,
     jarvis_mcp_server_artifact_binding_verified,
@@ -79,17 +80,6 @@ class JarvisDatasetMember(BaseModel):
     location: str
     timestep: float | int | None = Field(default=None, exclude_if=lambda value: value is None)
 
-    @model_validator(mode="before")
-    @classmethod
-    def reject_null_timestep(cls, value: object) -> object:
-        """Require an optional timestep to be omitted instead of serialized as null."""
-        if not isinstance(value, dict):
-            return value
-        typed = cast(dict[str, object], value)
-        if "timestep" in typed and typed["timestep"] is None:
-            raise ValueError("dataset member timestep must be omitted when absent")
-        return typed
-
     @model_validator(mode="after")
     def validate_member(self) -> JarvisDatasetMember:
         """Require one normalized absolute location and a finite optional timestep."""
@@ -108,17 +98,6 @@ class JarvisDatasetArray(BaseModel):
     association: Literal["point", "cell", "field"]
     components: int = Field(ge=1, le=64)
     units: str | None = Field(default=None, exclude_if=lambda value: value is None)
-
-    @model_validator(mode="before")
-    @classmethod
-    def reject_null_units(cls, value: object) -> object:
-        """Require optional units to be omitted instead of serialized as null."""
-        if not isinstance(value, dict):
-            return value
-        typed = cast(dict[str, object], value)
-        if "units" in typed and typed["units"] is None:
-            raise ValueError("dataset array units must be omitted when absent")
-        return typed
 
     @model_validator(mode="after")
     def validate_array(self) -> JarvisDatasetArray:
@@ -333,6 +312,19 @@ class JarvisServiceRuntimeBinding(BaseModel):
         return _canonical_sha256(value, "binding digest")
 
 
+class JarvisServiceRuntimeHandoff(BaseModel):
+    """Agent-facing selectors copied unchanged into a relay runtime bind call."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    cluster: str = Field(min_length=1, max_length=256)
+    source_job_id: DurableRecordId
+    source_artifact_id: DurableRecordId
+    package_id: str = Field(min_length=1, max_length=256)
+    package_name: str = Field(min_length=1, max_length=256)
+    service_instance_id: str = Field(min_length=1, max_length=512)
+
+
 class VerifiedJarvisServiceRuntime(BaseModel):
     """Validated runtime and its immutable relay provenance."""
 
@@ -352,6 +344,7 @@ def resolve_jarvis_service_runtime(
     source_artifact_id: str,
     package_id: str,
     package_name: str,
+    service_instance_id: str | None = None,
 ) -> VerifiedJarvisServiceRuntime:
     """Resolve one ready service solely from a verified durable JARVIS MCP result."""
     job, artifact, document = _load_source(
@@ -361,7 +354,7 @@ def resolve_jarvis_service_runtime(
         source_job_id=source_job_id,
         source_artifact_id=source_artifact_id,
     )
-    spec = _validate_source_job(job, definition=definition)
+    spec = _validate_source_job(job, cluster=definition.name)
     query = _validate_mcp_result(document, job=job, spec=spec)
     native = native_execution_documents(query.model_dump(mode="json"))
     if native is None:
@@ -372,6 +365,7 @@ def resolve_jarvis_service_runtime(
         snapshot,
         package_id=package_id,
         package_name=package_name,
+        service_instance_id=service_instance_id,
     )
     _validate_runtime_package(native, runtime=runtime)
     scheduler_provider = native.execution_handle.scheduler_provider
@@ -404,6 +398,49 @@ def resolve_jarvis_service_runtime(
     return VerifiedJarvisServiceRuntime(binding=binding, runtime=runtime, native_execution=native)
 
 
+def derive_jarvis_service_runtime_handoffs(
+    *,
+    cluster: str,
+    source_job: RelayJob,
+    source_artifact: ArtifactRef,
+    document: JSON,
+) -> list[JarvisServiceRuntimeHandoff]:
+    """Derive ready-service selectors from one SHA-verified durable MCP artifact.
+
+    The caller verifies the artifact envelope and payload digest before passing
+    the decoded document. The same route, release, execution, and package checks
+    used by the eventual bind operation are then applied here.
+    """
+    if source_artifact.job_id != source_job.job_id or source_artifact.kind != "mcp_result":
+        raise ValueError("JARVIS service handoff artifact identity did not match its source job")
+    if source_artifact.sha256 is None:
+        raise ValueError("JARVIS service handoff artifact has no durable SHA-256")
+    _canonical_sha256(source_artifact.sha256, "handoff artifact digest")
+    spec = _validate_source_job(source_job, cluster=cluster)
+    query = _validate_mcp_result(document, job=source_job, spec=spec)
+    native = native_execution_documents(query.model_dump(mode="json"))
+    if native is None:
+        raise ValueError("JARVIS service runtime result omitted native execution documents")
+    snapshot = query.service_runtimes
+    _validate_snapshot_execution(snapshot, native=native)
+    handoffs: list[JarvisServiceRuntimeHandoff] = []
+    for runtime in snapshot.service_runtimes:
+        _validate_runtime_package(native, runtime=runtime)
+        if runtime.lifecycle != "ready":
+            continue
+        handoffs.append(
+            JarvisServiceRuntimeHandoff(
+                cluster=cluster,
+                source_job_id=source_job.job_id,
+                source_artifact_id=source_artifact.artifact_id,
+                package_id=runtime.package_id,
+                package_name=runtime.package_name,
+                service_instance_id=runtime.service_instance_id,
+            )
+        )
+    return handoffs
+
+
 def reverify_jarvis_service_runtime(
     *,
     queue: ClioCoreQueue,
@@ -421,6 +458,7 @@ def reverify_jarvis_service_runtime(
         source_artifact_id=expected.source_relay_artifact_id,
         package_id=expected.package_id,
         package_name=expected.package_name,
+        service_instance_id=expected.service_instance_id,
     )
     if not hmac.compare_digest(
         _canonical_json_bytes(observed.binding.model_dump(mode="json")),
@@ -503,8 +541,8 @@ def _load_source(
     return job, artifact, cast(JSON, document)
 
 
-def _validate_source_job(job: RelayJob, *, definition: ClusterDefinition) -> McpCallSpec:
-    if job.cluster != definition.name:
+def _validate_source_job(job: RelayJob, *, cluster: str) -> McpCallSpec:
+    if job.cluster != cluster:
         raise ValueError("JARVIS service source job belongs to a different cluster")
     if job.state is not JobState.SUCCEEDED:
         raise ValueError("JARVIS service source job must have completed successfully")
@@ -601,11 +639,14 @@ def _select_ready_runtime(
     *,
     package_id: str,
     package_name: str,
+    service_instance_id: str | None = None,
 ) -> JarvisServiceRuntime:
     matches = [
         runtime
         for runtime in snapshot.service_runtimes
-        if runtime.package_id == package_id and runtime.package_name == package_name
+        if runtime.package_id == package_id
+        and runtime.package_name == package_name
+        and (service_instance_id is None or runtime.service_instance_id == service_instance_id)
     ]
     if len(matches) != 1:
         raise ValueError(

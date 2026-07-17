@@ -53,7 +53,7 @@ def test_release_identity_is_consistent_across_package_policy_matrix_and_runbook
     init_source = (ROOT / "src" / "clio_relay" / "__init__.py").read_text(encoding="utf-8")
     release_process = RELEASE_PROCESS.read_text(encoding="utf-8")
 
-    assert version == "1.3.15"
+    assert version == "1.3.16"
     assert relay_lock["version"] == version
     assert f'__version__ = "{version}"' in init_source
     assert policy["release_version"] == version

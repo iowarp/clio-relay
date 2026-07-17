@@ -21,6 +21,7 @@ from clio_relay.remote_mcp import (
     RemoteMcpToolSchema,
     remote_mcp_server_artifact_digest,
 )
+from tests.jarvis_mcp_fakes import verified_jarvis_server_artifact
 
 
 def test_packaged_stdio_session_initializes_lists_and_calls_virtual_jarvis(
@@ -36,11 +37,7 @@ def test_packaged_stdio_session_initializes_lists_and_calls_virtual_jarvis(
     ClusterRegistry(clusters={"alpha": ClusterDefinition(name="alpha", ssh_host="localhost")}).save(
         tmp_path / ".clio-relay" / "clusters.json"
     )
-    server_artifact = {
-        "verified": True,
-        "server_process_artifact_verified": True,
-        "executable": {"path": "/opt/bin/uvx", "sha256": "a" * 64},
-    }
+    server_artifact = verified_jarvis_server_artifact()
     contract = jarvis_user_contract()
     now = datetime.now(UTC)
     RemoteMcpSchemaCache.update_entry(
@@ -79,6 +76,7 @@ def test_packaged_stdio_session_initializes_lists_and_calls_virtual_jarvis(
 
     initialize = session.initialize_response["result"]
     listed = session.tools_list_response["result"]["tools"]
+    assert "result" in session.tools_call_response, session.evidence()
     call = session.tools_call_response["result"]["structuredContent"]
     job = ClioCoreQueue(tmp_path / "core").get_job(call["job_id"])
     assert initialize["serverInfo"]["name"] == "clio-relay"

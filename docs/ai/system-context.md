@@ -104,7 +104,10 @@ from an authenticated completed relay-routed MCP result and persists
 `gateway.jarvis_runtime_binding`. That record binds the source relay job and
 artifact SHA-256 to the JARVIS execution, optional scheduler provider/native id,
 package/service revision, and exact dataset descriptor. Caller-provided runtime
-metadata and lifecycle commands are rejected. Binding starts no application or
+metadata and lifecycle commands are rejected. A waited execution query emits a
+compact selector-only `service_runtime_bindings` handoff which is copied unchanged
+into the bind call; the source artifact is still re-read and fully verified.
+Binding starts no application or
 scheduler work; it starts only the relay connectors. Any later explicit scheduler
 cancellation re-verifies the immutable source before invoking the provider.
 
