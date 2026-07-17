@@ -205,6 +205,7 @@ _BASE_CHILD_ENV_NAMES = frozenset(
         "LC_CTYPE",
         "LOCALAPPDATA",
         "LOGNAME",
+        "NoDefaultCurrentDirectoryInExePath",
         "PATH",
         "PATHEXT",
         "PYTHONIOENCODING",
@@ -1791,7 +1792,6 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
     execution_artifact: dict[str, Any] | None = None
     result_validation: dict[str, Any] | None = None
     try:
-        command = [_resolve_executable(server), *server_args]
         server_artifact = (
             _server_artifact_identity(
                 server,
@@ -1801,10 +1801,14 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
             if expected_jarvis_cd_lock_binding is not None
             else _server_artifact_identity(server, server_args)
         )
-        _reject_verified_nested_runtime_path_remap(
+        _reject_verified_runtime_environment_remap(
             server_artifact=server_artifact,
             env_from=env_from,
         )
+        command = [
+            _server_artifact_launch_executable(server_artifact),
+            *server_args,
+        ]
         observed_server_artifact_digest = _server_artifact_digest(server_artifact)
         if expected_jarvis_cd_lock_binding is not None:
             _require_locked_jarvis_cd_binding(
@@ -2975,9 +2979,29 @@ def _server_artifact_identity(
         if install_spec is None and executable is not None
         else None
     )
+    runtime_launcher_identity = (
+        python_distribution_runtime.get("external_launcher_identity")
+        if python_distribution_runtime is not None
+        else None
+    )
+    runtime_launcher_verified = (
+        executable is not None
+        and isinstance(runtime_launcher_identity, dict)
+        and cast(dict[str, Any], runtime_launcher_identity) == executable
+    )
+    if (
+        python_distribution_runtime is not None
+        and python_distribution_runtime.get("runtime_closure_verified") is True
+        and not runtime_launcher_verified
+    ):
+        python_distribution_runtime["runtime_closure_verified"] = False
+        python_distribution_runtime["error"] = (
+            "direct server executable changed during Python runtime inspection"
+        )
     direct_runtime_verified = (
         python_distribution_runtime is not None
         and python_distribution_runtime.get("runtime_closure_verified") is True
+        and runtime_launcher_verified
     )
     direct_install_artifact = _direct_distribution_source_identity(python_distribution_runtime)
     if direct_install_artifact is not None and direct_install_artifact not in input_files:
@@ -3074,6 +3098,7 @@ def _python_console_distribution_identity(executable: Path) -> dict[str, Any]:
         "runtime_closure_verified": False,
         "direct_url": None,
         "provider_interpreter": None,
+        "external_launcher_identity": None,
         "contract_source_path": None,
         "server_lock_paths": {},
         "error": None,
@@ -3083,6 +3108,11 @@ def _python_console_distribution_identity(executable: Path) -> dict[str, Any]:
     except OSError as exc:
         evidence["error"] = f"could not resolve direct server executable: {exc}"
         return evidence
+    launcher_identity = _file_identity(resolved_executable)
+    if launcher_identity is None:
+        evidence["error"] = "direct server executable has no stable file identity"
+        return evidence
+    evidence["external_launcher_identity"] = launcher_identity
     command_name = (
         resolved_executable.stem
         if resolved_executable.suffix.casefold() == ".exe"
@@ -3422,6 +3452,12 @@ print(json.dumps({"matches": matches}, sort_keys=True))
         )
         return evidence
     identity = cast(dict[str, Any], matches[0])
+    direct_url = identity.get("direct_url")
+    if isinstance(direct_url, dict):
+        dir_info = cast(dict[str, Any], direct_url).get("dir_info")
+        if isinstance(dir_info, dict) and cast(dict[str, Any], dir_info).get("editable") is True:
+            evidence["error"] = "editable Python distributions have no immutable runtime closure"
+            return evidence
     raw_files = identity.get("files")
     if not isinstance(raw_files, list):
         evidence["error"] = "persistent tool distribution omitted its RECORD closure"
@@ -3764,25 +3800,79 @@ def _server_artifact_digest(server_artifact: dict[str, Any]) -> str:
     ).hexdigest()
 
 
-def _reject_verified_nested_runtime_path_remap(
+def _reject_verified_runtime_environment_remap(
     *,
     server_artifact: dict[str, Any],
     env_from: dict[str, str],
 ) -> None:
-    """Keep a locked clio-kit child on the PATH/PATHEXT identity just verified."""
+    """Keep a locked clio-kit child on the uv resolution identity just verified."""
+    python_runtime = server_artifact.get("python_distribution_runtime")
+    python_runtime_verified = (
+        isinstance(python_runtime, dict)
+        and cast(dict[str, Any], python_runtime).get("runtime_closure_verified") is True
+    )
     nested_runtime = server_artifact.get("nested_runtime")
-    if (
-        not isinstance(nested_runtime, dict)
-        or cast(dict[str, Any], nested_runtime).get("locked_runtime_verified") is not True
-    ):
+    nested_runtime_verified = (
+        isinstance(nested_runtime, dict)
+        and cast(dict[str, Any], nested_runtime).get("locked_runtime_verified") is True
+    )
+    if not python_runtime_verified and not nested_runtime_verified:
         return
+    fixed_names = {
+        "home",
+        "homedrive",
+        "homepath",
+        "nodefaultcurrentdirectoryinexepath",
+        "path",
+        "pathext",
+        "userprofile",
+        "virtual_env",
+        "xdg_cache_home",
+        "xdg_config_home",
+        "xdg_data_home",
+        "xdg_state_home",
+    }
     forbidden = sorted(
-        child_name for child_name in env_from if child_name.casefold() in {"path", "pathext"}
+        child_name
+        for child_name in env_from
+        if (
+            (
+                python_runtime_verified
+                and (
+                    child_name.casefold() == "__pyvenv_launcher__"
+                    or child_name.casefold() in {"libpath", "shlib_path"}
+                    or child_name.casefold().startswith(("dyld_", "ld_", "python"))
+                )
+            )
+            or (
+                nested_runtime_verified
+                and (
+                    child_name.casefold() in fixed_names
+                    or child_name.casefold().startswith(("clio_kit_", "python", "uv_"))
+                )
+            )
+        )
     )
     if forbidden:
         raise ValueError(
-            "verified nested clio-kit runtime cannot remap PATH or PATHEXT through env_from"
+            "verified MCP runtime cannot remap interpreter, native loader, or uv "
+            "resolution environment through env_from"
         )
+
+
+def _server_artifact_launch_executable(server_artifact: dict[str, Any]) -> str:
+    """Return the exact executable path captured by server artifact inspection."""
+    executable = server_artifact.get("executable")
+    if isinstance(executable, dict):
+        path = cast(dict[str, Any], executable).get("path")
+        if isinstance(path, str) and path:
+            return path
+    if server_artifact.get("verified") is True:
+        raise ValueError("verified MCP server artifact omitted its executable path")
+    resolved = server_artifact.get("resolved_executable")
+    if not isinstance(resolved, str) or not resolved:
+        raise ValueError("MCP server artifact omitted its resolved executable")
+    return resolved
 
 
 def _nested_clio_kit_server_name(

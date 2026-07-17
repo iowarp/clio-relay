@@ -130,6 +130,13 @@ def _verified_jarvis_server_artifact() -> dict[str, Any]:
     expected = _jarvis_cd_lock_expectation()
     return {
         "verified": True,
+        "resolved_executable": "clio-kit",
+        "executable": {
+            "path": "clio-kit",
+            "filename": "clio-kit",
+            "sha256": "d" * 64,
+            "size_bytes": 1,
+        },
         "nested_runtime": {
             "schema_version": "clio-kit.locked-server.v4",
             "server_name": "jarvis",
@@ -212,6 +219,71 @@ def test_mcp_call_runner_invokes_tool_with_defaults(
     assert result["timed_out"] is False
     assert result["protocol_error"] is None
     assert result["protocol_result"] == {"content": [{"type": "text", "text": "ok"}]}
+
+
+def test_mcp_call_runner_launches_captured_artifact_executable_path(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+    captured_executable = tmp_path / "captured-science-mcp"
+    captured_executable.write_bytes(b"captured executable")
+    executable_identity = cast(Any, runner)._file_identity(captured_executable)
+    assert executable_identity is not None
+    artifact: dict[str, Any] = {
+        "verified": False,
+        "resolved_executable": "must-not-be-resolved-again",
+        "executable": executable_identity,
+        "install_source": None,
+        "input_files": [],
+        "python_distribution_runtime": None,
+        "nested_runtime": None,
+    }
+
+    def server_artifact_identity(
+        _server: str,
+        _server_args: list[str],
+        *,
+        verify_relay_jarvis_cd_lock: bool = False,
+    ) -> dict[str, Any]:
+        del verify_relay_jarvis_cd_lock
+        return artifact
+
+    launched: list[str] = []
+
+    def fake_run(
+        command: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        launched.extend(command)
+        stdout = "\n".join(
+            [
+                json.dumps({"jsonrpc": "2.0", "id": "clio-relay-mcp-init", "result": {}}),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "clio-relay-mcp-call",
+                        "result": {"content": []},
+                    }
+                ),
+            ]
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    def fail_if_resolved_again(_server: str) -> str:
+        raise AssertionError("server executable must come from its captured artifact")
+
+    monkeypatch.setattr(runner, "_server_artifact_identity", server_artifact_identity)
+    monkeypatch.setattr(runner, "_run_mcp_session", fake_run)
+    monkeypatch.setattr(runner, "_resolve_executable", fail_if_resolved_again)
+
+    return_code = cast(McpCallRunnerModule, runner).run_mcp_call_from_params(
+        {"server": "science-mcp", "tool": "inspect"}
+    )
+
+    assert return_code == 0
+    assert launched == [str(captured_executable.resolve())]
 
 
 def test_mcp_call_runner_discovers_tools_and_records_server_provenance(
@@ -507,6 +579,7 @@ def test_persistent_uv_tool_clio_kit_runtime_is_receipt_bindable(
             "runtime_closure_verified": True,
             "direct_url": {"url": wheel.resolve().as_uri()},
             "provider_interpreter": str(tmp_path / "tool-python"),
+            "external_launcher_identity": cast(Any, runner)._file_identity(tool),
             "contract_source_path": str(source),
             "server_lock_paths": {"jarvis": str(lock)},
             "error": None,
@@ -537,6 +610,42 @@ def test_persistent_uv_tool_clio_kit_runtime_is_receipt_bindable(
     assert identity["nested_runtime"]["locked_runtime_verified"] is True
     assert identity["server_process_artifact_verified"] is True
     assert identity["verified"] is True
+
+
+def test_python_runtime_rejects_contradictory_top_level_launcher_identity(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    launcher = tmp_path / "science-mcp"
+    launcher.write_bytes(b"verified-launcher")
+    observed_launcher = cast(Any, runner)._file_identity(launcher)
+    assert observed_launcher is not None
+    contradictory_launcher = {**observed_launcher, "sha256": "0" * 64}
+
+    def console_distribution_identity(_path: Path) -> dict[str, object]:
+        return {
+            "runtime_closure_verified": True,
+            "runtime_closure_sha256": "a" * 64,
+            "external_launcher_identity": contradictory_launcher,
+            "direct_url": None,
+            "error": None,
+        }
+
+    monkeypatch.setattr(
+        runner,
+        "_python_console_distribution_identity",
+        console_distribution_identity,
+    )
+
+    identity = cast(Any, runner)._server_artifact_identity(str(launcher), [])
+
+    assert identity["verified"] is False
+    assert identity["launcher_artifact_verified"] is False
+    assert identity["python_distribution_runtime"]["runtime_closure_verified"] is False
+    assert identity["python_distribution_runtime"]["error"] == (
+        "direct server executable changed during Python runtime inspection"
+    )
 
 
 def test_external_console_probe_preserves_logical_provider_path(
@@ -578,6 +687,47 @@ def test_external_console_probe_preserves_logical_provider_path(
         evidence["error"]
         == "persistent tool launcher has no unique installed console-script distribution"
     )
+
+
+def test_external_console_probe_rejects_editable_distribution(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    provider = tmp_path / "tool" / "bin" / "python"
+    provider.parent.mkdir(parents=True)
+    provider.write_bytes(b"provider")
+    launcher = tmp_path / "science-mcp"
+    launcher.write_text(f"#!{provider}\n", encoding="utf-8")
+
+    def run_probe(
+        command: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        identity: dict[str, object] = {
+            "executable": str(provider.resolve()),
+            "distribution": "science-mcp",
+            "distribution_version": "1.0.0",
+            "entry_point": "science-mcp",
+            "entry_point_value": "science_mcp:main",
+            "direct_url": {"dir_info": {"editable": True}, "url": "file:///mutable"},
+        }
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps({"matches": [identity]}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(cast(Any, runner).subprocess, "run", run_probe)
+
+    evidence = cast(Any, runner)._external_python_console_distribution_identity(
+        launcher,
+        command_name="science-mcp",
+    )
+
+    assert evidence["runtime_closure_verified"] is False
+    assert evidence["error"] == "editable Python distributions have no immutable runtime closure"
 
 
 def test_windows_uv_trampoline_binds_digest_equal_record_launcher(
@@ -1932,6 +2082,7 @@ def test_mcp_call_runner_scrubs_progress_env_from_server(
     monkeypatch.setenv("CLIO_RELAY_RUNTIME_METADATA_TOKEN", "forbidden-runtime-token")
     monkeypatch.setenv("UNDECLARED_APPLICATION_SECRET", "not-forwarded")
     monkeypatch.setenv("REGISTERED_APPLICATION_SECRET", "forwarded-value")
+    monkeypatch.setenv("NoDefaultCurrentDirectoryInExePath", "1")
 
     scrubbed = cast(Any, runner)._scrubbed_env()
     explicit = cast(Any, runner)._child_env({"SCIENCE_API_KEY": "REGISTERED_APPLICATION_SECRET"})
@@ -1941,6 +2092,7 @@ def test_mcp_call_runner_scrubs_progress_env_from_server(
     assert "CLIO_RELAY_RUNTIME_METADATA_FILE" not in scrubbed
     assert "CLIO_RELAY_RUNTIME_METADATA_TOKEN" not in scrubbed
     assert "UNDECLARED_APPLICATION_SECRET" not in scrubbed
+    assert scrubbed["NoDefaultCurrentDirectoryInExePath"] == "1"
     assert explicit["SCIENCE_API_KEY"] == "forwarded-value"
     assert "REGISTERED_APPLICATION_SECRET" not in explicit
 
@@ -1952,13 +2104,34 @@ def test_mcp_call_runner_rejects_relay_credential_references() -> None:
         cast(Any, runner)._environment_references({"REMOTE_TOKEN": "CLIO_RELAY_API_TOKEN"})
 
 
-def test_verified_nested_runtime_rejects_path_environment_remap(
+@mark.parametrize(
+    "child_name",
+    [
+        "PATH",
+        "pathext",
+        "HOME",
+        "userprofile",
+        "HOMEDRIVE",
+        "homepath",
+        "NoDefaultCurrentDirectoryInExePath",
+        "PYTHONPATH",
+        "pythonhome",
+        "PythonUserBase",
+        "UV_PYTHON",
+        "uv_no_sync",
+        "CLIO_KIT_CACHE_DIR",
+        "virtual_env",
+        "XDG_CACHE_HOME",
+    ],
+)
+def test_verified_nested_runtime_rejects_uv_resolution_environment_remap(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    child_name: str,
 ) -> None:
     runner = _load_runner()
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("UNVERIFIED_MCP_PATH", str(tmp_path))
+    monkeypatch.setenv("UNVERIFIED_RUNTIME_ROOT", str(tmp_path))
     artifact = _verified_jarvis_server_artifact()
 
     def server_artifact_identity(
@@ -1988,7 +2161,7 @@ def test_verified_nested_runtime_rejects_path_environment_remap(
             "server": "clio-kit",
             "server_args": ["mcp-server", "jarvis"],
             "tool": "jarvis_describe",
-            "env_from": {"Path": "UNVERIFIED_MCP_PATH"},
+            "env_from": {child_name: "UNVERIFIED_RUNTIME_ROOT"},
             "expected_jarvis_cd_lock_binding": _jarvis_cd_lock_expectation(),
         }
     )
@@ -1996,7 +2169,69 @@ def test_verified_nested_runtime_rejects_path_environment_remap(
 
     assert return_code == 1
     assert launched is False
-    assert "cannot remap PATH or PATHEXT" in result["protocol_error"]
+    assert "cannot remap interpreter, native loader, or uv resolution" in result["protocol_error"]
+
+
+@mark.parametrize(
+    "child_name",
+    [
+        "PYTHONPATH",
+        "pythonhome",
+        "__PYVENV_LAUNCHER__",
+        "LD_PRELOAD",
+        "dyld_insert_libraries",
+        "LIBPATH",
+        "shlib_path",
+    ],
+)
+def test_verified_python_runtime_rejects_loader_environment_remap(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    child_name: str,
+) -> None:
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UNVERIFIED_PYTHON_ROOT", str(tmp_path))
+    artifact: dict[str, Any] = {
+        "verified": True,
+        "python_distribution_runtime": {"runtime_closure_verified": True},
+        "nested_runtime": None,
+    }
+
+    def server_artifact_identity(
+        _server: str,
+        _server_args: list[str],
+        *,
+        verify_relay_jarvis_cd_lock: bool = False,
+    ) -> dict[str, Any]:
+        del verify_relay_jarvis_cd_lock
+        return artifact
+
+    launched = False
+
+    def fail_if_launched(
+        _command: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal launched
+        launched = True
+        raise AssertionError("verified Python runtime must reject loader remapping")
+
+    monkeypatch.setattr(runner, "_server_artifact_identity", server_artifact_identity)
+    monkeypatch.setattr(runner, "_run_mcp_session", fail_if_launched)
+
+    return_code = cast(McpCallRunnerModule, runner).run_mcp_call_from_params(
+        {
+            "server": "science-mcp",
+            "tool": "inspect",
+            "env_from": {child_name: "UNVERIFIED_PYTHON_ROOT"},
+        }
+    )
+    result = json.loads((tmp_path / "mcp-result.json").read_text(encoding="utf-8"))
+
+    assert return_code == 1
+    assert launched is False
+    assert "cannot remap interpreter, native loader, or uv resolution" in result["protocol_error"]
 
 
 def test_mcp_call_result_persists_environment_references_not_values(
