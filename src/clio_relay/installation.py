@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import unquote, urlsplit
 
+from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from clio_relay.errors import ConfigurationError
@@ -1048,23 +1049,79 @@ def verify_remote_worker_info(
     return current_receipt
 
 
-def attach_verified_worker_identity(
+def _verify_release_worker_install_source(receipt: InstallReceipt) -> str:
+    """Validate the worker's own release-pinned installation source.
+
+    The desktop operator and persistent cluster worker may obtain the same
+    released wheel through different transports.  For example, an operator can
+    run a GitHub-release wheel while cluster bootstrap downloads the exact
+    version-pinned PyPI wheel.  Artifact, version, and software identity remain
+    exact; this check validates the worker receipt's source semantics instead
+    of incorrectly requiring it to equal the desktop launcher's source kind.
+    """
+    filename = receipt.artifact_filename
+    if not isinstance(filename, str) or not filename:
+        raise ConfigurationError("remote worker install receipt omitted its wheel filename")
+    try:
+        project, version, _build, _tags = parse_wheel_filename(filename)
+    except InvalidWheelFilename as exc:
+        raise ConfigurationError("remote worker install receipt wheel filename is invalid") from exc
+    if project != canonicalize_name("clio-relay") or str(version) != receipt.distribution_version:
+        raise ConfigurationError(
+            "remote worker install receipt wheel does not match its distribution version"
+        )
+
+    requested_source = receipt.requested_source
+    if requested_source == InstallSourceKind.PYPI.value:
+        expected_spec = f"clio-relay=={receipt.distribution_version}"
+        if receipt.install_spec != expected_spec:
+            raise ConfigurationError(
+                "remote worker PyPI install source is not pinned to the exact release version"
+            )
+    elif requested_source == InstallSourceKind.WHEEL.value:
+        parsed = urlsplit(receipt.install_spec)
+        if parsed.query or parsed.fragment:
+            raise ConfigurationError("remote worker wheel install source is not immutable")
+        install_filename = unquote(parsed.path).replace("\\", "/").rsplit("/", 1)[-1]
+        if install_filename != filename:
+            raise ConfigurationError(
+                "remote worker wheel install source does not match its receipt artifact"
+            )
+    else:
+        raise ConfigurationError(
+            "remote worker install source is not a release-pinned PyPI or wheel source"
+        )
+    return requested_source
+
+
+def _verify_report_worker_receipt(
     report: LiveValidationReport,
     info: dict[str, object],
 ) -> InstallReceipt:
-    """Verify and attach remote worker identity checks to a canonical report."""
+    """Bind a report to the exact worker artifact and its own pinned source."""
     receipt = verify_remote_worker_info(
         info,
         expected_cluster=report.cluster,
         expected_version=report.install_source.distribution_version,
         expected_software=report.software,
         expected_artifact_sha256=report.install_source.artifact_sha256,
-        expected_source=report.install_source.kind.value,
+        expected_source=None,
     )
+    _verify_release_worker_install_source(receipt)
+    return receipt
+
+
+def attach_verified_worker_identity(
+    report: LiveValidationReport,
+    info: dict[str, object],
+) -> InstallReceipt:
+    """Verify and attach remote worker identity checks to a canonical report."""
+    receipt = _verify_report_worker_receipt(report, info)
     now = datetime.now(UTC)
     checks = {
         "worker.artifact-version": receipt.distribution_version,
         "worker.artifact-sha256": receipt.artifact_sha256 or "none",
+        "worker.install-source": receipt.requested_source,
         "worker.source-identity": (
             f"{receipt.software.commit or 'none'}:"
             f"{receipt.software.tag or 'none'}:{receipt.software.dirty}"
