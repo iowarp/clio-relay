@@ -889,12 +889,16 @@ def test_component_runtime_identity_does_not_probe_unverified_clio_kit_launcher(
             )
         },
     )
-    monkeypatch.setattr(
-        "clio_relay.jarvis_mcp.jarvis_mcp_runtime_identity",
-        lambda _receipt: {
+
+    def unverified_runtime_identity(_receipt: object) -> dict[str, object]:
+        return {
             "artifact_identity_verified": False,
             "error": "locked JARVIS dependency did not verify",
-        },
+        }
+
+    monkeypatch.setattr(
+        "clio_relay.jarvis_mcp.jarvis_mcp_runtime_identity",
+        unverified_runtime_identity,
     )
     probed = False
 
@@ -909,7 +913,9 @@ def test_component_runtime_identity_does_not_probe_unverified_clio_kit_launcher(
         fail_if_probed,
     )
 
-    identities = installation_module._component_runtime_identity(receipt)
+    identities = installation_module._component_runtime_identity(  # pyright: ignore[reportPrivateUsage]
+        receipt
+    )
     runtime = cast(dict[str, object], identities["clio-kit"])
 
     assert probed is False
