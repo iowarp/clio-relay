@@ -1124,6 +1124,17 @@ def render_linux_user_bootstrap_script(
         character not in "0123456789abcdef" for character in resolved_jarvis_mcp_artifact_sha256
     ):
         raise ConfigurationError("clio-kit bootstrap wheel SHA-256 must be lowercase hex")
+    if resolved_jarvis_mcp_artifact_sha256 != CLIO_KIT_JARVIS_MCP_WHEEL_SHA256:
+        raise ConfigurationError(
+            "the built-in JARVIS MCP bootstrap requires the released clio-kit wheel; "
+            "register a different JARVIS server through the generic remote MCP registry"
+        )
+    if resolved_jarvis_mcp_install_spec.startswith("clio-kit==") and (
+        resolved_jarvis_mcp_install_spec != f"clio-kit=={CLIO_KIT_JARVIS_MCP_VERSION}"
+    ):
+        raise ConfigurationError(
+            "the built-in JARVIS MCP bootstrap requires the released clio-kit version"
+        )
     rendered_jarvis_mcp_install_spec = shlex.quote(resolved_jarvis_mcp_install_spec)
     rendered_jarvis_mcp_artifact_sha256 = shlex.quote(resolved_jarvis_mcp_artifact_sha256)
     script = f"""set -euo pipefail
@@ -1470,6 +1481,7 @@ from clio_relay.installation import (
     probe_jarvis_native_execution_capability,
     write_install_receipt,
 )
+from clio_relay.mcp_call.runner import mcp_server_artifact_identity
 from clio_relay.validation_report import sha256_file
 
 artifact_value = os.environ["CLIO_RELAY_BOOTSTRAP_ARTIFACT"]
@@ -1517,6 +1529,52 @@ persistent_clio_kit_tool = probe_persistent_uv_tool_identity(
     distribution_version=component_version,
     entry_point="clio-kit",
 )
+clio_kit_server_artifact = mcp_server_artifact_identity(
+    runtime_command[0],
+    runtime_command[1:],
+    verify_relay_jarvis_cd_lock=True,
+)
+locked_server_runtime = clio_kit_server_artifact.get("nested_runtime")
+if not isinstance(locked_server_runtime, dict):
+    raise SystemExit("clio-kit JARVIS runtime omitted locked-server evidence")
+jarvis_cd_lock_binding = locked_server_runtime.get("jarvis_cd_lock_binding")
+if not isinstance(jarvis_cd_lock_binding, dict):
+    raise SystemExit("clio-kit JARVIS runtime omitted jarvis-cd lock binding")
+expected_jarvis_cd_url = os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_CD_WHEEL_URL"]
+expected_jarvis_cd_version = os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_CD_VERSION"]
+expected_jarvis_cd_sha256 = os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_CD_WHEEL_SHA256"]
+if not (
+    clio_kit_server_artifact.get("verified") is True
+    and locked_server_runtime.get("schema_version") == "clio-kit.locked-server.v4"
+    and locked_server_runtime.get("server_name") == "jarvis"
+    and locked_server_runtime.get("locked_runtime_verified") is True
+    and jarvis_cd_lock_binding.get("schema_version")
+    == "clio-relay.jarvis-cd-lock-binding.v1"
+    and jarvis_cd_lock_binding.get("dependency") == "jarvis-cd"
+    and jarvis_cd_lock_binding.get("verified") is True
+    and jarvis_cd_lock_binding.get("error") is None
+    and jarvis_cd_lock_binding.get("expected_version") == expected_jarvis_cd_version
+    and jarvis_cd_lock_binding.get("expected_url") == expected_jarvis_cd_url
+    and jarvis_cd_lock_binding.get("expected_sha256") == expected_jarvis_cd_sha256
+    and jarvis_cd_lock_binding.get("observed_version") == expected_jarvis_cd_version
+    and jarvis_cd_lock_binding.get("observed_source_url") == expected_jarvis_cd_url
+    and jarvis_cd_lock_binding.get("observed_wheel_url") == expected_jarvis_cd_url
+    and jarvis_cd_lock_binding.get("observed_wheel_sha256") == expected_jarvis_cd_sha256
+    and jarvis_cd_lock_binding.get("jarvis_mcp_package_entry_count") == 1
+    and jarvis_cd_lock_binding.get("resolved_dependency_entry_count") == 1
+    and jarvis_cd_lock_binding.get("observed_resolved_dependency_entries")
+    == [{{"name": "jarvis-cd"}}]
+    and jarvis_cd_lock_binding.get("metadata_requirement_entry_count") == 1
+    and jarvis_cd_lock_binding.get("observed_metadata_requirement_entries")
+    == [{{"name": "jarvis-cd", "url": expected_jarvis_cd_url}}]
+    and jarvis_cd_lock_binding.get("observed_metadata_requirement_urls")
+    == [expected_jarvis_cd_url]
+    and jarvis_cd_lock_binding.get("package_entry_count") == 1
+    and jarvis_cd_lock_binding.get("wheel_entry_count") == 1
+):
+    raise SystemExit(
+        "clio-kit locked JARVIS dependency does not match the relay jarvis-cd release pin"
+    )
 jarvis_execution_native_execution = probe_jarvis_native_execution_capability(
     os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_CD_EXECUTION_PYTHON"]
 )
@@ -1573,6 +1631,7 @@ receipt = write_install_receipt(
             }},
             native_execution=clio_kit_native_execution,
             persistent_tool=persistent_clio_kit_tool,
+            locked_server_runtime=locked_server_runtime,
         ),
         "jarvis-cd": ComponentArtifactIdentity(
             distribution=jarvis_cd_distribution.name,

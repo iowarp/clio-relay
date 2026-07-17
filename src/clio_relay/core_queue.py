@@ -13629,6 +13629,13 @@ def _job_idempotency_digest(job: RelayJob) -> str:
     # upgrade. Non-empty dependency pins remain part of the canonical identity.
     if not payload.get("used_artifact_refs"):
         payload.pop("used_artifact_refs", None)
+    # Preserve the pre-JARVIS-lock digest for generic MCP calls. The marker is
+    # release authority only when explicitly present on the built-in route.
+    raw_spec = payload.get("spec")
+    if isinstance(raw_spec, dict):
+        spec_payload = cast(dict[str, object], raw_spec)
+        if spec_payload.get("expected_jarvis_cd_lock_binding") is None:
+            spec_payload.pop("expected_jarvis_cd_lock_binding", None)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 

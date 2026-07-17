@@ -67,6 +67,7 @@ from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_MCP_VERSION,
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
     JARVIS_MCP_CACHE_SERVER_NAME,
+    jarvis_cd_lock_binding_expectation,
     jarvis_mcp_artifact_binding_from_entry,
     jarvis_mcp_env_from,
     jarvis_mcp_server,
@@ -7634,6 +7635,7 @@ def jarvis_mcp_call(
             server_args=server_args,
             env_from=jarvis_mcp_env_from(),
             expected_server_artifact_digest=expected_server_artifact_digest,
+            expected_jarvis_cd_lock_binding=jarvis_cd_lock_binding_expectation(),
             operation=operation,
             tool=tool,
             arguments=arguments,
@@ -10613,6 +10615,7 @@ def _run_jarvis_remote_contract_discovery(
                     server=server,
                     server_args=server_args,
                     env_from=jarvis_mcp_env_from(),
+                    expected_jarvis_cd_lock_binding=jarvis_cd_lock_binding_expectation(),
                     operation=McpOperation.TOOLS_LIST,
                     timeout_seconds=max(1, int(wait_timeout_seconds)),
                 ),
@@ -10648,6 +10651,15 @@ def _persist_jarvis_remote_contract_discovery(
     artifact_payload: bytes,
 ) -> tuple[RemoteMcpSchemaCacheEntry, str]:
     """Persist and verify the exact discovery identity used by built-in JARVIS calls."""
+    durable_result = _decode_json_artifact(artifact_payload, kind="mcp_result")
+    if durable_result != result:
+        raise RelayError(
+            "JARVIS MCP discovery result did not match its durable mcp_result artifact"
+        )
+    result = durable_result
+    expected_jarvis_cd_lock_binding = jarvis_cd_lock_binding_expectation()
+    if result.get("expected_jarvis_cd_lock_binding") != expected_jarvis_cd_lock_binding:
+        raise RelayError("JARVIS MCP discovery did not enforce the relay JARVIS-CD lock pin")
     server = result.get("server")
     raw_server_args = result.get("server_args")
     raw_env_from = result.get("env_from", {})
@@ -10742,7 +10754,12 @@ def _artifact_record(
     *,
     kind: str,
 ) -> dict[str, Any] | None:
-    return next((artifact for artifact in artifacts if artifact.get("kind") == kind), None)
+    matches = [artifact for artifact in artifacts if artifact.get("kind") == kind]
+    if len(matches) > 1:
+        raise RelayError(
+            f"durable artifact authority is ambiguous: found {len(matches)} {kind} artifacts"
+        )
+    return matches[0] if matches else None
 
 
 def _read_remote_json_artifact_kind(
@@ -10836,14 +10853,8 @@ def _read_local_mcp_result_artifact(
     queue: ClioCoreQueue,
     job_id: str,
 ) -> tuple[dict[str, object], bytes]:
-    artifact = next(
-        (
-            item
-            for item in _complete_local_artifact_records(queue, job_id)
-            if item.get("kind") == "mcp_result"
-        ),
-        None,
-    )
+    artifacts = _complete_local_artifact_records(queue, job_id)
+    artifact = _artifact_record(artifacts, kind="mcp_result")
     if artifact is None:
         raise RelayError(f"remote MCP discovery job has no mcp_result artifact: {job_id}")
     artifact_id = artifact.get("artifact_id")

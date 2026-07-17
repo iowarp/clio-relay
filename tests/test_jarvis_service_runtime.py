@@ -23,6 +23,7 @@ from clio_relay.cluster_config import (
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError
+from clio_relay.jarvis_mcp import jarvis_cd_lock_binding_expectation
 from clio_relay.jarvis_service_runtime import (
     RELAY_JARVIS_RUNTIME_BINDING_SCHEMA,
     JarvisServiceRuntime,
@@ -40,8 +41,10 @@ from clio_relay.models import (
     SchedulerConnectorStepIdentity,
     ServiceRuntimeSpec,
 )
+from clio_relay.remote_mcp import remote_mcp_server_artifact_digest
 from clio_relay.service_runtime import ServiceRuntimeSupervisor
 from clio_relay.session_lifecycle import CleanupResource
+from tests.jarvis_mcp_fakes import verified_jarvis_server_artifact
 
 
 def test_resolve_jarvis_service_runtime_binds_only_exact_durable_result(
@@ -390,6 +393,78 @@ def test_service_runtime_source_rejects_jarvis_run_and_unconfigured_mcp_route(
             definition=definition,
             source_job_id=route_job.job_id,
             source_artifact_id=route_artifact.artifact_id,
+            package_id="paraview-1",
+            package_name="builtin.paraview",
+        )
+
+
+def test_service_runtime_source_rejects_generic_unmarked_jarvis_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operator JARVIS calls cannot authorize the built-in gateway binding path."""
+    queue, definition, job, artifact, envelope = _source_result(
+        tmp_path,
+        bind_relay_jarvis=False,
+    )
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+
+    with pytest.raises(ValueError, match="JARVIS-CD lock pin"):
+        resolve_jarvis_service_runtime(
+            queue=queue,
+            definition=definition,
+            source_job_id=job.job_id,
+            source_artifact_id=artifact.artifact_id,
+            package_id="paraview-1",
+            package_name="builtin.paraview",
+        )
+
+
+def test_service_runtime_source_rejects_result_lock_marker_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persisted result evidence must carry the same built-in lock marker as its job."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    document = json.loads(base64.b64decode(envelope["data"], validate=True).decode("utf-8"))
+    document["expected_jarvis_cd_lock_binding"] = None
+    _replace_envelope_document(envelope, document)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+
+    with pytest.raises(ValueError, match="result JARVIS-CD lock pin"):
+        resolve_jarvis_service_runtime(
+            queue=queue,
+            definition=definition,
+            source_job_id=job.job_id,
+            source_artifact_id=artifact.artifact_id,
+            package_id="paraview-1",
+            package_name="builtin.paraview",
+        )
+
+
+def test_service_runtime_rejects_unverified_outer_clio_kit_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A self-consistent digest cannot authorize a different clio-kit release."""
+    server_artifact = verified_jarvis_server_artifact()
+    python_runtime = cast(
+        dict[str, object],
+        server_artifact["python_distribution_runtime"],
+    )
+    python_runtime["distribution_version"] = "0.0.0"
+    queue, definition, job, artifact, envelope = _source_result(
+        tmp_path,
+        server_artifact=server_artifact,
+    )
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+
+    with pytest.raises(ValueError, match="not the exact release pin"):
+        resolve_jarvis_service_runtime(
+            queue=queue,
+            definition=definition,
+            source_job_id=job.job_id,
+            source_artifact_id=artifact.artifact_id,
             package_id="paraview-1",
             package_name="builtin.paraview",
         )
@@ -1432,9 +1507,14 @@ def _source_result(
     tool: str = "jarvis_get_execution",
     include_service_runtimes: bool | None = True,
     server: str = "/home/cluster/.local/bin/clio-kit",
+    bind_relay_jarvis: bool = True,
+    server_artifact: dict[str, Any] | None = None,
 ) -> tuple[ClioCoreQueue, ClusterDefinition, RelayJob, ArtifactRef, dict[str, Any]]:
     queue = ClioCoreQueue(tmp_path / "core")
-    digest = "a" * 64
+    resolved_server_artifact = (
+        verified_jarvis_server_artifact() if server_artifact is None else server_artifact
+    )
+    digest = remote_mcp_server_artifact_digest(resolved_server_artifact)
     job = queue.submit_job(
         RelayJob(
             cluster="test-cluster",
@@ -1443,6 +1523,9 @@ def _source_result(
                 server=server,
                 server_args=["mcp-server", "jarvis"],
                 expected_server_artifact_digest=digest,
+                expected_jarvis_cd_lock_binding=(
+                    jarvis_cd_lock_binding_expectation() if bind_relay_jarvis else None
+                ),
                 tool=tool,
                 arguments={
                     "pipeline_id": "pipeline-1",
@@ -1458,7 +1541,11 @@ def _source_result(
         )
     )
     job = queue.update_job_state(job.job_id, JobState.SUCCEEDED)
-    document = _mcp_result_document(digest=digest, spec=cast(McpCallSpec, job.spec))
+    document = _mcp_result_document(
+        digest=digest,
+        spec=cast(McpCallSpec, job.spec),
+        server_artifact=resolved_server_artifact,
+    )
     payload = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
     artifact = ArtifactRef(
         artifact_id="artifact-result",
@@ -1486,7 +1573,12 @@ def _source_result(
     return queue, definition, job, artifact, envelope
 
 
-def _mcp_result_document(*, digest: str, spec: McpCallSpec) -> dict[str, Any]:
+def _mcp_result_document(
+    *,
+    digest: str,
+    spec: McpCallSpec,
+    server_artifact: dict[str, Any],
+) -> dict[str, Any]:
     submission = {
         "schema_version": "jarvis.scheduler.submission.v1",
         "execution_id": "execution-1",
@@ -1583,7 +1675,9 @@ def _mcp_result_document(*, digest: str, spec: McpCallSpec) -> dict[str, Any]:
         "server_args": spec.server_args,
         "env_from": spec.env_from,
         "expected_server_artifact_digest": digest,
+        "expected_jarvis_cd_lock_binding": spec.expected_jarvis_cd_lock_binding,
         "observed_server_artifact_digest": digest,
+        "server_artifact": server_artifact,
         "operation": "tools/call",
         "tool": spec.tool,
         "arguments": spec.arguments,

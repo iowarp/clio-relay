@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import threading
@@ -24,6 +25,7 @@ from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
     JobState,
+    McpCallSpec,
     MonitorRule,
     MonitorRuleAction,
     ProgressRecord,
@@ -1134,6 +1136,44 @@ def test_submit_rejects_reserved_idempotency_digest_mismatch(tmp_path: Path) -> 
                 idempotency_key="reserved",
             )
         )
+
+
+def test_null_jarvis_binding_preserves_pre_upgrade_mcp_submission_digest() -> None:
+    """An additive null trust marker cannot invalidate existing generic retries."""
+    job = RelayJob(
+        cluster="configured-target",
+        kind=JobKind.MCP_CALL,
+        spec=McpCallSpec(
+            server="operator-mcp",
+            tool="operator_query",
+            arguments={"query": "status"},
+        ),
+        idempotency_key="legacy-generic-mcp",
+    )
+    legacy_payload = job.model_dump(mode="json")
+    for generated_field in {
+        "job_id",
+        "state",
+        "created_at",
+        "updated_at",
+        "leased_by",
+        "attempts",
+        "last_error",
+        "submission_digest",
+        "used_artifact_refs",
+    }:
+        legacy_payload.pop(generated_field, None)
+    legacy_spec = cast(dict[str, object], legacy_payload["spec"])
+    legacy_spec.pop("expected_jarvis_cd_lock_binding")
+    expected = hashlib.sha256(
+        json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+    observed = core_queue_module._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        job
+    )
+
+    assert observed == expected
 
 
 def test_submit_repairs_existing_job_missing_initial_event(tmp_path: Path) -> None:

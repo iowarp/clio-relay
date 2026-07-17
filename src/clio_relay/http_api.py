@@ -31,6 +31,7 @@ from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError
 from clio_relay.identifiers import DurableRecordId
 from clio_relay.jarvis_mcp import (
+    jarvis_cd_lock_binding_expectation,
     jarvis_mcp_artifact_binding,
     jarvis_mcp_env_from,
     jarvis_mcp_server,
@@ -864,6 +865,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                     server_args=jarvis_mcp_server_args(),
                     env_from=jarvis_mcp_env_from(),
                     expected_server_artifact_digest=expected_digest,
+                    expected_jarvis_cd_lock_binding=jarvis_cd_lock_binding_expectation(),
                     tool=request.tool,
                     arguments=request.arguments,
                     timeout_seconds=request.timeout_seconds,

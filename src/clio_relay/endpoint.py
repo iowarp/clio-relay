@@ -43,7 +43,11 @@ from clio_relay.filesystem_paths import (
 from clio_relay.identifiers import filesystem_key
 from clio_relay.installation import installation_info
 from clio_relay.jarvis_execution import RUNTIME_SCHEDULER_PROVIDER_ENV
-from clio_relay.jarvis_mcp import jarvis_mcp_command
+from clio_relay.jarvis_mcp import (
+    jarvis_cd_lock_binding_expectation,
+    jarvis_mcp_command,
+    jarvis_mcp_server_artifact_binding_verified,
+)
 from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.models import (
     EndpointRegistration,
@@ -2046,6 +2050,9 @@ class EndpointWorker:
         scheduler_job_ids: list[str],
     ) -> None:
         """Ingest structured runtime metadata returned by a remote MCP call."""
+        route_valid, _route_reason = _trusted_jarvis_mcp_route(job)
+        if not route_valid:
+            return
         result_path = spool.path / "mcp-result.json"
         storage_result_path = internal_filesystem_path(result_path)
         if not storage_result_path.exists():
@@ -2057,6 +2064,19 @@ class EndpointWorker:
                 job.job_id,
                 "runtime.metadata_read_failed",
                 f"MCP runtime result could not be read: {exc}",
+            )
+            return
+        trusted, reason = _trusted_jarvis_mcp_result(job, result_document)
+        if not trusted:
+            self.queue.append_event(
+                job.job_id,
+                "runtime.metadata_refused",
+                f"Refused JARVIS MCP runtime metadata: {reason}",
+                payload={
+                    "source": RuntimeMetadataSource.JARVIS_MCP.value,
+                    "ownership_verified": False,
+                    "reason": reason,
+                },
             )
             return
         try:
@@ -2094,19 +2114,6 @@ class EndpointWorker:
                     },
                 )
                 raise ConfigurationError(reason)
-        trusted, reason = _trusted_jarvis_mcp_result(job, result_document)
-        if not trusted:
-            self.queue.append_event(
-                job.job_id,
-                "runtime.metadata_refused",
-                f"Refused JARVIS MCP runtime metadata: {reason}",
-                payload={
-                    "source": RuntimeMetadataSource.JARVIS_MCP.value,
-                    "ownership_verified": False,
-                    "reason": reason,
-                },
-            )
-            return
         current_runtime = state[0]
         superseded_transport_runtime = (
             current_runtime
@@ -4162,6 +4169,8 @@ def _trusted_jarvis_mcp_route(job: RelayJob) -> tuple[bool, str]:
         return False, "MCP command does not match the configured JARVIS server"
     if job.spec.tool != "jarvis_run":
         return False, "MCP tool is not the owned jarvis_run operation"
+    if job.spec.expected_jarvis_cd_lock_binding != jarvis_cd_lock_binding_expectation():
+        return False, "MCP call did not enforce the relay JARVIS-CD lock pin"
     if job.spec.expected_server_artifact_digest is None:
         return False, "MCP call is not bound to its discovered server artifact"
     return True, "configured JARVIS MCP route and artifact binding matched"
@@ -4187,11 +4196,18 @@ def _trusted_jarvis_mcp_result(
         return False, "MCP result arguments do not match the durable job spec"
     if typed.get("env_from") != job.spec.env_from:
         return False, "MCP result environment references do not match the durable job spec"
+    if typed.get("expected_jarvis_cd_lock_binding") != job.spec.expected_jarvis_cd_lock_binding:
+        return False, "MCP result JARVIS-CD lock pin does not match the durable job spec"
     if (
         typed.get("expected_server_artifact_digest") != job.spec.expected_server_artifact_digest
         or typed.get("observed_server_artifact_digest") != job.spec.expected_server_artifact_digest
     ):
         return False, "MCP result server artifact does not match the durable job spec"
+    if not jarvis_mcp_server_artifact_binding_verified(
+        typed.get("server_artifact"),
+        expected_digest=job.spec.expected_server_artifact_digest,
+    ):
+        return False, "MCP result server artifact identity is not the exact relay release pin"
     if (
         typed.get("returncode") != 0
         or typed.get("timed_out") is True

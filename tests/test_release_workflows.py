@@ -292,11 +292,29 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
         if resource["kind"] == "mcp_server"
     )
     assert server["metadata_equals"]["install_source"] == "uv-tool"
-    assert server["metadata_equals"]["nested_runtime"] == {
-        "server_name": "jarvis",
-        "persistent_tool": True,
-        "locked_runtime_verified": True,
-    }
+    nested_runtime = server["metadata_equals"]["nested_runtime"]
+    assert nested_runtime["server_name"] == "jarvis"
+    assert nested_runtime["persistent_tool"] is True
+    assert nested_runtime["locked_runtime_verified"] is True
+    lock_binding = nested_runtime["jarvis_cd_lock_binding"]
+    assert lock_binding["schema_version"] == "clio-relay.jarvis-cd-lock-binding.v1"
+    assert lock_binding["dependency"] == "jarvis-cd"
+    assert lock_binding["error"] is None
+    assert lock_binding["expected_version"] == "1.3.11"
+    assert lock_binding["expected_url"] == lock_binding["observed_source_url"]
+    assert lock_binding["expected_url"] == lock_binding["observed_wheel_url"]
+    assert lock_binding["expected_sha256"] == lock_binding["observed_wheel_sha256"]
+    assert lock_binding["observed_metadata_requirement_urls"] == [lock_binding["expected_url"]]
+    assert lock_binding["jarvis_mcp_package_entry_count"] == 1
+    assert lock_binding["resolved_dependency_entry_count"] == 1
+    assert lock_binding["observed_resolved_dependency_entries"] == [{"name": "jarvis-cd"}]
+    assert lock_binding["metadata_requirement_entry_count"] == 1
+    assert lock_binding["observed_metadata_requirement_entries"] == [
+        {"name": "jarvis-cd", "url": lock_binding["expected_url"]}
+    ]
+    assert lock_binding["package_entry_count"] == 1
+    assert lock_binding["wheel_entry_count"] == 1
+    assert lock_binding["verified"] is True
     assert server["metadata_equals"]["server_process_artifact_verified"] is True
     worker = next(
         resource
@@ -304,11 +322,11 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
         if resource["kind"] == "relay_worker"
     )
     clio_kit_component = worker["metadata_equals"]["component_artifacts"]["clio-kit"]
-    assert clio_kit_component["distribution_version"] == "2.5.1"
+    assert clio_kit_component["distribution_version"] == "2.5.3"
     assert clio_kit_component["persistent_tool"]["manager"] == "uv"
     assert clio_kit_component["persistent_tool"]["uv_version"] == "0.11.28"
     assert clio_kit_component["persistent_tool"]["source_artifact_sha256"] == (
-        "e2710b915e1b77d758f25118ed5cdf522687d2a813bdbf1abd3891164b9676d1"
+        "1c528be468f156b14ae40b72214360c6fe923765d75b244c4505d3689dad0c6b"
     )
     jarvis_component = worker["metadata_equals"]["component_artifacts"]["jarvis-cd"]
     assert jarvis_component["distribution_version"] == "1.3.11"
@@ -324,6 +342,7 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
     clio_kit_runtime = worker["metadata_equals"]["component_runtime"]["clio-kit"]
     assert clio_kit_runtime["uv_tool_environment_verified"] is True
     assert clio_kit_runtime["record_closure_verified"] is True
+    assert clio_kit_runtime["locked_server_runtime_verified"] is True
     progress = next(
         resource
         for resource in cast(list[dict[str, Any]], jarvis["required_resources"])
@@ -471,7 +490,7 @@ def test_spack_release_requirements_split_existing_resolution_from_fresh_install
     )
     assert fresh_server["metadata_equals"]["server_name"] == "spack-fresh"
     assert fresh_server["metadata_equals"]["install_artifact_sha256"] == (
-        "e2710b915e1b77d758f25118ed5cdf522687d2a813bdbf1abd3891164b9676d1"
+        "1c528be468f156b14ae40b72214360c6fe923765d75b244c4505d3689dad0c6b"
     )
     assert fresh_server["metadata_equals"]["contract_id"] == "clio-kit-spack-user-v2"
     assert fresh_server["metadata_equals"]["contract_sha256"] == (

@@ -35,6 +35,7 @@ from clio_relay.identifiers import (
 from clio_relay.jarvis_mcp import (
     JARVIS_MCP_CACHE_SERVER_NAME,
     is_virtual_jarvis_tool,
+    jarvis_cd_lock_binding_expectation,
     jarvis_mcp_artifact_binding,
     jarvis_mcp_artifact_binding_from_entry,
     jarvis_mcp_server,
@@ -3449,6 +3450,15 @@ def _submit_mcp_call(
         arguments,
         "expected_server_artifact_digest",
     )
+    raw_expected_jarvis_cd_lock_binding = arguments.get("expected_jarvis_cd_lock_binding")
+    expected_jarvis_cd_lock_binding = (
+        _string_mapping(
+            raw_expected_jarvis_cd_lock_binding,
+            "expected_jarvis_cd_lock_binding",
+        )
+        if raw_expected_jarvis_cd_lock_binding is not None
+        else None
+    )
     tool = _required_str(arguments, "tool")
     tool_arguments = _object(arguments.get("arguments", {}))
     timeout_seconds = _optional_int(arguments, "timeout_seconds")
@@ -3465,6 +3475,8 @@ def _submit_mcp_call(
         "arguments_digest": digest,
         "timeout_seconds": timeout_seconds,
     }
+    if expected_jarvis_cd_lock_binding is not None:
+        identity["expected_jarvis_cd_lock_binding"] = expected_jarvis_cd_lock_binding
     if used_artifact_refs:
         identity["used_artifact_refs"] = [
             item.model_dump(mode="json") for item in used_artifact_refs
@@ -3607,6 +3619,7 @@ def _submit_mcp_call(
                 server_args=server_args,
                 env_from=env_from,
                 expected_server_artifact_digest=expected_server_artifact_digest,
+                expected_jarvis_cd_lock_binding=expected_jarvis_cd_lock_binding,
                 tool=tool,
                 arguments=tool_arguments,
                 timeout_seconds=timeout_seconds,
@@ -3856,6 +3869,7 @@ def _submit_jarvis_mcp_call(
         or f"mcp:{cluster}:jarvis:{tool}:{digest}{dependency_suffix}"
     )
     forwarded["idempotency_key"] = idempotency_key
+    forwarded["expected_jarvis_cd_lock_binding"] = jarvis_cd_lock_binding_expectation()
     registered_route = arguments.get("registered_route") is True
     definition = (
         _remote_cluster_definition(cluster)

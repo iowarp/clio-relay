@@ -20,11 +20,144 @@ from typing import Any, Protocol, cast
 
 from pytest import MonkeyPatch, mark, raises
 
+from clio_relay.bootstrap import (
+    JARVIS_CD_VERSION,
+    JARVIS_CD_WHEEL_SHA256,
+    JARVIS_CD_WHEEL_URL,
+)
+
 
 class McpCallRunnerModule(Protocol):
     def run_mcp_call_from_params(self, params: dict[str, object]) -> int:
         """Run a remote MCP call from serialized parameters."""
         ...
+
+
+def _jarvis_cd_uv_lock(
+    *,
+    version: str = JARVIS_CD_VERSION,
+    source_url: str = JARVIS_CD_WHEEL_URL,
+    wheel_url: str = JARVIS_CD_WHEEL_URL,
+    sha256: str = JARVIS_CD_WHEEL_SHA256,
+    package_entries: int = 1,
+    metadata_entries: int = 1,
+    metadata_url: str = JARVIS_CD_WHEEL_URL,
+    metadata_marker: str | None = None,
+    jarvis_mcp_entries: int = 1,
+    resolved_dependency_entries: int = 1,
+    resolved_dependency_marker: str | None = None,
+) -> bytes:
+    """Return a minimal uv lock with independently mutable JARVIS binding surfaces."""
+    lines = ["version = 1", ""]
+    for _index in range(jarvis_mcp_entries):
+        lines.extend(
+            [
+                "[[package]]",
+                'name = "jarvis-mcp"',
+                'version = "3.2.1"',
+                'source = { editable = "." }',
+                "dependencies = [",
+                *(
+                    (
+                        '    { name = "jarvis-cd"'
+                        + (
+                            f", marker = {json.dumps(resolved_dependency_marker)}"
+                            if resolved_dependency_marker is not None
+                            else ""
+                        )
+                        + " },"
+                    )
+                    for _dependency_index in range(resolved_dependency_entries)
+                ),
+                "]",
+                "",
+                "[package.metadata]",
+                "requires-dist = [",
+                *(
+                    (
+                        f'    {{ name = "jarvis-cd", url = {json.dumps(metadata_url)}'
+                        + (
+                            f", marker = {json.dumps(metadata_marker)}"
+                            if metadata_marker is not None
+                            else ""
+                        )
+                        + " },"
+                    )
+                    for _requirement_index in range(metadata_entries)
+                ),
+                "]",
+                "",
+            ]
+        )
+    if package_entries == 0:
+        lines.extend(
+            [
+                "[[package]]",
+                'name = "unrelated"',
+                'version = "1.0.0"',
+                'source = { registry = "https://pypi.org/simple" }',
+                "",
+            ]
+        )
+    for _index in range(package_entries):
+        lines.extend(
+            [
+                "[[package]]",
+                'name = "jarvis-cd"',
+                f"version = {json.dumps(version)}",
+                f"source = {{ url = {json.dumps(source_url)} }}",
+                "wheels = [",
+                (f'    {{ url = {json.dumps(wheel_url)}, hash = "sha256:{sha256}" }},'),
+                "]",
+                "",
+            ]
+        )
+    return "\n".join(lines).encode("utf-8")
+
+
+def _jarvis_cd_lock_expectation() -> dict[str, str]:
+    return {
+        "schema_version": "clio-relay.jarvis-cd-lock-expectation.v1",
+        "version": JARVIS_CD_VERSION,
+        "url": JARVIS_CD_WHEEL_URL,
+        "sha256": JARVIS_CD_WHEEL_SHA256,
+    }
+
+
+def _verified_jarvis_server_artifact() -> dict[str, Any]:
+    """Return the minimal verified built-in JARVIS artifact boundary."""
+    expected = _jarvis_cd_lock_expectation()
+    return {
+        "verified": True,
+        "nested_runtime": {
+            "schema_version": "clio-kit.locked-server.v4",
+            "server_name": "jarvis",
+            "locked_runtime_verified": True,
+            "jarvis_cd_lock_binding": {
+                "schema_version": "clio-relay.jarvis-cd-lock-binding.v1",
+                "dependency": "jarvis-cd",
+                "verified": True,
+                "error": None,
+                "expected_version": expected["version"],
+                "expected_url": expected["url"],
+                "expected_sha256": expected["sha256"],
+                "observed_version": expected["version"],
+                "observed_source_url": expected["url"],
+                "observed_wheel_url": expected["url"],
+                "observed_wheel_sha256": expected["sha256"],
+                "jarvis_mcp_package_entry_count": 1,
+                "resolved_dependency_entry_count": 1,
+                "observed_resolved_dependency_entries": [{"name": "jarvis-cd"}],
+                "metadata_requirement_entry_count": 1,
+                "observed_metadata_requirement_entries": [
+                    {"name": "jarvis-cd", "url": expected["url"]}
+                ],
+                "observed_metadata_requirement_urls": [expected["url"]],
+                "package_entry_count": 1,
+                "wheel_entry_count": 1,
+            },
+        },
+    }
 
 
 def test_mcp_call_runner_invokes_tool_with_defaults(
@@ -353,7 +486,7 @@ def test_persistent_uv_tool_clio_kit_runtime_is_receipt_bindable(
     uv.write_bytes(b"pinned-uv")
     wheel.write_bytes(b"released-clio-kit-wheel")
     source.write_text(_locked_clio_kit_v4_launcher_source(), encoding="utf-8")
-    lock.write_text("version = 1\n", encoding="utf-8")
+    lock.write_bytes(_jarvis_cd_uv_lock())
 
     def console_distribution_identity(_path: Path) -> dict[str, object]:
         return {
@@ -383,6 +516,7 @@ def test_persistent_uv_tool_clio_kit_runtime_is_receipt_bindable(
     identity = cast(Any, runner)._server_artifact_identity(
         str(tool),
         ["mcp-server", "jarvis"],
+        verify_relay_jarvis_cd_lock=True,
     )
 
     assert identity["install_source"] == "uv-tool"
@@ -393,6 +527,7 @@ def test_persistent_uv_tool_clio_kit_runtime_is_receipt_bindable(
     )
     assert identity["nested_launcher"] is True
     assert identity["nested_runtime"]["persistent_tool"] is True
+    assert identity["nested_runtime"]["jarvis_cd_lock_binding"]["verified"] is True
     assert identity["nested_runtime"]["locked_runtime_verified"] is True
     assert identity["server_process_artifact_verified"] is True
     assert identity["verified"] is True
@@ -554,6 +689,346 @@ def test_mcp_call_runner_verifies_locked_clio_kit_child_runtime(
     assert identity["server_process_artifact_verified"] is True
     assert identity["verified"] is True
     assert identity["identity_error"] is None
+
+
+def test_mcp_call_runner_verifies_relay_jarvis_cd_pin_in_locked_child_runtime(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    assert cast(Any, runner).JARVIS_CD_VERSION == JARVIS_CD_VERSION
+    assert cast(Any, runner).JARVIS_CD_WHEEL_URL == JARVIS_CD_WHEEL_URL
+    assert cast(Any, runner).JARVIS_CD_WHEEL_SHA256 == JARVIS_CD_WHEEL_SHA256
+    monkeypatch.chdir(tmp_path)
+    uvx = tmp_path / ("uvx.exe" if os.name == "nt" else "uvx")
+    uv = tmp_path / ("uv.exe" if os.name == "nt" else "uv")
+    uvx.write_bytes(b"pinned-uv-launcher")
+    uv.write_bytes(b"pinned-uv-runtime")
+    wheel = tmp_path / "clio_kit-2.5.3-py3-none-any.whl"
+    _write_synthetic_clio_kit_wheel(
+        wheel,
+        server_name="jarvis",
+        project={
+            "pyproject.toml": b"[project]\nname='jarvis-mcp'\n",
+            "uv.lock": _jarvis_cd_uv_lock(),
+        },
+    )
+    launched = False
+
+    def fake_run(
+        command: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal launched
+        launched = True
+        stdout = "\n".join(
+            [
+                json.dumps({"jsonrpc": "2.0", "id": "clio-relay-mcp-init", "result": {}}),
+                json.dumps({"jsonrpc": "2.0", "id": "clio-relay-mcp-call", "result": {}}),
+            ]
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(cast(Any, runner), "_run_mcp_session", fake_run)
+
+    return_code = cast(McpCallRunnerModule, runner).run_mcp_call_from_params(
+        {
+            "server": str(uvx),
+            "server_args": [
+                "--from",
+                str(wheel),
+                "clio-kit",
+                "mcp-server",
+                "jarvis",
+            ],
+            "expected_jarvis_cd_lock_binding": _jarvis_cd_lock_expectation(),
+            "tool": "jarvis_describe",
+        }
+    )
+    result = json.loads((tmp_path / "mcp-result.json").read_text(encoding="utf-8"))
+
+    assert return_code == 0
+    assert launched is True
+    binding = result["server_artifact"]["nested_runtime"]["jarvis_cd_lock_binding"]
+    assert binding == {
+        "dependency": "jarvis-cd",
+        "error": None,
+        "expected_sha256": JARVIS_CD_WHEEL_SHA256,
+        "expected_url": JARVIS_CD_WHEEL_URL,
+        "expected_version": JARVIS_CD_VERSION,
+        "jarvis_mcp_package_entry_count": 1,
+        "observed_resolved_dependency_entries": [{"name": "jarvis-cd"}],
+        "metadata_requirement_entry_count": 1,
+        "observed_metadata_requirement_entries": [
+            {"name": "jarvis-cd", "url": JARVIS_CD_WHEEL_URL}
+        ],
+        "observed_metadata_requirement_urls": [JARVIS_CD_WHEEL_URL],
+        "observed_source_url": JARVIS_CD_WHEEL_URL,
+        "observed_version": JARVIS_CD_VERSION,
+        "observed_wheel_sha256": JARVIS_CD_WHEEL_SHA256,
+        "observed_wheel_url": JARVIS_CD_WHEEL_URL,
+        "package_entry_count": 1,
+        "resolved_dependency_entry_count": 1,
+        "schema_version": "clio-relay.jarvis-cd-lock-binding.v1",
+        "verified": True,
+        "wheel_entry_count": 1,
+    }
+
+
+@mark.parametrize(
+    ("lock_content", "expected_error"),
+    [
+        (_jarvis_cd_uv_lock(version="0.0.0"), "version does not match relay pin"),
+        (
+            _jarvis_cd_uv_lock(
+                source_url=("https://example.invalid/jarvis_cd-1.3.11-py3-none-any.whl"),
+                wheel_url=("https://example.invalid/jarvis_cd-1.3.11-py3-none-any.whl"),
+            ),
+            "source URL does not match relay pin",
+        ),
+        (_jarvis_cd_uv_lock(sha256="0" * 64), "wheel SHA-256 does not match relay pin"),
+        (_jarvis_cd_uv_lock(package_entries=0), "exactly one jarvis-cd package record"),
+        (_jarvis_cd_uv_lock(package_entries=2), "exactly one jarvis-cd package record"),
+        (
+            _jarvis_cd_uv_lock(
+                wheel_url="https://example.invalid/jarvis_cd-1.3.11-py3-none-any.whl"
+            ),
+            "source and wheel URLs do not match",
+        ),
+        (
+            _jarvis_cd_uv_lock(
+                metadata_url="https://example.invalid/jarvis_cd-1.3.11-py3-none-any.whl"
+            ),
+            "metadata jarvis-cd URL does not match relay pin",
+        ),
+        (
+            _jarvis_cd_uv_lock(metadata_entries=0),
+            "metadata must contain exactly one jarvis-cd requirement",
+        ),
+        (
+            _jarvis_cd_uv_lock(metadata_entries=2),
+            "metadata must contain exactly one jarvis-cd requirement",
+        ),
+        (
+            _jarvis_cd_uv_lock(metadata_marker="sys_platform == 'never'"),
+            "metadata jarvis-cd requirement must be an unconditional direct URL",
+        ),
+        (
+            _jarvis_cd_uv_lock(jarvis_mcp_entries=2),
+            "exactly one jarvis-mcp package record",
+        ),
+        (
+            _jarvis_cd_uv_lock(resolved_dependency_entries=0),
+            "must resolve exactly one direct jarvis-cd dependency",
+        ),
+        (
+            _jarvis_cd_uv_lock(resolved_dependency_entries=2),
+            "must resolve exactly one direct jarvis-cd dependency",
+        ),
+        (
+            _jarvis_cd_uv_lock(resolved_dependency_marker="sys_platform == 'never'"),
+            "resolved jarvis-cd dependency must be unconditional",
+        ),
+        (
+            _jarvis_cd_uv_lock(resolved_dependency_marker="typed-marker").replace(
+                b'marker = "typed-marker"',
+                b"marker = 1979-05-27T07:32:00Z",
+            ),
+            "resolved jarvis-cd dependency must be unconditional",
+        ),
+        (
+            _jarvis_cd_uv_lock(metadata_marker="typed-marker").replace(
+                b'marker = "typed-marker"',
+                b"marker = nan",
+            ),
+            "metadata jarvis-cd requirement must be an unconditional direct URL",
+        ),
+    ],
+    ids=[
+        "wrong-version",
+        "wrong-url",
+        "wrong-hash",
+        "missing",
+        "duplicate",
+        "source-wheel-mismatch",
+        "wrong-metadata-url",
+        "missing-metadata-requirement",
+        "duplicate-metadata-requirement",
+        "conditional-metadata-requirement",
+        "duplicate-jarvis-mcp-package",
+        "missing-resolved-dependency",
+        "duplicate-resolved-dependency",
+        "conditional-resolved-dependency",
+        "datetime-resolved-dependency-marker",
+        "nonfinite-metadata-requirement-marker",
+    ],
+)
+def test_mcp_call_runner_refuses_unbound_jarvis_cd_lock_before_process_launch(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    lock_content: bytes,
+    expected_error: str,
+) -> None:
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+    uvx = tmp_path / ("uvx.exe" if os.name == "nt" else "uvx")
+    uv = tmp_path / ("uv.exe" if os.name == "nt" else "uv")
+    uvx.write_bytes(b"pinned-uv-launcher")
+    uv.write_bytes(b"pinned-uv-runtime")
+    wheel = tmp_path / "clio_kit-2.5.3-py3-none-any.whl"
+    _write_synthetic_clio_kit_wheel(
+        wheel,
+        server_name="jarvis",
+        project={
+            "pyproject.toml": b"[project]\nname='jarvis-mcp'\n",
+            "uv.lock": lock_content,
+        },
+    )
+    opened = False
+
+    def fail_if_opened(
+        _command: list[str],
+        *,
+        env_from: dict[str, str] | None = None,
+    ) -> subprocess.Popen[str]:
+        del env_from
+        nonlocal opened
+        opened = True
+        raise AssertionError("_open_process must not run for an unbound JARVIS lock")
+
+    monkeypatch.setattr(cast(Any, runner), "_open_process", fail_if_opened)
+
+    return_code = cast(McpCallRunnerModule, runner).run_mcp_call_from_params(
+        {
+            "server": str(uvx),
+            "server_args": [
+                "--from",
+                str(wheel),
+                "clio-kit",
+                "mcp-server",
+                "jarvis",
+            ],
+            "expected_jarvis_cd_lock_binding": _jarvis_cd_lock_expectation(),
+            "tool": "jarvis_describe",
+        }
+    )
+    result_text = (tmp_path / "mcp-result.json").read_text(encoding="utf-8")
+
+    def reject_nonfinite_json(value: str) -> None:
+        raise ValueError(f"non-finite JSON constant: {value}")
+
+    result = json.loads(result_text, parse_constant=reject_nonfinite_json)
+
+    assert return_code == 1
+    assert opened is False
+    assert expected_error in result["protocol_error"]
+    binding = result["server_artifact"]["nested_runtime"]["jarvis_cd_lock_binding"]
+    assert binding["verified"] is False
+    assert expected_error in binding["error"]
+
+
+def test_mcp_call_runner_refuses_unverified_builtin_jarvis_launcher_before_launch(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A correct nested pin cannot authorize an unverified outer launcher."""
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+    uvx = tmp_path / ("uvx.exe" if os.name == "nt" else "uvx")
+    uvx.write_bytes(b"unverified-launcher")
+    artifact = _verified_jarvis_server_artifact()
+    artifact["verified"] = False
+    artifact["identity_error"] = "launcher digest did not verify"
+    monkeypatch.setattr(
+        runner,
+        "_server_artifact_identity",
+        lambda *_args, **_kwargs: artifact,
+    )
+    opened = False
+
+    def fail_if_opened(
+        _command: list[str],
+        *,
+        env_from: dict[str, str] | None = None,
+    ) -> subprocess.Popen[str]:
+        del env_from
+        nonlocal opened
+        opened = True
+        raise AssertionError("_open_process must not run for an unverified launcher")
+
+    monkeypatch.setattr(runner, "_open_process", fail_if_opened)
+
+    return_code = cast(McpCallRunnerModule, runner).run_mcp_call_from_params(
+        {
+            "server": str(uvx),
+            "expected_jarvis_cd_lock_binding": _jarvis_cd_lock_expectation(),
+            "tool": "jarvis_describe",
+        }
+    )
+    result = json.loads((tmp_path / "mcp-result.json").read_text(encoding="utf-8"))
+
+    assert return_code == 1
+    assert opened is False
+    assert "launcher digest did not verify" in result["protocol_error"]
+
+
+def test_registered_jarvis_server_uses_artifact_binding_without_relay_dependency_pin(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+    uvx = tmp_path / ("uvx.exe" if os.name == "nt" else "uvx")
+    uv = tmp_path / ("uv.exe" if os.name == "nt" else "uv")
+    uvx.write_bytes(b"pinned-uv-launcher")
+    uv.write_bytes(b"pinned-uv-runtime")
+    wheel = tmp_path / "operator_clio_kit-py3-none-any.whl"
+    _write_synthetic_clio_kit_wheel(
+        wheel,
+        server_name="jarvis",
+        project={
+            "pyproject.toml": b"[project]\nname='jarvis-mcp'\n",
+            "uv.lock": _jarvis_cd_uv_lock(version="9.9.9"),
+        },
+    )
+    launched = False
+
+    def fake_run(
+        command: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal launched
+        launched = True
+        stdout = "\n".join(
+            [
+                json.dumps({"jsonrpc": "2.0", "id": "clio-relay-mcp-init", "result": {}}),
+                json.dumps({"jsonrpc": "2.0", "id": "clio-relay-mcp-call", "result": {}}),
+            ]
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(cast(Any, runner), "_run_mcp_session", fake_run)
+
+    return_code = cast(McpCallRunnerModule, runner).run_mcp_call_from_params(
+        {
+            "server": str(uvx),
+            "server_args": [
+                "--from",
+                str(wheel),
+                "clio-kit",
+                "mcp-server",
+                "jarvis",
+            ],
+            "tool": "jarvis_describe",
+        }
+    )
+    result = json.loads((tmp_path / "mcp-result.json").read_text(encoding="utf-8"))
+
+    assert return_code == 0
+    assert launched is True
+    assert "expected_jarvis_cd_lock_binding" not in result
+    assert result["server_artifact"]["nested_runtime"]["locked_runtime_verified"] is True
+    assert "jarvis_cd_lock_binding" not in result["server_artifact"]["nested_runtime"]
 
 
 def test_mcp_call_runner_v4_identity_resists_structural_collision(tmp_path: Path) -> None:
@@ -1750,6 +2225,7 @@ def test_mcp_call_runner_does_not_unlock_progress_for_unverified_server(
         tool="jarvis_run",
         arguments={"pipeline_id": "pipeline-a"},
         expected_server_artifact_digest="a" * 64,
+        expected_jarvis_cd_lock_binding=_jarvis_cd_lock_expectation(),
         observed_server_artifact_digest="a" * 64,
         server_artifact={
             "verified": False,
@@ -1758,6 +2234,28 @@ def test_mcp_call_runner_does_not_unlock_progress_for_unverified_server(
                 "locked_runtime_verified": False,
             },
         },
+    )
+
+    assert bridge is None
+
+
+def test_registered_jarvis_run_does_not_enable_builtin_progress_bridge(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Keep built-in package progress semantics out of operator JARVIS servers."""
+    runner = _load_runner()
+    monkeypatch.setenv("CLIO_RELAY_PROGRESS_FILE", str(tmp_path / "progress.jsonl"))
+    monkeypatch.setenv("CLIO_RELAY_PROGRESS_TOKEN", "outer")
+
+    bridge = cast(Any, runner)._package_progress_bridge_from_invocation(
+        operation="tools/call",
+        tool="jarvis_run",
+        arguments={"pipeline_id": "operator-pipeline"},
+        expected_server_artifact_digest="a" * 64,
+        expected_jarvis_cd_lock_binding=None,
+        observed_server_artifact_digest="a" * 64,
+        server_artifact=_verified_jarvis_server_artifact(),
     )
 
     assert bridge is None
@@ -2126,15 +2624,13 @@ def test_mcp_call_runner_persists_query_validation_in_durable_result(
         tmp_path,
         _jarvis_execution_query_result(include_progress=True, include_artifacts=True),
     )
-    artifact = {
-        "verified": True,
-        "nested_runtime": {
-            "server_name": "jarvis",
-            "locked_runtime_verified": True,
-        },
-    }
+    artifact = _verified_jarvis_server_artifact()
 
-    def server_identity(_server: str, _args: list[str]) -> dict[str, Any]:
+    def server_identity(
+        _server: str,
+        _args: list[str],
+        **_kwargs: object,
+    ) -> dict[str, Any]:
         return artifact
 
     def server_digest(_artifact: dict[str, Any]) -> str:
@@ -2155,6 +2651,7 @@ def test_mcp_call_runner_persists_query_validation_in_durable_result(
                 "artifacts": {"role": "output"},
             },
             "expected_server_artifact_digest": "a" * 64,
+            "expected_jarvis_cd_lock_binding": _jarvis_cd_lock_expectation(),
         }
     )
 
@@ -2166,6 +2663,41 @@ def test_mcp_call_runner_persists_query_validation_in_durable_result(
         "clio-relay.jarvis-execution-query-validation.v1"
     )
     assert result["result_validation"]["returned_artifact_count"] == 1
+
+
+def test_registered_jarvis_execution_query_keeps_operator_result_schema(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Do not impose the relay's built-in result schema on registered JARVIS MCPs."""
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+    server = _write_structured_tools_call_server(
+        tmp_path,
+        {"operator_contract": "custom", "status": "ready"},
+    )
+    artifact = _verified_jarvis_server_artifact()
+    monkeypatch.setattr(runner, "_server_artifact_identity", lambda *_args: artifact)
+    monkeypatch.setattr(runner, "_server_artifact_digest", lambda _artifact: "a" * 64)
+
+    returncode = cast(Any, runner).run_mcp_call_from_params(
+        {
+            "server": sys.executable,
+            "server_args": [str(server)],
+            "operation": "tools/call",
+            "tool": "jarvis_get_execution",
+            "arguments": {"operator_argument": True},
+            "expected_server_artifact_digest": "a" * 64,
+        }
+    )
+
+    result = json.loads((tmp_path / "mcp-result.json").read_text(encoding="utf-8"))
+    assert returncode == 0
+    assert result["structured_result"] == {
+        "operator_contract": "custom",
+        "status": "ready",
+    }
+    assert result["result_validation"] is None
 
 
 def test_mcp_call_runner_accepts_explicit_execution_query_opt_outs() -> None:
@@ -2561,10 +3093,11 @@ def _write_synthetic_clio_kit_wheel(
     wheel: Path,
     *,
     project: dict[str, bytes],
+    server_name: str = "spack",
     excluded: dict[str, bytes] | None = None,
     outer_members: dict[str, bytes] | None = None,
 ) -> None:
-    prefix = "clio_kit-2.3.1.data/data/clio-kit-mcp-servers/spack/"
+    prefix = f"clio_kit-2.3.1.data/data/clio-kit-mcp-servers/{server_name}/"
     with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr("clio_kit/__init__.py", _locked_clio_kit_v4_launcher_source())
         for relative, content in project.items():

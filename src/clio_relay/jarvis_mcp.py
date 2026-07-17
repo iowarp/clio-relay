@@ -22,14 +22,14 @@ from clio_relay.remote_mcp import (
 if TYPE_CHECKING:
     from clio_relay.installation import ComponentArtifactIdentity, InstallReceipt
 
-CLIO_KIT_JARVIS_MCP_VERSION = "2.5.1"
+CLIO_KIT_JARVIS_MCP_VERSION = "2.5.3"
 CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME = f"clio_kit-{CLIO_KIT_JARVIS_MCP_VERSION}-py3-none-any.whl"
 CLIO_KIT_JARVIS_MCP_WHEEL_URL = (
     "https://github.com/iowarp/clio-kit/releases/download/"
     f"v{CLIO_KIT_JARVIS_MCP_VERSION}/{CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME}"
 )
 CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 = (
-    "e2710b915e1b77d758f25118ed5cdf522687d2a813bdbf1abd3891164b9676d1"
+    "1c528be468f156b14ae40b72214360c6fe923765d75b244c4505d3689dad0c6b"
 )
 CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.2"
 DEFAULT_JARVIS_MCP_COMMAND = [
@@ -207,6 +207,22 @@ def jarvis_mcp_env_from() -> dict[str, str]:
     return {JARVIS_MCP_SPACK_COMMAND_ENV: JARVIS_MCP_SPACK_COMMAND_ENV}
 
 
+def jarvis_cd_lock_binding_expectation() -> dict[str, str]:
+    """Return the exact relay release pin required by its built-in JARVIS MCP."""
+    from clio_relay.bootstrap import (
+        JARVIS_CD_VERSION,
+        JARVIS_CD_WHEEL_SHA256,
+        JARVIS_CD_WHEEL_URL,
+    )
+
+    return {
+        "schema_version": "clio-relay.jarvis-cd-lock-expectation.v1",
+        "version": JARVIS_CD_VERSION,
+        "url": JARVIS_CD_WHEEL_URL,
+        "sha256": JARVIS_CD_WHEEL_SHA256,
+    }
+
+
 def jarvis_mcp_runtime_identity(receipt: InstallReceipt) -> dict[str, object]:
     """Verify the persistent clio-kit tool against its receipt-bound source wheel."""
     component = receipt.component_artifacts.get("clio-kit")
@@ -249,12 +265,14 @@ def jarvis_mcp_runtime_identity(receipt: InstallReceipt) -> dict[str, object]:
         command=command,
         source_artifact=runtime_path_resolved,
     )
+    locked_server_runtime_verified = _receipt_locked_server_runtime_verified(component)
     artifact_identity_verified = (
         command_matches_receipt
         and artifact_exists
         and expected_digest is not None
         and observed_digest == expected_digest
         and tool_identity.get("persistent_tool_verified") is True
+        and locked_server_runtime_verified
     )
     error: str | None = None
     if not command_matches_receipt:
@@ -265,6 +283,8 @@ def jarvis_mcp_runtime_identity(receipt: InstallReceipt) -> dict[str, object]:
         error = "receipt-bound clio-kit runtime wheel SHA-256 does not match"
     elif tool_identity.get("persistent_tool_verified") is not True:
         error = str(tool_identity.get("error") or "persistent clio-kit tool did not verify")
+    elif not locked_server_runtime_verified:
+        error = "receipt-bound clio-kit locked JARVIS dependency did not verify"
     return {
         "source": "environment" if configured is not None and configured.strip() else "receipt",
         "launcher": "uv tool",
@@ -276,10 +296,91 @@ def jarvis_mcp_runtime_identity(receipt: InstallReceipt) -> dict[str, object]:
         "artifact_exists": artifact_exists,
         "artifact_path_matches": tool_identity.get("source_identity_verified") is True,
         "command_matches_receipt": command_matches_receipt,
+        "locked_server_runtime": component.locked_server_runtime,
+        "locked_server_runtime_verified": locked_server_runtime_verified,
         "artifact_identity_verified": artifact_identity_verified,
         **tool_identity,
         "error": error,
     }
+
+
+def _receipt_locked_server_runtime_verified(component: ComponentArtifactIdentity) -> bool:
+    """Verify the bootstrap-recorded clio-kit to JARVIS-CD dependency edge."""
+    return jarvis_cd_lock_binding_verified(component.locked_server_runtime)
+
+
+def jarvis_cd_lock_binding_verified(value: object) -> bool:
+    """Return whether one nested runtime proves the relay's built-in JARVIS-CD pin."""
+    runtime = cast(dict[str, object], value) if isinstance(value, dict) else None
+    if not isinstance(runtime, dict):
+        return False
+    raw_binding = runtime.get("jarvis_cd_lock_binding")
+    if not isinstance(raw_binding, dict):
+        return False
+    binding = cast(dict[str, object], raw_binding)
+    expected = jarvis_cd_lock_binding_expectation()
+    return (
+        runtime.get("schema_version") == "clio-kit.locked-server.v4"
+        and runtime.get("server_name") == "jarvis"
+        and runtime.get("locked_runtime_verified") is True
+        and binding.get("schema_version") == "clio-relay.jarvis-cd-lock-binding.v1"
+        and binding.get("dependency") == "jarvis-cd"
+        and binding.get("verified") is True
+        and binding.get("error") is None
+        and binding.get("expected_version") == expected["version"]
+        and binding.get("expected_url") == expected["url"]
+        and binding.get("expected_sha256") == expected["sha256"]
+        and binding.get("observed_version") == expected["version"]
+        and binding.get("observed_source_url") == expected["url"]
+        and binding.get("observed_wheel_url") == expected["url"]
+        and binding.get("observed_wheel_sha256") == expected["sha256"]
+        and binding.get("jarvis_mcp_package_entry_count") == 1
+        and binding.get("resolved_dependency_entry_count") == 1
+        and binding.get("observed_resolved_dependency_entries") == [{"name": "jarvis-cd"}]
+        and binding.get("metadata_requirement_entry_count") == 1
+        and binding.get("observed_metadata_requirement_entries")
+        == [{"name": "jarvis-cd", "url": expected["url"]}]
+        and binding.get("observed_metadata_requirement_urls") == [expected["url"]]
+        and binding.get("package_entry_count") == 1
+        and binding.get("wheel_entry_count") == 1
+    )
+
+
+def jarvis_mcp_server_artifact_verified(value: object) -> bool:
+    """Verify the exact released outer clio-kit artifact and its nested JARVIS-CD pin."""
+    if not isinstance(value, dict):
+        return False
+    server_artifact = cast(dict[str, object], value)
+    python_runtime_value = server_artifact.get("python_distribution_runtime")
+    nested_runtime = server_artifact.get("nested_runtime")
+    if not isinstance(python_runtime_value, dict) or not isinstance(nested_runtime, dict):
+        return False
+    python_runtime = cast(dict[str, object], python_runtime_value)
+    return (
+        server_artifact.get("verified") is True
+        and server_artifact.get("server_process_artifact_verified") is True
+        and isinstance(server_artifact.get("executable"), dict)
+        and server_artifact.get("install_source") == "uv-tool"
+        and server_artifact.get("install_artifact_sha256") == CLIO_KIT_JARVIS_MCP_WHEEL_SHA256
+        and str(python_runtime.get("distribution", "")).lower().replace("_", "-") == "clio-kit"
+        and python_runtime.get("distribution_version") == CLIO_KIT_JARVIS_MCP_VERSION
+        and python_runtime.get("entry_point") == "clio-kit"
+        and python_runtime.get("runtime_closure_verified") is True
+        and cast(dict[str, object], nested_runtime).get("persistent_tool") is True
+        and jarvis_cd_lock_binding_verified(cast(dict[str, object], nested_runtime))
+    )
+
+
+def jarvis_mcp_server_artifact_binding_verified(
+    value: object,
+    *,
+    expected_digest: str | None,
+) -> bool:
+    """Verify an exact built-in server artifact and its content-derived digest."""
+    if expected_digest is None or not jarvis_mcp_server_artifact_verified(value):
+        return False
+    server_artifact = cast(JSON, value)
+    return remote_mcp_server_artifact_digest(server_artifact) == expected_digest
 
 
 def _persistent_clio_kit_tool_identity(
@@ -494,12 +595,11 @@ def jarvis_mcp_artifact_binding_from_entry(
     if {tool.name for tool in entry.tools} != set(_VIRTUAL_JARVIS_TOOLS):
         raise ValueError("JARVIS MCP discovery does not contain the exact user tool set")
     server_artifact = entry.provenance.server_artifact
-    if (
-        server_artifact.get("verified") is not True
-        or server_artifact.get("server_process_artifact_verified") is not True
-        or not isinstance(server_artifact.get("executable"), dict)
-    ):
-        raise ValueError("JARVIS MCP discovered server artifact identity is unverified")
+    if not jarvis_mcp_server_artifact_verified(server_artifact):
+        raise ValueError(
+            "JARVIS MCP discovered persistent server or JARVIS-CD lock identity is "
+            "unverified; run jarvis-mcp-refresh"
+        )
     return remote_mcp_server_artifact_digest(server_artifact)
 
 

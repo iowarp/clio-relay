@@ -16,6 +16,8 @@ from clio_relay.installation import (
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_MCP_VERSION,
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
+    jarvis_cd_lock_binding_expectation,
+    jarvis_mcp_server_artifact_verified,
     jarvis_user_contract,
 )
 from clio_relay.remote_mcp import (
@@ -96,6 +98,7 @@ def build_jarvis_mcp_validation_report(
     )
     observed_at = datetime.now(UTC)
     report.completed_at = observed_at
+    expected_jarvis_cd_lock_binding = jarvis_cd_lock_binding_expectation()
 
     tool_definition = _listed_tool(tools_list_response, tool)
     input_schema = _mapping(tool_definition.get("inputSchema")) if tool_definition else None
@@ -236,6 +239,7 @@ def build_jarvis_mcp_validation_report(
     )
     server_artifact_passed = (
         server_artifact is not None
+        and jarvis_mcp_server_artifact_verified(server_artifact)
         and server_artifact.get("verified") is True
         and server_artifact.get("server_process_artifact_verified") is True
         and bool(server_artifact.get("executable"))
@@ -256,7 +260,9 @@ def build_jarvis_mcp_validation_report(
         and server_artifact == discovery_server_artifact
         and _is_sha256(expected_server_artifact_digest)
         and expected_server_artifact_digest == computed_server_artifact_digest
+        and spec.get("expected_jarvis_cd_lock_binding") == expected_jarvis_cd_lock_binding
         and mcp_result is not None
+        and mcp_result.get("expected_jarvis_cd_lock_binding") == expected_jarvis_cd_lock_binding
         and mcp_result.get("expected_server_artifact_digest") == expected_server_artifact_digest
         and mcp_result.get("observed_server_artifact_digest") == expected_server_artifact_digest
     )
@@ -272,6 +278,11 @@ def build_jarvis_mcp_validation_report(
                 "discovery_server_artifact": discovery_server_artifact or {},
                 "expected_server_artifact_digest": expected_server_artifact_digest,
                 "computed_server_artifact_digest": computed_server_artifact_digest,
+                "expected_jarvis_cd_lock_binding": expected_jarvis_cd_lock_binding,
+                "spec_jarvis_cd_lock_binding": spec.get("expected_jarvis_cd_lock_binding"),
+                "result_jarvis_cd_lock_binding": (
+                    mcp_result.get("expected_jarvis_cd_lock_binding") if mcp_result else None
+                ),
                 "launcher": "uv tool",
                 "python_distribution_runtime": python_runtime or {},
                 "nested_runtime": nested_runtime or {},
@@ -777,10 +788,14 @@ def _jarvis_package_search_evidence(
         else None
     )
     result_server_artifact = _mapping(mcp_result.get("server_artifact")) if mcp_result else None
+    expected_jarvis_cd_lock_binding = jarvis_cd_lock_binding_expectation()
     server_binding_passed = bool(
         _is_sha256(expected_server_artifact_digest)
+        and jarvis_mcp_server_artifact_verified(expected_server_artifact)
         and spec.get("expected_server_artifact_digest") == expected_server_artifact_digest
+        and spec.get("expected_jarvis_cd_lock_binding") == expected_jarvis_cd_lock_binding
         and mcp_result is not None
+        and mcp_result.get("expected_jarvis_cd_lock_binding") == expected_jarvis_cd_lock_binding
         and mcp_result.get("expected_server_artifact_digest") == expected_server_artifact_digest
         and mcp_result.get("observed_server_artifact_digest") == expected_server_artifact_digest
         and result_server_artifact == expected_server_artifact
@@ -863,6 +878,11 @@ def _jarvis_package_search_evidence(
             "artifact_kinds": sorted(durable_artifacts),
             "required_artifact_kinds": sorted(required_artifacts),
             "expected_server_artifact_digest": expected_server_artifact_digest,
+            "expected_jarvis_cd_lock_binding": expected_jarvis_cd_lock_binding,
+            "spec_jarvis_cd_lock_binding": spec.get("expected_jarvis_cd_lock_binding"),
+            "result_jarvis_cd_lock_binding": (
+                mcp_result.get("expected_jarvis_cd_lock_binding") if mcp_result else None
+            ),
             "returned_count": returned_count_value,
             "total_matches": total_matches_value,
             "next_cursor_present": isinstance(next_cursor, str),
@@ -977,10 +997,14 @@ def _jarvis_execution_query_evidence(
     )
 
     result_server_artifact = _mapping(mcp_result.get("server_artifact")) if mcp_result else None
+    expected_jarvis_cd_lock_binding = jarvis_cd_lock_binding_expectation()
     server_binding_passed = (
         _is_sha256(expected_server_artifact_digest)
+        and jarvis_mcp_server_artifact_verified(expected_server_artifact)
         and spec.get("expected_server_artifact_digest") == expected_server_artifact_digest
+        and spec.get("expected_jarvis_cd_lock_binding") == expected_jarvis_cd_lock_binding
         and mcp_result is not None
+        and mcp_result.get("expected_jarvis_cd_lock_binding") == expected_jarvis_cd_lock_binding
         and mcp_result.get("expected_server_artifact_digest") == expected_server_artifact_digest
         and mcp_result.get("observed_server_artifact_digest") == expected_server_artifact_digest
         and result_server_artifact == expected_server_artifact
@@ -1142,6 +1166,12 @@ def _jarvis_execution_query_evidence(
         "terminal": call_status.get("terminal"),
         "required_artifact_kinds": sorted(required_artifacts),
         "artifact_kinds": sorted(durable_artifacts),
+        "expected_server_artifact_digest": expected_server_artifact_digest,
+        "expected_jarvis_cd_lock_binding": expected_jarvis_cd_lock_binding,
+        "spec_jarvis_cd_lock_binding": spec.get("expected_jarvis_cd_lock_binding"),
+        "result_jarvis_cd_lock_binding": (
+            mcp_result.get("expected_jarvis_cd_lock_binding") if mcp_result else None
+        ),
         "local_contract": local_contract,
         "packaged_stdio": stdio_evidence or {},
         "runner_validation": runner_validation or {},

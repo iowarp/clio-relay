@@ -30,6 +30,7 @@ from clio_relay.installation import (
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
     CLIO_KIT_JARVIS_USER_WIRE_SHA256,
+    jarvis_cd_lock_binding_expectation,
     jarvis_mcp_runtime_identity,
     jarvis_user_contract,
 )
@@ -117,6 +118,41 @@ EXPECTED_CONTRACTS = {
         },
     },
 }
+
+
+def _verified_locked_jarvis_runtime() -> dict[str, object]:
+    """Return complete receipt evidence for the relay's built-in JARVIS child."""
+    expectation = jarvis_cd_lock_binding_expectation()
+    return {
+        "schema_version": "clio-kit.locked-server.v4",
+        "server_name": "jarvis",
+        "locked_runtime_verified": True,
+        "jarvis_cd_lock_binding": {
+            "schema_version": "clio-relay.jarvis-cd-lock-binding.v1",
+            "dependency": "jarvis-cd",
+            "verified": True,
+            "error": None,
+            "expected_version": expectation["version"],
+            "expected_url": expectation["url"],
+            "expected_sha256": expectation["sha256"],
+            "observed_version": expectation["version"],
+            "observed_source_url": expectation["url"],
+            "observed_wheel_url": expectation["url"],
+            "observed_wheel_sha256": expectation["sha256"],
+            "jarvis_mcp_package_entry_count": 1,
+            "resolved_dependency_entry_count": 1,
+            "observed_resolved_dependency_entries": [{"name": "jarvis-cd"}],
+            "metadata_requirement_entry_count": 1,
+            "observed_metadata_requirement_entries": [
+                {"name": "jarvis-cd", "url": expectation["url"]}
+            ],
+            "observed_metadata_requirement_urls": [expectation["url"]],
+            "package_entry_count": 1,
+            "wheel_entry_count": 1,
+        },
+    }
+
+
 ACTIVE_CONTRACT_IDS = frozenset(EXPECTED_CONTRACTS) - {
     "clio-kit-jarvis-user-v3",
     "clio-kit-jarvis-user-v3.1",
@@ -343,6 +379,50 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
     )
 
 
+def test_install_receipt_exposes_verified_locked_jarvis_dependency_edge(
+    tmp_path: Path,
+) -> None:
+    locked_server_runtime = _verified_locked_jarvis_runtime()
+    receipt_path = tmp_path / "install-receipt.json"
+    receipt = write_install_receipt(
+        install_spec="checkout",
+        path=receipt_path,
+        component_artifacts={
+            "clio-kit": ComponentArtifactIdentity(
+                distribution="clio-kit",
+                install_spec="clio-kit.whl",
+                requested_source="wheel",
+                runtime_command=["clio-kit", "mcp-server", "jarvis"],
+                locked_server_runtime=locked_server_runtime,
+            )
+        },
+    )
+
+    runtime_identity = jarvis_mcp_runtime_identity(receipt)
+    persisted = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+    assert runtime_identity["locked_server_runtime_verified"] is True
+    assert runtime_identity["locked_server_runtime"] == locked_server_runtime
+    assert (
+        persisted["component_artifacts"]["clio-kit"]["locked_server_runtime"]
+        == locked_server_runtime
+    )
+
+    receipt_runtime = cast(
+        dict[str, object],
+        receipt.component_artifacts["clio-kit"].locked_server_runtime,
+    )
+    binding = cast(dict[str, object], receipt_runtime["jarvis_cd_lock_binding"])
+    binding["resolved_dependency_entry_count"] = 0
+    invalid_runtime_identity = jarvis_mcp_runtime_identity(receipt)
+    assert invalid_runtime_identity["locked_server_runtime_verified"] is False
+    assert invalid_runtime_identity["artifact_identity_verified"] is False
+
+    binding["resolved_dependency_entry_count"] = 1
+    receipt_runtime["schema_version"] = "clio-kit.locked-server.v5"
+    assert jarvis_mcp_runtime_identity(receipt)["locked_server_runtime_verified"] is False
+
+
 def test_real_uv_tool_install_binds_external_launcher_to_receipt_and_record(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -418,6 +498,7 @@ def test_real_uv_tool_install_binds_external_launcher_to_receipt_and_record(
                 runtime_interpreters={"provider": str(provider)},
                 runtime_executables={"clio-kit": str(executable), "uv": uv},
                 persistent_tool=identity,
+                locked_server_runtime=_verified_locked_jarvis_runtime(),
             )
         },
     )

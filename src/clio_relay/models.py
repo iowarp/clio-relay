@@ -427,6 +427,7 @@ class McpCallSpec(BaseModel):
     server_args: list[str] = Field(default_factory=list)
     env_from: dict[str, str] = Field(default_factory=dict)
     expected_server_artifact_digest: str | None = None
+    expected_jarvis_cd_lock_binding: dict[str, str] | None = None
     operation: McpOperation = McpOperation.TOOLS_CALL
     tool: str | None = None
     arguments: dict[str, Any] = Field(default_factory=dict)
@@ -450,6 +451,25 @@ class McpCallSpec(BaseModel):
         ):
             raise ValueError("expected_server_artifact_digest must be a SHA-256")
         return normalized
+
+    @field_validator("expected_jarvis_cd_lock_binding")
+    @classmethod
+    def validate_expected_jarvis_cd_lock_binding(
+        cls,
+        value: dict[str, str] | None,
+    ) -> dict[str, str] | None:
+        """Require a complete expected dependency artifact identity when present."""
+        if value is None:
+            return None
+        expected_keys = {"schema_version", "version", "url", "sha256"}
+        if set(value) != expected_keys or any(not item for item in value.values()):
+            raise ValueError("expected_jarvis_cd_lock_binding must be a complete identity")
+        if value["schema_version"] != "clio-relay.jarvis-cd-lock-expectation.v1":
+            raise ValueError("expected_jarvis_cd_lock_binding schema is unsupported")
+        sha256 = value["sha256"].lower()
+        if len(sha256) != 64 or any(character not in "0123456789abcdef" for character in sha256):
+            raise ValueError("expected_jarvis_cd_lock_binding SHA-256 is invalid")
+        return {**value, "sha256": sha256}
 
     @model_validator(mode="after")
     def validate_operation_contract(self) -> McpCallSpec:
