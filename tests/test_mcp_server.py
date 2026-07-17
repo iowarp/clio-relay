@@ -142,6 +142,90 @@ def _bind_virtual_jarvis_catalog(
     monkeypatch.setattr(mcp_server_module, "_remote_mcp_catalog", bound_catalog)
 
 
+def test_mcp_session_remote_job_routes_are_collision_safe_and_reset() -> None:
+    session = McpSessionState()
+    job_id = "remote-job"
+    session.observe_remote_job_result(
+        {
+            "remote": True,
+            "job_id": job_id,
+            "cluster": "ares",
+            "route_revision": "a" * 64,
+        }
+    )
+
+    assert session.remote_job_route(job_id) == ("ares", "a" * 64)
+
+    session.observe_remote_job_result(
+        {
+            "remote": True,
+            "job_id": job_id,
+            "cluster": "homelab",
+            "route_revision": "b" * 64,
+        }
+    )
+    with pytest.raises(ValueError, match="ambiguous in this MCP session"):
+        session.remote_job_route(job_id)
+
+    session.reset()
+    assert session.remote_job_route(job_id) is None
+
+
+def test_mcp_session_remote_route_never_overrides_same_id_local_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="desktop",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["echo", "local"]),
+            idempotency_key="local-precedence",
+        )
+    )
+    session = McpSessionState()
+    session.observe_remote_job_result(
+        {
+            "remote": True,
+            "job_id": job.job_id,
+            "cluster": "ares",
+            "route_revision": "a" * 64,
+        }
+    )
+
+    class ForbiddenOwnedSessionApiClient:
+        def __init__(self, **_kwargs: object) -> None:
+            raise AssertionError("local job follow-up was incorrectly routed to the cluster")
+
+    monkeypatch.setattr(
+        mcp_server_module,
+        "OwnedSessionApiClient",
+        ForbiddenOwnedSessionApiClient,
+    )
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_status",
+                "arguments": {"job_id": job.job_id},
+            },
+        },
+        queue=queue,
+        settings=settings,
+        profile="user",
+        session=session,
+    )
+
+    assert response is not None
+    structured = response["result"]["structuredContent"]
+    assert structured["job"]["job_id"] == job.job_id
+    assert structured["job"]["cluster"] == "desktop"
+
+
 def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     queue = ClioCoreQueue(tmp_path / "core")
@@ -2124,12 +2208,13 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
 
     monkeypatch.setattr(mcp_server_module, "_remote_mcp_catalog", selected_catalog)
     captured: dict[str, object] = {}
+    submitted_jobs: list[RelayJob] = []
 
     def submit_owned(**kwargs: object) -> RelayJob:
         captured.update(kwargs)
         payload = cast(dict[str, object], kwargs["payload"])
         selected_settings = cast(RelaySettings, kwargs["settings"])
-        return RelayJob(
+        job = RelayJob(
             cluster="ares",
             kind=JobKind.MCP_CALL,
             spec=McpCallSpec(
@@ -2149,6 +2234,8 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
                 "owner_session_generation_id": (selected_settings.owner_session_generation_id),
             },
         )
+        submitted_jobs.append(job)
+        return job
 
     monkeypatch.setattr("clio_relay.mcp_server.submit_owned_session_job", submit_owned)
     settings = RelaySettings.from_env()
@@ -2191,6 +2278,122 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
     assert payload["expected_server_artifact_digest"] == "c" * 64
     assert payload["arguments"] == {"dataset": "asteroid2018"}
     assert queue.list_jobs() == []
+
+    submitted = submitted_jobs[0]
+    terminal = submitted.model_copy(update={"state": JobState.SUCCEEDED})
+    requests: list[tuple[str, str]] = []
+
+    class FakeOwnedSessionApiClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> FakeOwnedSessionApiClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def request_json(
+            self,
+            *,
+            method: str,
+            path: str,
+            query: dict[str, object] | None = None,
+            body: dict[str, object] | None = None,
+            response_timeout_seconds: float | None = None,
+        ) -> object:
+            del query, body, response_timeout_seconds
+            requests.append((method, path))
+            if path == f"/jobs/{submitted.job_id}/status":
+                return {
+                    "job": terminal.model_dump(mode="json"),
+                    "relay_queue": {},
+                    "scheduler": [],
+                    "terminal": True,
+                }
+            if path == f"/jobs/{submitted.job_id}/monitor":
+                return {
+                    "job": submitted.model_dump(mode="json"),
+                    "relay_queue": {},
+                    "scheduler": [],
+                    "terminal": False,
+                    "events": [],
+                    "next_cursor": 1,
+                }
+            if path == f"/jobs/{submitted.job_id}/wait":
+                return terminal.model_dump(mode="json")
+            if path == f"/queue/jobs/{submitted.job_id}/cancel":
+                return {
+                    "job": terminal.model_dump(mode="json"),
+                    "scheduler_policy": "relay-only",
+                }
+            if path == f"/jobs/{submitted.job_id}/artifacts":
+                return {
+                    "artifacts": [],
+                    "cursor": 1,
+                    "limit": 500,
+                    "next_cursor": None,
+                    "total": 0,
+                }
+            raise AssertionError(f"unexpected owned session request: {method} {path}")
+
+    monkeypatch.setattr(mcp_server_module, "OwnedSessionApiClient", FakeOwnedSessionApiClient)
+    followups: list[tuple[str, dict[str, object]]] = [
+        ("relay_status", {}),
+        ("relay_cancel", {}),
+        ("relay_observe", {"include_logs": False}),
+        ("relay_wait", {"include_logs": False, "timeout_seconds": 1}),
+    ]
+    followup_responses = [
+        handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": index,
+                "method": "tools/call",
+                "params": {
+                    "name": tool_name,
+                    "arguments": {"job_id": submitted.job_id, **controls},
+                },
+            },
+            queue=queue,
+            settings=settings,
+            profile="user",
+            session=session,
+        )
+        for index, (tool_name, controls) in enumerate(followups, start=3)
+    ]
+
+    assert all(item is not None and "error" not in item for item in followup_responses)
+    assert requests == [
+        ("GET", f"/jobs/{submitted.job_id}/status"),
+        ("POST", f"/queue/jobs/{submitted.job_id}/cancel"),
+        ("GET", f"/jobs/{submitted.job_id}/monitor"),
+        ("POST", f"/jobs/{submitted.job_id}/wait"),
+        ("GET", f"/jobs/{submitted.job_id}/status"),
+        ("GET", f"/jobs/{submitted.job_id}/artifacts"),
+    ]
+
+    ClusterRegistry(
+        clusters={"ares": ClusterDefinition(name="ares", ssh_host="replacement-login")}
+    ).save(registry_path)
+    stale = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_status",
+                "arguments": {"job_id": submitted.job_id},
+            },
+        },
+        queue=queue,
+        settings=settings,
+        profile="user",
+        session=session,
+    )
+    assert stale is not None
+    assert "cluster route changed" in stale["error"]["message"]
+    assert len(requests) == 6
 
 
 def test_virtual_remote_mcp_wait_envelope_returns_same_call_result_without_leaking(

@@ -1050,7 +1050,7 @@ def test_mcp_call_runner_verifies_relay_jarvis_cd_pin_in_locked_child_runtime(
     uv = tmp_path / ("uv.exe" if os.name == "nt" else "uv")
     uvx.write_bytes(b"pinned-uv-launcher")
     uv.write_bytes(b"pinned-uv-runtime")
-    wheel = tmp_path / "clio_kit-2.5.3-py3-none-any.whl"
+    wheel = tmp_path / "clio_kit-2.5.4-py3-none-any.whl"
     _write_synthetic_clio_kit_wheel(
         wheel,
         server_name="jarvis",
@@ -1221,7 +1221,7 @@ def test_mcp_call_runner_refuses_unbound_jarvis_cd_lock_before_process_launch(
     uv = tmp_path / ("uv.exe" if os.name == "nt" else "uv")
     uvx.write_bytes(b"pinned-uv-launcher")
     uv.write_bytes(b"pinned-uv-runtime")
-    wheel = tmp_path / "clio_kit-2.5.3-py3-none-any.whl"
+    wheel = tmp_path / "clio_kit-2.5.4-py3-none-any.whl"
     _write_synthetic_clio_kit_wheel(
         wheel,
         server_name="jarvis",

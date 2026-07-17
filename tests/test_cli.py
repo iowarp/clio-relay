@@ -2274,16 +2274,16 @@ def test_cli_remote_teardown_writes_closure_only_in_remote_authoritative_core(
 
     monkeypatch.setattr(cli, "run_remote_clio", fake_remote)
 
-    def skip_worker_verification(
+    def forbid_worker_verification(
         _report: LiveValidationReport,
         _definition: ClusterDefinition,
         *,
         observed_worker_info: dict[str, object] | None = None,
     ) -> None:
         del observed_worker_info
-        return
+        raise AssertionError("cleanup without an artifact digest must not claim worker identity")
 
-    monkeypatch.setattr(cli, "_attach_verified_remote_worker", skip_worker_verification)
+    monkeypatch.setattr(cli, "_attach_verified_remote_worker", forbid_worker_verification)
 
     def observe_no_worker(
         _definition: ClusterDefinition,
@@ -2292,9 +2292,19 @@ def test_cli_remote_teardown_writes_closure_only_in_remote_authoritative_core(
 
     monkeypatch.setattr(cli, "_observe_worker_before_cleanup", observe_no_worker)
 
+    report_path = tmp_path / "remote-teardown.json"
     result = CliRunner().invoke(
         app,
-        ["session", "teardown", "--cluster", "ares", "--session-id", "session-1"],
+        [
+            "session",
+            "teardown",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--validation-report",
+            str(report_path),
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -2337,6 +2347,11 @@ def test_cli_remote_teardown_writes_closure_only_in_remote_authoritative_core(
     )
     assert local_closure is not None
     assert local_closure.residual_resource_ids == []
+    validation_report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert validation_report["status"] == "passed"
+    assert validation_report["install_source"]["artifact_sha256"] is None
+    assert validation_report["install_source"]["artifact_identity_verified"] is False
+    assert not any(check["check_id"].startswith("worker.") for check in validation_report["checks"])
 
 
 def test_cli_session_start_requires_token_by_default(
@@ -5267,6 +5282,46 @@ def test_cleanup_worker_observation_is_bounded_and_never_retried_after_cleanup(
     assert saved["status"] == "failed"
     assert saved["completed_at"] is not None
     assert all(check["completed_at"] is not None for check in saved["checks"])
+    assert saved["checks"][-1]["check_id"] == "worker.installation-info"
+
+
+def test_cleanup_with_artifact_digest_keeps_worker_identity_verification_strict(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    report = new_live_validation_report(
+        scenario="cleanup",
+        cluster="ares",
+        artifact_sha256="a" * 64,
+    )
+    recorder = ValidationRecorder(report)
+    with recorder.check("cleanup.relay-session", "remote API stopped") as evidence:
+        evidence.append(EvidenceReference(kind="cleanup", excerpt="remote API stopped"))
+    recorder.finish()
+    report_path = tmp_path / "strict-cleanup-report.json"
+
+    def reject_worker_identity(
+        _report: LiveValidationReport,
+        _definition: ClusterDefinition,
+        *,
+        observed_worker_info: dict[str, object] | None = None,
+    ) -> None:
+        del observed_worker_info
+        raise ConfigurationError("remote worker wheel SHA-256 does not match")
+
+    monkeypatch.setattr(cli, "_attach_verified_remote_worker", reject_worker_identity)
+
+    with pytest.raises(ConfigurationError, match="wheel SHA-256 does not match"):
+        cli._write_cleanup_validation_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            report,
+            ClusterDefinition(name="ares", ssh_host="ares"),
+            report_path,
+            observed_worker_info={"running": True},
+        )
+
+    saved = json.loads(report_path.read_text(encoding="utf-8"))
+    assert saved["status"] == "failed"
+    assert saved["install_source"]["artifact_sha256"] == "a" * 64
     assert saved["checks"][-1]["check_id"] == "worker.installation-info"
 
 

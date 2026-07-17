@@ -3416,7 +3416,7 @@ def session_detach(
             update={"report_id": seed_report.report_id, "started_at": seed_report.started_at}
         )
         canonical_report[0] = canonical
-        _write_remote_verified_report(
+        _write_cleanup_validation_report(
             canonical,
             definition,
             canonical_report_path,
@@ -4100,7 +4100,7 @@ def session_teardown(
                     state="canceled",
                 )
             )
-        _write_remote_verified_report(
+        _write_cleanup_validation_report(
             canonical,
             definition,
             canonical_report_path,
@@ -12037,6 +12037,35 @@ def _write_remote_verified_report(
         recorder.write(path)
         raise
     write_validation_report(report, path)
+
+
+def _write_cleanup_validation_report(
+    report: LiveValidationReport,
+    definition: ClusterDefinition,
+    path: Path,
+    *,
+    observed_worker_info: dict[str, object] | None = None,
+    worker_observation_error: Exception | None = None,
+) -> None:
+    """Persist operational cleanup without manufacturing release provenance.
+
+    Ordinary detach and teardown commands do not require a candidate wheel.  When
+    no independently computed artifact digest was supplied, the cleanup report
+    remains an honest operational result with unverified artifact provenance and
+    without verified-worker checks.  The release gate therefore cannot consume it
+    as released-artifact evidence.  If a digest is supplied, remote worker
+    verification remains strict and any mismatch still fails the acceptance run.
+    """
+    if report.install_source.artifact_sha256 is None:
+        write_validation_report(report, path)
+        return
+    _write_remote_verified_report(
+        report,
+        definition,
+        path,
+        observed_worker_info=observed_worker_info,
+        worker_observation_error=worker_observation_error,
+    )
 
 
 def _new_cleanup_acceptance_report(

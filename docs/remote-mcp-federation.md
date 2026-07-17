@@ -264,7 +264,7 @@ Virtual JARVIS mutations and runs receive a fresh relay job by default. Supply
 an explicit `idempotency_key` only when retry de-duplication is intentional; an
 identical second `jarvis_run` is otherwise a new execution.
 
-The released clio-kit 2.5.3 artifact is the pinned six-tool JARVIS v3.2 contract.
+The released clio-kit 2.5.4 artifact is the pinned six-tool JARVIS v3.2 contract.
 Bootstrap
 downloads and hashes the exact coordinated wheel, installs it once with
 `uv tool install`, and persists the wheel plus the direct JARVIS command in the
@@ -283,13 +283,13 @@ relay's exact JARVIS-CD release pin. That dependency edge is recorded in the
 install receipt and call result. Operator-registered MCP servers remain bound
 by their own discovery artifact and are not constrained to the relay's
 JARVIS-CD version.
-The release gate requires that exact 2.5.3 artifact to be rerun on every target
+The release gate requires that exact 2.5.4 artifact to be rerun on every target
 selected by the release policy. Other servers use the operator registry and
 generated `remote_...` aliases.
 
 The exact release wheel is
-`clio_kit-2.5.3-py3-none-any.whl` with SHA-256
-`1c528be468f156b14ae40b72214360c6fe923765d75b244c4505d3689dad0c6b`.
+`clio_kit-2.5.4-py3-none-any.whl` with SHA-256
+`8e29cdde8abc669ca700aec09b38b6954322e924ac175cfcdf16a7f41a32374f`.
 Its canonical contract is `clio-kit-jarvis-user-v3.2`, with contract SHA-256
 `12f6d349c9d44d8ce3594943dcd4018ec9b6e01ebb0e59d468bb1bb783a1ad5d`
 and canonical tools-wire SHA-256
@@ -308,7 +308,7 @@ operator-defined and do not select behavior.
 
 ## Register the scientific catalog MCP
 
-clio-kit 2.5.3 also ships the two-tool
+clio-kit 2.5.4 also ships the two-tool
 `clio-kit-scientific-catalog-user-v1` contract. It separates dataset discovery
 from visualization control: `scientific_dataset_search` finds operator catalog
 records and `scientific_dataset_describe` returns one exact
