@@ -26,7 +26,7 @@ def test_mcp_call_refuses_artifact_drift_before_launch(
     artifact: dict[str, Any] = {
         "requested_command": "science-mcp",
         "resolved_executable": "/opt/science-mcp",
-        "executable": {"sha256": "a" * 64},
+        "executable": {"path": "/opt/science-mcp", "sha256": "a" * 64},
         "install_spec": "/opt/science.whl",
         "install_source": "wheel",
         "install_artifact_sha256": "b" * 64,

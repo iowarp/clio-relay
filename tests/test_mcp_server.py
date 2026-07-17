@@ -7,7 +7,7 @@ from dataclasses import replace
 from datetime import timedelta
 from io import StringIO
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -22,6 +22,7 @@ from clio_relay.cluster_config import (
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.filesystem_paths import internal_filesystem_path
+from clio_relay.identifiers import durable_record_id_json_schema
 from clio_relay.mcp_server import (
     McpSessionState,
     handle_request,
@@ -263,6 +264,18 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         tool for tool in response["result"]["tools"] if tool["name"] == "relay_bind_jarvis_runtime"
     )
     assert "desktop_bind_port" not in bind_runtime_tool["inputSchema"]["properties"]
+    binding_schema = bind_runtime_tool["inputSchema"]["properties"]["binding"]
+    assert binding_schema["required"] == [
+        "cluster",
+        "source_job_id",
+        "source_artifact_id",
+        "package_id",
+        "package_name",
+        "service_instance_id",
+    ]
+    assert len(bind_runtime_tool["inputSchema"]["oneOf"]) == 2
+    assert binding_schema["properties"]["source_job_id"] == durable_record_id_json_schema()
+    assert binding_schema["properties"]["source_artifact_id"] == durable_record_id_json_schema()
     create_pipeline_tool = next(
         tool for tool in response["result"]["tools"] if tool["name"] == "jarvis_create_pipeline"
     )
@@ -336,6 +349,10 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         "type": "string",
         "const": "mcp_call",
     }
+    assert (
+        query_tool["outputSchema"]["properties"]["service_runtime_bindings"]["items"]
+        == binding_schema
+    )
     diagnose_tool = next(
         tool for tool in response["result"]["tools"] if tool["name"] == "relay_queue_diagnose"
     )
@@ -2065,6 +2082,11 @@ def test_direct_remote_waited_mcp_submission_returns_artifact_bound_result(
                         "cluster": "ares",
                         "kind": "mcp_call",
                         "state": "succeeded",
+                        "spec": {
+                            "server": "jarvis",
+                            "tool": "jarvis_describe",
+                        },
+                        "idempotency_key": "direct-waited-fixture",
                         "last_error": None,
                     },
                     "terminal": True,
@@ -2495,13 +2517,20 @@ def test_virtual_remote_mcp_wait_envelope_returns_same_call_result_without_leaki
             }
         ]
 
-    def verified_result(_queue: ClioCoreQueue, _job_id: str) -> dict[str, object]:
-        return {
+    def verified_result(
+        _queue: ClioCoreQueue,
+        _job_id: str,
+    ) -> mcp_server_module._VerifiedMcpResult:  # pyright: ignore[reportPrivateUsage]
+        document: dict[str, Any] = {
             "operation": "tools/call",
             "tool": "scientific_dataset_search",
             "returncode": 0,
             "structured_result": {"datasets": [{"dataset_id": "asteroid-first-five"}]},
         }
+        return mcp_server_module._VerifiedMcpResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            document=document,
+            public=document,
+        )
 
     def bounded_logs(
         selected_queue: ClioCoreQueue,

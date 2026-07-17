@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
+from clio_relay.identifiers import durable_record_id_json_schema
 from clio_relay.remote_mcp import (
     VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA,
     RemoteMcpSchemaCache,
@@ -22,14 +23,14 @@ from clio_relay.remote_mcp import (
 if TYPE_CHECKING:
     from clio_relay.installation import ComponentArtifactIdentity, InstallReceipt
 
-CLIO_KIT_JARVIS_MCP_VERSION = "2.5.4"
+CLIO_KIT_JARVIS_MCP_VERSION = "2.5.5"
 CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME = f"clio_kit-{CLIO_KIT_JARVIS_MCP_VERSION}-py3-none-any.whl"
 CLIO_KIT_JARVIS_MCP_WHEEL_URL = (
     "https://github.com/iowarp/clio-kit/releases/download/"
     f"v{CLIO_KIT_JARVIS_MCP_VERSION}/{CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME}"
 )
 CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 = (
-    "8e29cdde8abc669ca700aec09b38b6954322e924ac175cfcdf16a7f41a32374f"
+    "622344b951d39f35b0952d2bf056d83040b81ad52e4aca4794fa486026eab278"
 )
 CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.2"
 DEFAULT_JARVIS_MCP_COMMAND = [
@@ -530,6 +531,18 @@ def virtual_jarvis_tool_definitions(*, clusters: list[str] | None = None) -> lis
         }
         required = cast(list[str], input_schema.get("required", []))
         input_schema["required"] = ["cluster", *required]
+        output_schema = deepcopy(VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA)
+        if remote_tool == "jarvis_get_execution":
+            output_properties = cast(JSON, output_schema["properties"])
+            output_properties["service_runtime_bindings"] = {
+                "type": "array",
+                "description": (
+                    "Ready-service handoffs derived from the verified durable MCP result. "
+                    "Pass one item unchanged as relay_bind_jarvis_runtime.binding."
+                ),
+                "items": jarvis_service_runtime_handoff_json_schema(clusters=clusters),
+                "maxItems": 4_096,
+            }
         tools.append(
             {
                 "name": virtual_jarvis_tool_name(remote_tool),
@@ -538,11 +551,47 @@ def virtual_jarvis_tool_definitions(*, clusters: list[str] | None = None) -> lis
                     "clio-kit JARVIS MCP and returned as a durable relay job."
                 ),
                 "inputSchema": input_schema,
-                "outputSchema": deepcopy(VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA),
+                "outputSchema": output_schema,
                 "annotations": deepcopy(cast(JSON, definition["annotations"])),
             }
         )
     return tools
+
+
+def jarvis_service_runtime_handoff_json_schema(
+    *,
+    clusters: list[str] | None = None,
+) -> JSON:
+    """Return the exact agent-facing JARVIS service handoff schema."""
+    return {
+        "type": "object",
+        "properties": {
+            "cluster": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                **({"enum": sorted(clusters)} if clusters is not None else {}),
+            },
+            "source_job_id": durable_record_id_json_schema(),
+            "source_artifact_id": durable_record_id_json_schema(),
+            "package_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "package_name": {"type": "string", "minLength": 1, "maxLength": 256},
+            "service_instance_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+            },
+        },
+        "required": [
+            "cluster",
+            "source_job_id",
+            "source_artifact_id",
+            "package_id",
+            "package_name",
+            "service_instance_id",
+        ],
+        "additionalProperties": False,
+    }
 
 
 def jarvis_user_contract() -> dict[str, JSON]:
@@ -667,6 +716,9 @@ def render_virtual_jarvis_agent_context() -> str:
         "selected canonical package name. "
         "When wait_for_terminal=true, the same JARVIS tool returns a bounded, "
         "artifact-bound mcp_result instead of requiring a second status or log call. "
+        "A completed jarvis_get_execution call with include_service_runtimes=true also "
+        "returns service_runtime_bindings. Pass one item unchanged as the binding argument "
+        "to relay_bind_jarvis_runtime; jarvis_run does not produce these handoffs. "
         "For later job queries, preserve cluster, job_id, and the opaque 64-character "
         "route_revision from one receipt as a single handle; never substitute a catalog "
         "or dataset revision. "

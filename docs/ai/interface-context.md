@@ -156,15 +156,16 @@ pair. Submission tools accept `used_artifact_refs` as unique artifact-id/SHA-256
 pairs, and owned-session routes enforce an exact producer/consumer session
 generation match.
 
-`relay_bind_jarvis_runtime` is in the user profile. It takes a configured cluster,
-one completed relay-routed `jarvis_get_execution` source job with
-`include_service_runtimes=true`, its `mcp_result` artifact, and an exact package
-id/name. Its output includes the
+`relay_bind_jarvis_runtime` is in the user profile. A waited
+`jarvis_get_execution(include_service_runtimes=true)` response supplies compact
+`service_runtime_bindings`; pass one exact entry unchanged as `binding`. It carries
+the configured cluster, completed source job and `mcp_result` artifact, exact
+package id/name, and service-instance id. Its output includes the
 durable gateway session and six local URLs: connect, health, stream, events, state,
 and command. The gateway stores the immutable source job/artifact digest,
 execution and scheduler identities, service revision/report digest, and exact
 dataset descriptor/digest. The tool does not accept submit, status, cancel, host,
-port, path, or descriptor overrides.
+port, path, descriptor overrides, or mixed compact/legacy selectors.
 
 Normal bind and gateway-get results never contain a browser capability. A trusted
 desktop viewer calls `gateway browser-attach` only after exact binding verification

@@ -337,11 +337,11 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
         if resource["kind"] == "relay_worker"
     )
     clio_kit_component = worker["metadata_equals"]["component_artifacts"]["clio-kit"]
-    assert clio_kit_component["distribution_version"] == "2.5.4"
+    assert clio_kit_component["distribution_version"] == "2.5.5"
     assert clio_kit_component["persistent_tool"]["manager"] == "uv"
     assert clio_kit_component["persistent_tool"]["uv_version"] == "0.11.28"
     assert clio_kit_component["persistent_tool"]["source_artifact_sha256"] == (
-        "8e29cdde8abc669ca700aec09b38b6954322e924ac175cfcdf16a7f41a32374f"
+        "622344b951d39f35b0952d2bf056d83040b81ad52e4aca4794fa486026eab278"
     )
     jarvis_component = worker["metadata_equals"]["component_artifacts"]["jarvis-cd"]
     assert jarvis_component["distribution_version"] == "1.3.12"
@@ -505,7 +505,7 @@ def test_spack_release_requirements_split_existing_resolution_from_fresh_install
     )
     assert fresh_server["metadata_equals"]["server_name"] == "spack-fresh"
     assert fresh_server["metadata_equals"]["install_artifact_sha256"] == (
-        "8e29cdde8abc669ca700aec09b38b6954322e924ac175cfcdf16a7f41a32374f"
+        "622344b951d39f35b0952d2bf056d83040b81ad52e4aca4794fa486026eab278"
     )
     assert fresh_server["metadata_equals"]["contract_id"] == "clio-kit-spack-user-v2"
     assert fresh_server["metadata_equals"]["contract_sha256"] == (

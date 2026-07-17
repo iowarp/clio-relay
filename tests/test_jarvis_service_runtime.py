@@ -13,6 +13,7 @@ import pytest
 from typer.testing import CliRunner
 
 import clio_relay.jarvis_service_runtime as runtime_binding
+import clio_relay.mcp_server as mcp_server_module
 import clio_relay.service_runtime as service_runtime_module
 from clio_relay.browser_gateway import BrowserAttachmentGrant, BrowserDetachmentResult
 from clio_relay.cli import app
@@ -27,6 +28,7 @@ from clio_relay.errors import ConfigurationError
 from clio_relay.jarvis_mcp import jarvis_cd_lock_binding_expectation
 from clio_relay.jarvis_service_runtime import (
     RELAY_JARVIS_RUNTIME_BINDING_SCHEMA,
+    JarvisDatasetDescriptor,
     JarvisServiceRuntime,
     resolve_jarvis_service_runtime,
     reverify_jarvis_service_runtime,
@@ -80,6 +82,176 @@ def test_resolve_jarvis_service_runtime_binds_only_exact_durable_result(
     ]
     assert len(verified.binding.service_report_sha256) == 64
     assert len(verified.binding.dataset_descriptor_sha256) == 64
+
+
+def test_waited_execution_exposes_compact_verified_binding_before_large_result(
+    tmp_path: Path,
+) -> None:
+    """A waited query exposes the exact bind input before its bounded MCP payload."""
+    _queue, _definition, job, _artifact, envelope = _source_result(tmp_path)
+    document = json.loads(base64.b64decode(envelope["data"], validate=True).decode("utf-8"))
+    document["structured_result"]["runtime_metadata"] = {"padding": "x" * 90_000}
+    document["protocol_result"]["structuredContent"] = document["structured_result"]
+    _replace_envelope_document(envelope, document)
+    artifact = ArtifactRef.model_validate(envelope["artifact"])
+    parsed = mcp_server_module._decode_verified_mcp_result(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        envelope,
+        artifact=artifact.model_dump(mode="json"),
+        job_id=job.job_id,
+    )
+    receipt: dict[str, Any] = {
+        "cluster": job.cluster,
+        "job_id": job.job_id,
+        "state": "succeeded",
+    }
+
+    mcp_server_module._attach_terminal_mcp_evidence(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        receipt,
+        source_job=job,
+        last_error=None,
+        artifacts=[artifact.model_dump(mode="json")],
+        parsed_result=parsed,
+    )
+
+    expected = {
+        "cluster": job.cluster,
+        "source_job_id": job.job_id,
+        "source_artifact_id": artifact.artifact_id,
+        "package_id": "paraview-1",
+        "package_name": "builtin.paraview",
+        "service_instance_id": "paraview-live-1",
+    }
+    assert receipt["service_runtime_bindings"] == [expected]
+    keys = list(receipt)
+    assert keys.index("mcp_result_artifact") < keys.index("service_runtime_bindings")
+    assert keys.index("service_runtime_bindings") < keys.index("mcp_result")
+    serialized = mcp_server_module._serialize_tool_result(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        receipt
+    )
+    assert serialized.index('"mcp_result_artifact":') < serialized.index(
+        '"service_runtime_bindings":'
+    )
+    assert serialized.index('"service_runtime_bindings":') < serialized.index('"mcp_result":')
+
+
+def test_multiple_ready_services_have_exact_unchanged_bindings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated package services remain individually selectable by their handoff."""
+    queue, definition, job, _artifact, envelope = _source_result(tmp_path)
+    document = json.loads(base64.b64decode(envelope["data"], validate=True).decode("utf-8"))
+    services = document["structured_result"]["service_runtimes"]["service_runtimes"]
+    second = dict(services[0])
+    second.update(
+        {
+            "service_instance_id": "paraview-live-2",
+            "revision": 1,
+            "port": 18778,
+        }
+    )
+    services.append(second)
+    document["protocol_result"]["structuredContent"] = document["structured_result"]
+    _replace_envelope_document(envelope, document)
+    artifact = ArtifactRef.model_validate(envelope["artifact"])
+    parsed = mcp_server_module._decode_verified_mcp_result(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        envelope,
+        artifact=artifact.model_dump(mode="json"),
+        job_id=job.job_id,
+    )
+    receipt: dict[str, Any] = {}
+    mcp_server_module._attach_terminal_mcp_evidence(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        receipt,
+        source_job=job,
+        last_error=None,
+        artifacts=[artifact.model_dump(mode="json")],
+        parsed_result=parsed,
+    )
+    bindings = cast(list[dict[str, Any]], receipt["service_runtime_bindings"])
+    assert [item["service_instance_id"] for item in bindings] == [
+        "paraview-live-1",
+        "paraview-live-2",
+    ]
+
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(clusters={definition.name: definition}).save(registry_path)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "token")
+    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "secret")
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    _patch_connector_start(monkeypatch)
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_bind_jarvis_runtime",
+                "arguments": {"binding": bindings[1]},
+            },
+        },
+        queue=queue,
+        settings=RelaySettings(
+            core_dir=tmp_path / "core",
+            spool_dir=tmp_path / "spool",
+            frpc_bin="frpc-test",
+        ),
+        profile="user",
+    )
+
+    assert response is not None and "error" not in response, response
+    gateway = response["result"]["structuredContent"]["gateway_session"]
+    persisted_binding = gateway["gateway"]["jarvis_runtime_binding"]
+    assert persisted_binding["service_instance_id"] == "paraview-live-2"
+    assert persisted_binding["source_relay_artifact_id"] == artifact.artifact_id
+
+
+def test_bind_rejects_mixed_or_invalid_handoff_forms(tmp_path: Path) -> None:
+    binding = {
+        "cluster": "test-cluster",
+        "source_job_id": "job-source",
+        "source_artifact_id": "artifact-result",
+        "package_id": "paraview-1",
+        "package_name": "builtin.paraview",
+        "service_instance_id": "paraview-live-1",
+    }
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+
+    mixed = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_bind_jarvis_runtime",
+                "arguments": {"binding": binding, "cluster": "other-cluster"},
+            },
+        },
+        queue=queue,
+        settings=settings,
+        profile="user",
+    )
+    invalid = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_bind_jarvis_runtime",
+                "arguments": {"binding": {**binding, "host": "caller.example"}},
+            },
+        },
+        queue=queue,
+        settings=settings,
+        profile="user",
+    )
+
+    assert mixed is not None
+    assert "cannot be mixed with legacy selectors: cluster" in mixed["error"]["message"]
+    assert invalid is not None
+    assert "binding is invalid" in invalid["error"]["message"]
+    assert "host" in invalid["error"]["message"]
 
 
 def test_owned_remote_source_uses_identity_bound_api_for_every_verification(
@@ -339,6 +511,46 @@ def test_service_runtime_uses_exact_jarvis_epoch_observation_contract(
     fictional.pop("observed_at_epoch")
     with pytest.raises(ValueError, match="observed_at"):
         JarvisServiceRuntime.model_validate(fictional)
+
+
+def test_dataset_descriptor_accepts_producer_null_optionals_but_canonicalizes_them() -> None:
+    """clio-kit may serialize optional timestep and units as null on the wire."""
+    canonical = {
+        "schema_version": "jarvis.dataset-descriptor.v1",
+        "dataset_id": "asteroid-first-five",
+        "kind": "temporal-volume",
+        "format": "vti-series",
+        "members": [{"index": 0, "location": "/datasets/asteroid/frame-000.vti"}],
+        "arrays": [
+            {
+                "name": "density",
+                "association": "point",
+                "components": 1,
+            }
+        ],
+        "bounds": None,
+        "source_artifact": None,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    wire = json.loads(json.dumps(canonical))
+    wire["members"][0]["timestep"] = None
+    wire["arrays"][0]["units"] = None
+    wire["fingerprint"] = {"algorithm": "sha256", "digest": digest}
+
+    descriptor = JarvisDatasetDescriptor.model_validate(wire)
+    dumped = descriptor.model_dump(mode="json")
+
+    assert "timestep" not in dumped["members"][0]
+    assert "units" not in dumped["arrays"][0]
+    assert dumped["fingerprint"]["digest"] == digest
 
 
 @pytest.mark.parametrize("include_service_runtimes", [None, False])
