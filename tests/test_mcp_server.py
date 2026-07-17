@@ -166,6 +166,7 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         "relay_queue_stale",
         "relay_storage_status",
         "relay_bind_jarvis_runtime",
+        "relay_artifact_lineage",
         "jarvis_create_pipeline",
         "jarvis_describe",
         "jarvis_add_step",
@@ -174,6 +175,10 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         "jarvis_run",
     }
     assert "jarvis_create_pipeline" in tool_names
+    bind_runtime_tool = next(
+        tool for tool in response["result"]["tools"] if tool["name"] == "relay_bind_jarvis_runtime"
+    )
+    assert "desktop_bind_port" not in bind_runtime_tool["inputSchema"]["properties"]
     create_pipeline_tool = next(
         tool for tool in response["result"]["tools"] if tool["name"] == "jarvis_create_pipeline"
     )

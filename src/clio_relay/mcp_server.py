@@ -1182,7 +1182,8 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                 "Bind local relay connectors to one ready service reported by a completed, "
                 "artifact-bound JARVIS execution query with service runtimes included. "
                 "Runtime host, paths, scheduler identity, and dataset metadata are read "
-                "only from the durable JARVIS result."
+                "only from the durable JARVIS result. The relay allocates the desktop "
+                "loopback port."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1196,11 +1197,6 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     "package_id": {"type": "string", "minLength": 1, "maxLength": 256},
                     "package_name": {"type": "string", "minLength": 1, "maxLength": 256},
                     "name": {"type": "string", "minLength": 1, "maxLength": 256},
-                    "desktop_bind_port": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 65535,
-                    },
                     "readiness_timeout_seconds": {
                         "type": "number",
                         "exclusiveMinimum": 0,
@@ -4129,7 +4125,6 @@ def _bind_jarvis_runtime(
         "package_id",
         "package_name",
         "name",
-        "desktop_bind_port",
         "readiness_timeout_seconds",
         "poll_seconds",
     }
@@ -4150,14 +4145,6 @@ def _bind_jarvis_runtime(
         package_id=_required_str(arguments, "package_id"),
         package_name=_required_str(arguments, "package_name"),
     )
-    raw_desktop_bind_port = arguments.get("desktop_bind_port")
-    if raw_desktop_bind_port is not None and (
-        isinstance(raw_desktop_bind_port, bool) or not isinstance(raw_desktop_bind_port, int)
-    ):
-        raise ValueError("desktop_bind_port must be an integer")
-    desktop_bind_port = raw_desktop_bind_port
-    if desktop_bind_port is not None and not 1 <= desktop_bind_port <= 65_535:
-        raise ValueError("desktop_bind_port must be between 1 and 65535")
     readiness_timeout_seconds = _positive_float_argument(
         arguments,
         "readiness_timeout_seconds",
@@ -4190,7 +4177,6 @@ def _bind_jarvis_runtime(
     started = supervisor.bind_verified_jarvis_runtime(
         name=runtime_name,
         verified=verified,
-        desktop_bind_port=desktop_bind_port,
         owner_session_id=settings.owner_session_id,
         owner_session_generation_id=settings.owner_session_generation_id,
         readiness_timeout_seconds=readiness_timeout_seconds,
