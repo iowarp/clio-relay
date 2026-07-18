@@ -92,6 +92,17 @@ def test_remote_mcp_registration_is_deny_by_default_and_validated() -> None:
     )
     assert catalog_registration.contract == "clio-kit-scientific-catalog-user-v1"
 
+    current_spack_registration = RemoteMcpServerConfig(
+        command="clio-kit",
+        contract="clio-kit-spack-user-v2.1",
+    )
+    legacy_spack_registration = RemoteMcpServerConfig(
+        command="clio-kit",
+        contract="clio-kit-spack-user-v2",
+    )
+    assert current_spack_registration.contract == "clio-kit-spack-user-v2.1"
+    assert legacy_spack_registration.contract == "clio-kit-spack-user-v2"
+
     with pytest.raises(ValidationError, match="exact names or '\\*' only"):
         RemoteMcpServerConfig(command="science-mcp", allow_tools=["inspect*"])
     with pytest.raises(ValidationError, match="must not be empty"):
@@ -2516,8 +2527,16 @@ def test_acceptance_report_requires_verified_persistent_uv_tool_runtime(
     assert report.passed is expected
 
 
+@pytest.mark.parametrize(
+    "contract_id",
+    [
+        "clio-kit-spack-user-v2.1",
+        "clio-kit-spack-user-v2",
+    ],
+)
 def test_spack_acceptance_enforces_exact_stateless_user_contract(
     monkeypatch: MonkeyPatch,
+    contract_id: str,
 ) -> None:
     expected_names = ["spack_find", "spack_locate", "spack_install"]
     registration = RemoteMcpServerConfig(
@@ -2531,7 +2550,7 @@ def test_spack_acceptance_enforces_exact_stateless_user_contract(
         ],
         allow_tools=expected_names,
         profiles=["user"],
-        contract="clio-kit-spack-user-v2",
+        contract=cast(Any, contract_id),
     )
     registry = ClusterRegistry(
         clusters={"alpha": _cluster("alpha", {"site-software": registration})}
@@ -2618,8 +2637,12 @@ def test_spack_acceptance_enforces_exact_stateless_user_contract(
         discovered_at=NOW,
     )
     monkeypatch.setattr(
-        "clio_relay.remote_mcp.CLIO_KIT_SPACK_USER_CONTRACT_SHA256",
-        expected_entry.schema_digest,
+        remote_mcp,
+        "CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID",
+        {
+            **remote_mcp.CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID,
+            contract_id: expected_entry.schema_digest,
+        },
     )
 
     exact_report = build(exact_tools)
@@ -2637,11 +2660,11 @@ def test_spack_acceptance_enforces_exact_stateless_user_contract(
     )
     assert server_resource.metadata["remote_tool_names"] == sorted(expected_names)
     assert server_resource.metadata["allowlisted_tool_names"] == sorted(expected_names)
-    assert server_resource.metadata["contract_id"] == "clio-kit-spack-user-v2"
+    assert server_resource.metadata["contract_id"] == contract_id
     assert server_resource.metadata["contract_sha256"] == expected_entry.schema_digest
 
     expectation = RemoteMcpStructuredResultExpectation(
-        contract="clio-kit-spack-user-v2",
+        contract=cast(Any, contract_id),
         tool="spack_find",
         package_name="lammps",
         dag_hash="a" * 32,

@@ -21,6 +21,7 @@ from typing import Any, cast
 
 import pytest
 
+import clio_relay.remote_mcp as remote_mcp
 from clio_relay.errors import ConfigurationError
 from clio_relay.installation import (
     ComponentArtifactIdentity,
@@ -36,8 +37,13 @@ from clio_relay.jarvis_mcp import (
 )
 from clio_relay.remote_mcp import (
     CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256,
+    CLIO_KIT_SPACK_USER_ARTIFACT_SHA256_BY_ID,
+    CLIO_KIT_SPACK_USER_CONTRACT_ARTIFACT_BY_ID,
+    CLIO_KIT_SPACK_USER_CONTRACT_ID,
     CLIO_KIT_SPACK_USER_CONTRACT_SHA256,
+    CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID,
     CLIO_KIT_SPACK_USER_WHEEL_VERSION,
+    CLIO_KIT_SPACK_USER_WIRE_SHA256_BY_ID,
     RemoteMcpToolSchema,
     remote_mcp_schema_digest,
 )
@@ -105,6 +111,12 @@ EXPECTED_CONTRACTS = {
     "clio-kit-spack-user-v2": {
         "server_name": "spack",
         "artifact": "spack-user-v2.json",
+        "contract_sha256": CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID["clio-kit-spack-user-v2"],
+        "tool_names": {"spack_find", "spack_install", "spack_locate"},
+    },
+    "clio-kit-spack-user-v2.1": {
+        "server_name": "spack",
+        "artifact": "spack-user-v2.1.json",
         "contract_sha256": CLIO_KIT_SPACK_USER_CONTRACT_SHA256,
         "tool_names": {"spack_find", "spack_install", "spack_locate"},
     },
@@ -170,6 +182,7 @@ ACTIVE_CONTRACT_IDS = frozenset(EXPECTED_CONTRACTS) - {
     "clio-kit-jarvis-user-v3",
     "clio-kit-jarvis-user-v3.1",
     "clio-kit-jarvis-user-v3.2",
+    "clio-kit-spack-user-v2",
 }
 UV_TOOL_PROBE_VERSION = "0.0.0"
 
@@ -379,12 +392,19 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
         CLIO_KIT_JARVIS_USER_WIRE_SHA256
     )
 
-    spack_tools = _tools_by_name(shipped_contracts["clio-kit-spack-user-v2"])
+    spack_tools = _tools_by_name(shipped_contracts[CLIO_KIT_SPACK_USER_CONTRACT_ID])
     assert "spack_load" not in spack_tools
     locate_output = cast(JSON, spack_tools["spack_locate"]["outputSchema"])
     locate_properties = cast(JSON, locate_output["properties"])
     assert locate_properties["load_spec"] == {"type": "string"}
     assert "load_spec" in cast(list[str], locate_output["required"])
+    assert "No matches is a successful result" in cast(
+        str, spack_tools["spack_find"]["description"]
+    )
+    assert "structured not_installed error" in cast(str, spack_tools["spack_locate"]["description"])
+
+    legacy_spack_tools = _tools_by_name(shipped_contracts["clio-kit-spack-user-v2"])
+    assert set(legacy_spack_tools) == set(spack_tools)
 
     scientific_tools = _tools_by_name(shipped_contracts["clio-kit-scientific-catalog-user-v1"])
     assert set(scientific_tools) == {
@@ -395,6 +415,29 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
         cast(JSON, tool["annotations"])["readOnlyHint"] is True
         for tool in scientific_tools.values()
     )
+
+
+@pytest.mark.parametrize("contract_id", sorted(CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID))
+def test_relay_vendors_exact_spack_contract_artifacts(contract_id: str) -> None:
+    """Keep current and compatibility Spack artifacts immutable in relay wheels."""
+    artifact_name = CLIO_KIT_SPACK_USER_CONTRACT_ARTIFACT_BY_ID[contract_id]
+    path = Path(remote_mcp.__file__).with_name("_contracts") / artifact_name
+    payload = path.read_bytes()
+    artifact = _json_object(payload, label=contract_id)
+    tools = cast(list[JSON], artifact["tools"])
+
+    assert (
+        hashlib.sha256(payload).hexdigest()
+        == CLIO_KIT_SPACK_USER_ARTIFACT_SHA256_BY_ID[contract_id]
+    )
+    assert artifact["contract_id"] == contract_id
+    assert artifact["contract_sha256"] == CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID[contract_id]
+    assert artifact["wire_sha256"] == CLIO_KIT_SPACK_USER_WIRE_SHA256_BY_ID[contract_id]
+    assert (
+        hashlib.sha256(_canonical_json(_contract_projection(tools))).hexdigest()
+        == artifact["contract_sha256"]
+    )
+    assert hashlib.sha256(_canonical_json({"tools": tools})).hexdigest() == artifact["wire_sha256"]
 
 
 def test_install_receipt_exposes_verified_locked_jarvis_dependency_edge(

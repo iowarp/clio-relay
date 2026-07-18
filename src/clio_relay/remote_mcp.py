@@ -74,14 +74,49 @@ MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH = 64
 MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES = 32_768
 REMOTE_MCP_REPLACE_ATTEMPTS = 25
 REMOTE_MCP_REPLACE_RETRY_SECONDS = 0.02
-CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.5.9"
-CLIO_KIT_SPACK_USER_CONTRACT_ID = "clio-kit-spack-user-v2"
+CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.5.10"
+CLIO_KIT_SPACK_USER_CONTRACT_ID = "clio-kit-spack-user-v2.1"
+CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID = "clio-kit-spack-user-v2"
+CLIO_KIT_SPACK_USER_CONTRACT_IDS = frozenset(
+    {
+        CLIO_KIT_SPACK_USER_CONTRACT_ID,
+        CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID,
+    }
+)
 # Digest the MCP wire ``tools/list`` result. FastMCP's in-process FunctionTool
 # schemas retain ``$defs`` that its protocol serializer dereferences, so their
 # digest is intentionally not the relay contract.
-CLIO_KIT_SPACK_USER_CONTRACT_SHA256 = (
-    "3c5412148c770f4844e98eb893c4db0d0afdbf13afe967df67bd5f7d25e1f7db"
-)
+CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID = {
+    CLIO_KIT_SPACK_USER_CONTRACT_ID: (
+        "cc90789227aa0baea99d0e0379b320811c1dbd40c7fa66877d372309201be1c2"
+    ),
+    CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID: (
+        "3c5412148c770f4844e98eb893c4db0d0afdbf13afe967df67bd5f7d25e1f7db"
+    ),
+}
+CLIO_KIT_SPACK_USER_WIRE_SHA256_BY_ID = {
+    CLIO_KIT_SPACK_USER_CONTRACT_ID: (
+        "5f1d3aaf1d7311df84d9b25a66c3ed1987f3b84799658eaf8d9ccbbb79485ed2"
+    ),
+    CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID: (
+        "e575c901226a34a1f4286228b3f71966fe55b68d82bae5c6fd6582af0e43fd2d"
+    ),
+}
+CLIO_KIT_SPACK_USER_ARTIFACT_SHA256_BY_ID = {
+    CLIO_KIT_SPACK_USER_CONTRACT_ID: (
+        "1bae2c8386a85e90fde674819c04a598033b360367745fd36bead97b5728d537"
+    ),
+    CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID: (
+        "6a254d2d6734b71d8069b6806a81a4e237cc682e3bf6dde4b76b61de7464701b"
+    ),
+}
+CLIO_KIT_SPACK_USER_CONTRACT_ARTIFACT_BY_ID = {
+    CLIO_KIT_SPACK_USER_CONTRACT_ID: "spack-user-v2.1.json",
+    CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID: "spack-user-v2.json",
+}
+CLIO_KIT_SPACK_USER_CONTRACT_SHA256 = CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID[
+    CLIO_KIT_SPACK_USER_CONTRACT_ID
+]
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID = "clio-kit-scientific-catalog-user-v1"
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256 = (
     "a53006f24f4698f659f0a7c8bf61fc7bd7ad23274b06d2eed2ccfca68b9ecb0a"
@@ -513,7 +548,7 @@ class RemoteMcpStructuredResultExpectation(BaseModel):
     schema_version: Literal["clio-relay.remote-mcp-result-expectation.v1"] = (
         "clio-relay.remote-mcp-result-expectation.v1"
     )
-    contract: Literal["clio-kit-spack-user-v2"]
+    contract: Literal["clio-kit-spack-user-v2.1", "clio-kit-spack-user-v2"]
     tool: Literal["spack_find", "spack_locate", "spack_install"]
     package_name: str = Field(min_length=1, max_length=255, pattern=r"^[A-Za-z0-9_.+-]+$")
     dag_hash: str = Field(pattern=r"^[a-z0-9]{32}$")
@@ -3005,7 +3040,7 @@ def build_remote_mcp_structured_result_check(
     output_schema: JSON | None,
 ) -> RemoteMcpAcceptanceCheck:
     """Validate a remote structured result against an explicit semantic contract."""
-    if expectation.contract == "clio-kit-spack-user-v2":
+    if expectation.contract in CLIO_KIT_SPACK_USER_CONTRACT_IDS:
         return _spack_structured_result_check(
             expectation=expectation,
             remote_tool_name=remote_tool_name,
@@ -3024,7 +3059,7 @@ def _spack_structured_result_check(
     protocol_result: JSON | None,
     output_schema: JSON | None,
 ) -> RemoteMcpAcceptanceCheck:
-    """Validate the exact clio-kit Spack v2 result semantics for one operation."""
+    """Validate the exact clio-kit Spack v2 or v2.1 result semantics for one operation."""
     failures: list[str] = []
     typed_arguments = _as_json(arguments) or {}
     structured_value = (
@@ -3365,6 +3400,10 @@ def _spack_user_contract_check(
         set(registration.allow_tools) if registration is not None else set()
     )
     observed_contract_digest = remote_mcp_schema_digest(list(tools.values()))
+    declared_contract = registration.contract if registration is not None else None
+    expected_contract_digest = CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID.get(
+        declared_contract or ""
+    )
 
     annotation_expectations: dict[str, dict[str, bool]] = {
         "spack_find": {
@@ -3429,12 +3468,12 @@ def _spack_user_contract_check(
         actual_names == expected_names
         and allowlisted_names == expected_names
         and registration is not None
-        and registration.contract == CLIO_KIT_SPACK_USER_CONTRACT_ID
+        and registration.contract in CLIO_KIT_SPACK_USER_CONTRACT_IDS
         and "user" in registration.profiles
         and all(annotation_matches.values())
         and all(schema_matches.values())
         and locate_load_spec_matches
-        and observed_contract_digest == CLIO_KIT_SPACK_USER_CONTRACT_SHA256
+        and observed_contract_digest == expected_contract_digest
     )
     return RemoteMcpAcceptanceCheck(
         name="remote-mcp.spack-user-contract",
@@ -3449,12 +3488,21 @@ def _spack_user_contract_check(
             "remote_tool_names": sorted(actual_names),
             "allowlisted_tool_names": sorted(allowlisted_names),
             "profiles": registration.profiles if registration is not None else [],
-            "declared_contract": registration.contract if registration is not None else None,
+            "declared_contract": declared_contract,
             "annotations_match": annotation_matches,
             "schemas_match": schema_matches,
             "locate_load_spec_matches": locate_load_spec_matches,
             "stateful_load_exposed": "spack_load" in actual_names,
-            "expected_contract_sha256": CLIO_KIT_SPACK_USER_CONTRACT_SHA256,
+            "expected_contract_sha256": expected_contract_digest,
+            "expected_wire_sha256": CLIO_KIT_SPACK_USER_WIRE_SHA256_BY_ID.get(
+                declared_contract or ""
+            ),
+            "expected_contract_artifact": CLIO_KIT_SPACK_USER_CONTRACT_ARTIFACT_BY_ID.get(
+                declared_contract or ""
+            ),
+            "expected_contract_artifact_sha256": (
+                CLIO_KIT_SPACK_USER_ARTIFACT_SHA256_BY_ID.get(declared_contract or "")
+            ),
             "expected_clio_kit_version": CLIO_KIT_SPACK_USER_WHEEL_VERSION,
             "observed_contract_sha256": observed_contract_digest,
         },
@@ -3601,7 +3649,7 @@ def _declared_contract_check(
     registration: RemoteMcpServerConfig,
 ) -> RemoteMcpAcceptanceCheck:
     """Evaluate the semantic contract explicitly declared by an operator."""
-    if registration.contract == CLIO_KIT_SPACK_USER_CONTRACT_ID:
+    if registration.contract in CLIO_KIT_SPACK_USER_CONTRACT_IDS:
         return _spack_user_contract_check(entry, registration)
     if registration.contract == CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID:
         return _scientific_catalog_user_contract_check(entry, registration)

@@ -567,7 +567,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     "route_revision": cluster_route_revision_json_schema(),
                     "timeout_seconds": {"type": "number", "default": 600},
                     "poll_seconds": {"type": "number", "default": 2},
-                    "include_logs": {"type": "boolean", "default": True},
+                    "include_logs": {"type": "boolean", "default": False},
                     "log_limit": {
                         "type": "integer",
                         "default": MAX_AGENT_LOG_READ_BYTES,
@@ -2974,17 +2974,22 @@ def _mcp_result_artifact(artifacts: list[JSON], *, job_id: str) -> JSON | None:
 
 
 def _bounded_mcp_result(result: JSON) -> JSON:
-    """Inline a complete MCP result when small, otherwise return a bounded summary."""
+    """Return a bounded agent projection while the artifact retains full protocol evidence."""
+
+    projected = dict(result)
+    if projected.get("structured_result") is not None and "protocol_result" in projected:
+        projected.pop("protocol_result")
+        projected["protocol_result_omitted"] = "redundant_with_structured_result"
 
     encoded = json.dumps(
-        result,
+        projected,
         allow_nan=False,
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
     if len(encoded) <= MAX_INLINE_MCP_RESULT_BYTES:
-        return result
+        return projected
 
     preferred = (
         "operation",
@@ -2997,11 +3002,14 @@ def _bounded_mcp_result(result: JSON) -> JSON:
         "structured_result",
         "result_validation",
         "protocol_result",
+        "protocol_result_omitted",
     )
     summary: JSON = {}
     omitted: list[str] = []
     for key in preferred:
-        candidate = {**summary, key: result.get(key)}
+        if key not in projected:
+            continue
+        candidate = {**summary, key: projected.get(key)}
         candidate_size = len(
             json.dumps(
                 candidate,
@@ -3012,7 +3020,7 @@ def _bounded_mcp_result(result: JSON) -> JSON:
             ).encode("utf-8")
         )
         if candidate_size <= MAX_INLINE_MCP_RESULT_BYTES - 2_048:
-            summary[key] = result.get(key)
+            summary[key] = projected.get(key)
         else:
             omitted.append(key)
     summary["content_truncated"] = True
@@ -3278,7 +3286,7 @@ def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings)
                     job_id=job_id,
                     cluster=target.name,
                 )
-                if arguments.get("include_logs", True) is not False:
+                if arguments.get("include_logs", False) is True:
                     logs = _owned_job_logs(
                         client,
                         job_id,
@@ -3310,7 +3318,7 @@ def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings)
                 job_id=job_id,
                 cluster=target.name,
             )
-            if arguments.get("include_logs", True) is not False:
+            if arguments.get("include_logs", False) is True:
                 logs = _remote_job_logs(
                     target,
                     job_id,
@@ -3332,7 +3340,7 @@ def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings)
             poll_seconds=float(arguments.get("poll_seconds", 2)),
         )
         result = job_status(queue, source_job.job_id)
-        if arguments.get("include_logs", True) is not False:
+        if arguments.get("include_logs", False) is True:
             logs = _job_logs(
                 queue,
                 settings,
