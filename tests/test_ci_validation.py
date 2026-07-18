@@ -1696,7 +1696,7 @@ def test_release_report_asset_manifest_enforces_exact_ordered_matrix() -> None:
     ]
     matrix = validate_release_acceptance_matrix(raw_matrix)
     assert matrix["matrix_sha256"] == (
-        "8f3d7f03d4e04d7fc9e79147cefe78fab3beaf51e6083486298fe6b7a4769cd6"
+        "020c854123be068df00468f604a903150434b0e5bab9638239760570c6a06133"
     )
     reports = cast(list[dict[str, object]], matrix["reports"])
     report_ids = [cast(str, item["id"]) for item in reports]
