@@ -88,9 +88,14 @@ def test_remote_mcp_registration_is_deny_by_default_and_validated() -> None:
         command="clio-kit",
         allow_tools=["scientific_dataset_search", "scientific_dataset_describe"],
         profiles=["user"],
+        contract="clio-kit-scientific-catalog-user-v1.1",
+    )
+    legacy_catalog_registration = RemoteMcpServerConfig(
+        command="clio-kit",
         contract="clio-kit-scientific-catalog-user-v1",
     )
-    assert catalog_registration.contract == "clio-kit-scientific-catalog-user-v1"
+    assert catalog_registration.contract == "clio-kit-scientific-catalog-user-v1.1"
+    assert legacy_catalog_registration.contract == "clio-kit-scientific-catalog-user-v1"
 
     current_spack_registration = RemoteMcpServerConfig(
         command="clio-kit",
@@ -147,8 +152,16 @@ def test_remote_mcp_registration_is_deny_by_default_and_validated() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "contract_id",
+    [
+        "clio-kit-scientific-catalog-user-v1.1",
+        "clio-kit-scientific-catalog-user-v1",
+    ],
+)
 def test_scientific_catalog_contract_is_read_only_and_exact(
     monkeypatch: MonkeyPatch,
+    contract_id: str,
 ) -> None:
     """The released catalog contract must be registrable and fail closed on drift."""
     expected_names = ["scientific_dataset_describe", "scientific_dataset_search"]
@@ -163,9 +176,9 @@ def test_scientific_catalog_contract_is_read_only_and_exact(
         ],
         allow_tools=expected_names,
         profiles=["user"],
-        contract="clio-kit-scientific-catalog-user-v1",
+        contract=cast(Any, contract_id),
     )
-    tools = [_scientific_catalog_tool(name) for name in expected_names]
+    tools = [_scientific_catalog_tool(name, contract_id=contract_id) for name in expected_names]
     entry = _entry(
         registration,
         cluster="alpha",
@@ -174,8 +187,11 @@ def test_scientific_catalog_contract_is_read_only_and_exact(
     )
     monkeypatch.setattr(
         remote_mcp,
-        "CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256",
-        entry.schema_digest,
+        "CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256_BY_ID",
+        {
+            **remote_mcp.CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256_BY_ID,
+            contract_id: entry.schema_digest,
+        },
     )
 
     exact = remote_mcp._declared_contract_check(  # pyright: ignore[reportPrivateUsage]
@@ -186,6 +202,13 @@ def test_scientific_catalog_contract_is_read_only_and_exact(
     assert exact.name == "remote-mcp.scientific-catalog-user-contract"
     assert exact.evidence["remote_tool_names"] == expected_names
     assert exact.evidence["allowlisted_tool_names"] == expected_names
+    assert exact.evidence["declared_contract"] == contract_id
+    if contract_id == "clio-kit-scientific-catalog-user-v1.1":
+        assert exact.evidence["dataset_descriptor_handoff_required"] is True
+        assert exact.evidence["dataset_descriptor_handoff_matches"] is True
+    else:
+        assert exact.evidence["dataset_descriptor_handoff_required"] is False
+        assert exact.evidence["dataset_descriptor_handoff_matches"] is None
 
     drifted_tools = deepcopy(tools)
     cast(dict[str, object], drifted_tools[1]["annotations"])["openWorldHint"] = True
@@ -197,8 +220,11 @@ def test_scientific_catalog_contract_is_read_only_and_exact(
     )
     monkeypatch.setattr(
         remote_mcp,
-        "CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256",
-        drifted_entry.schema_digest,
+        "CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256_BY_ID",
+        {
+            **remote_mcp.CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256_BY_ID,
+            contract_id: drifted_entry.schema_digest,
+        },
     )
 
     drifted = remote_mcp._declared_contract_check(  # pyright: ignore[reportPrivateUsage]
@@ -210,6 +236,321 @@ def test_scientific_catalog_contract_is_read_only_and_exact(
         "scientific_dataset_describe": True,
         "scientific_dataset_search": False,
     }
+
+
+def test_current_scientific_catalog_contract_requires_explicit_handoff(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The v1.1 declaration cannot pass with the ambiguous historical output shape."""
+    contract_id = "clio-kit-scientific-catalog-user-v1.1"
+    expected_names = ["scientific_dataset_describe", "scientific_dataset_search"]
+    registration = RemoteMcpServerConfig(
+        command="uvx",
+        args=[
+            "--from",
+            "/opt/wheels/clio_kit-2.5.11-py3-none-any.whl",
+            "clio-kit",
+            "mcp-server",
+            "scientific-catalog",
+        ],
+        allow_tools=expected_names,
+        profiles=["user"],
+        contract=contract_id,
+    )
+    tools = [
+        _scientific_catalog_tool(
+            name,
+            contract_id="clio-kit-scientific-catalog-user-v1",
+        )
+        for name in expected_names
+    ]
+    entry = _entry(
+        registration,
+        cluster="alpha",
+        server_name="scientific-catalog",
+        tools=tools,
+    )
+    monkeypatch.setattr(
+        remote_mcp,
+        "CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256_BY_ID",
+        {
+            **remote_mcp.CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256_BY_ID,
+            contract_id: entry.schema_digest,
+        },
+    )
+
+    check = remote_mcp._declared_contract_check(  # pyright: ignore[reportPrivateUsage]
+        entry, registration
+    )
+
+    assert check.passed is False
+    assert check.evidence["dataset_descriptor_handoff_matches"] is False
+
+
+def test_scientific_catalog_contract_projects_identity_to_live_report() -> None:
+    """A live describe call proves and projects the v1.1 descriptor handoff."""
+    contract_id = "clio-kit-scientific-catalog-user-v1.1"
+    contract_sha256 = "80a9b583c26a084ff07d638ddf0c2c7d4325dbc8d4299931d0c4f3627cb8674c"
+    dataset_id = "deep-water-impact-2018-yb31-first5"
+    registration = RemoteMcpServerConfig(
+        command="uvx",
+        args=[
+            "--from",
+            "/opt/wheels/clio_kit-2.5.11-py3-none-any.whl",
+            "clio-kit",
+            "mcp-server",
+            "scientific-catalog",
+        ],
+        allow_tools=["scientific_dataset_describe", "scientific_dataset_search"],
+        profiles=["user"],
+        contract=contract_id,
+    )
+    contract_artifact = json.loads(
+        (
+            Path(remote_mcp.__file__).with_name("_contracts") / "scientific-catalog-user-v1.1.json"
+        ).read_text(encoding="utf-8")
+    )
+    tools = cast(list[dict[str, object]], contract_artifact["tools"])
+    entry = _entry(
+        registration,
+        cluster="alpha",
+        server_name="scientific-catalog",
+        tools=tools,
+    )
+    registry = ClusterRegistry(
+        clusters={"alpha": _cluster("alpha", {"scientific-catalog": registration})}
+    )
+    server_artifact = _server_artifact(registration)
+    server_artifact_digest = remote_mcp_server_artifact_digest(server_artifact)
+    job_id = "job_catalog_describe"
+    arguments = {"dataset_id": dataset_id}
+    job: dict[str, object] = {
+        "job_id": job_id,
+        "cluster": "alpha",
+        "kind": "mcp_call",
+        "state": "succeeded",
+        "spec": {
+            "server": registration.command,
+            "server_args": registration.args,
+            "env_from": {},
+            "operation": "tools/call",
+            "tool": "scientific_dataset_describe",
+            "arguments": arguments,
+            "expected_server_artifact_digest": server_artifact_digest,
+        },
+    }
+    structured = _scientific_catalog_describe_result(dataset_id)
+    acceptance = build_remote_mcp_acceptance_report(
+        registry=registry,
+        cache=RemoteMcpSchemaCache(entries=[entry]),
+        cluster="alpha",
+        server_name="scientific-catalog",
+        remote_tool_name="scientific_dataset_describe",
+        profile="user",
+        call_job_id=job_id,
+        call_status={"job": job, "terminal": True},
+        artifacts=[
+            {
+                "artifact_id": f"artifact_{kind}",
+                "job_id": job_id,
+                "kind": kind,
+                "sha256": hashlib.sha256(kind.encode()).hexdigest(),
+            }
+            for kind in ("stdout", "stderr", "mcp_result", "provenance")
+        ],
+        mcp_result={
+            "server": registration.command,
+            "server_args": registration.args,
+            "env_from": {},
+            "operation": "tools/call",
+            "tool": "scientific_dataset_describe",
+            "arguments": arguments,
+            "returncode": 0,
+            "protocol_result": {"structuredContent": structured},
+            "server_artifact": server_artifact,
+            "expected_server_artifact_digest": server_artifact_digest,
+            "observed_server_artifact_digest": server_artifact_digest,
+            "protocol_error": None,
+        },
+        provenance={"job": job},
+        now=NOW,
+    )
+
+    assert acceptance.passed is True
+    catalog_result = next(
+        check for check in acceptance.checks if check.name == "remote-mcp.scientific-catalog-result"
+    )
+    assert catalog_result.passed is True
+    assert catalog_result.evidence["dataset_descriptor_handoff_matches"] is True
+    assert catalog_result.evidence["descriptor_digest_matches"] is True
+    report = acceptance.to_live_validation_report()
+
+    server_resource = next(
+        resource for resource in report.resources if resource.kind == "mcp_server"
+    )
+    assert server_resource.metadata["contract_id"] == contract_id
+    assert server_resource.metadata["contract_sha256"] == contract_sha256
+    call_resource = next(
+        resource for resource in report.resources if resource.role == "virtual_remote_mcp_call"
+    )
+    assert call_resource.metadata["scientific_catalog_result_assertion"] == (
+        catalog_result.evidence
+    )
+
+
+@pytest.mark.parametrize("drift", ["handoff", "digest"])
+def test_scientific_catalog_result_rejects_descriptor_drift(drift: str) -> None:
+    """Schema-valid output cannot substitute a divergent or unbound descriptor."""
+    dataset_id = "deep-water-impact-2018-yb31-first5"
+    structured = _scientific_catalog_describe_result(dataset_id)
+    if drift == "handoff":
+        nested_descriptor = cast(
+            dict[str, object],
+            cast(dict[str, object], structured["dataset"])["descriptor"],
+        )
+        cast(list[dict[str, object]], nested_descriptor["members"])[0]["location"] = (
+            "/mnt/common/datasets-staging/scivis/drifted.vti"
+        )
+    else:
+        structured["descriptor_sha256"] = "0" * 64
+    contract_artifact = json.loads(
+        (
+            Path(remote_mcp.__file__).with_name("_contracts") / "scientific-catalog-user-v1.1.json"
+        ).read_text(encoding="utf-8")
+    )
+    describe_tool = next(
+        tool
+        for tool in cast(list[dict[str, object]], contract_artifact["tools"])
+        if tool["name"] == "scientific_dataset_describe"
+    )
+
+    check = remote_mcp._scientific_catalog_structured_result_check(  # pyright: ignore[reportPrivateUsage]
+        arguments={"dataset_id": dataset_id},
+        protocol_result={"structuredContent": structured},
+        output_schema=cast(dict[str, object], describe_tool["outputSchema"]),
+    )
+
+    assert check.passed is False
+    assert check.evidence["output_schema"]["structured_content_valid"] is True
+    assert (
+        check.evidence[
+            "dataset_descriptor_handoff_matches"
+            if drift == "handoff"
+            else "descriptor_digest_matches"
+        ]
+        is False
+    )
+
+
+def test_scientific_catalog_result_rejects_nan_without_raising() -> None:
+    """A non-finite descriptor fails into bounded evidence before hashing."""
+    dataset_id = "deep-water-impact-2018-yb31-first5"
+    structured = _scientific_catalog_describe_result(dataset_id)
+    descriptor = cast(dict[str, object], structured["dataset_descriptor"])
+    cast(list[float], descriptor["bounds"])[0] = float("nan")
+    cast(dict[str, object], structured["dataset"])["descriptor"] = deepcopy(descriptor)
+
+    check = remote_mcp._scientific_catalog_structured_result_check(  # pyright: ignore[reportPrivateUsage]
+        arguments={"dataset_id": dataset_id},
+        protocol_result={"structuredContent": structured},
+        output_schema=_scientific_catalog_describe_output_schema(),
+    )
+
+    schema_evidence = cast(dict[str, object], check.evidence["output_schema"])
+    assert check.passed is False
+    assert schema_evidence["structured_content_bounded"] is True
+    assert schema_evidence["structured_content_finite"] is False
+    assert "non-finite JSON number" in cast(str, schema_evidence["structured_content_guard_error"])
+    assert check.evidence["computed_descriptor_sha256"] is None
+    assert check.evidence["descriptor_digest_matches"] is False
+
+
+def test_scientific_catalog_result_rejects_overdeep_content_without_traversing() -> None:
+    """Unsafe nesting fails before schema evaluation or descriptor comparison."""
+    dataset_id = "deep-water-impact-2018-yb31-first5"
+    structured = _scientific_catalog_describe_result(dataset_id)
+    nested: dict[str, object] = {"leaf": True}
+    for _ in range(remote_mcp.MAX_REMOTE_MCP_JSON_DEPTH + 1):
+        nested = {"child": nested}
+    descriptor = cast(dict[str, object], structured["dataset_descriptor"])
+    descriptor["unsafe_test_nesting"] = nested
+    cast(dict[str, object], structured["dataset"])["descriptor"] = deepcopy(descriptor)
+
+    check = remote_mcp._scientific_catalog_structured_result_check(  # pyright: ignore[reportPrivateUsage]
+        arguments={"dataset_id": dataset_id},
+        protocol_result={"structuredContent": structured},
+        output_schema=_scientific_catalog_describe_output_schema(),
+    )
+
+    schema_evidence = cast(dict[str, object], check.evidence["output_schema"])
+    assert check.passed is False
+    assert schema_evidence["structured_content_bounded"] is False
+    assert "nesting levels" in cast(str, schema_evidence["structured_content_guard_error"])
+    assert check.evidence["computed_descriptor_sha256"] is None
+    assert check.evidence["dataset_descriptor_handoff_matches"] is False
+
+
+def test_scientific_catalog_result_bounds_oversized_evidence() -> None:
+    """Oversized catalog strings fail without being copied into report evidence."""
+    dataset_id = "deep-water-impact-2018-yb31-first5"
+    structured = _scientific_catalog_describe_result(dataset_id)
+    structured["schema_version"] = "x" * (
+        remote_mcp.MAX_REMOTE_MCP_SCIENTIFIC_CATALOG_STRUCTURED_BYTES + 1
+    )
+
+    check = remote_mcp._scientific_catalog_structured_result_check(  # pyright: ignore[reportPrivateUsage]
+        arguments={"dataset_id": dataset_id},
+        protocol_result={"structuredContent": structured},
+        output_schema=_scientific_catalog_describe_output_schema(),
+    )
+
+    schema_evidence = cast(dict[str, object], check.evidence["output_schema"])
+    assert check.passed is False
+    assert schema_evidence["structured_content_bounded"] is False
+    assert schema_evidence["structured_content_finite"] is True
+    assert cast(int, schema_evidence["structured_content_bytes"]) > cast(
+        int, schema_evidence["structured_content_bytes_limit"]
+    )
+    assert "exceeds" in cast(str, schema_evidence["structured_content_guard_error"])
+    assert schema_evidence["schema_evaluated"] is False
+    assert check.evidence["response_schema_version"] is None
+    assert check.evidence["computed_descriptor_sha256"] is None
+    assert len(json.dumps(check.evidence, allow_nan=False)) < 16_384
+
+
+def test_scientific_catalog_result_hashes_unicode_like_clio_kit() -> None:
+    """Unicode descriptor bytes use clio-kit's unescaped canonical JSON."""
+    dataset_id = "deep-water-impact-2018-yb31-first5"
+    structured = _scientific_catalog_describe_result(dataset_id)
+    descriptor = cast(dict[str, object], structured["dataset_descriptor"])
+    arrays = cast(list[dict[str, object]], descriptor["arrays"])
+    arrays[0]["name"] = "temperature-Δ"
+    identity = {key: value for key, value in descriptor.items() if key != "fingerprint"}
+    fingerprint = cast(dict[str, object], descriptor["fingerprint"])
+    fingerprint["digest"] = _canonical_json_sha256(identity)
+    cast(dict[str, object], structured["dataset"])["descriptor"] = deepcopy(descriptor)
+    expected_digest = _canonical_json_sha256(descriptor)
+    ascii_escaped_digest = hashlib.sha256(
+        json.dumps(
+            descriptor,
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    structured["descriptor_sha256"] = expected_digest
+
+    check = remote_mcp._scientific_catalog_structured_result_check(  # pyright: ignore[reportPrivateUsage]
+        arguments={"dataset_id": dataset_id},
+        protocol_result={"structuredContent": structured},
+        output_schema=_scientific_catalog_describe_output_schema(),
+    )
+
+    assert expected_digest != ascii_escaped_digest
+    assert check.passed is True
+    assert check.evidence["computed_descriptor_sha256"] == expected_digest
+    assert check.evidence["descriptor_digest_matches"] is True
 
 
 def test_discovery_artifact_creates_fresh_provenance_cache_entry(tmp_path: Path) -> None:
@@ -2233,7 +2574,7 @@ def test_cli_registers_released_scientific_catalog_contract(
             "--profile",
             "user",
             "--contract",
-            "clio-kit-scientific-catalog-user-v1",
+            "clio-kit-scientific-catalog-user-v1.1",
         ],
     )
 
@@ -2243,7 +2584,7 @@ def test_cli_registers_released_scientific_catalog_contract(
         .require("alpha")
         .remote_mcp_servers["scientific-catalog"]
     )
-    assert registration.contract == "clio-kit-scientific-catalog-user-v1"
+    assert registration.contract == "clio-kit-scientific-catalog-user-v1.1"
     assert registration.args == [
         "mcp-server",
         "scientific-catalog",
@@ -4498,6 +4839,163 @@ def test_cli_validate_calls_virtual_alias_and_writes_report(
     assert json.loads(output_path.read_text(encoding="utf-8")) == report
 
 
+@pytest.mark.parametrize("complete", [True, False], ids=["durable-result", "nonterminal"])
+def test_cli_validate_catalog_waits_and_projects_automatic_assertion(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    complete: bool,
+) -> None:
+    """CLI validation waits on the queued call and projects catalog semantics."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
+    dataset_id = "deep-water-impact-2018-yb31-first5"
+    registration = RemoteMcpServerConfig(
+        command="uvx",
+        args=[
+            "--from",
+            "/opt/wheels/clio_kit-2.5.11-py3-none-any.whl",
+            "clio-kit",
+            "mcp-server",
+            "scientific-catalog",
+        ],
+        allow_tools=["scientific_dataset_describe", "scientific_dataset_search"],
+        profiles=["user"],
+        contract="clio-kit-scientific-catalog-user-v1.1",
+    )
+    registry = ClusterRegistry(
+        clusters={"alpha": _cluster("alpha", {"scientific-catalog": registration})}
+    )
+    registry.save(tmp_path / ".clio-relay" / "clusters.json")
+    contract_artifact = json.loads(
+        (
+            Path(remote_mcp.__file__).with_name("_contracts") / "scientific-catalog-user-v1.1.json"
+        ).read_text(encoding="utf-8")
+    )
+    refreshed_at = datetime.now(UTC)
+    discovery_entry = _entry(
+        registration,
+        cluster="alpha",
+        server_name="scientific-catalog",
+        tools=cast(list[dict[str, object]], contract_artifact["tools"]),
+    ).model_copy(
+        update={
+            "discovered_at": refreshed_at,
+            "expires_at": refreshed_at + timedelta(hours=1),
+        }
+    )
+    RemoteMcpSchemaCache.update_entry(
+        tmp_path / ".clio-relay" / "remote-mcp-cache.json",
+        discovery_entry,
+    )
+    server_artifact = _server_artifact(registration)
+    server_artifact_digest = remote_mcp_server_artifact_digest(server_artifact)
+    observed_initial_states: list[JobState] = []
+
+    def finish_or_leave_queued(
+        queue: ClioCoreQueue,
+        job_id: str,
+        *,
+        timeout_seconds: float,
+        poll_seconds: float,
+    ) -> RelayJob:
+        del timeout_seconds, poll_seconds
+        job = queue.get_job(job_id)
+        observed_initial_states.append(job.state)
+        assert job.state == JobState.QUEUED
+        assert isinstance(job.spec, McpCallSpec)
+        assert job.spec.tool == "scientific_dataset_describe"
+        assert job.spec.arguments == {"dataset_id": dataset_id}
+        if not complete:
+            return job
+        spool = JobSpool(tmp_path / "spool", job)
+        spool.initialize()
+        mcp_result_path = spool.path / "mcp-result.json"
+        mcp_result_path.write_text(
+            json.dumps(
+                {
+                    "server": registration.command,
+                    "server_args": registration.args,
+                    "operation": "tools/call",
+                    "tool": "scientific_dataset_describe",
+                    "arguments": {"dataset_id": dataset_id},
+                    "returncode": 0,
+                    "protocol_result": {
+                        "structuredContent": _scientific_catalog_describe_result(dataset_id)
+                    },
+                    "server_artifact": server_artifact,
+                    "expected_server_artifact_digest": server_artifact_digest,
+                    "observed_server_artifact_digest": server_artifact_digest,
+                    "protocol_error": None,
+                    "timed_out": False,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        provenance_path = spool.path / "provenance.json"
+        provenance_path.write_text(
+            json.dumps({"job": job.model_dump(mode="json")}, default=str),
+            encoding="utf-8",
+        )
+        for kind, path in (
+            ("stdout", spool.path / "stdout.log"),
+            ("stderr", spool.path / "stderr.log"),
+            ("mcp_result", mcp_result_path),
+            ("provenance", provenance_path),
+        ):
+            queue.append_artifact(spool.artifact_for(path, kind=kind))
+        return queue.update_job_state(job_id, JobState.SUCCEEDED, message="call complete")
+
+    monkeypatch.setattr("clio_relay.cli.wait_for_terminal", finish_or_leave_queued)
+    output_path = tmp_path / "validation" / "catalog-domain.json"
+    canonical_path = tmp_path / "validation" / "catalog-live.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "remote-mcp",
+            "validate",
+            "--cluster",
+            "alpha",
+            "--name",
+            "scientific-catalog",
+            "--tool",
+            "scientific_dataset_describe",
+            "--arguments-json",
+            json.dumps({"dataset_id": dataset_id}),
+            "--profile",
+            "user",
+            "--output-json",
+            str(output_path),
+            "--validation-report",
+            str(canonical_path),
+        ],
+    )
+
+    assert result.exit_code == (0 if complete else 1), result.output
+    assert observed_initial_states == [JobState.QUEUED]
+    domain_report = json.loads(output_path.read_text(encoding="utf-8"))
+    catalog_check = next(
+        check
+        for check in domain_report["checks"]
+        if check["name"] == "remote-mcp.scientific-catalog-result"
+    )
+    assert catalog_check["passed"] is complete
+    canonical_report = json.loads(canonical_path.read_text(encoding="utf-8"))
+    assert canonical_report["status"] == ("passed" if complete else "failed")
+    call_resource = next(
+        resource
+        for resource in canonical_report["resources"]
+        if resource.get("role") == "virtual_remote_mcp_call"
+    )
+    assertion = call_resource["metadata"]["scientific_catalog_result_assertion"]
+    assert assertion["contract"] == "clio-kit-scientific-catalog-user-v1.1"
+    assert assertion["requested_dataset_id"] == dataset_id
+    assert assertion["dataset_descriptor_handoff_matches"] is complete
+
+
 def test_cli_validate_preflight_failure_writes_canonical_report(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -4944,7 +5442,86 @@ def _spack_result_schema(name: str) -> dict[str, object]:
     raise AssertionError(f"unexpected Spack tool: {name}")
 
 
-def _scientific_catalog_tool(name: str) -> dict[str, object]:
+def _canonical_json_sha256(value: object) -> str:
+    """Return the compact unescaped canonical JSON digest used by clio-kit."""
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _scientific_catalog_describe_output_schema() -> dict[str, object]:
+    """Load the exact vendored v1.1 describe output schema."""
+    contract_artifact = json.loads(
+        (
+            Path(remote_mcp.__file__).with_name("_contracts") / "scientific-catalog-user-v1.1.json"
+        ).read_text(encoding="utf-8")
+    )
+    describe_tool = next(
+        tool
+        for tool in cast(list[dict[str, object]], contract_artifact["tools"])
+        if tool["name"] == "scientific_dataset_describe"
+    )
+    return cast(dict[str, object], describe_tool["outputSchema"])
+
+
+def _scientific_catalog_describe_result(dataset_id: str) -> dict[str, object]:
+    """Return one valid v1.1 describe result with canonical descriptor identity."""
+    descriptor_without_fingerprint: dict[str, object] = {
+        "schema_version": "jarvis.dataset-descriptor.v1",
+        "dataset_id": dataset_id,
+        "kind": "temporal-volume",
+        "format": "vti",
+        "members": [
+            {
+                "index": 0,
+                "location": "/mnt/common/datasets-staging/scivis/asteroid-000.vti",
+                "timestep": 0.0,
+            }
+        ],
+        "arrays": [
+            {
+                "name": "density",
+                "association": "point",
+                "components": 1,
+            }
+        ],
+        "bounds": [0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        "source_artifact": None,
+    }
+    fingerprint = _canonical_json_sha256(descriptor_without_fingerprint)
+    descriptor = {
+        **descriptor_without_fingerprint,
+        "fingerprint": {"algorithm": "sha256", "digest": fingerprint},
+    }
+    descriptor_sha256 = _canonical_json_sha256(descriptor)
+    return {
+        "schema_version": "clio-kit.scientific-dataset-description.v1",
+        "site_id": "ares",
+        "catalog_revision": "release-v1",
+        "catalog_sha256": "a" * 64,
+        "dataset": {
+            "dataset_id": dataset_id,
+            "title": "2018 Deep Water Impact first five timesteps",
+            "summary": "Bounded release-acceptance dataset record.",
+            "tags": ["asteroid", "impact", "volume"],
+            "descriptor": deepcopy(descriptor),
+        },
+        "dataset_descriptor": deepcopy(descriptor),
+        "descriptor_sha256": descriptor_sha256,
+    }
+
+
+def _scientific_catalog_tool(
+    name: str,
+    *,
+    contract_id: str = "clio-kit-scientific-catalog-user-v1.1",
+) -> dict[str, object]:
     """Return the bounded schema shape required by the scientific catalog contract check."""
     annotations = {
         "readOnlyHint": True,
@@ -4953,6 +5530,34 @@ def _scientific_catalog_tool(name: str) -> dict[str, object]:
         "openWorldHint": False,
     }
     if name == "scientific_dataset_describe":
+        descriptor_schema: dict[str, object] = {
+            "type": "object",
+            "properties": {
+                "schema_version": {
+                    "const": "jarvis.dataset-descriptor.v1",
+                    "type": "string",
+                }
+            },
+            "additionalProperties": False,
+        }
+        output_properties: dict[str, object] = {
+            "schema_version": {
+                "const": "clio-kit.scientific-dataset-description.v1",
+                "default": "clio-kit.scientific-dataset-description.v1",
+                "type": "string",
+            },
+            "dataset": {
+                "type": "object",
+                "properties": {"descriptor": deepcopy(descriptor_schema)},
+                "additionalProperties": False,
+            },
+        }
+        output_required: list[str] = []
+        if contract_id == "clio-kit-scientific-catalog-user-v1.1":
+            output_properties["dataset_descriptor"] = deepcopy(descriptor_schema)
+            output_required.append("dataset_descriptor")
+        elif contract_id != "clio-kit-scientific-catalog-user-v1":
+            raise AssertionError(f"unsupported scientific catalog contract: {contract_id}")
         return {
             "name": name,
             "description": "Return one exact operator catalog record.",
@@ -4965,29 +5570,8 @@ def _scientific_catalog_tool(name: str) -> dict[str, object]:
             },
             "outputSchema": {
                 "type": "object",
-                "properties": {
-                    "schema_version": {
-                        "const": "clio-kit.scientific-dataset-description.v1",
-                        "default": "clio-kit.scientific-dataset-description.v1",
-                        "type": "string",
-                    },
-                    "dataset": {
-                        "type": "object",
-                        "properties": {
-                            "descriptor": {
-                                "type": "object",
-                                "properties": {
-                                    "schema_version": {
-                                        "const": "jarvis.dataset-descriptor.v1",
-                                        "type": "string",
-                                    }
-                                },
-                                "additionalProperties": False,
-                            }
-                        },
-                        "additionalProperties": False,
-                    },
-                },
+                "properties": output_properties,
+                "required": output_required,
                 "additionalProperties": False,
             },
         }

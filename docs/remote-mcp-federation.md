@@ -264,7 +264,7 @@ Virtual JARVIS mutations and runs receive a fresh relay job by default. Supply
 an explicit `idempotency_key` only when retry de-duplication is intentional; an
 identical second `jarvis_run` is otherwise a new execution.
 
-The released clio-kit 2.5.10 artifact is the pinned six-tool JARVIS v3.3 contract.
+The released clio-kit 2.5.11 artifact is the pinned six-tool JARVIS v3.3 contract.
 Bootstrap
 downloads and hashes the exact coordinated wheel, installs it once with
 `uv tool install`, and persists the wheel plus the direct JARVIS command in the
@@ -283,13 +283,13 @@ relay's exact JARVIS-CD release pin. That dependency edge is recorded in the
 install receipt and call result. Operator-registered MCP servers remain bound
 by their own discovery artifact and are not constrained to the relay's
 JARVIS-CD version.
-The release gate requires that exact 2.5.10 artifact to be rerun on every target
+The release gate requires that exact 2.5.11 artifact to be rerun on every target
 selected by the release policy. Other servers use the operator registry and
 generated `remote_...` aliases.
 
 The exact release wheel is
-`clio_kit-2.5.10-py3-none-any.whl` with SHA-256
-`4911142152f476f973caa0c7f8050d88e8efa5f803651bda88685836ee3232f5`.
+`clio_kit-2.5.11-py3-none-any.whl` with SHA-256
+`a0a2bbf8d23495dd4f43881d35a47bfb83bc2d1c016bd952bd7a1c88a43ca03e`.
 Its canonical contract is `clio-kit-jarvis-user-v3.3`, with contract SHA-256
 `0993ee9b2ee9b3c2b021a3967d9221199c3a6be50d726d4b125812e6b1148115`
 and canonical tools-wire SHA-256
@@ -315,13 +315,16 @@ against their distinct preserved contract digest.
 
 ## Register the scientific catalog MCP
 
-clio-kit 2.5.10 also ships the two-tool
-`clio-kit-scientific-catalog-user-v1` contract. It separates dataset discovery
+clio-kit 2.5.11 also ships the two-tool
+`clio-kit-scientific-catalog-user-v1.1` contract. It separates dataset discovery
 from visualization control: `scientific_dataset_search` finds operator catalog
-records and `scientific_dataset_describe` returns one exact
-`jarvis.dataset-descriptor.v1`. Register it through the same generic federation
-layer; the relay does not add dataset names, scene recipes, or site-specific
-semantics:
+records and `scientific_dataset_describe` returns the complete catalog record
+plus one exact top-level `dataset_descriptor` with schema
+`jarvis.dataset-descriptor.v1`. Pass only that top-level descriptor unchanged as
+`jarvis_add_step`'s `config.dataset_descriptor`; the surrounding `dataset`
+record is human discovery metadata and is not a JARVIS package argument. Register
+the server through the same generic federation layer; the relay does not add
+dataset names, scene recipes, or site-specific semantics:
 
 ```powershell
 clio-relay remote-mcp register `
@@ -332,13 +335,22 @@ clio-relay remote-mcp register `
   --arg scientific-catalog `
   --allow-tool scientific_dataset_search `
   --allow-tool scientific_dataset_describe `
+  --contract clio-kit-scientific-catalog-user-v1.1 `
   --profile user
 clio-relay remote-mcp refresh --cluster my-cluster --name scientific-catalog
 ```
 
-The released wheel contract and its hashes are checked by the relay release
-gate. At runtime, the operator registration and refreshed schema cache remain
-the authority, so adding a different catalog or cluster requires no relay code
+The relay checks the current contract SHA-256
+`80a9b583c26a084ff07d638ddf0c2c7d4325dbc8d4299931d0c4f3627cb8674c`,
+canonical tools-wire SHA-256
+`1c8df94a298f92b92126c953a7b8124d90b2fa12919de93738a40e563c3eaa28`,
+and exact contract artifact SHA-256
+`29cbbfe64eaa7bcf29531b3d28762b8ff47e89d291b0a5b66119da96c790135e`.
+Historical `clio-kit-scientific-catalog-user-v1` registrations remain accepted
+against their separately preserved contract, wire, and artifact digests; they
+do not claim the explicit top-level descriptor handoff added in v1.1. At
+runtime, the operator registration and refreshed schema cache remain the
+authority, so adding a different catalog or cluster requires no relay code
 change.
 
 For an unreleased candidate, use an exact wheel path for the remote command and

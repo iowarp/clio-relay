@@ -1945,9 +1945,9 @@ def test_default_report_path_sanitizes_cluster_name(tmp_path: Path) -> None:
 def test_repository_release_policy_is_machine_readable() -> None:
     policy = load_release_gate_policy(Path("docs/release-gate-1.0.yaml"))
 
-    assert policy.release_version == "1.3.29"
+    assert policy.release_version == "1.3.30"
     assert policy.acceptance_matrix is not None
-    assert policy.acceptance_matrix["report_count_per_stage"] == 17
+    assert policy.acceptance_matrix["report_count_per_stage"] == 18
     assert policy.acceptance_matrix["matrix_sha256"] == policy.acceptance_matrix_sha256
     matrix_stages = cast(list[dict[str, object]], policy.acceptance_matrix["stages"])
     assert [stage["name"] for stage in matrix_stages] == [
@@ -1963,6 +1963,12 @@ def test_repository_release_policy_is_machine_readable() -> None:
     assert "ares-jarvis-native-application-progress" in requirement_ids
     assert "ares-jarvis-lammps-package-progress" in requirement_ids
     assert "homelab-owned-cleanup" in requirement_ids
+    catalog = next(
+        item for item in policy.requirements if item.requirement_id == "ares-non-jarvis-virtual-mcp"
+    )
+    assert "remote-mcp.scientific-catalog-user-contract" in catalog.required_checks
+    assert "remote-mcp.scientific-catalog-result" in catalog.required_checks
+    assert catalog.evidence_group_resource_kind == "mcp_server"
     ares_bootstrap = next(
         item for item in policy.requirements if item.requirement_id == "ares-released-bootstrap"
     )

@@ -261,7 +261,7 @@ For the legacy clio-kit 2.2.6 compatibility path, a successful synchronous
 `jarvis_run` MCP return is normalized to a terminal `completed` record even
 though that release labels the result `status=running`; the original status and
 completion basis remain in `details.completion_normalization` for auditability.
-The pinned clio-kit 2.5.10 production path removes that ambiguity upstream and
+The pinned clio-kit 2.5.11 production path removes that ambiguity upstream and
 returns a structured completed result directly. The legacy normalization is
 diagnostic compatibility evidence and cannot satisfy the 1.0 gate. Scheduler
 submissions remain non-terminal unless JARVIS was asked to wait.
@@ -496,7 +496,7 @@ Install the cluster-side server once, then launch its persistent executable:
 
 ```bash
 uv tool install --python 3.12 --no-config \
-  https://github.com/iowarp/clio-kit/releases/download/v2.5.10/clio_kit-2.5.10-py3-none-any.whl
+  https://github.com/iowarp/clio-kit/releases/download/v2.5.11/clio_kit-2.5.11-py3-none-any.whl
 clio-kit mcp-server jarvis
 ```
 
@@ -645,6 +645,14 @@ locate prefix and canonical `/hash` load spec, or installed status with the
 requested reuse setting. The resulting `remote-mcp.structured-result` check and
 `structured_result_assertion` job metadata are suitable for release-policy
 constraints; successful text content cannot substitute for structured data.
+
+For clio-kit's scientific catalog, register the current
+`clio-kit-scientific-catalog-user-v1.1` contract. Its describe result exposes an
+exact top-level `dataset_descriptor` for direct handoff to
+`jarvis_add_step(config.dataset_descriptor=...)`; do not pass the surrounding
+catalog `dataset` record to JARVIS. Historical
+`clio-kit-scientific-catalog-user-v1` registrations remain valid against their
+own preserved digest, but do not claim this explicit handoff shape.
 
 The wheel path is an operator-supplied immutable artifact. A PyPI requirement
 string is insufficient for user-profile evidence. A direct console script is
