@@ -1945,7 +1945,7 @@ def test_default_report_path_sanitizes_cluster_name(tmp_path: Path) -> None:
 def test_repository_release_policy_is_machine_readable() -> None:
     policy = load_release_gate_policy(Path("docs/release-gate-1.0.yaml"))
 
-    assert policy.release_version == "1.3.22"
+    assert policy.release_version == "1.3.23"
     assert policy.acceptance_matrix is not None
     assert policy.acceptance_matrix["report_count_per_stage"] == 17
     assert policy.acceptance_matrix["matrix_sha256"] == policy.acceptance_matrix_sha256
@@ -2264,9 +2264,11 @@ def test_native_application_progress_gate_rejects_legacy_adapter_only_evidence()
     worker_metadata = deepcopy(worker_requirement.metadata_equals)
     component_runtime = worker_metadata.get("component_runtime")
     assert isinstance(component_runtime, dict)
-    jarvis_runtime = component_runtime.get("jarvis-cd")
+    typed_component_runtime = cast(dict[str, object], component_runtime)
+    jarvis_runtime = typed_component_runtime.get("jarvis-cd")
     assert isinstance(jarvis_runtime, dict)
-    jarvis_runtime.update(
+    typed_jarvis_runtime = cast(dict[str, object], jarvis_runtime)
+    typed_jarvis_runtime.update(
         {
             "provider_interpreter_verified": True,
             "provider_native_execution_capability_verified": True,
