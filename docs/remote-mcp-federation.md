@@ -260,11 +260,14 @@ so using one with another query or after the inventory changes fails closed.
 The legacy `target="packages"` response remains exhaustive and potentially
 large; agents should not use it for ordinary discovery.
 
-Virtual JARVIS mutations and runs receive a fresh relay job by default. Supply
+Virtual JARVIS mutations and runs receive a fresh relay job by default. `jarvis_run`
+is handle-first: outer `wait_for_terminal` waits only for the brief MCP dispatch
+that returns the handle, never for workload completion. Use
+`jarvis_get_execution` for lifecycle, progress, artifacts, and services. Supply
 an explicit `idempotency_key` only when retry de-duplication is intentional; an
 identical second `jarvis_run` is otherwise a new execution.
 
-The released clio-kit 2.5.11 artifact is the pinned six-tool JARVIS v3.3 contract.
+The released clio-kit 2.5.13 artifact is the pinned six-tool JARVIS v3.4 contract.
 Bootstrap
 downloads and hashes the exact coordinated wheel, installs it once with
 `uv tool install`, and persists the wheel plus the direct JARVIS command in the
@@ -283,17 +286,17 @@ relay's exact JARVIS-CD release pin. That dependency edge is recorded in the
 install receipt and call result. Operator-registered MCP servers remain bound
 by their own discovery artifact and are not constrained to the relay's
 JARVIS-CD version.
-The release gate requires that exact 2.5.11 artifact to be rerun on every target
+The release gate requires that exact 2.5.13 artifact to be rerun on every target
 selected by the release policy. Other servers use the operator registry and
 generated `remote_...` aliases.
 
 The exact release wheel is
-`clio_kit-2.5.11-py3-none-any.whl` with SHA-256
-`a0a2bbf8d23495dd4f43881d35a47bfb83bc2d1c016bd952bd7a1c88a43ca03e`.
-Its canonical contract is `clio-kit-jarvis-user-v3.3`, with contract SHA-256
-`0993ee9b2ee9b3c2b021a3967d9221199c3a6be50d726d4b125812e6b1148115`
+`clio_kit-2.5.13-py3-none-any.whl` with SHA-256
+`225045e6c93de3423d2fe9156eee3075973f49c788bcc0955e130d565693feeb`.
+Its canonical contract is `clio-kit-jarvis-user-v3.4`, with contract SHA-256
+`52bfe1d416e674d120f200e502ded2197ee27219c26891a22c6c33ba917d5696`
 and canonical tools-wire SHA-256
-`c74276800cab5031ccd1538343180c40a58e9b8700d0b49e9ca9d4461d37696d`.
+`2ced8dc66ecee832ee86df0c99c29610bce61a82f9d80a8a53e0ea037d262219`.
 The nested runtime lock is bound to the public
 [`jarvis_cd-1.3.16-py3-none-any.whl`](https://github.com/grc-iit/jarvis-cd/releases/download/v1.3.16/jarvis_cd-1.3.16-py3-none-any.whl)
 release artifact with SHA-256
@@ -315,7 +318,7 @@ against their distinct preserved contract digest.
 
 ## Register the scientific catalog MCP
 
-clio-kit 2.5.11 also ships the two-tool
+clio-kit 2.5.13 also ships the two-tool
 `clio-kit-scientific-catalog-user-v1.1` contract. It separates dataset discovery
 from visualization control: `scientific_dataset_search` finds operator catalog
 records and `scientific_dataset_describe` returns the complete catalog record

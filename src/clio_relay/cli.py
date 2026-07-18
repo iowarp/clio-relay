@@ -74,6 +74,7 @@ from clio_relay.jarvis_mcp import (
     jarvis_mcp_env_from,
     jarvis_mcp_server,
     jarvis_mcp_server_args,
+    require_handle_first_jarvis_run_schema,
 )
 from clio_relay.jarvis_mcp_validation import build_jarvis_mcp_validation_report
 from clio_relay.live_acceptance import LiveAcceptanceOptions, run_live_acceptance
@@ -7800,6 +7801,12 @@ def jarvis_mcp_validate(
             raise typer.BadParameter(
                 "JARVIS tool arguments must not contain reserved key 'cluster'"
             )
+        if "wait" in arguments:
+            raise typer.BadParameter(
+                "jarvis_run is handle-first and does not accept internal wait; remove 'wait' "
+                "and let jarvis-mcp-validate observe workload lifecycle with "
+                "jarvis_get_execution"
+            )
         if not isinstance(arguments.get("pipeline_id"), str):
             raise typer.BadParameter("jarvis-mcp-validate requires a string pipeline_id argument")
         return arguments, _require_cluster(cluster), normalized_package_search_query
@@ -7856,6 +7863,7 @@ def jarvis_mcp_validate(
             profile=profile,
             tool="jarvis_run",
             arguments={"cluster": cluster, **arguments},
+            timeout_seconds=min(60.0, max(0.001, wait_timeout_seconds)),
         )
         tools_list_response = stdio_session.tools_list_response
         call_response = stdio_session.tools_call_response
@@ -7863,12 +7871,19 @@ def jarvis_mcp_validate(
         remote_install_info: dict[str, object] | None = None
         if should_execute_on_cluster(definition):
             remote_install_info = _remote_worker_info(definition)
-            call_status, progress, live_progress_observation = _wait_for_remote_jarvis_mcp_progress(
+            call_status = _wait_for_remote_job_terminal(
                 definition,
                 job_id,
                 timeout_seconds=wait_timeout_seconds,
                 poll_seconds=poll_seconds,
             )
+            progress = _complete_remote_collection(
+                definition,
+                ["job", "progress", job_id],
+                record_key="progress",
+                label=f"JARVIS MCP dispatch progress for {job_id}",
+            )
+            live_progress_observation = None
             artifacts = _remote_artifact_records(definition, job_id)
             mcp_result = _read_remote_json_artifact_kind(definition, artifacts, kind="mcp_result")
             provenance = _read_remote_json_artifact_kind(definition, artifacts, kind="provenance")
@@ -7876,12 +7891,14 @@ def jarvis_mcp_validate(
                 definition, artifacts, kind="runtime_metadata"
             )
         else:
-            call_status, progress, live_progress_observation = _wait_for_local_jarvis_mcp_progress(
+            call_status = _wait_for_local_job_terminal(
                 queue,
                 job_id,
                 timeout_seconds=wait_timeout_seconds,
                 poll_seconds=poll_seconds,
             )
+            progress = _complete_local_progress_records(queue, job_id)
+            live_progress_observation = None
             artifacts = _complete_local_artifact_records(queue, job_id)
             mcp_result = _read_local_json_artifact_kind(queue, artifacts, kind="mcp_result")
             provenance = _read_local_json_artifact_kind(queue, artifacts, kind="provenance")
@@ -7941,6 +7958,11 @@ def jarvis_mcp_validate(
             query_provenance=execution_query.provenance,
             query_initialize_response=execution_query.initialize_response,
             query_stdio_evidence=execution_query.stdio_evidence,
+            query_lifecycle_observations=getattr(
+                execution_query,
+                "lifecycle_observations",
+                [],
+            ),
             launcher=validation_launcher,
             install_source=validation_install_source,
             artifact_sha256=(
@@ -10625,6 +10647,13 @@ def _persist_jarvis_remote_contract_discovery(
         artifact_sha256=artifact_sha256,
         artifact_payload=artifact_payload,
     )
+    run_tool = next((tool for tool in entry.tools if tool.name == "jarvis_run"), None)
+    if run_tool is None:
+        raise RelayError("JARVIS MCP discovery contract omitted jarvis_run")
+    try:
+        require_handle_first_jarvis_run_schema(run_tool.input_schema)
+    except ValueError as exc:
+        raise RelayError(str(exc)) from exc
     if entry.schema_digest != CLIO_KIT_JARVIS_USER_CONTRACT_SHA256:
         raise RelayError(
             f"JARVIS MCP discovery contract does not match clio-kit {CLIO_KIT_JARVIS_MCP_VERSION}"
@@ -10659,12 +10688,15 @@ def _read_remote_mcp_result_artifact(
 def _remote_artifact_records(
     definition: ClusterDefinition,
     job_id: str,
+    *,
+    deadline: float | None = None,
 ) -> list[dict[str, Any]]:
     return _complete_remote_collection(
         definition,
         ["job", "list-artifacts", job_id],
         record_key="artifacts",
         label=f"remote artifacts for {job_id}",
+        deadline=deadline,
     )
 
 
@@ -10686,8 +10718,14 @@ def _read_remote_json_artifact_kind(
     artifacts: list[dict[str, Any]],
     *,
     kind: str,
+    deadline: float | None = None,
 ) -> dict[str, Any] | None:
-    payload = _read_remote_artifact_kind_bytes(definition, artifacts, kind=kind)
+    payload = _read_remote_artifact_kind_bytes(
+        definition,
+        artifacts,
+        kind=kind,
+        deadline=deadline,
+    )
     return _decode_json_artifact(payload, kind=kind) if payload is not None else None
 
 
@@ -10696,6 +10734,7 @@ def _read_remote_artifact_kind_bytes(
     artifacts: list[dict[str, Any]],
     *,
     kind: str,
+    deadline: float | None = None,
 ) -> bytes | None:
     """Read the exact remote artifact bytes recorded by the durable queue."""
     artifact = _artifact_record(artifacts, kind=kind)
@@ -10705,7 +10744,11 @@ def _read_remote_artifact_kind_bytes(
     if not isinstance(artifact_id, str) or not artifact_id:
         raise RelayError(f"remote {kind} artifact has no artifact_id")
     envelope = _json_output(
-        run_remote_clio(definition, ["job", "read-artifact", artifact_id]),
+        _run_remote_clio_before_deadline(
+            definition,
+            ["job", "read-artifact", artifact_id],
+            deadline=deadline,
+        ),
         f"remote {kind} artifact payload",
     )
     return _decode_artifact_envelope(envelope)
@@ -10886,6 +10929,88 @@ class _JarvisExecutionQueryAcceptance:
     provenance: dict[str, Any] | None
     initialize_response: dict[str, Any]
     stdio_evidence: dict[str, Any]
+    lifecycle_observations: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class _JarvisExecutionQueryAttempt:
+    """One durable ``jarvis_get_execution`` query and its local transport evidence."""
+
+    session: PackagedMcpStdioSession
+    call_job_id: str
+    call_status: dict[str, Any]
+    artifacts: list[dict[str, Any]]
+    mcp_result: dict[str, Any] | None
+    provenance: dict[str, Any] | None
+
+
+_MAX_JARVIS_EXECUTION_QUERY_OBSERVATIONS = 512
+
+
+def _append_bounded_jarvis_execution_query_observation(
+    observations: list[dict[str, Any]],
+    observation: dict[str, Any],
+) -> None:
+    """Retain ordered lifecycle evidence without failing a healthy long run."""
+    observations.append(observation)
+    if len(observations) <= _MAX_JARVIS_EXECUTION_QUERY_OBSERVATIONS:
+        return
+
+    protected_indexes = {0, len(observations) - 1}
+    first_state_indexes: dict[tuple[object, object], int] = {}
+    first_live_progress_index: int | None = None
+    for index, item in enumerate(observations):
+        raw_state = item.get("state")
+        state = (
+            raw_state
+            if raw_state in {"unknown", "submitted", "running", "completed", "failed", "canceled"}
+            else "invalid"
+        )
+        state_key = (state, item.get("terminal"))
+        first_state_indexes.setdefault(state_key, index)
+        if first_live_progress_index is None and _has_live_jarvis_package_progress(item):
+            first_live_progress_index = index
+    protected_indexes.update(first_state_indexes.values())
+    if first_live_progress_index is not None:
+        protected_indexes.add(first_live_progress_index)
+
+    target_size = _MAX_JARVIS_EXECUTION_QUERY_OBSERVATIONS // 2
+    available_slots = max(0, target_size - len(protected_indexes))
+    candidates = [index for index in range(len(observations)) if index not in protected_indexes]
+    if available_slots and candidates:
+        selected = {
+            candidates[index * len(candidates) // available_slots]
+            for index in range(available_slots)
+        }
+        protected_indexes.update(selected)
+    observations[:] = [
+        item for index, item in enumerate(observations) if index in protected_indexes
+    ]
+
+
+def _has_live_jarvis_package_progress(observation: dict[str, Any]) -> bool:
+    """Return whether an in-flight observation contains native package progress."""
+    if observation.get("state") != "running" or observation.get("terminal") is not False:
+        return False
+    progress = observation.get("progress")
+    if not isinstance(progress, dict):
+        return False
+    packages = cast(dict[str, object], progress).get("packages")
+    if not isinstance(packages, list):
+        return False
+    for raw_package in cast(list[object], packages):
+        if not isinstance(raw_package, dict):
+            continue
+        package = cast(dict[str, object], raw_package)
+        event_count = package.get("event_count")
+        if (
+            isinstance(event_count, int)
+            and not isinstance(event_count, bool)
+            and event_count > 0
+            and isinstance(package.get("latest"), dict)
+        ):
+            return True
+    return False
 
 
 def _run_post_run_jarvis_execution_query(
@@ -10899,59 +11024,216 @@ def _run_post_run_jarvis_execution_query(
     wait_timeout_seconds: float,
     poll_seconds: float,
 ) -> _JarvisExecutionQueryAcceptance:
-    """Query the completed JARVIS execution through the local virtual MCP surface."""
-    arguments: dict[str, Any] = {
+    """Observe one handle-first JARVIS run to terminal through durable queries."""
+    _validate_progress_wait(timeout_seconds=wait_timeout_seconds, poll_seconds=poll_seconds)
+    query_arguments: dict[str, Any] = {
         "cluster": cluster,
         "pipeline_id": pipeline_id,
         "execution_id": execution_id,
         "include_progress": True,
-        "artifacts": {"page_size": 25},
     }
+    deadline = monotonic() + wait_timeout_seconds
+    lifecycle_observations: list[dict[str, Any]] = []
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                "JARVIS execution did not reach terminal state through "
+                f"jarvis_get_execution before timeout: {execution_id}"
+            )
+        attempt = _execute_jarvis_execution_query(
+            definition=definition,
+            queue=queue,
+            profile=profile,
+            arguments=query_arguments,
+            deadline=deadline,
+            poll_seconds=poll_seconds,
+        )
+        observation = _jarvis_execution_lifecycle_observation(
+            attempt.mcp_result,
+            query_job_id=attempt.call_job_id,
+            expected_pipeline_id=pipeline_id,
+            expected_execution_id=execution_id,
+        )
+        _append_bounded_jarvis_execution_query_observation(
+            lifecycle_observations,
+            observation,
+        )
+        if observation["terminal"] is True:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "JARVIS execution reached terminal state without enough time for its "
+                    f"bounded artifact query: {execution_id}"
+                )
+            terminal_attempt = _execute_jarvis_execution_query(
+                definition=definition,
+                queue=queue,
+                profile=profile,
+                arguments={**query_arguments, "artifacts": {"page_size": 25}},
+                deadline=deadline,
+                poll_seconds=poll_seconds,
+            )
+            terminal_observation = _jarvis_execution_lifecycle_observation(
+                terminal_attempt.mcp_result,
+                query_job_id=terminal_attempt.call_job_id,
+                expected_pipeline_id=pipeline_id,
+                expected_execution_id=execution_id,
+            )
+            if terminal_observation["terminal"] is not True:
+                raise RelayError(
+                    "JARVIS execution regressed from terminal during its artifact query"
+                )
+            lifecycle_observations[-1] = terminal_observation
+            return _JarvisExecutionQueryAcceptance(
+                tools_list_response=terminal_attempt.session.tools_list_response,
+                call_response=terminal_attempt.session.tools_call_response,
+                call_job_id=terminal_attempt.call_job_id,
+                call_status=terminal_attempt.call_status,
+                artifacts=terminal_attempt.artifacts,
+                mcp_result=terminal_attempt.mcp_result,
+                provenance=terminal_attempt.provenance,
+                initialize_response=terminal_attempt.session.initialize_response,
+                stdio_evidence=terminal_attempt.session.evidence(),
+                lifecycle_observations=lifecycle_observations,
+            )
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            continue
+        sleep(min(poll_seconds, remaining))
+
+
+def _execute_jarvis_execution_query(
+    *,
+    definition: ClusterDefinition,
+    queue: ClioCoreQueue,
+    profile: str,
+    arguments: dict[str, Any],
+    deadline: float,
+    poll_seconds: float,
+) -> _JarvisExecutionQueryAttempt:
+    """Execute one query with the workload deadline applied to every boundary."""
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise TimeoutError("JARVIS execution query deadline expired before MCP dispatch")
+    timeout_seconds = min(60.0, max(0.001, remaining))
     session = run_packaged_mcp_stdio_session(
         profile=profile,
         tool="jarvis_get_execution",
         arguments=arguments,
+        timeout_seconds=timeout_seconds,
     )
     call_job_id = _mcp_response_job_id(session.tools_call_response)
+    timeout_seconds = deadline - monotonic()
+    if timeout_seconds <= 0:
+        raise TimeoutError(f"JARVIS execution query dispatch exceeded its deadline: {call_job_id}")
     if should_execute_on_cluster(definition):
         call_status = _wait_for_remote_job_terminal(
             definition,
             call_job_id,
-            timeout_seconds=wait_timeout_seconds,
+            timeout_seconds=timeout_seconds,
             poll_seconds=poll_seconds,
+            deadline=deadline,
         )
-        artifacts = _remote_artifact_records(definition, call_job_id)
+        artifacts = _remote_artifact_records(
+            definition,
+            call_job_id,
+            deadline=deadline,
+        )
         mcp_result = _read_remote_json_artifact_kind(
             definition,
             artifacts,
             kind="mcp_result",
+            deadline=deadline,
         )
         provenance = _read_remote_json_artifact_kind(
             definition,
             artifacts,
             kind="provenance",
+            deadline=deadline,
         )
     else:
         call_status = _wait_for_local_job_terminal(
             queue,
             call_job_id,
-            timeout_seconds=wait_timeout_seconds,
+            timeout_seconds=timeout_seconds,
             poll_seconds=poll_seconds,
         )
         artifacts = _complete_local_artifact_records(queue, call_job_id)
         mcp_result = _read_local_json_artifact_kind(queue, artifacts, kind="mcp_result")
         provenance = _read_local_json_artifact_kind(queue, artifacts, kind="provenance")
-    return _JarvisExecutionQueryAcceptance(
-        tools_list_response=session.tools_list_response,
-        call_response=session.tools_call_response,
+    return _JarvisExecutionQueryAttempt(
+        session=session,
         call_job_id=call_job_id,
         call_status=cast(dict[str, Any], call_status),
         artifacts=artifacts,
         mcp_result=mcp_result,
         provenance=provenance,
-        initialize_response=session.initialize_response,
-        stdio_evidence=session.evidence(),
     )
+
+
+def _jarvis_execution_lifecycle_observation(
+    mcp_result: dict[str, Any] | None,
+    *,
+    query_job_id: str,
+    expected_pipeline_id: str,
+    expected_execution_id: str,
+) -> dict[str, Any]:
+    """Extract one identity-bound workload observation from a query result."""
+    structured = (
+        cast(dict[str, Any], mcp_result.get("structured_result"))
+        if mcp_result is not None and isinstance(mcp_result.get("structured_result"), dict)
+        else None
+    )
+    record = (
+        cast(dict[str, Any], structured.get("execution_record"))
+        if structured is not None and isinstance(structured.get("execution_record"), dict)
+        else None
+    )
+    handle = (
+        cast(dict[str, Any], structured.get("execution_handle"))
+        if structured is not None and isinstance(structured.get("execution_handle"), dict)
+        else None
+    )
+    progress = (
+        cast(dict[str, Any], structured.get("progress"))
+        if structured is not None and isinstance(structured.get("progress"), dict)
+        else None
+    )
+    if structured is None or handle is None or record is None or progress is None:
+        raise RelayError(
+            f"jarvis_get_execution job {query_job_id} omitted its structured lifecycle result"
+        )
+    if (
+        structured.get("pipeline_id") != expected_pipeline_id
+        or structured.get("execution_id") != expected_execution_id
+        or record.get("pipeline_id") != expected_pipeline_id
+        or record.get("execution_id") != expected_execution_id
+        or handle.get("pipeline_id") != expected_pipeline_id
+        or handle.get("execution_id") != expected_execution_id
+        or progress.get("pipeline_id") != expected_pipeline_id
+        or progress.get("execution_id") != expected_execution_id
+    ):
+        raise RelayError(
+            f"jarvis_get_execution job {query_job_id} returned a different execution identity"
+        )
+    state = record.get("state")
+    terminal = record.get("terminal")
+    if not isinstance(state, str) or not isinstance(terminal, bool):
+        raise RelayError(
+            f"jarvis_get_execution job {query_job_id} returned an invalid lifecycle state"
+        )
+    return {
+        "query_job_id": query_job_id,
+        "pipeline_id": expected_pipeline_id,
+        "execution_id": expected_execution_id,
+        "state": state,
+        "terminal": terminal,
+        "execution_handle": handle,
+        "execution_record": record,
+        "progress": progress,
+        "runtime_metadata": structured.get("runtime_metadata"),
+    }
 
 
 def _wait_for_remote_job_terminal(
@@ -10960,18 +11242,24 @@ def _wait_for_remote_job_terminal(
     *,
     timeout_seconds: float,
     poll_seconds: float,
+    deadline: float | None = None,
 ) -> dict[str, object]:
     """Wait for one remote relay job without requiring progress observations."""
     _validate_progress_wait(timeout_seconds=timeout_seconds, poll_seconds=poll_seconds)
-    deadline = monotonic() + timeout_seconds
+    timeout_deadline = monotonic() + timeout_seconds
+    effective_deadline = timeout_deadline if deadline is None else min(timeout_deadline, deadline)
     while True:
         status = _json_output(
-            run_remote_clio(definition, ["job", "status", job_id]),
+            _run_remote_clio_before_deadline(
+                definition,
+                ["job", "status", job_id],
+                deadline=effective_deadline,
+            ),
             "JARVIS MCP execution-query job status",
         )
         if status.get("terminal") is True:
             return status
-        remaining = deadline - monotonic()
+        remaining = effective_deadline - monotonic()
         if remaining <= 0:
             raise TimeoutError(f"job did not reach terminal state before timeout: {job_id}")
         sleep(min(poll_seconds, remaining))
@@ -10997,105 +11285,11 @@ def _wait_for_local_job_terminal(
         sleep(min(poll_seconds, remaining))
 
 
-def _wait_for_remote_jarvis_mcp_progress(
-    definition: ClusterDefinition,
-    job_id: str,
-    *,
-    timeout_seconds: float,
-    poll_seconds: float,
-) -> tuple[dict[str, object], list[dict[str, Any]], dict[str, Any] | None]:
-    """Wait remotely while proving progress was observable before job completion."""
-    _validate_progress_wait(timeout_seconds=timeout_seconds, poll_seconds=poll_seconds)
-    deadline = monotonic() + timeout_seconds
-    live_observation: dict[str, Any] | None = None
-    while True:
-        progress = _complete_remote_collection(
-            definition,
-            ["job", "progress", job_id],
-            record_key="progress",
-            label=f"JARVIS MCP validation progress for {job_id}",
-        )
-        status = _json_output(
-            run_remote_clio(definition, ["job", "status", job_id]),
-            "JARVIS MCP validation job status",
-        )
-        if live_observation is None:
-            live_observation = _live_jarvis_progress_observation(progress, status)
-        if status.get("terminal") is True:
-            return status, progress, live_observation
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            raise TimeoutError(f"job did not reach terminal state before timeout: {job_id}")
-        sleep(min(poll_seconds, remaining))
-
-
-def _wait_for_local_jarvis_mcp_progress(
-    queue: ClioCoreQueue,
-    job_id: str,
-    *,
-    timeout_seconds: float,
-    poll_seconds: float,
-) -> tuple[dict[str, object], list[dict[str, Any]], dict[str, Any] | None]:
-    """Wait locally while proving progress was observable before job completion."""
-    _validate_progress_wait(timeout_seconds=timeout_seconds, poll_seconds=poll_seconds)
-    deadline = monotonic() + timeout_seconds
-    live_observation: dict[str, Any] | None = None
-    while True:
-        progress = _complete_local_progress_records(queue, job_id)
-        status = get_job_status(queue, job_id)
-        if live_observation is None:
-            live_observation = _live_jarvis_progress_observation(progress, status)
-        if status.get("terminal") is True:
-            return status, progress, live_observation
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            raise TimeoutError(f"job did not reach terminal state before timeout: {job_id}")
-        sleep(min(poll_seconds, remaining))
-
-
 def _validate_progress_wait(*, timeout_seconds: float, poll_seconds: float) -> None:
     if timeout_seconds <= 0:
         raise ConfigurationError("timeout_seconds must be positive")
     if poll_seconds <= 0:
         raise ConfigurationError("poll_seconds must be positive")
-
-
-def _live_jarvis_progress_observation(
-    progress: list[dict[str, Any]],
-    status: dict[str, object],
-) -> dict[str, Any] | None:
-    """Capture one native JARVIS progress record while the relay job is running."""
-    job = status.get("job")
-    if not isinstance(job, dict):
-        return None
-    typed_job = {str(key): value for key, value in cast(dict[object, object], job).items()}
-    if typed_job.get("state") != JobState.RUNNING.value or status.get("terminal") is not False:
-        return None
-    for record in progress:
-        metadata = record.get("metadata")
-        if not isinstance(metadata, dict):
-            continue
-        typed_metadata = cast(dict[str, Any], metadata)
-        progress_id = record.get("progress_id")
-        if (
-            isinstance(progress_id, str)
-            and typed_metadata.get("source") == "jarvis_execution"
-            and typed_metadata.get("provider_source_authority")
-            == "jarvis_mcp_progress_notification"
-            and typed_metadata.get("producer_validated") is True
-            and typed_metadata.get("execution_binding_validated") is False
-            and isinstance(typed_metadata.get("progress_transport_sequence"), int)
-            and not isinstance(typed_metadata.get("progress_transport_sequence"), bool)
-            and cast(int, typed_metadata["progress_transport_sequence"]) > 0
-        ):
-            return {
-                "progress_id": progress_id,
-                "job_state": typed_job.get("state"),
-                "job_updated_at": typed_job.get("updated_at"),
-                "terminal": False,
-                "progress_transport_sequence": typed_metadata.get("progress_transport_sequence"),
-            }
-    return None
 
 
 def _json_value(value: str, label: str) -> object:
@@ -11187,6 +11381,7 @@ def _complete_remote_collection(
     record_key: str,
     label: str,
     max_records: int = MAX_INTERNAL_COLLECTION_RECORDS,
+    deadline: float | None = None,
 ) -> list[dict[str, Any]]:
     """Drain a remote paged CLI collection under an explicit completeness cap."""
     cursor = 1
@@ -11194,7 +11389,7 @@ def _complete_remote_collection(
     records: list[dict[str, Any]] = []
     while True:
         payload = _json_output(
-            run_remote_clio(
+            _run_remote_clio_before_deadline(
                 definition,
                 [
                     *command,
@@ -11203,6 +11398,7 @@ def _complete_remote_collection(
                     "--limit",
                     str(MAX_RESPONSE_PAGE_RECORDS),
                 ],
+                deadline=deadline,
             ),
             label,
         )

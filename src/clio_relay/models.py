@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -491,6 +494,61 @@ JobSpec = Annotated[
 ]
 
 
+def deterministic_jarvis_execution_id(
+    *,
+    cluster: str,
+    idempotency_key: str,
+    job_id: str,
+) -> str:
+    """Return the JARVIS execution identity owned by one relay admission."""
+    canonical = json.dumps(
+        {
+            "schema_version": "clio-relay.jarvis-run-execution-identity.v2",
+            "cluster": cluster,
+            "idempotency_key": idempotency_key,
+            "job_id": job_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return f"jarvis_{hashlib.sha256(canonical).hexdigest()[:32]}"
+
+
+def is_owned_jarvis_run_spec(kind: JobKind, spec: JobSpec) -> bool:
+    """Recognize a relay-pinned built-in JARVIS run without importing configuration."""
+    if kind is not JobKind.MCP_CALL or not isinstance(spec, McpCallSpec):
+        return False
+    normalized_tool = (spec.tool or "").replace("-", "_").lower()
+    return (
+        spec.operation is McpOperation.TOOLS_CALL
+        and normalized_tool == "jarvis_run"
+        and spec.expected_server_artifact_digest is not None
+        and spec.expected_jarvis_cd_lock_binding is not None
+    )
+
+
+def _validate_jarvis_execution_id(value: object) -> str:
+    """Validate the portable execution-id contract exposed by JARVIS-CD."""
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) is None
+    ):
+        raise ValueError("trusted jarvis_run execution_id must be 1-128 portable ASCII characters")
+    reserved_stem = value.split(".", 1)[0].upper()
+    reserved = {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+    }
+    if value.endswith(".") or reserved_stem in reserved:
+        raise ValueError("trusted jarvis_run execution_id is not a portable path component")
+    return value
+
+
 class StorageReservationEstimate(BaseModel):
     """Validated per-job storage growth reserved before queue admission."""
 
@@ -542,6 +600,50 @@ class RelayJob(BaseModel):
         if len(artifact_ids) != len(set(artifact_ids)):
             raise ValueError("used_artifact_refs must contain unique artifact_id values")
         return sorted(value, key=lambda item: item.artifact_id)
+
+
+def prepare_owned_jarvis_run_submission(job: RelayJob) -> RelayJob:
+    """Bind a newly admitted trusted JARVIS run to one durable execution ID.
+
+    This is intentionally an admission operation rather than a model validator.
+    Durable jobs written by older relay releases must remain readable during an
+    upgrade even when their historical public contract exposed ``wait`` or did
+    not yet accept a caller-owned ``execution_id``.
+    """
+    if not is_owned_jarvis_run_spec(job.kind, job.spec):
+        return job
+    assert isinstance(job.spec, McpCallSpec)
+    if "wait" in job.spec.arguments:
+        raise ValueError(
+            "trusted jarvis_run does not accept internal wait; query the returned "
+            "execution with jarvis_get_execution"
+        )
+    expected_execution_id = deterministic_jarvis_execution_id(
+        cluster=job.cluster,
+        idempotency_key=job.idempotency_key,
+        job_id=job.job_id,
+    )
+    supplied_execution_id = job.spec.arguments.get("execution_id")
+    if supplied_execution_id is not None:
+        validated_execution_id = _validate_jarvis_execution_id(supplied_execution_id)
+        if validated_execution_id != expected_execution_id:
+            raise ValueError(
+                "trusted jarvis_run execution_id must match the relay-owned "
+                "cluster and idempotency identity"
+            )
+    execution_id = expected_execution_id
+    return job.model_copy(
+        update={
+            "spec": job.spec.model_copy(
+                update={
+                    "arguments": {
+                        **job.spec.arguments,
+                        "execution_id": execution_id,
+                    }
+                }
+            )
+        }
+    )
 
 
 class RelayTask(BaseModel):

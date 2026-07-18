@@ -337,16 +337,16 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
         if resource["kind"] == "relay_worker"
     )
     clio_kit_component = worker["metadata_equals"]["component_artifacts"]["clio-kit"]
-    assert clio_kit_component["distribution_version"] == "2.5.11"
+    assert clio_kit_component["distribution_version"] == "2.5.13"
     assert clio_kit_component["persistent_tool"]["manager"] == "uv"
     assert clio_kit_component["persistent_tool"]["uv_version"] == "0.11.28"
     assert clio_kit_component["persistent_tool"]["source_artifact_sha256"] == (
-        "a0a2bbf8d23495dd4f43881d35a47bfb83bc2d1c016bd952bd7a1c88a43ca03e"
+        "225045e6c93de3423d2fe9156eee3075973f49c788bcc0955e130d565693feeb"
     )
     native_execution = clio_kit_component["native_execution"]
-    assert native_execution["contract_id"] == "clio-kit-jarvis-user-v3.3"
+    assert native_execution["contract_id"] == "clio-kit-jarvis-user-v3.4"
     assert native_execution["contract_sha256"] == (
-        "0993ee9b2ee9b3c2b021a3967d9221199c3a6be50d726d4b125812e6b1148115"
+        "52bfe1d416e674d120f200e502ded2197ee27219c26891a22c6c33ba917d5696"
     )
     jarvis_component = worker["metadata_equals"]["component_artifacts"]["jarvis-cd"]
     assert jarvis_component["distribution_version"] == "1.3.16"
@@ -376,7 +376,8 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
         if resource["kind"] == "jarvis_generated_artifact"
     )
     assert artifact["metadata_equals"]["logical_name"] == "gray-scott-timesteps"
-    assert artifact["metadata_equals"]["metadata"]["latest_timestep"] == 20
+    assert artifact["metadata_equals"]["metadata"]["latest_timestep"] == 10000
+    assert artifact["metadata_equals"]["metadata"]["members_observed"] == 10
 
     lammps = requirements["ares-jarvis-lammps-package-progress"]
     lammps_progress = next(
@@ -385,17 +386,17 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
         if resource["kind"] == "jarvis_execution_progress"
     )
     assert lammps_progress["metadata_equals"] == {
-        "source": "jarvis_execution",
+        "source": "jarvis_get_execution",
         "package_name": "builtin.lammps",
         "package_id": "lammps",
         "progress_schema_version": "jarvis.progress.v1",
         "progress_determinate": True,
-        "provider_source_authority": "jarvis_mcp_progress_notification",
-        "producer_validated": True,
-        "execution_binding_validated": True,
+        "provider_source_authority": "jarvis_get_execution",
+        "native_documents_validated": True,
+        "query_identity_validated": True,
         "live_observed_while_running": True,
-        "bridge_validated": True,
-        "runtime_bound": True,
+        "lifecycle_query_validated": True,
+        "terminal_query_bound": True,
     }
     lammps_worker = next(
         resource
@@ -558,7 +559,7 @@ def test_spack_release_requirements_split_existing_resolution_from_fresh_install
     )
     assert fresh_server["metadata_equals"]["server_name"] == "spack-fresh"
     assert fresh_server["metadata_equals"]["install_artifact_sha256"] == (
-        "a0a2bbf8d23495dd4f43881d35a47bfb83bc2d1c016bd952bd7a1c88a43ca03e"
+        "225045e6c93de3423d2fe9156eee3075973f49c788bcc0955e130d565693feeb"
     )
     assert fresh_server["metadata_equals"]["contract_id"] == "clio-kit-spack-user-v2.1"
     assert fresh_server["metadata_equals"]["contract_sha256"] == (

@@ -46,7 +46,7 @@ JARVIS_EXECUTION_ARTIFACTS_SCHEMA = "jarvis.execution.artifacts.v1"
 JARVIS_ARTIFACT_SCHEMA = "jarvis.artifact.v1"
 JARVIS_EXECUTION_SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 CLIO_KIT_JARVIS_EXECUTION_SCHEMA = "clio-kit.jarvis-execution.v2"
-CLIO_KIT_JARVIS_CONTRACT_ID = "clio-kit-jarvis-user-v3.3"
+CLIO_KIT_JARVIS_CONTRACT_ID = "clio-kit-jarvis-user-v3.4"
 CLIO_KIT_MCP_CONTRACT_SCHEMA = "clio-kit.mcp-user-contract.v1"
 CLIO_KIT_NATIVE_OPERATIONS = (
     "jarvis_get_execution",
@@ -1380,6 +1380,16 @@ def probe_clio_kit_native_execution_contract(
             "execution_record": JARVIS_EXECUTION_RECORD_SCHEMA,
             "progress": JARVIS_EXECUTION_PROGRESS_SCHEMA,
         },
+    )
+    run_input_schema = by_name["jarvis_run"].get("inputSchema")
+    if not isinstance(run_input_schema, dict):
+        raise ConfigurationError("clio-kit native JARVIS run input schema was invalid")
+    from clio_relay.jarvis_mcp import require_handle_first_jarvis_run_schema
+
+    require_handle_first_jarvis_run_schema(
+        cast(dict[str, Any], run_input_schema),
+        error_type=ConfigurationError,
+        label="clio-kit native JARVIS contract",
     )
     _require_native_execution_query_contract(by_name["jarvis_get_execution"])
     contract_sha256 = document.get("contract_sha256")

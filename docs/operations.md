@@ -261,10 +261,10 @@ For the legacy clio-kit 2.2.6 compatibility path, a successful synchronous
 `jarvis_run` MCP return is normalized to a terminal `completed` record even
 though that release labels the result `status=running`; the original status and
 completion basis remain in `details.completion_normalization` for auditability.
-The pinned clio-kit 2.5.11 production path removes that ambiguity upstream and
-returns a structured completed result directly. The legacy normalization is
+The pinned clio-kit 2.5.13 production path removes that ambiguity upstream and
+returns a structured durable execution handle immediately. The legacy normalization is
 diagnostic compatibility evidence and cannot satisfy the 1.0 gate. Scheduler
-submissions remain non-terminal unless JARVIS was asked to wait.
+submissions remain non-terminal and are observed through `jarvis_get_execution`.
 
 Exercise the agent-facing virtual `jarvis_run` tool, its cluster routing, durable
 result, and non-legacy runtime artifact in one canonical acceptance run:
@@ -279,8 +279,9 @@ clio-relay jarvis-mcp-validate `
 
 The package-search query must identify at least one installed application; its
 bounded summary page is retained in the same machine-readable report.
-`jarvis-run.json` must contain the remote `pipeline_id` and any `execution`,
-`submit`, or `wait` fields accepted by the cluster-local JARVIS MCP. The local
+`jarvis-run.json` must contain the remote `pipeline_id` and any `execution` or
+`submit` fields accepted by the cluster-local JARVIS MCP. Internal `wait` is not
+part of the public handle-first contract. The local
 `cluster` selector is injected by clio-relay and is never forwarded to JARVIS.
 
 Runtime observations are emitted only by the relay-owned JARVIS execution
@@ -496,7 +497,7 @@ Install the cluster-side server once, then launch its persistent executable:
 
 ```bash
 uv tool install --python 3.12 --no-config \
-  https://github.com/iowarp/clio-kit/releases/download/v2.5.11/clio_kit-2.5.11-py3-none-any.whl
+  https://github.com/iowarp/clio-kit/releases/download/v2.5.13/clio_kit-2.5.13-py3-none-any.whl
 clio-kit mcp-server jarvis
 ```
 
@@ -569,20 +570,15 @@ and `execution_id`. The relay forwards the query as a durable remote MCP job and
 validates the returned identities, lifecycle, progress, artifact filters,
 counts, and cursor bounds before marking its result valid.
 
-For virtual `jarvis_run`, the packaged runner creates a distinct one-call MCP
-progress token; the remote JARVIS server never receives the outer relay sidecar
-credential. It accepts only bounded `notifications/progress` messages whose
-`params.message` is an exact `jarvis.execution.progress.v1` snapshot and whose
-`params.progress` sequence is monotonic for that call. The final structured
-result must bind the same native execution handle, durable record, progress
-snapshot, pipeline identity, and discovery-time server artifact. The
-relay-owned broker continues querying JARVIS by execution id and persists each
-coherent snapshot through its HMAC-authenticated sidecar. Package progress
-adapters and `clio-kit.jarvis-package-progress.v1` notifications remain legacy
-compatibility paths and are invalid as 1.0 acceptance evidence.
-`jarvis-mcp-validate` polls job progress before job completion, and the
-machine-readable live-progress check requires an in-flight native snapshot and
-its coherently bound terminal snapshot.
+Virtual `jarvis_run` returns a durable execution handle without waiting for the
+workload. The short relay MCP job may be waited only long enough to obtain that
+handle; its completion is not workload completion and its progress
+notifications are not live-workload evidence. `jarvis-mcp-validate` repeatedly
+calls `jarvis_get_execution`, requiring an identity-coherent running package
+progress snapshot followed by a coherent terminal snapshot. Package progress
+adapters, stdout scraping, and `clio-kit.jarvis-package-progress.v1`
+notifications remain legacy compatibility paths and are invalid as 1.0
+acceptance evidence.
 
 Cluster bootstrap stores the exact clio-kit wheel path, digest, persistent-tool
 environment, and JARVIS MCP command in the installation receipt. The worker

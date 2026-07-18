@@ -62,7 +62,7 @@ gh pr create --title "fix: ..." --body-file PR.md
 gh pr merge --squash --delete-branch
 git switch main
 git pull --ff-only origin main
-$Tag = "v1.3.31"
+$Tag = "v1.3.32"
 $Commit = (git rev-parse HEAD).Trim()
 if (git status --porcelain) { throw "release checkout is dirty" }
 if (git tag --list $Tag) { throw "release tag already exists locally: $Tag" }
@@ -114,7 +114,7 @@ publish those already-built bytes:
 
 ```powershell
 git push origin $Tag
-gh release create $Tag --draft --target $Commit --title "clio-relay 1.3.31" `
+gh release create $Tag --draft --target $Commit --title "clio-relay 1.3.32" `
   dist/*.whl dist/*.tar.gz dist/SHA256SUMS --notes-file RELEASE.md
 gh release edit $Tag --draft=false
 ```

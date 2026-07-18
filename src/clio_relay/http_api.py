@@ -24,7 +24,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
@@ -55,6 +55,7 @@ from clio_relay.models import (
     RemoteAgentTaskSpec,
     TaskEventStatus,
     TaskTimelineEvent,
+    new_id,
     validate_mcp_env_from,
 )
 from clio_relay.pagination import (
@@ -408,6 +409,13 @@ class JarvisMcpCallSubmitRequest(BaseModel):
         max_length=1_000,
     )
 
+    @model_validator(mode="after")
+    def reject_internal_jarvis_run_wait(self) -> JarvisMcpCallSubmitRequest:
+        """Keep workload waiting out of the trusted handle-first HTTP ingress."""
+        if self.tool == "jarvis_run" and "wait" in self.arguments:
+            raise ValueError("jarvis_run does not accept internal wait; use jarvis_get_execution")
+        return self
+
 
 class QueueCancelRequest(BaseModel):
     """HTTP request to cancel a relay job with explicit scheduler policy."""
@@ -690,8 +698,14 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             )
             if resolved.owner_session_generation_id is not None:
                 metadata["owner_session_generation_id"] = resolved.owner_session_generation_id
+        # Job ids crossing HTTP are caller-controlled, including on the raw
+        # /jobs route. Generate new-admission entropy inside the server; an
+        # idempotent retry is still canonicalized by the durable key record.
+        job = job.model_copy(update={"job_id": new_id("job")})
         try:
             return _public_record(queue.submit_job(job.model_copy(update={"metadata": metadata})))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except QueueConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except StorageAdmissionError as exc:

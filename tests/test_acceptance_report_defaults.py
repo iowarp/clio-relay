@@ -769,13 +769,6 @@ def _persist_jarvis_contract(**_kwargs: object) -> None:
     return None
 
 
-def _local_jarvis_progress(
-    *_args: object,
-    **_kwargs: object,
-) -> tuple[dict[str, object], list[dict[str, object]], dict[str, object]]:
-    return {"terminal": True}, [], {"observed": True}
-
-
 def _post_run_jarvis_query(**_kwargs: object) -> SimpleNamespace:
     return SimpleNamespace(
         tools_list_response={},
@@ -914,11 +907,8 @@ def _install_success_fakes(
         )
         monkeypatch.setattr(cli, "run_packaged_mcp_stdio_session", _packaged_mcp_session)
         monkeypatch.setattr(cli, "_mcp_response_job_id", _relay_job_id)
-        monkeypatch.setattr(
-            cli,
-            "_wait_for_local_jarvis_mcp_progress",
-            _local_jarvis_progress,
-        )
+        monkeypatch.setattr(cli, "_wait_for_local_job_terminal", _terminal_job_status)
+        monkeypatch.setattr(cli, "_complete_local_progress_records", _empty_artifacts)
         monkeypatch.setattr(cli, "_complete_local_artifact_records", _empty_artifacts)
 
         def read_jarvis_artifact(

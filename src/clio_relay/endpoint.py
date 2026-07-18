@@ -22,7 +22,7 @@ import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
@@ -97,7 +97,7 @@ from clio_relay.scheduler_providers import (
     provider_for_scheduler,
     reconciliation_provider_for_scheduler,
 )
-from clio_relay.spool import JobSpool
+from clio_relay.spool import JobSpool, read_owned_regular_file_bytes
 from clio_relay.storage_runtime import (
     StorageManagedQueue,
     StorageRuntime,
@@ -145,6 +145,27 @@ class _RuntimeSidecarAnchor:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _RecoveryDirectoryAnchor:
+    """Pinned filesystem identity for the private execution-recovery directory."""
+
+    device: int
+    inode: int
+    owner: int
+    mode: int
+    descriptor: int | None = field(default=None, compare=False, repr=False)
+    windows_handle: int | None = field(default=None, compare=False, repr=False)
+
+    def as_metadata(self) -> dict[str, int]:
+        """Return the durable, non-handle portion of this directory identity."""
+        return {
+            "device": self.device,
+            "inode": self.inode,
+            "owner": self.owner,
+            "mode": self.mode,
+        }
+
+
 PACKAGE_PROGRESS_LOG_READ_BYTES = 1024 * 1024
 PACKAGE_PROGRESS_LOG_FINAL_MAX_BYTES = 64 * 1024 * 1024
 PROGRESS_SIDECAR_MAX_RECORD_BYTES = 64 * 1024
@@ -159,6 +180,46 @@ RUNTIME_SIDECAR_MAX_RECORDS = 4_096
 SIDECAR_DRAIN_CHUNK_BYTES = 64 * 1024
 MCP_PACKAGE_PROGRESS_BRIDGE_SCHEMA = "clio-relay.mcp-package-progress-bridge.v1"
 MCP_JARVIS_NATIVE_PROGRESS_BRIDGE_SCHEMA = "clio-relay.mcp-jarvis-progress-bridge.v1"
+MCP_JARVIS_EXECUTION_RECOVERY_SCHEMA = "clio-relay.jarvis-execution-recovery.v1"
+MCP_JARVIS_EXECUTION_QUERY_TIMEOUT_SECONDS = 60
+MCP_JARVIS_EXECUTION_QUERY_PROCESS_TIMEOUT_SECONDS = 75
+MCP_JARVIS_EXECUTION_RECOVERY_RESULT_MAX_BYTES = 16 * 1024 * 1024
+MCP_JARVIS_EXECUTION_RECOVERY_RETRY_BASE_SECONDS = 5
+MCP_JARVIS_EXECUTION_RECOVERY_RETRY_MAX_SECONDS = 300
+EXECUTION_CLEANUP_MAX_FOREGROUND_JOBS = 8
+MCP_RUNNER_BASE_ENV_NAMES = frozenset(
+    {
+        "APPDATA",
+        "COMSPEC",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LOCALAPPDATA",
+        "LOGNAME",
+        "NoDefaultCurrentDirectoryInExePath",
+        "PATH",
+        "PATHEXT",
+        "PYTHONIOENCODING",
+        "PYTHONUTF8",
+        "SHELL",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "USER",
+        "USERPROFILE",
+        "UV_CACHE_DIR",
+        "UV_PYTHON_INSTALL_DIR",
+        "UV_TOOL_DIR",
+        "WINDIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+    }
+)
 OUTPUT_EVENT_MAX_BYTES = 64 * 1024
 # One larger than the queue's enforced active-lease scan bound. Since a pending
 # cleanup marker blocks a second lease for its job, a full batch cannot consist
@@ -200,6 +261,7 @@ class EndpointWorker:
         provider: JarvisCdProvider | None = None,
         scheduler_provider: SchedulerProvider | None = None,
         storage_runtime: StorageRuntime | None = None,
+        reconcile_execution_cleanup: bool = True,
     ) -> None:
         if concurrency < 1:
             raise ConfigurationError("worker concurrency must be at least 1")
@@ -207,6 +269,8 @@ class EndpointWorker:
         self.cluster = cluster
         self.concurrency = concurrency
         self.kind_concurrency = normalize_kind_concurrency(kind_concurrency)
+        self.reconcile_execution_cleanup = reconcile_execution_cleanup
+        self._foreground_jobs_since_cleanup = 0
         self._closed = False
         self._queue_root_path: Path | None = None
         self._queue_root_identity: tuple[int, int] | None = None
@@ -343,8 +407,13 @@ class EndpointWorker:
         endpoint = self.endpoint or self.register()
         self.endpoint = self.queue.register_endpoint(endpoint)
         self.queue.recover_stale_jobs(cluster=self.cluster)
-        self._reconcile_pending_execution_cleanup()
         self._reconcile_canceled_scheduler_jobs()
+        if (
+            self.reconcile_execution_cleanup
+            and self._foreground_jobs_since_cleanup >= EXECUTION_CLEANUP_MAX_FOREGROUND_JOBS
+        ):
+            self._reconcile_pending_execution_cleanup()
+            self._foreground_jobs_since_cleanup = 0
         lease = self.queue.acquire_next_job(
             endpoint.endpoint_id,
             cluster=self.cluster,
@@ -352,6 +421,9 @@ class EndpointWorker:
             kind_concurrency=self.kind_concurrency,
         )
         if lease is None:
+            if self.reconcile_execution_cleanup:
+                self._reconcile_pending_execution_cleanup()
+                self._foreground_jobs_since_cleanup = 0
             return None
         job = self.queue.get_job(lease.job_id)
         try:
@@ -361,6 +433,8 @@ class EndpointWorker:
                 self._record_unhandled_job_failure(job, exc)
         finally:
             self.queue.release_lease(lease.lease_id)
+        if self.reconcile_execution_cleanup:
+            self._foreground_jobs_since_cleanup += 1
         return self.queue.get_job(job.job_id)
 
     def _record_unhandled_job_failure(self, job: RelayJob, error: Exception) -> None:
@@ -374,6 +448,32 @@ class EndpointWorker:
                 payload={"error": detail},
             )
             return
+        if isinstance(error, SchedulerSubmissionUnresolvedError):
+            pending_recovery_task_ids: list[str] = []
+            for task in self._bounded_job_tasks(job.job_id):
+                try:
+                    recovery_pending = _jarvis_execution_recovery_is_pending(
+                        current,
+                        task,
+                    )
+                except RelayError:
+                    recovery_pending = False
+                if recovery_pending:
+                    pending_recovery_task_ids.append(task.task_id)
+            if pending_recovery_task_ids:
+                self.queue.append_event(
+                    job.job_id,
+                    "jarvis.execution_reconciliation_deferred",
+                    "Relay response remains nonterminal while JARVIS ownership is queried",
+                    payload={
+                        "task_ids": pending_recovery_task_ids,
+                        "error": detail,
+                        "scheduler_cancel_requested": self._scheduler_cancel_was_requested(
+                            job.job_id
+                        ),
+                    },
+                )
+                return
         if isinstance(current.metadata.get("cancellation_request"), dict):
             self.queue.append_event(
                 job.job_id,
@@ -431,6 +531,7 @@ class EndpointWorker:
             queue=self.queue,
             scheduler_provider=self.scheduler_provider,
             storage_runtime=self.storage_runtime,
+            reconcile_execution_cleanup=index == 0,
         )
         endpoint = EndpointRegistration(
             role=self.role,
@@ -702,44 +803,81 @@ class EndpointWorker:
                 runtime_direct_proof_token.encode("utf-8")
             ).hexdigest(),
         }
+        jarvis_execution_recovery = _jarvis_execution_recovery_intent(
+            job,
+            created_at=started_at,
+        )
         sidecar_anchors[progress_sidecar] = progress_sidecar_anchor
         sidecar_anchors[runtime_sidecar] = runtime_sidecar_anchor
         sidecars.extend((progress_sidecar, runtime_sidecar))
-        self.queue.register_execution_cleanup(
-            task.task_id,
-            {
-                "execution_sidecars": {
-                    "schema_version": "clio-relay.execution-sidecars.v1",
-                    "progress": progress_sidecar.name,
-                    "progress_anchor": progress_sidecar_anchor.as_metadata(),
-                    "progress_anchor_required": True,
-                    "runtime": runtime_sidecar.name,
-                    "runtime_anchor": runtime_sidecar_anchor.as_metadata(),
-                    "scheduler_submission_intent": runtime_submission_intent,
-                },
-                "execution_cleanup": {
-                    "schema_version": EXECUTION_CLEANUP_SCHEMA,
-                    "launch_protocol": EXECUTION_LAUNCH_PROTOCOL,
-                    "acknowledgment_stage": "prepared",
-                    "sidecars": {
-                        "progress": _execution_sidecar_cleanup_plan(
-                            progress_sidecar,
-                            progress_sidecar_anchor,
-                        ),
-                        "runtime": _execution_sidecar_cleanup_plan(
-                            runtime_sidecar,
-                            runtime_sidecar_anchor,
-                        ),
-                    },
-                },
-                "runtime_sidecar_channel": {
-                    "schema_version": RUNTIME_SIDECAR_CHANNEL_SCHEMA,
-                    "state": "open",
-                    "opened_at": started_at.isoformat(),
-                    "evidence_retention": "whole_job_spool",
+        recovery_directory_anchor: _RecoveryDirectoryAnchor | None = None
+        if jarvis_execution_recovery is not None:
+            recovery_directory = spool.path / cast(
+                str,
+                jarvis_execution_recovery["recovery_directory_name"],
+            )
+            recovery_directory_anchor, _created = _open_or_create_recovery_directory(
+                recovery_directory,
+                expected_metadata=None,
+            )
+            jarvis_execution_recovery = {
+                **jarvis_execution_recovery,
+                "recovery_directory_anchor": recovery_directory_anchor.as_metadata(),
+            }
+        execution_cleanup_metadata: dict[str, object] = {
+            "execution_sidecars": {
+                "schema_version": "clio-relay.execution-sidecars.v1",
+                "progress": progress_sidecar.name,
+                "progress_anchor": progress_sidecar_anchor.as_metadata(),
+                "progress_anchor_required": True,
+                "runtime": runtime_sidecar.name,
+                "runtime_anchor": runtime_sidecar_anchor.as_metadata(),
+                "scheduler_submission_intent": runtime_submission_intent,
+            },
+            "execution_cleanup": {
+                "schema_version": EXECUTION_CLEANUP_SCHEMA,
+                "launch_protocol": EXECUTION_LAUNCH_PROTOCOL,
+                "acknowledgment_stage": "prepared",
+                "sidecars": {
+                    "progress": _execution_sidecar_cleanup_plan(
+                        progress_sidecar,
+                        progress_sidecar_anchor,
+                    ),
+                    "runtime": _execution_sidecar_cleanup_plan(
+                        runtime_sidecar,
+                        runtime_sidecar_anchor,
+                    ),
                 },
             },
-        )
+            "runtime_sidecar_channel": {
+                "schema_version": RUNTIME_SIDECAR_CHANNEL_SCHEMA,
+                "state": "open",
+                "opened_at": started_at.isoformat(),
+                "evidence_retention": "whole_job_spool",
+            },
+        }
+        if jarvis_execution_recovery is not None:
+            execution_cleanup_metadata["jarvis_execution_recovery"] = jarvis_execution_recovery
+        try:
+            self.queue.register_execution_cleanup(
+                task.task_id,
+                execution_cleanup_metadata,
+            )
+        finally:
+            if recovery_directory_anchor is not None:
+                _close_recovery_directory_anchor(recovery_directory_anchor)
+        if jarvis_execution_recovery is not None:
+            self.queue.append_event(
+                job.job_id,
+                "jarvis.execution_intent_persisted",
+                "JARVIS execution identity persisted before MCP dispatch",
+                payload={
+                    "task_id": task.task_id,
+                    "pipeline_id": jarvis_execution_recovery["pipeline_id"],
+                    "execution_id": jarvis_execution_recovery["execution_id"],
+                    "scheduler_expected": "unknown",
+                },
+            )
         sidecar_task_ids.append(task.task_id)
         runtime_sidecar_offset = [0]
         runtime_sidecar_record_count = [0]
@@ -888,7 +1026,7 @@ class EndpointWorker:
                 package_progress_provider=package_log_progress_adapter,
                 source_authority=PackageProgressSourceAuthority.PACKAGE_LOG,
             )
-        self._ingest_mcp_runtime_metadata(
+        mcp_runtime_ingested = self._ingest_mcp_runtime_metadata(
             job,
             task_id=task.task_id,
             spool=spool,
@@ -896,6 +1034,16 @@ class EndpointWorker:
             digests=runtime_metadata_digests,
             scheduler_job_ids=scheduler_job_ids,
         )
+        dispatch_recovered = False
+        if jarvis_execution_recovery is not None and not mcp_runtime_ingested:
+            dispatch_recovered = self._recover_jarvis_execution(
+                job,
+                task_id=task.task_id,
+                spool=spool,
+                state=runtime_metadata_state,
+                digests=runtime_metadata_digests,
+                scheduler_job_ids=scheduler_job_ids,
+            )
         scheduler_identity_reconciled = self._resolve_execution_ownership(
             job,
             task_id=task.task_id,
@@ -938,11 +1086,12 @@ class EndpointWorker:
         self.queue.append_artifact(spool.artifact_for(spool.path / "stderr.log", kind="stderr"))
         self.queue.append_artifact(spool.artifact_for(spool.log_capture_path, kind="log_capture"))
         self._append_optional_result_artifacts(job, spool)
+        effective_returncode = 0 if dispatch_recovered else result.returncode
         terminal_state = (
             JobState.CANCELED
             if self._job_cancellation_requested(job.job_id)
             else JobState.SUCCEEDED
-            if result.returncode == 0
+            if effective_returncode == 0
             else JobState.FAILED
         )
         self._append_provenance_artifact(
@@ -951,7 +1100,7 @@ class EndpointWorker:
             pipeline_path=pipeline_path,
             started_at=started_at.isoformat(),
             finished_at=utc_now().isoformat(),
-            returncode=result.returncode,
+            returncode=effective_returncode,
             terminal_state=terminal_state,
             runtime_metadata=runtime_metadata_state[0],
         )
@@ -971,12 +1120,16 @@ class EndpointWorker:
             )
             self.queue.acknowledge_job_cancellation(job.job_id)
             return
-        if result.returncode == 0:
+        if effective_returncode == 0:
             self.queue.update_task_state(
                 task.task_id,
                 JobState.SUCCEEDED,
                 message=f"Task succeeded: {task.name}",
-                metadata={"returncode": result.returncode},
+                metadata={
+                    "returncode": effective_returncode,
+                    "mcp_dispatch_recovered": dispatch_recovered,
+                    "mcp_transport_returncode": result.returncode,
+                },
             )
             self.queue.update_job_state(
                 job.job_id,
@@ -988,13 +1141,13 @@ class EndpointWorker:
             task.task_id,
             JobState.FAILED,
             message=f"Task failed: {task.name}",
-            metadata={"returncode": result.returncode},
+            metadata={"returncode": effective_returncode},
         )
         self.queue.update_job_state(
             job.job_id,
             JobState.FAILED,
             message="JARVIS-CD run failed",
-            error=f"exit code {result.returncode}",
+            error=f"exit code {effective_returncode}",
         )
 
     def _append_provenance_artifact(
@@ -1048,7 +1201,12 @@ class EndpointWorker:
                 },
             }
         )
-        self.queue.append_artifact(spool.artifact_for(provenance_path, kind="provenance"))
+        self._append_spool_artifact_once(
+            job,
+            spool,
+            provenance_path,
+            kind="provenance",
+        )
         self.queue.append_event(
             job.job_id,
             "provenance.available",
@@ -2048,15 +2206,15 @@ class EndpointWorker:
         state: list[JarvisRuntimeMetadata | None],
         digests: set[str],
         scheduler_job_ids: list[str],
-    ) -> None:
+    ) -> bool:
         """Ingest structured runtime metadata returned by a remote MCP call."""
         route_valid, _route_reason = _trusted_jarvis_mcp_route(job)
         if not route_valid:
-            return
+            return False
         result_path = spool.path / "mcp-result.json"
         storage_result_path = internal_filesystem_path(result_path)
         if not storage_result_path.exists():
-            return
+            return False
         try:
             result_document = json.loads(storage_result_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -2065,7 +2223,7 @@ class EndpointWorker:
                 "runtime.metadata_read_failed",
                 f"MCP runtime result could not be read: {exc}",
             )
-            return
+            return False
         trusted, reason = _trusted_jarvis_mcp_result(job, result_document)
         if not trusted:
             self.queue.append_event(
@@ -2078,7 +2236,7 @@ class EndpointWorker:
                     "reason": reason,
                 },
             )
-            return
+            return False
         try:
             metadata = runtime_metadata_from_mcp_result_document(result_document)
         except ValueError as exc:
@@ -2096,24 +2254,51 @@ class EndpointWorker:
                 f"native JARVIS execution documents were invalid: {exc}"
             ) from exc
         if metadata is None:
-            return
-        if _runtime_metadata_is_native(metadata):
-            expected_pipeline_id = (
-                job.spec.arguments.get("pipeline_id") if isinstance(job.spec, McpCallSpec) else None
+            return False
+        if not _runtime_metadata_is_native(metadata):
+            self.queue.append_event(
+                job.job_id,
+                "runtime.metadata_refused",
+                "Refused non-native JARVIS MCP execution metadata",
+                payload={
+                    "source": RuntimeMetadataSource.JARVIS_MCP.value,
+                    "ownership_verified": False,
+                    "reason": "native handle, record, and progress documents are required",
+                },
             )
-            if metadata.pipeline_id != expected_pipeline_id:
-                reason = "native JARVIS pipeline identity did not match the durable MCP request"
-                self.queue.append_event(
-                    job.job_id,
-                    "runtime.metadata_refused",
-                    f"Refused JARVIS MCP runtime metadata: {reason}",
-                    payload={
-                        "source": RuntimeMetadataSource.JARVIS_MCP.value,
-                        "ownership_verified": False,
-                        "reason": reason,
-                    },
-                )
-                raise ConfigurationError(reason)
+            return False
+        expected_pipeline_id = (
+            job.spec.arguments.get("pipeline_id") if isinstance(job.spec, McpCallSpec) else None
+        )
+        if metadata.pipeline_id != expected_pipeline_id:
+            reason = "native JARVIS pipeline identity did not match the durable MCP request"
+            self.queue.append_event(
+                job.job_id,
+                "runtime.metadata_refused",
+                f"Refused JARVIS MCP runtime metadata: {reason}",
+                payload={
+                    "source": RuntimeMetadataSource.JARVIS_MCP.value,
+                    "ownership_verified": False,
+                    "reason": reason,
+                },
+            )
+            raise ConfigurationError(reason)
+        expected_execution_id = (
+            job.spec.arguments.get("execution_id") if isinstance(job.spec, McpCallSpec) else None
+        )
+        if metadata.execution_id != expected_execution_id:
+            reason = "native JARVIS execution identity did not match the durable MCP request"
+            self.queue.append_event(
+                job.job_id,
+                "runtime.metadata_refused",
+                f"Refused JARVIS MCP runtime metadata: {reason}",
+                payload={
+                    "source": RuntimeMetadataSource.JARVIS_MCP.value,
+                    "ownership_verified": False,
+                    "reason": reason,
+                },
+            )
+            raise ConfigurationError(reason)
         current_runtime = state[0]
         superseded_transport_runtime = (
             current_runtime
@@ -2131,6 +2316,795 @@ class EndpointWorker:
             scheduler_job_ids=scheduler_job_ids,
             superseded_transport_runtime=superseded_transport_runtime,
         )
+        self._resolve_jarvis_execution_recovery(
+            job,
+            task_id=task_id,
+            metadata=metadata,
+            resolution="dispatch_result",
+            result_path=result_path,
+        )
+        return True
+
+    def _recover_jarvis_execution(
+        self,
+        job: RelayJob,
+        *,
+        task_id: str,
+        spool: JobSpool,
+        state: list[JarvisRuntimeMetadata | None],
+        digests: set[str],
+        scheduler_job_ids: list[str],
+    ) -> bool:
+        """Recover an owned JARVIS execution after its run response was lost."""
+        task = self.queue.get_task(task_id)
+        intent = _durable_jarvis_execution_recovery(job, task)
+        if intent is None:
+            return False
+        if intent["state"] == "resolved":
+            return True
+        if intent["dispatch_state"] != "started":
+            raise SchedulerSubmissionUnresolvedError(
+                "JARVIS execution recovery refused an unreleased dispatch"
+            )
+        assert isinstance(job.spec, McpCallSpec)
+        attempt = cast(int, intent["attempts"]) + 1
+        attempted_at = utc_now()
+        self.queue.update_task_metadata(
+            task_id,
+            {
+                "jarvis_execution_recovery": {
+                    **intent,
+                    "attempts": attempt,
+                    "last_attempt_at": attempted_at.isoformat(),
+                    "last_error": None,
+                    "next_retry_at": None,
+                    "result_sha256": None,
+                    "query_process": None,
+                }
+            },
+        )
+        self.queue.append_event(
+            job.job_id,
+            "jarvis.execution_recovery_started",
+            "Querying the durable JARVIS execution after its run response was unavailable",
+            payload={
+                "task_id": task_id,
+                "pipeline_id": intent["pipeline_id"],
+                "execution_id": intent["execution_id"],
+                "attempt": attempt,
+            },
+        )
+        recovery_spec = McpCallSpec(
+            server=job.spec.server,
+            server_args=job.spec.server_args,
+            env_from=job.spec.env_from,
+            expected_server_artifact_digest=job.spec.expected_server_artifact_digest,
+            expected_jarvis_cd_lock_binding=job.spec.expected_jarvis_cd_lock_binding,
+            tool="jarvis_get_execution",
+            arguments={
+                "pipeline_id": intent["pipeline_id"],
+                "execution_id": intent["execution_id"],
+                "include_progress": True,
+                "include_service_runtimes": False,
+            },
+            timeout_seconds=MCP_JARVIS_EXECUTION_QUERY_TIMEOUT_SECONDS,
+        )
+        recovery_job = job.model_copy(update={"spec": recovery_spec})
+        try:
+            completed, result_payload, result_path = self._run_jarvis_execution_recovery_query(
+                job,
+                task_id=task_id,
+                spool=spool,
+                intent=intent,
+                recovery_spec=recovery_spec,
+                attempt=attempt,
+            )
+        except Exception as exc:
+            self._record_jarvis_recovery_failure(
+                job,
+                task_id=task_id,
+                error=f"{type(exc).__name__}: {exc}",
+                result_sha256=None,
+            )
+            raise SchedulerSubmissionUnresolvedError(
+                "artifact-pinned JARVIS execution recovery transport is unavailable"
+            ) from exc
+        if completed.returncode != 0:
+            detail = bounded_error_detail(completed.stderr or completed.stdout or "no detail")
+            self._record_jarvis_recovery_failure(
+                job,
+                task_id=task_id,
+                error=f"recovery query exited {completed.returncode}: {detail}",
+                result_sha256=None,
+            )
+            raise SchedulerSubmissionUnresolvedError(
+                "artifact-pinned JARVIS execution recovery did not return a valid execution"
+            )
+        try:
+            document = json.loads(result_payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._record_jarvis_recovery_failure(
+                job,
+                task_id=task_id,
+                error=f"recovery result could not be read: {exc}",
+                result_sha256=hashlib.sha256(result_payload).hexdigest(),
+            )
+            raise SchedulerSubmissionUnresolvedError(
+                "artifact-pinned JARVIS execution recovery result is unavailable"
+            ) from exc
+        result_sha256 = hashlib.sha256(result_payload).hexdigest()
+        trusted, reason = _trusted_jarvis_mcp_result(
+            recovery_job,
+            document,
+            expected_tool="jarvis_get_execution",
+        )
+        if not trusted or not _trusted_jarvis_execution_query_validation(
+            document,
+            pipeline_id=cast(str, intent["pipeline_id"]),
+            execution_id=cast(str, intent["execution_id"]),
+        ):
+            detail = reason if not trusted else "runner execution-query validation did not match"
+            self._record_jarvis_recovery_failure(
+                job,
+                task_id=task_id,
+                error=detail,
+                result_sha256=result_sha256,
+            )
+            raise SchedulerSubmissionUnresolvedError(
+                "artifact-pinned JARVIS execution recovery result was not trusted"
+            )
+        parser_document = {**cast(dict[str, object], document), "tool": "jarvis_run"}
+        try:
+            metadata = runtime_metadata_from_mcp_result_document(parser_document)
+        except ValueError as exc:
+            self._record_jarvis_recovery_failure(
+                job,
+                task_id=task_id,
+                error=f"native recovery documents were invalid: {exc}",
+                result_sha256=result_sha256,
+            )
+            raise SchedulerSubmissionUnresolvedError(
+                "artifact-pinned JARVIS execution recovery documents were invalid"
+            ) from exc
+        if (
+            metadata is None
+            or not _runtime_metadata_is_native(metadata)
+            or metadata.pipeline_id != intent["pipeline_id"]
+            or metadata.execution_id != intent["execution_id"]
+        ):
+            self._record_jarvis_recovery_failure(
+                job,
+                task_id=task_id,
+                error="native recovery identity did not match the durable execution intent",
+                result_sha256=result_sha256,
+            )
+            raise SchedulerSubmissionUnresolvedError(
+                "artifact-pinned JARVIS execution recovery identity did not match"
+            )
+        execution_created_at = _native_runtime_created_at(metadata)
+        intent_created_at = _recovery_timestamp(cast(str, intent["created_at"]))
+        if intent_created_at is None or execution_created_at < intent_created_at:
+            self._record_jarvis_recovery_failure(
+                job,
+                task_id=task_id,
+                error=("native execution predates the relay dispatch intent and cannot be adopted"),
+                result_sha256=result_sha256,
+            )
+            raise SchedulerSubmissionUnresolvedError(
+                "artifact-pinned JARVIS recovery refused a pre-existing execution"
+            )
+        metadata = metadata.model_copy(
+            update={
+                "details": {
+                    **metadata.details,
+                    "relay_execution_recovery": {
+                        "schema_version": MCP_JARVIS_EXECUTION_RECOVERY_SCHEMA,
+                        "pipeline_id": intent["pipeline_id"],
+                        "execution_id": intent["execution_id"],
+                        "expected_server_artifact_digest": (
+                            intent["expected_server_artifact_digest"]
+                        ),
+                        "result_sha256": result_sha256,
+                        "attempt": attempt,
+                    },
+                }
+            }
+        )
+        current_runtime = state[0]
+        superseded_transport_runtime = (
+            current_runtime
+            if current_runtime is not None
+            and current_runtime.execution_id != metadata.execution_id
+            and _runtime_metadata_is_mcp_transport_wrapper(current_runtime)
+            else None
+        )
+        self._persist_runtime_metadata(
+            job,
+            task_id=task_id,
+            metadata=metadata,
+            state=state,
+            digests=digests,
+            scheduler_job_ids=scheduler_job_ids,
+            superseded_transport_runtime=superseded_transport_runtime,
+            allow_artifact_pinned_recovery=True,
+        )
+        if state[0] is None or state[0].execution_id != intent["execution_id"]:
+            self._record_jarvis_recovery_failure(
+                job,
+                task_id=task_id,
+                error="recovered runtime metadata could not be persisted",
+                result_sha256=result_sha256,
+            )
+            raise SchedulerSubmissionUnresolvedError(
+                "artifact-pinned JARVIS execution recovery could not be persisted"
+            )
+        recovered_mode = _native_runtime_execution_mode(metadata)
+        if recovered_mode == "scheduler" and (
+            metadata.scheduler_provider is None or metadata.scheduler_job_id is None
+        ):
+            self._record_jarvis_recovery_failure(
+                job,
+                task_id=task_id,
+                error=(
+                    "scheduled JARVIS execution is durable but its scheduler identity "
+                    "is not available yet"
+                ),
+                result_sha256=result_sha256,
+            )
+            raise SchedulerSubmissionUnresolvedError(
+                "scheduled JARVIS execution recovery is awaiting scheduler identity"
+            )
+        self._write_recovered_jarvis_run_result(
+            job,
+            query_document=cast(dict[str, object], document),
+            spool=spool,
+            recovery_result_sha256=result_sha256,
+        )
+        self._resolve_jarvis_execution_recovery(
+            job,
+            task_id=task_id,
+            metadata=metadata,
+            resolution="execution_query",
+            result_path=result_path,
+            verified_result_sha256=result_sha256,
+        )
+        return True
+
+    def _run_jarvis_execution_recovery_query(
+        self,
+        job: RelayJob,
+        *,
+        task_id: str,
+        spool: JobSpool,
+        intent: dict[str, Any],
+        recovery_spec: McpCallSpec,
+        attempt: int,
+    ) -> tuple[subprocess.CompletedProcess[str], bytes, Path]:
+        """Run one query inside a pinned private directory and return trusted bytes."""
+        if not isinstance(job.spec, McpCallSpec):
+            raise RelayError("JARVIS execution recovery requires an MCP call spec")
+        recovery_directory = spool.path / cast(str, intent["recovery_directory_name"])
+        result_path = recovery_directory / "mcp-result.json"
+        params_path = recovery_directory / "params.json"
+        anchor, _created = _open_or_create_recovery_directory(
+            recovery_directory,
+            expected_metadata=intent.get("recovery_directory_anchor"),
+        )
+        try:
+            _remove_owned_recovery_output(
+                result_path,
+                directory_anchor=anchor,
+            )
+            _write_private_json_file(
+                params_path,
+                recovery_spec.model_dump(mode="json", exclude_none=True),
+                directory_anchor=anchor,
+            )
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import json,sys; from pathlib import Path; "
+                    "from clio_relay.mcp_call.runner import run_mcp_call_from_params; "
+                    "params=json.loads(Path(sys.argv[1]).read_text(encoding='utf-8')); "
+                    "raise SystemExit(run_mcp_call_from_params(params))"
+                ),
+                params_path.name,
+            ]
+
+            def record_started(process_id: int) -> None:
+                _validate_recovery_process_cwd(
+                    process_id,
+                    directory=recovery_directory,
+                    anchor=anchor,
+                )
+                self._record_jarvis_recovery_process(
+                    job,
+                    task_id=task_id,
+                    process_id=process_id,
+                )
+
+            try:
+                completed = self.provider.run_command_streaming(
+                    command,
+                    cwd=internal_filesystem_path(recovery_directory),
+                    env=_minimal_mcp_runner_environment(job.spec.env_from),
+                    on_start=record_started,
+                    timeout_seconds=MCP_JARVIS_EXECUTION_QUERY_PROCESS_TIMEOUT_SECONDS,
+                    on_timeout=lambda: self._record_jarvis_recovery_query_timeout(
+                        job,
+                        task_id=task_id,
+                        attempt=attempt,
+                    ),
+                )
+            finally:
+                self._clear_jarvis_recovery_process(job, task_id=task_id)
+            _validate_recovery_directory_path(recovery_directory, anchor)
+            payload = (
+                _read_owned_recovery_result(result_path, directory_anchor=anchor)
+                if completed.returncode == 0
+                else b""
+            )
+            return completed, payload, result_path
+        finally:
+            _close_recovery_directory_anchor(anchor)
+
+    @contextmanager
+    def _jarvis_execution_recovery_claim(
+        self,
+        job: RelayJob,
+        *,
+        task: RelayTask,
+    ) -> Generator[None, None, None]:
+        """Serialize restart recovery across manual and supervised workers."""
+        intent = _durable_jarvis_execution_recovery(job, task)
+        if intent is None or intent["state"] != "pending":
+            raise SchedulerSubmissionUnresolvedError(
+                "JARVIS execution recovery no longer has a pending intent"
+            )
+        recovery_directory = (
+            self.settings.spool_dir
+            / job.job_id
+            / cast(
+                str,
+                intent["recovery_directory_name"],
+            )
+        )
+        anchor, _created = _open_or_create_recovery_directory(
+            recovery_directory,
+            expected_metadata=intent["recovery_directory_anchor"],
+        )
+        _close_recovery_directory_anchor(anchor)
+        claim = FileLock(str(internal_filesystem_path(recovery_directory / ".claim.lock")))
+        try:
+            claim.acquire(timeout=0)
+        except Timeout as exc:
+            raise SchedulerSubmissionUnresolvedError(
+                "another worker owns the JARVIS execution recovery claim"
+            ) from exc
+        try:
+            refreshed = self.queue.get_task(task.task_id)
+            refreshed_intent = _durable_jarvis_execution_recovery(job, refreshed)
+            if refreshed_intent is None or refreshed_intent["state"] != "pending":
+                raise SchedulerSubmissionUnresolvedError(
+                    "JARVIS execution recovery resolved before claim acquisition"
+                )
+            yield
+        finally:
+            claim.release()
+
+    def _record_jarvis_recovery_process(
+        self,
+        job: RelayJob,
+        *,
+        task_id: str,
+        process_id: int,
+    ) -> None:
+        """Persist exact ownership of the read-only recovery query process."""
+        task = self.queue.get_task(task_id)
+        intent = _durable_jarvis_execution_recovery(job, task)
+        if intent is None or intent["state"] != "pending":
+            raise RelayError("JARVIS execution recovery process has no pending intent")
+        start_identity = process_containment.process_start_identity(process_id)
+        if start_identity is None:
+            start_identity = f"process-not-observed:{process_id}"
+        ownership = {
+            "schema_version": "clio-relay.execution-ownership.v1",
+            "pid": process_id,
+            "hostname": socket.gethostname(),
+            "process_start_identity": start_identity,
+            "process_group_id": process_id if os.name != "nt" else None,
+            "started_at": utc_now().isoformat(),
+            "endpoint_id": None if self.endpoint is None else self.endpoint.endpoint_id,
+            "containment": process_containment.owned_process_metadata(process_id),
+        }
+        self.queue.update_task_metadata(
+            task_id,
+            {"jarvis_execution_recovery": {**intent, "query_process": ownership}},
+        )
+
+    def _record_jarvis_recovery_query_timeout(
+        self,
+        job: RelayJob,
+        *,
+        task_id: str,
+        attempt: int,
+    ) -> None:
+        """Record a recovery transport timeout without requesting cancellation."""
+        self.queue.append_event(
+            job.job_id,
+            "jarvis.execution_recovery_query_timeout",
+            "Artifact-pinned JARVIS execution recovery query timed out",
+            payload={
+                "task_id": task_id,
+                "attempt": attempt,
+                "scheduler_cancel_requested": False,
+            },
+        )
+
+    def _clear_jarvis_recovery_process(self, job: RelayJob, *, task_id: str) -> None:
+        """Clear recovery process ownership after the process has terminated."""
+        task = self.queue.get_task(task_id)
+        intent = _durable_jarvis_execution_recovery(job, task)
+        if intent is None or intent.get("query_process") is None:
+            return
+        self.queue.update_task_metadata(
+            task_id,
+            {"jarvis_execution_recovery": {**intent, "query_process": None}},
+        )
+
+    def _record_jarvis_recovery_failure(
+        self,
+        job: RelayJob,
+        *,
+        task_id: str,
+        error: str,
+        result_sha256: str | None,
+    ) -> None:
+        """Keep a failed recovery durable and retryable without cancellation intent."""
+        task = self.queue.get_task(task_id)
+        intent = _durable_jarvis_execution_recovery(job, task)
+        if intent is None:
+            raise RelayError("JARVIS execution recovery failure has no durable intent")
+        if intent["state"] != "pending" or intent["dispatch_state"] != "started":
+            raise RelayError("JARVIS execution recovery failure is not pending dispatch")
+        bounded = bounded_error_detail(error)
+        attempts = cast(int, intent["attempts"])
+        exponent = min(max(attempts - 1, 0), 16)
+        retry_delay_seconds = min(
+            MCP_JARVIS_EXECUTION_RECOVERY_RETRY_BASE_SECONDS * (2**exponent),
+            MCP_JARVIS_EXECUTION_RECOVERY_RETRY_MAX_SECONDS,
+        )
+        next_retry_at = utc_now() + timedelta(seconds=retry_delay_seconds)
+        self.queue.update_task_metadata(
+            task_id,
+            {
+                "jarvis_execution_recovery": {
+                    **intent,
+                    "state": "pending",
+                    "last_error": bounded,
+                    "next_retry_at": next_retry_at.isoformat(),
+                    "result_sha256": result_sha256,
+                    "query_process": None,
+                }
+            },
+        )
+        self.queue.append_event(
+            job.job_id,
+            "jarvis.execution_recovery_pending",
+            "JARVIS execution recovery remains pending for endpoint reconciliation",
+            payload={
+                "task_id": task_id,
+                "pipeline_id": intent["pipeline_id"],
+                "execution_id": intent["execution_id"],
+                "error": bounded,
+                "attempt": attempts,
+                "retry_delay_seconds": retry_delay_seconds,
+                "next_retry_at": next_retry_at.isoformat(),
+                "scheduler_cancel_requested": False,
+            },
+        )
+
+    def _resolve_jarvis_execution_recovery(
+        self,
+        job: RelayJob,
+        *,
+        task_id: str,
+        metadata: JarvisRuntimeMetadata,
+        resolution: str,
+        result_path: Path,
+        verified_result_sha256: str | None = None,
+    ) -> None:
+        """Mark one exact native execution observation as the recovery resolution."""
+        task = self.queue.get_task(task_id)
+        intent = _durable_jarvis_execution_recovery(job, task)
+        if intent is None:
+            return
+        if (
+            intent["state"] != "pending"
+            or intent["dispatch_state"] != "started"
+            or not _runtime_metadata_is_native(metadata)
+            or metadata.pipeline_id != intent["pipeline_id"]
+            or metadata.execution_id != intent["execution_id"]
+            or resolution not in {"dispatch_result", "execution_query"}
+        ):
+            raise RelayError("JARVIS execution recovery resolution did not match its intent")
+        execution_mode = _native_runtime_execution_mode(metadata)
+        scheduler_identity_present = (
+            metadata.scheduler_provider is not None or metadata.scheduler_job_id is not None
+        )
+        if execution_mode == "direct" and scheduler_identity_present:
+            raise RelayError("direct JARVIS execution recovery carried scheduler identity")
+        if execution_mode == "scheduler" and (
+            metadata.scheduler_provider is None or metadata.scheduler_job_id is None
+        ):
+            raise SchedulerSubmissionUnresolvedError(
+                "scheduled JARVIS execution recovery is awaiting scheduler identity"
+            )
+        if verified_result_sha256 is None:
+            storage_result = internal_filesystem_path(result_path)
+            if not storage_result.is_file():
+                raise RelayError("JARVIS execution recovery resolution has no result artifact")
+            result_sha256 = hashlib.sha256(storage_result.read_bytes()).hexdigest()
+        else:
+            if not re.fullmatch(r"[0-9a-f]{64}", verified_result_sha256):
+                raise RelayError("JARVIS execution recovery result hash is invalid")
+            result_sha256 = verified_result_sha256
+        resolved = {
+            **intent,
+            "state": "resolved",
+            "last_error": None,
+            "next_retry_at": None,
+            "result_sha256": result_sha256,
+            "resolved_at": utc_now().isoformat(),
+            "resolution": resolution,
+            "scheduler_provider": metadata.scheduler_provider,
+            "scheduler_job_id": metadata.scheduler_job_id,
+            "query_process": None,
+        }
+        updates: dict[str, object] = {"jarvis_execution_recovery": resolved}
+        if metadata.scheduler_provider is None and metadata.scheduler_job_id is None:
+            sidecars = task.metadata.get("execution_sidecars")
+            if isinstance(sidecars, dict):
+                updates["execution_sidecars"] = {
+                    **cast(dict[str, object], sidecars),
+                    "scheduler_expected_resolved": False,
+                }
+        self.queue.update_task_metadata(task_id, updates)
+        self.queue.append_event(
+            job.job_id,
+            "jarvis.execution_recovered",
+            "JARVIS execution ownership resolved from native durable metadata",
+            payload={
+                "task_id": task_id,
+                "pipeline_id": metadata.pipeline_id,
+                "execution_id": metadata.execution_id,
+                "scheduler_provider": metadata.scheduler_provider,
+                "scheduler_job_id": metadata.scheduler_job_id,
+                "resolution": resolution,
+                "result_sha256": result_sha256,
+            },
+        )
+
+    def _write_recovered_jarvis_run_result(
+        self,
+        job: RelayJob,
+        *,
+        query_document: dict[str, object],
+        spool: JobSpool,
+        recovery_result_sha256: str,
+    ) -> None:
+        """Project a validated execution query back into the lost run response."""
+        if not isinstance(job.spec, McpCallSpec) or job.spec.tool != "jarvis_run":
+            raise RelayError("recovered JARVIS run result has no trusted run spec")
+        raw_structured = query_document.get("structured_result")
+        if not isinstance(raw_structured, dict):
+            raise RelayError("recovered JARVIS execution query has no structured result")
+        structured = cast(dict[str, object], raw_structured)
+        handle = structured.get("execution_handle")
+        record = structured.get("execution_record")
+        progress = structured.get("progress")
+        runtime = structured.get("runtime_metadata")
+        if not all(isinstance(item, dict) for item in (handle, record, progress, runtime)):
+            raise RelayError("recovered JARVIS execution query omitted native documents")
+        typed_handle = cast(dict[str, object], handle)
+        typed_record = cast(dict[str, object], record)
+        typed_runtime = cast(dict[str, object], runtime)
+        script_path = typed_runtime.get("script_path")
+        if script_path is not None and not isinstance(script_path, str):
+            raise RelayError("recovered JARVIS runtime script_path is invalid")
+        run_result: dict[str, object] = {
+            "schema_version": "clio-kit.jarvis-run.v1",
+            "pipeline_id": structured.get("pipeline_id"),
+            "execution_id": structured.get("execution_id"),
+            "status": typed_record.get("state"),
+            "mode": typed_handle.get("mode"),
+            "scheduler": None,
+            "script_path": script_path,
+            "wait": False,
+            "execution_handle": handle,
+            "execution_record": record,
+            "progress": progress,
+            "runtime_metadata": runtime,
+        }
+        recovered_document: dict[str, object] = {
+            **query_document,
+            "tool": "jarvis_run",
+            "arguments": job.spec.arguments,
+            "protocol_result": {"structuredContent": run_result},
+            "structured_result": run_result,
+            "returncode": 0,
+            "timed_out": False,
+            "protocol_error": None,
+            "stdout": "",
+            "stderr": "",
+            "result_validation": None,
+            "package_progress_bridge": None,
+            "relay_recovery": {
+                "schema_version": MCP_JARVIS_EXECUTION_RECOVERY_SCHEMA,
+                "source_tool": "jarvis_get_execution",
+                "source_result_sha256": recovery_result_sha256,
+            },
+        }
+        trusted, reason = _trusted_jarvis_mcp_result(job, recovered_document)
+        if not trusted:
+            raise RelayError(f"recovered JARVIS run result was not trusted: {reason}")
+        destination = spool.path / "mcp-result.json"
+        _write_private_json_file(destination, recovered_document)
+        self.queue.append_event(
+            job.job_id,
+            "mcp.dispatch_recovered",
+            "Lost JARVIS run response was reconstructed from its durable execution query",
+            payload={
+                "pipeline_id": structured.get("pipeline_id"),
+                "execution_id": structured.get("execution_id"),
+                "source_result_sha256": recovery_result_sha256,
+            },
+        )
+
+    def _validated_recovered_jarvis_dispatch(
+        self,
+        job: RelayJob,
+        *,
+        task: RelayTask,
+        spool: JobSpool,
+    ) -> JarvisRuntimeMetadata:
+        """Reload one resolved, exact JARVIS response after a worker restart."""
+        intent = _durable_jarvis_execution_recovery(job, task)
+        if intent is None or intent["state"] != "resolved":
+            raise SchedulerSubmissionUnresolvedError("JARVIS execution response has not resolved")
+        result_path = spool.path / "mcp-result.json"
+        try:
+            snapshot = read_owned_regular_file_bytes(
+                result_path,
+                owned_root=spool.path,
+                max_bytes=MCP_JARVIS_EXECUTION_RECOVERY_RESULT_MAX_BYTES,
+            )
+            if snapshot.data is None:
+                raise RelayError("resolved JARVIS result snapshot omitted its bytes")
+            document = json.loads(snapshot.data.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RuntimeError) as exc:
+            raise SchedulerSubmissionUnresolvedError(
+                f"resolved JARVIS result could not be reloaded: {exc}"
+            ) from exc
+        trusted, reason = _trusted_jarvis_mcp_result(job, document)
+        if not trusted:
+            raise SchedulerSubmissionUnresolvedError(
+                f"resolved JARVIS result was not trusted: {reason}"
+            )
+        typed_document = cast(dict[str, object], document)
+        try:
+            metadata = runtime_metadata_from_mcp_result_document(typed_document)
+        except ValueError as exc:
+            raise SchedulerSubmissionUnresolvedError(
+                f"resolved JARVIS runtime documents were invalid: {exc}"
+            ) from exc
+        if (
+            metadata is None
+            or not _runtime_metadata_is_native(metadata)
+            or metadata.pipeline_id != intent["pipeline_id"]
+            or metadata.execution_id != intent["execution_id"]
+            or metadata.scheduler_provider != intent["scheduler_provider"]
+            or metadata.scheduler_job_id != intent["scheduler_job_id"]
+        ):
+            raise SchedulerSubmissionUnresolvedError(
+                "resolved JARVIS runtime identity did not match its durable intent"
+            )
+        resolution = intent.get("resolution")
+        result_sha256 = intent.get("result_sha256")
+        if resolution == "dispatch_result":
+            if result_sha256 != snapshot.sha256:
+                raise SchedulerSubmissionUnresolvedError(
+                    "resolved JARVIS dispatch result changed after recovery"
+                )
+        elif resolution == "execution_query":
+            raw_recovery = typed_document.get("relay_recovery")
+            recovery = (
+                cast(dict[str, object], raw_recovery) if isinstance(raw_recovery, dict) else None
+            )
+            if (
+                not isinstance(recovery, dict)
+                or recovery.get("schema_version") != MCP_JARVIS_EXECUTION_RECOVERY_SCHEMA
+                or recovery.get("source_tool") != "jarvis_get_execution"
+                or recovery.get("source_result_sha256") != result_sha256
+            ):
+                raise SchedulerSubmissionUnresolvedError(
+                    "reconstructed JARVIS result lost its exact query provenance"
+                )
+        else:
+            raise SchedulerSubmissionUnresolvedError(
+                "resolved JARVIS response has an unsupported resolution"
+            )
+        return metadata
+
+    def _finalize_recovered_jarvis_dispatch(
+        self,
+        job: RelayJob,
+        *,
+        task: RelayTask,
+        spool: JobSpool,
+        runtime_metadata: JarvisRuntimeMetadata,
+    ) -> None:
+        """Index an eventually recovered handle-first response exactly once."""
+        intent = _durable_jarvis_execution_recovery(job, task)
+        if intent is None or intent["state"] != "resolved":
+            raise RelayError("cannot finalize an unresolved JARVIS response")
+        runtime_metadata_path = spool.path / "runtime-metadata.json"
+        if not internal_filesystem_path(runtime_metadata_path).exists():
+            spool.write_runtime_metadata(runtime_metadata.model_dump(mode="json"))
+        if self._append_spool_artifact_once(
+            job,
+            spool,
+            runtime_metadata_path,
+            kind="runtime_metadata",
+        ):
+            self.queue.append_event(
+                job.job_id,
+                "runtime.metadata_available",
+                "Structured runtime metadata available",
+                payload={
+                    "path": str(runtime_metadata_path),
+                    "source": runtime_metadata.source.value,
+                },
+            )
+        for kind, path in (
+            ("stdout", spool.path / "stdout.log"),
+            ("stderr", spool.path / "stderr.log"),
+            ("log_capture", spool.log_capture_path),
+            ("mcp_result", spool.path / "mcp-result.json"),
+        ):
+            if not internal_filesystem_path(path).is_file():
+                raise RelayError(f"recovered JARVIS spool omitted {kind}: {path}")
+            created = self._append_spool_artifact_once(job, spool, path, kind=kind)
+            if created and kind == "mcp_result":
+                self.queue.append_event(
+                    job.job_id,
+                    "mcp_result.available",
+                    "Result artifact available: mcp_result",
+                    payload={"path": str(path)},
+                )
+        provenance_path = spool.path / "provenance.json"
+        if internal_filesystem_path(provenance_path).is_file():
+            self._append_spool_artifact_once(
+                job,
+                spool,
+                provenance_path,
+                kind="provenance",
+            )
+            return
+        pipeline_path = spool.path / "pipeline.yaml"
+        if not internal_filesystem_path(pipeline_path).is_file():
+            pipeline_path = spool.path / "pipeline-reference.json"
+        self._append_provenance_artifact(
+            job,
+            spool,
+            pipeline_path=pipeline_path,
+            started_at=cast(str, intent["created_at"]),
+            finished_at=cast(str, intent["resolved_at"]),
+            returncode=0,
+            terminal_state=JobState.SUCCEEDED,
+            runtime_metadata=runtime_metadata,
+        )
 
     def _persist_runtime_metadata(
         self,
@@ -2142,14 +3116,28 @@ class EndpointWorker:
         digests: set[str],
         scheduler_job_ids: list[str],
         superseded_transport_runtime: JarvisRuntimeMetadata | None = None,
+        allow_artifact_pinned_recovery: bool = False,
     ) -> None:
         """Persist one normalized runtime observation to job, task, and events."""
         task = self.queue.get_task(task_id)
         failed_channel = _runtime_sidecar_channel_failed(task)
+        recovery_intent = _durable_jarvis_execution_recovery(job, task)
+        recovery_authorized = (
+            allow_artifact_pinned_recovery
+            and recovery_intent is not None
+            and recovery_intent["state"] == "pending"
+            and metadata.source is RuntimeMetadataSource.JARVIS_MCP
+            and _runtime_metadata_is_native(metadata)
+            and metadata.pipeline_id == recovery_intent["pipeline_id"]
+            and metadata.execution_id == recovery_intent["execution_id"]
+        )
         incoming_reconciliation = _runtime_metadata_exact_marker_reconciliation(metadata)
         if failed_channel and (
-            metadata.source is not RuntimeMetadataSource.RELAY_RECONCILIATION
-            or incoming_reconciliation is None
+            not recovery_authorized
+            and (
+                metadata.source is not RuntimeMetadataSource.RELAY_RECONCILIATION
+                or incoming_reconciliation is None
+            )
         ):
             state[0] = None
             digests.clear()
@@ -2425,6 +3413,30 @@ class EndpointWorker:
         """Prove direct execution or scheduler ownership before cleanup can succeed."""
         task = self.queue.get_task(task_id)
         intent = _durable_scheduler_submission_intent(task)
+        recovery_intent = _durable_jarvis_execution_recovery(job, task)
+        if recovery_intent is not None and recovery_intent["state"] == "resolved":
+            recovered_provider = recovery_intent.get("scheduler_provider")
+            recovered_job_id = recovery_intent.get("scheduler_job_id")
+            if recovered_provider is None and recovered_job_id is None:
+                return False
+            if not isinstance(recovered_provider, str) or not isinstance(
+                recovered_job_id,
+                str,
+            ):
+                raise SchedulerSubmissionUnresolvedError(
+                    "recovered JARVIS scheduler identity is incomplete"
+                )
+            owned_ids = _owned_scheduler_job_ids_from_metadata(
+                task.metadata,
+                relay_job_id=job.job_id,
+                task_id=task_id,
+            )
+            if owned_ids != [recovered_job_id]:
+                raise SchedulerSubmissionUnresolvedError(
+                    "recovered JARVIS scheduler ownership did not match task metadata"
+                )
+            scheduler_job_ids[:] = owned_ids
+            return True
         if intent["scheduler_expected"] is False:
             return False
         if _task_scheduler_submission_refused(task):
@@ -2971,17 +3983,27 @@ class EndpointWorker:
         start_identity = process_containment.process_start_identity(pid)
         if start_identity is None:
             start_identity = f"process-not-observed:{pid}"
+        started_at = utc_now().isoformat()
         execution = {
             "schema_version": "clio-relay.execution-ownership.v1",
             "pid": pid,
             "hostname": socket.gethostname(),
             "process_start_identity": start_identity,
             "process_group_id": pid if os.name != "nt" else None,
-            "started_at": utc_now().isoformat(),
+            "started_at": started_at,
             "endpoint_id": None if self.endpoint is None else self.endpoint.endpoint_id,
             "containment": process_containment.owned_process_metadata(pid),
         }
-        self.queue.update_task_metadata(task.task_id, {"execution_ownership": execution})
+        current_task = self.queue.get_task(task.task_id)
+        recovery_intent = _durable_jarvis_execution_recovery(job, current_task)
+        start_metadata: dict[str, object] = {"execution_ownership": execution}
+        if recovery_intent is not None and recovery_intent["state"] == "pending":
+            start_metadata["jarvis_execution_recovery"] = {
+                **recovery_intent,
+                "dispatch_state": "started",
+                "dispatch_started_at": started_at,
+            }
+        self.queue.update_task_metadata(task.task_id, start_metadata)
         self.queue.append_event(
             job.job_id,
             "execution.started",
@@ -3027,34 +4049,169 @@ class EndpointWorker:
                 continue
             if any(not lease.is_expired() for lease in leases):
                 continue
+            recovery_intent = _durable_jarvis_execution_recovery(job, task)
+            if (
+                recovery_intent is not None
+                and recovery_intent["state"] == "pending"
+                and not _jarvis_execution_recovery_retry_due(recovery_intent)
+            ):
+                continue
             eligible += 1
             try:
+                recovered_dispatch = False
+                dispatch_not_released = False
+                recovered_runtime: JarvisRuntimeMetadata | None = None
+                recovery_spool: JobSpool | None = None
                 process_id = self._terminate_recorded_execution(
                     task,
                     allow_unstarted=True,
                 )
-                self._reconcile_recorded_scheduler_submission(job, task)
-                cleanup_metadata = self._remove_recorded_execution_sidecars(job, task)
+                task = self.queue.get_task(task.task_id)
+                self._terminate_recorded_jarvis_recovery_query(job, task)
+                task = self.queue.get_task(task.task_id)
+                recovery_intent = _durable_jarvis_execution_recovery(job, task)
+                if (
+                    recovery_intent is not None
+                    and recovery_intent["state"] == "pending"
+                    and recovery_intent["dispatch_state"] == "prepared"
+                ):
+                    dispatch_not_released = True
+                    self.queue.append_event(
+                        job.job_id,
+                        "jarvis.dispatch_not_released",
+                        "Restart cleanup proved the JARVIS dispatch was never released",
+                        payload={
+                            "task_id": task.task_id,
+                            "execution_id": recovery_intent["execution_id"],
+                            "recovery_query_attempted": False,
+                        },
+                    )
+                elif recovery_intent is not None and recovery_intent["state"] == "pending":
+                    recovery_spool = JobSpool(
+                        self.settings.spool_dir,
+                        job,
+                        max_log_bytes_per_stream=(self.settings.spool_max_log_bytes_per_stream),
+                        max_log_bytes_per_job=self.settings.spool_max_log_bytes_per_job,
+                    )
+                    previous_runtime, previous_digests = _durable_runtime_recovery_state(task)
+                    recovered_state: list[JarvisRuntimeMetadata | None] = [previous_runtime]
+                    recovered_scheduler_job_ids = _owned_scheduler_job_ids_from_metadata(
+                        task.metadata,
+                        relay_job_id=job.job_id,
+                        task_id=task.task_id,
+                    )
+                    with self._jarvis_execution_recovery_claim(job, task=task):
+                        recovered_dispatch = self._recover_jarvis_execution(
+                            job,
+                            task_id=task.task_id,
+                            spool=recovery_spool,
+                            state=recovered_state,
+                            digests=previous_digests,
+                            scheduler_job_ids=recovered_scheduler_job_ids,
+                        )
+                    recovered_runtime = recovered_state[0]
+                    task = self.queue.get_task(task.task_id)
+                    recovery_intent = _durable_jarvis_execution_recovery(job, task)
+                elif recovery_intent is not None:
+                    recovery_spool = JobSpool(
+                        self.settings.spool_dir,
+                        job,
+                        max_log_bytes_per_stream=(self.settings.spool_max_log_bytes_per_stream),
+                        max_log_bytes_per_job=self.settings.spool_max_log_bytes_per_job,
+                    )
+                    recovered_runtime = self._validated_recovered_jarvis_dispatch(
+                        job,
+                        task=task,
+                        spool=recovery_spool,
+                    )
+                    recovered_dispatch = True
+                if recovery_intent is None:
+                    self._reconcile_recorded_scheduler_submission(job, task)
+                elif dispatch_not_released:
+                    pass
+                elif recovery_intent["state"] != "resolved" or not recovered_dispatch:
+                    raise SchedulerSubmissionUnresolvedError(
+                        "JARVIS execution response recovery remains pending"
+                    )
                 cancellation_requested = job.state == JobState.CANCELED or isinstance(
                     job.metadata.get("cancellation_request"),
                     dict,
                 )
+                if (
+                    cancellation_requested
+                    and self._scheduler_cancel_was_requested(job.job_id)
+                    and recovery_intent is not None
+                    and not dispatch_not_released
+                ):
+                    owned_ids = self._durable_scheduler_job_ids(
+                        job,
+                        task.task_id,
+                        [],
+                    )
+                    if owned_ids:
+                        self._cancel_scheduler_jobs(job, owned_ids)
+                    else:
+                        self._record_scheduler_cancel_refused(job)
+                cleanup_metadata = self._remove_recorded_execution_sidecars(job, task)
+                if recovered_dispatch and not cancellation_requested:
+                    if recovery_spool is None or recovered_runtime is None:
+                        raise RelayError(
+                            "resolved JARVIS execution recovery omitted its durable result"
+                        )
+                    self._finalize_recovered_jarvis_dispatch(
+                        job,
+                        task=task,
+                        spool=recovery_spool,
+                        runtime_metadata=recovered_runtime,
+                    )
+                    task = self.queue.get_task(task.task_id)
                 if task.state not in {
                     JobState.SUCCEEDED,
                     JobState.FAILED,
                     JobState.CANCELED,
                 }:
-                    target_state = JobState.CANCELED if cancellation_requested else JobState.FAILED
+                    target_state = (
+                        JobState.SUCCEEDED
+                        if recovered_dispatch and not cancellation_requested
+                        else JobState.CANCELED
+                        if cancellation_requested
+                        else JobState.FAILED
+                    )
                     self.queue.update_task_state(
                         task.task_id,
                         target_state,
                         message=(
-                            f"Recovered task cancellation after worker restart: {task.name}"
+                            f"Recovered durable JARVIS response: {task.name}"
+                            if target_state is JobState.SUCCEEDED
+                            else f"Recovered task cancellation after worker restart: {task.name}"
                             if cancellation_requested
                             else f"Closed stale execution attempt after worker restart: {task.name}"
                         ),
-                        metadata={"restart_cleanup_recovered": True},
+                        metadata={
+                            "restart_cleanup_recovered": True,
+                            "mcp_dispatch_recovered": recovered_dispatch,
+                        },
                     )
+                if recovered_dispatch and not cancellation_requested:
+                    current_job = self.queue.get_job(job.job_id)
+                    if current_job.state is not JobState.SUCCEEDED:
+                        self.queue.update_job_state(
+                            job.job_id,
+                            JobState.SUCCEEDED,
+                            message="JARVIS MCP response recovered from durable execution",
+                        )
+                elif dispatch_not_released and not cancellation_requested:
+                    current_job = self.queue.get_job(job.job_id)
+                    if current_job.state not in {
+                        JobState.FAILED,
+                        JobState.CANCELED,
+                    }:
+                        self.queue.update_job_state(
+                            job.job_id,
+                            JobState.FAILED,
+                            message="JARVIS dispatch was never released",
+                            error="owned JARVIS process did not reach dispatch release",
+                        )
                 self.queue.acknowledge_execution_cleanup(
                     job.job_id,
                     task.task_id,
@@ -3104,10 +4261,6 @@ class EndpointWorker:
             failed=len(failures),
             has_more=has_more,
         )
-        if eligible > 0 and completed == 0 and failures:
-            raise RelayError(
-                "pending execution cleanup batch made no progress: " + "; ".join(failures)
-            )
 
     def _record_execution_cleanup_scan(
         self,
@@ -3214,6 +4367,39 @@ class EndpointWorker:
             raise RelayError(
                 f"could not reconcile prior execution for task {task.task_id}: {exc}"
             ) from exc
+        return process_id
+
+    def _terminate_recorded_jarvis_recovery_query(
+        self,
+        job: RelayJob,
+        task: RelayTask,
+    ) -> int | None:
+        """Terminate an interrupted read-only recovery query before replaying it."""
+        intent = _durable_jarvis_execution_recovery(job, task)
+        if intent is None:
+            return None
+        raw_ownership = intent.get("query_process")
+        if raw_ownership is None:
+            return None
+        if not isinstance(raw_ownership, dict):
+            raise RelayError(f"JARVIS recovery query ownership is invalid for task {task.task_id}")
+        synthetic = task.model_copy(update={"metadata": {"execution_ownership": raw_ownership}})
+        process_id = self._terminate_recorded_execution(synthetic)
+        self.queue.update_task_metadata(
+            task.task_id,
+            {
+                "jarvis_execution_recovery": {
+                    **intent,
+                    "query_process": None,
+                }
+            },
+        )
+        self.queue.append_event(
+            job.job_id,
+            "jarvis.execution_recovery_process_reconciled",
+            "Interrupted JARVIS execution recovery query was proven stopped",
+            payload={"task_id": task.task_id, "pid": process_id},
+        )
         return process_id
 
     def _reconcile_canceled_execution(self, job: RelayJob) -> None:
@@ -3447,12 +4633,23 @@ class EndpointWorker:
         canceled = self._job_cancellation_requested(job.job_id)
         if not canceled or scheduler_cancel_attempted[0]:
             return canceled
-        scheduler_cancel_attempted[0] = True
         if self._scheduler_cancel_was_requested(job.job_id):
             owned_ids = self._durable_scheduler_job_ids(job, task_id, scheduler_job_ids)
             if owned_ids:
+                scheduler_cancel_attempted[0] = True
                 self._cancel_scheduler_jobs(job, owned_ids)
+            elif _jarvis_execution_recovery_is_pending(
+                job,
+                self.queue.get_task(task_id),
+            ):
+                self.queue.append_event(
+                    job.job_id,
+                    "scheduler.cancel_identity_pending",
+                    "Explicit scheduler cancellation is waiting for JARVIS ownership recovery",
+                    payload={"task_id": task_id},
+                )
             else:
+                scheduler_cancel_attempted[0] = True
                 self._record_scheduler_cancel_refused(job)
         return True
 
@@ -3469,6 +4666,18 @@ class EndpointWorker:
         scheduler_job_ids: list[str],
         scheduler_cancel_attempted: list[bool],
     ) -> None:
+        route_valid, _route_reason = _trusted_jarvis_mcp_route(job)
+        if route_valid:
+            self.queue.append_event(
+                job.job_id,
+                "mcp.dispatch_timeout",
+                "JARVIS MCP dispatch exceeded timeout_seconds; workload ownership will be queried",
+                payload={
+                    "task_id": task_id,
+                    "scheduler_cancel_requested": False,
+                },
+            )
+            return
         durable_scheduler_job_ids = self._durable_scheduler_job_ids(
             job,
             task_id,
@@ -3989,14 +5198,49 @@ class EndpointWorker:
             "mcp_result": spool.path / "mcp-result.json",
         }
         for kind, path in candidates.items():
-            if internal_filesystem_path(path).exists():
-                self.queue.append_artifact(spool.artifact_for(path, kind=kind))
+            if internal_filesystem_path(path).exists() and self._append_spool_artifact_once(
+                job,
+                spool,
+                path,
+                kind=kind,
+            ):
                 self.queue.append_event(
                     job.job_id,
                     f"{kind}.available",
                     f"Result artifact available: {kind}",
                     payload={"path": str(path)},
                 )
+
+    def _append_spool_artifact_once(
+        self,
+        job: RelayJob,
+        spool: JobSpool,
+        path: Path,
+        *,
+        kind: str,
+    ) -> bool:
+        """Index one immutable spool artifact, tolerating restart replay."""
+        candidate = spool.artifact_for(path, kind=kind)
+        cursor: int | None = 1
+        while cursor is not None:
+            artifacts, cursor, _total = self.queue.list_artifacts_page(
+                job.job_id,
+                cursor=cursor,
+                limit=100,
+            )
+            for existing in artifacts:
+                if existing.kind != kind or existing.uri != candidate.uri:
+                    continue
+                if (
+                    existing.sha256 != candidate.sha256
+                    or existing.size_bytes != candidate.size_bytes
+                ):
+                    raise RelayError(
+                        f"indexed {kind} artifact changed during restart recovery: {path}"
+                    )
+                return False
+        self.queue.append_artifact(candidate)
+        return True
 
     def _renew_lease_if_needed(self, lease: Lease, last_renewed_at: list[float]) -> None:
         now = time.monotonic()
@@ -4157,7 +5401,11 @@ def _extract_scheduler_job_id(line: str) -> str | None:
     return None
 
 
-def _trusted_jarvis_mcp_route(job: RelayJob) -> tuple[bool, str]:
+def _trusted_jarvis_mcp_route(
+    job: RelayJob,
+    *,
+    expected_tool: str = "jarvis_run",
+) -> tuple[bool, str]:
     """Verify a durable job targets the configured artifact-bound JARVIS call."""
     if job.kind is not JobKind.MCP_CALL or not isinstance(job.spec, McpCallSpec):
         return False, "relay job is not an MCP call"
@@ -4167,8 +5415,8 @@ def _trusted_jarvis_mcp_route(job: RelayJob) -> tuple[bool, str]:
         return False, f"configured JARVIS MCP command is invalid: {exc}"
     if [job.spec.server, *job.spec.server_args] != configured_command:
         return False, "MCP command does not match the configured JARVIS server"
-    if job.spec.tool != "jarvis_run":
-        return False, "MCP tool is not the owned jarvis_run operation"
+    if job.spec.tool != expected_tool:
+        return False, f"MCP tool is not the owned {expected_tool} operation"
     if job.spec.expected_jarvis_cd_lock_binding != jarvis_cd_lock_binding_expectation():
         return False, "MCP call did not enforce the relay JARVIS-CD lock pin"
     if job.spec.expected_server_artifact_digest is None:
@@ -4176,12 +5424,263 @@ def _trusted_jarvis_mcp_route(job: RelayJob) -> tuple[bool, str]:
     return True, "configured JARVIS MCP route and artifact binding matched"
 
 
+def _jarvis_execution_recovery_intent(
+    job: RelayJob,
+    *,
+    created_at: datetime,
+) -> dict[str, object] | None:
+    """Build the nested JARVIS intent persisted before a trusted run dispatch."""
+    trusted, _reason = _trusted_jarvis_mcp_route(job)
+    if not trusted:
+        return None
+    assert isinstance(job.spec, McpCallSpec)
+    pipeline_id = job.spec.arguments.get("pipeline_id")
+    execution_id = job.spec.arguments.get("execution_id")
+    if not isinstance(pipeline_id, str) or not pipeline_id:
+        raise ConfigurationError("trusted jarvis_run requires a pipeline_id")
+    if not isinstance(execution_id, str) or not execution_id:
+        raise ConfigurationError("trusted jarvis_run requires a durable execution_id")
+    recovery_directory_name = f".jarvis-execution-recovery-{secrets.token_hex(16)}"
+    return {
+        "schema_version": MCP_JARVIS_EXECUTION_RECOVERY_SCHEMA,
+        "state": "pending",
+        "pipeline_id": pipeline_id,
+        "execution_id": execution_id,
+        "scheduler_expected": "unknown",
+        "expected_server_artifact_digest": job.spec.expected_server_artifact_digest,
+        "idempotency_key_sha256": hashlib.sha256(job.idempotency_key.encode("utf-8")).hexdigest(),
+        "created_at": created_at.isoformat(),
+        "dispatch_state": "prepared",
+        "dispatch_started_at": None,
+        "attempts": 0,
+        "last_attempt_at": None,
+        "next_retry_at": None,
+        "last_error": None,
+        "result_sha256": None,
+        "result_relative_path": f"{recovery_directory_name}/mcp-result.json",
+        "recovery_directory_name": recovery_directory_name,
+        "recovery_directory_anchor": None,
+        "resolved_at": None,
+        "resolution": None,
+        "scheduler_provider": None,
+        "scheduler_job_id": None,
+        "query_process": None,
+    }
+
+
+def _durable_jarvis_execution_recovery(
+    job: RelayJob,
+    task: RelayTask,
+) -> dict[str, Any] | None:
+    """Validate and return one pending or resolved nested execution intent."""
+    raw = task.metadata.get("jarvis_execution_recovery")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise RelayError(f"JARVIS execution recovery intent is invalid for {task.task_id}")
+    intent = cast(dict[str, Any], raw)
+    expected_fields = {
+        "schema_version",
+        "state",
+        "pipeline_id",
+        "execution_id",
+        "scheduler_expected",
+        "expected_server_artifact_digest",
+        "idempotency_key_sha256",
+        "created_at",
+        "dispatch_state",
+        "dispatch_started_at",
+        "attempts",
+        "last_attempt_at",
+        "next_retry_at",
+        "last_error",
+        "result_sha256",
+        "result_relative_path",
+        "recovery_directory_name",
+        "recovery_directory_anchor",
+        "resolved_at",
+        "resolution",
+        "scheduler_provider",
+        "scheduler_job_id",
+        "query_process",
+    }
+    route_valid, _route_reason = _trusted_jarvis_mcp_route(job)
+    spec = job.spec
+    expected_pipeline_id = (
+        spec.arguments.get("pipeline_id") if isinstance(spec, McpCallSpec) else None
+    )
+    expected_execution_id = (
+        spec.arguments.get("execution_id") if isinstance(spec, McpCallSpec) else None
+    )
+    attempts = intent.get("attempts")
+    raw_created_at = intent.get("created_at")
+    created_at = _recovery_timestamp(raw_created_at) if isinstance(raw_created_at, str) else None
+    raw_dispatch_started_at = intent.get("dispatch_started_at")
+    dispatch_started_at = (
+        _recovery_timestamp(raw_dispatch_started_at)
+        if isinstance(raw_dispatch_started_at, str)
+        else None
+    )
+    raw_last_attempt_at = intent.get("last_attempt_at")
+    last_attempt_at = (
+        _recovery_timestamp(raw_last_attempt_at) if isinstance(raw_last_attempt_at, str) else None
+    )
+    next_retry_at = intent.get("next_retry_at")
+    parsed_next_retry_at = (
+        _recovery_timestamp(next_retry_at) if isinstance(next_retry_at, str) else None
+    )
+    raw_resolved_at = intent.get("resolved_at")
+    resolved_at = _recovery_timestamp(raw_resolved_at) if isinstance(raw_resolved_at, str) else None
+    last_error = intent.get("last_error")
+    result_sha256 = intent.get("result_sha256")
+    resolution = intent.get("resolution")
+    scheduler_provider = intent.get("scheduler_provider")
+    scheduler_job_id = intent.get("scheduler_job_id")
+    query_process = intent.get("query_process")
+    directory_anchor = intent.get("recovery_directory_anchor")
+    recovery_directory_name = intent.get("recovery_directory_name")
+    if (
+        not route_valid
+        or not isinstance(spec, McpCallSpec)
+        or set(intent) != expected_fields
+        or intent.get("schema_version") != MCP_JARVIS_EXECUTION_RECOVERY_SCHEMA
+        or intent.get("state") not in {"pending", "resolved"}
+        or intent.get("pipeline_id") != expected_pipeline_id
+        or intent.get("execution_id") != expected_execution_id
+        or intent.get("scheduler_expected") != "unknown"
+        or created_at is None
+        or intent.get("dispatch_state") not in {"prepared", "started"}
+        or (raw_dispatch_started_at is not None and dispatch_started_at is None)
+        or (intent.get("dispatch_state") == "prepared" and raw_dispatch_started_at is not None)
+        or (intent.get("dispatch_state") == "started" and dispatch_started_at is None)
+        or intent.get("expected_server_artifact_digest") != spec.expected_server_artifact_digest
+        or intent.get("idempotency_key_sha256")
+        != hashlib.sha256(job.idempotency_key.encode("utf-8")).hexdigest()
+        or not isinstance(recovery_directory_name, str)
+        or re.fullmatch(r"\.jarvis-execution-recovery-[0-9a-f]{32}", recovery_directory_name)
+        is None
+        or intent.get("result_relative_path") != f"{recovery_directory_name}/mcp-result.json"
+        or isinstance(attempts, bool)
+        or not isinstance(attempts, int)
+        or attempts < 0
+        or (raw_last_attempt_at is not None and last_attempt_at is None)
+        or (next_retry_at is not None and parsed_next_retry_at is None)
+        or (raw_resolved_at is not None and resolved_at is None)
+        or (last_error is not None and (not isinstance(last_error, str) or not last_error))
+        or (
+            result_sha256 is not None
+            and (
+                not isinstance(result_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", result_sha256) is None
+            )
+        )
+        or resolution not in {None, "dispatch_result", "execution_query"}
+        or (
+            scheduler_provider is not None
+            and (not isinstance(scheduler_provider, str) or not scheduler_provider)
+        )
+        or (
+            scheduler_job_id is not None
+            and (not isinstance(scheduler_job_id, str) or not scheduler_job_id)
+        )
+        or (query_process is not None and not isinstance(query_process, dict))
+        or not _recovery_directory_anchor_metadata_is_valid(directory_anchor)
+    ):
+        raise RelayError(f"JARVIS execution recovery intent is invalid for {task.task_id}")
+    if dispatch_started_at is not None and dispatch_started_at < created_at:
+        raise RelayError(f"JARVIS execution recovery intent is invalid for {task.task_id}")
+    if attempts == 0 and last_attempt_at is not None:
+        raise RelayError(f"JARVIS execution recovery intent is invalid for {task.task_id}")
+    if attempts > 0 and (
+        intent["dispatch_state"] != "started"
+        or dispatch_started_at is None
+        or last_attempt_at is None
+        or last_attempt_at < dispatch_started_at
+    ):
+        raise RelayError(f"JARVIS execution recovery intent is invalid for {task.task_id}")
+    if parsed_next_retry_at is not None and (
+        intent["state"] != "pending"
+        or attempts == 0
+        or last_attempt_at is None
+        or parsed_next_retry_at < last_attempt_at
+    ):
+        raise RelayError(f"JARVIS execution recovery intent is invalid for {task.task_id}")
+    if last_error is not None and (
+        intent["state"] != "pending" or attempts == 0 or parsed_next_retry_at is None
+    ):
+        raise RelayError(f"JARVIS execution recovery intent is invalid for {task.task_id}")
+    if query_process is not None and (
+        intent["state"] != "pending"
+        or attempts == 0
+        or last_attempt_at is None
+        or not _recovery_query_process_is_valid(
+            cast(dict[str, object], query_process),
+            attempted_at=last_attempt_at,
+        )
+    ):
+        raise RelayError(f"JARVIS execution recovery intent is invalid for {task.task_id}")
+    if intent["state"] == "pending":
+        if (
+            resolved_at is not None
+            or resolution is not None
+            or scheduler_provider is not None
+            or scheduler_job_id is not None
+            or (attempts == 0 and result_sha256 is not None)
+        ):
+            raise RelayError(f"JARVIS execution recovery intent is invalid for {task.task_id}")
+    elif (
+        intent["dispatch_state"] != "started"
+        or dispatch_started_at is None
+        or resolved_at is None
+        or resolved_at < dispatch_started_at
+        or (last_attempt_at is not None and resolved_at < last_attempt_at)
+        or result_sha256 is None
+        or resolution is None
+        or last_error is not None
+        or parsed_next_retry_at is not None
+        or query_process is not None
+        or ((scheduler_provider is None) != (scheduler_job_id is None))
+        or (resolution == "execution_query" and attempts == 0)
+    ):
+        raise RelayError(f"JARVIS execution recovery intent is invalid for {task.task_id}")
+    return intent
+
+
+def _jarvis_execution_recovery_is_pending(job: RelayJob, task: RelayTask) -> bool:
+    """Return whether scheduler identity is awaiting an exact JARVIS query."""
+    intent = _durable_jarvis_execution_recovery(job, task)
+    return intent is not None and intent["state"] == "pending"
+
+
+def _durable_runtime_recovery_state(
+    task: RelayTask,
+) -> tuple[JarvisRuntimeMetadata | None, set[str]]:
+    """Restore the prior trusted runtime snapshot used for transition checks."""
+    raw_runtime = task.metadata.get("runtime_metadata")
+    if raw_runtime is None:
+        return None, set()
+    if not isinstance(raw_runtime, dict):
+        raise RelayError(f"durable runtime metadata is invalid for {task.task_id}")
+    try:
+        runtime = JarvisRuntimeMetadata.model_validate(raw_runtime)
+    except ValueError as exc:
+        raise RelayError(f"durable runtime metadata is invalid for {task.task_id}: {exc}") from exc
+    digest_payload = runtime.model_dump(mode="json", exclude={"observed_at"})
+    digest = hashlib.sha256(json.dumps(digest_payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return runtime, {digest}
+
+
 def _trusted_jarvis_mcp_result(
     job: RelayJob,
     document: object,
+    *,
+    expected_tool: str = "jarvis_run",
 ) -> tuple[bool, str]:
     """Verify runtime identity came from the configured owned JARVIS MCP call."""
-    route_valid, route_reason = _trusted_jarvis_mcp_route(job)
+    route_valid, route_reason = _trusted_jarvis_mcp_route(
+        job,
+        expected_tool=expected_tool,
+    )
     if not route_valid:
         return False, route_reason
     assert isinstance(job.spec, McpCallSpec)
@@ -4225,6 +5724,35 @@ def _trusted_jarvis_mcp_result(
     ):
         return False, "JARVIS MCP tool returned isError"
     return True, "configured JARVIS MCP command and durable result matched"
+
+
+def _trusted_jarvis_execution_query_validation(
+    document: object,
+    *,
+    pipeline_id: str,
+    execution_id: str,
+) -> bool:
+    """Require the bundled runner's exact native execution-query attestation."""
+    if not isinstance(document, dict):
+        return False
+    validation = cast(dict[str, object], document).get("result_validation")
+    if not isinstance(validation, dict):
+        return False
+    typed = cast(dict[str, object], validation)
+    return (
+        typed.get("schema_version") == "clio-relay.jarvis-execution-query-validation.v1"
+        and typed.get("pipeline_id") == pipeline_id
+        and typed.get("execution_id") == execution_id
+        and typed.get("include_progress") is True
+        and typed.get("progress_included") is True
+        and typed.get("include_service_runtimes") is False
+        and typed.get("service_runtimes_included") is False
+        and typed.get("service_runtime_count") == 0
+        and typed.get("artifacts_requested") is False
+        and typed.get("artifact_filters") == {}
+        and typed.get("returned_artifact_count") == 0
+        and typed.get("next_cursor_present") is False
+    )
 
 
 def _scheduler_status_is_not_found(status: SchedulerStatus) -> bool:
@@ -4496,6 +6024,525 @@ def _precreate_runtime_sidecar(path: Path) -> _RuntimeSidecarAnchor:
     finally:
         if not keep_descriptor:
             os.close(descriptor)
+
+
+def _recovery_timestamp(value: str) -> datetime | None:
+    """Parse one timezone-aware durable recovery timestamp without coercion."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _recovery_query_process_is_valid(
+    value: dict[str, object],
+    *,
+    attempted_at: datetime,
+) -> bool:
+    """Validate the exact process identity needed after a recovery-query crash."""
+    expected_fields = {
+        "schema_version",
+        "pid",
+        "hostname",
+        "process_start_identity",
+        "process_group_id",
+        "started_at",
+        "endpoint_id",
+        "containment",
+    }
+    process_id = value.get("pid")
+    process_group_id = value.get("process_group_id")
+    endpoint_id = value.get("endpoint_id")
+    raw_started_at = value.get("started_at")
+    started_at = _recovery_timestamp(raw_started_at) if isinstance(raw_started_at, str) else None
+    return (
+        set(value) == expected_fields
+        and value.get("schema_version") == "clio-relay.execution-ownership.v1"
+        and isinstance(process_id, int)
+        and not isinstance(process_id, bool)
+        and process_id > 0
+        and isinstance(value.get("hostname"), str)
+        and bool(value["hostname"])
+        and isinstance(value.get("process_start_identity"), str)
+        and bool(value["process_start_identity"])
+        and (
+            process_group_id is None
+            or (
+                isinstance(process_group_id, int)
+                and not isinstance(process_group_id, bool)
+                and process_group_id > 0
+            )
+        )
+        and started_at is not None
+        and started_at >= attempted_at
+        and (endpoint_id is None or (isinstance(endpoint_id, str) and bool(endpoint_id)))
+        and isinstance(value.get("containment"), dict)
+    )
+
+
+def _jarvis_execution_recovery_retry_due(
+    intent: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Return whether one pending recovery reached its durable retry time."""
+    raw_retry_at = intent.get("next_retry_at")
+    if raw_retry_at is None:
+        return True
+    if not isinstance(raw_retry_at, str):
+        raise RelayError("JARVIS execution recovery retry timestamp is invalid")
+    retry_at = _recovery_timestamp(raw_retry_at)
+    if retry_at is None:
+        raise RelayError("JARVIS execution recovery retry timestamp is invalid")
+    return (now or utc_now()) >= retry_at
+
+
+def _recovery_directory_anchor_metadata_is_valid(value: object) -> bool:
+    """Return whether a durable private-directory identity is exact and bounded."""
+    if not isinstance(value, dict):
+        return False
+    typed = cast(dict[str, object], value)
+    fields = {"device", "inode", "owner", "mode"}
+    return set(typed) == fields and all(
+        not isinstance(typed[field], bool) and isinstance(typed[field], int) for field in fields
+    )
+
+
+def _recovery_directory_anchor_from_metadata(value: object) -> _RecoveryDirectoryAnchor:
+    """Restore a durable private recovery-directory identity."""
+    if not _recovery_directory_anchor_metadata_is_valid(value):
+        raise ConfigurationError("JARVIS recovery directory identity is invalid")
+    typed = cast(dict[str, int], value)
+    return _RecoveryDirectoryAnchor(
+        device=typed["device"],
+        inode=typed["inode"],
+        owner=typed["owner"],
+        mode=typed["mode"],
+    )
+
+
+def _recovery_directory_anchor_from_stat(
+    observed: os.stat_result,
+    *,
+    descriptor: int | None = None,
+    windows_handle: int | None = None,
+) -> _RecoveryDirectoryAnchor:
+    """Build a private recovery-directory anchor from one open filesystem object."""
+    return _RecoveryDirectoryAnchor(
+        device=int(observed.st_dev),
+        inode=int(observed.st_ino),
+        owner=int(observed.st_uid),
+        mode=stat_module.S_IMODE(observed.st_mode),
+        descriptor=descriptor,
+        windows_handle=windows_handle,
+    )
+
+
+def _validate_recovery_directory_stat(
+    observed: os.stat_result,
+    *,
+    expected: _RecoveryDirectoryAnchor | None,
+    path: Path,
+) -> None:
+    """Fail closed unless a recovery directory is real, private, and unchanged."""
+    if stat_module.S_ISLNK(observed.st_mode) or not stat_module.S_ISDIR(observed.st_mode):
+        raise ConfigurationError(f"JARVIS recovery path is not a real directory: {path}")
+    attributes = int(getattr(observed, "st_file_attributes", 0))
+    if attributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT:
+        raise ConfigurationError(f"JARVIS recovery directory is a reparse point: {path}")
+    current = _recovery_directory_anchor_from_stat(observed)
+    if expected is not None and current != expected:
+        raise ConfigurationError(f"JARVIS recovery directory identity changed: {path}")
+    if os.name != "nt":
+        if current.owner != os.getuid():
+            raise ConfigurationError("JARVIS recovery directory is not owned by the worker user")
+        if current.mode != 0o700:
+            raise ConfigurationError("JARVIS recovery directory mode must remain 0700")
+
+
+def _open_or_create_recovery_directory(
+    path: Path,
+    *,
+    expected_metadata: object,
+) -> tuple[_RecoveryDirectoryAnchor, bool]:
+    """Create or reopen one pinned private recovery directory without following links."""
+    storage_path = internal_filesystem_path(path)
+    expected = (
+        None
+        if expected_metadata is None
+        else _recovery_directory_anchor_from_metadata(expected_metadata)
+    )
+    created = False
+    if expected is None:
+        try:
+            os.mkdir(storage_path, 0o700)
+        except FileExistsError as exc:
+            raise ConfigurationError(
+                f"unowned JARVIS recovery path already exists: {path}"
+            ) from exc
+        except OSError as exc:
+            raise ConfigurationError(
+                f"could not create private JARVIS recovery directory {path}: {exc}"
+            ) from exc
+        created = True
+        if os.name != "nt":
+            os.chmod(storage_path, 0o700, follow_symlinks=False)
+    try:
+        path_stat = os.stat(storage_path, follow_symlinks=False)
+    except OSError as exc:
+        raise ConfigurationError(
+            f"could not inspect private JARVIS recovery directory {path}: {exc}"
+        ) from exc
+    _validate_recovery_directory_stat(path_stat, expected=expected, path=path)
+    if os.name == "nt":
+        handle = _open_windows_cleanup_handle(
+            path,
+            desired_access=_WINDOWS_FILE_READ_ATTRIBUTES,
+            share_mode=_WINDOWS_FILE_SHARE_READ | _WINDOWS_FILE_SHARE_WRITE,
+            flags=(_WINDOWS_FILE_FLAG_BACKUP_SEMANTICS | _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT),
+            missing_ok=False,
+        )
+        assert handle is not None
+        try:
+            attributes, file_id = _windows_handle_information(handle, path)
+            if attributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT:
+                raise ConfigurationError(f"JARVIS recovery directory is a reparse point: {path}")
+            if not attributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY:
+                raise ConfigurationError(f"JARVIS recovery path is not a directory: {path}")
+            if file_id != int(path_stat.st_ino):
+                raise ConfigurationError(f"JARVIS recovery directory changed while opening: {path}")
+            anchor = _recovery_directory_anchor_from_stat(
+                path_stat,
+                windows_handle=handle,
+            )
+            if expected is not None and anchor != expected:
+                raise ConfigurationError(f"JARVIS recovery directory identity changed: {path}")
+            return anchor, created
+        except BaseException:
+            _close_windows_cleanup_handle(handle)
+            raise
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(storage_path, flags)
+    except OSError as exc:
+        raise ConfigurationError(
+            f"could not pin private JARVIS recovery directory {path}: {exc}"
+        ) from exc
+    try:
+        os.set_inheritable(descriptor, False)
+        opened = os.fstat(descriptor)
+        anchor = _recovery_directory_anchor_from_stat(opened, descriptor=descriptor)
+        _validate_recovery_directory_stat(opened, expected=expected, path=path)
+        if (anchor.device, anchor.inode) != (int(path_stat.st_dev), int(path_stat.st_ino)):
+            raise ConfigurationError(f"JARVIS recovery directory changed while opening: {path}")
+        return anchor, created
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _close_recovery_directory_anchor(anchor: _RecoveryDirectoryAnchor) -> None:
+    """Release the OS handle that pinned one recovery directory."""
+    if anchor.descriptor is not None:
+        with suppress(OSError):
+            os.close(anchor.descriptor)
+    if anchor.windows_handle is not None:
+        _close_windows_cleanup_handle(anchor.windows_handle)
+
+
+def _validate_recovery_directory_path(
+    path: Path,
+    anchor: _RecoveryDirectoryAnchor,
+) -> None:
+    """Verify the named directory still resolves to the pinned recovery object."""
+    try:
+        observed = os.stat(internal_filesystem_path(path), follow_symlinks=False)
+    except OSError as exc:
+        raise ConfigurationError(
+            f"could not revalidate private JARVIS recovery directory {path}: {exc}"
+        ) from exc
+    _validate_recovery_directory_stat(observed, expected=anchor, path=path)
+    if anchor.descriptor is not None:
+        _validate_recovery_directory_stat(
+            os.fstat(anchor.descriptor),
+            expected=anchor,
+            path=path,
+        )
+    if anchor.windows_handle is not None:
+        attributes, file_id = _windows_handle_information(anchor.windows_handle, path)
+        if (
+            attributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+            or not attributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+            or file_id != anchor.inode
+        ):
+            raise ConfigurationError(f"JARVIS recovery directory handle changed: {path}")
+
+
+def _validate_recovery_process_cwd(
+    process_id: int,
+    *,
+    directory: Path,
+    anchor: _RecoveryDirectoryAnchor,
+) -> None:
+    """Prove the blocked recovery process inherited the pinned working directory."""
+    if os.name == "nt":
+        _validate_recovery_directory_path(directory, anchor)
+        return
+    if not sys.platform.startswith("linux"):
+        raise ConfigurationError(
+            "JARVIS recovery process cwd verification requires Linux or Windows"
+        )
+    try:
+        observed = os.stat(Path("/proc") / str(process_id) / "cwd")
+    except OSError as exc:
+        raise ConfigurationError(
+            f"could not verify JARVIS recovery process cwd for {process_id}: {exc}"
+        ) from exc
+    if (int(observed.st_dev), int(observed.st_ino)) != (anchor.device, anchor.inode):
+        raise ConfigurationError("JARVIS recovery process cwd escaped its pinned directory")
+
+
+def _read_owned_recovery_result(
+    path: Path,
+    *,
+    directory_anchor: _RecoveryDirectoryAnchor,
+) -> bytes:
+    """Read one bounded regular recovery result from the pinned directory object."""
+    storage_path = internal_filesystem_path(path)
+    name = path.name
+    try:
+        path_stat = (
+            os.stat(name, dir_fd=directory_anchor.descriptor, follow_symlinks=False)
+            if directory_anchor.descriptor is not None
+            else os.stat(storage_path, follow_symlinks=False)
+        )
+    except OSError as exc:
+        raise ConfigurationError(f"could not inspect JARVIS recovery result {path}: {exc}") from exc
+    if stat_module.S_ISLNK(path_stat.st_mode) or not stat_module.S_ISREG(path_stat.st_mode):
+        raise ConfigurationError(f"JARVIS recovery result is not a regular file: {path}")
+    if int(path_stat.st_nlink) != 1:
+        raise ConfigurationError("JARVIS recovery result must have exactly one hard link")
+    if os.name != "nt" and int(path_stat.st_uid) != os.getuid():
+        raise ConfigurationError("JARVIS recovery result is not owned by the worker user")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = (
+            os.open(name, flags, dir_fd=directory_anchor.descriptor)
+            if directory_anchor.descriptor is not None
+            else os.open(storage_path, flags)
+        )
+    except OSError as exc:
+        raise ConfigurationError(f"could not open JARVIS recovery result {path}: {exc}") from exc
+    try:
+        os.set_inheritable(descriptor, False)
+        opened = os.fstat(descriptor)
+        if (
+            not stat_module.S_ISREG(opened.st_mode)
+            or _progress_log_identity(opened) != _progress_log_identity(path_stat)
+            or int(opened.st_nlink) != 1
+            or (os.name != "nt" and int(opened.st_uid) != os.getuid())
+        ):
+            raise ConfigurationError("JARVIS recovery result identity changed while opening")
+        if int(opened.st_size) > MCP_JARVIS_EXECUTION_RECOVERY_RESULT_MAX_BYTES:
+            raise ConfigurationError("JARVIS recovery result exceeds its byte limit")
+        payload = os.read(descriptor, MCP_JARVIS_EXECUTION_RECOVERY_RESULT_MAX_BYTES + 1)
+        while len(payload) <= MCP_JARVIS_EXECUTION_RECOVERY_RESULT_MAX_BYTES:
+            chunk = os.read(
+                descriptor,
+                MCP_JARVIS_EXECUTION_RECOVERY_RESULT_MAX_BYTES + 1 - len(payload),
+            )
+            if not chunk:
+                break
+            payload += chunk
+        if len(payload) > MCP_JARVIS_EXECUTION_RECOVERY_RESULT_MAX_BYTES:
+            raise ConfigurationError("JARVIS recovery result exceeds its byte limit")
+        final_stat = os.fstat(descriptor)
+        if _progress_log_identity(final_stat) != _progress_log_identity(opened):
+            raise ConfigurationError("JARVIS recovery result changed while reading")
+        _validate_recovery_directory_path(path.parent, directory_anchor)
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def _remove_owned_recovery_output(
+    path: Path,
+    *,
+    directory_anchor: _RecoveryDirectoryAnchor,
+) -> None:
+    """Remove only a regular single-link prior result from the pinned directory."""
+    storage_path = internal_filesystem_path(path)
+    name = path.name
+    try:
+        observed = (
+            os.stat(name, dir_fd=directory_anchor.descriptor, follow_symlinks=False)
+            if directory_anchor.descriptor is not None
+            else os.stat(storage_path, follow_symlinks=False)
+        )
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ConfigurationError(f"could not inspect prior JARVIS recovery output: {exc}") from exc
+    if (
+        stat_module.S_ISLNK(observed.st_mode)
+        or not stat_module.S_ISREG(observed.st_mode)
+        or int(observed.st_nlink) != 1
+        or (os.name != "nt" and int(observed.st_uid) != os.getuid())
+    ):
+        raise ConfigurationError("prior JARVIS recovery output has unsafe filesystem identity")
+    try:
+        if directory_anchor.descriptor is not None:
+            os.unlink(name, dir_fd=directory_anchor.descriptor)
+            os.fsync(directory_anchor.descriptor)
+        else:
+            storage_path.unlink()
+    except OSError as exc:
+        raise ConfigurationError(f"could not remove prior JARVIS recovery output: {exc}") from exc
+    _validate_recovery_directory_path(path.parent, directory_anchor)
+
+
+def _private_json_payload(value: object) -> bytes:
+    """Serialize one bounded canonical private JSON document."""
+    try:
+        payload = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError(f"private JSON input is not canonical: {exc}") from exc
+    if len(payload) > 1024 * 1024:
+        raise ConfigurationError("private JSON input exceeds 1 MiB")
+    return payload
+
+
+def _write_private_json_file(
+    path: Path,
+    value: object,
+    *,
+    directory_anchor: _RecoveryDirectoryAnchor | None = None,
+) -> None:
+    """Atomically write private JSON without following or truncating hostile links."""
+    payload = _private_json_payload(value)
+    storage_path = internal_filesystem_path(path)
+    parent = internal_filesystem_path(path.parent)
+    name = path.name
+    directory_fd = None if directory_anchor is None else directory_anchor.descriptor
+    if directory_anchor is not None:
+        _validate_recovery_directory_path(path.parent, directory_anchor)
+    try:
+        existing = (
+            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if directory_fd is not None
+            else os.stat(storage_path, follow_symlinks=False)
+        )
+    except FileNotFoundError:
+        existing = None
+    except OSError as exc:
+        raise ConfigurationError(f"could not inspect private JSON input {path}: {exc}") from exc
+    if existing is not None and (
+        stat_module.S_ISLNK(existing.st_mode)
+        or not stat_module.S_ISREG(existing.st_mode)
+        or int(existing.st_nlink) != 1
+        or (os.name != "nt" and int(existing.st_uid) != os.getuid())
+    ):
+        raise ConfigurationError(f"private JSON input has unsafe filesystem identity: {path}")
+    temporary_name = f".{name}.{secrets.token_hex(16)}.tmp"
+    temporary_path = parent / temporary_name
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = (
+            os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+            if directory_fd is not None
+            else os.open(temporary_path, flags, 0o600)
+        )
+    except OSError as exc:
+        raise ConfigurationError(f"could not write private JSON input {path}: {exc}") from exc
+    try:
+        os.set_inheritable(descriptor, False)
+        if os.name != "nt":
+            os.fchmod(descriptor, 0o600)
+        opened = os.fstat(descriptor)
+        if not stat_module.S_ISREG(opened.st_mode):
+            raise ConfigurationError(f"private JSON input is not a regular file: {path}")
+        if int(opened.st_nlink) != 1:
+            raise ConfigurationError(f"private JSON input must have one hard link: {path}")
+        if os.name != "nt" and (
+            int(opened.st_uid) != os.getuid() or stat_module.S_IMODE(opened.st_mode) != 0o600
+        ):
+            raise ConfigurationError(f"private JSON input ownership or mode is unsafe: {path}")
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise ConfigurationError(f"private JSON input write made no progress: {path}")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        if directory_fd is not None:
+            os.replace(
+                temporary_name,
+                name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            os.fsync(directory_fd)
+        else:
+            os.replace(temporary_path, storage_path)
+        final_stat = (
+            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if directory_fd is not None
+            else os.stat(storage_path, follow_symlinks=False)
+        )
+        if (
+            not stat_module.S_ISREG(final_stat.st_mode)
+            or int(final_stat.st_nlink) != 1
+            or (os.name != "nt" and int(final_stat.st_uid) != os.getuid())
+        ):
+            raise ConfigurationError(f"private JSON input replacement was unsafe: {path}")
+        if directory_anchor is not None:
+            _validate_recovery_directory_path(path.parent, directory_anchor)
+    except BaseException:
+        with suppress(OSError):
+            if directory_fd is not None:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            else:
+                temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def _minimal_mcp_runner_environment(env_from: dict[str, str]) -> dict[str, str]:
+    """Expose only runtime basics and explicitly referenced MCP source variables."""
+    environment = {
+        name: os.environ[name] for name in MCP_RUNNER_BASE_ENV_NAMES if name in os.environ
+    }
+    for source_name in env_from.values():
+        if source_name not in os.environ:
+            raise ConfigurationError(f"MCP env_from source is not set: {source_name}")
+        environment[source_name] = os.environ[source_name]
+    return environment
 
 
 def _runtime_sidecar_anchor(
@@ -5865,6 +7912,40 @@ def _runtime_metadata_is_native(metadata: JarvisRuntimeMetadata) -> bool:
         and cast(dict[str, object], producer_contract).get("contract_kind") == "native_execution"
         and isinstance(native_execution, dict)
     )
+
+
+def _native_runtime_execution_mode(metadata: JarvisRuntimeMetadata) -> str:
+    """Return the matching mode from validated native handle and record documents."""
+    raw = metadata.details.get("native_execution")
+    if not isinstance(raw, dict):
+        raise RelayError("native JARVIS runtime metadata omitted execution documents")
+    native = cast(dict[str, object], raw)
+    handle = native.get("execution_handle")
+    record = native.get("execution_record")
+    if not isinstance(handle, dict) or not isinstance(record, dict):
+        raise RelayError("native JARVIS runtime metadata omitted handle or record")
+    handle_mode = cast(dict[str, object], handle).get("mode")
+    record_mode = cast(dict[str, object], record).get("mode")
+    if handle_mode not in {"direct", "scheduler"} or record_mode != handle_mode:
+        raise RelayError("native JARVIS execution mode was inconsistent")
+    return cast(str, handle_mode)
+
+
+def _native_runtime_created_at(metadata: JarvisRuntimeMetadata) -> datetime:
+    """Return the authenticated native record creation time."""
+    raw = metadata.details.get("native_execution")
+    if not isinstance(raw, dict):
+        raise RelayError("native JARVIS runtime metadata omitted execution documents")
+    record = cast(dict[str, object], raw).get("execution_record")
+    if not isinstance(record, dict):
+        raise RelayError("native JARVIS runtime metadata omitted its execution record")
+    raw_created_at = cast(dict[str, object], record).get("created_at")
+    if not isinstance(raw_created_at, str):
+        raise RelayError("native JARVIS execution record omitted created_at")
+    created_at = _recovery_timestamp(raw_created_at)
+    if created_at is None:
+        raise RelayError("native JARVIS execution record created_at is invalid")
+    return created_at
 
 
 def _runtime_metadata_is_mcp_transport_wrapper(metadata: JarvisRuntimeMetadata) -> bool:

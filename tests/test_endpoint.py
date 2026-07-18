@@ -44,6 +44,7 @@ from clio_relay.models import (
     RemoteAgentTaskSpec,
     SchedulerPhase,
     SchedulerStatus,
+    deterministic_jarvis_execution_id,
     utc_now,
 )
 from clio_relay.progress_adapters import package_progress_adapter_from_pipeline
@@ -386,8 +387,8 @@ def test_hard_crashed_non_canceled_attempt_blocks_requeue_until_cleanup_retry(
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     recovered = queue.recover_stale_jobs(cluster="ares")
-    assert [job.job_id for job in recovered] == [job_id]
-    assert queue.get_job(job_id).state is JobState.QUEUED
+    assert recovered == []
+    assert queue.get_job(job_id).state is JobState.RUNNING
 
     pending, truncated = queue.scan_execution_cleanup(cluster="ares", limit=10)
     assert truncated is False
@@ -408,11 +409,13 @@ def test_hard_crashed_non_canceled_attempt_blocks_requeue_until_cleanup_retry(
         raise ConfigurationError("injected restart sidecar cleanup fault")
 
     monkeypatch.setattr(endpoint, "_remove_recorded_execution_sidecars", fail_cleanup)
-    with pytest.raises(RelayError, match="injected restart sidecar cleanup fault"):
-        cast(Any, endpoint)._reconcile_pending_execution_cleanup()
+    cast(Any, endpoint)._reconcile_pending_execution_cleanup()
     pending, _ = queue.scan_execution_cleanup(cluster="ares", limit=10)
     assert [task.task_id for task in pending] == [task_id]
     assert queue.acquire_job(job_id, registration.endpoint_id, cluster="ares") is None
+    assert endpoint.endpoint is not None
+    failed_scan = cast(dict[str, object], endpoint.endpoint.metadata["execution_cleanup_scan"])
+    assert failed_scan["failed"] == 1
 
     monkeypatch.setattr(endpoint, "_remove_recorded_execution_sidecars", original_cleanup)
     cast(Any, endpoint)._reconcile_pending_execution_cleanup()
@@ -424,6 +427,8 @@ def test_hard_crashed_non_canceled_attempt_blocks_requeue_until_cleanup_retry(
     sidecars = cast(dict[str, object], identity["execution_sidecars"])
     for role in ("progress", "runtime"):
         assert not (settings.spool_dir / job_id / cast(str, sidecars[role])).exists()
+    recovered = queue.recover_stale_jobs(cluster="ares")
+    assert [item.job_id for item in recovered] == [job_id]
     retry_lease = queue.acquire_job(job_id, registration.endpoint_id, cluster="ares")
     assert retry_lease is not None
     events, _ = queue.read_event_page(job_id, limit=100)
@@ -3317,42 +3322,67 @@ def _native_mcp_result_document(
     command: list[str],
     digest: str,
     pipeline_id: str,
+    execution_id: str | None = None,
     server_artifact: dict[str, Any],
+    arguments: dict[str, object] | None = None,
+    mode: str = "direct",
+    scheduler_provider: str | None = None,
+    scheduler_native_id: str | None = None,
+    cluster: str | None = None,
 ) -> dict[str, object]:
-    execution_id = f"{pipeline_id}-execution"
+    execution_id = execution_id or f"{pipeline_id}-execution"
+    submitted = mode == "scheduler"
+    execution_state = "submitted" if submitted else "completed"
+    submission = (
+        {
+            "schema_version": "jarvis.scheduler.submission.v1",
+            "execution_id": execution_id,
+            "provider": scheduler_provider,
+            "script_path": f"/runs/{pipeline_id}/submit.sh",
+            "output_path": f"/runs/{pipeline_id}/stdout.log",
+            "error_path": f"/runs/{pipeline_id}/stderr.log",
+            "scheduler_job_id": scheduler_native_id,
+            "scheduler_cluster": cluster,
+            "identity_source": "scheduler_submit_api",
+            "submitted": True,
+            "reconciliation_marker": f"clio-relay-{execution_id}",
+        }
+        if submitted
+        else None
+    )
     handle: dict[str, object] = {
         "schema_version": "jarvis.execution.handle.v1",
         "execution_id": execution_id,
         "pipeline_id": pipeline_id,
-        "mode": "direct",
-        "scheduler_provider": None,
-        "scheduler_native_id": None,
-        "cluster": None,
+        "mode": mode,
+        "scheduler_provider": scheduler_provider,
+        "scheduler_native_id": scheduler_native_id,
+        "cluster": cluster,
     }
     record: dict[str, object] = {
         "schema_version": "jarvis.execution.record.v1",
         "execution_id": execution_id,
         "pipeline_id": pipeline_id,
         "pipeline_name": pipeline_id,
-        "mode": "direct",
-        "scheduler_provider": None,
-        "scheduler_native_id": None,
-        "cluster": None,
-        "state": "completed",
-        "submitted": False,
-        "terminal": True,
+        "mode": mode,
+        "scheduler_provider": scheduler_provider,
+        "scheduler_native_id": scheduler_native_id,
+        "cluster": cluster,
+        "state": execution_state,
+        "submitted": submitted,
+        "terminal": not submitted,
         "created_at": "2026-07-12T10:00:00Z",
         "updated_at": "2026-07-12T10:00:01Z",
-        "return_code": 0,
+        "return_code": None if submitted else 0,
         "error": None,
-        "metadata": {},
+        "metadata": {"submission": submission} if submission is not None else {},
     }
     progress: dict[str, object] = {
         "schema_version": "jarvis.execution.progress.v1",
         "execution_id": execution_id,
         "pipeline_id": pipeline_id,
-        "execution_state": "completed",
-        "terminal": True,
+        "execution_state": execution_state,
+        "terminal": not submitted,
         "packages": [],
     }
     structured: dict[str, object] = {
@@ -3364,14 +3394,14 @@ def _native_mcp_result_document(
             "source": "jarvis_mcp",
             "execution_id": execution_id,
             "pipeline_id": pipeline_id,
-            "mode": "direct",
-            "scheduler_provider": None,
-            "scheduler_native_id": None,
-            "cluster": None,
-            "scheduler_type": None,
-            "scheduler_job_id": None,
-            "scheduler_phase": None,
-            "script_path": None,
+            "mode": mode,
+            "scheduler_provider": scheduler_provider,
+            "scheduler_native_id": scheduler_native_id,
+            "cluster": cluster,
+            "scheduler_type": scheduler_provider,
+            "scheduler_job_id": scheduler_native_id,
+            "scheduler_phase": execution_state if submitted else None,
+            "script_path": (f"/runs/{pipeline_id}/submit.sh" if submitted else None),
             "hostfile_path": None,
             "output_path": f"/runs/{pipeline_id}/stdout.log",
             "error_path": f"/runs/{pipeline_id}/stderr.log",
@@ -3384,12 +3414,12 @@ def _native_mcp_result_document(
                 }
             ],
             "terminal": {
-                "state": "completed",
-                "terminal": True,
-                "returncode": 0,
+                "state": execution_state,
+                "terminal": not submitted,
+                "returncode": None if submitted else 0,
                 "reason": None,
                 "started_at": "2026-07-12T10:00:00Z",
-                "finished_at": "2026-07-12T10:00:01Z",
+                "finished_at": None if submitted else "2026-07-12T10:00:01Z",
             },
             "details": {
                 "execution_owner": "jarvis_cd.execution_record",
@@ -3401,7 +3431,7 @@ def _native_mcp_result_document(
                 },
                 "execution_handle": handle,
                 "execution_record": record,
-                "scheduler_submission": None,
+                "scheduler_submission": submission,
             },
         },
     }
@@ -3414,7 +3444,7 @@ def _native_mcp_result_document(
         "server_artifact": server_artifact,
         "operation": "tools/call",
         "tool": "jarvis_run",
-        "arguments": {"pipeline_id": pipeline_id},
+        "arguments": arguments or {"pipeline_id": pipeline_id, "execution_id": execution_id},
         "env_from": {},
         "protocol_result": {"structuredContent": structured},
         "structured_result": structured,
@@ -5665,66 +5695,22 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
                 on_start(700)
             if on_stdout is not None:
                 on_stdout("Submitted batch job stdout-wrong\n")
+            assert isinstance(job.spec, McpCallSpec)
+            execution_id = cast(str, job.spec.arguments["execution_id"])
             (cwd / "mcp-result.json").write_text(
                 json.dumps(
-                    {
-                        "server": command[0],
-                        "server_args": server_args,
-                        "expected_server_artifact_digest": digest,
-                        "expected_jarvis_cd_lock_binding": (
-                            endpoint_module.jarvis_cd_lock_binding_expectation()
-                        ),
-                        "observed_server_artifact_digest": digest,
-                        "server_artifact": server_artifact,
-                        "operation": "tools/call",
-                        "tool": "jarvis_run",
-                        "arguments": {"pipeline_id": "runtime-test"},
-                        "env_from": {},
-                        "protocol_result": {
-                            "structuredContent": {
-                                "runtime_metadata": {
-                                    "schema_version": "jarvis.runtime.v1",
-                                    "execution_id": "jarvis-execution-9",
-                                    "pipeline_id": "runtime-test",
-                                    "scheduler": {
-                                        "provider": "test-scheduler",
-                                        "type": "batch",
-                                        "job_id": "structured-42",
-                                        "phase": "allocated",
-                                        "allocated_nodes": ["compute-09"],
-                                    },
-                                    "script_path": "/runs/runtime-test/submit.sh",
-                                    "hostfile_path": "/runs/runtime-test/hosts",
-                                    "output_path": "/runs/runtime-test/job.out",
-                                    "error_path": "/runs/runtime-test/job.err",
-                                    "package_provenance": [
-                                        {
-                                            "package_name": "builtin.echo",
-                                            "package_version": "2.2.6",
-                                        }
-                                    ],
-                                    "terminal": {
-                                        "state": "completed",
-                                        "terminal": True,
-                                        "returncode": 0,
-                                    },
-                                    "details": {
-                                        "scheduler_submission": {
-                                            "schema_version": ("jarvis.scheduler.submission.v1"),
-                                            "provider": "test-scheduler",
-                                            "scheduler_job_id": "structured-42",
-                                            "identity_source": "scheduler_submit_api",
-                                            "submitted": True,
-                                        }
-                                    },
-                                }
-                            }
-                        },
-                        "stdout": "Submitted batch job stdout-wrong\n",
-                        "returncode": 0,
-                        "timed_out": False,
-                        "protocol_error": None,
-                    }
+                    _native_mcp_result_document(
+                        command=command,
+                        digest=digest,
+                        pipeline_id="runtime-test",
+                        execution_id=execution_id,
+                        server_artifact=server_artifact,
+                        arguments=job.spec.arguments,
+                        mode="scheduler",
+                        scheduler_provider="test-scheduler",
+                        scheduler_native_id="structured-42",
+                        cluster="research-cluster",
+                    )
                 ),
                 encoding="utf-8",
             )
@@ -5759,9 +5745,8 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
     assert task.metadata["runtime_metadata_source"] == "jarvis_mcp"
     assert task.metadata["scheduler_job_ids"] == ["structured-42"]
     assert runtime["scheduler_job_id"] == "structured-42"
-    assert runtime["allocated_nodes"] == ["compute-09"]
-    assert runtime["packages"][0]["name"] == "builtin.echo"
-    assert runtime["terminal"]["state"] == "completed"
+    assert runtime["packages"][0]["name"] == "builtin.paraview"
+    assert runtime["terminal"]["state"] == "submitted"
     artifact_kinds = {artifact.kind for artifact in queue.list_artifacts(job.job_id)}
     assert "runtime_metadata" in artifact_kinds
     provenance = json.loads(
@@ -5794,8 +5779,16 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
     server_artifact = verified_jarvis_server_artifact()
     digest = remote_mcp_server_artifact_digest(server_artifact)
     monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    idempotency_key = "native-direct-runtime"
+    relay_job_id = "job_22222222222222222222222222222222"
+    execution_id = deterministic_jarvis_execution_id(
+        cluster="research-cluster",
+        idempotency_key=idempotency_key,
+        job_id=relay_job_id,
+    )
     job = queue.submit_job(
         RelayJob(
+            job_id=relay_job_id,
             cluster="research-cluster",
             kind=JobKind.MCP_CALL,
             spec=McpCallSpec(
@@ -5806,9 +5799,12 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
                     endpoint_module.jarvis_cd_lock_binding_expectation()
                 ),
                 tool="jarvis_run",
-                arguments={"pipeline_id": "native-direct"},
+                arguments={
+                    "pipeline_id": "native-direct",
+                    "execution_id": execution_id,
+                },
             ),
-            idempotency_key="native-direct-runtime",
+            idempotency_key=idempotency_key,
         )
     )
 
@@ -5840,6 +5836,7 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
                         command=command,
                         digest=digest,
                         pipeline_id="native-direct",
+                        execution_id=execution_id,
                         server_artifact=server_artifact,
                     )
                 ),
@@ -5861,7 +5858,7 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
 
     assert result is not None
     assert result.state is JobState.SUCCEEDED
-    assert runtime["execution_id"] == "native-direct-execution"
+    assert runtime["execution_id"] == execution_id
     assert runtime["scheduler_provider"] is None
     assert runtime["scheduler_job_id"] is None
     assert runtime["scheduler_phase"] is None
