@@ -11,6 +11,7 @@ from typing import Any, Protocol, cast
 
 import pytest
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError
 
 from clio_relay import mcp_server as mcp_server_module
 from clio_relay.cluster_config import (
@@ -273,7 +274,7 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         "package_name",
         "service_instance_id",
     ]
-    assert len(bind_runtime_tool["inputSchema"]["oneOf"]) == 2
+    assert bind_runtime_tool["inputSchema"]["if"] == {"required": ["binding"]}
     assert binding_schema["properties"]["source_job_id"] == durable_record_id_json_schema()
     assert binding_schema["properties"]["source_artifact_id"] == durable_record_id_json_schema()
     bind_output_schema = bind_runtime_tool["outputSchema"]
@@ -418,6 +419,80 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert "package_search is discovery only" in add_step_tool["description"]
     assert "target='package'" in add_step_tool["description"]
     assert "package-owned settings contract rather than guessing" in add_step_tool["description"]
+
+
+def test_user_mcp_schemas_avoid_root_unions_and_preserve_exclusive_forms(
+    tmp_path: Path,
+) -> None:
+    """Keep agent-facing schemas visible to SDK clients without weakening validation."""
+
+    response = handle_request(
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        queue=ClioCoreQueue(tmp_path / "core"),
+        profile="user",
+    )
+
+    assert response is not None
+    tools = {tool["name"]: tool for tool in response["result"]["tools"]}
+    unsafe_root_unions = {"oneOf", "anyOf", "allOf"}
+    assert {
+        name: sorted(unsafe_root_unions.intersection(tool["inputSchema"]))
+        for name, tool in tools.items()
+        if unsafe_root_unions.intersection(tool["inputSchema"])
+    } == {}
+
+    lineage = cast(
+        _SchemaValidator,
+        Draft202012Validator(tools["relay_artifact_lineage"]["inputSchema"]),
+    )
+    for accepted in (
+        {"job_id": "job-source"},
+        {"artifact_id": "artifact-result"},
+        {
+            "artifact_id": "artifact-result",
+            "cluster": "ares",
+            "route_revision": "a" * 64,
+        },
+    ):
+        lineage.validate(accepted)
+    for rejected in (
+        {},
+        {"job_id": "job-source", "artifact_id": "artifact-result"},
+        {"artifact_id": "artifact-result", "cluster": "ares"},
+    ):
+        with pytest.raises(ValidationError):
+            lineage.validate(rejected)
+
+    handoff = {
+        "cluster": "ares",
+        "source_job_id": "job-source",
+        "source_artifact_id": "artifact-result",
+        "package_id": "paraview-1",
+        "package_name": "builtin.paraview",
+        "service_instance_id": "paraview-live-1",
+    }
+    bind_runtime = cast(
+        _SchemaValidator,
+        Draft202012Validator(tools["relay_bind_jarvis_runtime"]["inputSchema"]),
+    )
+    legacy_selectors = {
+        key: value for key, value in handoff.items() if key != "service_instance_id"
+    }
+    for accepted in (
+        {"binding": handoff},
+        {"binding": handoff, "readiness_timeout_seconds": 30},
+        legacy_selectors,
+        {**legacy_selectors, "name": "asteroid-viewer"},
+    ):
+        bind_runtime.validate(accepted)
+    for rejected in (
+        {},
+        {"binding": handoff, "cluster": "ares"},
+        {key: value for key, value in legacy_selectors.items() if key != "package_name"},
+        {"binding": {key: value for key, value in handoff.items() if key != "package_name"}},
+    ):
+        with pytest.raises(ValidationError):
+            bind_runtime.validate(rejected)
 
 
 def test_mcp_admin_profile_lists_operational_tools(tmp_path: Path) -> None:
