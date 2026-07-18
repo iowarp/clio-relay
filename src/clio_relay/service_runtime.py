@@ -1901,7 +1901,10 @@ class ServiceRuntimeSupervisor:
             errors.append(unresolved_scheduler.detail or "scheduler submission is unresolved")
         if session.scheduler_job_id is not None:
             try:
-                verified_submission = self._verified_scheduler_submission(session)
+                verified_submission = self._verified_scheduler_submission(
+                    session,
+                    allow_quiesced_owner_source_recovery=not cancel_scheduler_job,
+                )
             except (ConfigurationError, RelayError) as exc:
                 scheduler_resource = CleanupResource(
                     kind="scheduler_job",
@@ -2837,6 +2840,8 @@ class ServiceRuntimeSupervisor:
     def _verified_scheduler_submission(
         self,
         session: GatewaySession,
+        *,
+        allow_quiesced_owner_source_recovery: bool = False,
     ) -> _VerifiedSchedulerSubmission:
         """Prove the exact provider and job ID from the relay-created remote sidecar."""
         scheduler_job_id = _optional_str(session.scheduler_job_id)
@@ -2855,6 +2860,23 @@ class ServiceRuntimeSupervisor:
                     settings=self.settings,
                     binding_document=binding_document,
                 )
+            except (ConfigurationError, RelayError):
+                if not (
+                    allow_quiesced_owner_source_recovery
+                    and self._quiesced_owner_source_recovery_is_authorized(session)
+                ):
+                    raise
+                try:
+                    verified = reverify_jarvis_service_runtime(
+                        queue=self.queue,
+                        definition=self.definition,
+                        settings=None,
+                        binding_document=binding_document,
+                    )
+                except ValueError as exc:
+                    raise RelayError(
+                        f"JARVIS service runtime binding re-verification failed: {exc}"
+                    ) from exc
             except ValueError as exc:
                 raise RelayError(
                     f"JARVIS service runtime binding re-verification failed: {exc}"
@@ -2946,6 +2968,51 @@ class ServiceRuntimeSupervisor:
             provider=canonical_provider,
             scheduler_job_id=scheduler_job_id,
             spec=spec,
+        )
+
+    def _quiesced_owner_source_recovery_is_authorized(
+        self,
+        session: GatewaySession,
+    ) -> bool:
+        """Authorize a non-canceling direct source read for an exact closing owner."""
+        teardown_intent = _object(session.gateway.get("teardown_intent", {}))
+        owner_session_id = _optional_str(session.metadata.get("owner_session_id"))
+        generation_id = _optional_str(session.metadata.get("owner_session_generation_id"))
+        admission_id = _optional_str(session.metadata.get("owner_session_admission_id"))
+        if owner_session_id is None or generation_id is None or admission_id is None:
+            return False
+        try:
+            expected_admission_id = desktop_owner_session_admission_id(
+                cluster=self.cluster,
+                session_id=owner_session_id,
+            )
+        except ValueError:
+            return False
+        if (
+            teardown_intent.get("schema_version") != "clio-relay.gateway-teardown-intent.v1"
+            or teardown_intent.get("gateway_session_id") != session.session_id
+            or teardown_intent.get("cancel_scheduler_job") is not False
+            or self.settings.owner_session_id != owner_session_id
+            or self.settings.owner_session_generation_id != generation_id
+            or self.settings.resolved_owner_session_cluster() != self.cluster
+            or admission_id != expected_admission_id
+        ):
+            return False
+        try:
+            cleanup_intent = self.queue.get_owner_session_cleanup_intent(
+                admission_id,
+                session_generation_id=generation_id,
+            )
+        except (OSError, QueueConflictError, ValueError):
+            return False
+        return bool(
+            cleanup_intent is not None
+            and cleanup_intent.get("schema_version") == "clio-relay.owner-session-cleanup-intent.v1"
+            and cleanup_intent.get("owner_session_id") == admission_id
+            and cleanup_intent.get("session_generation_id") == generation_id
+            and cleanup_intent.get("cancel_scheduler_jobs") is False
+            and isinstance(cleanup_intent.get("operation_id"), str)
+            and bool(cleanup_intent.get("operation_id"))
         )
 
     def _stop_local_connector(

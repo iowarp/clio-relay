@@ -3986,6 +3986,16 @@ def session_teardown(
                         }
                     )
             write_validation_report(partial, canonical_report_path)
+        gateway_reports = _cleanup_owned_runtime_sessions(
+            cluster=cluster,
+            definition=definition,
+            owner_session_id=session_id,
+            owner_session_generation_id=session_generation_id,
+            mode="teardown",
+            cancel_scheduler_jobs=cancel_scheduler_jobs,
+            scheduler_sentinel_ids=scheduler_sentinel_ids,
+            owned_jobs=owned_jobs,
+        )
         report = teardown_remote_session(
             definition=definition,
             session_id=session_id,
@@ -4050,17 +4060,6 @@ def session_teardown(
             scheduler_sentinel_ids,
             owned_jobs,
             gateway_scheduler_job_ids=gateway_scheduler_job_ids,
-        )
-
-        gateway_reports = _cleanup_owned_runtime_sessions(
-            cluster=cluster,
-            definition=definition,
-            owner_session_id=session_id,
-            owner_session_generation_id=session_generation_id,
-            mode="teardown",
-            cancel_scheduler_jobs=cancel_scheduler_jobs,
-            scheduler_sentinel_ids=scheduler_sentinel_ids,
-            owned_jobs=owned_jobs,
         )
 
         scheduler_jobs = list_owned_jobs(include_terminal=True)
