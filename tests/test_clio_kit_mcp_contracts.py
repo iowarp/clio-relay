@@ -51,10 +51,23 @@ CONTRACT_PROJECTION = "mcp-agent-tool-schema-v1"
 MAX_CONTRACT_BYTES = 4 * 1024 * 1024
 MAX_PROBE_OUTPUT_BYTES = 16 * 1024 * 1024
 EXPECTED_CONTRACTS = {
+    "clio-kit-jarvis-user-v3.3": {
+        "server_name": "jarvis",
+        "artifact": "jarvis-user-v3.3.json",
+        "contract_sha256": CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
+        "tool_names": {
+            "jarvis_add_step",
+            "jarvis_create_pipeline",
+            "jarvis_describe",
+            "jarvis_edit_step",
+            "jarvis_get_execution",
+            "jarvis_run",
+        },
+    },
     "clio-kit-jarvis-user-v3.2": {
         "server_name": "jarvis",
         "artifact": "jarvis-user-v3.2.json",
-        "contract_sha256": CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
+        "contract_sha256": "12f6d349c9d44d8ce3594943dcd4018ec9b6e01ebb0e59d468bb1bb783a1ad5d",
         "tool_names": {
             "jarvis_add_step",
             "jarvis_create_pipeline",
@@ -156,6 +169,7 @@ def _verified_locked_jarvis_runtime() -> dict[str, object]:
 ACTIVE_CONTRACT_IDS = frozenset(EXPECTED_CONTRACTS) - {
     "clio-kit-jarvis-user-v3",
     "clio-kit-jarvis-user-v3.1",
+    "clio-kit-jarvis-user-v3.2",
 }
 UV_TOOL_PROBE_VERSION = "0.0.0"
 
@@ -242,7 +256,7 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
         assert artifact["contract_sha256"] == expected["contract_sha256"]
         assert set(cast(list[str], artifact["tool_names"])) == expected["tool_names"]
 
-    jarvis_tools = _tools_by_name(shipped_contracts["clio-kit-jarvis-user-v3.2"])
+    jarvis_tools = _tools_by_name(shipped_contracts["clio-kit-jarvis-user-v3.3"])
     artifact_projection = {
         name: {
             "description": tool.get("description"),
@@ -255,6 +269,10 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
     assert jarvis_user_contract() == artifact_projection
 
     assert "jarvis_remove_step" not in jarvis_tools
+    add_step_input = cast(JSON, jarvis_tools["jarvis_add_step"]["inputSchema"])
+    add_step_properties = cast(JSON, add_step_input["properties"])
+    assert "do_configure" not in add_step_properties
+    assert "canonical setting names exactly" in str(add_step_properties["config"]["description"])
     edit_input = cast(JSON, jarvis_tools["jarvis_edit_step"]["inputSchema"])
     edit_properties = cast(JSON, edit_input["properties"])
     assert cast(JSON, edit_properties["operation"])["enum"] == ["edit", "remove"]
@@ -357,7 +375,7 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
         "default": False,
         "type": "boolean",
     }
-    assert shipped_contracts["clio-kit-jarvis-user-v3.2"]["wire_sha256"] == (
+    assert shipped_contracts["clio-kit-jarvis-user-v3.3"]["wire_sha256"] == (
         CLIO_KIT_JARVIS_USER_WIRE_SHA256
     )
 

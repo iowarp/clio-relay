@@ -404,6 +404,11 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         assert "job_id alone is only for a local relay job" in description
     wait_tool = next(tool for tool in response["result"]["tools"] if tool["name"] == "relay_wait")
     assert "service_runtime_bindings" in wait_tool["description"]
+    assert (
+        "mcp_result.structured_result as the authoritative remote tool output"
+        in wait_tool["description"]
+    )
+    assert "do not call relay_observe merely to recover that result" in wait_tool["description"]
     assert "Never use a JARVIS execution_id as gateway_session_id" in wait_tool["description"]
     assert "JARVIS execution_id is not a gateway_session_id" in bind_runtime_tool["description"]
     assert "Never use execution_id as gateway_session_id" in query_tool["description"]

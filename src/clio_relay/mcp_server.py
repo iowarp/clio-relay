@@ -551,7 +551,9 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                 "evidence, and optional logs. For a remote job, copy cluster, job_id, and "
                 "route_revision unchanged from its submission receipt on every follow-up "
                 "call, including on the same MCP connection. job_id alone is only for a "
-                "local relay job. A terminal jarvis_get_execution requested with "
+                "local relay job. Treat mcp_result.structured_result as the authoritative "
+                "remote tool output; do not call relay_observe merely to recover that result. "
+                "A terminal jarvis_get_execution requested with "
                 "include_service_runtimes=true returns service_runtime_bindings; pass one "
                 "unchanged to relay_bind_jarvis_runtime, then use that bind result's "
                 "gateway_session_id. Never use a JARVIS execution_id as gateway_session_id."
@@ -1781,8 +1783,8 @@ def _call_tool(
 
 
 def _serialize_tool_result(result: JSON) -> str:
-    """Keep compact service handoffs ahead of a potentially large MCP result."""
-    if "service_runtime_bindings" in result:
+    """Keep actionable verified MCP output ahead of bulk operational evidence."""
+    if "service_runtime_bindings" in result or "mcp_result" in result:
         compact_keys = (
             "service_runtime_bindings",
             "mcp_result_artifact",
@@ -1794,8 +1796,9 @@ def _serialize_tool_result(result: JSON) -> str:
             "terminal",
             "remote",
             "last_error",
+            "mcp_result",
         )
-        bulk_keys = ("job", "mcp_result", "logs", "artifacts")
+        bulk_keys = ("job", "logs", "artifacts")
         ordered: JSON = {}
         for key in compact_keys:
             if key in result:

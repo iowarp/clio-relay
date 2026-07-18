@@ -264,7 +264,7 @@ Virtual JARVIS mutations and runs receive a fresh relay job by default. Supply
 an explicit `idempotency_key` only when retry de-duplication is intentional; an
 identical second `jarvis_run` is otherwise a new execution.
 
-The released clio-kit 2.5.6 artifact is the pinned six-tool JARVIS v3.2 contract.
+The released clio-kit 2.5.8 artifact is the pinned six-tool JARVIS v3.3 contract.
 Bootstrap
 downloads and hashes the exact coordinated wheel, installs it once with
 `uv tool install`, and persists the wheel plus the direct JARVIS command in the
@@ -283,17 +283,17 @@ relay's exact JARVIS-CD release pin. That dependency edge is recorded in the
 install receipt and call result. Operator-registered MCP servers remain bound
 by their own discovery artifact and are not constrained to the relay's
 JARVIS-CD version.
-The release gate requires that exact 2.5.6 artifact to be rerun on every target
+The release gate requires that exact 2.5.8 artifact to be rerun on every target
 selected by the release policy. Other servers use the operator registry and
 generated `remote_...` aliases.
 
 The exact release wheel is
-`clio_kit-2.5.6-py3-none-any.whl` with SHA-256
-`3c9d58b471abc2032ba0a63c875b12d2c2fc9245f42fd9ca4c41c68a5bfde9d4`.
-Its canonical contract is `clio-kit-jarvis-user-v3.2`, with contract SHA-256
-`12f6d349c9d44d8ce3594943dcd4018ec9b6e01ebb0e59d468bb1bb783a1ad5d`
+`clio_kit-2.5.8-py3-none-any.whl` with SHA-256
+`ac2f9f7d6af212d853d6b6453073991b8a9db812f7cec986e23f744ad352ed9a`.
+Its canonical contract is `clio-kit-jarvis-user-v3.3`, with contract SHA-256
+`0993ee9b2ee9b3c2b021a3967d9221199c3a6be50d726d4b125812e6b1148115`
 and canonical tools-wire SHA-256
-`bda0abe2b57d5e52ef639bf530e967c3b65072ebc4761d25cd9cbbcf0cd934e9`.
+`c74276800cab5031ccd1538343180c40a58e9b8700d0b49e9ca9d4461d37696d`.
 
 ## Register the Spack MCP
 
@@ -308,7 +308,7 @@ operator-defined and do not select behavior.
 
 ## Register the scientific catalog MCP
 
-clio-kit 2.5.6 also ships the two-tool
+clio-kit 2.5.8 also ships the two-tool
 `clio-kit-scientific-catalog-user-v1` contract. It separates dataset discovery
 from visualization control: `scientific_dataset_search` finds operator catalog
 records and `scientific_dataset_describe` returns one exact
