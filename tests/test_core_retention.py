@@ -553,6 +553,58 @@ def test_terminal_gc_uses_per_job_monitor_and_gateway_reference_indexes(
     assert queue.plan_terminal_job_gc(scheduler_job.job_id).eligible is True
 
 
+@pytest.mark.parametrize("provenance_location", ["metadata", "binding"])
+@pytest.mark.parametrize(
+    ("source_field", "source_kind"),
+    [
+        ("source_relay_job_id", "job"),
+        ("source_relay_artifact_id", "artifact"),
+    ],
+)
+def test_terminal_gc_protects_direct_live_gateway_source_provenance(
+    tmp_path: Path,
+    provenance_location: str,
+    source_field: str,
+    source_kind: str,
+) -> None:
+    queue = ClioCoreQueue(tmp_path)
+    _intent_record, job = _terminal_job(
+        queue,
+        f"gc-gateway-source-{provenance_location}-{source_kind}",
+    )
+    source_id = job.job_id
+    if source_kind == "artifact":
+        source_id = queue.append_artifact(
+            ArtifactRef(
+                job_id=job.job_id,
+                uri=(tmp_path / "gateway-source").as_uri(),
+                kind="runtime-binding",
+            )
+        ).artifact_id
+    metadata: dict[str, object] = {}
+    gateway: dict[str, object] = {}
+    if provenance_location == "metadata":
+        metadata[source_field] = source_id
+    else:
+        gateway["jarvis_runtime_binding"] = {source_field: source_id}
+
+    session = queue.create_gateway_session(
+        GatewaySession(
+            cluster="test-cluster",
+            name=f"source-{source_kind}-gateway",
+            gateway=gateway,
+            metadata=metadata,
+        )
+    )
+
+    plan = queue.plan_terminal_job_gc(job.job_id)
+    assert plan.eligible is False
+    assert "active_gateway_record" in plan.protections
+
+    queue.close_gateway_session(session.session_id)
+    assert queue.plan_terminal_job_gc(job.job_id).eligible is True
+
+
 def test_terminal_task_pending_cleanup_blocks_gc_until_acknowledged(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path)
     _intent_record, job = _terminal_job(queue, "gc-pending-execution-cleanup")

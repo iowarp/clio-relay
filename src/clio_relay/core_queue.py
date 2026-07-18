@@ -9222,7 +9222,7 @@ class ClioCoreQueue:
                 relation_kind="direct",
                 relation_key=job_id,
             )
-        for artifact_id in set(session.artifacts):
+        for artifact_id in _gateway_direct_artifact_ids(session):
             self._write_gateway_reverse_ref_unlocked("artifact", artifact_id, session)
             artifact = self._read_optional(
                 self._storage_root / "artifacts" / f"{artifact_id}.json",
@@ -12590,7 +12590,28 @@ def _gateway_direct_job_ids(session: GatewaySession) -> set[str]:
         value = session.metadata.get(field)
         if isinstance(value, str) and value:
             job_ids.add(value)
+    for provenance in _gateway_source_provenance(session):
+        value = provenance.get("source_relay_job_id")
+        if isinstance(value, str) and value:
+            job_ids.add(value)
     return job_ids
+
+
+def _gateway_direct_artifact_ids(session: GatewaySession) -> set[str]:
+    artifact_ids = {artifact_id for artifact_id in session.artifacts if artifact_id}
+    for provenance in _gateway_source_provenance(session):
+        value = provenance.get("source_relay_artifact_id")
+        if isinstance(value, str) and value:
+            artifact_ids.add(value)
+    return artifact_ids
+
+
+def _gateway_source_provenance(session: GatewaySession) -> tuple[dict[str, Any], ...]:
+    provenance = [session.metadata]
+    runtime_binding = session.gateway.get("jarvis_runtime_binding")
+    if isinstance(runtime_binding, dict):
+        provenance.append(cast(dict[str, Any], runtime_binding))
+    return tuple(provenance)
 
 
 def _gateway_relation_is_preserved(
@@ -12604,7 +12625,7 @@ def _gateway_relation_is_preserved(
     if relation_kind == "direct":
         return relation_key in _gateway_direct_job_ids(session)
     if relation_kind == "artifact":
-        return relation_key in session.artifacts
+        return relation_key in _gateway_direct_artifact_ids(session)
     if relation_kind == "scheduler":
         return relation_key == session.scheduler_job_id
     raise QueueConflictError(f"unsupported gateway relation kind: {relation_kind}")

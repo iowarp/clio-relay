@@ -631,6 +631,10 @@ def test_owned_remote_source_uses_identity_bound_api_for_every_verification(
         owner_session_generation_id="generation-1",
         remote_cluster=definition.name,
     )
+    # Browser attachment is intentionally desktop-local. Its immutable source
+    # receipt still belongs to the remote owner session and must not be looked up
+    # in the desktop queue merely because command placement is local.
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
     requests: list[tuple[str, str]] = []
     lifecycle: list[str] = []
 
@@ -670,10 +674,14 @@ def test_owned_remote_source_uses_identity_bound_api_for_every_verification(
     def local_artifact_forbidden(_queue: ClioCoreQueue, _artifact_id: str) -> dict[str, object]:
         raise AssertionError("owned remote source must not read desktop artifact storage")
 
-    def source_is_remote(_definition: ClusterDefinition) -> bool:
-        return True
+    def locality_must_not_select_provenance(_definition: ClusterDefinition) -> bool:
+        raise AssertionError("owner-session provenance must take precedence over CLI locality")
 
-    monkeypatch.setattr(runtime_binding, "should_execute_on_cluster", source_is_remote)
+    monkeypatch.setattr(
+        runtime_binding,
+        "should_execute_on_cluster",
+        locality_must_not_select_provenance,
+    )
     monkeypatch.setattr(runtime_binding, "OwnedSessionApiClient", FakeOwnedSessionApiClient)
     monkeypatch.setattr(runtime_binding, "run_remote_clio", direct_ssh_forbidden)
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", local_artifact_forbidden)
