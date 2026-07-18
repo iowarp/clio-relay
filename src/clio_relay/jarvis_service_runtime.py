@@ -476,36 +476,40 @@ def _load_source(
     source_job_id: str,
     source_artifact_id: str,
 ) -> tuple[RelayJob, ArtifactRef, JSON]:
-    if should_execute_on_cluster(definition):
-        if settings is not None and settings.owner_session_id is not None:
-            with OwnedSessionApiClient(definition=definition, settings=settings) as client:
-                status = _json_object(
-                    client.request_json(
-                        method="GET",
-                        path=f"/jobs/{source_job_id}/status",
-                    ),
-                    "JARVIS service source job",
-                )
-                envelope = _json_object(
-                    client.request_json(
-                        method="GET",
-                        path=f"/artifacts/{source_artifact_id}/content",
-                    ),
-                    "JARVIS service source artifact",
-                )
-            raw_job = status.get("job")
-        else:
-            status = _remote_json(
-                definition,
-                ["job", "status", source_job_id],
+    # The source receipt belongs to its exact owner-session generation, regardless of
+    # where the current operation executes.  In particular, browser attachment is a
+    # desktop-local operation, but it must re-verify the remote JARVIS receipt through
+    # the authenticated owner-session API rather than looking for that job in the
+    # desktop queue.  CLI locality controls command placement, not provenance storage.
+    if settings is not None and settings.owner_session_id is not None:
+        with OwnedSessionApiClient(definition=definition, settings=settings) as client:
+            status = _json_object(
+                client.request_json(
+                    method="GET",
+                    path=f"/jobs/{source_job_id}/status",
+                ),
                 "JARVIS service source job",
             )
-            raw_job = status.get("job")
-            envelope = _remote_json(
-                definition,
-                ["job", "read-artifact", source_artifact_id],
+            envelope = _json_object(
+                client.request_json(
+                    method="GET",
+                    path=f"/artifacts/{source_artifact_id}/content",
+                ),
                 "JARVIS service source artifact",
             )
+        raw_job = status.get("job")
+    elif should_execute_on_cluster(definition):
+        status = _remote_json(
+            definition,
+            ["job", "status", source_job_id],
+            "JARVIS service source job",
+        )
+        raw_job = status.get("job")
+        envelope = _remote_json(
+            definition,
+            ["job", "read-artifact", source_artifact_id],
+            "JARVIS service source artifact",
+        )
     else:
         raw_job = queue.get_job(source_job_id).model_dump(mode="json")
         envelope = cast(JSON, read_artifact_bytes(queue, source_artifact_id))
