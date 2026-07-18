@@ -2517,6 +2517,45 @@ def test_cli_session_teardown_reports_success_when_optional_worker_observation_t
     assert not any(check["check_id"] == "session.teardown" for check in validation_report["checks"])
 
 
+def test_cli_session_teardown_cleans_jarvis_gateway_before_stopping_owned_api(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    core_dir = tmp_path / "core"
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    _activate_owner_session(ClioCoreQueue(core_dir))
+    api_running = True
+    lifecycle_events: list[str] = []
+
+    def clean_jarvis_gateway(**_kwargs: object) -> list[dict[str, object]]:
+        lifecycle_events.append("clean_jarvis_gateway")
+        if not api_running:
+            raise RelayError(
+                "JARVIS scheduler ownership source is unavailable after owned API shutdown"
+            )
+        return []
+
+    def stop_owned_api(**_kwargs: object) -> SessionLifecycleReport:
+        nonlocal api_running
+        lifecycle_events.append("stop_owned_api")
+        api_running = False
+        return _verified_teardown_report()
+
+    monkeypatch.setattr(cli, "status_remote_session", _fake_owned_session_status)
+    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", clean_jarvis_gateway)
+    monkeypatch.setattr(cli, "teardown_remote_session", stop_owned_api)
+
+    result = CliRunner().invoke(
+        app,
+        ["session", "teardown", "--cluster", "ares", "--session-id", "session-1"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert lifecycle_events == ["clean_jarvis_gateway", "stop_owned_api"]
+
+
 def test_cli_session_teardown_failure_preserves_stopped_api_evidence(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -2539,14 +2578,14 @@ def test_cli_session_teardown_failure_preserves_stopped_api_evidence(
             return []
         raise RelayError("post-API owner-session rescan failed")
 
-    def forbidden_gateway_cleanup(**_kwargs: object) -> list[dict[str, object]]:
+    def record_gateway_cleanup(**_kwargs: object) -> list[dict[str, object]]:
         gateway_cleanup_calls.append("gateway")
         return []
 
     monkeypatch.setattr(cli, "status_remote_session", _fake_owned_session_status)
     monkeypatch.setattr(cli, "teardown_remote_session", _fake_verified_teardown)
     monkeypatch.setattr(cli, "_list_owned_active_cluster_jobs", fail_after_api_stop)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", forbidden_gateway_cleanup)
+    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", record_gateway_cleanup)
 
     result = CliRunner().invoke(
         app,
@@ -2577,7 +2616,7 @@ def test_cli_session_teardown_failure_preserves_stopped_api_evidence(
     assert process_resource["resource_id"] == "123"
     assert process_resource["state"] == "stopped"
     assert report["cleanup"]["actions"][0]["kind"] == "remote_relay_api"
-    assert gateway_cleanup_calls == []
+    assert gateway_cleanup_calls == ["gateway"]
     assert queue.owner_session_is_closing("session-1") is True
     assert queue.get_owner_session_closed("session-1") is None
 

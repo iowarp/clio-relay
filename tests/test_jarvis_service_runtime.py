@@ -25,7 +25,7 @@ from clio_relay.cluster_config import (
 )
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import ConfigurationError, QueueConflictError
+from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
 from clio_relay.jarvis_mcp import jarvis_cd_lock_binding_expectation
 from clio_relay.jarvis_service_runtime import (
     RELAY_JARVIS_RUNTIME_BINDING_SCHEMA,
@@ -1716,6 +1716,119 @@ def test_bound_runtime_detach_and_teardown_preserve_scheduler_by_default(
     assert sum("connector-step-cancel" in command for command in allocation_commands) == 1
     assert reverified == ["paraview-live-1", "paraview-live-1"]
     assert reverified_settings == [supervisor.settings, supervisor.settings]
+
+
+def test_quiesced_owner_keep_scheduler_recovery_reverifies_without_stopped_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    owner_session_id = "desktop-session"
+    generation_id = "generation-1"
+    admission_id = owner_session_admission_module.desktop_owner_session_admission_id(
+        cluster=definition.name,
+        session_id=owner_session_id,
+    )
+    queue.mirror_owner_session_generation_open(
+        admission_id,
+        session_generation_id=generation_id,
+    )
+    spec = ServiceRuntimeSpec(
+        kind="jarvis-service-runtime",
+        submit_command=None,
+        deployment_driver="jarvis-bound",
+        service_port=verified.runtime.port,
+        desktop_bind_port=28777,
+        scheduler="slurm",
+    )
+    session = queue.create_gateway_session(
+        GatewaySession(
+            cluster=definition.name,
+            name="quiesced-owner-recovery",
+            scheduler="slurm",
+            scheduler_job_id="12345",
+            gateway={
+                "runtime_spec": spec.model_dump(mode="json"),
+                "jarvis_runtime_binding": verified.binding.model_dump(mode="json"),
+                "teardown_intent": {
+                    "schema_version": "clio-relay.gateway-teardown-intent.v1",
+                    "operation_id": "gateway_cleanup_00000000000000000000000000000000",
+                    "gateway_session_id": "gateway_recovery",
+                    "cancel_scheduler_job": False,
+                    "created_at": "2026-07-18T03:00:00Z",
+                },
+            },
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": owner_session_id,
+                "owner_session_generation_id": generation_id,
+                "owner_session_admission_id": admission_id,
+            },
+            session_id="gateway_recovery",
+        )
+    )
+    queue.set_owner_session_closing(
+        admission_id,
+        session_generation_id=generation_id,
+        stop_worker=False,
+        cancel_jobs=False,
+        cancel_scheduler_jobs=False,
+    )
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="api-token",
+        owner_session_id=owner_session_id,
+        owner_session_generation_id=generation_id,
+        owner_session_cluster=definition.name,
+    )
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster=definition.name,
+        definition=definition,
+        token="token",
+        secret_key="secret",
+    )
+    observed_settings: list[RelaySettings | None] = []
+
+    def stopped_api_then_direct_source(**kwargs: Any) -> Any:
+        source_settings = kwargs.get("settings")
+        observed_settings.append(source_settings)
+        if source_settings is not None:
+            raise RelayError("owned API generation is already stopped")
+        return verified
+
+    monkeypatch.setattr(
+        service_runtime_module,
+        "reverify_jarvis_service_runtime",
+        stopped_api_then_direct_source,
+    )
+
+    submission = supervisor._verified_scheduler_submission(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session,
+        allow_quiesced_owner_source_recovery=True,
+    )
+
+    assert submission.provider == "slurm"
+    assert submission.scheduler_job_id == "12345"
+    assert observed_settings == [settings, None]
+    observed_settings.clear()
+    with pytest.raises(RelayError, match="already stopped"):
+        supervisor._verified_scheduler_submission(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            session,
+            allow_quiesced_owner_source_recovery=False,
+        )
+    assert observed_settings == [settings]
 
 
 def test_bound_runtime_scheduler_cancel_requires_fresh_binding_reverification(
