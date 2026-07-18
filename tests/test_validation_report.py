@@ -1945,7 +1945,7 @@ def test_default_report_path_sanitizes_cluster_name(tmp_path: Path) -> None:
 def test_repository_release_policy_is_machine_readable() -> None:
     policy = load_release_gate_policy(Path("docs/release-gate-1.0.yaml"))
 
-    assert policy.release_version == "1.3.31"
+    assert policy.release_version == "1.3.32"
     assert policy.acceptance_matrix is not None
     assert policy.acceptance_matrix["report_count_per_stage"] == 18
     assert policy.acceptance_matrix["matrix_sha256"] == policy.acceptance_matrix_sha256
@@ -2379,17 +2379,17 @@ def test_native_application_progress_gate_rejects_legacy_adapter_only_evidence()
             state="verified",
             provider="jarvis_cd",
             metadata={
-                "source": "jarvis_execution",
+                "source": "jarvis_get_execution",
                 "execution_id": gray_execution_id,
                 "package_name": "builtin.gray_scott",
                 "package_id": "gray_scott_bp5",
                 "progress_schema_version": "jarvis.progress.v1",
-                "provider_source_authority": "jarvis_mcp_progress_notification",
-                "producer_validated": True,
-                "execution_binding_validated": True,
+                "provider_source_authority": "jarvis_get_execution",
+                "native_documents_validated": True,
+                "query_identity_validated": True,
                 "live_observed_while_running": True,
-                "bridge_validated": True,
-                "runtime_bound": True,
+                "lifecycle_query_validated": True,
+                "terminal_query_bound": True,
             },
         )
     )
@@ -2419,9 +2419,9 @@ def test_native_application_progress_gate_rejects_legacy_adapter_only_evidence()
                 "metadata": {
                     "application": "gray_scott",
                     "io_backend": "adios2",
-                    "latest_timestep": 20,
+                    "latest_timestep": 10000,
                     "member_pattern": "adios2-steps",
-                    "members_observed": 2,
+                    "members_observed": 10,
                     "completion_signal": "process_exit_zero_after_final_output",
                 },
             },
@@ -2442,18 +2442,18 @@ def test_native_application_progress_gate_rejects_legacy_adapter_only_evidence()
             state="verified",
             provider="jarvis_cd",
             metadata={
-                "source": "jarvis_execution",
+                "source": "jarvis_get_execution",
                 "execution_id": lammps_execution_id,
                 "package_name": "builtin.lammps",
                 "package_id": "lammps",
                 "progress_schema_version": "jarvis.progress.v1",
                 "progress_determinate": True,
-                "provider_source_authority": "jarvis_mcp_progress_notification",
-                "producer_validated": True,
-                "execution_binding_validated": True,
+                "provider_source_authority": "jarvis_get_execution",
+                "native_documents_validated": True,
+                "query_identity_validated": True,
                 "live_observed_while_running": True,
-                "bridge_validated": True,
-                "runtime_bound": True,
+                "lifecycle_query_validated": True,
+                "terminal_query_bound": True,
             },
         )
     )

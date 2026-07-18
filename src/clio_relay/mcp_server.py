@@ -4111,6 +4111,8 @@ def _submit_jarvis_mcp_call(
     used_artifact_refs = _artifact_use_refs(arguments)
     tool = _required_str(arguments, "tool")
     tool_arguments = _object(arguments.get("arguments", {}))
+    if tool == "jarvis_run" and "wait" in tool_arguments:
+        raise ValueError("jarvis_run does not accept internal wait; use jarvis_get_execution")
     digest = hashlib.sha256(
         json.dumps(tool_arguments, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()

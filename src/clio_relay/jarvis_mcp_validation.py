@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any, TypeGuard, cast
@@ -44,6 +45,10 @@ _NATIVE_PROGRESS_IDENTITY_KEYS = (
     "package_name",
     "server_artifact_digest",
 )
+_JARVIS_PROGRESS_STATES = frozenset(
+    {"pending", "starting", "running", "ready", "completed", "failed", "canceled"}
+)
+_MAX_JARVIS_PROGRESS_IDENTITY_TEXT = 256
 
 
 def build_jarvis_mcp_validation_report(
@@ -84,6 +89,7 @@ def build_jarvis_mcp_validation_report(
     query_provenance: JSON | None,
     query_initialize_response: JSON | None,
     query_stdio_evidence: JSON | None,
+    query_lifecycle_observations: list[JSON] | None = None,
     launcher: str | None = None,
     install_source: str | None = None,
     artifact_sha256: str | None = None,
@@ -332,22 +338,48 @@ def build_jarvis_mcp_validation_report(
         )
     )
 
-    progress_evidence, progress_passed, progress_resource = _jarvis_live_progress_evidence(
-        progress=progress,
-        live_observation=live_progress_observation,
-        call_job_id=call_job_id,
-        pipeline_id=spec.get("arguments", {}).get("pipeline_id")
+    expected_pipeline_id = (
+        spec.get("arguments", {}).get("pipeline_id")
         if isinstance(spec.get("arguments"), dict)
-        else None,
-        expected_server_artifact_digest=expected_server_artifact_digest,
-        mcp_result=mcp_result,
-        runtime_metadata=runtime_metadata,
+        else None
     )
+    expected_execution_id = (
+        spec.get("arguments", {}).get("execution_id")
+        if isinstance(spec.get("arguments"), dict)
+        else None
+    )
+    if query_lifecycle_observations is None:
+        progress_evidence, progress_passed, progress_resource = _jarvis_live_progress_evidence(
+            progress=progress,
+            live_observation=live_progress_observation,
+            call_job_id=call_job_id,
+            pipeline_id=expected_pipeline_id,
+            expected_server_artifact_digest=expected_server_artifact_digest,
+            mcp_result=mcp_result,
+            runtime_metadata=runtime_metadata,
+        )
+        progress_summary = (
+            "jarvis_run exposed provider-valid progress before completion and replayed it only "
+            "after execution binding"
+        )
+    else:
+        (
+            progress_evidence,
+            progress_passed,
+            progress_resource,
+        ) = _jarvis_query_lifecycle_progress_evidence(
+            observations=query_lifecycle_observations,
+            pipeline_id=expected_pipeline_id,
+            execution_id=expected_execution_id,
+        )
+        progress_summary = (
+            "jarvis_get_execution observed provider-valid in-flight progress and a coherent "
+            "terminal workload snapshot"
+        )
     report.checks.append(
         _check(
             "remote-mcp.jarvis-live-progress",
-            "jarvis_run exposed provider-valid progress before completion and replayed it only "
-            "after execution binding",
+            progress_summary,
             progress_passed,
             report.started_at,
             observed_at,
@@ -401,20 +433,41 @@ def build_jarvis_mcp_validation_report(
     native_handle = _mapping(native_execution.get("execution_handle")) if native_execution else None
     native_record = _mapping(native_execution.get("execution_record")) if native_execution else None
     native_progress = _mapping(native_execution.get("progress")) if native_execution else None
+    scheduler_pair_coherent = (scheduler_provider is None and scheduler_job_id is None) or (
+        isinstance(scheduler_provider, str)
+        and bool(scheduler_provider)
+        and isinstance(scheduler_job_id, str)
+        and bool(scheduler_job_id)
+    )
+    scheduler_sources_coherent = (
+        scheduler_provider_source is None and scheduler_job_id_source is None
+        if scheduler_provider is None
+        else scheduler_provider_source in authoritative_runtime_sources
+        and scheduler_job_id_source in authoritative_runtime_sources
+    )
+    initial_terminal_coherent = bool(
+        native_record is not None
+        and terminal is not None
+        and isinstance(native_record.get("terminal"), bool)
+        and terminal.get("terminal") is native_record.get("terminal")
+        and terminal.get("state") == native_record.get("state")
+        and (
+            terminal.get("returncode") == 0
+            if terminal.get("terminal") is True
+            else terminal.get("returncode") is None
+        )
+    )
     runtime_passed = (
         tool == "jarvis_run"
         and runtime_metadata is not None
         and runtime_metadata.get("schema_version") == RUNTIME_METADATA_SCHEMA
         and source == RuntimeMetadataSource.JARVIS_MCP.value
-        and runtime_metadata.get("pipeline_id") is not None
-        and isinstance(scheduler_provider, str)
-        and bool(scheduler_provider)
-        and isinstance(scheduler_job_id, str)
-        and bool(scheduler_job_id)
+        and runtime_metadata.get("pipeline_id") == expected_pipeline_id
+        and runtime_metadata.get("execution_id") == expected_execution_id
+        and scheduler_pair_coherent
         and bool(field_sources)
         and RuntimeMetadataSource.LEGACY_STDOUT.value not in set(field_sources.values())
-        and scheduler_provider_source in authoritative_runtime_sources
-        and scheduler_job_id_source in authoritative_runtime_sources
+        and scheduler_sources_coherent
         and producer_contract is not None
         and producer_contract.get("trusted") is True
         and producer_contract.get("contract_kind") == "native_execution"
@@ -430,9 +483,11 @@ def build_jarvis_mcp_validation_report(
         and native_handle.get("execution_id") == runtime_metadata.get("execution_id")
         and native_record.get("execution_id") == runtime_metadata.get("execution_id")
         and native_progress.get("execution_id") == runtime_metadata.get("execution_id")
-        and terminal is not None
-        and terminal.get("terminal") is True
-        and terminal.get("returncode") == 0
+        and native_handle.get("scheduler_provider") == scheduler_provider
+        and native_record.get("scheduler_provider") == scheduler_provider
+        and native_handle.get("scheduler_native_id") == scheduler_job_id
+        and native_record.get("scheduler_native_id") == scheduler_job_id
+        and initial_terminal_coherent
         and "runtime_metadata" in artifacts_by_kind
     )
     report.checks.append(
@@ -455,10 +510,11 @@ def build_jarvis_mcp_validation_report(
                 "scheduler_job_id": scheduler_job_id,
                 "scheduler_provider_source": scheduler_provider_source,
                 "scheduler_job_id_source": scheduler_job_id_source,
+                "scheduler_identity_optional_and_coherent": scheduler_pair_coherent,
                 "field_sources": field_sources or {},
                 "producer_contract": producer_contract or {},
                 "native_execution": native_execution or {},
-                "terminal": terminal or {},
+                "dispatch_snapshot_terminal": terminal or {},
                 "runtime_artifact_id": (
                     artifacts_by_kind.get("runtime_metadata", {}).get("artifact_id")
                 ),
@@ -652,24 +708,32 @@ def build_jarvis_mcp_validation_report(
                 metadata=artifact,
             )
         )
-    if isinstance(scheduler_job_id, str):
+    final_query_result = (
+        _mapping(query_mcp_result.get("structured_result")) if query_mcp_result else None
+    )
+    final_query_record = (
+        _mapping(final_query_result.get("execution_record")) if final_query_result else None
+    )
+    final_scheduler_provider = (
+        final_query_record.get("scheduler_provider") if final_query_record else None
+    )
+    final_scheduler_job_id = (
+        final_query_record.get("scheduler_native_id") if final_query_record else None
+    )
+    if isinstance(final_scheduler_provider, str) and isinstance(final_scheduler_job_id, str):
         report.resources.append(
             ValidationResource(
                 kind="scheduler_job",
-                resource_id=scheduler_job_id,
+                resource_id=final_scheduler_job_id,
                 role="jarvis_owned_execution",
                 cluster=cluster,
                 state=(
-                    str(runtime_metadata.get("scheduler_phase"))
-                    if runtime_metadata and runtime_metadata.get("scheduler_phase") is not None
+                    str(final_query_record.get("state"))
+                    if final_query_record and final_query_record.get("state") is not None
                     else None
                 ),
-                provider=(
-                    str(runtime_metadata.get("scheduler_provider"))
-                    if runtime_metadata and runtime_metadata.get("scheduler_provider") is not None
-                    else None
-                ),
-                metadata=runtime_metadata or {},
+                provider=final_scheduler_provider,
+                metadata=final_query_record or {},
             )
         )
     if progress_resource is not None:
@@ -1076,8 +1140,11 @@ def _jarvis_execution_query_evidence(
     state = record.get("state") if record else None
     terminal = record.get("terminal") if record else None
     lifecycle_passed = (
-        isinstance(state, str)
-        and isinstance(terminal, bool)
+        state == "completed"
+        and terminal is True
+        and record is not None
+        and record.get("return_code") == 0
+        and record.get("error") is None
         and progress is not None
         and progress.get("execution_state") == state
         and progress.get("terminal") is terminal
@@ -1153,6 +1220,7 @@ def _jarvis_execution_query_evidence(
         "result_envelope_verified": envelope_passed,
         "identity_coherent": identity_passed,
         "lifecycle_coherent": lifecycle_passed,
+        "terminal_success_verified": lifecycle_passed,
         "pagination_coherent": pagination_passed,
         "artifact_filters_coherent": filters_passed,
         "runner_semantic_validation_verified": runner_attested,
@@ -1209,6 +1277,413 @@ def _artifact_matches_query(artifact: JSON, query: JSON) -> bool:
             ("artifact_id", "artifact_id"),
         )
     )
+
+
+def _jarvis_query_lifecycle_progress_evidence(
+    *,
+    observations: list[JSON],
+    pipeline_id: object,
+    execution_id: object,
+) -> tuple[JSON, bool, JSON | None]:
+    """Validate in-flight and terminal progress obtained through execution queries."""
+    state_rank = {
+        "preparing": 0,
+        "scripted": 1,
+        "submitting": 2,
+        "submitted": 3,
+        "running": 4,
+        "completed": 5,
+        "failed": 5,
+        "canceled": 5,
+    }
+    normalized: list[tuple[JSON, JSON, JSON, JSON]] = []
+    identities_valid = isinstance(pipeline_id, str) and bool(pipeline_id)
+    identities_valid = identities_valid and isinstance(execution_id, str) and bool(execution_id)
+    bounded = 0 < len(observations) <= 512
+    for observation in observations:
+        handle = _mapping(observation.get("execution_handle"))
+        record = _mapping(observation.get("execution_record"))
+        progress = _mapping(observation.get("progress"))
+        if handle is None or record is None or progress is None:
+            identities_valid = False
+            continue
+        if not (
+            observation.get("pipeline_id") == pipeline_id
+            and observation.get("execution_id") == execution_id
+            and record.get("pipeline_id") == pipeline_id
+            and record.get("execution_id") == execution_id
+            and handle.get("pipeline_id") == pipeline_id
+            and handle.get("execution_id") == execution_id
+            and progress.get("pipeline_id") == pipeline_id
+            and progress.get("execution_id") == execution_id
+            and handle.get("schema_version") == "jarvis.execution.handle.v1"
+            and record.get("state") == observation.get("state")
+            and record.get("terminal") is observation.get("terminal")
+            and progress.get("execution_state") == observation.get("state")
+            and progress.get("terminal") is observation.get("terminal")
+            and record.get("schema_version") == "jarvis.execution.record.v1"
+            and progress.get("schema_version") == "jarvis.execution.progress.v1"
+            and isinstance(observation.get("query_job_id"), str)
+        ):
+            identities_valid = False
+        normalized.append((observation, handle, record, progress))
+
+    base_identity_fields = (
+        "execution_id",
+        "pipeline_id",
+        "mode",
+        "scheduler_provider",
+        "cluster",
+    )
+    snapshot_identity_fields = (*base_identity_fields, "scheduler_native_id")
+    stable_identity: tuple[object, ...] | None = None
+    assigned_scheduler_native_id: str | None = None
+    scheduler_identity_valid = True
+    for observation, handle, record, _progress in normalized:
+        identity = tuple(handle.get(field) for field in base_identity_fields)
+        if stable_identity is None:
+            stable_identity = identity
+        elif identity != stable_identity:
+            scheduler_identity_valid = False
+        if any(handle.get(field) != record.get(field) for field in snapshot_identity_fields):
+            scheduler_identity_valid = False
+        mode = handle.get("mode")
+        provider = handle.get("scheduler_provider")
+        native_id = handle.get("scheduler_native_id")
+        if mode == "direct":
+            if provider is not None or native_id is not None:
+                scheduler_identity_valid = False
+            continue
+        if mode != "scheduler" or not isinstance(provider, str) or not provider:
+            scheduler_identity_valid = False
+            continue
+        if native_id is None:
+            if assigned_scheduler_native_id is not None or observation.get("terminal") is True:
+                scheduler_identity_valid = False
+            continue
+        if not isinstance(native_id, str) or not native_id:
+            scheduler_identity_valid = False
+            continue
+        if assigned_scheduler_native_id is None:
+            assigned_scheduler_native_id = native_id
+        elif native_id != assigned_scheduler_native_id:
+            scheduler_identity_valid = False
+    if (
+        stable_identity is not None
+        and stable_identity[2] == "scheduler"
+        and assigned_scheduler_native_id is None
+    ):
+        scheduler_identity_valid = False
+
+    lifecycle_valid = bool(normalized) and identities_valid and scheduler_identity_valid
+    last_known_rank = -1
+    for index, (observation, _handle, _record, _progress) in enumerate(normalized):
+        state = observation.get("state")
+        if state == "unknown":
+            if observation.get("terminal") is not False or index == len(normalized) - 1:
+                lifecycle_valid = False
+            continue
+        rank = state_rank.get(state) if isinstance(state, str) else None
+        if rank is None:
+            lifecycle_valid = False
+            continue
+        if rank < last_known_rank:
+            lifecycle_valid = False
+        last_known_rank = max(last_known_rank, rank)
+        if index < len(normalized) - 1 and observation.get("terminal") is not False:
+            lifecycle_valid = False
+    lifecycle_valid = bool(
+        lifecycle_valid
+        and normalized[-1][0].get("state") == "completed"
+        and normalized[-1][0].get("terminal") is True
+        and normalized[-1][2].get("return_code") == 0
+        and normalized[-1][2].get("error") is None
+    )
+
+    live_package: tuple[JSON, JSON, JSON] | None = None
+    progress_monotonic = True
+    package_counters: dict[tuple[object, object], tuple[int, int, JSON | None]] = {}
+    for observation, _handle, _record, execution_progress in normalized:
+        packages = execution_progress.get("packages")
+        if not isinstance(packages, list):
+            progress_monotonic = False
+            continue
+        for raw_package in cast(list[object], packages):
+            package = _mapping(raw_package)
+            if package is None:
+                progress_monotonic = False
+                continue
+            key = (package.get("package_id"), package.get("package_name"))
+            event_count = package.get("event_count")
+            latest = _mapping(package.get("latest"))
+            base_valid = bool(
+                isinstance(key[0], str)
+                and bool(key[0])
+                and isinstance(key[1], str)
+                and bool(key[1])
+                and _nonnegative_int(event_count)
+            )
+            if not base_valid:
+                progress_monotonic = False
+                continue
+            if event_count == 0 and latest is None:
+                counters = (0, -1)
+            elif latest is not None and bool(
+                _nonnegative_int(latest.get("sequence"))
+                and latest.get("schema_version") == "jarvis.progress.v1"
+                and latest.get("execution_id") == execution_id
+                and latest.get("package_id") == key[0]
+                and latest.get("package_name") == key[1]
+                and _valid_jarvis_progress_semantics(latest)
+            ):
+                counters = (cast(int, event_count), cast(int, latest["sequence"]))
+            else:
+                progress_monotonic = False
+                continue
+            prior = package_counters.get(key)
+            if prior is not None:
+                if counters[0] < prior[0] or counters[1] < prior[1]:
+                    progress_monotonic = False
+                prior_latest = prior[2]
+                if prior_latest is not None and latest is not None:
+                    if counters[1] == prior[1]:
+                        if counters[0] != prior[0] or _jarvis_progress_semantic_signature(
+                            latest
+                        ) != _jarvis_progress_semantic_signature(prior_latest):
+                            progress_monotonic = False
+                    elif counters[1] > prior[1] and (
+                        counters[0] <= prior[0]
+                        or not _jarvis_progress_transition_nonregressing(
+                            prior_latest,
+                            latest,
+                        )
+                    ):
+                        progress_monotonic = False
+            package_counters[key] = (counters[0], counters[1], latest)
+        if observation.get("state") != "running" or observation.get("terminal") is not False:
+            continue
+        for raw_package in cast(list[object], packages):
+            package = _mapping(raw_package)
+            latest = _mapping(package.get("latest")) if package else None
+            if (
+                package is not None
+                and latest is not None
+                and _positive_int(package.get("event_count"))
+                and latest.get("schema_version") == "jarvis.progress.v1"
+                and latest.get("execution_id") == execution_id
+                and latest.get("package_id") == package.get("package_id")
+                and latest.get("package_name") == package.get("package_name")
+                and _valid_jarvis_progress_semantics(latest)
+                and _nonnegative_int(latest.get("sequence"))
+            ):
+                live_package = (observation, package, latest)
+
+    terminal_package: tuple[JSON, JSON] | None = None
+    if live_package is not None and normalized:
+        live_summary = live_package[1]
+        terminal_packages = normalized[-1][3].get("packages")
+        if isinstance(terminal_packages, list):
+            for raw_package in cast(list[object], terminal_packages):
+                package = _mapping(raw_package)
+                latest = _mapping(package.get("latest")) if package else None
+                if (
+                    package is not None
+                    and latest is not None
+                    and package.get("package_id") == live_summary.get("package_id")
+                    and package.get("package_name") == live_summary.get("package_name")
+                ):
+                    terminal_package = (package, latest)
+                    break
+
+    progress_valid = False
+    if live_package is not None and terminal_package is not None:
+        _live_observation, live_summary, live_latest = live_package
+        terminal_summary, terminal_latest = terminal_package
+        progress_valid = bool(
+            terminal_latest.get("schema_version") == "jarvis.progress.v1"
+            and terminal_latest.get("execution_id") == execution_id
+            and terminal_latest.get("package_id") == live_latest.get("package_id")
+            and terminal_latest.get("package_name") == live_latest.get("package_name")
+            and _nonnegative_int(terminal_summary.get("event_count"))
+            and cast(int, terminal_summary["event_count"]) >= cast(int, live_summary["event_count"])
+            and _nonnegative_int(terminal_latest.get("sequence"))
+            and cast(int, terminal_latest["sequence"]) >= cast(int, live_latest["sequence"])
+            and _valid_jarvis_progress_semantics(terminal_latest)
+            and _jarvis_progress_transition_nonregressing(live_latest, terminal_latest)
+        )
+
+    compact_observations = [
+        {
+            "query_job_id": observation.get("query_job_id"),
+            "state": observation.get("state"),
+            "terminal": observation.get("terminal"),
+            "package_count": (
+                len(cast(list[object], progress.get("packages")))
+                if isinstance(progress.get("packages"), list)
+                else None
+            ),
+        }
+        for observation, _handle, _record, progress in normalized
+    ]
+    observations_truncated = len(compact_observations) > 32
+    if observations_truncated:
+        compact_observations = [*compact_observations[:31], compact_observations[-1]]
+    assertions = {
+        "observation_count_bounded": bounded,
+        "query_identities_coherent": identities_valid,
+        "scheduler_identity_optional_coherent_and_stable": scheduler_identity_valid,
+        "lifecycle_monotonic_and_completed": lifecycle_valid,
+        "in_flight_package_progress_observed": live_package is not None,
+        "package_progress_nonregressing": progress_monotonic,
+        "terminal_package_progress_bound": progress_valid,
+    }
+    evidence: JSON = {
+        "pipeline_id": pipeline_id,
+        "execution_id": execution_id,
+        "observation_count": len(observations),
+        "observations": compact_observations,
+        "observations_truncated": observations_truncated,
+        "live_progress": (
+            _compact_package_progress(live_package[2]) if live_package is not None else {}
+        ),
+        "terminal_progress": (
+            _compact_package_progress(terminal_package[1]) if terminal_package is not None else {}
+        ),
+        "assertions": assertions,
+    }
+    passed = all(assertions.values())
+    if live_package is None or terminal_package is None:
+        return evidence, passed, None
+    live_observation, _live_summary, live_latest = live_package
+    terminal_summary, terminal_latest = terminal_package
+    resource: JSON = {
+        "resource_id": f"{execution_id}:{live_latest.get('package_id', 'package')}",
+        "provider": "jarvis-cd",
+        "metadata": {
+            "source": "jarvis_get_execution",
+            "pipeline_id": pipeline_id,
+            "execution_id": execution_id,
+            "package_id": live_latest.get("package_id"),
+            "package_name": live_latest.get("package_name"),
+            "progress_schema_version": live_latest.get("schema_version"),
+            "progress_determinate": live_latest.get("determinate"),
+            "progress_event_count": terminal_summary.get("event_count"),
+            "progress_sequence": terminal_latest.get("sequence"),
+            "provider_source_authority": "jarvis_get_execution",
+            "native_documents_validated": identities_valid,
+            "query_identity_validated": identities_valid,
+            "live_observed_while_running": True,
+            "lifecycle_query_validated": lifecycle_valid,
+            "terminal_query_bound": progress_valid,
+            "live_query_job_id": live_observation.get("query_job_id"),
+            "terminal_query_job_id": normalized[-1][0].get("query_job_id"),
+        },
+    }
+    return evidence, passed, resource
+
+
+def _valid_jarvis_progress_semantics(progress: JSON) -> bool:
+    """Validate the quantitative and phase semantics of one native progress event."""
+    state = progress.get("state")
+    label = progress.get("label")
+    if (
+        not isinstance(state, str)
+        or state not in _JARVIS_PROGRESS_STATES
+        or not isinstance(label, str)
+        or not label.strip()
+        or len(label) > _MAX_JARVIS_PROGRESS_IDENTITY_TEXT
+    ):
+        return False
+    current = progress.get("current")
+    total = progress.get("total")
+    if current is not None and (not _finite_progress_number(current) or current < 0):
+        return False
+    if total is not None and (
+        not _finite_progress_number(total)
+        or total <= 0
+        or current is None
+        or not _finite_progress_number(current)
+        or current > total
+    ):
+        return False
+    unit = progress.get("unit")
+    if unit is not None and (
+        not isinstance(unit, str)
+        or not unit.strip()
+        or len(unit) > _MAX_JARVIS_PROGRESS_IDENTITY_TEXT
+    ):
+        return False
+    determinate = progress.get("determinate")
+    return isinstance(determinate, bool) and determinate is (
+        current is not None and total is not None
+    )
+
+
+def _finite_progress_number(value: object) -> TypeGuard[int | float]:
+    """Return whether a value is a finite, non-boolean JSON number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def _jarvis_progress_semantic_signature(progress: JSON) -> tuple[object, ...]:
+    """Return fields that must not change without a new progress sequence."""
+    return tuple(
+        progress.get(field)
+        for field in (
+            "state",
+            "label",
+            "determinate",
+            "current",
+            "total",
+            "unit",
+        )
+    )
+
+
+def _jarvis_progress_transition_nonregressing(previous: JSON, current: JSON) -> bool:
+    """Reject quantitative regression within a phase while allowing explicit phase changes."""
+    previous_phase = (previous.get("state"), previous.get("label"))
+    current_phase = (current.get("state"), current.get("label"))
+    if current_phase != previous_phase:
+        return True
+    previous_unit = previous.get("unit")
+    current_unit = current.get("unit")
+    if previous_unit is not None and current_unit != previous_unit:
+        return False
+    previous_total = previous.get("total")
+    current_total = current.get("total")
+    if previous_total is not None and current_total != previous_total:
+        return False
+    previous_value = previous.get("current")
+    current_value = current.get("current")
+    return previous_value is None or bool(
+        current_value is not None
+        and cast(int | float, current_value) >= cast(int | float, previous_value)
+    )
+
+
+def _compact_package_progress(progress: JSON) -> JSON:
+    """Keep validation reports bounded while retaining progress semantics."""
+    return {
+        field: progress.get(field)
+        for field in (
+            "schema_version",
+            "execution_id",
+            "package_id",
+            "package_name",
+            "state",
+            "label",
+            "sequence",
+            "determinate",
+            "current",
+            "total",
+            "unit",
+        )
+    }
 
 
 def _jarvis_live_progress_evidence(
@@ -1448,6 +1923,7 @@ def _remote_jarvis_contract(document: JSON | None) -> tuple[JSON, bool]:
     run_schema = _mapping(by_name.get("jarvis_run", {}).get("inputSchema"))
     run_properties = _mapping(run_schema.get("properties")) if run_schema else None
     spack_specs = _mapping(run_properties.get("spack_specs")) if run_properties else None
+    handle_first_run = run_properties is not None and "wait" not in run_properties
     query_evidence, query_passed = _execution_query_contract_evidence(
         by_name.get("jarvis_get_execution")
     )
@@ -1468,6 +1944,7 @@ def _remote_jarvis_contract(document: JSON | None) -> tuple[JSON, bool]:
         and operation is not None
         and operation.get("enum") == ["edit", "remove"]
         and spack_specs is not None
+        and handle_first_run
         and query_passed
         and package_search_passed
         and observed_digest == CLIO_KIT_JARVIS_USER_CONTRACT_SHA256
@@ -1478,6 +1955,9 @@ def _remote_jarvis_contract(document: JSON | None) -> tuple[JSON, bool]:
             "expected_tool_names": sorted(expected),
             "edit_operation_schema": operation or {},
             "spack_specs_schema": spack_specs or {},
+            "jarvis_run_input_fields": sorted(run_properties) if run_properties else [],
+            "handle_first_run": handle_first_run,
+            "internal_wait_exposed": bool(run_properties and "wait" in run_properties),
             "package_search": package_search_evidence,
             "execution_query": query_evidence,
             "expected_contract_sha256": CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,

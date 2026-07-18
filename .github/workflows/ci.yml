@@ -57,13 +57,13 @@ jobs:
       - name: stage exact clio-kit release wheel
         shell: bash
         env:
-          CLIO_KIT_WHEEL_FILENAME: clio_kit-2.5.11-py3-none-any.whl
-          CLIO_KIT_WHEEL_SHA256: a0a2bbf8d23495dd4f43881d35a47bfb83bc2d1c016bd952bd7a1c88a43ca03e
-          CLIO_KIT_WHEEL_URL: https://github.com/iowarp/clio-kit/releases/download/v2.5.11/clio_kit-2.5.11-py3-none-any.whl
+          CLIO_KIT_WHEEL_FILENAME: clio_kit-2.5.13-py3-none-any.whl
+          CLIO_KIT_WHEEL_SHA256: 225045e6c93de3423d2fe9156eee3075973f49c788bcc0955e130d565693feeb
+          CLIO_KIT_WHEEL_URL: https://github.com/iowarp/clio-kit/releases/download/v2.5.13/clio_kit-2.5.13-py3-none-any.whl
         run: |
           set -euo pipefail
           umask 077
-          wheel_dir="$RUNNER_TEMP/clio-kit-v2.5.11"
+          wheel_dir="$RUNNER_TEMP/clio-kit-v2.5.13"
           mkdir "$wheel_dir"
           wheel="$wheel_dir/$CLIO_KIT_WHEEL_FILENAME"
           curl --fail --show-error --silent --location \
@@ -160,13 +160,13 @@ jobs:
       - name: stage exact clio-kit release wheel
         shell: bash
         env:
-          CLIO_KIT_WHEEL_FILENAME: clio_kit-2.5.11-py3-none-any.whl
-          CLIO_KIT_WHEEL_SHA256: a0a2bbf8d23495dd4f43881d35a47bfb83bc2d1c016bd952bd7a1c88a43ca03e
-          CLIO_KIT_WHEEL_URL: https://github.com/iowarp/clio-kit/releases/download/v2.5.11/clio_kit-2.5.11-py3-none-any.whl
+          CLIO_KIT_WHEEL_FILENAME: clio_kit-2.5.13-py3-none-any.whl
+          CLIO_KIT_WHEEL_SHA256: 225045e6c93de3423d2fe9156eee3075973f49c788bcc0955e130d565693feeb
+          CLIO_KIT_WHEEL_URL: https://github.com/iowarp/clio-kit/releases/download/v2.5.13/clio_kit-2.5.13-py3-none-any.whl
         run: |
           set -euo pipefail
           umask 077
-          wheel_dir="$RUNNER_TEMP/clio-kit-v2.5.11"
+          wheel_dir="$RUNNER_TEMP/clio-kit-v2.5.13"
           mkdir "$wheel_dir"
           wheel="$wheel_dir/$CLIO_KIT_WHEEL_FILENAME"
           curl --fail --show-error --silent --location \

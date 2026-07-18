@@ -1,10 +1,14 @@
+# pyright: reportPrivateUsage=false
+
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any, cast
 
 import pytest
 
+import clio_relay.jarvis_mcp_validation as jarvis_validation
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_MCP_VERSION,
     CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
@@ -134,6 +138,7 @@ def test_jarvis_mcp_validation_accepts_structured_durable_run() -> None:
         "result_envelope_verified": True,
         "identity_coherent": True,
         "lifecycle_coherent": True,
+        "terminal_success_verified": True,
         "pagination_coherent": True,
         "artifact_filters_coherent": True,
         "runner_semantic_validation_verified": True,
@@ -419,6 +424,11 @@ def test_jarvis_mcp_validation_rejects_runner_without_execution_unlock() -> None
         (("structured_result", "progress", "execution_id"), "wrong", "identity_coherent"),
         (("structured_result", "artifact_page", "terminal"), False, "lifecycle_coherent"),
         (
+            ("structured_result", "execution_record", "return_code"),
+            1,
+            "terminal_success_verified",
+        ),
+        (
             ("structured_result", "artifact_page", "returned_artifact_count"),
             2,
             "pagination_coherent",
@@ -450,6 +460,256 @@ def test_jarvis_mcp_validation_rejects_incoherent_execution_query(
     assert report.status == ValidationStatus.FAILED
     assert query.status == ValidationStatus.FAILED
     assert query.evidence[0].metadata["assertions"][assertion] is False
+
+
+def test_query_lifecycle_accepts_running_progress_and_no_scheduler_identity() -> None:
+    observations = [
+        _query_lifecycle_observation("submitted", sequence=1, terminal=False),
+        _query_lifecycle_observation("running", sequence=2, terminal=False),
+        _query_lifecycle_observation("unknown", sequence=2, terminal=False),
+        _query_lifecycle_observation("running", sequence=3, terminal=False),
+        _query_lifecycle_observation("completed", sequence=4, terminal=True),
+    ]
+    first_progress = cast(dict[str, Any], observations[0]["progress"])
+    first_package = cast(dict[str, Any], cast(list[object], first_progress["packages"])[0])
+    first_package["event_count"] = 0
+    first_package["latest"] = None
+    for observation in observations:
+        handle = cast(dict[str, Any], observation["execution_handle"])
+        record = cast(dict[str, Any], observation["execution_record"])
+        for document in (handle, record):
+            document["mode"] = "direct"
+            document["scheduler_provider"] = None
+            document["scheduler_native_id"] = None
+
+    evidence, passed, resource = jarvis_validation._jarvis_query_lifecycle_progress_evidence(
+        observations=observations,
+        pipeline_id="acceptance",
+        execution_id="jarvis-execution-acceptance",
+    )
+
+    assert passed is True
+    assert resource is not None
+    assert evidence["assertions"] == {
+        "observation_count_bounded": True,
+        "query_identities_coherent": True,
+        "scheduler_identity_optional_coherent_and_stable": True,
+        "lifecycle_monotonic_and_completed": True,
+        "in_flight_package_progress_observed": True,
+        "package_progress_nonregressing": True,
+        "terminal_package_progress_bound": True,
+    }
+
+
+def test_query_lifecycle_accepts_one_way_scheduler_native_id_assignment() -> None:
+    observations = [
+        _query_lifecycle_observation("submitting", sequence=1, terminal=False),
+        _query_lifecycle_observation("submitted", sequence=2, terminal=False),
+        _query_lifecycle_observation("running", sequence=3, terminal=False),
+        _query_lifecycle_observation("completed", sequence=4, terminal=True),
+    ]
+    _set_scheduler_native_id(observations[0], None)
+
+    evidence, passed, resource = jarvis_validation._jarvis_query_lifecycle_progress_evidence(
+        observations=observations,
+        pipeline_id="acceptance",
+        execution_id="jarvis-execution-acceptance",
+    )
+
+    assert passed is True
+    assert resource is not None
+    assert evidence["assertions"]["scheduler_identity_optional_coherent_and_stable"] is True
+
+
+@pytest.mark.parametrize("mutation", ["removed_after_assignment", "changed_after_assignment"])
+def test_query_lifecycle_rejects_unstable_scheduler_native_id(mutation: str) -> None:
+    observations = [
+        _query_lifecycle_observation("submitting", sequence=1, terminal=False),
+        _query_lifecycle_observation("running", sequence=2, terminal=False),
+        _query_lifecycle_observation("completed", sequence=3, terminal=True),
+    ]
+    _set_scheduler_native_id(observations[0], None)
+    _set_scheduler_native_id(
+        observations[2],
+        None if mutation == "removed_after_assignment" else "different-job",
+    )
+
+    evidence, passed, _resource = jarvis_validation._jarvis_query_lifecycle_progress_evidence(
+        observations=observations,
+        pipeline_id="acceptance",
+        execution_id="jarvis-execution-acceptance",
+    )
+
+    assert passed is False
+    assert evidence["assertions"]["scheduler_identity_optional_coherent_and_stable"] is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("determinate", False),
+        ("current", -1.0),
+        ("current", float("nan")),
+        ("total", None),
+        ("total", 0.0),
+        ("total", 10.0),
+        ("unit", " "),
+    ],
+)
+def test_query_lifecycle_rejects_incoherent_determinate_progress(
+    field: str,
+    value: object,
+) -> None:
+    observations = [
+        _query_lifecycle_observation("submitted", sequence=1, terminal=False),
+        _query_lifecycle_observation("running", sequence=2, terminal=False),
+        _query_lifecycle_observation("completed", sequence=3, terminal=True),
+    ]
+    _query_progress_latest(observations[1])[field] = value
+
+    evidence, passed, _resource = jarvis_validation._jarvis_query_lifecycle_progress_evidence(
+        observations=observations,
+        pipeline_id="acceptance",
+        execution_id="jarvis-execution-acceptance",
+    )
+
+    assert passed is False
+    assert evidence["assertions"]["package_progress_nonregressing"] is False
+
+
+def test_query_lifecycle_rejects_same_phase_current_regression() -> None:
+    observations = [
+        _query_lifecycle_observation("submitted", sequence=1, terminal=False),
+        _query_lifecycle_observation("running", sequence=2, terminal=False),
+        _query_lifecycle_observation("completed", sequence=3, terminal=True),
+    ]
+    _query_progress_latest(observations[0])["current"] = 10.0
+    _query_progress_latest(observations[1])["current"] = 20.0
+    _query_progress_latest(observations[2])["current"] = 10.0
+
+    evidence, passed, _resource = jarvis_validation._jarvis_query_lifecycle_progress_evidence(
+        observations=observations,
+        pipeline_id="acceptance",
+        execution_id="jarvis-execution-acceptance",
+    )
+
+    assert passed is False
+    assert evidence["assertions"]["package_progress_nonregressing"] is False
+    assert evidence["assertions"]["terminal_package_progress_bound"] is False
+
+
+def test_query_lifecycle_allows_current_reset_after_explicit_phase_transition() -> None:
+    observations = [
+        _query_lifecycle_observation("submitted", sequence=1, terminal=False),
+        _query_lifecycle_observation("running", sequence=2, terminal=False),
+        _query_lifecycle_observation("completed", sequence=3, terminal=True),
+    ]
+    _query_progress_latest(observations[0])["current"] = 10.0
+    _query_progress_latest(observations[1])["current"] = 20.0
+    terminal = _query_progress_latest(observations[2])
+    terminal["state"] = "completed"
+    terminal["label"] = "finalization"
+    terminal["current"] = 0.0
+    terminal["total"] = 10.0
+
+    evidence, passed, resource = jarvis_validation._jarvis_query_lifecycle_progress_evidence(
+        observations=observations,
+        pipeline_id="acceptance",
+        execution_id="jarvis-execution-acceptance",
+    )
+
+    assert passed is True
+    assert resource is not None
+    assert evidence["assertions"]["package_progress_nonregressing"] is True
+    assert evidence["assertions"]["terminal_package_progress_bound"] is True
+
+
+def _replace_running_observation_with_submitted(
+    observations: list[dict[str, Any]],
+) -> None:
+    observations[1] = _query_lifecycle_observation("submitted", sequence=2, terminal=False)
+
+
+def _set_terminal_return_code_failure(observations: list[dict[str, Any]]) -> None:
+    record = cast(dict[str, Any], observations[2]["execution_record"])
+    record["return_code"] = 1
+
+
+def _regress_terminal_progress_sequence(observations: list[dict[str, Any]]) -> None:
+    _query_progress_latest(observations[2])["sequence"] = 1
+
+
+def _change_terminal_handle_scheduler_identity(
+    observations: list[dict[str, Any]],
+) -> None:
+    handle = cast(dict[str, Any], observations[2]["execution_handle"])
+    handle["scheduler_native_id"] = "changed"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "failed_assertion"),
+    [
+        (
+            _replace_running_observation_with_submitted,
+            "in_flight_package_progress_observed",
+        ),
+        (
+            _set_terminal_return_code_failure,
+            "lifecycle_monotonic_and_completed",
+        ),
+        (
+            _regress_terminal_progress_sequence,
+            "package_progress_nonregressing",
+        ),
+        (
+            _change_terminal_handle_scheduler_identity,
+            "scheduler_identity_optional_coherent_and_stable",
+        ),
+    ],
+)
+def test_query_lifecycle_rejects_missing_or_regressing_evidence(
+    mutate: Callable[[list[dict[str, Any]]], None],
+    failed_assertion: str,
+) -> None:
+    observations = [
+        _query_lifecycle_observation("submitted", sequence=1, terminal=False),
+        _query_lifecycle_observation("running", sequence=2, terminal=False),
+        _query_lifecycle_observation("completed", sequence=3, terminal=True),
+    ]
+    mutate(observations)
+
+    evidence, passed, _resource = jarvis_validation._jarvis_query_lifecycle_progress_evidence(
+        observations=observations,
+        pipeline_id="acceptance",
+        execution_id="jarvis-execution-acceptance",
+    )
+
+    assert passed is False
+    assert evidence["assertions"][failed_assertion] is False
+
+
+def test_query_lifecycle_report_evidence_is_bounded() -> None:
+    observations = [
+        _query_lifecycle_observation("running", sequence=index + 1, terminal=False)
+        for index in range(600)
+    ]
+    observations[-1] = _query_lifecycle_observation(
+        "completed",
+        sequence=600,
+        terminal=True,
+    )
+
+    evidence, passed, _resource = jarvis_validation._jarvis_query_lifecycle_progress_evidence(
+        observations=observations,
+        pipeline_id="acceptance",
+        execution_id="jarvis-execution-acceptance",
+    )
+
+    assert passed is False
+    assert evidence["assertions"]["observation_count_bounded"] is False
+    assert evidence["observation_count"] == 600
+    assert evidence["observations_truncated"] is True
+    assert len(evidence["observations"]) == 32
 
 
 def _acceptance_inputs() -> dict[str, Any]:
@@ -516,6 +776,7 @@ def _acceptance_inputs() -> dict[str, Any]:
                     "tool": "jarvis_run",
                     "arguments": {
                         "pipeline_id": "acceptance",
+                        "execution_id": execution_id,
                         "spack_specs": ["lammps"],
                     },
                     "expected_server_artifact_digest": server_artifact_digest,
@@ -997,6 +1258,51 @@ def _native_execution_documents(execution_id: str) -> dict[str, object]:
             ],
         },
     }
+
+
+def _query_lifecycle_observation(
+    state: str,
+    *,
+    sequence: int,
+    terminal: bool,
+) -> dict[str, Any]:
+    execution_id = "jarvis-execution-acceptance"
+    documents = cast(dict[str, Any], _native_execution_documents(execution_id))
+    handle = cast(dict[str, Any], documents["execution_handle"])
+    record = cast(dict[str, Any], documents["execution_record"])
+    progress = cast(dict[str, Any], documents["progress"])
+    package = cast(dict[str, Any], cast(list[object], progress["packages"])[0])
+    latest = cast(dict[str, Any], package["latest"])
+    record["state"] = state
+    record["terminal"] = terminal
+    record["return_code"] = 0 if terminal else None
+    progress["execution_state"] = state
+    progress["terminal"] = terminal
+    package["event_count"] = sequence
+    latest["sequence"] = sequence
+    return {
+        "query_job_id": f"job-query-{sequence}",
+        "pipeline_id": "acceptance",
+        "execution_id": execution_id,
+        "state": state,
+        "terminal": terminal,
+        "execution_handle": handle,
+        "execution_record": record,
+        "progress": progress,
+        "runtime_metadata": None,
+    }
+
+
+def _set_scheduler_native_id(observation: dict[str, Any], native_id: str | None) -> None:
+    for key in ("execution_handle", "execution_record"):
+        document = cast(dict[str, Any], observation[key])
+        document["scheduler_native_id"] = native_id
+
+
+def _query_progress_latest(observation: dict[str, Any]) -> dict[str, Any]:
+    progress = cast(dict[str, Any], observation["progress"])
+    package = cast(dict[str, Any], cast(list[object], progress["packages"])[0])
+    return cast(dict[str, Any], package["latest"])
 
 
 def _jarvis_server_artifact() -> dict[str, object]:

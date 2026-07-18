@@ -56,7 +56,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.3.31"
+$Version = "1.3.32"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }
@@ -726,8 +726,12 @@ Render-Template "examples/release-gate/gateway/homelab-runtime.json.tmpl" $Homel
 ## Run the two JARVIS application reports
 
 Set up each fresh pipeline through the same durable JARVIS MCP path, wait for
-the setup jobs, and then let `jarvis-mcp-validate` run and query it. The two
-applications produce two independent reports.
+the setup jobs, and then let `jarvis-mcp-validate` submit handle-first and poll
+`jarvis_get_execution` until the workload is terminal. The two applications
+produce two independent reports. The bounded Gray-Scott fixture uses a moderate
+step count and output cadence intended to leave an observation window; the
+release run must still prove real package progress while the execution is
+running, and a submitted-to-completed jump cannot satisfy the gate.
 
 ```powershell
 function Write-JsonFile {
@@ -762,17 +766,17 @@ Invoke-JarvisSetupTool "jarvis_add_step" "gray-add" @{
   pipeline_id = $GrayPipeline
   package_name = "builtin.gray_scott"
   step_id = "gray_scott_bp5"
-  do_configure = $true
   config = @{
     deploy_mode = "default"; nprocs = 1; ppn = 1
-    executable = $GrayExecutable; width = 32; height = 32; steps = 20; out_every = 10
+    executable = $GrayExecutable; width = 32; height = 32
+    steps = 10000; out_every = 1000
     outdir = $GrayOutput; checkpoint = $true; checkpoint_freq = 1
     checkpoint_output = $GrayCheckpoint; adios_span = $false
     adios_memory_selection = $false; mesh_type = "image"
   }
 }
 $GrayRun = Write-JsonFile "gray-run.json" @{
-  pipeline_id = $GrayPipeline; submit = $true; wait = $true
+  pipeline_id = $GrayPipeline; submit = $true
   spack_specs = @("/$ExpectedAdiosHash")
   execution = @{
     mode = "scheduler"; partition = "compute"; nodes = 1; tasks = 1; tasks_per_node = 1
@@ -783,7 +787,7 @@ $GrayRun = Write-JsonFile "gray-run.json" @{
 Invoke-RelayReport -Id "ares-jarvis-gray-scott" -ReportOption "--report" -Command @(
   "jarvis-mcp-validate", "--cluster", $AresCluster, "--arguments-json-file", $GrayRun,
   "--package-search-query", "gray scott",
-  "--wait-timeout-seconds", "900", "--poll-seconds", "0.05"
+  "--wait-timeout-seconds", "900", "--poll-seconds", "2"
 )
 
 $RemoteLammpsInput = "$AresRemoteRoot/lammps/in.lj"
@@ -802,7 +806,6 @@ Invoke-JarvisSetupTool "jarvis_add_step" "lammps-add" @{
   pipeline_id = $LammpsPipeline
   package_name = "builtin.lammps"
   step_id = "lammps"
-  do_configure = $true
   config = @{
     deploy_mode = "default"; nprocs = 1; ppn = 1; script = $RemoteLammpsInput
     lmp_bin = "lmp -nonbuf"; out = "$AresRemoteRoot/lammps/out"; kokkos_gpu = $false
@@ -810,7 +813,7 @@ Invoke-JarvisSetupTool "jarvis_add_step" "lammps-add" @{
   }
 }
 $LammpsRun = Write-JsonFile "lammps-run.json" @{
-  pipeline_id = $LammpsPipeline; submit = $true; wait = $true
+  pipeline_id = $LammpsPipeline; submit = $true
   spack_specs = @("/$ExpectedLammpsHash")
   execution = @{
     mode = "scheduler"; partition = "compute"; nodes = 1; tasks = 1; tasks_per_node = 1
@@ -821,19 +824,20 @@ $LammpsRun = Write-JsonFile "lammps-run.json" @{
 Invoke-RelayReport -Id "ares-jarvis-lammps" -ReportOption "--report" -Command @(
   "jarvis-mcp-validate", "--cluster", $AresCluster, "--arguments-json-file", $LammpsRun,
   "--package-search-query", "lammps",
-  "--wait-timeout-seconds", "900", "--poll-seconds", "0.05"
+  "--wait-timeout-seconds", "900", "--poll-seconds", "2"
 )
 ```
 
-The Gray report must contain JARVIS-native progress for package id
+The Gray report must contain a running and a terminal JARVIS-native progress
+snapshot for package id
 `gray_scott_bp5` and a finalized `gray-scott-timesteps` ADIOS2 BP5 collection
-with latest timestep 20 and two observed members. The LAMMPS report must contain
+with latest timestep 10000 and ten observed members. The LAMMPS report must contain
 determinate JARVIS-native progress for package id `lammps`. Stdout parsing alone
 cannot satisfy either requirement.
 
 ## Run the scientific catalog v1.1 contract
 
-Use the exact clio-kit 2.5.11 persistent executable installed and receipt-bound
+Use the exact clio-kit 2.5.13 persistent executable installed and receipt-bound
 by bootstrap. The catalog file is operator-owned site metadata supplied through
 `CLIO_RELAY_VALIDATION_ARES_SCIENTIFIC_CATALOG_FILE`; it is not copied into the
 relay release. This policy uses

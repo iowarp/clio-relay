@@ -9,7 +9,7 @@ from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
@@ -2872,45 +2872,6 @@ def test_cli_jarvis_mcp_preflight_failure_writes_canonical_report(
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["status"] == "failed"
     assert report["checks"][-1]["check_id"] == "jarvis-mcp.preflight"
-
-
-def test_jarvis_live_progress_observation_requires_running_warming_record() -> None:
-    progress = [
-        {
-            "progress_id": "progress-live",
-            "metadata": {
-                "source": "jarvis_execution",
-                "provider_source_authority": "jarvis_mcp_progress_notification",
-                "producer_validated": True,
-                "execution_binding_validated": False,
-                "progress_transport_sequence": 1,
-            },
-        }
-    ]
-    running: dict[str, object] = {
-        "job": {"state": "running", "updated_at": "2026-07-11T10:00:00Z"},
-        "terminal": False,
-    }
-
-    observation = cli._live_jarvis_progress_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        progress,
-        running,
-    )
-
-    assert observation == {
-        "progress_id": "progress-live",
-        "job_state": "running",
-        "job_updated_at": "2026-07-11T10:00:00Z",
-        "terminal": False,
-        "progress_transport_sequence": 1,
-    }
-    assert (
-        cli._live_jarvis_progress_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            progress,
-            {"job": {"state": "succeeded"}, "terminal": True},
-        )
-        is None
-    )
 
 
 def test_cli_scheduler_preflight_failure_writes_canonical_report(
@@ -7043,3 +7004,287 @@ def test_cli_remote_agent_run_preserves_posix_prompt_path(
     assert "--prompt /home/user/prompt.md" in commands[0][2]
     assert "--mcp-config /home/user/mcp.toml" in commands[0][2]
     assert "\\home\\user" not in commands[0][2]
+
+
+def test_post_run_execution_query_polls_progress_then_requests_artifacts_once(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+    timeout_values: list[float] = []
+    states = (("running", False, None), ("completed", True, 0), ("completed", True, 0))
+
+    def evidence() -> dict[str, object]:
+        return {}
+
+    def run_session(**kwargs: object) -> SimpleNamespace:
+        arguments = cast(dict[str, object], kwargs["arguments"])
+        calls.append(arguments)
+        timeout_values.append(cast(float, kwargs["timeout_seconds"]))
+        job_id = f"job-query-{len(calls)}"
+        return SimpleNamespace(
+            tools_list_response={},
+            tools_call_response={"result": {"structuredContent": {"job_id": job_id}}},
+            initialize_response={},
+            evidence=evidence,
+        )
+
+    def artifacts(_queue: object, job_id: str) -> list[dict[str, object]]:
+        return [{"job_id": job_id}]
+
+    def read_result(
+        _queue: object,
+        artifact_records: list[dict[str, object]],
+        *,
+        kind: str,
+    ) -> dict[str, object] | None:
+        if kind != "mcp_result":
+            return None
+        job_id = cast(str, artifact_records[0]["job_id"])
+        index = int(job_id.rsplit("-", 1)[1]) - 1
+        state, terminal, return_code = states[index]
+        return {
+            "structured_result": {
+                "pipeline_id": "pipeline",
+                "execution_id": "execution",
+                "execution_handle": {
+                    "schema_version": "jarvis.execution.handle.v1",
+                    "pipeline_id": "pipeline",
+                    "execution_id": "execution",
+                    "mode": "direct",
+                    "scheduler_provider": None,
+                    "scheduler_native_id": None,
+                    "cluster": None,
+                },
+                "execution_record": {
+                    "schema_version": "jarvis.execution.record.v1",
+                    "pipeline_id": "pipeline",
+                    "execution_id": "execution",
+                    "mode": "direct",
+                    "scheduler_provider": None,
+                    "scheduler_native_id": None,
+                    "cluster": None,
+                    "state": state,
+                    "terminal": terminal,
+                    "return_code": return_code,
+                    "error": None,
+                },
+                "progress": {
+                    "schema_version": "jarvis.execution.progress.v1",
+                    "pipeline_id": "pipeline",
+                    "execution_id": "execution",
+                    "execution_state": state,
+                    "terminal": terminal,
+                    "packages": [],
+                },
+                "runtime_metadata": None,
+                "artifact_page": {} if "artifacts" in calls[index] else None,
+                "service_runtimes": None,
+            }
+        }
+
+    def execute_locally(_definition: ClusterDefinition) -> bool:
+        return False
+
+    def wait_for_local_terminal(
+        _queue: ClioCoreQueue,
+        _job_id: str,
+        *,
+        timeout_seconds: float,
+        poll_seconds: float,
+    ) -> dict[str, object]:
+        assert timeout_seconds > 0
+        assert poll_seconds == 2
+        return {"terminal": True}
+
+    def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(cli, "run_packaged_mcp_stdio_session", run_session)
+    monkeypatch.setattr(cli, "should_execute_on_cluster", execute_locally)
+    monkeypatch.setattr(
+        cli,
+        "_wait_for_local_job_terminal",
+        wait_for_local_terminal,
+    )
+    monkeypatch.setattr(cli, "_complete_local_artifact_records", artifacts)
+    monkeypatch.setattr(cli, "_read_local_json_artifact_kind", read_result)
+    monkeypatch.setattr(cli, "sleep", no_sleep)
+
+    result = cli._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster="ares",
+        definition=cast(ClusterDefinition, SimpleNamespace()),
+        queue=cast(ClioCoreQueue, SimpleNamespace()),
+        profile="user",
+        pipeline_id="pipeline",
+        execution_id="execution",
+        wait_timeout_seconds=900,
+        poll_seconds=2,
+    )
+
+    assert ["artifacts" in arguments for arguments in calls] == [False, False, True]
+    assert all(0 < value <= 60 for value in timeout_values)
+    assert result.call_job_id == "job-query-3"
+    assert [item["state"] for item in result.lifecycle_observations] == [
+        "running",
+        "completed",
+    ]
+
+
+def test_execution_query_remote_boundaries_share_one_deadline(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    observed: list[tuple[str, float | None]] = []
+
+    def run_session(**kwargs: object) -> SimpleNamespace:
+        assert kwargs["timeout_seconds"] == 60.0
+        return SimpleNamespace(
+            tools_call_response={"result": {"structuredContent": {"job_id": "job-query"}}},
+        )
+
+    def wait_for_terminal(
+        _definition: ClusterDefinition,
+        _job_id: str,
+        *,
+        timeout_seconds: float,
+        poll_seconds: float,
+        deadline: float | None = None,
+    ) -> dict[str, object]:
+        assert timeout_seconds == 90.0
+        assert poll_seconds == 2.0
+        observed.append(("status", deadline))
+        return {"terminal": True}
+
+    def artifact_records(
+        _definition: ClusterDefinition,
+        _job_id: str,
+        *,
+        deadline: float | None = None,
+    ) -> list[dict[str, object]]:
+        observed.append(("list-artifacts", deadline))
+        return []
+
+    def read_artifact(
+        _definition: ClusterDefinition,
+        _artifacts: list[dict[str, object]],
+        *,
+        kind: str,
+        deadline: float | None = None,
+    ) -> dict[str, object] | None:
+        observed.append((f"read-{kind}", deadline))
+        return None
+
+    def execute_remotely(_definition: ClusterDefinition) -> bool:
+        return True
+
+    monkeypatch.setattr(cli, "monotonic", lambda: 10.0)
+    monkeypatch.setattr(cli, "run_packaged_mcp_stdio_session", run_session)
+    monkeypatch.setattr(cli, "should_execute_on_cluster", execute_remotely)
+    monkeypatch.setattr(cli, "_wait_for_remote_job_terminal", wait_for_terminal)
+    monkeypatch.setattr(cli, "_remote_artifact_records", artifact_records)
+    monkeypatch.setattr(cli, "_read_remote_json_artifact_kind", read_artifact)
+
+    cli._execute_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        definition=ClusterDefinition(name="ares", ssh_host="ares"),
+        queue=cast(ClioCoreQueue, SimpleNamespace()),
+        profile="user",
+        arguments={"execution_id": "execution"},
+        deadline=100.0,
+        poll_seconds=2.0,
+    )
+
+    assert observed == [
+        ("status", 100.0),
+        ("list-artifacts", 100.0),
+        ("read-mcp_result", 100.0),
+        ("read-provenance", 100.0),
+    ]
+
+
+def test_remote_status_and_artifact_io_apply_the_shared_deadline(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    observed: list[tuple[list[str], float | None]] = []
+
+    def run_before_deadline(
+        _definition: ClusterDefinition,
+        arguments: list[str],
+        *,
+        deadline: float | None,
+    ) -> str:
+        observed.append((arguments, deadline))
+        if arguments[1] == "status":
+            return json.dumps({"terminal": True})
+        if arguments[1] == "list-artifacts":
+            return json.dumps(
+                {
+                    "artifacts": [{"artifact_id": "artifact-result", "kind": "mcp_result"}],
+                    "cursor": 1,
+                    "limit": cli.MAX_RESPONSE_PAGE_RECORDS,
+                    "next_cursor": None,
+                    "total": 1,
+                }
+            )
+        return json.dumps({"encoding": "base64", "data": "e30="})
+
+    monkeypatch.setattr(cli, "monotonic", lambda: 10.0)
+    monkeypatch.setattr(cli, "_run_remote_clio_before_deadline", run_before_deadline)
+    definition = ClusterDefinition(name="ares", ssh_host="ares")
+
+    status = cli._wait_for_remote_job_terminal(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        definition,
+        "job-query",
+        timeout_seconds=20.0,
+        poll_seconds=2.0,
+        deadline=25.0,
+    )
+    artifacts = cli._remote_artifact_records(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        definition,
+        "job-query",
+        deadline=25.0,
+    )
+    payload = cli._read_remote_artifact_kind_bytes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        definition,
+        artifacts,
+        kind="mcp_result",
+        deadline=25.0,
+    )
+
+    assert status["terminal"] is True
+    assert payload == b"{}"
+    assert [deadline for _arguments, deadline in observed] == [25.0, 25.0, 25.0]
+
+
+def test_execution_query_observations_compact_without_losing_milestones() -> None:
+    observations: list[dict[str, Any]] = []
+    for index in range(701):
+        state = "submitted" if index == 0 else "running"
+        progress = {
+            "packages": ([{"event_count": 1, "latest": {"sequence": 1}}] if index == 333 else [])
+        }
+        cli._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            observations,
+            {
+                "query_job_id": f"job-query-{index}",
+                "state": state,
+                "terminal": False,
+                "progress": progress,
+            },
+        )
+    cli._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        observations,
+        {
+            "query_job_id": "job-query-701",
+            "state": "completed",
+            "terminal": True,
+            "progress": {"packages": []},
+        },
+    )
+
+    retained_ids = [cast(str, item["query_job_id"]) for item in observations]
+    assert len(observations) <= cli._MAX_JARVIS_EXECUTION_QUERY_OBSERVATIONS  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert "job-query-0" in retained_ids
+    assert "job-query-333" in retained_ids
+    assert retained_ids[-1] == "job-query-701"
+    assert [int(item.rsplit("-", 1)[1]) for item in retained_ids] == sorted(
+        int(item.rsplit("-", 1)[1]) for item in retained_ids
+    )

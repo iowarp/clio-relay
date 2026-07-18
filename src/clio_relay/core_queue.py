@@ -66,6 +66,8 @@ from clio_relay.models import (
     TerminalJobGcPlan,
     TerminalJobGcResult,
     UsedArtifactRef,
+    is_owned_jarvis_run_spec,
+    prepare_owned_jarvis_run_submission,
     utc_now,
 )
 from clio_relay.pagination import (
@@ -2860,10 +2862,6 @@ class ClioCoreQueue:
         _validate_new_owner_session_metadata(job.metadata)
         self.initialize()
         self._require_index_migration_complete()
-        job_digest = _job_idempotency_digest(job)
-        if job.submission_digest not in {None, job_digest}:
-            raise QueueConflictError("submitted job carries a mismatched submission_digest")
-        submitted = job.model_copy(update={"submission_digest": job_digest})
         key_path = (
             self._storage_root
             / "idempotency"
@@ -2873,6 +2871,12 @@ class ClioCoreQueue:
             try:
                 raw = self._read_json_document(key_path)
             except FileNotFoundError:
+                job = prepare_owned_jarvis_run_submission(job)
+                job_digest = _job_idempotency_digest(job)
+                if job.submission_digest not in {None, job_digest}:
+                    raise QueueConflictError(
+                        "submitted job carries a mismatched submission_digest"
+                    ) from None
                 return IdempotentSubmissionResolution(
                     state="new",
                     canonical_job_id=job.job_id,
@@ -2886,8 +2890,6 @@ class ClioCoreQueue:
             if (
                 not _safe_global_record_id(canonical_job_id)
                 or record.get("idempotency_key") != job.idempotency_key
-                or not _is_sha256_digest(recorded_digest)
-                or recorded_digest != job_digest
                 or state not in {"reserved", "committed", "retired"}
             ):
                 raise QueueConflictError(
@@ -2895,6 +2897,18 @@ class ClioCoreQueue:
                     f"{job.idempotency_key}"
                 )
             canonical_job_id = cast(str, canonical_job_id)
+            job = prepare_owned_jarvis_run_submission(
+                job.model_copy(update={"job_id": canonical_job_id})
+            )
+            job_digest = _job_idempotency_digest(job)
+            if job.submission_digest not in {None, job_digest}:
+                raise QueueConflictError("submitted job carries a mismatched submission_digest")
+            if not _is_sha256_digest(recorded_digest) or recorded_digest != job_digest:
+                raise QueueConflictError(
+                    f"idempotency key was reused with a different or invalid job payload: "
+                    f"{job.idempotency_key}"
+                )
+            submitted = job.model_copy(update={"submission_digest": job_digest})
             if state == "retired":
                 retired = self._replay_retired_job(
                     submitted,
@@ -2943,18 +2957,33 @@ class ClioCoreQueue:
             / "idempotency"
             / f"{_idempotency_key_filename(job.idempotency_key)}.json"
         )
-        job_digest = _job_idempotency_digest(job)
-        if job.submission_digest not in {None, job_digest}:
-            raise QueueConflictError("submitted job carries a mismatched submission_digest")
-        job = job.model_copy(update={"submission_digest": job_digest})
         with self._lock:
             self._recover_pending_transitions_unlocked()
-            if not key_path.exists():
-                self._artifact_use_records_unlocked(job, allocate_sequences=False)
+            raw_existing: object | None = None
             if key_path.exists():
                 raw_existing = self._read_json_document(key_path)
                 if not isinstance(raw_existing, dict):
                     raise QueueConflictError(f"idempotency record is not an object: {key_path}")
+                typed_existing = cast(dict[str, object], raw_existing)
+                canonical_job_id = typed_existing.get("job_id")
+                if (
+                    not _safe_global_record_id(canonical_job_id)
+                    or typed_existing.get("idempotency_key") != job.idempotency_key
+                    or typed_existing.get("state") not in {"reserved", "committed", "retired"}
+                ):
+                    raise QueueConflictError(
+                        f"invalid idempotency record for key: {job.idempotency_key}"
+                    )
+                job = job.model_copy(update={"job_id": cast(str, canonical_job_id)})
+            job = prepare_owned_jarvis_run_submission(job)
+            job_digest = _job_idempotency_digest(job)
+            if job.submission_digest not in {None, job_digest}:
+                raise QueueConflictError("submitted job carries a mismatched submission_digest")
+            job = job.model_copy(update={"submission_digest": job_digest})
+            if raw_existing is None:
+                self._artifact_use_records_unlocked(job, allocate_sequences=False)
+            else:
+                assert isinstance(raw_existing, dict)
                 existing = cast(dict[str, object], raw_existing)
                 existing_job_id = existing.get("job_id")
                 existing_digest = existing.get("job_digest")
@@ -3024,7 +3053,7 @@ class ClioCoreQueue:
                 self._assert_owner_session_intake_open_unlocked(job.metadata)
                 self._ensure_active_job_capacity_unlocked(job)
                 job = job.model_copy(update={"job_id": existing_job_id})
-            else:
+            if raw_existing is None:
                 self._assert_owner_session_intake_open_unlocked(job.metadata)
                 self._ensure_active_job_capacity_unlocked(job)
                 self._write_json(
@@ -5806,6 +5835,11 @@ class ClioCoreQueue:
                 for lease in expired:
                     self._delete_lease_unlocked(lease, job=job)
                 return None
+            if self._job_has_pending_execution_cleanup_after_migration_unlocked(
+                cluster,
+                job.job_id,
+            ):
+                return None
             if self._job_has_scheduler_observation_unlocked(job):
                 return None
             return self._recover_expired_leases_unlocked(
@@ -6887,6 +6921,19 @@ class ClioCoreQueue:
             return True
         pending_job_path = self._execution_cleanup_job_path(cluster, job_id)
         return pending_job_path.exists() or pending_job_path.is_symlink()
+
+    def _job_has_pending_execution_cleanup_after_migration_unlocked(
+        self,
+        cluster: str,
+        job_id: str,
+    ) -> bool:
+        """Resolve legacy cleanup state before deciding stale-job ownership."""
+        self._migrate_execution_cleanup_shard_unlocked(
+            cluster,
+            self._execution_cleanup_shard(job_id),
+            limit=DEFAULT_EXACT_RECORD_LIMIT + 1,
+        )
+        return self._job_has_pending_execution_cleanup_unlocked(cluster, job_id)
 
     def _execution_cleanup_path(self, cluster: str, job_id: str, task_id: str) -> Path:
         return self._execution_cleanup_job_path(cluster, job_id) / (
@@ -9753,6 +9800,11 @@ class ClioCoreQueue:
                 for lease in leases:
                     self._delete_lease_unlocked(lease, job=job)
                     changed = True
+                continue
+            if self._job_has_pending_execution_cleanup_after_migration_unlocked(
+                cluster,
+                job.job_id,
+            ):
                 continue
             if self._job_has_scheduler_observation_unlocked(job):
                 continue
@@ -13657,6 +13709,13 @@ def _job_idempotency_digest(job: RelayJob) -> str:
         spec_payload = cast(dict[str, object], raw_spec)
         if spec_payload.get("expected_jarvis_cd_lock_binding") is None:
             spec_payload.pop("expected_jarvis_cd_lock_binding", None)
+        if is_owned_jarvis_run_spec(job.kind, job.spec):
+            raw_arguments = spec_payload.get("arguments")
+            if isinstance(raw_arguments, dict):
+                # The relay injects this identity at admission. Like job_id and
+                # timestamps, it is durable output rather than caller payload,
+                # so excluding it keeps pre-handle idempotency records replayable.
+                cast(dict[str, object], raw_arguments).pop("execution_id", None)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 

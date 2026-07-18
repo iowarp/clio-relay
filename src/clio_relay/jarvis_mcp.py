@@ -23,16 +23,16 @@ from clio_relay.remote_mcp import (
 if TYPE_CHECKING:
     from clio_relay.installation import ComponentArtifactIdentity, InstallReceipt
 
-CLIO_KIT_JARVIS_MCP_VERSION = "2.5.11"
+CLIO_KIT_JARVIS_MCP_VERSION = "2.5.13"
 CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME = f"clio_kit-{CLIO_KIT_JARVIS_MCP_VERSION}-py3-none-any.whl"
 CLIO_KIT_JARVIS_MCP_WHEEL_URL = (
     "https://github.com/iowarp/clio-kit/releases/download/"
     f"v{CLIO_KIT_JARVIS_MCP_VERSION}/{CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME}"
 )
 CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 = (
-    "a0a2bbf8d23495dd4f43881d35a47bfb83bc2d1c016bd952bd7a1c88a43ca03e"
+    "225045e6c93de3423d2fe9156eee3075973f49c788bcc0955e130d565693feeb"
 )
-CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.3"
+CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.4"
 DEFAULT_JARVIS_MCP_COMMAND = [
     "clio-kit",
     "mcp-server",
@@ -46,12 +46,12 @@ JARVIS_MCP_CACHE_SERVER_NAME = "__builtin_jarvis__"
 JSON = dict[str, Any]
 
 CLIO_KIT_JARVIS_USER_CONTRACT_SHA256 = (
-    "0993ee9b2ee9b3c2b021a3967d9221199c3a6be50d726d4b125812e6b1148115"
+    "52bfe1d416e674d120f200e502ded2197ee27219c26891a22c6c33ba917d5696"
 )
 CLIO_KIT_JARVIS_USER_WIRE_SHA256 = (
-    "c74276800cab5031ccd1538343180c40a58e9b8700d0b49e9ca9d4461d37696d"
+    "2ced8dc66ecee832ee86df0c99c29610bce61a82f9d80a8a53e0ea037d262219"
 )
-_JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.3.json"
+_JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.4.json"
 _EXPECTED_JARVIS_USER_TOOLS = {
     "jarvis_add_step",
     "jarvis_create_pipeline",
@@ -125,6 +125,11 @@ def _load_bundled_jarvis_user_contract() -> dict[str, JSON]:
         tools[name] = cast(JSON, definition)
     if set(tools) != _EXPECTED_JARVIS_USER_TOOLS:
         raise RuntimeError("bundled clio-kit JARVIS user tool set did not match")
+    require_handle_first_jarvis_run_schema(
+        cast(JSON, tools["jarvis_run"]["inputSchema"]),
+        error_type=RuntimeError,
+        label="bundled clio-kit JARVIS user contract",
+    )
     if _jarvis_contract_digest(tools) != CLIO_KIT_JARVIS_USER_CONTRACT_SHA256:
         raise RuntimeError("bundled clio-kit JARVIS user contract digest did not match")
     if (
@@ -169,6 +174,23 @@ def _jarvis_wire_digest(tools: list[JSON]) -> str:
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def require_handle_first_jarvis_run_schema(
+    input_schema: JSON,
+    *,
+    error_type: type[Exception] = ValueError,
+    label: str = "JARVIS MCP discovery contract",
+) -> None:
+    """Reject a public JARVIS run schema that exposes internal blocking controls."""
+    properties = input_schema.get("properties")
+    if not isinstance(properties, dict):
+        raise error_type(f"{label} has no jarvis_run property map")
+    if "wait" in properties:
+        raise error_type(
+            f"{label} exposes internal jarvis_run wait; the public contract must return "
+            "a durable execution handle and use jarvis_get_execution for workload lifecycle"
+        )
 
 
 _VIRTUAL_JARVIS_TOOLS = _load_bundled_jarvis_user_contract()
@@ -546,6 +568,13 @@ def virtual_jarvis_tool_definitions(*, clusters: list[str] | None = None) -> lis
                 "target='package' and package_name set to the selected canonical name, then use "
                 "that package-owned settings contract rather than guessing settings."
             )
+        elif remote_tool == "jarvis_run":
+            tool_guidance = (
+                " wait_for_terminal is a clio-relay transport control: it waits only for the "
+                "brief remote MCP dispatch to return the durable execution handle. It never "
+                "waits for workload completion. Use jarvis_get_execution with the returned "
+                "pipeline_id and execution_id for lifecycle, progress, artifacts, and services."
+            )
         tools.append(
             {
                 "name": virtual_jarvis_tool_name(remote_tool),
@@ -742,8 +771,10 @@ def render_virtual_jarvis_agent_context() -> str:
         "page without adding another agent tool. Use jarvis_describe with "
         "target='package_search' for bounded package discovery, then describe the "
         "selected canonical package name. "
-        "When wait_for_terminal=true, the same JARVIS tool returns a bounded, "
-        "artifact-bound mcp_result instead of requiring a second status or log call. "
+        "When wait_for_terminal=true, the same JARVIS tool waits only for its bounded remote "
+        "MCP dispatch and returns the artifact-bound mcp_result. For jarvis_run this means the "
+        "durable execution handle, not workload completion; query that lifecycle with "
+        "jarvis_get_execution. "
         "If a JARVIS call returns queued, call relay_wait with its exact cluster, job_id, and "
         "route_revision. A completed jarvis_get_execution call with "
         "include_service_runtimes=true returns service_runtime_bindings either directly or "
