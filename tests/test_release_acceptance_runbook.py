@@ -32,7 +32,7 @@ def _matrix_reports() -> list[dict[str, object]]:
         dict[str, object],
         json.loads((FIXTURES / "report-matrix-1.0.json").read_text(encoding="utf-8")),
     )
-    assert document["report_count_per_stage"] == 17
+    assert document["report_count_per_stage"] == 18
     return cast(list[dict[str, object]], document["reports"])
 
 
@@ -53,7 +53,7 @@ def test_release_identity_is_consistent_across_package_policy_matrix_and_runbook
     init_source = (ROOT / "src" / "clio_relay" / "__init__.py").read_text(encoding="utf-8")
     release_process = RELEASE_PROCESS.read_text(encoding="utf-8")
 
-    assert version == "1.3.29"
+    assert version == "1.3.30"
     assert relay_lock["version"] == version
     assert f'__version__ = "{version}"' in init_source
     assert policy["release_version"] == version
@@ -502,8 +502,8 @@ def test_gray_scott_helper_fails_closed_on_spack_and_config_discovery_errors(
 def test_release_acceptance_matrix_is_complete_ordered_and_unique() -> None:
     reports = _matrix_reports()
 
-    assert [report["ordinal"] for report in reports] == list(range(1, 18))
-    assert len({cast(str, report["id"]) for report in reports}) == 17
+    assert [report["ordinal"] for report in reports] == list(range(1, 19))
+    assert len({cast(str, report["id"]) for report in reports}) == 18
     assert reports[2]["id"] == "ares-queue-management"
     assert all(
         cast(int, report["ordinal"]) > 3
@@ -518,17 +518,35 @@ def test_release_acceptance_matrix_is_complete_ordered_and_unique() -> None:
         "builtin.lammps",
     ]
     assert [report.get("remote_tool") for report in reports if "remote_tool" in report] == [
+        "scientific_dataset_describe",
         "spack_find",
         "spack_locate",
         "spack_install",
     ]
+    catalog = next(
+        report for report in reports if report["id"] == "ares-scientific-catalog-describe"
+    )
+    assert catalog["arguments"] == {"dataset_id": "deep-water-impact-2018-yb31-first5"}
 
 
 def test_release_acceptance_upload_checks_derive_matrix_cardinality() -> None:
     runbook = RUNBOOK.read_text(encoding="utf-8")
 
-    assert "-ne 17" not in runbook
+    assert "-ne 18" not in runbook
     assert runbook.count("-ne $Matrix.report_count_per_stage") >= 3
+
+
+def test_release_acceptance_runs_released_catalog_v11_descriptor_proof() -> None:
+    """The operator runbook registers, refreshes, and validates the catalog handoff."""
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+
+    assert "CLIO_RELAY_VALIDATION_ARES_SCIENTIFIC_CATALOG_FILE" in runbook
+    assert "--contract clio-kit-scientific-catalog-user-v1.1" in runbook
+    assert "remote-mcp refresh --cluster $AresCluster --name scientific-catalog" in runbook
+    assert 'Invoke-RelayReport -Id "ares-scientific-catalog-describe"' in runbook
+    assert '"--tool", "scientific_dataset_describe"' in runbook
+    assert 'dataset_id = "deep-water-impact-2018-yb31-first5"' in runbook
+    assert "concrete Ares release evidence, not as a" in runbook
 
 
 def test_release_acceptance_matrix_preserves_evidence_groups() -> None:

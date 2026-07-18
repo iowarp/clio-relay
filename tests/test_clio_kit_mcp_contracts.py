@@ -36,7 +36,12 @@ from clio_relay.jarvis_mcp import (
     jarvis_user_contract,
 )
 from clio_relay.remote_mcp import (
+    CLIO_KIT_SCIENTIFIC_CATALOG_USER_ARTIFACT_SHA256_BY_ID,
+    CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ARTIFACT_BY_ID,
+    CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID,
     CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256,
+    CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256_BY_ID,
+    CLIO_KIT_SCIENTIFIC_CATALOG_USER_WIRE_SHA256_BY_ID,
     CLIO_KIT_SPACK_USER_ARTIFACT_SHA256_BY_ID,
     CLIO_KIT_SPACK_USER_CONTRACT_ARTIFACT_BY_ID,
     CLIO_KIT_SPACK_USER_CONTRACT_ID,
@@ -120,10 +125,21 @@ EXPECTED_CONTRACTS = {
         "contract_sha256": CLIO_KIT_SPACK_USER_CONTRACT_SHA256,
         "tool_names": {"spack_find", "spack_install", "spack_locate"},
     },
+    "clio-kit-scientific-catalog-user-v1.1": {
+        "server_name": "scientific-catalog",
+        "artifact": "scientific-catalog-user-v1.1.json",
+        "contract_sha256": CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256,
+        "tool_names": {
+            "scientific_dataset_describe",
+            "scientific_dataset_search",
+        },
+    },
     "clio-kit-scientific-catalog-user-v1": {
         "server_name": "scientific-catalog",
         "artifact": "scientific-catalog-user-v1.json",
-        "contract_sha256": CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256,
+        "contract_sha256": CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256_BY_ID[
+            "clio-kit-scientific-catalog-user-v1"
+        ],
         "tool_names": {
             "scientific_dataset_describe",
             "scientific_dataset_search",
@@ -182,6 +198,7 @@ ACTIVE_CONTRACT_IDS = frozenset(EXPECTED_CONTRACTS) - {
     "clio-kit-jarvis-user-v3",
     "clio-kit-jarvis-user-v3.1",
     "clio-kit-jarvis-user-v3.2",
+    "clio-kit-scientific-catalog-user-v1",
     "clio-kit-spack-user-v2",
 }
 UV_TOOL_PROBE_VERSION = "0.0.0"
@@ -406,7 +423,9 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
     legacy_spack_tools = _tools_by_name(shipped_contracts["clio-kit-spack-user-v2"])
     assert set(legacy_spack_tools) == set(spack_tools)
 
-    scientific_tools = _tools_by_name(shipped_contracts["clio-kit-scientific-catalog-user-v1"])
+    scientific_tools = _tools_by_name(
+        shipped_contracts[CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID]
+    )
     assert set(scientific_tools) == {
         "scientific_dataset_describe",
         "scientific_dataset_search",
@@ -415,6 +434,16 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
         cast(JSON, tool["annotations"])["readOnlyHint"] is True
         for tool in scientific_tools.values()
     )
+    describe_output = cast(JSON, scientific_tools["scientific_dataset_describe"]["outputSchema"])
+    describe_properties = cast(JSON, describe_output["properties"])
+    dataset_properties = cast(JSON, cast(JSON, describe_properties["dataset"])["properties"])
+    assert "dataset_descriptor" in cast(list[str], describe_output["required"])
+    assert describe_properties["dataset_descriptor"] == dataset_properties["descriptor"]
+
+    legacy_scientific_tools = _tools_by_name(
+        shipped_contracts["clio-kit-scientific-catalog-user-v1"]
+    )
+    assert set(legacy_scientific_tools) == set(scientific_tools)
 
 
 @pytest.mark.parametrize("contract_id", sorted(CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID))
@@ -433,6 +462,38 @@ def test_relay_vendors_exact_spack_contract_artifacts(contract_id: str) -> None:
     assert artifact["contract_id"] == contract_id
     assert artifact["contract_sha256"] == CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID[contract_id]
     assert artifact["wire_sha256"] == CLIO_KIT_SPACK_USER_WIRE_SHA256_BY_ID[contract_id]
+    assert (
+        hashlib.sha256(_canonical_json(_contract_projection(tools))).hexdigest()
+        == artifact["contract_sha256"]
+    )
+    assert hashlib.sha256(_canonical_json({"tools": tools})).hexdigest() == artifact["wire_sha256"]
+
+
+@pytest.mark.parametrize(
+    "contract_id", sorted(CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256_BY_ID)
+)
+def test_relay_vendors_exact_scientific_catalog_contract_artifacts(
+    contract_id: str,
+) -> None:
+    """Keep current and compatibility catalog artifacts immutable in relay wheels."""
+    artifact_name = CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ARTIFACT_BY_ID[contract_id]
+    path = Path(remote_mcp.__file__).with_name("_contracts") / artifact_name
+    payload = path.read_bytes()
+    artifact = _json_object(payload, label=contract_id)
+    tools = cast(list[JSON], artifact["tools"])
+
+    assert (
+        hashlib.sha256(payload).hexdigest()
+        == CLIO_KIT_SCIENTIFIC_CATALOG_USER_ARTIFACT_SHA256_BY_ID[contract_id]
+    )
+    assert artifact["contract_id"] == contract_id
+    assert (
+        artifact["contract_sha256"]
+        == CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256_BY_ID[contract_id]
+    )
+    assert (
+        artifact["wire_sha256"] == CLIO_KIT_SCIENTIFIC_CATALOG_USER_WIRE_SHA256_BY_ID[contract_id]
+    )
     assert (
         hashlib.sha256(_canonical_json(_contract_projection(tools))).hexdigest()
         == artifact["contract_sha256"]

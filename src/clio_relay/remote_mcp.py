@@ -60,6 +60,7 @@ MAX_REMOTE_MCP_CACHE_ENTRIES = 1_024
 MAX_REMOTE_MCP_TOOLS_PER_SERVER = 2_048
 MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES = 1024 * 1024
 MAX_REMOTE_MCP_PROVENANCE_BYTES = 1024 * 1024
+MAX_REMOTE_MCP_SCIENTIFIC_CATALOG_STRUCTURED_BYTES = 1024 * 1024
 MAX_REMOTE_MCP_JSON_DEPTH = 64
 MAX_REMOTE_MCP_JSON_NODES = 100_000
 MAX_REMOTE_MCP_DIAGNOSTIC_CHARS = 4_096
@@ -74,7 +75,7 @@ MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH = 64
 MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES = 32_768
 REMOTE_MCP_REPLACE_ATTEMPTS = 25
 REMOTE_MCP_REPLACE_RETRY_SECONDS = 0.02
-CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.5.10"
+CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.5.11"
 CLIO_KIT_SPACK_USER_CONTRACT_ID = "clio-kit-spack-user-v2.1"
 CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID = "clio-kit-spack-user-v2"
 CLIO_KIT_SPACK_USER_CONTRACT_IDS = frozenset(
@@ -117,9 +118,47 @@ CLIO_KIT_SPACK_USER_CONTRACT_ARTIFACT_BY_ID = {
 CLIO_KIT_SPACK_USER_CONTRACT_SHA256 = CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID[
     CLIO_KIT_SPACK_USER_CONTRACT_ID
 ]
-CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID = "clio-kit-scientific-catalog-user-v1"
+CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION = "2.5.11"
+CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID = "clio-kit-scientific-catalog-user-v1.1"
+CLIO_KIT_SCIENTIFIC_CATALOG_USER_LEGACY_CONTRACT_ID = "clio-kit-scientific-catalog-user-v1"
+CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_IDS = frozenset(
+    {
+        CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID,
+        CLIO_KIT_SCIENTIFIC_CATALOG_USER_LEGACY_CONTRACT_ID,
+    }
+)
+CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256_BY_ID = {
+    CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID: (
+        "80a9b583c26a084ff07d638ddf0c2c7d4325dbc8d4299931d0c4f3627cb8674c"
+    ),
+    CLIO_KIT_SCIENTIFIC_CATALOG_USER_LEGACY_CONTRACT_ID: (
+        "a53006f24f4698f659f0a7c8bf61fc7bd7ad23274b06d2eed2ccfca68b9ecb0a"
+    ),
+}
+CLIO_KIT_SCIENTIFIC_CATALOG_USER_WIRE_SHA256_BY_ID = {
+    CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID: (
+        "1c8df94a298f92b92126c953a7b8124d90b2fa12919de93738a40e563c3eaa28"
+    ),
+    CLIO_KIT_SCIENTIFIC_CATALOG_USER_LEGACY_CONTRACT_ID: (
+        "55bd04f45653c9117b8a1ae41cbc5e79dd6383e86a851b43caa071ae357bb2c4"
+    ),
+}
+CLIO_KIT_SCIENTIFIC_CATALOG_USER_ARTIFACT_SHA256_BY_ID = {
+    CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID: (
+        "29cbbfe64eaa7bcf29531b3d28762b8ff47e89d291b0a5b66119da96c790135e"
+    ),
+    CLIO_KIT_SCIENTIFIC_CATALOG_USER_LEGACY_CONTRACT_ID: (
+        "86097ef70d5b4e740a93ae0cdd0eb723cae1ac8898cfd8cbbc1911835cb22d56"
+    ),
+}
+CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ARTIFACT_BY_ID = {
+    CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID: "scientific-catalog-user-v1.1.json",
+    CLIO_KIT_SCIENTIFIC_CATALOG_USER_LEGACY_CONTRACT_ID: ("scientific-catalog-user-v1.json"),
+}
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256 = (
-    "a53006f24f4698f659f0a7c8bf61fc7bd7ad23274b06d2eed2ccfca68b9ecb0a"
+    CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256_BY_ID[
+        CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID
+    ]
 )
 _COMPOSED_SCHEMA_KEYS = {
     "$dynamicRef",
@@ -928,6 +967,16 @@ class RemoteMcpAcceptanceReport(BaseModel):
             )
             if result_check is not None:
                 call_metadata["structured_result_assertion"] = result_check.evidence
+            catalog_result_check = next(
+                (
+                    check
+                    for check in self.checks
+                    if check.name == "remote-mcp.scientific-catalog-result"
+                ),
+                None,
+            )
+            if catalog_result_check is not None:
+                call_metadata["scientific_catalog_result_assertion"] = catalog_result_check.evidence
             report.resources.append(
                 ValidationResource(
                     kind="relay_job",
@@ -997,7 +1046,15 @@ class RemoteMcpAcceptanceReport(BaseModel):
             None,
         )
         contract_check = next(
-            (check for check in self.checks if check.name == "remote-mcp.spack-user-contract"),
+            (
+                check
+                for check in self.checks
+                if check.name
+                in {
+                    "remote-mcp.spack-user-contract",
+                    "remote-mcp.scientific-catalog-user-contract",
+                }
+            ),
             None,
         )
         contract_metadata: JSON = {}
@@ -2085,6 +2142,24 @@ def build_remote_mcp_acceptance_report(
             build_remote_mcp_structured_result_check(
                 expectation=result_expectation,
                 remote_tool_name=remote_tool_name,
+                arguments=spec.get("arguments", {}),
+                protocol_result=protocol_result,
+                output_schema=output_schema,
+            )
+        )
+    if (
+        registration is not None
+        and registration.contract == CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID
+        and remote_tool_name == "scientific_dataset_describe"
+    ):
+        matching_tools = (
+            [tool for tool in entry.tools if tool.name == remote_tool_name]
+            if entry is not None
+            else []
+        )
+        output_schema = matching_tools[0].output_schema if len(matching_tools) == 1 else None
+        checks.append(
+            _scientific_catalog_structured_result_check(
                 arguments=spec.get("arguments", {}),
                 protocol_result=protocol_result,
                 output_schema=output_schema,
@@ -3187,6 +3262,237 @@ def _structured_result_schema_evidence(
     return evidence
 
 
+def _scientific_catalog_structured_result_check(
+    *,
+    arguments: object,
+    protocol_result: JSON | None,
+    output_schema: JSON | None,
+) -> RemoteMcpAcceptanceCheck:
+    """Verify the v1.1 catalog describe result and explicit JARVIS handoff."""
+    failures: list[str] = []
+    typed_arguments = _as_json(arguments) or {}
+    structured_value = (
+        protocol_result.get("structuredContent") if protocol_result is not None else None
+    )
+    structured = _as_json(structured_value)
+    output_schema_evidence = _scientific_catalog_structured_schema_evidence(
+        output_schema=output_schema,
+        structured_value=structured_value,
+    )
+    structured_content_safe = (
+        output_schema_evidence["structured_content_bounded"] is True
+        and output_schema_evidence["structured_content_finite"] is True
+    )
+    if not structured_content_safe:
+        failures.append("structuredContent is not bounded finite JSON")
+    elif output_schema_evidence["schema_present"] is not True:
+        failures.append("cached tool outputSchema is absent")
+    elif output_schema_evidence["schema_valid"] is not True:
+        failures.append("cached tool outputSchema is invalid")
+    elif output_schema_evidence["structured_content_valid"] is not True:
+        failures.append("structuredContent does not satisfy the cached tool outputSchema")
+
+    requested_dataset_id = _bounded_catalog_identity(typed_arguments.get("dataset_id"))
+    dataset: JSON | None = None
+    dataset_descriptor: JSON | None = None
+    nested_descriptor: JSON | None = None
+    computed_descriptor_sha256: str | None = None
+    descriptor_digest_error: str | None = None
+    if requested_dataset_id is None:
+        failures.append("call arguments do not contain one bounded dataset_id")
+    if structured is None:
+        failures.append("protocol result has no structuredContent object")
+    elif structured_content_safe:
+        dataset = _as_json(structured.get("dataset"))
+        dataset_descriptor = _as_json(structured.get("dataset_descriptor"))
+        nested_descriptor = _as_json(dataset.get("descriptor")) if dataset is not None else None
+        if dataset_descriptor is not None:
+            try:
+                computed_descriptor_sha256 = _scientific_catalog_descriptor_sha256(
+                    dataset_descriptor
+                )
+            except (RecursionError, TypeError, ValueError) as exc:
+                descriptor_digest_error = _bounded_diagnostic(str(exc))
+                failures.append("dataset_descriptor is not canonical finite JSON")
+
+    response_schema_version = (
+        structured.get("schema_version")
+        if structured is not None and structured_content_safe
+        else None
+    )
+    descriptor_schema_version = (
+        dataset_descriptor.get("schema_version") if dataset_descriptor is not None else None
+    )
+    nested_descriptor_schema_version = (
+        nested_descriptor.get("schema_version") if nested_descriptor is not None else None
+    )
+    schema_versions_match = (
+        response_schema_version == "clio-kit.scientific-dataset-description.v1"
+        and descriptor_schema_version == "jarvis.dataset-descriptor.v1"
+        and nested_descriptor_schema_version == "jarvis.dataset-descriptor.v1"
+    )
+    if not schema_versions_match:
+        failures.append("catalog result or descriptor schema_version does not match v1.1")
+
+    dataset_id = _bounded_catalog_identity(
+        dataset.get("dataset_id") if dataset is not None else None
+    )
+    descriptor_dataset_id = _bounded_catalog_identity(
+        dataset_descriptor.get("dataset_id") if dataset_descriptor is not None else None
+    )
+    nested_descriptor_dataset_id = _bounded_catalog_identity(
+        nested_descriptor.get("dataset_id") if nested_descriptor is not None else None
+    )
+    dataset_identity_matches = (
+        requested_dataset_id is not None
+        and requested_dataset_id == dataset_id
+        and requested_dataset_id == descriptor_dataset_id
+        and requested_dataset_id == nested_descriptor_dataset_id
+    )
+    if not dataset_identity_matches:
+        failures.append(
+            "requested dataset_id does not match the catalog record and both descriptors"
+        )
+
+    descriptor_handoff_matches = (
+        dataset_descriptor is not None
+        and nested_descriptor is not None
+        and dataset_descriptor == nested_descriptor
+    )
+    if not descriptor_handoff_matches:
+        failures.append("dataset_descriptor does not equal dataset.descriptor")
+
+    observed_descriptor_sha256 = (
+        structured.get("descriptor_sha256") if structured is not None else None
+    )
+    descriptor_digest_matches = (
+        _is_sha256(observed_descriptor_sha256)
+        and observed_descriptor_sha256 == computed_descriptor_sha256
+    )
+    if not descriptor_digest_matches:
+        failures.append("descriptor_sha256 does not match the canonical dataset_descriptor")
+
+    passed = not failures
+    return RemoteMcpAcceptanceCheck(
+        name="remote-mcp.scientific-catalog-result",
+        passed=passed,
+        message=(
+            "scientific catalog result proves the exact JARVIS descriptor handoff"
+            if passed
+            else "scientific catalog result does not prove the exact JARVIS descriptor handoff"
+        ),
+        evidence={
+            "contract": CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID,
+            "tool": "scientific_dataset_describe",
+            "requested_dataset_id": requested_dataset_id,
+            "dataset_id": dataset_id,
+            "descriptor_dataset_id": descriptor_dataset_id,
+            "nested_descriptor_dataset_id": nested_descriptor_dataset_id,
+            "response_schema_version": _bounded_optional_string(response_schema_version, 128),
+            "descriptor_schema_version": _bounded_optional_string(descriptor_schema_version, 128),
+            "nested_descriptor_schema_version": _bounded_optional_string(
+                nested_descriptor_schema_version, 128
+            ),
+            "schema_versions_match": schema_versions_match,
+            "dataset_identity_matches": dataset_identity_matches,
+            "dataset_descriptor_handoff_matches": descriptor_handoff_matches,
+            "descriptor_sha256": (
+                observed_descriptor_sha256 if _is_sha256(observed_descriptor_sha256) else None
+            ),
+            "computed_descriptor_sha256": computed_descriptor_sha256,
+            "descriptor_digest_matches": descriptor_digest_matches,
+            "descriptor_digest_error": descriptor_digest_error,
+            "output_schema": output_schema_evidence,
+            "failures": failures,
+        },
+    )
+
+
+def _scientific_catalog_structured_schema_evidence(
+    *,
+    output_schema: JSON | None,
+    structured_value: object,
+) -> JSON:
+    """Bound and reject non-finite catalog content before schema evaluation."""
+    guard_evidence: JSON = {
+        "structured_content_bounded": False,
+        "structured_content_finite": False,
+        "structured_content_bytes": None,
+        "structured_content_bytes_limit": (MAX_REMOTE_MCP_SCIENTIFIC_CATALOG_STRUCTURED_BYTES),
+        "structured_content_guard_error": None,
+        "schema_evaluated": False,
+    }
+    try:
+        _require_bounded_json_structure(
+            structured_value,
+            label="scientific catalog structuredContent",
+        )
+        guard_evidence["structured_content_bounded"] = True
+        _require_finite_json(
+            structured_value,
+            label="scientific catalog structuredContent",
+        )
+        guard_evidence["structured_content_finite"] = True
+        encoded = json.dumps(
+            structured_value,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        guard_evidence["structured_content_bytes"] = len(encoded)
+        if len(encoded) > MAX_REMOTE_MCP_SCIENTIFIC_CATALOG_STRUCTURED_BYTES:
+            guard_evidence["structured_content_bounded"] = False
+            raise ValueError(
+                "remote MCP scientific catalog structuredContent exceeds "
+                f"{MAX_REMOTE_MCP_SCIENTIFIC_CATALOG_STRUCTURED_BYTES} bytes"
+            )
+    except (RecursionError, TypeError, ValueError) as exc:
+        guard_evidence["structured_content_guard_error"] = _bounded_diagnostic(str(exc))
+        return {
+            "schema_present": output_schema is not None,
+            "schema_valid": False,
+            "schema_sha256": None,
+            "structured_content_valid": False,
+            "validation_errors": [guard_evidence["structured_content_guard_error"]],
+            "validation_errors_truncated": False,
+            **guard_evidence,
+        }
+    schema_evidence = _structured_result_schema_evidence(
+        output_schema=output_schema,
+        structured_value=structured_value,
+    )
+    guard_evidence["schema_evaluated"] = True
+    return {
+        **schema_evidence,
+        **guard_evidence,
+    }
+
+
+def _scientific_catalog_descriptor_sha256(descriptor: JSON) -> str:
+    """Hash a descriptor with the exact canonical JSON used by clio-kit."""
+    payload = json.dumps(
+        descriptor,
+        allow_nan=False,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _bounded_catalog_identity(value: object) -> str | None:
+    """Return one bounded printable catalog identity for release evidence."""
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 256
+        or not value.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return None
+    return value
+
+
 def _validate_spack_find_result(
     structured: JSON,
     arguments: JSON,
@@ -3521,6 +3827,10 @@ def _scientific_catalog_user_contract_check(
         set(registration.allow_tools) if registration is not None else set()
     )
     observed_contract_digest = remote_mcp_schema_digest(list(tools.values()))
+    declared_contract = registration.contract if registration is not None else None
+    expected_contract_digest = CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256_BY_ID.get(
+        declared_contract or ""
+    )
 
     annotation_matches: dict[str, bool] = {}
     expected_annotations = {
@@ -3566,10 +3876,31 @@ def _scientific_catalog_user_contract_check(
     describe_output_properties = (
         _as_json(describe_output.get("properties")) if describe_output is not None else None
     ) or {}
+    describe_output_required_value: object = (
+        describe_output.get("required", []) if describe_output is not None else []
+    )
+    describe_output_required = (
+        cast(list[object], describe_output_required_value)
+        if isinstance(describe_output_required_value, list)
+        else []
+    )
     dataset_schema = _as_json(describe_output_properties.get("dataset")) or {}
     dataset_properties = _as_json(dataset_schema.get("properties")) or {}
     descriptor_schema = _as_json(dataset_properties.get("descriptor")) or {}
     descriptor_properties = _as_json(descriptor_schema.get("properties")) or {}
+    handoff_descriptor_schema = _as_json(describe_output_properties.get("dataset_descriptor")) or {}
+    descriptor_handoff_required = declared_contract == CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID
+    descriptor_handoff_matches: bool | None = (
+        "dataset_descriptor" in describe_output_required
+        and handoff_descriptor_schema == descriptor_schema
+        if descriptor_handoff_required
+        else None
+    )
+    descriptor_handoff_accepted = (
+        descriptor_handoff_matches is True
+        if descriptor_handoff_required
+        else declared_contract == CLIO_KIT_SCIENTIFIC_CATALOG_USER_LEGACY_CONTRACT_ID
+    )
     describe_output_matches = (
         describe_output is not None
         and describe_output.get("type") == "object"
@@ -3584,6 +3915,7 @@ def _scientific_catalog_user_contract_check(
         and descriptor_schema.get("additionalProperties") is False
         and _as_json(descriptor_properties.get("schema_version"))
         == {"const": "jarvis.dataset-descriptor.v1", "type": "string"}
+        and descriptor_handoff_accepted
     )
 
     search_output = search.output_schema if search is not None else None
@@ -3615,11 +3947,11 @@ def _scientific_catalog_user_contract_check(
         actual_names == expected_names
         and allowlisted_names == expected_names
         and registration is not None
-        and registration.contract == CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID
+        and registration.contract in CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_IDS
         and "user" in registration.profiles
         and all(annotation_matches.values())
         and all(schema_matches.values())
-        and observed_contract_digest == CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256
+        and observed_contract_digest == expected_contract_digest
     )
     return RemoteMcpAcceptanceCheck(
         name="remote-mcp.scientific-catalog-user-contract",
@@ -3634,11 +3966,24 @@ def _scientific_catalog_user_contract_check(
             "remote_tool_names": sorted(actual_names),
             "allowlisted_tool_names": sorted(allowlisted_names),
             "profiles": registration.profiles if registration is not None else [],
-            "declared_contract": registration.contract if registration is not None else None,
+            "declared_contract": declared_contract,
             "annotations_match": annotation_matches,
             "schemas_match": schema_matches,
-            "expected_contract_sha256": CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256,
-            "expected_clio_kit_version": CLIO_KIT_SPACK_USER_WHEEL_VERSION,
+            "dataset_descriptor_handoff_required": descriptor_handoff_required,
+            "dataset_descriptor_handoff_matches": descriptor_handoff_matches,
+            "expected_contract_sha256": expected_contract_digest,
+            "expected_wire_sha256": (
+                CLIO_KIT_SCIENTIFIC_CATALOG_USER_WIRE_SHA256_BY_ID.get(declared_contract or "")
+            ),
+            "expected_contract_artifact": (
+                CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ARTIFACT_BY_ID.get(
+                    declared_contract or ""
+                )
+            ),
+            "expected_contract_artifact_sha256": (
+                CLIO_KIT_SCIENTIFIC_CATALOG_USER_ARTIFACT_SHA256_BY_ID.get(declared_contract or "")
+            ),
+            "expected_clio_kit_version": (CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION),
             "observed_contract_sha256": observed_contract_digest,
         },
     )
@@ -3651,7 +3996,7 @@ def _declared_contract_check(
     """Evaluate the semantic contract explicitly declared by an operator."""
     if registration.contract in CLIO_KIT_SPACK_USER_CONTRACT_IDS:
         return _spack_user_contract_check(entry, registration)
-    if registration.contract == CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID:
+    if registration.contract in CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_IDS:
         return _scientific_catalog_user_contract_check(entry, registration)
     raise ValueError(f"unsupported remote MCP semantic contract: {registration.contract}")
 

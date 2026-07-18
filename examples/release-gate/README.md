@@ -19,7 +19,7 @@ The JSON and YAML templates use the following literal replacement tokens:
 
 Render into an ignored per-stage directory. Never edit a tracked template with
 live values, and never write token or shared-secret values into rendered files.
-`report-matrix-1.0.json` is the authoritative ordered inventory of the 17
+`report-matrix-1.0.json` is the authoritative ordered inventory of the 18
 non-local reports required for each evidence stage.
 
 The nonscheduler gateway driver is Linux-specific and stores private state with

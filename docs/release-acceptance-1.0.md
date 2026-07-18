@@ -13,7 +13,7 @@ instances without a core-code change.
 
 ## Required report matrix
 
-Each stage produces exactly these 17 policy reports. The tracked
+Each stage produces exactly these 18 policy reports. The tracked
 [`report-matrix-1.0.json`](../examples/release-gate/report-matrix-1.0.json) is the
 machine-readable inventory.
 
@@ -24,22 +24,23 @@ machine-readable inventory.
 | 3 | `ares-queue-management` | `queue validate` | must precede lifecycle fixtures |
 | 4 | `ares-jarvis-gray-scott` | `jarvis-mcp-validate` | bounded package search, Gray-Scott run, progress, query, and artifacts |
 | 5 | `ares-jarvis-lammps` | `jarvis-mcp-validate` | bounded package search and separate LAMMPS progress run |
-| 6 | `ares-spack-find` | `remote-mcp validate` | `spack_find` |
-| 7 | `ares-spack-locate` | `remote-mcp validate` | `spack_locate` |
-| 8 | `ares-spack-install` | `remote-mcp validate` | absent -> fresh install -> exact locate transition |
-| 9 | `ares-slurm-lifecycle` | `scheduler validate-lifecycle` | explicit SLURM provider |
-| 10 | `ares-cleanup-detach` | `session detach` | grouped with report 11 by relay session |
-| 11 | `ares-cleanup-teardown` | `session teardown` | explicit keep-jobs default proof |
-| 12 | `ares-explicit-cancel-teardown` | `session teardown` | separate owned job plus unowned sentinel |
-| 13 | `homelab-cleanup-detach` | `session detach` | grouped with report 14 by relay session |
-| 14 | `homelab-cleanup-teardown` | `session teardown` | explicit keep-jobs default proof |
-| 15 | `homelab-transport` | `live-test` | relay and owned SSH transport |
-| 16 | `ares-gateway-start` | `gateway start-runtime` | grouped with report 17 by gateway session |
-| 17 | `ares-gateway-stop` | `gateway stop-runtime` | keeps scheduler job by default |
+| 6 | `ares-scientific-catalog-describe` | `remote-mcp validate` | catalog v1.1 output schema, exact dataset identity, and JARVIS descriptor handoff |
+| 7 | `ares-spack-find` | `remote-mcp validate` | `spack_find` |
+| 8 | `ares-spack-locate` | `remote-mcp validate` | `spack_locate` |
+| 9 | `ares-spack-install` | `remote-mcp validate` | absent -> fresh install -> exact locate transition |
+| 10 | `ares-slurm-lifecycle` | `scheduler validate-lifecycle` | explicit SLURM provider |
+| 11 | `ares-cleanup-detach` | `session detach` | grouped with report 12 by relay session |
+| 12 | `ares-cleanup-teardown` | `session teardown` | explicit keep-jobs default proof |
+| 13 | `ares-explicit-cancel-teardown` | `session teardown` | separate owned job plus unowned sentinel |
+| 14 | `homelab-cleanup-detach` | `session detach` | grouped with report 15 by relay session |
+| 15 | `homelab-cleanup-teardown` | `session teardown` | explicit keep-jobs default proof |
+| 16 | `homelab-transport` | `live-test` | relay and owned SSH transport |
+| 17 | `ares-gateway-start` | `gateway start-runtime` | grouped with report 18 by gateway session |
+| 18 | `ares-gateway-stop` | `gateway stop-runtime` | keeps scheduler job by default |
 
 Bootstrap of the homelab target and creation of cleanup-owned gateway fixtures
 also write diagnostic reports. Store those outside the policy report directory
-and do not upload them as part of the 17-report set.
+and do not upload them as part of the 18-report set.
 
 ## Start one evidence stage
 
@@ -55,7 +56,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.3.29"
+$Version = "1.3.30"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }
@@ -264,7 +265,7 @@ The producer login and numeric GitHub id are resolved afresh for the stage but
 remain the real operator identity. The invocation id, report id, report path,
 pipeline id, relay-session id, and gateway-session id must be fresh for every
 operation. This helper guarantees a new invocation id, refuses report-path
-replacement, and tracks only the 17 policy reports:
+replacement, and tracks only the 18 policy reports:
 
 ```powershell
 $PolicyReports = [System.Collections.Generic.List[string]]::new()
@@ -401,6 +402,7 @@ the whole definition.
 ```powershell
 $AresSpack = [string]$AresDefinition.spack_executable
 $AresFreshBaseSpack = "$AresHome/spack/bin/spack"
+$AresScientificCatalogFile = [string]$env:CLIO_RELAY_VALIDATION_ARES_SCIENTIFIC_CATALOG_FILE
 if ($AresDefinition.scheduler_provider -ne "slurm") { throw "Ares must explicitly use slurm" }
 if ($AresSpack -notmatch '^/[A-Za-z0-9._+/-]+$' -or
     $AresSpack.StartsWith("//") -or
@@ -411,6 +413,16 @@ if ($AresSpack -notmatch '^/[A-Za-z0-9._+/-]+$' -or
 foreach ($Executable in @($AresSpack, $AresFreshBaseSpack)) {
   & $OpenSsh $AresSshHost "test -x '$Executable'"
   if ($LASTEXITCODE -ne 0) { throw "required Ares Spack executable is absent: $Executable" }
+}
+if ($AresScientificCatalogFile -notmatch '^/[A-Za-z0-9._+/-]+$' -or
+    $AresScientificCatalogFile.StartsWith("//") -or
+    $AresScientificCatalogFile.EndsWith("/") -or
+    $AresScientificCatalogFile -match '(^|/)\.\.(/|$)') {
+  throw "CLIO_RELAY_VALIDATION_ARES_SCIENTIFIC_CATALOG_FILE must name one canonical absolute remote path"
+}
+& $OpenSsh $AresSshHost "test -f '$AresScientificCatalogFile'"
+if ($LASTEXITCODE -ne 0) {
+  throw "the operator-configured Ares scientific catalog is absent: $AresScientificCatalogFile"
 }
 if ($HomelabDefinition.scheduler_provider -ne "external") { throw "homelab must explicitly use external" }
 foreach ($Name in @(
@@ -819,6 +831,48 @@ with latest timestep 20 and two observed members. The LAMMPS report must contain
 determinate JARVIS-native progress for package id `lammps`. Stdout parsing alone
 cannot satisfy either requirement.
 
+## Run the scientific catalog v1.1 contract
+
+Use the exact clio-kit 2.5.11 persistent executable installed and receipt-bound
+by bootstrap. The catalog file is operator-owned site metadata supplied through
+`CLIO_RELAY_VALIDATION_ARES_SCIENTIFIC_CATALOG_FILE`; it is not copied into the
+relay release. This policy uses
+`deep-water-impact-2018-yb31-first5` as concrete Ares release evidence, not as a
+runtime allowlist. Operators replace both the target and dataset evidence in a
+later policy without changing relay code.
+
+The describe validation checks the cached output schema and the actual
+`structuredContent`. It also proves that the requested dataset id, catalog
+record id, and both descriptor ids agree; that the top-level
+`dataset_descriptor` equals `dataset.descriptor`; and that
+`descriptor_sha256` is the canonical digest of that exact JARVIS handoff.
+
+```powershell
+$AresClioKit = "$AresHome/.local/bin/clio-kit"
+& $Relay remote-mcp register --cluster $AresCluster --name scientific-catalog `
+  --command $AresClioKit `
+  --arg=mcp-server --arg=scientific-catalog --arg=-- `
+  --arg=--catalog-file --arg=$AresScientificCatalogFile `
+  --contract clio-kit-scientific-catalog-user-v1.1 `
+  --allow-tool scientific_dataset_search `
+  --allow-tool scientific_dataset_describe `
+  --profile user --call-timeout-seconds 300 --replace
+if ($LASTEXITCODE -ne 0) { throw "scientific catalog MCP registration failed" }
+& $Relay remote-mcp refresh --cluster $AresCluster --name scientific-catalog
+if ($LASTEXITCODE -ne 0) { throw "scientific catalog MCP discovery failed" }
+
+$CatalogDescribeArguments = Write-JsonFile "ares-scientific-catalog-describe.json" @{
+  dataset_id = "deep-water-impact-2018-yb31-first5"
+}
+Invoke-RelayReport -Id "ares-scientific-catalog-describe" `
+  -ReportOption "--validation-report" -Command @(
+    "remote-mcp", "validate", "--cluster", $AresCluster,
+    "--name", "scientific-catalog", "--tool", "scientific_dataset_describe",
+    "--arguments-json-file", $CatalogDescribeArguments,
+    "--wait-timeout-seconds", "300", "--poll-seconds", "1"
+  )
+```
+
 ## Run the three-tool Spack contract
 
 Register exactly the three agent-facing user operations. The `--arg=...` form is
@@ -830,7 +884,6 @@ structured `not_installed` error. Relay still accepts the preserved
 it against its own v2 artifact and digest rather than the current contract.
 
 ```powershell
-$AresClioKit = "$AresHome/.local/bin/clio-kit"
 & $Relay remote-mcp register --cluster $AresCluster --name spack `
   --command $AresClioKit `
   --arg=mcp-server --arg=spack --arg=-- --arg=--spack-command --arg=$AresSpack `
@@ -1358,7 +1411,7 @@ Invoke-RelayReport -Id "homelab-transport" -ReportOption "--report" -Command @(
 
 ## Prove the dedicated gateway pair
 
-Reports 16 and 17 must refer to the exact same gateway session. Stop closes the
+Reports 17 and 18 must refer to the exact same gateway session. Stop closes the
 connectors and record while explicitly retaining the scheduler job; the bounded
 fixture exits by itself.
 
@@ -1508,7 +1561,7 @@ The release workflow order is fixed:
 
 After the candidate upload, dispatch `live-validation-attest.yml` and then
 `release-gate.yml` from protected `main`. After public PyPI publication, create
-a new released stage, install from the public index, rerun all 17 reports, upload
+a new released stage, install from the public index, rerun all 18 reports, upload
 the distinct `released-validation-*.json` files, and dispatch
 `released-validation-attest.yml`. Only then may `finalize-release.yml` publish
 the final GitHub release claims.

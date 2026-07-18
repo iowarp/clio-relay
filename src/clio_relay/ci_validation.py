@@ -2214,7 +2214,7 @@ def validate_release_acceptance_matrix(
         "command",
         "report_option",
     }
-    optional_report_fields = {"package", "remote_tool", "evidence_group"}
+    optional_report_fields = {"package", "remote_tool", "arguments", "evidence_group"}
     normalized_reports: list[dict[str, object]] = []
     report_ids: set[str] = set()
     for ordinal, raw in enumerate(reports, start=1):
@@ -2251,6 +2251,31 @@ def validate_release_acceptance_matrix(
             raise ProvenanceError(
                 f"release acceptance matrix report option is invalid: {report_id}"
             )
+        if "arguments" in report:
+            arguments = _mapping(report.get("arguments"), "matrix report arguments")
+            if len(arguments) > 64 or any(
+                not key or len(key) > 256 or re.fullmatch(r"[A-Za-z0-9_.-]+", key) is None
+                for key in arguments
+            ):
+                raise ProvenanceError(
+                    f"release acceptance matrix arguments are invalid: {report_id}"
+                )
+            try:
+                encoded_arguments = json.dumps(
+                    arguments,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            except (TypeError, ValueError) as exc:
+                raise ProvenanceError(
+                    f"release acceptance matrix arguments are not finite JSON: {report_id}"
+                ) from exc
+            if len(encoded_arguments) > 64 * 1024:
+                raise ProvenanceError(
+                    f"release acceptance matrix arguments are too large: {report_id}"
+                )
         normalized_reports.append(
             {
                 "ordinal": ordinal,

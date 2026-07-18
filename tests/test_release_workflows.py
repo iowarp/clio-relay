@@ -337,11 +337,11 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
         if resource["kind"] == "relay_worker"
     )
     clio_kit_component = worker["metadata_equals"]["component_artifacts"]["clio-kit"]
-    assert clio_kit_component["distribution_version"] == "2.5.10"
+    assert clio_kit_component["distribution_version"] == "2.5.11"
     assert clio_kit_component["persistent_tool"]["manager"] == "uv"
     assert clio_kit_component["persistent_tool"]["uv_version"] == "0.11.28"
     assert clio_kit_component["persistent_tool"]["source_artifact_sha256"] == (
-        "4911142152f476f973caa0c7f8050d88e8efa5f803651bda88685836ee3232f5"
+        "a0a2bbf8d23495dd4f43881d35a47bfb83bc2d1c016bd952bd7a1c88a43ca03e"
     )
     native_execution = clio_kit_component["native_execution"]
     assert native_execution["contract_id"] == "clio-kit-jarvis-user-v3.3"
@@ -408,6 +408,54 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
         == "c35f531e386cc9a5e728c1c67c1902b08e0776f07d95bdfb13c33cb00550310a"
     )
     assert lammps.get("evidence_group_resource_kind") is None
+
+    catalog = requirements["ares-non-jarvis-virtual-mcp"]
+    assert "remote-mcp.scientific-catalog-user-contract" in catalog["required_checks"]
+    assert "remote-mcp.scientific-catalog-result" in catalog["required_checks"]
+    catalog_call = next(
+        resource
+        for resource in cast(list[dict[str, Any]], catalog["required_resources"])
+        if resource["kind"] == "relay_job"
+    )
+    catalog_call_metadata = catalog_call["metadata_equals"]
+    assert catalog_call_metadata["remote_mcp_server_name"] == "scientific-catalog"
+    assert catalog_call_metadata["remote_mcp_tool_name"] == "scientific_dataset_describe"
+    assert catalog_call_metadata["spec"]["arguments"] == {
+        "dataset_id": "deep-water-impact-2018-yb31-first5"
+    }
+    assert catalog_call_metadata["scientific_catalog_result_assertion"] == {
+        "contract": "clio-kit-scientific-catalog-user-v1.1",
+        "tool": "scientific_dataset_describe",
+        "requested_dataset_id": "deep-water-impact-2018-yb31-first5",
+        "dataset_id": "deep-water-impact-2018-yb31-first5",
+        "descriptor_dataset_id": "deep-water-impact-2018-yb31-first5",
+        "nested_descriptor_dataset_id": "deep-water-impact-2018-yb31-first5",
+        "schema_versions_match": True,
+        "dataset_identity_matches": True,
+        "dataset_descriptor_handoff_matches": True,
+        "descriptor_digest_matches": True,
+    }
+    catalog_server = next(
+        resource
+        for resource in cast(list[dict[str, Any]], catalog["required_resources"])
+        if resource["kind"] == "mcp_server"
+    )
+    assert catalog_server["metadata_equals"]["server_name"] == "scientific-catalog"
+    assert catalog_server["metadata_equals"]["remote_tool_names"] == [
+        "scientific_dataset_describe",
+        "scientific_dataset_search",
+    ]
+    assert catalog_server["metadata_equals"]["allowlisted_tool_names"] == [
+        "scientific_dataset_describe",
+        "scientific_dataset_search",
+    ]
+    assert catalog_server["metadata_equals"]["contract_id"] == (
+        "clio-kit-scientific-catalog-user-v1.1"
+    )
+    assert catalog_server["metadata_equals"]["contract_sha256"] == (
+        "80a9b583c26a084ff07d638ddf0c2c7d4325dbc8d4299931d0c4f3627cb8674c"
+    )
+    assert catalog["evidence_group_resource_kind"] == "mcp_server"
 
     spack = requirements["ares-spack-virtual-mcp"]
     assert spack["evidence_group_resource_kind"] == "mcp_server"
@@ -510,7 +558,7 @@ def test_spack_release_requirements_split_existing_resolution_from_fresh_install
     )
     assert fresh_server["metadata_equals"]["server_name"] == "spack-fresh"
     assert fresh_server["metadata_equals"]["install_artifact_sha256"] == (
-        "4911142152f476f973caa0c7f8050d88e8efa5f803651bda88685836ee3232f5"
+        "a0a2bbf8d23495dd4f43881d35a47bfb83bc2d1c016bd952bd7a1c88a43ca03e"
     )
     assert fresh_server["metadata_equals"]["contract_id"] == "clio-kit-spack-user-v2.1"
     assert fresh_server["metadata_equals"]["contract_sha256"] == (
@@ -989,16 +1037,16 @@ def test_release_seals_decisions_and_claims_bind_the_exact_matrix() -> None:
     assert '"acceptance_matrix": matrix_binding' in candidate
     assert 'matrix_report_count = matrix_binding.get("report_count")' in candidate
     assert "len(expected_reports) != matrix_report_count" in candidate
-    assert 'matrix_binding.get("report_count") != 17' not in candidate
+    assert 'matrix_binding.get("report_count") != 18' not in candidate
     assert 'decision.get("acceptance_report_ids") == expected_ids' in gate
     assert '"acceptance_matrix": matrix_binding' in released
     assert 'matrix_report_count = matrix_binding.get("report_count")' in released
     assert "len(expected_reports) != matrix_report_count" in released
-    assert 'matrix_binding.get("report_count") != 17' not in released
+    assert 'matrix_binding.get("report_count") != 18' not in released
     assert "candidate-to-released matrix binding failed" in released
     assert 'matrix_report_count = matrix.get("report_count")' in finalization
     assert "len(expected_reports) == matrix_report_count" in finalization
-    assert 'matrix.get("report_count") == 17' not in finalization
+    assert 'matrix.get("report_count") == 18' not in finalization
     assert '"ordered_report_ids": released_matrix_ids' in finalization
     assert '"ordered_report_document_ids": ordered_document_ids' in finalization
 

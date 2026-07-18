@@ -3,9 +3,9 @@
 # registry and may require them for a later release by adding policy requirements;
 # neither action requires a clio-relay code change.
 schema_version: "1.0"
-release_version: "1.3.29"
+release_version: "1.3.30"
 acceptance_matrix_path: examples/release-gate/report-matrix-1.0.json
-acceptance_matrix_sha256: f29cd3531821dccf58a19f43b4e6c840ace0702e060222566e3a87a3580b3405
+acceptance_matrix_sha256: 2c760f9cc33077d6f4e584fde49d93d2c2300ea2312adb281a4aff2a6b96ce25
 artifact_stage: published
 evidence_trust_model: maintainer_sealed_operator_evidence
 require_released_artifact: true
@@ -110,16 +110,16 @@ requirements:
         states: [running]
         metadata_equals:
           components:
-            clio-kit: "2.5.10"
+            clio-kit: "2.5.11"
             jarvis-cd: "1.3.16"
             jarvis-util: c91bfdc9bba802e4b03bfb1babe614ffa3e09644
           component_artifacts:
             clio-kit:
               distribution: clio-kit
-              distribution_version: "2.5.10"
-              install_spec: https://github.com/iowarp/clio-kit/releases/download/v2.5.10/clio_kit-2.5.10-py3-none-any.whl
+              distribution_version: "2.5.11"
+              install_spec: https://github.com/iowarp/clio-kit/releases/download/v2.5.11/clio_kit-2.5.11-py3-none-any.whl
               requested_source: github_release
-              artifact_sha256: 4911142152f476f973caa0c7f8050d88e8efa5f803651bda88685836ee3232f5
+              artifact_sha256: a0a2bbf8d23495dd4f43881d35a47bfb83bc2d1c016bd952bd7a1c88a43ca03e
               native_execution:
                 schema_version: clio-relay.jarvis-native-execution-capability.v1
                 handle_schema: jarvis.execution.handle.v1
@@ -220,14 +220,14 @@ requirements:
         states: [running]
         metadata_equals:
           components:
-            clio-kit: "2.5.10"
+            clio-kit: "2.5.11"
           component_artifacts:
             clio-kit:
               distribution: clio-kit
-              distribution_version: "2.5.10"
-              install_spec: https://github.com/iowarp/clio-kit/releases/download/v2.5.10/clio_kit-2.5.10-py3-none-any.whl
+              distribution_version: "2.5.11"
+              install_spec: https://github.com/iowarp/clio-kit/releases/download/v2.5.11/clio_kit-2.5.11-py3-none-any.whl
               requested_source: github_release
-              artifact_sha256: 4911142152f476f973caa0c7f8050d88e8efa5f803651bda88685836ee3232f5
+              artifact_sha256: a0a2bbf8d23495dd4f43881d35a47bfb83bc2d1c016bd952bd7a1c88a43ca03e
       - kind: scheduler_job
         roles: [queue-preservation-fixture]
         states: [completed]
@@ -288,24 +288,24 @@ requirements:
         states: [running]
         metadata_equals:
           components:
-            clio-kit: "2.5.10"
+            clio-kit: "2.5.11"
             jarvis-cd: "1.3.16"
           component_artifacts:
             clio-kit:
               distribution: clio-kit
-              distribution_version: "2.5.10"
-              install_spec: https://github.com/iowarp/clio-kit/releases/download/v2.5.10/clio_kit-2.5.10-py3-none-any.whl
+              distribution_version: "2.5.11"
+              install_spec: https://github.com/iowarp/clio-kit/releases/download/v2.5.11/clio_kit-2.5.11-py3-none-any.whl
               requested_source: github_release
-              artifact_filename: clio_kit-2.5.10-py3-none-any.whl
-              artifact_sha256: 4911142152f476f973caa0c7f8050d88e8efa5f803651bda88685836ee3232f5
+              artifact_filename: clio_kit-2.5.11-py3-none-any.whl
+              artifact_sha256: a0a2bbf8d23495dd4f43881d35a47bfb83bc2d1c016bd952bd7a1c88a43ca03e
               persistent_tool:
                 manager: uv
                 uv_version: "0.11.28"
                 pyvenv_uv_version: "0.11.28"
                 distribution: clio-kit
-                distribution_version: "2.5.10"
+                distribution_version: "2.5.11"
                 entry_point: clio-kit
-                source_artifact_sha256: 4911142152f476f973caa0c7f8050d88e8efa5f803651bda88685836ee3232f5
+                source_artifact_sha256: a0a2bbf8d23495dd4f43881d35a47bfb83bc2d1c016bd952bd7a1c88a43ca03e
               native_execution:
                 schema_version: clio-relay.jarvis-native-execution-capability.v1
                 handle_schema: jarvis.execution.handle.v1
@@ -364,10 +364,10 @@ requirements:
         states: [verified]
         metadata_equals:
           install_source: uv-tool
-          install_artifact_sha256: 4911142152f476f973caa0c7f8050d88e8efa5f803651bda88685836ee3232f5
+          install_artifact_sha256: a0a2bbf8d23495dd4f43881d35a47bfb83bc2d1c016bd952bd7a1c88a43ca03e
           python_distribution_runtime:
             distribution: clio-kit
-            distribution_version: "2.5.10"
+            distribution_version: "2.5.11"
             entry_point: clio-kit
             runtime_closure_verified: true
           nested_runtime:
@@ -617,7 +617,7 @@ requirements:
               jarvis_executable_verified: true
 
   - requirement_id: ares-non-jarvis-virtual-mcp
-    description: discover and run a registered non-JARVIS clio-kit MCP on Ares
+    description: discover and run the released scientific catalog v1.1 contract on Ares, including its explicit JARVIS descriptor handoff
     cluster: ares
     scenarios:
       - remote-mcp
@@ -625,9 +625,11 @@ requirements:
       - remote-mcp.register
       - remote-mcp.discover
       - remote-mcp.tools-list
+      - remote-mcp.scientific-catalog-user-contract
       - remote-mcp.call
       - remote-mcp.server-artifact
       - remote-mcp.durable-result
+      - remote-mcp.scientific-catalog-result
       - worker.artifact-version
       - worker.artifact-sha256
       - worker.source-identity
@@ -641,6 +643,23 @@ requirements:
       - kind: relay_job
         roles: [virtual_remote_mcp_call]
         states: [succeeded]
+        metadata_equals:
+          remote_mcp_server_name: scientific-catalog
+          remote_mcp_tool_name: scientific_dataset_describe
+          spec:
+            arguments:
+              dataset_id: deep-water-impact-2018-yb31-first5
+          scientific_catalog_result_assertion:
+            contract: clio-kit-scientific-catalog-user-v1.1
+            tool: scientific_dataset_describe
+            requested_dataset_id: deep-water-impact-2018-yb31-first5
+            dataset_id: deep-water-impact-2018-yb31-first5
+            descriptor_dataset_id: deep-water-impact-2018-yb31-first5
+            nested_descriptor_dataset_id: deep-water-impact-2018-yb31-first5
+            schema_versions_match: true
+            dataset_identity_matches: true
+            dataset_descriptor_handoff_matches: true
+            descriptor_digest_matches: true
       - kind: relay_worker
         roles: [cluster_worker]
         states: [running]
@@ -648,10 +667,16 @@ requirements:
         roles: [remote_mcp_server]
         states: [verified]
         metadata_equals:
+          server_name: scientific-catalog
+          remote_tool_names: [scientific_dataset_describe, scientific_dataset_search]
+          allowlisted_tool_names: [scientific_dataset_describe, scientific_dataset_search]
           install_source: wheel
-          install_artifact_sha256: 4911142152f476f973caa0c7f8050d88e8efa5f803651bda88685836ee3232f5
+          install_artifact_sha256: a0a2bbf8d23495dd4f43881d35a47bfb83bc2d1c016bd952bd7a1c88a43ca03e
+          contract_id: clio-kit-scientific-catalog-user-v1.1
+          contract_sha256: 80a9b583c26a084ff07d638ddf0c2c7d4325dbc8d4299931d0c4f3627cb8674c
           server_process_artifact_verified: true
           verified: true
+    evidence_group_resource_kind: mcp_server
 
   - requirement_id: ares-spack-virtual-mcp
     description: discover the complete released Spack MCP user contract and resolve the existing LAMMPS installation on Ares
@@ -748,7 +773,7 @@ requirements:
           remote_tool_names: [spack_find, spack_install, spack_locate]
           allowlisted_tool_names: [spack_find, spack_install, spack_locate]
           install_source: wheel
-          install_artifact_sha256: 4911142152f476f973caa0c7f8050d88e8efa5f803651bda88685836ee3232f5
+          install_artifact_sha256: a0a2bbf8d23495dd4f43881d35a47bfb83bc2d1c016bd952bd7a1c88a43ca03e
           contract_id: clio-kit-spack-user-v2.1
           contract_sha256: cc90789227aa0baea99d0e0379b320811c1dbd40c7fa66877d372309201be1c2
           server_process_artifact_verified: true
@@ -853,7 +878,7 @@ requirements:
           remote_tool_names: [spack_find, spack_install, spack_locate]
           allowlisted_tool_names: [spack_find, spack_install, spack_locate]
           install_source: wheel
-          install_artifact_sha256: 4911142152f476f973caa0c7f8050d88e8efa5f803651bda88685836ee3232f5
+          install_artifact_sha256: a0a2bbf8d23495dd4f43881d35a47bfb83bc2d1c016bd952bd7a1c88a43ca03e
           contract_id: clio-kit-spack-user-v2.1
           contract_sha256: cc90789227aa0baea99d0e0379b320811c1dbd40c7fa66877d372309201be1c2
           server_process_artifact_verified: true

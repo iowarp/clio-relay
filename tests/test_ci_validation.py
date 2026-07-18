@@ -1679,24 +1679,27 @@ def test_release_report_asset_manifest_enforces_exact_ordered_matrix() -> None:
     )
     raw_matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
     raw_reports = cast(list[dict[str, object]], raw_matrix["reports"])
-    assert [item["id"] for item in raw_reports[5:8]] == [
+    assert raw_reports[5]["id"] == "ares-scientific-catalog-describe"
+    assert raw_reports[5]["remote_tool"] == "scientific_dataset_describe"
+    assert raw_reports[5]["arguments"] == {"dataset_id": "deep-water-impact-2018-yb31-first5"}
+    assert [item["id"] for item in raw_reports[6:9]] == [
         "ares-spack-find",
         "ares-spack-locate",
         "ares-spack-install",
     ]
-    assert [item["evidence_group"] for item in raw_reports[5:8]] == [
+    assert [item["evidence_group"] for item in raw_reports[6:9]] == [
         "spack",
         "spack",
         "spack-fresh",
     ]
-    assert [item["package"] for item in raw_reports[5:8]] == [
+    assert [item["package"] for item in raw_reports[6:9]] == [
         "lammps",
         "lammps",
         "libsigsegv@2.14",
     ]
     matrix = validate_release_acceptance_matrix(raw_matrix)
     assert matrix["matrix_sha256"] == (
-        "51ad060c4f2d806d5483a875c0a65374f2b29e3ca5e1c88e3f7ac7716df90509"
+        "2c760f9cc33077d6f4e584fde49d93d2c2300ea2312adb281a4aff2a6b96ce25"
     )
     reports = cast(list[dict[str, object]], matrix["reports"])
     report_ids = [cast(str, item["id"]) for item in reports]
@@ -1713,7 +1716,7 @@ def test_release_report_asset_manifest_enforces_exact_ordered_matrix() -> None:
 
     binding = cast(dict[str, object], manifest["acceptance_matrix"])
     assert binding["sha256"] == matrix["matrix_sha256"]
-    assert binding["report_count"] == 17
+    assert binding["report_count"] == 18
     manifest_assets = cast(list[dict[str, object]], manifest["assets"])
     assert [cast(str, item["name"]) for item in manifest_assets] == [
         "validation-local.json",

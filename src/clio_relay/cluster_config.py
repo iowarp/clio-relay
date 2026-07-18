@@ -259,6 +259,7 @@ RemoteMcpProfile = Literal["user", "admin", "operator"]
 RemoteMcpContract = Literal[
     "clio-kit-spack-user-v2.1",
     "clio-kit-spack-user-v2",
+    "clio-kit-scientific-catalog-user-v1.1",
     "clio-kit-scientific-catalog-user-v1",
 ]
 
