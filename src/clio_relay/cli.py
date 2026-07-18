@@ -59,8 +59,10 @@ from clio_relay.errors import ConfigurationError, NotFoundError, RelayError
 from clio_relay.frp_check import run_frpc_connection_check
 from clio_relay.identifiers import validate_durable_record_id
 from clio_relay.installation import (
+    InstallReceipt,
     attach_verified_worker_identity,
     installation_info,
+    verify_remote_worker_info,
     worker_runtime_info,
 )
 from clio_relay.jarvis_mcp import (
@@ -102,6 +104,17 @@ from clio_relay.models import (
     ServiceRuntimeSpec,
     TaskEventStatus,
     TaskTimelineEvent,
+)
+from clio_relay.owner_session_admission import (
+    assert_no_unscoped_desktop_admission_state as _assert_no_unscoped_desktop_admission_state,
+)
+from clio_relay.owner_session_admission import (
+    desktop_owner_session_admission_id as _desktop_owner_session_admission_id,
+)
+from clio_relay.owner_session_admission import (
+    owner_session_admission_status,
+    owner_session_gateway_admission,
+    owner_session_transition_lock,
 )
 from clio_relay.pagination import (
     DEFAULT_RESPONSE_PAGE_RECORDS,
@@ -179,10 +192,11 @@ from clio_relay.scheduler_providers import (
     validation_provider_for_scheduler,
 )
 from clio_relay.scheduler_validation import run_scheduler_lifecycle_validation
-from clio_relay.service_runtime import ServiceRuntimeStartResult, ServiceRuntimeSupervisor
+from clio_relay.service_runtime import ServiceRuntimeSupervisor
 from clio_relay.session_api import submit_owned_session_job
 from clio_relay.session_lifecycle import (
     CleanupResource,
+    SessionApiReleaseIdentity,
     SessionLifecycleReport,
     cleanup_connectors_cover_gateways,
     detach_remote_session,
@@ -204,6 +218,7 @@ from clio_relay.validation_report import (
     CleanupEvidence,
     EvidenceReference,
     LiveValidationReport,
+    SoftwareIdentity,
     ValidationRecorder,
     ValidationResource,
     ValidationStatus,
@@ -3003,17 +3018,89 @@ def session_start(
 
     def action() -> None:
         with _session_transition_lock(cluster=cluster, session_id=session_id):
+            api_release_identity = _verify_session_start_worker_compatibility(definition)
             lines = start_remote_session(
                 cluster=cluster,
                 definition=definition,
                 session_id=session_id,
                 remote_api_port=remote_api_port,
                 api_token=settings.api_token if require_token else None,
+                expected_api_release_identity=api_release_identity,
                 replace=replace,
             )
             _echo_lines(lines)
 
     _run_or_exit(action)
+
+
+def _verify_session_start_worker_compatibility(
+    definition: ClusterDefinition,
+) -> SessionApiReleaseIdentity:
+    """Require one exact live worker/install identity before session mutation."""
+    local_identity = _session_api_release_identity_from_installation(
+        installation_info(),
+        label="local clio-relay",
+    )
+    remote_receipt = verify_remote_worker_info(
+        _remote_worker_info(definition),
+        expected_cluster=definition.name,
+        expected_version=local_identity.distribution_version,
+        expected_software=local_identity.software,
+        expected_artifact_sha256=local_identity.artifact_sha256,
+        expected_source=None,
+    )
+    artifact_sha256 = remote_receipt.artifact_sha256
+    if artifact_sha256 is None:
+        raise ConfigurationError("remote worker receipt omitted its artifact SHA-256")
+    return SessionApiReleaseIdentity(
+        distribution_version=remote_receipt.distribution_version,
+        artifact_sha256=artifact_sha256,
+        software=remote_receipt.software,
+    )
+
+
+def _session_api_release_identity_from_installation(
+    info: dict[str, object],
+    *,
+    label: str,
+) -> SessionApiReleaseIdentity:
+    """Validate installation evidence and return its session-API identity."""
+    if info.get("receipt_matches_install") is not True:
+        raise ConfigurationError(f"{label} installation receipt does not match the running package")
+    try:
+        receipt = InstallReceipt.model_validate(info.get("receipt"))
+        software = SoftwareIdentity.model_validate(info.get("software"))
+    except ValidationError as exc:
+        raise ConfigurationError(f"{label} installation identity is invalid: {exc}") from exc
+    version = info.get("distribution_version")
+    artifact_sha256 = receipt.artifact_sha256
+    if (
+        not isinstance(version, str)
+        or receipt.distribution_version != version
+        or receipt.software != software
+        or artifact_sha256 is None
+    ):
+        raise ConfigurationError(f"{label} installation receipt does not match the running package")
+    return SessionApiReleaseIdentity(
+        distribution_version=version,
+        artifact_sha256=artifact_sha256,
+        software=software,
+    )
+
+
+def _require_process_bound_session_api_release() -> None:
+    """Require the API process to match its release marker when one is present."""
+    expected_sha256 = os.environ.get("CLIO_RELAY_API_RELEASE_IDENTITY_SHA256")
+    if expected_sha256 is None:
+        return
+    if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+        raise ConfigurationError("session API release identity marker is invalid")
+    observed = _session_api_release_identity_from_installation(
+        installation_info(),
+        label="session API",
+    )
+    if observed.sha256() != expected_sha256:
+        raise ConfigurationError("session API release identity does not match running package")
 
 
 @session_app.command("status")
@@ -6760,89 +6847,26 @@ def gateway_start_runtime(
             ),
         )
 
-        def start_runtime() -> ServiceRuntimeStartResult:
-            if owner_session_id is None or owner_session_generation_id is None:
-                return supervisor.start(name=name, spec=spec)
-            remote_execution = should_execute_on_cluster(definition)
-            local_admission_id = _desktop_owner_session_admission_id(
+        if owner_session_id is None or owner_session_generation_id is None:
+            result = supervisor.start(name=name, spec=spec)
+        else:
+            with owner_session_gateway_admission(
+                queue=queue,
+                definition=definition,
                 cluster=cluster,
                 session_id=owner_session_id,
-            )
-            if remote_execution:
-                _assert_no_unscoped_desktop_admission_state(
-                    queue,
-                    cluster=cluster,
-                    session_id=owner_session_id,
-                    session_generation_id=owner_session_generation_id,
+                session_generation_id=owner_session_generation_id,
+                transition_lock_factory=_session_transition_lock,
+                session_status_reader=status_remote_session,
+                admission_status_reader=_owner_session_admission_status,
+            ) as admission:
+                result = supervisor.start(
+                    name=name,
+                    spec=spec,
+                    owner_session_id=admission.owner_session_id,
+                    owner_session_generation_id=admission.owner_session_generation_id,
+                    owner_session_admission_id=admission.owner_session_admission_id,
                 )
-            process_status = status_remote_session(
-                definition=definition,
-                session_id=owner_session_id,
-            )
-            _require_live_owner_session_for_gateway(
-                process_status,
-                session_id=owner_session_id,
-                session_generation_id=owner_session_generation_id,
-            )
-            authoritative_admission = _owner_session_admission_status(
-                queue=queue,
-                definition=definition,
-                remote_execution=remote_execution,
-                session_id=owner_session_id,
-                session_generation_id=owner_session_generation_id,
-            )
-            _require_owner_session_admission_open(
-                authoritative_admission,
-                session_id=owner_session_id,
-                session_generation_id=owner_session_generation_id,
-            )
-            local_admission = queue.mirror_owner_session_generation_open(
-                local_admission_id,
-                session_generation_id=owner_session_generation_id,
-            )
-            _require_owner_session_admission_open(
-                local_admission,
-                session_id=local_admission_id,
-                session_generation_id=owner_session_generation_id,
-            )
-
-            # Reverify the authoritative boundary immediately before the first
-            # durable gateway write. The desktop transition lock remains held
-            # through all scheduler and connector side effects and rollback.
-            process_status = status_remote_session(
-                definition=definition,
-                session_id=owner_session_id,
-            )
-            _require_live_owner_session_for_gateway(
-                process_status,
-                session_id=owner_session_id,
-                session_generation_id=owner_session_generation_id,
-            )
-            authoritative_admission = _owner_session_admission_status(
-                queue=queue,
-                definition=definition,
-                remote_execution=remote_execution,
-                session_id=owner_session_id,
-                session_generation_id=owner_session_generation_id,
-            )
-            _require_owner_session_admission_open(
-                authoritative_admission,
-                session_id=owner_session_id,
-                session_generation_id=owner_session_generation_id,
-            )
-            return supervisor.start(
-                name=name,
-                spec=spec,
-                owner_session_id=owner_session_id,
-                owner_session_generation_id=owner_session_generation_id,
-                owner_session_admission_id=local_admission_id,
-            )
-
-        if owner_session_id is not None:
-            with _session_transition_lock(cluster=cluster, session_id=owner_session_id):
-                result = start_runtime()
-        else:
-            result = start_runtime()
         canonical = result.to_live_validation_report(
             launcher=validation_launcher,
             install_source=validation_install_source,
@@ -7980,6 +8004,10 @@ def api_start(
     """Start the desktop-facing HTTP API."""
     if require_token and RelaySettings.from_env().api_token is None:
         raise typer.BadParameter("CLIO_RELAY_API_TOKEN is required with --require-token")
+    try:
+        _require_process_bound_session_api_release()
+    except ConfigurationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     uvicorn.run("clio_relay.http_api:app", host=host, port=port)
 
 
@@ -8611,85 +8639,15 @@ def _owner_session_admission_status(
     session_id: str,
     session_generation_id: str,
 ) -> dict[str, object]:
-    """Read and strictly validate exact local or remote owner-session intake state."""
-    if remote_execution:
-        raw_status = cast(
-            object,
-            json.loads(
-                run_remote_clio(
-                    definition,
-                    [
-                        "session",
-                        "admission-status",
-                        "--session-id",
-                        session_id,
-                        "--session-generation-id",
-                        session_generation_id,
-                    ],
-                )
-            ),
-        )
-        if not isinstance(raw_status, dict):
-            raise RelayError("remote owner-session admission status was not an object")
-        status = {str(key): value for key, value in cast(dict[object, object], raw_status).items()}
-    else:
-        status = queue.owner_session_generation_status(
-            session_id,
-            session_generation_id=session_generation_id,
-        )
-    if (
-        status.get("schema_version") != "clio-relay.owner-session-admission-status.v1"
-        or status.get("owner_session_id") != session_id
-        or status.get("session_generation_id") != session_generation_id
-        or not all(
-            isinstance(status.get(key), bool) for key in ("active", "closing", "closed", "open")
-        )
-    ):
-        raise RelayError("owner-session admission status identity or schema did not match")
-    raw_intent = status.get("cleanup_intent")
-    if status.get("closing") is True:
-        if not isinstance(raw_intent, dict):
-            raise RelayError("closing owner-session admission status omitted cleanup intent")
-        intent = cast(dict[str, object], raw_intent)
-        operation_id = intent.get("operation_id")
-        if (
-            intent.get("schema_version") != "clio-relay.owner-session-cleanup-intent.v1"
-            or intent.get("owner_session_id") != session_id
-            or intent.get("session_generation_id") != session_generation_id
-            or not isinstance(operation_id, str)
-            or re.fullmatch(r"cleanup_[A-Za-z0-9_.-]+", operation_id) is None
-            or not all(
-                isinstance(intent.get(key), bool)
-                for key in ("stop_worker", "cancel_jobs", "cancel_scheduler_jobs")
-            )
-        ):
-            raise RelayError("owner-session admission cleanup intent was invalid")
-    elif raw_intent is not None:
-        raise RelayError("open owner-session admission status contained a cleanup intent")
-    return status
-
-
-def _require_owner_session_admission_open(
-    status: dict[str, object],
-    *,
-    session_id: str,
-    session_generation_id: str,
-) -> None:
-    """Fail closed unless exact generation intake is authoritatively open."""
-    if not (
-        status.get("owner_session_id") == session_id
-        and status.get("session_generation_id") == session_generation_id
-        and status.get("active") is True
-        and status.get("closing") is False
-        and status.get("closed") is False
-        and status.get("open") is True
-        and status.get("active_generation_id") == session_generation_id
-        and status.get("closing_generation_id") is None
-    ):
-        raise RelayError(
-            "owned session generation is not open for gateway admission: "
-            f"{session_id}:{session_generation_id}"
-        )
+    """Read owner-session intake through the CLI's injectable remote runner."""
+    return owner_session_admission_status(
+        queue=queue,
+        definition=definition,
+        remote_execution=remote_execution,
+        session_id=session_id,
+        session_generation_id=session_generation_id,
+        remote_cli_runner=run_remote_clio,
+    )
 
 
 def _select_owner_session_cleanup_operation(
@@ -10217,50 +10175,6 @@ def _verified_owner_session_generation(
     if status.get("running") is True and status.get("ownership_verified") is not True:
         raise RelayError("running remote session failed process ownership verification")
     return generation_id
-
-
-def _require_live_owner_session_for_gateway(
-    status: dict[str, object],
-    *,
-    session_id: str,
-    session_generation_id: str,
-) -> None:
-    """Require a live, owned, exact-generation API before gateway side effects."""
-    if not (
-        status.get("session_id") == session_id
-        and status.get("owner") == "clio-relay"
-        and status.get("session_generation_id") == session_generation_id
-        and status.get("running") is True
-        and status.get("ownership_verified") is True
-    ):
-        raise RelayError(
-            "gateway admission requires a live owned session with the exact generation: "
-            f"{session_id}:{session_generation_id}"
-        )
-
-
-def _assert_no_unscoped_desktop_admission_state(
-    queue: ClioCoreQueue,
-    *,
-    cluster: str,
-    session_id: str,
-    session_generation_id: str,
-) -> None:
-    """Fail closed when legacy desktop state cannot be attributed to one cluster."""
-    legacy = queue.owner_session_generation_status(
-        session_id,
-        session_generation_id=session_generation_id,
-    )
-    if (
-        legacy.get("active_generation_id") is not None
-        or legacy.get("closing_generation_id") is not None
-        or legacy.get("closed") is True
-    ):
-        raise RelayError(
-            "legacy unscoped desktop owner-session admission state cannot be safely assigned "
-            f"to cluster {cluster!r} for session {session_id!r}; clean or migrate it before "
-            "cluster-scoped admission"
-        )
 
 
 def _verified_owner_session_detach(
@@ -12269,17 +12183,8 @@ def _require_cluster(cluster: str) -> ClusterDefinition:
 
 
 def _session_transition_lock(*, cluster: str, session_id: str) -> FileLock:
-    """Serialize start, detach, and teardown orchestration for one desktop session."""
-    directory = default_registry_path().parent / "session-transitions"
-    directory.mkdir(parents=True, exist_ok=True)
-    identity = hashlib.sha256(f"{cluster}\0{session_id}".encode()).hexdigest()
-    return FileLock(str(directory / f"{identity}.lock"), timeout=60)
-
-
-def _desktop_owner_session_admission_id(*, cluster: str, session_id: str) -> str:
-    """Return a cluster-scoped local admission key without exposing raw names in paths."""
-    identity = hashlib.sha256(f"{cluster}\0{session_id}".encode()).hexdigest()
-    return f"desktop_{identity}"
+    """Return the shared cluster-scoped owner-session transition lock."""
+    return owner_session_transition_lock(cluster=cluster, session_id=session_id)
 
 
 def _require_durable_session_identity(value: str, *, field: str) -> str:

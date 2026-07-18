@@ -9,6 +9,7 @@ import pytest
 from pytest import MonkeyPatch
 
 import clio_relay.session_lifecycle as session_lifecycle
+from clio_relay import __version__
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import RelayError
 from clio_relay.session_lifecycle import (
@@ -18,6 +19,7 @@ from clio_relay.session_lifecycle import (
     SESSION_WORKER_CHECK_ID,
     CleanupResource,
     RemoteSessionStateEvidence,
+    SessionApiReleaseIdentity,
     SessionLifecycleReport,
     challenge_remote_session_identity,
     detach_remote_session,
@@ -25,6 +27,21 @@ from clio_relay.session_lifecycle import (
     status_remote_session,
     teardown_remote_session,
 )
+
+
+def _api_release_identity() -> SessionApiReleaseIdentity:
+    return SessionApiReleaseIdentity.model_validate(
+        {
+            "distribution_version": __version__,
+            "artifact_sha256": "a" * 64,
+            "software": {
+                "version": __version__,
+                "commit": "1" * 40,
+                "tag": f"v{__version__}",
+                "dirty": False,
+            },
+        }
+    )
 
 
 def test_scheduler_cancellation_evidence_rejects_an_extra_relay_link() -> None:
@@ -233,6 +250,7 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
         session_id="session-1",
         remote_api_port=9001,
         api_token="token",
+        expected_api_release_identity=_api_release_identity(),
     )
 
     assert "session_started=session-1" in lines
@@ -256,6 +274,16 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
     assert "trap cleanup_incomplete_start EXIT" in script
     assert "flock -w 10 -x 9" in script
     assert "CLIO_RELAY_SESSION_GENERATION_ID" in script
+    assert "CLIO_RELAY_API_RELEASE_IDENTITY_SHA256" in script
+    assert "clio-relay.session-api-release.v1" in script
+    assert "session API installation changed after worker compatibility verification" in script
+    assert "existing owned session API has no release identity; use --replace" in script
+    assert "existing owned session API release identity differs; use --replace" in script
+    assert (
+        "existing owned session API release identity is not process-bound; use --replace" in script
+    )
+    assert "api_release_identity" in script
+    assert "api_release_identity_sha256" in script
     assert "session_generation_id" in script
     assert "clio-relay session prepare-start" in script
     assert '--recorded-generation-id "$recorded_generation_id"' in script
@@ -276,6 +304,44 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
     assert "owned API did not become ready" in script
     assert "\x00" not in script
     assert "pkill" not in script
+
+
+def test_start_remote_session_checks_existing_api_release_before_reuse(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    scripts: list[str] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        input: bytes,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del capture_output, check, timeout
+        scripts.append(input.decode("utf-8"))
+        return subprocess.CompletedProcess(command, 0, b"session_already_running=session-1\n", b"")
+
+    monkeypatch.setattr("clio_relay.session_lifecycle.subprocess.run", fake_run)
+
+    start_remote_session(
+        cluster="ares",
+        definition=ClusterDefinition(name="ares", ssh_host="ares"),
+        session_id="session-1",
+        remote_api_port=9001,
+        api_token="token",
+        expected_api_release_identity=_api_release_identity(),
+        replace=False,
+    )
+
+    script = scripts[0]
+    assert '[ -n "$existing_owned_pid" ] && [ "0" != "1" ]' in script
+    assert script.index("__CLIO_RELAY_EXISTING_API_RELEASE__") < script.index(
+        'echo "session_already_running=$session_id"'
+    )
+    assert '(Path("/proc") / pid / "environ")' in script
+    assert "CLIO_RELAY_API_RELEASE_IDENTITY_SHA256={observed_sha256}" in script
 
 
 def test_status_remote_session_returns_json(monkeypatch: MonkeyPatch) -> None:

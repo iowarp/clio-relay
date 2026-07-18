@@ -14,6 +14,7 @@ from typer.testing import CliRunner
 
 import clio_relay.jarvis_service_runtime as runtime_binding
 import clio_relay.mcp_server as mcp_server_module
+import clio_relay.owner_session_admission as owner_session_admission_module
 import clio_relay.service_runtime as service_runtime_module
 from clio_relay.browser_gateway import BrowserAttachmentGrant, BrowserDetachmentResult
 from clio_relay.cli import app
@@ -24,7 +25,7 @@ from clio_relay.cluster_config import (
 )
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import ConfigurationError
+from clio_relay.errors import ConfigurationError, QueueConflictError
 from clio_relay.jarvis_mcp import jarvis_cd_lock_binding_expectation
 from clio_relay.jarvis_service_runtime import (
     RELAY_JARVIS_RUNTIME_BINDING_SCHEMA,
@@ -1219,6 +1220,185 @@ def test_agent_bind_persists_urls_and_rejects_runtime_commands(
     assert queue.get_gateway_session(gateway["session_id"]).gateway["jarvis_runtime_binding"]
 
 
+def test_owned_agent_bind_uses_shared_cluster_scoped_gateway_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The MCP bind path mirrors owner intake and locks through connector setup."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    remote_definition = definition.model_copy(update={"ssh_host": "relay.example.test"})
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(clusters={definition.name: remote_definition}).save(registry_path)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "token")
+    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "secret")
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+
+    with pytest.raises(
+        QueueConflictError,
+        match="owner session generation has no active admission state",
+    ):
+        queue.create_gateway_session(
+            GatewaySession(
+                cluster=definition.name,
+                name="pre-fix-owned-bind",
+                metadata={
+                    "owner": "clio-relay",
+                    "owner_session_id": "desktop-session",
+                    "owner_session_generation_id": "generation-1",
+                },
+            )
+        )
+
+    def resolved_runtime(**_kwargs: object) -> Any:
+        return verified
+
+    monkeypatch.setattr(mcp_server_module, "resolve_jarvis_service_runtime", resolved_runtime)
+    _patch_connector_start(monkeypatch)
+    events: list[str] = []
+    lock_held = False
+
+    class RecordingLock:
+        def __enter__(self) -> RecordingLock:
+            nonlocal lock_held
+            assert lock_held is False
+            lock_held = True
+            events.append("enter")
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            nonlocal lock_held
+            assert lock_held is True
+            lock_held = False
+            events.append("exit")
+
+    def transition_lock(*, cluster: str, session_id: str) -> RecordingLock:
+        assert (cluster, session_id) == (definition.name, "desktop-session")
+        return RecordingLock()
+
+    def remote_session_status(**_kwargs: object) -> dict[str, object]:
+        assert lock_held is True
+        events.append("session")
+        return {
+            "owner": "clio-relay",
+            "session_id": "desktop-session",
+            "session_generation_id": "generation-1",
+            "running": True,
+            "ownership_verified": True,
+        }
+
+    def remote_admission_status(
+        _definition: ClusterDefinition,
+        args: list[str],
+    ) -> str:
+        assert lock_held is True
+        assert args[:2] == ["session", "admission-status"]
+        events.append("admission")
+        return json.dumps(
+            {
+                "schema_version": "clio-relay.owner-session-admission-status.v1",
+                "owner_session_id": "desktop-session",
+                "session_generation_id": "generation-1",
+                "active_generation_id": "generation-1",
+                "closing_generation_id": None,
+                "active": True,
+                "closing": False,
+                "closed": False,
+                "open": True,
+                "cleanup_intent": None,
+            }
+        )
+
+    monkeypatch.setattr(
+        owner_session_admission_module,
+        "owner_session_transition_lock",
+        transition_lock,
+    )
+    monkeypatch.setattr(
+        owner_session_admission_module,
+        "status_remote_session",
+        remote_session_status,
+    )
+    monkeypatch.setattr(
+        owner_session_admission_module,
+        "run_remote_clio",
+        remote_admission_status,
+    )
+    original_bind = ServiceRuntimeSupervisor.bind_verified_jarvis_runtime
+
+    def bind_while_locked(self: ServiceRuntimeSupervisor, **kwargs: Any) -> Any:
+        assert lock_held is True
+        assert kwargs["owner_session_admission_id"].startswith("desktop_")
+        events.append("bind")
+        return original_bind(self, **kwargs)
+
+    monkeypatch.setattr(
+        ServiceRuntimeSupervisor,
+        "bind_verified_jarvis_runtime",
+        bind_while_locked,
+    )
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+        api_token="api-token",
+        owner_session_id="desktop-session",
+        owner_session_generation_id="generation-1",
+        owner_session_cluster=definition.name,
+        remote_cluster=definition.name,
+    )
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_bind_jarvis_runtime",
+                "arguments": {
+                    "cluster": definition.name,
+                    "source_job_id": job.job_id,
+                    "source_artifact_id": artifact.artifact_id,
+                    "package_id": "paraview-1",
+                    "package_name": "builtin.paraview",
+                },
+            },
+        },
+        queue=queue,
+        settings=settings,
+        profile="user",
+    )
+
+    assert response is not None and "error" not in response, response
+    result = cast(dict[str, Any], response["result"]["structuredContent"])
+    gateway = cast(dict[str, Any], result["gateway_session"])
+    persisted = queue.get_gateway_session(cast(str, gateway["session_id"]))
+    admission_id = cast(str, persisted.metadata["owner_session_admission_id"])
+    assert admission_id.startswith("desktop_")
+    assert persisted.metadata["owner_session_id"] == "desktop-session"
+    assert persisted.metadata["owner_session_generation_id"] == "generation-1"
+    assert gateway["metadata"]["owner_session_admission_id"] == admission_id
+    assert result["scheduler_cancel_requested"] is False
+    assert events == [
+        "enter",
+        "session",
+        "admission",
+        "session",
+        "admission",
+        "bind",
+        "exit",
+    ]
+
+
 def test_internal_bind_override_rejects_occupied_loopback_port(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1256,6 +1436,93 @@ def test_internal_bind_override_rejects_occupied_loopback_port(
                 verified=verified,
                 desktop_bind_port=occupied_port,
             )
+
+
+def test_owned_bind_rejects_missing_cluster_scoped_admission_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct callers cannot regress an owned bind to the raw session key."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    supervisor = ServiceRuntimeSupervisor(
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+        queue=queue,
+        cluster=definition.name,
+        definition=definition,
+        token="token",
+        secret_key="secret",
+    )
+
+    with pytest.raises(
+        ConfigurationError,
+        match="owned JARVIS runtime binding requires owner_session_admission_id",
+    ):
+        supervisor.bind_verified_jarvis_runtime(
+            name="paraview-live",
+            verified=verified,
+            owner_session_id="desktop-session",
+            owner_session_generation_id="generation-1",
+        )
+
+    assert queue.list_gateway_sessions() == []
+
+
+@pytest.mark.parametrize("wrong_admission", ["raw", "other-cluster"])
+def test_owned_bind_rejects_wrong_cluster_scoped_admission_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wrong_admission: str,
+) -> None:
+    """Direct callers cannot substitute raw or cross-cluster admission state."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    supervisor = ServiceRuntimeSupervisor(
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+        queue=queue,
+        cluster=definition.name,
+        definition=definition,
+        token="token",
+        secret_key="secret",
+    )
+    admission_id = (
+        "desktop-session"
+        if wrong_admission == "raw"
+        else owner_session_admission_module.desktop_owner_session_admission_id(
+            cluster="another-cluster",
+            session_id="desktop-session",
+        )
+    )
+
+    with pytest.raises(
+        ConfigurationError,
+        match="admission id does not match its cluster/session identity",
+    ):
+        supervisor.bind_verified_jarvis_runtime(
+            name="paraview-live",
+            verified=verified,
+            owner_session_id="desktop-session",
+            owner_session_generation_id="generation-1",
+            owner_session_admission_id=admission_id,
+        )
+
+    assert queue.list_gateway_sessions() == []
 
 
 def test_bound_runtime_detach_and_teardown_preserve_scheduler_by_default(
