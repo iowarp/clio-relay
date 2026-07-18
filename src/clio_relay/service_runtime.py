@@ -46,6 +46,7 @@ from clio_relay.models import (
     SchedulerConnectorPlacement,
     SchedulerConnectorStepIdentity,
     SchedulerConnectorStepStatus,
+    SchedulerPhase,
     SchedulerStatus,
     ServiceRuntimeSpec,
     utc_now,
@@ -491,7 +492,7 @@ class ServiceRuntimeStopResult:
             )
         else:
             allowed_retention_outcomes = (
-                {"retained"} if self.mode == "detach" else {"retained", "terminal"}
+                {"retained"} if self.mode == "detach" else {"retained", "terminal", "missing"}
             )
             scheduler_check = (
                 RUNTIME_SCHEDULER_RETAINED_CHECK_ID,
@@ -509,7 +510,7 @@ class ServiceRuntimeStopResult:
                             resource.observed_state in _ACTIVE_RUNTIME_STATES
                             if self.mode == "detach"
                             else resource.observed_state
-                            not in {"missing", "not-found", "not_found", "unknown"}
+                            not in {"not-found", "not_found", "unknown"}
                         )
                         and not resource.residual
                         for resource in scheduler_resources
@@ -3234,11 +3235,43 @@ class ServiceRuntimeSupervisor:
         if scheduler_job_id is None:
             raise ConfigurationError("scheduler retention requires a scheduler job id")
         try:
-            observed_state = self._observe_scheduler_state(
-                scheduler=session.scheduler,
-                spec=spec,
-                scheduler_job_id=scheduler_job_id,
-            )
+            provider = provider_for_scheduler(session.scheduler)
+            if provider.name == "external":
+                observed_state = self._observe_runtime_state(
+                    spec=spec,
+                    scheduler_job_id=scheduler_job_id,
+                )
+            else:
+                provider_status = self._poll_scheduler_provider(
+                    provider=provider.name,
+                    scheduler_job_id=scheduler_job_id,
+                )
+                if (
+                    provider_status.phase is SchedulerPhase.UNKNOWN
+                    and provider_status.active_record_found is False
+                ):
+                    return CleanupResource(
+                        kind="scheduler_job",
+                        resource_id=scheduler_job_id,
+                        location=self.definition.ssh_host,
+                        provider=session.scheduler,
+                        action="retain",
+                        metadata={
+                            "gateway_session_id": session.session_id,
+                            "scheduler_status": provider_status.model_dump(mode="json"),
+                        },
+                        ownership_verified=True,
+                        outcome="missing",
+                        verified_after_operation=True,
+                        observed_state="missing",
+                        residual=False,
+                        detail=(
+                            "scheduler cancellation was not requested; the provider proved "
+                            "that no active scheduler record remained; no completed or "
+                            "canceled state is claimed"
+                        ),
+                    )
+                observed_state = provider_status.phase.value
         except RelayError as exc:
             return CleanupResource(
                 kind="scheduler_job",
