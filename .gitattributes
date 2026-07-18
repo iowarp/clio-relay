@@ -2,3 +2,4 @@
 examples/release-gate/**/*.py text eol=lf
 examples/release-gate/**/*.in text eol=lf
 examples/release-gate/**/*.tmpl text eol=lf
+src/clio_relay/_contracts/*.json text eol=lf

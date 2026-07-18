@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import socket
 import threading
@@ -102,6 +103,119 @@ def test_browser_gateway_preflight_methods_stream_and_command_are_narrow(
             ]
 
 
+def test_browser_gateway_closes_ended_sse_and_reconnects_to_latest_revision(
+    tmp_path: Path,
+) -> None:
+    with _revision_sse_backend(keep_open_for_command=False) as (backend_port, requests):
+        capability = "r" * 43
+        with _capability_proxy(
+            backend_port=backend_port,
+            capability=capability,
+            revocation_path=tmp_path / "revoked",
+        ) as proxy_port:
+            query = urlencode({"capability": capability})
+            events_url = f"http://127.0.0.1:{proxy_port}/events?{query}"
+            command_url = f"http://127.0.0.1:{proxy_port}/commands?{query}"
+            with httpx.Client(timeout=2.0) as client:
+                with client.stream("GET", events_url, headers={"Origin": "null"}) as first:
+                    assert first.headers["connection"] == "close"
+                    assert b"".join(first.iter_bytes()) == b'data: {"revision":1}\n\n'
+
+                command = client.post(
+                    command_url,
+                    headers={"Origin": "null", "Content-Type": "application/json"},
+                    content=b'{"operation":"next-timestep"}',
+                )
+                assert command.status_code == 200
+
+                with client.stream("GET", events_url, headers={"Origin": "null"}) as latest:
+                    assert latest.headers["connection"] == "close"
+                    assert b"".join(latest.iter_bytes()) == b'data: {"revision":2}\n\n'
+
+            assert requests == [
+                ("GET", "/events", b""),
+                ("POST", "/commands", b'{"operation":"next-timestep"}'),
+                ("GET", "/events", b""),
+            ]
+
+
+def test_browser_gateway_streams_post_command_revision_before_sse_closes(
+    tmp_path: Path,
+) -> None:
+    with _revision_sse_backend(keep_open_for_command=True) as (backend_port, requests):
+        capability = "s" * 43
+        with _capability_proxy(
+            backend_port=backend_port,
+            capability=capability,
+            revocation_path=tmp_path / "revoked",
+        ) as proxy_port:
+            query = urlencode({"capability": capability})
+            events_url = f"http://127.0.0.1:{proxy_port}/events?{query}"
+            command_url = f"http://127.0.0.1:{proxy_port}/commands?{query}"
+            with (
+                httpx.Client(timeout=3.0) as stream_client,
+                stream_client.stream("GET", events_url, headers={"Origin": "null"}) as response,
+            ):
+                lines = response.iter_lines()
+                assert response.headers["connection"] == "close"
+                assert next(line for line in lines if line.startswith("data:")) == (
+                    'data: {"revision":1}'
+                )
+                command = httpx.post(
+                    command_url,
+                    headers={"Origin": "null", "Content-Type": "application/json"},
+                    content=b'{"operation":"next-timestep"}',
+                    timeout=2.0,
+                )
+                assert command.status_code == 200
+                assert next(line for line in lines if line.startswith("data:")) == (
+                    'data: {"revision":2}'
+                )
+                assert all(not line for line in lines)
+
+            assert requests == [
+                ("GET", "/events", b""),
+                ("POST", "/commands", b'{"operation":"next-timestep"}'),
+            ]
+
+
+def test_browser_gateway_keeps_finite_content_length_responses_alive(tmp_path: Path) -> None:
+    with _backend_server() as (backend_port, requests):
+        capability = "k" * 43
+        with _capability_proxy(
+            backend_port=backend_port,
+            capability=capability,
+            revocation_path=tmp_path / "revoked",
+        ) as proxy_port:
+            query = urlencode({"capability": capability})
+            connection = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=2.0)
+            try:
+                connection.request("GET", f"/healthz?{query}", headers={"Origin": "null"})
+                first = connection.getresponse()
+                assert first.getheader("Connection") is None
+                assert json.loads(first.read()) == {
+                    "schema_version": "jarvis.paraview.health.v1",
+                    "status": "ready",
+                    "service_instance_id": "service-1",
+                    "revision": 1,
+                }
+                downstream_socket = connection.sock
+                assert downstream_socket is not None
+
+                connection.request("GET", f"/state?{query}", headers={"Origin": "null"})
+                second = connection.getresponse()
+                assert second.getheader("Connection") is None
+                second.read()
+                assert connection.sock is downstream_socket
+            finally:
+                connection.close()
+
+            assert requests == [
+                ("GET", "/healthz", b""),
+                ("GET", "/state", b""),
+            ]
+
+
 def test_browser_gateway_revocation_and_expiry_fail_closed(tmp_path: Path) -> None:
     with _backend_server() as (backend_port, requests):
         capability = "z" * 43
@@ -194,6 +308,70 @@ def _backend_server() -> Generator[tuple[int, list[tuple[str, str, bytes]]]]:
             body = self.rfile.read(length)
             requests.append(("POST", self.path, body))
             payload = b'{"accepted":true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            del format, args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), BackendHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield int(server.server_address[1]), requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@contextmanager
+def _revision_sse_backend(
+    *, keep_open_for_command: bool
+) -> Generator[tuple[int, list[tuple[str, str, bytes]]]]:
+    requests: list[tuple[str, str, bytes]] = []
+    condition = threading.Condition()
+    revision = 1
+
+    class BackendHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:  # noqa: N802
+            nonlocal revision
+            requests.append(("GET", self.path, b""))
+            with condition:
+                initial_revision = revision
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            if not keep_open_for_command:
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            self.end_headers()
+            self.wfile.write(f'data: {{"revision":{initial_revision}}}\n\n'.encode())
+            self.wfile.flush()
+            if not keep_open_for_command:
+                return
+            with condition:
+                changed = condition.wait_for(lambda: revision > initial_revision, timeout=2.0)
+                latest_revision = revision
+            if changed:
+                self.wfile.write(f'data: {{"revision":{latest_revision}}}\n\n'.encode())
+                self.wfile.flush()
+            self.close_connection = True
+
+        def do_POST(self) -> None:  # noqa: N802
+            nonlocal revision
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            requests.append(("POST", self.path, body))
+            with condition:
+                revision += 1
+                current_revision = revision
+                condition.notify_all()
+            payload = json.dumps({"accepted": True, "revision": current_revision}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))

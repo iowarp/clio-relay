@@ -53,7 +53,7 @@ def test_release_identity_is_consistent_across_package_policy_matrix_and_runbook
     init_source = (ROOT / "src" / "clio_relay" / "__init__.py").read_text(encoding="utf-8")
     release_process = RELEASE_PROCESS.read_text(encoding="utf-8")
 
-    assert version == "1.3.30"
+    assert version == "1.3.31"
     assert relay_lock["version"] == version
     assert f'__version__ = "{version}"' in init_source
     assert policy["release_version"] == version
@@ -131,6 +131,12 @@ def test_remote_release_text_fixtures_are_lf_attributed_and_normalized_before_sc
     assert "$StagedBytes -contains [byte]0x00" in runbook
     assert "$Text = Read-LfUtf8TextFile $Source" in runbook
     assert '$Text = ConvertTo-LfText $Text "rendered template $Destination"' in runbook
+
+
+def test_vendored_contract_artifacts_are_lf_attributed() -> None:
+    attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8").splitlines()
+
+    assert "src/clio_relay/_contracts/*.json text eol=lf" in attributes
 
 
 def test_lf_text_staging_and_rendering_normalize_windows_bytes_under_powershell(

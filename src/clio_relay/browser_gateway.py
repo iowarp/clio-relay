@@ -325,11 +325,19 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
             response = connection.getresponse()
             if connection.sock is not None:
                 connection.sock.settimeout(UPSTREAM_IDLE_TIMEOUT_SECONDS)
+            media_type = response.getheader("Content-Type", "").partition(";")[0].strip()
+            close_downstream = (
+                media_type.casefold() == "text/event-stream"
+                or response.getheader("Content-Length") is None
+            )
             self.send_response(response.status, response.reason)
             for name, value in response.getheaders():
                 if name.casefold() not in _STRIPPED_RESPONSE_HEADERS:
                     self.send_header(name, value)
             self._cors_headers()
+            if close_downstream:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self.end_headers()
             response_started = True
             while True:
@@ -338,10 +346,15 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 self.wfile.flush()
+            if response.length not in {None, 0}:
+                self.close_connection = True
         except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
             return
         except (TimeoutError, OSError, http.client.HTTPException):
-            if not response_started and not self.wfile.closed:
+            if response_started:
+                self.close_connection = True
+            elif not self.wfile.closed:
                 with suppress(BrokenPipeError, ConnectionResetError, OSError):
                     self._error(502, "upstream service is unavailable")
         finally:
