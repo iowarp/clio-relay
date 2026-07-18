@@ -232,7 +232,11 @@ class SubprocessCommandRunner:
                 list(command),
                 stdout=stdout_handle,
                 stderr=stderr_handle,
-                close_fds=os.name != "nt",
+                # The launched connector outlives this CLI process.  In particular, a relay
+                # command may itself be invoked with captured stdout/stderr by an MCP surface.
+                # Closing inherited descriptors on Windows prevents the connector grandchild
+                # from retaining those capture pipes and blocking the short-lived CLI forever.
+                close_fds=True,
                 env=env,
                 creationflags=creationflags,
                 start_new_session=start_new_session,
