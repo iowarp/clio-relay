@@ -5,6 +5,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -56,6 +57,89 @@ from tests.gateway_ownership_crash_fixture import (
 class FakeProcess:
     def __init__(self, pid: int) -> None:
         self.pid = pid
+
+
+def test_local_connector_does_not_retain_captured_cli_pipes(tmp_path: Path) -> None:
+    """A long-lived connector grandchild must not keep its captured CLI parent open."""
+
+    started_path = tmp_path / "grandchild-started"
+    stop_path = tmp_path / "grandchild-stop"
+    stopped_path = tmp_path / "grandchild-stopped"
+    stdout_path = tmp_path / "connector.out"
+    stderr_path = tmp_path / "connector.err"
+    grandchild = "\n".join(
+        (
+            "import os",
+            "import sys",
+            "import time",
+            "from pathlib import Path",
+            "started, stop, stopped = map(Path, sys.argv[1:4])",
+            "started.write_text(str(os.getpid()), encoding='utf-8')",
+            "deadline = time.monotonic() + 10.0",
+            "while not stop.exists() and time.monotonic() < deadline:",
+            "    time.sleep(0.05)",
+            "stopped.write_text('stopped', encoding='utf-8')",
+        )
+    )
+    captured_cli = "\n".join(
+        (
+            "import sys",
+            "from pathlib import Path",
+            "from clio_relay.service_runtime import SubprocessCommandRunner",
+            "started, stop, stopped, stdout, stderr = map(Path, sys.argv[1:6])",
+            "process = SubprocessCommandRunner().popen(",
+            "    [sys.executable, '-c', sys.argv[6], str(started), str(stop), str(stopped)],",
+            "    stdout_path=stdout,",
+            "    stderr_path=stderr,",
+            ")",
+            "print(process.pid, flush=True)",
+        )
+    )
+    cli = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            captured_cli,
+            str(started_path),
+            str(stop_path),
+            str(stopped_path),
+            str(stdout_path),
+            str(stderr_path),
+            grandchild,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    timed_out = False
+    stdout = ""
+    stderr = ""
+    try:
+        try:
+            stdout, stderr = cli.communicate(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            stop_path.touch()
+            stdout, stderr = cli.communicate(timeout=5.0)
+
+        assert not timed_out, (
+            "captured relay CLI waited for its long-lived connector grandchild to exit"
+        )
+        assert cli.returncode == 0, stderr
+        assert stdout.strip().isdigit()
+        deadline = time.monotonic() + 2.0
+        while not started_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert started_path.is_file()
+        assert not stopped_path.exists()
+    finally:
+        stop_path.touch()
+        deadline = time.monotonic() + 2.0
+        while not stopped_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if cli.poll() is None:
+            cli.kill()
+            cli.wait(timeout=2.0)
 
 
 def _script_assignment(script: str, name: str) -> str:
