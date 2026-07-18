@@ -23,7 +23,13 @@ from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, FrpTra
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import RelayError
-from clio_relay.models import GatewaySession, GatewaySessionState, ServiceRuntimeSpec
+from clio_relay.models import (
+    GatewaySession,
+    GatewaySessionState,
+    SchedulerPhase,
+    SchedulerStatus,
+    ServiceRuntimeSpec,
+)
 from clio_relay.service_runtime import (
     CommandRunner,
     LocalConnectorIdentity,
@@ -368,6 +374,32 @@ class InvalidRetentionRunner(FakeRunner):
     ) -> subprocess.CompletedProcess[str]:
         if "jarvis runtime status 12345" in (input_text or ""):
             return subprocess.CompletedProcess(command, 0, '{"state":"banana"}\n', "")
+        return super().run(command, input_text=input_text, timeout_seconds=timeout_seconds)
+
+
+class ProviderRetentionRunner(FakeRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.retention_status: SchedulerStatus | None = None
+
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        input_text: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        if self.retention_status is not None and "clio-relay scheduler status 12345" in (
+            input_text or ""
+        ):
+            self.commands.append(list(command))
+            self.inputs.append(input_text)
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                self.retention_status.model_dump_json(indent=2) + "\n",
+                "",
+            )
         return super().run(command, input_text=input_text, timeout_seconds=timeout_seconds)
 
 
@@ -763,6 +795,103 @@ def test_service_runtime_uses_explicit_slurm_provider_for_tracking_and_cancel(
     assert scheduler_resource.provider == "slurm"
     assert scheduler_resource.observed_state == "canceled"
     assert scheduler_resource.verified_after_operation is True
+
+
+def test_service_runtime_keep_scheduler_accepts_provider_proven_no_active_record(
+    tmp_path: Path,
+) -> None:
+    runner = ProviderRetentionRunner()
+    spec = _runtime_spec().model_copy(update={"scheduler": "slurm"})
+    queue, settings, definition, _runner, session_id = _started_session(
+        tmp_path,
+        runner=runner,
+        spec=spec,
+    )
+    runner.retention_status = SchedulerStatus(
+        scheduler="slurm",
+        scheduler_job_id="12345",
+        phase=SchedulerPhase.UNKNOWN,
+        record_found=False,
+        active_record_found=False,
+    )
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=definition,
+        token="",
+        secret_key="",
+        runner=runner,
+        sleep=lambda _seconds: None,
+    )
+
+    result = supervisor.stop(session_id=session_id)
+
+    scheduler = next(resource for resource in result.resources if resource.kind == "scheduler_job")
+    report = result.to_live_validation_report()
+    retention_check = next(
+        check for check in report.checks if check.check_id == "gateway.jobs-preserved-default"
+    )
+    assert result.session.state is GatewaySessionState.CLOSED
+    assert result.errors == []
+    assert result.canceled_scheduler_job is None
+    assert runner.provider_canceled_jobs == []
+    assert scheduler.action == "retain"
+    assert scheduler.outcome == "missing"
+    assert scheduler.ownership_verified is True
+    assert scheduler.verified_after_operation is True
+    assert scheduler.observed_state == "missing"
+    assert scheduler.residual is False
+    scheduler_status = cast(dict[str, object], scheduler.metadata["scheduler_status"])
+    assert scheduler_status["phase"] == "unknown"
+    assert scheduler_status["active_record_found"] is False
+    assert "no completed or canceled state is claimed" in (scheduler.detail or "")
+    assert retention_check.status is ValidationStatus.PASSED
+    assert report.status is ValidationStatus.PASSED
+
+
+def test_service_runtime_keep_scheduler_rejects_ambiguous_unknown_provider_state(
+    tmp_path: Path,
+) -> None:
+    runner = ProviderRetentionRunner()
+    spec = _runtime_spec().model_copy(update={"scheduler": "slurm"})
+    queue, settings, definition, _runner, session_id = _started_session(
+        tmp_path,
+        runner=runner,
+        spec=spec,
+    )
+    runner.retention_status = SchedulerStatus(
+        scheduler="slurm",
+        scheduler_job_id="12345",
+        phase=SchedulerPhase.UNKNOWN,
+        record_found=None,
+        active_record_found=None,
+    )
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=definition,
+        token="",
+        secret_key="",
+        runner=runner,
+        sleep=lambda _seconds: None,
+    )
+
+    result = supervisor.stop(session_id=session_id)
+
+    scheduler = next(resource for resource in result.resources if resource.kind == "scheduler_job")
+    assert result.session.state is GatewaySessionState.DEGRADED
+    assert result.canceled_scheduler_job is None
+    assert runner.provider_canceled_jobs == []
+    assert scheduler.action == "retain"
+    assert scheduler.outcome == "failed"
+    assert scheduler.ownership_verified is True
+    assert scheduler.verified_after_operation is False
+    assert scheduler.observed_state == "unknown"
+    assert scheduler.residual is True
+    assert "verification remained unresolved: unknown" in (scheduler.detail or "")
+    assert result.to_live_validation_report().status is ValidationStatus.FAILED
 
 
 @pytest.mark.parametrize("mutation", ["gateway_job_id", "intent_job_id", "provider"])
