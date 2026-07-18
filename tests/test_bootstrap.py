@@ -43,6 +43,19 @@ from clio_relay.errors import ConfigurationError, RelayError
 from tests.plugin_fakes import FakeEntryPoint, FakeEntryPoints
 
 
+def test_bootstrap_uses_exact_public_jarvis_cd_release_pin() -> None:
+    """Keep bootstrap and the locked MCP child on the same public JARVIS wheel."""
+    assert JARVIS_CD_VERSION == "1.3.15"
+    assert JARVIS_CD_WHEEL_FILENAME == "jarvis_cd-1.3.15-py3-none-any.whl"
+    assert JARVIS_CD_WHEEL_URL == (
+        "https://github.com/grc-iit/jarvis-cd/releases/download/"
+        "v1.3.15/jarvis_cd-1.3.15-py3-none-any.whl"
+    )
+    assert JARVIS_CD_WHEEL_SHA256 == (
+        "3276b4db592934acc34e55eb16ce0ab9496bf9143ad38a768de4f9e58a8738e8"
+    )
+
+
 def _write_test_relay_wheel(
     path: Path,
     *,
