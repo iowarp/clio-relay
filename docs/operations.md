@@ -506,17 +506,28 @@ create a new `uvx` environment per call.
 
 The default agent MCP profile exposes compact relay tools and the compact JARVIS tools:
 
+- `relay_remote_mcp_context`
 - `relay_submit_agent`
 - `relay_status`
 - `relay_cancel`
 - `relay_observe`
 - `relay_wait`
+- `relay_queue_list`
+- `relay_queue_diagnose`
+- `relay_queue_stale`
+- `relay_storage_status`
+- `relay_bind_jarvis_runtime`
+- `relay_artifact_lineage`
 - `jarvis_create_pipeline`
 - `jarvis_describe`
 - `jarvis_add_step`
 - `jarvis_edit_step`
 - `jarvis_get_execution`
 - `jarvis_run`
+
+Operator-registered remote MCP aliases are added to this user surface from the
+profile-filtered durable schema cache. Administrative mutation, worker, raw
+dispatch, and direct gateway tools remain hidden and are rejected at dispatch.
 
 The pre-1.0 user contract merges removal into
 `jarvis_edit_step(operation="remove")`; `operation="edit"` requires `config`.
@@ -541,7 +552,10 @@ closed. After selecting a result, use `target="package"` with its canonical
 `name` as `package_name` to retrieve the package-owned settings. The exhaustive
 `target="packages"` inventory remains available for explicit legacy use, but it
 is not the normal discovery path. `relay_observe` and `relay_wait` are the
-agent-facing monitor loop for progress, stdout, stderr, and terminal output.
+agent-facing monitor loop for progress and terminal output. `relay_wait` omits
+stdout and stderr unless `include_logs=true`; its inline MCP result prioritizes
+the authoritative `structured_result`, while the complete protocol response
+remains available in the SHA-verified immutable result artifact.
 After submission, `jarvis_get_execution` is the single durable query. It always
 returns the execution handle, lifecycle record, and runtime metadata; progress
 is included by default and can be disabled with `include_progress=false`.

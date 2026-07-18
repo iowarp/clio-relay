@@ -404,6 +404,7 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         assert "on every follow-up call" in description
         assert "job_id alone is only for a local relay job" in description
     wait_tool = next(tool for tool in response["result"]["tools"] if tool["name"] == "relay_wait")
+    assert wait_tool["inputSchema"]["properties"]["include_logs"]["default"] is False
     assert "service_runtime_bindings" in wait_tool["description"]
     assert (
         "mcp_result.structured_result as the authoritative remote tool output"
@@ -837,7 +838,11 @@ def test_mcp_compact_status_observe_wait_and_cancel(tmp_path: Path) -> None:
             "method": "tools/call",
             "params": {
                 "name": "relay_wait",
-                "arguments": {"job_id": job.job_id, "timeout_seconds": 1},
+                "arguments": {
+                    "job_id": job.job_id,
+                    "timeout_seconds": 1,
+                    "include_logs": True,
+                },
             },
         },
         queue=queue,
@@ -868,6 +873,48 @@ def test_mcp_compact_status_observe_wait_and_cancel(tmp_path: Path) -> None:
     assert "finished" in waited["logs"]["stdout"]["text"]
     assert cancel_response is not None
     assert cancel_response["result"]["structuredContent"]["job_id"] == job.job_id
+
+
+def test_mcp_wait_omits_logs_unless_explicitly_requested(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Terminal structured results do not carry stdout and stderr by default."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="wait-without-logs",
+        )
+    )
+    queue.update_job_state(job.job_id, JobState.SUCCEEDED, message="done")
+
+    def reject_log_read(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("relay_wait read logs without include_logs=true")
+
+    monkeypatch.setattr(mcp_server_module, "_job_logs", reject_log_read)
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 32,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_wait",
+                "arguments": {"job_id": job.job_id, "timeout_seconds": 1},
+            },
+        },
+        queue=queue,
+        settings=settings,
+    )
+
+    assert response is not None and "error" not in response
+    waited = response["result"]["structuredContent"]
+    assert waited["terminal"] is True
+    assert "logs" not in waited
 
 
 def test_mcp_compact_log_limit_is_enforced_before_log_access(tmp_path: Path) -> None:
@@ -2253,6 +2300,8 @@ def test_direct_remote_waited_mcp_submission_returns_artifact_bound_result(
     assert result["terminal"] is True
     assert result["last_error"] is None
     assert result["mcp_result"]["structured_result"] == {"package": "builtin.paraview"}
+    assert result["mcp_result"]["protocol_result_omitted"] == ("redundant_with_structured_result")
+    assert "protocol_result" not in result["mcp_result"]
     assert result["mcp_result_artifact"]["artifact_id"] == artifact["artifact_id"]
     assert [command[:2] for command in commands] == [
         ["job", "wait"],
@@ -2282,7 +2331,8 @@ def test_large_terminal_mcp_result_omits_payload_but_keeps_summary() -> None:
 
     assert bounded["content_truncated"] is True
     assert "structured_result" in bounded["omitted_fields"]
-    assert "protocol_result" in bounded["omitted_fields"]
+    assert bounded["protocol_result_omitted"] == "redundant_with_structured_result"
+    assert "protocol_result" not in bounded
     assert bounded["tool"] == "jarvis_describe"
     assert len(json.dumps(bounded)) < 65_536
 
