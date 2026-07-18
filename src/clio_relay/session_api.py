@@ -29,6 +29,8 @@ from clio_relay.models import (
     McpCallSpec,
     RelayJob,
     RemoteAgentTaskSpec,
+    deterministic_jarvis_execution_id,
+    is_owned_jarvis_run_spec,
 )
 from clio_relay.session_lifecycle import (
     challenge_remote_session_identity,
@@ -324,9 +326,10 @@ def _validate_submission_receipt(
     if path == "/jobs/jarvis-mcp-call":
         if job.kind is not JobKind.MCP_CALL or not isinstance(job.spec, McpCallSpec):
             raise RelayError("owned session API returned the wrong job kind")
+        expected_arguments = _expected_jarvis_mcp_arguments(job, payload=payload)
         if (
             job.spec.tool != payload.get("tool")
-            or job.spec.arguments != payload.get("arguments", {})
+            or job.spec.arguments != expected_arguments
             or job.spec.expected_server_artifact_digest
             != payload.get("expected_server_artifact_digest")
             or job.spec.timeout_seconds != payload.get("timeout_seconds")
@@ -367,6 +370,43 @@ def _validate_submission_receipt(
         }
         if observed_agent != expected_agent:
             raise RelayError("owned session API returned a different remote-agent task")
+
+
+def _expected_jarvis_mcp_arguments(
+    job: RelayJob,
+    *,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    """Normalize only the server-owned identity added during JARVIS run admission.
+
+    The authenticated cluster API admits ``jarvis_run`` before returning its receipt. Admission
+    deterministically adds ``execution_id`` using the cluster, idempotency key, and server-owned
+    relay job ID. That field is intentionally absent from an ordinary caller request. Recompute
+    the one permitted normalization while retaining an exact comparison for every caller-owned
+    argument. An explicit execution ID is accepted only for an exact idempotent replay whose
+    returned job identity proves the same value.
+    """
+
+    raw_arguments = payload.get("arguments", {})
+    if not isinstance(raw_arguments, dict):
+        raise RelayError("owned session submission has invalid JARVIS MCP arguments")
+    expected_arguments = cast(dict[str, object], raw_arguments)
+    raw_tool = payload.get("tool")
+    normalized_tool = raw_tool.replace("-", "_").lower() if isinstance(raw_tool, str) else ""
+    if normalized_tool != "jarvis_run":
+        return expected_arguments
+    if not is_owned_jarvis_run_spec(job.kind, job.spec):
+        raise RelayError("owned session API returned an unbound JARVIS run")
+
+    expected_execution_id = deterministic_jarvis_execution_id(
+        cluster=job.cluster,
+        idempotency_key=job.idempotency_key,
+        job_id=job.job_id,
+    )
+    supplied_execution_id = expected_arguments.get("execution_id")
+    if supplied_execution_id is not None and supplied_execution_id != expected_execution_id:
+        raise RelayError("owned session JARVIS run used a different execution identity")
+    return {**expected_arguments, "execution_id": expected_execution_id}
 
 
 def _owned_session_credentials(

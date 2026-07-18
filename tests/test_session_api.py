@@ -12,7 +12,12 @@ import pytest
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.errors import RelayError
-from clio_relay.models import JobKind, McpCallSpec, RelayJob
+from clio_relay.models import (
+    JobKind,
+    McpCallSpec,
+    RelayJob,
+    prepare_owned_jarvis_run_submission,
+)
 from clio_relay.session_api import (
     OWNER_SESSION_ID_HEADER,
     SESSION_GENERATION_ID_HEADER,
@@ -140,6 +145,39 @@ def _job(expected_digest: str) -> RelayJob:
     )
 
 
+def _admitted_jarvis_run_job(
+    expected_digest: str,
+    *,
+    pipeline_id: str = "science-pipeline",
+) -> RelayJob:
+    """Return the exact server-normalized receipt for an owned JARVIS run."""
+
+    submitted = RelayJob(
+        cluster="ares",
+        kind=JobKind.MCP_CALL,
+        spec=McpCallSpec(
+            server="clio-kit",
+            server_args=["mcp-server", "jarvis"],
+            expected_server_artifact_digest=expected_digest,
+            expected_jarvis_cd_lock_binding={
+                "schema_version": "clio-relay.jarvis-cd-lock-expectation.v1",
+                "version": "1.3.16",
+                "url": "https://example.invalid/jarvis-cd.whl",
+                "sha256": "b" * 64,
+            },
+            tool="jarvis_run",
+            arguments={"pipeline_id": pipeline_id},
+        ),
+        idempotency_key="owned-session-client",
+        metadata={
+            "owner": "clio-relay",
+            "owner_session_id": "desktop-session-1",
+            "owner_session_generation_id": "generation-1",
+        },
+    )
+    return prepare_owned_jarvis_run_submission(submitted)
+
+
 def _install_transport(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -205,6 +243,44 @@ def _install_transport(
     monkeypatch.setattr("clio_relay.session_api.http.client.HTTPConnection", connection_factory)
     monkeypatch.setattr("clio_relay.session_api._ssh_forward", forward)
     return captured, connections
+
+
+def _submit_jarvis_run_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    admitted: RelayJob,
+    expected_digest: str,
+    arguments: dict[str, object],
+) -> RelayJob:
+    """Submit caller arguments against one simulated authenticated admission receipt."""
+
+    identity = session_identity_document(
+        owner_token="owner-token",
+        cluster="ares",
+        session_id="desktop-session-1",
+        generation_id="generation-1",
+        nonce="1" * 64,
+    )
+    _install_transport(
+        monkeypatch,
+        responses=[
+            _Response(identity),
+            _Response(admitted.model_dump(mode="json")),
+        ],
+    )
+    return submit_owned_session_job(
+        definition=ClusterDefinition(name="ares", ssh_host="ares-login"),
+        settings=_settings(tmp_path),
+        path="/jobs/jarvis-mcp-call",
+        payload={
+            "cluster": "ares",
+            "tool": "jarvis_run",
+            "arguments": arguments,
+            "expected_server_artifact_digest": expected_digest,
+            "idempotency_key": "owned-session-client",
+        },
+    )
 
 
 def test_owned_session_client_proves_identity_before_sending_credentials(
@@ -289,6 +365,82 @@ def test_owned_session_submission_rejects_dropped_artifact_dependencies(
                 "expected_server_artifact_digest": expected_digest,
                 "idempotency_key": "owned-session-client",
                 "used_artifact_refs": [{"artifact_id": "artifact_input", "sha256": "b" * 64}],
+            },
+        )
+
+
+def test_owned_session_submission_accepts_relay_owned_jarvis_execution_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Admission may add only its deterministic execution ID to jarvis_run arguments."""
+
+    expected_digest = "a" * 64
+    admitted = _admitted_jarvis_run_job(expected_digest)
+    received = _submit_jarvis_run_receipt(
+        tmp_path,
+        monkeypatch,
+        admitted=admitted,
+        expected_digest=expected_digest,
+        arguments={"pipeline_id": "science-pipeline"},
+    )
+
+    assert isinstance(received.spec, McpCallSpec)
+    assert isinstance(admitted.spec, McpCallSpec)
+    assert received.spec.arguments == admitted.spec.arguments
+    assert received.spec.arguments["execution_id"].startswith("jarvis_")
+
+
+def test_owned_session_submission_rejects_other_jarvis_run_arguments_after_normalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Execution-ID normalization must not hide a changed pipeline or other caller input."""
+
+    expected_digest = "a" * 64
+    admitted = _admitted_jarvis_run_job(expected_digest, pipeline_id="other-pipeline")
+    with pytest.raises(RelayError, match="different JARVIS MCP call"):
+        _submit_jarvis_run_receipt(
+            tmp_path,
+            monkeypatch,
+            admitted=admitted,
+            expected_digest=expected_digest,
+            arguments={"pipeline_id": "science-pipeline"},
+        )
+
+
+def test_owned_session_submission_accepts_only_proven_jarvis_execution_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit execution ID is valid only when the receipt's durable identity proves it."""
+
+    expected_digest = "a" * 64
+    admitted = _admitted_jarvis_run_job(expected_digest)
+    assert isinstance(admitted.spec, McpCallSpec)
+    execution_id = admitted.spec.arguments["execution_id"]
+    received = _submit_jarvis_run_receipt(
+        tmp_path,
+        monkeypatch,
+        admitted=admitted,
+        expected_digest=expected_digest,
+        arguments={
+            "pipeline_id": "science-pipeline",
+            "execution_id": execution_id,
+        },
+    )
+    assert isinstance(received.spec, McpCallSpec)
+    assert received.spec.arguments["execution_id"] == execution_id
+
+    with pytest.raises(RelayError, match="different execution identity"):
+        _submit_jarvis_run_receipt(
+            tmp_path,
+            monkeypatch,
+            admitted=admitted,
+            expected_digest=expected_digest,
+            arguments={
+                "pipeline_id": "science-pipeline",
+                "execution_id": "jarvis_forged",
             },
         )
 
