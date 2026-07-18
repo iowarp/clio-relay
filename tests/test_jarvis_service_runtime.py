@@ -134,6 +134,44 @@ def test_waited_execution_exposes_compact_verified_binding_before_large_result(
     assert serialized.index('"mcp_result_artifact":') < serialized.index('"mcp_result":')
 
 
+def test_generic_mcp_wait_serializes_verified_result_before_bulk_evidence() -> None:
+    """An agent sees the remote tool result before large logs and artifact inventories."""
+
+    result: dict[str, Any] = {
+        "job": {"job_id": "job_result_order", "metadata": {"padding": "j" * 20_000}},
+        "terminal": True,
+        "cluster": "ares",
+        "route_revision": "a" * 64,
+        "mcp_result_artifact": {
+            "artifact_id": "artifact_result_order",
+            "job_id": "job_result_order",
+            "kind": "mcp_result",
+            "sha256": "b" * 64,
+        },
+        "mcp_result": {
+            "operation": "tools/call",
+            "tool": "package_describe",
+            "structured_result": {
+                "agent_contract": {
+                    "config": {"dataset_descriptor": "JSON string", "mode": "service"}
+                }
+            },
+        },
+        "logs": {"stdout": {"text": "l" * 20_000}, "stderr": {"text": ""}},
+        "artifacts": [{"metadata": {"padding": "a" * 20_000}}],
+    }
+
+    serialized = mcp_server_module._serialize_tool_result(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        result
+    )
+
+    assert serialized.index('"mcp_result_artifact":') < serialized.index('"mcp_result":')
+    assert serialized.index('"mcp_result":') < serialized.index('"job":')
+    assert serialized.index('"mcp_result":') < serialized.index('"logs":')
+    assert serialized.index('"mcp_result":') < serialized.index('"artifacts":')
+    assert '"dataset_descriptor": "JSON string"' in serialized[:12_000]
+
+
 def test_async_relay_wait_exposes_same_compact_verified_service_binding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
