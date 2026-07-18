@@ -118,9 +118,12 @@ Spack MCP server through the normal `remote_mcp_servers` cluster configuration.
 The audited clio-kit user contract is `spack_find`, `spack_locate`, and
 `spack_install`. There is deliberately no stateful `spack_load` tool: an MCP
 child's process environment cannot survive into a later JARVIS process.
-Declare `contract: clio-kit-spack-user-v2` on that registration so the live
+Declare `contract: clio-kit-spack-user-v2.1` on new registrations so the live
 gate checks the exact upstream schemas; the operator's server name has no
 semantic effect.
+Existing `clio-kit-spack-user-v2` registrations remain accepted and are
+verified against the preserved v2 digest; changing the declared identifier
+requires a fresh discovery of the matching server surface.
 `jarvis_run(spack_specs=[...])` resolves the requested specs immediately before
 execution and persists the filtered environment into the JARVIS pipeline so
 direct execution and scheduler reload see the same values. Use the server's
@@ -258,7 +261,7 @@ For the legacy clio-kit 2.2.6 compatibility path, a successful synchronous
 `jarvis_run` MCP return is normalized to a terminal `completed` record even
 though that release labels the result `status=running`; the original status and
 completion basis remain in `details.completion_normalization` for auditability.
-The pinned clio-kit 2.5.9 production path removes that ambiguity upstream and
+The pinned clio-kit 2.5.10 production path removes that ambiguity upstream and
 returns a structured completed result directly. The legacy normalization is
 diagnostic compatibility evidence and cannot satisfy the 1.0 gate. Scheduler
 submissions remain non-terminal unless JARVIS was asked to wait.
@@ -493,7 +496,7 @@ Install the cluster-side server once, then launch its persistent executable:
 
 ```bash
 uv tool install --python 3.12 --no-config \
-  https://github.com/iowarp/clio-kit/releases/download/v2.5.9/clio_kit-2.5.9-py3-none-any.whl
+  https://github.com/iowarp/clio-kit/releases/download/v2.5.10/clio_kit-2.5.10-py3-none-any.whl
 clio-kit mcp-server jarvis
 ```
 

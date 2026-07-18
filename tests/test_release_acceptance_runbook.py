@@ -53,7 +53,7 @@ def test_release_identity_is_consistent_across_package_policy_matrix_and_runbook
     init_source = (ROOT / "src" / "clio_relay" / "__init__.py").read_text(encoding="utf-8")
     release_process = RELEASE_PROCESS.read_text(encoding="utf-8")
 
-    assert version == "1.3.26"
+    assert version == "1.3.27"
     assert relay_lock["version"] == version
     assert f'__version__ = "{version}"' in init_source
     assert policy["release_version"] == version
@@ -739,7 +739,7 @@ def test_release_acceptance_runbook_binds_production_specifics_without_secrets()
     assert "$LammpsHashes.Count -ne 1" in text
     assert "$ExpectedLammpsPrefix" in text
     assert "expected exact LAMMPS prefix is unavailable or non-canonical" in text
-    assert "--contract clio-kit-spack-user-v2" in text
+    assert "--contract clio-kit-spack-user-v2.1" in text
     assert "--allow-tool spack_find --allow-tool spack_locate --allow-tool spack_install" in text
     assert '"--result-expectation-json-file", $Expectation' in text
     assert '--keep-jobs", "--keep-scheduler-jobs' in text

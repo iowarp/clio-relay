@@ -55,7 +55,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.3.26"
+$Version = "1.3.27"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }
@@ -823,13 +823,18 @@ cannot satisfy either requirement.
 
 Register exactly the three agent-facing user operations. The `--arg=...` form is
 required for child arguments beginning with `--`.
+New acceptance runs use `clio-kit-spack-user-v2.1`, whose contract explicitly
+defines an empty `spack_find` as success and an absent `spack_locate` as the
+structured `not_installed` error. Relay still accepts the preserved
+`clio-kit-spack-user-v2` identifier for existing registrations, but validates
+it against its own v2 artifact and digest rather than the current contract.
 
 ```powershell
 $AresClioKit = "$AresHome/.local/bin/clio-kit"
 & $Relay remote-mcp register --cluster $AresCluster --name spack `
   --command $AresClioKit `
   --arg=mcp-server --arg=spack --arg=-- --arg=--spack-command --arg=$AresSpack `
-  --contract clio-kit-spack-user-v2 `
+  --contract clio-kit-spack-user-v2.1 `
   --allow-tool spack_find --allow-tool spack_locate --allow-tool spack_install `
   --profile user --call-timeout-seconds 14400 --replace
 if ($LASTEXITCODE -ne 0) { throw "Spack MCP registration failed" }
@@ -840,14 +845,14 @@ $SpackCalls = @(
   @{
     Id = "ares-spack-find"; Tool = "spack_find"; Arguments = @{ query = "lammps" }
     Expectation = @{
-      contract = "clio-kit-spack-user-v2"; tool = "spack_find"
+      contract = "clio-kit-spack-user-v2.1"; tool = "spack_find"
       package_name = "lammps"; dag_hash = $ExpectedLammpsHash
     }
   },
   @{
     Id = "ares-spack-locate"; Tool = "spack_locate"; Arguments = @{ spec = "lammps" }
     Expectation = @{
-      contract = "clio-kit-spack-user-v2"; tool = "spack_locate"
+      contract = "clio-kit-spack-user-v2.1"; tool = "spack_locate"
       package_name = "lammps"; dag_hash = $ExpectedLammpsHash
       requested_spec = "lammps"; prefix = $ExpectedLammpsPrefix
     }
@@ -902,7 +907,7 @@ if ($LASTEXITCODE -ne 0 -or $ExpectedFreshSpackHash -cnotmatch '^[a-z0-9]{32}$')
   --arg=mcp-server --arg=spack --arg=-- `
   --arg=--spack-command --arg=$FreshSpackWrapper `
   --namespace spack-fresh `
-  --contract clio-kit-spack-user-v2 `
+  --contract clio-kit-spack-user-v2.1 `
   --allow-tool spack_find --allow-tool spack_locate --allow-tool spack_install `
   --profile user --call-timeout-seconds 14400 --replace
 if ($LASTEXITCODE -ne 0) { throw "fresh Spack MCP registration failed" }
@@ -914,7 +919,7 @@ $FreshArguments = Write-JsonFile "ares-spack-install.json" @{
   spec = $FreshSpackSpec; reuse = $false; timeout_seconds = 14400
 }
 $FreshExpectation = Write-JsonFile "ares-spack-install-expectation.json" @{
-  contract = "clio-kit-spack-user-v2"; tool = "spack_install"
+  contract = "clio-kit-spack-user-v2.1"; tool = "spack_install"
   package_name = "libsigsegv"; dag_hash = $ExpectedFreshSpackHash
   requested_spec = $FreshSpackSpec; reuse = $false
   fresh_install_store_root = $FreshSpackStore
