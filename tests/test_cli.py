@@ -16,7 +16,7 @@ from _pytest.monkeypatch import MonkeyPatch
 from click import unstyle
 from typer.testing import CliRunner
 
-from clio_relay import cli
+from clio_relay import __version__, cli
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
     ClusterDefinition,
@@ -54,6 +54,7 @@ from clio_relay.service_runtime import ServiceRuntimeSupervisor
 from clio_relay.session_lifecycle import (
     CleanupResource,
     RemoteSessionStateEvidence,
+    SessionApiReleaseIdentity,
     SessionLifecycleReport,
 )
 from clio_relay.validation_report import (
@@ -156,6 +157,79 @@ def _owned_session_status(
         "running": running,
         "ownership_verified": running,
     }
+
+
+def _installation_identity(
+    *,
+    version: str = __version__,
+    artifact_sha256: str = "a" * 64,
+) -> dict[str, object]:
+    software: dict[str, object] = {
+        "version": version,
+        "commit": "1" * 40,
+        "tag": f"v{version}",
+        "dirty": False,
+    }
+    receipt: dict[str, object] = {
+        "schema_version": "clio-relay.install-receipt.v1",
+        "installed_at": datetime.now(UTC).isoformat(),
+        "install_spec": f"clio-relay=={version}",
+        "requested_source": "pypi",
+        "artifact_filename": f"clio_relay-{version}-py3-none-any.whl",
+        "artifact_sha256": artifact_sha256,
+        "distribution_version": version,
+        "software": software,
+        "components": {},
+        "component_artifacts": {},
+    }
+    return {
+        "schema_version": "clio-relay.installation-info.v1",
+        "distribution_version": version,
+        "software": software,
+        "receipt": receipt,
+        "receipt_origin": "uv-tool",
+        "install_source": None,
+        "receipt_matches_install": True,
+        "component_runtime": {},
+    }
+
+
+def _worker_runtime_identity(
+    installation: dict[str, object],
+    *,
+    fresh: bool = True,
+    process_running: bool = True,
+) -> dict[str, object]:
+    return {
+        "schema_version": "clio-relay.worker-runtime-info.v1",
+        "cluster": "ares",
+        "fresh": fresh,
+        "process_running": process_running,
+        "identity_matches_current": True,
+        "running": fresh and process_running,
+        "scheduler_provider": "external",
+        "endpoint": {
+            "role": "worker",
+            "cluster": "ares",
+            "pid": 123,
+            "metadata": {"scheduler_provider": "external"},
+        },
+        "installation": installation,
+        "endpoint_installation": installation,
+        "target_identity": {"verified": True},
+    }
+
+
+def _session_api_release_identity() -> SessionApiReleaseIdentity:
+    installation = _installation_identity()
+    receipt = cast(dict[str, object], installation["receipt"])
+    return SessionApiReleaseIdentity.model_validate(
+        {
+            "distribution_version": installation["distribution_version"],
+            "artifact_sha256": receipt["artifact_sha256"],
+            "software": installation["software"],
+        }
+    )
 
 
 def _verified_teardown_report(
@@ -1449,10 +1523,18 @@ def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch
         remote_calls.append(arguments)
         return "{}"
 
+    def accept_worker_compatibility(
+        _definition: ClusterDefinition,
+    ) -> SessionApiReleaseIdentity:
+        return _session_api_release_identity()
+
     monkeypatch.setattr("clio_relay.cli.start_remote_session", fake_start)
     monkeypatch.setattr("clio_relay.cli.status_remote_session", fake_status)
     monkeypatch.setattr("clio_relay.cli.teardown_remote_session", fake_teardown)
     monkeypatch.setattr("clio_relay.cli.run_remote_clio", fake_run_remote_clio)
+    monkeypatch.setattr(
+        cli, "_verify_session_start_worker_compatibility", accept_worker_compatibility
+    )
     monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
     _activate_owner_session(ClioCoreQueue(tmp_path / "core"))
@@ -1520,8 +1602,16 @@ def test_cli_session_start_does_not_reopen_intake_when_process_start_fails(
         remote_calls.append(arguments)
         return "{}"
 
+    def accept_worker_compatibility(
+        _definition: ClusterDefinition,
+    ) -> SessionApiReleaseIdentity:
+        return _session_api_release_identity()
+
     monkeypatch.setattr(cli, "start_remote_session", fail_start)
     monkeypatch.setattr(cli, "run_remote_clio", record_remote)
+    monkeypatch.setattr(
+        cli, "_verify_session_start_worker_compatibility", accept_worker_compatibility
+    )
 
     result = CliRunner().invoke(
         app,
@@ -1530,6 +1620,153 @@ def test_cli_session_start_does_not_reopen_intake_when_process_start_fails(
 
     assert result.exit_code == 1
     assert remote_calls == []
+
+
+@pytest.mark.parametrize(
+    ("remote_version", "fresh", "process_running", "error"),
+    [
+        ("1.3.21", True, True, "distribution version does not match"),
+        (__version__, False, True, "did not prove fresh"),
+        (__version__, True, False, "did not prove process_running"),
+    ],
+)
+def test_cli_session_start_rejects_incompatible_worker_before_remote_mutation(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    remote_version: str,
+    fresh: bool,
+    process_running: bool,
+    error: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
+    local_installation = _installation_identity()
+    remote_installation = _installation_identity(
+        version=remote_version,
+        artifact_sha256="a" * 64 if remote_version == __version__ else "b" * 64,
+    )
+    starts: list[dict[str, object]] = []
+
+    def record_start(**kwargs: object) -> list[str]:
+        starts.append(kwargs)
+        return ["session_started=session-1"]
+
+    def remote_worker_info(_definition: ClusterDefinition) -> dict[str, object]:
+        return _worker_runtime_identity(
+            remote_installation,
+            fresh=fresh,
+            process_running=process_running,
+        )
+
+    monkeypatch.setattr(cli, "installation_info", lambda: local_installation)
+    monkeypatch.setattr(cli, "_remote_worker_info", remote_worker_info)
+    monkeypatch.setattr(cli, "start_remote_session", record_start)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "start",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--replace",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert error in result.output
+    assert starts == []
+
+
+def test_cli_session_start_verifies_exact_worker_inside_lock_before_mutation(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
+    installation = _installation_identity()
+    events: list[str] = []
+
+    class RecordingLock:
+        def __enter__(self) -> RecordingLock:
+            events.append("lock-enter")
+            return self
+
+        def __exit__(
+            self,
+            _exc_type: object,
+            _exc: object,
+            _traceback: object,
+        ) -> None:
+            events.append("lock-exit")
+
+    def transition_lock(*, cluster: str, session_id: str) -> RecordingLock:
+        assert cluster == "ares"
+        assert session_id == "session-1"
+        return RecordingLock()
+
+    def local_info() -> dict[str, object]:
+        events.append("local-installation")
+        return installation
+
+    def remote_info(_definition: ClusterDefinition) -> dict[str, object]:
+        events.append("remote-worker")
+        return _worker_runtime_identity(installation)
+
+    def start(**kwargs: object) -> list[str]:
+        assert isinstance(kwargs["expected_api_release_identity"], SessionApiReleaseIdentity)
+        events.append("start-remote-session")
+        return ["session_started=session-1", "session_generation_id=generation-1"]
+
+    monkeypatch.setattr(cli, "_session_transition_lock", transition_lock)
+    monkeypatch.setattr(cli, "installation_info", local_info)
+    monkeypatch.setattr(cli, "_remote_worker_info", remote_info)
+    monkeypatch.setattr(cli, "start_remote_session", start)
+
+    result = CliRunner().invoke(
+        app,
+        ["session", "start", "--cluster", "ares", "--session-id", "session-1"],
+    )
+
+    assert result.exit_code == 0
+    assert events == [
+        "lock-enter",
+        "local-installation",
+        "remote-worker",
+        "start-remote-session",
+        "lock-exit",
+    ]
+
+
+def test_cli_api_start_verifies_process_bound_release_identity(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    installation = _installation_identity()
+    identity = _session_api_release_identity()
+    launches: list[tuple[str, int]] = []
+
+    def launch(_application: str, *, host: str, port: int) -> None:
+        launches.append((host, port))
+
+    monkeypatch.setattr(cli, "installation_info", lambda: installation)
+    monkeypatch.setattr(cli.uvicorn, "run", launch)
+    monkeypatch.setenv("CLIO_RELAY_API_RELEASE_IDENTITY_SHA256", identity.sha256())
+
+    accepted = CliRunner().invoke(app, ["api", "start", "--port", "9001"])
+
+    assert accepted.exit_code == 0, accepted.output
+    assert launches == [("127.0.0.1", 9001)]
+
+    monkeypatch.setenv("CLIO_RELAY_API_RELEASE_IDENTITY_SHA256", "b" * 64)
+    rejected = CliRunner().invoke(app, ["api", "start", "--port", "9002"])
+
+    assert rejected.exit_code == 2
+    assert "release identity does not match running package" in rejected.output
+    assert launches == [("127.0.0.1", 9001)]
 
 
 def test_cli_session_submit_jarvis_uses_identity_proven_client(

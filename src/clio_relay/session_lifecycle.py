@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shlex
 import subprocess
@@ -16,6 +17,7 @@ from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import RelayError
 from clio_relay.identifiers import DurableRecordId, validate_durable_record_id
 from clio_relay.remote_cli import remote_env
+from clio_relay.validation_report import SoftwareIdentity
 
 if TYPE_CHECKING:
     from clio_relay.validation_report import (
@@ -44,6 +46,31 @@ class RemoteSession:
     session_id: str
     remote_api_port: int
     api_token: str | None
+
+
+class SessionApiReleaseIdentity(BaseModel):
+    """Exact released artifact identity bound to an owned session API process."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["clio-relay.session-api-release.v1"] = (
+        "clio-relay.session-api-release.v1"
+    )
+    distribution_version: str = Field(min_length=1)
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    software: SoftwareIdentity
+
+    def canonical_json(self) -> str:
+        """Return the canonical JSON representation used for process attestation."""
+        return json.dumps(
+            self.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def sha256(self) -> str:
+        """Return the canonical release-identity digest."""
+        return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
 
 
 class CleanupResource(BaseModel):
@@ -640,6 +667,7 @@ def start_remote_session(
     session_id: str,
     remote_api_port: int,
     api_token: str | None,
+    expected_api_release_identity: SessionApiReleaseIdentity | None = None,
     replace: bool = False,
 ) -> list[str]:
     """Start a cluster-side relay API owned by a session id."""
@@ -652,6 +680,7 @@ def start_remote_session(
             session_id=session_id,
             remote_api_port=remote_api_port,
             api_token=api_token,
+            expected_api_release_identity=expected_api_release_identity,
             replace=replace,
         ),
     )
@@ -807,6 +836,7 @@ def _start_script(
     session_id: str,
     remote_api_port: int,
     api_token: str | None,
+    expected_api_release_identity: SessionApiReleaseIdentity | None,
     replace: bool,
 ) -> str:
     token_export = ""
@@ -815,6 +845,14 @@ def _start_script(
         token_export = f"export CLIO_RELAY_API_TOKEN={_shell_single_quote(api_token)}"
         require_token = " --require-token"
     replace_flag = "1" if replace else "0"
+    expected_release_json = (
+        expected_api_release_identity.canonical_json()
+        if expected_api_release_identity is not None
+        else ""
+    )
+    expected_release_sha256 = (
+        expected_api_release_identity.sha256() if expected_api_release_identity is not None else ""
+    )
     return f"""set -euo pipefail
 umask 077
 {remote_env(definition)}
@@ -827,6 +865,82 @@ flock -w 10 -x 9 || {{ echo "session transition lock timed out" >&2; exit 75; }}
 pid_file="$session_dir/api.pid"
 log_file="$session_dir/api.log"
 metadata_file="$session_dir/metadata.json"
+expected_api_release_identity_json={_shell_single_quote(expected_release_json)}
+expected_api_release_identity_sha256={shlex.quote(expected_release_sha256)}
+api_release_identity_json="$(python3 - \
+  "$expected_api_release_identity_json" "$expected_api_release_identity_sha256" \
+  <<'__CLIO_RELAY_CURRENT_API_RELEASE__'
+import hashlib
+import json
+import re
+import subprocess
+import sys
+
+expected_identity = json.loads(sys.argv[1]) if sys.argv[1] else None
+expected_sha256 = sys.argv[2]
+try:
+    completed = subprocess.run(
+        ["clio-relay", "installation-info"],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=20,
+    )
+except (OSError, subprocess.TimeoutExpired) as exc:
+    raise SystemExit(f"cannot attest the session API installation: {{exc}}") from exc
+if completed.returncode != 0:
+    raise SystemExit(
+        "cannot attest the session API installation: "
+        + (completed.stderr.strip() or completed.stdout.strip())
+    )
+try:
+    installation = json.loads(completed.stdout)
+except json.JSONDecodeError as exc:
+    raise SystemExit("session API installation identity is not valid JSON") from exc
+receipt = installation.get("receipt")
+software = installation.get("software")
+distribution_version = installation.get("distribution_version")
+artifact_sha256 = receipt.get("artifact_sha256") if isinstance(receipt, dict) else None
+if (
+    installation.get("schema_version") != "clio-relay.installation-info.v1"
+    or installation.get("receipt_matches_install") is not True
+    or not isinstance(receipt, dict)
+    or not isinstance(software, dict)
+    or receipt.get("schema_version") != "clio-relay.install-receipt.v1"
+    or receipt.get("distribution_version") != distribution_version
+    or receipt.get("software") != software
+    or not isinstance(distribution_version, str)
+    or not distribution_version
+    or not isinstance(software.get("version"), str)
+    or not software.get("version")
+    or not isinstance(artifact_sha256, str)
+    or re.fullmatch(r"[0-9a-f]{{64}}", artifact_sha256) is None
+):
+    raise SystemExit("session API installation receipt does not match the running package")
+identity = {{
+    "schema_version": "clio-relay.session-api-release.v1",
+    "distribution_version": distribution_version,
+    "artifact_sha256": artifact_sha256,
+    "software": software,
+}}
+canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+observed_sha256 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+if expected_identity is not None and (
+    identity != expected_identity or observed_sha256 != expected_sha256
+):
+    raise SystemExit("session API installation changed after worker compatibility verification")
+print(canonical)
+__CLIO_RELAY_CURRENT_API_RELEASE__
+)"
+expected_api_release_identity_json="$api_release_identity_json"
+expected_api_release_identity_sha256="$(python3 - "$api_release_identity_json" \
+  <<'__CLIO_RELAY_CURRENT_API_RELEASE_DIGEST__'
+import hashlib
+import sys
+
+print(hashlib.sha256(sys.argv[1].encode("utf-8")).hexdigest())
+__CLIO_RELAY_CURRENT_API_RELEASE_DIGEST__
+)"
 is_owned_api_pid() {{
   python3 - "$metadata_file" "$1" "$session_id" <<'__CLIO_RELAY_PID_OWNER__'
 import json
@@ -908,6 +1022,41 @@ elif [ -n "$recorded_api_pgid" ] \
   && kill -0 -- "-$recorded_api_pgid" 2>/dev/null; then
   echo "refusing to replace an active session API group without a PID record" >&2
   exit 1
+fi
+if [ -n "$existing_owned_pid" ] && [ "{replace_flag}" != "1" ]; then
+  python3 - \
+    "$metadata_file" "$existing_owned_pid" \
+    "$expected_api_release_identity_json" "$expected_api_release_identity_sha256" \
+    <<'__CLIO_RELAY_EXISTING_API_RELEASE__'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+metadata_path, pid, expected_json, expected_sha256 = sys.argv[1:]
+metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+expected_identity = json.loads(expected_json)
+observed_identity = metadata.get("api_release_identity")
+observed_sha256 = metadata.get("api_release_identity_sha256")
+if not isinstance(observed_identity, dict) or not isinstance(observed_sha256, str):
+    raise SystemExit("existing owned session API has no release identity; use --replace")
+canonical = json.dumps(observed_identity, sort_keys=True, separators=(",", ":"))
+if (
+    observed_identity != expected_identity
+    or observed_sha256 != expected_sha256
+    or hashlib.sha256(canonical.encode("utf-8")).hexdigest() != observed_sha256
+):
+    raise SystemExit("existing owned session API release identity differs; use --replace")
+try:
+    environment = (Path("/proc") / pid / "environ").read_bytes().split(bytes([0]))
+except OSError as exc:
+    raise SystemExit(f"cannot verify existing session API release identity: {{exc}}") from exc
+marker = f"CLIO_RELAY_API_RELEASE_IDENTITY_SHA256={{observed_sha256}}".encode()
+if marker not in environment:
+    raise SystemExit(
+        "existing owned session API release identity is not process-bound; use --replace"
+    )
+__CLIO_RELAY_EXISTING_API_RELEASE__
 fi
 recorded_generation_id="$(python3 - "$metadata_file" "$session_id" \
   <<'__CLIO_RELAY_RECORDED_GENERATION__'
@@ -1054,6 +1203,7 @@ trap cleanup_incomplete_start EXIT
 nohup setsid env \\
   "CLIO_RELAY_SESSION_OWNER_TOKEN=$owner_token" \\
   "CLIO_RELAY_SESSION_GENERATION_ID=$session_generation_id" \\
+  "CLIO_RELAY_API_RELEASE_IDENTITY_SHA256=$expected_api_release_identity_sha256" \\
   "CLIO_RELAY_OWNER_SESSION_ID=$session_id" \\
   "CLIO_RELAY_OWNER_SESSION_CLUSTER={shlex.quote(cluster)}" \\
   "${{api_command[@]}}" \\
@@ -1062,6 +1212,7 @@ api_pid="$!"
 echo "$api_pid" > "$pid_file"
 python3 - \
   "$metadata_file" "$api_pid" "$owner_token" "$session_generation_id" \
+  "$api_release_identity_json" "$expected_api_release_identity_sha256" \
   <<'__CLIO_RELAY_METADATA__'
 import json
 import os
@@ -1072,6 +1223,8 @@ path = sys.argv[1]
 api_pid = int(sys.argv[2])
 owner_token = sys.argv[3]
 session_generation_id = sys.argv[4]
+api_release_identity = json.loads(sys.argv[5])
+api_release_identity_sha256 = sys.argv[6]
 for _ in range(40):
     try:
         api_pgid = os.getpgid(api_pid)
@@ -1084,6 +1237,8 @@ for _ in range(40):
         api_pgid == api_pid
         and f"CLIO_RELAY_SESSION_OWNER_TOKEN={{owner_token}}".encode() in environment
         and f"CLIO_RELAY_SESSION_GENERATION_ID={{session_generation_id}}".encode()
+        in environment
+        and f"CLIO_RELAY_API_RELEASE_IDENTITY_SHA256={{api_release_identity_sha256}}".encode()
         in environment
     ):
         break
@@ -1100,6 +1255,8 @@ metadata = {{
     "api_pgid": api_pgid,
     "owner_token": owner_token,
     "session_generation_id": session_generation_id,
+    "api_release_identity": api_release_identity,
+    "api_release_identity_sha256": api_release_identity_sha256,
     "process_start_ticks": process_start_ticks,
     "started_at": datetime.now(timezone.utc).isoformat(),
     "owner": "clio-relay",
@@ -1282,6 +1439,7 @@ def _owned_status_script(*, session_id: str) -> str:
 session_id={shlex.quote(session_id)}
 metadata_file="$HOME/.local/share/clio-relay/sessions/$session_id/metadata.json"
 python3 - "$metadata_file" "$session_id" <<'__CLIO_RELAY_OWNED_STATUS__'
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -1301,6 +1459,7 @@ if not isinstance(pid, int):
         pid = None
 running = False
 ownership_verified = False
+environment = []
 try:
     proc = Path("/proc") / str(pid)
     stat = (proc / "stat").read_text(encoding="utf-8")
@@ -1330,8 +1489,23 @@ try:
 except (OSError, IndexError, TypeError):
     pass
 
+release_identity = metadata.get("api_release_identity")
+release_sha256 = metadata.get("api_release_identity_sha256")
+api_release_identity_verified = False
+if isinstance(release_identity, dict) and isinstance(release_sha256, str):
+    canonical_release = json.dumps(
+        release_identity,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    release_marker = f"CLIO_RELAY_API_RELEASE_IDENTITY_SHA256={{release_sha256}}".encode()
+    api_release_identity_verified = (
+        hashlib.sha256(canonical_release.encode("utf-8")).hexdigest() == release_sha256
+        and release_marker in environment
+    )
 metadata["running"] = running
 metadata["ownership_verified"] = ownership_verified
+metadata["api_release_identity_verified"] = api_release_identity_verified
 metadata["api_pid"] = pid if isinstance(pid, int) else None
 metadata["ownership_token_present"] = bool(metadata.pop("owner_token", None))
 print(json.dumps(metadata))

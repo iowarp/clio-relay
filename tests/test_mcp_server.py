@@ -423,8 +423,11 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
 def test_user_mcp_schemas_avoid_root_unions_and_preserve_exclusive_forms(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Keep agent-facing schemas visible to SDK clients without weakening validation."""
+
+    monkeypatch.setattr(mcp_server_module, "_configured_cluster_names", lambda: ["ares"])
 
     response = handle_request(
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},

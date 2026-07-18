@@ -50,6 +50,7 @@ from clio_relay.models import (
     ServiceRuntimeSpec,
     utc_now,
 )
+from clio_relay.owner_session_admission import desktop_owner_session_admission_id
 from clio_relay.public_records import public_gateway_payload
 from clio_relay.relay_host import (
     FrpcConfig,
@@ -1024,6 +1025,7 @@ class ServiceRuntimeSupervisor:
         desktop_bind_port: int | None = None,
         owner_session_id: str | None = None,
         owner_session_generation_id: str | None = None,
+        owner_session_admission_id: str | None = None,
         transport_mode: str = "frp-stcp-wss",
         readiness_timeout_seconds: float = 300.0,
         poll_seconds: float = 2.0,
@@ -1040,6 +1042,24 @@ class ServiceRuntimeSupervisor:
         if (owner_session_id is None) != (owner_session_generation_id is None):
             raise ConfigurationError(
                 "owner_session_id and owner_session_generation_id must be provided together"
+            )
+        if owner_session_admission_id is not None and owner_session_id is None:
+            raise ConfigurationError(
+                "owner_session_admission_id requires owner_session_id and generation"
+            )
+        if owner_session_id is not None and owner_session_admission_id is None:
+            raise ConfigurationError(
+                "owned JARVIS runtime binding requires owner_session_admission_id"
+            )
+        if owner_session_id is not None and owner_session_admission_id != (
+            desktop_owner_session_admission_id(
+                cluster=self.cluster,
+                session_id=owner_session_id,
+            )
+        ):
+            raise ConfigurationError(
+                "owned JARVIS runtime binding admission id does not match its "
+                "cluster/session identity"
             )
         if readiness_timeout_seconds <= 0 or poll_seconds <= 0:
             raise ConfigurationError("runtime readiness intervals must be positive")
@@ -1100,6 +1120,8 @@ class ServiceRuntimeSupervisor:
                     "owner_session_generation_id": owner_session_generation_id,
                 }
             )
+            if owner_session_admission_id is not None:
+                owner_metadata["owner_session_admission_id"] = owner_session_admission_id
         self.queue.initialize()
         session = self.queue.create_gateway_session(
             GatewaySession(

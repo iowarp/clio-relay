@@ -68,6 +68,7 @@ from clio_relay.models import (
     TaskEventStatus,
     TaskTimelineEvent,
 )
+from clio_relay.owner_session_admission import owner_session_gateway_admission
 from clio_relay.pagination import (
     DEFAULT_RESPONSE_PAGE_RECORDS,
     MAX_RESPONSE_PAGE_RECORDS,
@@ -4436,14 +4437,37 @@ def _bind_jarvis_runtime(
             "stcp secret",
         ),
     )
-    started = supervisor.bind_verified_jarvis_runtime(
-        name=runtime_name,
-        verified=verified,
-        owner_session_id=settings.owner_session_id,
-        owner_session_generation_id=settings.owner_session_generation_id,
-        readiness_timeout_seconds=readiness_timeout_seconds,
-        poll_seconds=poll_seconds,
-    )
+    owner_session_id = settings.owner_session_id
+    owner_session_generation_id = settings.owner_session_generation_id
+    if owner_session_id is None or owner_session_generation_id is None:
+        started = supervisor.bind_verified_jarvis_runtime(
+            name=runtime_name,
+            verified=verified,
+            readiness_timeout_seconds=readiness_timeout_seconds,
+            poll_seconds=poll_seconds,
+        )
+    else:
+        if settings.resolved_owner_session_cluster() != cluster:
+            raise ConfigurationError(
+                "owned runtime binding requires CLIO_RELAY_OWNER_SESSION_CLUSTER to match "
+                "the selected route"
+            )
+        with owner_session_gateway_admission(
+            queue=queue,
+            definition=definition,
+            cluster=cluster,
+            session_id=owner_session_id,
+            session_generation_id=owner_session_generation_id,
+        ) as admission:
+            started = supervisor.bind_verified_jarvis_runtime(
+                name=runtime_name,
+                verified=verified,
+                owner_session_id=admission.owner_session_id,
+                owner_session_generation_id=admission.owner_session_generation_id,
+                owner_session_admission_id=admission.owner_session_admission_id,
+                readiness_timeout_seconds=readiness_timeout_seconds,
+                poll_seconds=poll_seconds,
+            )
     if any(
         value is None
         for value in (

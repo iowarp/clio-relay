@@ -13,6 +13,7 @@ import subprocess
 import sys
 import zipfile
 from collections.abc import Callable
+from copy import deepcopy
 from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
@@ -1944,7 +1945,7 @@ def test_default_report_path_sanitizes_cluster_name(tmp_path: Path) -> None:
 def test_repository_release_policy_is_machine_readable() -> None:
     policy = load_release_gate_policy(Path("docs/release-gate-1.0.yaml"))
 
-    assert policy.release_version == "1.3.21"
+    assert policy.release_version == "1.3.22"
     assert policy.acceptance_matrix is not None
     assert policy.acceptance_matrix["report_count_per_stage"] == 17
     assert policy.acceptance_matrix["matrix_sha256"] == policy.acceptance_matrix_sha256
@@ -2257,6 +2258,21 @@ def test_native_application_progress_gate_rejects_legacy_adapter_only_evidence()
         for item in repository_policy.requirements
         if item.requirement_id == "ares-jarvis-lammps-package-progress"
     )
+    worker_requirement = next(
+        item for item in requirement.required_resources if item.kind == "relay_worker"
+    )
+    worker_metadata = deepcopy(worker_requirement.metadata_equals)
+    component_runtime = worker_metadata.get("component_runtime")
+    assert isinstance(component_runtime, dict)
+    jarvis_runtime = component_runtime.get("jarvis-cd")
+    assert isinstance(jarvis_runtime, dict)
+    jarvis_runtime.update(
+        {
+            "provider_interpreter_verified": True,
+            "provider_native_execution_capability_verified": True,
+            "extra_runtime_evidence": "preserved",
+        }
+    )
     policy = _without_acceptance_matrix(
         repository_policy.model_copy(
             update={
@@ -2302,30 +2318,6 @@ def test_native_application_progress_gate_rejects_legacy_adapter_only_evidence()
         "provider_validated": True,
         "acceptance_validated": True,
     }
-    native_capability = {
-        "schema_version": "clio-relay.jarvis-native-execution-capability.v1",
-        "handle_schema": "jarvis.execution.handle.v1",
-        "record_schema": "jarvis.execution.record.v1",
-        "progress_schema": "jarvis.execution.progress.v1",
-        "operations": [
-            "execution_handle.progress",
-            "pipeline.get_execution",
-            "pipeline.get_execution_progress",
-            "pipeline.run",
-        ],
-    }
-    jarvis_component = {
-        "distribution": "jarvis_cd",
-        "distribution_version": "1.3.12",
-        "install_spec": (
-            "https://github.com/grc-iit/jarvis-cd/releases/download/"
-            "v1.3.12/jarvis_cd-1.3.12-py3-none-any.whl"
-        ),
-        "requested_source": "github_release",
-        "artifact_filename": "jarvis_cd-1.3.12-py3-none-any.whl",
-        "artifact_sha256": "67541dde02e13842ab7a1581717a3577869f3d6ff7db4faf0238fd8c6319d3e3",
-        "native_execution": native_capability,
-    }
     report.resources = [
         ValidationResource(
             kind="relay_job",
@@ -2341,25 +2333,7 @@ def test_native_application_progress_gate_rejects_legacy_adapter_only_evidence()
             role="cluster_worker",
             cluster="ares",
             state="running",
-            metadata={
-                "components": {"jarvis-cd": "1.3.12"},
-                "component_artifacts": {"jarvis-cd": jarvis_component},
-                "component_runtime": {
-                    "jarvis-cd": {
-                        "verified": True,
-                        "artifact_sha256_verified": True,
-                        "provider_interpreter_verified": True,
-                        "execution_interpreter_verified": True,
-                        "execution_distribution_identity_verified": True,
-                        "execution_source_verified": True,
-                        "provider_native_execution_capability_verified": True,
-                        "execution_native_execution_capability_verified": True,
-                        "native_execution_capability_verified": True,
-                        "jarvis_executable_verified": True,
-                        "extra_runtime_evidence": "preserved",
-                    }
-                },
-            },
+            metadata=worker_metadata,
         ),
         ValidationResource(
             kind="package_progress_provider",
