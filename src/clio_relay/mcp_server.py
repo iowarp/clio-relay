@@ -888,10 +888,9 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                         "maximum": MAX_RESPONSE_PAGE_RECORDS,
                     },
                 },
-                "oneOf": [
-                    {"required": ["job_id"]},
-                    {"required": ["artifact_id"]},
-                ],
+                "if": {"required": ["job_id"]},
+                "then": {"not": {"required": ["artifact_id"]}},
+                "else": {"required": ["artifact_id"]},
                 "dependentRequired": {
                     "cluster": ["route_revision"],
                     "route_revision": ["cluster"],
@@ -1291,30 +1290,27 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                         "default": 2,
                     },
                 },
-                "oneOf": [
-                    {
-                        "required": ["binding"],
-                        "not": {
-                            "anyOf": [
-                                {"required": ["cluster"]},
-                                {"required": ["source_job_id"]},
-                                {"required": ["source_artifact_id"]},
-                                {"required": ["package_id"]},
-                                {"required": ["package_name"]},
-                            ]
-                        },
-                    },
-                    {
-                        "required": [
-                            "cluster",
-                            "source_job_id",
-                            "source_artifact_id",
-                            "package_id",
-                            "package_name",
-                        ],
-                        "not": {"required": ["binding"]},
-                    },
-                ],
+                "if": {"required": ["binding"]},
+                "then": {
+                    "not": {
+                        "anyOf": [
+                            {"required": ["cluster"]},
+                            {"required": ["source_job_id"]},
+                            {"required": ["source_artifact_id"]},
+                            {"required": ["package_id"]},
+                            {"required": ["package_name"]},
+                        ]
+                    }
+                },
+                "else": {
+                    "required": [
+                        "cluster",
+                        "source_job_id",
+                        "source_artifact_id",
+                        "package_id",
+                        "package_name",
+                    ]
+                },
                 "additionalProperties": False,
             },
             "outputSchema": {
