@@ -21,6 +21,7 @@ from clio_relay.models import (
     EndpointRegistration,
     EndpointRole,
     JobKind,
+    McpAdmissionClass,
     SchedulerPhase,
     SchedulerStatus,
 )
@@ -150,6 +151,24 @@ class LiveWorkerFleet:
 
     def start(self) -> LiveWorkerFleet:
         """Register three slots and start their real worker loops."""
+        self.queue.register_endpoint(
+            EndpointRegistration(
+                endpoint_id="test-supervisor",
+                role=EndpointRole.WORKER,
+                cluster=self.cluster,
+                hostname="test-host",
+                pid=10_000,
+                metadata={
+                    "worker_supervisor": True,
+                    "concurrency": 3,
+                    "workload_concurrency": 3,
+                    "control_query_concurrency": 0,
+                    "kind_concurrency": {"jarvis": 2},
+                    "scheduler_provider": "slurm",
+                    "process_containment": containment_capability(),
+                },
+            )
+        )
         for index in range(3):
             worker = EndpointWorker(
                 role=EndpointRole.WORKER,
@@ -166,11 +185,14 @@ class LiveWorkerFleet:
                 role=EndpointRole.WORKER,
                 cluster=self.cluster,
                 hostname="test-host",
-                pid=10_000 + index,
+                pid=10_000,
                 metadata={
                     "worker_slot": index,
                     "parent_endpoint_id": "test-supervisor",
                     "concurrency": 1,
+                    "workload_concurrency": 1,
+                    "control_query_concurrency": 0,
+                    "mcp_admission_class": McpAdmissionClass.WORKLOAD.value,
                     "kind_concurrency": {"jarvis": 2},
                     "scheduler_provider": "slurm",
                     "process_containment": containment_capability(),

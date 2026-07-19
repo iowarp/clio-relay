@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -9,9 +12,11 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from clio_relay.cluster_config import (
+    CLUSTER_REGISTRY_ENV,
     ClusterDefinition,
     ClusterRegistry,
     RemoteMcpServerConfig,
+    cluster_route_revision,
 )
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
@@ -32,6 +37,7 @@ from clio_relay.models import (
     McpAdmissionAuthority,
     McpAdmissionClass,
     McpCallSpec,
+    McpControlQueryEvidence,
     McpOperation,
     MonitorRule,
     RelayJob,
@@ -40,12 +46,44 @@ from clio_relay.models import (
     TaskTimelineEvent,
     utc_now,
 )
+from clio_relay.remote_mcp import (
+    cache_entry_from_discovery_artifact,
+    remote_mcp_registration_revision,
+    remote_mcp_server_artifact_digest,
+)
 from clio_relay.session_api import (
     OWNER_SESSION_ID_HEADER,
     SESSION_GENERATION_ID_HEADER,
     session_identity_document,
 )
+from clio_relay.spool import JobSpool
 from clio_relay.storage_runtime import StorageManagedQueue
+
+
+def _bind_owned_session_cluster_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    definition: ClusterDefinition | None = None,
+) -> ClusterDefinition:
+    """Bind one exact test cluster definition as owned-session process authority."""
+    bound_definition = definition or ClusterDefinition(
+        name="test-cluster",
+        ssh_host="test-cluster",
+    )
+    registry_path = tmp_path / "session-authority" / "clusters.json"
+    ClusterRegistry(clusters={bound_definition.name: bound_definition}).save(registry_path)
+    payload = registry_path.read_bytes()
+    monkeypatch.setenv(CLUSTER_REGISTRY_ENV, str(registry_path))
+    monkeypatch.setenv(
+        "CLIO_RELAY_SESSION_REGISTRY_SHA256",
+        hashlib.sha256(payload).hexdigest(),
+    )
+    monkeypatch.setenv(
+        "CLIO_RELAY_SESSION_ROUTE_REVISION",
+        cluster_route_revision(bound_definition),
+    )
+    return bound_definition
 
 
 def test_http_monitor_logs_and_artifact_content(tmp_path: Path) -> None:
@@ -854,7 +892,337 @@ def test_owned_session_api_fails_closed_without_cluster_or_owner_token(tmp_path:
         )
 
 
-def test_owned_session_identity_challenge_is_public_and_exact(tmp_path: Path) -> None:
+def test_owned_session_api_fails_closed_without_exact_process_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        owner_session_cluster="test-cluster",
+        session_owner_token="o" * 32,
+    )
+
+    with pytest.raises(ConfigurationError, match="process-bound cluster authority"):
+        create_app(settings)
+
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path)
+    monkeypatch.delenv("CLIO_RELAY_SESSION_ROUTE_REVISION")
+    with pytest.raises(ConfigurationError, match="must be configured together"):
+        create_app(settings)
+
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path)
+    monkeypatch.setenv(CLUSTER_REGISTRY_ENV, "")
+    with pytest.raises(ConfigurationError, match="path must not be blank"):
+        create_app(settings)
+
+
+def test_owned_session_api_rejects_invalid_or_ambiguous_process_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = ClusterDefinition(name="test-cluster", ssh_host="test-cluster")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        owner_session_cluster="test-cluster",
+        session_owner_token="o" * 32,
+    )
+
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path, definition=definition)
+    monkeypatch.setenv("CLIO_RELAY_SESSION_REGISTRY_SHA256", "invalid")
+    with pytest.raises(ConfigurationError, match="registry SHA-256 is invalid"):
+        create_app(settings)
+
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path, definition=definition)
+    monkeypatch.setenv("CLIO_RELAY_SESSION_ROUTE_REVISION", "invalid")
+    with pytest.raises(ConfigurationError, match="route revision is invalid"):
+        create_app(settings)
+
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path, definition=definition)
+    monkeypatch.setenv("CLIO_RELAY_SESSION_REGISTRY_SHA256", "f" * 64)
+    with pytest.raises(ConfigurationError, match="registry digest does not match"):
+        create_app(settings)
+
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path, definition=definition)
+    monkeypatch.setenv("CLIO_RELAY_SESSION_ROUTE_REVISION", "f" * 64)
+    with pytest.raises(ConfigurationError, match="route revision does not match"):
+        create_app(settings)
+
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path, definition=definition)
+    registry_path = Path(os.environ[CLUSTER_REGISTRY_ENV])
+    ClusterRegistry(
+        clusters={
+            "test-cluster": definition,
+            "other-cluster": ClusterDefinition(
+                name="other-cluster",
+                ssh_host="other-cluster",
+            ),
+        }
+    ).save(registry_path)
+    monkeypatch.setenv(
+        "CLIO_RELAY_SESSION_REGISTRY_SHA256",
+        hashlib.sha256(registry_path.read_bytes()).hexdigest(),
+    )
+    with pytest.raises(ConfigurationError, match="exactly the owner session cluster"):
+        create_app(settings)
+
+
+def test_normal_desktop_api_accepts_operator_registry_without_session_markers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registration = RemoteMcpServerConfig(
+        command="science-mcp",
+        args=["--stdio"],
+        allow_tools=["inspect"],
+        profiles=["user"],
+        call_timeout_seconds=30,
+    )
+    definition = ClusterDefinition(
+        name="alpha",
+        ssh_host="alpha-login",
+        remote_mcp_servers={"science": registration},
+    )
+    registry_path = tmp_path / "desktop-registry" / "clusters.json"
+    ClusterRegistry(clusters={"alpha": definition}).save(registry_path)
+    monkeypatch.setenv(CLUSTER_REGISTRY_ENV, str(registry_path))
+    monkeypatch.delenv("CLIO_RELAY_SESSION_REGISTRY_SHA256", raising=False)
+    monkeypatch.delenv("CLIO_RELAY_SESSION_ROUTE_REVISION", raising=False)
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    client = cast(Any, TestClient(create_app(settings)))
+
+    response = client.post(
+        "/jobs/mcp-call",
+        json={
+            "cluster": "alpha",
+            "server": registration.command,
+            "server_args": registration.args,
+            "operation": "tools/list",
+            "timeout_seconds": 30,
+            "idempotency_key": "desktop-science-discovery",
+        },
+    )
+
+    assert response.status_code == 200
+    job = queue.get_job(response.json()["job_id"])
+    assert isinstance(job.spec, McpCallSpec)
+    assert job.spec.admission_class is McpAdmissionClass.CONTROL_QUERY
+
+
+def test_owned_registered_mcp_call_uses_immutable_session_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registration = RemoteMcpServerConfig(
+        command="science-mcp",
+        args=["--stdio"],
+        env_from={"SCIENCE_TOKEN": "SITE_SCIENCE_TOKEN"},
+        allow_tools=["inspect"],
+        profiles=["user"],
+        call_timeout_seconds=30,
+        schema_cache_ttl_seconds=3600,
+    )
+    definition = ClusterDefinition(
+        name="alpha",
+        ssh_host="alpha-login",
+        remote_mcp_servers={"science": registration},
+    )
+    _bind_owned_session_cluster_authority(
+        monkeypatch,
+        tmp_path,
+        definition=definition,
+    )
+    registry_path = Path(os.environ[CLUSTER_REGISTRY_ENV])
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        owner_session_cluster="alpha",
+        session_owner_token="o" * 32,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    queue.prepare_owner_session_start(
+        "desktop-session-1",
+        recorded_generation_id=None,
+        candidate_generation_id="generation-1",
+    )
+    discovery = queue.submit_job(
+        RelayJob(
+            cluster="alpha",
+            kind=JobKind.MCP_CALL,
+            spec=McpCallSpec(
+                server=registration.command,
+                server_args=registration.args,
+                env_from=registration.env_from,
+                operation=McpOperation.TOOLS_LIST,
+                admission_class=McpAdmissionClass.CONTROL_QUERY,
+            ),
+            idempotency_key="owned-http-science-discovery",
+        )
+    )
+    server_artifact = {
+        "verified": True,
+        "server_process_artifact_verified": True,
+        "executable": {
+            "path": "/opt/science/bin/science-mcp",
+            "sha256": "a" * 64,
+        },
+    }
+    discovery_payload = json.dumps(
+        {
+            "server": registration.command,
+            "server_args": registration.args,
+            "env_from": registration.env_from,
+            "operation": "tools/list",
+            "tool": None,
+            "arguments": {},
+            "protocol_result": {
+                "tools": [
+                    {
+                        "name": "inspect",
+                        "description": "Inspect one scientific dataset.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                            "additionalProperties": False,
+                        },
+                        "annotations": {
+                            "readOnlyHint": True,
+                            "destructiveHint": False,
+                        },
+                    }
+                ]
+            },
+            "structured_result": None,
+            "protocol_version": "2024-11-05",
+            "server_info": {"name": "science", "version": "1.2.3"},
+            "server_artifact": server_artifact,
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "timed_out": False,
+            "protocol_error": None,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    spool = JobSpool(settings.spool_dir, discovery)
+    spool.initialize()
+    result_path = spool.path / "mcp-result.json"
+    result_path.write_bytes(discovery_payload)
+    artifact = queue.append_artifact(spool.artifact_for(result_path, kind="mcp_result"))
+    assert artifact.sha256 is not None
+    artifact_sha256 = artifact.sha256
+    discovery = queue.update_job_state(discovery.job_id, JobState.SUCCEEDED)
+    entry = cache_entry_from_discovery_artifact(
+        cluster="alpha",
+        server_name="science",
+        registration=registration,
+        discovery_job_id=discovery.job_id,
+        artifact_id=artifact.artifact_id,
+        artifact_sha256=artifact_sha256,
+        artifact_payload=discovery_payload,
+        discovered_at=discovery.updated_at,
+    )
+    server_digest = remote_mcp_server_artifact_digest(entry.provenance.server_artifact)
+    evidence = McpControlQueryEvidence(
+        cluster="alpha",
+        registered_server_name="science",
+        cluster_route_revision=cluster_route_revision(definition),
+        registration_revision=remote_mcp_registration_revision(registration),
+        discovery_job_id=discovery.job_id,
+        discovery_artifact_id=artifact.artifact_id,
+        discovery_artifact_sha256=artifact_sha256,
+        discovery_schema_digest=entry.schema_digest,
+        expected_server_artifact_digest=server_digest,
+    )
+    app = create_app(settings)
+    changed_definition = definition.model_copy(update={"ssh_host": "changed-login"})
+    ClusterRegistry(clusters={"alpha": changed_definition}).save(registry_path)
+    client = cast(
+        Any,
+        TestClient(
+            app,
+            headers={
+                "Authorization": "Bearer session-api-token",
+                OWNER_SESSION_ID_HEADER: "desktop-session-1",
+                SESSION_GENERATION_ID_HEADER: "generation-1",
+            },
+        ),
+    )
+    request = {
+        "cluster": "alpha",
+        "server": registration.command,
+        "server_args": registration.args,
+        "env_from": registration.env_from,
+        "expected_server_artifact_digest": server_digest,
+        "operation": "tools/call",
+        "tool": "inspect",
+        "arguments": {"path": "/datasets/example.bp"},
+        "control_query_evidence": evidence.model_dump(mode="json"),
+        "timeout_seconds": 30,
+        "idempotency_key": "owned-http-science-inspect",
+    }
+
+    accepted = client.post("/jobs/mcp-call", json=request)
+    assert accepted.status_code == 200
+    accepted_job = queue.get_job(accepted.json()["job_id"])
+    assert isinstance(accepted_job.spec, McpCallSpec)
+    assert accepted_job.spec.admission_class is McpAdmissionClass.CONTROL_QUERY
+    authority = McpAdmissionAuthority.model_validate(
+        accepted_job.metadata[MCP_ADMISSION_AUTHORITY_METADATA_KEY]
+    )
+    assert authority.source == "registered_discovery_artifact"
+    assert authority.evidence == evidence
+
+    route_drift = client.post(
+        "/jobs/mcp-call",
+        json={
+            **request,
+            "idempotency_key": "owned-http-science-route-drift",
+            "control_query_evidence": {
+                **evidence.model_dump(mode="json"),
+                "cluster_route_revision": cluster_route_revision(changed_definition),
+            },
+        },
+    )
+    assert route_drift.status_code == 409
+    assert "cluster route changed" in route_drift.json()["detail"]
+
+    registration_drift = client.post(
+        "/jobs/mcp-call",
+        json={
+            **request,
+            "idempotency_key": "owned-http-science-registration-drift",
+            "control_query_evidence": {
+                **evidence.model_dump(mode="json"),
+                "registration_revision": "f" * 64,
+            },
+        },
+    )
+    assert registration_drift.status_code == 409
+    assert "registered MCP server changed" in registration_drift.json()["detail"]
+
+    with pytest.raises(ConfigurationError, match="registry digest does not match"):
+        create_app(settings)
+
+
+def test_owned_session_identity_challenge_is_public_and_exact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path)
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
@@ -882,7 +1250,9 @@ def test_owned_session_identity_challenge_is_public_and_exact(tmp_path: Path) ->
 
 def test_owned_session_api_stamps_jobs_and_gateways_with_server_ownership(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path)
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
@@ -961,7 +1331,9 @@ def test_owned_session_api_stamps_jobs_and_gateways_with_server_ownership(
 
 def test_session_job_submission_rejects_missing_stale_and_unbound_identity(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path)
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
@@ -1038,6 +1410,9 @@ def test_session_job_submission_rejects_missing_stale_and_unbound_identity(
     assert queue.list_jobs() == []
     assert queue.list_gateway_sessions() == []
 
+    monkeypatch.delenv(CLUSTER_REGISTRY_ENV)
+    monkeypatch.delenv("CLIO_RELAY_SESSION_REGISTRY_SHA256")
+    monkeypatch.delenv("CLIO_RELAY_SESSION_ROUTE_REVISION")
     unbound_settings = RelaySettings(
         core_dir=tmp_path / "unbound-core",
         spool_dir=tmp_path / "unbound-spool",
@@ -1060,6 +1435,7 @@ def test_owned_jarvis_mcp_submission_forwards_desktop_binding_without_remote_cac
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path)
     expected_digest = "a" * 64
     settings = RelaySettings(
         core_dir=tmp_path / "core",
@@ -1222,6 +1598,7 @@ def test_owned_session_submission_race_with_quiesce_returns_conflict(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path)
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
@@ -1272,7 +1649,11 @@ def test_owned_session_submission_race_with_quiesce_returns_conflict(
     assert queue.list_jobs() == []
 
 
-def test_owned_session_api_cannot_take_over_or_close_other_gateways(tmp_path: Path) -> None:
+def test_owned_session_api_cannot_take_over_or_close_other_gateways(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path)
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
@@ -1367,7 +1748,9 @@ def test_owned_session_api_cannot_take_over_or_close_other_gateways(tmp_path: Pa
 
 def test_owned_session_api_filters_jobs_redacts_capabilities_and_quiesces_intake(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path)
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",

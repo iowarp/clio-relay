@@ -5,11 +5,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import secrets
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated, TypeVar, cast
 
 from fastapi import (
@@ -24,9 +27,17 @@ from fastapi import (
     status,
 )
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from clio_relay.cluster_config import ClusterRegistry, default_registry_path
+from clio_relay.cluster_config import (
+    CLUSTER_REGISTRY_ENV,
+    MAX_CLUSTER_REGISTRY_BYTES,
+    ClusterDefinition,
+    ClusterRegistry,
+    cluster_route_revision,
+    default_registry_path,
+    read_bounded_configuration_bytes,
+)
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError
@@ -645,6 +656,83 @@ class GatewaySessionUpdateRequest(BaseModel):
     _metadata_is_not_runtime_owned = field_validator("metadata")(_validate_generic_gateway_metadata)
 
 
+_SESSION_REGISTRY_SHA256_ENV = "CLIO_RELAY_SESSION_REGISTRY_SHA256"
+_SESSION_ROUTE_REVISION_ENV = "CLIO_RELAY_SESSION_ROUTE_REVISION"
+
+
+def _bound_owner_session_cluster_definition(
+    *, owner_session_id: str | None, owner_session_cluster: str | None
+) -> ClusterDefinition | None:
+    """Load one immutable process-bound cluster authority for an owned API."""
+    raw_bindings = {
+        CLUSTER_REGISTRY_ENV: os.getenv(CLUSTER_REGISTRY_ENV),
+        _SESSION_REGISTRY_SHA256_ENV: os.getenv(_SESSION_REGISTRY_SHA256_ENV),
+        _SESSION_ROUTE_REVISION_ENV: os.getenv(_SESSION_ROUTE_REVISION_ENV),
+    }
+    session_bindings = {
+        _SESSION_REGISTRY_SHA256_ENV,
+        _SESSION_ROUTE_REVISION_ENV,
+    }
+    configured_session_bindings = {
+        name for name in session_bindings if raw_bindings[name] is not None
+    }
+    if not configured_session_bindings:
+        if owner_session_id is not None:
+            raise ConfigurationError(
+                "owned relay session API requires process-bound cluster authority"
+            )
+        return None
+    configured = {name for name, value in raw_bindings.items() if value is not None}
+    if configured_session_bindings != session_bindings or configured != set(raw_bindings):
+        raise ConfigurationError(
+            "owned session cluster authority path, digest, and route revision must be configured "
+            "together"
+        )
+    if owner_session_id is None or owner_session_cluster is None:
+        raise ConfigurationError("session cluster authority requires an owned relay session")
+    registry_path_raw = raw_bindings[CLUSTER_REGISTRY_ENV]
+    if not registry_path_raw:
+        raise ConfigurationError("owned session cluster registry path must not be blank")
+    registry_sha256 = raw_bindings[_SESSION_REGISTRY_SHA256_ENV]
+    route_revision = raw_bindings[_SESSION_ROUTE_REVISION_ENV]
+    if (
+        not registry_sha256
+        or len(registry_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in registry_sha256)
+    ):
+        raise ConfigurationError("owned session cluster registry SHA-256 is invalid")
+    if (
+        not route_revision
+        or len(route_revision) != 64
+        or any(character not in "0123456789abcdef" for character in route_revision)
+    ):
+        raise ConfigurationError("owned session cluster route revision is invalid")
+    registry_path = Path(registry_path_raw).expanduser()
+    if not registry_path.is_absolute():
+        raise ConfigurationError("owned session cluster registry path must be absolute")
+    try:
+        payload = read_bounded_configuration_bytes(
+            registry_path,
+            max_bytes=MAX_CLUSTER_REGISTRY_BYTES,
+        )
+    except (ConfigurationError, OSError) as exc:
+        raise ConfigurationError("owned session cluster registry is unavailable") from exc
+    if not secrets.compare_digest(hashlib.sha256(payload).hexdigest(), registry_sha256):
+        raise ConfigurationError("owned session cluster registry digest does not match")
+    try:
+        registry = ClusterRegistry.model_validate_json(payload)
+    except ValidationError as exc:
+        raise ConfigurationError("owned session cluster registry is invalid") from exc
+    if set(registry.clusters) != {owner_session_cluster}:
+        raise ConfigurationError(
+            "owned session cluster registry must contain exactly the owner session cluster"
+        )
+    definition = registry.require(owner_session_cluster)
+    if not secrets.compare_digest(cluster_route_revision(definition), route_revision):
+        raise ConfigurationError("owned session cluster route revision does not match")
+    return definition
+
+
 def create_app(settings: RelaySettings | None = None) -> FastAPI:
     """Create the FastAPI relay surface."""
     resolved = settings or RelaySettings.from_env()
@@ -664,6 +752,10 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             )
         if not resolved.api_token:
             raise ConfigurationError("owned relay session API requires CLIO_RELAY_API_TOKEN")
+    owner_session_cluster_definition = _bound_owner_session_cluster_definition(
+        owner_session_id=resolved.owner_session_id,
+        owner_session_cluster=owner_session_cluster,
+    )
     queue = storage_managed_queue(resolved)
     queue.initialize()
 
@@ -918,9 +1010,13 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         registry_path = default_registry_path()
         try:
             definition = (
-                ClusterRegistry.load(registry_path).clusters.get(request.cluster)
-                if registry_path.exists()
-                else None
+                owner_session_cluster_definition
+                if owner_session_cluster_definition is not None
+                else (
+                    ClusterRegistry.load(registry_path).clusters.get(request.cluster)
+                    if registry_path.exists()
+                    else None
+                )
             )
             admission_class, admission_authority = resolve_registered_remote_mcp_admission(
                 queue=queue,

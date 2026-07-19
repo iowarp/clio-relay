@@ -5112,17 +5112,12 @@ def test_cli_validate_catalog_waits_and_projects_automatic_assertion(
             Path(remote_mcp.__file__).with_name("_contracts") / "scientific-catalog-user-v1.1.json"
         ).read_text(encoding="utf-8")
     )
-    refreshed_at = datetime.now(UTC)
-    discovery_entry = _entry(
+    discovery_entry = _persist_discovery_entry(
+        tmp_path,
         registration,
         cluster="alpha",
         server_name="scientific-catalog",
         tools=cast(list[dict[str, object]], contract_artifact["tools"]),
-    ).model_copy(
-        update={
-            "discovered_at": refreshed_at,
-            "expires_at": refreshed_at + timedelta(hours=1),
-        }
     )
     RemoteMcpSchemaCache.update_entry(
         tmp_path / ".clio-relay" / "remote-mcp-cache.json",
@@ -6050,6 +6045,55 @@ def _entry(
         artifact_sha256=hashlib.sha256(artifact_payload).hexdigest(),
         artifact_payload=artifact_payload,
         discovered_at=NOW,
+    )
+
+
+def _persist_discovery_entry(
+    root: Path,
+    registration: RemoteMcpServerConfig,
+    *,
+    cluster: str,
+    server_name: str,
+    tools: list[dict[str, object]],
+) -> RemoteMcpSchemaCacheEntry:
+    """Persist one production-shaped discovery job, artifact, and cache entry."""
+    queue = ClioCoreQueue(root / "core")
+    discovery = queue.submit_job(
+        RelayJob(
+            cluster=cluster,
+            kind=JobKind.MCP_CALL,
+            spec=McpCallSpec(
+                server=registration.command,
+                server_args=registration.args,
+                env_from=registration.env_from,
+                operation=McpOperation.TOOLS_LIST,
+                admission_class=McpAdmissionClass.CONTROL_QUERY,
+                timeout_seconds=registration.call_timeout_seconds,
+            ),
+            idempotency_key=f"discovery:{cluster}:{server_name}",
+        )
+    )
+    payload = _discovery_artifact(registration, tools=tools)
+    spool = JobSpool(root / "spool", discovery)
+    spool.initialize()
+    result_path = spool.path / "mcp-result.json"
+    result_path.write_bytes(payload)
+    artifact = queue.append_artifact(spool.artifact_for(result_path, kind="mcp_result"))
+    assert artifact.sha256 is not None
+    discovery = queue.update_job_state(
+        discovery.job_id,
+        JobState.SUCCEEDED,
+        message="discovery complete",
+    )
+    return cache_entry_from_discovery_artifact(
+        cluster=cluster,
+        server_name=server_name,
+        registration=registration,
+        discovery_job_id=discovery.job_id,
+        artifact_id=artifact.artifact_id,
+        artifact_sha256=artifact.sha256,
+        artifact_payload=payload,
+        discovered_at=discovery.updated_at,
     )
 
 

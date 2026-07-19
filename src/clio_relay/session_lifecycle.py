@@ -13,7 +13,12 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.cluster_config import (
+    MAX_CLUSTER_REGISTRY_BYTES,
+    ClusterDefinition,
+    ClusterRegistry,
+    cluster_route_revision,
+)
 from clio_relay.errors import RelayError
 from clio_relay.identifiers import DurableRecordId, validate_durable_record_id
 from clio_relay.remote_cli import remote_env
@@ -853,6 +858,9 @@ def _start_script(
     expected_release_sha256 = (
         expected_api_release_identity.sha256() if expected_api_release_identity is not None else ""
     )
+    cluster_registry_json, cluster_registry_sha256, route_revision = (
+        _session_cluster_registry_authority(cluster=cluster, definition=definition)
+    )
     return f"""set -euo pipefail
 umask 077
 {remote_env(definition)}
@@ -867,6 +875,8 @@ log_file="$session_dir/api.log"
 metadata_file="$session_dir/metadata.json"
 expected_api_release_identity_json={_shell_single_quote(expected_release_json)}
 expected_api_release_identity_sha256={shlex.quote(expected_release_sha256)}
+cluster_registry_sha256={shlex.quote(cluster_registry_sha256)}
+cluster_route_revision={shlex.quote(route_revision)}
 api_release_identity_json="$(python3 - \
   "$expected_api_release_identity_json" "$expected_api_release_identity_sha256" \
   <<'__CLIO_RELAY_CURRENT_API_RELEASE__'
@@ -1027,13 +1037,21 @@ if [ -n "$existing_owned_pid" ] && [ "{replace_flag}" != "1" ]; then
   python3 - \
     "$metadata_file" "$existing_owned_pid" \
     "$expected_api_release_identity_json" "$expected_api_release_identity_sha256" \
+    "$cluster_registry_sha256" "$cluster_route_revision" \
     <<'__CLIO_RELAY_EXISTING_API_RELEASE__'
 import hashlib
 import json
 import sys
 from pathlib import Path
 
-metadata_path, pid, expected_json, expected_sha256 = sys.argv[1:]
+(
+    metadata_path,
+    pid,
+    expected_json,
+    expected_sha256,
+    expected_registry_sha256,
+    expected_route_revision,
+) = sys.argv[1:]
 metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
 expected_identity = json.loads(expected_json)
 observed_identity = metadata.get("api_release_identity")
@@ -1055,6 +1073,35 @@ marker = f"CLIO_RELAY_API_RELEASE_IDENTITY_SHA256={{observed_sha256}}".encode()
 if marker not in environment:
     raise SystemExit(
         "existing owned session API release identity is not process-bound; use --replace"
+    )
+registry_path = metadata.get("cluster_registry_path")
+observed_registry_sha256 = metadata.get("cluster_registry_sha256")
+observed_route_revision = metadata.get("cluster_route_revision")
+cluster_authority_verified = metadata.get("cluster_authority_verified")
+if (
+    not isinstance(registry_path, str)
+    or not registry_path
+    or observed_registry_sha256 != expected_registry_sha256
+    or observed_route_revision != expected_route_revision
+    or cluster_authority_verified is not True
+):
+    raise SystemExit("existing owned session API cluster authority differs; use --replace")
+try:
+    registry_bytes = Path(registry_path).read_bytes()
+except OSError as exc:
+    raise SystemExit(f"cannot verify existing session API cluster authority: {{exc}}") from exc
+if (
+    hashlib.sha256(registry_bytes).hexdigest() != expected_registry_sha256
+):
+    raise SystemExit("existing owned session API cluster authority differs; use --replace")
+authority_markers = (
+    f"CLIO_RELAY_CLUSTER_REGISTRY={{registry_path}}".encode(),
+    f"CLIO_RELAY_SESSION_REGISTRY_SHA256={{expected_registry_sha256}}".encode(),
+    f"CLIO_RELAY_SESSION_ROUTE_REVISION={{expected_route_revision}}".encode(),
+)
+if any(authority_marker not in environment for authority_marker in authority_markers):
+    raise SystemExit(
+        "existing owned session API cluster authority is not process-bound; use --replace"
     )
 __CLIO_RELAY_EXISTING_API_RELEASE__
 fi
@@ -1149,36 +1196,65 @@ else
   echo "remote API port is already occupied: {remote_api_port}" >&2
   exit 1
 fi
+cluster_registry_file="$session_dir/cluster-registry-$session_generation_id.json"
+cluster_registry_candidate="$cluster_registry_file.$$.tmp"
+trap 'rm -f "$cluster_registry_candidate" "$cluster_registry_file"' EXIT
+printf '%s' {_shell_single_quote(cluster_registry_json)} > "$cluster_registry_candidate"
+python3 - \
+  "$cluster_registry_candidate" "$cluster_registry_file" "$cluster_registry_sha256" \
+  <<'__CLIO_RELAY_CLUSTER_REGISTRY__'
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+candidate = Path(sys.argv[1])
+path = Path(sys.argv[2])
+expected_sha256 = sys.argv[3]
+payload = candidate.read_bytes()
+if hashlib.sha256(payload).hexdigest() != expected_sha256:
+    raise SystemExit("session cluster registry digest does not match its payload")
+try:
+    with candidate.open("rb") as handle:
+        os.fsync(handle.fileno())
+    os.chmod(candidate, 0o600)
+    os.replace(candidate, path)
+finally:
+    candidate.unlink(missing_ok=True)
+__CLIO_RELAY_CLUSTER_REGISTRY__
 api_command=(clio-relay api start --host 127.0.0.1 --port {remote_api_port}{require_token})
 owner_token="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 api_pid=""
 start_complete=0
 cleanup_incomplete_start() {{
-  if [ "$start_complete" = "1" ] || [ -z "$api_pid" ]; then return; fi
-  kill -- "-$api_pid" 2>/dev/null || kill "$api_pid" 2>/dev/null || true
-  for _ in 1 2 3 4 5; do
-    if ! kill -0 -- "-$api_pid" 2>/dev/null; then break; fi
-    sleep 0.2
-  done
-  if kill -0 -- "-$api_pid" 2>/dev/null; then
-    kill -9 -- "-$api_pid" 2>/dev/null || kill -9 "$api_pid" 2>/dev/null || true
-  fi
-  for _ in 1 2 3 4 5; do
-    if ! kill -0 -- "-$api_pid" 2>/dev/null; then break; fi
-    sleep 0.1
-  done
-  if kill -0 -- "-$api_pid" 2>/dev/null; then
-    echo "incomplete session API process group cleanup: $api_pid" >&2
-    return 1
+  if [ "$start_complete" = "1" ]; then return; fi
+  if [ -n "$api_pid" ]; then
+    kill -- "-$api_pid" 2>/dev/null || kill "$api_pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      if ! kill -0 -- "-$api_pid" 2>/dev/null; then break; fi
+      sleep 0.2
+    done
+    if kill -0 -- "-$api_pid" 2>/dev/null; then
+      kill -9 -- "-$api_pid" 2>/dev/null || kill -9 "$api_pid" 2>/dev/null || true
+    fi
+    for _ in 1 2 3 4 5; do
+      if ! kill -0 -- "-$api_pid" 2>/dev/null; then break; fi
+      sleep 0.1
+    done
+    if kill -0 -- "-$api_pid" 2>/dev/null; then
+      echo "incomplete session API process group cleanup: $api_pid" >&2
+      return 1
+    fi
   fi
   python3 - \
     "$metadata_file" "$pid_file" "$api_pid" "$session_generation_id" \
+    "$cluster_registry_file" \
     <<'__CLIO_RELAY_ROLLBACK_METADATA__'
 import json
 import sys
 from pathlib import Path
 
-metadata_path, pid_path, pid_raw, generation_id = sys.argv[1:]
+metadata_path, pid_path, pid_raw, generation_id, registry_path = sys.argv[1:]
 metadata_file = Path(metadata_path)
 pid_file = Path(pid_path)
 try:
@@ -1197,6 +1273,7 @@ except OSError:
     recorded_pid = None
 if recorded_pid == pid_raw:
     pid_file.unlink(missing_ok=True)
+Path(registry_path).unlink(missing_ok=True)
 __CLIO_RELAY_ROLLBACK_METADATA__
 }}
 trap cleanup_incomplete_start EXIT
@@ -1204,6 +1281,9 @@ nohup setsid env \\
   "CLIO_RELAY_SESSION_OWNER_TOKEN=$owner_token" \\
   "CLIO_RELAY_SESSION_GENERATION_ID=$session_generation_id" \\
   "CLIO_RELAY_API_RELEASE_IDENTITY_SHA256=$expected_api_release_identity_sha256" \\
+  "CLIO_RELAY_CLUSTER_REGISTRY=$cluster_registry_file" \\
+  "CLIO_RELAY_SESSION_REGISTRY_SHA256=$cluster_registry_sha256" \\
+  "CLIO_RELAY_SESSION_ROUTE_REVISION=$cluster_route_revision" \\
   "CLIO_RELAY_OWNER_SESSION_ID=$session_id" \\
   "CLIO_RELAY_OWNER_SESSION_CLUSTER={shlex.quote(cluster)}" \\
   "${{api_command[@]}}" \\
@@ -1213,6 +1293,7 @@ echo "$api_pid" > "$pid_file"
 python3 - \
   "$metadata_file" "$api_pid" "$owner_token" "$session_generation_id" \
   "$api_release_identity_json" "$expected_api_release_identity_sha256" \
+  "$cluster_registry_file" "$cluster_registry_sha256" "$cluster_route_revision" \
   <<'__CLIO_RELAY_METADATA__'
 import json
 import os
@@ -1225,6 +1306,9 @@ owner_token = sys.argv[3]
 session_generation_id = sys.argv[4]
 api_release_identity = json.loads(sys.argv[5])
 api_release_identity_sha256 = sys.argv[6]
+cluster_registry_path = sys.argv[7]
+cluster_registry_sha256 = sys.argv[8]
+cluster_route_revision = sys.argv[9]
 for _ in range(40):
     try:
         api_pgid = os.getpgid(api_pid)
@@ -1239,6 +1323,11 @@ for _ in range(40):
         and f"CLIO_RELAY_SESSION_GENERATION_ID={{session_generation_id}}".encode()
         in environment
         and f"CLIO_RELAY_API_RELEASE_IDENTITY_SHA256={{api_release_identity_sha256}}".encode()
+        in environment
+        and f"CLIO_RELAY_CLUSTER_REGISTRY={{cluster_registry_path}}".encode() in environment
+        and f"CLIO_RELAY_SESSION_REGISTRY_SHA256={{cluster_registry_sha256}}".encode()
+        in environment
+        and f"CLIO_RELAY_SESSION_ROUTE_REVISION={{cluster_route_revision}}".encode()
         in environment
     ):
         break
@@ -1257,6 +1346,10 @@ metadata = {{
     "session_generation_id": session_generation_id,
     "api_release_identity": api_release_identity,
     "api_release_identity_sha256": api_release_identity_sha256,
+    "cluster_registry_path": cluster_registry_path,
+    "cluster_registry_sha256": cluster_registry_sha256,
+    "cluster_route_revision": cluster_route_revision,
+    "cluster_authority_verified": True,
     "process_start_ticks": process_start_ticks,
     "started_at": datetime.now(timezone.utc).isoformat(),
     "owner": "clio-relay",
@@ -1320,6 +1413,31 @@ echo "session_generation_id=$session_generation_id"
 echo "remote_api_port={remote_api_port}"
 echo "metadata=$metadata_file"
 """
+
+
+def _session_cluster_registry_authority(
+    *, cluster: str, definition: ClusterDefinition
+) -> tuple[str, str, str]:
+    """Return the exact registry payload and identities owned by one session API."""
+    if definition.name != cluster:
+        raise RelayError("session cluster does not match its cluster definition")
+    registry = ClusterRegistry(clusters={cluster: definition})
+    payload = json.dumps(
+        registry.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    encoded_payload = payload.encode("utf-8")
+    if len(encoded_payload) > MAX_CLUSTER_REGISTRY_BYTES:
+        raise RelayError(
+            "session cluster registry exceeds the "
+            f"{MAX_CLUSTER_REGISTRY_BYTES}-byte configuration limit"
+        )
+    return (
+        payload,
+        hashlib.sha256(encoded_payload).hexdigest(),
+        cluster_route_revision(definition),
+    )
 
 
 def _status_script(*, session_id: str) -> str:  # pyright: ignore[reportUnusedFunction]

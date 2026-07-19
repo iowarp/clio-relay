@@ -12,6 +12,12 @@ from typer.testing import CliRunner
 
 import clio_relay.core_queue as core_queue_module
 from clio_relay.cli import app
+from clio_relay.cluster_config import (
+    CLUSTER_REGISTRY_ENV,
+    ClusterDefinition,
+    ClusterRegistry,
+    cluster_route_revision,
+)
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
@@ -46,6 +52,26 @@ def _job(
     if job_id is not None:
         values["job_id"] = job_id
     return RelayJob.model_validate(values)
+
+
+def _bind_owned_session_cluster_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Bind the exact test cluster definition to an owned API process."""
+    definition = ClusterDefinition(name="test-cluster", ssh_host="test-cluster")
+    registry_path = tmp_path / "session-authority" / "clusters.json"
+    ClusterRegistry(clusters={definition.name: definition}).save(registry_path)
+    payload = registry_path.read_bytes()
+    monkeypatch.setenv(CLUSTER_REGISTRY_ENV, str(registry_path))
+    monkeypatch.setenv(
+        "CLIO_RELAY_SESSION_REGISTRY_SHA256",
+        hashlib.sha256(payload).hexdigest(),
+    )
+    monkeypatch.setenv(
+        "CLIO_RELAY_SESSION_ROUTE_REVISION",
+        cluster_route_revision(definition),
+    )
 
 
 def _producer_artifact(queue: ClioCoreQueue) -> tuple[RelayJob, ArtifactRef]:
@@ -170,7 +196,9 @@ def test_core_rejects_cross_session_artifact_use_before_idempotency_reservation(
 
 def test_owned_http_submission_rejects_other_session_artifact(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path)
     core_dir = tmp_path / "core"
     queue = ClioCoreQueue(core_dir)
     for session_id, generation_id in (
