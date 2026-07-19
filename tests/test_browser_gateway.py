@@ -7,7 +7,7 @@ import socket
 import threading
 import time
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -231,6 +231,49 @@ def test_browser_gateway_preflight_methods_stream_and_command_are_narrow(
                 ("POST", "/commands", b'{"operation":"render"}'),
                 ("GET", "/events", b""),
             ]
+
+
+def test_browser_gateway_extends_response_header_timeout_only_for_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Long commands outlive connect timeout while ordinary reads remain bounded."""
+    monkeypatch.setattr(browser_gateway_module, "UPSTREAM_CONNECT_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(
+        browser_gateway_module,
+        "UPSTREAM_COMMAND_RESPONSE_TIMEOUT_SECONDS",
+        0.75,
+        raising=False,
+    )
+    with _delayed_response_backend(delay_seconds=0.25) as (backend_port, requests):
+        capability = "d" * 43
+        with _capability_proxy(
+            backend_port=backend_port,
+            capability=capability,
+            revocation_path=tmp_path / "revoked-delayed-command",
+        ) as proxy_port:
+            query = urlencode({"capability": capability})
+            command = httpx.post(
+                f"http://127.0.0.1:{proxy_port}/commands?{query}",
+                headers={"Origin": "null", "Content-Type": "application/json"},
+                content=b'{"operation":"measure-field"}',
+                timeout=2.0,
+            )
+            assert command.status_code == 200
+            assert command.json() == {"accepted": True}
+
+            state = httpx.get(
+                f"http://127.0.0.1:{proxy_port}/state?{query}",
+                headers={"Origin": "null"},
+                timeout=2.0,
+            )
+            assert state.status_code == 502
+            assert state.json() == {"error": "upstream service is unavailable"}
+
+        assert requests == [
+            ("POST", "/commands", b'{"operation":"measure-field"}'),
+            ("GET", "/state", b""),
+        ]
 
 
 def test_browser_gateway_closes_ended_sse_and_reconnects_to_latest_revision(
@@ -628,6 +671,46 @@ def _backend_server() -> Generator[tuple[int, list[tuple[str, str, bytes]]]]:
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            del format, args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), BackendHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield int(server.server_address[1]), requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@contextmanager
+def _delayed_response_backend(
+    *, delay_seconds: float
+) -> Generator[tuple[int, list[tuple[str, str, bytes]]]]:
+    requests: list[tuple[str, str, bytes]] = []
+
+    class BackendHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            requests.append(("GET", self.path, b""))
+            self._delayed_response(b'{"revision":1}')
+
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            requests.append(("POST", self.path, body))
+            self._delayed_response(b'{"accepted":true}')
+
+        def _delayed_response(self, payload: bytes) -> None:
+            threading.Event().wait(delay_seconds)
+            with suppress(BrokenPipeError, ConnectionResetError, OSError):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
 
         def log_message(self, format: str, *args: Any) -> None:
             del format, args
