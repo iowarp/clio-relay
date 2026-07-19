@@ -44,6 +44,7 @@ from clio_relay.models import (
     RelayJob,
     RelayTask,
     RemoteAgentTaskSpec,
+    deterministic_jarvis_execution_id,
     utc_now,
 )
 from clio_relay.remote_mcp import (
@@ -3095,9 +3096,15 @@ def test_mcp_virtual_jarvis_run_forwards_spack_specs(
     assert isinstance(job.spec, McpCallSpec)
     assert job.spec.tool == "jarvis_run"
     assert job.spec.env_from == {"JARVIS_MCP_SPACK_COMMAND": "JARVIS_MCP_SPACK_COMMAND"}
+    execution_id = deterministic_jarvis_execution_id(
+        cluster=job.cluster,
+        idempotency_key=job.idempotency_key,
+        job_id=job.job_id,
+    )
     assert job.spec.arguments == {
         "pipeline_id": "example",
         "spack_specs": ["lammps@2024.08.29"],
+        "execution_id": execution_id,
     }
 
 

@@ -13,7 +13,7 @@ from clio_relay.jarvis_mcp import (
     jarvis_user_contract,
 )
 from clio_relay.mcp_stdio_validation import run_packaged_mcp_stdio_session
-from clio_relay.models import McpCallSpec
+from clio_relay.models import McpCallSpec, deterministic_jarvis_execution_id
 from clio_relay.remote_mcp import (
     RemoteMcpDiscoveryProvenance,
     RemoteMcpSchemaCache,
@@ -86,6 +86,14 @@ def test_packaged_stdio_session_initializes_lists_and_calls_virtual_jarvis(
         server_artifact
     )
     assert job.spec.tool == "jarvis_run"
-    assert job.spec.arguments == {"pipeline_id": "stdio-acceptance"}
+    execution_id = deterministic_jarvis_execution_id(
+        cluster=job.cluster,
+        idempotency_key=job.idempotency_key,
+        job_id=job.job_id,
+    )
+    assert job.spec.arguments == {
+        "pipeline_id": "stdio-acceptance",
+        "execution_id": execution_id,
+    }
     assert session.evidence()["boundary"] == "packaged_clio_relay_mcp_server_stdio"
     assert session.transcript_sha256

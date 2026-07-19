@@ -922,8 +922,8 @@ def test_retry_exhausted_hard_crash_cleans_sidecars_without_requeue(tmp_path: Pa
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     recovered = queue.recover_stale_jobs(cluster="ares", max_attempts=1)
-    assert [job.job_id for job in recovered] == [job_id]
-    assert queue.get_job(job_id).state is JobState.FAILED
+    assert recovered == []
+    assert queue.get_job(job_id).state is JobState.RUNNING
 
     endpoint = EndpointWorker(
         role=EndpointRole.WORKER,
@@ -933,6 +933,9 @@ def test_retry_exhausted_hard_crash_cleans_sidecars_without_requeue(tmp_path: Pa
     )
     cast(Any, endpoint)._reconcile_pending_execution_cleanup()
 
+    assert queue.get_job(job_id).state is JobState.RUNNING
+    recovered = queue.recover_stale_jobs(cluster="ares", max_attempts=1)
+    assert [job.job_id for job in recovered] == [job_id]
     assert queue.get_job(job_id).state is JobState.FAILED
     assert queue.get_task(task_id).state is JobState.FAILED
     pending, truncated = queue.scan_execution_cleanup(cluster="ares", limit=10)
@@ -2970,7 +2973,8 @@ def test_virtual_jarvis_progress_is_visible_while_outer_job_is_running(
     monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
-    digest = "a" * 64
+    server_artifact = verified_jarvis_server_artifact()
+    digest = remote_mcp_server_artifact_digest(server_artifact)
     job = queue.submit_job(
         RelayJob(
             cluster="research-cluster",
@@ -2988,6 +2992,7 @@ def test_virtual_jarvis_progress_is_visible_while_outer_job_is_running(
             idempotency_key="virtual-jarvis-live-progress",
         )
     )
+    execution_id = cast(str, cast(McpCallSpec, job.spec).arguments["execution_id"])
     observed_running_progress: list[list[bool]] = []
 
     class LiveMcpProgressProvider(RecordingProvider):
@@ -3005,8 +3010,9 @@ def test_virtual_jarvis_progress_is_visible_while_outer_job_is_running(
             timeout_seconds: int | None = None,
             on_timeout: Callable[[], None] | None = None,
         ) -> subprocess.CompletedProcess[str]:
-            del pipeline_path, cwd, on_stdout, on_stderr, should_cancel
+            del pipeline_path, on_stdout, on_stderr, should_cancel
             del timeout_seconds, on_timeout
+            assert cwd is not None
             assert env is not None
             assert on_poll is not None
             if on_start is not None:
@@ -3016,6 +3022,7 @@ def test_virtual_jarvis_progress_is_visible_while_outer_job_is_running(
             initial = _virtual_mcp_progress_record(
                 digest=digest,
                 execution_validated=False,
+                execution_id=execution_id,
             )
             progress_path.write_text(
                 json.dumps(_signed_progress_sidecar_record(initial, key=token)) + "\n",
@@ -3032,12 +3039,20 @@ def test_virtual_jarvis_progress_is_visible_while_outer_job_is_running(
             final = _virtual_mcp_progress_record(
                 digest=digest,
                 execution_validated=True,
+                execution_id=execution_id,
             )
             with progress_path.open("a", encoding="utf-8") as stream:
                 stream.write(
                     json.dumps(_signed_progress_sidecar_record(final, key=token, sequence=2)) + "\n"
                 )
             on_poll()
+            _write_completed_jarvis_mcp_result(
+                cwd,
+                job=job,
+                command=command,
+                digest=digest,
+                server_artifact=server_artifact,
+            )
             return subprocess.CompletedProcess(["jarvis"], 0, "", "")
 
     worker = EndpointWorker(
@@ -3056,7 +3071,7 @@ def test_virtual_jarvis_progress_is_visible_while_outer_job_is_running(
     assert observed_running_progress == [[False]]
     assert [item.metadata["acceptance_validated"] for item in progress] == [False, True]
     assert all(item.metadata["provider_validated"] is True for item in progress)
-    assert progress[-1].metadata["provider_execution_id"] == "jarvis-execution-live"
+    assert progress[-1].metadata["provider_execution_id"] == execution_id
     assert progress[-1].metadata["provider_server_artifact_digest"] == digest
     assert progress[-1].metadata["provider_source_authority"] == "mcp_progress_notification"
 
@@ -3070,7 +3085,8 @@ def test_virtual_jarvis_progress_rejects_provider_identity_mismatch(
     monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
-    digest = "b" * 64
+    server_artifact = verified_jarvis_server_artifact()
+    digest = remote_mcp_server_artifact_digest(server_artifact)
     job = queue.submit_job(
         RelayJob(
             cluster="research-cluster",
@@ -3088,6 +3104,7 @@ def test_virtual_jarvis_progress_rejects_provider_identity_mismatch(
             idempotency_key="virtual-jarvis-provider-mismatch",
         )
     )
+    execution_id = cast(str, cast(McpCallSpec, job.spec).arguments["execution_id"])
 
     class MismatchedMcpProgressProvider(RecordingProvider):
         def run_pipeline_streaming(
@@ -3104,12 +3121,16 @@ def test_virtual_jarvis_progress_rejects_provider_identity_mismatch(
             timeout_seconds: int | None = None,
             on_timeout: Callable[[], None] | None = None,
         ) -> subprocess.CompletedProcess[str]:
-            del pipeline_path, cwd, on_stdout, on_stderr, should_cancel
+            del pipeline_path, on_stdout, on_stderr, should_cancel
             del timeout_seconds, on_timeout
+            assert cwd is not None
             assert env is not None
+            if on_start is not None:
+                on_start(911)
             record = _virtual_mcp_progress_record(
                 digest=digest,
                 execution_validated=True,
+                execution_id=execution_id,
             )
             bridge = cast(dict[str, Any], record["metadata"])["mcp_progress_bridge"]
             assert isinstance(bridge, dict)
@@ -3129,6 +3150,13 @@ def test_virtual_jarvis_progress_rejects_provider_identity_mismatch(
             )
             if on_poll is not None:
                 on_poll()
+            _write_completed_jarvis_mcp_result(
+                cwd,
+                job=job,
+                command=command,
+                digest=digest,
+                server_artifact=server_artifact,
+            )
             return subprocess.CompletedProcess(["jarvis"], 0, "", "")
 
     worker = EndpointWorker(
@@ -3162,7 +3190,8 @@ def test_virtual_jarvis_native_progress_accepts_indeterminate_event_without_adap
     monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
-    digest = "c" * 64
+    server_artifact = verified_jarvis_server_artifact()
+    digest = remote_mcp_server_artifact_digest(server_artifact)
     job = queue.submit_job(
         RelayJob(
             cluster="research-cluster",
@@ -3180,6 +3209,7 @@ def test_virtual_jarvis_native_progress_accepts_indeterminate_event_without_adap
             idempotency_key="virtual-jarvis-native-progress",
         )
     )
+    execution_id = cast(str, cast(McpCallSpec, job.spec).arguments["execution_id"])
 
     class NativeMcpProgressProvider(RecordingProvider):
         def run_pipeline_streaming(
@@ -3196,12 +3226,16 @@ def test_virtual_jarvis_native_progress_accepts_indeterminate_event_without_adap
             timeout_seconds: int | None = None,
             on_timeout: Callable[[], None] | None = None,
         ) -> subprocess.CompletedProcess[str]:
-            del pipeline_path, cwd, on_stdout, on_stderr, should_cancel
+            del pipeline_path, on_stdout, on_stderr, should_cancel
             del timeout_seconds, on_timeout
+            assert cwd is not None
             assert env is not None
             if on_start is not None:
                 on_start(912)
-            record = _virtual_native_mcp_progress_record(digest=digest)
+            record = _virtual_native_mcp_progress_record(
+                digest=digest,
+                execution_id=execution_id,
+            )
             Path(env["CLIO_RELAY_PROGRESS_FILE"]).write_text(
                 json.dumps(
                     _signed_progress_sidecar_record(
@@ -3214,6 +3248,13 @@ def test_virtual_jarvis_native_progress_accepts_indeterminate_event_without_adap
             )
             if on_poll is not None:
                 on_poll()
+            _write_completed_jarvis_mcp_result(
+                cwd,
+                job=job,
+                command=command,
+                digest=digest,
+                server_artifact=server_artifact,
+            )
             return subprocess.CompletedProcess(["jarvis"], 0, "", "")
 
     worker = EndpointWorker(
@@ -3234,7 +3275,7 @@ def test_virtual_jarvis_native_progress_accepts_indeterminate_event_without_adap
     assert progress[0].total is None
     assert progress[0].source == "jarvis_execution"
     assert progress[0].metadata["relay_job_id"] == job.job_id
-    assert progress[0].metadata["execution_id"] == "native-execution-live"
+    assert progress[0].metadata["execution_id"] == execution_id
     assert progress[0].metadata["pipeline_id"] == "pipeline-live"
     assert progress[0].metadata["package_name"] == "builtin.paraview"
     assert progress[0].metadata["package_id"] == "server"
@@ -3247,6 +3288,7 @@ def _virtual_mcp_progress_record(
     *,
     digest: str,
     execution_validated: bool,
+    execution_id: str,
 ) -> dict[str, object]:
     return {
         "label": "iteration",
@@ -3258,13 +3300,13 @@ def _virtual_mcp_progress_record(
             "adapter": "site-progress",
             "package_name": "site.simulation",
             "package_version": "test-plugin",
-            "run_id": "jarvis-execution-live",
-            "execution_id": "jarvis-execution-live",
+            "run_id": execution_id,
+            "execution_id": execution_id,
             "prediction_status": "observed",
             "eta_seconds": 5.0,
             "mcp_progress_bridge": {
                 "schema_version": "clio-relay.mcp-package-progress-bridge.v1",
-                "execution_id": "jarvis-execution-live",
+                "execution_id": execution_id,
                 "pipeline_id": "pipeline-live",
                 "notification_sequence": 2 if execution_validated else 1,
                 "source_authority": "package_log",
@@ -3287,7 +3329,11 @@ def _virtual_mcp_progress_record(
     }
 
 
-def _virtual_native_mcp_progress_record(*, digest: str) -> dict[str, object]:
+def _virtual_native_mcp_progress_record(
+    *,
+    digest: str,
+    execution_id: str,
+) -> dict[str, object]:
     return {
         "label": "server readiness",
         "message": "ParaView server is ready",
@@ -3295,7 +3341,7 @@ def _virtual_native_mcp_progress_record(*, digest: str) -> dict[str, object]:
             "mode": "server",
             "mcp_native_progress_bridge": {
                 "schema_version": "clio-relay.mcp-jarvis-progress-bridge.v1",
-                "execution_id": "native-execution-live",
+                "execution_id": execution_id,
                 "pipeline_id": "pipeline-live",
                 "execution_state": "running",
                 "terminal": False,
@@ -3453,6 +3499,33 @@ def _native_mcp_result_document(
         "timed_out": False,
         "protocol_error": None,
     }
+
+
+def _write_completed_jarvis_mcp_result(
+    cwd: Path,
+    *,
+    job: RelayJob,
+    command: list[str],
+    digest: str,
+    server_artifact: dict[str, Any],
+) -> None:
+    """Write the successful native result required by handle-first JARVIS runs."""
+    spec = cast(McpCallSpec, job.spec)
+    pipeline_id = cast(str, spec.arguments["pipeline_id"])
+    execution_id = cast(str, spec.arguments["execution_id"])
+    (cwd / "mcp-result.json").write_text(
+        json.dumps(
+            _native_mcp_result_document(
+                command=command,
+                digest=digest,
+                pipeline_id=pipeline_id,
+                execution_id=execution_id,
+                server_artifact=server_artifact,
+                arguments=spec.arguments,
+            )
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_worker_binds_run_id_before_resolving_provider_log_paths(
