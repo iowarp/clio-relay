@@ -13,12 +13,12 @@ from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_MCP_VERSION,
     CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
+    is_virtual_jarvis_control_query,
     jarvis_cd_lock_binding_expectation,
     jarvis_mcp_server,
     jarvis_mcp_server_args,
     jarvis_user_contract,
     jarvis_user_contract_digest,
-    is_virtual_jarvis_control_query,
     render_virtual_jarvis_agent_context,
     virtual_jarvis_tool_definitions,
 )
