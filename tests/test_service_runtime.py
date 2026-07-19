@@ -3736,7 +3736,21 @@ def test_gateway_stop_runtime_default_report_failure_controls_exit(
         cluster="test-cluster",
         name="canonical-failure",
         spec=_runtime_spec(),
-    ).model_copy(update={"state": GatewaySessionState.CLOSED})
+    ).model_copy(
+        update={
+            "state": GatewaySessionState.CLOSED,
+            "gateway": {
+                "runtime_spec": _runtime_spec().model_dump(mode="json"),
+                "teardown_intent": {
+                    "schema_version": "clio-relay.gateway-teardown-intent.v1",
+                    "operation_id": "gateway_cleanup_canonical_failure",
+                    "gateway_session_id": "canonical-failure",
+                    "cancel_scheduler_job": True,
+                    "created_at": "2026-07-19T00:00:00Z",
+                },
+            },
+        }
+    )
     result = ServiceRuntimeStopResult(
         session=session,
         mode="teardown",

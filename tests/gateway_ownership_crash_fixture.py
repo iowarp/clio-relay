@@ -95,6 +95,16 @@ class DurableFixtureRunner(CommandRunner):
             session_id = _assignment(script, "session_id")
             owner_token = _assignment(script, "owner_token")
             generation_id = _assignment(script, "connector_generation_id")
+            session_dir_template = _assignment(script, "session_dir")
+            if session_dir_template != (
+                "$HOME/.local/share/clio-relay/service-sessions/$session_id"
+            ):
+                raise RuntimeError("fixture received an unexpected owned session directory")
+            session_dir = session_dir_template.replace("$HOME", "/home/fixture").replace(
+                "$session_id", session_id
+            )
+            config_path = _assignment(script, "config_file").replace("$session_dir", session_dir)
+            log_path = _assignment(script, "log_file").replace("$session_dir", session_dir)
             connector: dict[str, object] = {
                 "owner": "clio-relay",
                 "session_id": session_id,
@@ -102,8 +112,8 @@ class DurableFixtureRunner(CommandRunner):
                 "process_group_id": 444,
                 "connector_generation_id": generation_id,
                 "owner_token": owner_token,
-                "config_path": f"/fixture/{session_id}/remote-frpc.toml",
-                "log_path": f"/fixture/{session_id}/remote-frpc.log",
+                "config_path": config_path,
+                "log_path": log_path,
             }
             state["remote_connector"] = connector
             self._save(state)
@@ -115,8 +125,8 @@ class DurableFixtureRunner(CommandRunner):
                         "remote_frpc_pid=444",
                         "remote_frpc_pgid=444",
                         f"connector_generation_id={generation_id}",
-                        f"remote_frpc_config=/fixture/{session_id}/remote-frpc.toml",
-                        f"remote_frpc_log=/fixture/{session_id}/remote-frpc.log",
+                        f"remote_frpc_config={config_path}",
+                        f"remote_frpc_log={log_path}",
                     ]
                 )
                 + "\n",

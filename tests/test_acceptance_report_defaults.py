@@ -537,6 +537,21 @@ def _gateway_stop_result(*, mode: Literal["detach", "teardown"]) -> ServiceRunti
     session = _gateway_session(
         state=GatewaySessionState.DEGRADED if detached else GatewaySessionState.CLOSED
     )
+    if not detached:
+        session = session.model_copy(
+            update={
+                "gateway": {
+                    **session.gateway,
+                    "teardown_intent": {
+                        "schema_version": "clio-relay.gateway-teardown-intent.v1",
+                        "operation_id": "gateway_cleanup_acceptance_default",
+                        "gateway_session_id": session.session_id,
+                        "cancel_scheduler_job": False,
+                        "created_at": "2026-07-19T00:00:00Z",
+                    },
+                }
+            }
+        )
     return ServiceRuntimeStopResult(
         session=session,
         mode=mode,
