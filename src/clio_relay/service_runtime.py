@@ -7599,10 +7599,20 @@ def _local_process_ids(*, command_markers: tuple[str, ...] = ()) -> list[int]:
         if not isinstance(item, dict):
             raise RelayError("local Windows process enumeration returned an invalid record")
         record = cast(dict[str, object], item)
-        process_id = _optional_int(record.get("ProcessId"))
+        raw_process_id = record.get("ProcessId")
         command_line = record.get("CommandLine")
-        if process_id is None or process_id <= 0:
+        if (
+            isinstance(raw_process_id, bool)
+            or not isinstance(raw_process_id, int)
+            or raw_process_id < 0
+        ):
             raise RelayError("local Windows process enumeration returned an invalid process id")
+        # Win32_Process includes the System Idle Process as PID 0. It cannot own
+        # or be signaled as a connector, while every relay process identity is
+        # strictly positive, so omit only this Windows sentinel from discovery.
+        if raw_process_id == 0:
+            continue
+        process_id = raw_process_id
         if folded_markers:
             if not isinstance(command_line, str):
                 continue

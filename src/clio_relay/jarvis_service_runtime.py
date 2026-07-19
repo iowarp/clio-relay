@@ -49,6 +49,7 @@ RELAY_JARVIS_RUNTIME_BINDING_SCHEMA_V1 = "clio-relay.jarvis-service-runtime-bind
 RELAY_JARVIS_RUNTIME_BINDING_SCHEMA_V2 = "clio-relay.jarvis-service-runtime-binding.v2"
 RELAY_JARVIS_RUNTIME_BINDING_SCHEMA = RELAY_JARVIS_RUNTIME_BINDING_SCHEMA_V2
 JARVIS_SERVICE_RUNTIME_AUTHORITY_SCHEMA = "jarvis.execution.service-runtime-authority.v1"
+OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH = "/internal/jarvis-runtime-authority"
 _HEX_DIGITS = frozenset("0123456789abcdef")
 _MAX_AUTHORITY_OUTPUT_BYTES = 32 * 1024
 _AUTHORITY_QUERY_TIMEOUT_SECONDS = 30
@@ -670,7 +671,22 @@ def resolve_jarvis_service_runtime_authorization(
         revision=binding.service_revision,
         token_sha256=expected_digest,
     )
-    if should_execute_on_cluster(definition):
+    if settings is not None and settings.owner_session_id is not None:
+        # Browser attachment is deliberately desktop-local, but the private
+        # capability belongs to JARVIS on the cluster that owns the immutable
+        # execution receipt. Resolve it through the already identity-proven,
+        # exact-generation session API instead of consulting desktop PATH.
+        with OwnedSessionApiClient(definition=definition, settings=settings) as client:
+            document = _json_object(
+                client.request_json(
+                    method="POST",
+                    path=OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH,
+                    body={"binding": binding.model_dump(mode="json")},
+                ),
+                "owned JARVIS service runtime authority resolver",
+            )
+        authority = JarvisServiceRuntimeAuthority.model_validate(document)
+    elif should_execute_on_cluster(definition):
         payload = run_remote_jarvis_runtime_authority(
             definition,
             arguments,
@@ -684,17 +700,40 @@ def resolve_jarvis_service_runtime_authorization(
         authority = JarvisServiceRuntimeAuthority.model_validate(document)
     else:
         resolved_settings = settings or RelaySettings.from_env()
-        authority = resolve_local_jarvis_service_runtime_authority(
+        authority = resolve_local_verified_jarvis_service_runtime_authority(
             jarvis_bin=resolved_settings.jarvis_bin,
-            execution_id=binding.jarvis_execution_id,
-            pipeline_id=pipeline_id,
-            package_id=binding.package_id,
-            service_instance_id=binding.service_instance_id,
-            revision=binding.service_revision,
-            token_sha256=expected_digest,
+            verified=verified,
         )
+        if authority is None:
+            raise RelayError("authenticated JARVIS runtime authority unexpectedly resolved empty")
     _validate_resolved_authority(verified=verified, authority=authority)
     return f"Bearer {authority.authorization.token.get_secret_value()}"
+
+
+def resolve_local_verified_jarvis_service_runtime_authority(
+    *,
+    jarvis_bin: str,
+    verified: VerifiedJarvisServiceRuntime,
+) -> JarvisServiceRuntimeAuthority | None:
+    """Resolve and revalidate one exact verified runtime on its cluster host."""
+    runtime = verified.runtime
+    binding = verified.binding
+    if runtime.schema_version == JARVIS_SERVICE_RUNTIME_SCHEMA_V1:
+        return None
+    expected_digest = binding.authorization_sha256
+    if expected_digest is None:
+        raise RelayError("authenticated JARVIS runtime omitted its authority digest")
+    authority = resolve_local_jarvis_service_runtime_authority(
+        jarvis_bin=jarvis_bin,
+        execution_id=binding.jarvis_execution_id,
+        pipeline_id=verified.native_execution.execution_handle.pipeline_id,
+        package_id=binding.package_id,
+        service_instance_id=binding.service_instance_id,
+        revision=binding.service_revision,
+        token_sha256=expected_digest,
+    )
+    _validate_resolved_authority(verified=verified, authority=authority)
+    return authority
 
 
 def resolve_local_jarvis_service_runtime_authority(

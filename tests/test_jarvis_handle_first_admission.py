@@ -217,7 +217,7 @@ def test_idempotent_retry_replays_pre_handle_jarvis_record(
 def test_raw_http_submission_cannot_select_jarvis_handle_identity(
     tmp_path: Path,
 ) -> None:
-    """The authenticated raw route still receives server-owned job entropy."""
+    """The raw route rejects MCP jobs before caller identity reaches intake."""
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
@@ -233,23 +233,11 @@ def test_raw_http_submission_cannot_select_jarvis_handle_identity(
 
     response = client.post("/jobs", json=submission.model_dump(mode="json"))
 
-    assert response.status_code == 200
-    accepted = queue.get_job(response.json()["job_id"])
-    assert accepted.job_id != caller_job_id
-    assert _mcp_spec(accepted).arguments["execution_id"] == (
-        deterministic_jarvis_execution_id(
-            cluster=accepted.cluster,
-            idempotency_key=accepted.idempotency_key,
-            job_id=accepted.job_id,
-        )
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "MCP jobs must use /jobs/mcp-call or /jobs/jarvis-mcp-call"
     )
-    assert _mcp_spec(accepted).arguments["execution_id"] != (
-        deterministic_jarvis_execution_id(
-            cluster=submission.cluster,
-            idempotency_key=submission.idempotency_key,
-            job_id=caller_job_id,
-        )
-    )
+    assert queue.list_jobs() == []
 
 
 def test_typed_http_jarvis_run_retry_replays_server_identity(

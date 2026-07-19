@@ -18,6 +18,7 @@ from clio_relay.models import (
     JobKind,
     JobState,
     Lease,
+    McpAdmissionClass,
     RelayJob,
     RelayTask,
 )
@@ -194,15 +195,15 @@ def test_only_worker_slot_zero_owns_cleanup_reconciliation(
             self.endpoint: object | None = None
             observed_ownership.append(reconcile_execution_cleanup)
 
-        def run_once(self) -> NoReturn:
+        def run_once(self, **_kwargs: object) -> NoReturn:
             raise StopSlot
 
     monkeypatch.setattr(endpoint_module, "EndpointWorker", FakeSlotWorker)
     try:
         with pytest.raises(StopSlot):
-            cast(Any, supervisor)._serve_worker_slot(0, 0)
+            cast(Any, supervisor)._serve_worker_slot(0, 0, McpAdmissionClass.WORKLOAD)
         with pytest.raises(StopSlot):
-            cast(Any, supervisor)._serve_worker_slot(1, 0)
+            cast(Any, supervisor)._serve_worker_slot(1, 0, McpAdmissionClass.WORKLOAD)
     finally:
         supervisor.close()
 
