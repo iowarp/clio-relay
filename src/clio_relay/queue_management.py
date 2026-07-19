@@ -15,6 +15,8 @@ from clio_relay.models import (
     JobKind,
     JobState,
     Lease,
+    McpAdmissionClass,
+    McpCallSpec,
     RelayJob,
     utc_now,
 )
@@ -763,7 +765,9 @@ def _admission_snapshot(
     supervisor_endpoints = [
         endpoint for endpoint in workers if endpoint.metadata.get("worker_supervisor") is True
     ]
-    kind_policy_endpoints = supervisor_endpoints or capacity_endpoints
+    kind_policy_endpoints = (
+        [*supervisor_endpoints, *capacity_endpoints] if supervisor_endpoints else capacity_endpoints
+    )
     kind_configurations, kind_configurations_valid = _kind_concurrency_configurations(
         kind_policy_endpoints
     )
@@ -1282,8 +1286,15 @@ def worker_status(
         and now - endpoint.last_seen_at <= timedelta(seconds=fresh_seconds)
     ]
     endpoints_truncated = fresh_endpoints_truncated or history_endpoints_truncated
-    slot_endpoints = [endpoint for endpoint in endpoints if "worker_slot" in endpoint.metadata]
-    if slot_endpoints:
+    (
+        slot_endpoints,
+        supervisor_endpoints,
+        worker_generation_id,
+        worker_generation_complete,
+        fresh_worker_generation_count,
+    ) = _select_active_worker_generation(queue, endpoints)
+    supervised_generation_selected = worker_generation_id is not None
+    if supervised_generation_selected:
         capacity_endpoints = slot_endpoints
         configured_concurrency = len(slot_endpoints)
     else:
@@ -1295,19 +1306,64 @@ def worker_status(
         configured_concurrency = sum(
             _endpoint_concurrency(endpoint.metadata) for endpoint in capacity_endpoints
         )
-    supervisor_endpoints = [
-        endpoint for endpoint in endpoints if endpoint.metadata.get("worker_supervisor") is True
-    ]
     kind_policy_endpoints = supervisor_endpoints or capacity_endpoints
     kind_configurations, kind_configurations_valid = _kind_concurrency_configurations(
         kind_policy_endpoints
     )
-    kind_concurrency_consistent = kind_configurations_valid and len(kind_configurations) <= 1
+    kind_concurrency_consistent = (
+        kind_configurations_valid
+        and len(kind_configurations) <= 1
+        and worker_generation_complete is not False
+    )
     configured_kind_concurrency: dict[str, int] | None
     if kind_concurrency_consistent:
         configured_kind_concurrency = kind_configurations[0] if kind_configurations else {}
     else:
         configured_kind_concurrency = None
+    lane_policy_endpoints = supervisor_endpoints or capacity_endpoints
+    lane_configurations = [
+        _endpoint_lane_configuration(endpoint.metadata) for endpoint in lane_policy_endpoints
+    ]
+    distinct_lane_configurations = sorted(
+        {item for item in lane_configurations if item is not None}
+    )
+    configured_workload_concurrency: int | None = None
+    configured_control_query_concurrency: int | None = None
+    if slot_endpoints:
+        slot_lane_configurations = [
+            _endpoint_lane_configuration(endpoint.metadata) for endpoint in slot_endpoints
+        ]
+        workload_slots = sum(item == (1, 0) for item in slot_lane_configurations)
+        control_slots = sum(item == (0, 1) for item in slot_lane_configurations)
+        lane_concurrency_consistent = (
+            all(item is not None for item in slot_lane_configurations)
+            and workload_slots + control_slots == len(slot_endpoints)
+            and worker_generation_complete is not False
+        )
+        if supervisor_endpoints:
+            supervisor_lane_configurations = [
+                _endpoint_lane_configuration(endpoint.metadata) for endpoint in supervisor_endpoints
+            ]
+            lane_concurrency_consistent = (
+                lane_concurrency_consistent
+                and all(item is not None for item in supervisor_lane_configurations)
+                and set(cast(tuple[int, int], item) for item in supervisor_lane_configurations)
+                == {(workload_slots, control_slots)}
+            )
+        if lane_concurrency_consistent:
+            configured_workload_concurrency = workload_slots
+            configured_control_query_concurrency = control_slots
+        distinct_lane_configurations = [(workload_slots, control_slots)]
+    else:
+        lane_concurrency_consistent = (
+            all(item is not None for item in lane_configurations)
+            and len(distinct_lane_configurations) <= 1
+            and worker_generation_complete is not False
+        )
+        if lane_concurrency_consistent and distinct_lane_configurations:
+            configured_workload_concurrency, configured_control_query_concurrency = (
+                distinct_lane_configurations[0]
+            )
     scanned_leases, leases_truncated = queue.scan_leases(limit=scan_limit)
     leases: list[Lease] = []
     jobs_by_id: dict[str, RelayJob] = {}
@@ -1321,6 +1377,9 @@ def worker_status(
         leases.append(lease)
         jobs_by_id[job.job_id] = job
     active_leases_by_kind = {kind.value: 0 for kind in JobKind}
+    active_leases_by_mcp_admission_class = {
+        admission_class.value: 0 for admission_class in McpAdmissionClass
+    }
     counted_jobs: set[str] = set()
     for lease in leases:
         if lease.is_expired() or lease.job_id in counted_jobs:
@@ -1330,6 +1389,13 @@ def worker_status(
             continue
         counted_jobs.add(job.job_id)
         active_leases_by_kind[job.kind.value] += 1
+        active_leases_by_mcp_admission_class[
+            (
+                job.spec.admission_class.value
+                if job.kind is JobKind.MCP_CALL and isinstance(job.spec, McpCallSpec)
+                else McpAdmissionClass.WORKLOAD.value
+            )
+        ] += 1
     return {
         "cluster": cluster,
         "workers": [endpoint.model_dump(mode="json") for endpoint in endpoints],
@@ -1338,7 +1404,21 @@ def worker_status(
         "configured_kind_concurrency": configured_kind_concurrency,
         "kind_concurrency_consistent": kind_concurrency_consistent,
         "kind_concurrency_configurations": kind_configurations,
+        "configured_workload_concurrency": configured_workload_concurrency,
+        "configured_control_query_concurrency": configured_control_query_concurrency,
+        "control_query_concurrency_consistent": lane_concurrency_consistent,
+        "worker_generation_id": worker_generation_id,
+        "worker_generation_complete": worker_generation_complete,
+        "fresh_worker_generation_count": fresh_worker_generation_count,
+        "control_query_concurrency_configurations": [
+            {
+                "workload": workload,
+                "control_query": control,
+            }
+            for workload, control in distinct_lane_configurations
+        ],
         "active_leases_by_kind": active_leases_by_kind,
+        "active_leases_by_mcp_admission_class": active_leases_by_mcp_admission_class,
         "active_job_capacity": queue.active_job_capacity(),
         "fresh_seconds": fresh_seconds,
         "registered_worker_count": len(all_endpoints),
@@ -1409,6 +1489,136 @@ def _endpoint_concurrency(metadata: dict[str, object]) -> int:
     if isinstance(value, int) and value > 0:
         return value
     return 1
+
+
+def _select_active_worker_generation(
+    queue: ClioCoreQueue,
+    endpoints: list[EndpointRegistration],
+) -> tuple[
+    list[EndpointRegistration],
+    list[EndpointRegistration],
+    str | None,
+    bool | None,
+    int,
+]:
+    """Select the newest supervised process generation and its fresh slots.
+
+    Endpoint records intentionally survive process exit. During a systemd
+    restart, the previous and replacement generations can therefore both be
+    inside the freshness window. Capacity must come from exactly one complete
+    parent generation rather than summing those records together.
+    """
+    fresh_supervisors = {
+        endpoint.endpoint_id: endpoint
+        for endpoint in endpoints
+        if endpoint.metadata.get("worker_supervisor") is True
+    }
+    slots_by_parent: dict[str, list[EndpointRegistration]] = {}
+    unbound_slots: list[EndpointRegistration] = []
+    for endpoint in endpoints:
+        if "worker_slot" not in endpoint.metadata:
+            continue
+        parent_endpoint_id = endpoint.metadata.get("parent_endpoint_id")
+        if not isinstance(parent_endpoint_id, str) or not parent_endpoint_id:
+            unbound_slots.append(endpoint)
+            continue
+        slots_by_parent.setdefault(parent_endpoint_id, []).append(endpoint)
+    candidate_ids = set(fresh_supervisors) | set(slots_by_parent)
+    if not candidate_ids:
+        if unbound_slots:
+            return unbound_slots, [], None, False, 0
+        return [], [], None, None, 0
+
+    candidates: list[
+        tuple[datetime, str, EndpointRegistration | None, list[EndpointRegistration]]
+    ] = []
+    for parent_endpoint_id in candidate_ids:
+        try:
+            parent = fresh_supervisors.get(parent_endpoint_id) or queue.get_endpoint(
+                parent_endpoint_id
+            )
+        except NotFoundError:
+            parent = None
+        slots = slots_by_parent.get(parent_endpoint_id, [])
+        observed_at = (
+            parent.registered_at
+            if parent is not None
+            else max(slot.registered_at for slot in slots)
+        )
+        candidates.append((observed_at, parent_endpoint_id, parent, slots))
+    _observed_at, selected_id, selected_parent, selected_slots = max(
+        candidates,
+        key=lambda item: (item[0], item[1]),
+    )
+    selected_slots = sorted(
+        [*selected_slots, *unbound_slots],
+        key=lambda endpoint: (
+            _worker_slot_index(endpoint.metadata),
+            endpoint.endpoint_id,
+        ),
+    )
+    complete = _worker_generation_is_complete(selected_parent, selected_slots)
+    return (
+        selected_slots,
+        [] if selected_parent is None else [selected_parent],
+        selected_id,
+        complete,
+        len(candidate_ids),
+    )
+
+
+def _worker_generation_is_complete(
+    parent: EndpointRegistration | None,
+    slots: list[EndpointRegistration],
+) -> bool:
+    """Require every declared slot from one exact supervisor generation."""
+    if parent is None or parent.metadata.get("worker_supervisor") is not True:
+        return False
+    expected_concurrency = _endpoint_concurrency(parent.metadata)
+    if expected_concurrency < 2 or len(slots) != expected_concurrency:
+        return False
+    indices = [_worker_slot_index(endpoint.metadata) for endpoint in slots]
+    if indices != list(range(expected_concurrency)):
+        return False
+    return all(
+        endpoint.metadata.get("parent_endpoint_id") == parent.endpoint_id
+        and _endpoint_concurrency(endpoint.metadata) == 1
+        and endpoint.hostname == parent.hostname
+        and endpoint.pid == parent.pid
+        and endpoint.registered_at >= parent.registered_at
+        for endpoint in slots
+    )
+
+
+def _worker_slot_index(metadata: dict[str, object]) -> int:
+    """Return a sortable slot index while keeping malformed metadata invalid."""
+    value = metadata.get("worker_slot")
+    return value if type(value) is int and value >= 0 else 2**63 - 1
+
+
+def _endpoint_lane_configuration(metadata: dict[str, object]) -> tuple[int, int] | None:
+    """Return one explicit workload/control slot declaration, or fail closed."""
+    workload = metadata.get("workload_concurrency")
+    control = metadata.get("control_query_concurrency")
+    if (
+        type(workload) is not int
+        or type(control) is not int
+        or workload < 0
+        or control < 0
+        or workload + control != _endpoint_concurrency(metadata)
+    ):
+        return None
+    admission_class = metadata.get("mcp_admission_class")
+    if admission_class is not None:
+        if admission_class not in {
+            McpAdmissionClass.WORKLOAD.value,
+            McpAdmissionClass.CONTROL_QUERY.value,
+        }:
+            return None
+        expected = (1, 0) if admission_class == McpAdmissionClass.WORKLOAD.value else (0, 1)
+        if (workload, control) != expected:
+            return None
+    return workload, control
 
 
 def _kind_concurrency_configurations(

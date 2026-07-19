@@ -8,8 +8,9 @@ import shlex
 import subprocess
 from math import isfinite
 from pathlib import Path
+from typing import Literal
 
-from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.cluster_config import ClusterDefinition, WorkerCapacityPolicy
 from clio_relay.errors import RelayError
 from clio_relay.identifiers import filesystem_key
 from clio_relay.installation import INSTALL_RECEIPT_PATH_ENV
@@ -30,12 +31,29 @@ def render_endpoint_user_service(
     cluster: str,
     definition: ClusterDefinition,
     relay_bin: str = "%h/.local/bin/clio-relay",
-    concurrency: int = 1,
+    concurrency: int | None = None,
+    control_query_concurrency: int | None = None,
     kind_concurrency: KindConcurrencyInput | None = None,
 ) -> str:
     """Render a user-level systemd service for a configured worker endpoint."""
-    if concurrency < 1:
-        raise RelayError("worker concurrency must be at least 1")
+    capacity = definition.worker_capacity
+    selected_concurrency = capacity.concurrency if concurrency is None else concurrency
+    selected_control_concurrency = (
+        capacity.control_query_concurrency
+        if control_query_concurrency is None
+        else control_query_concurrency
+    )
+    selected_kind_concurrency = (
+        capacity.kind_concurrency if kind_concurrency is None else kind_concurrency
+    )
+    if selected_concurrency < 2:
+        raise RelayError("managed worker concurrency must be at least 2")
+    if selected_control_concurrency < 1:
+        raise RelayError("managed worker control-query concurrency must be at least 1")
+    if selected_control_concurrency >= selected_concurrency:
+        raise RelayError(
+            "managed worker control-query concurrency must be less than total concurrency"
+        )
     core_source = definition.core_dir
     spool_source = definition.spool_dir
     jarvis_source = definition.jarvis_bin or "$HOME/.local/bin/jarvis"
@@ -54,7 +72,7 @@ def render_endpoint_user_service(
     )
     agent_bin = render_systemd_remote_value(agent_source, field="agent_bin")
     agent_args = " ".join(definition.agent_args)
-    kind_limits = kind_concurrency_metadata(kind_concurrency)
+    kind_limits = kind_concurrency_metadata(selected_kind_concurrency)
     jarvis_mcp_line = _optional_environment_line(
         JARVIS_MCP_COMMAND_ENV,
         os.environ.get(JARVIS_MCP_COMMAND_ENV),
@@ -84,7 +102,9 @@ def render_endpoint_user_service(
         "--cluster",
         cluster,
         "--concurrency",
-        str(concurrency),
+        str(selected_concurrency),
+        "--control-query-concurrency",
+        str(selected_control_concurrency),
     ]
     for kind, limit in kind_limits.items():
         exec_start_arguments.extend(["--kind-concurrency", f"{kind}={limit}"])
@@ -183,6 +203,48 @@ def install_endpoint_user_service_over_ssh(
         enable=enable,
         require_persistent=require_persistent,
     )
+    return _run_endpoint_service_script_over_ssh(
+        ssh_host=ssh_host,
+        remote_script=remote_script,
+        timeout_seconds=timeout_seconds,
+        operation="installation",
+    )
+
+
+def restart_endpoint_user_service_over_ssh(
+    *,
+    cluster: str,
+    ssh_host: str,
+    expected_capacity: WorkerCapacityPolicy,
+    require_persistent: bool = True,
+    timeout_seconds: float = 120.0,
+) -> list[str]:
+    """Restart an installed endpoint unit after verifying its persisted policy."""
+    _validate_ssh_destination(ssh_host)
+    if not isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise RelayError("endpoint service SSH timeout must be finite and positive")
+    service_name = endpoint_user_service_name(cluster)
+    remote_script = _remote_restart_script(
+        service_name=service_name,
+        expected_capacity=expected_capacity,
+        require_persistent=require_persistent,
+    )
+    return _run_endpoint_service_script_over_ssh(
+        ssh_host=ssh_host,
+        remote_script=remote_script,
+        timeout_seconds=timeout_seconds,
+        operation="restart",
+    )
+
+
+def _run_endpoint_service_script_over_ssh(
+    *,
+    ssh_host: str,
+    remote_script: str,
+    timeout_seconds: float,
+    operation: Literal["installation", "restart"],
+) -> list[str]:
+    """Run one bounded endpoint-service operation through SSH."""
     try:
         result = subprocess.run(
             ["ssh", ssh_host, "bash", "-s"],
@@ -193,13 +255,14 @@ def install_endpoint_user_service_over_ssh(
         )
     except subprocess.TimeoutExpired as exc:
         raise RelayError(
-            f"endpoint service installation exceeded {timeout_seconds:g} seconds"
+            f"endpoint service {operation} exceeded {timeout_seconds:g} seconds"
         ) from exc
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace")
         stdout = result.stdout.decode("utf-8", errors="replace")
         detail = stderr.strip() or stdout.strip()
-        raise RelayError(f"failed to install endpoint user service: {detail}")
+        verb = "install" if operation == "installation" else "restart"
+        raise RelayError(f"failed to {verb} endpoint user service: {detail}")
     return result.stdout.decode("utf-8", errors="replace").splitlines()
 
 
@@ -271,6 +334,150 @@ fi
 mkdir -p "$HOME/.config/systemd/user"
 printf '%s' {service_literal} > "$HOME/.config/systemd/user/{service_name}"
 {command}"""
+    return script.replace("\r\n", "\n")
+
+
+def _remote_restart_script(
+    *,
+    service_name: str,
+    expected_capacity: WorkerCapacityPolicy,
+    require_persistent: bool,
+) -> str:
+    """Render a restart-only script that verifies but cannot replace the unit."""
+    if _SYSTEMD_SERVICE_NAME.fullmatch(service_name) is None:
+        raise RelayError(f"unsafe endpoint systemd service name: {service_name!r}")
+    service_literal = shlex.quote(service_name)
+    persistent_literal = "1" if require_persistent else "0"
+    expected_kind_concurrency = ",".join(
+        f"{kind}={limit}"
+        for kind, limit in kind_concurrency_metadata(expected_capacity.kind_concurrency).items()
+    )
+    script = f"""set -euo pipefail
+require_persistent={persistent_literal}
+expected_concurrency={shlex.quote(str(expected_capacity.concurrency))}
+expected_control_query_concurrency={shlex.quote(str(expected_capacity.control_query_concurrency))}
+expected_kind_concurrency={shlex.quote(expected_kind_concurrency)}
+relay_user="${{USER:-$(id -un)}}"
+linger="$(loginctl show-user "$relay_user" -p Linger --value 2>/dev/null || true)"
+if [ "$linger" = "yes" ]; then
+  persistence_mode=systemd-user-linger
+elif [ "$require_persistent" = "1" ]; then
+  echo "persistent endpoint service requires systemd user lingering (Linger=yes)" >&2
+  echo "run 'loginctl enable-linger $relay_user' once, or ask the site administrator" >&2
+  echo "to enable lingering for this account" >&2
+  echo "use --allow-login-scoped only when logout-time shutdown is explicitly acceptable" >&2
+  exit 78
+else
+  persistence_mode=login-scoped
+  echo "warning: endpoint service is login-scoped and may stop after the final login exits" >&2
+fi
+export SYSTEMD_COLORS=0 LANG=C LC_ALL=C
+service_enabled="$(systemctl --user is-enabled {service_literal} 2>/dev/null || true)"
+if [ "$service_enabled" != "enabled" ]; then
+  echo "endpoint service is not installed and enabled: {service_name} $service_enabled" >&2
+  exit 1
+fi
+installed_exec_start="$(
+  systemctl --user show {service_literal} \
+    --property=ExecStart --value --no-pager 2>/dev/null || true
+)"
+set -f
+argv_count=0
+in_argv=0
+expected_value=""
+policy_parse_error=""
+observed_concurrency=""
+observed_control_query_concurrency=""
+observed_kind_concurrency=""
+for token in $installed_exec_start; do
+  if [ "$in_argv" = "0" ]; then
+    case "$token" in
+      "argv[]="*)
+        argv_count=$((argv_count + 1))
+        in_argv=1
+        ;;
+    esac
+    continue
+  fi
+  if [ "$token" = ";" ]; then
+    if [ -n "$expected_value" ]; then
+      policy_parse_error="missing value for $expected_value"
+      expected_value=""
+    fi
+    in_argv=0
+    continue
+  fi
+  if [ -n "$expected_value" ]; then
+    case "$expected_value" in
+      concurrency) observed_concurrency="$token" ;;
+      control_query_concurrency) observed_control_query_concurrency="$token" ;;
+      kind_concurrency)
+        if [ -n "$observed_kind_concurrency" ]; then
+          observed_kind_concurrency="$observed_kind_concurrency,$token"
+        else
+          observed_kind_concurrency="$token"
+        fi
+        ;;
+    esac
+    expected_value=""
+    continue
+  fi
+  case "$token" in
+    --concurrency)
+      if [ -n "$observed_concurrency" ]; then
+        policy_parse_error="duplicate --concurrency"
+      fi
+      expected_value="concurrency"
+      ;;
+    --control-query-concurrency)
+      if [ -n "$observed_control_query_concurrency" ]; then
+        policy_parse_error="duplicate --control-query-concurrency"
+      fi
+      expected_value="control_query_concurrency"
+      ;;
+    --kind-concurrency)
+      expected_value="kind_concurrency"
+      ;;
+  esac
+done
+if [ -n "$expected_value" ]; then
+  policy_parse_error="missing value for $expected_value"
+fi
+if [ "$argv_count" -ne 1 ] || [ -n "$policy_parse_error" ] || \
+   [ "$observed_concurrency" != "$expected_concurrency" ] || \
+   [ "$observed_control_query_concurrency" != "$expected_control_query_concurrency" ] || \
+   [ "$observed_kind_concurrency" != "$expected_kind_concurrency" ]; then
+  echo "endpoint service capacity policy does not match the persisted cluster policy" >&2
+  printf 'expected concurrency=%s control_query_concurrency=%s kind_concurrency=%s\\n' \
+    "$expected_concurrency" "$expected_control_query_concurrency" \
+    "${{expected_kind_concurrency:-none}}" >&2
+  printf 'observed concurrency=%s control_query_concurrency=%s kind_concurrency=%s\\n' \
+    "${{observed_concurrency:-missing}}" \
+    "${{observed_control_query_concurrency:-missing}}" \
+    "${{observed_kind_concurrency:-none}}" >&2
+  if [ -n "$policy_parse_error" ]; then
+    printf 'policy parse error: %s\\n' "$policy_parse_error" >&2
+  fi
+  echo "run 'clio-relay cluster install-endpoint-service --cluster <configured-cluster>'" >&2
+  echo "to reinstall the managed unit" >&2
+  exit 79
+fi
+systemctl --user restart {service_literal}
+service_active="$(systemctl --user is-active {service_literal} 2>/dev/null || true)"
+if [ "$service_active" != "active" ]; then
+  echo "endpoint service is not active after restart: {service_name} $service_active" >&2
+  exit 1
+fi
+echo user_systemd=$(systemctl --user is-system-running || true)
+echo linger="$linger"
+echo endpoint_service.persistence="$persistence_mode"
+echo endpoint_service.enabled="$service_enabled"
+echo endpoint_service.active="$service_active"
+echo endpoint_service.unit_rewritten=false
+echo endpoint_service.policy_source=installed-unit
+echo endpoint_service.policy_validated=true
+systemctl --user --no-pager --plain --full status {service_literal} || true
+"""
     return script.replace("\r\n", "\n")
 
 

@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from clio_relay.identifiers import durable_record_id_json_schema
 from clio_relay.remote_mcp import (
+    MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS,
     VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA,
     RemoteMcpSchemaCache,
     RemoteMcpSchemaCacheEntry,
@@ -532,6 +533,21 @@ def jarvis_mcp_server_args() -> list[str]:
     return jarvis_mcp_command()[1:]
 
 
+def is_virtual_jarvis_control_query(remote_tool: str) -> bool:
+    """Return whether the pinned virtual JARVIS contract marks a tool read-only."""
+    definition = _VIRTUAL_JARVIS_TOOLS.get(remote_tool)
+    if definition is None:
+        return False
+    annotations = definition.get("annotations")
+    if not isinstance(annotations, dict):
+        return False
+    typed_annotations = cast(JSON, annotations)
+    return bool(
+        typed_annotations.get("readOnlyHint") is True
+        and typed_annotations.get("destructiveHint") is False
+    )
+
+
 def virtual_jarvis_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
     """Return agent-facing virtual tools for the cluster-local JARVIS MCP server."""
     tools: list[JSON] = []
@@ -545,7 +561,15 @@ def virtual_jarvis_tool_definitions(*, clusters: list[str] | None = None) -> lis
                 **({"enum": sorted(clusters)} if clusters is not None else {}),
             },
             **properties,
-            "timeout_seconds": {"type": "integer", "minimum": 1},
+            "timeout_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                **(
+                    {"maximum": MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS}
+                    if is_virtual_jarvis_control_query(remote_tool)
+                    else {}
+                ),
+            },
             "idempotency_key": {"type": "string"},
             "wait_for_terminal": {
                 "type": "boolean",

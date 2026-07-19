@@ -18,6 +18,7 @@ from clio_relay.jarvis_mcp import (
     jarvis_mcp_server_args,
     jarvis_user_contract,
     jarvis_user_contract_digest,
+    is_virtual_jarvis_control_query,
     render_virtual_jarvis_agent_context,
     virtual_jarvis_tool_definitions,
 )
@@ -53,6 +54,15 @@ def test_virtual_jarvis_context_teaches_bounded_interactive_waiting() -> None:
     assert "current call" in context
     assert "intentionally queuing transport" in context
     assert "not workload completion" in context
+
+
+def test_virtual_jarvis_control_queries_follow_the_pinned_annotations() -> None:
+    """Only read-only, non-destructive JARVIS operations use reserved capacity."""
+    assert is_virtual_jarvis_control_query("jarvis_get_execution") is True
+    assert is_virtual_jarvis_control_query("jarvis_describe") is True
+    assert is_virtual_jarvis_control_query("jarvis_run") is False
+    assert is_virtual_jarvis_control_query("jarvis_add_step") is False
+    assert is_virtual_jarvis_control_query("not-a-contract-tool") is False
 
 
 def test_jarvis_mcp_validation_accepts_structured_durable_run() -> None:

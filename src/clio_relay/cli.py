@@ -44,6 +44,7 @@ from clio_relay.cluster_config import (
     RemoteMcpContract,
     RemoteMcpProfile,
     RemoteMcpServerConfig,
+    WorkerCapacityPolicy,
     default_registry_path,
 )
 from clio_relay.config import RelaySettings
@@ -51,6 +52,7 @@ from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.deployment import (
     install_endpoint_user_service_over_ssh,
     render_endpoint_user_service,
+    restart_endpoint_user_service_over_ssh,
     write_endpoint_user_service,
 )
 from clio_relay.doctor import run_cluster_doctor, run_doctor
@@ -69,6 +71,7 @@ from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_MCP_VERSION,
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
     JARVIS_MCP_CACHE_SERVER_NAME,
+    is_virtual_jarvis_control_query,
     jarvis_cd_lock_binding_expectation,
     jarvis_mcp_artifact_binding_from_entry,
     jarvis_mcp_env_from,
@@ -90,6 +93,7 @@ from clio_relay.mcp_server import (
 )
 from clio_relay.mcp_stdio_validation import PackagedMcpStdioSession, run_packaged_mcp_stdio_session
 from clio_relay.models import (
+    MCP_ADMISSION_AUTHORITY_METADATA_KEY,
     ArtifactUse,
     Cursor,
     EndpointRole,
@@ -98,7 +102,9 @@ from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
     JobState,
+    McpAdmissionClass,
     McpCallSpec,
+    McpControlQueryEvidence,
     McpOperation,
     MonitorRule,
     MonitorRuleAction,
@@ -176,6 +182,7 @@ from clio_relay.remote_cli import (
     write_remote_file,
 )
 from clio_relay.remote_mcp import (
+    MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS,
     MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES,
     MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS,
     MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES,
@@ -190,6 +197,8 @@ from clio_relay.remote_mcp import (
     cache_entry_from_discovery_artifact,
     default_remote_mcp_cache_path,
     remote_mcp_execution_fingerprint,
+    resolve_pinned_mcp_admission,
+    resolve_registered_remote_mcp_admission,
 )
 from clio_relay.retention import TerminalRetentionCoordinator
 from clio_relay.scheduler_providers import (
@@ -1021,6 +1030,10 @@ def endpoint_start(
         int,
         typer.Option(help="Number of in-process worker slots for worker endpoints."),
     ] = 1,
+    control_query_concurrency: Annotated[
+        int,
+        typer.Option(help="Slots carved out of total capacity for control-class MCP queries."),
+    ] = 0,
     kind_concurrency: Annotated[
         list[str] | None,
         typer.Option(
@@ -1036,6 +1049,10 @@ def endpoint_start(
     """Start a desktop or worker endpoint."""
     if concurrency < 1:
         raise typer.BadParameter("--concurrency must be at least 1")
+    if control_query_concurrency < 0:
+        raise typer.BadParameter("--control-query-concurrency must not be negative")
+    if control_query_concurrency >= concurrency:
+        raise typer.BadParameter("--control-query-concurrency must be less than --concurrency")
     kind_limits = _kind_concurrency_options(kind_concurrency)
     settings = RelaySettings.from_env()
     definition: ClusterDefinition | None = None
@@ -1052,6 +1069,7 @@ def endpoint_start(
         settings=settings,
         cluster=cluster or "local",
         concurrency=concurrency,
+        control_query_concurrency=control_query_concurrency,
         kind_concurrency=kind_limits,
         scheduler_provider=(
             provider_for_scheduler(selected_scheduler) if role == EndpointRole.WORKER else None
@@ -1120,9 +1138,13 @@ def endpoint_render_user_service(
         typer.Option(help="Optional path to write the systemd user service."),
     ] = None,
     concurrency: Annotated[
-        int,
+        int | None,
         typer.Option(help="Number of in-process worker slots for the user service."),
-    ] = 1,
+    ] = None,
+    control_query_concurrency: Annotated[
+        int | None,
+        typer.Option(help="Slots reserved within total capacity for live control queries."),
+    ] = None,
     kind_concurrency: Annotated[
         list[str] | None,
         typer.Option(
@@ -1130,14 +1152,26 @@ def endpoint_render_user_service(
             help="Per-kind worker limit as KIND=LIMIT; repeat for multiple kinds.",
         ),
     ] = None,
+    clear_kind_concurrency: Annotated[
+        bool,
+        typer.Option(help="Clear every persisted per-kind override in the rendered unit."),
+    ] = False,
 ) -> None:
     """Render a sudo-less systemd user service for a worker endpoint."""
     definition = _require_cluster(cluster)
+    capacity = _resolved_worker_capacity_policy(
+        definition,
+        concurrency=concurrency,
+        control_query_concurrency=control_query_concurrency,
+        kind_concurrency=kind_concurrency,
+        clear_kind_concurrency=clear_kind_concurrency,
+    )
     service_text = render_endpoint_user_service(
         cluster=cluster,
         definition=definition,
-        concurrency=concurrency,
-        kind_concurrency=_kind_concurrency_options(kind_concurrency),
+        concurrency=capacity.concurrency,
+        control_query_concurrency=capacity.control_query_concurrency,
+        kind_concurrency=capacity.kind_concurrency,
     )
     if output is None:
         typer.echo(service_text)
@@ -1212,7 +1246,12 @@ def cluster_list() -> None:
     """List configured clusters."""
     registry = ClusterRegistry.load(default_registry_path())
     for name, definition in sorted(registry.clusters.items()):
-        typer.echo(f"{name} ssh={definition.ssh_host} profile={definition.bootstrap_profile}")
+        capacity = definition.worker_capacity
+        typer.echo(
+            f"{name} ssh={definition.ssh_host} profile={definition.bootstrap_profile} "
+            f"worker_concurrency={capacity.concurrency} "
+            f"control_query_concurrency={capacity.control_query_concurrency}"
+        )
 
 
 @cluster_app.command("add")
@@ -1257,6 +1296,21 @@ def cluster_add(
             help="Registered scheduler provider for relay-owned status/cancel operations."
         ),
     ] = "external",
+    worker_concurrency: Annotated[
+        int,
+        typer.Option(help="Total slot capacity for the managed cluster worker service."),
+    ] = 3,
+    worker_control_query_concurrency: Annotated[
+        int,
+        typer.Option(help="Slots reserved within total worker capacity for live control queries."),
+    ] = 1,
+    worker_kind_concurrency: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--worker-kind-concurrency",
+            help="Per-kind managed-worker limit as KIND=LIMIT; repeat for multiple kinds.",
+        ),
+    ] = None,
     agent_npm_package: Annotated[
         str | None,
         typer.Option(help="Optional npm package used to install the agent."),
@@ -1341,6 +1395,14 @@ def cluster_add(
             agent_bin=_none_if_blank(agent_bin),
             agent_adapter=agent_adapter,
             scheduler_provider=scheduler_provider,
+            worker_capacity=WorkerCapacityPolicy(
+                concurrency=worker_concurrency,
+                control_query_concurrency=worker_control_query_concurrency,
+                kind_concurrency=_kind_concurrency_options(
+                    worker_kind_concurrency,
+                    param_hint="--worker-kind-concurrency",
+                ),
+            ),
             target_identity=(
                 ClusterTargetIdentity(
                     hostnames=target_hostname,
@@ -1745,6 +1807,28 @@ def remote_mcp_refresh(
             )
         else:
             queue = _managed_queue_from_env()
+            admission_class, admission_authority = resolve_registered_remote_mcp_admission(
+                queue=queue,
+                definition=definition,
+                cluster=cluster,
+                server=registration.command,
+                server_args=registration.args,
+                env_from=registration.env_from,
+                operation=McpOperation.TOOLS_LIST,
+                tool=None,
+                expected_server_artifact_digest=None,
+                evidence=None,
+                timeout_seconds=timeout_seconds,
+            )
+            metadata = (
+                {}
+                if admission_authority is None
+                else {
+                    MCP_ADMISSION_AUTHORITY_METADATA_KEY: admission_authority.model_dump(
+                        mode="json"
+                    )
+                }
+            )
             job = queue.submit_job(
                 RelayJob(
                     cluster=cluster,
@@ -1753,10 +1837,12 @@ def remote_mcp_refresh(
                         server=registration.command,
                         server_args=registration.args,
                         env_from=registration.env_from,
+                        admission_class=admission_class,
                         operation=McpOperation.TOOLS_LIST,
                         timeout_seconds=timeout_seconds,
                     ),
                     idempotency_key=key,
+                    metadata=metadata,
                 )
             )
             terminal = wait_for_terminal(
@@ -3005,15 +3091,87 @@ def cluster_install_endpoint_service(
     start: Annotated[bool, typer.Option(help="Restart the service after installing.")] = True,
     enable: Annotated[bool, typer.Option(help="Enable the user service.")] = True,
     concurrency: Annotated[
-        int,
-        typer.Option(help="Number of in-process worker slots for the user service."),
-    ] = 1,
+        int | None,
+        typer.Option(
+            help="Override and persist total worker slots; defaults to the cluster policy."
+        ),
+    ] = None,
+    control_query_concurrency: Annotated[
+        int | None,
+        typer.Option(
+            help=(
+                "Override and persist slots reserved within total capacity for live "
+                "control queries."
+            )
+        ),
+    ] = None,
     kind_concurrency: Annotated[
         list[str] | None,
         typer.Option(
             "--kind-concurrency",
             help="Per-kind worker limit as KIND=LIMIT; repeat for multiple kinds.",
         ),
+    ] = None,
+    clear_kind_concurrency: Annotated[
+        bool,
+        typer.Option(help="Clear and persist every per-kind worker capacity override."),
+    ] = False,
+    require_persistent: Annotated[
+        bool,
+        typer.Option(
+            "--require-persistent/--allow-login-scoped",
+            help=(
+                "Require systemd user lingering so the enabled worker survives all logouts. "
+                "The login-scoped opt-out is diagnostic and not release-gate eligible."
+            ),
+        ),
+    ] = True,
+) -> None:
+    """Install a worker service from its persisted cluster capacity policy."""
+    definition = _require_cluster(cluster)
+    capacity = _resolved_worker_capacity_policy(
+        definition,
+        concurrency=concurrency,
+        control_query_concurrency=control_query_concurrency,
+        kind_concurrency=kind_concurrency,
+        clear_kind_concurrency=clear_kind_concurrency,
+    )
+    if capacity != definition.worker_capacity:
+        ClusterRegistry.mutate(
+            default_registry_path(),
+            lambda registry: registry.clusters.__setitem__(
+                cluster,
+                registry.require(cluster).model_copy(update={"worker_capacity": capacity}),
+            ),
+        )
+        definition = definition.model_copy(update={"worker_capacity": capacity})
+    service_text = render_endpoint_user_service(
+        cluster=cluster,
+        definition=definition,
+        concurrency=capacity.concurrency,
+        control_query_concurrency=capacity.control_query_concurrency,
+        kind_concurrency=capacity.kind_concurrency,
+    )
+    _run_or_exit(
+        lambda: _echo_lines(
+            install_endpoint_user_service_over_ssh(
+                cluster=cluster,
+                ssh_host=ssh_host or definition.ssh_host,
+                service_text=service_text,
+                start=start,
+                enable=enable,
+                require_persistent=require_persistent,
+            )
+        )
+    )
+
+
+@cluster_app.command("restart-endpoint-service")
+def cluster_restart_endpoint_service(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    ssh_host: Annotated[
+        str | None,
+        typer.Option(help="Override SSH host alias for this run."),
     ] = None,
     require_persistent: Annotated[
         bool,
@@ -3026,22 +3184,14 @@ def cluster_install_endpoint_service(
         ),
     ] = True,
 ) -> None:
-    """Install and optionally start a sudo-less worker endpoint service over SSH."""
+    """Verify persisted capacity, then restart without rewriting the installed unit."""
     definition = _require_cluster(cluster)
-    service_text = render_endpoint_user_service(
-        cluster=cluster,
-        definition=definition,
-        concurrency=concurrency,
-        kind_concurrency=_kind_concurrency_options(kind_concurrency),
-    )
     _run_or_exit(
         lambda: _echo_lines(
-            install_endpoint_user_service_over_ssh(
+            restart_endpoint_user_service_over_ssh(
                 cluster=cluster,
                 ssh_host=ssh_host or definition.ssh_host,
-                service_text=service_text,
-                start=start,
-                enable=enable,
+                expected_capacity=definition.worker_capacity,
                 require_persistent=require_persistent,
             )
         )
@@ -7478,6 +7628,13 @@ def mcp_call(
         str | None,
         typer.Option(help="Expected discovery-time MCP server artifact SHA-256 binding."),
     ] = None,
+    control_query_evidence_json: Annotated[
+        str | None,
+        typer.Option(
+            help="Internal discovery evidence offered for server-side admission validation.",
+            hidden=True,
+        ),
+    ] = None,
 ) -> None:
     """Submit a durable remote MCP call or schema-discovery operation."""
     definition = _require_cluster(cluster)
@@ -7494,6 +7651,14 @@ def mcp_call(
     )
     if operation == McpOperation.TOOLS_LIST and arguments:
         raise typer.BadParameter("tools/list does not accept arguments")
+    try:
+        control_query_evidence = (
+            McpControlQueryEvidence.model_validate_json(control_query_evidence_json)
+            if control_query_evidence_json is not None
+            else None
+        )
+    except ValidationError as exc:
+        raise typer.BadParameter("--control-query-evidence-json is invalid") from exc
     digest = hashlib.sha256(
         json.dumps(
             {"operation": operation.value, "tool": tool, "arguments": arguments},
@@ -7504,22 +7669,6 @@ def mcp_call(
     server_args = server_arg or []
     environment_references = _environment_references(env_from)
     artifact_uses = _artifact_use_refs(used_artifact)
-    server_digest = hashlib.sha256(
-        json.dumps(
-            {
-                "server": server,
-                "args": server_args,
-                "env_from": environment_references,
-                "expected_server_artifact_digest": expected_server_artifact_digest,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-    key = idempotency_key or (
-        f"mcp:{cluster}:{server_digest}:{operation.value}:{tool}:{digest}"
-        + _artifact_use_idempotency_suffix(artifact_uses)
-    )
     if should_execute_on_cluster(definition):
         remote_arguments_path: str | None = None
         remote_command = [
@@ -7530,9 +7679,20 @@ def mcp_call(
             server,
             "--operation",
             operation.value,
-            "--idempotency-key",
-            key,
         ]
+        if idempotency_key is not None:
+            remote_command.extend(["--idempotency-key", idempotency_key])
+        if control_query_evidence is not None:
+            remote_command.extend(
+                [
+                    "--control-query-evidence-json",
+                    json.dumps(
+                        control_query_evidence.model_dump(mode="json"),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ]
+            )
         if tool is not None:
             remote_arguments_path = (
                 ".local/share/clio-relay/desktop-submissions/"
@@ -7572,23 +7732,86 @@ def mcp_call(
                     remove_empty_parent=True,
                 )
         return
-    job = RelayJob(
-        cluster=cluster,
-        kind=JobKind.MCP_CALL,
-        spec=McpCallSpec(
-            server=server,
-            server_args=server_args,
-            env_from=environment_references,
-            expected_server_artifact_digest=expected_server_artifact_digest,
-            operation=operation,
-            tool=tool,
-            arguments=arguments,
-            timeout_seconds=timeout_seconds,
-        ),
-        idempotency_key=key,
-        used_artifact_refs=artifact_uses,
-    )
-    saved = _submit_managed_job(job)
+    queue = _managed_queue_from_env()
+    try:
+        try:
+            resolved_admission_class, admission_authority = resolve_registered_remote_mcp_admission(
+                queue=queue,
+                definition=definition,
+                cluster=cluster,
+                server=server,
+                server_args=server_args,
+                env_from=environment_references,
+                operation=operation,
+                tool=tool,
+                expected_server_artifact_digest=expected_server_artifact_digest,
+                evidence=control_query_evidence,
+                timeout_seconds=timeout_seconds,
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        admission_identity: dict[str, object] = {
+            "server": server,
+            "args": server_args,
+            "env_from": environment_references,
+            "expected_server_artifact_digest": expected_server_artifact_digest,
+        }
+        if (
+            resolved_admission_class is McpAdmissionClass.CONTROL_QUERY
+            or admission_authority is not None
+        ):
+            admission_identity.update(
+                {
+                    "timeout_seconds": timeout_seconds,
+                    "admission_class": resolved_admission_class.value,
+                    "admission_authority": (
+                        None
+                        if admission_authority is None
+                        else admission_authority.model_dump(mode="json")
+                    ),
+                }
+            )
+        server_digest = hashlib.sha256(
+            json.dumps(
+                admission_identity,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        key = idempotency_key or (
+            f"mcp:{cluster}:{server_digest}:{operation.value}:{tool}:{digest}"
+            + _artifact_use_idempotency_suffix(artifact_uses)
+        )
+        metadata = (
+            {}
+            if admission_authority is None
+            else {MCP_ADMISSION_AUTHORITY_METADATA_KEY: admission_authority.model_dump(mode="json")}
+        )
+        job = RelayJob(
+            cluster=cluster,
+            kind=JobKind.MCP_CALL,
+            spec=McpCallSpec(
+                server=server,
+                server_args=server_args,
+                env_from=environment_references,
+                expected_server_artifact_digest=expected_server_artifact_digest,
+                admission_class=resolved_admission_class,
+                operation=operation,
+                tool=tool,
+                arguments=arguments,
+                timeout_seconds=timeout_seconds,
+            ),
+            idempotency_key=key,
+            used_artifact_refs=artifact_uses,
+            metadata=metadata,
+        )
+        try:
+            saved = queue.submit_job(job)
+        except StorageAdmissionError as exc:
+            _echo_storage_admission_error(exc)
+            raise typer.Exit(code=1) from exc
+    finally:
+        queue.close()
     typer.echo(saved.job_id)
 
 
@@ -7650,6 +7873,18 @@ def jarvis_mcp_call(
     )
     if operation == McpOperation.TOOLS_LIST and arguments:
         raise typer.BadParameter("tools/list does not accept arguments")
+    try:
+        resolved_admission_class, admission_authority = resolve_pinned_mcp_admission(
+            operation=operation,
+            tool=tool,
+            expected_server_artifact_digest=expected_server_artifact_digest,
+            pinned_control_query=(tool is not None and is_virtual_jarvis_control_query(tool)),
+            timeout_seconds=timeout_seconds,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if resolved_admission_class is McpAdmissionClass.CONTROL_QUERY and timeout_seconds is None:
+        timeout_seconds = MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
     digest = hashlib.sha256(
         json.dumps(
             {"operation": operation.value, "tool": tool, "arguments": arguments},
@@ -7658,10 +7893,19 @@ def jarvis_mcp_call(
         ).encode("utf-8")
     ).hexdigest()
     artifact_uses = _artifact_use_refs(used_artifact)
-    key = idempotency_key or (
+    legacy_key = (
         f"mcp:{cluster}:jarvis:{operation.value}:{tool}:{digest}:"
         f"{expected_server_artifact_digest or 'unbound'}"
         + _artifact_use_idempotency_suffix(artifact_uses)
+    )
+    key = idempotency_key or (
+        legacy_key
+        if resolved_admission_class is McpAdmissionClass.WORKLOAD
+        else (
+            f"{legacy_key}:{resolved_admission_class.value}:"
+            f"{admission_authority.source if admission_authority is not None else 'none'}:"
+            f"timeout={timeout_seconds}"
+        )
     )
     if definition is not None and should_execute_on_cluster(definition):
         remote_args: str | None = None
@@ -7708,6 +7952,11 @@ def jarvis_mcp_call(
         return
     server = jarvis_mcp_server()
     server_args = jarvis_mcp_server_args()
+    metadata = (
+        {}
+        if admission_authority is None
+        else {MCP_ADMISSION_AUTHORITY_METADATA_KEY: admission_authority.model_dump(mode="json")}
+    )
     job = RelayJob(
         cluster=cluster,
         kind=JobKind.MCP_CALL,
@@ -7717,6 +7966,7 @@ def jarvis_mcp_call(
             env_from=jarvis_mcp_env_from(),
             expected_server_artifact_digest=expected_server_artifact_digest,
             expected_jarvis_cd_lock_binding=jarvis_cd_lock_binding_expectation(),
+            admission_class=resolved_admission_class,
             operation=operation,
             tool=tool,
             arguments=arguments,
@@ -7724,6 +7974,7 @@ def jarvis_mcp_call(
         ),
         idempotency_key=key,
         used_artifact_refs=artifact_uses,
+        metadata=metadata,
     )
     saved = _submit_managed_job(job)
     typer.echo(saved.job_id)
@@ -10599,6 +10850,14 @@ def _run_jarvis_remote_contract_discovery(
     else:
         server = jarvis_mcp_server()
         server_args = jarvis_mcp_server_args()
+        admission_class, admission_authority = resolve_pinned_mcp_admission(
+            operation=McpOperation.TOOLS_LIST,
+            tool=None,
+            expected_server_artifact_digest=None,
+            pinned_control_query=False,
+            timeout_seconds=MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS,
+        )
+        assert admission_authority is not None
         submitted = queue.submit_job(
             RelayJob(
                 cluster=cluster,
@@ -10608,10 +10867,16 @@ def _run_jarvis_remote_contract_discovery(
                     server_args=server_args,
                     env_from=jarvis_mcp_env_from(),
                     expected_jarvis_cd_lock_binding=jarvis_cd_lock_binding_expectation(),
+                    admission_class=admission_class,
                     operation=McpOperation.TOOLS_LIST,
-                    timeout_seconds=max(1, int(wait_timeout_seconds)),
+                    timeout_seconds=MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS,
                 ),
                 idempotency_key=idempotency_key,
+                metadata={
+                    MCP_ADMISSION_AUTHORITY_METADATA_KEY: admission_authority.model_dump(
+                        mode="json"
+                    )
+                },
             )
         )
         job_id = submitted.job_id
@@ -12443,13 +12708,57 @@ def _require_durable_session_identity(value: str, *, field: str) -> str:
         raise RelayError(f"invalid {field}: {error}") from error
 
 
-def _kind_concurrency_options(items: list[str] | None) -> dict[JobKind, int]:
+def _kind_concurrency_options(
+    items: list[str] | None,
+    *,
+    param_hint: str = "--kind-concurrency",
+) -> dict[JobKind, int]:
     try:
         return parse_kind_concurrency_options(items)
     except ConfigurationError as exc:
         raise typer.BadParameter(
             str(exc),
-            param_hint="--kind-concurrency",
+            param_hint=param_hint,
+        ) from exc
+
+
+def _resolved_worker_capacity_policy(
+    definition: ClusterDefinition,
+    *,
+    concurrency: int | None,
+    control_query_concurrency: int | None,
+    kind_concurrency: list[str] | None,
+    clear_kind_concurrency: bool,
+) -> WorkerCapacityPolicy:
+    """Resolve optional CLI overrides against one persisted worker policy."""
+    if clear_kind_concurrency and kind_concurrency is not None:
+        raise typer.BadParameter(
+            "--clear-kind-concurrency cannot be combined with --kind-concurrency"
+        )
+    current = definition.worker_capacity
+    selected_kind_concurrency = (
+        {}
+        if clear_kind_concurrency
+        else (
+            current.kind_concurrency
+            if kind_concurrency is None
+            else _kind_concurrency_options(kind_concurrency)
+        )
+    )
+    try:
+        return WorkerCapacityPolicy(
+            concurrency=current.concurrency if concurrency is None else concurrency,
+            control_query_concurrency=(
+                current.control_query_concurrency
+                if control_query_concurrency is None
+                else control_query_concurrency
+            ),
+            kind_concurrency=selected_kind_concurrency,
+        )
+    except ValidationError as exc:
+        raise typer.BadParameter(
+            str(exc),
+            param_hint="--concurrency/--control-query-concurrency",
         ) from exc
 
 

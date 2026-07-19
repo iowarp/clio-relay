@@ -8,12 +8,18 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from clio_relay.cluster_config import (
+    ClusterDefinition,
+    ClusterRegistry,
+    RemoteMcpServerConfig,
+)
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError
 from clio_relay.http_api import create_app
 from clio_relay.jarvis_mcp import jarvis_cd_lock_binding_expectation
 from clio_relay.models import (
+    MCP_ADMISSION_AUTHORITY_METADATA_KEY,
     ArtifactRef,
     Cursor,
     EndpointRegistration,
@@ -23,7 +29,10 @@ from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
     JobState,
+    McpAdmissionAuthority,
+    McpAdmissionClass,
     McpCallSpec,
+    McpOperation,
     MonitorRule,
     RelayJob,
     RelayTask,
@@ -344,6 +353,144 @@ def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
     assert jarvis_mcp.spec.server_args == ["mcp-server", "jarvis"]
     assert jarvis_mcp.spec.tool == "jarvis_describe"
     assert jarvis_mcp.spec.arguments == {"target": "packages"}
+
+
+def test_http_mcp_admission_is_server_owned_and_raw_bypass_is_closed(
+    tmp_path: Path,
+) -> None:
+    """Reject caller lane claims and keep arbitrary tools/list on workload capacity."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    client = cast(Any, TestClient(create_app(settings)))
+    raw_mcp = RelayJob(
+        cluster="test-cluster",
+        kind=JobKind.MCP_CALL,
+        spec=McpCallSpec(server="arbitrary-mcp", tool="inspect"),
+        idempotency_key="raw-mcp-bypass",
+    )
+    forged_metadata = RelayJob(
+        cluster="test-cluster",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(command=["true"]),
+        idempotency_key="raw-authority-bypass",
+        metadata={MCP_ADMISSION_AUTHORITY_METADATA_KEY: {"source": "forged"}},
+    )
+
+    raw_response = client.post("/jobs", json=raw_mcp.model_dump(mode="json"))
+    metadata_response = client.post(
+        "/jobs",
+        json=forged_metadata.model_dump(mode="json"),
+    )
+    generic_enum = client.post(
+        "/jobs/mcp-call",
+        json={
+            "cluster": "test-cluster",
+            "server": "arbitrary-mcp",
+            "tool": "inspect",
+            "admission_class": "control_query",
+            "idempotency_key": "forged-generic-enum",
+        },
+    )
+    jarvis_enum = client.post(
+        "/jobs/jarvis-mcp-call",
+        json={
+            "cluster": "test-cluster",
+            "tool": "jarvis_describe",
+            "admission_class": "control_query",
+            "idempotency_key": "forged-jarvis-enum",
+        },
+    )
+    arbitrary_discovery = client.post(
+        "/jobs/mcp-call",
+        json={
+            "cluster": "test-cluster",
+            "server": "arbitrary-mcp",
+            "server_args": ["--hang"],
+            "operation": "tools/list",
+            "timeout_seconds": 1,
+            "idempotency_key": "arbitrary-tools-list",
+        },
+    )
+
+    assert raw_response.status_code == 422
+    assert "must use /jobs/mcp-call" in raw_response.json()["detail"]
+    assert metadata_response.status_code == 422
+    assert "server-managed" in metadata_response.json()["detail"]
+    assert generic_enum.status_code == 422
+    assert jarvis_enum.status_code == 422
+    assert arbitrary_discovery.status_code == 200
+    queued = ClioCoreQueue(settings.core_dir).get_job(arbitrary_discovery.json()["job_id"])
+    assert isinstance(queued.spec, McpCallSpec)
+    assert queued.spec.operation is McpOperation.TOOLS_LIST
+    assert queued.spec.admission_class is McpAdmissionClass.WORKLOAD
+    assert MCP_ADMISSION_AUTHORITY_METADATA_KEY not in queued.metadata
+
+
+def test_http_registered_tools_list_gets_bounded_intrinsic_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Promote only an exact enabled registration and persist server provenance."""
+    registration = RemoteMcpServerConfig(
+        command="science-mcp",
+        args=["--stdio"],
+        env_from={"SCIENCE_TOKEN": "SITE_SCIENCE_TOKEN"},
+        allow_tools=["inspect"],
+        call_timeout_seconds=30,
+    )
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(
+        clusters={
+            "alpha": ClusterDefinition(
+                name="alpha",
+                ssh_host="alpha-login",
+                remote_mcp_servers={"science": registration},
+            )
+        }
+    ).save(registry_path)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    client = cast(Any, TestClient(create_app(settings)))
+    payload = {
+        "cluster": "alpha",
+        "server": registration.command,
+        "server_args": registration.args,
+        "env_from": registration.env_from,
+        "operation": "tools/list",
+        "timeout_seconds": registration.call_timeout_seconds,
+        "idempotency_key": "registered-tools-list",
+    }
+
+    accepted = client.post("/jobs/mcp-call", json=payload)
+    omitted_payload = {
+        **payload,
+        "idempotency_key": "registered-tools-list-omitted",
+    }
+    omitted_payload.pop("timeout_seconds")
+    omitted = client.post(
+        "/jobs/mcp-call",
+        json=omitted_payload,
+    )
+    overlong = client.post(
+        "/jobs/mcp-call",
+        json={
+            **payload,
+            "timeout_seconds": registration.call_timeout_seconds + 1,
+            "idempotency_key": "registered-tools-list-overlong",
+        },
+    )
+
+    assert accepted.status_code == 200
+    assert omitted.status_code == 409
+    assert "explicit timeout" in omitted.json()["detail"]
+    assert overlong.status_code == 409
+    queued = ClioCoreQueue(settings.core_dir).get_job(accepted.json()["job_id"])
+    assert isinstance(queued.spec, McpCallSpec)
+    assert queued.spec.admission_class is McpAdmissionClass.CONTROL_QUERY
+    authority = McpAdmissionAuthority.model_validate(
+        queued.metadata[MCP_ADMISSION_AUTHORITY_METADATA_KEY]
+    )
+    assert authority.source == "intrinsic_tools_list"
+    assert authority.operation is McpOperation.TOOLS_LIST
 
 
 def test_owned_jarvis_mcp_submission_inherits_operator_spack_reference(
@@ -972,14 +1119,33 @@ def test_owned_jarvis_mcp_submission_forwards_desktop_binding_without_remote_cac
         "/jobs/jarvis-mcp-call",
         json={**payload, "expected_server_artifact_digest": expected_digest},
     )
+    oversized = client.post(
+        "/jobs/jarvis-mcp-call",
+        json={
+            **payload,
+            "expected_server_artifact_digest": expected_digest,
+            "timeout_seconds": 61,
+            "idempotency_key": "owned-artifact-source-oversized",
+        },
+    )
 
     assert omitted.status_code == 422
     assert accepted.status_code == 200
+    assert oversized.status_code == 422
+    assert "timeout exceeds 60 seconds" in str(oversized.json())
     job = queue.get_job(accepted.json()["job_id"])
     assert isinstance(job.spec, McpCallSpec)
     assert job.spec.expected_server_artifact_digest == expected_digest
     assert job.spec.expected_jarvis_cd_lock_binding == jarvis_cd_lock_binding_expectation()
-    assert job.metadata == {
+    assert job.spec.timeout_seconds == 60
+    metadata = dict(job.metadata)
+    authority = McpAdmissionAuthority.model_validate(
+        metadata.pop(MCP_ADMISSION_AUTHORITY_METADATA_KEY)
+    )
+    assert authority.source == "pinned_jarvis_contract"
+    assert authority.tool == "jarvis_get_execution"
+    assert authority.expected_server_artifact_digest == expected_digest
+    assert metadata == {
         "owner": "clio-relay",
         "owner_session_id": "desktop-session-1",
         "owner_session_generation_id": "generation-1",

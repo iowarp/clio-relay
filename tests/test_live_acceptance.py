@@ -33,6 +33,7 @@ from clio_relay.live_acceptance import (
     _find_agent_child_job,  # pyright: ignore[reportPrivateUsage]
     _http_json,  # pyright: ignore[reportPrivateUsage]
     _packaged_mcp_acceptance_evidence,  # pyright: ignore[reportPrivateUsage]
+    _require_secure_runtime_control_capacity,  # pyright: ignore[reportPrivateUsage]
     _secure_runtime_probe_config,  # pyright: ignore[reportPrivateUsage]
     _select_secure_runtime_handoff,  # pyright: ignore[reportPrivateUsage]
     _verify_cluster_deployment,  # pyright: ignore[reportPrivateUsage]
@@ -551,6 +552,22 @@ def test_secure_runtime_orchestration_never_waits_for_outer_job_terminal(
         commands.append(script)
         if "mkdir -p" in script or "cat >" in script:
             return _completed(command, "")
+        if "worker status --cluster test-cluster" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    {
+                        "configured_workload_concurrency": 2,
+                        "configured_control_query_concurrency": 1,
+                        "control_query_concurrency_consistent": True,
+                        "active_leases_by_mcp_admission_class": {
+                            "workload": 0,
+                            "control_query": 0,
+                        },
+                        "scan_truncated": False,
+                    }
+                ),
+            )
         if "job submit" in script:
             return _completed(command, f"{_LIVE_SOURCE_JOB_ID}\n")
         if f"job status {_LIVE_SOURCE_JOB_ID}" in script:
@@ -639,6 +656,50 @@ def test_secure_runtime_orchestration_never_waits_for_outer_job_terminal(
     assert source.state == "running"
     assert source.metadata["retained"] is True
     assert source.metadata["cancel_scheduler_job"] is False
+
+
+def test_secure_runtime_capacity_failure_records_pre_submission_evidence() -> None:
+    """A missing reserved lane is diagnosable and cannot create scheduler work."""
+    evidence: list[Any] = []
+
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        return _completed(
+            command,
+            json.dumps(
+                {
+                    "configured_workload_concurrency": 1,
+                    "configured_control_query_concurrency": 0,
+                    "control_query_concurrency_consistent": False,
+                    "active_leases_by_mcp_admission_class": {
+                        "workload": 0,
+                        "control_query": 0,
+                    },
+                    "worker_generation_id": "endpoint_replacement",
+                    "worker_generation_complete": False,
+                    "scan_truncated": False,
+                }
+            ),
+        )
+
+    with pytest.raises(RelayError, match="control-query policy is inconsistent"):
+        _require_secure_runtime_control_capacity(
+            ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            cluster="test-cluster",
+            runner=fake_runner,
+            evidence=evidence,
+        )
+
+    assert len(evidence) == 1
+    metadata = evidence[0].metadata
+    assert metadata["worker_generation_id"] == "endpoint_replacement"
+    assert metadata["worker_generation_complete"] is False
+    assert metadata["source_submitted"] is False
+    assert metadata["scheduler_job_created"] is False
 
 
 def test_live_acceptance_stages_files_and_strips_relay_extension(

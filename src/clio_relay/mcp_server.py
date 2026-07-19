@@ -35,6 +35,7 @@ from clio_relay.identifiers import (
 )
 from clio_relay.jarvis_mcp import (
     JARVIS_MCP_CACHE_SERVER_NAME,
+    is_virtual_jarvis_control_query,
     is_virtual_jarvis_tool,
     jarvis_cd_lock_binding_expectation,
     jarvis_mcp_artifact_binding,
@@ -52,6 +53,7 @@ from clio_relay.jarvis_service_runtime import (
     resolve_jarvis_service_runtime,
 )
 from clio_relay.models import (
+    MCP_ADMISSION_AUTHORITY_METADATA_KEY,
     ArtifactRef,
     ArtifactUse,
     Cursor,
@@ -60,7 +62,10 @@ from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
     JobState,
+    McpAdmissionClass,
     McpCallSpec,
+    McpControlQueryEvidence,
+    McpOperation,
     MonitorRule,
     MonitorRuleAction,
     ProgressRecord,
@@ -102,12 +107,16 @@ from clio_relay.remote_cli import (
     write_remote_file,
 )
 from clio_relay.remote_mcp import (
+    MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS,
     RemoteMcpSchemaCache,
     VirtualRemoteMcpCatalog,
     cluster_route_revision_json_schema,
     default_remote_mcp_cache_path,
+    is_remote_mcp_control_query,
     load_virtual_remote_mcp_catalog,
     remote_mcp_registration_revision,
+    resolve_pinned_mcp_admission,
+    resolve_registered_remote_mcp_admission,
     unavailable_virtual_remote_mcp_catalog,
 )
 from clio_relay.retention import TerminalRetentionCoordinator
@@ -1540,6 +1549,7 @@ def _call_tool(
         result["catalog_revision"] = catalog.revision
     elif catalog is not None and name in catalog.tools:
         cluster = _required_str(arguments, "cluster")
+        virtual_tool = catalog.tools[name]
         route = catalog.resolve(name, cluster)
         forwarded_arguments = catalog.forwarded_arguments(name, arguments)
         relay_arguments = catalog.relay_arguments(name, arguments)
@@ -1555,13 +1565,23 @@ def _call_tool(
                 "expected_cluster_route_revision": route.cluster_route_revision,
                 "registered_server_name": route.server_name,
                 "expected_remote_mcp_registration_revision": (route.registration_revision),
+                "control_query_evidence": (
+                    route.control_query_evidence.model_dump(mode="json")
+                    if route.expected_server_artifact_digest is not None
+                    and is_remote_mcp_control_query(virtual_tool.remote_tool)
+                    and route.control_query_evidence is not None
+                    else None
+                ),
                 "tool": route.remote_tool_name,
                 "arguments": forwarded_arguments,
                 "timeout_seconds": route.timeout_seconds,
                 **relay_arguments,
                 "idempotency_key": (
-                    f"mcp:virtual:{cluster}:{route.server_name}:"
-                    f"{route.remote_tool_name}:{uuid4().hex}"
+                    relay_arguments.get("idempotency_key")
+                    or (
+                        f"mcp:virtual:{cluster}:{route.server_name}:"
+                        f"{route.remote_tool_name}:{uuid4().hex}"
+                    )
                 ),
             },
             queue=queue,
@@ -3743,6 +3763,7 @@ def _submit_mcp_call(
     *,
     queue: ClioCoreQueue,
     settings: RelaySettings,
+    pinned_jarvis: bool = False,
 ) -> JSON:
     cluster = _required_str(arguments, "cluster")
     used_artifact_refs = _artifact_use_refs(arguments)
@@ -3762,6 +3783,15 @@ def _submit_mcp_call(
         if raw_expected_jarvis_cd_lock_binding is not None
         else None
     )
+    raw_control_query_evidence = arguments.get("control_query_evidence")
+    try:
+        control_query_evidence = (
+            McpControlQueryEvidence.model_validate(raw_control_query_evidence)
+            if raw_control_query_evidence is not None
+            else None
+        )
+    except ValidationError as exc:
+        raise ValueError("invalid MCP control-query discovery evidence") from exc
     tool = _required_str(arguments, "tool")
     tool_arguments = _object(arguments.get("arguments", {}))
     timeout_seconds = _optional_int(arguments, "timeout_seconds")
@@ -3778,6 +3808,8 @@ def _submit_mcp_call(
         "arguments_digest": digest,
         "timeout_seconds": timeout_seconds,
     }
+    if control_query_evidence is not None:
+        identity["control_query_evidence"] = control_query_evidence.model_dump(mode="json")
     if expected_jarvis_cd_lock_binding is not None:
         identity["expected_jarvis_cd_lock_binding"] = expected_jarvis_cd_lock_binding
     if used_artifact_refs:
@@ -3834,6 +3866,18 @@ def _submit_mcp_call(
                 f"remote MCP registration changed for {cluster}/{registered_server_name}; "
                 "call tools/list again before submission"
             )
+    if control_query_evidence is not None:
+        if not registered_remote_mcp_route:
+            raise ValueError("MCP control-query evidence requires a registered remote route")
+        if (
+            control_query_evidence.cluster != cluster
+            or control_query_evidence.registered_server_name != registered_server_name
+            or control_query_evidence.cluster_route_revision != expected_cluster_route_revision
+            or control_query_evidence.registration_revision != expected_registration_revision
+            or control_query_evidence.expected_server_artifact_digest
+            != expected_server_artifact_digest
+        ):
+            raise ValueError("MCP control-query evidence does not match its selected route")
     if definition is not None and should_execute_on_cluster(definition):
         if settings.owner_session_id is not None:
             payload: dict[str, object] = {
@@ -3841,11 +3885,14 @@ def _submit_mcp_call(
                 "server": server,
                 "server_args": server_args,
                 "env_from": env_from,
+                "operation": McpOperation.TOOLS_CALL.value,
                 "tool": tool,
                 "arguments": tool_arguments,
                 "idempotency_key": idempotency_key,
                 "used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs],
             }
+            if control_query_evidence is not None:
+                payload["control_query_evidence"] = control_query_evidence.model_dump(mode="json")
             if timeout_seconds is not None:
                 payload["timeout_seconds"] = timeout_seconds
             if expected_server_artifact_digest is not None:
@@ -3886,6 +3933,17 @@ def _submit_mcp_call(
             "--idempotency-key",
             idempotency_key,
         ]
+        if control_query_evidence is not None:
+            remote_args.extend(
+                [
+                    "--control-query-evidence-json",
+                    json.dumps(
+                        control_query_evidence.model_dump(mode="json"),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ]
+            )
         if timeout_seconds is not None:
             remote_args.extend(["--timeout-seconds", str(timeout_seconds)])
         for item in server_args:
@@ -3912,6 +3970,39 @@ def _submit_mcp_call(
             definition=definition,
             arguments=arguments,
         )
+    operation = McpOperation.TOOLS_CALL
+    if pinned_jarvis:
+        admission_class, admission_authority = resolve_pinned_mcp_admission(
+            operation=operation,
+            tool=tool,
+            expected_server_artifact_digest=expected_server_artifact_digest,
+            pinned_control_query=is_virtual_jarvis_control_query(tool),
+            timeout_seconds=timeout_seconds,
+        )
+    elif control_query_evidence is not None:
+        if definition is None:
+            raise ValueError("registered MCP control-query admission requires a cluster route")
+        admission_class, admission_authority = resolve_registered_remote_mcp_admission(
+            queue=queue,
+            definition=definition,
+            cluster=cluster,
+            server=server,
+            server_args=server_args,
+            env_from=env_from,
+            operation=operation,
+            tool=tool,
+            expected_server_artifact_digest=expected_server_artifact_digest,
+            evidence=control_query_evidence,
+            timeout_seconds=timeout_seconds,
+        )
+    else:
+        admission_class = McpAdmissionClass.WORKLOAD
+        admission_authority = None
+    metadata = (
+        {}
+        if admission_authority is None
+        else {MCP_ADMISSION_AUTHORITY_METADATA_KEY: admission_authority.model_dump(mode="json")}
+    )
     job = _submit_local_job(
         queue,
         RelayJob(
@@ -3923,12 +4014,15 @@ def _submit_mcp_call(
                 env_from=env_from,
                 expected_server_artifact_digest=expected_server_artifact_digest,
                 expected_jarvis_cd_lock_binding=expected_jarvis_cd_lock_binding,
+                admission_class=admission_class,
+                operation=operation,
                 tool=tool,
                 arguments=tool_arguments,
                 timeout_seconds=timeout_seconds,
             ),
             idempotency_key=idempotency_key,
             used_artifact_refs=used_artifact_refs,
+            metadata=metadata,
         ),
         settings=settings,
     )
@@ -4165,19 +4259,6 @@ def _submit_jarvis_mcp_call(
     digest = hashlib.sha256(
         json.dumps(tool_arguments, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-    dependency_suffix = (
-        ":"
-        + _stable_digest(
-            {"used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs]}
-        )
-        if used_artifact_refs
-        else ""
-    )
-    idempotency_key = str(
-        forwarded.get("idempotency_key")
-        or f"mcp:{cluster}:jarvis:{tool}:{digest}{dependency_suffix}"
-    )
-    forwarded["idempotency_key"] = idempotency_key
     forwarded["expected_jarvis_cd_lock_binding"] = jarvis_cd_lock_binding_expectation()
     registered_route = arguments.get("registered_route") is True
     definition = (
@@ -4219,6 +4300,39 @@ def _submit_jarvis_mcp_call(
         )
     if expected_server_artifact_digest is not None:
         forwarded["expected_server_artifact_digest"] = expected_server_artifact_digest
+    timeout_seconds = _optional_int(arguments, "timeout_seconds")
+    admission_class, admission_authority = resolve_pinned_mcp_admission(
+        operation=McpOperation.TOOLS_CALL,
+        tool=tool,
+        expected_server_artifact_digest=expected_server_artifact_digest,
+        pinned_control_query=is_virtual_jarvis_control_query(tool),
+        timeout_seconds=timeout_seconds,
+    )
+    if admission_class is McpAdmissionClass.CONTROL_QUERY and timeout_seconds is None:
+        timeout_seconds = MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
+    if timeout_seconds is not None:
+        forwarded["timeout_seconds"] = timeout_seconds
+    dependency_suffix = (
+        ":"
+        + _stable_digest(
+            {"used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs]}
+        )
+        if used_artifact_refs
+        else ""
+    )
+    legacy_idempotency_key = f"mcp:{cluster}:jarvis:{tool}:{digest}{dependency_suffix}"
+    derived_idempotency_key = (
+        legacy_idempotency_key
+        if admission_class is McpAdmissionClass.WORKLOAD
+        else (
+            f"mcp:{cluster}:jarvis:{tool}:{digest}:"
+            f"{expected_server_artifact_digest or 'unbound'}:{admission_class.value}:"
+            f"{admission_authority.source if admission_authority is not None else 'none'}:"
+            f"timeout={timeout_seconds}{dependency_suffix}"
+        )
+    )
+    idempotency_key = str(forwarded.get("idempotency_key") or derived_idempotency_key)
+    forwarded["idempotency_key"] = idempotency_key
     if definition is not None and should_execute_on_cluster(definition):
         if settings.owner_session_id is not None:
             if expected_server_artifact_digest is None:
@@ -4227,13 +4341,13 @@ def _submit_jarvis_mcp_call(
                 )
             payload: dict[str, object] = {
                 "cluster": cluster,
+                "operation": McpOperation.TOOLS_CALL.value,
                 "tool": tool,
                 "arguments": tool_arguments,
                 "expected_server_artifact_digest": expected_server_artifact_digest,
                 "idempotency_key": idempotency_key,
                 "used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs],
             }
-            timeout_seconds = _optional_int(arguments, "timeout_seconds")
             if timeout_seconds is not None:
                 payload["timeout_seconds"] = timeout_seconds
             job = submit_owned_session_job(
@@ -4269,7 +4383,6 @@ def _submit_jarvis_mcp_call(
             "--idempotency-key",
             idempotency_key,
         ]
-        timeout_seconds = _optional_int(arguments, "timeout_seconds")
         if timeout_seconds is not None:
             remote_args.extend(["--timeout-seconds", str(timeout_seconds)])
         if expected_server_artifact_digest is not None:
@@ -4296,7 +4409,12 @@ def _submit_jarvis_mcp_call(
     server_args = jarvis_mcp_server_args()
     forwarded["server"] = server
     forwarded["server_args"] = server_args
-    return _submit_mcp_call(forwarded, queue=queue, settings=settings)
+    return _submit_mcp_call(
+        forwarded,
+        queue=queue,
+        settings=settings,
+        pinned_jarvis=True,
+    )
 
 
 def _submission_result(

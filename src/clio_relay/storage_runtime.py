@@ -23,6 +23,7 @@ from clio_relay.core_queue import (
     MAX_ACTIVE_JOB_RECORDS,
     MAX_LIVE_LEASE_RECORDS,
     ClioCoreQueue,
+    _job_matches_mcp_admission_class,  # pyright: ignore[reportPrivateUsage]
 )
 from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError, RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
@@ -31,6 +32,7 @@ from clio_relay.models import (
     JobKind,
     JobState,
     Lease,
+    McpAdmissionClass,
     RelayJob,
     StorageReservationEstimate,
 )
@@ -560,9 +562,25 @@ class StorageManagedQueue(ClioCoreQueue):
         ttl_seconds: int = 300,
         max_attempts: int = 3,
         kind_concurrency: KindConcurrencyInput | None = None,
+        mcp_admission_class: McpAdmissionClass | None = None,
+        mcp_admission_limit: int | None = None,
     ) -> Lease | None:
-        """Run terminal stale recovery outside the acquire lock before leasing."""
+        """Recover stale work, then lease atomically from one strict worker lane."""
         normalized = normalize_kind_concurrency(kind_concurrency)
+        if mcp_admission_class is not None and not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            mcp_admission_class,
+            McpAdmissionClass,
+        ):
+            raise ConfigurationError("worker MCP admission class is invalid")
+        if mcp_admission_limit is not None:
+            if mcp_admission_class is None:
+                raise ConfigurationError("worker MCP admission limit requires an admission class")
+            if (
+                isinstance(mcp_admission_limit, bool)
+                or not isinstance(mcp_admission_limit, int)  # pyright: ignore[reportUnnecessaryIsInstance]
+                or mcp_admission_limit < 1
+            ):
+                raise ConfigurationError("worker MCP admission limit must be at least 1")
         self.recover_stale_jobs(cluster=cluster, max_attempts=max_attempts)
         self.initialize()
         with self._acquire_lock_with_replay():
@@ -572,9 +590,29 @@ class StorageManagedQueue(ClioCoreQueue):
                 cluster=cluster,
             )
             if active is not None:
+                active_job = self.get_job(active.job_id)
+                if mcp_admission_class is not None and not _job_matches_mcp_admission_class(
+                    active_job,
+                    mcp_admission_class,
+                ):
+                    raise QueueConflictError(
+                        "endpoint active lease does not match its MCP admission lane: "
+                        f"{endpoint_id}"
+                    )
                 return active
             if global_lease_total >= MAX_LIVE_LEASE_RECORDS:
                 return None
+            mcp_admission_at_limit = False
+            active_mcp_workload_count: int | None = None
+            if mcp_admission_class is not None and mcp_admission_limit is not None:
+                mcp_admission_at_limit = (
+                    self._active_mcp_admission_count_unlocked(
+                        cluster=cluster,
+                        admission_class=mcp_admission_class,
+                        expiry_refs=None,
+                    )
+                    >= mcp_admission_limit
+                )
             queued_jobs, truncated = self._scan_many(  # pyright: ignore[reportPrivateUsage]
                 self._storage_root / "jobs_queued",  # pyright: ignore[reportPrivateUsage]
                 RelayJob,
@@ -588,13 +626,32 @@ class StorageManagedQueue(ClioCoreQueue):
             ):
                 if queued.cluster != cluster or queued.state is not JobState.QUEUED:
                     continue
+                if mcp_admission_class is not None and not _job_matches_mcp_admission_class(
+                    queued,
+                    mcp_admission_class,
+                ):
+                    continue
+                if mcp_admission_at_limit and queued.kind is JobKind.MCP_CALL:
+                    continue
                 if self._job_has_pending_execution_cleanup_unlocked(  # pyright: ignore[reportPrivateUsage]
                     queued.cluster,
                     queued.job_id,
                 ):
                     continue
                 kind_limit = normalized.get(queued.kind)
-                if kind_limit is not None and active_counts.get(queued.kind, 0) >= kind_limit:
+                active_kind_count = active_counts.get(queued.kind, 0)
+                if queued.kind is JobKind.MCP_CALL and mcp_admission_class is not None:
+                    if mcp_admission_class is McpAdmissionClass.CONTROL_QUERY:
+                        kind_limit = None
+                    else:
+                        if active_mcp_workload_count is None:
+                            active_mcp_workload_count = self._active_mcp_admission_count_unlocked(
+                                cluster=cluster,
+                                admission_class=McpAdmissionClass.WORKLOAD,
+                                expiry_refs=None,
+                            )
+                        active_kind_count = active_mcp_workload_count
+                if kind_limit is not None and active_kind_count >= kind_limit:
                     continue
                 return self._lease_job_unlocked(  # pyright: ignore[reportPrivateUsage]
                     queued,

@@ -56,6 +56,7 @@ from clio_relay.models import (
     JobKind,
     JobState,
     Lease,
+    McpAdmissionClass,
     McpCallSpec,
     ProgressRecord,
     RelayEvent,
@@ -256,6 +257,7 @@ class EndpointWorker:
         settings: RelaySettings,
         cluster: str = "local",
         concurrency: int = 1,
+        control_query_concurrency: int = 0,
         kind_concurrency: KindConcurrencyInput | None = None,
         queue: ClioCoreQueue | None = None,
         provider: JarvisCdProvider | None = None,
@@ -263,11 +265,30 @@ class EndpointWorker:
         storage_runtime: StorageRuntime | None = None,
         reconcile_execution_cleanup: bool = True,
     ) -> None:
-        if concurrency < 1:
+        if (
+            isinstance(concurrency, bool)
+            or not isinstance(concurrency, int)  # pyright: ignore[reportUnnecessaryIsInstance]
+            or concurrency < 1
+        ):
             raise ConfigurationError("worker concurrency must be at least 1")
+        if (
+            isinstance(control_query_concurrency, bool)
+            or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+                control_query_concurrency,
+                int,
+            )
+            or control_query_concurrency < 0
+        ):
+            raise ConfigurationError("worker control-query concurrency cannot be negative")
+        if control_query_concurrency >= concurrency:
+            raise ConfigurationError(
+                "worker control-query concurrency must leave at least one workload slot"
+            )
         self.role = role
         self.cluster = cluster
         self.concurrency = concurrency
+        self.control_query_concurrency = control_query_concurrency
+        self.workload_concurrency = concurrency - control_query_concurrency
         self.kind_concurrency = normalize_kind_concurrency(kind_concurrency)
         self.reconcile_execution_cleanup = reconcile_execution_cleanup
         self._foreground_jobs_since_cleanup = 0
@@ -382,6 +403,8 @@ class EndpointWorker:
         if self.role == EndpointRole.WORKER and self.concurrency > 1:
             metadata["worker_supervisor"] = True
         if self.role == EndpointRole.WORKER:
+            metadata["workload_concurrency"] = self.workload_concurrency
+            metadata["control_query_concurrency"] = self.control_query_concurrency
             metadata["installation_info"] = _worker_installation_snapshot()
             process_identity = _worker_process_identity()
             if process_identity is not None:
@@ -399,17 +422,25 @@ class EndpointWorker:
         self.endpoint = self.queue.register_endpoint(endpoint)
         return self.endpoint
 
-    def run_once(self) -> RelayJob | None:
-        """Run one leased cluster job if available."""
+    def run_once(
+        self,
+        *,
+        mcp_admission_class: McpAdmissionClass = McpAdmissionClass.WORKLOAD,
+        mcp_admission_limit: int | None = None,
+    ) -> RelayJob | None:
+        """Run one job from a strict workload or reserved MCP control lane."""
         self._require_open_queue_identity()
         if self.role != EndpointRole.WORKER:
             return None
         endpoint = self.endpoint or self.register()
         self.endpoint = self.queue.register_endpoint(endpoint)
         self.queue.recover_stale_jobs(cluster=self.cluster)
-        self._reconcile_canceled_scheduler_jobs()
+        workload_lane = mcp_admission_class is McpAdmissionClass.WORKLOAD
+        if workload_lane:
+            self._reconcile_canceled_scheduler_jobs()
         if (
-            self.reconcile_execution_cleanup
+            workload_lane
+            and self.reconcile_execution_cleanup
             and self._foreground_jobs_since_cleanup >= EXECUTION_CLEANUP_MAX_FOREGROUND_JOBS
         ):
             self._reconcile_pending_execution_cleanup()
@@ -419,9 +450,11 @@ class EndpointWorker:
             cluster=self.cluster,
             ttl_seconds=self.lease_ttl_seconds,
             kind_concurrency=self.kind_concurrency,
+            mcp_admission_class=mcp_admission_class,
+            mcp_admission_limit=mcp_admission_limit,
         )
         if lease is None:
-            if self.reconcile_execution_cleanup:
+            if workload_lane and self.reconcile_execution_cleanup:
                 self._reconcile_pending_execution_cleanup()
                 self._foreground_jobs_since_cleanup = 0
             return None
@@ -433,7 +466,7 @@ class EndpointWorker:
                 self._record_unhandled_job_failure(job, exc)
         finally:
             self.queue.release_lease(lease.lease_id)
-        if self.reconcile_execution_cleanup:
+        if workload_lane and self.reconcile_execution_cleanup:
             self._foreground_jobs_since_cleanup += 1
         return self.queue.get_job(job.job_id)
 
@@ -513,25 +546,41 @@ class EndpointWorker:
                 time.sleep(poll_seconds)
 
     def _serve_worker_slots(self, *, poll_seconds: float) -> None:
+        slot_admission_classes = [
+            *([McpAdmissionClass.WORKLOAD] * self.workload_concurrency),
+            *([McpAdmissionClass.CONTROL_QUERY] * self.control_query_concurrency),
+        ]
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as executor:
             futures = [
-                executor.submit(self._serve_worker_slot, index, poll_seconds)
-                for index in range(self.concurrency)
+                executor.submit(
+                    self._serve_worker_slot,
+                    index,
+                    poll_seconds,
+                    admission_class,
+                )
+                for index, admission_class in enumerate(slot_admission_classes)
             ]
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
-    def _serve_worker_slot(self, index: int, poll_seconds: float) -> None:
+    def _serve_worker_slot(
+        self,
+        index: int,
+        poll_seconds: float,
+        admission_class: McpAdmissionClass,
+    ) -> None:
+        workload_lane = admission_class is McpAdmissionClass.WORKLOAD
         worker = EndpointWorker(
             role=self.role,
             settings=self.settings,
             cluster=self.cluster,
             concurrency=1,
+            control_query_concurrency=0,
             kind_concurrency=self.kind_concurrency,
             queue=self.queue,
             scheduler_provider=self.scheduler_provider,
             storage_runtime=self.storage_runtime,
-            reconcile_execution_cleanup=index == 0,
+            reconcile_execution_cleanup=workload_lane and index == 0,
         )
         endpoint = EndpointRegistration(
             role=self.role,
@@ -542,6 +591,9 @@ class EndpointWorker:
                 "worker_slot": index,
                 "parent_endpoint_id": None if self.endpoint is None else self.endpoint.endpoint_id,
                 "concurrency": 1,
+                "workload_concurrency": 1 if workload_lane else 0,
+                "control_query_concurrency": 0 if workload_lane else 1,
+                "mcp_admission_class": admission_class.value,
                 "kind_concurrency": kind_concurrency_metadata(self.kind_concurrency),
                 "process_containment": process_containment.containment_capability(),
                 "installation_info": _worker_installation_snapshot(),
@@ -554,7 +606,14 @@ class EndpointWorker:
         )
         worker.endpoint = self.queue.register_endpoint(endpoint)
         while True:
-            worker.run_once()
+            worker.run_once(
+                mcp_admission_class=admission_class,
+                mcp_admission_limit=(
+                    self.control_query_concurrency
+                    if admission_class is McpAdmissionClass.CONTROL_QUERY
+                    else None
+                ),
+            )
             time.sleep(poll_seconds)
 
     def _run_job(self, job: RelayJob, lease: Lease) -> None:

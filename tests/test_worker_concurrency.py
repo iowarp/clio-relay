@@ -285,7 +285,8 @@ def test_user_service_renders_deterministic_kind_limits() -> None:
     )
 
     assert (
-        "--concurrency 4 --kind-concurrency remote_agent=2 "
+        "--concurrency 4 --control-query-concurrency 1 "
+        "--kind-concurrency remote_agent=2 "
         "--kind-concurrency mcp_call=1 --scheduler-provider slurm"
     ) in rendered
 

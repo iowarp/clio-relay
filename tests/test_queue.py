@@ -25,6 +25,7 @@ from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
     JobState,
+    McpAdmissionClass,
     McpCallSpec,
     MonitorRule,
     MonitorRuleAction,
@@ -1165,6 +1166,7 @@ def test_null_jarvis_binding_preserves_pre_upgrade_mcp_submission_digest() -> No
         legacy_payload.pop(generated_field, None)
     legacy_spec = cast(dict[str, object], legacy_payload["spec"])
     legacy_spec.pop("expected_jarvis_cd_lock_binding")
+    legacy_spec.pop("admission_class")
     expected = hashlib.sha256(
         json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -1174,6 +1176,86 @@ def test_null_jarvis_binding_preserves_pre_upgrade_mcp_submission_digest() -> No
     )
 
     assert observed == expected
+
+
+def test_control_query_admission_changes_mcp_submission_digest() -> None:
+    """A promoted control query cannot alias the legacy workload identity."""
+    workload = RelayJob(
+        cluster="configured-target",
+        kind=JobKind.MCP_CALL,
+        spec=McpCallSpec(
+            server="operator-mcp",
+            expected_server_artifact_digest="a" * 64,
+            tool="operator_query",
+        ),
+        idempotency_key="mcp-admission-class",
+    )
+    control = workload.model_copy(
+        update={
+            "spec": workload.spec.model_copy(
+                update={"admission_class": McpAdmissionClass.CONTROL_QUERY}
+            )
+        }
+    )
+
+    assert core_queue_module._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        workload
+    ) != core_queue_module._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        control
+    )
+
+
+def test_legacy_workload_mcp_idempotency_record_replays_after_lane_upgrade(
+    tmp_path: Path,
+) -> None:
+    """A durable pre-lane MCP reservation remains replayable after model loading."""
+    queue = ClioCoreQueue(tmp_path)
+    queue.initialize()
+    job = RelayJob(
+        cluster="configured-target",
+        kind=JobKind.MCP_CALL,
+        spec=McpCallSpec(
+            server="operator-mcp",
+            tool="operator_query",
+            arguments={"query": "status"},
+        ),
+        idempotency_key="legacy-workload-mcp",
+    )
+    legacy_payload = job.model_dump(mode="json")
+    for generated_field in {
+        "job_id",
+        "state",
+        "created_at",
+        "updated_at",
+        "leased_by",
+        "attempts",
+        "last_error",
+        "submission_digest",
+        "used_artifact_refs",
+    }:
+        legacy_payload.pop(generated_field, None)
+    legacy_spec = cast(dict[str, object], legacy_payload["spec"])
+    legacy_spec.pop("expected_jarvis_cd_lock_binding")
+    legacy_spec.pop("admission_class")
+    legacy_digest = hashlib.sha256(
+        json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    _idempotency_path(tmp_path, job.idempotency_key).write_text(
+        json.dumps(
+            {
+                "state": "reserved",
+                "job_id": "job_legacy_workload_mcp",
+                "idempotency_key": job.idempotency_key,
+                "job_digest": legacy_digest,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    saved = queue.submit_job(job)
+
+    assert saved.job_id == "job_legacy_workload_mcp"
+    assert saved.spec == job.spec
 
 
 def test_submit_repairs_existing_job_missing_initial_event(tmp_path: Path) -> None:

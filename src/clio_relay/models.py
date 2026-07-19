@@ -24,6 +24,7 @@ RELAY_CREDENTIAL_ENV_NAMES = frozenset(
         "CLIO_RELAY_STCP_SECRET",
     }
 )
+MCP_ADMISSION_AUTHORITY_METADATA_KEY = "mcp_admission_authority"
 
 
 def validate_mcp_env_from(value: dict[str, str]) -> dict[str, str]:
@@ -84,6 +85,83 @@ class McpOperation(StrEnum):
 
     TOOLS_CALL = "tools/call"
     TOOLS_LIST = "tools/list"
+
+
+class McpAdmissionClass(StrEnum):
+    """Durable worker-lane admission assigned to one remote MCP operation.
+
+    ``control_query`` is a privileged scheduling assertion.  Generic callers
+    must remain on ``workload``; trusted ingress may promote an artifact-bound,
+    non-destructive read operation after validating its registered contract.
+    """
+
+    WORKLOAD = "workload"
+    CONTROL_QUERY = "control_query"
+
+
+class McpControlQueryEvidence(BaseModel):
+    """Cluster-owned discovery evidence offered for reserved query admission."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["clio-relay.mcp-control-query-evidence.v1"] = (
+        "clio-relay.mcp-control-query-evidence.v1"
+    )
+    cluster: str = Field(min_length=1, max_length=256)
+    registered_server_name: str = Field(min_length=1, max_length=256)
+    cluster_route_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    registration_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    discovery_job_id: DurableRecordId
+    discovery_artifact_id: DurableRecordId
+    discovery_artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    discovery_schema_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_server_artifact_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class McpAdmissionAuthority(BaseModel):
+    """Server-stamped provenance explaining one reserved MCP admission."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["clio-relay.mcp-admission-authority.v1"] = (
+        "clio-relay.mcp-admission-authority.v1"
+    )
+    admission_class: Literal["control_query"] = "control_query"
+    source: Literal[
+        "intrinsic_tools_list",
+        "pinned_jarvis_contract",
+        "registered_discovery_artifact",
+    ]
+    operation: McpOperation
+    tool: str | None = Field(default=None, max_length=512)
+    expected_server_artifact_digest: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    evidence: McpControlQueryEvidence | None = None
+
+    @model_validator(mode="after")
+    def validate_authority_source(self) -> McpAdmissionAuthority:
+        """Require source-specific evidence and operation bindings."""
+        if self.source == "intrinsic_tools_list":
+            if self.operation is not McpOperation.TOOLS_LIST:
+                raise ValueError("intrinsic MCP admission authority requires tools/list")
+            if self.tool is not None or self.evidence is not None:
+                raise ValueError("intrinsic tools/list authority must not name a tool or evidence")
+            return self
+        if self.operation is not McpOperation.TOOLS_CALL or not self.tool:
+            raise ValueError("MCP control-query authority requires one tools/call tool")
+        if self.expected_server_artifact_digest is None:
+            raise ValueError("MCP control-query authority requires an artifact digest")
+        if self.source == "pinned_jarvis_contract":
+            if self.evidence is not None:
+                raise ValueError("pinned JARVIS authority must not carry generic route evidence")
+            return self
+        if self.evidence is None:
+            raise ValueError("registered MCP authority requires discovery evidence")
+        if self.evidence.expected_server_artifact_digest != self.expected_server_artifact_digest:
+            raise ValueError("registered MCP authority artifact binding changed")
+        return self
 
 
 class JobState(StrEnum):
@@ -431,6 +509,7 @@ class McpCallSpec(BaseModel):
     env_from: dict[str, str] = Field(default_factory=dict)
     expected_server_artifact_digest: str | None = None
     expected_jarvis_cd_lock_binding: dict[str, str] | None = None
+    admission_class: McpAdmissionClass = McpAdmissionClass.WORKLOAD
     operation: McpOperation = McpOperation.TOOLS_CALL
     tool: str | None = None
     arguments: dict[str, Any] = Field(default_factory=dict)
@@ -480,6 +559,13 @@ class McpCallSpec(BaseModel):
         if self.operation == McpOperation.TOOLS_CALL:
             if self.tool is None or not self.tool:
                 raise ValueError("tool is required for tools/call")
+            if (
+                self.admission_class is McpAdmissionClass.CONTROL_QUERY
+                and self.expected_server_artifact_digest is None
+            ):
+                raise ValueError(
+                    "control_query MCP calls require an expected server artifact digest"
+                )
             return self
         if self.tool is not None:
             raise ValueError("tool must be omitted for tools/list")

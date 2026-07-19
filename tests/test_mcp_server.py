@@ -32,6 +32,7 @@ from clio_relay.mcp_server import (
     serve_stdio,
 )
 from clio_relay.models import (
+    MCP_ADMISSION_AUTHORITY_METADATA_KEY,
     ArtifactRef,
     Cursor,
     EndpointRegistration,
@@ -40,7 +41,11 @@ from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
     JobState,
+    McpAdmissionAuthority,
+    McpAdmissionClass,
     McpCallSpec,
+    McpControlQueryEvidence,
+    McpOperation,
     RelayJob,
     RelayTask,
     RemoteAgentTaskSpec,
@@ -358,6 +363,8 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         tool for tool in response["result"]["tools"] if tool["name"] == "jarvis_get_execution"
     )
     query_properties = query_tool["inputSchema"]["properties"]
+    assert query_properties["timeout_seconds"]["maximum"] == 60
+    assert "maximum" not in run_tool["inputSchema"]["properties"]["timeout_seconds"]
     assert query_tool["inputSchema"]["required"] == [
         "cluster",
         "pipeline_id",
@@ -2516,6 +2523,17 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
         contract=None,
         cluster_route_revision=cluster_route_revision(definition),
         registration_revision=remote_mcp_registration_revision(registration),
+        control_query_evidence=McpControlQueryEvidence(
+            cluster="ares",
+            registered_server_name="science",
+            cluster_route_revision=cluster_route_revision(definition),
+            registration_revision=remote_mcp_registration_revision(registration),
+            discovery_job_id="job_discovery",
+            discovery_artifact_id="artifact_result",
+            discovery_artifact_sha256="d" * 64,
+            discovery_schema_digest="e" * 64,
+            expected_server_artifact_digest="c" * 64,
+        ),
     )
     virtual_tool = VirtualRemoteMcpTool(
         alias="science_inspect",
@@ -2528,6 +2546,7 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
                 "required": ["dataset"],
                 "additionalProperties": False,
             },
+            annotations={"readOnlyHint": True, "destructiveHint": False},
         ),
         routes={"ares": route},
         arguments_wrapped=False,
@@ -2551,6 +2570,17 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
         captured.update(kwargs)
         payload = cast(dict[str, object], kwargs["payload"])
         selected_settings = cast(RelaySettings, kwargs["settings"])
+        evidence = McpControlQueryEvidence.model_validate(payload["control_query_evidence"])
+        authority = McpAdmissionAuthority(
+            source="registered_discovery_artifact",
+            operation=McpOperation.TOOLS_CALL,
+            tool=cast(str, payload["tool"]),
+            expected_server_artifact_digest=cast(
+                str,
+                payload["expected_server_artifact_digest"],
+            ),
+            evidence=evidence,
+        )
         job = RelayJob(
             cluster="ares",
             kind=JobKind.MCP_CALL,
@@ -2561,6 +2591,7 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
                     str,
                     payload["expected_server_artifact_digest"],
                 ),
+                admission_class=McpAdmissionClass.CONTROL_QUERY,
                 tool=cast(str, payload["tool"]),
                 arguments=cast(dict[str, object], payload["arguments"]),
             ),
@@ -2569,6 +2600,7 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
                 "owner": "clio-relay",
                 "owner_session_id": selected_settings.owner_session_id,
                 "owner_session_generation_id": (selected_settings.owner_session_generation_id),
+                MCP_ADMISSION_AUTHORITY_METADATA_KEY: authority.model_dump(mode="json"),
             },
         )
         submitted_jobs.append(job)
@@ -2613,10 +2645,16 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
     payload = cast(dict[str, object], captured["payload"])
     assert payload["server"] == "science-mcp"
     assert payload["expected_server_artifact_digest"] == "c" * 64
+    assert "admission_class" not in payload
+    assert McpControlQueryEvidence.model_validate(payload["control_query_evidence"]) == (
+        route.control_query_evidence
+    )
     assert payload["arguments"] == {"dataset": "asteroid2018"}
     assert queue.list_jobs() == []
 
     submitted = submitted_jobs[0]
+    assert isinstance(submitted.spec, McpCallSpec)
+    assert submitted.spec.admission_class is McpAdmissionClass.CONTROL_QUERY
     terminal = submitted.model_copy(update={"state": JobState.SUCCEEDED})
     requests: list[tuple[str, str]] = []
 
@@ -2731,6 +2769,195 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
     assert stale is not None
     assert "cluster route changed" in stale["error"]["message"]
     assert len(requests) == 6
+
+
+def test_registered_remote_mcp_ssh_forwarding_carries_evidence_not_lane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SSH fallback lets the cluster receiver derive admission from exact evidence."""
+    registration = RemoteMcpServerConfig(
+        command="science-mcp",
+        args=["--stdio"],
+        allow_tools=["inspect"],
+    )
+    definition = ClusterDefinition(
+        name="ares",
+        ssh_host="ares-login",
+        remote_mcp_servers={"science": registration},
+    )
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(clusters={"ares": definition}).save(registry_path)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+    evidence = McpControlQueryEvidence(
+        cluster="ares",
+        registered_server_name="science",
+        cluster_route_revision=cluster_route_revision(definition),
+        registration_revision=remote_mcp_registration_revision(registration),
+        discovery_job_id="job_discovery",
+        discovery_artifact_id="artifact_result",
+        discovery_artifact_sha256="d" * 64,
+        discovery_schema_digest="e" * 64,
+        expected_server_artifact_digest="c" * 64,
+    )
+    commands: list[list[str]] = []
+
+    def ignore_write(_definition: ClusterDefinition, _path: str, _data: bytes) -> None:
+        return None
+
+    def ignore_remove(
+        _definition: ClusterDefinition,
+        _path: str,
+        *,
+        remove_empty_parent: bool,
+    ) -> None:
+        del remove_empty_parent
+
+    monkeypatch.setattr(mcp_server_module, "write_remote_file", ignore_write)
+    monkeypatch.setattr(mcp_server_module, "remove_remote_file", ignore_remove)
+
+    def run_remote(_definition: ClusterDefinition, command: list[str]) -> str:
+        commands.append(command)
+        return "job_remote_registered\n"
+
+    monkeypatch.setattr(mcp_server_module, "run_remote_clio", run_remote)
+    result = mcp_server_module._submit_mcp_call(  # pyright: ignore[reportPrivateUsage]
+        {
+            "cluster": "ares",
+            "server": registration.command,
+            "server_args": registration.args,
+            "tool": "inspect",
+            "arguments": {"dataset": "asteroid2018"},
+            "timeout_seconds": registration.call_timeout_seconds,
+            "expected_server_artifact_digest": "c" * 64,
+            "registered_route": True,
+            "registered_remote_mcp_route": True,
+            "expected_cluster_route_revision": cluster_route_revision(definition),
+            "registered_server_name": "science",
+            "expected_remote_mcp_registration_revision": (
+                remote_mcp_registration_revision(registration)
+            ),
+            "control_query_evidence": evidence.model_dump(mode="json"),
+        },
+        queue=ClioCoreQueue(tmp_path / "core"),
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+    )
+
+    assert result["job_id"] == "job_remote_registered"
+    command = commands[0]
+    assert "--admission-class" not in command
+    evidence_json = command[command.index("--control-query-evidence-json") + 1]
+    assert McpControlQueryEvidence.model_validate_json(evidence_json) == evidence
+
+
+def test_virtual_remote_mcp_idempotency_replays_exactly_and_conflicts_on_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expose a relay-only retry key without leaking it into remote tool arguments."""
+    registration = RemoteMcpServerConfig(
+        command="science-mcp",
+        args=["--stdio"],
+        allow_tools=["mutate"],
+        profiles=["user"],
+    )
+    definition = ClusterDefinition(
+        name="alpha",
+        ssh_host="localhost",
+        remote_mcp_servers={"science": registration},
+    )
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(clusters={"alpha": definition}).save(registry_path)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
+    route = RemoteMcpRoute(
+        cluster="alpha",
+        server_name="science",
+        command=registration.command,
+        args=tuple(registration.args),
+        env_from=(),
+        expected_server_artifact_digest=None,
+        remote_tool_name="mutate",
+        timeout_seconds=registration.call_timeout_seconds,
+        contract=None,
+        cluster_route_revision=cluster_route_revision(definition),
+        registration_revision=remote_mcp_registration_revision(registration),
+    )
+    catalog = VirtualRemoteMcpCatalog(
+        revision="f" * 64,
+        tools={
+            "science_mutate": VirtualRemoteMcpTool(
+                alias="science_mutate",
+                namespace="science",
+                remote_tool=RemoteMcpToolSchema(
+                    name="mutate",
+                    input_schema={
+                        "type": "object",
+                        "properties": {"value": {"type": "integer"}},
+                        "required": ["value"],
+                        "additionalProperties": False,
+                    },
+                    annotations={"readOnlyHint": False, "destructiveHint": True},
+                ),
+                routes={"alpha": route},
+                arguments_wrapped=False,
+            )
+        },
+        issues=(),
+        cluster_route_revisions={"alpha": cluster_route_revision(definition)},
+    )
+
+    def selected_catalog(*, profile: str, reserved_names: set[str]) -> VirtualRemoteMcpCatalog:
+        del profile, reserved_names
+        return catalog
+
+    monkeypatch.setattr(mcp_server_module, "_remote_mcp_catalog", selected_catalog)
+    queue = ClioCoreQueue(tmp_path / "core")
+    session = McpSessionState()
+    assert (
+        handle_request(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            queue=queue,
+            profile="user",
+            session=session,
+        )
+        is not None
+    )
+
+    def invoke(request_id: int, value: int) -> dict[str, Any] | None:
+        return handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "science_mutate",
+                    "arguments": {
+                        "cluster": "alpha",
+                        "value": value,
+                        "idempotency_key": "agent-retry-1",
+                    },
+                },
+            },
+            queue=queue,
+            profile="user",
+            session=session,
+        )
+
+    first = invoke(2, 1)
+    replay = invoke(3, 1)
+    conflict = invoke(4, 2)
+
+    assert first is not None and replay is not None and conflict is not None
+    first_job_id = first["result"]["structuredContent"]["job_id"]
+    assert replay["result"]["structuredContent"]["job_id"] == first_job_id
+    assert "idempotency" in conflict["error"]["message"].lower()
+    assert len(queue.list_jobs()) == 1
+    job = queue.get_job(first_job_id)
+    assert isinstance(job.spec, McpCallSpec)
+    assert job.spec.arguments == {"value": 1}
+    assert job.idempotency_key == "agent-retry-1"
 
 
 def test_virtual_remote_mcp_wait_envelope_returns_same_call_result_without_leaking(
@@ -3284,6 +3511,8 @@ def test_mcp_virtual_jarvis_execution_query_routes_selectors_through_remote_job(
     job = queue.get_job(response["result"]["structuredContent"]["job_id"])
     assert isinstance(job.spec, McpCallSpec)
     assert job.spec.tool == "jarvis_get_execution"
+    assert job.spec.admission_class is McpAdmissionClass.CONTROL_QUERY
+    assert job.spec.timeout_seconds == 60
     assert job.spec.arguments == {
         "pipeline_id": "example",
         "execution_id": "jarvis_execution_1",
@@ -3297,6 +3526,55 @@ def test_mcp_virtual_jarvis_execution_query_routes_selectors_through_remote_job(
             "cursor": "opaque_cursor_1",
         },
     }
+
+
+def test_jarvis_default_key_changes_after_artifact_bound_control_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An earlier unbound workload call cannot alias a later pinned control query."""
+    _configure_local_cluster(tmp_path, monkeypatch, "test-cluster")
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    arguments = {
+        "cluster": "test-cluster",
+        "tool": "jarvis_get_execution",
+        "arguments": {"pipeline_id": "example", "execution_id": "execution-1"},
+    }
+
+    unbound = mcp_server_module._submit_jarvis_mcp_call(  # pyright: ignore[reportPrivateUsage]
+        arguments,
+        queue=queue,
+        settings=settings,
+    )
+    bound = mcp_server_module._submit_jarvis_mcp_call(  # pyright: ignore[reportPrivateUsage]
+        {**arguments, "registered_route": True},
+        queue=queue,
+        settings=settings,
+    )
+    unbound_job = queue.get_job(cast(str, unbound["job_id"]))
+    bound_job = queue.get_job(cast(str, bound["job_id"]))
+
+    assert unbound_job.job_id != bound_job.job_id
+    assert unbound_job.idempotency_key != bound_job.idempotency_key
+    legacy_digest = hashlib.sha256(
+        json.dumps(
+            arguments["arguments"],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert unbound_job.idempotency_key == (
+        f"mcp:test-cluster:jarvis:jarvis_get_execution:{legacy_digest}"
+    )
+    assert isinstance(unbound_job.spec, McpCallSpec)
+    assert isinstance(bound_job.spec, McpCallSpec)
+    assert unbound_job.spec.expected_server_artifact_digest is None
+    assert unbound_job.spec.admission_class is McpAdmissionClass.WORKLOAD
+    assert unbound_job.spec.timeout_seconds is None
+    assert bound_job.spec.expected_server_artifact_digest == "a" * 64
+    assert bound_job.spec.admission_class is McpAdmissionClass.CONTROL_QUERY
+    assert bound_job.spec.timeout_seconds == 60
 
 
 def test_mcp_virtual_jarvis_run_is_fresh_unless_idempotency_is_explicit(

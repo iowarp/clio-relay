@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -19,6 +21,8 @@ from clio_relay.cluster_config import (
     ClusterRegistry,
     ClusterTargetIdentity,
     RemoteMcpServerConfig,
+    WorkerCapacityPolicy,
+    cluster_route_revision,
     default_registry_path,
     ensure_private_configuration_directory,
     ensure_private_configuration_path,
@@ -645,6 +649,35 @@ def test_cluster_target_identity_round_trips_operator_pins(tmp_path: Path) -> No
     registry.save(path)
 
     assert ClusterRegistry.load(path) == registry
+
+
+def test_cluster_route_revision_excludes_worker_capacity_across_upgrade_and_edits() -> None:
+    """Scheduling capacity changes must not invalidate durable queue-route handles."""
+    legacy_definition = ClusterDefinition.model_validate(
+        {
+            "name": "ares",
+            "ssh_host": "ares-login",
+            "scheduler_provider": "slurm",
+        }
+    )
+    legacy_payload = legacy_definition.model_dump(
+        mode="json",
+        exclude={"remote_mcp_servers", "worker_capacity"},
+    )
+    pre_upgrade_revision = hashlib.sha256(
+        json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    tuned_definition = legacy_definition.model_copy(
+        update={
+            "worker_capacity": WorkerCapacityPolicy(
+                concurrency=8,
+                control_query_concurrency=2,
+            )
+        }
+    )
+
+    assert cluster_route_revision(legacy_definition) == pre_upgrade_revision
+    assert cluster_route_revision(tuned_definition) == pre_upgrade_revision
 
 
 @pytest.mark.parametrize(
