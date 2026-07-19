@@ -10,7 +10,11 @@ from pytest import MonkeyPatch
 
 import clio_relay.session_lifecycle as session_lifecycle
 from clio_relay import __version__
-from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.cluster_config import (
+    MAX_CLUSTER_REGISTRY_BYTES,
+    ClusterDefinition,
+    RemoteMcpServerConfig,
+)
 from clio_relay.errors import RelayError
 from clio_relay.session_lifecycle import (
     SESSION_CONNECTORS_CHECK_ID,
@@ -275,6 +279,23 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
     assert "flock -w 10 -x 9" in script
     assert "CLIO_RELAY_SESSION_GENERATION_ID" in script
     assert "CLIO_RELAY_API_RELEASE_IDENTITY_SHA256" in script
+    assert (
+        'cluster_registry_file="$session_dir/cluster-registry-$session_generation_id.json"'
+        in script
+    )
+    assert "printf '%s'" in script
+    assert (
+        '"$cluster_registry_candidate" "$cluster_registry_file" "$cluster_registry_sha256"'
+        in script
+    )
+    assert "CLIO_RELAY_SESSION_REGISTRY_SHA256" in script
+    assert "CLIO_RELAY_SESSION_ROUTE_REVISION" in script
+    assert "cluster_registry_path" in script
+    assert "cluster_registry_sha256" in script
+    assert "cluster_route_revision" in script
+    assert '"cluster_authority_verified": True' in script
+    assert "Path(registry_path).unlink(missing_ok=True)" in script
+    assert "$cluster_registry_json" not in script
     assert "clio-relay.session-api-release.v1" in script
     assert "session API installation changed after worker compatibility verification" in script
     assert "existing owned session API has no release identity; use --replace" in script
@@ -342,6 +363,97 @@ def test_start_remote_session_checks_existing_api_release_before_reuse(
     )
     assert '(Path("/proc") / pid / "environ")' in script
     assert "CLIO_RELAY_API_RELEASE_IDENTITY_SHA256={observed_sha256}" in script
+    assert "existing owned session API cluster authority differs; use --replace" in script
+    assert (
+        "existing owned session API cluster authority is not process-bound; use --replace" in script
+    )
+    assert "cluster_authority_verified" in script
+    assert script.index("__CLIO_RELAY_EXISTING_API_RELEASE__") < script.index(
+        'echo "session_already_running=$session_id"'
+    )
+
+
+def test_start_remote_session_stages_large_registry_without_python_argv(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    scripts: list[str] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        input: bytes,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del capture_output, check, timeout
+        scripts.append(input.decode("utf-8"))
+        return subprocess.CompletedProcess(command, 0, b"session_started=session-1\n", b"")
+
+    monkeypatch.setattr("clio_relay.session_lifecycle.subprocess.run", fake_run)
+    registration = RemoteMcpServerConfig(
+        command="science-mcp",
+        args=[f"{index:03d}-" + ("x" * 4_000) for index in range(40)],
+        allow_tools=["inspect"],
+    )
+
+    start_remote_session(
+        cluster="alpha",
+        definition=ClusterDefinition(
+            name="alpha",
+            ssh_host="alpha",
+            remote_mcp_servers={"science": registration},
+        ),
+        session_id="session-1",
+        remote_api_port=9001,
+        api_token="token",
+        expected_api_release_identity=_api_release_identity(),
+    )
+
+    script = scripts[0]
+    assert len(script.encode("utf-8")) > 128 * 1024
+    assert "printf '%s'" in script
+    registry_path_arguments = (
+        '"$cluster_registry_candidate" "$cluster_registry_file" "$cluster_registry_sha256"'
+    )
+    assert registry_path_arguments in script
+    assert script.index("python3 -", script.index("printf '%s'")) < script.index(
+        registry_path_arguments
+    )
+    assert 'python3 - "{\\"clusters\\"' not in script
+
+
+def test_start_remote_session_rejects_registry_over_configuration_limit(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    def unexpected_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        del args, kwargs
+        pytest.fail("oversized session authority must fail before SSH")
+
+    monkeypatch.setattr("clio_relay.session_lifecycle.subprocess.run", unexpected_run)
+    registration = RemoteMcpServerConfig(
+        command="science-mcp",
+        args=["x" * 4_000 for _ in range(256)],
+        allow_tools=["inspect"],
+    )
+    definition = ClusterDefinition(
+        name="alpha",
+        ssh_host="alpha",
+        remote_mcp_servers={f"science-{index}": registration for index in range(5)},
+    )
+
+    with pytest.raises(
+        RelayError,
+        match=rf"{MAX_CLUSTER_REGISTRY_BYTES}-byte configuration limit",
+    ):
+        start_remote_session(
+            cluster="alpha",
+            definition=definition,
+            session_id="session-1",
+            remote_api_port=9001,
+            api_token="token",
+            expected_api_release_identity=_api_release_identity(),
+        )
 
 
 def test_status_remote_session_returns_json(monkeypatch: MonkeyPatch) -> None:
