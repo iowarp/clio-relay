@@ -752,6 +752,18 @@ unchanged as `binding`:
 }
 ```
 
+For live acceptance, the outer relay/JARVIS source job is deliberately not
+waited to terminal. The runner polls the supported `clio-relay job status`
+surface until that running `RelayJob` contains valid structured JARVIS runtime
+metadata, then performs the query and bind while retaining the source job. A
+failed or canceled source job, malformed metadata, or the existing acceptance
+timeout fails closed. If the execution is running before its selected service
+reports ready, the runner repeats the identity-bound execution query within the
+same deadline; a nonempty selector mismatch or multiple matches fails
+immediately. The `wait_for_terminal=true` argument above is scoped to
+the inner `jarvis_get_execution` MCP dispatch; it does not replace the live
+source-job poll or wait for the scheduler allocation to end.
+
 The compact binding contains selectors only. The bind operation accepts no host,
 port, endpoint path, dataset descriptor,
 scheduler identity, or lifecycle command from the caller. It verifies the exact

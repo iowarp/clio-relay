@@ -3,9 +3,9 @@
 # registry and may require them for a later release by adding policy requirements;
 # neither action requires a clio-relay code change.
 schema_version: "1.0"
-release_version: "1.4.2"
+release_version: "1.4.3"
 acceptance_matrix_path: examples/release-gate/report-matrix-1.0.json
-acceptance_matrix_sha256: 2db9a93f8ec88c41fa3fa937cdf62022f9bea211f78f1a7c23e4771907fe2e7a
+acceptance_matrix_sha256: 3ef31b0f5ce75c626de7c00f9c2a432e12adbad88c89cd77c8a630429bbea55b
 artifact_stage: published
 evidence_trust_model: maintainer_sealed_operator_evidence
 require_released_artifact: true
@@ -1111,6 +1111,7 @@ requirements:
     scenarios:
       - secure-runtime
     required_checks:
+      - secure-runtime.source-live-metadata
       - secure-runtime.jarvis-v3.5-query
       - secure-runtime.private-authority-bind
       - secure-runtime.browser-protocol

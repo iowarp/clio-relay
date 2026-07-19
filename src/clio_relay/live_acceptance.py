@@ -35,7 +35,7 @@ from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.doctor import run_cluster_doctor
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.identifiers import DurableRecordId
+from clio_relay.identifiers import DurableRecordId, validate_durable_record_id
 from clio_relay.installation import (
     verify_remote_clio_kit_native_execution_component,
     verify_remote_native_jarvis_component,
@@ -52,7 +52,13 @@ from clio_relay.mcp_stdio_validation import (
     decode_strict_json,
     run_packaged_mcp_stdio_session,
 )
-from clio_relay.models import GatewaySession, GatewaySessionState
+from clio_relay.models import (
+    TERMINAL_STATES,
+    GatewaySession,
+    GatewaySessionState,
+    JobState,
+    RelayJob,
+)
 from clio_relay.pagination import MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.progress_provenance import (
     validate_package_progress_acceptance_metadata,
@@ -649,37 +655,77 @@ def _run_live_acceptance(
         )
         lines.append(f"acceptance.live_progress_adapter={expected_progress_adapter}")
 
-    _wait_for_success(
-        options.definition,
-        job_id,
-        timeout_seconds=options.timeout_seconds,
-        poll_seconds=options.poll_seconds,
-        runner=command_runner,
-    )
-    lines.append("acceptance.job_state=succeeded")
-    if options.verify_cluster_deployment:
-        lines.append("worker.execute=passed")
-
-    runtime_metadata = _verify_completed_job(
-        options.definition,
-        job_id,
-        line_prefix="acceptance",
-        lines=lines,
-        runner=command_runner,
-        expected_progress_adapter=expected_progress_adapter,
-        expected_progress_package=expected_progress_package,
-        recorder=recorder,
-        require_structured_runtime_metadata=options.require_structured_runtime_metadata,
-    )
     secure_runtime_forbidden_values: set[str] = set()
-    if secure_runtime_probe is not None:
+    if secure_runtime_probe is None:
+        _wait_for_success(
+            options.definition,
+            job_id,
+            timeout_seconds=options.timeout_seconds,
+            poll_seconds=options.poll_seconds,
+            runner=command_runner,
+        )
+        lines.append("acceptance.job_state=succeeded")
+        if options.verify_cluster_deployment:
+            lines.append("worker.execute=passed")
+
+        _verify_completed_job(
+            options.definition,
+            job_id,
+            line_prefix="acceptance",
+            lines=lines,
+            runner=command_runner,
+            expected_progress_adapter=expected_progress_adapter,
+            expected_progress_package=expected_progress_package,
+            recorder=recorder,
+            require_structured_runtime_metadata=options.require_structured_runtime_metadata,
+        )
+    else:
         if recorder is None:
             raise ConfigurationError(
                 "secure runtime acceptance requires a machine-readable report path"
             )
-        if runtime_metadata is None or not runtime_metadata.structured:
-            raise RelayError(
-                "secure runtime acceptance requires structured JARVIS runtime metadata"
+        with _validation_check(
+            recorder,
+            "secure-runtime.source-live-metadata",
+            "observe trusted runtime metadata while retaining the running source job",
+            forbidden_values=set(),
+        ) as evidence:
+            runtime_metadata = _wait_for_live_structured_runtime_metadata(
+                options.definition,
+                job_id,
+                line_prefix="acceptance",
+                lines=lines,
+                timeout_seconds=options.timeout_seconds,
+                poll_seconds=options.poll_seconds,
+                runner=command_runner,
+            )
+            runtime_document = runtime_metadata.document
+            runtime_source = str(runtime_document["source"])
+            evidence.append(
+                EvidenceReference(
+                    kind="relay_job_status",
+                    reference=f"relay-job://{options.cluster}/{job_id}",
+                    metadata={
+                        "state": JobState.RUNNING.value,
+                        "runtime_metadata_source": runtime_source,
+                        "source_job_retained": True,
+                        "cancel_scheduler_job": False,
+                    },
+                )
+            )
+            recorder.add_resource(
+                ValidationResource(
+                    kind="relay_job",
+                    resource_id=job_id,
+                    role="secure_runtime_source",
+                    cluster=options.cluster,
+                    state=JobState.RUNNING.value,
+                    metadata={
+                        "runtime_metadata_source": runtime_source,
+                        "retained": True,
+                        "cancel_scheduler_job": False,
+                    },
+                )
             )
         secure_runtime_forbidden_values = _verify_secure_runtime_acceptance(
             options,
@@ -1320,35 +1366,80 @@ def _verify_secure_runtime_acceptance(
             "query one execution-owned service through the pinned JARVIS v3.5 contract",
             forbidden_values=forbidden_values,
         ) as evidence:
-            query_session = run_packaged_mcp_stdio_session(
-                profile="user",
-                tool="jarvis_get_execution",
-                arguments={
-                    "cluster": options.cluster,
-                    "pipeline_id": pipeline_id,
-                    "execution_id": execution_id,
-                    "include_service_runtimes": True,
-                    "wait_for_terminal": True,
-                    "wait_timeout_seconds": options.timeout_seconds,
-                    "poll_seconds": options.poll_seconds,
-                },
-                timeout_seconds=options.timeout_seconds + 30.0,
-                require_enforceable_containment=True,
-            )
-            query_result = _packaged_mcp_structured_result(
-                query_session,
-                expected_tool="jarvis_get_execution",
-            )
-            query_mcp_evidence = _packaged_mcp_acceptance_evidence(
-                query_session,
-                expected_tool="jarvis_get_execution",
-            )
-            public_documents.append(query_result)
-            handoff = _select_secure_runtime_handoff(
-                query_result,
-                cluster=options.cluster,
-                config=config,
-            )
+            query_deadline = time.monotonic() + options.timeout_seconds
+            query_attempt = 0
+            first_query_identity: PackagedMcpAcceptanceEvidence | None = None
+            handoff: JarvisServiceRuntimeHandoff | None = None
+            while True:
+                remaining = query_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RelayError(
+                        "timed out waiting for one ready JARVIS service runtime binding: "
+                        f"{execution_id}"
+                    )
+                query_attempt += 1
+                query_session = run_packaged_mcp_stdio_session(
+                    profile="user",
+                    tool="jarvis_get_execution",
+                    arguments={
+                        "cluster": options.cluster,
+                        "pipeline_id": pipeline_id,
+                        "execution_id": execution_id,
+                        "include_service_runtimes": True,
+                        "wait_for_terminal": True,
+                        "wait_timeout_seconds": remaining,
+                        "poll_seconds": options.poll_seconds,
+                    },
+                    timeout_seconds=remaining + 30.0,
+                    require_enforceable_containment=True,
+                )
+                query_result = _packaged_mcp_structured_result(
+                    query_session,
+                    expected_tool="jarvis_get_execution",
+                )
+                query_mcp_evidence = _packaged_mcp_acceptance_evidence(
+                    query_session,
+                    expected_tool="jarvis_get_execution",
+                )
+                if first_query_identity is None:
+                    first_query_identity = query_mcp_evidence
+                elif query_mcp_evidence != first_query_identity:
+                    raise RelayError(
+                        "packaged MCP identity changed while waiting for service readiness"
+                    )
+                public_documents.append(query_result)
+                candidate_handoff = _select_secure_runtime_handoff(
+                    query_result,
+                    cluster=options.cluster,
+                    config=config,
+                )
+                if candidate_handoff is not None:
+                    handoff = candidate_handoff
+                    break
+                evidence.append(
+                    EvidenceReference(
+                        kind="packaged_mcp_stdio",
+                        reference=(
+                            f"packaged-mcp://jarvis_get_execution/readiness-attempt/{query_attempt}"
+                        ),
+                        excerpt="execution query returned no ready service runtime binding",
+                        metadata={
+                            **query_mcp_evidence.model_dump(mode="json"),
+                            "pipeline_id": pipeline_id,
+                            "execution_id": execution_id,
+                            "ready_binding_count": 0,
+                        },
+                    )
+                )
+                remaining = query_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RelayError(
+                        "timed out waiting for one ready JARVIS service runtime binding: "
+                        f"{execution_id}"
+                    )
+                time.sleep(min(options.poll_seconds, remaining))
+
+            assert handoff is not None
             source_artifact_sha256 = _query_source_artifact_sha256(
                 query_result,
                 handoff=handoff,
@@ -2209,13 +2300,18 @@ def _select_secure_runtime_handoff(
     *,
     cluster: str,
     config: SecureRuntimeProbeConfig,
-) -> JarvisServiceRuntimeHandoff:
+) -> JarvisServiceRuntimeHandoff | None:
     """Select exactly one artifact-bound service handoff using configured identities."""
     if query_result.get("terminal") is not True or query_result.get("state") != "succeeded":
         raise RelayError("JARVIS execution query did not complete successfully")
+    if query_result.get("cluster") != cluster:
+        raise RelayError("JARVIS execution query changed cluster identity")
+    _query_receipt_artifact_identity(query_result)
     raw_bindings = query_result.get("service_runtime_bindings")
     if not isinstance(raw_bindings, list):
         raise RelayError("JARVIS v3.5 execution query omitted service_runtime_bindings")
+    if not raw_bindings:
+        return None
     bindings: list[JarvisServiceRuntimeHandoff] = []
     for raw in cast(list[object], raw_bindings):
         try:
@@ -2248,22 +2344,37 @@ def _query_source_artifact_sha256(
     handoff: JarvisServiceRuntimeHandoff,
 ) -> str:
     """Bind the compact handoff to the same immutable private MCP artifact."""
-    if query_result.get("job_id") != handoff.source_job_id:
+    job_id, artifact_id, digest = _query_receipt_artifact_identity(query_result)
+    if job_id != handoff.source_job_id:
         raise RelayError("service runtime handoff source job differs from its query receipt")
+    if artifact_id != handoff.source_artifact_id:
+        raise RelayError("service runtime handoff source artifact differs from its query receipt")
+    return digest
+
+
+def _query_receipt_artifact_identity(
+    query_result: dict[str, Any],
+) -> tuple[str, str, str]:
+    """Validate one durable query receipt and its private result-artifact identity."""
+    try:
+        job_id = validate_durable_record_id(query_result.get("job_id"))
+    except (TypeError, ValueError) as exc:
+        raise RelayError("JARVIS execution query omitted a durable relay job identity") from exc
     raw_artifact = query_result.get("mcp_result_artifact")
     if not isinstance(raw_artifact, dict):
         raise RelayError("JARVIS execution query omitted mcp_result_artifact")
     artifact = cast(dict[str, object], raw_artifact)
-    if (
-        artifact.get("artifact_id") != handoff.source_artifact_id
-        or artifact.get("job_id") != handoff.source_job_id
-        or artifact.get("kind") != "mcp_result"
-    ):
-        raise RelayError("service runtime handoff does not match its private MCP artifact")
+    try:
+        artifact_id = validate_durable_record_id(artifact.get("artifact_id"))
+        artifact_job_id = validate_durable_record_id(artifact.get("job_id"))
+    except (TypeError, ValueError) as exc:
+        raise RelayError("JARVIS execution query artifact identity was invalid") from exc
+    if artifact_job_id != job_id or artifact.get("kind") != "mcp_result":
+        raise RelayError("JARVIS execution query artifact does not match its receipt")
     digest = artifact.get("sha256")
     if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
         raise RelayError("service runtime source artifact omitted a canonical SHA-256")
-    return digest
+    return job_id, artifact_id, digest
 
 
 def _secure_runtime_cleanup_candidate(
@@ -3228,6 +3339,97 @@ def _generated_agent_prompt(
     )
 
 
+def _wait_for_live_structured_runtime_metadata(
+    definition: ClusterDefinition,
+    job_id: str,
+    *,
+    line_prefix: str,
+    lines: list[str],
+    timeout_seconds: float,
+    poll_seconds: float,
+    runner: CommandRunner,
+) -> RuntimeMetadataAcceptance:
+    """Wait for trusted runtime metadata without waiting for its source job to finish."""
+    deadline = time.monotonic() + timeout_seconds
+    structured_sources = {
+        RuntimeMetadataSource.JARVIS_MCP,
+        RuntimeMetadataSource.JARVIS_SIDECAR,
+    }
+    while True:
+        raw_status = _remote_clio_json(
+            definition,
+            ["job", "status", job_id],
+            runner=runner,
+        )
+        if not isinstance(raw_status, dict):
+            raise RelayError("secure runtime source job status was not a JSON object")
+        status = cast(dict[str, Any], raw_status)
+        raw_job = status.get("job")
+        try:
+            job = RelayJob.model_validate(raw_job)
+        except ValueError as exc:
+            raise RelayError(f"secure runtime source RelayJob was invalid: {exc}") from exc
+        if job.job_id != job_id:
+            raise RelayError(
+                "secure runtime source job status changed identity: "
+                f"expected={job_id} observed={job.job_id}"
+            )
+        reported_terminal = status.get("terminal")
+        actual_terminal = job.state in TERMINAL_STATES
+        if not isinstance(reported_terminal, bool) or reported_terminal is not actual_terminal:
+            raise RelayError("secure runtime source job status had inconsistent terminal state")
+        if actual_terminal:
+            lines.append(f"{line_prefix}.job_state={job.state.value}")
+            if job.state.value in {"failed", "canceled"}:
+                raise RelayError(
+                    "secure runtime source job "
+                    f"{job.state.value} before structured runtime metadata was usable"
+                )
+            raise RelayError(
+                "secure runtime source job succeeded before a live structured runtime was available"
+            )
+
+        raw_runtime = job.metadata.get("runtime_metadata")
+        if raw_runtime is not None:
+            if not isinstance(raw_runtime, dict):
+                raise RelayError("secure runtime source metadata was not a JSON object")
+            try:
+                validated = JarvisRuntimeMetadata.model_validate(raw_runtime)
+            except ValueError as exc:
+                raise RelayError(f"secure runtime source metadata was invalid: {exc}") from exc
+            if validated.source in structured_sources:
+                if not validated.pipeline_id or not validated.execution_id:
+                    raise RelayError(
+                        "secure runtime source metadata omitted pipeline_id or execution_id"
+                    )
+                if job.state is not JobState.RUNNING:
+                    if time.monotonic() >= deadline:
+                        lines.append(f"{line_prefix}.job_state={job.state.value}")
+                        raise RelayError(
+                            f"timed out waiting for the secure runtime source job to run: {job_id}"
+                        )
+                    time.sleep(poll_seconds)
+                    continue
+                document = validated.model_dump(mode="json")
+                lines.append(f"{line_prefix}.job_state={job.state.value}")
+                lines.extend(
+                    _runtime_metadata_document_facts(
+                        document,
+                        line_prefix=line_prefix,
+                    )
+                )
+                lines.append(f"{line_prefix}.source_job_retained=ok")
+                return RuntimeMetadataAcceptance(document=document, structured=True)
+
+        if time.monotonic() >= deadline:
+            lines.append(f"{line_prefix}.job_state={job.state.value}")
+            raise RelayError(
+                "timed out waiting for structured runtime metadata from secure runtime "
+                f"source job: {job_id}"
+            )
+        time.sleep(poll_seconds)
+
+
 def _wait_for_success(
     definition: ClusterDefinition,
     job_id: str,
@@ -3587,11 +3789,20 @@ def _runtime_metadata_facts(
 ) -> list[str]:
     """Validate a runtime metadata payload and return report-ready facts."""
     runtime = _decode_runtime_metadata_payload(payload)
-    source = str(runtime["source"])
-    facts = [
+    return [
         f"{line_prefix}.runtime_metadata_artifact={artifact_id}",
-        f"{line_prefix}.runtime_metadata_source={source}",
+        *_runtime_metadata_document_facts(runtime, line_prefix=line_prefix),
     ]
+
+
+def _runtime_metadata_document_facts(
+    runtime: dict[str, Any],
+    *,
+    line_prefix: str,
+) -> list[str]:
+    """Return report-ready facts for one already validated runtime document."""
+    source = str(runtime["source"])
+    facts = [f"{line_prefix}.runtime_metadata_source={source}"]
     structured_sources = {
         RuntimeMetadataSource.JARVIS_MCP.value,
         RuntimeMetadataSource.JARVIS_SIDECAR.value,
