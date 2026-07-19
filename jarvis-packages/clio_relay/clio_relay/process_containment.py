@@ -55,14 +55,18 @@ class OwnedProcessSpawnError(RuntimeError):
         process_id: int,
         mode: str,
         cleanup_errors: list[str],
+        cause: BaseException,
     ) -> None:
         self.process_id = process_id
         self.mode = mode
         self.cleanup_verified = not cleanup_errors
         self.cleanup_errors = tuple(cleanup_errors)
+        self.startup_error_type = type(cause).__name__
+        self.startup_error_message = str(cause)
         detail = ",".join(cleanup_errors) if cleanup_errors else "none"
         super().__init__(
             "owned process startup failed: "
+            f"cause={self.startup_error_type}: {self.startup_error_message}; "
             f"pid={process_id} mode={mode} cleanup_verified={self.cleanup_verified} "
             f"cleanup_errors={detail}"
         )
@@ -580,7 +584,7 @@ def spawn_owned_process(
                 target_environment=validated_target_environment,
                 startup_deadline=startup_deadline,
             )
-        except BaseException:
+        except BaseException as exc:
             cleanup_errors = _cleanup_failed_owned_spawn(
                 process,
                 readiness=readiness,
@@ -591,7 +595,8 @@ def spawn_owned_process(
                 process_id=process.pid,
                 mode=mode,
                 cleanup_errors=cleanup_errors,
-            ) from None
+                cause=exc,
+            ) from exc
         return process
     if enforceable and mode == "linux_systemd_scope":
         process, unit, scope, readiness = _spawn_linux_systemd_scope(
@@ -621,7 +626,7 @@ def spawn_owned_process(
                 target_environment=validated_target_environment,
                 startup_deadline=startup_deadline,
             )
-        except BaseException:
+        except BaseException as exc:
             cleanup_errors = _cleanup_failed_owned_spawn(
                 process,
                 readiness=readiness,
@@ -633,7 +638,8 @@ def spawn_owned_process(
                 process_id=process.pid,
                 mode=mode,
                 cleanup_errors=cleanup_errors,
-            ) from None
+                cause=exc,
+            ) from exc
         return process
     process, readiness = _spawn_broker(command, popen_kwargs)
     registered = False
@@ -653,7 +659,7 @@ def spawn_owned_process(
             target_environment=validated_target_environment,
             startup_deadline=startup_deadline,
         )
-    except BaseException:
+    except BaseException as exc:
         cleanup_errors = _cleanup_failed_owned_spawn(
             process,
             readiness=readiness,
@@ -663,7 +669,8 @@ def spawn_owned_process(
             process_id=process.pid,
             mode="cooperative_process_group",
             cleanup_errors=cleanup_errors,
-        ) from None
+            cause=exc,
+        ) from exc
     return process
 
 
@@ -1454,7 +1461,7 @@ def _spawn_linux_systemd_scope(
             startup_deadline=startup_deadline,
         )
         scope = _validated_systemd_cgroup_path(control_group, unit=unit)
-    except BaseException:
+    except BaseException as exc:
         cleanup_errors = _cleanup_failed_linux_systemd_spawn(
             process,
             unit=unit,
@@ -1465,7 +1472,8 @@ def _spawn_linux_systemd_scope(
             process_id=process.pid,
             mode="linux_systemd_scope",
             cleanup_errors=cleanup_errors,
-        ) from None
+            cause=exc,
+        ) from exc
     return process, unit, scope, readiness
 
 

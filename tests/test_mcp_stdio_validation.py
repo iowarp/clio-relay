@@ -902,10 +902,12 @@ def test_packaged_stdio_surfaces_safe_failed_startup_cleanup_evidence(
             process_id=8123,
             mode="windows_job_object",
             cleanup_errors=["owned spawn termination failed: RuntimeError"],
+            cause=RuntimeError("private startup detail"),
         )
 
     monkeypatch.setattr(mcp_stdio_validation_module, "spawn_owned_process", fail_spawn)
     with pytest.raises(RelayError, match="cleanup_verified=False") as failure:
         run_packaged_mcp_stdio_session(profile="user", tool="jarvis_run", arguments={})
     assert "pid=8123" in str(failure.value)
+    assert "private startup detail" not in str(failure.value)
     assert failure.value.__cause__ is None

@@ -413,6 +413,9 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
     )
     assert lammps.get("evidence_group_resource_kind") is None
 
+    secure_runtime = requirements["ares-secure-jarvis-runtime"]
+    assert "secure-runtime.source-live-metadata" in secure_runtime["required_checks"]
+
     catalog = requirements["ares-non-jarvis-virtual-mcp"]
     assert "remote-mcp.scientific-catalog-user-contract" in catalog["required_checks"]
     assert "remote-mcp.scientific-catalog-result" in catalog["required_checks"]

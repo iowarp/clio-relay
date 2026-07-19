@@ -34,14 +34,23 @@ from clio_relay.live_acceptance import (
     _http_json,  # pyright: ignore[reportPrivateUsage]
     _packaged_mcp_acceptance_evidence,  # pyright: ignore[reportPrivateUsage]
     _secure_runtime_probe_config,  # pyright: ignore[reportPrivateUsage]
+    _select_secure_runtime_handoff,  # pyright: ignore[reportPrivateUsage]
     _verify_cluster_deployment,  # pyright: ignore[reportPrivateUsage]
     _verify_live_package_progress,  # pyright: ignore[reportPrivateUsage]
     _verify_runtime_metadata_artifact,  # pyright: ignore[reportPrivateUsage]
     _verify_secure_runtime_acceptance,  # pyright: ignore[reportPrivateUsage]
+    _wait_for_live_structured_runtime_metadata,  # pyright: ignore[reportPrivateUsage]
     run_live_acceptance,
 )
 from clio_relay.mcp_stdio_validation import PackagedMcpStdioSession
-from clio_relay.models import GatewaySession, GatewaySessionState
+from clio_relay.models import (
+    GatewaySession,
+    GatewaySessionState,
+    JarvisRunSpec,
+    JobKind,
+    JobState,
+    RelayJob,
+)
 from clio_relay.service_runtime import ServiceRuntimeStartResult, ServiceRuntimeStopResult
 from clio_relay.session_lifecycle import CleanupResource
 from clio_relay.validation_report import (
@@ -103,6 +112,54 @@ def _provider_progress_record(
             "prediction_status": prediction_status,
             "eta_seconds": 1.0,
         },
+    }
+
+
+_LIVE_SOURCE_JOB_ID = "job_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
+def _structured_live_runtime_metadata() -> dict[str, object]:
+    """Build one valid nonterminal JARVIS-owned runtime observation."""
+    return {
+        "schema_version": "clio-relay.jarvis-runtime.v1",
+        "source": "jarvis_mcp",
+        "execution_id": "execution-live-41",
+        "pipeline_id": "pipeline-live-41",
+        "scheduler_provider": "slurm",
+        "scheduler_job_id": "22064",
+        "terminal": {"state": "running", "terminal": False},
+        "field_sources": {
+            "execution_id": "jarvis_mcp",
+            "pipeline_id": "jarvis_mcp",
+            "scheduler_provider": "jarvis_mcp",
+            "scheduler_job_id": "jarvis_mcp",
+        },
+    }
+
+
+def _live_source_status(
+    state: JobState,
+    *,
+    runtime_metadata: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Render the supported remote ``job status`` envelope for a source run."""
+    metadata: dict[str, object] = {}
+    if runtime_metadata is not None:
+        metadata["runtime_metadata"] = runtime_metadata
+    job = RelayJob(
+        job_id=_LIVE_SOURCE_JOB_ID,
+        cluster="test-cluster",
+        kind=JobKind.JARVIS,
+        state=state,
+        spec=JarvisRunSpec(command=["true"]),
+        idempotency_key="secure-runtime-live-source",
+        metadata=metadata,
+    )
+    return {
+        "job": job.model_dump(mode="json"),
+        "relay_queue": {"state": state.value},
+        "scheduler": [],
+        "terminal": state in {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELED},
     }
 
 
@@ -314,6 +371,274 @@ def test_live_acceptance_does_not_mark_untrusted_metadata_as_structured() -> Non
     assert "acceptance.structured_runtime_metadata=ok" not in lines
     assert "acceptance.structured_runtime_scheduler_identity=ok" not in lines
     assert "runtime_metadata.compatibility=acceptance:untrusted_compatibility" in lines
+
+
+def test_secure_runtime_acceptance_polls_running_source_metadata() -> None:
+    """A live service probe starts from authoritative metadata while its job runs."""
+    commands: list[str] = []
+
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        commands.append(command[-1])
+        return _completed(
+            command,
+            json.dumps(
+                _live_source_status(
+                    JobState.RUNNING,
+                    runtime_metadata=_structured_live_runtime_metadata(),
+                )
+            ),
+        )
+
+    lines: list[str] = []
+    result = _wait_for_live_structured_runtime_metadata(
+        ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+        _LIVE_SOURCE_JOB_ID,
+        line_prefix="acceptance",
+        lines=lines,
+        timeout_seconds=5,
+        poll_seconds=0.01,
+        runner=fake_runner,
+    )
+
+    assert result.structured is True
+    assert result.document["execution_id"] == "execution-live-41"
+    assert "acceptance.job_state=running" in lines
+    assert "acceptance.structured_runtime_metadata=ok" in lines
+    assert "acceptance.source_job_retained=ok" in lines
+    assert len(commands) == 1
+    assert f"job status {_LIVE_SOURCE_JOB_ID}" in commands[0]
+
+
+def test_secure_runtime_acceptance_fails_if_source_job_fails_before_metadata() -> None:
+    """A failed source job cannot be mistaken for a not-yet-ready live service."""
+
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        return _completed(command, json.dumps(_live_source_status(JobState.FAILED)))
+
+    with pytest.raises(RelayError, match="source job failed before structured runtime metadata"):
+        _wait_for_live_structured_runtime_metadata(
+            ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            _LIVE_SOURCE_JOB_ID,
+            line_prefix="acceptance",
+            lines=[],
+            timeout_seconds=5,
+            poll_seconds=0.01,
+            runner=fake_runner,
+        )
+
+
+def test_secure_runtime_acceptance_metadata_poll_is_bounded() -> None:
+    """Missing live metadata exhausts the caller's existing acceptance timeout."""
+    calls = 0
+
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        nonlocal calls
+        del input
+        calls += 1
+        return _completed(command, json.dumps(_live_source_status(JobState.RUNNING)))
+
+    with pytest.raises(RelayError, match="timed out waiting for structured runtime metadata"):
+        _wait_for_live_structured_runtime_metadata(
+            ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            _LIVE_SOURCE_JOB_ID,
+            line_prefix="acceptance",
+            lines=[],
+            timeout_seconds=0,
+            poll_seconds=0.01,
+            runner=fake_runner,
+        )
+
+    assert calls == 1
+
+
+def test_secure_runtime_acceptance_rejects_unsupported_metadata_schema() -> None:
+    """A model-shaped document cannot bypass the exact runtime schema pin."""
+    metadata = _structured_live_runtime_metadata()
+    metadata["schema_version"] = "unsupported.runtime.v99"
+
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        return _completed(
+            command,
+            json.dumps(
+                _live_source_status(
+                    JobState.RUNNING,
+                    runtime_metadata=metadata,
+                )
+            ),
+        )
+
+    with pytest.raises(RelayError, match="unsupported schema version"):
+        _wait_for_live_structured_runtime_metadata(
+            ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            _LIVE_SOURCE_JOB_ID,
+            line_prefix="acceptance",
+            lines=[],
+            timeout_seconds=5,
+            poll_seconds=0.01,
+            runner=fake_runner,
+        )
+
+
+def test_secure_runtime_orchestration_never_waits_for_outer_job_terminal(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Secure acceptance probes a running service without batch completion checks."""
+    pipeline = tmp_path / "secure-runtime.yaml"
+    pipeline.write_text("name: secure-runtime\npkgs: []\n", encoding="utf-8")
+    commands: list[str] = []
+    verifier_calls: list[dict[str, Any]] = []
+    config = SecureRuntimeProbeConfig(
+        package_name="builtin.paraview",
+        command={"command_id": "view-command-41"},
+        protocol_adapter=SecureRuntimeProtocolAdapter.model_validate(
+            {
+                "command_request_id_pointer": "/command_id",
+                "health": {
+                    "service_instance_id_pointer": "/service_instance_id",
+                    "revision_pointer": "/revision",
+                },
+                "state": {
+                    "service_instance_id_pointer": "/service_instance_id",
+                    "execution_id_pointer": "/execution_id",
+                    "dataset_descriptor_pointer": "/dataset/descriptor",
+                    "revision_pointer": "/revision",
+                },
+                "command": {
+                    "service_instance_id_pointer": "/state/service_instance_id",
+                    "execution_id_pointer": "/state/execution_id",
+                    "dataset_descriptor_pointer": "/state/dataset/descriptor",
+                    "revision_pointer": "/state/revision",
+                    "command_id_pointer": "/command_id",
+                },
+                "events": {
+                    "service_instance_id_pointer": "/service_instance_id",
+                    "execution_id_pointer": "/execution_id",
+                    "dataset_descriptor_pointer": "/dataset/descriptor",
+                    "revision_pointer": "/revision",
+                    "event_name": "state",
+                },
+            }
+        ),
+    )
+
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        script = command[-1]
+        commands.append(script)
+        if "mkdir -p" in script or "cat >" in script:
+            return _completed(command, "")
+        if "job submit" in script:
+            return _completed(command, f"{_LIVE_SOURCE_JOB_ID}\n")
+        if f"job status {_LIVE_SOURCE_JOB_ID}" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    _live_source_status(
+                        JobState.RUNNING,
+                        runtime_metadata=_structured_live_runtime_metadata(),
+                    )
+                ),
+            )
+        raise AssertionError(f"unexpected command: {command}")
+
+    def forbidden_batch_call(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("secure runtime acceptance used a batch terminal verifier")
+
+    def verify_secure_runtime(
+        _options: LiveAcceptanceOptions,
+        *,
+        config: SecureRuntimeProbeConfig,
+        runtime_metadata: dict[str, Any],
+        recorder: ValidationRecorder,
+    ) -> set[str]:
+        verifier_calls.append(
+            {
+                "config": config,
+                "runtime_metadata": runtime_metadata,
+                "recorder": recorder,
+            }
+        )
+        return set()
+
+    def fake_cluster_doctor(_definition: ClusterDefinition) -> list[str]:
+        return ["cluster: test-cluster"]
+
+    def configured_probe(_pipeline_yaml: str) -> SecureRuntimeProbeConfig:
+        return config
+
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.run_cluster_doctor",
+        fake_cluster_doctor,
+    )
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance._secure_runtime_probe_config",
+        configured_probe,
+    )
+    monkeypatch.setattr("clio_relay.live_acceptance._wait_for_success", forbidden_batch_call)
+    monkeypatch.setattr("clio_relay.live_acceptance._verify_completed_job", forbidden_batch_call)
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance._verify_secure_runtime_acceptance",
+        verify_secure_runtime,
+    )
+
+    report_path = tmp_path / "secure-runtime-report.json"
+    lines = run_live_acceptance(
+        LiveAcceptanceOptions(
+            cluster="test-cluster",
+            definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            jarvis_yaml=pipeline,
+            report_path=report_path,
+            timeout_seconds=5,
+            poll_seconds=0.01,
+        ),
+        runner=fake_runner,
+    )
+
+    assert len(verifier_calls) == 1
+    assert verifier_calls[0]["runtime_metadata"]["execution_id"] == "execution-live-41"
+    assert not any("job wait" in command for command in commands)
+    assert not any("job monitor" in command for command in commands)
+    assert "acceptance.job_state=running" in lines
+    assert "secure-runtime.acceptance=ok" in lines
+    assert "live acceptance passed" in lines
+    report = load_validation_report(report_path)
+    source_check = next(
+        check for check in report.checks if check.check_id == "secure-runtime.source-live-metadata"
+    )
+    assert source_check.status.value == "passed"
+    source = next(
+        resource
+        for resource in report.resources
+        if resource.kind == "relay_job" and resource.resource_id == _LIVE_SOURCE_JOB_ID
+    )
+    assert source.role == "secure_runtime_source"
+    assert source.state == "running"
+    assert source.metadata["retained"] is True
+    assert source.metadata["cancel_scheduler_job"] is False
 
 
 def test_live_acceptance_stages_files_and_strips_relay_extension(
@@ -2287,6 +2612,7 @@ def test_secure_runtime_acceptance_records_exact_v35_browser_and_cleanup_path(
         "scheduler_cancel_requested": False,
     }
     mcp_calls: list[tuple[str, dict[str, Any]]] = []
+    query_attempts = 0
 
     def packaged_session(
         *,
@@ -2297,6 +2623,7 @@ def test_secure_runtime_acceptance_records_exact_v35_browser_and_cleanup_path(
         extra_environment: dict[str, str] | None = None,
         require_enforceable_containment: bool = False,
     ) -> PackagedMcpStdioSession:
+        nonlocal query_attempts
         assert profile == "user"
         assert timeout_seconds > 0
         assert require_enforceable_containment is True
@@ -2308,7 +2635,16 @@ def test_secure_runtime_acceptance_records_exact_v35_browser_and_cleanup_path(
         else:
             assert extra_environment is None
         mcp_calls.append((tool, arguments))
-        payload = query_result if tool == "jarvis_get_execution" else bind_result
+        payload: dict[str, Any]
+        if tool == "jarvis_get_execution":
+            query_attempts += 1
+            if query_attempts == 1:
+                payload = dict(query_result)
+                payload["service_runtime_bindings"] = list[dict[str, Any]]()
+            else:
+                payload = query_result
+        else:
+            payload = bind_result
         return _secure_runtime_packaged_session(
             tool,
             payload,
@@ -2530,18 +2866,18 @@ def test_secure_runtime_acceptance_records_exact_v35_browser_and_cleanup_path(
 
     assert [name for name, _arguments in mcp_calls] == [
         "jarvis_get_execution",
+        "jarvis_get_execution",
         "relay_bind_jarvis_runtime",
     ]
-    assert mcp_calls[0][1] == {
-        "cluster": cluster,
-        "pipeline_id": "pipeline-service-41",
-        "execution_id": "execution-service-41",
-        "include_service_runtimes": True,
-        "wait_for_terminal": True,
-        "wait_timeout_seconds": 30,
-        "poll_seconds": 0.01,
-    }
-    assert mcp_calls[1][1]["binding"] == handoff
+    for _name, query_arguments in mcp_calls[:2]:
+        assert query_arguments["cluster"] == cluster
+        assert query_arguments["pipeline_id"] == "pipeline-service-41"
+        assert query_arguments["execution_id"] == "execution-service-41"
+        assert query_arguments["include_service_runtimes"] is True
+        assert query_arguments["wait_for_terminal"] is True
+        assert 0 < query_arguments["wait_timeout_seconds"] <= 30
+        assert query_arguments["poll_seconds"] == 0.01
+    assert mcp_calls[2][1]["binding"] == handoff
     assert _SecureSupervisor.calls == [
         "browser_attach",
         "browser_detach",
@@ -2565,6 +2901,13 @@ def test_secure_runtime_acceptance_records_exact_v35_browser_and_cleanup_path(
         if reference.kind == "secure_runtime_acceptance"
     )
     metadata = evidence.metadata
+    readiness_evidence = next(
+        reference
+        for check in report.checks
+        for reference in check.evidence
+        if reference.reference == "packaged-mcp://jarvis_get_execution/readiness-attempt/1"
+    )
+    assert readiness_evidence.metadata["ready_binding_count"] == 0
     assert metadata["cluster"] == cluster
     assert metadata["lifecycle_states"] == ["ready", "degraded", "ready", "closed"]
     assert metadata["scheduler_cancel_requested"] is False
@@ -2606,6 +2949,261 @@ def test_secure_runtime_acceptance_records_exact_v35_browser_and_cleanup_path(
         forbidden_values=forbidden,
         label="finished secure runtime report",
     )
+
+
+def test_secure_runtime_ready_binding_wait_is_bounded(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A running execution with no ready service fails on the acceptance deadline."""
+    cluster = "operator-readiness-timeout"
+    calls = 0
+    clock = 100.0
+
+    def monotonic() -> float:
+        return clock
+
+    def sleep(seconds: float) -> None:
+        nonlocal clock
+        clock += seconds
+
+    def packaged_session(
+        *,
+        profile: str,
+        tool: str,
+        arguments: dict[str, Any],
+        timeout_seconds: float,
+        extra_environment: dict[str, str] | None = None,
+        require_enforceable_containment: bool = False,
+    ) -> PackagedMcpStdioSession:
+        nonlocal calls
+        del profile, arguments, timeout_seconds, extra_environment
+        assert tool == "jarvis_get_execution"
+        assert require_enforceable_containment is True
+        calls += 1
+        return _secure_runtime_packaged_session(
+            tool,
+            {
+                "terminal": True,
+                "state": "succeeded",
+                "cluster": cluster,
+                "job_id": "job_readiness_timeout",
+                "mcp_result_artifact": {
+                    "artifact_id": "artifact_readiness_timeout",
+                    "job_id": "job_readiness_timeout",
+                    "kind": "mcp_result",
+                    "sha256": "a" * 64,
+                },
+                "service_runtime_bindings": [],
+            },
+            transcript_sha256="9" * 64,
+        )
+
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.run_packaged_mcp_stdio_session",
+        packaged_session,
+    )
+    monkeypatch.setattr("clio_relay.live_acceptance.time.monotonic", monotonic)
+    monkeypatch.setattr("clio_relay.live_acceptance.time.sleep", sleep)
+    recorder = ValidationRecorder(
+        new_live_validation_report(
+            scenario="secure-runtime-readiness-timeout",
+            cluster=cluster,
+            launcher="uv-tool",
+            install_source="pypi:clio-relay",
+            artifact_sha256="8" * 64,
+        )
+    )
+
+    with pytest.raises(
+        RelayError,
+        match="timed out waiting for one ready JARVIS service runtime binding",
+    ):
+        _verify_secure_runtime_acceptance(
+            LiveAcceptanceOptions(
+                cluster=cluster,
+                definition=ClusterDefinition(name=cluster, ssh_host="timeout.invalid"),
+                timeout_seconds=1,
+                poll_seconds=1,
+                transport_token="transport-token-timeout",
+                transport_secret_key="transport-secret-timeout",
+            ),
+            config=SecureRuntimeProbeConfig(
+                package_name="builtin.paraview",
+                command={"command_id": "timeout-command"},
+                protocol_adapter=_secure_runtime_protocol_adapter(),
+            ),
+            runtime_metadata={
+                "pipeline_id": "pipeline-readiness-timeout",
+                "execution_id": "execution-readiness-timeout",
+            },
+            recorder=recorder,
+        )
+
+    assert calls == 1
+
+
+def test_secure_runtime_late_ready_binding_fails_deadline(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A ready result returned after the advertised deadline is not accepted."""
+    cluster = "operator-late-ready"
+    clock = 100.0
+    calls = 0
+    handoff = {
+        "cluster": cluster,
+        "source_job_id": "job_late_ready",
+        "source_artifact_id": "artifact_late_ready",
+        "package_id": "paraview-late-ready",
+        "package_name": "builtin.paraview",
+        "service_instance_id": "visualizer-late-ready",
+    }
+
+    def monotonic() -> float:
+        return clock
+
+    def packaged_session(
+        *,
+        profile: str,
+        tool: str,
+        arguments: dict[str, Any],
+        timeout_seconds: float,
+        extra_environment: dict[str, str] | None = None,
+        require_enforceable_containment: bool = False,
+    ) -> PackagedMcpStdioSession:
+        nonlocal calls, clock
+        del profile, arguments, timeout_seconds, extra_environment
+        assert tool == "jarvis_get_execution"
+        assert require_enforceable_containment is True
+        calls += 1
+        clock = 101.0
+        return _secure_runtime_packaged_session(
+            tool,
+            {
+                "terminal": True,
+                "state": "succeeded",
+                "cluster": cluster,
+                "job_id": handoff["source_job_id"],
+                "mcp_result_artifact": {
+                    "artifact_id": handoff["source_artifact_id"],
+                    "job_id": handoff["source_job_id"],
+                    "kind": "mcp_result",
+                    "sha256": "d" * 64,
+                },
+                "service_runtime_bindings": [handoff],
+            },
+            transcript_sha256="e" * 64,
+        )
+
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.run_packaged_mcp_stdio_session",
+        packaged_session,
+    )
+    monkeypatch.setattr("clio_relay.live_acceptance.time.monotonic", monotonic)
+    recorder = ValidationRecorder(
+        new_live_validation_report(
+            scenario="secure-runtime-late-ready",
+            cluster=cluster,
+            launcher="uv-tool",
+            install_source="pypi:clio-relay",
+            artifact_sha256="f" * 64,
+        )
+    )
+
+    with pytest.raises(
+        RelayError,
+        match="timed out waiting for one ready JARVIS service runtime binding",
+    ):
+        _verify_secure_runtime_acceptance(
+            LiveAcceptanceOptions(
+                cluster=cluster,
+                definition=ClusterDefinition(name=cluster, ssh_host="late-ready.invalid"),
+                timeout_seconds=1,
+                poll_seconds=0.1,
+                transport_token="transport-token-late-ready",
+                transport_secret_key="transport-secret-late-ready",
+            ),
+            config=SecureRuntimeProbeConfig(
+                package_name="builtin.paraview",
+                package_id="paraview-late-ready",
+                command={"command_id": "late-ready-command"},
+                protocol_adapter=_secure_runtime_protocol_adapter(),
+            ),
+            runtime_metadata={
+                "pipeline_id": "pipeline-late-ready",
+                "execution_id": "execution-late-ready",
+            },
+            recorder=recorder,
+        )
+
+    assert calls == 1
+
+
+def test_secure_runtime_ready_binding_ambiguity_fails_immediately() -> None:
+    """Multiple matching ready services are an identity error, not a retry state."""
+    cluster = "operator-ambiguous-runtime"
+    handoff = {
+        "cluster": cluster,
+        "source_job_id": "job_ambiguous_runtime",
+        "source_artifact_id": "artifact_ambiguous_runtime",
+        "package_id": "paraview-ambiguous",
+        "package_name": "builtin.paraview",
+        "service_instance_id": "visualizer-ambiguous-a",
+    }
+    config = SecureRuntimeProbeConfig(
+        package_name="builtin.paraview",
+        package_id="paraview-ambiguous",
+        command={"command_id": "ambiguous-command"},
+        protocol_adapter=_secure_runtime_protocol_adapter(),
+    )
+
+    with pytest.raises(RelayError, match="matched=2"):
+        _select_secure_runtime_handoff(
+            {
+                "terminal": True,
+                "state": "succeeded",
+                "cluster": cluster,
+                "job_id": "job_ambiguous_runtime",
+                "mcp_result_artifact": {
+                    "artifact_id": "artifact_ambiguous_runtime",
+                    "job_id": "job_ambiguous_runtime",
+                    "kind": "mcp_result",
+                    "sha256": "b" * 64,
+                },
+                "service_runtime_bindings": [
+                    handoff,
+                    {**handoff, "service_instance_id": "visualizer-ambiguous-b"},
+                ],
+            },
+            cluster=cluster,
+            config=config,
+        )
+
+
+def test_secure_runtime_empty_binding_rejects_cluster_identity_drift() -> None:
+    """An empty binding list is transient only for the exact requested cluster."""
+    cluster = "operator-exact-runtime"
+    with pytest.raises(RelayError, match="changed cluster identity"):
+        _select_secure_runtime_handoff(
+            {
+                "terminal": True,
+                "state": "succeeded",
+                "cluster": "operator-wrong-runtime",
+                "job_id": "job_exact_runtime",
+                "mcp_result_artifact": {
+                    "artifact_id": "artifact_exact_runtime",
+                    "job_id": "job_exact_runtime",
+                    "kind": "mcp_result",
+                    "sha256": "c" * 64,
+                },
+                "service_runtime_bindings": [],
+            },
+            cluster=cluster,
+            config=SecureRuntimeProbeConfig(
+                package_name="builtin.paraview",
+                command={"command_id": "exact-command"},
+                protocol_adapter=_secure_runtime_protocol_adapter(),
+            ),
+        )
 
 
 def test_secure_runtime_bind_failure_preserves_error_and_attempts_safe_teardown(
@@ -2655,6 +3253,7 @@ def test_secure_runtime_bind_failure_preserves_error_and_attempts_safe_teardown(
     query_result = {
         "terminal": True,
         "state": "succeeded",
+        "cluster": cluster,
         "job_id": handoff["source_job_id"],
         "mcp_result_artifact": {
             "artifact_id": handoff["source_artifact_id"],

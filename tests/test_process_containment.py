@@ -374,9 +374,16 @@ def test_registration_failure_cleans_new_process_without_touching_stale_owner(
     monkeypatch.setattr(process_containment, "_remove_broker_readiness", remove_readiness)
     monkeypatch.setattr(process_containment, "terminate_owned_process", fail_stale_termination)
     try:
-        with pytest.raises(OwnedProcessSpawnError) as failure:
+        with pytest.raises(
+            OwnedProcessSpawnError,
+            match="process containment was already registered",
+        ) as failure:
             process_containment.spawn_owned_process(["test-command"])
         assert failure.value.cleanup_verified is True
+        assert isinstance(failure.value.__cause__, RuntimeError)
+        assert str(failure.value.__cause__) == (
+            f"process containment was already registered: {process_id}"
+        )
         assert private._OWNED_PROCESSES[process_id] is stale_state
         assert "readiness" in actions
         if mode == "linux_systemd_scope":

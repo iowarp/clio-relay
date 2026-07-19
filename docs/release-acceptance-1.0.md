@@ -59,7 +59,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.4.2"
+$Version = "1.4.3"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }
@@ -1519,6 +1519,18 @@ Invoke-RelayReport -Id "ares-secure-runtime" -ReportOption "--report" -Command @
   "--timeout-seconds", "900", "--poll-seconds", "1"
 )
 ```
+
+This scenario polls the released remote `clio-relay job status` contract for
+valid structured runtime metadata while the outer relay/JARVIS/SLURM source job
+is still `running`. It must not call the outer `job wait` or the completed-job
+artifact verifier before exercising the service. A failed or canceled source
+job, invalid metadata, or the same bounded timeout fails the report. The inner
+`jarvis_get_execution(wait_for_terminal=true)` remains required because it waits
+for that MCP dispatch and durable result, not for the source scheduler job to
+finish. A zero-binding result is retried within the same deadline while a
+nonempty selector mismatch or ambiguous match fails immediately. The report
+records the source relay job as retained and never requests scheduler
+cancellation.
 
 Detach and teardown inside this probe always pass
 `cancel_scheduler_job=false`. A naturally completed allocation is acceptable
