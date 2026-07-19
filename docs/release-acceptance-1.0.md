@@ -58,7 +58,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.3.35"
+$Version = "1.3.36"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }
@@ -839,7 +839,7 @@ cannot satisfy either requirement.
 
 ## Run the scientific catalog v1.1 contract
 
-Use the exact clio-kit 2.5.15 persistent executable installed and receipt-bound
+Use the exact clio-kit 2.5.17 persistent executable installed and receipt-bound
 by bootstrap. The catalog file is operator-owned site metadata supplied through
 `CLIO_RELAY_VALIDATION_ARES_SCIENTIFIC_CATALOG_FILE`; it is not copied into the
 relay release. This policy uses

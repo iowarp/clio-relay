@@ -2565,7 +2565,7 @@ def _source_result(
                 tool=tool,
                 arguments={
                     "pipeline_id": "pipeline-1",
-                    "execution_id": "execution-1",
+                    **({} if tool == "jarvis_run" else {"execution_id": "execution-1"}),
                     **(
                         {"include_service_runtimes": include_service_runtimes}
                         if include_service_runtimes is not None
