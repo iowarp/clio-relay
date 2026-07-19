@@ -261,7 +261,7 @@ For the legacy clio-kit 2.2.6 compatibility path, a successful synchronous
 `jarvis_run` MCP return is normalized to a terminal `completed` record even
 though that release labels the result `status=running`; the original status and
 completion basis remain in `details.completion_normalization` for auditability.
-The pinned clio-kit 2.5.17 production path removes that ambiguity upstream and
+The pinned clio-kit 2.5.19 production path removes that ambiguity upstream and
 returns a structured durable execution handle immediately. The legacy normalization is
 diagnostic compatibility evidence and cannot satisfy the 1.0 gate. Scheduler
 submissions remain non-terminal and are observed through `jarvis_get_execution`.
@@ -497,7 +497,7 @@ Install the cluster-side server once, then launch its persistent executable:
 
 ```bash
 uv tool install --python 3.12 --no-config \
-  https://github.com/iowarp/clio-kit/releases/download/v2.5.17/clio_kit-2.5.17-py3-none-any.whl
+  https://github.com/iowarp/clio-kit/releases/download/v2.5.19/clio_kit-2.5.19-py3-none-any.whl
 clio-kit mcp-server jarvis
 ```
 
@@ -757,12 +757,13 @@ port, endpoint path, dataset descriptor,
 scheduler identity, or lifecycle command from the caller. It verifies the exact
 completed relay job, artifact SHA-256, installed MCP-server artifact digest,
 structured protocol result, native JARVIS execution identity, scheduler-provider
-boundary, ready `jarvis.service-runtime.v1` report, and dataset fingerprint. It
+boundary, ready `jarvis.service-runtime.v2` report, execution-owned bearer digest,
+and dataset fingerprint. It
 accepts only `clio-kit.jarvis-execution.v2` from the configured artifact-bound
 clio-kit JARVIS MCP; `jarvis_run` and historical execution v1 results are not
 reinterpreted as containing service runtimes. It then starts only the remote frp
 connector and desktop visitor and persists an
-immutable `clio-relay.jarvis-service-runtime-binding.v1` provenance record in the
+immutable `clio-relay.jarvis-service-runtime-binding.v2` provenance record in the
 gateway session. The result returns the gateway session plus `connect_url`,
 `health_url`, `stream_url`, `events_url`, `state_url`, and `command_url`.
 
@@ -773,7 +774,21 @@ source artifact and exact provider/native identity immediately before requesting
 provider cancellation. Generic gateway create/update/close calls cannot modify or
 erase the binding.
 
-JARVIS service endpoints remain loopback-only inside the allocation. For SLURM,
+JARVIS service endpoints remain loopback-only inside the allocation and require
+the exact 256-bit execution-owned bearer capability on every request, including
+health probes. Public `jarvis.service-runtime.v2` output contains only
+`{scheme: "bearer", token_sha256: ...}`. Once the complete durable MCP artifact has
+been re-verified, relay invokes JARVIS's private authority resolver with the exact
+execution, pipeline, package, service-instance, revision, and digest identities.
+The resolver response is rejected on any identity or digest drift. The raw bearer is
+never written to MCP artifacts, gateway records, connector configuration, command
+arguments, browser URLs, model-facing results, or process logs. Relay resolves it
+independently for each readiness, reconnect, or proxy-launch operation. A browser
+attachment transfers it over anonymous stdin to the owned loopback proxy, which
+retains it only in process memory for the attachment lifetime. Unauthenticated v1
+records may re-verify an already persisted v1 binding but cannot create a new binding.
+
+For SLURM,
 relay resolves the exact job with the configured scheduler provider, requires
 `NumNodes=1`, verifies that `BatchHost` is the sole expansion of `NodeList`, and
 launches a detached `srun --jobid ... --overlap --exact --nodes=1 --ntasks=1
@@ -784,10 +799,16 @@ as the connector PID. Failed registration terminates the launcher. Missing,
 ambiguous, or multi-node placement and ambiguous marker recovery are rejected.
 Detach checks that exact step with `squeue --steps=job.step`. Stop cancels only
 `scancel job.step`, waits for provider-confirmed step absence, and retains the
-parent scheduler job by default. Relay readiness also requires the exact
-`jarvis.paraview.health.v1` service identity and a matching initial
-`jarvis.paraview.service-state.v1` execution, state revision, and canonical dataset
-descriptor digest; an arbitrary HTTP 2xx cannot satisfy binding.
+parent scheduler job by default. Relay readiness re-verifies the exact durable
+JARVIS execution, package, service, endpoint, dataset-descriptor, revision, and
+authorization identities. For authenticated v2 services it then proves the health
+endpoint is protected (the request without authorization must return 401) and live
+(the request with the resolved bearer must return 2xx), without interpreting the
+application response body. JARVIS packages own application-specific readiness
+before reporting `READY`; consumers such as VIGIL own ParaView health, state,
+dataset, and scene validation after browser attachment. Relay continues to proxy
+the declared state and command endpoints but contains no ParaView-specific schema
+or scene policy.
 
 Sandboxed MCP-UI iframes have the browser origin `null` and cannot attach headers
 to `EventSource`. Do not add broad CORS to the remote application and do not put a
@@ -808,7 +829,12 @@ and revocation metadata. The loopback proxy requires the exact capability and
 `Origin: null` on every request, emits only `Access-Control-Allow-Origin: null`,
 never emits a wildcard, accepts only the advertised paths and narrow
 GET/POST/OPTIONS contract, bounds request bodies and upstream idle time, and strips
-the capability before forwarding. Detach durably writes a revocation marker before
+the browser capability before forwarding and injects the independently verified
+JARVIS service bearer only on the private upstream hop. The capability and service
+bearer reach the proxy in one bounded JSON document over an anonymous inherited
+stdin pipe that is immediately closed; they never enter its environment,
+configuration file, process arguments, records, sidecars, or logs. Detach durably
+writes a revocation marker before
 stopping the owned proxy; same-id retries return an idempotent revoked result, while
 a different attachment id is refused.
 

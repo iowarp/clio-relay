@@ -15,7 +15,7 @@ instances without a core-code change.
 
 ## Required report matrix
 
-Each stage produces exactly these 18 policy reports. The tracked
+Each stage produces exactly these 19 policy reports. The tracked
 [`report-matrix-1.0.json`](../examples/release-gate/report-matrix-1.0.json) is the
 machine-readable inventory.
 
@@ -39,10 +39,11 @@ machine-readable inventory.
 | 16 | `homelab-transport` | `live-test` | relay and owned SSH transport |
 | 17 | `ares-gateway-start` | `gateway start-runtime` | grouped with report 18 by gateway session |
 | 18 | `ares-gateway-stop` | `gateway stop-runtime` | keeps scheduler job by default |
+| 19 | `ares-secure-runtime` | `live-test` | authenticated JARVIS v3.5 handoff, browser reconnect, and preserve-by-default teardown |
 
 Bootstrap of the homelab target and creation of cleanup-owned gateway fixtures
 also write diagnostic reports. Store those outside the policy report directory
-and do not upload them as part of the 18-report set.
+and do not upload them as part of the 19-report set.
 
 ## Start one evidence stage
 
@@ -58,7 +59,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.3.36"
+$Version = "1.4.0"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }
@@ -267,7 +268,7 @@ The producer login and numeric GitHub id are resolved afresh for the stage but
 remain the real operator identity. The invocation id, report id, report path,
 pipeline id, relay-session id, and gateway-session id must be fresh for every
 operation. This helper guarantees a new invocation id, refuses report-path
-replacement, and tracks only the 18 policy reports:
+replacement, and tracks only the 19 policy reports:
 
 ```powershell
 $PolicyReports = [System.Collections.Generic.List[string]]::new()
@@ -839,7 +840,7 @@ cannot satisfy either requirement.
 
 ## Run the scientific catalog v1.1 contract
 
-Use the exact clio-kit 2.5.17 persistent executable installed and receipt-bound
+Use the exact clio-kit 2.5.19 persistent executable installed and receipt-bound
 by bootstrap. The catalog file is operator-owned site metadata supplied through
 `CLIO_RELAY_VALIDATION_ARES_SCIENTIFIC_CATALOG_FILE`; it is not copied into the
 relay release. This policy uses
@@ -1462,6 +1463,70 @@ if ($DedicatedGatewayPrimaryError) {
 if ($DedicatedGatewayCleanupError) { throw $DedicatedGatewayCleanupError }
 ```
 
+## Prove the authenticated JARVIS service lifecycle
+
+Report 19 uses an ordinary JARVIS pipeline plus an explicit application-owned
+probe extension. The extension is stripped before the pipeline is submitted to
+JARVIS. It selects a package/service and supplies one bounded command, but it
+does not supply a runtime host, port, credential, connector, scheduler id, or
+ParaView executable. The relay discovers those only from the authenticated
+JARVIS v3.5 execution query and private-authority binding.
+
+The selected dataset and `builtin.paraview` are concrete release-evidence
+inputs, not relay-core behavior. To keep this stage tied to report 6, materialize
+the descriptor from the same operator-owned catalog record that the released
+Scientific Catalog MCP already validated. This lightweight preparation may run
+on the login node; ParaView itself runs only in the submitted SLURM allocation.
+
+```powershell
+$SecureDatasetId = "deep-water-impact-2018-yb31-first5"
+$CatalogText = (& $OpenSsh $AresSshHost "cat '$AresScientificCatalogFile'" | Out-String)
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($CatalogText)) {
+  throw "Ares scientific catalog could not be read for secure-runtime configuration"
+}
+$CatalogDocument = $CatalogText | ConvertFrom-Json
+$SecureDatasetRecords = @(
+  $CatalogDocument.datasets | Where-Object { $_.dataset_id -ceq $SecureDatasetId }
+)
+if ($SecureDatasetRecords.Count -ne 1 -or $null -eq $SecureDatasetRecords[0].descriptor) {
+  throw "secure-runtime dataset must resolve to exactly one catalog descriptor"
+}
+$SecureDescriptorLocal = Write-JsonFile `
+  "ares-secure-runtime-dataset-descriptor.json" $SecureDatasetRecords[0].descriptor
+$SecureDescriptorRemote = "$AresRemoteRoot/secure-runtime/dataset-descriptor.json"
+& $OpenSsh $AresSshHost "install -d -m 700 '$AresRemoteRoot/secure-runtime'"
+if ($LASTEXITCODE -ne 0) { throw "secure-runtime fixture directory creation failed" }
+Copy-RemoteTextFile `
+  -Source $SecureDescriptorLocal `
+  -StagingName "ares-secure-runtime-dataset-descriptor.json" `
+  -SshHost $AresSshHost `
+  -RemotePath $SecureDescriptorRemote `
+  -Description "secure-runtime dataset descriptor"
+
+$SecureRuntimeYaml = Join-Path $RenderedRoot "ares-secure-runtime.yaml"
+Render-Template "examples/release-gate/ares-secure-runtime.yaml.tmpl" `
+  $SecureRuntimeYaml @{
+    RUN_ID = $RunId
+    REMOTE_ROOT = $AresRemoteRoot
+    REMOTE_DESCRIPTOR = $SecureDescriptorRemote
+  }
+Invoke-RelayReport -Id "ares-secure-runtime" -ReportOption "--report" -Command @(
+  "live-test", "--cluster", $AresCluster,
+  "--validation-scenario", "secure-runtime",
+  "--jarvis-yaml", $SecureRuntimeYaml,
+  "--verify-cluster-deployment",
+  "--require-structured-runtime-metadata",
+  "--timeout-seconds", "900", "--poll-seconds", "1"
+)
+```
+
+Detach and teardown inside this probe always pass
+`cancel_scheduler_job=false`. A naturally completed allocation is acceptable
+only when its exact identity and verified terminal disposition are recorded;
+the report must never claim that relay cancelled it. The probe cleans up any
+gateway or connector it created on a failed bind while retaining the scheduler
+job.
+
 ## Verify and upload the exact report set
 
 Do not use a wildcard over a long-lived validation directory. Verify the
@@ -1567,7 +1632,7 @@ The release workflow order is fixed:
 
 After the candidate upload, dispatch `live-validation-attest.yml` and then
 `release-gate.yml` from protected `main`. After public PyPI publication, create
-a new released stage, install from the public index, rerun all 18 reports, upload
+a new released stage, install from the public index, rerun all 19 reports, upload
 the distinct `released-validation-*.json` files, and dispatch
 `released-validation-attest.yml`. Only then may `finalize-release.yml` publish
 the final GitHub release claims.

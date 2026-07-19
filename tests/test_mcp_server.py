@@ -305,6 +305,11 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     )
     assert create_pipeline_tool["inputSchema"]["required"] == ["cluster", "pipeline_id"]
     assert "pipeline_id" in create_pipeline_tool["inputSchema"]["properties"]
+    assert "ordinary interactive use" in create_pipeline_tool["description"]
+    wait_control = create_pipeline_tool["inputSchema"]["properties"]["wait_for_terminal"]
+    assert wait_control["default"] is False
+    assert "current turn needs" in wait_control["description"]
+    assert "never for the scheduler workload" in wait_control["description"]
     describe_tool = next(
         tool for tool in response["result"]["tools"] if tool["name"] == "jarvis_describe"
     )
@@ -2312,30 +2317,164 @@ def test_direct_remote_waited_mcp_submission_returns_artifact_bound_result(
     ]
 
 
-def test_large_terminal_mcp_result_omits_payload_but_keeps_summary() -> None:
-    """Oversized MCP payloads remain durable without overflowing an agent context."""
+def test_under_limit_terminal_mcp_result_returns_complete_structured_result() -> None:
+    """A safely bounded result remains a successful, complete agent result."""
 
     bounded = mcp_server_module._bounded_mcp_result(  # pyright: ignore[reportPrivateUsage]
         {
             "operation": "tools/call",
-            "tool": "jarvis_describe",
+            "tool": "science_inspect",
             "returncode": 0,
             "timed_out": False,
             "protocol_error": None,
-            "structured_result": {"yaml": "x" * 100_000},
-            "protocol_result": {"structuredContent": {"yaml": "x" * 100_000}},
+            "structured_result": {"dataset_id": "asteroid-first-five"},
+            "protocol_result": {"structuredContent": {"dataset_id": "asteroid-first-five"}},
+        }
+    )
+
+    assert bounded["structured_result"] == {"dataset_id": "asteroid-first-five"}
+    assert bounded["protocol_result_omitted"] == "redundant_with_structured_result"
+    assert "delivery" not in bounded
+
+
+def test_oversized_terminal_mcp_result_fails_closed_without_partial_payload() -> None:
+    """Oversized arbitrary output becomes an explicit, secret-free delivery failure."""
+
+    secret = "unclassified-application-secret-" + "x" * 100_000
+
+    bounded = mcp_server_module._bounded_mcp_result(  # pyright: ignore[reportPrivateUsage]
+        {
+            "operation": "tools/call",
+            "tool": "science_inspect",
+            "returncode": 0,
+            "timed_out": False,
+            "protocol_error": None,
+            "structured_result": {"application_payload": secret},
+            "protocol_result": {"structuredContent": {"application_payload": secret}},
             "protocol_version": "2024-11-05",
-            "server_info": {"name": "jarvis"},
+            "server_info": {"name": "science"},
             "result_validation": None,
         }
     )
 
-    assert bounded["content_truncated"] is True
-    assert "structured_result" in bounded["omitted_fields"]
-    assert bounded["protocol_result_omitted"] == "redundant_with_structured_result"
+    assert bounded == {
+        "content_truncated": True,
+        "result_available": False,
+        "delivery": {
+            "schema_version": "clio-relay.mcp-result-delivery.v1",
+            "status": "failed",
+            "code": "inline_result_limit_exceeded",
+            "max_inline_bytes": 65_536,
+            "private_evidence_preserved": True,
+            "remote_side_effects_may_have_occurred": True,
+            "message": mcp_server_module.MCP_RESULT_INLINE_LIMIT_MESSAGE,
+        },
+    }
+    assert "structured_result" not in bounded
     assert "protocol_result" not in bounded
-    assert bounded["tool"] == "jarvis_describe"
-    assert len(json.dumps(bounded)) < 65_536
+    assert secret not in json.dumps(bounded, sort_keys=True)
+
+
+def test_oversized_terminal_mcp_result_sets_tool_error_and_preserves_job_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The MCP call fails while preserving truthful remote state and private evidence."""
+
+    secret = "opaque-result-secret-" + "z" * 100_000
+    document: dict[str, Any] = {
+        "operation": "tools/call",
+        "tool": "science_inspect",
+        "returncode": 0,
+        "timed_out": False,
+        "protocol_error": None,
+        "structured_result": {"application_payload": secret},
+    }
+    source_job = RelayJob(
+        job_id="job_oversized_remote_result",
+        cluster="ares",
+        kind=JobKind.MCP_CALL,
+        state=JobState.SUCCEEDED,
+        spec=McpCallSpec(server="science-mcp", tool="science_inspect"),
+        idempotency_key="oversized-result-fixture",
+    )
+    payload = json.dumps(document, sort_keys=True).encode("utf-8")
+    artifact = ArtifactRef(
+        artifact_id="artifact_oversized_remote_result",
+        job_id=source_job.job_id,
+        uri=(tmp_path / "private-mcp-result.json").as_uri(),
+        kind="mcp_result",
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    receipt: dict[str, Any] = {
+        "cluster": "ares",
+        "job_id": source_job.job_id,
+        "state": "succeeded",
+        "kind": "mcp_call",
+        "terminal": True,
+        "remote": True,
+        "route_revision": "a" * 64,
+    }
+    parsed = mcp_server_module._VerifiedMcpResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        document=document,
+        public=document,
+    )
+    mcp_server_module._attach_terminal_mcp_evidence(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        receipt,
+        source_job=source_job,
+        last_error=None,
+        artifacts=[artifact.model_dump(mode="json")],
+        parsed_result=parsed,
+    )
+
+    def waited_result(
+        _arguments: dict[str, Any],
+        *,
+        queue: ClioCoreQueue,
+        settings: RelaySettings,
+    ) -> dict[str, Any]:
+        del queue, settings
+        return receipt
+
+    monkeypatch.setattr(mcp_server_module, "_wait_job", waited_result)
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_wait",
+                "arguments": {"job_id": source_job.job_id},
+            },
+        },
+        queue=ClioCoreQueue(tmp_path / "core"),
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+        profile="user",
+    )
+
+    assert response is not None and "error" not in response, response
+    tool_result = cast(dict[str, Any], response["result"])
+    assert tool_result["isError"] is True
+    public_receipt = cast(dict[str, Any], tool_result["structuredContent"])
+    assert public_receipt["state"] == "succeeded"
+    assert public_receipt["last_error"] is None
+    assert public_receipt["mcp_result_artifact"] == {
+        "artifact_id": artifact.artifact_id,
+        "job_id": source_job.job_id,
+        "kind": "mcp_result",
+        "size_bytes": len(payload),
+        "sha256": artifact.sha256,
+        "created_at": artifact.model_dump(mode="json")["created_at"],
+    }
+    delivery = cast(dict[str, Any], public_receipt["mcp_result"])["delivery"]
+    assert delivery["status"] == "failed"
+    assert delivery["private_evidence_preserved"] is True
+    assert delivery["remote_side_effects_may_have_occurred"] is True
+    serialized = json.dumps(response, sort_keys=True)
+    assert "Remote side effects may have occurred" in serialized
+    assert secret not in serialized
+    assert parsed.document["structured_result"] == {"application_payload": secret}
 
 
 def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
@@ -3576,6 +3715,15 @@ def test_mcp_reads_logs_and_artifacts(tmp_path: Path) -> None:
     artifact = queue.append_artifact(
         ArtifactRef(job_id=job.job_id, uri=stdout_path.as_uri(), kind="stdout")
     )
+    protocol_path = spool / "mcp-result.json"
+    bearer = "a" * 64
+    protocol_path.write_text(
+        json.dumps({"authorization": {"scheme": "bearer", "token": bearer}}),
+        encoding="utf-8",
+    )
+    internal_artifact = queue.append_artifact(
+        ArtifactRef(job_id=job.job_id, uri=protocol_path.as_uri(), kind="mcp_result")
+    )
 
     log_response = handle_request(
         {
@@ -3616,6 +3764,19 @@ def test_mcp_reads_logs_and_artifacts(tmp_path: Path) -> None:
         queue=queue,
         settings=settings,
     )
+    internal_content_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_read_artifact",
+                "arguments": {"artifact_id": internal_artifact.artifact_id},
+            },
+        },
+        queue=queue,
+        settings=settings,
+    )
 
     assert log_response is not None
     assert log_response["result"]["structuredContent"]["text"] == "hello"
@@ -3627,6 +3788,11 @@ def test_mcp_reads_logs_and_artifacts(tmp_path: Path) -> None:
     )
     assert content_response is not None
     assert content_response["result"]["structuredContent"]["encoding"] == "base64"
+    assert internal_content_response is not None
+    assert internal_content_response["error"]["code"] == -32000
+    serialized_error = json.dumps(internal_content_response, sort_keys=True)
+    assert "not model-readable" in serialized_error
+    assert bearer not in serialized_error
 
 
 def test_mcp_cancels_job(tmp_path: Path) -> None:

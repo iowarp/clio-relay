@@ -1,0 +1,62 @@
+name: __RUN_ID__-secure-runtime
+scheduler:
+  name: slurm
+  job_name: __RUN_ID__-secure-runtime
+  nodes: 1
+  ntasks: 1
+  time: "00:30:00"
+  output: "__REMOTE_ROOT__/secure-runtime-%j.out"
+  error: "__REMOTE_ROOT__/secure-runtime-%j.err"
+pkgs:
+  - pkg_type: builtin.paraview
+    pkg_name: secure_viewer
+    mode: service
+    dataset_descriptor: __REMOTE_DESCRIPTOR__
+    service_bind_host: 127.0.0.1
+    service_advertise_host: 127.0.0.1
+    service_port: 0
+    service_startup_timeout: 180
+    nprocs: 1
+x_clio_relay:
+  secure_runtime_probe:
+    package_name: builtin.paraview
+    package_id: secure_viewer
+    command:
+      schema_version: jarvis.paraview.command.v2
+      command_id: __RUN_ID__-secure-runtime-set-timestep
+      operation: set_timestep
+      expected_revision: 1
+      arguments:
+        index: 1
+    protocol_adapter:
+      command_request_id_pointer: /command_id
+      health:
+        assertions:
+          /schema_version: jarvis.paraview.health.v1
+          /status: ready
+        service_instance_id_pointer: /service_instance_id
+        revision_pointer: /revision
+      state:
+        assertions:
+          /schema_version: jarvis.paraview.service-state.v2
+        service_instance_id_pointer: /service_instance_id
+        execution_id_pointer: /execution_id
+        dataset_descriptor_pointer: /dataset/descriptor
+        revision_pointer: /revision
+      command:
+        assertions:
+          /schema_version: jarvis.paraview.command-result.v2
+          /applied: true
+        service_instance_id_pointer: /state/service_instance_id
+        execution_id_pointer: /state/execution_id
+        dataset_descriptor_pointer: /state/dataset/descriptor
+        revision_pointer: /state/revision
+        command_id_pointer: /command_id
+      events:
+        assertions:
+          /schema_version: jarvis.paraview.service-state.v2
+        service_instance_id_pointer: /service_instance_id
+        execution_id_pointer: /execution_id
+        dataset_descriptor_pointer: /dataset/descriptor
+        revision_pointer: /revision
+        event_name: state

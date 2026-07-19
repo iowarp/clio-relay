@@ -197,6 +197,8 @@ def test_local_release_validation_runs_all_checks_and_records_artifacts(
         "local.containment-hard-crash",
         "local.sidecar-reclamation",
         "local.retention-storage-pagination",
+        "local.packaged-mcp-boundary",
+        "local.secure-runtime-acceptance",
         "local.dependency-lock-export",
         "local.dependency-audit",
         "local.build-backend",
@@ -229,7 +231,7 @@ def test_local_release_validation_runs_all_checks_and_records_artifacts(
     pytest_commands = [
         command for command in commands if command[:4] == ["uv", "run", "--no-sync", "pytest"]
     ]
-    assert len(pytest_commands) == 4
+    assert len(pytest_commands) == 6
     assert all(
         command[4:6] == ["-p", "clio_relay.pytest_release_gate"] for command in pytest_commands
     )
@@ -263,6 +265,17 @@ def test_local_release_validation_runs_all_checks_and_records_artifacts(
         "tests/test_storage_managed_queue.py::test_managed_queue_never_scans_storage_while_core_lock_is_held",
         "tests/test_storage_managed_queue.py::test_managed_queue_recovers_crash_reserved_canonical_id_without_leak",
         "tests/test_surface_pagination.py::test_sparse_job_filters_return_empty_source_page_with_next_cursor",
+    ]
+    assert pytest_commands[4][7:] == [
+        "tests/test_process_containment.py",
+        "tests/test_mcp_stdio_validation.py",
+    ]
+    assert pytest_commands[5][7:] == [
+        "tests/test_live_acceptance.py::test_secure_runtime_probe_config_is_generic_strict_and_bounded",
+        "tests/test_live_acceptance.py::test_secure_runtime_secret_scanner_rejects_capabilities_without_key_false_positives",
+        "tests/test_live_acceptance.py::test_secure_runtime_browser_http_is_direct_strict_bounded_and_deadlined",
+        "tests/test_live_acceptance.py::test_secure_runtime_acceptance_records_exact_v35_browser_and_cleanup_path",
+        "tests/test_live_acceptance.py::test_secure_runtime_bind_failure_preserves_error_and_attempts_safe_teardown",
     ]
     assert load_validation_report(report_path).status is ValidationStatus.PASSED
 

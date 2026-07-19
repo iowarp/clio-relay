@@ -75,7 +75,7 @@ MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH = 64
 MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES = 32_768
 REMOTE_MCP_REPLACE_ATTEMPTS = 25
 REMOTE_MCP_REPLACE_RETRY_SECONDS = 0.02
-CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.5.17"
+CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.5.19"
 CLIO_KIT_SPACK_USER_CONTRACT_ID = "clio-kit-spack-user-v2.1"
 CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID = "clio-kit-spack-user-v2"
 CLIO_KIT_SPACK_USER_CONTRACT_IDS = frozenset(
@@ -118,7 +118,7 @@ CLIO_KIT_SPACK_USER_CONTRACT_ARTIFACT_BY_ID = {
 CLIO_KIT_SPACK_USER_CONTRACT_SHA256 = CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID[
     CLIO_KIT_SPACK_USER_CONTRACT_ID
 ]
-CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION = "2.5.17"
+CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION = "2.5.19"
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID = "clio-kit-scientific-catalog-user-v1.1"
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_LEGACY_CONTRACT_ID = "clio-kit-scientific-catalog-user-v1"
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_IDS = frozenset(
@@ -4004,6 +4004,46 @@ def _declared_contract_check(
 def _stdio_initialize_passed(evidence: JSON | None) -> bool:
     if evidence is None:
         return True
+    if "protocol_evidence_sha256" in evidence:
+        projected = dict(evidence)
+        expected_digest = projected.pop("protocol_evidence_sha256", None)
+        try:
+            observed_digest = hashlib.sha256(
+                json.dumps(
+                    projected,
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        except (TypeError, ValueError):
+            return False
+        digest_fields = (
+            "executable_sha256",
+            "server_info_sha256",
+            "tools_list_sha256",
+            "called_tool_schema_sha256",
+            "jarvis_contract_sha256",
+            "jarvis_virtual_tools_sha256",
+        )
+        return (
+            evidence.get("schema_version") == "clio-relay.packaged-mcp-stdio-evidence.v1"
+            and evidence.get("boundary") == "packaged_clio_relay_mcp_server_stdio"
+            and evidence.get("returncode") == 0
+            and evidence.get("protocol_version") == "2024-11-05"
+            and evidence.get("server_name") == "clio-relay"
+            and isinstance(evidence.get("server_version"), str)
+            and bool(evidence.get("server_version"))
+            and isinstance(evidence.get("containment_enforceable"), bool)
+            and isinstance(evidence.get("containment_mode"), str)
+            and expected_digest == observed_digest
+            and all(
+                isinstance(evidence.get(name), str)
+                and re.fullmatch(r"[0-9a-f]{64}", cast(str, evidence[name])) is not None
+                for name in digest_fields
+            )
+        )
     response = _as_json(evidence.get("initialize_response"))
     if response is None or response.get("error") is not None:
         return False
@@ -4023,22 +4063,33 @@ def _stdio_initialize_passed(evidence: JSON | None) -> bool:
 def _stdio_listed_tool_names(evidence: JSON | None) -> set[str]:
     if evidence is None:
         return set()
+    if "protocol_evidence_sha256" in evidence:
+        raw_names = evidence.get("tool_names")
+        if not isinstance(raw_names, list):
+            return set()
+        typed_names = cast(list[object], raw_names)
+        if not all(isinstance(name, str) and name for name in typed_names):
+            return set()
+        return set(cast(list[str], typed_names))
     response = _as_json(evidence.get("tools_list_response"))
     result = _as_json(response.get("result")) if response is not None else None
     tools = result.get("tools") if result is not None else None
     if not isinstance(tools, list):
         return set()
-    names: set[str] = set()
+    listed_names: set[str] = set()
     for value in cast(list[object], tools):
         tool = _as_json(value)
         if tool is not None and isinstance(tool.get("name"), str):
-            names.add(cast(str, tool["name"]))
-    return names
+            listed_names.add(cast(str, tool["name"]))
+    return listed_names
 
 
 def _stdio_call_job_id(evidence: JSON | None) -> str | None:
     if evidence is None:
         return None
+    if "protocol_evidence_sha256" in evidence:
+        job_id = evidence.get("call_job_id")
+        return job_id if isinstance(job_id, str) else None
     response = _as_json(evidence.get("tools_call_response"))
     result = _as_json(response.get("result")) if response is not None else None
     if result is None:

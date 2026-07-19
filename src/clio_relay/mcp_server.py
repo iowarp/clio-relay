@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import hmac
 import json
@@ -122,12 +123,21 @@ from clio_relay.storage_runtime import (
     StorageManagedQueue,
     storage_managed_queue,
 )
+from clio_relay.validation_report import redact_sensitive_values
 
 JSON = dict[str, Any]
 MCP_PROFILE_ENV = "CLIO_RELAY_MCP_PROFILE"
 MAX_INTERNAL_COLLECTION_RECORDS = 10_000
 MAX_AGENT_LOG_READ_BYTES = 32_768
 MAX_INLINE_MCP_RESULT_BYTES = 65_536
+MCP_RESULT_DELIVERY_SCHEMA = "clio-relay.mcp-result-delivery.v1"
+MCP_RESULT_INLINE_LIMIT_CODE = "inline_result_limit_exceeded"
+MCP_RESULT_INLINE_LIMIT_MESSAGE = (
+    "The remote MCP operation reached a terminal state, but its result exceeded the safe "
+    "inline response limit and is unavailable to the agent. Immutable private evidence was "
+    "preserved for operator diagnosis. Remote side effects may have occurred; inspect the "
+    "job before retrying."
+)
 MAX_OBSERVE_MATCHES = 100
 MAX_OBSERVE_MATCH_TEXT_CHARS = 1_024
 USER_MCP_TOOL_NAMES = {
@@ -327,7 +337,21 @@ def handle_request(
             data={"storage_decision": exc.decision.to_dict()},
         )
     except Exception as exc:
-        return _error(request_id, -32000, logical_filesystem_text(str(exc)))
+        public_error = redact_sensitive_values(
+            {
+                "request": request,
+                "error": logical_filesystem_text(str(exc)),
+            }
+        )
+        public_error_document = (
+            cast(dict[str, object], public_error) if isinstance(public_error, dict) else {}
+        )
+        error_message = public_error_document.get("error")
+        return _error(
+            request_id,
+            -32000,
+            error_message if isinstance(error_message, str) else "relay tool request failed",
+        )
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
@@ -941,7 +965,10 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
         },
         {
             "name": "relay_read_artifact",
-            "description": "Read a file artifact payload as base64.",
+            "description": (
+                "Read a model-readable file artifact payload as base64. Internal protocol and "
+                "credential-bearing artifacts are intentionally unavailable through this tool."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {"artifact_id": durable_record_id_json_schema()},
@@ -1633,7 +1660,7 @@ def _call_tool(
             else _used_by_tool(arguments, queue=queue, settings=settings)
         )
     elif name == "relay_read_artifact":
-        result = read_artifact_bytes(
+        result = _read_model_artifact_bytes(
             queue,
             _required_durable_record_id(arguments, "artifact_id"),
         )
@@ -1775,7 +1802,7 @@ def _call_tool(
     return {
         "content": [{"type": "text", "text": _serialize_tool_result(result)}],
         "structuredContent": result,
-        "isError": False,
+        "isError": _mcp_result_delivery_failed(result),
     }
 
 
@@ -2976,10 +3003,17 @@ def _mcp_result_artifact(artifacts: list[JSON], *, job_id: str) -> JSON | None:
 def _bounded_mcp_result(result: JSON) -> JSON:
     """Return a bounded agent projection while the artifact retains full protocol evidence."""
 
-    projected = dict(result)
+    original = copy.deepcopy(result)
+    sanitized = redact_sensitive_values(original)
+    if not isinstance(sanitized, dict):
+        raise ValueError("MCP result redaction did not preserve its object shape")
+    projected = cast(JSON, sanitized)
+    sensitive_values_redacted = projected != result
     if projected.get("structured_result") is not None and "protocol_result" in projected:
         projected.pop("protocol_result")
         projected["protocol_result_omitted"] = "redundant_with_structured_result"
+    if sensitive_values_redacted:
+        projected["sensitive_values_redacted"] = True
 
     encoded = json.dumps(
         projected,
@@ -2991,41 +3025,56 @@ def _bounded_mcp_result(result: JSON) -> JSON:
     if len(encoded) <= MAX_INLINE_MCP_RESULT_BYTES:
         return projected
 
-    preferred = (
-        "operation",
-        "tool",
-        "returncode",
-        "timed_out",
-        "protocol_error",
-        "protocol_version",
-        "server_info",
-        "structured_result",
-        "result_validation",
-        "protocol_result",
-        "protocol_result_omitted",
+    # Arbitrary MCP output has no generic, safe pagination or redaction contract.
+    # Returning a successful-looking partial projection would lose the only
+    # agent-readable result, while exposing selected fields could disclose
+    # application-defined secrets. Keep the full artifact private and fail the
+    # MCP delivery explicitly without changing the immutable remote job state.
+    failure: JSON = {
+        "content_truncated": True,
+        "result_available": False,
+        "delivery": {
+            "schema_version": MCP_RESULT_DELIVERY_SCHEMA,
+            "status": "failed",
+            "code": MCP_RESULT_INLINE_LIMIT_CODE,
+            "max_inline_bytes": MAX_INLINE_MCP_RESULT_BYTES,
+            "private_evidence_preserved": True,
+            "remote_side_effects_may_have_occurred": True,
+            "message": MCP_RESULT_INLINE_LIMIT_MESSAGE,
+        },
+    }
+    if sensitive_values_redacted:
+        failure["sensitive_values_redacted"] = True
+    return failure
+
+
+def _mcp_result_delivery_failed(result: JSON) -> bool:
+    """Return whether a terminal MCP result could not be delivered to the agent."""
+
+    mcp_result = result.get("mcp_result")
+    if not isinstance(mcp_result, dict):
+        return False
+    delivery = cast(dict[str, object], mcp_result).get("delivery")
+    if not isinstance(delivery, dict):
+        return False
+    typed_delivery = cast(dict[str, object], delivery)
+    return (
+        typed_delivery.get("schema_version") == MCP_RESULT_DELIVERY_SCHEMA
+        and typed_delivery.get("status") == "failed"
+        and typed_delivery.get("code") == MCP_RESULT_INLINE_LIMIT_CODE
     )
-    summary: JSON = {}
-    omitted: list[str] = []
-    for key in preferred:
-        if key not in projected:
-            continue
-        candidate = {**summary, key: projected.get(key)}
-        candidate_size = len(
-            json.dumps(
-                candidate,
-                allow_nan=False,
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
+
+
+def _read_model_artifact_bytes(queue: ClioCoreQueue, artifact_id: str) -> dict[str, object]:
+    """Read one public artifact without exposing internal protocol capabilities."""
+
+    artifact = queue.get_artifact(artifact_id)
+    if artifact.kind == "mcp_result" or artifact.metadata.get("model_readable") is False:
+        raise ValueError(
+            "artifact is internal protocol evidence and is not model-readable; use relay_wait "
+            "for its bounded public result"
         )
-        if candidate_size <= MAX_INLINE_MCP_RESULT_BYTES - 2_048:
-            summary[key] = projected.get(key)
-        else:
-            omitted.append(key)
-    summary["content_truncated"] = True
-    summary["omitted_fields"] = omitted
-    return summary
+    return read_artifact_bytes(queue, artifact_id)
 
 
 def _public_mcp_result_artifact(artifact: JSON) -> JSON:

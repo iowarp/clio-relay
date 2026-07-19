@@ -8,6 +8,7 @@ import hmac
 import http.client
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -16,16 +17,26 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import ClassVar, Literal, cast
+from typing import Any, BinaryIO, ClassVar, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 CAPABILITY_ENV = "CLIO_RELAY_BROWSER_CAPABILITY"
+UPSTREAM_AUTHORIZATION_ENV = "CLIO_RELAY_BROWSER_UPSTREAM_AUTHORIZATION"
 BROWSER_GATEWAY_CONFIG_SCHEMA = "clio-relay.browser-gateway-config.v1"
+BROWSER_GATEWAY_BOOTSTRAP_SCHEMA = "clio-relay.browser-gateway-bootstrap.v1"
 BROWSER_ATTACHMENT_SCHEMA = "clio-relay.browser-attachment.v1"
 BROWSER_ATTACHMENT_RECORD_SCHEMA = "clio-relay.browser-attachment-record.v1"
 BROWSER_DETACHMENT_SCHEMA = "clio-relay.browser-detachment.v1"
 MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
+MAX_BROWSER_BOOTSTRAP_BYTES = 4096
+MAX_ACTIVE_BROWSER_REQUESTS = 32
+MAX_BROWSER_OVERLOAD_RESPONDERS = 4
+BROWSER_REQUEST_BACKLOG = 32
+BROWSER_CLIENT_IO_TIMEOUT_SECONDS = 15.0
+BROWSER_CLIENT_REQUEST_DEADLINE_SECONDS = 15.0
+BROWSER_OVERLOAD_IO_TIMEOUT_SECONDS = 1.0
+BROWSER_OVERLOAD_REQUEST_DEADLINE_SECONDS = 1.0
 UPSTREAM_CONNECT_TIMEOUT_SECONDS = 5.0
 UPSTREAM_IDLE_TIMEOUT_SECONDS = 60.0
 _CAPABILITY_QUERY_KEY = "capability"
@@ -112,6 +123,34 @@ class BrowserGatewayConfig(BaseModel):
         return self
 
 
+class BrowserGatewayBootstrap(BaseModel):
+    """One bounded stdin-only secret handoff for a browser gateway process."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["clio-relay.browser-gateway-bootstrap.v1"] = (
+        BROWSER_GATEWAY_BOOTSTRAP_SCHEMA
+    )
+    capability: str = Field(min_length=43, max_length=512)
+    upstream_authorization: str | None = Field(default=None, max_length=96)
+
+    @field_validator("upstream_authorization")
+    @classmethod
+    def validate_upstream_authorization(cls, value: str | None) -> str | None:
+        """Accept only the exact execution-owned 256-bit bearer shape."""
+        if value is None:
+            return None
+        scheme, separator, token = value.partition(" ")
+        if (
+            scheme != "Bearer"
+            or separator != " "
+            or len(token) != 64
+            or any(character not in "0123456789abcdef" for character in token)
+        ):
+            raise ValueError("upstream authorization must contain one 256-bit bearer token")
+        return value
+
+
 class BrowserAttachmentGrant(BaseModel):
     """One-time browser capability returned only by explicit attachment."""
 
@@ -191,19 +230,231 @@ class BrowserDetachmentResult(BaseModel):
         return value
 
 
+class _AbsoluteSocketDeadline:
+    """Close one request socket when an absolute input deadline expires."""
+
+    def __init__(self, request_socket: socket.socket, timeout_seconds: float) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("browser request deadline must be positive")
+        self._request_socket = request_socket
+        self._lock = threading.Lock()
+        self._finished = False
+        self._expired = False
+        self._timer = threading.Timer(timeout_seconds, self._expire)
+        self._timer.daemon = True
+
+    def start(self) -> None:
+        """Start the one-shot absolute deadline."""
+        self._timer.start()
+
+    def complete(self) -> None:
+        """Disarm the deadline once headers, authorization, and body are complete."""
+        with self._lock:
+            if self._finished:
+                return
+            self._finished = True
+        self._timer.cancel()
+
+    @property
+    def expired(self) -> bool:
+        """Return whether the deadline, rather than normal completion, won the race."""
+        with self._lock:
+            return self._expired
+
+    def _expire(self) -> None:
+        with self._lock:
+            if self._finished:
+                return
+            self._finished = True
+            self._expired = True
+        with suppress(OSError):
+            self._request_socket.shutdown(socket.SHUT_RDWR)
+
+
+class _OverloadedRequestHandler(BaseHTTPRequestHandler):
+    """Parse one rejected request before returning a deterministic HTTP 503."""
+
+    protocol_version = "HTTP/1.1"
+    server_version = "clio-relay-browser-gateway/1"
+    sys_version = ""
+
+    def do_GET(self) -> None:  # noqa: N802
+        """Reject an overloaded GET with a complete close-delimited response."""
+        self._reject()
+
+    def do_POST(self) -> None:  # noqa: N802
+        """Reject an overloaded POST with a complete close-delimited response."""
+        self._reject()
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        """Reject an overloaded preflight with a complete HTTP response."""
+        self._reject()
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        """Reject an overloaded HEAD without writing a response body."""
+        self._reject()
+
+    def _reject(self) -> None:
+        payload = b'{"error":"browser attachment request capacity exhausted"}'
+        self.close_connection = True
+        self.send_response(503)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "null")
+        self.send_header("Vary", "Origin")
+        self.send_header("Retry-After", "1")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if self.command != "HEAD":
+            with suppress(BrokenPipeError, ConnectionResetError, OSError):
+                self.wfile.write(payload)
+                self.wfile.flush()
+
+    def log_message(self, format: str, *args: object) -> None:
+        """Avoid attacker-controlled request text in overload logs."""
+        del format, args
+
+
 class CapabilityProxyServer(ThreadingHTTPServer):
     """Threaded loopback server with immutable attachment configuration."""
 
     daemon_threads = True
     allow_reuse_address = False
+    request_queue_size = BROWSER_REQUEST_BACKLOG
 
-    def __init__(self, config: BrowserGatewayConfig, capability: str) -> None:
+    def __init__(
+        self,
+        config: BrowserGatewayConfig,
+        capability: str,
+        upstream_authorization: str | None = None,
+    ) -> None:
         observed = hashlib.sha256(capability.encode("utf-8")).hexdigest()
         if not hmac.compare_digest(observed, config.token_sha256):
             raise ValueError("browser capability does not match its configured digest")
+        if upstream_authorization is not None:
+            scheme, separator, token = upstream_authorization.partition(" ")
+            if (
+                scheme != "Bearer"
+                or separator != " "
+                or len(token) != 64
+                or any(character not in "0123456789abcdef" for character in token)
+            ):
+                raise ValueError("upstream authorization must contain one 256-bit bearer token")
         self.config = config
         self.capability = capability
+        self.upstream_authorization = upstream_authorization
+        self._maximum_active_requests = MAX_ACTIVE_BROWSER_REQUESTS
+        self._active_request_count = 0
+        self._active_request_condition = threading.Condition()
+        self._overload_slots = threading.BoundedSemaphore(MAX_BROWSER_OVERLOAD_RESPONDERS)
         super().__init__((config.bind_addr, config.bind_port), CapabilityProxyHandler)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        """Start a handler only when the bounded attachment budget has capacity."""
+
+        request_socket = cast(socket.socket, request)
+        if not self._admit_request():
+            self._start_overload_response(request_socket, client_address)
+            return
+        try:
+            super().process_request(request_socket, client_address)
+        except BaseException:
+            self._release_request()
+            raise
+
+    def process_request_thread(
+        self,
+        request: Any,
+        client_address: Any,
+    ) -> None:
+        """Release one request slot after every success, error, or disconnect."""
+
+        request_socket = cast(socket.socket, request)
+        try:
+            request_socket.settimeout(BROWSER_CLIENT_IO_TIMEOUT_SECONDS)
+            super().process_request_thread(request_socket, client_address)
+        finally:
+            self._release_request()
+
+    @property
+    def active_request_count(self) -> int:
+        """Return the exact number of admitted live handler threads."""
+        with self._active_request_condition:
+            return self._active_request_count
+
+    def wait_for_active_request_count(self, expected: int, timeout: float) -> bool:
+        """Wait for an exact admitted-handler count for diagnostics and tests."""
+        if not 0 <= expected <= self._maximum_active_requests:
+            raise ValueError("expected active request count is outside the server bound")
+        if timeout < 0:
+            raise ValueError("active request wait timeout cannot be negative")
+        with self._active_request_condition:
+            return self._active_request_condition.wait_for(
+                lambda: self._active_request_count == expected,
+                timeout=timeout,
+            )
+
+    def _admit_request(self) -> bool:
+        """Atomically reserve one bounded handler slot."""
+        with self._active_request_condition:
+            if self._active_request_count >= self._maximum_active_requests:
+                return False
+            self._active_request_count += 1
+            self._active_request_condition.notify_all()
+            return True
+
+    def _release_request(self) -> None:
+        """Release one previously admitted handler slot exactly once."""
+        with self._active_request_condition:
+            if self._active_request_count < 1:
+                raise RuntimeError("browser request admission accounting underflow")
+            self._active_request_count -= 1
+            self._active_request_condition.notify_all()
+
+    def _start_overload_response(
+        self,
+        request_socket: socket.socket,
+        client_address: Any,
+    ) -> None:
+        """Use a separately bounded parser so Windows closes after a valid response."""
+        if not self._overload_slots.acquire(blocking=False):
+            self.shutdown_request(request_socket)
+            return
+        worker = threading.Thread(
+            target=self._process_overloaded_request,
+            args=(request_socket, client_address),
+            name=f"browser-gateway-overload-{self.config.attachment_id}",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except BaseException:
+            self._overload_slots.release()
+            self.shutdown_request(request_socket)
+            raise
+
+    def _process_overloaded_request(
+        self,
+        request_socket: socket.socket,
+        client_address: Any,
+    ) -> None:
+        """Parse request headers, flush HTTP 503, and close without a Windows RST."""
+        deadline = _AbsoluteSocketDeadline(
+            request_socket,
+            BROWSER_OVERLOAD_REQUEST_DEADLINE_SECONDS,
+        )
+        deadline.start()
+        try:
+            request_socket.settimeout(BROWSER_OVERLOAD_IO_TIMEOUT_SECONDS)
+            with suppress(BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                _OverloadedRequestHandler(request_socket, client_address, self)
+        finally:
+            deadline.complete()
+            try:
+                self.shutdown_request(request_socket)
+            finally:
+                self._overload_slots.release()
 
 
 class CapabilityProxyHandler(BaseHTTPRequestHandler):
@@ -213,6 +464,26 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
     server_version = "clio-relay-browser-gateway/1"
     sys_version = ""
     _SUPPORTED_METHODS: ClassVar[frozenset[str]] = frozenset({"GET", "POST", "OPTIONS"})
+    _request_input_deadline: _AbsoluteSocketDeadline | None = None
+
+    def handle_one_request(self) -> None:
+        """Bound every keep-alive request until authentication and body completion."""
+        deadline = _AbsoluteSocketDeadline(
+            cast(socket.socket, self.connection),
+            BROWSER_CLIENT_REQUEST_DEADLINE_SECONDS,
+        )
+        self._request_input_deadline = deadline
+        deadline.start()
+        try:
+            super().handle_one_request()
+        except OSError:
+            if deadline.expired:
+                self.close_connection = True
+                return
+            raise
+        finally:
+            deadline.complete()
+            self._request_input_deadline = None
 
     @property
     def capability_server(self) -> CapabilityProxyServer:
@@ -232,6 +503,12 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         target = self._authorize()
         if target is None:
             return
+        try:
+            self._request_body()
+        except ValueError as exc:
+            self._error(413, str(exc))
+            return
+        self._mark_request_input_complete()
         requested_method = self.headers.get("Access-Control-Request-Method")
         if requested_method not in {"GET", "POST"}:
             self._error(403, "requested method is not allowed")
@@ -302,6 +579,7 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._error(413, str(exc))
             return
+        self._mark_request_input_complete()
         config = self.capability_server.config
         connection_type: type[http.client.HTTPConnection] = (
             http.client.HTTPSConnection
@@ -319,6 +597,8 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
             if name.casefold() in _ALLOWED_REQUEST_HEADERS
         }
         request_headers["Host"] = f"{config.upstream_addr}:{config.upstream_port}"
+        if self.capability_server.upstream_authorization is not None:
+            request_headers["Authorization"] = self.capability_server.upstream_authorization
         response_started = False
         try:
             connection.request(self.command, target, body=body, headers=request_headers)
@@ -372,7 +652,19 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
             raise ValueError("request Content-Length is invalid") from exc
         if length < 0 or length > MAX_REQUEST_BODY_BYTES:
             raise ValueError("request body exceeds the browser gateway limit")
-        return self.rfile.read(length)
+        body = self.rfile.read(length)
+        if len(body) != length:
+            deadline = self._request_input_deadline
+            if deadline is not None and deadline.expired:
+                raise TimeoutError("browser request input exceeded its absolute deadline")
+            raise ValueError("request body ended before its declared Content-Length")
+        return body
+
+    def _mark_request_input_complete(self) -> None:
+        """Disarm only after the current request is authenticated and fully consumed."""
+        deadline = self._request_input_deadline
+        if deadline is not None:
+            deadline.complete()
 
     def _cors_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "null")
@@ -393,8 +685,21 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         """Emit bounded process-log entries without logging capability-bearing URLs."""
         del format
-        status = args[1] if len(args) > 1 else "unknown"
-        sys.stderr.write(f"browser-gateway method={self.command} status={status}\n")
+        command = getattr(self, "command", None)
+        method = command if command in self._SUPPORTED_METHODS else "unparsed"
+        status_value = args[1] if len(args) > 1 else None
+        status = (
+            str(status_value)
+            if isinstance(status_value, int)
+            or (
+                isinstance(status_value, str)
+                and len(status_value) == 3
+                and status_value.isascii()
+                and status_value.isdigit()
+            )
+            else "unknown"
+        )
+        sys.stderr.write(f"browser-gateway method={method} status={status}\n")
 
 
 def parse_utc_timestamp(value: str, field: str) -> datetime:
@@ -416,12 +721,46 @@ def load_browser_gateway_config(path: Path) -> BrowserGatewayConfig:
         raise ValueError(f"cannot read browser gateway configuration: {exc}") from exc
 
 
-def serve_browser_gateway(config: BrowserGatewayConfig, capability: str) -> None:
+def read_browser_gateway_bootstrap(stream: BinaryIO) -> BrowserGatewayBootstrap:
+    """Read exactly one bounded duplicate-key-free bootstrap object from stdin."""
+    content = stream.read(MAX_BROWSER_BOOTSTRAP_BYTES + 1)
+    if len(content) > MAX_BROWSER_BOOTSTRAP_BYTES:
+        raise ValueError("browser gateway bootstrap exceeds its byte limit")
+    if not content:
+        raise ValueError("browser gateway bootstrap is missing")
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"browser gateway bootstrap contains duplicate key: {key}")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> object:
+        raise ValueError(f"browser gateway bootstrap contains non-finite constant: {value}")
+
+    try:
+        decoded = json.loads(
+            content.decode("utf-8-sig"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+        return BrowserGatewayBootstrap.model_validate(decoded)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("browser gateway bootstrap is not valid UTF-8 JSON") from exc
+
+
+def serve_browser_gateway(
+    config: BrowserGatewayConfig,
+    capability: str,
+    upstream_authorization: str | None = None,
+) -> None:
     """Serve one attachment until revocation, expiry, or an owned process stop."""
     expires_at = parse_utc_timestamp(config.expires_at, "expires_at").timestamp()
     if Path(config.revocation_path).exists() or time.time() >= expires_at:
         return
-    server = CapabilityProxyServer(config, capability)
+    server = CapabilityProxyServer(config, capability, upstream_authorization)
     watchdog_stop = threading.Event()
 
     def stop_when_authority_ends() -> None:
@@ -450,11 +789,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--process-label", choices=["clio-relay-browser-frpc-proxy"])
     arguments = parser.parse_args(argv)
-    capability = os.environ.get(CAPABILITY_ENV)
-    if capability is None or len(capability) < 43:
-        parser.error(f"{CAPABILITY_ENV} must contain a high-entropy capability")
+    os.environ.pop(CAPABILITY_ENV, None)
+    os.environ.pop(UPSTREAM_AUTHORIZATION_ENV, None)
+    try:
+        bootstrap = read_browser_gateway_bootstrap(sys.stdin.buffer)
+    except ValueError:
+        parser.error("browser gateway bootstrap on stdin is invalid")
     config = load_browser_gateway_config(arguments.config.resolve())
-    serve_browser_gateway(config, capability)
+    serve_browser_gateway(
+        config,
+        bootstrap.capability,
+        bootstrap.upstream_authorization,
+    )
     return 0
 
 

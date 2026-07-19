@@ -7733,17 +7733,24 @@ class ClioCoreQueue:
         *,
         state: GatewaySessionState | None = None,
         metadata: dict[str, object] | None = None,
+        expected_updated_at: object = None,
         allow_owned_runtime_close: object = False,
         reject_relay_managed_fields: object = False,
         **updates: object,
     ) -> GatewaySession:
-        """Merge gateway session state and metadata updates."""
+        """Merge gateway state using an optional optimistic transition guard."""
         session_id = self._require_durable_record_id(session_id, field="session_id")
         self.initialize()
         self._require_index_migration_complete()
         with self._lock:
             self._recover_pending_transitions_unlocked()
             session = self.get_gateway_session(session_id)
+            if expected_updated_at is not None and not isinstance(expected_updated_at, datetime):
+                raise ValueError("expected_updated_at must be an aware datetime")
+            if expected_updated_at is not None and session.updated_at != expected_updated_at:
+                raise QueueConflictError(
+                    f"gateway session changed during a runtime transition: {session_id}"
+                )
             self._ensure_global_order_entry_unlocked(
                 "gateway_sessions",
                 session.session_id,
@@ -7775,6 +7782,18 @@ class ClioCoreQueue:
                     raise QueueConflictError(f"cannot reopen closed gateway session: {session_id}")
                 if updates and allow_owned_runtime_close is not True:
                     raise QueueConflictError(f"cannot update closed gateway session: {session_id}")
+            current_teardown_intent = session.gateway.get("teardown_intent")
+            if current_teardown_intent is not None and "gateway" in updates:
+                replacement_gateway = updates.get("gateway")
+                if (
+                    not isinstance(replacement_gateway, dict)
+                    or cast(dict[str, object], replacement_gateway).get("teardown_intent")
+                    != current_teardown_intent
+                ):
+                    raise QueueConflictError(
+                        "a committed gateway teardown intent cannot be removed or changed: "
+                        f"{session_id}"
+                    )
             merged_metadata = dict(session.metadata)
             if metadata:
                 merged_metadata.update(metadata)

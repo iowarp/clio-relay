@@ -13,31 +13,43 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
-from collections.abc import Callable, Sequence
-from contextlib import suppress
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import httpx
+from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
 
 from clio_relay.browser_gateway import (
     CAPABILITY_ENV,
+    UPSTREAM_AUTHORIZATION_ENV,
     BrowserAttachmentGrant,
     BrowserAttachmentRecord,
     BrowserDetachmentResult,
+    BrowserGatewayBootstrap,
     BrowserGatewayConfig,
 )
-from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.cluster_config import (
+    ClusterDefinition,
+    ensure_private_configuration_directory,
+)
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
+from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.jarvis_service_runtime import (
-    JarvisDatasetDescriptor,
+    JARVIS_SERVICE_RUNTIME_SCHEMA_V1,
+    JARVIS_SERVICE_RUNTIME_SCHEMA_V2,
+    JarvisServiceRuntimeBinding,
     VerifiedJarvisServiceRuntime,
+    resolve_jarvis_service_runtime_authorization,
     reverify_jarvis_service_runtime,
 )
 from clio_relay.models import (
@@ -94,6 +106,12 @@ _LOCAL_CONNECTOR_WRAPPER_CODE = (
 )
 _OWNERSHIP_INTENT_SCHEMA = "clio-relay.gateway-ownership-intent.v1"
 _MAX_SUBMISSION_OUTPUT_BYTES = 262_144
+_MAX_LOCAL_HEALTH_BYTES = 64 * 1024
+_GATEWAY_TEARDOWN_LOCK_TIMEOUT_SECONDS = 60.0
+_GATEWAY_DETACH_INTENT_SCHEMA = "clio-relay.gateway-detach-intent.v1"
+_GATEWAY_DETACH_RESULT_SCHEMA = "clio-relay.gateway-detach-result.v1"
+_GATEWAY_TEARDOWN_POLICY_SCHEMA = "clio-relay.gateway-teardown-policy.v1"
+_GATEWAY_TEARDOWN_RESULT_SCHEMA = "clio-relay.gateway-teardown-result.v1"
 _REMOTE_RUNTIME_COMMAND_TIMEOUT_SECONDS = 120.0
 _LOCAL_CLEANUP_COMMAND_TIMEOUT_SECONDS = 30.0
 _CONNECTOR_STEP_CLEANUP_TIMEOUT_SECONDS = 30.0
@@ -129,6 +147,24 @@ class LocalConnectorIdentity:
 
 
 @dataclass(frozen=True)
+class _BoundedHttpResponse:
+    """Response metadata plus an optional fully consumed, caller-bounded body."""
+
+    status_code: int
+    headers: httpx.Headers
+    content: bytes
+
+
+@dataclass
+class _BoundedHttpReadState:
+    """Cross-thread state for one absolute-deadline HTTP response read."""
+
+    response: httpx.Response | None = None
+    result: _BoundedHttpResponse | None = None
+    error: BaseException | None = None
+
+
+@dataclass(frozen=True)
 class _ObservedLocalProcess:
     pid: int
     process_group_id: int
@@ -144,6 +180,15 @@ class _VerifiedSchedulerSubmission:
     provider: str
     scheduler_job_id: str
     spec: ServiceRuntimeSpec
+
+
+@dataclass(frozen=True)
+class _DurableSchedulerContract:
+    """Scheduler identity or explicit absence proven by durable gateway state."""
+
+    provider: str
+    scheduler_job_id: str | None
+    unresolved_submission: bool = False
 
 
 class CommandRunner(Protocol):
@@ -167,6 +212,7 @@ class CommandRunner(Protocol):
         stderr_path: Path,
         env: dict[str, str] | None = None,
         isolate_process_group: bool = False,
+        input_bytes: bytes | None = None,
     ) -> subprocess.Popen[bytes]:
         """Start a long-running local process."""
         ...
@@ -216,6 +262,7 @@ class SubprocessCommandRunner:
         stderr_path: Path,
         env: dict[str, str] | None = None,
         isolate_process_group: bool = False,
+        input_bytes: bytes | None = None,
     ) -> subprocess.Popen[bytes]:
         """Start a local subprocess with owned log files."""
         stdout_handle = stdout_path.open("ab")
@@ -228,8 +275,9 @@ class SubprocessCommandRunner:
             else:
                 start_new_session = True
         try:
-            return subprocess.Popen(
+            process = subprocess.Popen(
                 list(command),
+                stdin=subprocess.PIPE if input_bytes is not None else None,
                 stdout=stdout_handle,
                 stderr=stderr_handle,
                 # The launched connector outlives this CLI process.  In particular, a relay
@@ -241,6 +289,13 @@ class SubprocessCommandRunner:
                 creationflags=creationflags,
                 start_new_session=start_new_session,
             )
+            if input_bytes is not None:
+                _deliver_process_input(
+                    process,
+                    input_bytes=input_bytes,
+                    isolate_process_group=isolate_process_group,
+                )
+            return process
         finally:
             stdout_handle.close()
             stderr_handle.close()
@@ -258,6 +313,46 @@ class SubprocessCommandRunner:
             owner_token=owner_token,
             expected_config=expected_config,
         )
+
+
+def _deliver_process_input(
+    process: subprocess.Popen[bytes],
+    *,
+    input_bytes: bytes,
+    isolate_process_group: bool,
+) -> None:
+    """Write one private bootstrap document and close its anonymous pipe promptly."""
+    input_pipe = process.stdin
+    delivery_error: Exception | None = None
+    if input_pipe is None:
+        delivery_error = RuntimeError("subprocess stdin pipe was not created")
+    else:
+        try:
+            written = input_pipe.write(input_bytes)
+            if written != len(input_bytes):
+                raise OSError("subprocess stdin accepted only a partial bootstrap document")
+            input_pipe.flush()
+        except Exception as exc:
+            delivery_error = exc
+        finally:
+            try:
+                input_pipe.close()
+            except Exception as exc:
+                if delivery_error is None:
+                    delivery_error = exc
+    if delivery_error is None:
+        return
+    if isolate_process_group:
+        _terminate_just_started_process_group(process.pid)
+    else:
+        with suppress(OSError):
+            process.terminate()
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            with suppress(OSError):
+                process.kill()
+    raise RelayError("failed to deliver private process bootstrap over stdin") from delivery_error
 
 
 @dataclass(frozen=True)
@@ -416,16 +511,18 @@ class ServiceRuntimeStopResult:
         """Convert this stop result to shared cleanup evidence."""
         from clio_relay.validation_report import CleanupEvidence
 
-        scheduler_cancel_requested = any(
-            resource.kind == "scheduler_job" and resource.action == "cancel"
-            for resource in self.resources
+        operation_intent_name = "detach_intent" if self.mode == "detach" else "teardown_intent"
+        operation_intent = _object(self.session.gateway.get(operation_intent_name, {}))
+        raw_cancel_scheduler_jobs: object = (
+            False if self.mode == "detach" else operation_intent.get("cancel_scheduler_job")
         )
-        teardown_intent = _object(self.session.gateway.get("teardown_intent", {}))
+        if not isinstance(raw_cancel_scheduler_jobs, bool):
+            raise RelayError("gateway cleanup operation policy is invalid")
         return CleanupEvidence(
             requested=True,
             mode=self.mode,
-            operation_id=_optional_str(teardown_intent.get("operation_id")),
-            cancel_scheduler_jobs=scheduler_cancel_requested,
+            operation_id=_optional_str(operation_intent.get("operation_id")),
+            cancel_scheduler_jobs=raw_cancel_scheduler_jobs,
             actions=[resource.model_dump(mode="json") for resource in self.resources],
             remaining_resources=[
                 resource.to_validation_resource(cluster=self.session.cluster)
@@ -690,6 +787,17 @@ class ServiceRuntimeSupervisor:
         self.runner = runner or SubprocessCommandRunner()
         self.sleep = sleep
 
+    def _jarvis_runtime_authorization(
+        self,
+        verified: VerifiedJarvisServiceRuntime,
+    ) -> str | None:
+        """Resolve per operation; callers may stdin-transfer only to the owned memory proxy."""
+        return resolve_jarvis_service_runtime_authorization(
+            definition=self.definition,
+            settings=self.settings,
+            verified=verified,
+        )
+
     def start(
         self,
         *,
@@ -752,6 +860,12 @@ class ServiceRuntimeSupervisor:
                 metadata=owner_metadata,
             )
         )
+        transition_lock = self._acquire_gateway_transition_lock(session.session_id)
+        try:
+            session = self._runtime_start_session_after_lock(session.session_id)
+        except BaseException:
+            transition_lock.release()
+            raise
         remote_connector: dict[str, object] | None = None
         local_connector: dict[str, object] | None = None
         try:
@@ -825,6 +939,10 @@ class ServiceRuntimeSupervisor:
                 proxy_name=proxy_name,
                 ownership_intent=remote_intent,
             )
+            # Allocation-scoped connector startup may enrich and durably persist
+            # the ownership intent before launching a scheduler step. Reload the
+            # exact revision before publishing the returned connector identity.
+            session = self.queue.get_gateway_session(session.session_id)
             session = self._update(
                 session,
                 gateway=self._gateway_with_ownership_intent(
@@ -1003,7 +1121,7 @@ class ServiceRuntimeSupervisor:
                     except RelayError as rollback_exc:
                         cleanup_errors.append(str(rollback_exc))
             try:
-                stop_result = self.stop(
+                stop_result = self._stop_serialized(
                     session_id=session.session_id,
                     cancel_scheduler_job=False,
                     final_state=GatewaySessionState.FAILED,
@@ -1011,16 +1129,19 @@ class ServiceRuntimeSupervisor:
                 cleanup_errors.extend(stop_result.errors)
             except Exception as cleanup_exc:
                 cleanup_errors.append(str(cleanup_exc))
-            self._update(
-                session,
-                state=GatewaySessionState.FAILED,
-                metadata={
-                    "failed_at": utc_now().isoformat(),
-                    "last_error": str(exc),
-                    "cleanup_error": "; ".join(dict.fromkeys(cleanup_errors)) or None,
-                },
-            )
+            try:
+                self._record_runtime_start_failure(
+                    session_id=session.session_id,
+                    error=exc,
+                    cleanup_errors=cleanup_errors,
+                )
+            except Exception as record_exc:
+                exc.add_note(
+                    f"runtime failure handling could not persist its final record: {record_exc}"
+                )
             raise
+        finally:
+            transition_lock.release()
 
     def bind_verified_jarvis_runtime(
         self,
@@ -1152,6 +1273,12 @@ class ServiceRuntimeSupervisor:
                 metadata=owner_metadata,
             )
         )
+        transition_lock = self._acquire_gateway_transition_lock(session.session_id)
+        try:
+            session = self._runtime_start_session_after_lock(session.session_id)
+        except BaseException:
+            transition_lock.release()
+            raise
         remote_connector: dict[str, object] | None = None
         local_connector: dict[str, object] | None = None
         try:
@@ -1162,6 +1289,7 @@ class ServiceRuntimeSupervisor:
                 node=runtime.host,
                 metadata={"binding_started_at": utc_now().isoformat()},
             )
+            service_authorization = self._jarvis_runtime_authorization(verified)
             proxy_name = f"{session.session_id}-service"
             remote_intent = _new_ownership_intent(
                 "starting",
@@ -1178,6 +1306,11 @@ class ServiceRuntimeSupervisor:
                 allocation_provider=allocation_provider,
                 allocation_job_id=allocation_job_id,
             )
+            # ``_start_remote_connector`` persists scheduler placement and its
+            # unique step marker before starting an allocation-scoped process.
+            # Continue from that newer durable revision instead of the stale
+            # pre-placement snapshot.
+            session = self.queue.get_gateway_session(session.session_id)
             session = self._update(
                 session,
                 gateway=self._gateway_with_ownership_intent(
@@ -1218,20 +1351,12 @@ class ServiceRuntimeSupervisor:
             events_url = f"{base_url}{runtime.events_path}"
             state_url = f"{base_url}{runtime.state_path}"
             command_url = f"{base_url}{runtime.command_path}"
-            health_revision = self._wait_for_jarvis_health(
+            self._wait_for_jarvis_health(
                 health_url,
                 timeout_seconds=readiness_timeout_seconds,
                 poll_seconds=poll_seconds,
-                service_instance_id=runtime.service_instance_id,
-            )
-            self._wait_for_jarvis_state(
-                state_url,
-                timeout_seconds=readiness_timeout_seconds,
-                poll_seconds=poll_seconds,
-                service_instance_id=runtime.service_instance_id,
-                execution_id=binding.jarvis_execution_id,
-                health_revision=health_revision,
-                dataset_descriptor_sha256=binding.dataset_descriptor_sha256,
+                runtime_schema_version=runtime.schema_version,
+                authorization=service_authorization,
             )
             session = self._update(
                 session,
@@ -1283,6 +1408,24 @@ class ServiceRuntimeSupervisor:
             )
         except Exception as exc:
             cleanup_errors: list[str] = []
+            if remote_connector is None or local_connector is None:
+                try:
+                    recovered = self._reconcile_ownership_intents(
+                        self.queue.get_gateway_session(session.session_id)
+                    )
+                    recovered_transport = _object(recovered.gateway.get("transport", {}))
+                    if remote_connector is None:
+                        recovered_remote = _object(recovered_transport.get("remote_connector", {}))
+                        if recovered_remote:
+                            remote_connector = recovered_remote
+                    if local_connector is None:
+                        recovered_local = _object(recovered_transport.get("desktop_connector", {}))
+                        if recovered_local:
+                            local_connector = recovered_local
+                except (ConfigurationError, RelayError) as recovery_exc:
+                    cleanup_errors.append(
+                        f"connector rollback reconciliation failed: {recovery_exc}"
+                    )
             if local_connector is not None:
                 _, local_rollback = self._stop_local_connector(
                     session_id=session.session_id,
@@ -1327,18 +1470,36 @@ class ServiceRuntimeSupervisor:
                                 )
                         except RelayError as rollback_exc:
                             cleanup_errors.append(str(rollback_exc))
-            self._update(
-                session,
-                state=GatewaySessionState.FAILED,
-                metadata={
-                    "failed_at": utc_now().isoformat(),
-                    "last_error": str(exc),
-                    "cleanup_error": "; ".join(dict.fromkeys(cleanup_errors)) or None,
-                },
-            )
+            try:
+                self._record_runtime_start_failure(
+                    session_id=session.session_id,
+                    error=exc,
+                    cleanup_errors=cleanup_errors,
+                )
+            except Exception as record_exc:
+                exc.add_note(
+                    f"runtime failure handling could not persist its final record: {record_exc}"
+                )
             raise
+        finally:
+            transition_lock.release()
 
     def browser_attach(
+        self,
+        *,
+        session_id: str,
+        ttl_seconds: int = 1_800,
+        bind_port: int | None = None,
+    ) -> BrowserAttachmentGrant:
+        """Serialize browser capability creation against all gateway transitions."""
+        with self._gateway_transition_lock(session_id):
+            return self._browser_attach_serialized(
+                session_id=session_id,
+                ttl_seconds=ttl_seconds,
+                bind_port=bind_port,
+            )
+
+    def _browser_attach_serialized(
         self,
         *,
         session_id: str,
@@ -1474,6 +1635,7 @@ class ServiceRuntimeSupervisor:
                 session=session,
                 config=config,
                 capability=capability,
+                upstream_authorization=self._jarvis_runtime_authorization(verified_runtime),
                 ownership_intent=intent,
             )
             active = record.model_copy(update={"state": "active", "proxy_process_id": proxy["pid"]})
@@ -1488,21 +1650,10 @@ class ServiceRuntimeSupervisor:
                 capability=capability,
                 spec=spec,
             )
-            browser_health_revision = self._wait_for_browser_health(
+            self._wait_for_browser_health(
                 grant.health_url,
                 timeout_seconds=min(spec.readiness_timeout_seconds, 60.0),
                 poll_seconds=min(spec.poll_seconds, 1.0),
-                service_instance_id=verified_runtime.runtime.service_instance_id,
-            )
-            self._wait_for_jarvis_state(
-                grant.state_url,
-                timeout_seconds=min(spec.readiness_timeout_seconds, 60.0),
-                poll_seconds=min(spec.poll_seconds, 1.0),
-                service_instance_id=verified_runtime.runtime.service_instance_id,
-                execution_id=verified_runtime.binding.jarvis_execution_id,
-                health_revision=browser_health_revision,
-                dataset_descriptor_sha256=(verified_runtime.binding.dataset_descriptor_sha256),
-                browser_origin=True,
             )
             return grant
         except Exception as exc:
@@ -1537,6 +1688,19 @@ class ServiceRuntimeSupervisor:
             raise
 
     def browser_detach(
+        self,
+        *,
+        session_id: str,
+        attachment_id: str,
+    ) -> BrowserDetachmentResult:
+        """Serialize browser capability revocation against gateway transitions."""
+        with self._gateway_transition_lock(session_id):
+            return self._browser_detach_serialized(
+                session_id=session_id,
+                attachment_id=attachment_id,
+            )
+
+    def _browser_detach_serialized(
         self,
         *,
         session_id: str,
@@ -1741,22 +1905,55 @@ class ServiceRuntimeSupervisor:
         cancel_scheduler_job: bool = False,
         final_state: GatewaySessionState = GatewaySessionState.CLOSED,
     ) -> ServiceRuntimeStopResult:
-        """Stop owned relay connector processes and optionally cancel the scheduler job."""
+        """Serialize and durably replay one owned runtime teardown operation."""
         session = self.queue.get_gateway_session(session_id)
-        if session.cluster != self.cluster:
-            raise ConfigurationError(
-                f"gateway session {session_id} belongs to cluster {session.cluster}, "
-                f"not {self.cluster}"
+        self._validate_gateway_transition_session(session)
+        if final_state not in {GatewaySessionState.CLOSED, GatewaySessionState.FAILED}:
+            raise ConfigurationError("gateway teardown final state must be closed or failed")
+        with self._gateway_transition_lock(session_id):
+            return self._stop_serialized(
+                session_id=session_id,
+                cancel_scheduler_job=cancel_scheduler_job,
+                final_state=final_state,
             )
-        if session.metadata.get("owner") != "clio-relay":
-            raise ConfigurationError(
-                f"gateway session {session_id} is not an owned clio-relay runtime"
-            )
-        session = self._reconcile_ownership_intents(session)
+
+    def _stop_serialized(
+        self,
+        *,
+        session_id: str,
+        cancel_scheduler_job: bool,
+        final_state: GatewaySessionState,
+    ) -> ServiceRuntimeStopResult:
+        """Execute teardown while holding the exact cluster/session transition lock."""
+        session = self.queue.get_gateway_session(session_id)
+        self._validate_gateway_transition_session(session)
         session = self._prepare_teardown_intent(
             session,
             cancel_scheduler_job=cancel_scheduler_job,
         )
+        session = self._prepare_teardown_policy(
+            session,
+            cancel_scheduler_job=cancel_scheduler_job,
+            final_state=final_state,
+        )
+        replay = self._completed_teardown_result(
+            session,
+            cancel_scheduler_job=cancel_scheduler_job,
+            final_state=final_state,
+        )
+        if replay is not None:
+            return replay
+        session = self._reconcile_ownership_intents(session)
+        scheduler_contract = _validated_durable_scheduler_contract(session, strict=False)
+
+        # Reconciliation may refresh durable connector identities, but cannot alter
+        # the teardown policy that was committed before any cleanup side effect.
+        self._validate_teardown_policy(
+            session,
+            cancel_scheduler_job=cancel_scheduler_job,
+            final_state=final_state,
+        )
+
         session, browser_resource, browser_error = self._revoke_browser_for_runtime_cleanup(session)
         teardown_intent = _object(session.gateway.get("teardown_intent", {}))
         ownership_intents = _object(session.gateway.get("ownership_intents", {}))
@@ -1883,10 +2080,7 @@ class ServiceRuntimeSupervisor:
         resources.append(_bind_cleanup_resource_to_gateway(remote_resource, session.session_id))
         canceled_scheduler_job = None
         scheduler_intent = _object(ownership_intents.get("scheduler_submission", {}))
-        if session.scheduler_job_id is None and scheduler_intent.get("state") in {
-            "starting",
-            "recorded",
-        }:
+        if scheduler_contract.unresolved_submission:
             unresolved_scheduler = CleanupResource(
                 kind="scheduler_job",
                 resource_id=str(scheduler_intent.get("submission_id") or session.session_id),
@@ -2069,6 +2263,7 @@ class ServiceRuntimeSupervisor:
             metadata={
                 "cleanup_operation_id": cleanup_operation_id,
                 "cancel_scheduler_job": cancel_scheduler_job,
+                "gateway_session_id": session_id,
             },
         )
         resources.append(gateway_resource)
@@ -2076,6 +2271,7 @@ class ServiceRuntimeSupervisor:
         updated = self.queue.update_gateway_session(
             session_id,
             state=effective_state,
+            expected_updated_at=session.updated_at,
             allow_owned_runtime_close=effective_state == GatewaySessionState.CLOSED,
             metadata={
                 "cleanup_at": cleanup_completed_at,
@@ -2090,6 +2286,15 @@ class ServiceRuntimeSupervisor:
             gateway={
                 **session.gateway,
                 "teardown": {
+                    "schema_version": _GATEWAY_TEARDOWN_RESULT_SCHEMA,
+                    "operation_id": cleanup_operation_id,
+                    "gateway_session_id": session_id,
+                    "mode": "teardown",
+                    "cancel_scheduler_job": cancel_scheduler_job,
+                    "requested_final_state": final_state.value,
+                    "effective_state": effective_state.value,
+                    "completed_at": cleanup_completed_at,
+                    "retryable": not cleanup_succeeded,
                     "stopped_local_pid": stopped_local_pid,
                     "stopped_remote_pid": stopped_remote_pid,
                     "canceled_scheduler_job": canceled_scheduler_job,
@@ -2109,22 +2314,28 @@ class ServiceRuntimeSupervisor:
         )
 
     def detach(self, *, session_id: str) -> ServiceRuntimeStopResult:
-        """Stop only the desktop connector and retain remote runtime resources."""
+        """Serialize detachment against attach and teardown for this gateway."""
         session = self.queue.get_gateway_session(session_id)
-        if session.cluster != self.cluster:
-            raise ConfigurationError(
-                f"gateway session {session_id} belongs to cluster {session.cluster}, "
-                f"not {self.cluster}"
-            )
-        if session.metadata.get("owner") != "clio-relay":
-            raise ConfigurationError(
-                f"gateway session {session_id} is not an owned clio-relay runtime"
-            )
+        self._validate_gateway_transition_session(session)
+        with self._gateway_transition_lock(session_id):
+            return self._detach_serialized(session_id=session_id)
+
+    def _detach_serialized(self, *, session_id: str) -> ServiceRuntimeStopResult:
+        """Stop only the desktop connector while holding the gateway transition lock."""
+        session = self.queue.get_gateway_session(session_id)
+        self._validate_gateway_transition_session(session)
+        if session.state is GatewaySessionState.CLOSED:
+            raise ConfigurationError(f"gateway session {session_id} is closed")
         if session.gateway.get("teardown_intent") is not None:
             raise ConfigurationError(
                 f"gateway session {session_id} is committed to teardown and cannot detach"
             )
+        session = self._prepare_detach_intent(session)
+        replay = self._completed_detach_result(session)
+        if replay is not None:
+            return replay
         session = self._reconcile_ownership_intents(session)
+        scheduler_contract = _validated_durable_scheduler_contract(session, strict=False)
         session, browser_resource, browser_error = self._revoke_browser_for_runtime_cleanup(session)
         transport = _object(session.gateway.get("transport", {}))
         desktop_connector = _object(transport.get("desktop_connector", {}))
@@ -2241,7 +2452,31 @@ class ServiceRuntimeSupervisor:
                     session.session_id,
                 )
             )
-        if session.scheduler_job_id is not None:
+        if scheduler_contract.unresolved_submission:
+            scheduler_intent = _object(
+                _object(session.gateway.get("ownership_intents", {})).get(
+                    "scheduler_submission",
+                    {},
+                )
+            )
+            scheduler_resource = CleanupResource(
+                kind="scheduler_job",
+                resource_id=str(scheduler_intent.get("submission_id") or session.session_id),
+                location=self.definition.ssh_host,
+                provider=scheduler_contract.provider,
+                action="retain",
+                metadata={"gateway_session_id": session.session_id},
+                ownership_verified=False,
+                outcome="failed",
+                verified_after_operation=False,
+                residual=True,
+                detail=(
+                    "scheduler submission side effect could not be reconciled to an exact job id"
+                ),
+            )
+            resources.append(scheduler_resource)
+            errors.append(scheduler_resource.detail or "scheduler submission is unresolved")
+        elif session.scheduler_job_id is not None:
             try:
                 verified_submission = self._verified_scheduler_submission(session)
             except (ConfigurationError, RelayError) as exc:
@@ -2268,9 +2503,10 @@ class ServiceRuntimeSupervisor:
                 errors.append(
                     scheduler_resource.detail or "scheduler retention verification failed"
                 )
-            elif scheduler_resource.outcome == "terminal":
+            elif scheduler_resource.outcome in {"terminal", "missing"}:
                 errors.append(
-                    "scheduler job is terminal; detached runtime cannot be proven reattachable"
+                    f"scheduler job is {scheduler_resource.outcome}; detached runtime cannot "
+                    "be proven reattachable"
                 )
         resources.append(
             CleanupResource(
@@ -2283,20 +2519,49 @@ class ServiceRuntimeSupervisor:
                 verified_after_operation=True,
                 observed_state=GatewaySessionState.DEGRADED.value,
                 detail="gateway record retained for an explicit later reattachment or teardown",
+                metadata={"gateway_session_id": session.session_id},
             )
         )
+        detach_intent = _validated_gateway_detach_intent(session)
+        detach_operation_id = cast(str, detach_intent["operation_id"])
+        resources = [
+            resource.model_copy(
+                update={
+                    "metadata": {
+                        **resource.metadata,
+                        "cleanup_operation_id": detach_operation_id,
+                        "cancel_scheduler_job": False,
+                    }
+                }
+            )
+            for resource in resources
+        ]
+        detach_retryable = any(item.residual for item in resources)
+        detached_at = utc_now().isoformat()
         updated = self.queue.update_gateway_session(
             session_id,
             state=GatewaySessionState.DEGRADED,
+            expected_updated_at=session.updated_at,
             metadata={
-                "detached_at": utc_now().isoformat(),
-                "cleanup_retryable": any(item.residual for item in resources),
+                "detached_at": detached_at,
+                "cleanup_retryable": detach_retryable,
                 "cleanup_errors": errors,
+                "detach_operation_id": detach_operation_id,
+                "detach_retryable": detach_retryable,
+                "detach_errors": errors,
             },
             gateway={
                 **session.gateway,
                 "detach": {
-                    "resources": [resource.model_dump(mode="json") for resource in resources]
+                    "schema_version": _GATEWAY_DETACH_RESULT_SCHEMA,
+                    "operation_id": detach_operation_id,
+                    "gateway_session_id": session_id,
+                    "mode": "detach",
+                    "completed_at": detached_at,
+                    "retryable": detach_retryable,
+                    "stopped_local_pid": stopped_local_pid,
+                    "resources": [resource.model_dump(mode="json") for resource in resources],
+                    "errors": errors,
                 },
             },
         )
@@ -2311,25 +2576,62 @@ class ServiceRuntimeSupervisor:
         )
 
     def attach(self, *, session_id: str) -> ServiceRuntimeStartResult:
-        """Recreate an owned desktop connector for a detached remote runtime."""
+        """Serialize attachment against detach and teardown for this gateway."""
         session = self.queue.get_gateway_session(session_id)
-        if session.cluster != self.cluster:
-            raise ConfigurationError(
-                f"gateway session {session_id} belongs to cluster {session.cluster}, "
-                f"not {self.cluster}"
-            )
+        self._validate_gateway_transition_session(session)
+        with self._gateway_transition_lock(session_id):
+            return self._attach_serialized(session_id=session_id)
+
+    def _attach_serialized(self, *, session_id: str) -> ServiceRuntimeStartResult:
+        """Recreate the desktop connector while holding the gateway transition lock."""
+        session = self.queue.get_gateway_session(session_id)
+        self._validate_gateway_transition_session(session)
         if session.state == GatewaySessionState.CLOSED:
             raise ConfigurationError(f"gateway session {session_id} is closed")
-        if session.metadata.get("owner") != "clio-relay":
-            raise ConfigurationError(
-                f"gateway session {session_id} is not an owned clio-relay runtime"
-            )
         if session.gateway.get("teardown_intent") is not None:
             raise ConfigurationError(
                 f"gateway session {session_id} is committed to teardown and cannot attach"
             )
+        if session.gateway.get("detach_intent") is not None:
+            completed_detach = self._completed_detach_result(session)
+            if completed_detach is None:
+                raise ConfigurationError(
+                    f"gateway session {session_id} has an incomplete detach; retry detach or "
+                    "tear down the runtime"
+                )
+            session = self._consume_completed_detach_for_attach(session)
         session = self._reconcile_ownership_intents(session)
         spec = ServiceRuntimeSpec.model_validate(session.gateway["runtime_spec"])
+        verified_runtime: VerifiedJarvisServiceRuntime | None = None
+        service_authorization: str | None = None
+        binding_document = session.gateway.get("jarvis_runtime_binding")
+        if binding_document is not None:
+            try:
+                verified_runtime = reverify_jarvis_service_runtime(
+                    queue=self.queue,
+                    definition=self.definition,
+                    settings=self.settings,
+                    binding_document=binding_document,
+                )
+            except ValueError as exc:
+                raise RelayError(
+                    f"JARVIS service runtime binding re-verification failed: {exc}"
+                ) from exc
+            runtime = verified_runtime.runtime
+            if runtime.lifecycle != "ready":
+                raise ConfigurationError("detached JARVIS service runtime is no longer ready")
+            if (
+                spec.deployment_driver != "jarvis-bound"
+                or runtime.port != spec.service_port
+                or runtime.protocol != spec.protocol
+                or runtime.health_path != spec.health_path
+                or runtime.live_data_path != spec.stream_path
+                or runtime.events_path != spec.event_stream_path
+                or runtime.state_path != spec.state_path
+                or runtime.command_path != spec.command_path
+            ):
+                raise RelayError("detached JARVIS runtime endpoints changed before reattachment")
+            service_authorization = self._jarvis_runtime_authorization(verified_runtime)
         transport = _object(session.gateway.get("transport", {}))
         proxy_name = _optional_str(transport.get("proxy_name"))
         if proxy_name is None:
@@ -2364,6 +2666,7 @@ class ServiceRuntimeSupervisor:
                     proxy_name=proxy_name,
                     ownership_intent=local_intent,
                 )
+                created_connector = True
                 session = self._update(
                     session,
                     gateway=self._gateway_with_ownership_intent(
@@ -2376,7 +2679,6 @@ class ServiceRuntimeSupervisor:
                         },
                     ),
                 )
-                created_connector = True
             connect_url = spec.connect_url_template.format(
                 bind_addr=spec.desktop_bind_addr,
                 bind_port=spec.desktop_bind_port,
@@ -2386,14 +2688,42 @@ class ServiceRuntimeSupervisor:
                 f"{spec.protocol}://{spec.desktop_bind_addr}:"
                 f"{spec.desktop_bind_port}{spec.health_path}"
             )
-            self._wait_for_local_health(
-                health_url,
-                spec.readiness_timeout_seconds,
-                spec.poll_seconds,
-                expected_body=spec.health_expected_body,
-            )
+            if verified_runtime is None:
+                self._wait_for_local_health(
+                    health_url,
+                    spec.readiness_timeout_seconds,
+                    spec.poll_seconds,
+                    expected_body=spec.health_expected_body,
+                )
+            else:
+                self._wait_for_jarvis_health(
+                    health_url,
+                    timeout_seconds=spec.readiness_timeout_seconds,
+                    poll_seconds=spec.poll_seconds,
+                    runtime_schema_version=verified_runtime.runtime.schema_version,
+                    authorization=service_authorization,
+                )
         except Exception as exc:
             cleanup_error: str | None = None
+            if not created_connector:
+                try:
+                    recovered = self._reconcile_ownership_intents(
+                        self.queue.get_gateway_session(session.session_id)
+                    )
+                    recovered_local = _object(
+                        _object(recovered.gateway.get("transport", {})).get(
+                            "desktop_connector",
+                            {},
+                        )
+                    )
+                    if recovered_local:
+                        session = recovered
+                        local_connector = recovered_local
+                        created_connector = True
+                except (ConfigurationError, RelayError) as recovery_exc:
+                    cleanup_error = (
+                        f"desktop connector rollback reconciliation failed: {recovery_exc}"
+                    )
             if created_connector and local_connector is not None:
                 _, rollback = self._stop_local_connector(
                     session_id=session.session_id,
@@ -2402,14 +2732,18 @@ class ServiceRuntimeSupervisor:
                 )
                 if rollback.residual or not rollback.verified_after_operation:
                     cleanup_error = rollback.detail or "desktop connector rollback was not proven"
-            self.queue.update_gateway_session(
-                session_id,
-                state=GatewaySessionState.DEGRADED,
-                metadata={
-                    "attach_failed_at": utc_now().isoformat(),
-                    "attach_error": str(exc),
-                    "attach_cleanup_error": cleanup_error,
-                },
+                else:
+                    try:
+                        self._remove_unpublished_local_connector_files(
+                            session_id=session.session_id,
+                            connector=local_connector,
+                        )
+                    except RelayError as cleanup_exc:
+                        cleanup_error = str(cleanup_exc)
+            self._record_attach_failure(
+                session_id=session_id,
+                error=exc,
+                cleanup_error=cleanup_error,
             )
             raise
         try:
@@ -2444,6 +2778,7 @@ class ServiceRuntimeSupervisor:
             updated = self.queue.update_gateway_session(
                 session_id,
                 state=GatewaySessionState.READY,
+                expected_updated_at=session.updated_at,
                 metadata={"attached_at": utc_now().isoformat()},
                 gateway={
                     **session.gateway,
@@ -2463,14 +2798,18 @@ class ServiceRuntimeSupervisor:
                 )
                 if rollback.residual or not rollback.verified_after_operation:
                     cleanup_error = rollback.detail or "desktop connector rollback was not proven"
-            self.queue.update_gateway_session(
-                session_id,
-                state=GatewaySessionState.DEGRADED,
-                metadata={
-                    "attach_failed_at": utc_now().isoformat(),
-                    "attach_error": str(exc),
-                    "attach_cleanup_error": cleanup_error,
-                },
+                else:
+                    try:
+                        self._remove_unpublished_local_connector_files(
+                            session_id=session.session_id,
+                            connector=local_connector,
+                        )
+                    except RelayError as cleanup_exc:
+                        cleanup_error = str(cleanup_exc)
+            self._record_attach_failure(
+                session_id=session_id,
+                error=exc,
+                cleanup_error=cleanup_error,
             )
             raise
         return ServiceRuntimeStartResult(
@@ -2494,6 +2833,136 @@ class ServiceRuntimeSupervisor:
         gateway = self._gateway_with_ownership_intent(session, role, intent)
         return self._update(session, gateway=gateway)
 
+    def _prepare_detach_intent(self, session: GatewaySession) -> GatewaySession:
+        """Persist or validate one detach operation before destructive cleanup."""
+        raw_intent = session.gateway.get("detach_intent")
+        if raw_intent is not None:
+            _validated_gateway_detach_intent(session)
+            return session
+        raw_result = session.gateway.get("detach")
+        versioned_result = (
+            cast(dict[str, object], raw_result).get("schema_version")
+            == _GATEWAY_DETACH_RESULT_SCHEMA
+            if isinstance(raw_result, dict)
+            else False
+        )
+        if versioned_result or session.metadata.get("detach_operation_id") is not None:
+            raise RelayError("gateway detach evidence is invalid")
+        operation_id = f"gateway_detach_{secrets.token_hex(16)}"
+        created_at = utc_now().isoformat()
+        gateway = dict(session.gateway)
+        # A legacy, unversioned detach observation cannot be replayed as durable
+        # evidence. A new operation supersedes it and proves the current state.
+        gateway.pop("detach", None)
+        gateway["detach_intent"] = {
+            "schema_version": _GATEWAY_DETACH_INTENT_SCHEMA,
+            "operation_id": operation_id,
+            "gateway_session_id": session.session_id,
+            "created_at": created_at,
+        }
+        return self.queue.update_gateway_session(
+            session.session_id,
+            expected_updated_at=session.updated_at,
+            metadata={
+                "detach_operation_id": operation_id,
+                "detach_retryable": True,
+                "detach_errors": [],
+            },
+            gateway=gateway,
+        )
+
+    def _completed_detach_result(
+        self,
+        session: GatewaySession,
+    ) -> ServiceRuntimeStopResult | None:
+        """Rehydrate exact completed detach evidence without repeating side effects."""
+        intent = _validated_gateway_detach_intent(session)
+        raw_result = session.gateway.get("detach")
+        retryable = session.metadata.get("detach_retryable")
+        result = cast(dict[str, object], raw_result) if isinstance(raw_result, dict) else None
+        result_marks_completed = bool(
+            result is not None
+            and result.get("schema_version") == _GATEWAY_DETACH_RESULT_SCHEMA
+            and result.get("retryable") is False
+        )
+        if retryable is True:
+            if result_marks_completed:
+                raise RelayError("gateway detach evidence is invalid")
+            return None
+        if retryable is not False:
+            if result_marks_completed:
+                raise RelayError("gateway detach evidence is invalid")
+            return None
+        if result is None or set(result) != {
+            "schema_version",
+            "operation_id",
+            "gateway_session_id",
+            "mode",
+            "completed_at",
+            "retryable",
+            "stopped_local_pid",
+            "resources",
+            "errors",
+        }:
+            raise RelayError("gateway detach evidence is invalid")
+        completed_at = result.get("completed_at")
+        operation_id = cast(str, intent["operation_id"])
+        if (
+            result.get("schema_version") != _GATEWAY_DETACH_RESULT_SCHEMA
+            or result.get("operation_id") != operation_id
+            or result.get("gateway_session_id") != session.session_id
+            or result.get("mode") != "detach"
+            or result.get("retryable") is not False
+            or not isinstance(completed_at, str)
+            or session.state is not GatewaySessionState.DEGRADED
+        ):
+            raise RelayError("gateway detach evidence is invalid")
+        _gateway_teardown_timestamp(completed_at)
+        stopped_local_pid = _strict_optional_positive_int(result.get("stopped_local_pid"))
+        resources, errors = _validated_completed_resource_lists(
+            result,
+            error="gateway detach evidence is invalid",
+        )
+        _validate_completed_detach_resources(
+            session,
+            resources=resources,
+            stopped_local_pid=stopped_local_pid,
+            operation_id=operation_id,
+        )
+        if not _completed_detach_metadata_matches(
+            session,
+            operation_id=operation_id,
+            completed_at=completed_at,
+            errors=errors,
+        ):
+            raise RelayError("gateway detach evidence is invalid")
+        return ServiceRuntimeStopResult(
+            session=session,
+            mode="detach",
+            stopped_local_pid=stopped_local_pid,
+            stopped_remote_pid=None,
+            canceled_scheduler_job=None,
+            resources=resources,
+            errors=errors,
+        )
+
+    def _consume_completed_detach_for_attach(self, session: GatewaySession) -> GatewaySession:
+        """Retire one validated detach generation before creating its replacement connector."""
+        gateway = dict(session.gateway)
+        gateway.pop("detach", None)
+        gateway.pop("detach_intent", None)
+        return self.queue.update_gateway_session(
+            session.session_id,
+            expected_updated_at=session.updated_at,
+            metadata={
+                "detached_at": None,
+                "detach_operation_id": None,
+                "detach_retryable": None,
+                "detach_errors": [],
+            },
+            gateway=gateway,
+        )
+
     def _prepare_teardown_intent(
         self,
         session: GatewaySession,
@@ -2504,6 +2973,264 @@ class ServiceRuntimeSupervisor:
         return self.queue.prepare_gateway_teardown_intent(
             session.session_id,
             cancel_scheduler_job=cancel_scheduler_job,
+        )
+
+    def _validate_gateway_transition_session(self, session: GatewaySession) -> None:
+        """Require one exact relay-owned session before and after lock acquisition."""
+        if session.cluster != self.cluster:
+            raise ConfigurationError(
+                f"gateway session {session.session_id} belongs to cluster {session.cluster}, "
+                f"not {self.cluster}"
+            )
+        if session.metadata.get("owner") != "clio-relay":
+            raise ConfigurationError(
+                f"gateway session {session.session_id} is not an owned clio-relay runtime"
+            )
+
+    def _gateway_transition_lock_path(self, session_id: str) -> Path:
+        """Return a private lock path keyed by the exact cluster and gateway session."""
+        directory = self.queue.root / ".gateway-transition-locks"
+        try:
+            ensure_private_configuration_directory(directory)
+        except (ConfigurationError, OSError) as exc:
+            raise RelayError(
+                "could not prepare the trusted gateway transition lock directory"
+            ) from exc
+        identity = hashlib.sha256(f"{self.cluster}\0{session_id}".encode()).hexdigest()
+        return directory / f"{identity}.lock"
+
+    def _acquire_gateway_transition_lock(self, session_id: str) -> FileLock:
+        """Acquire and return the exact bounded cross-process transition lock."""
+        lock_path = self._gateway_transition_lock_path(session_id)
+        lock = FileLock(
+            str(internal_filesystem_path(lock_path, force_extended=True)),
+            timeout=_GATEWAY_TEARDOWN_LOCK_TIMEOUT_SECONDS,
+        )
+        try:
+            lock.acquire()
+        except FileLockTimeout as exc:
+            raise RelayError("timed out acquiring the gateway transition lock") from exc
+        except OSError as exc:
+            raise RelayError("could not acquire the gateway transition lock") from exc
+        return lock
+
+    @contextmanager
+    def _gateway_transition_lock(self, session_id: str) -> Generator[None, None, None]:
+        """Hold the bounded cross-process lock for one gateway state transition."""
+        lock = self._acquire_gateway_transition_lock(session_id)
+        try:
+            yield
+        finally:
+            lock.release()
+
+    def _runtime_start_session_after_lock(self, session_id: str) -> GatewaySession:
+        """Reread and admit one newly created gateway before any runtime side effect."""
+        session = self.queue.get_gateway_session(session_id)
+        self._validate_gateway_transition_session(session)
+        if session.state is not GatewaySessionState.CREATED:
+            raise ConfigurationError(
+                f"gateway session {session_id} changed before runtime start acquired its lock"
+            )
+        if session.gateway.get("teardown_intent") is not None:
+            raise ConfigurationError(
+                f"gateway session {session_id} is committed to teardown and cannot start"
+            )
+        return session
+
+    def _prepare_teardown_policy(
+        self,
+        session: GatewaySession,
+        *,
+        cancel_scheduler_job: bool,
+        final_state: GatewaySessionState,
+    ) -> GatewaySession:
+        """Persist or validate immutable cleanup policy before cleanup side effects."""
+        intent = _validated_gateway_teardown_intent(
+            session,
+            cancel_scheduler_job=cancel_scheduler_job,
+        )
+        raw_policy = session.gateway.get("teardown_policy")
+        if raw_policy is not None:
+            self._validate_teardown_policy(
+                session,
+                cancel_scheduler_job=cancel_scheduler_job,
+                final_state=final_state,
+            )
+            return session
+        if session.state is GatewaySessionState.CLOSED or (
+            session.metadata.get("cleanup_retryable") is False
+            and session.gateway.get("teardown") is not None
+        ):
+            raise RelayError("completed gateway teardown evidence is invalid")
+        policy: dict[str, object] = {
+            "schema_version": _GATEWAY_TEARDOWN_POLICY_SCHEMA,
+            "operation_id": intent["operation_id"],
+            "gateway_session_id": session.session_id,
+            "cancel_scheduler_job": cancel_scheduler_job,
+            "final_state": final_state.value,
+            "committed_at": utc_now().isoformat(),
+        }
+        return self.queue.update_gateway_session(
+            session.session_id,
+            expected_updated_at=session.updated_at,
+            metadata={
+                "cleanup_at": None,
+                "closed_at": None,
+                "cancel_scheduler_job": cancel_scheduler_job,
+                "cleanup_retryable": True,
+                "cleanup_errors": [],
+                "cleanup_operation_id": intent["operation_id"],
+            },
+            gateway={**session.gateway, "teardown_policy": policy},
+        )
+
+    def _validate_teardown_policy(
+        self,
+        session: GatewaySession,
+        *,
+        cancel_scheduler_job: bool,
+        final_state: GatewaySessionState,
+    ) -> dict[str, object]:
+        """Validate the exact immutable cleanup policy committed for this operation."""
+        intent = _validated_gateway_teardown_intent(
+            session,
+            cancel_scheduler_job=cancel_scheduler_job,
+        )
+        raw_policy = session.gateway.get("teardown_policy")
+        if not isinstance(raw_policy, dict):
+            raise RelayError("gateway teardown policy is invalid")
+        policy = cast(dict[str, object], raw_policy)
+        if set(policy) != {
+            "schema_version",
+            "operation_id",
+            "gateway_session_id",
+            "cancel_scheduler_job",
+            "final_state",
+            "committed_at",
+        }:
+            raise RelayError("gateway teardown policy is invalid")
+        committed_at = policy.get("committed_at")
+        if (
+            policy.get("schema_version") != _GATEWAY_TEARDOWN_POLICY_SCHEMA
+            or policy.get("operation_id") != intent["operation_id"]
+            or policy.get("gateway_session_id") != session.session_id
+            or not isinstance(committed_at, str)
+        ):
+            raise RelayError("gateway teardown policy is invalid")
+        _gateway_teardown_timestamp(committed_at)
+        if policy.get("cancel_scheduler_job") is not cancel_scheduler_job:
+            raise RelayError(
+                "gateway cleanup policy changed during retry; resume with the original "
+                f"cancel_scheduler_job={policy.get('cancel_scheduler_job')} policy"
+            )
+        if policy.get("final_state") != final_state.value:
+            raise RelayError(
+                "gateway cleanup final-state policy changed during retry; resume with the "
+                f"original final_state={policy.get('final_state')} policy"
+            )
+        return policy
+
+    def _completed_teardown_result(
+        self,
+        session: GatewaySession,
+        *,
+        cancel_scheduler_job: bool,
+        final_state: GatewaySessionState,
+    ) -> ServiceRuntimeStopResult | None:
+        """Rehydrate exact non-retryable teardown evidence without repeating side effects."""
+        raw_result = session.gateway.get("teardown")
+        retryable = session.metadata.get("cleanup_retryable")
+        typed_result = cast(dict[str, object], raw_result) if isinstance(raw_result, dict) else None
+        result_marks_completed = bool(
+            typed_result is not None
+            and typed_result.get("schema_version") == _GATEWAY_TEARDOWN_RESULT_SCHEMA
+            and typed_result.get("retryable") is False
+        )
+        if retryable is True:
+            if result_marks_completed or session.state is GatewaySessionState.CLOSED:
+                raise RelayError("completed gateway teardown evidence is invalid")
+            return None
+        if retryable is not False:
+            if result_marks_completed or session.state is GatewaySessionState.CLOSED:
+                raise RelayError("completed gateway teardown evidence is invalid")
+            return None
+        policy = self._validate_teardown_policy(
+            session,
+            cancel_scheduler_job=cancel_scheduler_job,
+            final_state=final_state,
+        )
+        if typed_result is None:
+            raise RelayError("completed gateway teardown evidence is invalid")
+        result = typed_result
+        expected_fields = {
+            "schema_version",
+            "operation_id",
+            "gateway_session_id",
+            "mode",
+            "cancel_scheduler_job",
+            "requested_final_state",
+            "effective_state",
+            "completed_at",
+            "retryable",
+            "stopped_local_pid",
+            "stopped_remote_pid",
+            "canceled_scheduler_job",
+            "resources",
+            "errors",
+        }
+        if set(result) != expected_fields:
+            raise RelayError("completed gateway teardown evidence is invalid")
+        operation_id = cast(str, policy["operation_id"])
+        completed_at = result.get("completed_at")
+        if (
+            result.get("schema_version") != _GATEWAY_TEARDOWN_RESULT_SCHEMA
+            or result.get("operation_id") != operation_id
+            or result.get("gateway_session_id") != session.session_id
+            or result.get("mode") != "teardown"
+            or result.get("cancel_scheduler_job") is not cancel_scheduler_job
+            or result.get("requested_final_state") != final_state.value
+            or result.get("effective_state") != final_state.value
+            or result.get("retryable") is not False
+            or not isinstance(completed_at, str)
+            or session.state.value != result.get("effective_state")
+        ):
+            raise RelayError("completed gateway teardown evidence is invalid")
+        _gateway_teardown_timestamp(completed_at)
+        stopped_local_pid = _strict_optional_positive_int(result.get("stopped_local_pid"))
+        stopped_remote_pid = _strict_optional_positive_int(result.get("stopped_remote_pid"))
+        canceled_scheduler_job = _strict_optional_nonempty_str(result.get("canceled_scheduler_job"))
+        resources, errors = _validated_completed_resource_lists(
+            result,
+            error="completed gateway teardown evidence is invalid",
+        )
+        if errors or any(resource.residual for resource in resources):
+            raise RelayError("completed gateway teardown evidence is invalid")
+        _validate_completed_teardown_resources(
+            session,
+            resources=resources,
+            stopped_local_pid=stopped_local_pid,
+            stopped_remote_pid=stopped_remote_pid,
+            canceled_scheduler_job=canceled_scheduler_job,
+            operation_id=operation_id,
+            cancel_scheduler_job=cancel_scheduler_job,
+        )
+        if not _completed_teardown_metadata_matches(
+            session,
+            operation_id=operation_id,
+            cancel_scheduler_job=cancel_scheduler_job,
+            completed_at=completed_at,
+            final_state=final_state,
+            errors=errors,
+        ):
+            raise RelayError("completed gateway teardown evidence is invalid")
+        return ServiceRuntimeStopResult(
+            session=session,
+            mode="teardown",
+            stopped_local_pid=stopped_local_pid,
+            stopped_remote_pid=stopped_remote_pid,
+            canceled_scheduler_job=canceled_scheduler_job,
+            resources=resources,
+            errors=errors,
         )
 
     def _gateway_with_ownership_intent(
@@ -3133,6 +3860,32 @@ class ServiceRuntimeSupervisor:
             detail="connector still running after termination" if residual else None,
         )
 
+    def _remove_unpublished_local_connector_files(
+        self,
+        *,
+        session_id: str,
+        connector: dict[str, object],
+    ) -> None:
+        """Remove private files for a connector that failed before durable publication."""
+
+        expected_directory = (
+            self.settings.core_dir.parent / "runtime-sessions" / session_id
+        ).resolve()
+        paths: list[Path] = []
+        for field in ("config_path", "stdout_path", "stderr_path", "metadata_path"):
+            raw_path = _optional_str(connector.get(field))
+            if raw_path is None:
+                raise RelayError(f"unpublished desktop connector omitted {field}")
+            path = Path(raw_path).resolve()
+            if path.parent != expected_directory:
+                raise RelayError("unpublished desktop connector path escaped its runtime directory")
+            paths.append(path)
+        try:
+            for path in paths:
+                path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise RelayError("could not remove unpublished desktop connector files") from exc
+
     def _wait_for_allocation_and_health(
         self,
         session: GatewaySession,
@@ -3614,16 +4367,45 @@ class ServiceRuntimeSupervisor:
             )
         )
         metadata = _key_value_output(output)
-        pid = int(metadata["remote_frpc_pid"])
+        expected_fields = {
+            "remote_frpc_pid",
+            "remote_frpc_pgid",
+            "connector_generation_id",
+            "remote_frpc_config",
+            "remote_frpc_log",
+        }
+        if set(metadata) != expected_fields:
+            raise RelayError("remote connector start returned an invalid response shape")
+        try:
+            pid = int(metadata["remote_frpc_pid"])
+            process_group_id = int(metadata["remote_frpc_pgid"])
+        except ValueError as exc:
+            raise RelayError("remote connector start returned an invalid process identity") from exc
+        if pid <= 0 or process_group_id != pid:
+            raise RelayError("remote connector start returned an invalid process group identity")
+        if metadata["connector_generation_id"] != connector_generation_id:
+            raise RelayError("remote connector start identity did not match its durable intent")
+        config_path = _validated_remote_session_file(
+            metadata["remote_frpc_config"],
+            session_id=session.session_id,
+            filename="remote-frpc.toml",
+        )
+        log_path = _validated_remote_session_file(
+            metadata["remote_frpc_log"],
+            session_id=session.session_id,
+            filename="remote-frpc.log",
+        )
+        if config_path.parent != log_path.parent:
+            raise RelayError("remote connector start returned paths from different sessions")
         connector: dict[str, object] = {
             "owner": "clio-relay",
             "session_id": session.session_id,
             "pid": pid,
-            "process_group_id": int(metadata["remote_frpc_pgid"]),
-            "connector_generation_id": metadata["connector_generation_id"],
+            "process_group_id": process_group_id,
+            "connector_generation_id": connector_generation_id,
             "owner_token": owner_token,
-            "config_path": metadata["remote_frpc_config"],
-            "log_path": metadata["remote_frpc_log"],
+            "config_path": config_path.as_posix(),
+            "log_path": log_path.as_posix(),
         }
         return connector
 
@@ -3946,9 +4728,10 @@ class ServiceRuntimeSupervisor:
         session: GatewaySession,
         config: BrowserGatewayConfig,
         capability: str,
+        upstream_authorization: str | None,
         ownership_intent: dict[str, object],
     ) -> dict[str, object]:
-        """Start one owned capability proxy without placing its secret on disk."""
+        """Start one owned capability proxy without placing either secret on disk."""
         runtime_dir = (
             self.settings.core_dir.parent / "runtime-sessions" / session.session_id
         ).resolve()
@@ -3968,9 +4751,18 @@ class ServiceRuntimeSupervisor:
         owner_token = _required_intent_str(ownership_intent, "owner_token")
         generation_id = _required_intent_str(ownership_intent, "connector_generation_id")
         environment = os.environ.copy()
-        environment[CAPABILITY_ENV] = capability
+        environment.pop(CAPABILITY_ENV, None)
+        environment.pop(UPSTREAM_AUTHORIZATION_ENV, None)
         environment["CLIO_RELAY_CONNECTOR_OWNER_TOKEN"] = owner_token
         environment["CLIO_RELAY_CONNECTOR_GENERATION_ID"] = generation_id
+        bootstrap = (
+            BrowserGatewayBootstrap(
+                capability=capability,
+                upstream_authorization=upstream_authorization,
+            )
+            .model_dump_json()
+            .encode("utf-8")
+        )
         process = self.runner.popen(
             [
                 sys.executable,
@@ -3990,6 +4782,7 @@ class ServiceRuntimeSupervisor:
             stderr_path=stderr_path,
             env=environment,
             isolate_process_group=True,
+            input_bytes=bootstrap,
         )
         try:
             identity = self.runner.local_process_identity(
@@ -4023,41 +4816,55 @@ class ServiceRuntimeSupervisor:
         *,
         timeout_seconds: float,
         poll_seconds: float,
-        service_instance_id: str,
-    ) -> int:
-        """Require exact ParaView service identity instead of accepting an arbitrary 2xx."""
-        deadline = time.time() + timeout_seconds
+        runtime_schema_version: Literal["jarvis.service-runtime.v1", "jarvis.service-runtime.v2"],
+        authorization: str | None,
+    ) -> None:
+        """Prove the versioned JARVIS HTTP authorization boundary is live."""
+        if runtime_schema_version == JARVIS_SERVICE_RUNTIME_SCHEMA_V1:
+            if authorization is not None:
+                raise RelayError(
+                    "legacy JARVIS service runtime unexpectedly resolved authorization"
+                )
+        elif runtime_schema_version == JARVIS_SERVICE_RUNTIME_SCHEMA_V2:
+            if authorization is None:
+                raise RelayError("authenticated JARVIS service runtime omitted authorization")
+        else:
+            raise RelayError("JARVIS service runtime schema is unsupported")
+        deadline = time.monotonic() + timeout_seconds
         last_error = "no response"
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             try:
-                response = httpx.get(health_url, timeout=5.0)
-                raw_document: object = response.json()
-                document = (
-                    cast(dict[str, object], raw_document)
-                    if isinstance(raw_document, dict)
-                    else None
+                anonymous = _read_bounded_http_response(
+                    health_url,
+                    headers=None,
+                    maximum_bytes=None,
+                    deadline=deadline,
                 )
-                if (
-                    200 <= response.status_code < 300
-                    and document is not None
-                    and set(document)
-                    == {"schema_version", "status", "service_instance_id", "revision"}
-                    and document.get("schema_version") == "jarvis.paraview.health.v1"
-                    and document.get("status") == "ready"
-                    and document.get("service_instance_id") == service_instance_id
-                    and isinstance(document.get("revision"), int)
-                    and not isinstance(document.get("revision"), bool)
-                    and cast(int, document["revision"]) > 0
-                ):
-                    return cast(int, document["revision"])
-                last_error = (
-                    f"unexpected status or identity: status={response.status_code} "
-                    f"body={response.text[:512]!r}"
-                )
-            except (httpx.HTTPError, ValueError) as exc:
-                last_error = str(exc)
-            self.sleep(poll_seconds)
-        raise RelayError(f"JARVIS service health identity was not ready: {last_error}")
+                if runtime_schema_version == JARVIS_SERVICE_RUNTIME_SCHEMA_V1:
+                    if 200 <= anonymous.status_code < 300:
+                        return
+                    last_error = f"legacy anonymous health status={anonymous.status_code}"
+                else:
+                    if 200 <= anonymous.status_code < 300:
+                        raise RelayError(
+                            "authenticated JARVIS service health accepted an anonymous request"
+                        )
+                    if anonymous.status_code != 401:
+                        last_error = f"anonymous health status={anonymous.status_code}"
+                    else:
+                        authenticated = _read_bounded_http_response(
+                            health_url,
+                            headers={"Authorization": cast(str, authorization)},
+                            maximum_bytes=None,
+                            deadline=deadline,
+                        )
+                        if 200 <= authenticated.status_code < 300:
+                            return
+                        last_error = f"authenticated health status={authenticated.status_code}"
+            except httpx.HTTPError:
+                last_error = "HTTP transport failed"
+            _sleep_before_deadline(self.sleep, poll_seconds, deadline)
+        raise RelayError(f"JARVIS service health boundary was not ready: {last_error}")
 
     def _wait_for_browser_health(
         self,
@@ -4065,89 +4872,31 @@ class ServiceRuntimeSupervisor:
         *,
         timeout_seconds: float,
         poll_seconds: float,
-        service_instance_id: str,
-    ) -> int:
-        """Prove the capability proxy authorizes only the sandbox origin and forwards."""
-        deadline = time.time() + timeout_seconds
+    ) -> None:
+        """Prove the capability proxy forwards health with exact sandbox-origin CORS."""
+        deadline = time.monotonic() + timeout_seconds
         last_error = "no response"
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             try:
-                response = httpx.get(
+                response = _read_bounded_http_response(
                     health_url,
                     headers={"Origin": "null"},
-                    timeout=5.0,
-                )
-                raw_document: object = response.json()
-                document = (
-                    cast(dict[str, object], raw_document)
-                    if isinstance(raw_document, dict)
-                    else None
+                    maximum_bytes=None,
+                    deadline=deadline,
                 )
                 if (
                     200 <= response.status_code < 300
                     and response.headers.get("access-control-allow-origin") == "null"
-                    and "*" not in response.headers.get("access-control-allow-origin", "")
-                    and document is not None
-                    and set(document)
-                    == {"schema_version", "status", "service_instance_id", "revision"}
-                    and document.get("schema_version") == "jarvis.paraview.health.v1"
-                    and document.get("status") == "ready"
-                    and document.get("service_instance_id") == service_instance_id
-                    and isinstance(document.get("revision"), int)
-                    and not isinstance(document.get("revision"), bool)
-                    and cast(int, document["revision"]) > 0
                 ):
-                    return cast(int, document["revision"])
-                last_error = f"status={response.status_code}"
-            except (httpx.HTTPError, ValueError) as exc:
-                last_error = str(exc)
-            self.sleep(poll_seconds)
-        raise RelayError(f"browser capability gateway did not become ready: {last_error}")
-
-    def _wait_for_jarvis_state(
-        self,
-        state_url: str,
-        *,
-        timeout_seconds: float,
-        poll_seconds: float,
-        service_instance_id: str,
-        execution_id: str,
-        health_revision: int,
-        dataset_descriptor_sha256: str,
-        browser_origin: bool = False,
-    ) -> None:
-        """Validate the identity-bearing initial service state and bound dataset."""
-        deadline = time.time() + timeout_seconds
-        last_error = "no response"
-        headers = {"Origin": "null"} if browser_origin else None
-        while time.time() < deadline:
-            try:
-                response = httpx.get(state_url, headers=headers, timeout=5.0)
-                raw_document: object = response.json()
-                document = (
-                    cast(dict[str, object], raw_document)
-                    if isinstance(raw_document, dict)
-                    else None
-                )
-                if 200 <= response.status_code < 300 and document is not None:
-                    _validate_jarvis_service_state(
-                        document,
-                        service_instance_id=service_instance_id,
-                        execution_id=execution_id,
-                        health_revision=health_revision,
-                        dataset_descriptor_sha256=dataset_descriptor_sha256,
-                    )
-                    if (
-                        browser_origin
-                        and response.headers.get("access-control-allow-origin") != "null"
-                    ):
-                        raise ValueError("browser state response omitted exact null-origin CORS")
                     return
-                last_error = f"status={response.status_code}"
-            except (httpx.HTTPError, ValueError) as exc:
-                last_error = str(exc)
-            self.sleep(poll_seconds)
-        raise RelayError(f"JARVIS service state identity was not ready: {last_error}")
+                last_error = (
+                    f"status={response.status_code}; "
+                    "access-control-allow-origin was not exactly null"
+                )
+            except httpx.HTTPError:
+                last_error = "HTTP transport failed"
+            _sleep_before_deadline(self.sleep, poll_seconds, deadline)
+        raise RelayError(f"browser capability gateway did not become ready: {last_error}")
 
     def _wait_for_local_health(
         self,
@@ -4157,11 +4906,16 @@ class ServiceRuntimeSupervisor:
         *,
         expected_body: str | None = None,
     ) -> None:
-        deadline = time.time() + timeout_seconds
+        deadline = time.monotonic() + timeout_seconds
         last_error: str | None = None
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             try:
-                response = httpx.get(health_url, timeout=5.0)
+                response = _read_bounded_http_response(
+                    health_url,
+                    headers=None,
+                    maximum_bytes=_MAX_LOCAL_HEALTH_BYTES,
+                    deadline=deadline,
+                )
                 if 200 <= response.status_code < 300:
                     if expected_body is None or response.content == expected_body.encode("utf-8"):
                         return
@@ -4170,7 +4924,7 @@ class ServiceRuntimeSupervisor:
                     last_error = f"HTTP {response.status_code}"
             except httpx.HTTPError as exc:
                 last_error = str(exc)
-            self.sleep(poll_seconds)
+            _sleep_before_deadline(self.sleep, poll_seconds, deadline)
         raise RelayError(f"local service health probe failed: {health_url}: {last_error}")
 
     def _update(
@@ -4185,8 +4939,76 @@ class ServiceRuntimeSupervisor:
             session.session_id,
             state=state,
             metadata=metadata,
+            expected_updated_at=session.updated_at,
             **updates,
         )
+
+    def _record_runtime_start_failure(
+        self,
+        *,
+        session_id: str,
+        error: BaseException,
+        cleanup_errors: Sequence[str],
+    ) -> None:
+        """Persist a start failure against the latest post-cleanup session revision."""
+
+        last_conflict: QueueConflictError | None = None
+        for _attempt in range(3):
+            current = self.queue.get_gateway_session(session_id)
+            if current.state is GatewaySessionState.READY:
+                return
+            target_state = (
+                GatewaySessionState.CLOSED
+                if current.state is GatewaySessionState.CLOSED
+                else GatewaySessionState.FAILED
+            )
+            try:
+                self.queue.update_gateway_session(
+                    session_id,
+                    state=target_state,
+                    expected_updated_at=current.updated_at,
+                    metadata={
+                        "failed_at": utc_now().isoformat(),
+                        "last_error": str(error),
+                        "cleanup_error": ("; ".join(dict.fromkeys(cleanup_errors)) or None),
+                    },
+                )
+                return
+            except QueueConflictError as exc:
+                last_conflict = exc
+        if last_conflict is not None:
+            raise last_conflict
+
+    def _record_attach_failure(
+        self,
+        *,
+        session_id: str,
+        error: BaseException,
+        cleanup_error: str | None,
+    ) -> None:
+        """Record an attach failure only while the same gateway remains mutable."""
+
+        if isinstance(error, QueueConflictError):
+            return
+        current = self.queue.get_gateway_session(session_id)
+        if (
+            current.state in {GatewaySessionState.READY, GatewaySessionState.CLOSED}
+            or current.gateway.get("teardown_intent") is not None
+        ):
+            return
+        try:
+            self.queue.update_gateway_session(
+                session_id,
+                state=GatewaySessionState.DEGRADED,
+                expected_updated_at=current.updated_at,
+                metadata={
+                    "attach_failed_at": utc_now().isoformat(),
+                    "attach_error": str(error),
+                    "attach_cleanup_error": cleanup_error,
+                },
+            )
+        except QueueConflictError:
+            return
 
     def _ssh(self, script: str) -> str:
         try:
@@ -4204,6 +5026,109 @@ class ServiceRuntimeSupervisor:
             detail = result.stderr.strip() or result.stdout.strip()
             raise RelayError(f"remote service runtime command failed: {detail}")
         return result.stdout
+
+
+def _read_bounded_http_response(
+    url: str,
+    *,
+    headers: dict[str, str] | None,
+    maximum_bytes: int | None,
+    deadline: float | None = None,
+) -> _BoundedHttpResponse:
+    """Read headers and, when requested, a bounded body by one absolute deadline."""
+
+    if maximum_bytes is not None and maximum_bytes <= 0:
+        raise ValueError("HTTP response byte limit must be positive")
+    effective_deadline = time.monotonic() + 5.0 if deadline is None else deadline
+    remaining = effective_deadline - time.monotonic()
+    if remaining <= 0:
+        raise httpx.TimeoutException("HTTP response total deadline expired before connection")
+
+    state = _BoundedHttpReadState()
+    state_lock = threading.Lock()
+    completed = threading.Event()
+    client = _new_readiness_http_client(remaining)
+
+    def read_response() -> None:
+        try:
+            with client.stream("GET", url, headers=headers) as response:
+                with state_lock:
+                    state.response = response
+                if maximum_bytes is None:
+                    state.result = _BoundedHttpResponse(
+                        status_code=response.status_code,
+                        headers=httpx.Headers(response.headers),
+                        content=b"",
+                    )
+                    return
+                raw_length = response.headers.get("content-length")
+                if raw_length is not None:
+                    try:
+                        content_length = int(raw_length)
+                    except ValueError as exc:
+                        raise ValueError("HTTP response Content-Length is invalid") from exc
+                    if content_length < 0 or content_length > maximum_bytes:
+                        raise ValueError(
+                            f"HTTP response exceeds the {maximum_bytes}-byte decompressed limit"
+                        )
+                content = bytearray()
+                for chunk in response.iter_bytes(chunk_size=64 * 1024):
+                    if len(content) + len(chunk) > maximum_bytes:
+                        raise ValueError(
+                            f"HTTP response exceeds the {maximum_bytes}-byte decompressed limit"
+                        )
+                    content.extend(chunk)
+                state.result = _BoundedHttpResponse(
+                    status_code=response.status_code,
+                    headers=httpx.Headers(response.headers),
+                    content=bytes(content),
+                )
+        except BaseException as exc:
+            state.error = exc
+        finally:
+            with suppress(Exception):
+                client.close()
+            completed.set()
+
+    reader = threading.Thread(
+        target=read_response,
+        name="clio-relay-readiness-http",
+        daemon=True,
+    )
+    reader.start()
+    completed_before_deadline = completed.wait(max(0.0, effective_deadline - time.monotonic()))
+    if not completed_before_deadline or time.monotonic() > effective_deadline:
+        with state_lock:
+            active_response = state.response
+        if active_response is not None:
+            with suppress(Exception):
+                active_response.close()
+        with suppress(Exception):
+            client.close()
+        raise httpx.TimeoutException("HTTP response exceeded its total monotonic deadline")
+    if state.error is not None:
+        raise state.error
+    if state.result is None:
+        raise RuntimeError("HTTP response reader completed without a result or error")
+    return state.result
+
+
+def _new_readiness_http_client(timeout_seconds: float) -> httpx.Client:
+    """Create one operation-owned client whose pool can be closed at the deadline."""
+
+    return httpx.Client(timeout=timeout_seconds)
+
+
+def _sleep_before_deadline(
+    sleep: Callable[[float], None],
+    poll_seconds: float,
+    deadline: float,
+) -> None:
+    """Sleep for at most the remaining monotonic readiness budget."""
+
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        sleep(min(poll_seconds, remaining))
 
 
 def _available_loopback_port(*, exclude: set[int] | None = None) -> int:
@@ -4230,102 +5155,6 @@ def _validated_available_loopback_port(port: object) -> int:
     except OSError as exc:
         raise ConfigurationError(f"desktop bind port is already occupied: {port}") from exc
     return port
-
-
-def _validate_jarvis_service_state(
-    document: dict[str, object],
-    *,
-    service_instance_id: str,
-    execution_id: str,
-    health_revision: int,
-    dataset_descriptor_sha256: str,
-) -> None:
-    """Validate exact ParaView state identity while leaving scene semantics to VIGIL."""
-    if set(document) != {
-        "schema_version",
-        "service_instance_id",
-        "revision",
-        "execution_id",
-        "dataset",
-        "pipeline",
-    }:
-        raise ValueError("JARVIS ParaView state top-level shape is invalid")
-    revision = document.get("revision")
-    if (
-        document.get("schema_version") != "jarvis.paraview.service-state.v1"
-        or document.get("service_instance_id") != service_instance_id
-        or document.get("execution_id") != execution_id
-        or not isinstance(revision, int)
-        or isinstance(revision, bool)
-        or revision <= 0
-        or revision != health_revision
-    ):
-        raise ValueError("JARVIS ParaView state identity disagrees with health or binding")
-    dataset = document.get("dataset")
-    if not isinstance(dataset, dict):
-        raise ValueError("JARVIS ParaView state dataset is invalid")
-    typed_dataset = cast(dict[str, object], dataset)
-    if set(typed_dataset) != {"descriptor", "discovery"}:
-        raise ValueError("JARVIS ParaView state dataset shape is invalid")
-    discovery = typed_dataset.get("discovery")
-    if not isinstance(discovery, dict) or set(cast(dict[str, object], discovery)) != {
-        "arrays",
-        "bounds",
-        "timestep_values",
-    }:
-        raise ValueError("JARVIS ParaView state discovery shape is invalid")
-    descriptor = JarvisDatasetDescriptor.model_validate(typed_dataset.get("descriptor"))
-    descriptor_digest = hashlib.sha256(
-        json.dumps(
-            descriptor.model_dump(mode="json"),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
-    if not secrets.compare_digest(descriptor_digest, dataset_descriptor_sha256):
-        raise ValueError("JARVIS ParaView state dataset descriptor disagrees with binding")
-    pipeline = document.get("pipeline")
-    if not isinstance(pipeline, dict):
-        raise ValueError("JARVIS ParaView state pipeline is invalid")
-    typed_pipeline = cast(dict[str, object], pipeline)
-    if set(typed_pipeline) != {
-        "timestep",
-        "active_field",
-        "filters",
-        "colormap",
-        "camera",
-        "selection",
-        "artifacts",
-    }:
-        raise ValueError("JARVIS ParaView state pipeline shape is invalid")
-    timestep = typed_pipeline.get("timestep")
-    if not isinstance(timestep, dict):
-        raise ValueError("JARVIS ParaView timestep is invalid")
-    typed_timestep = cast(dict[str, object], timestep)
-    index = typed_timestep.get("index")
-    count = typed_timestep.get("count")
-    value = typed_timestep.get("value")
-    if (
-        set(typed_timestep) != {"index", "value", "count"}
-        or not isinstance(index, int)
-        or isinstance(index, bool)
-        or index < 0
-        or not isinstance(count, int)
-        or isinstance(count, bool)
-        or count < 1
-        or index >= count
-        or (
-            value is not None
-            and (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-            )
-        )
-    ):
-        raise ValueError("JARVIS ParaView timestep shape is invalid")
 
 
 def _browser_attachment_grant(
@@ -6059,12 +6888,48 @@ def _runtime_events(value: object) -> list[dict[str, object]] | None:
 
 
 def _key_value_output(output: str) -> dict[str, str]:
+    if len(output.encode("utf-8")) > 16_384:
+        raise RelayError("remote connector start response exceeded its size limit")
+    lines = output.splitlines()
+    if not lines or len(lines) > 16:
+        raise RelayError("remote connector start returned an invalid response")
     values: dict[str, str] = {}
-    for line in output.splitlines():
+    for line in lines:
         key, separator, value = line.partition("=")
-        if separator:
-            values[key.strip()] = value.strip()
+        key = key.strip()
+        value = value.strip()
+        if not separator or not key or not value or key in values:
+            raise RelayError("remote connector start returned an invalid key/value response")
+        values[key] = value
     return values
+
+
+def _validated_remote_session_file(
+    value: str,
+    *,
+    session_id: str,
+    filename: str,
+) -> PurePosixPath:
+    """Validate an exact remote session-owned file path without trusting SSH output."""
+    if len(value) > 4_096 or any(ord(character) < 32 for character in value):
+        raise RelayError("remote connector start returned an invalid owned path")
+    path = PurePosixPath(value)
+    expected_tail = (
+        ".local",
+        "share",
+        "clio-relay",
+        "service-sessions",
+        session_id,
+        filename,
+    )
+    if (
+        not path.is_absolute()
+        or path.as_posix() != value
+        or ".." in path.parts
+        or tuple(path.parts[-len(expected_tail) :]) != expected_tail
+    ):
+        raise RelayError("remote connector start returned a path outside its owned session")
+    return path
 
 
 def _connector_step_marker(session_id: str, connector_generation_id: str) -> str:
@@ -6083,6 +6948,122 @@ def _new_ownership_intent(state: str, **identity: object) -> dict[str, object]:
     }
 
 
+def _validated_durable_scheduler_contract(
+    session: GatewaySession,
+    *,
+    strict: bool = True,
+) -> _DurableSchedulerContract:
+    """Cross-check scheduler identity or explicit absence across durable records."""
+    try:
+        spec = ServiceRuntimeSpec.model_validate(session.gateway.get("runtime_spec"))
+    except ValueError as exc:
+        raise RelayError("owned runtime has no valid service runtime specification") from exc
+
+    binding_document = session.gateway.get("jarvis_runtime_binding")
+    if binding_document is not None:
+        try:
+            binding = JarvisServiceRuntimeBinding.model_validate(binding_document)
+        except ValueError as exc:
+            raise RelayError("owned runtime has an invalid JARVIS runtime binding") from exc
+        provider = binding.scheduler_provider
+        scheduler_job_id = binding.scheduler_native_id
+        if (provider is None) != (scheduler_job_id is None):
+            raise RelayError("JARVIS runtime binding has incomplete scheduler identity")
+        expected_provider = provider or "external"
+        if session.scheduler != expected_provider or spec.scheduler != expected_provider:
+            raise RelayError(
+                "scheduler provider disagrees between the gateway, runtime specification, "
+                "and JARVIS runtime binding"
+            )
+        if session.scheduler_job_id != scheduler_job_id:
+            raise RelayError(
+                "scheduler job identity disagrees between the gateway and JARVIS runtime binding"
+            )
+        return _DurableSchedulerContract(
+            provider=expected_provider,
+            scheduler_job_id=scheduler_job_id,
+        )
+
+    def unresolved_or_known() -> _DurableSchedulerContract:
+        scheduler_job_id = _optional_str(session.scheduler_job_id)
+        return _DurableSchedulerContract(
+            provider=session.scheduler,
+            scheduler_job_id=scheduler_job_id,
+            unresolved_submission=scheduler_job_id is None,
+        )
+
+    intents = session.gateway.get("ownership_intents")
+    if not isinstance(intents, dict):
+        if not strict:
+            return unresolved_or_known()
+        raise RelayError("gateway has no durable scheduler ownership contract")
+    typed_intents = cast(dict[str, object], intents)
+    scheduler_intent = typed_intents.get("scheduler_submission")
+    if not isinstance(scheduler_intent, dict):
+        if not strict:
+            return unresolved_or_known()
+        raise RelayError("gateway has no durable scheduler submission intent")
+    typed_scheduler_intent = cast(dict[str, object], scheduler_intent)
+    if typed_scheduler_intent.get("schema_version") != _OWNERSHIP_INTENT_SCHEMA:
+        if not strict:
+            return unresolved_or_known()
+        raise RelayError("gateway scheduler submission intent has the wrong schema")
+    if session.scheduler != spec.scheduler:
+        if not strict:
+            return unresolved_or_known()
+        raise RelayError(
+            "scheduler provider disagrees between the gateway and runtime specification"
+        )
+
+    state = typed_scheduler_intent.get("state")
+    if state in {"not_started", "absent_verified"}:
+        if session.scheduler_job_id is not None:
+            if not strict:
+                return unresolved_or_known()
+            raise RelayError(
+                "gateway scheduler job identity contradicts an explicit absence intent"
+            )
+        return _DurableSchedulerContract(
+            provider=session.scheduler,
+            scheduler_job_id=None,
+        )
+
+    intent_provider = _optional_str(typed_scheduler_intent.get("scheduler_provider"))
+    if intent_provider != session.scheduler:
+        if not strict:
+            return unresolved_or_known()
+        raise RelayError("scheduler provider disagrees between the gateway and submission intent")
+    if state == "starting":
+        if (
+            session.scheduler_job_id is not None
+            or _optional_str(typed_scheduler_intent.get("submission_id")) is None
+            or _optional_str(typed_scheduler_intent.get("submission_marker")) is None
+        ):
+            if not strict:
+                return unresolved_or_known()
+            raise RelayError("starting scheduler submission intent has inconsistent identity")
+        return _DurableSchedulerContract(
+            provider=session.scheduler,
+            scheduler_job_id=None,
+            unresolved_submission=True,
+        )
+    if state == "recorded":
+        intent_job_id = _optional_str(typed_scheduler_intent.get("scheduler_job_id"))
+        if intent_job_id is None or intent_job_id != session.scheduler_job_id:
+            if not strict:
+                return unresolved_or_known()
+            raise RelayError(
+                "scheduler job identity disagrees between the gateway and submission intent"
+            )
+        return _DurableSchedulerContract(
+            provider=session.scheduler,
+            scheduler_job_id=intent_job_id,
+        )
+    if not strict:
+        return unresolved_or_known()
+    raise RelayError("gateway scheduler submission intent has an invalid state")
+
+
 def _intent_proves_absence(intents: dict[str, object], role: str) -> bool:
     """Return whether a durable intent proves a connector never started or is absent."""
     intent = _object(intents.get(role, {}))
@@ -6097,6 +7078,375 @@ def _required_intent_str(intent: dict[str, object], field: str) -> str:
     if value is None:
         raise RelayError(f"connector ownership intent has no {field}")
     return value
+
+
+def _validated_gateway_teardown_intent(
+    session: GatewaySession,
+    *,
+    cancel_scheduler_job: bool,
+) -> dict[str, object]:
+    """Validate the immutable queue-authored teardown operation identity."""
+    raw_intent = session.gateway.get("teardown_intent")
+    if not isinstance(raw_intent, dict):
+        raise RelayError("gateway teardown intent is invalid")
+    intent = cast(dict[str, object], raw_intent)
+    if set(intent) != {
+        "schema_version",
+        "operation_id",
+        "gateway_session_id",
+        "cancel_scheduler_job",
+        "created_at",
+    }:
+        raise RelayError("gateway teardown intent is invalid")
+    operation_id = intent.get("operation_id")
+    created_at = intent.get("created_at")
+    if (
+        intent.get("schema_version") != "clio-relay.gateway-teardown-intent.v1"
+        or intent.get("gateway_session_id") != session.session_id
+        or not isinstance(operation_id, str)
+        or not operation_id.startswith("gateway_cleanup_")
+        or not isinstance(created_at, str)
+        or not isinstance(intent.get("cancel_scheduler_job"), bool)
+    ):
+        raise RelayError("gateway teardown intent is invalid")
+    _gateway_teardown_timestamp(created_at)
+    if intent.get("cancel_scheduler_job") is not cancel_scheduler_job:
+        raise RelayError(
+            "gateway cleanup policy changed during retry; resume with the original "
+            f"cancel_scheduler_job={intent.get('cancel_scheduler_job')} policy"
+        )
+    return intent
+
+
+def _validated_gateway_detach_intent(session: GatewaySession) -> dict[str, object]:
+    """Validate one immutable relay-authored detach operation identity."""
+    raw_intent = session.gateway.get("detach_intent")
+    if not isinstance(raw_intent, dict):
+        raise RelayError("gateway detach intent is invalid")
+    intent = cast(dict[str, object], raw_intent)
+    if set(intent) != {
+        "schema_version",
+        "operation_id",
+        "gateway_session_id",
+        "created_at",
+    }:
+        raise RelayError("gateway detach intent is invalid")
+    operation_id = intent.get("operation_id")
+    created_at = intent.get("created_at")
+    if (
+        intent.get("schema_version") != _GATEWAY_DETACH_INTENT_SCHEMA
+        or intent.get("gateway_session_id") != session.session_id
+        or not isinstance(operation_id, str)
+        or not operation_id.startswith("gateway_detach_")
+        or not isinstance(created_at, str)
+    ):
+        raise RelayError("gateway detach intent is invalid")
+    _gateway_teardown_timestamp(created_at)
+    return intent
+
+
+def _validated_completed_resource_lists(
+    result: dict[str, object],
+    *,
+    error: str,
+) -> tuple[list[CleanupResource], list[str]]:
+    """Strictly parse bounded completed lifecycle resources and errors."""
+    raw_resources = result.get("resources")
+    raw_errors = result.get("errors")
+    if not isinstance(raw_resources, list) or not isinstance(raw_errors, list):
+        raise RelayError(error)
+    typed_resources = cast(list[object], raw_resources)
+    typed_errors = cast(list[object], raw_errors)
+    if not 3 <= len(typed_resources) <= 5 or any(
+        not isinstance(item, str) or not item for item in typed_errors
+    ):
+        raise RelayError(error)
+    try:
+        resources = [
+            CleanupResource.model_validate(resource, strict=True) for resource in typed_resources
+        ]
+    except ValueError as exc:
+        raise RelayError(error) from exc
+    return resources, cast(list[str], typed_errors)
+
+
+def _validate_completed_detach_resources(
+    session: GatewaySession,
+    *,
+    resources: list[CleanupResource],
+    stopped_local_pid: int | None,
+    operation_id: str,
+) -> None:
+    """Require complete ownership and disposition proof for a finished detach."""
+    error = "gateway detach evidence is invalid"
+    scheduler_contract = _validated_durable_scheduler_contract(session)
+    if scheduler_contract.unresolved_submission:
+        raise RelayError(error)
+    allowed_kinds = {
+        "browser_proxy",
+        "desktop_connector",
+        "remote_connector",
+        "scheduler_job",
+        "gateway_record",
+    }
+    counts = {kind: sum(item.kind == kind for item in resources) for kind in allowed_kinds}
+    expected_scheduler_count = 1 if scheduler_contract.scheduler_job_id is not None else 0
+    if (
+        any(item.kind not in allowed_kinds for item in resources)
+        or counts["desktop_connector"] != 1
+        or counts["remote_connector"] != 1
+        or counts["gateway_record"] != 1
+        or counts["browser_proxy"] > 1
+        or counts["scheduler_job"] != expected_scheduler_count
+        or any(
+            not item.resource_id
+            or not item.location
+            or item.residual
+            or item.metadata.get("gateway_session_id") != session.session_id
+            or item.metadata.get("cleanup_operation_id") != operation_id
+            or item.metadata.get("cancel_scheduler_job") is not False
+            for item in resources
+        )
+    ):
+        raise RelayError(error)
+    desktop = next(item for item in resources if item.kind == "desktop_connector")
+    remote = next(item for item in resources if item.kind == "remote_connector")
+    gateway = next(item for item in resources if item.kind == "gateway_record")
+    if (
+        desktop.action != "stop"
+        or desktop.outcome not in {"stopped", "missing"}
+        or not desktop.ownership_verified
+        or not desktop.verified_after_operation
+        or (desktop.outcome == "stopped") != (stopped_local_pid is not None)
+        or (stopped_local_pid is not None and desktop.resource_id != str(stopped_local_pid))
+        or remote.action != "retain"
+        or remote.outcome != "retained"
+        or not remote.ownership_verified
+        or not remote.verified_after_operation
+        or gateway.resource_id != session.session_id
+        or gateway.action != "retain"
+        or gateway.outcome != "retained"
+        or not gateway.ownership_verified
+        or not gateway.verified_after_operation
+        or gateway.observed_state != GatewaySessionState.DEGRADED.value
+    ):
+        raise RelayError(error)
+    browser = [item for item in resources if item.kind == "browser_proxy"]
+    if browser and (
+        browser[0].action != "stop"
+        or browser[0].outcome not in {"stopped", "missing"}
+        or not browser[0].ownership_verified
+        or not browser[0].verified_after_operation
+    ):
+        raise RelayError(error)
+    scheduler = [item for item in resources if item.kind == "scheduler_job"]
+    if scheduler:
+        item = scheduler[0]
+        outcome_state_valid = (
+            (item.outcome == "retained" and item.observed_state in _ACTIVE_RUNTIME_STATES)
+            or (item.outcome == "terminal" and item.observed_state in _TERMINAL_RUNTIME_STATES)
+            or (item.outcome == "missing" and item.observed_state == "missing")
+        )
+        if (
+            item.resource_id != scheduler_contract.scheduler_job_id
+            or item.provider != scheduler_contract.provider
+            or item.action != "retain"
+            or not item.ownership_verified
+            or not item.verified_after_operation
+            or not outcome_state_valid
+        ):
+            raise RelayError(error)
+
+
+def _validate_completed_teardown_resources(
+    session: GatewaySession,
+    *,
+    resources: list[CleanupResource],
+    stopped_local_pid: int | None,
+    stopped_remote_pid: int | None,
+    canceled_scheduler_job: str | None,
+    operation_id: str,
+    cancel_scheduler_job: bool,
+) -> None:
+    """Require complete ownership and disposition proof for a finished teardown."""
+    error = "completed gateway teardown evidence is invalid"
+    scheduler_contract = _validated_durable_scheduler_contract(session)
+    if scheduler_contract.unresolved_submission:
+        raise RelayError(error)
+    allowed_kinds = {
+        "browser_proxy",
+        "desktop_connector",
+        "remote_connector",
+        "scheduler_job",
+        "gateway_record",
+    }
+    counts = {kind: sum(item.kind == kind for item in resources) for kind in allowed_kinds}
+    expected_scheduler_count = 1 if scheduler_contract.scheduler_job_id is not None else 0
+    if (
+        any(item.kind not in allowed_kinds for item in resources)
+        or counts["desktop_connector"] != 1
+        or counts["remote_connector"] != 1
+        or counts["gateway_record"] != 1
+        or counts["browser_proxy"] > 1
+        or counts["scheduler_job"] != expected_scheduler_count
+        or any(
+            not item.resource_id
+            or not item.location
+            or item.residual
+            or item.metadata.get("gateway_session_id") != session.session_id
+            or item.metadata.get("cleanup_operation_id") != operation_id
+            or item.metadata.get("cancel_scheduler_job") is not cancel_scheduler_job
+            for item in resources
+        )
+    ):
+        raise RelayError(error)
+    desktop = next(item for item in resources if item.kind == "desktop_connector")
+    remote = next(item for item in resources if item.kind == "remote_connector")
+    gateway = next(item for item in resources if item.kind == "gateway_record")
+    if (
+        desktop.action != "stop"
+        or desktop.outcome not in {"stopped", "missing"}
+        or not desktop.ownership_verified
+        or not desktop.verified_after_operation
+        or (desktop.outcome == "stopped") != (stopped_local_pid is not None)
+        or (stopped_local_pid is not None and desktop.resource_id != str(stopped_local_pid))
+        or remote.action != "stop"
+        or remote.outcome not in {"stopped", "missing"}
+        or not remote.ownership_verified
+        or not remote.verified_after_operation
+        or gateway.resource_id != session.session_id
+        or gateway.action != "close"
+        or gateway.outcome != "closed"
+        or not gateway.ownership_verified
+        or not gateway.verified_after_operation
+    ):
+        raise RelayError(error)
+    remote_connector = _object(
+        _object(session.gateway.get("transport", {})).get("remote_connector", {})
+    )
+    if remote_connector.get("execution_scope") == "scheduler_allocation":
+        if stopped_remote_pid is not None or remote.resource_id != _optional_str(
+            remote_connector.get("scheduler_step_id")
+        ):
+            raise RelayError(error)
+    elif (remote.outcome == "stopped") != (stopped_remote_pid is not None) or (
+        stopped_remote_pid is not None and remote.resource_id != str(stopped_remote_pid)
+    ):
+        raise RelayError(error)
+    browser = [item for item in resources if item.kind == "browser_proxy"]
+    if browser and (
+        browser[0].action != "stop"
+        or browser[0].outcome not in {"stopped", "missing"}
+        or not browser[0].ownership_verified
+        or not browser[0].verified_after_operation
+    ):
+        raise RelayError(error)
+    scheduler = [item for item in resources if item.kind == "scheduler_job"]
+    if not scheduler:
+        if canceled_scheduler_job is not None:
+            raise RelayError(error)
+        return
+    item = scheduler[0]
+    if (
+        item.resource_id != scheduler_contract.scheduler_job_id
+        or item.provider != scheduler_contract.provider
+        or not item.ownership_verified
+        or not item.verified_after_operation
+    ):
+        raise RelayError(error)
+    if cancel_scheduler_job:
+        canceled = item.outcome == "canceled" and item.observed_state in (_CANCELED_RUNTIME_STATES)
+        naturally_terminal = (
+            item.outcome == "terminal"
+            and item.observed_state in _TERMINAL_RUNTIME_STATES - _CANCELED_RUNTIME_STATES
+        )
+        if (
+            item.action != "cancel"
+            or not (canceled or naturally_terminal)
+            or (canceled_scheduler_job is not None) != canceled
+            or (canceled and canceled_scheduler_job != item.resource_id)
+        ):
+            raise RelayError(error)
+        return
+    retained_state_valid = (
+        (item.outcome == "retained" and item.observed_state in _ACTIVE_RUNTIME_STATES)
+        or (item.outcome == "terminal" and item.observed_state in _TERMINAL_RUNTIME_STATES)
+        or (item.outcome == "missing" and item.observed_state == "missing")
+    )
+    if item.action != "retain" or not retained_state_valid or canceled_scheduler_job is not None:
+        raise RelayError(error)
+
+
+def _gateway_teardown_timestamp(value: str) -> datetime:
+    """Parse one timezone-aware teardown timestamp without accepting naive evidence."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RelayError("gateway teardown timestamp is invalid") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RelayError("gateway teardown timestamp is invalid")
+    return parsed
+
+
+def _strict_optional_positive_int(value: object) -> int | None:
+    """Validate an optional positive process identity in completed teardown evidence."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise RelayError("completed gateway teardown evidence is invalid")
+    return value
+
+
+def _strict_optional_nonempty_str(value: object) -> str | None:
+    """Validate an optional non-empty identity in completed teardown evidence."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise RelayError("completed gateway teardown evidence is invalid")
+    return value
+
+
+def _completed_teardown_metadata_matches(
+    session: GatewaySession,
+    *,
+    operation_id: str,
+    cancel_scheduler_job: bool,
+    completed_at: str,
+    final_state: GatewaySessionState,
+    errors: list[str],
+) -> bool:
+    """Return whether public session metadata agrees exactly with completed evidence."""
+    metadata = session.metadata
+    expected_closed_at: str | None = (
+        completed_at if final_state is GatewaySessionState.CLOSED else None
+    )
+    return bool(
+        metadata.get("cleanup_at") == completed_at
+        and metadata.get("closed_at") == expected_closed_at
+        and metadata.get("cancel_scheduler_job") is cancel_scheduler_job
+        and metadata.get("cleanup_retryable") is False
+        and metadata.get("cleanup_errors") == errors
+        and metadata.get("cleanup_operation_id") == operation_id
+    )
+
+
+def _completed_detach_metadata_matches(
+    session: GatewaySession,
+    *,
+    operation_id: str,
+    completed_at: str,
+    errors: list[str],
+) -> bool:
+    """Return whether public session metadata agrees with completed detach evidence."""
+    metadata = session.metadata
+    return bool(
+        metadata.get("detached_at") == completed_at
+        and metadata.get("detach_operation_id") == operation_id
+        and metadata.get("detach_retryable") is False
+        and metadata.get("detach_errors") == errors
+        and metadata.get("cleanup_retryable") is False
+        and metadata.get("cleanup_errors") == errors
+    )
 
 
 def _write_local_connector_sidecar(path: Path, connector: dict[str, object]) -> None:

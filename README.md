@@ -8,7 +8,7 @@
 
 It is a piece of the federation layer for [`clio-agent`](https://github.com/iowarp/clio-agent): a local CLIO experience can delegate work to a remote machine, keep observing it, detach, reconnect, and clean up after itself. The project is also designed for use outside CLIO. Any client that can call the CLI, HTTP API, or MCP tools can use the same relay model.
 
-> Version `1.3.36` uses a release-first patch process. A maintainer builds the
+> Version `1.4.0` uses a release-first patch process. A maintainer builds the
 > wheel and source distribution once, attaches those exact bytes and their
 > checksums to a GitHub Release, and publishes the release immediately. Tag
 > regression jobs and the trusted PyPI upload then run asynchronously; they do
@@ -148,11 +148,24 @@ dataset identities, starts only
 the connector path, and returns local connect, health, stream, events, state, and
 command URLs. Detach and stop retain the scheduler job unless cancellation is
 explicitly requested and the original binding can be re-verified.
+New live services use `jarvis.service-runtime.v2`: every cluster-side endpoint
+requires an execution-owned bearer capability, but the public JARVIS report exposes
+only `authorization.scheme` and `authorization.token_sha256`. After re-verifying the
+durable source, relay passes the exact execution, pipeline, package, service-instance,
+revision, and digest identities to JARVIS's private resolver. Relay resolves the
+returned bearer independently for each operation. Browser attachment transfers it
+over anonymous stdin to the owned loopback proxy, which retains it only in process
+memory for that attachment and injects it solely on the private proxy-to-service
+hop; gateway provenance stores only its digest. Previously released
+v1 execution records remain readable for existing bindings, but they cannot produce a
+new handoff or authenticated binding.
 
 Sandboxed viewers obtain browser-safe URLs only through the internal
 `gateway browser-attach` command after verifying that binding. Its one-time,
 short-lived capability is never stored in normal gateway output; a loopback proxy
 requires the capability plus exact `Origin: null` without wildcard CORS.
+The proxy strips that browser capability and independently injects the verified
+JARVIS bearer upstream; neither secret appears in the public gateway record.
 `gateway browser-detach` revokes it before stopping the proxy. For SLURM-owned
 loopback services, the cluster connector is pinned to a provider-verified,
 single-node `BatchHost` rather than guessing an allocation node.

@@ -21,16 +21,16 @@ from clio_relay.remote_mcp import (
 ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
-WHEEL_FILENAME = "clio_kit-2.5.17-py3-none-any.whl"
-WHEEL_SHA256 = "cedd0eeb95aa4546223ea57702cb206c012ca4dddd84248881de08b7af811e53"
-WHEEL_URL = f"https://github.com/iowarp/clio-kit/releases/download/v2.5.17/{WHEEL_FILENAME}"
+WHEEL_FILENAME = "clio_kit-2.5.19-py3-none-any.whl"
+WHEEL_SHA256 = "4094bbc957db0682c27a84adcdb135ba9a4ef1bc1d6a05046f11ad777907a652"
+WHEEL_URL = f"https://github.com/iowarp/clio-kit/releases/download/v2.5.19/{WHEEL_FILENAME}"
 
 
 def test_runtime_and_ci_share_one_exact_clio_kit_release_pin() -> None:
     """Keep bootstrap, JARVIS MCP, and CI on the same exact release wheel bytes."""
-    assert CLIO_KIT_JARVIS_MCP_VERSION == "2.5.17"
-    assert CLIO_KIT_SPACK_USER_WHEEL_VERSION == "2.5.17"
-    assert CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION == "2.5.17"
+    assert CLIO_KIT_JARVIS_MCP_VERSION == "2.5.19"
+    assert CLIO_KIT_SPACK_USER_WHEEL_VERSION == "2.5.19"
+    assert CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION == "2.5.19"
     assert CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME == WHEEL_FILENAME
     assert CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 == WHEEL_SHA256
     assert CLIO_KIT_JARVIS_MCP_WHEEL_URL == WHEEL_URL
@@ -106,7 +106,7 @@ def test_ci_wheel_download_is_bounded_https_only_and_fail_closed() -> None:
         assert "pip install" not in script
         assert "uvx" not in script
         assert "|| true" not in script
-        assert "clio-kit-v2.5.17" in script
+        assert "clio-kit-v2.5.19" in script
         assert "clio-kit-v2.5.11" not in script
 
     assert 'if [ "$RUNNER_OS" = Windows ]' in scripts["validate"]

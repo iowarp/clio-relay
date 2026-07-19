@@ -46,7 +46,7 @@ JARVIS_EXECUTION_ARTIFACTS_SCHEMA = "jarvis.execution.artifacts.v1"
 JARVIS_ARTIFACT_SCHEMA = "jarvis.artifact.v1"
 JARVIS_EXECUTION_SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 CLIO_KIT_JARVIS_EXECUTION_SCHEMA = "clio-kit.jarvis-execution.v2"
-CLIO_KIT_JARVIS_CONTRACT_ID = "clio-kit-jarvis-user-v3.4"
+CLIO_KIT_JARVIS_CONTRACT_ID = "clio-kit-jarvis-user-v3.5"
 CLIO_KIT_MCP_CONTRACT_SCHEMA = "clio-kit.mcp-user-contract.v1"
 CLIO_KIT_NATIVE_OPERATIONS = (
     "jarvis_get_execution",
@@ -58,6 +58,7 @@ OFFICIAL_COMPONENT_RELEASE_REPOSITORIES = {
 }
 JARVIS_CD_NATIVE_OPERATIONS = (
     "execution_handle.progress",
+    "execution_store.resolve_service_runtime_authority",
     "pipeline.get_execution",
     "pipeline.get_execution_progress",
     "pipeline.run",
@@ -1421,6 +1422,7 @@ import json
 
 from jarvis_cd.core.execution import (
     ExecutionHandle,
+    ExecutionStore,
     HANDLE_SCHEMA,
     PROGRESS_SNAPSHOT_SCHEMA,
     RECORD_SCHEMA,
@@ -1429,6 +1431,9 @@ from jarvis_cd.core.pipeline import Pipeline
 
 operations = {{
     "execution_handle.progress": callable(getattr(ExecutionHandle, "progress", None)),
+    "execution_store.resolve_service_runtime_authority": callable(
+        getattr(ExecutionStore, "resolve_service_runtime_authority", None)
+    ),
     "pipeline.get_execution": callable(getattr(Pipeline, "get_execution", None)),
     "pipeline.get_execution_progress": callable(
         getattr(Pipeline, "get_execution_progress", None)

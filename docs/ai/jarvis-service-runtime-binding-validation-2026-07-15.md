@@ -7,6 +7,12 @@ a durable relay-routed JARVIS MCP result to a local agent-facing gateway. It is 
 a live cluster acceptance report and makes no Ares, homelab, released-wheel, or
 network claim.
 
+> Historical note: the ParaView-specific readiness assertions below describe the
+> July 15 prototype and are superseded by the generic JARVIS service boundary in
+> relay 1.4. Relay now verifies durable JARVIS provenance, bearer protection, and
+> live transport; the consuming application validates its own health/state schema.
+> This file remains historical evidence and is not a current release claim.
+
 ## Contract checks
 
 - The source relay job must be succeeded, `mcp_call`, `tools/call`, and exactly

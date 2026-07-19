@@ -62,10 +62,23 @@ CONTRACT_PROJECTION = "mcp-agent-tool-schema-v1"
 MAX_CONTRACT_BYTES = 4 * 1024 * 1024
 MAX_PROBE_OUTPUT_BYTES = 16 * 1024 * 1024
 EXPECTED_CONTRACTS = {
+    "clio-kit-jarvis-user-v3.5": {
+        "server_name": "jarvis",
+        "artifact": "jarvis-user-v3.5.json",
+        "contract_sha256": CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
+        "tool_names": {
+            "jarvis_add_step",
+            "jarvis_create_pipeline",
+            "jarvis_describe",
+            "jarvis_edit_step",
+            "jarvis_get_execution",
+            "jarvis_run",
+        },
+    },
     "clio-kit-jarvis-user-v3.4": {
         "server_name": "jarvis",
         "artifact": "jarvis-user-v3.4.json",
-        "contract_sha256": CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
+        "contract_sha256": "52bfe1d416e674d120f200e502ded2197ee27219c26891a22c6c33ba917d5696",
         "tool_names": {
             "jarvis_add_step",
             "jarvis_create_pipeline",
@@ -212,6 +225,7 @@ ACTIVE_CONTRACT_IDS = frozenset(EXPECTED_CONTRACTS) - {
     "clio-kit-jarvis-user-v3.1",
     "clio-kit-jarvis-user-v3.2",
     "clio-kit-jarvis-user-v3.3",
+    "clio-kit-jarvis-user-v3.4",
     "clio-kit-scientific-catalog-user-v1",
     "clio-kit-spack-user-v2",
 }
@@ -300,7 +314,7 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
         assert artifact["contract_sha256"] == expected["contract_sha256"]
         assert set(cast(list[str], artifact["tool_names"])) == expected["tool_names"]
 
-    jarvis_tools = _tools_by_name(shipped_contracts["clio-kit-jarvis-user-v3.4"])
+    jarvis_tools = _tools_by_name(shipped_contracts["clio-kit-jarvis-user-v3.5"])
     artifact_projection = {
         name: {
             "description": tool.get("description"),
@@ -423,7 +437,40 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
         "default": False,
         "type": "boolean",
     }
-    assert shipped_contracts["clio-kit-jarvis-user-v3.4"]["wire_sha256"] == (
+    service_runtime_selector = cast(JSON, query_output["properties"])["service_runtimes"]
+    service_runtime_page = next(
+        cast(JSON, option)
+        for option in cast(list[object], cast(JSON, service_runtime_selector)["anyOf"])
+        if isinstance(option, dict) and cast(JSON, option).get("type") == "object"
+    )
+    runtime_items = cast(
+        JSON,
+        cast(JSON, cast(JSON, service_runtime_page["properties"])["service_runtimes"])["items"],
+    )
+    runtime_v2 = next(
+        cast(JSON, option)
+        for option in cast(list[object], runtime_items["oneOf"])
+        if cast(JSON, cast(JSON, option)["properties"])["schema_version"]["const"]
+        == "jarvis.service-runtime.v2"
+    )
+    authorization = cast(JSON, cast(JSON, runtime_v2["properties"])["authorization"])
+    assert authorization == {
+        "additionalProperties": False,
+        "description": "Non-secret fingerprint for an execution-owned runtime capability.",
+        "properties": {
+            "scheme": {"const": "bearer", "type": "string"},
+            "token_sha256": {
+                "maxLength": 64,
+                "minLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string",
+            },
+        },
+        "required": ["scheme", "token_sha256"],
+        "type": "object",
+    }
+    assert "token" not in cast(JSON, authorization["properties"])
+    assert shipped_contracts["clio-kit-jarvis-user-v3.5"]["wire_sha256"] == (
         CLIO_KIT_JARVIS_USER_WIRE_SHA256
     )
 

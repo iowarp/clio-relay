@@ -32,7 +32,7 @@ def _matrix_reports() -> list[dict[str, object]]:
         dict[str, object],
         json.loads((FIXTURES / "report-matrix-1.0.json").read_text(encoding="utf-8")),
     )
-    assert document["report_count_per_stage"] == 18
+    assert document["report_count_per_stage"] == 19
     return cast(list[dict[str, object]], document["reports"])
 
 
@@ -53,7 +53,7 @@ def test_release_identity_is_consistent_across_package_policy_matrix_and_runbook
     init_source = (ROOT / "src" / "clio_relay" / "__init__.py").read_text(encoding="utf-8")
     release_process = RELEASE_PROCESS.read_text(encoding="utf-8")
 
-    assert version == "1.3.36"
+    assert version == "1.4.0"
     assert relay_lock["version"] == version
     assert f'__version__ = "{version}"' in init_source
     assert policy["release_version"] == version
@@ -508,13 +508,14 @@ def test_gray_scott_helper_fails_closed_on_spack_and_config_discovery_errors(
 def test_release_acceptance_matrix_is_complete_ordered_and_unique() -> None:
     reports = _matrix_reports()
 
-    assert [report["ordinal"] for report in reports] == list(range(1, 19))
-    assert len({cast(str, report["id"]) for report in reports}) == 18
+    assert [report["ordinal"] for report in reports] == list(range(1, 20))
+    assert len({cast(str, report["id"]) for report in reports}) == 19
+    assert reports[-1]["id"] == "ares-secure-runtime"
     assert reports[2]["id"] == "ares-queue-management"
     assert all(
         cast(int, report["ordinal"]) > 3
         for report in reports
-        if report["scenario"] in {"cleanup", "transport", "gateway-runtime"}
+        if report["scenario"] in {"cleanup", "transport", "gateway-runtime", "secure-runtime"}
     )
     jarvis_reports = [
         report for report in reports if cast(str, report["id"]).startswith("ares-jarvis-")
@@ -575,6 +576,24 @@ def test_release_acceptance_matrix_preserves_evidence_groups() -> None:
         "ares-gateway-start",
         "ares-gateway-stop",
     ]
+    assert grouped["ares-secure-jarvis-runtime"] == ["ares-secure-runtime"]
+
+
+def test_release_acceptance_runs_mandatory_secure_runtime_report_last() -> None:
+    """The operator path must produce the secure report required by matrix entry 19."""
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    secure_call = 'Invoke-RelayReport -Id "ares-secure-runtime"'
+    gateway_stop = 'Invoke-RelayReport -Id "ares-gateway-stop"'
+    verification = "## Verify and upload the exact report set"
+
+    assert secure_call in runbook
+    assert runbook.index(gateway_stop) < runbook.index(secure_call) < runbook.index(verification)
+    assert '"--validation-scenario", "secure-runtime"' in runbook
+    assert '"--jarvis-yaml", $SecureRuntimeYaml' in runbook
+    assert '"--verify-cluster-deployment"' in runbook
+    assert '"--require-structured-runtime-metadata"' in runbook
+    assert "examples/release-gate/ares-secure-runtime.yaml.tmpl" in runbook
+    assert "cancel_scheduler_job=false" in runbook
 
 
 def test_release_policy_groups_bootstrap_and_worker_proof_by_physical_target() -> None:
@@ -670,8 +689,10 @@ def test_release_acceptance_yaml_templates_are_real_bounded_pipelines() -> None:
     replacements = {
         "RUN_ID": "released-1-0-acceptance",
         "REMOTE_ROOT": "/tmp/clio-relay-release-acceptance",
+        "REMOTE_DESCRIPTOR": "/tmp/clio-relay-release-acceptance/descriptor.json",
     }
     for name in (
+        "ares-secure-runtime.yaml.tmpl",
         "ares-bootstrap-echo.yaml.tmpl",
         "homelab-transport-echo.yaml.tmpl",
         "owned-cleanup-ares.yaml.tmpl",
@@ -682,6 +703,36 @@ def test_release_acceptance_yaml_templates_are_real_bounded_pipelines() -> None:
         packages = cast(list[dict[str, object]], document["pkgs"])
         assert packages
         assert all(isinstance(package.get("pkg_type"), str) for package in packages)
+
+    secure = cast(
+        dict[str, object],
+        yaml.safe_load(_render(FIXTURES / "ares-secure-runtime.yaml.tmpl", replacements)),
+    )
+    extension = cast(dict[str, object], secure["x_clio_relay"])
+    probe = cast(dict[str, object], extension["secure_runtime_probe"])
+    command = cast(dict[str, object], probe["command"])
+    package = cast(list[dict[str, object]], secure["pkgs"])[0]
+    assert package["pkg_type"] == probe["package_name"] == "builtin.paraview"
+    assert package["pkg_name"] == probe["package_id"] == "secure_viewer"
+    assert package["mode"] == "service"
+    assert package["dataset_descriptor"] == replacements["REMOTE_DESCRIPTOR"]
+    assert command["schema_version"] == "jarvis.paraview.command.v2"
+    assert command["operation"] == "set_timestep"
+    assert command["expected_revision"] == 1
+    adapter = cast(dict[str, object], probe["protocol_adapter"])
+    assert adapter["command_request_id_pointer"] == "/command_id"
+    health = cast(dict[str, object], adapter["health"])
+    state = cast(dict[str, object], adapter["state"])
+    command_response = cast(dict[str, object], adapter["command"])
+    events = cast(dict[str, object], adapter["events"])
+    assert cast(dict[str, object], health["assertions"]) == {
+        "/schema_version": "jarvis.paraview.health.v1",
+        "/status": "ready",
+    }
+    assert state["dataset_descriptor_pointer"] == "/dataset/descriptor"
+    assert command_response["dataset_descriptor_pointer"] == "/state/dataset/descriptor"
+    assert command_response["command_id_pointer"] == "/command_id"
+    assert events["event_name"] == "state"
 
 
 def test_release_acceptance_gateway_templates_match_runtime_contract() -> None:

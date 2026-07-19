@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import errno
 import json
+import math
 import os
 import shutil
 import signal
@@ -16,16 +18,18 @@ import time
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Protocol, cast
 from uuid import uuid4
 
 CONTAINMENT_ENV = "CLIO_RELAY_PROCESS_CONTAINMENT"
 CONTAINMENT_VALUE = "relay-owned-v1"
+BROKER_CHILD_ENVIRONMENT_SCHEMA = "clio-relay.child-environment.v1"
 BROKER_CREDENTIAL_FD_ENV = "CLIO_RELAY_BROKER_CREDENTIAL_FD"
 BROKER_READY_FD_ENV = "CLIO_RELAY_BROKER_READY_FD"
 BROKER_PROTOCOL_MAX_BYTES = 16 * 1024
+BROKER_STDIN_MAX_BYTES = 4 * 1024 * 1024
+BROKER_SETUP_MAX_BYTES = 6 * 1024 * 1024
 BROKER_HANDSHAKE_TIMEOUT_SECONDS = 5.0
 BROKER_READY_TIMEOUT_SECONDS = 10.0
 DISCOVERY_TIMEOUT_SECONDS = 5.0
@@ -40,6 +44,28 @@ class _ResourceModule(Protocol):
     def setrlimit(self, resource_id: int, limits: tuple[int, int]) -> None: ...
 
     def getrlimit(self, resource_id: int) -> tuple[int, int]: ...
+
+
+class OwnedProcessSpawnError(RuntimeError):
+    """Safe ownership evidence for a contained process that failed during startup."""
+
+    def __init__(
+        self,
+        *,
+        process_id: int,
+        mode: str,
+        cleanup_errors: list[str],
+    ) -> None:
+        self.process_id = process_id
+        self.mode = mode
+        self.cleanup_verified = not cleanup_errors
+        self.cleanup_errors = tuple(cleanup_errors)
+        detail = ",".join(cleanup_errors) if cleanup_errors else "none"
+        super().__init__(
+            "owned process startup failed: "
+            f"pid={process_id} mode={mode} cleanup_verified={self.cleanup_verified} "
+            f"cleanup_errors={detail}"
+        )
 
 
 def enforce_linux_secret_memory_gate() -> None:
@@ -80,15 +106,128 @@ def enforce_linux_secret_memory_gate() -> None:
         )
 
 
+def broker_child_environment_payload(environment: Mapping[str, str]) -> str:
+    """Encode validated child-only environment values for the gated broker pipe."""
+    validated: dict[str, str] = {}
+    for name, value in environment.items():
+        if not name or "=" in name or "\x00" in name or "\x00" in value:
+            raise RuntimeError("broker child environment contained an invalid entry")
+        validated[name] = value
+    payload = json.dumps(
+        {
+            "schema_version": BROKER_CHILD_ENVIRONMENT_SCHEMA,
+            "environment": validated,
+        },
+        allow_nan=False,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if not validated or len(payload.encode("utf-8")) > BROKER_PROTOCOL_MAX_BYTES:
+        raise RuntimeError("broker child environment payload was empty or exceeded its byte limit")
+    return payload
+
+
+def consume_broker_child_environment() -> bool:
+    """Consume child-only environment values only after disabling Linux process inspection."""
+    credential_fd_text = os.environ.get(BROKER_CREDENTIAL_FD_ENV)
+    ready_fd_text = os.environ.get(BROKER_READY_FD_ENV)
+    if credential_fd_text is None and ready_fd_text is None:
+        return False
+    if credential_fd_text is None or ready_fd_text is None:
+        raise RuntimeError("broker child environment descriptors were incomplete")
+    enforce_linux_secret_memory_gate()
+    os.environ.pop(BROKER_CREDENTIAL_FD_ENV, None)
+    os.environ.pop(BROKER_READY_FD_ENV, None)
+    try:
+        credential_fd = int(credential_fd_text)
+        ready_fd = int(ready_fd_text)
+    except ValueError:
+        raise RuntimeError("broker child environment descriptors were invalid") from None
+    payload = bytearray()
+    try:
+        while True:
+            chunk = os.read(credential_fd, min(4096, BROKER_PROTOCOL_MAX_BYTES + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+            if len(payload) > BROKER_PROTOCOL_MAX_BYTES:
+                raise RuntimeError("broker child environment payload exceeded its byte limit")
+    except OSError:
+        raise RuntimeError("broker child environment payload could not be read") from None
+    finally:
+        with suppress(OSError):
+            os.close(credential_fd)
+    try:
+        decoded = cast(
+            object,
+            json.loads(
+                payload.decode("utf-8"),
+                object_pairs_hook=_reject_broker_duplicate_keys,
+            ),
+        )
+        if not isinstance(decoded, dict):
+            raise ValueError
+        raw_document = cast(dict[object, object], decoded)
+        if set(raw_document) != {"schema_version", "environment"}:
+            raise ValueError
+        document = cast(dict[str, object], raw_document)
+        if document.get("schema_version") != BROKER_CHILD_ENVIRONMENT_SCHEMA or not isinstance(
+            document.get("environment"), dict
+        ):
+            raise ValueError
+        environment = cast(dict[object, object], document["environment"])
+        if not environment:
+            raise ValueError
+        validated: dict[str, str] = {}
+        for raw_name, raw_value in environment.items():
+            if (
+                not isinstance(raw_name, str)
+                or not raw_name
+                or "=" in raw_name
+                or "\x00" in raw_name
+                or not isinstance(raw_value, str)
+                or "\x00" in raw_value
+            ):
+                raise ValueError
+            validated[raw_name] = raw_value
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+        raise RuntimeError("broker child environment payload was invalid") from None
+    os.environ.update(validated)
+    try:
+        if os.write(ready_fd, b"1") != 1:
+            raise RuntimeError("broker child environment acknowledgement was incomplete")
+    except OSError:
+        raise RuntimeError("broker child environment acknowledgement failed") from None
+    finally:
+        with suppress(OSError):
+            os.close(ready_fd)
+    return True
+
+
+def _reject_broker_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
+
+
 _BROKER_SCRIPT = r"""
+import base64
+import binascii
 import json
 import os
 import select
+import stat
 import subprocess
 import sys
 import time
 
-MAX_PROTOCOL_BYTES = 16 * 1024
+MAX_CREDENTIAL_BYTES = 16 * 1024
+MAX_STDIN_BYTES = 4 * 1024 * 1024
+MAX_SETUP_BYTES = 6 * 1024 * 1024
 HANDSHAKE_TIMEOUT_SECONDS = 5.0
 FD_ENV = "CLIO_RELAY_BROKER_CREDENTIAL_FD"
 READY_FD_ENV = "CLIO_RELAY_BROKER_READY_FD"
@@ -110,7 +249,6 @@ if sys.platform.startswith("linux"):
 def publish_ready(token):
     flags = (
         os.O_WRONLY
-        | os.O_TRUNC
         | int(getattr(os, "O_CLOEXEC", 0))
         | int(getattr(os, "O_NOFOLLOW", 0))
     )
@@ -128,12 +266,15 @@ def publish_ready(token):
         if (
             not isinstance(expected, dict)
             or observed != expected
-            or not os.path.isfile(sys.argv[2])
+            or not stat.S_ISREG(opened.st_mode)
             or opened.st_nlink != 1
         ):
             raise RuntimeError("broker readiness file identity changed")
         payload = token.encode("ascii")
-        if not payload or len(payload) > 128 or os.write(descriptor, payload) != len(payload):
+        if not payload or len(payload) > 128:
+            raise RuntimeError("broker readiness payload was invalid")
+        os.ftruncate(descriptor, 0)
+        if os.write(descriptor, payload) != len(payload):
             raise RuntimeError("broker readiness write was incomplete")
         os.fsync(descriptor)
     finally:
@@ -149,8 +290,8 @@ def close_fd(descriptor):
         pass
 
 
-raw_message = sys.stdin.buffer.readline(MAX_PROTOCOL_BYTES + 1)
-if not raw_message.endswith(b"\n") or len(raw_message) > MAX_PROTOCOL_BYTES:
+raw_message = sys.stdin.buffer.readline(MAX_SETUP_BYTES + 1)
+if not raw_message.endswith(b"\n") or len(raw_message) > MAX_SETUP_BYTES:
     raise SystemExit(125)
 try:
     message = json.loads(raw_message)
@@ -161,9 +302,43 @@ if not isinstance(message, dict) or message.get("release") is not True:
     raise SystemExit(125)
 credential = message.get("credential")
 readiness_token = message.get("readiness_token")
+stdin_payload_encoded = message.get("stdin_payload")
+interactive_stdin = message.get("interactive_stdin")
+target_environment = message.get("target_environment")
 if credential is not None and (os.name == "nt" or not isinstance(credential, str)):
     raise SystemExit(125)
 if not isinstance(readiness_token, str) or not readiness_token.isascii() or not readiness_token:
+    raise SystemExit(125)
+if stdin_payload_encoded is not None and not isinstance(stdin_payload_encoded, str):
+    raise SystemExit(125)
+if not isinstance(interactive_stdin, bool):
+    raise SystemExit(125)
+if interactive_stdin and stdin_payload_encoded is not None:
+    raise SystemExit(125)
+if target_environment is not None:
+    if os.name != "nt" or credential is not None or not isinstance(target_environment, dict):
+        raise SystemExit(125)
+    if not target_environment:
+        raise SystemExit(125)
+    for environment_name, environment_value in target_environment.items():
+        if (
+            not isinstance(environment_name, str)
+            or not environment_name
+            or "=" in environment_name
+            or "\x00" in environment_name
+            or not isinstance(environment_value, str)
+            or "\x00" in environment_value
+        ):
+            raise SystemExit(125)
+try:
+    stdin_payload = (
+        None
+        if stdin_payload_encoded is None
+        else base64.b64decode(stdin_payload_encoded.encode("ascii"), validate=True)
+    )
+except (UnicodeEncodeError, binascii.Error):
+    raise SystemExit(125)
+if stdin_payload is not None and len(stdin_payload) > MAX_STDIN_BYTES:
     raise SystemExit(125)
 
 read_fd = None
@@ -173,9 +348,13 @@ ready_write_fd = None
 process = None
 try:
     popen_kwargs = {}
+    if target_environment is not None:
+        child_env = os.environ.copy()
+        child_env.update(target_environment)
+        popen_kwargs["env"] = child_env
     if credential is not None:
         credential_bytes = credential.encode("utf-8")
-        if len(credential_bytes) > MAX_PROTOCOL_BYTES:
+        if len(credential_bytes) > MAX_CREDENTIAL_BYTES:
             raise RuntimeError("broker credential exceeded its byte limit")
         read_fd, write_fd = os.pipe()
         ready_read_fd, ready_write_fd = os.pipe()
@@ -186,7 +365,15 @@ try:
             "env": child_env,
             "pass_fds": (read_fd, ready_write_fd),
         }
-    process = subprocess.Popen(command, **popen_kwargs)
+    process = subprocess.Popen(
+        command,
+        **popen_kwargs,
+        stdin=(
+            subprocess.PIPE
+            if stdin_payload is not None or interactive_stdin
+            else subprocess.DEVNULL
+        ),
+    )
     close_fd(read_fd)
     read_fd = None
     close_fd(ready_write_fd)
@@ -234,6 +421,21 @@ try:
         close_fd(ready_read_fd)
         ready_read_fd = None
     publish_ready(readiness_token)
+    if stdin_payload is not None:
+        if process.stdin is None:
+            raise RuntimeError("stdin consumer did not expose its input pipe")
+        process.stdin.write(stdin_payload)
+        process.stdin.close()
+    elif interactive_stdin:
+        if process.stdin is None:
+            raise RuntimeError("interactive stdin consumer did not expose its input pipe")
+        while True:
+            chunk = os.read(sys.stdin.fileno(), 64 * 1024)
+            if not chunk:
+                break
+            process.stdin.write(chunk)
+            process.stdin.flush()
+        process.stdin.close()
 except BaseException:
     close_fd(read_fd)
     close_fd(write_fd)
@@ -282,29 +484,53 @@ class _BrokerReadiness:
 
 _OWNED_PROCESSES: dict[int, _OwnedProcessState] = {}
 _OWNED_PROCESSES_LOCK = threading.Lock()
+_OWNED_PROCESSES_RELEASING: set[int] = set()
+_containment_capability_cache: dict[str, object] | None = None
+_CONTAINMENT_CAPABILITY_LOCK = threading.Lock()
 
 
-@lru_cache(maxsize=1)
-def containment_capability() -> dict[str, object]:
+def containment_capability(*, startup_deadline: float | None = None) -> dict[str, object]:
     """Return whether this host offers kernel-enforced descendant containment."""
+    global _containment_capability_cache
+    with _CONTAINMENT_CAPABILITY_LOCK:
+        cached = _containment_capability_cache
+    if cached is not None:
+        return dict(cached)
     if os.name == "nt":
         try:
             handle = _create_windows_job()
         except RuntimeError as exc:
-            return {"mode": "windows_job_object", "enforceable": False, "reason": str(exc)}
+            result: dict[str, object] = {
+                "mode": "windows_job_object",
+                "enforceable": False,
+                "reason": str(exc),
+            }
+            with _CONTAINMENT_CAPABILITY_LOCK:
+                _containment_capability_cache = result
+            return dict(result)
         _close_windows_handle(handle)
-        return {
+        result = {
             "mode": "windows_job_object",
             "enforceable": True,
             "reason": "kill-on-close Job Object available",
         }
+        with _CONTAINMENT_CAPABILITY_LOCK:
+            _containment_capability_cache = result
+        return dict(result)
     if sys.platform.startswith("linux"):
-        return _probe_linux_systemd_scope_capability()
-    return {
+        result = _probe_linux_systemd_scope_capability(startup_deadline=startup_deadline)
+        if result.pop("transient", False) is not True:
+            with _CONTAINMENT_CAPABILITY_LOCK:
+                _containment_capability_cache = result
+        return dict(result)
+    result = {
         "mode": "cooperative_process_group",
         "enforceable": False,
         "reason": "no supported kernel containment provider",
     }
+    with _CONTAINMENT_CAPABILITY_LOCK:
+        _containment_capability_cache = result
+    return dict(result)
 
 
 def spawn_owned_process(
@@ -312,13 +538,26 @@ def spawn_owned_process(
     *,
     on_ready: Callable[[int, dict[str, object]], None] | None = None,
     credential_payload: str | None = None,
+    stdin_payload: bytes | None = None,
+    interactive_stdin: bool = False,
+    target_environment: Mapping[str, str] | None = None,
+    startup_timeout_seconds: float = BROKER_READY_TIMEOUT_SECONDS,
+    require_enforceable: bool = False,
     **popen_kwargs: Any,
 ) -> subprocess.Popen[str]:
     """Spawn a root process after establishing enforceable containment when available."""
+    if not math.isfinite(startup_timeout_seconds) or startup_timeout_seconds <= 0:
+        raise ValueError("owned process startup timeout must be finite and positive")
+    startup_deadline = time.monotonic() + startup_timeout_seconds
     _validate_broker_credential_payload(credential_payload)
-    capability = containment_capability()
+    validated_target_environment = _validate_broker_target_environment(target_environment)
+    if interactive_stdin and stdin_payload is not None:
+        raise ValueError("interactive owned process stdin cannot include a fixed payload")
+    capability = containment_capability(startup_deadline=startup_deadline)
     mode = str(capability["mode"])
     enforceable = capability.get("enforceable") is True
+    if require_enforceable and not enforceable:
+        raise RuntimeError("enforceable owned process containment is unavailable")
     if enforceable and mode == "windows_job_object":
         handle = _create_windows_job()
         process, readiness = _spawn_broker(command, popen_kwargs)
@@ -335,23 +574,31 @@ def spawn_owned_process(
                 process,
                 readiness=readiness,
                 credential_payload=credential_payload,
+                stdin_payload=stdin_payload,
+                interactive_stdin=interactive_stdin,
+                target_environment=validated_target_environment,
+                startup_deadline=startup_deadline,
             )
         except BaseException:
-            _remove_broker_readiness(readiness)
-            if registered:
-                terminate_owned_process(process)
-                release_owned_process(process)
-            else:
-                process.kill()
-                process.wait(timeout=TERMINATION_TIMEOUT_SECONDS)
-                _close_windows_handle(handle)
-            raise
+            cleanup_errors = _cleanup_failed_owned_spawn(
+                process,
+                readiness=readiness,
+                registered=registered,
+                unregistered_windows_handle=None if registered else handle,
+            )
+            raise OwnedProcessSpawnError(
+                process_id=process.pid,
+                mode=mode,
+                cleanup_errors=cleanup_errors,
+            ) from None
         return process
     if enforceable and mode == "linux_systemd_scope":
         process, unit, scope, readiness = _spawn_linux_systemd_scope(
             command,
             popen_kwargs,
+            startup_deadline=startup_deadline,
         )
+        registered = False
         try:
             _register_owned_process(
                 process.pid,
@@ -362,36 +609,118 @@ def spawn_owned_process(
                     systemd_unit=unit,
                 ),
             )
+            registered = True
             _notify_containment_ready(process, on_ready)
             _release_broker(
                 process,
                 readiness=readiness,
                 credential_payload=credential_payload,
+                stdin_payload=stdin_payload,
+                interactive_stdin=interactive_stdin,
+                target_environment=validated_target_environment,
+                startup_deadline=startup_deadline,
             )
         except BaseException:
-            _remove_broker_readiness(readiness)
-            terminate_owned_process(process)
-            release_owned_process(process)
-            raise
+            cleanup_errors = _cleanup_failed_owned_spawn(
+                process,
+                readiness=readiness,
+                registered=registered,
+                unregistered_systemd_unit=None if registered else unit,
+                unregistered_systemd_scope=None if registered else scope,
+            )
+            raise OwnedProcessSpawnError(
+                process_id=process.pid,
+                mode=mode,
+                cleanup_errors=cleanup_errors,
+            ) from None
         return process
     process, readiness = _spawn_broker(command, popen_kwargs)
+    registered = False
     try:
         _register_owned_process(
             process.pid,
             _OwnedProcessState(mode="cooperative_process_group", enforceable=False),
         )
+        registered = True
         _notify_containment_ready(process, on_ready)
         _release_broker(
             process,
             readiness=readiness,
             credential_payload=credential_payload,
+            stdin_payload=stdin_payload,
+            interactive_stdin=interactive_stdin,
+            target_environment=validated_target_environment,
+            startup_deadline=startup_deadline,
         )
     except BaseException:
-        _remove_broker_readiness(readiness)
-        terminate_owned_process(process)
-        release_owned_process(process)
-        raise
+        cleanup_errors = _cleanup_failed_owned_spawn(
+            process,
+            readiness=readiness,
+            registered=registered,
+        )
+        raise OwnedProcessSpawnError(
+            process_id=process.pid,
+            mode="cooperative_process_group",
+            cleanup_errors=cleanup_errors,
+        ) from None
     return process
+
+
+def _cleanup_failed_owned_spawn(
+    process: subprocess.Popen[str],
+    *,
+    readiness: _BrokerReadiness,
+    registered: bool,
+    unregistered_windows_handle: int | None = None,
+    unregistered_systemd_unit: str | None = None,
+    unregistered_systemd_scope: Path | None = None,
+) -> list[str]:
+    """Attempt every cleanup step after a failed broker launch, preserving ownership."""
+    errors: list[str] = []
+    if registered:
+        try:
+            terminate_owned_process(process)
+        except BaseException as exc:
+            errors.append(f"owned spawn termination failed: {type(exc).__name__}")
+        try:
+            release_owned_process(process)
+        except BaseException as exc:
+            errors.append(f"owned spawn provider release failed: {type(exc).__name__}")
+    elif unregistered_systemd_unit is not None and unregistered_systemd_scope is not None:
+        try:
+            _terminate_linux_systemd_scope(
+                unregistered_systemd_unit,
+                unregistered_systemd_scope,
+            )
+        except BaseException as exc:
+            errors.append(f"unregistered systemd scope termination failed: {type(exc).__name__}")
+        try:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=TERMINATION_TIMEOUT_SECONDS)
+        except BaseException as exc:
+            errors.append(f"unregistered systemd broker termination failed: {type(exc).__name__}")
+        try:
+            _release_linux_systemd_scope(unregistered_systemd_unit)
+        except BaseException as exc:
+            errors.append(f"unregistered systemd scope release failed: {type(exc).__name__}")
+    else:
+        try:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=TERMINATION_TIMEOUT_SECONDS)
+        except BaseException as exc:
+            errors.append(f"unregistered broker termination failed: {type(exc).__name__}")
+        if unregistered_windows_handle is not None:
+            try:
+                _close_windows_handle(unregistered_windows_handle)
+            except BaseException as exc:
+                errors.append(f"unregistered Job Object release failed: {type(exc).__name__}")
+    try:
+        _remove_broker_readiness(readiness)
+    except BaseException as exc:
+        errors.append(f"broker readiness cleanup failed: {type(exc).__name__}")
+    return errors
 
 
 def owned_process_metadata(process_id: int) -> dict[str, object]:
@@ -424,6 +753,9 @@ def terminate_owned_process(process: subprocess.Popen[str]) -> None:
     """Terminate a registered root process through its strongest ownership provider."""
     with _OWNED_PROCESSES_LOCK:
         state = _OWNED_PROCESSES.get(process.pid)
+        releasing = process.pid in _OWNED_PROCESSES_RELEASING
+    if releasing:
+        raise RuntimeError(f"process containment release is already in progress: {process.pid}")
     if state is None or not state.enforceable:
         terminate_process_tree(process, owns_group=True)
         return
@@ -448,13 +780,27 @@ def terminate_owned_process(process: subprocess.Popen[str]) -> None:
 def release_owned_process(process: subprocess.Popen[str]) -> None:
     """Release an empty containment provider after execution observation completes."""
     with _OWNED_PROCESSES_LOCK:
-        state = _OWNED_PROCESSES.pop(process.pid, None)
-    if state is None:
-        return
-    if state.job_handle is not None:
-        _close_windows_handle(state.job_handle)
-    if state.systemd_unit is not None:
-        _release_linux_systemd_scope(state.systemd_unit)
+        state = _OWNED_PROCESSES.get(process.pid)
+        if state is None:
+            return
+        if process.pid in _OWNED_PROCESSES_RELEASING:
+            raise RuntimeError(f"process containment release is already in progress: {process.pid}")
+        _OWNED_PROCESSES_RELEASING.add(process.pid)
+    try:
+        ensure_owned_process_tree_empty(process)
+        if state.job_handle is not None:
+            _close_windows_handle(state.job_handle)
+        if state.systemd_unit is not None:
+            _release_linux_systemd_scope(state.systemd_unit)
+    except BaseException:
+        with _OWNED_PROCESSES_LOCK:
+            _OWNED_PROCESSES_RELEASING.discard(process.pid)
+        raise
+    with _OWNED_PROCESSES_LOCK:
+        _OWNED_PROCESSES_RELEASING.discard(process.pid)
+        if _OWNED_PROCESSES.get(process.pid) is not state:
+            raise RuntimeError("owned process registration changed during provider release")
+        _OWNED_PROCESSES.pop(process.pid)
 
 
 def owner_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
@@ -767,25 +1113,53 @@ def _validate_broker_credential_payload(payload: str | None) -> None:
         raise RuntimeError("broker credential payload is empty or exceeds its byte limit")
 
 
+def _validate_broker_target_environment(
+    environment: Mapping[str, str] | None,
+) -> dict[str, str] | None:
+    """Validate Windows target-only values delivered after Job Object assignment."""
+    if environment is None:
+        return None
+    if os.name != "nt":
+        raise RuntimeError("broker target environment setup is restricted to Windows")
+    payload = broker_child_environment_payload(environment)
+    if len(payload.encode("utf-8")) > BROKER_PROTOCOL_MAX_BYTES:
+        raise RuntimeError("broker target environment exceeded its byte limit")
+    return dict(environment)
+
+
 def _release_broker(
     process: subprocess.Popen[str],
     *,
     readiness: _BrokerReadiness,
     credential_payload: str | None = None,
+    stdin_payload: bytes | None = None,
+    interactive_stdin: bool = False,
+    target_environment: Mapping[str, str] | None = None,
+    startup_deadline: float,
 ) -> None:
     if process.stdin is None:
         raise RuntimeError("containment broker did not expose its setup channel")
+    if stdin_payload is not None and len(stdin_payload) > BROKER_STDIN_MAX_BYTES:
+        raise RuntimeError("containment broker stdin payload exceeded its byte limit")
     message = json.dumps(
         {
             "release": True,
             "credential": credential_payload,
             "readiness_token": readiness.token,
+            "stdin_payload": (
+                None if stdin_payload is None else base64.b64encode(stdin_payload).decode("ascii")
+            ),
+            "interactive_stdin": interactive_stdin,
+            "target_environment": (
+                None if target_environment is None else dict(target_environment)
+            ),
         },
         separators=(",", ":"),
     )
-    encoded = (message + "\n").encode("utf-8")
-    if len(encoded) > BROKER_PROTOCOL_MAX_BYTES:
+    setup = (message + "\n").encode("utf-8")
+    if len(setup) > BROKER_SETUP_MAX_BYTES:
         raise RuntimeError("containment broker setup message exceeded its byte limit")
+    encoded = setup
     setup_channel = process.stdin
     completed = threading.Event()
     errors: list[BaseException] = []
@@ -809,7 +1183,7 @@ def _release_broker(
         daemon=True,
     )
     writer.start()
-    if not completed.wait(BROKER_HANDSHAKE_TIMEOUT_SECONDS):
+    if not completed.wait(max(0.0, startup_deadline - time.monotonic())):
         if process.poll() is None:
             process.kill()
         with suppress(OSError):
@@ -817,13 +1191,14 @@ def _release_broker(
         process.stdin = None
         process.wait(timeout=TERMINATION_TIMEOUT_SECONDS)
         raise RuntimeError("containment broker setup write timed out")
-    try:
-        if errors:
-            raise RuntimeError(f"containment broker setup write failed: {errors[0]}")
-    finally:
+    if errors:
         setup_channel.close()
         process.stdin = None
-    _await_broker_readiness(process, readiness)
+        raise RuntimeError(f"containment broker setup write failed: {errors[0]}")
+    if not interactive_stdin:
+        setup_channel.close()
+        process.stdin = None
+    _await_broker_readiness(process, readiness, startup_deadline=startup_deadline)
 
 
 def _precreate_broker_readiness() -> _BrokerReadiness:
@@ -870,13 +1245,19 @@ def _precreate_broker_readiness() -> _BrokerReadiness:
 def _await_broker_readiness(
     process: subprocess.Popen[str],
     readiness: _BrokerReadiness,
+    *,
+    startup_deadline: float | None = None,
 ) -> None:
     """Wait until the released child has consumed credentials or fail boundedly."""
     descriptor = readiness.descriptor
     if descriptor is None:
         raise RuntimeError("containment broker readiness channel was already closed")
     expected = readiness.token.encode("ascii")
-    deadline = time.monotonic() + BROKER_READY_TIMEOUT_SECONDS
+    deadline = (
+        startup_deadline
+        if startup_deadline is not None
+        else time.monotonic() + BROKER_READY_TIMEOUT_SECONDS
+    )
     try:
         while time.monotonic() < deadline:
             try:
@@ -941,7 +1322,10 @@ def _remove_broker_readiness(readiness: _BrokerReadiness) -> None:
             os.close(descriptor)
 
 
-def _probe_linux_systemd_scope_capability() -> dict[str, object]:
+def _probe_linux_systemd_scope_capability(
+    *,
+    startup_deadline: float | None,
+) -> dict[str, object]:
     if not (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
         return {
             "mode": "linux_systemd_scope",
@@ -976,15 +1360,22 @@ def _probe_linux_systemd_scope_capability() -> dict[str, object]:
             check=False,
             capture_output=True,
             text=True,
-            timeout=TERMINATION_TIMEOUT_SECONDS,
+            timeout=_remaining_deadline_seconds(
+                startup_deadline,
+                maximum=TERMINATION_TIMEOUT_SECONDS,
+            ),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {
             "mode": "linux_systemd_scope",
             "enforceable": False,
-            "reason": f"systemd user-scope probe failed: {exc}",
+            "reason": f"systemd user-scope probe failed: {type(exc).__name__}",
+            "transient": isinstance(exc, subprocess.TimeoutExpired),
         }
-    _release_linux_systemd_scope(f"{unit_base}.scope")
+    _release_linux_systemd_scope(
+        f"{unit_base}.scope",
+        startup_deadline=startup_deadline,
+    )
     if result.returncode != 0:
         return {
             "mode": "linux_systemd_scope",
@@ -1001,6 +1392,8 @@ def _probe_linux_systemd_scope_capability() -> dict[str, object]:
 def _spawn_linux_systemd_scope(
     command: list[str],
     popen_kwargs: dict[str, Any],
+    *,
+    startup_deadline: float,
 ) -> tuple[subprocess.Popen[str], str, Path, _BrokerReadiness]:
     if "stdin" in popen_kwargs:
         raise RuntimeError("owned process launch reserves stdin for containment setup")
@@ -1054,30 +1447,93 @@ def _spawn_linux_systemd_scope(
         _remove_broker_readiness(readiness)
         raise
     try:
-        control_group = _wait_for_systemd_control_group(unit, process=process)
+        control_group = _wait_for_systemd_control_group(
+            unit,
+            process=process,
+            startup_deadline=startup_deadline,
+        )
+        scope = _validated_systemd_cgroup_path(control_group, unit=unit)
     except BaseException:
+        cleanup_errors = _cleanup_failed_linux_systemd_spawn(
+            process,
+            unit=unit,
+            readiness=readiness,
+            startup_deadline=startup_deadline,
+        )
+        raise OwnedProcessSpawnError(
+            process_id=process.pid,
+            mode="linux_systemd_scope",
+            cleanup_errors=cleanup_errors,
+        ) from None
+    return process, unit, scope, readiness
+
+
+def _cleanup_failed_linux_systemd_spawn(
+    process: subprocess.Popen[str],
+    *,
+    unit: str,
+    readiness: _BrokerReadiness,
+    startup_deadline: float,
+) -> list[str]:
+    """Attempt every cleanup action for a scope that failed before registration."""
+    errors: list[str] = []
+    try:
         if process.poll() is None:
             process.kill()
-        process.wait(timeout=TERMINATION_TIMEOUT_SECONDS)
-        _release_linux_systemd_scope(unit)
+    except BaseException as exc:
+        errors.append(f"unregistered systemd broker termination failed: {type(exc).__name__}")
+    try:
+        process.wait(
+            timeout=_remaining_deadline_seconds(
+                startup_deadline,
+                maximum=TERMINATION_TIMEOUT_SECONDS,
+            )
+        )
+    except BaseException as exc:
+        errors.append(f"unregistered systemd broker wait failed: {type(exc).__name__}")
+    try:
+        _release_linux_systemd_scope(unit, startup_deadline=startup_deadline)
+    except BaseException as exc:
+        errors.append(f"unregistered systemd scope release failed: {type(exc).__name__}")
+    try:
         _remove_broker_readiness(readiness)
-        raise
-    scope = Path("/sys/fs/cgroup") / control_group.lstrip("/")
-    if not scope.is_dir() or not (scope / "cgroup.procs").is_file():
-        process.kill()
-        process.wait(timeout=TERMINATION_TIMEOUT_SECONDS)
-        _release_linux_systemd_scope(unit)
-        _remove_broker_readiness(readiness)
-        raise RuntimeError(f"systemd scope did not expose its cgroup: {control_group}")
-    return process, unit, scope, readiness
+    except BaseException as exc:
+        errors.append(f"broker readiness cleanup failed: {type(exc).__name__}")
+    return errors
+
+
+def _validated_systemd_cgroup_path(
+    control_group: str,
+    *,
+    unit: str,
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+) -> Path:
+    """Bind systemctl ControlGroup output to the exact newly-created delegated unit."""
+    if (
+        not control_group.startswith("/")
+        or "\x00" in control_group
+        or any(part in {"", ".", ".."} for part in control_group.split("/")[1:])
+    ):
+        raise RuntimeError("systemd scope returned an invalid ControlGroup path")
+    try:
+        root = cgroup_root.resolve(strict=True)
+        candidate = (root / control_group.lstrip("/")).resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("systemd scope ControlGroup path could not be resolved") from exc
+    if candidate == root or not candidate.is_relative_to(root) or candidate.name != unit:
+        raise RuntimeError("systemd scope ControlGroup did not match its exact unit")
+    if not candidate.is_dir() or not (candidate / "cgroup.procs").is_file():
+        raise RuntimeError("systemd scope did not expose its exact cgroup")
+    return candidate
 
 
 def _wait_for_systemd_control_group(
     unit: str,
     *,
     process: subprocess.Popen[str],
+    startup_deadline: float,
 ) -> str:
-    deadline = time.monotonic() + TERMINATION_TIMEOUT_SECONDS
+    deadline = startup_deadline
     last_error = "unit was not observable"
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -1093,13 +1549,16 @@ def _wait_for_systemd_control_group(
             )
         result = _systemctl_user(
             ["show", unit, "--property=ControlGroup", "--value"],
-            timeout_seconds=DISCOVERY_TIMEOUT_SECONDS,
+            timeout_seconds=_remaining_deadline_seconds(
+                deadline,
+                maximum=DISCOVERY_TIMEOUT_SECONDS,
+            ),
         )
         value = result.stdout.strip()
         if result.returncode == 0 and value:
             return value
         last_error = result.stderr.strip() or last_error
-        time.sleep(POLL_SECONDS)
+        time.sleep(min(POLL_SECONDS, max(0.0, deadline - time.monotonic())))
     raise RuntimeError(f"systemd scope setup timed out: {unit}: {last_error}")
 
 
@@ -1133,11 +1592,38 @@ def _terminate_linux_systemd_scope(unit: str, cgroup_path: Path) -> None:
         raise RuntimeError(f"systemd scope remained populated after cleanup: {unit}: {residual}")
 
 
-def _release_linux_systemd_scope(unit: str) -> None:
+def _release_linux_systemd_scope(
+    unit: str,
+    *,
+    startup_deadline: float | None = None,
+) -> None:
     if shutil.which("systemctl") is None:
         return
-    _systemctl_user(["stop", unit], timeout_seconds=DISCOVERY_TIMEOUT_SECONDS)
-    _systemctl_user(["reset-failed", unit], timeout_seconds=DISCOVERY_TIMEOUT_SECONDS)
+    _systemctl_user(
+        ["stop", unit],
+        timeout_seconds=_remaining_deadline_seconds(
+            startup_deadline,
+            maximum=DISCOVERY_TIMEOUT_SECONDS,
+        ),
+    )
+    _systemctl_user(
+        ["reset-failed", unit],
+        timeout_seconds=_remaining_deadline_seconds(
+            startup_deadline,
+            maximum=DISCOVERY_TIMEOUT_SECONDS,
+        ),
+    )
+
+
+def _remaining_deadline_seconds(
+    deadline: float | None,
+    *,
+    maximum: float,
+) -> float:
+    """Return one finite subprocess timeout capped by a shared absolute deadline."""
+    if deadline is None:
+        return maximum
+    return max(0.001, min(maximum, deadline - time.monotonic()))
 
 
 def _systemctl_user(

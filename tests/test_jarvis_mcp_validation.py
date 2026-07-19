@@ -18,6 +18,7 @@ from clio_relay.jarvis_mcp import (
     jarvis_mcp_server_args,
     jarvis_user_contract,
     jarvis_user_contract_digest,
+    render_virtual_jarvis_agent_context,
     virtual_jarvis_tool_definitions,
 )
 from clio_relay.jarvis_mcp_validation import build_jarvis_mcp_validation_report
@@ -40,6 +41,18 @@ def _pinned_jarvis_mcp_wheel(  # pyright: ignore[reportUnusedFunction]
             ]
         ),
     )
+
+
+def test_virtual_jarvis_context_teaches_bounded_interactive_waiting() -> None:
+    """Small models can avoid an unnecessary relay_wait without hiding durable queuing."""
+
+    context = render_virtual_jarvis_agent_context()
+
+    assert "ordinary interactive operations" in context
+    assert "wait_for_terminal=true" in context
+    assert "current call" in context
+    assert "intentionally queuing transport" in context
+    assert "not workload completion" in context
 
 
 def test_jarvis_mcp_validation_accepts_structured_durable_run() -> None:

@@ -10,16 +10,18 @@ import math
 from pathlib import PurePosixPath
 from typing import Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.identifiers import DurableRecordId
 from clio_relay.jarvis_mcp import (
     jarvis_cd_lock_binding_expectation,
     jarvis_mcp_server_artifact_binding_verified,
 )
+from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.models import (
     ArtifactRef,
     JobKind,
@@ -29,16 +31,27 @@ from clio_relay.models import (
     RelayJob,
 )
 from clio_relay.relay_ops import read_artifact_bytes
-from clio_relay.remote_cli import run_remote_clio, should_execute_on_cluster
+from clio_relay.remote_cli import (
+    run_remote_clio,
+    run_remote_jarvis_runtime_authority,
+    should_execute_on_cluster,
+)
 from clio_relay.runtime_metadata import JarvisNativeExecutionDocuments, native_execution_documents
 from clio_relay.session_api import OwnedSessionApiClient
 
 JSON = dict[str, Any]
-JARVIS_SERVICE_RUNTIME_SCHEMA = "jarvis.service-runtime.v1"
+JARVIS_SERVICE_RUNTIME_SCHEMA_V1 = "jarvis.service-runtime.v1"
+JARVIS_SERVICE_RUNTIME_SCHEMA_V2 = "jarvis.service-runtime.v2"
+JARVIS_SERVICE_RUNTIME_SCHEMA = JARVIS_SERVICE_RUNTIME_SCHEMA_V2
 JARVIS_SERVICE_RUNTIME_SNAPSHOT_SCHEMA = "jarvis.execution.service-runtimes.v1"
 JARVIS_DATASET_DESCRIPTOR_SCHEMA = "jarvis.dataset-descriptor.v1"
-RELAY_JARVIS_RUNTIME_BINDING_SCHEMA = "clio-relay.jarvis-service-runtime-binding.v1"
+RELAY_JARVIS_RUNTIME_BINDING_SCHEMA_V1 = "clio-relay.jarvis-service-runtime-binding.v1"
+RELAY_JARVIS_RUNTIME_BINDING_SCHEMA_V2 = "clio-relay.jarvis-service-runtime-binding.v2"
+RELAY_JARVIS_RUNTIME_BINDING_SCHEMA = RELAY_JARVIS_RUNTIME_BINDING_SCHEMA_V2
+JARVIS_SERVICE_RUNTIME_AUTHORITY_SCHEMA = "jarvis.execution.service-runtime-authority.v1"
 _HEX_DIGITS = frozenset("0123456789abcdef")
+_MAX_AUTHORITY_OUTPUT_BYTES = 32 * 1024
+_AUTHORITY_QUERY_TIMEOUT_SECONDS = 30
 
 
 class JarvisArtifactIdentity(BaseModel):
@@ -151,12 +164,78 @@ class JarvisDatasetDescriptor(BaseModel):
         return self
 
 
+class JarvisServiceAuthorization(BaseModel):
+    """Public digest identity for one execution-owned service capability."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+
+    scheme: Literal["bearer"]
+    token_sha256: str
+
+    @field_validator("token_sha256")
+    @classmethod
+    def validate_token_sha256(cls, value: str) -> str:
+        """Require a canonical digest without exposing the bearer capability."""
+        if len(value) != 64 or any(character not in _HEX_DIGITS for character in value):
+            raise ValueError("service runtime token_sha256 must be 64 lowercase hex characters")
+        return value
+
+
+class JarvisPrivateServiceAuthorization(BaseModel):
+    """Process-local bearer returned only by JARVIS's trusted resolver."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+
+    scheme: Literal["bearer"]
+    token: SecretStr
+
+    @field_validator("token")
+    @classmethod
+    def validate_token(cls, value: SecretStr) -> SecretStr:
+        """Require the exact 256-bit lowercase hexadecimal capability shape."""
+        token = value.get_secret_value()
+        if len(token) != 64 or any(character not in _HEX_DIGITS for character in token):
+            raise ValueError("service runtime bearer token must be 64 lowercase hex characters")
+        return value
+
+
+class JarvisServiceRuntimeAuthority(BaseModel):
+    """Identity-checked private authority for one exact current service revision."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+
+    schema_version: Literal["jarvis.execution.service-runtime-authority.v1"]
+    execution_id: str = Field(min_length=1, max_length=512)
+    pipeline_id: str = Field(min_length=1, max_length=512)
+    package_id: str = Field(min_length=1, max_length=256)
+    service_instance_id: str = Field(min_length=1, max_length=512)
+    revision: int = Field(ge=1)
+    token_sha256: str
+    authorization: JarvisPrivateServiceAuthorization
+
+    @field_validator("token_sha256")
+    @classmethod
+    def validate_token_sha256(cls, value: str) -> str:
+        """Require the canonical public identity of the resolved private token."""
+        return _canonical_sha256(value, "service runtime authority token_sha256")
+
+    @model_validator(mode="after")
+    def validate_authority_digest(self) -> JarvisServiceRuntimeAuthority:
+        """Bind the private bearer to the public digest in the same response."""
+        observed = hashlib.sha256(
+            self.authorization.token.get_secret_value().encode("ascii")
+        ).hexdigest()
+        if not hmac.compare_digest(observed, self.token_sha256):
+            raise ValueError("service runtime authority token did not match token_sha256")
+        return self
+
+
 class JarvisServiceRuntime(BaseModel):
     """Latest exact service report for one JARVIS package instance."""
 
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
 
-    schema_version: Literal["jarvis.service-runtime.v1"]
+    schema_version: Literal["jarvis.service-runtime.v1", "jarvis.service-runtime.v2"]
     execution_id: str = Field(min_length=1, max_length=512)
     package_name: str = Field(min_length=1, max_length=256)
     package_id: str = Field(min_length=1, max_length=256)
@@ -172,6 +251,10 @@ class JarvisServiceRuntime(BaseModel):
     state_path: str
     command_path: str
     delivery_mode: Literal["push"]
+    authorization: JarvisServiceAuthorization | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     dataset_descriptor: JarvisDatasetDescriptor
     message: str | None = Field(default=None, max_length=16_384)
     observed_at_epoch: float = Field(ge=0)
@@ -221,6 +304,16 @@ class JarvisServiceRuntime(BaseModel):
         if not math.isfinite(value):
             raise ValueError("service runtime observed_at_epoch must be finite")
         return value
+
+    @model_validator(mode="after")
+    def validate_versioned_authorization(self) -> JarvisServiceRuntime:
+        """Keep released v1 unauthenticated and require a capability in v2."""
+        if self.schema_version == JARVIS_SERVICE_RUNTIME_SCHEMA_V1:
+            if self.authorization is not None:
+                raise ValueError("service runtime v1 cannot contain authorization")
+        elif self.authorization is None:
+            raise ValueError("service runtime v2 requires authorization")
+        return self
 
 
 class JarvisExecutionServiceRuntimes(BaseModel):
@@ -283,9 +376,10 @@ class JarvisServiceRuntimeBinding(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    schema_version: Literal["clio-relay.jarvis-service-runtime-binding.v1"] = (
-        RELAY_JARVIS_RUNTIME_BINDING_SCHEMA
-    )
+    schema_version: Literal[
+        "clio-relay.jarvis-service-runtime-binding.v1",
+        "clio-relay.jarvis-service-runtime-binding.v2",
+    ] = RELAY_JARVIS_RUNTIME_BINDING_SCHEMA_V2
     source_relay_job_id: str = Field(min_length=1, max_length=512)
     source_relay_artifact_id: str = Field(min_length=1, max_length=512)
     source_relay_artifact_sha256: str
@@ -298,18 +392,45 @@ class JarvisServiceRuntimeBinding(BaseModel):
     service_instance_id: str = Field(min_length=1, max_length=512)
     service_revision: int = Field(ge=1)
     service_report_sha256: str
+    service_runtime_schema_version: Literal["jarvis.service-runtime.v2"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    authorization_sha256: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     dataset_descriptor_sha256: str
     dataset_descriptor: JarvisDatasetDescriptor
 
     @field_validator(
         "source_relay_artifact_sha256",
         "service_report_sha256",
+        "authorization_sha256",
         "dataset_descriptor_sha256",
     )
     @classmethod
-    def validate_digests(cls, value: str) -> str:
+    def validate_digests(cls, value: str | None) -> str | None:
         """Require canonical SHA-256 values for every persisted evidence digest."""
+        if value is None:
+            return value
         return _canonical_sha256(value, "binding digest")
+
+    @model_validator(mode="after")
+    def validate_versioned_runtime_binding(self) -> JarvisServiceRuntimeBinding:
+        """Require authenticated runtime provenance only in binding v2."""
+        if self.schema_version == RELAY_JARVIS_RUNTIME_BINDING_SCHEMA_V1:
+            if (
+                self.service_runtime_schema_version is not None
+                or self.authorization_sha256 is not None
+            ):
+                raise ValueError("JARVIS runtime binding v1 cannot contain v2 authorization fields")
+        elif (
+            self.service_runtime_schema_version != JARVIS_SERVICE_RUNTIME_SCHEMA_V2
+            or self.authorization_sha256 is None
+        ):
+            raise ValueError("JARVIS runtime binding v2 requires authenticated runtime provenance")
+        return self
 
 
 class JarvisServiceRuntimeHandoff(BaseModel):
@@ -347,6 +468,32 @@ def resolve_jarvis_service_runtime(
     service_instance_id: str | None = None,
 ) -> VerifiedJarvisServiceRuntime:
     """Resolve one ready service solely from a verified durable JARVIS MCP result."""
+    return _resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        settings=settings,
+        source_job_id=source_job_id,
+        source_artifact_id=source_artifact_id,
+        package_id=package_id,
+        package_name=package_name,
+        service_instance_id=service_instance_id,
+        allow_legacy_v1=False,
+    )
+
+
+def _resolve_jarvis_service_runtime(
+    *,
+    queue: ClioCoreQueue,
+    definition: ClusterDefinition,
+    settings: RelaySettings | None,
+    source_job_id: str,
+    source_artifact_id: str,
+    package_id: str,
+    package_name: str,
+    service_instance_id: str | None,
+    allow_legacy_v1: bool,
+) -> VerifiedJarvisServiceRuntime:
+    """Resolve an exact runtime, optionally for re-verifying a released v1 binding."""
     job, artifact, document = _load_source(
         queue=queue,
         definition=definition,
@@ -367,6 +514,10 @@ def resolve_jarvis_service_runtime(
         package_name=package_name,
         service_instance_id=service_instance_id,
     )
+    if runtime.schema_version == JARVIS_SERVICE_RUNTIME_SCHEMA_V1 and not allow_legacy_v1:
+        raise ValueError(
+            "legacy unauthenticated JARVIS service runtimes cannot create new relay bindings"
+        )
     _validate_runtime_package(native, runtime=runtime)
     scheduler_provider = native.execution_handle.scheduler_provider
     scheduler_native_id = native.execution_handle.scheduler_native_id
@@ -379,7 +530,15 @@ def resolve_jarvis_service_runtime(
             )
     descriptor_payload = runtime.dataset_descriptor.model_dump(mode="json")
     runtime_payload = runtime.model_dump(mode="json")
+    authorization_sha256 = (
+        runtime.authorization.token_sha256 if runtime.authorization is not None else None
+    )
     binding = JarvisServiceRuntimeBinding(
+        schema_version=(
+            RELAY_JARVIS_RUNTIME_BINDING_SCHEMA_V2
+            if runtime.schema_version == JARVIS_SERVICE_RUNTIME_SCHEMA_V2
+            else RELAY_JARVIS_RUNTIME_BINDING_SCHEMA_V1
+        ),
         source_relay_job_id=job.job_id,
         source_relay_artifact_id=artifact.artifact_id,
         source_relay_artifact_sha256=cast(str, artifact.sha256),
@@ -392,6 +551,12 @@ def resolve_jarvis_service_runtime(
         service_instance_id=runtime.service_instance_id,
         service_revision=runtime.revision,
         service_report_sha256=_canonical_json_sha256(runtime_payload),
+        service_runtime_schema_version=(
+            JARVIS_SERVICE_RUNTIME_SCHEMA_V2
+            if runtime.schema_version == JARVIS_SERVICE_RUNTIME_SCHEMA_V2
+            else None
+        ),
+        authorization_sha256=authorization_sha256,
         dataset_descriptor_sha256=_canonical_json_sha256(descriptor_payload),
         dataset_descriptor=runtime.dataset_descriptor,
     )
@@ -426,7 +591,10 @@ def derive_jarvis_service_runtime_handoffs(
     handoffs: list[JarvisServiceRuntimeHandoff] = []
     for runtime in snapshot.service_runtimes:
         _validate_runtime_package(native, runtime=runtime)
-        if runtime.lifecycle != "ready":
+        if (
+            runtime.lifecycle != "ready"
+            or runtime.schema_version != JARVIS_SERVICE_RUNTIME_SCHEMA_V2
+        ):
             continue
         handoffs.append(
             JarvisServiceRuntimeHandoff(
@@ -450,7 +618,7 @@ def reverify_jarvis_service_runtime(
 ) -> VerifiedJarvisServiceRuntime:
     """Re-read an exact source artifact and require its persisted binding to remain unchanged."""
     expected = JarvisServiceRuntimeBinding.model_validate(binding_document)
-    observed = resolve_jarvis_service_runtime(
+    observed = _resolve_jarvis_service_runtime(
         queue=queue,
         definition=definition,
         settings=settings,
@@ -459,6 +627,7 @@ def reverify_jarvis_service_runtime(
         package_id=expected.package_id,
         package_name=expected.package_name,
         service_instance_id=expected.service_instance_id,
+        allow_legacy_v1=(expected.schema_version == RELAY_JARVIS_RUNTIME_BINDING_SCHEMA_V1),
     )
     if not hmac.compare_digest(
         _canonical_json_bytes(observed.binding.model_dump(mode="json")),
@@ -466,6 +635,192 @@ def reverify_jarvis_service_runtime(
     ):
         raise ValueError("bound JARVIS service runtime no longer matches its durable source")
     return observed
+
+
+def resolve_jarvis_service_runtime_authorization(
+    *,
+    definition: ClusterDefinition,
+    settings: RelaySettings | None,
+    verified: VerifiedJarvisServiceRuntime,
+) -> str | None:
+    """Resolve a private bearer for one exact verified v2 runtime without persisting it."""
+    runtime = verified.runtime
+    binding = verified.binding
+    public_authorization = runtime.authorization
+    expected_digest = binding.authorization_sha256
+    if runtime.schema_version == JARVIS_SERVICE_RUNTIME_SCHEMA_V1:
+        if (
+            binding.schema_version != RELAY_JARVIS_RUNTIME_BINDING_SCHEMA_V1
+            or public_authorization is not None
+            or expected_digest is not None
+        ):
+            raise RelayError("legacy JARVIS runtime authorization provenance is inconsistent")
+        return None
+    if public_authorization is None or expected_digest is None:
+        raise RelayError("authenticated JARVIS runtime omitted its public authority digest")
+    if not hmac.compare_digest(public_authorization.token_sha256, expected_digest):
+        raise RelayError("JARVIS runtime authority digest disagrees with its durable binding")
+
+    pipeline_id = verified.native_execution.execution_handle.pipeline_id
+    arguments = _authority_cli_arguments(
+        execution_id=binding.jarvis_execution_id,
+        pipeline_id=pipeline_id,
+        package_id=binding.package_id,
+        service_instance_id=binding.service_instance_id,
+        revision=binding.service_revision,
+        token_sha256=expected_digest,
+    )
+    if should_execute_on_cluster(definition):
+        payload = run_remote_jarvis_runtime_authority(
+            definition,
+            arguments,
+            timeout_seconds=_AUTHORITY_QUERY_TIMEOUT_SECONDS,
+            maximum_stdout_bytes=_MAX_AUTHORITY_OUTPUT_BYTES,
+        )
+        document = _decode_unique_json_object(
+            payload,
+            label="JARVIS service runtime authority resolver",
+        )
+        authority = JarvisServiceRuntimeAuthority.model_validate(document)
+    else:
+        resolved_settings = settings or RelaySettings.from_env()
+        authority = resolve_local_jarvis_service_runtime_authority(
+            jarvis_bin=resolved_settings.jarvis_bin,
+            execution_id=binding.jarvis_execution_id,
+            pipeline_id=pipeline_id,
+            package_id=binding.package_id,
+            service_instance_id=binding.service_instance_id,
+            revision=binding.service_revision,
+            token_sha256=expected_digest,
+        )
+    _validate_resolved_authority(verified=verified, authority=authority)
+    return f"Bearer {authority.authorization.token.get_secret_value()}"
+
+
+def resolve_local_jarvis_service_runtime_authority(
+    *,
+    jarvis_bin: str,
+    execution_id: str,
+    pipeline_id: str,
+    package_id: str,
+    service_instance_id: str,
+    revision: int,
+    token_sha256: str,
+) -> JarvisServiceRuntimeAuthority:
+    """Invoke JARVIS's bounded trusted resolver on the current cluster host."""
+    if not jarvis_bin:
+        raise ConfigurationError("JARVIS service runtime authority resolver is not configured")
+    provider = JarvisCdProvider(jarvis_bin=jarvis_bin)
+    provider.require_available()
+    arguments = _authority_cli_arguments(
+        execution_id=execution_id,
+        pipeline_id=pipeline_id,
+        package_id=package_id,
+        service_instance_id=service_instance_id,
+        revision=revision,
+        token_sha256=token_sha256,
+    )
+    result = provider.run_command_streaming(
+        [jarvis_bin, "execution", "resolve-service-runtime-authority", *arguments, "+json"],
+        timeout_seconds=_AUTHORITY_QUERY_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        raise RelayError(
+            f"JARVIS service runtime authority resolution failed with exit code {result.returncode}"
+        )
+    if len(result.stdout.encode("utf-8")) > _MAX_AUTHORITY_OUTPUT_BYTES:
+        raise RelayError("JARVIS service runtime authority response exceeded its byte limit")
+    document = _decode_unique_json_object(
+        result.stdout,
+        label="JARVIS service runtime authority resolver",
+    )
+    return JarvisServiceRuntimeAuthority.model_validate(document)
+
+
+def private_jarvis_service_runtime_authority_document(
+    authority: JarvisServiceRuntimeAuthority,
+) -> JSON:
+    """Render the resolver's raw private wire document for relay-internal transport only."""
+    document = authority.model_dump(mode="json")
+    authorization = cast(dict[str, object], document["authorization"])
+    authorization["token"] = authority.authorization.token.get_secret_value()
+    return document
+
+
+def _authority_cli_arguments(
+    *,
+    execution_id: str,
+    pipeline_id: str,
+    package_id: str,
+    service_instance_id: str,
+    revision: int,
+    token_sha256: str,
+) -> list[str]:
+    """Build the exact identity-complete argument vector for JARVIS's private resolver."""
+    return [
+        execution_id,
+        "--pipeline-id",
+        pipeline_id,
+        "--package-id",
+        package_id,
+        "--service-instance-id",
+        service_instance_id,
+        "--revision",
+        str(revision),
+        "--token-sha256",
+        token_sha256,
+    ]
+
+
+def _validate_resolved_authority(
+    *,
+    verified: VerifiedJarvisServiceRuntime,
+    authority: JarvisServiceRuntimeAuthority,
+) -> None:
+    """Require the resolver response to match every durable public identity."""
+    binding = verified.binding
+    pipeline_id = verified.native_execution.execution_handle.pipeline_id
+    if (
+        authority.execution_id != binding.jarvis_execution_id
+        or authority.pipeline_id != pipeline_id
+        or authority.package_id != binding.package_id
+        or authority.service_instance_id != binding.service_instance_id
+        or authority.revision != binding.service_revision
+    ):
+        raise RelayError("JARVIS service runtime authority returned a different runtime identity")
+    expected_digest = binding.authorization_sha256
+    if expected_digest is None or not hmac.compare_digest(
+        authority.token_sha256,
+        expected_digest,
+    ):
+        raise RelayError("JARVIS service runtime authority returned a different token digest")
+
+
+def _decode_unique_json_object(value: str, *, label: str) -> JSON:
+    """Decode one bounded JSON object while rejecting duplicate keys and constants."""
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, nested in pairs:
+            if key in result:
+                raise ValueError(f"{label} returned duplicate JSON key: {key}")
+            result[key] = nested
+        return result
+
+    def reject_constant(constant: str) -> object:
+        raise ValueError(f"{label} returned non-finite JSON constant: {constant}")
+
+    try:
+        document: object = json.loads(
+            value,
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (json.JSONDecodeError, UnicodeError, RecursionError):
+        raise RelayError(f"{label} returned invalid JSON") from None
+    if not isinstance(document, dict):
+        raise RelayError(f"{label} did not return a JSON object")
+    return cast(JSON, document)
 
 
 def _load_source(

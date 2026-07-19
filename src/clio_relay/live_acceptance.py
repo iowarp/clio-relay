@@ -3,28 +3,36 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import math
+import os
 import posixpath
 import re
 import shlex
+import socket
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from base64 import b64decode
-from collections.abc import Iterable
+from collections.abc import Generator, Iterable
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 from uuid import uuid4
 
 import yaml
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from clio_relay import __version__
+from clio_relay.browser_gateway import BrowserAttachmentGrant
 from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.config import RelaySettings
 from clio_relay.doctor import run_cluster_doctor
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.identifiers import DurableRecordId
@@ -33,16 +41,35 @@ from clio_relay.installation import (
     verify_remote_native_jarvis_component,
     verify_remote_worker_info,
 )
+from clio_relay.jarvis_service_runtime import (
+    JARVIS_SERVICE_RUNTIME_SCHEMA_V2,
+    RELAY_JARVIS_RUNTIME_BINDING_SCHEMA_V2,
+    JarvisServiceRuntimeBinding,
+    JarvisServiceRuntimeHandoff,
+)
+from clio_relay.mcp_stdio_validation import (
+    PackagedMcpStdioSession,
+    decode_strict_json,
+    run_packaged_mcp_stdio_session,
+)
+from clio_relay.models import GatewaySession, GatewaySessionState
 from clio_relay.pagination import MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.progress_provenance import (
     validate_package_progress_acceptance_metadata,
 )
+from clio_relay.public_records import public_gateway_session
 from clio_relay.remote_values import render_remote_shell_path, render_remote_shell_value
-from clio_relay.runtime_metadata import RUNTIME_METADATA_SCHEMA, RuntimeMetadataSource
+from clio_relay.runtime_metadata import (
+    RUNTIME_METADATA_SCHEMA,
+    JarvisRuntimeMetadata,
+    RuntimeMetadataSource,
+)
+from clio_relay.service_runtime import ServiceRuntimeStopResult, ServiceRuntimeSupervisor
 from clio_relay.session_api import (
     OWNER_SESSION_ID_HEADER,
     SESSION_GENERATION_ID_HEADER,
 )
+from clio_relay.storage_runtime import StorageManagedQueue, storage_managed_queue
 from clio_relay.transport_probe import (
     run_frp_direct_http_probe,
     run_frp_http_probe,
@@ -56,6 +83,7 @@ from clio_relay.validation_report import (
     ValidationResource,
     detect_software_identity,
     new_live_validation_report,
+    redact_sensitive_values,
 )
 
 
@@ -73,6 +101,237 @@ class CommandRunner(Protocol):
 
 
 MAX_ACCEPTANCE_COLLECTION_RECORDS = 10_000
+MAX_SECURE_RUNTIME_RESPONSE_BYTES = 1024 * 1024
+MAX_SECURE_RUNTIME_SSE_EVENT_BYTES = 256 * 1024
+SECURE_RUNTIME_ACCEPTANCE_SCHEMA = "clio-relay.secure-runtime-acceptance.v1"
+SECURE_RUNTIME_HTTP_EVIDENCE_SCHEMA = "clio-relay.secure-runtime-http-evidence.v1"
+
+
+class SecureRuntimeEndpointAdapter(BaseModel):
+    """Application-owned JSON selectors for one runtime HTTP response."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    assertions: dict[str, str | int | bool | None] = Field(default_factory=dict)
+    service_instance_id_pointer: str = Field(min_length=1, max_length=512)
+    revision_pointer: str = Field(min_length=1, max_length=512)
+    execution_id_pointer: str | None = Field(default=None, min_length=1, max_length=512)
+    dataset_descriptor_pointer: str | None = Field(default=None, min_length=1, max_length=512)
+    command_id_pointer: str | None = Field(default=None, min_length=1, max_length=512)
+    event_name: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_pointers(self) -> SecureRuntimeEndpointAdapter:
+        """Require bounded RFC 6901 pointers without embedding application semantics."""
+        pointers = [
+            *self.assertions,
+            self.service_instance_id_pointer,
+            self.revision_pointer,
+            self.execution_id_pointer,
+            self.dataset_descriptor_pointer,
+            self.command_id_pointer,
+        ]
+        for pointer in pointers:
+            if pointer is not None:
+                _validate_secure_runtime_json_pointer(pointer)
+        if len(self.assertions) > 16:
+            raise ValueError("secure runtime endpoint assertions exceed 16 entries")
+        return self
+
+
+class SecureRuntimeProtocolAdapter(BaseModel):
+    """Declarative package protocol used only by live acceptance."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    command_request_id_pointer: str = Field(min_length=1, max_length=512)
+    health: SecureRuntimeEndpointAdapter
+    state: SecureRuntimeEndpointAdapter
+    command: SecureRuntimeEndpointAdapter
+    events: SecureRuntimeEndpointAdapter
+
+    @model_validator(mode="after")
+    def validate_protocol(self) -> SecureRuntimeProtocolAdapter:
+        """Require enough selectors to correlate every durable runtime surface."""
+        _validate_secure_runtime_json_pointer(self.command_request_id_pointer)
+        if self.health.event_name is not None:
+            raise ValueError("secure runtime health adapter cannot declare an SSE event name")
+        for name, adapter in (
+            ("state", self.state),
+            ("command", self.command),
+            ("events", self.events),
+        ):
+            if adapter.execution_id_pointer is None or adapter.dataset_descriptor_pointer is None:
+                raise ValueError(
+                    f"secure runtime {name} adapter requires execution and dataset selectors"
+                )
+        if self.command.command_id_pointer is None:
+            raise ValueError("secure runtime command adapter requires a command identity selector")
+        if self.events.event_name is None:
+            raise ValueError("secure runtime events adapter requires an SSE event name")
+        if self.state.event_name is not None or self.command.event_name is not None:
+            raise ValueError("only the secure runtime events adapter may declare an SSE event name")
+        return self
+
+
+class SecureRuntimeProbeConfig(BaseModel):
+    """Application-configured selectors and command for one secure runtime probe."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    package_name: str = Field(min_length=1, max_length=256)
+    package_id: str | None = Field(default=None, min_length=1, max_length=256)
+    service_instance_id: str | None = Field(default=None, min_length=1, max_length=512)
+    command: dict[str, Any]
+    protocol_adapter: SecureRuntimeProtocolAdapter
+    browser_attachment_ttl_seconds: int = Field(default=300, ge=60, le=28_800)
+    require_state_change: bool = True
+    require_sse_change: bool = True
+
+    @model_validator(mode="after")
+    def validate_command(self) -> SecureRuntimeProbeConfig:
+        """Require one bounded finite JSON command supplied by the owning package demo."""
+        if not self.command:
+            raise ValueError("secure runtime probe command must not be empty")
+        try:
+            encoded = json.dumps(
+                self.command,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("secure runtime probe command must be finite JSON") from exc
+        if len(encoded) > 64 * 1024:
+            raise ValueError("secure runtime probe command exceeds 65536 bytes")
+        command_id = _secure_runtime_json_pointer_value(
+            self.command,
+            self.protocol_adapter.command_request_id_pointer,
+            label="command request identity",
+        )
+        if (
+            not isinstance(command_id, str)
+            or not command_id
+            or len(command_id) > 256
+            or any(character in command_id for character in "\r\n\x00")
+        ):
+            raise ValueError("secure runtime probe command requires one bounded command identity")
+        return self
+
+
+class SecureRuntimeHttpEvidence(BaseModel):
+    """Secret-free digest evidence for one browser-capability request."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["clio-relay.secure-runtime-http-evidence.v1"] = (
+        SECURE_RUNTIME_HTTP_EVIDENCE_SCHEMA
+    )
+    endpoint: Literal["health", "state", "command", "events"]
+    method: Literal["GET", "POST"]
+    status_code: int = Field(ge=200, le=299)
+    content_type: str = Field(min_length=1, max_length=256)
+    body_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    body_bytes: int = Field(ge=1, le=MAX_SECURE_RUNTIME_RESPONSE_BYTES)
+    service_instance_id: str | None = Field(default=None, max_length=512)
+    execution_id: str | None = Field(default=None, max_length=512)
+    dataset_descriptor_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    command_id: str | None = Field(default=None, min_length=1, max_length=256)
+    revision: int | None = Field(default=None, ge=0)
+
+
+class PackagedMcpAcceptanceEvidence(BaseModel):
+    """Observed identity and contract digests from one installed MCP process."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["clio-relay.packaged-mcp-stdio-evidence.v1"] = (
+        "clio-relay.packaged-mcp-stdio-evidence.v1"
+    )
+    command: list[str] = Field(min_length=1, max_length=16)
+    configured_executable: str = Field(min_length=1, max_length=4096)
+    canonical_executable: str = Field(min_length=1, max_length=4096)
+    executable_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    server_name: Literal["clio-relay"]
+    server_version: str = Field(min_length=1, max_length=256)
+    server_info_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    tools_list_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    called_tool_schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    jarvis_virtual_tools_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    containment_mode: Literal["windows_job_object", "linux_systemd_scope"]
+    containment_enforceable: Literal[True]
+
+
+class SecureRuntimeAcceptanceEvidence(BaseModel):
+    """Complete secret-free proof for one v3.5 secure runtime lifecycle."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["clio-relay.secure-runtime-acceptance.v1"] = (
+        SECURE_RUNTIME_ACCEPTANCE_SCHEMA
+    )
+    claim_scope: Literal["clio-relay-core-lifecycle-and-public-evidence"] = (
+        "clio-relay-core-lifecycle-and-public-evidence"
+    )
+    cluster: str = Field(min_length=1, max_length=256)
+    query_mcp_session: PackagedMcpAcceptanceEvidence
+    bind_mcp_session: PackagedMcpAcceptanceEvidence
+    handoff: JarvisServiceRuntimeHandoff
+    source_artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    gateway_session_id: DurableRecordId
+    binding_schema_version: Literal["clio-relay.jarvis-service-runtime-binding.v2"]
+    service_runtime_schema_version: Literal["jarvis.service-runtime.v2"]
+    service_revision: int = Field(ge=1)
+    authorization_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    dataset_descriptor_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    browser_attachment_ids: list[str] = Field(min_length=2, max_length=2)
+    browser_observations: list[SecureRuntimeHttpEvidence] = Field(min_length=8)
+    lifecycle_states: list[Literal["ready", "degraded", "closed"]]
+    scheduler_cancel_requested: Literal[False]
+    browser_capability_in_public_evidence: Literal[False]
+    raw_authority_material_in_public_evidence: Literal[False]
+    secret_values_absent_from_public_evidence: Literal[True]
+
+    @model_validator(mode="after")
+    def validate_lifecycle(self) -> SecureRuntimeAcceptanceEvidence:
+        """Require bind, detach, reconnect, and final teardown in exact order."""
+        if self.lifecycle_states != ["ready", "degraded", "ready", "closed"]:
+            raise ValueError("secure runtime lifecycle evidence is incomplete")
+        if len(set(self.browser_attachment_ids)) != 2:
+            raise ValueError("secure runtime reconnect requires two distinct attachments")
+        endpoints = {observation.endpoint for observation in self.browser_observations}
+        if endpoints != {"health", "state", "command", "events"}:
+            raise ValueError("secure runtime browser evidence omitted a required endpoint")
+        return self
+
+
+@dataclass(frozen=True)
+class RuntimeMetadataAcceptance:
+    """Decoded runtime metadata and its structured-source trust decision."""
+
+    document: dict[str, Any]
+    structured: bool
+
+
+@dataclass(frozen=True)
+class _BrowserHttpResponse:
+    """One bounded response read directly from the loopback browser proxy."""
+
+    status_code: int
+    content_type: str
+    payload: bytes
+
+
+class _BrowserHttpRequestError(RelayError):
+    """Classified loopback transport failure used by revocation checks."""
+
+    def __init__(self, message: str, *, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 class _ValidationLines(list[str]):
@@ -277,6 +536,7 @@ def _run_live_acceptance(
         )
     run_id = _acceptance_run_id(jarvis_yaml)
     pipeline_yaml_text = jarvis_yaml.read_text(encoding="utf-8")
+    secure_runtime_probe = _secure_runtime_probe_config(pipeline_yaml_text)
     pipeline_yaml_text = _stage_acceptance_files(
         options.definition,
         jarvis_yaml=jarvis_yaml,
@@ -400,7 +660,7 @@ def _run_live_acceptance(
     if options.verify_cluster_deployment:
         lines.append("worker.execute=passed")
 
-    _verify_completed_job(
+    runtime_metadata = _verify_completed_job(
         options.definition,
         job_id,
         line_prefix="acceptance",
@@ -411,6 +671,23 @@ def _run_live_acceptance(
         recorder=recorder,
         require_structured_runtime_metadata=options.require_structured_runtime_metadata,
     )
+    secure_runtime_forbidden_values: set[str] = set()
+    if secure_runtime_probe is not None:
+        if recorder is None:
+            raise ConfigurationError(
+                "secure runtime acceptance requires a machine-readable report path"
+            )
+        if runtime_metadata is None or not runtime_metadata.structured:
+            raise RelayError(
+                "secure runtime acceptance requires structured JARVIS runtime metadata"
+            )
+        secure_runtime_forbidden_values = _verify_secure_runtime_acceptance(
+            options,
+            config=secure_runtime_probe,
+            runtime_metadata=runtime_metadata.document,
+            recorder=recorder,
+        )
+        lines.append("secure-runtime.acceptance=ok")
 
     if monitor_pattern is not None:
         _remote_clio_json(
@@ -520,6 +797,12 @@ def _run_live_acceptance(
         raise RelayError(
             "transport cleanup left structured residual resources: "
             f"count={len(recorder.report.cleanup.remaining_resources)}"
+        )
+    if recorder is not None and secure_runtime_probe is not None:
+        _assert_secret_free_document(
+            recorder.report.model_dump(mode="json"),
+            forbidden_values=secure_runtime_forbidden_values,
+            label="secure runtime validation report",
         )
     return lines
 
@@ -989,6 +1272,1903 @@ def _require_transport_secrets(
     return token, secret_key
 
 
+def _verify_secure_runtime_acceptance(
+    options: LiveAcceptanceOptions,
+    *,
+    config: SecureRuntimeProbeConfig,
+    runtime_metadata: dict[str, Any],
+    recorder: ValidationRecorder,
+) -> set[str]:
+    """Exercise one authenticated JARVIS service through bind, browser, and cleanup."""
+    pipeline_id = runtime_metadata.get("pipeline_id")
+    execution_id = runtime_metadata.get("execution_id")
+    if not isinstance(pipeline_id, str) or not pipeline_id:
+        raise RelayError("secure runtime metadata omitted pipeline_id")
+    if not isinstance(execution_id, str) or not execution_id:
+        raise RelayError("secure runtime metadata omitted execution_id")
+
+    token = _configured_runtime_secret(
+        explicit=options.transport_token,
+        environment_name=options.definition.frp_transport.token_env,
+        label="frp token",
+    )
+    secret_key = _configured_runtime_secret(
+        explicit=options.transport_secret_key,
+        environment_name=options.definition.frp_transport.stcp_secret_env,
+        label="stcp secret",
+    )
+    forbidden_values = {token, secret_key}
+    public_documents: list[object] = []
+    gateway_session_id: str | None = None
+    active_attachment: BrowserAttachmentGrant | None = None
+    teardown_complete = False
+    browser_observations: list[SecureRuntimeHttpEvidence] = []
+    attachment_ids: list[str] = []
+    revoked_grants: list[tuple[BrowserAttachmentGrant, bool]] = []
+    lifecycle_states: list[Literal["ready", "degraded", "closed"]] = []
+    supervisor: ServiceRuntimeSupervisor | None = None
+    runtime_queue: StorageManagedQueue | None = None
+    baseline_gateway_session_ids: set[str] | None = None
+    handoff: JarvisServiceRuntimeHandoff | None = None
+    teardown_result: ServiceRuntimeStopResult | None = None
+
+    primary_error: Exception | None = None
+    try:
+        with _validation_check(
+            recorder,
+            "secure-runtime.jarvis-v3.5-query",
+            "query one execution-owned service through the pinned JARVIS v3.5 contract",
+            forbidden_values=forbidden_values,
+        ) as evidence:
+            query_session = run_packaged_mcp_stdio_session(
+                profile="user",
+                tool="jarvis_get_execution",
+                arguments={
+                    "cluster": options.cluster,
+                    "pipeline_id": pipeline_id,
+                    "execution_id": execution_id,
+                    "include_service_runtimes": True,
+                    "wait_for_terminal": True,
+                    "wait_timeout_seconds": options.timeout_seconds,
+                    "poll_seconds": options.poll_seconds,
+                },
+                timeout_seconds=options.timeout_seconds + 30.0,
+                require_enforceable_containment=True,
+            )
+            query_result = _packaged_mcp_structured_result(
+                query_session,
+                expected_tool="jarvis_get_execution",
+            )
+            query_mcp_evidence = _packaged_mcp_acceptance_evidence(
+                query_session,
+                expected_tool="jarvis_get_execution",
+            )
+            public_documents.append(query_result)
+            handoff = _select_secure_runtime_handoff(
+                query_result,
+                cluster=options.cluster,
+                config=config,
+            )
+            source_artifact_sha256 = _query_source_artifact_sha256(
+                query_result,
+                handoff=handoff,
+            )
+            evidence.append(
+                EvidenceReference(
+                    kind="packaged_mcp_stdio",
+                    reference=(
+                        f"relay-job://{handoff.cluster}/{handoff.source_job_id}/"
+                        f"{handoff.source_artifact_id}"
+                    ),
+                    sha256=source_artifact_sha256,
+                    metadata={
+                        **query_mcp_evidence.model_dump(mode="json"),
+                        "pipeline_id": pipeline_id,
+                        "execution_id": execution_id,
+                    },
+                )
+            )
+            recorder.add_resource(
+                ValidationResource(
+                    kind="relay_job",
+                    resource_id=handoff.source_job_id,
+                    role="secure_runtime_query",
+                    cluster=options.cluster,
+                    state="succeeded",
+                )
+            )
+            recorder.add_resource(
+                ValidationResource(
+                    kind="artifact",
+                    resource_id=handoff.source_artifact_id,
+                    role="private_mcp_result",
+                    cluster=options.cluster,
+                    metadata={"sha256": source_artifact_sha256, "model_readable": False},
+                )
+            )
+
+        with _isolated_runtime_child_environment(
+            token_name=options.definition.frp_transport.token_env,
+            token=token,
+            secret_name=options.definition.frp_transport.stcp_secret_env,
+            secret=secret_key,
+        ) as runtime_child_environment:
+            settings = RelaySettings.from_env()
+            runtime_queue = storage_managed_queue(settings)
+            baseline_gateway_session_ids = {
+                session.session_id
+                for session in _gateway_sessions_for_acceptance(
+                    runtime_queue,
+                    cluster=options.cluster,
+                )
+            }
+            supervisor = ServiceRuntimeSupervisor(
+                settings=settings,
+                queue=runtime_queue,
+                cluster=options.cluster,
+                definition=options.definition,
+                token=token,
+                secret_key=secret_key,
+            )
+            with _validation_check(
+                recorder,
+                "secure-runtime.private-authority-bind",
+                "resolve exact private authority and bind authenticated relay connectors",
+                forbidden_values=forbidden_values,
+            ) as evidence:
+                bind_session = run_packaged_mcp_stdio_session(
+                    profile="user",
+                    tool="relay_bind_jarvis_runtime",
+                    arguments={
+                        "binding": handoff.model_dump(mode="json"),
+                        "readiness_timeout_seconds": options.timeout_seconds,
+                        "poll_seconds": options.poll_seconds,
+                    },
+                    timeout_seconds=options.timeout_seconds + 30.0,
+                    extra_environment=runtime_child_environment,
+                    require_enforceable_containment=True,
+                )
+                bind_result = _packaged_mcp_structured_result(
+                    bind_session,
+                    expected_tool="relay_bind_jarvis_runtime",
+                )
+                bind_mcp_evidence = _packaged_mcp_acceptance_evidence(
+                    bind_session,
+                    expected_tool="relay_bind_jarvis_runtime",
+                )
+                if (
+                    bind_mcp_evidence.canonical_executable
+                    != query_mcp_evidence.canonical_executable
+                    or bind_mcp_evidence.executable_sha256 != query_mcp_evidence.executable_sha256
+                    or bind_mcp_evidence.jarvis_virtual_tools_sha256
+                    != query_mcp_evidence.jarvis_virtual_tools_sha256
+                ):
+                    raise RelayError("packaged MCP identity changed between query and bind")
+                public_documents.append(bind_result)
+                gateway_session_id = _secure_runtime_cleanup_candidate(
+                    bind_result,
+                    handoff=handoff,
+                )
+                validated_session_id, binding = _validated_secure_runtime_bind(
+                    bind_result,
+                    handoff=handoff,
+                    expected_execution_id=execution_id,
+                    expected_source_artifact_sha256=source_artifact_sha256,
+                )
+                if validated_session_id != gateway_session_id:
+                    raise RelayError("secure runtime bind changed its cleanup identity")
+                gateway = cast(dict[str, Any], bind_result["gateway_session"])
+                public_documents.append(gateway)
+                lifecycle_states.append("ready")
+                evidence.append(
+                    EvidenceReference(
+                        kind="private_authority_resolution",
+                        reference=f"gateway-runtime://{options.cluster}/{gateway_session_id}",
+                        sha256=cast(str, binding.authorization_sha256),
+                        metadata={
+                            "resolver_identity_complete": True,
+                            "pipeline_id": pipeline_id,
+                            "execution_id": binding.jarvis_execution_id,
+                            "package_id": binding.package_id,
+                            "service_instance_id": binding.service_instance_id,
+                            "service_revision": binding.service_revision,
+                            "raw_authority_material_in_public_evidence": False,
+                        },
+                    )
+                )
+                recorder.add_resource(
+                    ValidationResource(
+                        kind="secure_runtime_binding",
+                        resource_id=(f"{gateway_session_id}:revision:{binding.service_revision}"),
+                        role="private_authority_bind",
+                        cluster=options.cluster,
+                        state="ready",
+                        metadata={
+                            "binding_schema_version": binding.schema_version,
+                            "evidence_scope": ("clio-relay-core-lifecycle-and-public-evidence"),
+                            "service_runtime_schema_version": (
+                                binding.service_runtime_schema_version
+                            ),
+                            "source_relay_job_id": binding.source_relay_job_id,
+                            "source_relay_artifact_id": binding.source_relay_artifact_id,
+                            "source_relay_artifact_sha256": (binding.source_relay_artifact_sha256),
+                            "jarvis_execution_id": binding.jarvis_execution_id,
+                            "package_id": binding.package_id,
+                            "package_name": binding.package_name,
+                            "service_instance_id": binding.service_instance_id,
+                            "service_revision": binding.service_revision,
+                            "authorization_sha256": binding.authorization_sha256,
+                            "dataset_descriptor_sha256": (binding.dataset_descriptor_sha256),
+                            "query_mcp_containment_mode": query_mcp_evidence.containment_mode,
+                            "query_mcp_containment_enforceable": (
+                                query_mcp_evidence.containment_enforceable
+                            ),
+                            "bind_mcp_containment_mode": bind_mcp_evidence.containment_mode,
+                            "bind_mcp_containment_enforceable": (
+                                bind_mcp_evidence.containment_enforceable
+                            ),
+                        },
+                    )
+                )
+
+            with _validation_check(
+                recorder,
+                "secure-runtime.browser-protocol",
+                "exercise authenticated health, state, command, and SSE browser surfaces",
+                forbidden_values=forbidden_values,
+            ) as evidence:
+                command_id = cast(
+                    str,
+                    _secure_runtime_json_pointer_value(
+                        config.command,
+                        config.protocol_adapter.command_request_id_pointer,
+                        label="command request identity",
+                    ),
+                )
+                event_name = cast(str, config.protocol_adapter.events.event_name)
+                active_attachment = supervisor.browser_attach(
+                    session_id=gateway_session_id,
+                    ttl_seconds=config.browser_attachment_ttl_seconds,
+                )
+                attachment_ids.append(active_attachment.attachment_id)
+                browser_capability = _browser_attachment_capability(active_attachment)
+                forbidden_values.add(browser_capability)
+                initial_health, initial_health_document = _browser_json_observation(
+                    active_attachment.health_url,
+                    endpoint="health",
+                    method="GET",
+                    body=None,
+                    timeout_seconds=min(options.timeout_seconds, 60.0),
+                )
+                initial_health, initial_health_revision = (
+                    _correlate_secure_runtime_browser_document(
+                        initial_health_document,
+                        initial_health,
+                        endpoint="health",
+                        adapter=config.protocol_adapter.health,
+                        expected_service_instance_id=binding.service_instance_id,
+                        expected_execution_id=binding.jarvis_execution_id,
+                        expected_dataset_descriptor_sha256=binding.dataset_descriptor_sha256,
+                        expected_command_id=None,
+                    )
+                )
+                initial_state, initial_state_document = _browser_json_observation(
+                    active_attachment.state_url,
+                    endpoint="state",
+                    method="GET",
+                    body=None,
+                    timeout_seconds=min(options.timeout_seconds, 60.0),
+                )
+                initial_state, initial_state_revision = _correlate_secure_runtime_browser_document(
+                    initial_state_document,
+                    initial_state,
+                    endpoint="state",
+                    adapter=config.protocol_adapter.state,
+                    expected_service_instance_id=binding.service_instance_id,
+                    expected_execution_id=binding.jarvis_execution_id,
+                    expected_dataset_descriptor_sha256=binding.dataset_descriptor_sha256,
+                    expected_command_id=None,
+                )
+                initial_event, initial_event_document = _browser_sse_observation(
+                    active_attachment.events_url,
+                    timeout_seconds=min(options.timeout_seconds, 60.0),
+                    expected_event_name=event_name,
+                )
+                initial_event, initial_event_revision = _correlate_secure_runtime_browser_document(
+                    initial_event_document,
+                    initial_event,
+                    endpoint="events",
+                    adapter=config.protocol_adapter.events,
+                    expected_service_instance_id=binding.service_instance_id,
+                    expected_execution_id=binding.jarvis_execution_id,
+                    expected_dataset_descriptor_sha256=binding.dataset_descriptor_sha256,
+                    expected_command_id=None,
+                )
+                if {
+                    initial_health_revision,
+                    initial_state_revision,
+                    initial_event_revision,
+                } != {binding.service_revision}:
+                    raise RelayError("secure runtime initial surfaces changed binding revision")
+                command_observation, command_response = _browser_json_observation(
+                    active_attachment.command_url,
+                    endpoint="command",
+                    method="POST",
+                    body=config.command,
+                    timeout_seconds=min(options.timeout_seconds, 60.0),
+                )
+                command_observation, command_revision = _correlate_secure_runtime_browser_document(
+                    command_response,
+                    command_observation,
+                    endpoint="command",
+                    adapter=config.protocol_adapter.command,
+                    expected_service_instance_id=binding.service_instance_id,
+                    expected_execution_id=binding.jarvis_execution_id,
+                    expected_dataset_descriptor_sha256=binding.dataset_descriptor_sha256,
+                    expected_command_id=command_id,
+                )
+                if command_revision <= initial_state_revision:
+                    raise RelayError("secure runtime command did not advance service revision")
+                changed_event, changed_event_document = _wait_for_changed_sse_event(
+                    active_attachment.events_url,
+                    previous=initial_event,
+                    require_change=config.require_sse_change,
+                    timeout_seconds=min(options.timeout_seconds, 60.0),
+                    poll_seconds=options.poll_seconds,
+                    expected_event_name=event_name,
+                )
+                changed_event, changed_event_revision = _correlate_secure_runtime_browser_document(
+                    changed_event_document,
+                    changed_event,
+                    endpoint="events",
+                    adapter=config.protocol_adapter.events,
+                    expected_service_instance_id=binding.service_instance_id,
+                    expected_execution_id=binding.jarvis_execution_id,
+                    expected_dataset_descriptor_sha256=binding.dataset_descriptor_sha256,
+                    expected_command_id=command_id,
+                )
+                changed_state, changed_state_document = _wait_for_changed_browser_state(
+                    active_attachment.state_url,
+                    previous=initial_state,
+                    require_change=config.require_state_change,
+                    timeout_seconds=min(options.timeout_seconds, 60.0),
+                    poll_seconds=options.poll_seconds,
+                )
+                changed_state, changed_state_revision = _correlate_secure_runtime_browser_document(
+                    changed_state_document,
+                    changed_state,
+                    endpoint="state",
+                    adapter=config.protocol_adapter.state,
+                    expected_service_instance_id=binding.service_instance_id,
+                    expected_execution_id=binding.jarvis_execution_id,
+                    expected_dataset_descriptor_sha256=binding.dataset_descriptor_sha256,
+                    expected_command_id=command_id,
+                )
+                if {changed_event_revision, changed_state_revision} != {command_revision}:
+                    raise RelayError("secure runtime command correlation changed its revision")
+                first_observations = [
+                    initial_health,
+                    initial_state,
+                    initial_event,
+                    command_observation,
+                    changed_event,
+                    changed_state,
+                ]
+                browser_observations.extend(first_observations)
+                evidence.extend(
+                    _browser_evidence_reference(
+                        active_attachment.attachment_id,
+                        observation,
+                    )
+                    for observation in first_observations
+                )
+
+            with _validation_check(
+                recorder,
+                "secure-runtime.browser-revocation",
+                "revoke the one-time browser capability before runtime detach",
+                forbidden_values=forbidden_values,
+            ) as evidence:
+                revoked_grant = active_attachment
+                detached_browser = supervisor.browser_detach(
+                    session_id=gateway_session_id,
+                    attachment_id=revoked_grant.attachment_id,
+                )
+                active_attachment = None
+                if detached_browser.attachment_id != revoked_grant.attachment_id:
+                    raise RelayError("browser detach returned a different attachment identity")
+                if not detached_browser.capability_revoked or not detached_browser.proxy_stopped:
+                    raise RelayError("browser detach did not revoke and stop its exact proxy")
+                revoked_grants.append((revoked_grant, detached_browser.proxy_stopped))
+                _assert_browser_capability_revoked(
+                    revoked_grant.health_url,
+                    timeout_seconds=min(options.poll_seconds, 2.0),
+                    proxy_stopped=detached_browser.proxy_stopped,
+                )
+                evidence.append(
+                    EvidenceReference(
+                        kind="browser_capability_revocation",
+                        reference=(
+                            f"browser-attachment://{gateway_session_id}/"
+                            f"{revoked_grant.attachment_id}"
+                        ),
+                        excerpt="revocation observed before runtime detach",
+                    )
+                )
+
+            with _validation_check(
+                recorder,
+                "secure-runtime.detach",
+                "detach desktop connector while retaining remote and scheduler resources",
+                forbidden_values=forbidden_values,
+            ) as evidence:
+                detached = supervisor.detach(session_id=gateway_session_id)
+                _validate_secure_runtime_cleanup(
+                    detached,
+                    expected_mode="detach",
+                    expected_session_id=gateway_session_id,
+                )
+                lifecycle_states.append("degraded")
+                public_detach = cast(
+                    dict[str, Any], redact_sensitive_values(detached.json_payload())
+                )
+                public_documents.append(public_detach)
+                _record_runtime_cleanup(
+                    recorder,
+                    detached,
+                    role="secure_runtime_detach",
+                )
+                evidence.append(
+                    EvidenceReference(
+                        kind="gateway_cleanup",
+                        reference=f"gateway-runtime://{options.cluster}/{gateway_session_id}",
+                        excerpt="desktop detached; remote runtime and scheduler work retained",
+                        metadata={"mode": "detach", "scheduler_cancel_requested": False},
+                    )
+                )
+
+            with _validation_check(
+                recorder,
+                "secure-runtime.reconnect",
+                "reattach relay connector and issue a fresh browser capability",
+                forbidden_values=forbidden_values,
+            ) as evidence:
+                reattached = supervisor.attach(session_id=gateway_session_id)
+                if (
+                    reattached.session.session_id != gateway_session_id
+                    or reattached.session.state is not GatewaySessionState.READY
+                ):
+                    raise RelayError("secure runtime reattachment did not restore the gateway")
+                lifecycle_states.append("ready")
+                public_documents.append(public_gateway_session(reattached.session))
+                active_attachment = supervisor.browser_attach(
+                    session_id=gateway_session_id,
+                    ttl_seconds=config.browser_attachment_ttl_seconds,
+                )
+                attachment_ids.append(active_attachment.attachment_id)
+                browser_capability = _browser_attachment_capability(active_attachment)
+                if browser_capability in forbidden_values:
+                    raise RelayError("secure runtime reconnect reused a browser capability")
+                forbidden_values.add(browser_capability)
+                for old_grant, proxy_stopped in revoked_grants:
+                    _assert_browser_capability_revoked(
+                        old_grant.health_url,
+                        timeout_seconds=min(options.poll_seconds, 2.0),
+                        proxy_stopped=proxy_stopped,
+                    )
+                reconnected_health, reconnected_health_document = _browser_json_observation(
+                    active_attachment.health_url,
+                    endpoint="health",
+                    method="GET",
+                    body=None,
+                    timeout_seconds=min(options.timeout_seconds, 60.0),
+                )
+                reconnected_health, reconnected_health_revision = (
+                    _correlate_secure_runtime_browser_document(
+                        reconnected_health_document,
+                        reconnected_health,
+                        endpoint="health",
+                        adapter=config.protocol_adapter.health,
+                        expected_service_instance_id=binding.service_instance_id,
+                        expected_execution_id=binding.jarvis_execution_id,
+                        expected_dataset_descriptor_sha256=binding.dataset_descriptor_sha256,
+                        expected_command_id=None,
+                    )
+                )
+                reconnected_state, reconnected_state_document = _browser_json_observation(
+                    active_attachment.state_url,
+                    endpoint="state",
+                    method="GET",
+                    body=None,
+                    timeout_seconds=min(options.timeout_seconds, 60.0),
+                )
+                reconnected_state, reconnected_state_revision = (
+                    _correlate_secure_runtime_browser_document(
+                        reconnected_state_document,
+                        reconnected_state,
+                        endpoint="state",
+                        adapter=config.protocol_adapter.state,
+                        expected_service_instance_id=binding.service_instance_id,
+                        expected_execution_id=binding.jarvis_execution_id,
+                        expected_dataset_descriptor_sha256=binding.dataset_descriptor_sha256,
+                        expected_command_id=command_id,
+                    )
+                )
+                reconnected_event, reconnected_event_document = _browser_sse_observation(
+                    active_attachment.events_url,
+                    timeout_seconds=min(options.timeout_seconds, 60.0),
+                    expected_event_name=event_name,
+                )
+                reconnected_event, reconnected_event_revision = (
+                    _correlate_secure_runtime_browser_document(
+                        reconnected_event_document,
+                        reconnected_event,
+                        endpoint="events",
+                        adapter=config.protocol_adapter.events,
+                        expected_service_instance_id=binding.service_instance_id,
+                        expected_execution_id=binding.jarvis_execution_id,
+                        expected_dataset_descriptor_sha256=binding.dataset_descriptor_sha256,
+                        expected_command_id=command_id,
+                    )
+                )
+                if {
+                    reconnected_health_revision,
+                    reconnected_state_revision,
+                    reconnected_event_revision,
+                } != {command_revision}:
+                    raise RelayError("secure runtime reconnect changed command revision")
+                reconnected_observations = [
+                    reconnected_health,
+                    reconnected_state,
+                    reconnected_event,
+                ]
+                browser_observations.extend(reconnected_observations)
+                evidence.extend(
+                    _browser_evidence_reference(
+                        active_attachment.attachment_id,
+                        observation,
+                    )
+                    for observation in reconnected_observations
+                )
+
+            with _validation_check(
+                recorder,
+                "secure-runtime.teardown",
+                "revoke browser access and close relay resources without scheduler cancellation",
+                forbidden_values=forbidden_values,
+            ) as evidence:
+                assert active_attachment is not None
+                final_grant = active_attachment
+                final_detachment = supervisor.browser_detach(
+                    session_id=gateway_session_id,
+                    attachment_id=final_grant.attachment_id,
+                )
+                active_attachment = None
+                if (
+                    final_detachment.attachment_id != final_grant.attachment_id
+                    or not final_detachment.capability_revoked
+                    or not final_detachment.proxy_stopped
+                ):
+                    raise RelayError("final browser detach did not revoke and stop its exact proxy")
+                revoked_grants.append((final_grant, final_detachment.proxy_stopped))
+                _assert_browser_capability_revoked(
+                    final_grant.health_url,
+                    timeout_seconds=min(options.poll_seconds, 2.0),
+                    proxy_stopped=final_detachment.proxy_stopped,
+                )
+                teardown_result = supervisor.stop(
+                    session_id=gateway_session_id,
+                    cancel_scheduler_job=False,
+                )
+                _validate_secure_runtime_cleanup(
+                    teardown_result,
+                    expected_mode="teardown",
+                    expected_session_id=gateway_session_id,
+                )
+                teardown_complete = True
+                lifecycle_states.append("closed")
+                public_teardown = cast(
+                    dict[str, Any],
+                    redact_sensitive_values(teardown_result.json_payload()),
+                )
+                public_documents.append(public_teardown)
+                _record_runtime_cleanup(
+                    recorder,
+                    teardown_result,
+                    role="secure_runtime_teardown",
+                )
+                for old_grant, proxy_stopped in revoked_grants:
+                    _assert_browser_capability_revoked(
+                        old_grant.health_url,
+                        timeout_seconds=min(options.poll_seconds, 2.0),
+                        proxy_stopped=proxy_stopped,
+                    )
+                evidence.append(
+                    EvidenceReference(
+                        kind="gateway_cleanup",
+                        reference=f"gateway-runtime://{options.cluster}/{gateway_session_id}",
+                        excerpt="gateway closed; scheduler cancellation not requested",
+                        metadata={
+                            "mode": "teardown",
+                            "scheduler_cancel_requested": False,
+                            "remaining_resources": 0,
+                        },
+                    )
+                )
+
+        assert gateway_session_id is not None
+        assert teardown_result is not None
+        secure_evidence = SecureRuntimeAcceptanceEvidence(
+            cluster=options.cluster,
+            query_mcp_session=query_mcp_evidence,
+            bind_mcp_session=bind_mcp_evidence,
+            handoff=handoff,
+            source_artifact_sha256=source_artifact_sha256,
+            gateway_session_id=gateway_session_id,
+            binding_schema_version=cast(
+                Literal["clio-relay.jarvis-service-runtime-binding.v2"],
+                binding.schema_version,
+            ),
+            service_runtime_schema_version=cast(
+                Literal["jarvis.service-runtime.v2"],
+                binding.service_runtime_schema_version,
+            ),
+            service_revision=binding.service_revision,
+            authorization_sha256=cast(str, binding.authorization_sha256),
+            dataset_descriptor_sha256=binding.dataset_descriptor_sha256,
+            browser_attachment_ids=attachment_ids,
+            browser_observations=browser_observations,
+            lifecycle_states=lifecycle_states,
+            scheduler_cancel_requested=False,
+            browser_capability_in_public_evidence=False,
+            raw_authority_material_in_public_evidence=False,
+            secret_values_absent_from_public_evidence=True,
+        )
+        public_documents.append(secure_evidence.model_dump(mode="json"))
+        with _validation_check(
+            recorder,
+            "secure-runtime.secrets-absent",
+            "prove private authority, browser capabilities, and connector secrets are absent",
+            forbidden_values=forbidden_values,
+        ) as evidence:
+            for index, document in enumerate(public_documents):
+                _assert_secret_free_document(
+                    document,
+                    forbidden_values=forbidden_values,
+                    label=f"secure runtime public document {index}",
+                )
+            _assert_secret_free_document(
+                recorder.report.model_dump(mode="json"),
+                forbidden_values=forbidden_values,
+                label="secure runtime report before final evidence",
+            )
+            evidence.append(
+                EvidenceReference(
+                    kind="secure_runtime_acceptance",
+                    reference=f"gateway-runtime://{options.cluster}/{gateway_session_id}",
+                    sha256=_secure_runtime_canonical_json_sha256(
+                        secure_evidence.model_dump(mode="json")
+                    ),
+                    metadata=secure_evidence.model_dump(mode="json"),
+                )
+            )
+        return forbidden_values
+    except Exception as exc:
+        primary_error = exc
+        _redact_exception_values(exc, forbidden_values)
+        raise
+    finally:
+        cleanup_session_ids: list[str] = []
+        if gateway_session_id is not None:
+            cleanup_session_ids.append(gateway_session_id)
+        elif (
+            supervisor is not None
+            and runtime_queue is not None
+            and baseline_gateway_session_ids is not None
+            and handoff is not None
+        ):
+            try:
+                cleanup_session_ids.extend(
+                    session.session_id
+                    for session in _gateway_sessions_for_acceptance(
+                        runtime_queue,
+                        cluster=options.cluster,
+                    )
+                    if session.session_id not in baseline_gateway_session_ids
+                    and _gateway_session_matches_handoff(session, handoff=handoff)
+                )
+            except Exception as cleanup_discovery_exc:
+                if primary_error is not None:
+                    primary_error.add_note(
+                        "secure runtime cleanup discovery: "
+                        + _redacted_error_text(cleanup_discovery_exc, forbidden_values)
+                    )
+        if supervisor is not None and cleanup_session_ids and not teardown_complete:
+            cleanup_errors: list[str] = []
+            if active_attachment is not None and gateway_session_id is not None:
+                try:
+                    supervisor.browser_detach(
+                        session_id=gateway_session_id,
+                        attachment_id=active_attachment.attachment_id,
+                    )
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(_redacted_error_text(cleanup_exc, forbidden_values))
+            for cleanup_session_id in cleanup_session_ids:
+                try:
+                    cleanup = supervisor.stop(
+                        session_id=cleanup_session_id,
+                        cancel_scheduler_job=False,
+                    )
+                    _record_runtime_cleanup(
+                        recorder,
+                        cleanup,
+                        role="secure_runtime_failure_cleanup",
+                    )
+                    if cleanup.errors or cleanup.residual_resources:
+                        cleanup_errors.extend(
+                            _redacted_text(item, forbidden_values) for item in cleanup.errors
+                        )
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(_redacted_error_text(cleanup_exc, forbidden_values))
+            if cleanup_errors and primary_error is not None:
+                primary_error.add_note("secure runtime cleanup: " + "; ".join(cleanup_errors))
+
+
+@contextmanager
+def _validation_check(
+    recorder: ValidationRecorder,
+    check_id: str,
+    summary: str,
+    *,
+    forbidden_values: set[str],
+) -> Generator[list[EvidenceReference]]:
+    """Expose a typed check while redacting private values before failure recording."""
+    with recorder.check(check_id, summary) as evidence:
+        try:
+            yield evidence
+        except Exception as exc:
+            original = str(exc)
+            redacted = _redacted_text(original, forbidden_values)
+            if redacted == original:
+                raise
+            raise RelayError(f"secure runtime operation failed: {redacted}") from None
+
+
+def _configured_runtime_secret(
+    *,
+    explicit: str | None,
+    environment_name: str,
+    label: str,
+) -> str:
+    """Resolve one required runtime transport secret without echoing its value."""
+    value = explicit if explicit is not None else os.environ.get(environment_name)
+    if not value:
+        raise ConfigurationError(
+            f"secure runtime acceptance requires {label} in {environment_name}"
+        )
+    return value
+
+
+@contextmanager
+def _isolated_runtime_child_environment(
+    *,
+    token_name: str,
+    token: str,
+    secret_name: str,
+    secret: str,
+) -> Generator[dict[str, str]]:
+    """Yield explicit transport values for one packaged child without parent mutation."""
+    yield {token_name: token, secret_name: secret}
+
+
+def _packaged_mcp_structured_result(
+    session: PackagedMcpStdioSession,
+    *,
+    expected_tool: str,
+) -> dict[str, Any]:
+    """Validate one packaged MCP call and return its exact structured content."""
+    tools_result = session.tools_list_response.get("result")
+    if not isinstance(tools_result, dict):
+        raise RelayError("packaged MCP tools/list omitted its result")
+    tools_value = cast(dict[str, object], tools_result).get("tools")
+    tools = cast(list[object], tools_value) if isinstance(tools_value, list) else []
+    advertised_names = {
+        cast(dict[str, object], tool).get("name") for tool in tools if isinstance(tool, dict)
+    }
+    if expected_tool not in advertised_names:
+        raise RelayError(f"packaged MCP did not advertise required tool {expected_tool}")
+    if "error" in session.tools_call_response:
+        error_value = session.tools_call_response.get("error")
+        error = cast(dict[str, object], error_value) if isinstance(error_value, dict) else {}
+        message = error.get("message")
+        raise RelayError(
+            f"packaged MCP {expected_tool} failed: "
+            f"{message if isinstance(message, str) else 'unknown error'}"
+        )
+    raw_result = session.tools_call_response.get("result")
+    if not isinstance(raw_result, dict):
+        raise RelayError(f"packaged MCP {expected_tool} omitted its result")
+    result = cast(dict[str, Any], raw_result)
+    if result.get("isError") is True:
+        raise RelayError(f"packaged MCP {expected_tool} returned isError=true")
+    structured = result.get("structuredContent")
+    if not isinstance(structured, dict):
+        raise RelayError(f"packaged MCP {expected_tool} omitted structuredContent")
+    content_value = result.get("content")
+    content = cast(list[object], content_value) if isinstance(content_value, list) else []
+    if len(content) != 1:
+        raise RelayError(f"packaged MCP {expected_tool} returned invalid text content")
+    item = content[0]
+    text = cast(dict[str, object], item).get("text") if isinstance(item, dict) else None
+    if not isinstance(text, str):
+        raise RelayError(f"packaged MCP {expected_tool} returned invalid text content")
+    text_document = decode_strict_json(
+        text,
+        label=f"packaged MCP {expected_tool} text",
+    )
+    if text_document != structured:
+        raise RelayError(f"packaged MCP {expected_tool} text and structured content differ")
+    return {str(key): value for key, value in cast(dict[object, object], structured).items()}
+
+
+def _packaged_mcp_acceptance_evidence(
+    session: PackagedMcpStdioSession,
+    *,
+    expected_tool: str,
+) -> PackagedMcpAcceptanceEvidence:
+    """Recheck and copy identities observed by the installed MCP child process."""
+    initialize_result = session.initialize_response.get("result")
+    if not isinstance(initialize_result, dict):
+        raise RelayError("packaged MCP initialize omitted its result")
+    raw_server_info = cast(dict[str, object], initialize_result).get("serverInfo")
+    if not isinstance(raw_server_info, dict):
+        raise RelayError("packaged MCP initialize omitted observed serverInfo")
+    server_info = cast(dict[str, object], raw_server_info)
+    server_name = server_info.get("name")
+    server_version = server_info.get("version")
+    if server_name != "clio-relay" or not isinstance(server_version, str):
+        raise RelayError("packaged MCP initialize returned invalid observed serverInfo")
+    tools_result = session.tools_list_response.get("result")
+    if not isinstance(tools_result, dict):
+        raise RelayError("packaged MCP tools/list omitted its result")
+    raw_tools = cast(dict[str, object], tools_result).get("tools")
+    tools = cast(list[object], raw_tools) if isinstance(raw_tools, list) else []
+    typed_tools = [cast(dict[str, Any], item) for item in tools if isinstance(item, dict)]
+    selected = [tool for tool in typed_tools if tool.get("name") == expected_tool]
+    if len(selected) != 1:
+        raise RelayError("packaged MCP observed tool schema was not unique")
+    configured = session.configured_executable
+    canonical = session.canonical_executable
+    digests = {
+        "executable_sha256": session.executable_sha256,
+        "server_info_sha256": session.server_info_sha256,
+        "tools_list_sha256": session.tools_list_sha256,
+        "called_tool_schema_sha256": session.called_tool_schema_sha256,
+        "jarvis_virtual_tools_sha256": session.jarvis_virtual_tools_sha256,
+    }
+    if not configured or not canonical:
+        raise RelayError("packaged MCP omitted its observed executable identity")
+    containment_mode = session.containment_mode
+    if (
+        containment_mode not in {"windows_job_object", "linux_systemd_scope"}
+        or not session.containment_enforceable
+    ):
+        raise RelayError("packaged MCP process containment was not enforceable")
+    if not session.command or session.command[0] != canonical:
+        raise RelayError("packaged MCP command did not use its observed canonical executable")
+    if any(
+        not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        for digest in digests.values()
+    ):
+        raise RelayError("packaged MCP omitted an observed contract digest")
+    if session.server_info_sha256 != _packaged_mcp_canonical_sha256(server_info):
+        raise RelayError("packaged MCP observed serverInfo digest changed")
+    if session.tools_list_sha256 != _packaged_mcp_tools_sha256(typed_tools):
+        raise RelayError("packaged MCP observed tools/list digest changed")
+    if session.called_tool_schema_sha256 != _packaged_mcp_canonical_sha256(selected[0]):
+        raise RelayError("packaged MCP observed called-tool schema digest changed")
+    return PackagedMcpAcceptanceEvidence(
+        command=list(session.command),
+        configured_executable=configured,
+        canonical_executable=canonical,
+        executable_sha256=cast(str, session.executable_sha256),
+        server_name="clio-relay",
+        server_version=server_version,
+        server_info_sha256=cast(str, session.server_info_sha256),
+        tools_list_sha256=cast(str, session.tools_list_sha256),
+        called_tool_schema_sha256=cast(str, session.called_tool_schema_sha256),
+        jarvis_virtual_tools_sha256=cast(str, session.jarvis_virtual_tools_sha256),
+        containment_mode=cast(
+            Literal["windows_job_object", "linux_systemd_scope"],
+            containment_mode,
+        ),
+        containment_enforceable=True,
+    )
+
+
+def _packaged_mcp_canonical_sha256(value: object) -> str:
+    """Reproduce the packaged MCP helper's canonical contract digest."""
+    payload = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _packaged_mcp_tools_sha256(tools: list[dict[str, Any]]) -> str:
+    """Digest the exact sorted tools/list contract observed from stdio."""
+    ordered = sorted(tools, key=lambda definition: cast(str, definition.get("name")))
+    return _packaged_mcp_canonical_sha256({"tools": ordered})
+
+
+def _select_secure_runtime_handoff(
+    query_result: dict[str, Any],
+    *,
+    cluster: str,
+    config: SecureRuntimeProbeConfig,
+) -> JarvisServiceRuntimeHandoff:
+    """Select exactly one artifact-bound service handoff using configured identities."""
+    if query_result.get("terminal") is not True or query_result.get("state") != "succeeded":
+        raise RelayError("JARVIS execution query did not complete successfully")
+    raw_bindings = query_result.get("service_runtime_bindings")
+    if not isinstance(raw_bindings, list):
+        raise RelayError("JARVIS v3.5 execution query omitted service_runtime_bindings")
+    bindings: list[JarvisServiceRuntimeHandoff] = []
+    for raw in cast(list[object], raw_bindings):
+        try:
+            binding = JarvisServiceRuntimeHandoff.model_validate(raw)
+        except ValueError as exc:
+            raise RelayError(f"JARVIS service runtime handoff was invalid: {exc}") from exc
+        if binding.cluster != cluster:
+            raise RelayError("JARVIS service runtime handoff changed cluster identity")
+        if binding.package_name != config.package_name:
+            continue
+        if config.package_id is not None and binding.package_id != config.package_id:
+            continue
+        if (
+            config.service_instance_id is not None
+            and binding.service_instance_id != config.service_instance_id
+        ):
+            continue
+        bindings.append(binding)
+    if len(bindings) != 1:
+        raise RelayError(
+            "secure runtime selectors must identify exactly one ready service; "
+            f"matched={len(bindings)}"
+        )
+    return bindings[0]
+
+
+def _query_source_artifact_sha256(
+    query_result: dict[str, Any],
+    *,
+    handoff: JarvisServiceRuntimeHandoff,
+) -> str:
+    """Bind the compact handoff to the same immutable private MCP artifact."""
+    if query_result.get("job_id") != handoff.source_job_id:
+        raise RelayError("service runtime handoff source job differs from its query receipt")
+    raw_artifact = query_result.get("mcp_result_artifact")
+    if not isinstance(raw_artifact, dict):
+        raise RelayError("JARVIS execution query omitted mcp_result_artifact")
+    artifact = cast(dict[str, object], raw_artifact)
+    if (
+        artifact.get("artifact_id") != handoff.source_artifact_id
+        or artifact.get("job_id") != handoff.source_job_id
+        or artifact.get("kind") != "mcp_result"
+    ):
+        raise RelayError("service runtime handoff does not match its private MCP artifact")
+    digest = artifact.get("sha256")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise RelayError("service runtime source artifact omitted a canonical SHA-256")
+    return digest
+
+
+def _secure_runtime_cleanup_candidate(
+    bind_result: dict[str, Any],
+    *,
+    handoff: JarvisServiceRuntimeHandoff,
+) -> str:
+    """Recover only the exact owned session identity safe to tear down after bind failure."""
+    session_id = bind_result.get("gateway_session_id")
+    gateway_value = bind_result.get("gateway_session")
+    if not isinstance(session_id, str) or not isinstance(gateway_value, dict):
+        raise RelayError("secure runtime bind omitted its cleanup identity")
+    gateway = cast(dict[str, object], gateway_value)
+    metadata_value = gateway.get("metadata")
+    metadata = cast(dict[str, object], metadata_value) if isinstance(metadata_value, dict) else {}
+    gateway_data_value = gateway.get("gateway")
+    gateway_data = (
+        cast(dict[str, object], gateway_data_value) if isinstance(gateway_data_value, dict) else {}
+    )
+    binding_value = gateway_data.get("jarvis_runtime_binding")
+    binding = cast(dict[str, object], binding_value) if isinstance(binding_value, dict) else {}
+    if (
+        gateway.get("session_id") != session_id
+        or gateway.get("cluster") != handoff.cluster
+        or metadata.get("owner") != "clio-relay"
+        or binding.get("source_relay_job_id") != handoff.source_job_id
+        or binding.get("source_relay_artifact_id") != handoff.source_artifact_id
+        or binding.get("package_id") != handoff.package_id
+        or binding.get("package_name") != handoff.package_name
+        or binding.get("service_instance_id") != handoff.service_instance_id
+    ):
+        raise RelayError("secure runtime bind did not prove an exact owned cleanup identity")
+    return session_id
+
+
+def _gateway_session_matches_handoff(
+    session: GatewaySession,
+    *,
+    handoff: JarvisServiceRuntimeHandoff,
+) -> bool:
+    """Identify only a newly created owned gateway for the exact requested service."""
+    binding_value = session.gateway.get("jarvis_runtime_binding")
+    binding = cast(dict[str, object], binding_value) if isinstance(binding_value, dict) else {}
+    return (
+        session.cluster == handoff.cluster
+        and session.metadata.get("owner") == "clio-relay"
+        and binding.get("source_relay_job_id") == handoff.source_job_id
+        and binding.get("source_relay_artifact_id") == handoff.source_artifact_id
+        and binding.get("package_id") == handoff.package_id
+        and binding.get("package_name") == handoff.package_name
+        and binding.get("service_instance_id") == handoff.service_instance_id
+    )
+
+
+def _gateway_sessions_for_acceptance(
+    queue: StorageManagedQueue,
+    *,
+    cluster: str,
+) -> list[GatewaySession]:
+    """Read one target's gateway records through bounded canonical pagination."""
+    sessions: list[GatewaySession] = []
+    cursor = 1
+    while True:
+        page, next_cursor, total = queue.list_gateway_sessions_page(
+            cursor=cursor,
+            limit=MAX_RESPONSE_PAGE_RECORDS,
+            cluster=cluster,
+        )
+        sessions.extend(page)
+        if total > MAX_ACCEPTANCE_COLLECTION_RECORDS or len(sessions) > total:
+            raise RelayError(
+                "secure runtime acceptance gateway inventory exceeded "
+                f"{MAX_ACCEPTANCE_COLLECTION_RECORDS} records"
+            )
+        if next_cursor is None:
+            return sessions
+        if next_cursor <= cursor:
+            raise RelayError("secure runtime acceptance gateway pagination did not advance")
+        cursor = next_cursor
+
+
+def _validated_secure_runtime_bind(
+    bind_result: dict[str, Any],
+    *,
+    handoff: JarvisServiceRuntimeHandoff,
+    expected_execution_id: str,
+    expected_source_artifact_sha256: str,
+) -> tuple[str, JarvisServiceRuntimeBinding]:
+    """Validate the public v2 bind result without accepting caller-owned runtime data."""
+    if bind_result.get("scheduler_cancel_requested") is not False:
+        raise RelayError("secure runtime bind unexpectedly requested scheduler cancellation")
+    gateway_session_id = bind_result.get("gateway_session_id")
+    gateway = bind_result.get("gateway_session")
+    if not isinstance(gateway_session_id, str) or not isinstance(gateway, dict):
+        raise RelayError("secure runtime bind omitted its gateway identity")
+    typed_gateway = cast(dict[str, Any], gateway)
+    if (
+        typed_gateway.get("session_id") != gateway_session_id
+        or typed_gateway.get("cluster") != handoff.cluster
+        or typed_gateway.get("state") != "ready"
+    ):
+        raise RelayError("secure runtime bind returned an inconsistent gateway")
+    gateway_data = typed_gateway.get("gateway")
+    if not isinstance(gateway_data, dict):
+        raise RelayError("secure runtime gateway omitted its public binding")
+    try:
+        binding = JarvisServiceRuntimeBinding.model_validate(
+            cast(dict[str, Any], gateway_data).get("jarvis_runtime_binding")
+        )
+    except ValueError as exc:
+        raise RelayError(f"secure runtime public binding was invalid: {exc}") from exc
+    if (
+        binding.schema_version != RELAY_JARVIS_RUNTIME_BINDING_SCHEMA_V2
+        or binding.service_runtime_schema_version != JARVIS_SERVICE_RUNTIME_SCHEMA_V2
+        or binding.authorization_sha256 is None
+        or binding.source_relay_job_id != handoff.source_job_id
+        or binding.source_relay_artifact_id != handoff.source_artifact_id
+        or binding.source_relay_artifact_sha256 != expected_source_artifact_sha256
+        or binding.jarvis_execution_id != expected_execution_id
+        or binding.package_id != handoff.package_id
+        or binding.package_name != handoff.package_name
+        or binding.service_instance_id != handoff.service_instance_id
+        or binding.dataset_descriptor_sha256
+        != _secure_runtime_canonical_json_sha256(binding.dataset_descriptor.model_dump(mode="json"))
+    ):
+        raise RelayError("secure runtime public binding changed its exact handoff identity")
+    for key in (
+        "connect_url",
+        "health_url",
+        "stream_url",
+        "events_url",
+        "state_url",
+        "command_url",
+    ):
+        value = bind_result.get(key)
+        if not isinstance(value, str):
+            raise RelayError(f"secure runtime bind omitted {key}")
+        parsed = urllib.parse.urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or parsed.hostname != "127.0.0.1"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise RelayError(f"secure runtime public {key} is not a clean loopback URL")
+    _assert_secret_free_document(bind_result, forbidden_values=set(), label="secure runtime bind")
+    return gateway_session_id, binding
+
+
+def _secure_runtime_canonical_json_sha256(value: object) -> str:
+    """Hash canonical finite JSON using the JARVIS runtime binding contract."""
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _validate_secure_runtime_json_pointer(pointer: str) -> None:
+    """Validate one bounded RFC 6901 pointer used by an acceptance adapter."""
+    if not pointer.startswith("/") or len(pointer.split("/")) > 65:
+        raise ValueError("secure runtime adapter selector must be a bounded JSON pointer")
+    if re.search(r"~(?:[^01]|$)", pointer) is not None:
+        raise ValueError("secure runtime adapter selector used an invalid JSON pointer escape")
+
+
+def _secure_runtime_json_pointer_value(
+    document: object,
+    pointer: str,
+    *,
+    label: str,
+) -> object:
+    """Resolve a validated RFC 6901 pointer without inference or fallback paths."""
+    try:
+        _validate_secure_runtime_json_pointer(pointer)
+    except ValueError as exc:
+        raise RelayError(f"secure runtime {label} selector was invalid") from exc
+    current = document
+    for encoded_token in pointer[1:].split("/"):
+        token = encoded_token.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict):
+            mapping = cast(dict[object, object], current)
+            if token not in mapping:
+                raise RelayError(f"secure runtime {label} selector did not resolve")
+            current = mapping[token]
+            continue
+        if isinstance(current, list):
+            if re.fullmatch(r"0|[1-9][0-9]*", token) is None:
+                raise RelayError(f"secure runtime {label} selector did not resolve")
+            index = int(token)
+            sequence = cast(list[object], current)
+            if index >= len(sequence):
+                raise RelayError(f"secure runtime {label} selector did not resolve")
+            current = sequence[index]
+            continue
+        raise RelayError(f"secure runtime {label} selector did not resolve")
+    return current
+
+
+def _correlate_secure_runtime_browser_document(
+    document: dict[str, Any],
+    observation: SecureRuntimeHttpEvidence,
+    *,
+    endpoint: Literal["health", "state", "command", "events"],
+    adapter: SecureRuntimeEndpointAdapter,
+    expected_service_instance_id: str,
+    expected_execution_id: str,
+    expected_dataset_descriptor_sha256: str,
+    expected_command_id: str | None,
+) -> tuple[SecureRuntimeHttpEvidence, int]:
+    """Apply an application-owned adapter and bind selected values to relay identity."""
+    for pointer, expected in adapter.assertions.items():
+        observed = _secure_runtime_json_pointer_value(
+            document,
+            pointer,
+            label=f"browser {endpoint} assertion",
+        )
+        if type(observed) is not type(expected) or observed != expected:
+            raise RelayError(f"secure runtime browser {endpoint} assertion did not match")
+    service_instance_id = _secure_runtime_json_pointer_value(
+        document,
+        adapter.service_instance_id_pointer,
+        label=f"browser {endpoint} service identity",
+    )
+    if service_instance_id != expected_service_instance_id:
+        raise RelayError(f"secure runtime browser {endpoint} changed service identity")
+    revision = _secure_runtime_json_pointer_value(
+        document,
+        adapter.revision_pointer,
+        label=f"browser {endpoint} revision",
+    )
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+        raise RelayError(f"secure runtime browser {endpoint} omitted a valid revision")
+    execution_id: str | None = None
+    if adapter.execution_id_pointer is not None:
+        selected_execution_id = _secure_runtime_json_pointer_value(
+            document,
+            adapter.execution_id_pointer,
+            label=f"browser {endpoint} execution identity",
+        )
+        if selected_execution_id != expected_execution_id:
+            raise RelayError(f"secure runtime browser {endpoint} changed execution identity")
+        execution_id = expected_execution_id
+    dataset_descriptor_sha256: str | None = None
+    if adapter.dataset_descriptor_pointer is not None:
+        descriptor = _secure_runtime_json_pointer_value(
+            document,
+            adapter.dataset_descriptor_pointer,
+            label=f"browser {endpoint} dataset descriptor",
+        )
+        try:
+            dataset_descriptor_sha256 = _secure_runtime_canonical_json_sha256(descriptor)
+        except (TypeError, ValueError) as exc:
+            raise RelayError(
+                f"secure runtime browser {endpoint} dataset descriptor was not finite JSON"
+            ) from exc
+        if dataset_descriptor_sha256 != expected_dataset_descriptor_sha256:
+            raise RelayError(f"secure runtime browser {endpoint} changed dataset identity")
+    command_id: str | None = None
+    if adapter.command_id_pointer is not None:
+        selected_command_id = _secure_runtime_json_pointer_value(
+            document,
+            adapter.command_id_pointer,
+            label=f"browser {endpoint} command identity",
+        )
+        if not isinstance(selected_command_id, str) or not selected_command_id:
+            raise RelayError(f"secure runtime browser {endpoint} omitted command identity")
+        command_id = selected_command_id
+        if expected_command_id is not None and command_id != expected_command_id:
+            raise RelayError(f"secure runtime browser {endpoint} changed command identity")
+    return (
+        observation.model_copy(
+            update={
+                "service_instance_id": expected_service_instance_id,
+                "execution_id": execution_id,
+                "dataset_descriptor_sha256": dataset_descriptor_sha256,
+                "command_id": command_id,
+                "revision": revision,
+            }
+        ),
+        revision,
+    )
+
+
+def _browser_attachment_capability(grant: BrowserAttachmentGrant) -> str:
+    """Require one identical one-time capability across every loopback attachment URL."""
+    capabilities: set[str] = set()
+    for value in (
+        grant.connect_url,
+        grant.health_url,
+        grant.stream_url,
+        grant.events_url,
+        grant.state_url,
+        grant.command_url,
+    ):
+        parsed = urllib.parse.urlsplit(value)
+        query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname != "127.0.0.1"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+            or set(query) != {"capability"}
+            or len(query["capability"]) != 1
+            or not query["capability"][0]
+        ):
+            raise RelayError("browser attachment returned an invalid capability URL")
+        capabilities.add(query["capability"][0])
+    if len(capabilities) != 1:
+        raise RelayError("browser attachment URLs did not share one exact capability")
+    capability = next(iter(capabilities))
+    if re.fullmatch(r"[0-9a-f]{64}", capability) is None:
+        raise RelayError("browser attachment did not return one 256-bit capability")
+    return capability
+
+
+def _browser_json_observation(
+    url: str,
+    *,
+    endpoint: Literal["health", "state", "command"],
+    method: Literal["GET", "POST"],
+    body: dict[str, Any] | None,
+    timeout_seconds: float,
+) -> tuple[SecureRuntimeHttpEvidence, dict[str, Any]]:
+    """Call one sandbox-browser JSON surface without persisting its capability URL."""
+    encoded: bytes | None = None
+    headers = {"Accept": "application/json", "Origin": "null"}
+    if body is not None:
+        encoded = _canonical_finite_json_bytes(body)
+        headers["Content-Type"] = "application/json"
+    response = _direct_browser_http_request(
+        url,
+        method=method,
+        headers=headers,
+        body=encoded,
+        timeout_seconds=timeout_seconds,
+        maximum_bytes=MAX_SECURE_RUNTIME_RESPONSE_BYTES,
+        stop_after_sse_event=False,
+    )
+    _require_media_type(response.content_type, expected="application/json")
+    decoded = _strict_finite_json(response.payload, label=f"browser {endpoint} response")
+    if not isinstance(decoded, dict):
+        raise RelayError(f"secure runtime browser {endpoint} response was not an object")
+    document = {str(key): value for key, value in cast(dict[object, object], decoded).items()}
+    observation = SecureRuntimeHttpEvidence(
+        endpoint=endpoint,
+        method=method,
+        status_code=response.status_code,
+        content_type=response.content_type[:256],
+        body_sha256=hashlib.sha256(response.payload).hexdigest(),
+        body_bytes=len(response.payload),
+    )
+    return observation, document
+
+
+def _browser_sse_observation(
+    url: str,
+    *,
+    timeout_seconds: float,
+    expected_event_name: str,
+) -> tuple[SecureRuntimeHttpEvidence, dict[str, Any]]:
+    """Read exactly one bounded SSE event over a fresh browser-capability connection."""
+    response = _direct_browser_http_request(
+        url,
+        method="GET",
+        headers={"Accept": "text/event-stream", "Origin": "null"},
+        body=None,
+        timeout_seconds=timeout_seconds,
+        maximum_bytes=MAX_SECURE_RUNTIME_SSE_EVENT_BYTES,
+        stop_after_sse_event=True,
+    )
+    _require_media_type(response.content_type, expected="text/event-stream")
+    document = _strict_sse_data_document(
+        response.payload,
+        expected_event_name=expected_event_name,
+    )
+    return (
+        SecureRuntimeHttpEvidence(
+            endpoint="events",
+            method="GET",
+            status_code=response.status_code,
+            content_type=response.content_type[:256],
+            body_sha256=hashlib.sha256(response.payload).hexdigest(),
+            body_bytes=len(response.payload),
+        ),
+        document,
+    )
+
+
+def _direct_browser_http_request(
+    url: str,
+    *,
+    method: Literal["GET", "POST"],
+    headers: dict[str, str],
+    body: bytes | None,
+    timeout_seconds: float,
+    maximum_bytes: int,
+    stop_after_sse_event: bool,
+) -> _BrowserHttpResponse:
+    """Issue one direct loopback request with an absolute wall-clock deadline."""
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise RelayError("secure runtime browser timeout must be positive and finite")
+    target, port = _direct_browser_http_target(url)
+    deadline = time.monotonic() + timeout_seconds
+    expired = threading.Event()
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout_seconds)
+
+    def abort_at_deadline() -> None:
+        expired.set()
+        active_socket = connection.sock
+        if active_socket is not None:
+            with suppress(OSError):
+                active_socket.shutdown(socket.SHUT_RDWR)
+        connection.close()
+
+    timer = threading.Timer(timeout_seconds, abort_at_deadline)
+    timer.daemon = True
+    timer.start()
+    try:
+        connection.request(
+            method,
+            target,
+            body=body,
+            headers={**headers, "Connection": "close"},
+        )
+        response = connection.getresponse()
+        if response.status < 200 or response.status > 299:
+            raise _BrowserHttpRequestError(
+                f"secure runtime browser request returned HTTP {response.status}",
+                kind=f"http_{response.status}",
+            )
+        content_type_values = response.headers.get_all("Content-Type", failobj=[])
+        if len(content_type_values) != 1:
+            raise _BrowserHttpRequestError(
+                "secure runtime browser response requires one Content-Type header",
+                kind="protocol",
+            )
+        content_length_values = response.headers.get_all("Content-Length", failobj=[])
+        if len(content_length_values) > 1:
+            raise _BrowserHttpRequestError(
+                "secure runtime browser response repeated Content-Length",
+                kind="protocol",
+            )
+        transfer_encoding_values = response.headers.get_all("Transfer-Encoding", failobj=[])
+        if (
+            len(transfer_encoding_values) > 1
+            or (transfer_encoding_values and transfer_encoding_values[0].casefold() != "chunked")
+            or (transfer_encoding_values and content_length_values)
+        ):
+            raise _BrowserHttpRequestError(
+                "secure runtime browser response had ambiguous transfer framing",
+                kind="protocol",
+            )
+        if content_length_values:
+            try:
+                content_length = int(content_length_values[0])
+            except ValueError as exc:
+                raise _BrowserHttpRequestError(
+                    "secure runtime browser response had invalid Content-Length",
+                    kind="protocol",
+                ) from exc
+            if content_length < 0 or content_length > maximum_bytes:
+                raise _BrowserHttpRequestError(
+                    "secure runtime browser response exceeded its byte limit",
+                    kind="flood",
+                )
+        payload = _read_browser_http_body(
+            connection,
+            response,
+            deadline=deadline,
+            maximum_bytes=maximum_bytes,
+            stop_after_sse_event=stop_after_sse_event,
+        )
+        return _BrowserHttpResponse(
+            status_code=int(response.status),
+            content_type=str(content_type_values[0]),
+            payload=payload,
+        )
+    except _BrowserHttpRequestError:
+        raise
+    except TimeoutError as exc:
+        raise _BrowserHttpRequestError(
+            "secure runtime browser request exceeded its absolute deadline",
+            kind="deadline",
+        ) from exc
+    except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError) as exc:
+        kind = (
+            "connection_refused" if isinstance(exc, ConnectionRefusedError) else "connection_reset"
+        )
+        raise _BrowserHttpRequestError(
+            "secure runtime browser loopback proxy was unavailable",
+            kind=kind,
+        ) from exc
+    except (OSError, http.client.HTTPException) as exc:
+        if expired.is_set() or time.monotonic() >= deadline:
+            raise _BrowserHttpRequestError(
+                "secure runtime browser request exceeded its absolute deadline",
+                kind="deadline",
+            ) from exc
+        error_number = getattr(exc, "winerror", None) or getattr(exc, "errno", None)
+        if error_number in {61, 104, 111, 10054, 10061}:
+            kind = "connection_refused" if error_number in {61, 111, 10061} else "connection_reset"
+            raise _BrowserHttpRequestError(
+                "secure runtime browser loopback proxy was unavailable",
+                kind=kind,
+            ) from exc
+        raise _BrowserHttpRequestError(
+            "secure runtime browser request failed at its direct loopback transport",
+            kind="transport",
+        ) from exc
+    finally:
+        timer.cancel()
+        connection.close()
+
+
+def _direct_browser_http_target(url: str) -> tuple[str, int]:
+    """Return a direct HTTP request target without consulting redirect or proxy settings."""
+    parsed = urllib.parse.urlsplit(url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise RelayError("secure runtime browser URL had an invalid port") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or port is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or any(character in url for character in "\r\n\x00")
+    ):
+        raise RelayError("secure runtime browser request requires one clean loopback HTTP URL")
+    path = parsed.path or "/"
+    return path + (f"?{parsed.query}" if parsed.query else ""), port
+
+
+def _read_browser_http_body(
+    connection: http.client.HTTPConnection,
+    response: http.client.HTTPResponse,
+    *,
+    deadline: float,
+    maximum_bytes: int,
+    stop_after_sse_event: bool,
+) -> bytes:
+    """Read bounded decoded HTTP bytes while recomputing the absolute deadline."""
+    payload = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _BrowserHttpRequestError(
+                "secure runtime browser request exceeded its absolute deadline",
+                kind="deadline",
+            )
+        if connection.sock is not None:
+            connection.sock.settimeout(remaining)
+        chunk = response.read1(min(8192, maximum_bytes + 1 - len(payload)))
+        if not chunk:
+            if time.monotonic() >= deadline:
+                raise _BrowserHttpRequestError(
+                    "secure runtime browser request exceeded its absolute deadline",
+                    kind="deadline",
+                )
+            break
+        payload.extend(chunk)
+        if len(payload) > maximum_bytes:
+            raise _BrowserHttpRequestError(
+                "secure runtime browser response exceeded its byte limit",
+                kind="flood",
+            )
+        if stop_after_sse_event:
+            frame_end = _first_sse_frame_end(payload)
+            if frame_end is not None:
+                return bytes(payload[:frame_end])
+    if stop_after_sse_event:
+        raise _BrowserHttpRequestError(
+            "secure runtime browser events response omitted a complete event",
+            kind="protocol",
+        )
+    if not payload:
+        raise _BrowserHttpRequestError(
+            "secure runtime browser response body was empty",
+            kind="protocol",
+        )
+    return bytes(payload)
+
+
+def _first_sse_frame_end(payload: bytes | bytearray) -> int | None:
+    endings = [
+        index + len(marker)
+        for marker in (b"\n\n", b"\r\n\r\n")
+        if (index := payload.find(marker)) >= 0
+    ]
+    return min(endings) if endings else None
+
+
+def _require_media_type(content_type: str, *, expected: str) -> None:
+    """Require one exact media type with at most a UTF-8 charset parameter."""
+    parts = [part.strip() for part in content_type.split(";")]
+    if not parts or parts[0].casefold() != expected:
+        raise RelayError(f"secure runtime browser response was not {expected}")
+    parameters: dict[str, str] = {}
+    for raw in parts[1:]:
+        name, separator, value = raw.partition("=")
+        normalized_name = name.strip().casefold()
+        normalized_value = value.strip().strip('"').casefold()
+        if (
+            separator != "="
+            or not normalized_name
+            or normalized_name in parameters
+            or normalized_name != "charset"
+            or normalized_value != "utf-8"
+        ):
+            raise RelayError("secure runtime browser response had invalid media-type parameters")
+        parameters[normalized_name] = normalized_value
+
+
+def _canonical_finite_json_bytes(value: object) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise RelayError("secure runtime browser request body was not finite JSON") from exc
+
+
+def _strict_finite_json(payload: bytes, *, label: str) -> object:
+    """Decode UTF-8 JSON while rejecting duplicate keys and non-finite numbers."""
+    try:
+        return decode_strict_json(payload, label=f"secure runtime {label}")
+    except RelayError:
+        raise RelayError(f"secure runtime {label} was not strict finite JSON") from None
+
+
+def _strict_sse_data_document(
+    frame: bytes,
+    *,
+    expected_event_name: str,
+) -> dict[str, Any]:
+    """Require one complete SSE frame whose data field is a strict JSON object."""
+    try:
+        text = frame.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RelayError("secure runtime browser SSE frame was not UTF-8") from exc
+    normalized = text.replace("\r\n", "\n")
+    if not normalized.endswith("\n\n"):
+        raise RelayError("secure runtime browser SSE frame was incomplete")
+    lines = normalized[:-2].split("\n")
+    event_lines = [line[6:].lstrip(" ") for line in lines if line.startswith("event:")]
+    if event_lines != [expected_event_name]:
+        raise RelayError("secure runtime browser SSE event name did not match its adapter")
+    data_lines = [line[5:].lstrip(" ") for line in lines if line.startswith("data:")]
+    if not data_lines:
+        raise RelayError("secure runtime browser SSE frame omitted data")
+    decoded = _strict_finite_json("\n".join(data_lines).encode("utf-8"), label="SSE data")
+    if not isinstance(decoded, dict):
+        raise RelayError("secure runtime browser SSE data was not an object")
+    return {str(key): value for key, value in cast(dict[object, object], decoded).items()}
+
+
+def _wait_for_changed_sse_event(
+    url: str,
+    *,
+    previous: SecureRuntimeHttpEvidence,
+    require_change: bool,
+    timeout_seconds: float,
+    poll_seconds: float,
+    expected_event_name: str,
+) -> tuple[SecureRuntimeHttpEvidence, dict[str, Any]]:
+    """Reconnect to SSE until the configured command produces a new event digest."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = max(0.001, deadline - time.monotonic())
+        observed, document = _browser_sse_observation(
+            url,
+            timeout_seconds=min(remaining, 10.0),
+            expected_event_name=expected_event_name,
+        )
+        if not require_change or observed.body_sha256 != previous.body_sha256:
+            return observed, document
+        if time.monotonic() >= deadline:
+            raise RelayError("secure runtime SSE did not change after its command")
+        time.sleep(min(poll_seconds, max(0.001, deadline - time.monotonic())))
+
+
+def _wait_for_changed_browser_state(
+    url: str,
+    *,
+    previous: SecureRuntimeHttpEvidence,
+    require_change: bool,
+    timeout_seconds: float,
+    poll_seconds: float,
+) -> tuple[SecureRuntimeHttpEvidence, dict[str, Any]]:
+    """Poll browser state until the configured command is durably observable."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = max(0.001, deadline - time.monotonic())
+        observed, document = _browser_json_observation(
+            url,
+            endpoint="state",
+            method="GET",
+            body=None,
+            timeout_seconds=min(remaining, 10.0),
+        )
+        if not require_change or observed.body_sha256 != previous.body_sha256:
+            return observed, document
+        if time.monotonic() >= deadline:
+            raise RelayError("secure runtime state did not change after its command")
+        time.sleep(min(poll_seconds, max(0.001, deadline - time.monotonic())))
+
+
+def _browser_evidence_reference(
+    attachment_id: str,
+    observation: SecureRuntimeHttpEvidence,
+) -> EvidenceReference:
+    """Project a browser observation without including its one-time capability URL."""
+    return EvidenceReference(
+        kind="secure_runtime_browser_http",
+        reference=f"browser-attachment://{attachment_id}/{observation.endpoint}",
+        sha256=observation.body_sha256,
+        metadata=observation.model_dump(mode="json"),
+    )
+
+
+def _assert_browser_capability_revoked(
+    url: str,
+    *,
+    timeout_seconds: float,
+    proxy_stopped: bool,
+) -> None:
+    """Require explicit denial, or a proven-stopped loopback proxy, for an old grant."""
+    try:
+        _direct_browser_http_request(
+            url,
+            method="GET",
+            headers={"Accept": "application/json", "Origin": "null"},
+            body=None,
+            timeout_seconds=max(timeout_seconds, 0.1),
+            maximum_bytes=1,
+            stop_after_sse_event=False,
+        )
+    except _BrowserHttpRequestError as exc:
+        if exc.kind in {"http_401", "http_403", "http_410"}:
+            return
+        if proxy_stopped and exc.kind in {"connection_refused", "connection_reset"}:
+            return
+        raise RelayError(
+            f"revoked browser capability failed with non-revocation cause {exc.kind}"
+        ) from exc
+    raise RelayError("revoked browser capability remained usable")
+
+
+def _validate_secure_runtime_cleanup(
+    result: ServiceRuntimeStopResult,
+    *,
+    expected_mode: Literal["detach", "teardown"],
+    expected_session_id: str,
+) -> None:
+    """Require exact owned cleanup with scheduler preservation as the default."""
+    expected_state = (
+        GatewaySessionState.DEGRADED if expected_mode == "detach" else GatewaySessionState.CLOSED
+    )
+    if (
+        result.mode != expected_mode
+        or result.session.session_id != expected_session_id
+        or result.session.state is not expected_state
+        or result.errors
+        or result.residual_resources
+        or result.canceled_scheduler_job is not None
+    ):
+        raise RelayError(f"secure runtime {expected_mode} did not complete cleanly")
+    if any(resource.action == "cancel" for resource in result.resources):
+        raise RelayError(f"secure runtime {expected_mode} requested cancellation")
+    report = result.to_live_validation_report()
+    if report.status.value != "passed" or report.cleanup.cancel_scheduler_jobs:
+        raise RelayError(f"secure runtime {expected_mode} evidence did not pass")
+
+
+def _record_runtime_cleanup(
+    recorder: ValidationRecorder,
+    result: ServiceRuntimeStopResult,
+    *,
+    role: str,
+) -> None:
+    """Merge one secret-free runtime cleanup operation into the canonical report."""
+    recorder.report.cleanup.requested = True
+    recorder.report.cleanup.mode = "secure_runtime_detach_reconnect_teardown"
+    recorder.report.cleanup.cancel_scheduler_jobs = False
+    for resource in result.resources:
+        raw = resource.to_validation_resource(cluster=result.session.cluster).model_dump(
+            mode="json"
+        )
+        public = redact_sensitive_values(raw)
+        if not isinstance(public, dict):
+            raise RelayError("secure runtime cleanup projection was invalid")
+        parsed_resource = ValidationResource.model_validate(public)
+        validation_resource = parsed_resource.model_copy(
+            update={
+                "role": role,
+                "metadata": {
+                    **parsed_resource.metadata,
+                    "cancel_scheduler_job": False,
+                    "cleanup_action": resource.action,
+                    "cleanup_outcome": resource.outcome,
+                    "evidence_scope": "clio-relay-core-lifecycle-and-public-evidence",
+                },
+            }
+        )
+        recorder.add_resource(validation_resource)
+        action = cast(dict[str, Any], redact_sensitive_values(resource.model_dump(mode="json")))
+        action["phase"] = role
+        if action not in recorder.report.cleanup.actions:
+            recorder.report.cleanup.actions.append(action)
+        if resource.residual:
+            recorder.report.cleanup.remaining_resources.append(validation_resource)
+
+
+def _assert_secret_free_document(
+    document: object,
+    *,
+    forbidden_values: set[str],
+    label: str,
+) -> None:
+    """Reject raw credentials, browser capabilities, or bearer material in public evidence."""
+    rendered = json.dumps(document, ensure_ascii=False, sort_keys=True, default=str)
+    if re.search(r"(?i)authorization\s*:\s*bearer\s+(?!<redacted>)", rendered):
+        raise RelayError(f"{label} retained a bearer authorization value")
+    if "?capability=" in rendered or "&capability=" in rendered:
+        raise RelayError(f"{label} retained a browser capability URL")
+
+    def visit(value: object, *, parent_key: str | None = None) -> None:
+        if isinstance(value, dict):
+            for raw_key, nested in cast(dict[object, object], value).items():
+                key = str(raw_key)
+                normalized = key.casefold().replace("-", "_").replace(".", "_")
+                digest_key = normalized.endswith("_sha256") or normalized.endswith("_digest")
+                sensitive_key = normalized in {
+                    "authorization",
+                    "capability",
+                    "credential",
+                    "credentials",
+                    "password",
+                    "private_key",
+                    "secret",
+                    "secret_key",
+                    "token",
+                } or normalized.endswith(
+                    (
+                        "_credential",
+                        "_credentials",
+                        "_authorization",
+                        "_capability",
+                        "_password",
+                        "_private_key",
+                        "_secret",
+                        "_secret_key",
+                        "_token",
+                    )
+                )
+                if sensitive_key and not digest_key and nested != "<redacted>":
+                    raise RelayError(f"{label} retained sensitive field {key}")
+                visit(nested, parent_key=key)
+        elif isinstance(value, list):
+            for nested in cast(list[object], value):
+                visit(nested, parent_key=parent_key)
+        elif isinstance(value, str):
+            if any(secret and secret in value for secret in forbidden_values):
+                raise RelayError(f"{label} retained a private capability value")
+            if re.search(r"(?i)\bbearer\s+(?!<redacted>)(?:\S+)", value):
+                raise RelayError(f"{label} retained bearer authorization material")
+            if parent_key == "authorization" and value not in {"<redacted>", "bearer"}:
+                raise RelayError(f"{label} retained raw authorization material")
+
+    visit(document)
+
+
+def _redacted_text(value: str, forbidden_values: set[str]) -> str:
+    """Remove known private values from a diagnostic before it reaches a report."""
+    result = value
+    for secret in sorted(forbidden_values, key=len, reverse=True):
+        if secret:
+            result = result.replace(secret, "<redacted>")
+    return result
+
+
+def _redacted_error_text(error: BaseException, forbidden_values: set[str]) -> str:
+    return _redacted_text(f"{type(error).__name__}: {error}", forbidden_values)
+
+
+def _redact_exception_values(error: BaseException, forbidden_values: set[str]) -> None:
+    """Attach a safe diagnostic when an upstream exception may contain known capabilities."""
+    safe = _redacted_error_text(error, forbidden_values)
+    if safe != f"{type(error).__name__}: {error}":
+        error.add_note(f"redacted secure runtime diagnostic: {safe}")
+
+
 def _write_generated_agent_prompt(
     definition: ClusterDefinition,
     *,
@@ -1152,7 +3332,7 @@ def _verify_completed_job(
     expected_progress_package: str | None = None,
     recorder: ValidationRecorder | None = None,
     require_structured_runtime_metadata: bool = False,
-) -> None:
+) -> RuntimeMetadataAcceptance | None:
     monitor = _remote_clio_json(
         definition,
         ["job", "monitor", job_id, "--cursor", "1", "--limit", "250"],
@@ -1301,14 +3481,16 @@ def _verify_completed_job(
     if provenance_payload.get("encoding") != "base64":
         raise RelayError("acceptance provenance payload was not base64 encoded")
     lines.append(f"{line_prefix}.provenance=ok")
-    structured_runtime_metadata = _verify_runtime_metadata_artifact(
+    runtime_metadata = _verify_runtime_metadata_artifact(
         definition,
         artifact_items,
         line_prefix=line_prefix,
         lines=lines,
         runner=runner,
     )
-    if require_structured_runtime_metadata and not structured_runtime_metadata:
+    if require_structured_runtime_metadata and (
+        runtime_metadata is None or not runtime_metadata.structured
+    ):
         raise RelayError(
             "acceptance requires structured JARVIS runtime metadata, not a missing or "
             "legacy stdout-derived runtime artifact"
@@ -1358,6 +3540,7 @@ def _verify_completed_job(
                     metadata=dict(provider_metadata),
                 )
             )
+    return runtime_metadata
 
 
 def _verify_runtime_metadata_artifact(
@@ -1367,14 +3550,14 @@ def _verify_runtime_metadata_artifact(
     line_prefix: str,
     lines: list[str],
     runner: CommandRunner,
-) -> bool:
+) -> RuntimeMetadataAcceptance | None:
     """Validate and report a normalized runtime metadata artifact when present."""
     runtime_artifact = next(
         (artifact for artifact in artifacts if artifact.get("kind") == "runtime_metadata"),
         None,
     )
     if runtime_artifact is None:
-        return False
+        return None
     artifact_id = runtime_artifact.get("artifact_id")
     if not isinstance(artifact_id, str) or not artifact_id:
         raise RelayError("runtime metadata artifact has no artifact id")
@@ -1389,7 +3572,11 @@ def _verify_runtime_metadata_artifact(
         line_prefix=line_prefix,
     )
     lines.extend(facts)
-    return f"{line_prefix}.structured_runtime_metadata=ok" in facts
+    runtime = _decode_runtime_metadata_payload(payload)
+    return RuntimeMetadataAcceptance(
+        document=runtime,
+        structured=f"{line_prefix}.structured_runtime_metadata=ok" in facts,
+    )
 
 
 def _runtime_metadata_facts(
@@ -1399,21 +3586,8 @@ def _runtime_metadata_facts(
     line_prefix: str,
 ) -> list[str]:
     """Validate a runtime metadata payload and return report-ready facts."""
-    if payload.get("encoding") != "base64" or not isinstance(payload.get("data"), str):
-        raise RelayError("runtime metadata artifact payload was not base64 encoded")
-    try:
-        decoded = json.loads(b64decode(cast(str, payload["data"])).decode("utf-8"))
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RelayError(f"runtime metadata artifact was not valid JSON: {exc}") from exc
-    if not isinstance(decoded, dict):
-        raise RelayError("runtime metadata artifact was not an object")
-    runtime = cast(dict[str, Any], decoded)
-    if runtime.get("schema_version") != RUNTIME_METADATA_SCHEMA:
-        raise RelayError("runtime metadata artifact has an unsupported schema")
-    source = runtime.get("source")
-    allowed_sources = {item.value for item in RuntimeMetadataSource}
-    if not isinstance(source, str) or source not in allowed_sources:
-        raise RelayError("runtime metadata artifact has an invalid source")
+    runtime = _decode_runtime_metadata_payload(payload)
+    source = str(runtime["source"])
     facts = [
         f"{line_prefix}.runtime_metadata_artifact={artifact_id}",
         f"{line_prefix}.runtime_metadata_source={source}",
@@ -1457,9 +3631,51 @@ def _runtime_metadata_facts(
     return facts
 
 
+def _decode_runtime_metadata_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Decode and strictly validate one normalized runtime metadata artifact."""
+    if payload.get("encoding") != "base64" or not isinstance(payload.get("data"), str):
+        raise RelayError("runtime metadata artifact payload was not base64 encoded")
+    try:
+        decoded = json.loads(b64decode(cast(str, payload["data"])).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RelayError(f"runtime metadata artifact was not valid JSON: {exc}") from exc
+    if not isinstance(decoded, dict):
+        raise RelayError("runtime metadata artifact was not an object")
+    runtime = cast(dict[str, Any], decoded)
+    if runtime.get("schema_version") != RUNTIME_METADATA_SCHEMA:
+        raise RelayError("runtime metadata artifact has an unsupported schema")
+    try:
+        validated = JarvisRuntimeMetadata.model_validate(runtime)
+    except ValueError as exc:
+        raise RelayError(f"runtime metadata artifact was invalid: {exc}") from exc
+    return validated.model_dump(mode="json")
+
+
 def _expected_progress_adapter(pipeline_yaml: str) -> str | None:
     declaration = _expected_progress_declaration(pipeline_yaml)
     return declaration[0] if declaration is not None else None
+
+
+def _secure_runtime_probe_config(pipeline_yaml: str) -> SecureRuntimeProbeConfig | None:
+    """Read an acceptance-only secure runtime probe without forwarding it to JARVIS."""
+    try:
+        loaded = cast(object, yaml.safe_load(pipeline_yaml))
+    except yaml.YAMLError as exc:
+        raise ConfigurationError(f"live-test JARVIS YAML is invalid: {exc}") from exc
+    if not isinstance(loaded, dict):
+        return None
+    extension = cast(dict[str, object], loaded).get("x_clio_relay")
+    if extension is None:
+        return None
+    if not isinstance(extension, dict):
+        raise ConfigurationError("x_clio_relay must be an object")
+    raw_probe = cast(dict[str, object], extension).get("secure_runtime_probe")
+    if raw_probe is None:
+        return None
+    try:
+        return SecureRuntimeProbeConfig.model_validate(raw_probe)
+    except ValueError as exc:
+        raise ConfigurationError(f"x_clio_relay.secure_runtime_probe is invalid: {exc}") from exc
 
 
 def _expected_progress_package(pipeline_yaml: str) -> str | None:
