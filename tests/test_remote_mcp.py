@@ -248,7 +248,7 @@ def test_current_scientific_catalog_contract_requires_explicit_handoff(
         command="uvx",
         args=[
             "--from",
-            "/opt/wheels/clio_kit-2.5.13-py3-none-any.whl",
+            "/opt/wheels/clio_kit-2.5.14-py3-none-any.whl",
             "clio-kit",
             "mcp-server",
             "scientific-catalog",
@@ -296,7 +296,7 @@ def test_scientific_catalog_contract_projects_identity_to_live_report() -> None:
         command="uvx",
         args=[
             "--from",
-            "/opt/wheels/clio_kit-2.5.13-py3-none-any.whl",
+            "/opt/wheels/clio_kit-2.5.14-py3-none-any.whl",
             "clio-kit",
             "mcp-server",
             "scientific-catalog",
@@ -4855,7 +4855,7 @@ def test_cli_validate_catalog_waits_and_projects_automatic_assertion(
         command="uvx",
         args=[
             "--from",
-            "/opt/wheels/clio_kit-2.5.13-py3-none-any.whl",
+            "/opt/wheels/clio_kit-2.5.14-py3-none-any.whl",
             "clio-kit",
             "mcp-server",
             "scientific-catalog",
