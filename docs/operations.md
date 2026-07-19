@@ -33,6 +33,21 @@ explicit `session teardown --stop-worker` does. The persistent unit restarts
 after both clean and failed worker-process exits; an explicit systemd stop is
 still respected and remains stopped until an operator starts it again.
 
+Worker capacity is part of the cluster definition, not a property reconstructed
+from whichever restart command happened to run last. New and legacy cluster
+definitions default to three total slots with one slot reserved for control
+queries. A normal reinstall uses that persisted policy. To restart the exact
+installed unit without replacing its `ExecStart` or capacity policy, use:
+
+```powershell
+clio-relay cluster restart-endpoint-service --cluster my-cluster
+```
+
+The restart-only command verifies the installed unit's total, reserved-control,
+and per-kind capacity arguments against the persisted cluster policy before it
+restarts anything. A legacy or drifted unit is left untouched and must be
+reinstalled with `cluster install-endpoint-service`.
+
 ### Upgrade durable queue indexes
 
 The worker service runs this preflight before it accepts work:
@@ -457,19 +472,31 @@ For targeted operator cleanup, pass `--job-id` to `queue stale` or
 `queue cleanup-stale`. The exact-job form still computes bounded queue context,
 but it cannot recover or cancel a neighboring stale record.
 
-Worker capacity is configured when the user-level worker service is installed:
+Worker capacity is persisted per cluster and applied whenever the user-level
+worker service is installed:
 
 ```powershell
-clio-relay cluster install-endpoint-service --cluster my-cluster --concurrency 4 --kind-concurrency jarvis=2 --kind-concurrency remote_agent=2 --kind-concurrency mcp_call=1 --start --enable
+clio-relay cluster install-endpoint-service --cluster my-cluster --concurrency 4 --control-query-concurrency 1 --kind-concurrency jarvis=2 --kind-concurrency remote_agent=2 --start --enable
 ```
 
 This keeps one sudo-less user service per cluster and runs multiple in-process
 worker slots inside that service. `--concurrency` is the total process capacity.
-Repeat `--kind-concurrency KIND=LIMIT` to reserve an independent admission cap
-for `jarvis`, `remote_agent`, or `mcp_call`; omitted kinds remain governed only
-by total capacity. The queue checks these limits atomically with durable lease
-creation across slots and processes. A saturated kind is skipped so it cannot
-block an eligible job of another kind. `clio-relay worker status`, HTTP
+`--control-query-concurrency` carves a strict control-query lane out of that
+total; managed policies retain at least one control slot and one workload slot.
+This allows status, progress, artifact, and runtime-binding queries to execute
+while a long-lived workload is still running. Repeat `--kind-concurrency
+KIND=LIMIT` to add a ceiling for `jarvis`, `remote_agent`, or `mcp_call`;
+omitted kinds remain governed only by their lane and total capacity. Kind limits
+are caps, not reserved slots. An `mcp_call` kind limit applies to workload-class
+MCP calls; reserved control queries use the separately configured control-query
+cap, so a long-running workload MCP call cannot consume its query lane. The
+queue checks these limits atomically with
+durable lease creation across slots and processes. A saturated kind is skipped
+so it cannot block an eligible job of another kind. Explicit install overrides
+are saved back to the cluster registry, so a later install with no capacity
+flags cannot silently reset the worker to one slot. Use
+`--clear-kind-concurrency` to remove every persisted per-kind override.
+`clio-relay worker status`, HTTP
 `/workers`, and the equivalent MCP operation report the configured policy,
 whether fresh worker registrations agree, and active leases by kind.
 

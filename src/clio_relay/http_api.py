@@ -26,11 +26,13 @@ from fastapi import (
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from clio_relay.cluster_config import ClusterRegistry, default_registry_path
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError
 from clio_relay.identifiers import DurableRecordId
 from clio_relay.jarvis_mcp import (
+    is_virtual_jarvis_control_query,
     jarvis_cd_lock_binding_expectation,
     jarvis_mcp_artifact_binding,
     jarvis_mcp_env_from,
@@ -38,6 +40,7 @@ from clio_relay.jarvis_mcp import (
     jarvis_mcp_server_args,
 )
 from clio_relay.models import (
+    MCP_ADMISSION_AUTHORITY_METADATA_KEY,
     ArtifactRef,
     ArtifactUse,
     Cursor,
@@ -46,7 +49,11 @@ from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
     JobState,
+    McpAdmissionAuthority,
+    McpAdmissionClass,
     McpCallSpec,
+    McpControlQueryEvidence,
+    McpOperation,
     MonitorRule,
     ProgressRecord,
     RelayEvent,
@@ -86,6 +93,11 @@ from clio_relay.relay_ops import (
 )
 from clio_relay.relay_ops import (
     job_status as get_job_status_operation,
+)
+from clio_relay.remote_mcp import (
+    MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS,
+    resolve_pinned_mcp_admission,
+    resolve_registered_remote_mcp_admission,
 )
 from clio_relay.retention import TerminalRetentionCoordinator
 from clio_relay.session_api import (
@@ -374,8 +386,10 @@ class McpCallSubmitRequest(BaseModel):
         default=None,
         pattern=r"^[0-9a-f]{64}$",
     )
-    tool: str
+    operation: McpOperation = McpOperation.TOOLS_CALL
+    tool: str | None = None
     arguments: dict[str, object] = Field(default_factory=dict)
+    control_query_evidence: McpControlQueryEvidence | None = None
     timeout_seconds: int | None = Field(default=None, gt=0)
     idempotency_key: str
     used_artifact_refs: list[ArtifactUse] = Field(
@@ -389,6 +403,23 @@ class McpCallSubmitRequest(BaseModel):
         """Reject invalid names and relay-owned credential references."""
         return validate_mcp_env_from(value)
 
+    @model_validator(mode="after")
+    def validate_operation_contract(self) -> McpCallSubmitRequest:
+        """Keep call and discovery payloads unambiguous before admission."""
+        if self.operation is McpOperation.TOOLS_CALL:
+            if not self.tool:
+                raise ValueError("tool is required for tools/call")
+            return self
+        if self.tool is not None:
+            raise ValueError("tool must be omitted for tools/list")
+        if self.arguments:
+            raise ValueError("arguments must be empty for tools/list")
+        if self.expected_server_artifact_digest is not None:
+            raise ValueError("tools/list must not carry an expected server artifact digest")
+        if self.control_query_evidence is not None:
+            raise ValueError("tools/list must not carry control-query route evidence")
+        return self
+
 
 class JarvisMcpCallSubmitRequest(BaseModel):
     """HTTP request to submit a remote JARVIS MCP tool call."""
@@ -396,7 +427,8 @@ class JarvisMcpCallSubmitRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     cluster: str
-    tool: str
+    operation: McpOperation = McpOperation.TOOLS_CALL
+    tool: str | None = None
     arguments: dict[str, object] = Field(default_factory=dict)
     expected_server_artifact_digest: str | None = Field(
         default=None,
@@ -412,8 +444,37 @@ class JarvisMcpCallSubmitRequest(BaseModel):
     @model_validator(mode="after")
     def reject_internal_jarvis_run_wait(self) -> JarvisMcpCallSubmitRequest:
         """Keep workload waiting out of the trusted handle-first HTTP ingress."""
+        if self.operation is McpOperation.TOOLS_CALL and not self.tool:
+            raise ValueError("tool is required for tools/call")
+        if self.operation is McpOperation.TOOLS_LIST:
+            if self.tool is not None:
+                raise ValueError("tool must be omitted for tools/list")
+            if self.arguments:
+                raise ValueError("arguments must be empty for tools/list")
+            if self.expected_server_artifact_digest is not None:
+                raise ValueError("tools/list must not carry an expected server artifact digest")
+            if (
+                self.timeout_seconds is not None
+                and self.timeout_seconds > MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
+            ):
+                raise ValueError(
+                    "pinned MCP control-query timeout exceeds "
+                    f"{MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS} seconds"
+                )
+            return self
         if self.tool == "jarvis_run" and "wait" in self.arguments:
             raise ValueError("jarvis_run does not accept internal wait; use jarvis_get_execution")
+        if (
+            self.expected_server_artifact_digest is not None
+            and self.tool is not None
+            and is_virtual_jarvis_control_query(self.tool)
+            and self.timeout_seconds is not None
+            and self.timeout_seconds > MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "pinned MCP control-query timeout exceeds "
+                f"{MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS} seconds"
+            )
         return self
 
 
@@ -663,7 +724,11 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         require_owned_job(artifact.job_id)
         return artifact
 
-    def submit_owned(job: RelayJob) -> RelayJob:
+    def submit_owned(
+        job: RelayJob,
+        *,
+        mcp_admission_authority: McpAdmissionAuthority | None = None,
+    ) -> RelayJob:
         ensure_intake_open()
         if owner_session_cluster is not None and job.cluster != owner_session_cluster:
             raise HTTPException(
@@ -677,6 +742,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 "owner_session_id",
                 "owner_session_generation_id",
                 "owner_session_admission_id",
+                MCP_ADMISSION_AUTHORITY_METADATA_KEY,
             }.intersection(metadata)
         )
         if protected:
@@ -686,6 +752,28 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                     "job ownership metadata is server-managed and cannot be supplied: "
                     + ", ".join(protected)
                 ),
+            )
+        if job.kind is JobKind.MCP_CALL:
+            if not isinstance(job.spec, McpCallSpec):
+                raise HTTPException(status_code=422, detail="MCP job has an invalid specification")
+            if job.spec.admission_class is McpAdmissionClass.CONTROL_QUERY:
+                if mcp_admission_authority is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="control-query MCP admission requires server authority",
+                    )
+                metadata[MCP_ADMISSION_AUTHORITY_METADATA_KEY] = mcp_admission_authority.model_dump(
+                    mode="json"
+                )
+            elif mcp_admission_authority is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="workload MCP admission must not carry control-query authority",
+                )
+        elif mcp_admission_authority is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="MCP admission authority cannot be attached to another job kind",
             )
         if resolved.owner_session_id is not None:
             for use in job.used_artifact_refs:
@@ -760,6 +848,11 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         dependencies=[auth_dependency, session_submission_dependency],
     )
     def submit_job(job: RelayJob) -> RelayJob:
+        if job.kind is JobKind.MCP_CALL:
+            raise HTTPException(
+                status_code=422,
+                detail="MCP jobs must use /jobs/mcp-call or /jobs/jarvis-mcp-call",
+            )
         return submit_owned(job)
 
     @app.post(
@@ -822,6 +915,28 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         dependencies=[auth_dependency, session_submission_dependency],
     )
     def submit_mcp_call(request: McpCallSubmitRequest) -> RelayJob:
+        registry_path = default_registry_path()
+        try:
+            definition = (
+                ClusterRegistry.load(registry_path).clusters.get(request.cluster)
+                if registry_path.exists()
+                else None
+            )
+            admission_class, admission_authority = resolve_registered_remote_mcp_admission(
+                queue=queue,
+                definition=definition,
+                cluster=request.cluster,
+                server=request.server,
+                server_args=request.server_args,
+                env_from=request.env_from,
+                operation=request.operation,
+                tool=request.tool,
+                expected_server_artifact_digest=request.expected_server_artifact_digest,
+                evidence=request.control_query_evidence,
+                timeout_seconds=request.timeout_seconds,
+            )
+        except (ConfigurationError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return submit_owned(
             RelayJob(
                 cluster=request.cluster,
@@ -831,13 +946,16 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                     server_args=request.server_args,
                     env_from=request.env_from,
                     expected_server_artifact_digest=(request.expected_server_artifact_digest),
+                    admission_class=admission_class,
+                    operation=request.operation,
                     tool=request.tool,
                     arguments=request.arguments,
                     timeout_seconds=request.timeout_seconds,
                 ),
                 idempotency_key=request.idempotency_key,
                 used_artifact_refs=request.used_artifact_refs,
-            )
+            ),
+            mcp_admission_authority=admission_authority,
         )
 
     @app.post(
@@ -847,7 +965,26 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     )
     def submit_jarvis_mcp_call(request: JarvisMcpCallSubmitRequest) -> RelayJob:
         expected_digest = request.expected_server_artifact_digest
-        if resolved.owner_session_id is not None and expected_digest is None:
+        try:
+            admission_class, admission_authority = resolve_pinned_mcp_admission(
+                operation=request.operation,
+                tool=request.tool,
+                expected_server_artifact_digest=expected_digest,
+                pinned_control_query=(
+                    request.tool is not None and is_virtual_jarvis_control_query(request.tool)
+                ),
+                timeout_seconds=request.timeout_seconds,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        timeout_seconds = request.timeout_seconds
+        if admission_class is McpAdmissionClass.CONTROL_QUERY and timeout_seconds is None:
+            timeout_seconds = MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
+        if (
+            resolved.owner_session_id is not None
+            and request.operation is McpOperation.TOOLS_CALL
+            and expected_digest is None
+        ):
             raise HTTPException(
                 status_code=422,
                 detail=("owned JARVIS MCP submission requires expected_server_artifact_digest"),
@@ -858,7 +995,11 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         # not substitute a second, unrelated cache as authority here: preserve
         # the supplied digest in the durable spec and let the MCP runner compare
         # it with the server artifact observed immediately before launch.
-        if expected_digest is not None and resolved.owner_session_id is None:
+        if (
+            request.operation is McpOperation.TOOLS_CALL
+            and expected_digest is not None
+            and resolved.owner_session_id is None
+        ):
             try:
                 observed_digest = jarvis_mcp_artifact_binding(request.cluster)
             except ValueError as exc:
@@ -880,13 +1021,16 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                     env_from=jarvis_mcp_env_from(),
                     expected_server_artifact_digest=expected_digest,
                     expected_jarvis_cd_lock_binding=jarvis_cd_lock_binding_expectation(),
+                    admission_class=admission_class,
+                    operation=request.operation,
                     tool=request.tool,
                     arguments=request.arguments,
-                    timeout_seconds=request.timeout_seconds,
+                    timeout_seconds=timeout_seconds,
                 ),
                 idempotency_key=request.idempotency_key,
                 used_artifact_refs=request.used_artifact_refs,
-            )
+            ),
+            mcp_admission_authority=admission_authority,
         )
 
     @app.get("/jobs/{job_id}", response_model=RelayJob, dependencies=[auth_dependency])

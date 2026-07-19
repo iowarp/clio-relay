@@ -18,7 +18,7 @@ from filelock import FileLock
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from clio_relay.errors import ConfigurationError
-from clio_relay.models import validate_mcp_env_from
+from clio_relay.models import JobKind, validate_mcp_env_from
 from clio_relay.remote_values import validate_remote_path
 
 CLUSTER_REGISTRY_ENV = "CLIO_RELAY_CLUSTER_REGISTRY"
@@ -368,6 +368,53 @@ class RemoteMcpServerConfig(BaseModel):
         return self
 
 
+class WorkerCapacityPolicy(BaseModel):
+    """Persisted capacity policy for one managed cluster worker service.
+
+    ``concurrency`` is the total number of worker slots. The control-query
+    capacity is carved out of that total so a long-lived workload cannot make
+    its own live status and binding queries impossible.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    concurrency: int = Field(default=3, ge=2, strict=True)
+    control_query_concurrency: int = Field(default=1, ge=1, strict=True)
+    kind_concurrency: dict[JobKind, int] = Field(
+        default_factory=dict[JobKind, int],
+        max_length=len(JobKind),
+    )
+
+    @field_validator("kind_concurrency", mode="before")
+    @classmethod
+    def _validate_kind_concurrency(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            raise ValueError("worker kind concurrency must be an object")
+        normalized: dict[JobKind, int] = {}
+        for raw_kind, raw_limit in cast(dict[object, object], value).items():
+            if not isinstance(raw_kind, str):
+                raise ValueError("worker job kind keys must be strings")
+            try:
+                kind = JobKind(raw_kind)
+            except ValueError as exc:
+                expected = ", ".join(kind.value for kind in JobKind)
+                raise ValueError(
+                    f"unknown worker job kind {raw_kind!r}; expected one of {expected}"
+                ) from exc
+            if type(raw_limit) is not int or raw_limit < 1:
+                raise ValueError(
+                    f"worker concurrency limit for {kind.value} must be an integer at least 1"
+                )
+            normalized[kind] = raw_limit
+        return normalized
+
+    @model_validator(mode="after")
+    def _reserve_a_workload_slot(self) -> WorkerCapacityPolicy:
+        if self.control_query_concurrency >= self.concurrency:
+            raise ValueError("worker control_query_concurrency must be less than total concurrency")
+        return self
+
+
 class ClusterDefinition(BaseModel):
     """A locally configured cluster target."""
 
@@ -387,6 +434,7 @@ class ClusterDefinition(BaseModel):
     agent_npm_bin: str | None = None
     agent_args: list[str] = Field(default_factory=list)
     scheduler_provider: str = "external"
+    worker_capacity: WorkerCapacityPolicy = Field(default_factory=WorkerCapacityPolicy)
     remote_mcp_servers: dict[str, RemoteMcpServerConfig] = Field(
         default_factory=dict,
         max_length=MAX_REMOTE_MCP_SERVERS_PER_CLUSTER,
@@ -487,8 +535,15 @@ class ClusterDefinition(BaseModel):
 
 
 def cluster_route_revision(definition: ClusterDefinition) -> str:
-    """Return a stable digest for every operator-controlled cluster route field."""
-    payload = definition.model_dump(mode="json", exclude={"remote_mcp_servers"})
+    """Return a stable digest for fields that determine durable queue routing.
+
+    Remote MCP registrations and worker scheduling capacity can change without
+    changing the SSH destination or queue location of an existing job handle.
+    """
+    payload = definition.model_dump(
+        mode="json",
+        exclude={"remote_mcp_servers", "worker_capacity"},
+    )
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()

@@ -22,16 +22,23 @@ from pydantic import ValidationError
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.jarvis_mcp import is_virtual_jarvis_control_query
 from clio_relay.models import (
+    MCP_ADMISSION_AUTHORITY_METADATA_KEY,
     ArtifactUse,
     JarvisRunSpec,
     JobKind,
+    McpAdmissionAuthority,
+    McpAdmissionClass,
     McpCallSpec,
+    McpControlQueryEvidence,
+    McpOperation,
     RelayJob,
     RemoteAgentTaskSpec,
     deterministic_jarvis_execution_id,
     is_owned_jarvis_run_spec,
 )
+from clio_relay.remote_mcp import resolve_pinned_mcp_admission
 from clio_relay.session_lifecycle import (
     challenge_remote_session_identity,
     status_remote_session,
@@ -302,11 +309,50 @@ def _validate_submission_receipt(
     if path == "/jobs/mcp-call":
         if job.kind is not JobKind.MCP_CALL or not isinstance(job.spec, McpCallSpec):
             raise RelayError("owned session API returned the wrong job kind")
+        try:
+            operation = McpOperation(payload.get("operation", McpOperation.TOOLS_CALL.value))
+            raw_evidence = payload.get("control_query_evidence")
+            evidence = (
+                McpControlQueryEvidence.model_validate(raw_evidence)
+                if raw_evidence is not None
+                else None
+            )
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise RelayError("owned session submission has invalid MCP admission evidence") from exc
+        expected_authority: McpAdmissionAuthority | None
+        if operation is McpOperation.TOOLS_LIST:
+            if job.spec.admission_class is McpAdmissionClass.CONTROL_QUERY:
+                _expected_class = McpAdmissionClass.CONTROL_QUERY
+                expected_authority = McpAdmissionAuthority(
+                    source="intrinsic_tools_list",
+                    operation=McpOperation.TOOLS_LIST,
+                )
+            else:
+                _expected_class = McpAdmissionClass.WORKLOAD
+                expected_authority = None
+        elif evidence is not None:
+            tool = payload.get("tool")
+            expected_digest = payload.get("expected_server_artifact_digest")
+            if not isinstance(tool, str) or not isinstance(expected_digest, str):
+                raise RelayError("owned session MCP evidence is missing its call binding")
+            _expected_class = McpAdmissionClass.CONTROL_QUERY
+            expected_authority = McpAdmissionAuthority(
+                source="registered_discovery_artifact",
+                operation=operation,
+                tool=tool,
+                expected_server_artifact_digest=expected_digest,
+                evidence=evidence,
+            )
+        else:
+            _expected_class = McpAdmissionClass.WORKLOAD
+            expected_authority = None
         expected = {
             "server": payload.get("server"),
             "server_args": payload.get("server_args", []),
             "env_from": payload.get("env_from", {}),
             "expected_server_artifact_digest": payload.get("expected_server_artifact_digest"),
+            "admission_class": _expected_class.value,
+            "operation": operation.value,
             "tool": payload.get("tool"),
             "arguments": payload.get("arguments", {}),
             "timeout_seconds": payload.get("timeout_seconds"),
@@ -316,25 +362,56 @@ def _validate_submission_receipt(
             "server_args": job.spec.server_args,
             "env_from": job.spec.env_from,
             "expected_server_artifact_digest": (job.spec.expected_server_artifact_digest),
+            "admission_class": job.spec.admission_class.value,
+            "operation": job.spec.operation.value,
             "tool": job.spec.tool,
             "arguments": job.spec.arguments,
             "timeout_seconds": job.spec.timeout_seconds,
         }
         if observed != expected:
             raise RelayError("owned session API returned a different MCP call")
+        _validate_admission_authority(job, expected=expected_authority)
         return
     if path == "/jobs/jarvis-mcp-call":
         if job.kind is not JobKind.MCP_CALL or not isinstance(job.spec, McpCallSpec):
             raise RelayError("owned session API returned the wrong job kind")
+        try:
+            operation = McpOperation(payload.get("operation", McpOperation.TOOLS_CALL.value))
+        except ValueError as exc:
+            raise RelayError(
+                "owned session submission has an invalid JARVIS MCP operation"
+            ) from exc
+        raw_tool = payload.get("tool")
+        tool = raw_tool if isinstance(raw_tool, str) else None
+        raw_expected_digest = payload.get("expected_server_artifact_digest")
+        expected_digest = raw_expected_digest if isinstance(raw_expected_digest, str) else None
+        raw_timeout = payload.get("timeout_seconds")
+        if raw_timeout is not None and (
+            isinstance(raw_timeout, bool) or not isinstance(raw_timeout, int)
+        ):
+            raise RelayError("owned session submission has an invalid JARVIS MCP timeout")
+        try:
+            expected_class, expected_authority = resolve_pinned_mcp_admission(
+                operation=operation,
+                tool=tool,
+                expected_server_artifact_digest=expected_digest,
+                pinned_control_query=(tool is not None and is_virtual_jarvis_control_query(tool)),
+                timeout_seconds=raw_timeout,
+            )
+        except ValueError as exc:
+            raise RelayError("owned session submission has an invalid JARVIS MCP timeout") from exc
         expected_arguments = _expected_jarvis_mcp_arguments(job, payload=payload)
         if (
-            job.spec.tool != payload.get("tool")
+            job.spec.operation is not operation
+            or job.spec.tool != payload.get("tool")
             or job.spec.arguments != expected_arguments
             or job.spec.expected_server_artifact_digest
             != payload.get("expected_server_artifact_digest")
+            or job.spec.admission_class is not expected_class
             or job.spec.timeout_seconds != payload.get("timeout_seconds")
         ):
             raise RelayError("owned session API returned a different JARVIS MCP call")
+        _validate_admission_authority(job, expected=expected_authority)
         return
     if path == "/jobs/jarvis":
         if job.kind is not JobKind.JARVIS or not isinstance(job.spec, JarvisRunSpec):
@@ -370,6 +447,24 @@ def _validate_submission_receipt(
         }
         if observed_agent != expected_agent:
             raise RelayError("owned session API returned a different remote-agent task")
+
+
+def _validate_admission_authority(
+    job: RelayJob,
+    *,
+    expected: McpAdmissionAuthority | None,
+) -> None:
+    """Require the exact deterministic authority stamped by trusted HTTP ingress."""
+    raw_authority = job.metadata.get(MCP_ADMISSION_AUTHORITY_METADATA_KEY)
+    if raw_authority is None:
+        observed = None
+    else:
+        try:
+            observed = McpAdmissionAuthority.model_validate(raw_authority)
+        except ValidationError as exc:
+            raise RelayError("owned session API returned invalid MCP admission authority") from exc
+    if observed != expected:
+        raise RelayError("owned session API returned different MCP admission authority")
 
 
 def _expected_jarvis_mcp_arguments(

@@ -40,7 +40,15 @@ from clio_relay.jarvis_mcp import (
 )
 from clio_relay.mcp_server import McpSessionState, handle_request, serve_stdio
 from clio_relay.mcp_stdio_validation import PackagedMcpStdioSession
-from clio_relay.models import JobKind, JobState, McpCallSpec, McpOperation, RelayJob
+from clio_relay.models import (
+    JobKind,
+    JobState,
+    McpAdmissionClass,
+    McpCallSpec,
+    McpControlQueryEvidence,
+    McpOperation,
+    RelayJob,
+)
 from clio_relay.remote_mcp import (
     MAX_REMOTE_MCP_CACHE_BYTES,
     MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES,
@@ -64,6 +72,7 @@ from clio_relay.remote_mcp import (
     build_virtual_remote_mcp_catalog,
     cache_entry_from_discovery_artifact,
     inject_cluster_argument,
+    is_remote_mcp_control_query,
     remote_mcp_server_artifact_digest,
 )
 from clio_relay.spool import JobSpool
@@ -75,6 +84,213 @@ NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
 class _SchemaValidator(Protocol):
     def validate(self, instance: object) -> None:
         """Validate one JSON-compatible instance."""
+
+
+@pytest.mark.parametrize(
+    ("annotations", "expected"),
+    [
+        ({"readOnlyHint": True, "destructiveHint": False}, True),
+        ({"readOnlyHint": True}, False),
+        ({"destructiveHint": False}, False),
+        ({"readOnlyHint": False, "destructiveHint": False}, False),
+        ({"readOnlyHint": True, "destructiveHint": True}, False),
+        (None, False),
+    ],
+)
+def test_control_query_classification_requires_explicit_safe_annotations(
+    annotations: dict[str, object] | None,
+    expected: bool,
+) -> None:
+    """Advisory discovery annotations must fail closed when incomplete."""
+    tool = RemoteMcpToolSchema(
+        name="inspect",
+        input_schema={"type": "object"},
+        annotations=annotations,
+    )
+
+    assert is_remote_mcp_control_query(tool) is expected
+
+
+def test_registered_control_query_requires_exact_durable_discovery_evidence(
+    tmp_path: Path,
+) -> None:
+    """Re-read the cluster-owned artifact and reject a caller-tampered proof."""
+    registration = _registration()
+    definition = _cluster("alpha", {"science": registration})
+    queue = ClioCoreQueue(tmp_path / "core")
+    discovery = queue.submit_job(
+        RelayJob(
+            cluster="alpha",
+            kind=JobKind.MCP_CALL,
+            spec=McpCallSpec(
+                server=registration.command,
+                server_args=registration.args,
+                env_from=registration.env_from,
+                operation=McpOperation.TOOLS_LIST,
+                admission_class=McpAdmissionClass.CONTROL_QUERY,
+            ),
+            idempotency_key="registered-control-discovery",
+        )
+    )
+    payload = _discovery_artifact(
+        registration,
+        tools=[
+            {
+                **_tool("inspect", required=["path"]),
+                "annotations": {"readOnlyHint": True, "destructiveHint": False},
+            }
+        ],
+    )
+    spool = JobSpool(tmp_path / "spool", discovery)
+    spool.initialize()
+    result_path = spool.path / "mcp-result.json"
+    result_path.write_bytes(payload)
+    artifact = queue.append_artifact(spool.artifact_for(result_path, kind="mcp_result"))
+    discovery = queue.update_job_state(
+        discovery.job_id,
+        JobState.SUCCEEDED,
+        message="discovery complete",
+    )
+    entry = cache_entry_from_discovery_artifact(
+        cluster="alpha",
+        server_name="science",
+        registration=registration,
+        discovery_job_id=discovery.job_id,
+        artifact_id=artifact.artifact_id,
+        artifact_sha256=cast(str, artifact.sha256),
+        artifact_payload=payload,
+        discovered_at=discovery.updated_at,
+    )
+    server_digest = remote_mcp_server_artifact_digest(entry.provenance.server_artifact)
+    evidence = McpControlQueryEvidence(
+        cluster="alpha",
+        registered_server_name="science",
+        cluster_route_revision=cluster_route_revision(definition),
+        registration_revision=remote_mcp.remote_mcp_registration_revision(registration),
+        discovery_job_id=discovery.job_id,
+        discovery_artifact_id=artifact.artifact_id,
+        discovery_artifact_sha256=cast(str, artifact.sha256),
+        discovery_schema_digest=entry.schema_digest,
+        expected_server_artifact_digest=server_digest,
+    )
+
+    admission_class, authority = remote_mcp.resolve_registered_remote_mcp_admission(
+        queue=queue,
+        definition=definition,
+        cluster="alpha",
+        server=registration.command,
+        server_args=registration.args,
+        env_from=registration.env_from,
+        operation=McpOperation.TOOLS_CALL,
+        tool="inspect",
+        expected_server_artifact_digest=server_digest,
+        evidence=evidence,
+        timeout_seconds=registration.call_timeout_seconds,
+    )
+
+    assert admission_class is McpAdmissionClass.CONTROL_QUERY
+    assert authority is not None
+    assert authority.source == "registered_discovery_artifact"
+    assert authority.evidence == evidence
+    with pytest.raises(ValueError, match="schema does not match"):
+        remote_mcp.resolve_registered_remote_mcp_admission(
+            queue=queue,
+            definition=definition,
+            cluster="alpha",
+            server=registration.command,
+            server_args=registration.args,
+            env_from=registration.env_from,
+            operation=McpOperation.TOOLS_CALL,
+            tool="inspect",
+            expected_server_artifact_digest=server_digest,
+            evidence=evidence.model_copy(update={"discovery_schema_digest": "f" * 64}),
+            timeout_seconds=registration.call_timeout_seconds,
+        )
+    with pytest.raises(ValueError, match="evidence expired"):
+        remote_mcp.resolve_registered_remote_mcp_admission(
+            queue=queue,
+            definition=definition,
+            cluster="alpha",
+            server=registration.command,
+            server_args=registration.args,
+            env_from=registration.env_from,
+            operation=McpOperation.TOOLS_CALL,
+            tool="inspect",
+            expected_server_artifact_digest=server_digest,
+            evidence=evidence,
+            timeout_seconds=registration.call_timeout_seconds,
+            now=discovery.updated_at + timedelta(seconds=registration.schema_cache_ttl_seconds),
+        )
+
+
+def test_generic_tools_list_only_uses_control_lane_for_exact_registration(
+    tmp_path: Path,
+) -> None:
+    """Arbitrary discovery commands remain workload and registered timeouts stay bounded."""
+    registration = _registration()
+    definition = _cluster("alpha", {"science": registration})
+    queue = ClioCoreQueue(tmp_path / "core")
+
+    arbitrary_class, arbitrary_authority = remote_mcp.resolve_registered_remote_mcp_admission(
+        queue=queue,
+        definition=definition,
+        cluster="alpha",
+        server="arbitrary-mcp",
+        server_args=["--hang"],
+        env_from={},
+        operation=McpOperation.TOOLS_LIST,
+        tool=None,
+        expected_server_artifact_digest=None,
+        evidence=None,
+        timeout_seconds=1,
+    )
+    registered_class, registered_authority = remote_mcp.resolve_registered_remote_mcp_admission(
+        queue=queue,
+        definition=definition,
+        cluster="alpha",
+        server=registration.command,
+        server_args=registration.args,
+        env_from=registration.env_from,
+        operation=McpOperation.TOOLS_LIST,
+        tool=None,
+        expected_server_artifact_digest=None,
+        evidence=None,
+        timeout_seconds=registration.call_timeout_seconds,
+    )
+
+    assert arbitrary_class is McpAdmissionClass.WORKLOAD
+    assert arbitrary_authority is None
+    assert registered_class is McpAdmissionClass.CONTROL_QUERY
+    assert registered_authority is not None
+    assert registered_authority.source == "intrinsic_tools_list"
+    with pytest.raises(ValueError, match="requires an explicit timeout"):
+        remote_mcp.resolve_registered_remote_mcp_admission(
+            queue=queue,
+            definition=definition,
+            cluster="alpha",
+            server=registration.command,
+            server_args=registration.args,
+            env_from=registration.env_from,
+            operation=McpOperation.TOOLS_LIST,
+            tool=None,
+            expected_server_artifact_digest=None,
+            evidence=None,
+            timeout_seconds=None,
+        )
+    with pytest.raises(ValueError, match="timeout exceeds"):
+        remote_mcp.resolve_registered_remote_mcp_admission(
+            queue=queue,
+            definition=definition,
+            cluster="alpha",
+            server=registration.command,
+            server_args=registration.args,
+            env_from=registration.env_from,
+            operation=McpOperation.TOOLS_LIST,
+            tool=None,
+            expected_server_artifact_digest=None,
+            evidence=None,
+            timeout_seconds=registration.call_timeout_seconds + 1,
+        )
 
 
 def test_remote_mcp_registration_is_deny_by_default_and_validated() -> None:

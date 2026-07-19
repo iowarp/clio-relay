@@ -18,6 +18,8 @@ from clio_relay.models import (
     JobKind,
     JobState,
     Lease,
+    McpAdmissionClass,
+    McpCallSpec,
     ProgressRecord,
     RelayJob,
     RelayTask,
@@ -850,6 +852,161 @@ def test_worker_status_counts_active_slots_not_supervisor(tmp_path: Path) -> Non
     assert status["stale_worker_count"] == 0
 
 
+def test_worker_status_reports_reserved_control_capacity_and_usage(tmp_path: Path) -> None:
+    """Operators can distinguish reserved query capacity from workload slots."""
+    queue = ClioCoreQueue(tmp_path / "core")
+    parent = queue.register_endpoint(
+        EndpointRegistration(
+            role=EndpointRole.WORKER,
+            cluster="ares",
+            hostname="node",
+            pid=123,
+            metadata={
+                "concurrency": 3,
+                "workload_concurrency": 2,
+                "control_query_concurrency": 1,
+                "worker_supervisor": True,
+            },
+        )
+    )
+    slots: list[EndpointRegistration] = []
+    for index, admission_class in enumerate(
+        (
+            McpAdmissionClass.WORKLOAD,
+            McpAdmissionClass.WORKLOAD,
+            McpAdmissionClass.CONTROL_QUERY,
+        )
+    ):
+        workload = admission_class is McpAdmissionClass.WORKLOAD
+        slots.append(
+            queue.register_endpoint(
+                EndpointRegistration(
+                    role=EndpointRole.WORKER,
+                    cluster="ares",
+                    hostname="node",
+                    pid=123,
+                    metadata={
+                        "worker_slot": index,
+                        "parent_endpoint_id": parent.endpoint_id,
+                        "concurrency": 1,
+                        "workload_concurrency": 1 if workload else 0,
+                        "control_query_concurrency": 0 if workload else 1,
+                        "mcp_admission_class": admission_class.value,
+                    },
+                )
+            )
+        )
+    source = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["sleep", "30"]),
+            idempotency_key="status-source",
+        )
+    )
+    query = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.MCP_CALL,
+            spec=McpCallSpec(
+                server="science-mcp",
+                expected_server_artifact_digest="a" * 64,
+                admission_class=McpAdmissionClass.CONTROL_QUERY,
+                tool="inspect",
+            ),
+            idempotency_key="status-query",
+        )
+    )
+    assert queue.acquire_job(source.job_id, slots[0].endpoint_id, cluster="ares") is not None
+    assert queue.acquire_job(query.job_id, slots[2].endpoint_id, cluster="ares") is not None
+
+    status = worker_status(queue, cluster="ares")
+
+    assert status["configured_concurrency"] == 3
+    assert status["configured_workload_concurrency"] == 2
+    assert status["configured_control_query_concurrency"] == 1
+    assert status["control_query_concurrency_consistent"] is True
+    assert status["active_leases_by_mcp_admission_class"] == {
+        "workload": 1,
+        "control_query": 1,
+    }
+
+
+def test_worker_status_selects_newest_complete_generation_during_restart(
+    tmp_path: Path,
+) -> None:
+    """Fresh records from the replaced process cannot double-count capacity."""
+    queue = ClioCoreQueue(tmp_path / "core")
+    old_parent = _register_supervised_worker_generation(queue, pid=101)
+    new_parent = _register_supervised_worker_generation(queue, pid=202)
+
+    status = worker_status(queue, cluster="ares")
+
+    assert status["worker_generation_id"] == new_parent.endpoint_id
+    assert status["worker_generation_complete"] is True
+    assert status["fresh_worker_generation_count"] == 2
+    assert status["worker_count"] == 3
+    assert status["configured_concurrency"] == 3
+    assert status["configured_workload_concurrency"] == 2
+    assert status["configured_control_query_concurrency"] == 1
+    assert status["control_query_concurrency_consistent"] is True
+    assert old_parent.endpoint_id != new_parent.endpoint_id
+
+
+def test_worker_status_rejects_incomplete_newest_generation_during_restart(
+    tmp_path: Path,
+) -> None:
+    """A complete stale generation cannot mask a replacement still starting."""
+    queue = ClioCoreQueue(tmp_path / "core")
+    _register_supervised_worker_generation(queue, pid=101)
+    new_parent = _register_supervised_worker_generation(
+        queue,
+        pid=202,
+        slot_indices=(0, 2),
+    )
+
+    status = worker_status(queue, cluster="ares")
+
+    assert status["worker_generation_id"] == new_parent.endpoint_id
+    assert status["worker_generation_complete"] is False
+    assert status["fresh_worker_generation_count"] == 2
+    assert status["worker_count"] == 2
+    assert status["configured_concurrency"] == 2
+    assert status["configured_workload_concurrency"] is None
+    assert status["configured_control_query_concurrency"] is None
+    assert status["control_query_concurrency_consistent"] is False
+
+
+def test_worker_status_fails_closed_for_fresh_slot_with_missing_parent(tmp_path: Path) -> None:
+    """An orphan slot remains visible but cannot establish usable capacity."""
+    queue = ClioCoreQueue(tmp_path / "core")
+    queue.register_endpoint(
+        EndpointRegistration(
+            role=EndpointRole.WORKER,
+            cluster="ares",
+            hostname="node",
+            pid=202,
+            metadata={
+                "worker_slot": 0,
+                "parent_endpoint_id": "missing-parent",
+                "concurrency": 1,
+                "workload_concurrency": 1,
+                "control_query_concurrency": 0,
+                "mcp_admission_class": McpAdmissionClass.WORKLOAD.value,
+            },
+        )
+    )
+
+    status = worker_status(queue, cluster="ares")
+
+    assert status["worker_generation_id"] == "missing-parent"
+    assert status["worker_generation_complete"] is False
+    assert status["worker_count"] == 1
+    assert status["configured_workload_concurrency"] is None
+    assert status["configured_control_query_concurrency"] is None
+    assert status["control_query_concurrency_consistent"] is False
+
+
 def test_stale_discovery_fails_closed_when_active_window_truncates(
     tmp_path: Path,
 ) -> None:
@@ -1002,6 +1159,54 @@ def test_stale_discovery_fails_closed_when_exact_lease_index_truncates(
     assert result["lease_scan_truncated"] is True
     assert result["lease_scan_truncated_job_ids"] == [job.job_id]
     assert result["jobs"] == []
+
+
+def _register_supervised_worker_generation(
+    queue: ClioCoreQueue,
+    *,
+    pid: int,
+    slot_indices: tuple[int, ...] = (0, 1, 2),
+) -> EndpointRegistration:
+    """Register one synthetic two-workload/one-control worker generation."""
+    parent = queue.register_endpoint(
+        EndpointRegistration(
+            role=EndpointRole.WORKER,
+            cluster="ares",
+            hostname="node",
+            pid=pid,
+            metadata={
+                "concurrency": 3,
+                "workload_concurrency": 2,
+                "control_query_concurrency": 1,
+                "worker_supervisor": True,
+                "kind_concurrency": {"jarvis": 2},
+            },
+        )
+    )
+    for index in slot_indices:
+        workload = index < 2
+        queue.register_endpoint(
+            EndpointRegistration(
+                role=EndpointRole.WORKER,
+                cluster="ares",
+                hostname="node",
+                pid=pid,
+                metadata={
+                    "worker_slot": index,
+                    "parent_endpoint_id": parent.endpoint_id,
+                    "concurrency": 1,
+                    "workload_concurrency": 1 if workload else 0,
+                    "control_query_concurrency": 0 if workload else 1,
+                    "mcp_admission_class": (
+                        McpAdmissionClass.WORKLOAD.value
+                        if workload
+                        else McpAdmissionClass.CONTROL_QUERY.value
+                    ),
+                    "kind_concurrency": {"jarvis": 2},
+                },
+            )
+        )
+    return parent
 
 
 def job_id_cursor(job_id: str) -> Cursor:

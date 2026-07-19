@@ -8,6 +8,8 @@ deterministic, and free of cluster-side execution side effects.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -37,6 +39,7 @@ from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from clio_relay.cluster_config import (
+    ClusterDefinition,
     ClusterRegistry,
     RemoteMcpProfile,
     RemoteMcpServerConfig,
@@ -46,11 +49,23 @@ from clio_relay.cluster_config import (
     open_private_atomic_file,
     read_bounded_configuration_bytes,
 )
+from clio_relay.errors import NotFoundError, RelayError
+from clio_relay.models import (
+    JobKind,
+    JobState,
+    McpAdmissionAuthority,
+    McpAdmissionClass,
+    McpCallSpec,
+    McpControlQueryEvidence,
+    McpOperation,
+)
 
 if TYPE_CHECKING:
+    from clio_relay.core_queue import ClioCoreQueue
     from clio_relay.validation_report import LiveValidationReport, ValidationResource
 
 JSON = dict[str, Any]
+MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS = 60
 REMOTE_MCP_CACHE_ENV = "CLIO_RELAY_REMOTE_MCP_CACHE"
 REMOTE_MCP_CACHE_VERSION = 1
 REMOTE_MCP_CACHE_SOURCE = "durable_relay_mcp_tools_list"
@@ -210,6 +225,15 @@ _JSON_SCHEMA_VALIDATORS.update(
 )
 
 VIRTUAL_REMOTE_MCP_RELAY_CONTROL_SCHEMAS: dict[str, JSON] = {
+    "idempotency_key": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512,
+        "description": (
+            "Stable retry identity consumed by clio-relay and never forwarded to the "
+            "remote MCP server. Reuse it only for the exact same call payload."
+        ),
+    },
     "wait_for_terminal": {
         "type": "boolean",
         "default": False,
@@ -358,6 +382,22 @@ class RemoteMcpToolSchema(BaseModel):
                 f"remote MCP tool schema exceeds {MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES} bytes"
             )
         return self
+
+
+def is_remote_mcp_control_query(tool: RemoteMcpToolSchema) -> bool:
+    """Return whether discovery explicitly classifies a tool as a safe query.
+
+    MCP annotations are advisory server claims, so this predicate is only one
+    input to admission. Callers must additionally bind the invocation to the
+    registered route and exact discovered server artifact before assigning the
+    reserved control-query class.
+    """
+    annotations = tool.annotations
+    return bool(
+        annotations is not None
+        and annotations.get("readOnlyHint") is True
+        and annotations.get("destructiveHint") is False
+    )
 
 
 class RemoteMcpDiscoveryProvenance(BaseModel):
@@ -1220,12 +1260,22 @@ class RemoteMcpRoute:
     contract: str | None
     cluster_route_revision: str
     registration_revision: str
+    control_query_evidence: McpControlQueryEvidence | None = None
 
 
 def _virtual_remote_mcp_relay_arguments(arguments: JSON) -> JSON:
     """Validate and copy relay-only controls from an agent-facing invocation."""
 
     controls: JSON = {}
+    if "idempotency_key" in arguments:
+        idempotency_key = arguments["idempotency_key"]
+        if (
+            not isinstance(idempotency_key, str)
+            or not idempotency_key
+            or len(idempotency_key) > 512
+        ):
+            raise ValueError("idempotency_key must be a non-empty string of at most 512 characters")
+        controls["idempotency_key"] = idempotency_key
     for field_name in ("wait_for_terminal", "include_logs"):
         if field_name not in arguments:
             continue
@@ -1371,6 +1421,8 @@ class _Candidate:
     base_alias: str
     identity: str
     expected_server_artifact_digest: str | None
+    discovery_provenance: RemoteMcpDiscoveryProvenance
+    discovery_schema_digest: str
 
 
 def unavailable_virtual_remote_mcp_catalog(reason: str) -> VirtualRemoteMcpCatalog:
@@ -1526,6 +1578,243 @@ def cache_entry_from_discovery_artifact(
             server_artifact=cast(JSON, server_artifact),
         ),
     )
+
+
+def resolve_registered_remote_mcp_admission(
+    *,
+    queue: ClioCoreQueue,
+    definition: ClusterDefinition | None,
+    cluster: str,
+    server: str,
+    server_args: list[str],
+    env_from: dict[str, str],
+    operation: McpOperation,
+    tool: str | None,
+    expected_server_artifact_digest: str | None,
+    evidence: McpControlQueryEvidence | None,
+    timeout_seconds: int | None = None,
+    now: datetime | None = None,
+) -> tuple[McpAdmissionClass, McpAdmissionAuthority | None]:
+    """Derive admission from intrinsic discovery or cluster-owned route evidence.
+
+    A caller can offer evidence but can never select the resulting worker lane.
+    The receiving queue independently reloads the operator registration and the
+    exact durable ``tools/list`` artifact before granting reserved capacity.
+    """
+    if operation is McpOperation.TOOLS_LIST:
+        if evidence is not None:
+            raise ValueError("tools/list must not carry control-query route evidence")
+        if definition is None or definition.name != cluster:
+            return McpAdmissionClass.WORKLOAD, None
+        matches = [
+            registration
+            for registration in definition.remote_mcp_servers.values()
+            if registration.enabled
+            and registration.command == server
+            and registration.args == server_args
+            and registration.env_from == env_from
+        ]
+        if not matches:
+            return McpAdmissionClass.WORKLOAD, None
+        if len(matches) != 1:
+            raise ValueError("tools/list route matches multiple operator registrations")
+        if timeout_seconds is None:
+            raise ValueError("registered tools/list control admission requires an explicit timeout")
+        if timeout_seconds <= 0:
+            raise ValueError("registered tools/list timeout must be positive")
+        if timeout_seconds > matches[0].call_timeout_seconds:
+            raise ValueError("tools/list timeout exceeds the operator registration limit")
+        return (
+            McpAdmissionClass.CONTROL_QUERY,
+            McpAdmissionAuthority(
+                source="intrinsic_tools_list",
+                operation=McpOperation.TOOLS_LIST,
+            ),
+        )
+    if evidence is None:
+        return McpAdmissionClass.WORKLOAD, None
+    if not tool:
+        raise ValueError("control-query evidence requires one tools/call tool")
+    if expected_server_artifact_digest is None:
+        raise ValueError("control-query evidence requires an expected server artifact digest")
+    if definition is None:
+        raise ValueError("control-query evidence requires a configured cluster route")
+    if evidence.cluster != cluster or definition.name != cluster:
+        raise ValueError("control-query evidence does not match the selected cluster")
+    if not hmac.compare_digest(
+        evidence.cluster_route_revision,
+        cluster_route_revision(definition),
+    ):
+        raise ValueError("cluster route changed after MCP discovery; refresh the registered server")
+    registration = definition.remote_mcp_servers.get(evidence.registered_server_name)
+    if registration is None or not registration.enabled:
+        raise ValueError("registered MCP server is unavailable; refresh its discovery")
+    if not hmac.compare_digest(
+        evidence.registration_revision,
+        remote_mcp_registration_revision(registration),
+    ):
+        raise ValueError("registered MCP server changed after discovery; refresh its discovery")
+    if (
+        registration.command != server
+        or registration.args != server_args
+        or registration.env_from != env_from
+    ):
+        raise ValueError("MCP call route does not match its operator registration")
+    if not registration.allows_tool(tool):
+        raise ValueError("MCP tool is not allowlisted by its operator registration")
+    if registration.allow_mutable_artifact:
+        raise ValueError("mutable MCP server artifacts cannot use reserved query capacity")
+    if timeout_seconds is None:
+        raise ValueError("registered MCP control admission requires an explicit timeout")
+    if timeout_seconds <= 0:
+        raise ValueError("registered MCP query timeout must be positive")
+    if timeout_seconds > registration.call_timeout_seconds:
+        raise ValueError("MCP query timeout exceeds the operator registration limit")
+    if not hmac.compare_digest(
+        evidence.expected_server_artifact_digest,
+        expected_server_artifact_digest,
+    ):
+        raise ValueError("MCP call artifact binding does not match its discovery evidence")
+
+    try:
+        discovery_job = queue.get_job(evidence.discovery_job_id)
+        discovery_artifact = queue.get_artifact(evidence.discovery_artifact_id)
+    except NotFoundError as exc:
+        raise ValueError(
+            "MCP control-query discovery evidence is unavailable; refresh discovery"
+        ) from exc
+    if (
+        discovery_job.cluster != cluster
+        or discovery_job.kind is not JobKind.MCP_CALL
+        or discovery_job.state is not JobState.SUCCEEDED
+        or not isinstance(discovery_job.spec, McpCallSpec)
+        or discovery_job.spec.operation is not McpOperation.TOOLS_LIST
+        or discovery_job.spec.server != registration.command
+        or discovery_job.spec.server_args != registration.args
+        or discovery_job.spec.env_from != registration.env_from
+    ):
+        raise ValueError("MCP discovery job does not match the registered tools/list route")
+    if (
+        discovery_artifact.job_id != discovery_job.job_id
+        or discovery_artifact.kind != "mcp_result"
+        or discovery_artifact.sha256 is None
+        or not hmac.compare_digest(
+            discovery_artifact.sha256,
+            evidence.discovery_artifact_sha256,
+        )
+    ):
+        raise ValueError("MCP discovery artifact identity does not match its evidence")
+    try:
+        artifact_payload = _control_query_discovery_artifact_bytes(
+            queue,
+            evidence.discovery_artifact_id,
+        )
+    except RelayError as exc:
+        raise ValueError(
+            "MCP control-query discovery artifact is unavailable; refresh discovery"
+        ) from exc
+    observed_artifact_sha256 = hashlib.sha256(artifact_payload).hexdigest()
+    if not hmac.compare_digest(
+        observed_artifact_sha256,
+        evidence.discovery_artifact_sha256,
+    ):
+        raise ValueError("MCP discovery artifact bytes changed after evidence was issued")
+    entry = cache_entry_from_discovery_artifact(
+        cluster=cluster,
+        server_name=evidence.registered_server_name,
+        registration=registration,
+        discovery_job_id=evidence.discovery_job_id,
+        artifact_id=evidence.discovery_artifact_id,
+        artifact_sha256=evidence.discovery_artifact_sha256,
+        artifact_payload=artifact_payload,
+        discovered_at=discovery_job.updated_at,
+    )
+    if not hmac.compare_digest(entry.schema_digest, evidence.discovery_schema_digest):
+        raise ValueError("MCP discovery schema does not match its route evidence")
+    if not entry.is_fresh(now=now):
+        raise ValueError("MCP control-query discovery evidence expired; refresh discovery")
+    matching_tools = [candidate for candidate in entry.tools if candidate.name == tool]
+    if len(matching_tools) != 1 or not is_remote_mcp_control_query(matching_tools[0]):
+        raise ValueError("MCP tool is not explicitly classified as a non-destructive read query")
+    if not _server_artifact_verified(entry.provenance.server_artifact):
+        raise ValueError("MCP discovery did not verify an immutable server artifact")
+    observed_server_digest = remote_mcp_server_artifact_digest(entry.provenance.server_artifact)
+    if not hmac.compare_digest(observed_server_digest, expected_server_artifact_digest):
+        raise ValueError("MCP server artifact does not match the discovered route binding")
+    return (
+        McpAdmissionClass.CONTROL_QUERY,
+        McpAdmissionAuthority(
+            source="registered_discovery_artifact",
+            operation=McpOperation.TOOLS_CALL,
+            tool=tool,
+            expected_server_artifact_digest=expected_server_artifact_digest,
+            evidence=evidence,
+        ),
+    )
+
+
+def resolve_pinned_mcp_admission(
+    *,
+    operation: McpOperation,
+    tool: str | None,
+    expected_server_artifact_digest: str | None,
+    pinned_control_query: bool,
+    timeout_seconds: int | None = None,
+) -> tuple[McpAdmissionClass, McpAdmissionAuthority | None]:
+    """Derive tools/list or built-in JARVIS query admission without caller input."""
+    if operation is McpOperation.TOOLS_LIST:
+        _validate_pinned_control_query_timeout(timeout_seconds)
+        return (
+            McpAdmissionClass.CONTROL_QUERY,
+            McpAdmissionAuthority(
+                source="intrinsic_tools_list",
+                operation=McpOperation.TOOLS_LIST,
+            ),
+        )
+    if pinned_control_query and tool is not None and expected_server_artifact_digest is not None:
+        _validate_pinned_control_query_timeout(timeout_seconds)
+        return (
+            McpAdmissionClass.CONTROL_QUERY,
+            McpAdmissionAuthority(
+                source="pinned_jarvis_contract",
+                operation=McpOperation.TOOLS_CALL,
+                tool=tool,
+                expected_server_artifact_digest=expected_server_artifact_digest,
+            ),
+        )
+    return McpAdmissionClass.WORKLOAD, None
+
+
+def _validate_pinned_control_query_timeout(timeout_seconds: int | None) -> None:
+    """Reject an explicitly invalid timeout on a reserved pinned query."""
+    if timeout_seconds is None:
+        return
+    if timeout_seconds <= 0:
+        raise ValueError("pinned MCP control-query timeout must be positive")
+    if timeout_seconds > MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS:
+        raise ValueError(
+            "pinned MCP control-query timeout exceeds "
+            f"{MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS} seconds"
+        )
+
+
+def _control_query_discovery_artifact_bytes(
+    queue: ClioCoreQueue,
+    artifact_id: str,
+) -> bytes:
+    """Read one queue-owned artifact envelope without trusting a caller path."""
+    from clio_relay.relay_ops import read_artifact_bytes
+
+    envelope = read_artifact_bytes(queue, artifact_id)
+    if envelope.get("encoding") != "base64":
+        raise ValueError("MCP discovery artifact encoding is unsupported")
+    encoded = envelope.get("data")
+    if not isinstance(encoded, str):
+        raise ValueError("MCP discovery artifact payload is unavailable")
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("MCP discovery artifact payload is not valid base64") from exc
 
 
 def build_virtual_remote_mcp_catalog(
@@ -1696,6 +1985,8 @@ def build_virtual_remote_mcp_catalog(
                             if not registration.allow_mutable_artifact
                             else None
                         ),
+                        discovery_provenance=entry.provenance,
+                        discovery_schema_digest=entry.schema_digest,
                     )
                 )
 
@@ -1736,22 +2027,39 @@ def build_virtual_remote_mcp_catalog(
     for identity, group in sorted(grouped.items()):
         alias = aliases[identity]
         first = group[0]
-        routes = {
-            candidate.cluster: RemoteMcpRoute(
+        routes: dict[str, RemoteMcpRoute] = {}
+        for candidate in group:
+            registration_revision = remote_mcp_registration_revision(candidate.registration)
+            expected_digest = candidate.expected_server_artifact_digest
+            evidence = (
+                McpControlQueryEvidence(
+                    cluster=candidate.cluster,
+                    registered_server_name=candidate.server_name,
+                    cluster_route_revision=route_revisions[candidate.cluster],
+                    registration_revision=registration_revision,
+                    discovery_job_id=candidate.discovery_provenance.discovery_job_id,
+                    discovery_artifact_id=candidate.discovery_provenance.artifact_id,
+                    discovery_artifact_sha256=(candidate.discovery_provenance.artifact_sha256),
+                    discovery_schema_digest=candidate.discovery_schema_digest,
+                    expected_server_artifact_digest=expected_digest,
+                )
+                if expected_digest is not None
+                else None
+            )
+            routes[candidate.cluster] = RemoteMcpRoute(
                 cluster=candidate.cluster,
                 server_name=candidate.server_name,
                 command=candidate.registration.command,
                 args=tuple(candidate.registration.args),
                 env_from=tuple(sorted(candidate.registration.env_from.items())),
-                expected_server_artifact_digest=candidate.expected_server_artifact_digest,
+                expected_server_artifact_digest=expected_digest,
                 remote_tool_name=candidate.tool.name,
                 timeout_seconds=candidate.registration.call_timeout_seconds,
                 contract=candidate.registration.contract,
                 cluster_route_revision=route_revisions[candidate.cluster],
-                registration_revision=remote_mcp_registration_revision(candidate.registration),
+                registration_revision=registration_revision,
+                control_query_evidence=evidence,
             )
-            for candidate in group
-        }
         virtual_tools[alias] = VirtualRemoteMcpTool(
             alias=alias,
             namespace=first.namespace,
@@ -1774,6 +2082,11 @@ def build_virtual_remote_mcp_catalog(
                             "registration_revision": route.registration_revision,
                             "expected_server_artifact_digest": (
                                 route.expected_server_artifact_digest
+                            ),
+                            "control_query_evidence": (
+                                None
+                                if route.control_query_evidence is None
+                                else route.control_query_evidence.model_dump(mode="json")
                             ),
                         }
                         for cluster, route in sorted(tool.routes.items())

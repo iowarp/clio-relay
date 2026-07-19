@@ -575,6 +575,24 @@ def _run_live_acceptance(
                 ),
             )
         )
+    if secure_runtime_probe is not None:
+        if recorder is None:
+            raise ConfigurationError(
+                "secure runtime acceptance requires a machine-readable report path"
+            )
+        with _validation_check(
+            recorder,
+            "secure-runtime.control-query-capacity",
+            "verify one free reserved control-query slot before source submission",
+            forbidden_values=set(),
+        ) as evidence:
+            _require_secure_runtime_control_capacity(
+                options.definition,
+                cluster=options.cluster,
+                runner=command_runner,
+                evidence=evidence,
+            )
+        lines.append("secure-runtime.control_query_capacity=ready")
     if verify_transport:
         assert transport_token is not None
         assert transport_secret_key is not None
@@ -680,10 +698,7 @@ def _run_live_acceptance(
             require_structured_runtime_metadata=options.require_structured_runtime_metadata,
         )
     else:
-        if recorder is None:
-            raise ConfigurationError(
-                "secure runtime acceptance requires a machine-readable report path"
-            )
+        assert recorder is not None
         with _validation_check(
             recorder,
             "secure-runtime.source-live-metadata",
@@ -3342,6 +3357,76 @@ def _generated_agent_prompt(
         f"{pipeline_yaml.rstrip()}\n"
         "```\n"
     )
+
+
+def _require_secure_runtime_control_capacity(
+    definition: ClusterDefinition,
+    *,
+    cluster: str,
+    runner: CommandRunner,
+    evidence: list[EvidenceReference] | None = None,
+) -> dict[str, object]:
+    """Return verified free control-query capacity before scheduling a service."""
+    raw_status = _remote_clio_json(
+        definition,
+        ["worker", "status", "--cluster", cluster],
+        runner=runner,
+    )
+    if not isinstance(raw_status, dict):
+        raise RelayError("secure runtime worker status was not a JSON object")
+    status = cast(dict[str, object], raw_status)
+    configured_control = status.get("configured_control_query_concurrency")
+    configured_workload = status.get("configured_workload_concurrency")
+    consistent = status.get("control_query_concurrency_consistent")
+    scan_truncated = status.get("scan_truncated")
+    active_raw = status.get("active_leases_by_mcp_admission_class")
+    active = cast(dict[str, object], active_raw) if isinstance(active_raw, dict) else None
+    active_control = None if active is None else active.get("control_query")
+    observed: dict[str, object] = {
+        "configured_workload_concurrency": configured_workload,
+        "configured_control_query_concurrency": configured_control,
+        "active_control_query_leases": active_control,
+        "control_query_concurrency_consistent": consistent,
+        "scan_truncated": scan_truncated,
+        "worker_generation_id": status.get("worker_generation_id"),
+        "worker_generation_complete": status.get("worker_generation_complete"),
+        "source_submitted": False,
+        "scheduler_job_created": False,
+    }
+    if (
+        type(configured_control) is int
+        and type(active_control) is int
+        and configured_control >= active_control
+    ):
+        observed["free_control_query_slots"] = configured_control - active_control
+    if evidence is not None:
+        evidence.append(
+            EvidenceReference(
+                kind="worker_capacity",
+                reference=f"relay-worker://{cluster}/control-query",
+                metadata=observed,
+            )
+        )
+    if scan_truncated is not False:
+        raise RelayError("secure runtime worker-capacity scan was incomplete")
+    if consistent is not True:
+        raise RelayError("secure runtime worker control-query policy is inconsistent")
+    if type(configured_workload) is not int or configured_workload < 1:
+        raise RelayError("secure runtime requires at least one workload worker slot")
+    if type(configured_control) is not int or configured_control < 1:
+        raise RelayError("secure runtime requires at least one reserved control-query slot")
+    if type(active_control) is not int or active_control < 0:
+        raise RelayError("secure runtime worker status omitted active control-query usage")
+    if active_control >= configured_control:
+        raise RelayError("secure runtime has no free reserved control-query slot")
+    observed.update(
+        {
+            "free_control_query_slots": configured_control - active_control,
+            "control_query_concurrency_consistent": True,
+            "scan_truncated": False,
+        }
+    )
+    return observed
 
 
 def _wait_for_live_structured_runtime_metadata(

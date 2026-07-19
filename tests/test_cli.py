@@ -23,6 +23,7 @@ from clio_relay.cluster_config import (
     ClusterRegistry,
     ClusterTargetIdentity,
     FrpTransportConfig,
+    RemoteMcpServerConfig,
 )
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
@@ -43,7 +44,9 @@ from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
     JobState,
+    McpAdmissionClass,
     McpCallSpec,
+    McpOperation,
     RelayJob,
     RelayTask,
     SchedulerPhase,
@@ -5992,6 +5995,179 @@ def test_cli_mcp_call_preserves_arguments(tmp_path: Path, monkeypatch: MonkeyPat
     assert job.spec.timeout_seconds == 90
 
 
+@pytest.mark.parametrize("command", ["mcp-call", "jarvis-mcp-call"])
+def test_cli_mcp_call_rejects_public_admission_class_option(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    command: str,
+) -> None:
+    """The CLI exposes no caller-selectable reserved worker lane."""
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            command,
+            "--cluster",
+            "ares",
+            "--tool",
+            "jarvis_describe" if command == "jarvis-mcp-call" else "inspect",
+            *(["--server", "arbitrary-mcp"] if command == "mcp-call" else []),
+            "--admission-class",
+            "control_query",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "No such option: --admission-class" in result.output
+
+
+def test_cli_arbitrary_tools_list_remains_workload(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """An arbitrary MCP discovery command cannot occupy reserved capacity."""
+    core_dir = tmp_path / "core"
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "mcp-call",
+            "--cluster",
+            "ares",
+            "--server",
+            "arbitrary-mcp",
+            "--server-arg=--hang",
+            "--operation",
+            "tools/list",
+            "--timeout-seconds",
+            "1",
+            "--idempotency-key",
+            "arbitrary-tools-list",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    job = ClioCoreQueue(core_dir).get_job(result.output.strip())
+    assert isinstance(job.spec, McpCallSpec)
+    assert job.spec.operation is McpOperation.TOOLS_LIST
+    assert job.spec.admission_class is McpAdmissionClass.WORKLOAD
+
+
+def test_cli_generic_default_key_tracks_timeout_and_derived_authority(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Default retries cannot alias workload, registered control, or timeout changes."""
+    core_dir = tmp_path / "core"
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+
+    def invoke(timeout: int) -> Any:
+        return CliRunner().invoke(
+            app,
+            [
+                "mcp-call",
+                "--cluster",
+                "ares",
+                "--server",
+                "science-mcp",
+                "--server-arg=--stdio",
+                "--operation",
+                "tools/list",
+                "--timeout-seconds",
+                str(timeout),
+            ],
+        )
+
+    workload_result = invoke(30)
+    assert workload_result.exit_code == 0, workload_result.output
+    registration = RemoteMcpServerConfig(
+        command="science-mcp",
+        args=["--stdio"],
+        allow_tools=["inspect"],
+        call_timeout_seconds=60,
+    )
+    ClusterRegistry(
+        clusters={
+            "ares": ClusterDefinition(
+                name="ares",
+                ssh_host="ares",
+                remote_mcp_servers={"science": registration},
+            )
+        }
+    ).save(tmp_path / ".clio-relay" / "clusters.json")
+    control_30_result = invoke(30)
+    control_60_result = invoke(60)
+    assert control_30_result.exit_code == 0, control_30_result.output
+    assert control_60_result.exit_code == 0, control_60_result.output
+
+    queue = ClioCoreQueue(core_dir)
+    jobs = [
+        queue.get_job(result.output.strip())
+        for result in (workload_result, control_30_result, control_60_result)
+    ]
+    assert all(isinstance(job.spec, McpCallSpec) for job in jobs)
+    specs = [cast(McpCallSpec, job.spec) for job in jobs]
+    assert specs[0].admission_class is McpAdmissionClass.WORKLOAD
+    assert specs[1].admission_class is McpAdmissionClass.CONTROL_QUERY
+    assert specs[2].admission_class is McpAdmissionClass.CONTROL_QUERY
+    assert len({job.idempotency_key for job in jobs}) == 3
+    legacy_server_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "server": "science-mcp",
+                "args": ["--stdio"],
+                "env_from": {},
+                "expected_server_artifact_digest": None,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    legacy_arguments_digest = hashlib.sha256(
+        json.dumps(
+            {"operation": "tools/list", "tool": None, "arguments": {}},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert jobs[0].idempotency_key == (
+        f"mcp:ares:{legacy_server_digest}:tools/list:None:{legacy_arguments_digest}"
+    )
+
+
+def test_cli_pinned_jarvis_control_query_rejects_oversized_timeout(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Pinned control-query processes cannot outlive the reserved-lane bound."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
+    monkeypatch.setenv("CLIO_RELAY_REMOTE_CLUSTER", "ares")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "jarvis-mcp-call",
+            "--cluster",
+            "ares",
+            "--operation",
+            "tools/list",
+            "--timeout-seconds",
+            "61",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "timeout exceeds 60 seconds" in result.output
+
+
 def test_cli_jarvis_mcp_call_uses_builtin_cluster_command(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -6393,6 +6569,8 @@ def test_target_side_jarvis_discovery_uses_receipt_without_cluster_registry(
     assert isinstance(job.spec, McpCallSpec)
     assert job.spec.operation.value == "tools/list"
     assert job.spec.tool is None
+    assert job.spec.admission_class is McpAdmissionClass.CONTROL_QUERY
+    assert job.spec.timeout_seconds == 60
     assert job.spec.expected_jarvis_cd_lock_binding == jarvis_cd_lock_binding_expectation()
 
 

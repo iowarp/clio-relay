@@ -13,8 +13,12 @@ from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.errors import RelayError
 from clio_relay.models import (
+    MCP_ADMISSION_AUTHORITY_METADATA_KEY,
     JobKind,
+    McpAdmissionAuthority,
+    McpAdmissionClass,
     McpCallSpec,
+    McpOperation,
     RelayJob,
     prepare_owned_jarvis_run_submission,
 )
@@ -133,14 +137,22 @@ def _job(expected_digest: str) -> RelayJob:
             server="clio-kit",
             server_args=["mcp-server", "jarvis"],
             expected_server_artifact_digest=expected_digest,
+            admission_class=McpAdmissionClass.CONTROL_QUERY,
             tool="jarvis_get_execution",
             arguments={"execution_id": "execution-1"},
+            timeout_seconds=60,
         ),
         idempotency_key="owned-session-client",
         metadata={
             "owner": "clio-relay",
             "owner_session_id": "desktop-session-1",
             "owner_session_generation_id": "generation-1",
+            MCP_ADMISSION_AUTHORITY_METADATA_KEY: McpAdmissionAuthority(
+                source="pinned_jarvis_contract",
+                operation=McpOperation.TOOLS_CALL,
+                tool="jarvis_get_execution",
+                expected_server_artifact_digest=expected_digest,
+            ).model_dump(mode="json"),
         },
     )
 
@@ -307,6 +319,7 @@ def test_owned_session_client_proves_identity_before_sending_credentials(
         "tool": "jarvis_get_execution",
         "arguments": {"execution_id": "execution-1"},
         "expected_server_artifact_digest": expected_digest,
+        "timeout_seconds": 60,
         "idempotency_key": "owned-session-client",
     }
 

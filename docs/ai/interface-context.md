@@ -11,6 +11,7 @@ Core setup:
 - `clio-relay cluster add`
 - `clio-relay cluster bootstrap`
 - `clio-relay cluster install-endpoint-service`
+- `clio-relay cluster restart-endpoint-service`
 - `clio-relay doctor`
 - `clio-relay live-test`
 - `clio-relay release validate-local`
