@@ -15,24 +15,30 @@ from typing import Any, cast
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 import clio_relay.cli as cli_module
+import clio_relay.http_api as http_api_module
 import clio_relay.jarvis_service_runtime as runtime_binding
 import clio_relay.mcp_server as mcp_server_module
 import clio_relay.owner_session_admission as owner_session_admission_module
 import clio_relay.remote_cli as remote_cli_module
 import clio_relay.service_runtime as service_runtime_module
+import clio_relay.session_api as session_api_module
 from clio_relay.browser_gateway import BrowserAttachmentGrant, BrowserDetachmentResult
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
+    CLUSTER_REGISTRY_ENV,
     ClusterDefinition,
     ClusterRegistry,
     FrpTransportConfig,
+    cluster_route_revision,
 )
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
+from clio_relay.http_api import create_app
 from clio_relay.jarvis_mcp import jarvis_cd_lock_binding_expectation
 from clio_relay.jarvis_service_runtime import (
     RELAY_JARVIS_RUNTIME_BINDING_SCHEMA,
@@ -278,6 +284,329 @@ def test_private_authority_resolver_uses_exact_remote_identity_and_never_persist
     assert token not in verified.binding.model_dump_json()
     persisted_payloads = [path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()]
     assert all(token.encode("ascii") not in payload for payload in persisted_payloads)
+
+
+def test_owned_session_authority_uses_identity_bound_api_when_browser_attach_is_local(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Desktop-local browser attach must resolve authority on the receipt-owning cluster."""
+    queue, local_definition, job, artifact, envelope = _source_result(tmp_path)
+    definition = local_definition.model_copy(update={"ssh_host": "relay.example.test"})
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=local_definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    settings = RelaySettings(
+        core_dir=tmp_path / "desktop-core",
+        spool_dir=tmp_path / "desktop-spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        owner_session_cluster=definition.name,
+    )
+    token = "a" * 64
+    requests: list[dict[str, object]] = []
+    lifecycle: list[str] = []
+
+    class FakeOwnedSessionApiClient:
+        def __init__(
+            self,
+            *,
+            definition: ClusterDefinition,
+            settings: RelaySettings,
+        ) -> None:
+            assert definition == local_definition.model_copy(
+                update={"ssh_host": "relay.example.test"}
+            )
+            assert settings == settings_for_assertion
+
+        def __enter__(self) -> FakeOwnedSessionApiClient:
+            lifecycle.append("entered")
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            lifecycle.append("exited")
+
+        def request_json(
+            self,
+            *,
+            method: str,
+            path: str,
+            body: dict[str, object] | None = None,
+        ) -> object:
+            requests.append({"method": method, "path": path, "body": body})
+            return _service_runtime_authority_document(token=token)
+
+    settings_for_assertion = settings
+
+    def forbidden(*_args: object, **_kwargs: object) -> Any:
+        raise AssertionError("owned-session authority must not use desktop JARVIS or direct SSH")
+
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
+    monkeypatch.setattr(runtime_binding, "OwnedSessionApiClient", FakeOwnedSessionApiClient)
+    monkeypatch.setattr(runtime_binding, "should_execute_on_cluster", forbidden)
+    monkeypatch.setattr(runtime_binding, "run_remote_jarvis_runtime_authority", forbidden)
+    monkeypatch.setattr(
+        runtime_binding, "resolve_local_jarvis_service_runtime_authority", forbidden
+    )
+
+    assert (
+        session_api_module._validate_request(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            method="POST",
+            path=runtime_binding.OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH,
+        )
+        == "POST"
+    )
+
+    header = runtime_binding.resolve_jarvis_service_runtime_authorization(
+        definition=definition,
+        settings=settings,
+        verified=verified,
+    )
+
+    assert header == f"Bearer {token}"
+    assert lifecycle == ["entered", "exited"]
+    assert requests == [
+        {
+            "method": "POST",
+            "path": runtime_binding.OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH,
+            "body": {"binding": verified.binding.model_dump(mode="json")},
+        }
+    ]
+
+
+def test_owned_session_authority_endpoint_reverifies_owned_artifact_before_resolving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The private endpoint must bind its answer to this session's durable receipt."""
+    queue, local_definition, job, artifact, envelope = _source_result(tmp_path)
+    definition = local_definition.model_copy(update={"ssh_host": "relay.example.test"})
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
+    source_root = tmp_path / "spool" / job.job_id
+    source_root.mkdir(parents=True)
+    source_path = source_root / "mcp-result.json"
+    source_path.write_bytes(base64.b64decode(cast(str, envelope["data"]), validate=True))
+    artifact = artifact.model_copy(update={"uri": source_path.as_uri()})
+    envelope["artifact"] = artifact.model_dump(mode="json")
+    queue.append_artifact(artifact)
+    queue.update_job_metadata(
+        job.job_id,
+        {
+            "owner": "clio-relay",
+            "owner_session_id": "desktop-session-1",
+            "owner_session_generation_id": "generation-1",
+        },
+    )
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    foreign_job = queue.submit_job(
+        RelayJob(
+            cluster=definition.name,
+            kind=JobKind.MCP_CALL,
+            spec=job.spec,
+            idempotency_key="foreign-runtime-authority-source",
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": "another-desktop-session",
+                "owner_session_generation_id": "another-generation",
+            },
+        )
+    )
+    foreign_payload = b"foreign-session-artifact"
+    foreign_root = tmp_path / "spool" / foreign_job.job_id
+    foreign_root.mkdir(parents=True)
+    foreign_path = foreign_root / "foreign-mcp-result.json"
+    foreign_path.write_bytes(foreign_payload)
+    foreign_artifact = queue.append_artifact(
+        ArtifactRef(
+            job_id=foreign_job.job_id,
+            uri=foreign_path.as_uri(),
+            kind="mcp_result",
+            size_bytes=len(foreign_payload),
+            sha256=hashlib.sha256(foreign_payload).hexdigest(),
+        )
+    )
+    registry_path = tmp_path / "session-registry.json"
+    ClusterRegistry(clusters={definition.name: definition}).save(registry_path)
+    registry_payload = registry_path.read_bytes()
+    monkeypatch.setenv(CLUSTER_REGISTRY_ENV, str(registry_path))
+    monkeypatch.setenv(
+        "CLIO_RELAY_SESSION_REGISTRY_SHA256",
+        hashlib.sha256(registry_payload).hexdigest(),
+    )
+    monkeypatch.setenv(
+        "CLIO_RELAY_SESSION_ROUTE_REVISION",
+        cluster_route_revision(definition),
+    )
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        owner_session_cluster=definition.name,
+        session_owner_token="o" * 32,
+        jarvis_bin="/released/bin/jarvis",
+    )
+    authority = runtime_binding.JarvisServiceRuntimeAuthority.model_validate(
+        _service_runtime_authority_document(token="a" * 64)
+    )
+    observed: dict[str, object] = {}
+
+    def forbidden(*_args: object, **_kwargs: object) -> Any:
+        raise AssertionError("cluster-local API must not recurse through owner API or direct SSH")
+
+    def resolve_local_verified(**kwargs: object) -> runtime_binding.JarvisServiceRuntimeAuthority:
+        observed.update(kwargs)
+        return authority
+
+    monkeypatch.setattr(
+        http_api_module,
+        "resolve_local_verified_jarvis_service_runtime_authority",
+        resolve_local_verified,
+    )
+    monkeypatch.setattr(runtime_binding, "OwnedSessionApiClient", forbidden)
+    monkeypatch.setattr(runtime_binding, "run_remote_clio", forbidden)
+    headers = {
+        "Authorization": "Bearer session-api-token",
+        "X-Clio-Relay-Owner-Session-Id": "desktop-session-1",
+        "X-Clio-Relay-Session-Generation-Id": "generation-1",
+    }
+    request = {"binding": verified.binding.model_dump(mode="json")}
+
+    client = cast(Any, TestClient(create_app(settings)))
+    with client:
+        assert (
+            client.post(
+                runtime_binding.OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH,
+                json=request,
+            ).status_code
+            == 401
+        )
+        foreign_job_response = client.post(
+            runtime_binding.OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH,
+            headers=headers,
+            json={
+                "binding": verified.binding.model_copy(
+                    update={"source_relay_job_id": foreign_job.job_id}
+                ).model_dump(mode="json")
+            },
+        )
+        foreign_artifact_response = client.post(
+            runtime_binding.OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH,
+            headers=headers,
+            json={
+                "binding": verified.binding.model_copy(
+                    update={
+                        "source_relay_artifact_id": foreign_artifact.artifact_id,
+                        "source_relay_artifact_sha256": foreign_artifact.sha256,
+                    }
+                ).model_dump(mode="json")
+            },
+        )
+        drift_response = client.post(
+            runtime_binding.OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH,
+            headers=headers,
+            json={
+                "binding": verified.binding.model_copy(
+                    update={"service_revision": verified.binding.service_revision + 1}
+                ).model_dump(mode="json")
+            },
+        )
+        response = client.post(
+            runtime_binding.OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH,
+            headers=headers,
+            json=request,
+        )
+
+    assert foreign_job_response.status_code == 403
+    assert foreign_artifact_response.status_code == 403
+    assert drift_response.status_code == 409
+    assert "no longer matches its durable source" in drift_response.json()["detail"]
+    assert response.status_code == 200, response.text
+    assert response.json() == _service_runtime_authority_document(token="a" * 64)
+    assert observed["jarvis_bin"] == "/released/bin/jarvis"
+    resolved = cast(runtime_binding.VerifiedJarvisServiceRuntime, observed["verified"])
+    assert resolved.binding == verified.binding
+    token = ("a" * 64).encode("ascii")
+    assert token.decode("ascii") not in caplog.text
+    assert token not in verified.model_dump_json().encode("utf-8")
+    persisted = [path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()]
+    private_field = b'"token":"' + token + b'"'
+    assert all(private_field not in b"".join(payload.split()) for payload in persisted)
+
+
+def test_private_runtime_authority_endpoint_is_unavailable_on_non_owned_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ordinary relay API must never expose the private authority transport."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> Any:
+        raise AssertionError("ordinary API must not invoke a private authority resolver")
+
+    monkeypatch.setattr(
+        http_api_module,
+        "resolve_local_verified_jarvis_service_runtime_authority",
+        forbidden,
+    )
+    settings = RelaySettings(
+        core_dir=tmp_path / "ordinary-core",
+        spool_dir=tmp_path / "ordinary-spool",
+    )
+
+    client = cast(Any, TestClient(create_app(settings)))
+    with client:
+        response = client.post(
+            runtime_binding.OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH,
+            json={"binding": verified.binding.model_dump(mode="json")},
+        )
+        assert (
+            runtime_binding.OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH
+            not in (client.get("/openapi.json").json()["paths"])
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "owned JARVIS runtime authority resolver is unavailable"
+
+
+def test_owned_private_authority_api_cannot_start_without_api_token(tmp_path: Path) -> None:
+    """A secret-returning owned API must fail before serving without authentication."""
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        owner_session_cluster="test-cluster",
+        session_owner_token="o" * 32,
+    )
+
+    with pytest.raises(ConfigurationError, match="CLIO_RELAY_API_TOKEN"):
+        create_app(settings)
 
 
 def test_private_authority_resolver_rejects_private_token_digest_mismatch(

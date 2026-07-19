@@ -40,8 +40,8 @@ from clio_relay.cluster_config import (
 )
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError
-from clio_relay.identifiers import DurableRecordId
+from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError, RelayError
+from clio_relay.identifiers import DurableRecordId, validate_durable_record_id
 from clio_relay.jarvis_mcp import (
     is_virtual_jarvis_control_query,
     jarvis_cd_lock_binding_expectation,
@@ -49,6 +49,13 @@ from clio_relay.jarvis_mcp import (
     jarvis_mcp_env_from,
     jarvis_mcp_server,
     jarvis_mcp_server_args,
+)
+from clio_relay.jarvis_service_runtime import (
+    OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH,
+    JarvisServiceRuntimeBinding,
+    private_jarvis_service_runtime_authority_document,
+    resolve_local_verified_jarvis_service_runtime_authority,
+    reverify_jarvis_service_runtime,
 )
 from clio_relay.models import (
     MCP_ADMISSION_AUTHORITY_METADATA_KEY,
@@ -656,6 +663,14 @@ class GatewaySessionUpdateRequest(BaseModel):
     _metadata_is_not_runtime_owned = field_validator("metadata")(_validate_generic_gateway_metadata)
 
 
+class JarvisRuntimeAuthorityRequest(BaseModel):
+    """Private exact-binding request accepted only by an owned session API."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    binding: JarvisServiceRuntimeBinding
+
+
 _SESSION_REGISTRY_SHA256_ENV = "CLIO_RELAY_SESSION_REGISTRY_SHA256"
 _SESSION_ROUTE_REVISION_ENV = "CLIO_RELAY_SESSION_ROUTE_REVISION"
 
@@ -933,6 +948,49 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     def storage_status() -> dict[str, object]:
         """Return the machine-readable queue admission and storage decision."""
         return _public_payload(queue.storage_runtime.status())
+
+    @app.post(
+        OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH,
+        dependencies=[auth_dependency],
+        include_in_schema=False,
+    )
+    def resolve_owned_jarvis_runtime_authority(
+        request: JarvisRuntimeAuthorityRequest,
+    ) -> dict[str, object]:
+        """Resolve one private capability on its exact receipt-owning cluster host."""
+        if (
+            resolved.owner_session_id is None
+            or owner_session_cluster_definition is None
+            or not resolved.api_token
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail="owned JARVIS runtime authority resolver is unavailable",
+            )
+        binding = request.binding
+        try:
+            require_owned_job(validate_durable_record_id(binding.source_relay_job_id))
+            require_owned_artifact(validate_durable_record_id(binding.source_relay_artifact_id))
+            verified = reverify_jarvis_service_runtime(
+                queue=queue,
+                definition=owner_session_cluster_definition,
+                settings=None,
+                binding_document=binding.model_dump(mode="json"),
+            )
+            authority = resolve_local_verified_jarvis_service_runtime_authority(
+                jarvis_bin=resolved.jarvis_bin,
+                verified=verified,
+            )
+            if authority is None:
+                raise ConfigurationError("legacy JARVIS service runtimes have no private authority")
+            # This one response is intentionally not passed through the public
+            # payload redactor. It travels only on the authenticated,
+            # identity-bound owned-session connection and is never persisted.
+            return private_jarvis_service_runtime_authority_document(authority)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ConfigurationError, RelayError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post(
         "/jobs",
