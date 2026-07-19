@@ -122,9 +122,9 @@ class WorkerLifetimeLock:
     """Hold shared worker or exclusive migration ownership for one core directory.
 
     Worker processes use ``shared`` mode for their complete lifetime. Managed
-    bootstrap uses the same byte-range lock in ``exclusive`` mode so a newly
-    installed worker can start under systemd but cannot initialize its queue
-    until migration has finished and bootstrap releases the lock.
+    bootstrap uses the same byte-range lock in ``exclusive`` mode through
+    package replacement and migration, then releases it immediately before
+    starting the newly installed worker.
     """
 
     def __init__(
@@ -438,9 +438,9 @@ def exclusive_migration_lifetime(
     )
     # Do not unlock or close the inherited descriptor here. The bootstrap shell
     # owns the same open-file description and deliberately retains EX across
-    # package replacement, migration, service restart, and its EXIT trap. This
-    # process's inherited copy independently retains EX if that shell dies while
-    # migration is running.
+    # package replacement and migration, until immediately before a service
+    # start or its EXIT cleanup. This process's inherited copy independently
+    # retains EX if that shell dies while migration is running.
     try:
         yield locked_identity
     finally:
