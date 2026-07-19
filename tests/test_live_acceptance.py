@@ -465,6 +465,39 @@ def test_secure_runtime_acceptance_metadata_poll_is_bounded() -> None:
     assert calls == 1
 
 
+def test_secure_runtime_acceptance_rejects_unsupported_metadata_schema() -> None:
+    """A model-shaped document cannot bypass the exact runtime schema pin."""
+    metadata = _structured_live_runtime_metadata()
+    metadata["schema_version"] = "unsupported.runtime.v99"
+
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        return _completed(
+            command,
+            json.dumps(
+                _live_source_status(
+                    JobState.RUNNING,
+                    runtime_metadata=metadata,
+                )
+            ),
+        )
+
+    with pytest.raises(RelayError, match="unsupported schema version"):
+        _wait_for_live_structured_runtime_metadata(
+            ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+            _LIVE_SOURCE_JOB_ID,
+            line_prefix="acceptance",
+            lines=[],
+            timeout_seconds=5,
+            poll_seconds=0.01,
+            runner=fake_runner,
+        )
+
+
 def test_secure_runtime_orchestration_never_waits_for_outer_job_terminal(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -3002,6 +3035,102 @@ def test_secure_runtime_ready_binding_wait_is_bounded(
             runtime_metadata={
                 "pipeline_id": "pipeline-readiness-timeout",
                 "execution_id": "execution-readiness-timeout",
+            },
+            recorder=recorder,
+        )
+
+    assert calls == 1
+
+
+def test_secure_runtime_late_ready_binding_fails_deadline(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A ready result returned after the advertised deadline is not accepted."""
+    cluster = "operator-late-ready"
+    clock = 100.0
+    calls = 0
+    handoff = {
+        "cluster": cluster,
+        "source_job_id": "job_late_ready",
+        "source_artifact_id": "artifact_late_ready",
+        "package_id": "paraview-late-ready",
+        "package_name": "builtin.paraview",
+        "service_instance_id": "visualizer-late-ready",
+    }
+
+    def monotonic() -> float:
+        return clock
+
+    def packaged_session(
+        *,
+        profile: str,
+        tool: str,
+        arguments: dict[str, Any],
+        timeout_seconds: float,
+        extra_environment: dict[str, str] | None = None,
+        require_enforceable_containment: bool = False,
+    ) -> PackagedMcpStdioSession:
+        nonlocal calls, clock
+        del profile, arguments, timeout_seconds, extra_environment
+        assert tool == "jarvis_get_execution"
+        assert require_enforceable_containment is True
+        calls += 1
+        clock = 101.0
+        return _secure_runtime_packaged_session(
+            tool,
+            {
+                "terminal": True,
+                "state": "succeeded",
+                "cluster": cluster,
+                "job_id": handoff["source_job_id"],
+                "mcp_result_artifact": {
+                    "artifact_id": handoff["source_artifact_id"],
+                    "job_id": handoff["source_job_id"],
+                    "kind": "mcp_result",
+                    "sha256": "d" * 64,
+                },
+                "service_runtime_bindings": [handoff],
+            },
+            transcript_sha256="e" * 64,
+        )
+
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.run_packaged_mcp_stdio_session",
+        packaged_session,
+    )
+    monkeypatch.setattr("clio_relay.live_acceptance.time.monotonic", monotonic)
+    recorder = ValidationRecorder(
+        new_live_validation_report(
+            scenario="secure-runtime-late-ready",
+            cluster=cluster,
+            launcher="uv-tool",
+            install_source="pypi:clio-relay",
+            artifact_sha256="f" * 64,
+        )
+    )
+
+    with pytest.raises(
+        RelayError,
+        match="timed out waiting for one ready JARVIS service runtime binding",
+    ):
+        _verify_secure_runtime_acceptance(
+            LiveAcceptanceOptions(
+                cluster=cluster,
+                definition=ClusterDefinition(name=cluster, ssh_host="late-ready.invalid"),
+                timeout_seconds=1,
+                poll_seconds=0.1,
+                transport_token="transport-token-late-ready",
+                transport_secret_key="transport-secret-late-ready",
+            ),
+            config=SecureRuntimeProbeConfig(
+                package_name="builtin.paraview",
+                package_id="paraview-late-ready",
+                command={"command_id": "late-ready-command"},
+                protocol_adapter=_secure_runtime_protocol_adapter(),
+            ),
+            runtime_metadata={
+                "pipeline_id": "pipeline-late-ready",
+                "execution_id": "execution-late-ready",
             },
             recorder=recorder,
         )

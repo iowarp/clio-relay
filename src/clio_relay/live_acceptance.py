@@ -1393,6 +1393,11 @@ def _verify_secure_runtime_acceptance(
                     timeout_seconds=remaining + 30.0,
                     require_enforceable_containment=True,
                 )
+                if time.monotonic() >= query_deadline:
+                    raise RelayError(
+                        "timed out waiting for one ready JARVIS service runtime binding: "
+                        f"{execution_id}"
+                    )
                 query_result = _packaged_mcp_structured_result(
                     query_session,
                     expected_tool="jarvis_get_execution",
@@ -3397,6 +3402,11 @@ def _wait_for_live_structured_runtime_metadata(
                 validated = JarvisRuntimeMetadata.model_validate(raw_runtime)
             except ValueError as exc:
                 raise RelayError(f"secure runtime source metadata was invalid: {exc}") from exc
+            if validated.schema_version != RUNTIME_METADATA_SCHEMA:
+                raise RelayError(
+                    "secure runtime source metadata used an unsupported schema version: "
+                    f"{validated.schema_version}"
+                )
             if validated.source in structured_sources:
                 if not validated.pipeline_id or not validated.execution_id:
                     raise RelayError(
