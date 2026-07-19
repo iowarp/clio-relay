@@ -1,7 +1,7 @@
 {
   "schema_version": "clio-relay.release-acceptance-matrix.v1",
-  "release_version": "1.4.0",
-  "matrix_sha256": "969a0e753cfbba4fd1f6b1935d490da639c852c061bf13b8f91b780246b572b9",
+  "release_version": "1.4.1",
+  "matrix_sha256": "849a6b883f5fb523bbfc949b9c365a16811ac8150329a5b7b235b7bb74333ddf",
   "report_count_per_stage": 19,
   "target_labels_are_policy_evidence_instances": true,
   "stages": [

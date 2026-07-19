@@ -496,11 +496,12 @@ def containment_capability(*, startup_deadline: float | None = None) -> dict[str
         cached = _containment_capability_cache
     if cached is not None:
         return dict(cached)
+    result: dict[str, object]
     if os.name == "nt":
         try:
             handle = _create_windows_job()
         except RuntimeError as exc:
-            result: dict[str, object] = {
+            result = {
                 "mode": "windows_job_object",
                 "enforceable": False,
                 "reason": str(exc),
