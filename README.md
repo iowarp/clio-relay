@@ -8,7 +8,7 @@
 
 It is a piece of the federation layer for [`clio-agent`](https://github.com/iowarp/clio-agent): a local CLIO experience can delegate work to a remote machine, keep observing it, detach, reconnect, and clean up after itself. The project is also designed for use outside CLIO. Any client that can call the CLI, HTTP API, or MCP tools can use the same relay model.
 
-> Version `1.3.34` uses a release-first patch process. A maintainer builds the
+> Version `1.3.35` uses a release-first patch process. A maintainer builds the
 > wheel and source distribution once, attaches those exact bytes and their
 > checksums to a GitHub Release, and publishes the release immediately. Tag
 > regression jobs and the trusted PyPI upload then run asynchronously; they do
@@ -205,7 +205,9 @@ uv run pyright
 uv run pytest
 ```
 
-The tag workflow builds and attests a digest-bound draft candidate. Independent
-maintainer sealing verifies its digest and live reports before promotion
-publishes those exact bytes to PyPI. Published-artifact evidence and PyPI
-digests must then pass before final verification publishes the GitHub release.
+The optional staged acceptance workflows build and attest a digest-bound draft
+candidate, then collect independent candidate and released-artifact evidence.
+Normal patch publication follows the release-first process in
+[`docs/release.md`](docs/release.md) and does not wait for those acceptance
+workflows. A release must not be described as acceptance-validated unless the
+corresponding evidence stages actually completed.
