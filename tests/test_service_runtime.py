@@ -2847,6 +2847,109 @@ def test_unobservable_local_connector_intent_remains_retryable_after_restart(
     assert result.session.metadata["cleanup_retryable"] is True
 
 
+def test_windows_connector_discovery_ignores_system_idle_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PID zero cannot own a connector and must not block marker discovery."""
+    owner_token = "owner-token"
+    generation_id = "generation-1"
+    config_path = r"D:\owned\desktop-frpc.toml"
+    command_line = (
+        f"frpc -c {config_path} {owner_token} CLIO_RELAY_CONNECTOR_GENERATION_ID={generation_id}"
+    )
+    payload = json.dumps(
+        [
+            {"ProcessId": 0, "CommandLine": None},
+            {"ProcessId": 555, "CommandLine": command_line},
+        ]
+    )
+
+    def enumerate_processes(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, payload, "")
+
+    monkeypatch.setattr(service_runtime.os, "name", "nt")
+    monkeypatch.setattr(
+        service_runtime,
+        "_run_bounded_local_cleanup",
+        enumerate_processes,
+    )
+
+    assert service_runtime._local_process_ids(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        command_markers=(owner_token, generation_id, config_path),
+    ) == [555]
+
+
+def test_windows_system_idle_process_allows_connector_absence_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restart cleanup can prove an unrecorded connector absent on Windows."""
+    payload = json.dumps({"ProcessId": 0, "CommandLine": None})
+
+    def enumerate_processes(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, payload, "")
+
+    real_local_process_ids = service_runtime._local_process_ids  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def windows_process_ids(*, command_markers: tuple[str, ...] = ()) -> list[int]:
+        with monkeypatch.context() as windows:
+            windows.setattr(service_runtime.os, "name", "nt")
+            return real_local_process_ids(command_markers=command_markers)
+
+    def forbid_process_observation(_pid: int) -> object:
+        raise AssertionError("PID zero must never reach connector identity observation")
+
+    monkeypatch.setattr(
+        service_runtime,
+        "_run_bounded_local_cleanup",
+        enumerate_processes,
+    )
+    monkeypatch.setattr(service_runtime, "_local_process_ids", windows_process_ids)
+    monkeypatch.setattr(
+        service_runtime,
+        "_observe_local_process",
+        forbid_process_observation,
+    )
+    session_id = "owned-session"
+    connector, absence_verified = service_runtime._discover_local_connector(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        {
+            "owner_token": "owner-token",
+            "connector_generation_id": "generation-1",
+            "config_path": str(tmp_path / "desktop-frpc.toml"),
+            "metadata_path": str(tmp_path / "desktop-frpc-owner.json"),
+        },
+        session_id=session_id,
+    )
+
+    assert connector is None
+    assert absence_verified is True
+
+
+@pytest.mark.parametrize("process_id", [None, -1, True, "555"])
+def test_windows_connector_discovery_rejects_invalid_process_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    process_id: object,
+) -> None:
+    """Ignoring PID zero must not weaken fail-closed process identity parsing."""
+    payload = json.dumps({"ProcessId": process_id, "CommandLine": "frpc"})
+
+    def enumerate_processes(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, payload, "")
+
+    monkeypatch.setattr(service_runtime.os, "name", "nt")
+    monkeypatch.setattr(
+        service_runtime,
+        "_run_bounded_local_cleanup",
+        enumerate_processes,
+    )
+
+    with pytest.raises(
+        RelayError,
+        match="local Windows process enumeration returned an invalid process id",
+    ):
+        service_runtime._local_process_ids()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+
 def test_local_connector_pid_reuse_is_not_authorized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
