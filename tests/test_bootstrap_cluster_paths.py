@@ -82,6 +82,74 @@ def test_managed_bootstrap_fences_worker_around_migration() -> None:
     assert "worker state is unknown and requires operator verification" in script
 
 
+def test_managed_bootstrap_releases_lifetime_guard_before_normal_restart() -> None:
+    """The restarted worker can acquire its shared lifetime lock without timing out."""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.fail("bash is required to validate the Linux bootstrap restart path")
+    worker_fence, worker_recheck, _init, worker_restart = bootstrap._worker_upgrade_fence_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "test-cluster",
+        rendered_core_dir='"$test_root/core"',
+    )
+    harness = f"""set -euo pipefail
+test_root="$(mktemp -d)"
+trap 'rm -rf -- "$test_root"' EXIT
+mkdir -p "$test_root/bin"
+export BOOTSTRAP_TEST_STATE="$test_root/worker-state"
+echo active > "$BOOTSTRAP_TEST_STATE"
+cat > "$test_root/bin/python3" <<'__FAKE_PYTHON__'
+#!/usr/bin/env bash
+cat >/dev/null
+__FAKE_PYTHON__
+cat > "$test_root/bin/systemctl" <<'__FAKE_SYSTEMCTL__'
+#!/usr/bin/env bash
+set -u
+case "${{2:-}}" in
+  show)
+    case " $* " in
+      *" --property=LoadState "*) echo loaded ;;
+      *" --property=ActiveState "*) cat "$BOOTSTRAP_TEST_STATE" ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  stop)
+    echo "fake-systemctl=stop" >&2
+    echo inactive > "$BOOTSTRAP_TEST_STATE"
+    ;;
+  start)
+    echo "fake-systemctl=start" >&2
+    if {{ true <&8; }} 2>/dev/null; then
+      echo "fake-systemctl=start-with-lifetime-guard" >&2
+      echo activating > "$BOOTSTRAP_TEST_STATE"
+      exit 99
+    fi
+    echo active > "$BOOTSTRAP_TEST_STATE"
+    ;;
+  *) exit 2 ;;
+esac
+__FAKE_SYSTEMCTL__
+chmod +x "$test_root/bin/python3" "$test_root/bin/systemctl"
+export PATH="$test_root/bin:$PATH"
+{worker_fence}
+{worker_recheck}
+{worker_restart}
+"""
+
+    result = subprocess.run(
+        [bash, "-s"],
+        input=harness.encode("utf-8"),
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 0, stderr
+    assert stderr.count("fake-systemctl=stop") == 1
+    assert stderr.count("fake-systemctl=start") == 1
+    assert "fake-systemctl=start-with-lifetime-guard" not in stderr
+
+
 @pytest.mark.parametrize("restart_succeeds", [True, False])
 def test_failed_managed_bootstrap_restores_previously_active_worker(
     restart_succeeds: bool,
@@ -130,6 +198,10 @@ case "${{2:-}}" in
     ;;
   start)
     echo "fake-systemctl=start" >&2
+    if {{ true <&8; }} 2>/dev/null; then
+      echo "fake-systemctl=start-with-lifetime-guard" >&2
+      exit 99
+    fi
     : > "$BOOTSTRAP_TEST_STARTED"
     {restart_result}
     ;;
@@ -156,6 +228,7 @@ exit 37
     assert "remote-bootstrap-step=sabotaged" in stderr
     assert stderr.count("fake-systemctl=stop") == 1
     assert "fake-systemctl=start" in stderr
+    assert "fake-systemctl=start-with-lifetime-guard" not in stderr
     if restart_succeeds:
         assert stderr.count("fake-systemctl=start") == 1
         assert "worker_recovery=restored" in stderr

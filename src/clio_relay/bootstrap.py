@@ -884,8 +884,25 @@ def _worker_upgrade_fence_script(
     fence = "\n".join(
         [
             declarations,
+            "bootstrap_release_worker_lifetime_guard() {",
+            '  case "$WORKER_LIFETIME_GUARD_FD" in',
+            "    '') return 0 ;;",
+            "    8)",
+            "      WORKER_LIFETIME_GUARD_FD=",
+            "      exec 8>&-",
+            "      ;;",
+            "    *)",
+            (
+                '      echo "refusing to release unexpected worker lifetime guard fd: '
+                '$WORKER_LIFETIME_GUARD_FD" >&2'
+            ),
+            "      return 1",
+            "      ;;",
+            "  esac",
+            "}",
             "bootstrap_bounded_worker_restart() {",
             "  WORKER_RESTART_ATTEMPTED=1",
+            "  bootstrap_release_worker_lifetime_guard",
             (
                 "  if ! timeout --signal=TERM --kill-after=5s 30s systemctl --user start "
                 '"$WORKER_SERVICE_NAME"; then'
@@ -907,9 +924,6 @@ def _worker_upgrade_fence_script(
             "bootstrap_worker_fence_exit() {",
             "  status=$?",
             "  trap - EXIT",
-            '  if [ -n "$WORKER_LIFETIME_GUARD_FD" ]; then',
-            "    exec 8>&- || true",
-            "  fi",
             (
                 '  if [ "$status" -ne 0 ] && [ "$WORKER_WAS_ACTIVE" = "1" ]'
                 ' && [ "$WORKER_RESTARTED" != "1" ]; then'
@@ -961,6 +975,7 @@ def _worker_upgrade_fence_script(
             ),
             "    fi",
             "  fi",
+            "  bootstrap_release_worker_lifetime_guard || true",
             '  exit "$status"',
             "}",
             "trap bootstrap_worker_fence_exit EXIT",
