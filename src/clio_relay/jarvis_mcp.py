@@ -23,16 +23,16 @@ from clio_relay.remote_mcp import (
 if TYPE_CHECKING:
     from clio_relay.installation import ComponentArtifactIdentity, InstallReceipt
 
-CLIO_KIT_JARVIS_MCP_VERSION = "2.5.17"
+CLIO_KIT_JARVIS_MCP_VERSION = "2.5.19"
 CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME = f"clio_kit-{CLIO_KIT_JARVIS_MCP_VERSION}-py3-none-any.whl"
 CLIO_KIT_JARVIS_MCP_WHEEL_URL = (
     "https://github.com/iowarp/clio-kit/releases/download/"
     f"v{CLIO_KIT_JARVIS_MCP_VERSION}/{CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME}"
 )
 CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 = (
-    "cedd0eeb95aa4546223ea57702cb206c012ca4dddd84248881de08b7af811e53"
+    "4094bbc957db0682c27a84adcdb135ba9a4ef1bc1d6a05046f11ad777907a652"
 )
-CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.4"
+CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.5"
 DEFAULT_JARVIS_MCP_COMMAND = [
     "clio-kit",
     "mcp-server",
@@ -46,12 +46,12 @@ JARVIS_MCP_CACHE_SERVER_NAME = "__builtin_jarvis__"
 JSON = dict[str, Any]
 
 CLIO_KIT_JARVIS_USER_CONTRACT_SHA256 = (
-    "52bfe1d416e674d120f200e502ded2197ee27219c26891a22c6c33ba917d5696"
+    "9933815ca7ee913d56a7cb1081d7702474bc984efcc97bf16434980172d0469d"
 )
 CLIO_KIT_JARVIS_USER_WIRE_SHA256 = (
-    "2ced8dc66ecee832ee86df0c99c29610bce61a82f9d80a8a53e0ea037d262219"
+    "05f7d8a6286e211657ca40b64f0645bbd529e402fbf55770c845403695ddd366"
 )
-_JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.4.json"
+_JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.5.json"
 _EXPECTED_JARVIS_USER_TOOLS = {
     "jarvis_add_step",
     "jarvis_create_pipeline",
@@ -547,7 +547,16 @@ def virtual_jarvis_tool_definitions(*, clusters: list[str] | None = None) -> lis
             **properties,
             "timeout_seconds": {"type": "integer", "minimum": 1},
             "idempotency_key": {"type": "string"},
-            "wait_for_terminal": {"type": "boolean", "default": False},
+            "wait_for_terminal": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Set true when the current turn needs this JARVIS operation's result. "
+                    "This waits only for the bounded remote MCP dispatch, never for the "
+                    "scheduler workload. Leave false only when intentionally preserving an "
+                    "asynchronous relay receipt for a later relay_wait call."
+                ),
+            },
             "wait_timeout_seconds": {"type": "number", "default": 600},
             "poll_seconds": {"type": "number", "default": 2},
         }
@@ -582,7 +591,9 @@ def virtual_jarvis_tool_definitions(*, clusters: list[str] | None = None) -> lis
                     f"{definition['description']} Routed through the verified cluster-local "
                     "clio-kit JARVIS MCP and returned as a durable relay job. Preserve the "
                     "returned cluster, job_id, and route_revision unchanged for every remote "
-                    f"follow-up.{tool_guidance}"
+                    "follow-up. For ordinary interactive use, set wait_for_terminal=true so "
+                    "the bounded MCP result returns in this call; leave it false only when "
+                    f"intentionally queuing the transport operation.{tool_guidance}"
                 ),
                 "inputSchema": input_schema,
                 "outputSchema": output_schema,
@@ -771,6 +782,9 @@ def render_virtual_jarvis_agent_context() -> str:
         "page without adding another agent tool. Use jarvis_describe with "
         "target='package_search' for bounded package discovery, then describe the "
         "selected canonical package name. "
+        "For ordinary interactive operations, set wait_for_terminal=true so the bounded MCP "
+        "result returns in the current call; leave it false only when intentionally queuing "
+        "transport for a later relay_wait. "
         "When wait_for_terminal=true, the same JARVIS tool waits only for its bounded remote "
         "MCP dispatch and returns the artifact-bound mcp_result. For jarvis_run this means the "
         "durable execution handle, not workload completion; query that lifecycle with "

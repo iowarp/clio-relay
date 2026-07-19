@@ -58,6 +58,17 @@ _RETENTION_STORAGE_PAGINATION_TESTS = (
     "tests/test_storage_managed_queue.py::test_managed_queue_recovers_crash_reserved_canonical_id_without_leak",
     "tests/test_surface_pagination.py::test_sparse_job_filters_return_empty_source_page_with_next_cursor",
 )
+_SECURE_RUNTIME_ACCEPTANCE_TESTS = (
+    "tests/test_live_acceptance.py::test_secure_runtime_probe_config_is_generic_strict_and_bounded",
+    "tests/test_live_acceptance.py::test_secure_runtime_secret_scanner_rejects_capabilities_without_key_false_positives",
+    "tests/test_live_acceptance.py::test_secure_runtime_browser_http_is_direct_strict_bounded_and_deadlined",
+    "tests/test_live_acceptance.py::test_secure_runtime_acceptance_records_exact_v35_browser_and_cleanup_path",
+    "tests/test_live_acceptance.py::test_secure_runtime_bind_failure_preserves_error_and_attempts_safe_teardown",
+)
+_PACKAGED_MCP_BOUNDARY_TESTS = (
+    "tests/test_process_containment.py",
+    "tests/test_mcp_stdio_validation.py",
+)
 _PYTEST_RELEASE_GATE_ARGUMENTS = ("-p", "clio_relay.pytest_release_gate")
 
 
@@ -185,6 +196,22 @@ def run_local_release_validation(
             check_id="local.retention-storage-pagination",
             summary="execute bounded retention, storage, and pagination acceptance tests",
             node_ids=_RETENTION_STORAGE_PAGINATION_TESTS,
+            root=root,
+            runner=command_runner,
+        )
+        _run_required_tests(
+            recorder,
+            check_id="local.packaged-mcp-boundary",
+            summary="execute staged MCP protocol and owned-process containment boundary tests",
+            node_ids=_PACKAGED_MCP_BOUNDARY_TESTS,
+            root=root,
+            runner=command_runner,
+        )
+        _run_required_tests(
+            recorder,
+            check_id="local.secure-runtime-acceptance",
+            summary="execute v3.5 secure runtime lifecycle and evidence acceptance tests",
+            node_ids=_SECURE_RUNTIME_ACCEPTANCE_TESTS,
             root=root,
             runner=command_runner,
         )

@@ -85,6 +85,7 @@ jobs:
 
   publish-pypi:
     name: publish exact GitHub Release distributions to PyPI
+    needs: bind
     if: github.event_name == 'push' && github.repository == 'iowarp/clio-relay'
     runs-on: ubuntu-latest
     timeout-minutes: 15

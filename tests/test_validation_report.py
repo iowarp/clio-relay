@@ -1820,6 +1820,66 @@ def test_actual_release_policy_combines_bootstrap_with_worker_by_physical_target
     assert result.report_ids == ["validation_bootstrap", "validation_worker"]
 
 
+@pytest.mark.parametrize(
+    "missing_check",
+    ["local.packaged-mcp-boundary", "local.secure-runtime-acceptance"],
+)
+def test_local_release_policy_rejects_missing_critical_boundary_checks(
+    missing_check: str,
+) -> None:
+    policy = load_release_gate_policy(Path(__file__).parents[1] / "docs" / "release-gate-1.0.yaml")
+    requirement = next(
+        item for item in policy.requirements if item.requirement_id == "local-release-gate"
+    )
+    policy = _without_acceptance_matrix(policy)
+    policy.requirements = [requirement]
+    policy.targets = {}
+
+    report = _report(
+        kind=InstallSourceKind.CHECKOUT,
+        launcher="uv",
+        released_artifact=False,
+        artifact_identity_verified=False,
+        version=policy.release_version,
+    )
+    report.scenario = "local-release"
+    report.cluster = "local"
+    now = _timestamp()
+    report.checks = [
+        ValidationCheck(
+            check_id=check_id,
+            summary=check_id,
+            status=ValidationStatus.PASSED,
+            started_at=now,
+            completed_at=now,
+            evidence=[EvidenceReference(kind="test", excerpt="verified")],
+        )
+        for check_id in requirement.required_checks
+        if check_id != missing_check
+    ]
+    report.resources = [
+        ValidationResource(
+            kind="wheel",
+            resource_id="clio-relay-1.4.0-py3-none-any.whl",
+            cluster="local",
+            state="built",
+        ),
+        ValidationResource(
+            kind="source_distribution",
+            resource_id="clio_relay-1.4.0.tar.gz",
+            cluster="local",
+            state="built",
+        ),
+    ]
+
+    result = _evaluate(policy, [report])
+
+    assert result.passed is False
+    assert any(
+        missing_check in reason for reason in result.unsatisfied_requirements["local-release-gate"]
+    )
+
+
 def test_release_gate_does_not_combine_reports_outside_expected_artifact_hash() -> None:
     now = _timestamp()
     policy = _policy()
@@ -1945,9 +2005,9 @@ def test_default_report_path_sanitizes_cluster_name(tmp_path: Path) -> None:
 def test_repository_release_policy_is_machine_readable() -> None:
     policy = load_release_gate_policy(Path("docs/release-gate-1.0.yaml"))
 
-    assert policy.release_version == "1.3.36"
+    assert policy.release_version == "1.4.0"
     assert policy.acceptance_matrix is not None
-    assert policy.acceptance_matrix["report_count_per_stage"] == 18
+    assert policy.acceptance_matrix["report_count_per_stage"] == 19
     assert policy.acceptance_matrix["matrix_sha256"] == policy.acceptance_matrix_sha256
     matrix_stages = cast(list[dict[str, object]], policy.acceptance_matrix["stages"])
     assert [stage["name"] for stage in matrix_stages] == [
@@ -3388,7 +3448,19 @@ def test_gateway_start_and_stop_reports_combine_for_release_gate() -> None:
         compatibility_urls={},
         events_url=None,
     ).to_live_validation_report()
-    stopped_session = ready.model_copy(update={"state": GatewaySessionState.CLOSED})
+    stopped_session = ready.model_copy(
+        update={
+            "state": GatewaySessionState.CLOSED,
+            "gateway": {
+                **ready.gateway,
+                "teardown_intent": {
+                    "operation_id": "gateway_cleanup_00000000000000000000000000000000",
+                    "gateway_session_id": ready.session_id,
+                    "cancel_scheduler_job": False,
+                },
+            },
+        }
+    )
     stopped = ServiceRuntimeStopResult(
         session=stopped_session,
         mode="teardown",
@@ -3531,3 +3603,184 @@ def test_gateway_start_and_stop_reports_combine_for_release_gate() -> None:
     )
 
     assert result.passed is True, result.unsatisfied_requirements
+
+
+def test_secure_runtime_release_requirement_accepts_only_verified_preservation() -> None:
+    """Secure evidence distinguishes immutable binding from final cleanup state."""
+    full_policy = load_release_gate_policy(Path("docs/release-gate-1.0.yaml"))
+    requirement = next(
+        item
+        for item in full_policy.requirements
+        if item.requirement_id == "ares-secure-jarvis-runtime"
+    )
+    policy = _without_acceptance_matrix(
+        full_policy.model_copy(
+            update={
+                "release_blockers": [],
+                "requirements": [requirement],
+                "require_target_identity": False,
+                "targets": {},
+            }
+        )
+    )
+    now = _timestamp()
+
+    def metadata_for(kind: str) -> dict[str, object]:
+        predicate = next(item for item in requirement.required_resources if item.kind == kind)
+        return deepcopy(predicate.metadata_equals)
+
+    def report_with_scheduler_state(state: str) -> LiveValidationReport:
+        report = _report(version=policy.release_version)
+        report.report_id = "validation_ares_secure_runtime"
+        report.scenario = "secure-runtime"
+        report.cluster = "ares"
+        report.checks = [
+            ValidationCheck(
+                check_id=check_id,
+                summary=check_id,
+                status=ValidationStatus.PASSED,
+                started_at=now,
+                completed_at=now,
+                evidence=[EvidenceReference(kind="test", excerpt="verified")],
+            )
+            for check_id in requirement.required_checks
+        ]
+        report.resources = [
+            ValidationResource(
+                kind="relay_job",
+                resource_id="job_secure_query",
+                role="secure_runtime_query",
+                cluster="ares",
+                state="succeeded",
+            ),
+            ValidationResource(
+                kind="artifact",
+                resource_id="artifact_private_result",
+                role="private_mcp_result",
+                cluster="ares",
+                metadata=metadata_for("artifact"),
+            ),
+            ValidationResource(
+                kind="secure_runtime_binding",
+                resource_id="gateway_secure:revision:7",
+                role="private_authority_bind",
+                cluster="ares",
+                state="ready",
+                metadata={
+                    **metadata_for("secure_runtime_binding"),
+                    "source_job_id": "job_secure_query",
+                    "source_artifact_id": "artifact_private_result",
+                    "service_instance_id": "srv_secure",
+                    "service_revision": 7,
+                },
+            ),
+            ValidationResource(
+                kind="gateway_session",
+                resource_id="gateway_secure",
+                role="secure_runtime_teardown",
+                cluster="ares",
+                state="closed",
+                metadata=metadata_for("gateway_session"),
+            ),
+            *[
+                ValidationResource(
+                    kind="connector",
+                    resource_id=f"connector_{index}",
+                    role="secure_runtime_teardown",
+                    cluster="ares",
+                    state="stopped" if index == 1 else "missing",
+                    metadata=metadata_for("connector"),
+                )
+                for index in (1, 2)
+            ],
+            ValidationResource(
+                kind="scheduler_job",
+                resource_id="21996",
+                role="secure_runtime_teardown",
+                cluster="ares",
+                state=state,
+                provider="slurm",
+                metadata={
+                    **metadata_for("scheduler_job"),
+                    "observed_state": (
+                        "running"
+                        if state == "retained"
+                        else "completed"
+                        if state == "terminal"
+                        else "missing"
+                    ),
+                },
+            ),
+            ValidationResource(
+                kind="relay_worker",
+                resource_id="worker:ares",
+                role="cluster_worker",
+                cluster="ares",
+                state="running",
+                metadata=metadata_for("relay_worker"),
+            ),
+            ValidationResource(
+                kind="cluster_target",
+                resource_id="target:ares",
+                role="physical_cluster_target",
+                cluster="ares",
+                state="verified",
+                provider="slurm",
+                metadata=metadata_for("cluster_target"),
+            ),
+        ]
+        return report
+
+    for accepted_state in ("retained", "terminal", "missing"):
+        accepted = _evaluate(policy, [report_with_scheduler_state(accepted_state)])
+        assert accepted.passed is True, accepted.unsatisfied_requirements
+
+    rejected_cases: dict[str, LiveValidationReport] = {}
+    missing_binding = report_with_scheduler_state("retained")
+    missing_binding.resources = [
+        resource
+        for resource in missing_binding.resources
+        if resource.kind != "secure_runtime_binding"
+    ]
+    rejected_cases["missing-binding"] = missing_binding
+
+    canceled = report_with_scheduler_state("retained")
+    canceled_scheduler = next(
+        resource for resource in canceled.resources if resource.kind == "scheduler_job"
+    )
+    canceled_scheduler.state = "canceled"
+    canceled_scheduler.metadata["cancel_scheduler_job"] = True
+    rejected_cases["scheduler-canceled"] = canceled
+
+    unverified = report_with_scheduler_state("retained")
+    next(resource for resource in unverified.resources if resource.kind == "connector").metadata[
+        "verified_after_operation"
+    ] = False
+    rejected_cases["connector-unverified"] = unverified
+
+    wrong_provider = report_with_scheduler_state("retained")
+    next(
+        resource for resource in wrong_provider.resources if resource.kind == "scheduler_job"
+    ).provider = "external"
+    rejected_cases["wrong-provider"] = wrong_provider
+
+    uncontained_query = report_with_scheduler_state("retained")
+    next(
+        resource
+        for resource in uncontained_query.resources
+        if resource.kind == "secure_runtime_binding"
+    ).metadata["query_mcp_containment_enforceable"] = False
+    rejected_cases["uncontained-query-mcp"] = uncontained_query
+
+    uncontained_bind = report_with_scheduler_state("retained")
+    next(
+        resource
+        for resource in uncontained_bind.resources
+        if resource.kind == "secure_runtime_binding"
+    ).metadata["bind_mcp_containment_enforceable"] = False
+    rejected_cases["uncontained-bind-mcp"] = uncontained_bind
+
+    for case, report in rejected_cases.items():
+        result = _evaluate(policy, [report])
+        assert result.passed is False, case
+        assert requirement.requirement_id in result.unsatisfied_requirements, case

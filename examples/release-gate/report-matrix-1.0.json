@@ -1,8 +1,8 @@
 {
   "schema_version": "clio-relay.release-acceptance-matrix.v1",
-  "release_version": "1.3.36",
-  "matrix_sha256": "672b0c295fdfa73ab303527add0e0663ba16ffa0654fbabce99fab68dadf8b68",
-  "report_count_per_stage": 18,
+  "release_version": "1.4.0",
+  "matrix_sha256": "969a0e753cfbba4fd1f6b1935d490da639c852c061bf13b8f91b780246b572b9",
+  "report_count_per_stage": 19,
   "target_labels_are_policy_evidence_instances": true,
   "stages": [
     {
@@ -183,6 +183,15 @@
       "command": ["gateway", "stop-runtime"],
       "report_option": "--validation-report",
       "evidence_group": "ares-dedicated-gateway"
+    },
+    {
+      "ordinal": 19,
+      "id": "ares-secure-runtime",
+      "cluster": "ares",
+      "scenario": "secure-runtime",
+      "command": ["live-test"],
+      "report_option": "--report",
+      "evidence_group": "ares-secure-jarvis-runtime"
     }
   ]
 }

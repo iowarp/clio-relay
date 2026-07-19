@@ -7,10 +7,13 @@ import os
 import posixpath
 import shlex
 import subprocess
+import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Thread
 from typing import cast
 
 import yaml
@@ -64,6 +67,127 @@ def run_remote_clio(definition: ClusterDefinition, args: list[str]) -> str:
     """Run a clio-relay command on a configured cluster and return stdout."""
     rendered_args = " ".join(shlex.quote(arg) for arg in args)
     return run_remote_shell(definition, f"{remote_env(definition)} clio-relay {rendered_args}")
+
+
+def run_remote_jarvis_runtime_authority(
+    definition: ClusterDefinition,
+    args: list[str],
+    *,
+    timeout_seconds: float,
+    maximum_stdout_bytes: int,
+) -> str:
+    """Resolve private JARVIS authority through a bounded, output-safe SSH transport."""
+    rendered_args = " ".join(shlex.quote(arg) for arg in ["jarvis-runtime-authority", *args])
+    script = f"{remote_env(definition)} clio-relay {rendered_args}"
+    command = ["ssh", definition.ssh_host, f"bash -lc {shlex.quote(script)}"]
+    payload = _run_bounded_private_command(
+        command,
+        timeout_seconds=timeout_seconds,
+        maximum_stdout_bytes=maximum_stdout_bytes,
+        label="remote JARVIS service runtime authority resolution",
+    )
+    try:
+        return payload.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise RelayError("remote JARVIS service runtime authority response was not UTF-8") from None
+
+
+def _run_bounded_private_command(
+    command: list[str],
+    *,
+    timeout_seconds: float,
+    maximum_stdout_bytes: int,
+    label: str,
+) -> bytes:
+    """Capture bounded stdout while discarding every private-command failure payload."""
+    if timeout_seconds <= 0:
+        raise ValueError("private command timeout_seconds must be positive")
+    if maximum_stdout_bytes <= 0:
+        raise ValueError("private command maximum_stdout_bytes must be positive")
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        raise RelayError(f"{label} could not start") from exc
+    stdout = process.stdout
+    if stdout is None:  # pragma: no cover - guaranteed by stdout=PIPE
+        _stop_private_process(process)
+        raise RelayError(f"{label} could not capture its response")
+
+    responses: Queue[tuple[bytes | None, Exception | None]] = Queue(maxsize=1)
+
+    def read_stdout() -> None:
+        captured = bytearray()
+        try:
+            while True:
+                remaining = maximum_stdout_bytes + 1 - len(captured)
+                if remaining <= 0:
+                    responses.put((bytes(captured), None))
+                    return
+                chunk = stdout.read(min(64 * 1024, remaining))
+                if not chunk:
+                    responses.put((bytes(captured), None))
+                    return
+                captured.extend(chunk)
+        except Exception as exc:  # noqa: BLE001 - converted to a secret-safe boundary error
+            responses.put((None, exc))
+
+    reader = Thread(
+        target=read_stdout,
+        name="clio-relay-private-authority-reader",
+        daemon=True,
+    )
+    reader.start()
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        remaining_seconds = max(0.0, deadline - time.monotonic())
+        try:
+            payload, read_error = responses.get(timeout=remaining_seconds)
+        except Empty as exc:
+            _stop_private_process(process)
+            reader.join(timeout=1.0)
+            raise RelayError(f"{label} timed out after {timeout_seconds:g} seconds") from exc
+        if payload is None or read_error is not None:
+            _stop_private_process(process)
+            reader.join(timeout=1.0)
+            raise RelayError(f"{label} could not read its response") from None
+        if len(payload) > maximum_stdout_bytes:
+            _stop_private_process(process)
+            reader.join(timeout=1.0)
+            raise RelayError(f"{label} response exceeded its byte limit")
+        remaining_seconds = max(0.0, deadline - time.monotonic())
+        try:
+            returncode = process.wait(timeout=remaining_seconds)
+        except subprocess.TimeoutExpired as exc:
+            _stop_private_process(process)
+            reader.join(timeout=1.0)
+            raise RelayError(f"{label} timed out after {timeout_seconds:g} seconds") from exc
+        if returncode != 0:
+            raise RelayError(f"{label} failed with exit code {returncode}")
+        return payload
+    finally:
+        if process.poll() is None:
+            _stop_private_process(process)
+        reader.join(timeout=1.0)
+        stdout.close()
+
+
+def _stop_private_process(process: subprocess.Popen[bytes]) -> None:
+    """Best-effort stop a bounded private transport without inspecting its output."""
+    if process.poll() is not None:
+        return
+    try:
+        process.kill()
+    except OSError:
+        return
+    try:
+        process.wait(timeout=1.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return
 
 
 def run_remote_shell(definition: ClusterDefinition, script: str) -> str:

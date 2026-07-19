@@ -3,9 +3,9 @@
 # registry and may require them for a later release by adding policy requirements;
 # neither action requires a clio-relay code change.
 schema_version: "1.0"
-release_version: "1.3.36"
+release_version: "1.4.0"
 acceptance_matrix_path: examples/release-gate/report-matrix-1.0.json
-acceptance_matrix_sha256: 672b0c295fdfa73ab303527add0e0663ba16ffa0654fbabce99fab68dadf8b68
+acceptance_matrix_sha256: 969a0e753cfbba4fd1f6b1935d490da639c852c061bf13b8f91b780246b572b9
 artifact_stage: published
 evidence_trust_model: maintainer_sealed_operator_evidence
 require_released_artifact: true
@@ -62,6 +62,8 @@ requirements:
       - local.containment-hard-crash
       - local.sidecar-reclamation
       - local.retention-storage-pagination
+      - local.packaged-mcp-boundary
+      - local.secure-runtime-acceptance
       - local.dependency-lock-export
       - local.dependency-audit
       - local.build-backend
@@ -110,32 +112,32 @@ requirements:
         states: [running]
         metadata_equals:
           components:
-            clio-kit: "2.5.17"
-            jarvis-cd: "1.3.18"
+            clio-kit: "2.5.19"
+            jarvis-cd: "1.4.1"
             jarvis-util: c91bfdc9bba802e4b03bfb1babe614ffa3e09644
           component_artifacts:
             clio-kit:
               distribution: clio-kit
-              distribution_version: "2.5.17"
-              install_spec: https://github.com/iowarp/clio-kit/releases/download/v2.5.17/clio_kit-2.5.17-py3-none-any.whl
+              distribution_version: "2.5.19"
+              install_spec: https://github.com/iowarp/clio-kit/releases/download/v2.5.19/clio_kit-2.5.19-py3-none-any.whl
               requested_source: github_release
-              artifact_sha256: cedd0eeb95aa4546223ea57702cb206c012ca4dddd84248881de08b7af811e53
+              artifact_sha256: 4094bbc957db0682c27a84adcdb135ba9a4ef1bc1d6a05046f11ad777907a652
               native_execution:
                 schema_version: clio-relay.jarvis-native-execution-capability.v1
                 handle_schema: jarvis.execution.handle.v1
                 record_schema: jarvis.execution.record.v1
                 progress_schema: jarvis.execution.progress.v1
                 operations: [jarvis_get_execution, jarvis_run]
-                contract_id: clio-kit-jarvis-user-v3.4
+                contract_id: clio-kit-jarvis-user-v3.5
                 contract_schema_version: clio-kit.mcp-user-contract.v1
-                contract_sha256: 52bfe1d416e674d120f200e502ded2197ee27219c26891a22c6c33ba917d5696
+                contract_sha256: 9933815ca7ee913d56a7cb1081d7702474bc984efcc97bf16434980172d0469d
             jarvis-cd:
               distribution: jarvis_cd
-              distribution_version: "1.3.18"
-              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v1.3.18/jarvis_cd-1.3.18-py3-none-any.whl
+              distribution_version: "1.4.1"
+              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v1.4.1/jarvis_cd-1.4.1-py3-none-any.whl
               requested_source: github_release
-              artifact_filename: jarvis_cd-1.3.18-py3-none-any.whl
-              artifact_sha256: 28fc4879585055485be979c4e2039d2181290219ef67365d3056b7883f946cfc
+              artifact_filename: jarvis_cd-1.4.1-py3-none-any.whl
+              artifact_sha256: 1d1fa54b391b54279da440a8cf91d25a67f9558beeae7ebdfd2c88dd0f4f375b
               native_execution:
                 schema_version: clio-relay.jarvis-native-execution-capability.v1
                 handle_schema: jarvis.execution.handle.v1
@@ -143,6 +145,7 @@ requirements:
                 progress_schema: jarvis.execution.progress.v1
                 operations:
                   - execution_handle.progress
+                  - execution_store.resolve_service_runtime_authority
                   - pipeline.get_execution
                   - pipeline.get_execution_progress
                   - pipeline.run
@@ -220,14 +223,14 @@ requirements:
         states: [running]
         metadata_equals:
           components:
-            clio-kit: "2.5.17"
+            clio-kit: "2.5.19"
           component_artifacts:
             clio-kit:
               distribution: clio-kit
-              distribution_version: "2.5.17"
-              install_spec: https://github.com/iowarp/clio-kit/releases/download/v2.5.17/clio_kit-2.5.17-py3-none-any.whl
+              distribution_version: "2.5.19"
+              install_spec: https://github.com/iowarp/clio-kit/releases/download/v2.5.19/clio_kit-2.5.19-py3-none-any.whl
               requested_source: github_release
-              artifact_sha256: cedd0eeb95aa4546223ea57702cb206c012ca4dddd84248881de08b7af811e53
+              artifact_sha256: 4094bbc957db0682c27a84adcdb135ba9a4ef1bc1d6a05046f11ad777907a652
       - kind: scheduler_job
         roles: [queue-preservation-fixture]
         states: [completed]
@@ -288,24 +291,24 @@ requirements:
         states: [running]
         metadata_equals:
           components:
-            clio-kit: "2.5.17"
-            jarvis-cd: "1.3.18"
+            clio-kit: "2.5.19"
+            jarvis-cd: "1.4.1"
           component_artifacts:
             clio-kit:
               distribution: clio-kit
-              distribution_version: "2.5.17"
-              install_spec: https://github.com/iowarp/clio-kit/releases/download/v2.5.17/clio_kit-2.5.17-py3-none-any.whl
+              distribution_version: "2.5.19"
+              install_spec: https://github.com/iowarp/clio-kit/releases/download/v2.5.19/clio_kit-2.5.19-py3-none-any.whl
               requested_source: github_release
-              artifact_filename: clio_kit-2.5.17-py3-none-any.whl
-              artifact_sha256: cedd0eeb95aa4546223ea57702cb206c012ca4dddd84248881de08b7af811e53
+              artifact_filename: clio_kit-2.5.19-py3-none-any.whl
+              artifact_sha256: 4094bbc957db0682c27a84adcdb135ba9a4ef1bc1d6a05046f11ad777907a652
               persistent_tool:
                 manager: uv
                 uv_version: "0.11.28"
                 pyvenv_uv_version: "0.11.28"
                 distribution: clio-kit
-                distribution_version: "2.5.17"
+                distribution_version: "2.5.19"
                 entry_point: clio-kit
-                source_artifact_sha256: cedd0eeb95aa4546223ea57702cb206c012ca4dddd84248881de08b7af811e53
+                source_artifact_sha256: 4094bbc957db0682c27a84adcdb135ba9a4ef1bc1d6a05046f11ad777907a652
               native_execution:
                 schema_version: clio-relay.jarvis-native-execution-capability.v1
                 handle_schema: jarvis.execution.handle.v1
@@ -314,16 +317,16 @@ requirements:
                 operations:
                   - jarvis_get_execution
                   - jarvis_run
-                contract_id: clio-kit-jarvis-user-v3.4
+                contract_id: clio-kit-jarvis-user-v3.5
                 contract_schema_version: clio-kit.mcp-user-contract.v1
-                contract_sha256: 52bfe1d416e674d120f200e502ded2197ee27219c26891a22c6c33ba917d5696
+                contract_sha256: 9933815ca7ee913d56a7cb1081d7702474bc984efcc97bf16434980172d0469d
             jarvis-cd:
               distribution: jarvis_cd
-              distribution_version: "1.3.18"
-              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v1.3.18/jarvis_cd-1.3.18-py3-none-any.whl
+              distribution_version: "1.4.1"
+              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v1.4.1/jarvis_cd-1.4.1-py3-none-any.whl
               requested_source: github_release
-              artifact_filename: jarvis_cd-1.3.18-py3-none-any.whl
-              artifact_sha256: 28fc4879585055485be979c4e2039d2181290219ef67365d3056b7883f946cfc
+              artifact_filename: jarvis_cd-1.4.1-py3-none-any.whl
+              artifact_sha256: 1d1fa54b391b54279da440a8cf91d25a67f9558beeae7ebdfd2c88dd0f4f375b
               native_execution:
                 schema_version: clio-relay.jarvis-native-execution-capability.v1
                 handle_schema: jarvis.execution.handle.v1
@@ -331,6 +334,7 @@ requirements:
                 progress_schema: jarvis.execution.progress.v1
                 operations:
                   - execution_handle.progress
+                  - execution_store.resolve_service_runtime_authority
                   - pipeline.get_execution
                   - pipeline.get_execution_progress
                   - pipeline.run
@@ -364,10 +368,10 @@ requirements:
         states: [verified]
         metadata_equals:
           install_source: uv-tool
-          install_artifact_sha256: cedd0eeb95aa4546223ea57702cb206c012ca4dddd84248881de08b7af811e53
+          install_artifact_sha256: 4094bbc957db0682c27a84adcdb135ba9a4ef1bc1d6a05046f11ad777907a652
           python_distribution_runtime:
             distribution: clio-kit
-            distribution_version: "2.5.17"
+            distribution_version: "2.5.19"
             entry_point: clio-kit
             runtime_closure_verified: true
           nested_runtime:
@@ -378,9 +382,9 @@ requirements:
               schema_version: clio-relay.jarvis-cd-lock-binding.v1
               dependency: jarvis-cd
               error: null
-              expected_version: "1.3.18"
-              expected_url: https://github.com/grc-iit/jarvis-cd/releases/download/v1.3.18/jarvis_cd-1.3.18-py3-none-any.whl
-              expected_sha256: 28fc4879585055485be979c4e2039d2181290219ef67365d3056b7883f946cfc
+              expected_version: "1.4.1"
+              expected_url: https://github.com/grc-iit/jarvis-cd/releases/download/v1.4.1/jarvis_cd-1.4.1-py3-none-any.whl
+              expected_sha256: 1d1fa54b391b54279da440a8cf91d25a67f9558beeae7ebdfd2c88dd0f4f375b
               jarvis_mcp_package_entry_count: 1
               resolved_dependency_entry_count: 1
               observed_resolved_dependency_entries:
@@ -388,15 +392,15 @@ requirements:
               metadata_requirement_entry_count: 1
               observed_metadata_requirement_entries:
                 - name: jarvis-cd
-                  url: https://github.com/grc-iit/jarvis-cd/releases/download/v1.3.18/jarvis_cd-1.3.18-py3-none-any.whl
+                  url: https://github.com/grc-iit/jarvis-cd/releases/download/v1.4.1/jarvis_cd-1.4.1-py3-none-any.whl
               observed_metadata_requirement_urls:
-                - https://github.com/grc-iit/jarvis-cd/releases/download/v1.3.18/jarvis_cd-1.3.18-py3-none-any.whl
+                - https://github.com/grc-iit/jarvis-cd/releases/download/v1.4.1/jarvis_cd-1.4.1-py3-none-any.whl
               package_entry_count: 1
               wheel_entry_count: 1
-              observed_version: "1.3.18"
-              observed_source_url: https://github.com/grc-iit/jarvis-cd/releases/download/v1.3.18/jarvis_cd-1.3.18-py3-none-any.whl
-              observed_wheel_url: https://github.com/grc-iit/jarvis-cd/releases/download/v1.3.18/jarvis_cd-1.3.18-py3-none-any.whl
-              observed_wheel_sha256: 28fc4879585055485be979c4e2039d2181290219ef67365d3056b7883f946cfc
+              observed_version: "1.4.1"
+              observed_source_url: https://github.com/grc-iit/jarvis-cd/releases/download/v1.4.1/jarvis_cd-1.4.1-py3-none-any.whl
+              observed_wheel_url: https://github.com/grc-iit/jarvis-cd/releases/download/v1.4.1/jarvis_cd-1.4.1-py3-none-any.whl
+              observed_wheel_sha256: 1d1fa54b391b54279da440a8cf91d25a67f9558beeae7ebdfd2c88dd0f4f375b
               verified: true
           server_process_artifact_verified: true
           verified: true
@@ -509,15 +513,15 @@ requirements:
         states: [running]
         metadata_equals:
           components:
-            jarvis-cd: "1.3.18"
+            jarvis-cd: "1.4.1"
           component_artifacts:
             jarvis-cd:
               distribution: jarvis_cd
-              distribution_version: "1.3.18"
-              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v1.3.18/jarvis_cd-1.3.18-py3-none-any.whl
+              distribution_version: "1.4.1"
+              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v1.4.1/jarvis_cd-1.4.1-py3-none-any.whl
               requested_source: github_release
-              artifact_filename: jarvis_cd-1.3.18-py3-none-any.whl
-              artifact_sha256: 28fc4879585055485be979c4e2039d2181290219ef67365d3056b7883f946cfc
+              artifact_filename: jarvis_cd-1.4.1-py3-none-any.whl
+              artifact_sha256: 1d1fa54b391b54279da440a8cf91d25a67f9558beeae7ebdfd2c88dd0f4f375b
               native_execution:
                 schema_version: clio-relay.jarvis-native-execution-capability.v1
                 handle_schema: jarvis.execution.handle.v1
@@ -525,6 +529,7 @@ requirements:
                 progress_schema: jarvis.execution.progress.v1
                 operations:
                   - execution_handle.progress
+                  - execution_store.resolve_service_runtime_authority
                   - pipeline.get_execution
                   - pipeline.get_execution_progress
                   - pipeline.run
@@ -586,15 +591,15 @@ requirements:
         states: [running]
         metadata_equals:
           components:
-            jarvis-cd: "1.3.18"
+            jarvis-cd: "1.4.1"
           component_artifacts:
             jarvis-cd:
               distribution: jarvis_cd
-              distribution_version: "1.3.18"
-              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v1.3.18/jarvis_cd-1.3.18-py3-none-any.whl
+              distribution_version: "1.4.1"
+              install_spec: https://github.com/grc-iit/jarvis-cd/releases/download/v1.4.1/jarvis_cd-1.4.1-py3-none-any.whl
               requested_source: github_release
-              artifact_filename: jarvis_cd-1.3.18-py3-none-any.whl
-              artifact_sha256: 28fc4879585055485be979c4e2039d2181290219ef67365d3056b7883f946cfc
+              artifact_filename: jarvis_cd-1.4.1-py3-none-any.whl
+              artifact_sha256: 1d1fa54b391b54279da440a8cf91d25a67f9558beeae7ebdfd2c88dd0f4f375b
               native_execution:
                 schema_version: clio-relay.jarvis-native-execution-capability.v1
                 handle_schema: jarvis.execution.handle.v1
@@ -602,6 +607,7 @@ requirements:
                 progress_schema: jarvis.execution.progress.v1
                 operations:
                   - execution_handle.progress
+                  - execution_store.resolve_service_runtime_authority
                   - pipeline.get_execution
                   - pipeline.get_execution_progress
                   - pipeline.run
@@ -671,7 +677,7 @@ requirements:
           remote_tool_names: [scientific_dataset_describe, scientific_dataset_search]
           allowlisted_tool_names: [scientific_dataset_describe, scientific_dataset_search]
           install_source: wheel
-          install_artifact_sha256: cedd0eeb95aa4546223ea57702cb206c012ca4dddd84248881de08b7af811e53
+          install_artifact_sha256: 4094bbc957db0682c27a84adcdb135ba9a4ef1bc1d6a05046f11ad777907a652
           contract_id: clio-kit-scientific-catalog-user-v1.1
           contract_sha256: 80a9b583c26a084ff07d638ddf0c2c7d4325dbc8d4299931d0c4f3627cb8674c
           server_process_artifact_verified: true
@@ -773,7 +779,7 @@ requirements:
           remote_tool_names: [spack_find, spack_install, spack_locate]
           allowlisted_tool_names: [spack_find, spack_install, spack_locate]
           install_source: wheel
-          install_artifact_sha256: cedd0eeb95aa4546223ea57702cb206c012ca4dddd84248881de08b7af811e53
+          install_artifact_sha256: 4094bbc957db0682c27a84adcdb135ba9a4ef1bc1d6a05046f11ad777907a652
           contract_id: clio-kit-spack-user-v2.1
           contract_sha256: cc90789227aa0baea99d0e0379b320811c1dbd40c7fa66877d372309201be1c2
           server_process_artifact_verified: true
@@ -878,7 +884,7 @@ requirements:
           remote_tool_names: [spack_find, spack_install, spack_locate]
           allowlisted_tool_names: [spack_find, spack_install, spack_locate]
           install_source: wheel
-          install_artifact_sha256: cedd0eeb95aa4546223ea57702cb206c012ca4dddd84248881de08b7af811e53
+          install_artifact_sha256: 4094bbc957db0682c27a84adcdb135ba9a4ef1bc1d6a05046f11ad777907a652
           contract_id: clio-kit-spack-user-v2.1
           contract_sha256: cc90789227aa0baea99d0e0379b320811c1dbd40c7fa66877d372309201be1c2
           server_process_artifact_verified: true
@@ -1098,3 +1104,90 @@ requirements:
         roles: [cluster_worker]
         states: [running]
     evidence_group_resource_kind: gateway_session
+
+  - requirement_id: ares-secure-jarvis-runtime
+    description: exercise the authenticated JARVIS v3.5 handoff and relay-core browser, reconnect, and preserve-by-default lifecycle on the Ares release-evidence target; UI-adapter acceptance is separate
+    cluster: ares
+    scenarios:
+      - secure-runtime
+    required_checks:
+      - secure-runtime.jarvis-v3.5-query
+      - secure-runtime.private-authority-bind
+      - secure-runtime.browser-protocol
+      - secure-runtime.browser-revocation
+      - secure-runtime.detach
+      - secure-runtime.reconnect
+      - secure-runtime.teardown
+      - secure-runtime.secrets-absent
+      - worker.artifact-version
+      - worker.artifact-sha256
+      - worker.source-identity
+      - worker.component-clio-kit-released
+      - worker.component-clio-kit-native-jarvis-contract
+      - worker.component-jarvis-native-execution
+      - worker.target-identity
+    required_resource_kinds:
+      - relay_job
+      - artifact
+      - secure_runtime_binding
+      - gateway_session
+      - connector
+      - scheduler_job
+      - relay_worker
+      - cluster_target
+    required_resources:
+      - kind: relay_job
+        roles: [secure_runtime_query]
+        states: [succeeded]
+      - kind: artifact
+        roles: [private_mcp_result]
+        metadata_equals:
+          model_readable: false
+      - kind: secure_runtime_binding
+        roles: [private_authority_bind]
+        states: [ready]
+        metadata_equals:
+          binding_schema_version: clio-relay.jarvis-service-runtime-binding.v2
+          service_runtime_schema_version: jarvis.service-runtime.v2
+          evidence_scope: clio-relay-core-lifecycle-and-public-evidence
+          query_mcp_containment_enforceable: true
+          bind_mcp_containment_enforceable: true
+      - kind: gateway_session
+        roles: [secure_runtime_teardown]
+        states: [closed]
+        metadata_equals:
+          cancel_scheduler_job: false
+          ownership_verified: true
+          verified_after_operation: true
+          residual: false
+      - kind: connector
+        minimum_count: 2
+        roles: [secure_runtime_teardown]
+        states: [stopped, missing]
+        metadata_equals:
+          cancel_scheduler_job: false
+          ownership_verified: true
+          verified_after_operation: true
+          residual: false
+      - kind: scheduler_job
+        roles: [secure_runtime_teardown]
+        states: [retained, terminal, missing]
+        providers: [slurm]
+        metadata_equals:
+          cancel_scheduler_job: false
+          ownership_verified: true
+          verified_after_operation: true
+          residual: false
+      - kind: relay_worker
+        roles: [cluster_worker]
+        states: [running]
+        metadata_equals:
+          components:
+            clio-kit: "2.5.19"
+            jarvis-cd: "1.4.1"
+      - kind: cluster_target
+        roles: [physical_cluster_target]
+        states: [verified]
+        metadata_equals:
+          verified: true
+    evidence_group_resource_kind: cluster_target

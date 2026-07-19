@@ -170,8 +170,9 @@ class DurableFixtureRunner(CommandRunner):
         stderr_path: Path,
         env: dict[str, str] | None = None,
         isolate_process_group: bool = False,
+        input_bytes: bytes | None = None,
     ) -> subprocess.Popen[bytes]:
-        del command
+        del command, input_bytes
         if env is None:
             raise RuntimeError("connector environment is required")
         owner_token = env["CLIO_RELAY_CONNECTOR_OWNER_TOKEN"]

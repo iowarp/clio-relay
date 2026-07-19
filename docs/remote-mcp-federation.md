@@ -137,10 +137,16 @@ The local virtual tool is asynchronous. Its advertised `outputSchema` is the
 relay job handle (`job_id`, `state`, `kind`, and `terminal`), not the remote
 tool's synchronous output schema. The discovered remote output schema remains
 in the provenance cache and is validated at the remote server boundary. Agents
-retrieve the actual remote result from the completed job's `mcp_result`
-artifact. A call response is limited to 16 MiB, session stdout to 32 MiB, and
-stderr to 4 MiB; exceeding a limit fails the durable job instead of allowing an
-unbounded worker process.
+obtain a complete bounded public projection through `relay_wait`; the immutable
+raw `mcp_result` artifact is private protocol evidence and is not model-readable.
+A remote call response is limited to 16 MiB, session stdout to 32 MiB, and
+stderr to 4 MiB; exceeding one of those execution limits fails the durable job.
+The public result has a separate 64 KiB inline limit. Because arbitrary MCP
+output has no generic paging contract, an oversized public result fails delivery
+explicitly as `clio-relay.mcp-result-delivery.v1` instead of returning a partial
+success. The durable job and private artifact still record what actually happened,
+and the error warns that remote side effects may already have occurred so an agent
+does not blindly retry the operation.
 
 ## Reload the local catalog
 
@@ -214,15 +220,18 @@ remote_science_inspect_dataset(cluster="my-cluster", path="/data/run-001")
 ```
 
 The immediate result is a durable relay job record. Use `relay_observe` and
-`relay_wait`, or the equivalent CLI, to follow it and read its result:
+`relay_wait`, or the equivalent CLI, to follow it and obtain its bounded public
+result:
 
 ```powershell
 clio-relay job wait <job-id> --cluster my-cluster
 clio-relay job list-artifacts <job-id> --cluster my-cluster
 ```
 
-The `mcp_result`, `stdout`, `stderr`, and `provenance` artifacts provide the
-acceptance evidence for the actual cluster-side execution.
+The indexed `mcp_result`, `stdout`, `stderr`, and `provenance` artifacts provide
+operator acceptance evidence for the actual cluster-side execution. The raw
+`mcp_result` remains model-private; its public artifact binding and SHA-256 prove
+which immutable evidence backs the `relay_wait` projection.
 
 ## Keep the compact JARVIS surface
 
@@ -267,7 +276,7 @@ that returns the handle, never for workload completion. Use
 an explicit `idempotency_key` only when retry de-duplication is intentional; an
 identical second `jarvis_run` is otherwise a new execution.
 
-The released clio-kit 2.5.17 artifact is the pinned six-tool JARVIS v3.4 contract.
+The released clio-kit 2.5.19 artifact is the pinned six-tool JARVIS v3.5 contract.
 Bootstrap
 downloads and hashes the exact coordinated wheel, installs it once with
 `uv tool install`, and persists the wheel plus the direct JARVIS command in the
@@ -286,21 +295,21 @@ relay's exact JARVIS-CD release pin. That dependency edge is recorded in the
 install receipt and call result. Operator-registered MCP servers remain bound
 by their own discovery artifact and are not constrained to the relay's
 JARVIS-CD version.
-The release gate requires that exact 2.5.17 artifact to be rerun on every target
+The release gate requires that exact 2.5.19 artifact to be rerun on every target
 selected by the release policy. Other servers use the operator registry and
 generated `remote_...` aliases.
 
 The exact release wheel is
-`clio_kit-2.5.17-py3-none-any.whl` with SHA-256
-`cedd0eeb95aa4546223ea57702cb206c012ca4dddd84248881de08b7af811e53`.
-Its canonical contract is `clio-kit-jarvis-user-v3.4`, with contract SHA-256
-`52bfe1d416e674d120f200e502ded2197ee27219c26891a22c6c33ba917d5696`
+`clio_kit-2.5.19-py3-none-any.whl` with SHA-256
+`4094bbc957db0682c27a84adcdb135ba9a4ef1bc1d6a05046f11ad777907a652`.
+Its canonical contract is `clio-kit-jarvis-user-v3.5`, with contract SHA-256
+`9933815ca7ee913d56a7cb1081d7702474bc984efcc97bf16434980172d0469d`
 and canonical tools-wire SHA-256
-`2ced8dc66ecee832ee86df0c99c29610bce61a82f9d80a8a53e0ea037d262219`.
+`05f7d8a6286e211657ca40b64f0645bbd529e402fbf55770c845403695ddd366`.
 The nested runtime lock is bound to the public
-[`jarvis_cd-1.3.18-py3-none-any.whl`](https://github.com/grc-iit/jarvis-cd/releases/download/v1.3.18/jarvis_cd-1.3.18-py3-none-any.whl)
+[`jarvis_cd-1.4.1-py3-none-any.whl`](https://github.com/grc-iit/jarvis-cd/releases/download/v1.4.1/jarvis_cd-1.4.1-py3-none-any.whl)
 release artifact with SHA-256
-`28fc4879585055485be979c4e2039d2181290219ef67365d3056b7883f946cfc`;
+`1d1fa54b391b54279da440a8cf91d25a67f9558beeae7ebdfd2c88dd0f4f375b`;
 bootstrap and call-time validation reject any other URL, version, or bytes.
 
 ## Register the Spack MCP
@@ -318,7 +327,7 @@ against their distinct preserved contract digest.
 
 ## Register the scientific catalog MCP
 
-clio-kit 2.5.17 also ships the two-tool
+clio-kit 2.5.19 also ships the two-tool
 `clio-kit-scientific-catalog-user-v1.1` contract. It separates dataset discovery
 from visualization control: `scientific_dataset_search` finds operator catalog
 records and `scientific_dataset_describe` returns the complete catalog record
@@ -390,6 +399,12 @@ Before claiming a registered server path as released:
    `provenance` artifacts from the discovery and tool-call jobs;
 7. run `remote-mcp reload` and retain the machine-readable catalog revision and
    cache provenance in the live validation report.
+
+Each refresh profile reports both `virtual_tools`, the complete rendered profile
+catalog, and `registration_virtual_tools`, the aliases contributed by the exact
+`cluster` and `server_name` refreshed in that operation. Use the latter when
+attributing live evidence to one registered server; aliases from another cached
+registration must not be credited to it.
 
 The validation helper performs steps 4 through 7 against one allowlisted tool
 and writes report-ready JSON. It requires a fresh explicit discovery cache and

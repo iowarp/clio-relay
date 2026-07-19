@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
 import shlex
 import signal
+import socket
 import subprocess
 import sys
+import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
-from types import SimpleNamespace
 from typing import cast
 
 import httpx
@@ -23,7 +27,7 @@ from clio_relay.cli import app
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, FrpTransportConfig
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import RelayError
+from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
 from clio_relay.models import (
     GatewaySession,
     GatewaySessionState,
@@ -142,6 +146,91 @@ def test_local_connector_does_not_retain_captured_cli_pipes(tmp_path: Path) -> N
             cli.wait(timeout=2.0)
 
 
+def test_subprocess_runner_delivers_private_input_and_immediate_eof(tmp_path: Path) -> None:
+    """The real runner writes one anonymous-pipe payload without retaining stdin."""
+    observed_path = tmp_path / "observed-bootstrap.bin"
+    stdout_path = tmp_path / "bootstrap.out"
+    stderr_path = tmp_path / "bootstrap.err"
+    payload = b'{"schema_version":"private-bootstrap-test.v1","secret":"not-in-argv"}'
+    child = (
+        "import sys; from pathlib import Path; "
+        "Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())"
+    )
+
+    process = service_runtime.SubprocessCommandRunner().popen(
+        [
+            sys.executable,
+            "-c",
+            service_runtime._LOCAL_CONNECTOR_WRAPPER_CODE,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            "owner-token",
+            "generation-id",
+            sys.executable,
+            "-c",
+            child,
+            str(observed_path),
+        ],
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        isolate_process_group=True,
+        input_bytes=payload,
+    )
+
+    assert process.wait(timeout=5.0) == 0
+    assert observed_path.read_bytes() == payload
+    assert process.stdin is not None and process.stdin.closed
+    assert payload.decode("utf-8") not in " ".join(cast(list[str], process.args))
+
+
+def test_subprocess_runner_terminates_process_group_when_private_input_delivery_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child that rejects its bootstrap cannot survive as an unowned process."""
+
+    class RejectingPipe:
+        closed = False
+
+        def write(self, _content: bytes) -> int:
+            raise BrokenPipeError("child closed bootstrap pipe")
+
+        def flush(self) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+    class StartedProcess:
+        pid = 99123
+        stdin = RejectingPipe()
+
+    process = cast(subprocess.Popen[bytes], StartedProcess())
+
+    def fake_popen(*_args: object, **_kwargs: object) -> subprocess.Popen[bytes]:
+        return process
+
+    monkeypatch.setattr(service_runtime.subprocess, "Popen", fake_popen)
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        service_runtime,
+        "_terminate_just_started_process_group",
+        terminated.append,
+    )
+    secret = b"private-bootstrap-value"
+
+    with pytest.raises(RelayError, match="failed to deliver private process bootstrap") as caught:
+        service_runtime.SubprocessCommandRunner().popen(
+            ["browser-gateway-test"],
+            stdout_path=tmp_path / "failed-bootstrap.out",
+            stderr_path=tmp_path / "failed-bootstrap.err",
+            isolate_process_group=True,
+            input_bytes=secret,
+        )
+
+    assert terminated == [99123]
+    assert StartedProcess.stdin.closed is True
+    assert secret.decode("utf-8") not in str(caught.value)
+
+
 def _script_assignment(script: str, name: str) -> str:
     prefix = f"{name}="
     for line in script.splitlines():
@@ -168,6 +257,64 @@ def test_detached_remote_connector_closes_transition_lock_descriptor() -> None:
     assert '>"$log_file" 2>&1 9>&- &' in script
 
 
+@pytest.mark.parametrize("mutation", ["generation", "process_group", "config_path", "log_path"])
+def test_remote_connector_start_rejects_response_identity_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    """SSH output cannot replace the connector identity committed before launch."""
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    session = GatewaySession(cluster="test-cluster", name="identity-check")
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+    )
+    generation_id = "generation-1"
+    session_root = f"/home/user/.local/share/clio-relay/service-sessions/{session.session_id}"
+    values = {
+        "remote_frpc_pid": "444",
+        "remote_frpc_pgid": "444",
+        "connector_generation_id": generation_id,
+        "remote_frpc_config": f"{session_root}/remote-frpc.toml",
+        "remote_frpc_log": f"{session_root}/remote-frpc.log",
+    }
+    if mutation == "generation":
+        values["connector_generation_id"] = "generation-forged"
+    elif mutation == "process_group":
+        values["remote_frpc_pgid"] = "445"
+    elif mutation == "config_path":
+        values["remote_frpc_config"] = (
+            "/home/user/.local/share/clio-relay/service-sessions/gateway_other/remote-frpc.toml"
+        )
+    else:
+        values["remote_frpc_log"] = (
+            "/home/user/.local/share/clio-relay/service-sessions/gateway_other/remote-frpc.log"
+        )
+
+    def ssh(_script: str) -> str:
+        return "\n".join(f"{key}={value}" for key, value in values.items()) + "\n"
+
+    monkeypatch.setattr(supervisor, "_ssh", ssh)
+
+    with pytest.raises(RelayError, match="remote connector start"):
+        supervisor._start_remote_connector(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            session=session,
+            spec=_runtime_spec(),
+            node="compute-01",
+            proxy_name="identity-check",
+            ownership_intent={
+                "owner_token": "owner-token",
+                "connector_generation_id": generation_id,
+            },
+        )
+
+
 @pytest.fixture(autouse=True)
 def _fake_connector_process_absent(  # pyright: ignore[reportUnusedFunction]
     monkeypatch: pytest.MonkeyPatch,
@@ -184,6 +331,7 @@ class FakeRunner(CommandRunner):
         self.inputs: list[str | None] = []
         self.popen_commands: list[list[str]] = []
         self.popen_environments: list[dict[str, str] | None] = []
+        self.popen_inputs: list[bytes | None] = []
         self.isolated_processes: list[bool] = []
         self.canceled_jobs: list[str] = []
         self.provider_canceled_jobs: list[str] = []
@@ -203,6 +351,9 @@ class FakeRunner(CommandRunner):
             record = self.submission_record or {"present": False}
             return subprocess.CompletedProcess(command, 0, json.dumps(record) + "\n", "")
         if "remote-frpc.toml" in script and "nohup" in script:
+            session_id = _script_assignment(script, "session_id")
+            generation_id = _script_assignment(script, "connector_generation_id")
+            session_root = f"/home/user/.local/share/clio-relay/service-sessions/{session_id}"
             return subprocess.CompletedProcess(
                 command,
                 0,
@@ -210,9 +361,9 @@ class FakeRunner(CommandRunner):
                     [
                         "remote_frpc_pid=444",
                         "remote_frpc_pgid=444",
-                        "connector_generation_id=generation-444",
-                        "remote_frpc_config=/home/user/.local/share/clio-relay/service-sessions/gateway_x/remote-frpc.toml",
-                        "remote_frpc_log=/home/user/.local/share/clio-relay/service-sessions/gateway_x/remote-frpc.log",
+                        f"connector_generation_id={generation_id}",
+                        f"remote_frpc_config={session_root}/remote-frpc.toml",
+                        f"remote_frpc_log={session_root}/remote-frpc.log",
                     ]
                 )
                 + "\n",
@@ -320,9 +471,11 @@ class FakeRunner(CommandRunner):
         stderr_path: Path,
         env: dict[str, str] | None = None,
         isolate_process_group: bool = False,
+        input_bytes: bytes | None = None,
     ) -> subprocess.Popen[bytes]:
         self.popen_commands.append(list(command))
         self.popen_environments.append(env)
+        self.popen_inputs.append(input_bytes)
         self.isolated_processes.append(isolate_process_group)
         stdout_path.write_bytes(b"")
         stderr_path.write_bytes(b"")
@@ -335,13 +488,99 @@ class FakeRunner(CommandRunner):
         owner_token: str,
         expected_config: str,
     ) -> LocalConnectorIdentity:
-        assert expected_config.endswith("desktop-frpc.toml")
+        assert expected_config.endswith(("desktop-frpc.toml", ".browser-gateway.json"))
         return LocalConnectorIdentity(
             pid=pid,
             process_group_id=pid,
             process_start_marker=f"start-{pid}",
             owner_token=owner_token,
         )
+
+
+def test_browser_proxy_secrets_exist_only_in_anonymous_stdin_bootstrap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Capability and upstream bearer avoid argv, env, files, records, and logs."""
+    runner = FakeRunner()
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=ClioCoreQueue(settings.core_dir),
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: None,
+    )
+    session = GatewaySession(cluster="test-cluster", name="browser-secret-handoff")
+    runtime_dir = settings.core_dir.parent / "runtime-sessions" / session.session_id
+    runtime_dir.mkdir(parents=True)
+    config_path = runtime_dir / "browser-test.browser-gateway.json"
+    stdout_path = runtime_dir / "browser-test.browser-gateway.out"
+    stderr_path = runtime_dir / "browser-test.browser-gateway.err"
+    metadata_path = runtime_dir / "browser-test.browser-gateway-owner.json"
+    capability = "q" * 43
+    bearer_token = "a" * 64
+    authorization = f"Bearer {bearer_token}"
+    config = service_runtime.BrowserGatewayConfig(
+        attachment_id="browser-secret-test",
+        token_sha256=hashlib.sha256(capability.encode("utf-8")).hexdigest(),
+        bind_port=28778,
+        upstream_protocol="http",
+        upstream_port=28777,
+        allowed_paths=["/healthz", "/commands"],
+        command_path="/commands",
+        expires_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+        revocation_path=str((runtime_dir / "browser-test.revoked").resolve()),
+    )
+    intent: dict[str, object] = {
+        "owner_token": "owner-token",
+        "connector_generation_id": "generation-id",
+        "config_path": str(config_path),
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "metadata_path": str(metadata_path),
+    }
+    monkeypatch.setenv(service_runtime.CAPABILITY_ENV, "stale-capability")
+    monkeypatch.setenv(
+        service_runtime.UPSTREAM_AUTHORIZATION_ENV,
+        f"Bearer {'b' * 64}",
+    )
+
+    proxy = supervisor._start_browser_proxy(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session=session,
+        config=config,
+        capability=capability,
+        upstream_authorization=authorization,
+        ownership_intent=intent,
+    )
+
+    assert runner.popen_inputs[0] is not None
+    bootstrap = service_runtime.BrowserGatewayBootstrap.model_validate_json(runner.popen_inputs[0])
+    assert bootstrap.capability == capability
+    assert bootstrap.upstream_authorization == authorization
+    environment = cast(dict[str, str], runner.popen_environments[0])
+    assert service_runtime.CAPABILITY_ENV not in environment
+    assert service_runtime.UPSTREAM_AUTHORIZATION_ENV not in environment
+    assert environment["CLIO_RELAY_CONNECTOR_OWNER_TOKEN"] == "owner-token"
+    assert environment["CLIO_RELAY_CONNECTOR_GENERATION_ID"] == "generation-id"
+    non_pipe_surfaces = "\n".join(
+        (
+            json.dumps(runner.popen_commands[0], sort_keys=True),
+            json.dumps(environment, sort_keys=True),
+            config_path.read_text(encoding="utf-8"),
+            json.dumps(proxy, sort_keys=True),
+            metadata_path.read_text(encoding="utf-8"),
+            stdout_path.read_text(encoding="utf-8"),
+            stderr_path.read_text(encoding="utf-8"),
+            session.model_dump_json(),
+        )
+    )
+    assert capability not in non_pipe_surfaces
+    assert authorization not in non_pipe_surfaces
+    assert bearer_token not in non_pipe_surfaces
 
 
 class FailingSubmitRunner(FakeRunner):
@@ -763,7 +1002,403 @@ def test_service_runtime_stop_keeps_scheduler_job_by_default(tmp_path: Path) -> 
     assert scheduler_check.status is ValidationStatus.FAILED
 
 
+def test_cleanup_evidence_reports_requested_cancel_without_a_scheduler_resource() -> None:
+    """Requested policy comes from durable intent, not observed resource cardinality."""
+    operation_id = "gateway_cleanup_00000000000000000000000000000000"
+    session = GatewaySession(
+        cluster="test-cluster",
+        name="external-runtime",
+        state=GatewaySessionState.CLOSED,
+        scheduler="external",
+    )
+    session = session.model_copy(
+        update={
+            "gateway": {
+                "teardown_intent": {
+                    "operation_id": operation_id,
+                    "gateway_session_id": session.session_id,
+                    "cancel_scheduler_job": True,
+                }
+            }
+        }
+    )
+    result = ServiceRuntimeStopResult(
+        session=session,
+        mode="teardown",
+        stopped_local_pid=None,
+        stopped_remote_pid=None,
+        canceled_scheduler_job=None,
+        resources=[],
+        errors=[],
+    )
+
+    cleanup = result.to_cleanup_evidence()
+
+    assert cleanup.operation_id == operation_id
+    assert cleanup.cancel_scheduler_jobs is True
+
+
 def test_service_runtime_stop_rehydrates_cleanup_evidence_after_closed_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue, settings, definition, runner, session_id = _started_session(tmp_path)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=definition,
+        token="",
+        secret_key="",
+        runner=runner,
+        sleep=lambda _seconds: None,
+    )
+    local_stop_calls = 0
+    original_local_stop = supervisor._stop_local_connector  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def count_local_stop(**kwargs: object) -> tuple[int | None, CleanupResource]:
+        nonlocal local_stop_calls
+        local_stop_calls += 1
+        return original_local_stop(**kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(supervisor, "_stop_local_connector", count_local_stop)
+
+    first = supervisor.stop(session_id=session_id)
+    first_runner_inputs = list(runner.inputs)
+    retried = supervisor.stop(session_id=session_id)
+
+    assert retried == first
+    assert runner.inputs == first_runner_inputs
+    assert local_stop_calls == 1
+    assert first.session.state is GatewaySessionState.CLOSED
+    assert retried.session.state is GatewaySessionState.CLOSED
+    assert retried.errors == []
+    assert retried.residual_resources == []
+    assert {resource.kind for resource in retried.resources} == {
+        "desktop_connector",
+        "remote_connector",
+        "scheduler_job",
+        "gateway_record",
+    }
+    assert retried.to_live_validation_report().status is ValidationStatus.PASSED
+
+
+def test_concurrent_same_policy_runtime_stop_executes_each_side_effect_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same-policy callers serialize and the waiter rehydrates exact evidence."""
+    queue, settings, definition, runner, session_id = _started_session(tmp_path)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=definition,
+        token="",
+        secret_key="",
+        runner=runner,
+        sleep=lambda _seconds: None,
+    )
+    start_barrier = Barrier(2)
+    both_calling = threading.Event()
+    calls_lock = threading.Lock()
+    callers_started = 0
+    local_stop_calls = 0
+    original_local_stop = supervisor._stop_local_connector  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def count_local_stop(**kwargs: object) -> tuple[int | None, CleanupResource]:
+        nonlocal local_stop_calls
+        with calls_lock:
+            local_stop_calls += 1
+        assert both_calling.wait(timeout=5)
+        return original_local_stop(**kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(supervisor, "_stop_local_connector", count_local_stop)
+
+    def stop_concurrently() -> ServiceRuntimeStopResult:
+        nonlocal callers_started
+        start_barrier.wait(timeout=5)
+        with calls_lock:
+            callers_started += 1
+            if callers_started == 2:
+                both_calling.set()
+        return supervisor.stop(session_id=session_id, cancel_scheduler_job=False)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(stop_concurrently) for _index in range(2)]
+        results = [future.result(timeout=15) for future in futures]
+
+    assert results[0] == results[1]
+    assert local_stop_calls == 1
+    assert sum("__CLIO_STOP_CONNECTOR__" in (script or "") for script in runner.inputs) == 1
+    assert sum("jarvis runtime status 12345" in (script or "") for script in runner.inputs) == 1
+
+
+def test_runtime_start_serializes_connector_creation_against_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stop cannot prove a starting connector absent and then let its producer launch."""
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+    )
+    runner = FakeRunner()
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: None,
+    )
+    supervisor._wait_for_local_health = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    connector_start_entered = threading.Event()
+    stop_calling = threading.Event()
+    teardown_prepared = threading.Event()
+    original_remote_start = supervisor._start_remote_connector  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original_prepare = supervisor._prepare_teardown_intent  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def pause_remote_start(**kwargs: object) -> dict[str, object]:
+        connector_start_entered.set()
+        assert stop_calling.wait(timeout=5)
+        assert not teardown_prepared.wait(timeout=0.1)
+        return original_remote_start(**kwargs)  # pyright: ignore[reportArgumentType]
+
+    def observe_teardown_prepare(
+        session: GatewaySession,
+        *,
+        cancel_scheduler_job: bool,
+    ) -> GatewaySession:
+        teardown_prepared.set()
+        return original_prepare(
+            session,
+            cancel_scheduler_job=cancel_scheduler_job,
+        )
+
+    monkeypatch.setattr(supervisor, "_start_remote_connector", pause_remote_start)
+    monkeypatch.setattr(supervisor, "_prepare_teardown_intent", observe_teardown_prepare)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        start_future = pool.submit(
+            supervisor.start,
+            name="serialized-start",
+            spec=_runtime_spec(),
+        )
+        assert connector_start_entered.wait(timeout=5)
+        sessions = queue.list_gateway_sessions(cluster="test-cluster")
+        assert len(sessions) == 1
+        session_id = sessions[0].session_id
+
+        def stop_while_starting() -> ServiceRuntimeStopResult:
+            stop_calling.set()
+            return supervisor.stop(session_id=session_id)
+
+        stop_future = pool.submit(stop_while_starting)
+        started = start_future.result(timeout=15)
+        stopped = stop_future.result(timeout=15)
+
+    assert started.session.state is GatewaySessionState.READY
+    assert stopped.session.state is GatewaySessionState.CLOSED
+    assert teardown_prepared.is_set()
+    assert sum("__CLIO_STOP_CONNECTOR__" in (script or "") for script in runner.inputs) == 1
+    assert stopped.canceled_scheduler_job is None
+    assert runner.canceled_jobs == []
+
+
+def test_detach_waits_for_concurrent_teardown_and_has_no_losing_side_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A detach that loses the shared transition lock rereads and refuses teardown."""
+    queue, settings, definition, runner, session_id = _started_session(tmp_path)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=definition,
+        token="",
+        secret_key="",
+        runner=runner,
+        sleep=lambda _seconds: None,
+    )
+    policy_committed = threading.Event()
+    detach_calling = threading.Event()
+    original_policy = supervisor._prepare_teardown_policy  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original_local_stop = supervisor._stop_local_connector  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    local_stop_calls = 0
+
+    def pause_after_policy(
+        session: GatewaySession,
+        **kwargs: object,
+    ) -> GatewaySession:
+        policy = original_policy(session, **kwargs)  # pyright: ignore[reportArgumentType]
+        policy_committed.set()
+        assert detach_calling.wait(timeout=5)
+        return policy
+
+    def count_local_stop(**kwargs: object) -> tuple[int | None, CleanupResource]:
+        nonlocal local_stop_calls
+        local_stop_calls += 1
+        return original_local_stop(**kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(supervisor, "_prepare_teardown_policy", pause_after_policy)
+    monkeypatch.setattr(supervisor, "_stop_local_connector", count_local_stop)
+
+    def detach_after_policy() -> ServiceRuntimeStopResult:
+        detach_calling.set()
+        return supervisor.detach(session_id=session_id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        stop_future = pool.submit(supervisor.stop, session_id=session_id)
+        assert policy_committed.wait(timeout=5)
+        detach_future = pool.submit(detach_after_policy)
+        stopped = stop_future.result(timeout=15)
+        with pytest.raises(ConfigurationError, match="is closed"):
+            detach_future.result(timeout=15)
+
+    assert stopped.session.state is GatewaySessionState.CLOSED
+    assert local_stop_calls == 1
+    assert sum("__CLIO_STOP_CONNECTOR__" in (script or "") for script in runner.inputs) == 1
+    assert sum("jarvis runtime status 12345" in (script or "") for script in runner.inputs) == 1
+
+
+def test_malformed_completed_runtime_teardown_fails_closed_without_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue, settings, definition, runner, session_id = _started_session(tmp_path)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=definition,
+        token="",
+        secret_key="",
+        runner=runner,
+        sleep=lambda _seconds: None,
+    )
+    completed = supervisor.stop(session_id=session_id)
+    malformed = dict(cast(dict[str, object], completed.session.gateway["teardown"]))
+    malformed.pop("resources")
+    queue.update_gateway_session(
+        session_id,
+        allow_owned_runtime_close=True,
+        gateway={**completed.session.gateway, "teardown": malformed},
+    )
+    prior_runner_inputs = list(runner.inputs)
+    local_stop_calls = 0
+    original_local_stop = supervisor._stop_local_connector  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def count_local_stop(**kwargs: object) -> tuple[int | None, CleanupResource]:
+        nonlocal local_stop_calls
+        local_stop_calls += 1
+        return original_local_stop(**kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(supervisor, "_stop_local_connector", count_local_stop)
+
+    with pytest.raises(RelayError, match="completed gateway teardown evidence is invalid"):
+        supervisor.stop(session_id=session_id)
+
+    assert local_stop_calls == 0
+    assert runner.inputs == prior_runner_inputs
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing-scheduler", "unverified-desktop", "wrong-scheduler-provider"],
+)
+def test_completed_runtime_teardown_rejects_semantically_incomplete_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    """Schema-valid replay evidence still requires every exact owned-resource proof."""
+    queue, settings, definition, runner, session_id = _started_session(tmp_path)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=definition,
+        token="",
+        secret_key="",
+        runner=runner,
+        sleep=lambda _seconds: None,
+    )
+    completed = supervisor.stop(session_id=session_id)
+    teardown = dict(cast(dict[str, object], completed.session.gateway["teardown"]))
+    raw_resources = cast(list[object], teardown["resources"])
+    resources = [dict(cast(dict[str, object], item)) for item in raw_resources]
+    if mutation == "missing-scheduler":
+        resources = [item for item in resources if item["kind"] != "scheduler_job"]
+    elif mutation == "unverified-desktop":
+        desktop = next(item for item in resources if item["kind"] == "desktop_connector")
+        desktop["ownership_verified"] = False
+        desktop["verified_after_operation"] = False
+    else:
+        scheduler = next(item for item in resources if item["kind"] == "scheduler_job")
+        scheduler["provider"] = "slurm"
+    teardown["resources"] = resources
+    queue.update_gateway_session(
+        session_id,
+        allow_owned_runtime_close=True,
+        gateway={**completed.session.gateway, "teardown": teardown},
+    )
+    prior_runner_inputs = list(runner.inputs)
+    local_stop_calls = 0
+
+    def forbidden_local_stop(**_kwargs: object) -> tuple[int | None, CleanupResource]:
+        nonlocal local_stop_calls
+        local_stop_calls += 1
+        raise AssertionError("malformed completed evidence must fail before side effects")
+
+    monkeypatch.setattr(supervisor, "_stop_local_connector", forbidden_local_stop)
+    with pytest.raises(RelayError, match="completed gateway teardown evidence is invalid"):
+        supervisor.stop(session_id=session_id)
+
+    assert local_stop_calls == 0
+    assert runner.inputs == prior_runner_inputs
+
+
+def test_runtime_teardown_lock_timeout_fails_closed_before_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue, settings, definition, runner, session_id = _started_session(tmp_path)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=definition,
+        token="",
+        secret_key="",
+        runner=runner,
+        sleep=lambda _seconds: None,
+    )
+    lock_path = supervisor._gateway_transition_lock_path(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_id
+    )
+    monkeypatch.setattr(service_runtime, "_GATEWAY_TEARDOWN_LOCK_TIMEOUT_SECONDS", 0.02)
+    prior_runner_inputs = list(runner.inputs)
+
+    with (
+        service_runtime.FileLock(
+            str(service_runtime.internal_filesystem_path(lock_path, force_extended=True))
+        ),
+        pytest.raises(RelayError, match="timed out acquiring"),
+    ):
+        supervisor.stop(session_id=session_id)
+
+    assert runner.inputs == prior_runner_inputs
+    persisted = queue.get_gateway_session(session_id)
+    assert persisted.gateway.get("teardown_intent") is None
+
+
+def test_completed_runtime_teardown_rejects_final_state_policy_drift(
     tmp_path: Path,
 ) -> None:
     queue, settings, definition, runner, session_id = _started_session(tmp_path)
@@ -777,21 +1412,14 @@ def test_service_runtime_stop_rehydrates_cleanup_evidence_after_closed_record(
         runner=runner,
         sleep=lambda _seconds: None,
     )
+    first = supervisor.stop(session_id=session_id, final_state=GatewaySessionState.FAILED)
+    prior_runner_inputs = list(runner.inputs)
 
-    first = supervisor.stop(session_id=session_id)
-    retried = supervisor.stop(session_id=session_id)
+    with pytest.raises(RelayError, match="final-state policy changed during retry"):
+        supervisor.stop(session_id=session_id, final_state=GatewaySessionState.CLOSED)
 
-    assert first.session.state is GatewaySessionState.CLOSED
-    assert retried.session.state is GatewaySessionState.CLOSED
-    assert retried.errors == []
-    assert retried.residual_resources == []
-    assert {resource.kind for resource in retried.resources} == {
-        "desktop_connector",
-        "remote_connector",
-        "scheduler_job",
-        "gateway_record",
-    }
-    assert retried.to_live_validation_report().status is ValidationStatus.PASSED
+    assert first.session.state is GatewaySessionState.FAILED
+    assert runner.inputs == prior_runner_inputs
 
 
 def test_service_runtime_stop_can_cancel_scheduler_job_explicitly(tmp_path: Path) -> None:
@@ -1494,7 +2122,10 @@ def test_service_runtime_detach_stops_only_desktop_connector(tmp_path: Path) -> 
     assert gateway[0].outcome == "retained"
     assert gateway[0].verified_after_operation is True
     assert gateway[0].observed_state == GatewaySessionState.DEGRADED.value
-    assert result.to_cleanup_evidence().mode == "detach"
+    cleanup = result.to_cleanup_evidence()
+    assert cleanup.mode == "detach"
+    assert cleanup.operation_id == result.session.gateway["detach_intent"]["operation_id"]
+    assert cleanup.cancel_scheduler_jobs is False
     canonical = result.to_live_validation_report()
     assert canonical.status is ValidationStatus.PASSED
     assert {check.check_id for check in canonical.checks} == {
@@ -1529,8 +2160,248 @@ def test_service_runtime_detach_stops_only_desktop_connector(tmp_path: Path) -> 
     assert len(runner.popen_commands) == 2
 
 
+def test_committed_gateway_teardown_intent_cannot_be_overwritten(tmp_path: Path) -> None:
+    """A stale whole-gateway update cannot erase immutable cleanup policy."""
+    queue, _settings, _definition_value, _runner, session_id = _started_session(tmp_path)
+    stale = queue.get_gateway_session(session_id)
+    committed = queue.prepare_gateway_teardown_intent(
+        session_id,
+        cancel_scheduler_job=False,
+    )
+    expected_intent = dict(cast(dict[str, object], committed.gateway["teardown_intent"]))
+
+    with pytest.raises(QueueConflictError, match="teardown intent cannot be removed"):
+        queue.update_gateway_session(session_id, gateway=stale.gateway)
+
+    persisted = queue.get_gateway_session(session_id)
+    assert persisted.gateway["teardown_intent"] == expected_intent
+
+
+def test_attach_loses_to_concurrent_teardown_and_rolls_back_connector(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Teardown committed after connector start prevents stale attach publication."""
+    queue, settings, definition, runner, session_id = _started_session(tmp_path)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=definition,
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: None,
+    )
+    supervisor.detach(session_id=session_id)
+    supervisor._wait_for_local_health = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    original_start = supervisor._start_local_visitor  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    committed_intent: dict[str, object] = {}
+
+    def start_then_commit_teardown(
+        *,
+        session: GatewaySession,
+        spec: ServiceRuntimeSpec,
+        proxy_name: str,
+        ownership_intent: dict[str, object],
+    ) -> dict[str, object]:
+        connector = original_start(
+            session=session,
+            spec=spec,
+            proxy_name=proxy_name,
+            ownership_intent=ownership_intent,
+        )
+        committed = queue.prepare_gateway_teardown_intent(
+            session_id,
+            cancel_scheduler_job=False,
+        )
+        committed_intent.update(cast(dict[str, object], committed.gateway["teardown_intent"]))
+        return connector
+
+    monkeypatch.setattr(supervisor, "_start_local_visitor", start_then_commit_teardown)
+
+    with pytest.raises(QueueConflictError, match="changed during a runtime transition"):
+        supervisor.attach(session_id=session_id)
+
+    persisted = queue.get_gateway_session(session_id)
+    assert persisted.gateway["teardown_intent"] == committed_intent
+    assert "attached_at" not in persisted.metadata
+    assert len(runner.popen_commands) == 2
+    assert not _visitor_config_path(settings, session_id).exists()
+
+
+def test_detach_loses_to_concurrent_teardown_without_erasing_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A teardown committed during detach prevents its stale final gateway write."""
+    queue, settings, definition, runner, session_id = _started_session(tmp_path)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=definition,
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: None,
+    )
+    original_stop = supervisor._stop_local_connector  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    committed_intent: dict[str, object] = {}
+
+    def stop_then_commit_teardown(
+        *,
+        session_id: str,
+        connector: dict[str, object],
+        require_record: bool = False,
+        absence_verified: bool = False,
+    ) -> tuple[int | None, CleanupResource]:
+        stopped = original_stop(
+            session_id=session_id,
+            connector=connector,
+            require_record=require_record,
+            absence_verified=absence_verified,
+        )
+        committed = queue.prepare_gateway_teardown_intent(
+            session_id,
+            cancel_scheduler_job=False,
+        )
+        committed_intent.update(cast(dict[str, object], committed.gateway["teardown_intent"]))
+        return stopped
+
+    monkeypatch.setattr(supervisor, "_stop_local_connector", stop_then_commit_teardown)
+
+    with pytest.raises(QueueConflictError, match="changed during a runtime transition"):
+        supervisor.detach(session_id=session_id)
+
+    persisted = queue.get_gateway_session(session_id)
+    assert persisted.gateway["teardown_intent"] == committed_intent
+    assert "detach" not in persisted.gateway
+
+
+def test_two_concurrent_attaches_create_at_most_one_connector_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Serialized attach callers reuse the one connector proven live by the winner."""
+    queue, settings, definition, runner, session_id = _started_session(tmp_path)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=definition,
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: None,
+    )
+    supervisor.detach(session_id=session_id)
+    supervisor._wait_for_local_health = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    original_start = supervisor._start_local_visitor  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    created_generations: list[str] = []
+
+    def track_start(**kwargs: object) -> dict[str, object]:
+        connector = original_start(**kwargs)  # pyright: ignore[reportArgumentType]
+        created_generations.append(str(connector["connector_generation_id"]))
+        return connector
+
+    def connector_status(connector: dict[str, object]) -> tuple[str, str | None]:
+        generation = connector.get("connector_generation_id")
+        if created_generations and generation == created_generations[-1]:
+            return "owned", None
+        return "missing", "the prior detached connector is absent"
+
+    monkeypatch.setattr(supervisor, "_start_local_visitor", track_start)
+    monkeypatch.setattr(service_runtime, "_local_connector_identity_status", connector_status)
+
+    def attach_once() -> str:
+        try:
+            return supervisor.attach(session_id=session_id).session.state.value
+        except QueueConflictError:
+            return "rejected"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(attach_once) for _index in range(2)]
+        outcomes = [future.result() for future in futures]
+
+    assert outcomes == ["ready", "ready"]
+    assert len(created_generations) == 1
+    assert len(runner.popen_commands) == 2
+    assert queue.get_gateway_session(session_id).state is GatewaySessionState.READY
+
+
+def test_attach_recovers_and_stops_local_connector_after_lost_start_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reattach rolls back a visitor found through its durable local sidecar."""
+    queue, settings, definition, runner, session_id = _started_session(tmp_path)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=definition,
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: None,
+    )
+    supervisor.detach(session_id=session_id)
+    supervisor._wait_for_local_health = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    original_start = supervisor._start_local_visitor  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    stopped: list[int] = []
+    launched_generation: str | None = None
+
+    def start_then_lose_response(**kwargs: object) -> dict[str, object]:
+        nonlocal launched_generation
+        connector = original_start(**kwargs)  # pyright: ignore[reportArgumentType]
+        launched_generation = str(connector["connector_generation_id"])
+        raise RelayError("lost reattach connector start response")
+
+    def connector_owned(
+        connector: dict[str, object],
+    ) -> tuple[str, str | None]:
+        if connector.get("connector_generation_id") == launched_generation:
+            return "owned", None
+        return "missing", "the detached connector is absent"
+
+    def stop_local(
+        *,
+        session_id: str,
+        connector: dict[str, object],
+        require_record: bool = False,
+        absence_verified: bool = False,
+    ) -> tuple[int | None, CleanupResource]:
+        del session_id, require_record, absence_verified
+        pid = int(cast(int, connector["pid"]))
+        stopped.append(pid)
+        return pid, CleanupResource(
+            kind="desktop_connector",
+            resource_id=str(pid),
+            location="desktop",
+            action="stop",
+            ownership_verified=True,
+            outcome="stopped",
+            verified_after_operation=True,
+        )
+
+    monkeypatch.setattr(supervisor, "_start_local_visitor", start_then_lose_response)
+    monkeypatch.setattr(service_runtime, "_local_connector_identity_status", connector_owned)
+    monkeypatch.setattr(supervisor, "_stop_local_connector", stop_local)
+
+    with pytest.raises(RelayError, match="lost reattach connector start response"):
+        supervisor.attach(session_id=session_id)
+
+    persisted = queue.get_gateway_session(session_id)
+    assert persisted.state is GatewaySessionState.DEGRADED
+    assert stopped == [555]
+    assert persisted.metadata["attach_cleanup_error"] is None
+    assert not _visitor_config_path(settings, session_id).exists()
+
+
 def test_service_runtime_detach_is_idempotent_and_keeps_explicit_record_evidence(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     queue, settings, definition, runner, session_id = _started_session(tmp_path)
     supervisor = ServiceRuntimeSupervisor(
@@ -1544,9 +2415,22 @@ def test_service_runtime_detach_is_idempotent_and_keeps_explicit_record_evidence
         sleep=lambda _seconds: None,
     )
 
+    local_stop_calls = 0
+    original_local_stop = supervisor._stop_local_connector  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def count_local_stop(**kwargs: object) -> tuple[int | None, CleanupResource]:
+        nonlocal local_stop_calls
+        local_stop_calls += 1
+        return original_local_stop(**kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(supervisor, "_stop_local_connector", count_local_stop)
     first = supervisor.detach(session_id=session_id)
+    first_runner_inputs = list(runner.inputs)
     second = supervisor.detach(session_id=session_id)
 
+    assert second == first
+    assert local_stop_calls == 1
+    assert runner.inputs == first_runner_inputs
     assert first.residual_resources == []
     assert second.residual_resources == []
     assert second.errors == []
@@ -1561,6 +2445,92 @@ def test_service_runtime_detach_is_idempotent_and_keeps_explicit_record_evidence
     assert gateway.action == "retain"
     assert gateway.verified_after_operation is True
     assert second.to_live_validation_report().status is ValidationStatus.PASSED
+
+
+def test_service_runtime_detach_persists_intent_before_a_hard_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash after connector termination leaves a durable, retryable detach identity."""
+    queue, settings, definition, runner, session_id = _started_session(tmp_path)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=definition,
+        token="",
+        secret_key="",
+        runner=runner,
+        sleep=lambda _seconds: None,
+    )
+    original_local_stop = supervisor._stop_local_connector  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def crash_after_local_stop(**kwargs: object) -> tuple[int | None, CleanupResource]:
+        original_local_stop(**kwargs)  # pyright: ignore[reportArgumentType]
+        raise KeyboardInterrupt("simulated hard exit after local connector stop")
+
+    monkeypatch.setattr(supervisor, "_stop_local_connector", crash_after_local_stop)
+    with pytest.raises(KeyboardInterrupt, match="simulated hard exit"):
+        supervisor.detach(session_id=session_id)
+
+    interrupted = queue.get_gateway_session(session_id)
+    intent = cast(dict[str, object], interrupted.gateway["detach_intent"])
+    assert interrupted.state is GatewaySessionState.READY
+    assert intent["schema_version"] == "clio-relay.gateway-detach-intent.v1"
+    assert intent["gateway_session_id"] == session_id
+    assert interrupted.metadata["detach_operation_id"] == intent["operation_id"]
+    assert interrupted.metadata["detach_retryable"] is True
+    assert "detach" not in interrupted.gateway
+    assert runner.canceled_jobs == []
+
+    monkeypatch.setattr(supervisor, "_stop_local_connector", original_local_stop)
+    recovered = supervisor.detach(session_id=session_id)
+    assert recovered.session.state is GatewaySessionState.DEGRADED
+    assert recovered.session.gateway["detach"]["operation_id"] == intent["operation_id"]
+    assert recovered.session.metadata["detach_retryable"] is False
+    assert recovered.canceled_scheduler_job is None
+    assert runner.canceled_jobs == []
+
+
+@pytest.mark.parametrize("missing_kind", ["remote_connector", "scheduler_job"])
+def test_completed_detach_rejects_missing_retention_evidence_without_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_kind: str,
+) -> None:
+    """A replay cannot omit either the retained connector or scheduler disposition."""
+    queue, settings, definition, runner, session_id = _started_session(tmp_path)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=definition,
+        token="",
+        secret_key="",
+        runner=runner,
+        sleep=lambda _seconds: None,
+    )
+    completed = supervisor.detach(session_id=session_id)
+    detach = dict(cast(dict[str, object], completed.session.gateway["detach"]))
+    detach["resources"] = [
+        item
+        for item in cast(list[object], detach["resources"])
+        if cast(dict[str, object], item)["kind"] != missing_kind
+    ]
+    queue.update_gateway_session(
+        session_id,
+        gateway={**completed.session.gateway, "detach": detach},
+    )
+    prior_runner_inputs = list(runner.inputs)
+
+    def forbidden_local_stop(**_kwargs: object) -> tuple[int | None, CleanupResource]:
+        raise AssertionError("malformed detach evidence must fail before side effects")
+
+    monkeypatch.setattr(supervisor, "_stop_local_connector", forbidden_local_stop)
+    with pytest.raises(RelayError, match="gateway detach evidence is invalid"):
+        supervisor.detach(session_id=session_id)
+
+    assert runner.inputs == prior_runner_inputs
 
 
 def test_service_runtime_refuses_unowned_gateway_session(tmp_path: Path) -> None:
@@ -1673,6 +2643,51 @@ def test_unresolved_scheduler_submission_intent_blocks_closure(tmp_path: Path) -
     assert scheduler[0].ownership_verified is False
     assert scheduler[0].residual is True
     assert result.session.metadata["cleanup_retryable"] is True
+
+
+@pytest.mark.parametrize("intent_state", ["missing", "malformed"])
+def test_missing_scheduler_identity_proof_blocks_false_closure(
+    tmp_path: Path,
+    intent_state: str,
+) -> None:
+    """A nullable job ID needs explicit absence evidence, not silence or malformed state."""
+    queue, settings, definition, runner, session_id = _started_session(tmp_path)
+    session = queue.get_gateway_session(session_id)
+    gateway = dict(session.gateway)
+    intents = dict(cast(dict[str, object], gateway["ownership_intents"]))
+    if intent_state == "missing":
+        intents.pop("scheduler_submission")
+    else:
+        intents["scheduler_submission"] = {
+            "schema_version": "clio-relay.gateway-ownership-intent.invalid",
+            "state": "absent_verified",
+        }
+    gateway["ownership_intents"] = intents
+    queue.update_gateway_session(
+        session_id,
+        scheduler_job_id=None,
+        gateway=gateway,
+    )
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=definition,
+        token="",
+        secret_key="",
+        runner=runner,
+        sleep=lambda _seconds: None,
+    )
+
+    result = supervisor.stop(session_id=session_id)
+
+    scheduler = [resource for resource in result.resources if resource.kind == "scheduler_job"]
+    assert result.session.state is GatewaySessionState.DEGRADED
+    assert len(scheduler) == 1
+    assert scheduler[0].action == "retain"
+    assert scheduler[0].ownership_verified is False
+    assert scheduler[0].residual is True
+    assert "exact job id" in (scheduler[0].detail or "")
 
 
 def test_tampered_scheduler_submission_anchor_remains_unresolved(tmp_path: Path) -> None:
@@ -2074,6 +3089,49 @@ def test_service_runtime_failed_start_records_failed_session(tmp_path: Path) -> 
     )
 
 
+def test_service_runtime_failure_record_conflict_does_not_mask_original_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=FailingSubmitRunner(),
+        sleep=lambda _seconds: None,
+    )
+
+    def conflict_failure_record(
+        *,
+        session_id: str,
+        error: BaseException,
+        cleanup_errors: Sequence[str],
+    ) -> None:
+        del session_id, error, cleanup_errors
+        raise QueueConflictError("injected failure-record race")
+
+    monkeypatch.setattr(
+        supervisor,
+        "_record_runtime_start_failure",
+        conflict_failure_record,
+    )
+
+    with pytest.raises(RelayError, match="scheduler unavailable") as caught:
+        supervisor.start(name="generic-image-service", spec=_runtime_spec())
+
+    assert caught.value.__notes__ == [
+        "runtime failure handling could not persist its final record: injected failure-record race"
+    ]
+    assert queue.list_gateway_sessions(cluster="test-cluster")[0].state is (
+        GatewaySessionState.FAILED
+    )
+
+
 def test_service_runtime_failed_health_cleans_owned_connectors_without_canceling_job(
     tmp_path: Path,
 ) -> None:
@@ -2105,6 +3163,7 @@ def test_service_runtime_failed_health_cleans_owned_connectors_without_canceling
     assert session.gateway["teardown"]["stopped_remote_pid"] == 444
     assert session.gateway["teardown"]["canceled_scheduler_job"] is None
     assert runner.canceled_jobs == []
+    assert session.metadata["last_error"] == "desktop health failed"
 
 
 def test_service_runtime_supports_xtcp_transport_mode(tmp_path: Path) -> None:
@@ -2201,6 +3260,13 @@ def test_service_runtime_requires_status_command_for_deferred_service_host(
             spec=_runtime_spec().model_copy(update={"status_command": None}),
         )
 
+    session = queue.list_gateway_sessions(cluster="test-cluster")[0]
+    assert session.state is GatewaySessionState.FAILED
+    assert session.metadata["last_error"] == (
+        "service host was not reported by submission output; "
+        "ServiceRuntimeSpec.status_command is required"
+    )
+
 
 def test_service_runtime_rejects_unstructured_scheduler_output(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path / "core")
@@ -2218,6 +3284,12 @@ def test_service_runtime_rejects_unstructured_scheduler_output(tmp_path: Path) -
 
     with pytest.raises(Exception, match="deployment output must include a JSON object"):
         supervisor.start(name="generic-image-service", spec=_runtime_spec())
+
+    session = queue.list_gateway_sessions(cluster="test-cluster")[0]
+    assert session.state is GatewaySessionState.FAILED
+    assert session.metadata["last_error"] == (
+        "deployment output must include a JSON object: 'deployment accepted as job 67890\\n'"
+    )
 
 
 def test_gateway_start_runtime_cli_uses_service_runtime_spec(
@@ -3070,8 +4142,19 @@ def _health_probe_supervisor(tmp_path: Path) -> ServiceRuntimeSupervisor:
         token="token",
         secret_key="secret",
         runner=FakeRunner(),
-        sleep=lambda _seconds: None,
+        sleep=time.sleep,
     )
+
+
+def _mock_http_client_factory(
+    transport: httpx.BaseTransport,
+) -> Callable[[float], httpx.Client]:
+    """Return fresh operation-owned clients over one deterministic transport."""
+
+    def client_factory(_timeout_seconds: float) -> httpx.Client:
+        return httpx.Client(transport=transport)
+
+    return client_factory
 
 
 @pytest.mark.parametrize(
@@ -3089,27 +4172,18 @@ def test_local_health_probe_rejects_non_2xx_and_wrong_runtime_identity(
     error: str,
 ) -> None:
     supervisor = _health_probe_supervisor(tmp_path)
-    clock = iter((0.0, 0.0, 2.0))
+
+    transport = httpx.MockTransport(lambda _request: httpx.Response(status_code, content=body))
     monkeypatch.setattr(
         service_runtime,
-        "time",
-        SimpleNamespace(time=lambda: next(clock)),
+        "_new_readiness_http_client",
+        _mock_http_client_factory(transport),
     )
-
-    def fake_httpx_get(*_args: object, **_kwargs: object) -> httpx.Response:
-        return httpx.Response(status_code, content=body)
-
-    monkeypatch.setattr(
-        service_runtime.httpx,
-        "get",
-        fake_httpx_get,
-    )
-
     with pytest.raises(RelayError, match=error):
         supervisor._wait_for_local_health(  # pyright: ignore[reportPrivateUsage]
             "http://127.0.0.1:28777/healthz",
+            0.03,
             1.0,
-            0.1,
             expected_body="runtime-nonce",
         )
 
@@ -3120,21 +4194,224 @@ def test_local_health_probe_accepts_exact_2xx_runtime_identity(
 ) -> None:
     supervisor = _health_probe_supervisor(tmp_path)
 
-    def fake_httpx_get(*_args: object, **_kwargs: object) -> httpx.Response:
-        return httpx.Response(200, content=b"runtime-nonce")
-
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200, content=b"runtime-nonce"))
     monkeypatch.setattr(
-        service_runtime.httpx,
-        "get",
-        fake_httpx_get,
+        service_runtime,
+        "_new_readiness_http_client",
+        _mock_http_client_factory(transport),
     )
-
     supervisor._wait_for_local_health(  # pyright: ignore[reportPrivateUsage]
         "http://127.0.0.1:28777/healthz",
         1.0,
         0.1,
         expected_body="runtime-nonce",
     )
+
+
+def test_jarvis_v2_health_accepts_opaque_body_only_after_anonymous_401_and_bearer_2xx(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _health_probe_supervisor(tmp_path)
+    authorization = f"Bearer {'a' * 64}"
+    observed_headers: list[str | None] = []
+
+    def protected_health(request: httpx.Request) -> httpx.Response:
+        observed = request.headers.get("authorization")
+        observed_headers.append(observed)
+        if observed is None:
+            return httpx.Response(401, content=b"not-json-and-not-inspected")
+        return httpx.Response(200, content=b"\xff\x00opaque-health")
+
+    transport = httpx.MockTransport(protected_health)
+    monkeypatch.setattr(
+        service_runtime,
+        "_new_readiness_http_client",
+        _mock_http_client_factory(transport),
+    )
+
+    supervisor._wait_for_jarvis_health(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "http://127.0.0.1:28777/healthz",
+        timeout_seconds=1.0,
+        poll_seconds=0.1,
+        runtime_schema_version="jarvis.service-runtime.v2",
+        authorization=authorization,
+    )
+
+    assert observed_headers == [None, authorization]
+
+
+def test_jarvis_v2_health_rejects_an_unprotected_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _health_probe_supervisor(tmp_path)
+    observed_headers: list[str | None] = []
+
+    def unprotected_health(request: httpx.Request) -> httpx.Response:
+        observed_headers.append(request.headers.get("authorization"))
+        return httpx.Response(200, content=b"ignored")
+
+    transport = httpx.MockTransport(unprotected_health)
+    monkeypatch.setattr(
+        service_runtime,
+        "_new_readiness_http_client",
+        _mock_http_client_factory(transport),
+    )
+
+    with pytest.raises(RelayError, match="accepted an anonymous request"):
+        supervisor._wait_for_jarvis_health(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            "http://127.0.0.1:28777/healthz",
+            timeout_seconds=1.0,
+            poll_seconds=0.1,
+            runtime_schema_version="jarvis.service-runtime.v2",
+            authorization=f"Bearer {'a' * 64}",
+        )
+
+    assert observed_headers == [None]
+
+
+def test_legacy_jarvis_v1_health_accepts_anonymous_opaque_2xx(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _health_probe_supervisor(tmp_path)
+    observed_headers: list[str | None] = []
+
+    def legacy_health(request: httpx.Request) -> httpx.Response:
+        observed_headers.append(request.headers.get("authorization"))
+        return httpx.Response(200, content=b"\xfflegacy-opaque")
+
+    transport = httpx.MockTransport(legacy_health)
+    monkeypatch.setattr(
+        service_runtime,
+        "_new_readiness_http_client",
+        _mock_http_client_factory(transport),
+    )
+
+    supervisor._wait_for_jarvis_health(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "http://127.0.0.1:28777/healthz",
+        timeout_seconds=1.0,
+        poll_seconds=0.1,
+        runtime_schema_version="jarvis.service-runtime.v1",
+        authorization=None,
+    )
+
+    assert observed_headers == [None]
+
+
+def test_browser_health_accepts_opaque_2xx_with_exact_null_origin_cors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _health_probe_supervisor(tmp_path)
+    observed_origins: list[str | None] = []
+
+    def browser_health(request: httpx.Request) -> httpx.Response:
+        observed_origins.append(request.headers.get("origin"))
+        return httpx.Response(
+            200,
+            headers={"Access-Control-Allow-Origin": "null"},
+            content=b"\xffopaque-browser-health",
+        )
+
+    transport = httpx.MockTransport(browser_health)
+    monkeypatch.setattr(
+        service_runtime,
+        "_new_readiness_http_client",
+        _mock_http_client_factory(transport),
+    )
+
+    supervisor._wait_for_browser_health(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "http://127.0.0.1:28778/healthz?capability=private",
+        timeout_seconds=1.0,
+        poll_seconds=0.1,
+    )
+
+    assert observed_origins == ["null"]
+
+
+def test_browser_health_rejects_wildcard_cors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _health_probe_supervisor(tmp_path)
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            headers={"Access-Control-Allow-Origin": "*"},
+            content=b"ignored",
+        )
+    )
+    monkeypatch.setattr(
+        service_runtime,
+        "_new_readiness_http_client",
+        _mock_http_client_factory(transport),
+    )
+
+    with pytest.raises(RelayError, match="not exactly null"):
+        supervisor._wait_for_browser_health(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            "http://127.0.0.1:28778/healthz?capability=private",
+            timeout_seconds=0.03,
+            poll_seconds=1.0,
+        )
+
+
+def test_authenticated_jarvis_health_failure_redacts_echoed_bearer_from_error_and_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An authenticated upstream cannot reflect its bearer into durable relay state."""
+    supervisor = _health_probe_supervisor(tmp_path)
+    token = "a" * 64
+    authorization = f"Bearer {token}"
+    response_body = json.dumps(
+        {"echoed_authorization": authorization, "private_marker": "health-body-secret"}
+    ).encode("utf-8")
+    observed_headers: list[str | None] = []
+
+    def echo_bearer(request: httpx.Request) -> httpx.Response:
+        observed = request.headers.get("authorization")
+        observed_headers.append(observed)
+        if observed is None:
+            return httpx.Response(401, content=b"authorization required")
+        return httpx.Response(503, content=response_body)
+
+    transport = httpx.MockTransport(echo_bearer)
+    monkeypatch.setattr(
+        service_runtime,
+        "_new_readiness_http_client",
+        _mock_http_client_factory(transport),
+    )
+    with pytest.raises(RelayError, match="authenticated health status=503") as caught:
+        supervisor._wait_for_jarvis_health(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            "http://127.0.0.1:28777/healthz",
+            timeout_seconds=0.03,
+            poll_seconds=1.0,
+            runtime_schema_version="jarvis.service-runtime.v2",
+            authorization=authorization,
+        )
+
+    error_text = str(caught.value)
+    assert observed_headers == [None, authorization]
+    assert token not in error_text
+    assert "health-body-secret" not in error_text
+    supervisor.queue.initialize()
+    session = supervisor.queue.create_gateway_session(
+        GatewaySession(
+            cluster="test-cluster",
+            name="authenticated-health-failure",
+            state=GatewaySessionState.STARTING,
+        )
+    )
+    supervisor._record_attach_failure(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_id=session.session_id,
+        error=caught.value,
+        cleanup_error=None,
+    )
+    persisted = supervisor.queue.get_gateway_session(session.session_id).model_dump_json()
+    assert token not in persisted
+    assert "health-body-secret" not in persisted
 
 
 def test_remote_health_probe_requires_2xx_and_exact_runtime_identity() -> None:
@@ -3148,6 +4425,103 @@ def test_remote_health_probe_requires_2xx_and_exact_runtime_identity() -> None:
     assert "200 <= response.status < 300" in script
     assert "body == expected_body" in script
     assert "cnVudGltZS1ub25jZQ==" in script
+
+
+def test_local_readiness_responses_enforce_fixed_chunked_and_compressed_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Readiness never buffers beyond its decompressed response budget."""
+    maximum = 128
+
+    def assert_rejected(response: httpx.Response) -> None:
+        transport = httpx.MockTransport(lambda _request: response)
+        with httpx.Client(transport=transport) as client:
+
+            def client_factory(_timeout_seconds: float) -> httpx.Client:
+                return client
+
+            monkeypatch.setattr(
+                service_runtime,
+                "_new_readiness_http_client",
+                client_factory,
+            )
+            with pytest.raises(ValueError, match="decompressed limit"):
+                service_runtime._read_bounded_http_response(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                    "http://readiness.invalid/state",
+                    headers=None,
+                    maximum_bytes=maximum,
+                )
+
+    assert_rejected(
+        httpx.Response(
+            200,
+            headers={"Content-Length": str(maximum + 1)},
+            content=b"{}",
+        )
+    )
+    assert_rejected(httpx.Response(200, content=b"x" * (maximum + 1)))
+    compressed = gzip.compress(b"x" * (maximum + 1))
+    assert len(compressed) < maximum
+    assert_rejected(
+        httpx.Response(
+            200,
+            headers={
+                "Content-Encoding": "gzip",
+                "Content-Length": str(len(compressed)),
+            },
+            content=compressed,
+        )
+    )
+
+
+def test_local_readiness_response_has_one_absolute_slow_drip_deadline() -> None:
+    """Frequent response bytes cannot reset the readiness operation's total budget."""
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(1.0)
+    port = int(listener.getsockname()[1])
+    stop = threading.Event()
+
+    def serve_slow_response() -> None:
+        try:
+            connection, _address = listener.accept()
+        except OSError:
+            return
+        with connection:
+            connection.settimeout(1.0)
+            try:
+                connection.recv(64 * 1024)
+                connection.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: 1024\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                while not stop.wait(0.02):
+                    connection.sendall(b"x")
+            except OSError:
+                return
+
+    server_thread = threading.Thread(target=serve_slow_response, daemon=True)
+    server_thread.start()
+    started_at = time.monotonic()
+    try:
+        deadline = started_at + 0.2
+        with pytest.raises(httpx.TimeoutException, match="total monotonic deadline"):
+            service_runtime._read_bounded_http_response(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                f"http://127.0.0.1:{port}/state",
+                headers=None,
+                maximum_bytes=2048,
+                deadline=deadline,
+            )
+        elapsed = time.monotonic() - started_at
+        assert 0.1 <= elapsed < 0.8
+    finally:
+        stop.set()
+        listener.close()
+        server_thread.join(timeout=1.0)
 
 
 def _visitor_config_path(settings: RelaySettings, session_id: str) -> Path:

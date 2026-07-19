@@ -4,17 +4,24 @@ import base64
 import hashlib
 import json
 import socket
+import subprocess
+import sys
+import threading
 import urllib.parse
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, cast
 
+import httpx
 import pytest
 from typer.testing import CliRunner
 
+import clio_relay.cli as cli_module
 import clio_relay.jarvis_service_runtime as runtime_binding
 import clio_relay.mcp_server as mcp_server_module
 import clio_relay.owner_session_admission as owner_session_admission_module
+import clio_relay.remote_cli as remote_cli_module
 import clio_relay.service_runtime as service_runtime_module
 from clio_relay.browser_gateway import BrowserAttachmentGrant, BrowserDetachmentResult
 from clio_relay.cli import app
@@ -38,6 +45,7 @@ from clio_relay.mcp_server import handle_request
 from clio_relay.models import (
     ArtifactRef,
     GatewaySession,
+    GatewaySessionState,
     JobKind,
     JobState,
     McpCallSpec,
@@ -46,9 +54,33 @@ from clio_relay.models import (
     ServiceRuntimeSpec,
 )
 from clio_relay.remote_mcp import remote_mcp_server_artifact_digest
-from clio_relay.service_runtime import ServiceRuntimeSupervisor
+from clio_relay.service_runtime import ServiceRuntimeStopResult, ServiceRuntimeSupervisor
 from clio_relay.session_lifecycle import CleanupResource
 from tests.jarvis_mcp_fakes import verified_jarvis_server_artifact
+
+
+@pytest.fixture(autouse=True)
+def _private_authority_resolver(  # pyright: ignore[reportUnusedFunction]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep supervisor tests focused while authority transport has dedicated coverage."""
+
+    def resolve_for_test(
+        *,
+        definition: ClusterDefinition,
+        settings: RelaySettings | None,
+        verified: Any,
+    ) -> str | None:
+        del definition, settings
+        if verified.runtime.schema_version == "jarvis.service-runtime.v1":
+            return None
+        return f"Bearer {'a' * 64}"
+
+    monkeypatch.setattr(
+        service_runtime_module,
+        "resolve_jarvis_service_runtime_authorization",
+        resolve_for_test,
+    )
 
 
 def test_resolve_jarvis_service_runtime_binds_only_exact_durable_result(
@@ -82,7 +114,510 @@ def test_resolve_jarvis_service_runtime_binds_only_exact_durable_result(
         "/datasets/asteroid"
     ]
     assert len(verified.binding.service_report_sha256) == 64
+    assert verified.binding.service_runtime_schema_version == "jarvis.service-runtime.v2"
+    assert (
+        verified.binding.authorization_sha256
+        == hashlib.sha256(("a" * 64).encode("ascii")).hexdigest()
+    )
     assert len(verified.binding.dataset_descriptor_sha256) == 64
+
+
+def test_service_runtime_binding_defaults_to_authenticated_v2() -> None:
+    """New binding construction must fail closed toward authenticated provenance."""
+
+    assert (
+        runtime_binding.JarvisServiceRuntimeBinding.model_fields["schema_version"].default
+        == "clio-relay.jarvis-service-runtime-binding.v2"
+    )
+
+
+def test_service_runtime_v1_remains_readable_but_cannot_smuggle_authorization() -> None:
+    """Previously released executions remain queryable without weakening v2."""
+    runtime = _service_runtime_document()
+    runtime["schema_version"] = "jarvis.service-runtime.v1"
+    runtime.pop("authorization")
+    legacy = JarvisServiceRuntime.model_validate(runtime)
+    assert legacy.authorization is None
+
+    runtime["authorization"] = {
+        "scheme": "bearer",
+        "token_sha256": hashlib.sha256(("a" * 64).encode("ascii")).hexdigest(),
+    }
+    with pytest.raises(ValueError, match="v1 cannot contain authorization"):
+        JarvisServiceRuntime.model_validate(runtime)
+
+    runtime["schema_version"] = "jarvis.service-runtime.v2"
+    runtime.pop("authorization")
+    with pytest.raises(ValueError, match="v2 requires authorization"):
+        JarvisServiceRuntime.model_validate(runtime)
+
+    runtime["authorization"] = {"scheme": "bearer", "token": "a" * 64}
+    with pytest.raises(ValueError, match="token"):
+        JarvisServiceRuntime.model_validate(runtime)
+
+
+def test_legacy_runtime_cannot_create_new_handoff_but_existing_binding_reverifies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Released v1 receipts remain readable without admitting new unauthenticated binds."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    document = json.loads(base64.b64decode(envelope["data"], validate=True).decode("utf-8"))
+    runtime = document["structured_result"]["service_runtimes"]["service_runtimes"][0]
+    runtime["schema_version"] = "jarvis.service-runtime.v1"
+    runtime.pop("authorization")
+    document["protocol_result"]["structuredContent"] = document["structured_result"]
+    _replace_envelope_document(envelope, document)
+    artifact = ArtifactRef.model_validate(envelope["artifact"])
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+
+    with pytest.raises(ValueError, match="cannot create new relay bindings"):
+        resolve_jarvis_service_runtime(
+            queue=queue,
+            definition=definition,
+            source_job_id=job.job_id,
+            source_artifact_id=artifact.artifact_id,
+            package_id="paraview-1",
+            package_name="builtin.paraview",
+        )
+    assert (
+        runtime_binding.derive_jarvis_service_runtime_handoffs(
+            cluster=definition.name,
+            source_job=job,
+            source_artifact=artifact,
+            document=document,
+        )
+        == []
+    )
+
+    legacy = runtime_binding._resolve_jarvis_service_runtime(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        queue=queue,
+        definition=definition,
+        settings=None,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+        service_instance_id=None,
+        allow_legacy_v1=True,
+    )
+    assert legacy.binding.schema_version == "clio-relay.jarvis-service-runtime-binding.v1"
+    assert (
+        reverify_jarvis_service_runtime(
+            queue=queue,
+            definition=definition,
+            binding_document=legacy.binding.model_dump(mode="json"),
+        ).binding
+        == legacy.binding
+    )
+
+
+def test_private_authority_resolver_uses_exact_remote_identity_and_never_persists_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relay resolves the bearer only after binding every durable public identity."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    token = "a" * 64
+    digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+    observed: list[str] = []
+
+    def remote_authority(
+        selected: ClusterDefinition,
+        arguments: list[str],
+        *,
+        timeout_seconds: float,
+        maximum_stdout_bytes: int,
+    ) -> str:
+        assert selected == definition
+        assert timeout_seconds == 30
+        assert maximum_stdout_bytes == 32 * 1024
+        observed.extend(arguments)
+        return json.dumps(_service_runtime_authority_document(token=token))
+
+    def executes_remotely(_definition: ClusterDefinition) -> bool:
+        return True
+
+    monkeypatch.setattr(runtime_binding, "should_execute_on_cluster", executes_remotely)
+    monkeypatch.setattr(
+        runtime_binding,
+        "run_remote_jarvis_runtime_authority",
+        remote_authority,
+    )
+
+    header = runtime_binding.resolve_jarvis_service_runtime_authorization(
+        definition=definition,
+        settings=None,
+        verified=verified,
+    )
+
+    assert header == f"Bearer {token}"
+    assert observed == [
+        "execution-1",
+        "--pipeline-id",
+        "pipeline-1",
+        "--package-id",
+        "paraview-1",
+        "--service-instance-id",
+        "paraview-live-1",
+        "--revision",
+        "3",
+        "--token-sha256",
+        digest,
+    ]
+    assert token not in verified.runtime.model_dump_json()
+    assert token not in verified.binding.model_dump_json()
+    persisted_payloads = [path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()]
+    assert all(token.encode("ascii") not in payload for payload in persisted_payloads)
+
+
+def test_private_authority_resolver_rejects_private_token_digest_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A validly shaped but different private bearer cannot cross the relay boundary."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    document = _service_runtime_authority_document(token="b" * 64)
+    document["token_sha256"] = verified.binding.authorization_sha256
+
+    def executes_remotely(_definition: ClusterDefinition) -> bool:
+        return True
+
+    def mismatched_authority(
+        _definition: ClusterDefinition,
+        _arguments: list[str],
+        *,
+        timeout_seconds: float,
+        maximum_stdout_bytes: int,
+    ) -> str:
+        assert timeout_seconds == 30
+        assert maximum_stdout_bytes == 32 * 1024
+        return json.dumps(document)
+
+    monkeypatch.setattr(runtime_binding, "should_execute_on_cluster", executes_remotely)
+    monkeypatch.setattr(
+        runtime_binding,
+        "run_remote_jarvis_runtime_authority",
+        mismatched_authority,
+    )
+
+    with pytest.raises(ValueError, match="token did not match token_sha256"):
+        runtime_binding.resolve_jarvis_service_runtime_authorization(
+            definition=definition,
+            settings=None,
+            verified=verified,
+        )
+
+
+def test_private_authority_transport_rejects_duplicate_keys_without_disclosing_bearer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ambiguous private JSON is rejected without copying any raw bearer into errors."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    token = "a" * 64
+    digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+    duplicate_document = (
+        '{"authorization":{"scheme":"bearer","token":"'
+        + token
+        + '"},"execution_id":"execution-1","package_id":"paraview-1",'
+        '"pipeline_id":"pipeline-1","revision":3,'
+        '"schema_version":"jarvis.execution.service-runtime-authority.v1",'
+        '"service_instance_id":"paraview-live-1","token_sha256":"'
+        + digest
+        + '","token_sha256":"'
+        + digest
+        + '"}'
+    )
+
+    def executes_remotely(_definition: ClusterDefinition) -> bool:
+        return True
+
+    def duplicate_authority(
+        _definition: ClusterDefinition,
+        _arguments: list[str],
+        *,
+        timeout_seconds: float,
+        maximum_stdout_bytes: int,
+    ) -> str:
+        assert timeout_seconds == 30
+        assert maximum_stdout_bytes == 32 * 1024
+        return duplicate_document
+
+    monkeypatch.setattr(runtime_binding, "should_execute_on_cluster", executes_remotely)
+    monkeypatch.setattr(
+        runtime_binding,
+        "run_remote_jarvis_runtime_authority",
+        duplicate_authority,
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON key: token_sha256") as caught:
+        runtime_binding.resolve_jarvis_service_runtime_authorization(
+            definition=definition,
+            settings=None,
+            verified=verified,
+        )
+
+    assert token not in str(caught.value)
+    assert token not in verified.runtime.model_dump_json()
+    assert token not in verified.binding.model_dump_json()
+
+
+def test_private_authority_transport_sanitizes_invalid_json_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed private stdout cannot survive in the raised error or its cause chain."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    token = "a" * 64
+
+    def executes_remotely(_definition: ClusterDefinition) -> bool:
+        return True
+
+    def malformed_authority(
+        _definition: ClusterDefinition,
+        _arguments: list[str],
+        *,
+        timeout_seconds: float,
+        maximum_stdout_bytes: int,
+    ) -> str:
+        assert timeout_seconds == 30
+        assert maximum_stdout_bytes == 32 * 1024
+        return f"{token}\nnot-json"
+
+    monkeypatch.setattr(runtime_binding, "should_execute_on_cluster", executes_remotely)
+    monkeypatch.setattr(
+        runtime_binding,
+        "run_remote_jarvis_runtime_authority",
+        malformed_authority,
+    )
+
+    with pytest.raises(RelayError, match="returned invalid JSON") as caught:
+        runtime_binding.resolve_jarvis_service_runtime_authorization(
+            definition=definition,
+            settings=None,
+            verified=verified,
+        )
+
+    assert token not in str(caught.value)
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("script", "maximum_stdout_bytes", "timeout_seconds", "expected_error"),
+    [
+        (
+            "import sys; "
+            "sys.stdout.write('a' * 64); sys.stdout.flush(); "
+            "sys.stderr.write('a' * 64); sys.exit(19)",
+            1024,
+            2.0,
+            "failed with exit code 19",
+        ),
+        (
+            "import sys; sys.stdout.write('a' * 4096); sys.stdout.flush()",
+            128,
+            2.0,
+            "response exceeded its byte limit",
+        ),
+        (
+            "import sys, time; sys.stdout.write('a' * 64); sys.stdout.flush(); time.sleep(5)",
+            1024,
+            0.05,
+            "timed out after 0.05 seconds",
+        ),
+    ],
+)
+def test_private_command_transport_bounds_and_redacts_all_failure_output(
+    script: str,
+    maximum_stdout_bytes: int,
+    timeout_seconds: float,
+    expected_error: str,
+) -> None:
+    """Exit, byte-limit, and timeout failures disclose no captured private output."""
+    token = "a" * 64
+
+    with pytest.raises(RelayError, match=expected_error) as caught:
+        remote_cli_module._run_bounded_private_command(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            [sys.executable, "-c", script],
+            timeout_seconds=timeout_seconds,
+            maximum_stdout_bytes=maximum_stdout_bytes,
+            label="private resolver",
+        )
+
+    assert token not in str(caught.value)
+
+
+def test_local_authority_invocation_is_bounded_and_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cluster-side wrapper invokes only JARVIS's identity-complete JSON resolver."""
+    commands: list[tuple[list[str], int | None]] = []
+    payload = json.dumps(_service_runtime_authority_document(token="a" * 64))
+
+    class FakeProvider:
+        def __init__(self, *, jarvis_bin: str) -> None:
+            assert jarvis_bin == "/released/bin/jarvis"
+
+        def require_available(self) -> None:
+            return None
+
+        def run_command_streaming(
+            self,
+            command: list[str],
+            *,
+            timeout_seconds: int | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            commands.append((command, timeout_seconds))
+            return subprocess.CompletedProcess(command, 0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(runtime_binding, "JarvisCdProvider", FakeProvider)
+    digest = hashlib.sha256(("a" * 64).encode("ascii")).hexdigest()
+    authority = runtime_binding.resolve_local_jarvis_service_runtime_authority(
+        jarvis_bin="/released/bin/jarvis",
+        execution_id="execution-1",
+        pipeline_id="pipeline-1",
+        package_id="paraview-1",
+        service_instance_id="paraview-live-1",
+        revision=3,
+        token_sha256=digest,
+    )
+
+    assert authority.token_sha256 == digest
+    assert commands == [
+        (
+            [
+                "/released/bin/jarvis",
+                "execution",
+                "resolve-service-runtime-authority",
+                "execution-1",
+                "--pipeline-id",
+                "pipeline-1",
+                "--package-id",
+                "paraview-1",
+                "--service-instance-id",
+                "paraview-live-1",
+                "--revision",
+                "3",
+                "--token-sha256",
+                digest,
+                "+json",
+            ],
+            30,
+        )
+    ]
+
+
+def test_hidden_relay_authority_command_emits_one_private_json_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The remote relay wrapper preserves the exact JARVIS authority wire document."""
+    authority = runtime_binding.JarvisServiceRuntimeAuthority.model_validate(
+        _service_runtime_authority_document(token="a" * 64)
+    )
+    captured: dict[str, object] = {}
+
+    def resolve_local(**kwargs: object) -> runtime_binding.JarvisServiceRuntimeAuthority:
+        captured.update(kwargs)
+        return authority
+
+    monkeypatch.setattr(cli_module, "resolve_local_jarvis_service_runtime_authority", resolve_local)
+    monkeypatch.setenv("CLIO_RELAY_JARVIS_BIN", "/released/bin/jarvis")
+    digest = authority.token_sha256
+    result = CliRunner().invoke(
+        app,
+        [
+            "jarvis-runtime-authority",
+            "execution-1",
+            "--pipeline-id",
+            "pipeline-1",
+            "--package-id",
+            "paraview-1",
+            "--service-instance-id",
+            "paraview-live-1",
+            "--revision",
+            "3",
+            "--token-sha256",
+            digest,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == _service_runtime_authority_document(token="a" * 64)
+    assert captured == {
+        "jarvis_bin": "/released/bin/jarvis",
+        "execution_id": "execution-1",
+        "pipeline_id": "pipeline-1",
+        "package_id": "paraview-1",
+        "service_instance_id": "paraview-live-1",
+        "revision": 3,
+        "token_sha256": digest,
+    }
+
+
+def test_model_facing_mcp_projection_redacts_runtime_bearer_token() -> None:
+    """Every nested capability occurrence is absent from ordinary tool output."""
+    token = "a" * 64
+    projected = mcp_server_module._bounded_mcp_result(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        {
+            "structured_result": {
+                "service_runtimes": [
+                    {
+                        "authorization": {
+                            "scheme": "bearer",
+                            "token": token,
+                            "audience": "paraview",
+                        },
+                        "message": f"capability={token}",
+                    }
+                ],
+                "api_token": token,
+            }
+        }
+    )
+    assert projected["sensitive_values_redacted"] is True
+    structured = cast(dict[str, Any], projected["structured_result"])
+    services = cast(list[dict[str, Any]], structured["service_runtimes"])
+    assert services[0]["authorization"] == "<redacted>"
+    assert services[0]["message"] == "capability=<redacted>"
+    assert structured["api_token"] == "<redacted>"
+    assert token not in json.dumps(projected, sort_keys=True)
 
 
 def test_waited_execution_exposes_compact_verified_binding_before_large_result(
@@ -129,6 +664,8 @@ def test_waited_execution_exposes_compact_verified_binding_before_large_result(
     serialized = mcp_server_module._serialize_tool_result(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         receipt
     )
+    assert "a" * 64 not in serialized
+    assert '"sensitive_values_redacted": true' in serialized
     assert serialized.index('"service_runtime_bindings":') < serialized.index(
         '"mcp_result_artifact":'
     )
@@ -1065,7 +1602,34 @@ def test_agent_bind_persists_urls_and_rejects_runtime_commands(
     monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "token")
     monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "secret")
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    actual_jarvis_health = (
+        ServiceRuntimeSupervisor._wait_for_jarvis_health  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
     _patch_connector_start(monkeypatch)
+    monkeypatch.setattr(
+        ServiceRuntimeSupervisor,
+        "_wait_for_jarvis_health",
+        actual_jarvis_health,
+    )
+    readiness_requests: list[tuple[str, dict[str, str] | None]] = []
+
+    def read_readiness(
+        url: str,
+        *,
+        headers: dict[str, str] | None,
+        maximum_bytes: int | None,
+        deadline: float | None = None,
+    ) -> service_runtime_module._BoundedHttpResponse:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        del deadline
+        readiness_requests.append((url, headers))
+        assert maximum_bytes is None
+        return service_runtime_module._BoundedHttpResponse(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            status_code=401 if headers is None else 200,
+            headers=httpx.Headers(),
+            content=b"",
+        )
+
+    monkeypatch.setattr(service_runtime_module, "_read_bounded_http_response", read_readiness)
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
@@ -1101,6 +1665,10 @@ def test_agent_bind_persists_urls_and_rejects_runtime_commands(
     assert local_port != 18777
     assert result["connect_url"] == f"http://127.0.0.1:{local_port}"
     assert result["health_url"] == f"http://127.0.0.1:{local_port}/healthz"
+    assert readiness_requests == [
+        (result["health_url"], None),
+        (result["health_url"], {"Authorization": f"Bearer {'a' * 64}"}),
+    ]
     assert result["stream_url"] == f"http://127.0.0.1:{local_port}/live-data"
     assert result["events_url"] == f"http://127.0.0.1:{local_port}/events"
     assert result["state_url"] == f"http://127.0.0.1:{local_port}/state"
@@ -1112,13 +1680,21 @@ def test_agent_bind_persists_urls_and_rejects_runtime_commands(
     assert agent_visible["gateway_session_id"] == gateway["session_id"]
     assert agent_visible["gateway_session_id"] == agent_visible["gateway_session"]["session_id"]
     assert gateway["state"] == "ready"
-    assert gateway["gateway"]["jarvis_runtime_binding"]["source_relay_job_id"] == job.job_id
+    public_binding = gateway["gateway"]["jarvis_runtime_binding"]
+    assert public_binding["source_relay_job_id"] == job.job_id
+    assert public_binding["schema_version"] == "clio-relay.jarvis-service-runtime-binding.v2"
+    assert public_binding["service_runtime_schema_version"] == "jarvis.service-runtime.v2"
+    assert (
+        public_binding["authorization_sha256"]
+        == hashlib.sha256(("a" * 64).encode("ascii")).hexdigest()
+    )
     assert (
         gateway["gateway"]["jarvis_runtime_binding"]["dataset_descriptor"] == _dataset_descriptor()
     )
     assert gateway["gateway"]["state_url"] == result["state_url"]
     assert gateway["gateway"]["command_url"] == result["command_url"]
     public_document = json.dumps(response, sort_keys=True)
+    assert "a" * 64 not in public_document
     persisted = queue.get_gateway_session(gateway["session_id"])
     owner_tokens = _owner_token_values(persisted.model_dump(mode="json"))
     assert owner_tokens
@@ -1533,6 +2109,112 @@ def test_owned_bind_rejects_wrong_cluster_scoped_admission_id(
     assert queue.list_gateway_sessions() == []
 
 
+def test_jarvis_bind_serializes_connector_creation_against_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound-runtime stop cannot close before its connector producer publishes."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    _patch_connector_start(monkeypatch)
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    supervisor = ServiceRuntimeSupervisor(
+        settings=RelaySettings(
+            core_dir=tmp_path / "core",
+            spool_dir=tmp_path / "spool",
+            frpc_bin="frpc-test",
+        ),
+        queue=queue,
+        cluster=definition.name,
+        definition=definition,
+        token="token",
+        secret_key="secret",
+        sleep=lambda _seconds: None,
+    )
+    monkeypatch.setattr(supervisor, "_stop_local_connector", _fake_local_connector_stop)
+    monkeypatch.setattr(supervisor, "_ssh", _fake_connector_ssh)
+
+    def retained_scheduler_resource(
+        *,
+        session: GatewaySession,
+        spec: ServiceRuntimeSpec,
+    ) -> CleanupResource:
+        return CleanupResource(
+            kind="scheduler_job",
+            resource_id=str(session.scheduler_job_id),
+            location=definition.ssh_host,
+            provider=spec.scheduler,
+            action="retain",
+            ownership_verified=True,
+            outcome="retained",
+            verified_after_operation=True,
+            observed_state="running",
+        )
+
+    monkeypatch.setattr(
+        supervisor,
+        "_retained_scheduler_resource",
+        retained_scheduler_resource,
+    )
+    connector_start_entered = threading.Event()
+    stop_calling = threading.Event()
+    teardown_prepared = threading.Event()
+    original_remote_start = supervisor._start_remote_connector  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original_prepare = supervisor._prepare_teardown_intent  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def pause_remote_start(**kwargs: object) -> dict[str, object]:
+        connector_start_entered.set()
+        assert stop_calling.wait(timeout=5)
+        assert not teardown_prepared.wait(timeout=0.1)
+        return original_remote_start(**kwargs)  # pyright: ignore[reportArgumentType]
+
+    def observe_teardown_prepare(
+        session: GatewaySession,
+        *,
+        cancel_scheduler_job: bool,
+    ) -> GatewaySession:
+        teardown_prepared.set()
+        return original_prepare(
+            session,
+            cancel_scheduler_job=cancel_scheduler_job,
+        )
+
+    monkeypatch.setattr(supervisor, "_start_remote_connector", pause_remote_start)
+    monkeypatch.setattr(supervisor, "_prepare_teardown_intent", observe_teardown_prepare)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        bind_future = pool.submit(
+            supervisor.bind_verified_jarvis_runtime,
+            name="serialized-paraview-bind",
+            verified=verified,
+            desktop_bind_port=28777,
+        )
+        assert connector_start_entered.wait(timeout=5)
+        sessions = queue.list_gateway_sessions(cluster=definition.name)
+        assert len(sessions) == 1
+        session_id = sessions[0].session_id
+
+        def stop_while_binding() -> ServiceRuntimeStopResult:
+            stop_calling.set()
+            return supervisor.stop(session_id=session_id)
+
+        stop_future = pool.submit(stop_while_binding)
+        bound = bind_future.result(timeout=15)
+        stopped = stop_future.result(timeout=15)
+
+    assert bound.session.state is GatewaySessionState.READY
+    assert stopped.session.state is GatewaySessionState.CLOSED
+    assert teardown_prepared.is_set()
+    assert stopped.canceled_scheduler_job is None
+
+
 def test_bound_runtime_detach_and_teardown_preserve_scheduler_by_default(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1944,9 +2626,11 @@ def test_browser_attachment_is_one_time_safe_and_idempotently_revoked(
         session: GatewaySession,
         config: Any,
         capability: str,
+        upstream_authorization: str | None,
         ownership_intent: dict[str, object],
     ) -> dict[str, object]:
         assert len(capability) >= 43
+        assert upstream_authorization == f"Bearer {'a' * 64}"
         return {
             "owner": "clio-relay",
             "session_id": session.session_id,
@@ -1964,8 +2648,8 @@ def test_browser_attachment_is_one_time_safe_and_idempotently_revoked(
 
     monkeypatch.setattr(supervisor, "_start_browser_proxy", start_browser_proxy)
 
-    def browser_health(*_args: object, **_kwargs: object) -> int:
-        return 7
+    def browser_health(*_args: object, **_kwargs: object) -> None:
+        return None
 
     monkeypatch.setattr(supervisor, "_wait_for_browser_health", browser_health)
     marker_seen: list[Path] = []
@@ -2031,6 +2715,98 @@ def test_browser_attachment_is_one_time_safe_and_idempotently_revoked(
     assert repeated.already_revoked is True
     assert repeated.proxy_stopped is False
     assert marker_seen
+
+
+def test_browser_attach_serializes_its_launch_against_runtime_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stop cannot commit absence while a browser proxy launch is in flight."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    _patch_connector_start(monkeypatch)
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    supervisor = ServiceRuntimeSupervisor(
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+        queue=queue,
+        cluster=definition.name,
+        definition=definition,
+        token="token",
+        secret_key="secret",
+        sleep=lambda _seconds: None,
+    )
+    started = supervisor.bind_verified_jarvis_runtime(
+        name="paraview-live",
+        verified=verified,
+        desktop_bind_port=28777,
+    )
+    launch_entered = threading.Event()
+    allow_launch_return = threading.Event()
+    stop_entered = threading.Event()
+
+    def start_browser_proxy(
+        *,
+        session: GatewaySession,
+        config: Any,
+        capability: str,
+        upstream_authorization: str | None,
+        ownership_intent: dict[str, object],
+    ) -> dict[str, object]:
+        del capability, upstream_authorization
+        launch_entered.set()
+        assert allow_launch_return.wait(timeout=5)
+        return {
+            "owner": "clio-relay",
+            "session_id": session.session_id,
+            "attachment_id": config.attachment_id,
+            "pid": 777,
+            "process_group_id": 777,
+            "process_start_marker": "start-777",
+            "owner_token": ownership_intent["owner_token"],
+            "connector_generation_id": ownership_intent["connector_generation_id"],
+            "config_path": ownership_intent["config_path"],
+            "stdout_path": ownership_intent["stdout_path"],
+            "stderr_path": ownership_intent["stderr_path"],
+            "metadata_path": ownership_intent["metadata_path"],
+        }
+
+    def stop_serialized(**_kwargs: object) -> ServiceRuntimeStopResult:
+        stop_entered.set()
+        raise RuntimeError("stop entered after browser launch transition")
+
+    def browser_health_ready(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(supervisor, "_start_browser_proxy", start_browser_proxy)
+    monkeypatch.setattr(supervisor, "_wait_for_browser_health", browser_health_ready)
+    monkeypatch.setattr(supervisor, "_stop_serialized", stop_serialized)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        attach_future = executor.submit(
+            supervisor.browser_attach,
+            session_id=started.session.session_id,
+            ttl_seconds=300,
+        )
+        assert launch_entered.wait(timeout=5)
+        stop_future = executor.submit(
+            supervisor.stop,
+            session_id=started.session.session_id,
+        )
+        assert not stop_entered.wait(timeout=0.2)
+        allow_launch_return.set()
+        grant = attach_future.result(timeout=5)
+        with pytest.raises(RuntimeError, match="stop entered after browser launch transition"):
+            stop_future.result(timeout=5)
+
+    assert grant.attachment_id.startswith("browser-")
+    assert stop_entered.is_set()
 
 
 def test_bound_remote_connector_persists_verified_slurm_placement(
@@ -2150,6 +2926,442 @@ def test_bound_remote_connector_persists_verified_slurm_placement(
     )
     assert "scheduler-connector-step.pending.json" in start_script
     assert "remote_frpc_pid" not in start_script
+
+
+def test_public_jarvis_bind_uses_the_durable_allocation_connector_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real allocation-scoped bind must not publish through a stale queue revision."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    supervisor = ServiceRuntimeSupervisor(
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+        queue=queue,
+        cluster=definition.name,
+        definition=definition,
+        token="token",
+        secret_key="secret",
+        sleep=lambda _seconds: None,
+    )
+
+    def ssh(script: str) -> str:
+        if "clio-relay scheduler connector-placement" in script:
+            return json.dumps(
+                {
+                    "schema_version": "clio-relay.scheduler-connector-placement.v1",
+                    "scheduler": "slurm",
+                    "scheduler_job_id": "12345",
+                    "placement_host": "compute-07",
+                    "allocation_node_count": 1,
+                    "source": "slurm-scontrol-batch-host",
+                    "verified": True,
+                    "observed_at": "2026-07-15T02:00:00Z",
+                }
+            )
+        assert "connector-step-start" in script
+        session = queue.list_gateway_sessions(cluster=definition.name)[0]
+        remote_intent = cast(
+            dict[str, object],
+            cast(dict[str, object], session.gateway["ownership_intents"])["remote_connector"],
+        )
+        generation = str(remote_intent["connector_generation_id"])
+        step_marker = (
+            "clio-relay-connector-"
+            + hashlib.sha256(f"{session.session_id}\x00{generation}".encode()).hexdigest()[:32]
+        )
+        return json.dumps(
+            {
+                "schema_version": "clio-relay.allocation-connector-start.v1",
+                "session_id": session.session_id,
+                "connector_generation_id": generation,
+                "config_path": "/runtime/remote.toml",
+                "log_path": "/runtime/remote.log",
+                "step_identity": {
+                    "schema_version": "clio-relay.scheduler-connector-step.v1",
+                    "scheduler": "slurm",
+                    "scheduler_job_id": "12345",
+                    "scheduler_step_id": "12345.7",
+                    "step_marker": step_marker,
+                    "placement_host": "compute-07",
+                    "source": "slurm-srun-detached-marker",
+                    "verified": True,
+                    "observed_at": "2026-07-15T02:00:01Z",
+                },
+            }
+        )
+
+    def start_local(
+        *,
+        session: GatewaySession,
+        spec: ServiceRuntimeSpec,
+        proxy_name: str,
+        ownership_intent: dict[str, object],
+    ) -> dict[str, object]:
+        del spec, proxy_name
+        return {
+            "owner": "clio-relay",
+            "session_id": session.session_id,
+            "pid": 555,
+            "process_group_id": 555,
+            "process_start_marker": "start-555",
+            "connector_generation_id": ownership_intent["connector_generation_id"],
+            "owner_token": ownership_intent["owner_token"],
+            "config_path": "/runtime/desktop-frpc.toml",
+            "stdout_path": "/runtime/desktop-frpc.out",
+            "stderr_path": "/runtime/desktop-frpc.err",
+        }
+
+    def jarvis_health_ready(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(supervisor, "_ssh", ssh)
+    monkeypatch.setattr(supervisor, "_start_local_visitor", start_local)
+    monkeypatch.setattr(supervisor, "_wait_for_jarvis_health", jarvis_health_ready)
+
+    started = supervisor.bind_verified_jarvis_runtime(
+        name="paraview-live",
+        verified=verified,
+        desktop_bind_port=28777,
+    )
+
+    assert started.session.state is GatewaySessionState.READY
+    remote = cast(
+        dict[str, object],
+        cast(dict[str, object], started.session.gateway["transport"])["remote_connector"],
+    )
+    assert remote["execution_scope"] == "scheduler_allocation"
+    assert remote["scheduler_step_id"] == "12345.7"
+    intents = cast(dict[str, object], started.session.gateway["ownership_intents"])
+    remote_intent = cast(dict[str, object], intents["remote_connector"])
+    assert remote_intent["state"] == "recorded"
+
+
+def test_jarvis_bind_recovers_and_stops_allocation_connector_after_lost_start_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost SSH response cannot orphan its already-started scheduler step."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    supervisor = ServiceRuntimeSupervisor(
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+        queue=queue,
+        cluster=definition.name,
+        definition=definition,
+        token="token",
+        secret_key="secret",
+        sleep=lambda _seconds: None,
+    )
+    events: list[str] = []
+
+    def allocation_context() -> tuple[
+        GatewaySession,
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+    ]:
+        session = queue.list_gateway_sessions(cluster=definition.name)[0]
+        intent = cast(
+            dict[str, object],
+            cast(dict[str, object], session.gateway["ownership_intents"])["remote_connector"],
+        )
+        placement = cast(dict[str, object], intent["placement"])
+        connector = {
+            "owner": "clio-relay",
+            "session_id": session.session_id,
+            "execution_scope": "scheduler_allocation",
+            "scheduler_provider": "slurm",
+            "scheduler_native_id": "12345",
+            "scheduler_step_marker": intent["scheduler_step_marker"],
+            "connector_generation_id": intent["connector_generation_id"],
+            "owner_token": intent["owner_token"],
+            "config_path": "/runtime/remote.toml",
+            "log_path": "/runtime/remote.log",
+            "placement": placement,
+        }
+        step = {
+            "schema_version": "clio-relay.scheduler-connector-step.v1",
+            "scheduler": "slurm",
+            "scheduler_job_id": "12345",
+            "scheduler_step_id": "12345.7",
+            "step_marker": intent["scheduler_step_marker"],
+            "placement_host": "compute-07",
+            "source": "slurm-squeue-step-marker",
+            "verified": True,
+            "observed_at": "2026-07-15T02:00:01Z",
+        }
+        return session, intent, connector, step
+
+    def ssh(script: str) -> str:
+        if "clio-relay scheduler connector-placement" in script:
+            events.append("placement")
+            return json.dumps(
+                {
+                    "schema_version": "clio-relay.scheduler-connector-placement.v1",
+                    "scheduler": "slurm",
+                    "scheduler_job_id": "12345",
+                    "placement_host": "compute-07",
+                    "allocation_node_count": 1,
+                    "source": "slurm-scontrol-batch-host",
+                    "verified": True,
+                    "observed_at": "2026-07-15T02:00:00Z",
+                }
+            )
+        if "__CLIO_WRITE_ALLOCATION_FRPC__" in script:
+            events.append("start-side-effect")
+            raise RelayError("lost allocation connector start response")
+        _session, intent, connector, step = allocation_context()
+        if "__CLIO_DISCOVER_CONNECTOR__" in script:
+            events.append("discover")
+            return json.dumps(
+                {
+                    "present": True,
+                    "ownership_verified": True,
+                    "connector": connector,
+                }
+            )
+        if "connector-step-reconcile" in script:
+            events.append("reconcile-step")
+            return json.dumps(
+                {
+                    "schema_version": ("clio-relay.scheduler-connector-step-reconciliation.v1"),
+                    "scheduler": "slurm",
+                    "scheduler_job_id": "12345",
+                    "step_marker": intent["scheduler_step_marker"],
+                    "placement_host": "compute-07",
+                    "found": True,
+                    "step": step,
+                }
+            )
+        if "connector-step-cancel" in script:
+            events.append("cancel-step")
+            return json.dumps(
+                {
+                    "scheduler": "slurm",
+                    "scheduler_job_id": "12345",
+                    "scheduler_step_id": "12345.7",
+                    "cancel_requested": True,
+                    "accepted": True,
+                    "returncode": 0,
+                }
+            )
+        if "connector-step-status" in script:
+            status_count = sum(event.startswith("status-") for event in events)
+            state = "active" if status_count < 2 else "absent"
+            events.append(f"status-{state}")
+            return json.dumps(
+                {
+                    "schema_version": "clio-relay.scheduler-connector-step-status.v1",
+                    "scheduler": "slurm",
+                    "scheduler_job_id": "12345",
+                    "scheduler_step_id": "12345.7",
+                    "placement_host": "compute-07",
+                    "record_found": state != "absent",
+                    "state": state,
+                    "observed_host": "compute-07" if state != "absent" else None,
+                    "source": "slurm-squeue-steps",
+                    "verified": True,
+                    "observed_at": "2026-07-15T02:00:02Z",
+                }
+            )
+        raise AssertionError("unexpected remote connector script")
+
+    monkeypatch.setattr(supervisor, "_ssh", ssh)
+
+    with pytest.raises(RelayError, match="lost allocation connector start response"):
+        supervisor.bind_verified_jarvis_runtime(
+            name="paraview-lost-allocation-response",
+            verified=verified,
+            desktop_bind_port=28777,
+        )
+
+    persisted = queue.list_gateway_sessions(cluster=definition.name)[0]
+    assert persisted.state is GatewaySessionState.FAILED
+    assert events == [
+        "placement",
+        "start-side-effect",
+        "discover",
+        "reconcile-step",
+        "status-active",
+        "status-active",
+        "cancel-step",
+        "status-absent",
+    ]
+    assert persisted.metadata["cleanup_error"] is None
+
+
+def test_jarvis_bind_recovers_and_stops_local_connector_after_lost_start_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local sidecar recovers a visitor whose successful response was lost."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    _patch_connector_start(monkeypatch)
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    supervisor = ServiceRuntimeSupervisor(
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+        queue=queue,
+        cluster=definition.name,
+        definition=definition,
+        token="token",
+        secret_key="secret",
+        sleep=lambda _seconds: None,
+    )
+    stopped: list[int] = []
+
+    def start_local_then_lose_response(
+        *,
+        session: GatewaySession,
+        spec: ServiceRuntimeSpec,
+        proxy_name: str,
+        ownership_intent: dict[str, object],
+    ) -> dict[str, object]:
+        del spec, proxy_name
+        connector = {
+            "owner": "clio-relay",
+            "session_id": session.session_id,
+            "pid": 555,
+            "process_group_id": 555,
+            "process_start_marker": "start-555",
+            "connector_generation_id": ownership_intent["connector_generation_id"],
+            "owner_token": ownership_intent["owner_token"],
+            "config_path": ownership_intent["config_path"],
+            "stdout_path": ownership_intent["stdout_path"],
+            "stderr_path": ownership_intent["stderr_path"],
+            "metadata_path": ownership_intent["metadata_path"],
+        }
+        service_runtime_module._write_local_connector_sidecar(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            Path(str(ownership_intent["metadata_path"])),
+            connector,
+        )
+        raise RelayError("lost desktop connector start response")
+
+    def connector_owned(
+        _connector: dict[str, object],
+    ) -> tuple[str, str | None]:
+        return "owned", None
+
+    def stop_local(
+        *,
+        session_id: str,
+        connector: dict[str, object],
+        require_record: bool = False,
+        absence_verified: bool = False,
+    ) -> tuple[int | None, CleanupResource]:
+        del session_id, require_record, absence_verified
+        pid = int(cast(int, connector["pid"]))
+        stopped.append(pid)
+        return pid, CleanupResource(
+            kind="desktop_connector",
+            resource_id=str(pid),
+            location="desktop",
+            action="stop",
+            ownership_verified=True,
+            outcome="stopped",
+            verified_after_operation=True,
+        )
+
+    monkeypatch.setattr(supervisor, "_start_local_visitor", start_local_then_lose_response)
+    monkeypatch.setattr(service_runtime_module, "_local_connector_identity_status", connector_owned)
+    monkeypatch.setattr(supervisor, "_stop_local_connector", stop_local)
+    monkeypatch.setattr(supervisor, "_ssh", _fake_connector_ssh)
+
+    with pytest.raises(RelayError, match="lost desktop connector start response"):
+        supervisor.bind_verified_jarvis_runtime(
+            name="paraview-lost-desktop-response",
+            verified=verified,
+            desktop_bind_port=28777,
+        )
+
+    persisted = queue.list_gateway_sessions(cluster=definition.name)[0]
+    assert persisted.state is GatewaySessionState.FAILED
+    assert stopped == [555]
+    assert persisted.metadata["cleanup_error"] is None
+
+
+@pytest.mark.parametrize("operation", ["stop", "detach"])
+def test_cleanup_refuses_a_missing_scheduler_id_that_remains_in_the_jarvis_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    """Cleanup cannot close or detach without an exact scheduler disposition."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    _patch_connector_start(monkeypatch)
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    supervisor = ServiceRuntimeSupervisor(
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+        queue=queue,
+        cluster=definition.name,
+        definition=definition,
+        token="token",
+        secret_key="secret",
+        sleep=lambda _seconds: None,
+    )
+    started = supervisor.bind_verified_jarvis_runtime(
+        name="paraview-live",
+        verified=verified,
+        desktop_bind_port=28777,
+    )
+    queue.update_gateway_session(
+        started.session.session_id,
+        scheduler_job_id=None,
+    )
+    local_cleanup_calls: list[str] = []
+    ssh_calls: list[str] = []
+
+    def local_stop(**_kwargs: object) -> tuple[int | None, CleanupResource]:
+        local_cleanup_calls.append("called")
+        raise AssertionError("connector cleanup ran before scheduler identity validation")
+
+    def ssh(script: str) -> str:
+        ssh_calls.append(script)
+        raise AssertionError("remote side effect ran before scheduler identity validation")
+
+    monkeypatch.setattr(supervisor, "_stop_local_connector", local_stop)
+    monkeypatch.setattr(supervisor, "_ssh", ssh)
+    cleanup = supervisor.stop if operation == "stop" else supervisor.detach
+
+    with pytest.raises(RelayError, match="scheduler job identity disagrees"):
+        cleanup(session_id=started.session.session_id)
+
+    persisted = queue.get_gateway_session(started.session.session_id)
+    assert persisted.state is GatewaySessionState.READY
+    assert local_cleanup_calls == []
+    assert ssh_calls == []
 
 
 def test_allocation_connector_reconciliation_recovers_crash_interrupted_step(
@@ -2386,63 +3598,6 @@ def test_internal_scheduler_step_start_cli_preserves_connector_argv(
     ]
 
 
-def test_paraview_state_admission_binds_health_execution_and_dataset() -> None:
-    descriptor = _dataset_descriptor()
-    descriptor_sha256 = hashlib.sha256(
-        json.dumps(
-            descriptor,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
-    state: dict[str, object] = {
-        "schema_version": "jarvis.paraview.service-state.v1",
-        "service_instance_id": "paraview-live-1",
-        "revision": 7,
-        "execution_id": "execution-1",
-        "dataset": {
-            "descriptor": descriptor,
-            "discovery": {"arrays": [], "bounds": None, "timestep_values": []},
-        },
-        "pipeline": {
-            "timestep": {"index": 0, "value": None, "count": 1},
-            "active_field": None,
-            "filters": [],
-            "colormap": None,
-            "camera": None,
-            "selection": None,
-            "artifacts": [],
-        },
-    }
-
-    service_runtime_module._validate_jarvis_service_state(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        state,
-        service_instance_id="paraview-live-1",
-        execution_id="execution-1",
-        health_revision=7,
-        dataset_descriptor_sha256=descriptor_sha256,
-    )
-
-    with pytest.raises(ValueError, match="health or binding"):
-        service_runtime_module._validate_jarvis_service_state(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            {**state, "revision": 8},
-            service_instance_id="paraview-live-1",
-            execution_id="execution-1",
-            health_revision=7,
-            dataset_descriptor_sha256=descriptor_sha256,
-        )
-    with pytest.raises(ValueError, match="descriptor disagrees"):
-        service_runtime_module._validate_jarvis_service_state(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            state,
-            service_instance_id="paraview-live-1",
-            execution_id="execution-1",
-            health_revision=7,
-            dataset_descriptor_sha256="0" * 64,
-        )
-
-
 def test_internal_browser_cli_emits_pinned_one_time_and_detach_schemas(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2666,27 +3821,7 @@ def _mcp_result_document(
             }
         ],
     }
-    service = {
-        "schema_version": "jarvis.service-runtime.v1",
-        "execution_id": "execution-1",
-        "package_name": "builtin.paraview",
-        "package_id": "paraview-1",
-        "service_instance_id": "paraview-live-1",
-        "revision": 3,
-        "lifecycle": "ready",
-        "host": "127.0.0.1",
-        "port": 18777,
-        "protocol": "http",
-        "health_path": "/healthz",
-        "live_data_path": "/live-data",
-        "events_path": "/events",
-        "state_path": "/state",
-        "command_path": "/commands",
-        "delivery_mode": "push",
-        "dataset_descriptor": _dataset_descriptor(),
-        "message": "service ready",
-        "observed_at_epoch": 1_784_080_860.125,
-    }
+    service = _service_runtime_document()
     services = {
         "schema_version": "jarvis.execution.service-runtimes.v1",
         "execution_id": "execution-1",
@@ -2722,6 +3857,49 @@ def _mcp_result_document(
         "protocol_error": None,
         "structured_result": structured,
         "protocol_result": {"structuredContent": structured, "isError": False},
+    }
+
+
+def _service_runtime_document() -> dict[str, Any]:
+    """Return one authenticated service-runtime v2 test document."""
+    return {
+        "schema_version": "jarvis.service-runtime.v2",
+        "execution_id": "execution-1",
+        "package_name": "builtin.paraview",
+        "package_id": "paraview-1",
+        "service_instance_id": "paraview-live-1",
+        "revision": 3,
+        "lifecycle": "ready",
+        "host": "127.0.0.1",
+        "port": 18777,
+        "protocol": "http",
+        "health_path": "/healthz",
+        "live_data_path": "/live-data",
+        "events_path": "/events",
+        "state_path": "/state",
+        "command_path": "/commands",
+        "delivery_mode": "push",
+        "authorization": {
+            "scheme": "bearer",
+            "token_sha256": hashlib.sha256(("a" * 64).encode("ascii")).hexdigest(),
+        },
+        "dataset_descriptor": _dataset_descriptor(),
+        "message": "service ready",
+        "observed_at_epoch": 1_784_080_860.125,
+    }
+
+
+def _service_runtime_authority_document(*, token: str) -> dict[str, Any]:
+    """Return one exact private JARVIS authority response for the test runtime."""
+    return {
+        "authorization": {"scheme": "bearer", "token": token},
+        "execution_id": "execution-1",
+        "package_id": "paraview-1",
+        "pipeline_id": "pipeline-1",
+        "revision": 3,
+        "schema_version": "jarvis.execution.service-runtime-authority.v1",
+        "service_instance_id": "paraview-live-1",
+        "token_sha256": hashlib.sha256(token.encode("ascii")).hexdigest(),
     }
 
 
@@ -2848,18 +4026,13 @@ def _patch_connector_start(monkeypatch: pytest.MonkeyPatch) -> None:
         health_ready,
     )
 
-    def jarvis_health(*_args: object, **_kwargs: object) -> int:
-        return 1
+    def jarvis_health(*_args: object, **_kwargs: object) -> None:
+        return None
 
     monkeypatch.setattr(
         ServiceRuntimeSupervisor,
         "_wait_for_jarvis_health",
         jarvis_health,
-    )
-    monkeypatch.setattr(
-        ServiceRuntimeSupervisor,
-        "_wait_for_jarvis_state",
-        health_ready,
     )
 
 

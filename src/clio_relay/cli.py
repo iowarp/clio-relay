@@ -77,6 +77,10 @@ from clio_relay.jarvis_mcp import (
     require_handle_first_jarvis_run_schema,
 )
 from clio_relay.jarvis_mcp_validation import build_jarvis_mcp_validation_report
+from clio_relay.jarvis_service_runtime import (
+    private_jarvis_service_runtime_authority_document,
+    resolve_local_jarvis_service_runtime_authority,
+)
 from clio_relay.live_acceptance import LiveAcceptanceOptions, run_live_acceptance
 from clio_relay.mcp_server import (
     load_registered_remote_mcp_catalog,
@@ -121,6 +125,7 @@ from clio_relay.pagination import (
     DEFAULT_RESPONSE_PAGE_RECORDS,
     MAX_RESPONSE_PAGE_RECORDS,
 )
+from clio_relay.process_containment import consume_broker_child_environment
 from clio_relay.progress_provenance import external_progress_metadata
 from clio_relay.public_records import public_gateway_session
 from clio_relay.queue_management import (
@@ -295,6 +300,46 @@ app.add_typer(storage_app, name="storage")
 @app.callback()
 def main() -> None:
     """Run clio-relay commands."""
+    consume_broker_child_environment()
+
+
+@app.command("jarvis-runtime-authority", hidden=True)
+def jarvis_runtime_authority(
+    execution_id: str,
+    pipeline_id: Annotated[str, typer.Option(help="Exact JARVIS pipeline identity.")],
+    package_id: Annotated[str, typer.Option(help="Exact JARVIS package identity.")],
+    service_instance_id: Annotated[
+        str,
+        typer.Option(help="Exact JARVIS service instance identity."),
+    ],
+    revision: Annotated[int, typer.Option(help="Exact current service revision.")],
+    token_sha256: Annotated[
+        str,
+        typer.Option(help="Public SHA-256 identity of the private bearer capability."),
+    ],
+) -> None:
+    """Resolve one private JARVIS authority for relay-internal transport."""
+
+    def action() -> None:
+        settings = RelaySettings.from_env()
+        authority = resolve_local_jarvis_service_runtime_authority(
+            jarvis_bin=settings.jarvis_bin,
+            execution_id=execution_id,
+            pipeline_id=pipeline_id,
+            package_id=package_id,
+            service_instance_id=service_instance_id,
+            revision=revision,
+            token_sha256=token_sha256,
+        )
+        typer.echo(
+            json.dumps(
+                private_jarvis_service_runtime_authority_document(authority),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+
+    _run_or_exit(action)
 
 
 @storage_app.command("status")
@@ -1750,6 +1795,12 @@ def remote_mcp_refresh(
                         profile_name: {
                             "catalog_revision": catalog.revision,
                             "virtual_tools": sorted(catalog.tools),
+                            "registration_virtual_tools": sorted(
+                                alias
+                                for alias, tool in catalog.tools.items()
+                                if (route := tool.routes.get(cluster)) is not None
+                                and route.server_name == name
+                            ),
                         }
                         for profile_name, catalog in catalogs.items()
                     },

@@ -1699,7 +1699,7 @@ def test_release_report_asset_manifest_enforces_exact_ordered_matrix() -> None:
     ]
     matrix = validate_release_acceptance_matrix(raw_matrix)
     assert matrix["matrix_sha256"] == (
-        "672b0c295fdfa73ab303527add0e0663ba16ffa0654fbabce99fab68dadf8b68"
+        "969a0e753cfbba4fd1f6b1935d490da639c852c061bf13b8f91b780246b572b9"
     )
     reports = cast(list[dict[str, object]], matrix["reports"])
     report_ids = [cast(str, item["id"]) for item in reports]
@@ -1716,7 +1716,7 @@ def test_release_report_asset_manifest_enforces_exact_ordered_matrix() -> None:
 
     binding = cast(dict[str, object], manifest["acceptance_matrix"])
     assert binding["sha256"] == matrix["matrix_sha256"]
-    assert binding["report_count"] == 18
+    assert binding["report_count"] == 19
     manifest_assets = cast(list[dict[str, object]], manifest["assets"])
     assert [cast(str, item["name"]) for item in manifest_assets] == [
         "validation-local.json",

@@ -1,34 +1,55 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
+import threading
+import time
 import urllib.request
 from base64 import b64encode
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from pytest import MonkeyPatch
 
+from clio_relay.browser_gateway import BrowserAttachmentGrant, BrowserDetachmentResult
 from clio_relay.cluster_config import ClusterDefinition, LiveTestConfig
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.live_acceptance import (
     CommandRunner,
     LiveAcceptanceOptions,
+    SecureRuntimeHttpEvidence,
+    SecureRuntimeProbeConfig,
+    SecureRuntimeProtocolAdapter,
     _assert_progress_adapter,  # pyright: ignore[reportPrivateUsage]
+    _assert_secret_free_document,  # pyright: ignore[reportPrivateUsage]
+    _browser_json_observation,  # pyright: ignore[reportPrivateUsage]
+    _browser_sse_observation,  # pyright: ignore[reportPrivateUsage]
+    _BrowserHttpRequestError,  # pyright: ignore[reportPrivateUsage]
     _expected_progress_adapter,  # pyright: ignore[reportPrivateUsage]
     _expected_progress_package,  # pyright: ignore[reportPrivateUsage]
     _find_agent_child_job,  # pyright: ignore[reportPrivateUsage]
     _http_json,  # pyright: ignore[reportPrivateUsage]
+    _packaged_mcp_acceptance_evidence,  # pyright: ignore[reportPrivateUsage]
+    _secure_runtime_probe_config,  # pyright: ignore[reportPrivateUsage]
     _verify_cluster_deployment,  # pyright: ignore[reportPrivateUsage]
     _verify_live_package_progress,  # pyright: ignore[reportPrivateUsage]
     _verify_runtime_metadata_artifact,  # pyright: ignore[reportPrivateUsage]
+    _verify_secure_runtime_acceptance,  # pyright: ignore[reportPrivateUsage]
     run_live_acceptance,
 )
+from clio_relay.mcp_stdio_validation import PackagedMcpStdioSession
+from clio_relay.models import GatewaySession, GatewaySessionState
+from clio_relay.service_runtime import ServiceRuntimeStartResult, ServiceRuntimeStopResult
+from clio_relay.session_lifecycle import CleanupResource
 from clio_relay.validation_report import (
     TransportCleanupResourceEvidence,
     TransportProbeEvidence,
+    ValidationRecorder,
     load_validation_report,
+    new_live_validation_report,
     transport_probe_evidence_line,
 )
 
@@ -289,7 +310,7 @@ def test_live_acceptance_does_not_mark_untrusted_metadata_as_structured() -> Non
         runner=fake_runner,
     )
 
-    assert structured is False
+    assert structured is not None and structured.structured is False
     assert "acceptance.structured_runtime_metadata=ok" not in lines
     assert "acceptance.structured_runtime_scheduler_identity=ok" not in lines
     assert "runtime_metadata.compatibility=acceptance:untrusted_compatibility" in lines
@@ -1947,3 +1968,1160 @@ def _artifact_json(text: str) -> str:
             "data": b64encode(text.encode("utf-8")).decode("ascii"),
         }
     )
+
+
+def test_secure_runtime_probe_config_is_generic_strict_and_bounded() -> None:
+    """Operators can select any package runtime without site or application code."""
+    configured = _secure_runtime_probe_config(
+        """
+name: remote-service
+x_clio_relay:
+  secure_runtime_probe:
+    package_name: builtin.paraview
+    package_id: paraview-7
+    command:
+      command_id: view-command-41
+      schema_version: jarvis.paraview.command.v2
+      operation: set_timestep
+      expected_revision: 4
+      arguments: {index: 1}
+    protocol_adapter:
+      command_request_id_pointer: /command_id
+      health:
+        assertions:
+          /schema_version: jarvis.paraview.health.v1
+          /status: ready
+        service_instance_id_pointer: /service_instance_id
+        revision_pointer: /revision
+      state:
+        assertions: {/schema_version: jarvis.paraview.service-state.v2}
+        service_instance_id_pointer: /service_instance_id
+        execution_id_pointer: /execution_id
+        dataset_descriptor_pointer: /dataset/descriptor
+        revision_pointer: /revision
+      command:
+        assertions:
+          /schema_version: jarvis.paraview.command-result.v2
+          /applied: true
+        service_instance_id_pointer: /state/service_instance_id
+        execution_id_pointer: /state/execution_id
+        dataset_descriptor_pointer: /state/dataset/descriptor
+        revision_pointer: /state/revision
+        command_id_pointer: /command_id
+      events:
+        assertions: {/schema_version: jarvis.paraview.service-state.v2}
+        service_instance_id_pointer: /service_instance_id
+        execution_id_pointer: /execution_id
+        dataset_descriptor_pointer: /dataset/descriptor
+        revision_pointer: /revision
+        event_name: state
+pkgs:
+- pkg_type: builtin.paraview
+"""
+    )
+
+    assert configured == SecureRuntimeProbeConfig(
+        package_name="builtin.paraview",
+        package_id="paraview-7",
+        command={
+            "command_id": "view-command-41",
+            "schema_version": "jarvis.paraview.command.v2",
+            "operation": "set_timestep",
+            "expected_revision": 4,
+            "arguments": {"index": 1},
+        },
+        protocol_adapter=_secure_runtime_protocol_adapter(),
+    )
+    with pytest.raises(ConfigurationError, match="secure_runtime_probe is invalid"):
+        _secure_runtime_probe_config(
+            """
+x_clio_relay:
+  secure_runtime_probe:
+    package_name: site.custom-visualizer
+    command: {command_id: view-command-41, action: set-view}
+    protocol_adapter: {}
+    cluster: hardcoded-site
+"""
+        )
+    with pytest.raises(ConfigurationError, match="secure_runtime_probe is invalid"):
+        _secure_runtime_probe_config(
+            """
+x_clio_relay:
+  secure_runtime_probe:
+    package_name: true
+    browser_attachment_ttl_seconds: "300"
+    command: {command_id: view-command-41, action: set-view}
+    protocol_adapter: {}
+"""
+        )
+
+
+def test_secure_runtime_secret_scanner_rejects_capabilities_without_key_false_positives() -> None:
+    """Secret proof examines values while allowing redacted credential field names."""
+    _assert_secret_free_document(
+        {
+            "api_token": "<redacted>",
+            "secrets_absent": True,
+            "authorization_sha256": "a" * 64,
+        },
+        forbidden_values={"transport-token-value"},
+        label="redacted report",
+    )
+    with pytest.raises(RelayError, match="private capability"):
+        _assert_secret_free_document(
+            {"evidence": "prefix transport-token-value suffix"},
+            forbidden_values={"transport-token-value"},
+            label="leaking report",
+        )
+    with pytest.raises(RelayError, match="browser capability URL"):
+        _assert_secret_free_document(
+            {"url": "http://127.0.0.1:9999/health?capability=abc"},
+            forbidden_values=set(),
+            label="leaking report",
+        )
+
+
+def test_secure_runtime_browser_http_is_direct_strict_bounded_and_deadlined(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Browser probes bypass proxies/redirects and reject slow, duplicate, or flooded data."""
+    paths: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            paths.append(self.path)
+            path = self.path.partition("?")[0]
+            if path == "/redirect":
+                self.send_response(302)
+                self.send_header("Location", "/ok")
+                self.end_headers()
+                return
+            if path == "/flood":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(1024 * 1024 + 1))
+                self.end_headers()
+                return
+            if path == "/slow":
+                payload = b'{"status":"ready"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                for byte in payload:
+                    try:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+                    time.sleep(0.04)
+                return
+            if path == "/events-duplicate":
+                payload = b'event: state\ndata: {"revision":1,"revision":2}\n\n'
+                content_type = "text/event-stream"
+            elif path == "/duplicate":
+                payload = b'{"revision":1,"revision":2}'
+                content_type = "application/json"
+            else:
+                payload = b'{"status":"ready","revision":1}'
+                content_type = "application/json; charset=utf-8"
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = int(server.server_address[1])
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("NO_PROXY", "")
+    try:
+        observation, document = _browser_json_observation(
+            f"http://127.0.0.1:{port}/ok?capability={'a' * 64}",
+            endpoint="health",
+            method="GET",
+            body=None,
+            timeout_seconds=1,
+        )
+        assert observation.status_code == 200
+        assert document["status"] == "ready"
+        ok_requests = sum(path.startswith("/ok?") for path in paths)
+
+        with pytest.raises(_BrowserHttpRequestError) as redirect:
+            _browser_json_observation(
+                f"http://127.0.0.1:{port}/redirect?capability={'a' * 64}",
+                endpoint="health",
+                method="GET",
+                body=None,
+                timeout_seconds=1,
+            )
+        assert redirect.value.kind == "http_302"
+        assert sum(path.startswith("/ok?") for path in paths) == ok_requests
+
+        with pytest.raises(RelayError, match="strict finite JSON"):
+            _browser_json_observation(
+                f"http://127.0.0.1:{port}/duplicate?capability={'a' * 64}",
+                endpoint="state",
+                method="GET",
+                body=None,
+                timeout_seconds=1,
+            )
+        with pytest.raises(RelayError, match="strict finite JSON"):
+            _browser_sse_observation(
+                f"http://127.0.0.1:{port}/events-duplicate?capability={'a' * 64}",
+                timeout_seconds=1,
+                expected_event_name="state",
+            )
+        with pytest.raises(_BrowserHttpRequestError) as flood:
+            _browser_json_observation(
+                f"http://127.0.0.1:{port}/flood?capability={'a' * 64}",
+                endpoint="state",
+                method="GET",
+                body=None,
+                timeout_seconds=1,
+            )
+        assert flood.value.kind == "flood"
+
+        started = time.monotonic()
+        with pytest.raises(_BrowserHttpRequestError) as slow:
+            _browser_json_observation(
+                f"http://127.0.0.1:{port}/slow?capability={'a' * 64}",
+                endpoint="health",
+                method="GET",
+                body=None,
+                timeout_seconds=0.12,
+            )
+        assert slow.value.kind == "deadline"
+        assert time.monotonic() - started < 0.75
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_secure_runtime_acceptance_records_exact_v35_browser_and_cleanup_path(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The release probe emits complete secret-free evidence for one arbitrary target."""
+    cluster = "operator-edge-west"
+    source_job_id = "job_secure_query"
+    source_artifact_id = "artifact_secure_query"
+    gateway_session_id = "gateway_secure_runtime"
+    dataset_descriptor = _secure_runtime_dataset_descriptor()
+    dataset_sha256 = _secure_runtime_json_sha256(dataset_descriptor)
+    assert dataset_sha256 != cast(dict[str, str], dataset_descriptor["fingerprint"])["digest"]
+    handoff = {
+        "cluster": cluster,
+        "source_job_id": source_job_id,
+        "source_artifact_id": source_artifact_id,
+        "package_id": "paraview-7",
+        "package_name": "builtin.paraview",
+        "service_instance_id": "visualizer-service-41",
+    }
+    source_sha256 = "a" * 64
+    binding = {
+        "schema_version": "clio-relay.jarvis-service-runtime-binding.v2",
+        "source_relay_job_id": source_job_id,
+        "source_relay_artifact_id": source_artifact_id,
+        "source_relay_artifact_sha256": source_sha256,
+        "source_tool": "jarvis_get_execution",
+        "jarvis_execution_id": "execution-service-41",
+        "scheduler_provider": "slurm",
+        "scheduler_native_id": "90141",
+        "package_id": "paraview-7",
+        "package_name": "builtin.paraview",
+        "service_instance_id": "visualizer-service-41",
+        "service_revision": 4,
+        "service_report_sha256": "b" * 64,
+        "service_runtime_schema_version": "jarvis.service-runtime.v2",
+        "authorization_sha256": "c" * 64,
+        "dataset_descriptor_sha256": dataset_sha256,
+        "dataset_descriptor": dataset_descriptor,
+    }
+    ready_session = GatewaySession(
+        session_id=gateway_session_id,
+        cluster=cluster,
+        name="site-service",
+        state=GatewaySessionState.READY,
+        scheduler="slurm",
+        scheduler_job_id="90141",
+        queue_state="running",
+        gateway={"jarvis_runtime_binding": binding},
+        metadata={"owner": "clio-relay"},
+    )
+    query_result: dict[str, Any] = {
+        "terminal": True,
+        "state": "succeeded",
+        "cluster": cluster,
+        "job_id": source_job_id,
+        "mcp_result_artifact": {
+            "artifact_id": source_artifact_id,
+            "job_id": source_job_id,
+            "kind": "mcp_result",
+            "sha256": source_sha256,
+        },
+        "service_runtime_bindings": [handoff],
+    }
+    loopback_urls = {
+        name: f"http://127.0.0.1:19041/{name.removesuffix('_url')}"
+        for name in (
+            "connect_url",
+            "health_url",
+            "stream_url",
+            "events_url",
+            "state_url",
+            "command_url",
+        )
+    }
+    bind_result: dict[str, Any] = {
+        "gateway_session_id": gateway_session_id,
+        "gateway_session": ready_session.model_dump(mode="json"),
+        **loopback_urls,
+        "scheduler_cancel_requested": False,
+    }
+    mcp_calls: list[tuple[str, dict[str, Any]]] = []
+
+    def packaged_session(
+        *,
+        profile: str,
+        tool: str,
+        arguments: dict[str, Any],
+        timeout_seconds: float,
+        extra_environment: dict[str, str] | None = None,
+        require_enforceable_containment: bool = False,
+    ) -> PackagedMcpStdioSession:
+        assert profile == "user"
+        assert timeout_seconds > 0
+        assert require_enforceable_containment is True
+        if tool == "relay_bind_jarvis_runtime":
+            assert extra_environment == {
+                "CLIO_RELAY_FRP_TOKEN": "transport-token-value-41",
+                "CLIO_RELAY_STCP_SECRET": "transport-secret-value-41",
+            }
+        else:
+            assert extra_environment is None
+        mcp_calls.append((tool, arguments))
+        payload = query_result if tool == "jarvis_get_execution" else bind_result
+        return _secure_runtime_packaged_session(
+            tool,
+            payload,
+            transcript_sha256=("1" if tool == "jarvis_get_execution" else "2") * 64,
+        )
+
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.run_packaged_mcp_stdio_session",
+        packaged_session,
+    )
+
+    class EmptyGatewayQueue:
+        def list_gateway_sessions_page(
+            self,
+            *,
+            cursor: int,
+            limit: int,
+            cluster: str | None = None,
+        ) -> tuple[list[GatewaySession], int | None, int]:
+            del cursor, limit, cluster
+            return [], None, 0
+
+    def managed_queue(_settings: object) -> EmptyGatewayQueue:
+        return EmptyGatewayQueue()
+
+    monkeypatch.setattr("clio_relay.live_acceptance.storage_managed_queue", managed_queue)
+    monkeypatch.setattr("clio_relay.live_acceptance.ServiceRuntimeSupervisor", _SecureSupervisor)
+    _SecureSupervisor.reset(ready_session)
+
+    json_calls: list[tuple[str, str]] = []
+    state_revision = 4
+
+    def paraview_state(revision: int) -> dict[str, Any]:
+        """Exact released JARVIS ParaView service-state.v2 outer contract."""
+        return {
+            "schema_version": "jarvis.paraview.service-state.v2",
+            "service_instance_id": "visualizer-service-41",
+            "revision": revision,
+            "execution_id": "execution-service-41",
+            "dataset": {
+                "descriptor": dataset_descriptor,
+                "selected_timestep": 1 if revision > 4 else 0,
+            },
+            "pipeline": {"timestep": {"index": 1 if revision > 4 else 0}},
+        }
+
+    def browser_json(
+        _url: str,
+        *,
+        endpoint: str,
+        method: str,
+        body: dict[str, Any] | None,
+        timeout_seconds: float,
+    ) -> tuple[SecureRuntimeHttpEvidence, dict[str, Any]]:
+        nonlocal state_revision
+        assert timeout_seconds > 0
+        json_calls.append((endpoint, method))
+        if endpoint == "command":
+            assert body == {
+                "schema_version": "jarvis.paraview.command.v2",
+                "command_id": "view-command-41",
+                "operation": "set_timestep",
+                "expected_revision": 4,
+                "arguments": {"index": 1},
+            }
+            state_revision = 5
+            document: dict[str, Any] = {
+                "schema_version": "jarvis.paraview.command-result.v2",
+                "command_id": "view-command-41",
+                "operation": "set_timestep",
+                "applied": True,
+                "state": paraview_state(state_revision),
+                "result": {"index": 1},
+            }
+        elif endpoint == "health":
+            assert body is None
+            document = {
+                "schema_version": "jarvis.paraview.health.v1",
+                "status": "ready",
+                "service_instance_id": "visualizer-service-41",
+                "revision": state_revision,
+            }
+        else:
+            assert body is None
+            document = paraview_state(state_revision)
+        return (
+            _secure_runtime_http_evidence(
+                endpoint=cast(Any, endpoint),
+                method=cast(Any, method),
+                digest_character=str(state_revision),
+                revision=state_revision,
+                command_id=document.get("command_id"),
+            ),
+            document,
+        )
+
+    def browser_sse(
+        _url: str,
+        *,
+        timeout_seconds: float,
+        expected_event_name: str,
+    ) -> tuple[SecureRuntimeHttpEvidence, dict[str, Any]]:
+        assert timeout_seconds > 0
+        assert expected_event_name == "state"
+        document = paraview_state(state_revision)
+        return (
+            _secure_runtime_http_evidence(
+                endpoint="events",
+                method="GET",
+                digest_character=str(state_revision),
+                revision=state_revision,
+                command_id=None,
+            ),
+            document,
+        )
+
+    def changed_sse(
+        _url: str,
+        *,
+        previous: SecureRuntimeHttpEvidence,
+        require_change: bool,
+        timeout_seconds: float,
+        poll_seconds: float,
+        expected_event_name: str,
+    ) -> tuple[SecureRuntimeHttpEvidence, dict[str, Any]]:
+        del previous, require_change, timeout_seconds, poll_seconds
+        assert expected_event_name == "state"
+        document = paraview_state(5)
+        return (
+            _secure_runtime_http_evidence(
+                endpoint="events",
+                method="GET",
+                digest_character="5",
+                revision=5,
+                command_id=None,
+            ),
+            document,
+        )
+
+    def changed_state(
+        _url: str,
+        *,
+        previous: SecureRuntimeHttpEvidence,
+        require_change: bool,
+        timeout_seconds: float,
+        poll_seconds: float,
+    ) -> tuple[SecureRuntimeHttpEvidence, dict[str, Any]]:
+        del previous, require_change, timeout_seconds, poll_seconds
+        document = paraview_state(5)
+        return (
+            _secure_runtime_http_evidence(
+                endpoint="state",
+                method="GET",
+                digest_character="6",
+                revision=5,
+                command_id=None,
+            ),
+            document,
+        )
+
+    revoked_urls: list[str] = []
+
+    def revoke(url: str, *, timeout_seconds: float, proxy_stopped: bool) -> None:
+        assert timeout_seconds > 0
+        assert proxy_stopped is True
+        revoked_urls.append(url)
+
+    monkeypatch.setattr("clio_relay.live_acceptance._browser_json_observation", browser_json)
+    monkeypatch.setattr("clio_relay.live_acceptance._browser_sse_observation", browser_sse)
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance._wait_for_changed_sse_event",
+        changed_sse,
+    )
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance._wait_for_changed_browser_state",
+        changed_state,
+    )
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance._assert_browser_capability_revoked",
+        revoke,
+    )
+
+    report = new_live_validation_report(
+        scenario="released-secure-runtime",
+        cluster=cluster,
+        launcher="uv-tool",
+        install_source="pypi:clio-relay",
+        artifact_sha256="d" * 64,
+    )
+    recorder = ValidationRecorder(report)
+    forbidden = _verify_secure_runtime_acceptance(
+        LiveAcceptanceOptions(
+            cluster=cluster,
+            definition=ClusterDefinition(name=cluster, ssh_host="edge-west.invalid"),
+            timeout_seconds=30,
+            poll_seconds=0.01,
+            transport_token="transport-token-value-41",
+            transport_secret_key="transport-secret-value-41",
+        ),
+        config=SecureRuntimeProbeConfig(
+            package_name="builtin.paraview",
+            package_id="paraview-7",
+            command={
+                "schema_version": "jarvis.paraview.command.v2",
+                "command_id": "view-command-41",
+                "operation": "set_timestep",
+                "expected_revision": 4,
+                "arguments": {"index": 1},
+            },
+            protocol_adapter=_secure_runtime_protocol_adapter(),
+        ),
+        runtime_metadata={
+            "pipeline_id": "pipeline-service-41",
+            "execution_id": "execution-service-41",
+        },
+        recorder=recorder,
+    )
+    recorder.finish()
+
+    assert [name for name, _arguments in mcp_calls] == [
+        "jarvis_get_execution",
+        "relay_bind_jarvis_runtime",
+    ]
+    assert mcp_calls[0][1] == {
+        "cluster": cluster,
+        "pipeline_id": "pipeline-service-41",
+        "execution_id": "execution-service-41",
+        "include_service_runtimes": True,
+        "wait_for_terminal": True,
+        "wait_timeout_seconds": 30,
+        "poll_seconds": 0.01,
+    }
+    assert mcp_calls[1][1]["binding"] == handoff
+    assert _SecureSupervisor.calls == [
+        "browser_attach",
+        "browser_detach",
+        "detach",
+        "attach",
+        "browser_attach",
+        "browser_detach",
+        "stop:false",
+    ]
+    assert len(revoked_urls) == 5
+    assert ("health", "GET") in json_calls
+    assert ("state", "GET") in json_calls
+    assert ("command", "POST") in json_calls
+    assert report.status.value == "passed"
+    assert report.cleanup.cancel_scheduler_jobs is False
+    assert report.cleanup.remaining_resources == []
+    evidence = next(
+        reference
+        for check in report.checks
+        for reference in check.evidence
+        if reference.kind == "secure_runtime_acceptance"
+    )
+    metadata = evidence.metadata
+    assert metadata["cluster"] == cluster
+    assert metadata["lifecycle_states"] == ["ready", "degraded", "ready", "closed"]
+    assert metadata["scheduler_cancel_requested"] is False
+    assert metadata["claim_scope"] == "clio-relay-core-lifecycle-and-public-evidence"
+    assert metadata["browser_capability_in_public_evidence"] is False
+    assert metadata["raw_authority_material_in_public_evidence"] is False
+    assert metadata["secret_values_absent_from_public_evidence"] is True
+    binding_resource = next(
+        resource for resource in report.resources if resource.kind == "secure_runtime_binding"
+    )
+    assert binding_resource.state == "ready"
+    assert binding_resource.metadata["source_relay_artifact_sha256"] == source_sha256
+    assert (
+        binding_resource.metadata["evidence_scope"]
+        == "clio-relay-core-lifecycle-and-public-evidence"
+    )
+    assert binding_resource.metadata["query_mcp_containment_enforceable"] is True
+    assert binding_resource.metadata["bind_mcp_containment_enforceable"] is True
+    gateway_resource = next(
+        resource
+        for resource in report.resources
+        if resource.kind == "gateway_session" and resource.resource_id == gateway_session_id
+    )
+    assert gateway_resource.state == "closed"
+    final_resources = [
+        resource
+        for resource in report.resources
+        if resource.kind in {"connector", "gateway_session", "scheduler_job"}
+    ]
+    assert sum(resource.kind == "connector" for resource in final_resources) == 2
+    for resource in final_resources:
+        assert resource.metadata["cancel_scheduler_job"] is False
+        assert resource.metadata["ownership_verified"] is True
+        assert resource.metadata["verified_after_operation"] is True
+        assert resource.metadata["residual"] is False
+    assert len(metadata["browser_attachment_ids"]) == 2
+    _assert_secret_free_document(
+        report.model_dump(mode="json"),
+        forbidden_values=forbidden,
+        label="finished secure runtime report",
+    )
+
+
+def test_secure_runtime_bind_failure_preserves_error_and_attempts_safe_teardown(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A lost bind response recovers its exact new gateway and annotates failed cleanup."""
+    cluster = "operator-lab-two"
+    handoff = {
+        "cluster": cluster,
+        "source_job_id": "job_bind_failure",
+        "source_artifact_id": "artifact_bind_failure",
+        "package_id": "service-2",
+        "package_name": "site.runtime-service",
+        "service_instance_id": "runtime-service-2",
+    }
+    descriptor = _secure_runtime_dataset_descriptor()
+    descriptor_sha256 = _secure_runtime_json_sha256(descriptor)
+    binding = {
+        "schema_version": "clio-relay.jarvis-service-runtime-binding.v2",
+        "source_relay_job_id": handoff["source_job_id"],
+        "source_relay_artifact_id": handoff["source_artifact_id"],
+        "source_relay_artifact_sha256": "4" * 64,
+        "source_tool": "jarvis_get_execution",
+        "jarvis_execution_id": "execution-bind-failure",
+        "scheduler_provider": "slurm",
+        "scheduler_native_id": "902",
+        "package_id": handoff["package_id"],
+        "package_name": handoff["package_name"],
+        "service_instance_id": handoff["service_instance_id"],
+        "service_revision": 1,
+        "service_report_sha256": "5" * 64,
+        "service_runtime_schema_version": "jarvis.service-runtime.v2",
+        "authorization_sha256": "6" * 64,
+        "dataset_descriptor_sha256": descriptor_sha256,
+        "dataset_descriptor": descriptor,
+    }
+    session = GatewaySession(
+        session_id="gateway_bind_failure",
+        cluster=cluster,
+        name="failure-runtime",
+        state=GatewaySessionState.READY,
+        scheduler="slurm",
+        scheduler_job_id="902",
+        gateway={"jarvis_runtime_binding": binding},
+        metadata={"owner": "clio-relay"},
+    )
+    query_result = {
+        "terminal": True,
+        "state": "succeeded",
+        "job_id": handoff["source_job_id"],
+        "mcp_result_artifact": {
+            "artifact_id": handoff["source_artifact_id"],
+            "job_id": handoff["source_job_id"],
+            "kind": "mcp_result",
+            "sha256": "4" * 64,
+        },
+        "service_runtime_bindings": [handoff],
+    }
+    bind_state = {"created": False}
+
+    def packaged_session(
+        *,
+        profile: str,
+        tool: str,
+        arguments: dict[str, Any],
+        timeout_seconds: float,
+        extra_environment: dict[str, str] | None = None,
+        require_enforceable_containment: bool = False,
+    ) -> PackagedMcpStdioSession:
+        del profile, arguments, timeout_seconds, extra_environment
+        assert require_enforceable_containment is True
+        if tool != "jarvis_get_execution":
+            bind_state["created"] = True
+            raise RelayError("simulated lost bind response")
+        return _secure_runtime_packaged_session(
+            tool,
+            query_result,
+            transcript_sha256="7" * 64,
+        )
+
+    class EmptyGatewayQueue:
+        def list_gateway_sessions_page(
+            self,
+            *,
+            cursor: int,
+            limit: int,
+            cluster: str | None = None,
+        ) -> tuple[list[GatewaySession], int | None, int]:
+            del cursor, limit, cluster
+            return ([session], None, 1) if bind_state["created"] else ([], None, 0)
+
+    class FailingCleanupSupervisor(_SecureSupervisor):
+        def stop(
+            self,
+            *,
+            session_id: str,
+            cancel_scheduler_job: bool = False,
+        ) -> ServiceRuntimeStopResult:
+            assert session_id == session.session_id
+            type(self).calls.append(f"stop:{str(cancel_scheduler_job).lower()}")
+            raise RelayError("simulated cleanup failure")
+
+    def managed_queue(_settings: object) -> EmptyGatewayQueue:
+        return EmptyGatewayQueue()
+
+    FailingCleanupSupervisor.reset(session)
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.run_packaged_mcp_stdio_session",
+        packaged_session,
+    )
+    monkeypatch.setattr("clio_relay.live_acceptance.storage_managed_queue", managed_queue)
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.ServiceRuntimeSupervisor",
+        FailingCleanupSupervisor,
+    )
+    recorder = ValidationRecorder(
+        new_live_validation_report(scenario="secure-runtime", cluster=cluster)
+    )
+
+    with pytest.raises(RelayError, match="simulated lost bind response") as failure:
+        _verify_secure_runtime_acceptance(
+            LiveAcceptanceOptions(
+                cluster=cluster,
+                definition=ClusterDefinition(name=cluster, ssh_host="lab-two.invalid"),
+                timeout_seconds=30,
+                poll_seconds=0.01,
+                transport_token="bind-failure-token",
+                transport_secret_key="bind-failure-secret",
+            ),
+            config=SecureRuntimeProbeConfig(
+                package_name="site.runtime-service",
+                package_id="service-2",
+                command={"command_id": "probe-bind-failure", "action": "probe"},
+                protocol_adapter=_secure_runtime_protocol_adapter(),
+            ),
+            runtime_metadata={
+                "pipeline_id": "pipeline-bind-failure",
+                "execution_id": "execution-bind-failure",
+            },
+            recorder=recorder,
+        )
+
+    assert FailingCleanupSupervisor.calls == ["stop:false"]
+    assert any(
+        "simulated cleanup failure" in note for note in getattr(failure.value, "__notes__", [])
+    )
+
+
+def test_packaged_mcp_acceptance_evidence_projects_untrusted_server_info() -> None:
+    """Unknown initialize fields remain process-local and never enter live reports."""
+    secret = "one-time-server-capability-secret"
+    session = _secure_runtime_packaged_session(
+        "jarvis_get_execution",
+        {"job_id": "job-1"},
+        transcript_sha256="7" * 64,
+        server_info_extra={"capability": secret},
+    )
+
+    evidence = _packaged_mcp_acceptance_evidence(
+        session,
+        expected_tool="jarvis_get_execution",
+    )
+    serialized = evidence.model_dump_json()
+
+    assert evidence.server_name == "clio-relay"
+    assert evidence.server_version == "test-wheel"
+    assert "capability" not in serialized
+    assert secret not in serialized
+
+
+def _secure_runtime_dataset_descriptor() -> dict[str, Any]:
+    document: dict[str, Any] = {
+        "schema_version": "jarvis.dataset-descriptor.v1",
+        "dataset_id": "custom-visualizer-dataset",
+        "kind": "temporal-field",
+        "format": "site-native",
+        "members": [{"index": 0, "location": "/datasets/site/run-41/output.bin"}],
+        "arrays": [],
+        "bounds": None,
+        "source_artifact": None,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {**document, "fingerprint": {"algorithm": "sha256", "digest": digest}}
+
+
+def _secure_runtime_json_sha256(document: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _secure_runtime_protocol_adapter() -> SecureRuntimeProtocolAdapter:
+    """Return the application-owned selectors for the released ParaView v2 protocol."""
+    state_selectors = {
+        "service_instance_id_pointer": "/service_instance_id",
+        "execution_id_pointer": "/execution_id",
+        "dataset_descriptor_pointer": "/dataset/descriptor",
+        "revision_pointer": "/revision",
+    }
+    return SecureRuntimeProtocolAdapter.model_validate(
+        {
+            "command_request_id_pointer": "/command_id",
+            "health": {
+                "assertions": {
+                    "/schema_version": "jarvis.paraview.health.v1",
+                    "/status": "ready",
+                },
+                "service_instance_id_pointer": "/service_instance_id",
+                "revision_pointer": "/revision",
+            },
+            "state": {
+                "assertions": {"/schema_version": "jarvis.paraview.service-state.v2"},
+                **state_selectors,
+            },
+            "command": {
+                "assertions": {
+                    "/schema_version": "jarvis.paraview.command-result.v2",
+                    "/applied": True,
+                },
+                "service_instance_id_pointer": "/state/service_instance_id",
+                "execution_id_pointer": "/state/execution_id",
+                "dataset_descriptor_pointer": "/state/dataset/descriptor",
+                "revision_pointer": "/state/revision",
+                "command_id_pointer": "/command_id",
+            },
+            "events": {
+                "assertions": {"/schema_version": "jarvis.paraview.service-state.v2"},
+                **state_selectors,
+                "event_name": "state",
+            },
+        }
+    )
+
+
+def _secure_runtime_packaged_session(
+    tool: str,
+    payload: dict[str, Any],
+    *,
+    transcript_sha256: str,
+    server_info_extra: dict[str, Any] | None = None,
+) -> PackagedMcpStdioSession:
+    result = {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            }
+        ],
+        "structuredContent": payload,
+        "isError": False,
+    }
+    server_info = {"name": "clio-relay", "version": "test-wheel"}
+    if server_info_extra is not None:
+        server_info.update(server_info_extra)
+    tools = [
+        {
+            "name": tool,
+            "description": f"Observed {tool} schema",
+            "inputSchema": {"type": "object", "additionalProperties": False},
+        }
+    ]
+    executable = str((Path.cwd() / "installed" / "clio-relay").resolve())
+    return PackagedMcpStdioSession(
+        command=(executable, "mcp-server", "--profile", "user"),
+        returncode=0,
+        initialize_response={
+            "result": {"protocolVersion": "2024-11-05", "serverInfo": server_info}
+        },
+        tools_list_response={"result": {"tools": tools}},
+        tools_call_response={"result": result},
+        transcript_sha256=transcript_sha256,
+        stderr_sha256="0" * 64,
+        stderr_excerpt="",
+        configured_executable=executable,
+        canonical_executable=executable,
+        executable_sha256="3" * 64,
+        server_info_sha256=_secure_runtime_json_sha256(server_info),
+        tools_list_sha256=_secure_runtime_json_sha256({"tools": tools}),
+        called_tool_schema_sha256=_secure_runtime_json_sha256(tools[0]),
+        jarvis_virtual_tools_sha256="4" * 64,
+        called_tool_name=tool,
+        containment_mode="windows_job_object",
+        containment_enforceable=True,
+    )
+
+
+def _secure_runtime_http_evidence(
+    *,
+    endpoint: Any,
+    method: Any,
+    digest_character: str,
+    revision: int | None = None,
+    command_id: object = None,
+) -> SecureRuntimeHttpEvidence:
+    return SecureRuntimeHttpEvidence(
+        endpoint=endpoint,
+        method=method,
+        status_code=200,
+        content_type=("text/event-stream" if endpoint == "events" else "application/json"),
+        body_sha256=digest_character * 64,
+        body_bytes=32,
+        service_instance_id="visualizer-service-41",
+        execution_id="execution-service-41",
+        dataset_descriptor_sha256=_secure_runtime_json_sha256(_secure_runtime_dataset_descriptor()),
+        command_id=command_id if isinstance(command_id, str) else None,
+        revision=revision,
+    )
+
+
+def _secure_runtime_cleanup_resource(
+    *,
+    kind: str,
+    resource_id: str,
+    action: Any,
+    outcome: Any,
+    gateway_session_id: str,
+    provider: str | None = None,
+    observed_state: str | None = None,
+) -> CleanupResource:
+    return CleanupResource(
+        kind=kind,
+        resource_id=resource_id,
+        location=f"runtime://{gateway_session_id}/{kind}/{resource_id}",
+        action=action,
+        ownership_verified=True,
+        outcome=outcome,
+        provider=provider,
+        verified_after_operation=True,
+        observed_state=observed_state,
+        metadata={"gateway_session_id": gateway_session_id},
+    )
+
+
+class _SecureSupervisor:
+    session: GatewaySession
+    calls: list[str] = []
+    attachment_counter: int = 0
+
+    def __init__(self, **_kwargs: object) -> None:
+        pass
+
+    @classmethod
+    def reset(cls, session: GatewaySession) -> None:
+        cls.session = session
+        cls.calls = []
+        cls.attachment_counter = 0
+
+    def browser_attach(self, *, session_id: str, ttl_seconds: int) -> BrowserAttachmentGrant:
+        assert session_id == self.session.session_id
+        assert ttl_seconds == 300
+        type(self).calls.append("browser_attach")
+        type(self).attachment_counter += 1
+        counter = type(self).attachment_counter
+        capability = ("e" if counter == 1 else "f") * 64
+        base = f"http://127.0.0.1:{19100 + counter}"
+
+        def url(path: str) -> str:
+            return f"{base}/{path}?capability={capability}"
+
+        return BrowserAttachmentGrant(
+            attachment_id=f"browser-secure-{counter}",
+            expires_at="2026-07-19T22:00:00Z",
+            connect_url=url("connect"),
+            health_url=url("health"),
+            stream_url=url("stream"),
+            events_url=url("events"),
+            state_url=url("state"),
+            command_url=url("commands"),
+        )
+
+    def browser_detach(
+        self,
+        *,
+        session_id: str,
+        attachment_id: str,
+    ) -> BrowserDetachmentResult:
+        assert session_id == self.session.session_id
+        type(self).calls.append("browser_detach")
+        return BrowserDetachmentResult(
+            attachment_id=attachment_id,
+            revoked_at="2026-07-19T21:00:00Z",
+            already_revoked=False,
+            proxy_process_id=911,
+            proxy_stopped=True,
+        )
+
+    def detach(self, *, session_id: str) -> ServiceRuntimeStopResult:
+        assert session_id == self.session.session_id
+        type(self).calls.append("detach")
+        self.session = self.session.model_copy(update={"state": GatewaySessionState.DEGRADED})
+        return ServiceRuntimeStopResult(
+            session=self.session,
+            mode="detach",
+            stopped_local_pid=101,
+            stopped_remote_pid=None,
+            canceled_scheduler_job=None,
+            resources=self._cleanup_resources(mode="detach"),
+            errors=[],
+        )
+
+    def attach(self, *, session_id: str) -> ServiceRuntimeStartResult:
+        assert session_id == self.session.session_id
+        type(self).calls.append("attach")
+        self.session = self.session.model_copy(update={"state": GatewaySessionState.READY})
+        return ServiceRuntimeStartResult(
+            session=self.session,
+            connect_url="http://127.0.0.1:19041/connect",
+            health_url="http://127.0.0.1:19041/health",
+            stream_url="http://127.0.0.1:19041/stream",
+            compatibility_urls={},
+            events_url="http://127.0.0.1:19041/events",
+            state_url="http://127.0.0.1:19041/state",
+            command_url="http://127.0.0.1:19041/commands",
+        )
+
+    def stop(
+        self,
+        *,
+        session_id: str,
+        cancel_scheduler_job: bool = False,
+    ) -> ServiceRuntimeStopResult:
+        assert session_id == self.session.session_id
+        type(self).calls.append(f"stop:{str(cancel_scheduler_job).lower()}")
+        self.session = self.session.model_copy(
+            update={
+                "state": GatewaySessionState.CLOSED,
+                "gateway": {
+                    **self.session.gateway,
+                    "teardown_intent": {
+                        "schema_version": "clio-relay.gateway-teardown-intent.v1",
+                        "operation_id": "gateway_cleanup_secure_runtime_41",
+                        "gateway_session_id": self.session.session_id,
+                        "cancel_scheduler_job": False,
+                        "created_at": "2026-07-19T21:00:00Z",
+                    },
+                },
+            }
+        )
+        return ServiceRuntimeStopResult(
+            session=self.session,
+            mode="teardown",
+            stopped_local_pid=102,
+            stopped_remote_pid=202,
+            canceled_scheduler_job=None,
+            resources=self._cleanup_resources(mode="teardown"),
+            errors=[],
+        )
+
+    def _cleanup_resources(self, *, mode: str) -> list[CleanupResource]:
+        session_id = self.session.session_id
+        if mode == "detach":
+            connector_actions = (("desktop_connector", "stop", "stopped"),)
+            remote_action = ("remote_connector", "retain", "retained")
+            gateway_action = ("gateway_record", "retain", "retained")
+        else:
+            connector_actions = (
+                ("desktop_connector", "stop", "stopped"),
+                ("remote_connector", "stop", "stopped"),
+            )
+            remote_action = None
+            gateway_action = ("gateway_record", "close", "closed")
+        scheduler_outcome = "retained" if mode == "detach" else "terminal"
+        scheduler_state = "running" if mode == "detach" else "completed"
+        resources = [
+            _secure_runtime_cleanup_resource(
+                kind=kind,
+                resource_id=f"{kind}-41",
+                action=action,
+                outcome=outcome,
+                gateway_session_id=session_id,
+            )
+            for kind, action, outcome in connector_actions
+        ]
+        if remote_action is not None:
+            kind, action, outcome = remote_action
+            resources.append(
+                _secure_runtime_cleanup_resource(
+                    kind=kind,
+                    resource_id="remote_connector-41",
+                    action=action,
+                    outcome=outcome,
+                    gateway_session_id=session_id,
+                )
+            )
+        resources.extend(
+            [
+                _secure_runtime_cleanup_resource(
+                    kind="scheduler_job",
+                    resource_id="90141",
+                    action="retain",
+                    outcome=scheduler_outcome,
+                    gateway_session_id=session_id,
+                    provider="slurm",
+                    observed_state=scheduler_state,
+                ),
+                _secure_runtime_cleanup_resource(
+                    kind=gateway_action[0],
+                    resource_id=session_id,
+                    action=gateway_action[1],
+                    outcome=gateway_action[2],
+                    gateway_session_id=session_id,
+                ),
+            ]
+        )
+        return resources

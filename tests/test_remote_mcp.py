@@ -39,6 +39,7 @@ from clio_relay.jarvis_mcp import (
     jarvis_user_contract,
 )
 from clio_relay.mcp_server import McpSessionState, handle_request, serve_stdio
+from clio_relay.mcp_stdio_validation import PackagedMcpStdioSession
 from clio_relay.models import JobKind, JobState, McpCallSpec, McpOperation, RelayJob
 from clio_relay.remote_mcp import (
     MAX_REMOTE_MCP_CACHE_BYTES,
@@ -248,7 +249,7 @@ def test_current_scientific_catalog_contract_requires_explicit_handoff(
         command="uvx",
         args=[
             "--from",
-            "/opt/wheels/clio_kit-2.5.17-py3-none-any.whl",
+            "/opt/wheels/clio_kit-2.5.19-py3-none-any.whl",
             "clio-kit",
             "mcp-server",
             "scientific-catalog",
@@ -296,7 +297,7 @@ def test_scientific_catalog_contract_projects_identity_to_live_report() -> None:
         command="uvx",
         args=[
             "--from",
-            "/opt/wheels/clio_kit-2.5.17-py3-none-any.whl",
+            "/opt/wheels/clio_kit-2.5.19-py3-none-any.whl",
             "clio-kit",
             "mcp-server",
             "scientific-catalog",
@@ -2605,8 +2606,26 @@ def test_cli_refresh_ingests_only_terminal_discovery_artifact(
     registration = _registration(
         profiles=["user"], env_from={"SCIENCE_TOKEN": "SITE_SCIENCE_TOKEN"}
     )
-    ClusterRegistry(clusters={"alpha": _cluster("alpha", {"science": registration})}).save(
-        tmp_path / ".clio-relay" / "clusters.json"
+    other_registration = _registration(namespace="software", profiles=["user"])
+    ClusterRegistry(
+        clusters={
+            "alpha": _cluster(
+                "alpha",
+                {"science": registration, "spack": other_registration},
+            )
+        }
+    ).save(tmp_path / ".clio-relay" / "clusters.json")
+    other_entry = _entry(other_registration, cluster="alpha", server_name="spack")
+    current_time = datetime.now(UTC)
+    other_entry = other_entry.model_copy(
+        update={
+            "discovered_at": current_time,
+            "expires_at": current_time + timedelta(hours=1),
+        }
+    )
+    RemoteMcpSchemaCache.update_entry(
+        tmp_path / ".clio-relay" / "remote-mcp-cache.json",
+        other_entry,
     )
 
     def complete_discovery(
@@ -2649,7 +2668,11 @@ def test_cli_refresh_ingests_only_terminal_discovery_artifact(
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["cache_entry"]["provenance"]["discovery_job_id"] == payload["discovery_job_id"]
-    assert payload["profiles"]["user"]["virtual_tools"] == ["remote_science_inspect"]
+    assert payload["profiles"]["user"]["virtual_tools"] == [
+        "remote_science_inspect",
+        "remote_software_inspect",
+    ]
+    assert payload["profiles"]["user"]["registration_virtual_tools"] == ["remote_science_inspect"]
     cache = RemoteMcpSchemaCache.load(tmp_path / ".clio-relay" / "remote-mcp-cache.json")
     assert cache.entry_for("alpha", "science") is not None
 
@@ -4855,7 +4878,7 @@ def test_cli_validate_catalog_waits_and_projects_automatic_assertion(
         command="uvx",
         args=[
             "--from",
-            "/opt/wheels/clio_kit-2.5.17-py3-none-any.whl",
+            "/opt/wheels/clio_kit-2.5.19-py3-none-any.whl",
             "clio-kit",
             "mcp-server",
             "scientific-catalog",
@@ -5286,6 +5309,70 @@ def _transition_stdio(*, alias: str, job_id: str) -> dict[str, object]:
         "tools_list_response": {"result": {"tools": [{"name": alias}]}},
         "tools_call_response": {"result": {"structuredContent": {"job_id": job_id}}},
     }
+
+
+def test_remote_acceptance_consumes_safe_packaged_session_projection() -> None:
+    """Acceptance reads the safe projection without depending on process-local responses."""
+    alias = "remote_science_inspect"
+    job_id = "job-safe-stdio"
+    session = PackagedMcpStdioSession(
+        command=("/verified/clio-relay", "mcp-server", "--profile", "user"),
+        returncode=0,
+        initialize_response={
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "clio-relay", "version": "1.4.0"},
+            }
+        },
+        tools_list_response={
+            "result": {
+                "tools": [
+                    {
+                        "name": alias,
+                        "description": "Inspect science data.",
+                        "inputSchema": {"type": "object"},
+                    }
+                ]
+            }
+        },
+        tools_call_response={
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {"job_id": job_id},
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    }
+                ],
+                "structuredContent": {"job_id": job_id},
+                "isError": False,
+            }
+        },
+        transcript_sha256="1" * 64,
+        stderr_sha256="2" * 64,
+        stderr_excerpt="",
+        configured_executable="/verified/clio-relay",
+        canonical_executable="/verified/clio-relay",
+        executable_sha256="3" * 64,
+        server_info_sha256="4" * 64,
+        tools_list_sha256="5" * 64,
+        called_tool_schema_sha256="6" * 64,
+        jarvis_virtual_tools_sha256="7" * 64,
+        called_tool_name=alias,
+        containment_mode="windows_job_object",
+        containment_enforceable=True,
+    )
+    evidence = session.evidence()
+    private = cast(Any, remote_mcp)
+
+    assert private._stdio_initialize_passed(evidence)
+    assert private._stdio_listed_tool_names(evidence) == {alias}
+    assert private._stdio_call_job_id(evidence) == job_id
+    assert "initialize_response" not in evidence
 
 
 def _spack_configuration_observation(
