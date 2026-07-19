@@ -38,6 +38,7 @@ BROWSER_CLIENT_REQUEST_DEADLINE_SECONDS = 15.0
 BROWSER_OVERLOAD_IO_TIMEOUT_SECONDS = 1.0
 BROWSER_OVERLOAD_REQUEST_DEADLINE_SECONDS = 1.0
 UPSTREAM_CONNECT_TIMEOUT_SECONDS = 5.0
+UPSTREAM_COMMAND_RESPONSE_TIMEOUT_SECONDS = 900.0
 UPSTREAM_IDLE_TIMEOUT_SECONDS = 60.0
 _CAPABILITY_QUERY_KEY = "capability"
 _ALLOWED_REQUEST_HEADERS = frozenset({"accept", "cache-control", "content-type", "last-event-id"})
@@ -601,6 +602,17 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
             request_headers["Authorization"] = self.capability_server.upstream_authorization
         response_started = False
         try:
+            # Keep connection establishment tightly bounded, then allow an
+            # authenticated command to perform real remote work before it emits
+            # response headers.  HTTPConnection otherwise reuses its connect
+            # timeout while getresponse() waits for those headers.
+            connection.connect()
+            if (
+                connection.sock is not None
+                and self.command == "POST"
+                and urllib.parse.urlsplit(target).path == config.command_path
+            ):
+                connection.sock.settimeout(UPSTREAM_COMMAND_RESPONSE_TIMEOUT_SECONDS)
             connection.request(self.command, target, body=body, headers=request_headers)
             response = connection.getresponse()
             if connection.sock is not None:
