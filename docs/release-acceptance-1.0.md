@@ -1,10 +1,12 @@
 # 1.0 live acceptance runbook
 
-This is the operator procedure for collecting the non-local evidence required
-by [`release-gate-1.0.yaml`](release-gate-1.0.yaml). Run the complete procedure
-twice: once against the exact draft wheel and once against the released public
-PyPI artifact. A candidate report cannot be renamed or reused as released
-evidence.
+This is the optional formal operator procedure for collecting the non-local
+evidence required by [`release-gate-1.0.yaml`](release-gate-1.0.yaml). It does
+not block the normal release-first patch publication process documented in
+[`release.md`](release.md). When this formal acceptance procedure is used, run
+it completely twice: once against the exact draft wheel and once against the
+released public PyPI artifact. A candidate report cannot be renamed or reused
+as released evidence.
 
 `ares` and `homelab` below are the concrete physical evidence instances selected
 by the 1.0 release policy. They are not product allowlists. Any operator can
@@ -56,7 +58,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.3.34"
+$Version = "1.3.35"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }
@@ -837,7 +839,7 @@ cannot satisfy either requirement.
 
 ## Run the scientific catalog v1.1 contract
 
-Use the exact clio-kit 2.5.14 persistent executable installed and receipt-bound
+Use the exact clio-kit 2.5.15 persistent executable installed and receipt-bound
 by bootstrap. The catalog file is operator-owned site metadata supplied through
 `CLIO_RELAY_VALIDATION_ARES_SCIENTIFIC_CATALOG_FILE`; it is not copied into the
 relay release. This policy uses
