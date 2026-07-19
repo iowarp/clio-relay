@@ -352,6 +352,105 @@ def test_browser_gateway_streams_post_command_revision_before_sse_closes(
             ]
 
 
+def test_browser_gateway_keeps_two_sse_streams_across_application_idle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A quiet state/frame pair receives a later revision without reconnecting."""
+
+    # HTTPResponse owns a no-length SSE socket after headers.  Before the fix it
+    # therefore retained this connect timeout instead of receiving the intended
+    # post-header stream policy.
+    monkeypatch.setattr(browser_gateway_module, "UPSTREAM_CONNECT_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(browser_gateway_module, "UPSTREAM_IDLE_TIMEOUT_SECONDS", 0.75)
+    ownership: list[tuple[bool, bool, bool]] = []
+    closed_responses: list[int] = []
+    response_lock = threading.Lock()
+    original_getresponse = http.client.HTTPConnection.getresponse
+    original_close = http.client.HTTPResponse.close
+
+    def observed_getresponse(
+        connection: http.client.HTTPConnection,
+    ) -> http.client.HTTPResponse:
+        response = original_getresponse(connection)
+        with response_lock:
+            ownership.append(
+                (
+                    connection.sock is None,
+                    response.will_close,
+                    getattr(response, "fp", None) is not None,
+                )
+            )
+        return response
+
+    def observed_close(response: http.client.HTTPResponse) -> None:
+        with response_lock:
+            closed_responses.append(id(response))
+        original_close(response)
+
+    monkeypatch.setattr(http.client.HTTPConnection, "getresponse", observed_getresponse)
+    monkeypatch.setattr(http.client.HTTPResponse, "close", observed_close)
+    with _idle_sse_pair_backend() as (backend_port, release_revision, requests):
+        capability = "i" * 43
+        with _capability_proxy(
+            backend_port=backend_port,
+            capability=capability,
+            revocation_path=tmp_path / "revoked-idle-pair",
+        ) as proxy_port:
+            query = urlencode({"capability": capability})
+            received: dict[str, list[int]] = {"/events": [], "/live-data": []}
+            initial_pair = threading.Event()
+
+            def consume(path: str) -> None:
+                url = f"http://127.0.0.1:{proxy_port}{path}?{query}"
+                with httpx.stream(
+                    "GET",
+                    url,
+                    headers={"Origin": "null"},
+                    timeout=2.0,
+                ) as response:
+                    assert response.status_code == 200
+                    for line in response.iter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        revision = int(json.loads(line.removeprefix("data: "))["revision"])
+                        received[path].append(revision)
+                        if all(values for values in received.values()):
+                            initial_pair.set()
+                        if revision == 10:
+                            return
+
+            consumers = [
+                threading.Thread(target=consume, args=(path,), daemon=True) for path in received
+            ]
+            for consumer in consumers:
+                consumer.start()
+            assert initial_pair.wait(timeout=2.0)
+
+            # Exceed the connection-establishment timeout while remaining
+            # inside the post-header idle policy.  Both response-owned SSE
+            # sockets must receive that later policy instead of disconnecting.
+            time.sleep(0.25)
+            release_revision.set()
+            for consumer in consumers:
+                consumer.join(timeout=2.0)
+                assert not consumer.is_alive()
+
+            assert received == {"/events": [1, 10], "/live-data": [1, 10]}
+            assert requests == ["/events", "/live-data"] or requests == [
+                "/live-data",
+                "/events",
+            ]
+            assert ownership == [(True, True, True), (True, True, True)]
+            close_deadline = time.monotonic() + 2.0
+            while time.monotonic() < close_deadline:
+                with response_lock:
+                    if len(set(closed_responses)) == 2:
+                        break
+                time.sleep(0.01)
+            assert len(set(closed_responses)) == 2
+
+
 def test_browser_gateway_bounds_long_lived_requests_and_recovers_slots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -800,6 +899,54 @@ def _revision_sse_backend(
     try:
         yield int(server.server_address[1]), requests
     finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@contextmanager
+def _idle_sse_pair_backend() -> Generator[tuple[int, threading.Event, list[str]]]:
+    requests: list[str] = []
+    requests_lock = threading.Lock()
+    release_revision = threading.Event()
+
+    class BackendHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:  # noqa: N802
+            path = self.path.partition("?")[0]
+            with requests_lock:
+                requests.append(path)
+            if path not in {"/events", "/live-data"}:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            event_name = "state" if path == "/events" else "frame"
+            with suppress(BrokenPipeError, ConnectionResetError, OSError):
+                self.wfile.write(f'event: {event_name}\nid: 1\ndata: {{"revision":1}}\n\n'.encode())
+                self.wfile.flush()
+                if not release_revision.wait(timeout=2.0):
+                    return
+                self.wfile.write(
+                    f'event: {event_name}\nid: 10\ndata: {{"revision":10}}\n\n'.encode()
+                )
+                self.wfile.flush()
+                self.close_connection = True
+
+        def log_message(self, format: str, *args: Any) -> None:
+            del format, args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), BackendHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield int(server.server_address[1]), release_revision, requests
+    finally:
+        release_revision.set()
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)

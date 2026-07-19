@@ -601,27 +601,30 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         if self.capability_server.upstream_authorization is not None:
             request_headers["Authorization"] = self.capability_server.upstream_authorization
         response_started = False
+        response: http.client.HTTPResponse | None = None
         try:
             # Keep connection establishment tightly bounded, then allow an
             # authenticated command to perform real remote work before it emits
             # response headers.  HTTPConnection otherwise reuses its connect
             # timeout while getresponse() waits for those headers.
             connection.connect()
-            if (
-                connection.sock is not None
-                and self.command == "POST"
-                and urllib.parse.urlsplit(target).path == config.command_path
+            upstream_socket = connection.sock
+            if upstream_socket is None:
+                raise OSError("upstream connection has no socket")
+            if self.command == "POST" and urllib.parse.urlsplit(target).path == (
+                config.command_path
             ):
-                connection.sock.settimeout(UPSTREAM_COMMAND_RESPONSE_TIMEOUT_SECONDS)
+                upstream_socket.settimeout(UPSTREAM_COMMAND_RESPONSE_TIMEOUT_SECONDS)
             connection.request(self.command, target, body=body, headers=request_headers)
             response = connection.getresponse()
-            if connection.sock is not None:
-                connection.sock.settimeout(UPSTREAM_IDLE_TIMEOUT_SECONDS)
             media_type = response.getheader("Content-Type", "").partition(";")[0].strip()
-            close_downstream = (
-                media_type.casefold() == "text/event-stream"
-                or response.getheader("Content-Length") is None
-            )
+            is_event_stream = media_type.casefold() == "text/event-stream"
+            # A no-length HTTP response transfers socket ownership from
+            # HTTPConnection to HTTPResponse, so connection.sock is commonly
+            # already None for SSE here.  Keep the exact connected socket and
+            # apply the post-header policy to it directly.
+            upstream_socket.settimeout(UPSTREAM_IDLE_TIMEOUT_SECONDS)
+            close_downstream = is_event_stream or response.getheader("Content-Length") is None
             self.send_response(response.status, response.reason)
             for name, value in response.getheaders():
                 if name.casefold() not in _STRIPPED_RESPONSE_HEADERS:
@@ -650,6 +653,9 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
                 with suppress(BrokenPipeError, ConnectionResetError, OSError):
                     self._error(502, "upstream service is unavailable")
         finally:
+            if response is not None:
+                with suppress(OSError):
+                    response.close()
             connection.close()
 
     def _request_body(self) -> bytes | None:
