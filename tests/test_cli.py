@@ -6020,7 +6020,9 @@ def test_cli_mcp_call_rejects_public_admission_class_option(
     )
 
     assert result.exit_code == 2
-    assert "No such option: --admission-class" in result.output
+    output = unstyle(result.output)
+    assert "No such option" in output
+    assert "--admission-class" in output
 
 
 def test_cli_arbitrary_tools_list_remains_workload(
