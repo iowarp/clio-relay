@@ -868,13 +868,13 @@ def _bootstrap_preflight_over_ssh(
             "BOOTSTRAP_HELP_STATUS=$?",
             "set -e",
             'if [ "$BOOTSTRAP_HELP_STATUS" -ne 0 ]; then',
-            '  if printf \'%s\\n\' "$BOOTSTRAP_HELP_OUTPUT" | '
+            "  if printf '%s\\n' \"$BOOTSTRAP_HELP_OUTPUT\" | "
             "grep -Eqi "
             "'no such command.*bootstrap-inspect|bootstrap-inspect.*no such command'; then",
             "    echo bootstrap_preflight_unsupported=missing_command",
             "    exit 0",
             "  fi",
-            '  printf \'%s\\n\' "$BOOTSTRAP_HELP_OUTPUT" >&2',
+            "  printf '%s\\n' \"$BOOTSTRAP_HELP_OUTPUT\" >&2",
             '  exit "$BOOTSTRAP_HELP_STATUS"',
             "fi",
             "set +e",
@@ -887,7 +887,7 @@ def _bootstrap_preflight_over_ssh(
             "BOOTSTRAP_PREFLIGHT_STATUS=$?",
             "set -e",
             'if [ "$BOOTSTRAP_PREFLIGHT_STATUS" -ne 0 ]; then',
-            '  printf \'%s\\n\' "$BOOTSTRAP_PREFLIGHT_OUTPUT" >&2',
+            "  printf '%s\\n' \"$BOOTSTRAP_PREFLIGHT_OUTPUT\" >&2",
             '  exit "$BOOTSTRAP_PREFLIGHT_STATUS"',
             "fi",
             "printf '%s\\n' \"$BOOTSTRAP_PREFLIGHT_OUTPUT\"",
@@ -1264,7 +1264,14 @@ def _validate_bootstrap_receipt(
         "bootstrap_profile": receipt.get("bootstrap_profile") == bootstrap_profile,
         "relay_install_spec": receipt.get("relay_install_spec") == relay_install_spec,
         "desired_fingerprint": receipt.get("desired_fingerprint") == desired_fingerprint,
-        "outcome": outcome in {"noop_verified", "repaired", "reconciled", "full"},
+        "outcome": outcome
+        in {
+            "noop_verified",
+            "verified_after_transfer",
+            "repaired",
+            "reconciled",
+            "full",
+        },
         "install_receipt_sha256": _is_sha256_value(install_receipt_sha256),
         "duration_seconds": (
             not isinstance(duration, bool) and isinstance(duration, (int, float)) and duration >= 0
@@ -1340,6 +1347,10 @@ def _validate_bootstrap_receipt(
         )
     ):
         raise RelayError("bootstrap performed a forbidden scheduler or generation operation")
+    payload_count = cast(int, typed_operations["payload_transfer_count"])
+    payload_bytes = cast(int, typed_operations["payload_transfer_bytes"])
+    if payload_count not in {0, 2} or (payload_count == 0) != (payload_bytes == 0):
+        raise RelayError("bootstrap payload transfer evidence is inconsistent")
     assert isinstance(preservation, dict)
     typed_preservation = cast(dict[str, object], preservation)
     if typed_preservation != {
@@ -1419,8 +1430,7 @@ def _validate_bootstrap_receipt(
             not isinstance(raw_command, list)
             or not raw_command
             or any(
-                not isinstance(value, str) or not value
-                for value in cast(list[object], raw_command)
+                not isinstance(value, str) or not value for value in cast(list[object], raw_command)
             )
             for raw_command in typed_command_argv
         )
@@ -1451,12 +1461,29 @@ def _validate_bootstrap_receipt(
             or typed_jarvis_preservation.get("resource_graph_byte_identical") is not True
         ):
             raise RelayError("bootstrap no-op receipt reported mutation")
+    elif outcome == "verified_after_transfer":
+        if (
+            any(action != "reused" for action in component_actions.values())
+            or typed_operations["download_count"] != 0
+            or typed_operations["service_restart_count"] != 0
+            or typed_operations["service_start_count"] != 0
+            or typed_operations["service_stop_count"] != 0
+            or typed_operations["service_enable_count"] != 0
+            or payload_count != 2
+            or payload_bytes <= 0
+            or queue_action != "verified_read_only"
+            or queue_duration != 0
+            or jarvis_init_action != "preserved"
+            or jarvis_graph_action != "preserved"
+            or command_count != 0
+            or typed_jarvis_preservation.get("config_byte_identical") is not True
+            or typed_jarvis_preservation.get("resource_graph_byte_identical") is not True
+        ):
+            raise RelayError("post-transfer verification receipt reported mutation")
     elif outcome == "repaired":
         if (
             any(action != "reused" for action in component_actions.values())
             or typed_operations["download_count"] != 0
-            or typed_operations["payload_transfer_count"] != 0
-            or typed_operations["payload_transfer_bytes"] != 0
         ):
             raise RelayError("bootstrap repair receipt reported component replacement")
         if jarvis_init_action != "preserved":
@@ -1478,6 +1505,8 @@ def _validate_bootstrap_receipt(
             raise RelayError("relay-only reconcile reported JARVIS initialization")
         if jarvis_graph_action != "preserved" or command_count != 0:
             raise RelayError("relay-only reconcile reported JARVIS commands")
+        if payload_count != 2 or payload_bytes <= 0:
+            raise RelayError("relay-only reconcile omitted its transferred payload evidence")
     elif outcome == "full":
         if any(action != "prepared" for action in component_actions.values()):
             raise RelayError("fresh bootstrap receipt has invalid component actions")
@@ -1485,6 +1514,8 @@ def _validate_bootstrap_receipt(
             raise RelayError("fresh bootstrap did not report JARVIS initialization")
         if jarvis_graph_action != "built" or command_count != 2:
             raise RelayError("fresh bootstrap did not report init plus graph build")
+        if payload_count != 2 or payload_bytes <= 0:
+            raise RelayError("fresh bootstrap omitted its transferred payload evidence")
 
 
 def _is_sha256_value(value: object) -> bool:
@@ -2191,8 +2222,7 @@ bootstrap_relay_only_reconcile() {{
   export BOOTSTRAP_LEGACY_IDENTITY
   if [ ! -f "$BOOTSTRAP_GENERATION/.prepared" ]; then
     mkdir -m 0700 "$BOOTSTRAP_GENERATION"
-    mkdir -p "$BOOTSTRAP_GENERATION/source" "$BOOTSTRAP_GENERATION/bin" \
-      "$BOOTSTRAP_GENERATION/tools"
+    mkdir -p "$BOOTSTRAP_GENERATION/bin" "$BOOTSTRAP_GENERATION/tools"
     SOURCE_ARCHIVE={rendered_source_archive}
     SOURCE_ARCHIVE_SHA256={rendered_source_archive_sha256}
     if [ -z "$SOURCE_ARCHIVE_SHA256" ]; then
@@ -2200,20 +2230,8 @@ bootstrap_relay_only_reconcile() {{
       return 1
     fi
     echo "$SOURCE_ARCHIVE_SHA256 *$SOURCE_ARCHIVE" | sha256sum --check --strict -
-    "$BOOTSTRAP_PLAN_PROVIDER" - "$SOURCE_ARCHIVE" "$BOOTSTRAP_GENERATION/source" \
-      <<'__CLIO_RELAY_SAFE_EXTRACT__'
-import sys
-import tarfile
-from pathlib import Path
-
-archive = Path(sys.argv[1])
-destination = Path(sys.argv[2])
-with tarfile.open(archive, "r:") as stream:
-    members = stream.getmembers()
-    if len(members) > 100_000 or sum(member.size for member in members) > 4 * 1024**3:
-        raise SystemExit("bootstrap source archive exceeds extraction bounds")
-    stream.extractall(destination, members=members, filter="data")
-__CLIO_RELAY_SAFE_EXTRACT__
+    bootstrap_safe_extract \
+      "$BOOTSTRAP_PLAN_PROVIDER" "$SOURCE_ARCHIVE" "$BOOTSTRAP_GENERATION/source"
 
     DEST="$BOOTSTRAP_GENERATION/source"
     RELAY_INSTALL_SPEC={rendered_relay_install_spec}
@@ -2751,6 +2769,8 @@ receipt = make_bootstrap_receipt(
     queue_duration_seconds=(
         int(os.environ["BOOTSTRAP_QUEUE_DURATION_NS"]) / 1_000_000_000
     ),
+    payload_transfer_count=int(os.environ["BOOTSTRAP_PAYLOAD_TRANSFER_COUNT"]),
+    payload_transfer_bytes=int(os.environ["BOOTSTRAP_PAYLOAD_TRANSFER_BYTES"]),
 )
 destination = Path.home() / ".local/share/clio-relay/bootstrap-receipt.json"
 write_bootstrap_receipt(destination, receipt)
@@ -2965,6 +2985,8 @@ receipt = make_bootstrap_receipt(
     queue_duration_seconds=(
         int(os.environ["BOOTSTRAP_QUEUE_DURATION_NS"]) / 1_000_000_000
     ),
+    payload_transfer_count=int(os.environ["BOOTSTRAP_PAYLOAD_TRANSFER_COUNT"]),
+    payload_transfer_bytes=int(os.environ["BOOTSTRAP_PAYLOAD_TRANSFER_BYTES"]),
 )
 destination = Path.home() / ".local/share/clio-relay/bootstrap-receipt.json"
 write_bootstrap_receipt(destination, receipt)
@@ -3100,6 +3122,14 @@ def render_linux_user_bootstrap_script(
         "ascii"
     )
     candidate_reconcile_sha256 = hashlib.sha256(candidate_reconcile_source).hexdigest()
+    candidate_safe_archive_source = Path(__file__).with_name("safe_archive.py").read_bytes()
+    rendered_candidate_safe_archive_source = base64.b64encode(candidate_safe_archive_source).decode(
+        "ascii"
+    )
+    candidate_safe_archive_sha256 = hashlib.sha256(candidate_safe_archive_source).hexdigest()
+    candidate_errors_source = Path(__file__).with_name("errors.py").read_bytes()
+    rendered_candidate_errors_source = base64.b64encode(candidate_errors_source).decode("ascii")
+    candidate_errors_sha256 = hashlib.sha256(candidate_errors_source).hexdigest()
     relay_only_reconcile = _relay_only_reconcile_script(
         worker_fence=worker_fence,
         worker_recheck=worker_recheck,
@@ -3198,7 +3228,33 @@ fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
 __CLIO_RELAY_BOOTSTRAP_LOCK_VERIFY__
 BOOTSTRAP_INVOCATION_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
 BOOTSTRAP_INVOCATION_STARTED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
+read -r BOOTSTRAP_PAYLOAD_TRANSFER_COUNT BOOTSTRAP_PAYLOAD_TRANSFER_BYTES < <(
+  python3 - "$0" {rendered_source_archive} <<'__CLIO_RELAY_PAYLOAD_IDENTITY__'
+import os
+import stat
+import sys
+from pathlib import Path
+
+total = 0
+for value in sys.argv[1:]:
+    path = Path(value)
+    before = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(before.st_mode):
+        raise SystemExit(f"bootstrap payload is not one regular file: {{path}}")
+    total += before.st_size
+    after = path.lstat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise SystemExit(f"bootstrap payload changed during inspection: {{path}}")
+print(len(sys.argv) - 1, total)
+__CLIO_RELAY_PAYLOAD_IDENTITY__
+)
 export BOOTSTRAP_INVOCATION_STARTED_AT BOOTSTRAP_INVOCATION_STARTED_NS
+export BOOTSTRAP_PAYLOAD_TRANSFER_COUNT BOOTSTRAP_PAYLOAD_TRANSFER_BYTES
 AGENT_NPM_PACKAGE={rendered_agent_npm_package}
 AGENT_NPM_BIN={rendered_agent_npm_bin}
 AGENT_BIN=""
@@ -3320,7 +3376,7 @@ if inspection.exact_match:
     receipt = make_bootstrap_receipt(
         invocation_id=sys.argv[1],
         desired=desired,
-        outcome="noop_verified",
+        outcome="verified_after_transfer",
         inspection=inspection,
         started_at=datetime.fromisoformat(os.environ["BOOTSTRAP_INVOCATION_STARTED_AT"]),
         transaction=None,
@@ -3329,6 +3385,8 @@ if inspection.exact_match:
         duration_seconds=(completed_ns - started_ns) / 1_000_000_000,
         downloads=[],
         service_restart_count=0,
+        payload_transfer_count=int(os.environ["BOOTSTRAP_PAYLOAD_TRANSFER_COUNT"]),
+        payload_transfer_bytes=int(os.environ["BOOTSTRAP_PAYLOAD_TRANSFER_BYTES"]),
     )
     destination = Path.home() / ".local/share/clio-relay/bootstrap-receipt.json"
     write_bootstrap_receipt(destination, receipt)
@@ -3449,6 +3507,84 @@ __CLIO_RELAY_CANDIDATE_RECONCILE__
 fi
 echo "{candidate_reconcile_sha256} *$BOOTSTRAP_CANDIDATE_RECONCILE" | \
   sha256sum --check --strict -
+BOOTSTRAP_CANDIDATE_PYTHON_ROOT="$BOOTSTRAP_PREPARING_ROOT/candidate-python"
+BOOTSTRAP_CANDIDATE_PACKAGE="$BOOTSTRAP_CANDIDATE_PYTHON_ROOT/clio_relay"
+if [ -L "$BOOTSTRAP_CANDIDATE_PYTHON_ROOT" ] || \
+   [ -L "$BOOTSTRAP_CANDIDATE_PACKAGE" ]; then
+  echo "bootstrap candidate package root must not be a symbolic link" >&2
+  exit 1
+fi
+mkdir -m 0700 -p "$BOOTSTRAP_CANDIDATE_PACKAGE"
+python3 - "$BOOTSTRAP_CANDIDATE_PACKAGE" <<'__CLIO_RELAY_CANDIDATE_SAFE_ARCHIVE__'
+import base64
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+destination = Path(sys.argv[1])
+sources = {{
+    "__init__.py": b"\"\"\"Bootstrap candidate package.\"\"\"\n",
+    "errors.py": base64.b64decode(
+        "{rendered_candidate_errors_source}",
+        validate=True,
+    ),
+    "safe_archive.py": base64.b64decode(
+        "{rendered_candidate_safe_archive_source}",
+        validate=True,
+    ),
+}}
+for name, payload in sources.items():
+    path = destination / name
+    try:
+        observed = path.read_bytes()
+    except FileNotFoundError:
+        with path.open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(path, 0o600)
+        observed = payload
+    if observed != payload:
+        raise SystemExit(f"bootstrap candidate source identity changed: {{name}}")
+    print(f"bootstrap_candidate_source={{name}}:{{hashlib.sha256(observed).hexdigest()}}")
+__CLIO_RELAY_CANDIDATE_SAFE_ARCHIVE__
+echo "{candidate_errors_sha256} *$BOOTSTRAP_CANDIDATE_PACKAGE/errors.py" | \
+  sha256sum --check --strict -
+echo "{candidate_safe_archive_sha256} *$BOOTSTRAP_CANDIDATE_PACKAGE/safe_archive.py" | \
+  sha256sum --check --strict -
+export BOOTSTRAP_CANDIDATE_PYTHON_ROOT
+bootstrap_safe_extract() {{
+  local provider="$1"
+  local archive="$2"
+  local destination="$3"
+  PYTHONPATH="$BOOTSTRAP_CANDIDATE_PYTHON_ROOT" \
+    "$provider" - "$archive" "$destination" \
+      <<'__CLIO_RELAY_SAFE_EXTRACT__'
+import json
+import sys
+from pathlib import Path
+
+from clio_relay.safe_archive import safe_extract_tar
+
+receipt = safe_extract_tar(Path(sys.argv[1]), Path(sys.argv[2]))
+print(
+    "bootstrap_archive_extraction="
+    + json.dumps(
+        {{
+            "archive_bytes": receipt.archive_bytes,
+            "destination": str(receipt.destination),
+            "directory_count": receipt.directory_count,
+            "extracted_bytes": receipt.extracted_bytes,
+            "member_count": receipt.member_count,
+            "regular_file_count": receipt.regular_file_count,
+        }},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+)
+__CLIO_RELAY_SAFE_EXTRACT__
+}}
 BOOTSTRAP_PLAN_MODE="full"
 BOOTSTRAP_PLAN_JSON=""
 BOOTSTRAP_PLAN_PROVIDER=""
@@ -3688,13 +3824,12 @@ JARVIS_MCP_VERSION="$JARVIS_MCP_INSTALLED_VERSION"
 
 DEST="$HOME/.local/src/clio-relay"
 rm -rf "$DEST"
-mkdir -p "$DEST"
 SOURCE_ARCHIVE={rendered_source_archive}
 SOURCE_ARCHIVE_SHA256={rendered_source_archive_sha256}
 if [ -n "$SOURCE_ARCHIVE_SHA256" ]; then
   echo "$SOURCE_ARCHIVE_SHA256 *$SOURCE_ARCHIVE" | sha256sum --check --strict -
 fi
-tar -xf "$SOURCE_ARCHIVE" -C "$DEST"
+bootstrap_safe_extract "$JARVIS_VENV/bin/python" "$SOURCE_ARCHIVE" "$DEST"
 RELAY_INSTALL_SPEC={rendered_relay_install_spec}
 RELAY_ARTIFACT_SHA256={rendered_relay_artifact_sha256}
 RELAY_INSTALL_TARGET="$RELAY_INSTALL_SPEC"
@@ -4370,6 +4505,8 @@ receipt = make_bootstrap_receipt(
     jarvis_init_duration_seconds=(
         int(os.environ["BOOTSTRAP_JARVIS_INIT_DURATION_NS"]) / 1_000_000_000
     ),
+    payload_transfer_count=int(os.environ["BOOTSTRAP_PAYLOAD_TRANSFER_COUNT"]),
+    payload_transfer_bytes=int(os.environ["BOOTSTRAP_PAYLOAD_TRANSFER_BYTES"]),
 )
 destination = Path.home() / ".local/share/clio-relay/bootstrap-receipt.json"
 write_bootstrap_receipt(destination, receipt)
