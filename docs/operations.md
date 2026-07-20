@@ -25,6 +25,18 @@ share a version string. A fresh bootstrap may finish with the endpoint service
 reported as `pending_install`; the explicit `install-endpoint-service` command
 above owns unit creation and activation.
 
+Bootstrap is an install/reconcile operation, not a desktop-session startup
+requirement. An ordinary reconnect reuses the persistent endpoint directly.
+When an operator explicitly repeats bootstrap with the same release artifact,
+an exact healthy deployment must finish end to end within 30 seconds without
+reading or transferring the wheel, downloading components, invoking JARVIS,
+changing its configuration or resource graph, or touching scheduler state. If
+only the already-installed managed endpoint service is stopped, bootstrap may
+perform one bounded service activation and must converge within 60 seconds;
+that repair still performs no payload, component, JARVIS, or scheduler work.
+The bootstrap validation report records the observed outcome, total duration,
+operation counts, component actions, and byte-preservation evidence.
+
 An enabled endpoint worker is expected to survive every desktop disconnect and
 the operator's final cluster logout. Before installing it, verify the cluster's
 systemd user manager is persistent:
@@ -41,7 +53,8 @@ worker. It may stop after the last login and is not eligible for live release
 claims. Desktop detach and default teardown never stop either service; only an
 explicit `session teardown --stop-worker` does. The persistent unit restarts
 after both clean and failed worker-process exits; an explicit systemd stop is
-still respected and remains stopped until an operator starts it again.
+still respected and remains stopped until an operator starts it again or runs
+an explicit bootstrap reconciliation that reports the bounded service repair.
 
 Worker capacity is part of the cluster definition, not a property reconstructed
 from whichever restart command happened to run last. New and legacy cluster
