@@ -59,6 +59,10 @@ def _marker_path(root: Path) -> Path:
     return root / "migrations" / "legacy-output-v1.json"
 
 
+def _record_audit_marker_path(root: Path) -> Path:
+    return root / "migrations" / "legacy-record-audit-v1.json"
+
+
 def _no_migration_fault(_phase: str, _path: Path) -> None:
     return
 
@@ -285,7 +289,7 @@ def test_complete_marker_detects_deleted_migration_evidence(
     tmp_path: Path,
     deleted: str,
 ) -> None:
-    """The bounded receipt manifest distinguishes evidence loss from completion."""
+    """Indexed startup is O(1); access and bounded reseal still detect evidence loss."""
     root = tmp_path / deleted
     job_id = "job_marker_evidence"
     _write_v09_output_event(
@@ -301,6 +305,13 @@ def test_complete_marker_detects_deleted_migration_evidence(
     if deleted == "all":
         _event_path(root, job_id, 1).unlink()
 
+    reopened = ClioCoreQueue(root)
+    reopened.initialize()
+    if deleted != "all":
+        with pytest.raises(LegacyQueueStateError):
+            reopened.read_event_page(job_id)
+
+    _record_audit_marker_path(root).unlink()
     with pytest.raises(LegacyQueueStateError):
         ClioCoreQueue(root).initialize()
 
@@ -308,7 +319,7 @@ def test_complete_marker_detects_deleted_migration_evidence(
 def test_complete_marker_detects_schema_valid_retired_receipt_corruption(
     tmp_path: Path,
 ) -> None:
-    """The marker manifest authenticates retired receipt bytes after large data is gone."""
+    """A bounded explicit reseal authenticates retired evidence without startup scans."""
     root = tmp_path / "retired-corruption"
     job_id = "job_retired_corruption"
     _write_v09_output_event(
@@ -344,6 +355,8 @@ def test_complete_marker_detects_schema_valid_retired_receipt_corruption(
     receipt["archive_sha256"] = "c" * 64
     retired.write_text(json.dumps(receipt), encoding="utf-8")
 
+    ClioCoreQueue(root).initialize()
+    _record_audit_marker_path(root).unlink()
     with pytest.raises(LegacyQueueStateError, match="marker totals"):
         ClioCoreQueue(root).initialize()
 

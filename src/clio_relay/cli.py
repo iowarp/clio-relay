@@ -17,7 +17,7 @@ from collections import Counter
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from json import JSONDecodeError
 from pathlib import Path, PurePosixPath
 from time import monotonic, sleep
@@ -37,6 +37,15 @@ from clio_relay.bootstrap import (
     install_local_frp,
     package_source_root,
 )
+from clio_relay.bootstrap_reconcile import (
+    BootstrapDesiredState,
+    bootstrap_invocation_lock,
+    inspect_exact_bootstrap_noop,
+    make_bootstrap_receipt,
+    repair_managed_jarvis_binding,
+    write_bootstrap_receipt,
+)
+from clio_relay.bounded_process import BoundedProcessError, run_bounded_process
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
     ClusterDefinition,
@@ -2931,6 +2940,15 @@ def cluster_bootstrap(
             help="Local clio-relay wheel to include in the bootstrap archive.",
         ),
     ] = None,
+    relay_artifact_sha256: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "Expected lowercase SHA-256 for --relay-wheel. Supplying released "
+                "artifact provenance keeps exact no-op bootstrap payload-free."
+            ),
+        ),
+    ] = None,
     report: Annotated[
         Path | None,
         typer.Option(help="Canonical cluster-bootstrap JSON path. Defaults under .clio-relay."),
@@ -2963,12 +2981,22 @@ def cluster_bootstrap(
         raise
 
     def action() -> None:
+        expected_artifact_sha256 = relay_artifact_sha256
+        if expected_artifact_sha256 is not None and (
+            re.fullmatch(r"[0-9a-f]{64}", expected_artifact_sha256) is None
+        ):
+            raise ConfigurationError("relay artifact SHA-256 must be lowercase hex")
+        if relay_wheel is not None and expected_artifact_sha256 is None:
+            raise ConfigurationError(
+                "--relay-wheel requires --relay-artifact-sha256 so preflight never reads "
+                "payload bytes before deciding whether transfer is needed"
+            )
         validation = new_live_validation_report(
             scenario="cluster-bootstrap",
             cluster=cluster,
             launcher=validation_launcher,
             install_source=validation_install_source,
-            artifact_sha256=sha256_file(relay_wheel) if relay_wheel is not None else None,
+            artifact_sha256=expected_artifact_sha256,
         )
         recorder = ValidationRecorder(validation)
         try:
@@ -2984,7 +3012,7 @@ def cluster_bootstrap(
                     core_dir=definition.core_dir,
                     spool_dir=definition.spool_dir,
                     relay_wheel=relay_wheel,
-                    relay_artifact_sha256=validation.install_source.artifact_sha256,
+                    relay_artifact_sha256=expected_artifact_sha256,
                     agent_adapter=definition.agent_adapter,
                     agent_npm_package=definition.agent_npm_package,
                     agent_npm_bin=definition.agent_npm_bin,
@@ -5711,6 +5739,23 @@ def queue_migration_status(
         return
     status_payload = ClioCoreQueue(RelaySettings.from_env().core_dir).index_migration_status()
     typer.echo(json.dumps(status_payload, indent=2))
+
+
+@queue_app.command("readiness-info")
+def queue_readiness_info(
+    cluster: Annotated[
+        str | None,
+        typer.Option(help="Configured cluster to inspect over SSH, or local storage."),
+    ] = None,
+) -> None:
+    """Verify the sealed fixed queue layout without initialization or repair."""
+    if _try_remote_cluster_passthrough(cluster, ["queue", "readiness-info"]):
+        return
+    try:
+        payload = ClioCoreQueue(RelaySettings.from_env().core_dir).readiness_info()
+    except (RelayError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(json.dumps(payload, indent=2))
 
 
 @queue_app.command("repair-lease-indexes")
@@ -8766,6 +8811,252 @@ def agent_render_mcp_config(
 def show_installation_info() -> None:
     """Print the current package identity and durable cluster install receipt."""
     _run_or_exit(lambda: typer.echo(json.dumps(installation_info(), indent=2, default=str)))
+
+
+@app.command("bootstrap-inspect", hidden=True)
+def bootstrap_inspect(
+    invocation_id: Annotated[
+        str,
+        typer.Option(help="Unique bootstrap invocation identity."),
+    ],
+) -> None:
+    """Perform one payload-free, read-only exact bootstrap inspection."""
+
+    def _inspect_locked() -> None:
+        encoded = os.environ.get("CLIO_RELAY_BOOTSTRAP_DESIRED_STATE_BASE64", "")
+        if not encoded or len(encoded) > 128 * 1024:
+            raise ConfigurationError("bootstrap desired state environment is missing or oversized")
+        if re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", invocation_id) is None:
+            raise ConfigurationError("bootstrap invocation identity is invalid")
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+            if len(raw) > 64 * 1024:
+                raise ConfigurationError("bootstrap desired state exceeds its decoded bound")
+            desired = BootstrapDesiredState.model_validate_json(raw)
+        except (binascii.Error, UnicodeError, ValidationError, ValueError) as exc:
+            raise ConfigurationError("bootstrap desired state is invalid") from exc
+        started_at = datetime.now(UTC)
+        started = monotonic()
+        deadline = started + 50.0
+
+        def run_systemctl(
+            arguments: list[str], *, timeout_seconds: float
+        ) -> subprocess.CompletedProcess[str]:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise ConfigurationError("bootstrap inspection exceeded its total deadline")
+            try:
+                return run_bounded_process(
+                    ["systemctl", "--user", *arguments],
+                    timeout_seconds=min(timeout_seconds, remaining),
+                    stdout_maximum_bytes=4096,
+                    stderr_maximum_bytes=4096,
+                )
+            except (OSError, BoundedProcessError) as exc:
+                raise ConfigurationError(
+                    f"bounded systemd inspection failed: {arguments[0]}"
+                ) from exc
+
+        inspection_started = monotonic()
+        current_installation = installation_info()
+        service_active: bool | None = None
+        service_enabled: bool | None = None
+        if desired.worker_service is not None:
+            active_result = run_systemctl(
+                ["is-active", "--quiet", desired.worker_service],
+                timeout_seconds=5,
+            )
+            enabled_result = run_systemctl(
+                ["is-enabled", "--quiet", desired.worker_service],
+                timeout_seconds=5,
+            )
+            service_active = active_result.returncode == 0
+            service_enabled = enabled_result.returncode == 0
+        queue_evidence = ClioCoreQueue(RelaySettings.from_env().core_dir).readiness_info()
+        worker_evidence: dict[str, object] | None = None
+        if service_active is True and desired.cluster is not None:
+            try:
+                worker_evidence = worker_runtime_info(
+                    cluster=desired.cluster,
+                    current_installation=current_installation,
+                )
+            except (RelayError, ValueError) as exc:
+                worker_evidence = {
+                    "schema_version": "clio-relay.worker-runtime-info.v1",
+                    "cluster": desired.cluster,
+                    "running": False,
+                    "error": str(exc),
+                }
+        inspection = inspect_exact_bootstrap_noop(
+            desired,
+            service_was_active=service_active,
+            service_was_enabled=service_enabled,
+            queue_evidence=queue_evidence,
+            worker_evidence=worker_evidence,
+            installation_snapshot=current_installation,
+        )
+        initial_service_active = service_active
+        initial_service_enabled = service_enabled
+        initial_inspection_reasons = list(inspection.reasons)
+        initial_jarvis_state = inspection.jarvis_state
+        service_start_count = 0
+        service_enable_count = 0
+        service_restart_count = 0
+        repository_reconciliation: dict[str, object] | None = None
+        repairable_reasons = {
+            "managed endpoint service is inactive",
+            "managed endpoint service is disabled",
+            "active endpoint worker readiness did not verify",
+        }
+        repository_reasons = [
+            reason
+            for reason in inspection.reasons
+            if reason == "the exact relay-managed JARVIS repository is not registered"
+            or reason.startswith("relay-managed JARVIS repository")
+        ]
+        if repository_reasons and all(
+            reason in repairable_reasons or reason in repository_reasons
+            for reason in inspection.reasons
+        ):
+            binding = repair_managed_jarvis_binding(desired)
+            raw_repository_evidence = binding.get("repositories")
+            if not isinstance(raw_repository_evidence, dict):
+                raise ConfigurationError("managed JARVIS repair omitted repository evidence")
+            repository_reconciliation = {
+                str(key): value
+                for key, value in cast(dict[object, object], raw_repository_evidence).items()
+            }
+            inspection = inspect_exact_bootstrap_noop(
+                desired,
+                service_was_active=service_active,
+                service_was_enabled=service_enabled,
+                queue_evidence=queue_evidence,
+                worker_evidence=worker_evidence,
+                installation_snapshot=current_installation,
+            )
+        if (
+            desired.worker_service is not None
+            and inspection.reasons
+            and set(inspection.reasons).issubset(repairable_reasons)
+        ):
+            load_state = run_systemctl(
+                [
+                    "show",
+                    "--property=LoadState",
+                    "--value",
+                    desired.worker_service,
+                ],
+                timeout_seconds=5,
+            )
+            if (
+                load_state.returncode == 0
+                and len(load_state.stdout.encode()) <= 1024
+                and load_state.stdout.strip() == "loaded"
+            ):
+                if service_enabled is not True:
+                    enabled = run_systemctl(
+                        ["enable", desired.worker_service],
+                        timeout_seconds=15,
+                    )
+                    if enabled.returncode != 0:
+                        raise ConfigurationError("managed endpoint service could not be enabled")
+                    service_enable_count = 1
+                if service_active is True:
+                    started_service = run_systemctl(
+                        ["restart", desired.worker_service],
+                        timeout_seconds=20,
+                    )
+                    if started_service.returncode != 0:
+                        raise ConfigurationError("managed endpoint service could not be restarted")
+                    service_restart_count = 1
+                else:
+                    started_service = run_systemctl(
+                        ["start", desired.worker_service],
+                        timeout_seconds=20,
+                    )
+                    if started_service.returncode != 0:
+                        raise ConfigurationError("managed endpoint service could not be started")
+                    service_start_count = 1
+                worker_deadline = min(deadline, monotonic() + 30)
+                worker_evidence = None
+                while monotonic() < worker_deadline:
+                    try:
+                        worker_evidence = worker_runtime_info(
+                            cluster=desired.cluster or "",
+                            current_installation=current_installation,
+                        )
+                    except (RelayError, ValueError):
+                        sleep(0.25)
+                        continue
+                    if worker_evidence.get("running") is True:
+                        break
+                    sleep(0.25)
+                service_active = True
+                service_enabled = True
+                inspection = inspect_exact_bootstrap_noop(
+                    desired,
+                    service_was_active=True,
+                    service_was_enabled=True,
+                    queue_evidence=queue_evidence,
+                    worker_evidence=worker_evidence,
+                    installation_snapshot=current_installation,
+                )
+        payload: dict[str, object] = {
+            "schema_version": "clio-relay.bootstrap-preflight.v1",
+            "exact_match": inspection.exact_match,
+            "desired_fingerprint": desired.fingerprint,
+            "reasons": inspection.reasons,
+            "receipt": None,
+        }
+        if inspection.exact_match:
+            inspection_duration = monotonic() - inspection_started
+            outcome: Literal["noop_verified", "repaired"] = (
+                "repaired"
+                if service_start_count
+                or service_enable_count
+                or service_restart_count
+                or repository_reconciliation is not None
+                else "noop_verified"
+            )
+            receipt = make_bootstrap_receipt(
+                invocation_id=invocation_id,
+                desired=desired,
+                outcome=outcome,
+                inspection=inspection,
+                started_at=started_at,
+                transaction=None,
+                previous_generation=inspection.active_generation,
+                active_generation=inspection.active_generation,
+                duration_seconds=monotonic() - started,
+                inspection_duration_seconds=inspection_duration,
+                service_start_count=service_start_count,
+                service_enable_count=service_enable_count,
+                service_restart_count=service_restart_count,
+                initial_inspection_reasons=initial_inspection_reasons,
+                jarvis_state_before=initial_jarvis_state,
+                jarvis_repo_reconciliation=repository_reconciliation,
+                service_active_before=initial_service_active,
+                service_enabled_before=initial_service_enabled,
+                service_active_after=service_active,
+                service_enabled_after=service_enabled,
+            )
+            write_bootstrap_receipt(
+                Path.home() / ".local/share/clio-relay/bootstrap-receipt.json",
+                receipt,
+            )
+            payload["receipt"] = receipt
+            payload["action"] = outcome
+        else:
+            payload["action"] = "payload_required"
+        typer.echo(
+            "bootstrap_preflight_json=" + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        )
+
+    def _inspect() -> None:
+        with bootstrap_invocation_lock(timeout_seconds=5):
+            _inspect_locked()
+
+    _run_or_exit(_inspect)
 
 
 @app.command("doctor")

@@ -1,0 +1,693 @@
+"""Focused contracts for idempotent, crash-safe bootstrap reconciliation."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import stat
+import subprocess
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+
+import clio_relay.bootstrap_reconcile as bootstrap_reconcile_module
+from clio_relay.bootstrap_reconcile import (
+    BootstrapDesiredState,
+    BootstrapTransactionJournal,
+    BootstrapTransactionState,
+    bootstrap_invocation_lock,
+    execution_environment_identity,
+    inspect_exact_bootstrap_noop,
+    inspect_jarvis_state,
+    inspect_prepared_generation,
+    jarvis_wrapper_payload,
+    make_bootstrap_receipt,
+    plan_bootstrap_reconcile,
+    reconcile_managed_jarvis_repository,
+    write_jarvis_wrapper,
+)
+from clio_relay.errors import ConfigurationError
+
+
+def _digest(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _desired(*, uv_sha256: str, frpc_sha256: str, frps_sha256: str) -> BootstrapDesiredState:
+    return BootstrapDesiredState(
+        cluster="cluster-a",
+        core_dir="~/.local/share/clio-relay/core",
+        spool_dir="~/.local/share/clio-relay/spool",
+        worker_service="clio-relay-endpoint-cluster-a.service",
+        relay_install_spec="clio-relay==1.5.0",
+        relay_artifact_sha256="a" * 64,
+        relay_source_identity=f"wheel:sha256:{'a' * 64}",
+        frp_version="0.69.1",
+        frpc_sha256=frpc_sha256,
+        frps_sha256=frps_sha256,
+        uv_version="0.11.28",
+        uv_sha256=uv_sha256,
+        jarvis_util_commit="commit",
+        jarvis_cd_version="1.4.4",
+        jarvis_cd_wheel_url="https://example.test/jarvis.whl",
+        jarvis_cd_wheel_sha256="c" * 64,
+        clio_kit_install_spec="https://example.test/clio-kit.whl",
+        clio_kit_version="2.3.1",
+        clio_kit_artifact_sha256="d" * 64,
+        agent_adapter="exec",
+    )
+
+
+def _write_jarvis_state(home: Path, desired: BootstrapDesiredState) -> tuple[Path, bytes, bytes]:
+    root = home / ".ppi-jarvis"
+    root.mkdir(parents=True)
+    for relative in (
+        ".local/share/clio-relay/jarvis-config",
+        ".local/share/clio-relay/jarvis-private",
+        ".local/share/clio-relay/jarvis-shared",
+        ".local/share/clio-relay/managed-jarvis-repo",
+    ):
+        (home / relative).mkdir(parents=True)
+    config = {
+        "config_dir": str((home / ".local/share/clio-relay/jarvis-config").resolve()),
+        "private_dir": str((home / ".local/share/clio-relay/jarvis-private").resolve()),
+        "shared_dir": str((home / ".local/share/clio-relay/jarvis-shared").resolve()),
+        "current_pipeline": "operator-pipeline",
+        "hostfile": "/operator/hostfile",
+        "operator_extension": {"preserve": True},
+    }
+    config_bytes = yaml.safe_dump(config, sort_keys=False).encode()
+    repos_bytes = yaml.safe_dump(
+        {
+            "repos": [
+                str((home / ".local/share/clio-relay/managed-jarvis-repo").absolute()),
+                "/operator/clio_relay",
+            ]
+        },
+        sort_keys=False,
+    ).encode()
+    graph_bytes = b"storage:\n  nvme:\n    capacity: 100\nnetwork:\n  fabric: infiniband\n"
+    (root / "jarvis_config.yaml").write_bytes(config_bytes)
+    (root / "repos.yaml").write_bytes(repos_bytes)
+    (root / "resource_graph.yaml").write_bytes(graph_bytes)
+    return root, config_bytes, graph_bytes
+
+
+def _installation_info(desired: BootstrapDesiredState) -> dict[str, object]:
+    return {
+        "schema_version": "clio-relay.installation-info.v1",
+        "receipt_matches_install": True,
+        "receipt": {
+            "install_spec": desired.relay_install_spec,
+            "artifact_sha256": desired.relay_artifact_sha256,
+            "deployment_fingerprint": desired.fingerprint,
+            "deployment_manifest": desired.model_dump(mode="json"),
+            "generation": desired.fingerprint,
+            "components": {
+                "clio-relay": "1.5.0",
+                "clio-kit": desired.clio_kit_version,
+                "jarvis-cd": desired.jarvis_cd_version,
+                "jarvis-util": desired.jarvis_util_commit,
+            },
+        },
+        "component_runtime": {
+            "clio-relay": {"persistent_tool_verified": True},
+            "clio-kit": {
+                "artifact_identity_verified": True,
+                "command_matches_receipt": True,
+                "locked_server_runtime_verified": True,
+                "native_execution_capability_verified": True,
+                "persistent_tool_verified": True,
+            },
+            "jarvis-cd": {"verified": True},
+        },
+    }
+
+
+def test_exact_noop_is_read_only_and_preserves_operator_jarvis_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bin_dir = tmp_path / ".local/bin"
+    bin_dir.mkdir(parents=True)
+    binaries = {"uv": b"uv", "frpc": b"frpc", "frps": b"frps"}
+    for name, content in binaries.items():
+        path = bin_dir / name
+        path.write_bytes(content)
+        path.chmod(0o755)
+    desired = _desired(
+        uv_sha256=_digest(binaries["uv"]),
+        frpc_sha256=_digest(binaries["frpc"]),
+        frps_sha256=_digest(binaries["frps"]),
+    )
+    root, config_before, graph_before = _write_jarvis_state(tmp_path, desired)
+    generation = tmp_path / ".local/share/clio-relay/generations" / desired.fingerprint
+    generation.mkdir(parents=True)
+    monkeypatch.setattr(
+        "clio_relay.bootstrap_reconcile._inspect_active_generation",
+        lambda *_args, **_kwargs: (desired.fingerprint, str(generation.resolve())),
+    )
+    receipt_path = tmp_path / ".local/share/clio-relay/install-receipt.json"
+    receipt_path.write_text("{}\n", encoding="utf-8")
+    before = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in (
+            receipt_path,
+            root / "jarvis_config.yaml",
+            root / "repos.yaml",
+            root / "resource_graph.yaml",
+        )
+    }
+    monkeypatch.setattr(
+        "clio_relay.bootstrap_reconcile.installation_info",
+        lambda _path: _installation_info(desired),
+    )
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "run_bounded_process",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            ["uv", "--version"], 0, "uv 0.11.28\n", ""
+        ),
+    )
+
+    inspection = inspect_exact_bootstrap_noop(
+        desired,
+        home=tmp_path,
+        service_was_active=True,
+        service_was_enabled=True,
+        queue_evidence={
+            "schema_version": "clio-relay.queue-readiness.v1",
+            "complete": True,
+            "sealed": True,
+            "repair_required": False,
+        },
+        worker_evidence={
+            "schema_version": "clio-relay.worker-runtime-info.v1",
+            "cluster": "cluster-a",
+            "fresh": True,
+            "process_running": True,
+            "identity_matches_current": True,
+            "running": True,
+        },
+    )
+
+    assert inspection.exact_match is True
+    assert inspection.reasons == []
+    assert inspection.active_generation == desired.fingerprint
+    assert inspection.current_generation_target == str(generation.resolve())
+    assert (root / "jarvis_config.yaml").read_bytes() == config_before
+    assert (root / "resource_graph.yaml").read_bytes() == graph_before
+    assert {
+        path: (path.read_bytes(), path.stat().st_mtime_ns) for path in before
+    } == before
+
+
+def test_matching_receipt_with_tampered_runtime_is_not_a_noop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bin_dir = tmp_path / ".local/bin"
+    bin_dir.mkdir(parents=True)
+    for name, content in (("uv", b"uv"), ("frpc", b"frpc"), ("frps", b"frps")):
+        path = bin_dir / name
+        path.write_bytes(content)
+        path.chmod(0o755)
+    desired = _desired(
+        uv_sha256=_digest(b"uv"),
+        frpc_sha256=_digest(b"frpc"),
+        frps_sha256=_digest(b"frps"),
+    )
+    _write_jarvis_state(tmp_path, desired)
+    receipt_path = tmp_path / ".local/share/clio-relay/install-receipt.json"
+    receipt_path.write_text("{}\n", encoding="utf-8")
+    info = _installation_info(desired)
+    runtime = info["component_runtime"]
+    assert isinstance(runtime, dict)
+    runtime["clio-relay"] = {"persistent_tool_verified": False}
+    monkeypatch.setattr(
+        "clio_relay.bootstrap_reconcile.installation_info", lambda _path: info
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            ["uv", "--version"], 0, "uv 0.11.28\n", ""
+        ),
+    )
+
+    inspection = inspect_exact_bootstrap_noop(
+        desired,
+        home=tmp_path,
+        service_was_active=False,
+        service_was_enabled=True,
+        queue_evidence={
+            "schema_version": "clio-relay.queue-readiness.v1",
+            "complete": True,
+            "sealed": True,
+            "repair_required": False,
+        },
+        worker_evidence=None,
+    )
+
+    assert inspection.exact_match is False
+    assert "clio-relay persistent tool identity did not verify" in inspection.reasons
+    assert "managed endpoint service is inactive" in inspection.reasons
+
+
+def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bin_dir = tmp_path / ".local/bin"
+    bin_dir.mkdir(parents=True)
+    for name, content in (("uv", b"uv"), ("frpc", b"frpc"), ("frps", b"frps")):
+        path = bin_dir / name
+        path.write_bytes(content)
+        path.chmod(0o755)
+    desired = _desired(
+        uv_sha256=_digest(b"uv"),
+        frpc_sha256=_digest(b"frpc"),
+        frps_sha256=_digest(b"frps"),
+    )
+    _write_jarvis_state(tmp_path, desired)
+    legacy_python = tmp_path / ".local/share/clio-relay/jarvis-venv" / (
+        "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    )
+    legacy_python.parent.mkdir(parents=True)
+    legacy_python.write_bytes(b"python")
+    legacy_python.chmod(0o755)
+    jarvis_util_checkout = tmp_path / ".local/src/jarvis-util"
+    (jarvis_util_checkout / ".git").mkdir(parents=True)
+    receipt_path = tmp_path / ".local/share/clio-relay/install-receipt.json"
+    receipt_path.write_text("{}\n", encoding="utf-8")
+    clio_kit_wheel = tmp_path / "clio-kit.whl"
+    jarvis_wheel = tmp_path / "jarvis-cd.whl"
+    clio_kit_wheel.write_bytes(b"clio-kit")
+    jarvis_wheel.write_bytes(b"jarvis")
+    desired = desired.model_copy(
+        update={
+            "clio_kit_artifact_sha256": _digest(b"clio-kit"),
+            "jarvis_cd_wheel_sha256": _digest(b"jarvis"),
+        }
+    )
+    info = _installation_info(desired)
+    receipt = info["receipt"]
+    assert isinstance(receipt, dict)
+    receipt.pop("deployment_fingerprint")
+    receipt.pop("deployment_manifest")
+    receipt["component_artifacts"] = {
+        "clio-kit": {
+            "artifact_sha256": desired.clio_kit_artifact_sha256,
+            "runtime_artifact_path": str(clio_kit_wheel),
+            "runtime_interpreters": {"provider": "/tools/clio-kit/python"},
+            "runtime_executables": {"clio-kit": "/tools/clio-kit/bin/clio-kit"},
+        },
+        "jarvis-cd": {
+            "artifact_sha256": desired.jarvis_cd_wheel_sha256,
+            "runtime_artifact_path": str(jarvis_wheel),
+            "runtime_interpreters": {"execution": str(legacy_python)},
+            "runtime_executables": {"jarvis": str(legacy_python.parent / "jarvis")},
+        },
+    }
+    monkeypatch.setattr(
+        "clio_relay.bootstrap_reconcile.installation_info", lambda _path: info
+    )
+    def identity_command(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if command[:2] != [str(bin_dir / "uv"), "--version"]:
+            raise AssertionError(command)  # pragma: no cover
+        return subprocess.CompletedProcess(command, 0, "uv 0.11.28\n", "")
+
+    def bounded_identity(command: list[str], *, maximum: int) -> str:
+        assert maximum > 0
+        if command[:3] == ["git", "-C", str(jarvis_util_checkout)]:
+            return "commit" if "rev-parse" in command else ""
+        if command[0] == str(legacy_python):
+            return json.dumps(
+                {
+                    "name": "jarvis-util",
+                    "direct_url": json.dumps({"url": jarvis_util_checkout.resolve().as_uri()}),
+                    "record": True,
+                }
+            )
+        raise AssertionError(command)  # pragma: no cover
+
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "run_bounded_process",
+        identity_command,
+    )
+    monkeypatch.setattr(
+        "clio_relay.bootstrap_reconcile._bounded_subprocess",
+        bounded_identity,
+    )
+
+    plan = plan_bootstrap_reconcile(desired, home=tmp_path)
+
+    assert plan.mode == "relay-only", plan.reasons
+    assert plan.component_actions == {
+        "clio-relay": "replace",
+        "jarvis-cd": "reuse",
+        "jarvis-util": "reuse",
+        "clio-kit": "reuse",
+        "frp": "reuse",
+        "uv": "reuse",
+    }
+    assert plan.reusable_paths["jarvis_execution_environment"] == str(
+        (tmp_path / ".local/share/clio-relay/jarvis-venv").resolve()
+    )
+
+
+def test_existing_operator_jarvis_roots_are_adopted_without_mutation(tmp_path: Path) -> None:
+    desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
+    root, config_before, graph_before = _write_jarvis_state(tmp_path, desired)
+    config = yaml.safe_load(config_before)
+    operator_shared = tmp_path / "operator-shared"
+    operator_shared.mkdir()
+    config["shared_dir"] = str(operator_shared.resolve())
+    mismatched = yaml.safe_dump(config, sort_keys=False).encode()
+    (root / "jarvis_config.yaml").write_bytes(mismatched)
+
+    evidence = inspect_jarvis_state(desired, home=tmp_path)
+
+    assert evidence.initialized is True
+    assert evidence.roots["shared_dir"] == str(operator_shared.resolve())
+    assert (root / "jarvis_config.yaml").read_bytes() == mismatched
+    assert (root / "resource_graph.yaml").read_bytes() == graph_before
+
+
+def test_managed_repo_reconcile_preserves_same_name_operator_repository(tmp_path: Path) -> None:
+    repos_file = tmp_path / "repos.yaml"
+    operator_repo = tmp_path / "operator/clio_relay"
+    previous_managed = tmp_path / "legacy/clio_relay"
+    managed_repo = tmp_path / "relay/managed-jarvis-repo"
+    repos_file.write_text(
+        yaml.safe_dump(
+            {
+                "repos": [str(operator_repo.absolute()), str(previous_managed.absolute())],
+                "operator_extension": {"preserve": True},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    evidence = reconcile_managed_jarvis_repository(
+        repos_file,
+        managed_repo,
+        previous_managed_repos=(previous_managed,),
+    )
+    document = yaml.safe_load(repos_file.read_text(encoding="utf-8"))
+
+    assert evidence["action"] == "updated"
+    assert evidence["added_managed_repos"] == [str(managed_repo.absolute())]
+    assert evidence["removed_previous_managed_repos"] == [str(previous_managed.absolute())]
+    assert document["repos"] == [
+        str(managed_repo.absolute()),
+        str(operator_repo.absolute()),
+    ]
+    assert document["operator_extension"] == {"preserve": True}
+    before = repos_file.read_bytes()
+    reused = reconcile_managed_jarvis_repository(repos_file, managed_repo)
+    assert reused["action"] == "reused"
+    assert repos_file.read_bytes() == before
+
+
+def test_managed_repo_reconcile_refuses_concurrent_operator_edit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repos_file = tmp_path / "repos.yaml"
+    repos_file.write_text("repos:\n  - /operator/original\n", encoding="utf-8")
+    operator_update = b"repos:\n  - /operator/concurrent\n"
+    original_read = bootstrap_reconcile_module._read_regular_bounded_with_identity  # noqa: SLF001
+    call_count = 0
+
+    def mutate_before_compare(
+        path: Path,
+        *,
+        maximum: int,
+    ) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            repos_file.write_bytes(operator_update)
+        return original_read(path, maximum=maximum)
+
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "_read_regular_bounded_with_identity",
+        mutate_before_compare,
+    )
+
+    with pytest.raises(ConfigurationError, match="changed during reconciliation"):
+        reconcile_managed_jarvis_repository(
+            repos_file,
+            tmp_path / "relay/managed-jarvis-repo",
+        )
+
+    assert repos_file.read_bytes() == operator_update
+    assert not list(tmp_path.glob(".repos.yaml.*.tmp"))
+
+
+def test_transaction_journal_enforces_irreversible_forward_recovery(tmp_path: Path) -> None:
+    path = tmp_path / "transaction.json"
+    journal = BootstrapTransactionJournal(
+        invocation_id="bootstrap-1",
+        desired_fingerprint="a" * 64,
+    )
+    for state in (
+        BootstrapTransactionState.INSPECTED,
+        BootstrapTransactionState.PREPARING,
+        BootstrapTransactionState.PREPARED,
+        BootstrapTransactionState.FENCING,
+        BootstrapTransactionState.FENCED,
+        BootstrapTransactionState.ACTIVATING,
+        BootstrapTransactionState.ACTIVATED,
+    ):
+        if state is BootstrapTransactionState.PREPARED:
+            journal.prepared_generation = "a" * 64
+        journal.advance(state)
+        journal.persist(path)
+    assert journal.recovery_mode == "rollback"
+
+    journal.advance(BootstrapTransactionState.MIGRATION_STARTED)
+    journal.persist(path)
+
+    loaded = BootstrapTransactionJournal.load(path)
+    assert loaded.irreversible_boundary is True
+    assert loaded.recovery_mode == "forward"
+    assert json.loads(path.read_text(encoding="utf-8"))["state"] == "migration_started"
+
+
+def test_bootstrap_invocation_lock_is_private_and_bounded(tmp_path: Path) -> None:
+    with bootstrap_invocation_lock(home=tmp_path, timeout_seconds=1) as path:
+        assert path == tmp_path / ".local/share/clio-relay/bootstrap.lock"
+        if os.name != "nt":
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        with pytest.raises(
+            ConfigurationError, match="timed out acquiring"
+        ), bootstrap_invocation_lock(home=tmp_path, timeout_seconds=0.05):
+            raise AssertionError("a concurrent bootstrap lock was acquired")
+
+
+def test_bootstrap_invocation_lock_refuses_redirected_lock_path(tmp_path: Path) -> None:
+    with bootstrap_invocation_lock(home=tmp_path, timeout_seconds=1) as lock_path:
+        pass
+    lock_path.unlink()
+    if os.name == "nt":
+        target = tmp_path / "outside-lock-directory"
+        target.mkdir()
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(lock_path), str(target)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+    else:
+        target = tmp_path / "outside-lock"
+        target.write_bytes(b"outside")
+        lock_path.symlink_to(target)
+
+    with pytest.raises(
+        ConfigurationError, match="private bootstrap lock"
+    ), bootstrap_invocation_lock(home=tmp_path, timeout_seconds=0.1):
+        raise AssertionError("a redirected bootstrap lock was acquired")
+
+
+def test_transaction_journal_rejects_skip_and_tamper(tmp_path: Path) -> None:
+    journal = BootstrapTransactionJournal(
+        invocation_id="bootstrap-1",
+        desired_fingerprint="a" * 64,
+    )
+    with pytest.raises(ConfigurationError, match="invalid bootstrap transaction transition"):
+        journal.advance(BootstrapTransactionState.ACTIVATED)
+
+    path = tmp_path / "transaction.json"
+    path.write_text('{"state":"migration_started"}', encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="journal is invalid"):
+        BootstrapTransactionJournal.load(path)
+
+
+def test_noop_receipt_records_no_scheduler_or_generation_gc(tmp_path: Path) -> None:
+    desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
+    _write_jarvis_state(tmp_path, desired)
+    inspection = inspect_jarvis_state(desired, home=tmp_path)
+    from clio_relay.bootstrap_reconcile import (  # noqa: PLC0415
+        BootstrapInspection,
+        BootstrapReadinessEvidence,
+    )
+
+    exact = BootstrapInspection(
+        exact_match=True,
+        desired_fingerprint=desired.fingerprint,
+        jarvis_state=inspection,
+        readiness=BootstrapReadinessEvidence(queue_ready=True),
+    )
+    receipt = make_bootstrap_receipt(
+        invocation_id="bootstrap-1",
+        desired=desired,
+        outcome="noop_verified",
+        inspection=exact,
+        started_at=datetime.now(UTC),
+        transaction=None,
+        previous_generation="a" * 64,
+        active_generation="a" * 64,
+    )
+
+    assert receipt["outcome"] == "noop_verified"
+    preservation = receipt["preservation"]
+    assert isinstance(preservation, dict)
+    assert preservation == {
+        "scheduler_jobs_cancelled": False,
+        "old_generations_retained": True,
+        "jarvis_init_on_existing_root": False,
+    }
+
+
+def test_desired_fingerprint_is_canonical_and_field_sensitive() -> None:
+    desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
+    reconstructed = BootstrapDesiredState.model_validate(
+        json.loads(json.dumps(desired.model_dump(mode="json"), sort_keys=False))
+    )
+    changed = desired.model_copy(update={"agent_args": ["--model", "haiku"]})
+
+    assert reconstructed.fingerprint == desired.fingerprint
+    assert changed.fingerprint != desired.fingerprint
+
+
+def test_prepared_generation_refuses_a_tampered_relay_owned_jarvis_wrapper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
+    execution_root = tmp_path / "jarvis-venv"
+    execution_bin = execution_root / ("Scripts" if os.name == "nt" else "bin")
+    execution_bin.mkdir(parents=True)
+    execution_python = execution_bin / ("python.exe" if os.name == "nt" else "python")
+    legacy_jarvis = execution_bin / ("jarvis.exe" if os.name == "nt" else "jarvis")
+    for path, payload in (
+        (execution_python, b"python-runtime"),
+        (legacy_jarvis, b"legacy-launcher"),
+    ):
+        path.write_bytes(payload)
+        path.chmod(0o755)
+    execution_identity = execution_environment_identity(
+        execution_root,
+        executables={"python": execution_python, "jarvis": legacy_jarvis},
+    )
+    generation = tmp_path / "generation"
+    generation_bin = generation / "bin"
+    generation_bin.mkdir(parents=True)
+    wrapper = generation_bin / "jarvis"
+    wrapper_evidence = write_jarvis_wrapper(wrapper, execution_python)
+    simulated_launchers: set[Path] = set()
+    for name in ("clio-relay", "clio-kit"):
+        target = tmp_path / f"{name}-target"
+        target.write_bytes(name.encode())
+        target.chmod(0o755)
+        launcher = generation_bin / name
+        os.link(target, launcher)
+        simulated_launchers.add(launcher)
+    original_is_symlink = Path.is_symlink
+
+    def simulated_is_symlink(path: Path) -> bool:
+        return path in simulated_launchers or original_is_symlink(path)
+
+    monkeypatch.setattr(Path, "is_symlink", simulated_is_symlink)
+    receipt_path = generation / "install-receipt.json"
+    receipt_path.write_text("{}\n", encoding="utf-8")
+    plan = {
+        "mode": "relay-only",
+        "desired_fingerprint": desired.fingerprint,
+        "component_actions": {"clio-relay": "replace"},
+    }
+    manifest = {
+        "schema_version": "clio-relay.bootstrap-generation.v1",
+        "fingerprint": desired.fingerprint,
+        "plan": plan,
+        "legacy_execution_identity": execution_identity,
+        "jarvis_wrapper_sha256": wrapper_evidence["sha256"],
+        "install_receipt": str(receipt_path),
+    }
+    (generation / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with (generation / ".prepared").open("w", encoding="ascii", newline="\n") as stream:
+        stream.write(desired.fingerprint + "\n")
+    monkeypatch.setattr(
+        "clio_relay.bootstrap_reconcile.installation_info",
+        lambda _path: _installation_info(desired),
+    )
+
+    evidence = inspect_prepared_generation(
+        desired,
+        generation=generation,
+        legacy_execution_identity=execution_identity,
+    )
+
+    assert evidence["launcher_targets"]["jarvis"] == str(wrapper)
+    assert wrapper.read_bytes() == jarvis_wrapper_payload(execution_python)
+
+    wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    with pytest.raises(ConfigurationError, match="JARVIS wrapper identity changed"):
+        inspect_prepared_generation(
+            desired,
+            generation=generation,
+            legacy_execution_identity=execution_identity,
+        )
+
+
+def test_transaction_persistence_cleans_temporary_on_replace_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal = BootstrapTransactionJournal(
+        invocation_id="bootstrap-1",
+        desired_fingerprint="a" * 64,
+    )
+
+    def fail_replace(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("disk failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(OSError, match="disk failure"):
+        journal.persist(tmp_path / "transaction.json")
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_identity_command_collector_rejects_output_beyond_its_memory_bound() -> None:
+    with pytest.raises(ConfigurationError, match="output exceeded its bound"):
+        bootstrap_reconcile_module._bounded_subprocess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            [sys.executable, "-c", "import os; os.write(1, b'x' * 65536)"],
+            maximum=64,
+        )
