@@ -557,7 +557,7 @@ class ClioCoreQueue:
             root_stat = os.lstat(self._storage_root)
         except FileNotFoundError:
             try:
-                self._storage_root.mkdir(parents=True, exist_ok=True)
+                ensure_private_configuration_directory(self._storage_root)
                 root_stat = os.lstat(self._storage_root)
             except OSError as error:
                 raise LegacyQueueStateError(
@@ -577,6 +577,7 @@ class ClioCoreQueue:
                 path=self._storage_root,
                 reason="queue root is not an owned directory",
             )
+        self._require_owner_private_queue_directory("root", self._storage_root, root_stat)
         lock_path = self._storage_root / ".lock"
         try:
             lock_stat = os.lstat(lock_path)
@@ -601,9 +602,11 @@ class ClioCoreQueue:
 
         The seal intentionally contains no record counts or record digests. Those
         would require a history-sized verification scan at every process start.
-        Its contract is instead that every pre-seal record passed the bounded
-        legacy audit, all post-seal writes use the canonical access contract, and
-        individual records are validated whenever they are read.
+        It is cooperative migration evidence inside an owner-private directory,
+        not cryptographic proof against deletion or replay by another process
+        running as that owner. Its contract is that every pre-seal record passed
+        the bounded legacy audit, cooperative post-seal writers use the canonical
+        access contract, and individual records are validated whenever read.
         """
         return {
             "schema_version": LEGACY_RECORD_AUDIT_SCHEMA,
@@ -630,6 +633,7 @@ class ClioCoreQueue:
                 path=self._storage_root,
                 reason="indexed queue root is not an owned directory",
             )
+        self._require_owner_private_queue_directory("root", self._storage_root, root_stat)
         lock_path = self._storage_root / ".lock"
         try:
             lock_stat = os.lstat(lock_path)
@@ -659,25 +663,64 @@ class ClioCoreQueue:
                     path=directory,
                     reason="indexed queue seal requires its owned record directory",
                 )
+        global_order_root = self._storage_root / "global_order"
+        self._require_indexed_queue_directory(
+            family="global_order",
+            directory=global_order_root,
+        )
         for family in _GLOBAL_ORDER_FAMILIES:
+            family_root = global_order_root / family
+            self._require_indexed_queue_directory(
+                family="global_order",
+                directory=family_root,
+            )
             for child in ("by_id", "entries"):
-                directory = self._storage_root / "global_order" / family / child
-                try:
-                    directory_stat = os.lstat(directory)
-                except OSError as error:
-                    raise LegacyQueueStateError(
-                        family="global_order",
-                        path=directory,
-                        reason=(
-                            f"cannot inspect indexed global-order directory: {type(error).__name__}"
-                        ),
-                    ) from error
-                if not stat.S_ISDIR(directory_stat.st_mode) or _record_is_reparse(directory_stat):
-                    raise LegacyQueueStateError(
-                        family="global_order",
-                        path=directory,
-                        reason="indexed global-order path is not an owned directory",
-                    )
+                self._require_indexed_queue_directory(
+                    family="global_order",
+                    directory=family_root / child,
+                )
+
+    def _require_indexed_queue_directory(self, *, family: str, directory: Path) -> None:
+        """Require one fixed indexed-layout path to be an owned real directory."""
+        try:
+            directory_stat = os.lstat(directory)
+        except OSError as error:
+            raise LegacyQueueStateError(
+                family=family,
+                path=directory,
+                reason=f"cannot inspect indexed queue directory: {type(error).__name__}",
+            ) from error
+        if not stat.S_ISDIR(directory_stat.st_mode) or _record_is_reparse(directory_stat):
+            raise LegacyQueueStateError(
+                family=family,
+                path=directory,
+                reason="indexed queue path is not an owned directory",
+            )
+        self._require_owner_private_queue_directory(family, directory, directory_stat)
+
+    @staticmethod
+    def _require_owner_private_queue_directory(
+        family: str,
+        path: Path,
+        details: os.stat_result,
+    ) -> None:
+        """Require an exact owner-private POSIX directory for seal trust."""
+        if os.name == "nt":
+            return
+        getuid = getattr(os, "getuid", None)
+        current_uid = getuid() if callable(getuid) else None
+        if current_uid is not None and details.st_uid != current_uid:
+            raise LegacyQueueStateError(
+                family=family,
+                path=path,
+                reason="queue directory is not owned by the current user",
+            )
+        if stat.S_IMODE(details.st_mode) & 0o077:
+            raise LegacyQueueStateError(
+                family=family,
+                path=path,
+                reason="queue directory is readable or writable by another user",
+            )
 
     def _read_legacy_record_audit_marker(self) -> _LegacyOutputAudit | None:
         """Return constant-size indexed-era evidence, or ``None`` for bounded repair."""
@@ -829,7 +872,12 @@ class ClioCoreQueue:
         """Read and strictly validate indexed-era state without repairing or scanning."""
         path = self._storage_root / "migrations" / "index-v1.json"
         try:
-            state = self._read_index_migration_state()
+            raw_state = _read_unique_json_document(path)
+            if not isinstance(raw_state, dict):
+                raise QueueConflictError("sealed index migration state is not an object")
+            state = cast(dict[str, object], raw_state)
+            if state.get("schema_version") != INDEX_MIGRATION_SCHEMA:
+                raise QueueConflictError("sealed index migration state schema is unsupported")
             expected_keys = {
                 "schema_version",
                 "complete",
@@ -1016,6 +1064,7 @@ class ClioCoreQueue:
                 path=directory,
                 reason="canonical family is not an owned directory",
             )
+        self._require_owner_private_queue_directory(family, directory, directory_stat)
         return directory
 
     def _bounded_legacy_family_entries(self, family: str) -> list[Path]:
@@ -1093,7 +1142,7 @@ class ClioCoreQueue:
                 reason="legacy-output marker has no owned migrations directory",
             )
         try:
-            raw = self._read_json_document(marker_path)
+            raw = _read_unique_json_document(marker_path)
         except (OSError, ValueError, QueueConflictError) as error:
             raise LegacyQueueStateError(
                 family="migrations",
@@ -2351,13 +2400,19 @@ class ClioCoreQueue:
                         migrate_legacy_output=migrate_legacy_output,
                     )
                     for family in _INITIALIZED_QUEUE_FAMILIES:
-                        (self._storage_root / family).mkdir(parents=True, exist_ok=True)
+                        (self._storage_root / family).mkdir(
+                            mode=0o700,
+                            parents=True,
+                            exist_ok=True,
+                        )
                     for family in _GLOBAL_ORDER_FAMILIES:
                         (self._storage_root / "global_order" / family / "by_id").mkdir(
+                            mode=0o700,
                             parents=True,
                             exist_ok=True,
                         )
                         (self._storage_root / "global_order" / family / "entries").mkdir(
+                            mode=0o700,
                             parents=True,
                             exist_ok=True,
                         )
@@ -2508,7 +2563,9 @@ class ClioCoreQueue:
     ) -> None:
         """Pin initialization I/O to one authenticated exclusively locked core."""
         require_active_locked_core(locked_core)
+        original_root = self.root
         original_storage_root = self._storage_root
+        original_lock = self._lock
         try:
             queue_root_before = os.stat(original_storage_root)
         except OSError as exc:
@@ -2523,7 +2580,7 @@ class ClioCoreQueue:
         # in-flight alias retarget can never redirect writes to an unlocked root.
         self.root = logical_filesystem_path(locked_core.root)
         self._storage_root = internal_filesystem_path(
-            locked_core.root,
+            locked_core.filesystem_root,
             force_extended=True,
         )
         self._lock = _FairBoundedFileLock(
@@ -2532,15 +2589,59 @@ class ClioCoreQueue:
         )
         self._migration_lifetime_guarded = True
         try:
+            self._repair_locked_queue_directory_permissions()
             self.initialize(migrate_legacy_output=migrate_legacy_output)
         finally:
             self._migration_lifetime_guarded = False
-        try:
-            queue_root_after = os.stat(original_storage_root)
-        except OSError as exc:
-            raise ConfigurationError(f"migration queue root identity changed: {exc}") from exc
-        if (queue_root_after.st_dev, queue_root_after.st_ino) != expected_identity:
-            raise ConfigurationError("migration queue root identity changed while locked")
+            self.root = original_root
+            self._storage_root = original_storage_root
+            self._lock = original_lock
+            try:
+                queue_root_after = os.stat(original_storage_root)
+            except OSError as exc:
+                raise ConfigurationError(
+                    f"migration queue root identity changed: {exc}"
+                ) from exc
+            if (queue_root_after.st_dev, queue_root_after.st_ino) != expected_identity:
+                raise ConfigurationError("migration queue root identity changed while locked")
+
+    def _repair_locked_queue_directory_permissions(self) -> None:
+        """Privatize only fixed, owned queue directories under exclusive ownership."""
+        if os.name == "nt":
+            return
+        paths = [self._storage_root]
+        paths.extend(self._storage_root / family for family in _INITIALIZED_QUEUE_FAMILIES)
+        paths.extend(
+            self._storage_root / "global_order" / family / child
+            for family in _GLOBAL_ORDER_FAMILIES
+            for child in ("by_id", "entries")
+        )
+        getuid = getattr(os, "getuid", None)
+        current_uid = getuid() if callable(getuid) else None
+        for path in paths:
+            try:
+                details = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise ConfigurationError(
+                    f"queue directory protections cannot be inspected: {path}: {exc}"
+                ) from exc
+            if (
+                not stat.S_ISDIR(details.st_mode)
+                or _record_is_reparse(details)
+                or (current_uid is not None and details.st_uid != current_uid)
+            ):
+                raise ConfigurationError(
+                    f"queue directory cannot be safely privatized: {path}"
+                )
+            if stat.S_IMODE(details.st_mode) != 0o700:
+                try:
+                    os.chmod(path, 0o700, follow_symlinks=False)
+                except OSError as exc:
+                    raise ConfigurationError(
+                        f"queue directory could not be privatized: {path}: {exc}"
+                    ) from exc
 
     def reconcile_pending_transitions(self) -> None:
         """Replay bounded write-ahead transitions left by another process."""
@@ -2552,6 +2653,44 @@ class ClioCoreQueue:
         """Return the crash-safe v0.9 queue-index migration checkpoint."""
         self.initialize()
         return self._read_index_migration_state()
+
+    def readiness_info(self) -> dict[str, object]:
+        """Verify the fixed indexed layout and durable audit seal without writes."""
+        audit = self._read_legacy_record_audit_marker()
+        trust_contract = {
+            "seal_trust_model": "owner_private_cooperative_same_uid_writers",
+            "cryptographic_replay_protection": False,
+            "record_integrity_verification": "on_access",
+        }
+        if audit is None:
+            return {
+                "schema_version": "clio-relay.queue-readiness.v1",
+                "complete": False,
+                "sealed": False,
+                "repair_required": True,
+                "inspection_mode": "fixed_layout_and_seal",
+                "record_history_scanned": False,
+                "records_examined": 0,
+                **trust_contract,
+                "bounds": {
+                    "fixed_queue_family_count": len(_INITIALIZED_QUEUE_FAMILIES),
+                    "fixed_global_order_family_count": len(_GLOBAL_ORDER_FAMILIES),
+                },
+            }
+        return {
+            "schema_version": "clio-relay.queue-readiness.v1",
+            "complete": True,
+            "sealed": True,
+            "repair_required": False,
+            "inspection_mode": "fixed_layout_and_seal",
+            "record_history_scanned": False,
+            "records_examined": 0,
+            **trust_contract,
+            "bounds": {
+                "fixed_queue_family_count": len(_INITIALIZED_QUEUE_FAMILIES),
+                "fixed_global_order_family_count": len(_GLOBAL_ORDER_FAMILIES),
+            },
+        }
 
     def migrate_indexes_batch(self, *, batch_size: int = 500) -> dict[str, object]:
         """Migrate at most one bounded record batch from the v0.9 flat layout."""
@@ -4062,14 +4201,57 @@ class ClioCoreQueue:
         now: datetime | None = None,
     ) -> tuple[list[EndpointRegistration], bool]:
         """Read only recent endpoint buckets, independent of endpoint history size."""
+        self.initialize()
+        self._require_index_migration_complete()
+        return self._scan_fresh_endpoint_index(
+            limit=limit,
+            fresh_seconds=fresh_seconds,
+            cluster=cluster,
+            now=now,
+        )
+
+    def scan_fresh_endpoints_read_only(
+        self,
+        *,
+        limit: int,
+        fresh_seconds: int,
+        cluster: str,
+        now: datetime | None = None,
+    ) -> tuple[list[EndpointRegistration], bool]:
+        """Read one cluster's sealed fresh-endpoint index without initialization.
+
+        This path is for bootstrap/readiness probes. It proves the fixed queue
+        layout and audit seal first, then reads only the requested cluster's
+        bounded recent time buckets. It never creates, repairs, or migrates
+        queue state and never scans the historical endpoint family.
+        """
+        readiness = self.readiness_info()
+        if readiness.get("complete") is not True or readiness.get("sealed") is not True:
+            raise QueueConflictError(
+                "fresh endpoint readiness requires a sealed indexed queue"
+            )
+        return self._scan_fresh_endpoint_index(
+            limit=limit,
+            fresh_seconds=fresh_seconds,
+            cluster=cluster,
+            now=now,
+        )
+
+    def _scan_fresh_endpoint_index(
+        self,
+        *,
+        limit: int,
+        fresh_seconds: int,
+        cluster: str | None,
+        now: datetime | None,
+    ) -> tuple[list[EndpointRegistration], bool]:
+        """Read bounded fresh endpoint buckets after the caller proves readiness."""
         if limit < 1 or limit > MAX_BOUNDED_SCAN_RECORDS:
             raise ValueError(
                 f"endpoint scan limit must be between 1 and {MAX_BOUNDED_SCAN_RECORDS}"
             )
         if fresh_seconds < 1 or fresh_seconds > MAX_ENDPOINT_FRESH_SECONDS:
             raise ValueError(f"fresh_seconds must be between 1 and {MAX_ENDPOINT_FRESH_SECONDS}")
-        self.initialize()
-        self._require_index_migration_complete()
         observed_at = now or utc_now()
         cutoff = observed_at - timedelta(seconds=fresh_seconds)
         first_bucket = _endpoint_fresh_bucket(cutoff)

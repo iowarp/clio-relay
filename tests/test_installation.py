@@ -4,7 +4,11 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
+import venv
+import zipfile
+from base64 import urlsafe_b64encode
 from collections.abc import Callable
 from datetime import UTC, datetime
 from importlib import metadata
@@ -31,6 +35,7 @@ from clio_relay.installation import (
     verify_remote_clio_kit_native_execution_component,
     verify_remote_native_jarvis_component,
     verify_remote_worker_info,
+    worker_runtime_info,
     write_install_receipt,
 )
 from clio_relay.jarvis_mcp import (
@@ -244,6 +249,16 @@ def test_native_jarvis_runtime_accepts_canonical_source_aliases(
     monkeypatch.setattr(installation_module, "_probe_python_distribution", probe_execution)
     monkeypatch.setattr(
         installation_module,
+        "_probe_python_distribution_record_closure",
+        lambda *_args: {
+            "schema_version": "clio-relay.python-record-closure.v1",
+            "verified": True,
+            "tree_scanned": False,
+            "tree_copied": False,
+        },
+    )
+    monkeypatch.setattr(
+        installation_module,
         "probe_jarvis_native_execution_capability",
         probe_capability,
     )
@@ -290,6 +305,71 @@ def test_native_jarvis_runtime_accepts_canonical_source_aliases(
     assert substituted["runtime_artifact_path_verified"] is False
     assert substituted["execution_interpreter_verified"] is False
     assert substituted["verified"] is False
+
+
+def test_native_jarvis_record_closure_rejects_a_tampered_installed_member(
+    tmp_path: Path,
+) -> None:
+    environment = tmp_path / "environment"
+    venv.EnvBuilder(with_pip=False).create(environment)
+    python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    completed = subprocess.run(
+        [
+            str(python),
+            "-I",
+            "-c",
+            "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    site_packages = Path(completed.stdout.strip())
+    package = site_packages / "fixture_jarvis"
+    metadata_root = site_packages / "fixture_jarvis-1.0.dist-info"
+    package.mkdir(parents=True)
+    metadata_root.mkdir()
+    members = {
+        "fixture_jarvis/__init__.py": b'"""Fixture package."""\n',
+        "fixture_jarvis/runtime.py": b"VALUE = 1\n",
+        "fixture_jarvis-1.0.dist-info/METADATA": (
+            b"Metadata-Version: 2.1\nName: fixture-jarvis\nVersion: 1.0\n\n"
+        ),
+        "fixture_jarvis-1.0.dist-info/WHEEL": (
+            b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\n"
+            b"Tag: py3-none-any\n\n"
+        ),
+    }
+    record_name = "fixture_jarvis-1.0.dist-info/RECORD"
+    record_lines = []
+    for relative, payload in sorted(members.items()):
+        encoded = urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
+        record_lines.append(f"{relative},sha256={encoded},{len(payload)}")
+        destination = site_packages / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
+    record_lines.append(f"{record_name},,")
+    record = ("\n".join(record_lines) + "\n").encode()
+    (site_packages / record_name).write_bytes(record)
+    wheel = tmp_path / "fixture_jarvis-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for relative, payload in members.items():
+            archive.writestr(relative, payload)
+        archive.writestr(record_name, record)
+    probe = installation_module._probe_python_distribution_record_closure  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    verified = probe(str(python), "fixture-jarvis", wheel)
+
+    assert verified["verified"] is True
+    assert verified["wheel_payload_file_count"] == len(members)
+    assert verified["tree_scanned"] is False
+    assert verified["tree_copied"] is False
+
+    (package / "runtime.py").write_bytes(b"VALUE = 2\n")
+    tampered = probe(str(python), "fixture-jarvis", wheel)
+
+    assert tampered["verified"] is False
+    assert "digest mismatch" in str(tampered["error"])
 
 
 def test_jarvis_launcher_matches_a_uv_managed_python_symlink(tmp_path: Path) -> None:
@@ -795,6 +875,45 @@ def test_remote_worker_identity_is_bound_to_fresh_running_endpoint(tmp_path: Pat
             expected_artifact_sha256=receipt.artifact_sha256,
             expected_source="wheel",
         )
+
+
+def test_worker_runtime_info_reads_only_the_sealed_fresh_endpoint_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from clio_relay.core_queue import ClioCoreQueue
+    from clio_relay.models import EndpointRegistration, EndpointRole
+
+    root = tmp_path / "core"
+    identity: dict[str, object] = {"distribution_version": "test"}
+    queue = ClioCoreQueue(root)
+    endpoint = queue.register_endpoint(
+        EndpointRegistration(
+            endpoint_id="endpoint_worker_identity",
+            role=EndpointRole.WORKER,
+            cluster="ares",
+            hostname="worker",
+            pid=os.getpid(),
+            metadata={
+                "installation_info": identity,
+                "scheduler_provider": "slurm",
+            },
+        )
+    )
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(root))
+    monkeypatch.setattr(installation_module, "installation_info", lambda: identity)
+    monkeypatch.setattr(installation_module, "_worker_process_matches", lambda _pid: True)
+
+    def reject_history(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("worker readiness must not scan endpoint history")
+
+    monkeypatch.setattr(ClioCoreQueue, "scan_endpoints", reject_history)
+
+    result = worker_runtime_info(cluster="ares", freshness_seconds=120)
+
+    assert result["running"] is True
+    assert result["identity_matches_current"] is True
+    assert cast(dict[str, object], result["endpoint"])["endpoint_id"] == endpoint.endpoint_id
 
 
 def test_cleanup_report_accepts_exact_pypi_worker_for_wheel_operator() -> None:

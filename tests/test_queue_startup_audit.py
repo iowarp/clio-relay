@@ -152,6 +152,60 @@ def test_sealed_startup_refuses_malformed_index_state_without_repair_or_glob(
     assert index_path.read_bytes() == payload
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_sealed_startup_rejects_duplicate_index_keys_at_every_depth(
+    tmp_path: Path,
+    nested: bool,
+) -> None:
+    """A duplicate completion key cannot override sealed migration evidence."""
+    root = tmp_path / "core"
+    ClioCoreQueue(root).initialize()
+    index_path = root / "migrations" / "index-v1.json"
+    document = json.loads(index_path.read_bytes())
+    payload = json.dumps(document, separators=(",", ":"))
+    needle = (
+        '"jobs":{"cursor":null,"complete":true}'
+        if nested
+        else '"complete":true'
+    )
+    replacement = (
+        '"jobs":{"cursor":null,"complete":true,"complete":false}'
+        if nested
+        else '"complete":true,"complete":false'
+    )
+    assert needle in payload
+    payload = payload.replace(needle, replacement, 1).encode("utf-8")
+    index_path.write_bytes(payload)
+
+    with pytest.raises(LegacyQueueStateError, match="sealed index migration state"):
+        ClioCoreQueue(root).initialize()
+
+    assert index_path.read_bytes() == payload
+
+
+def test_sealed_startup_rejects_duplicate_legacy_output_marker_key(
+    tmp_path: Path,
+) -> None:
+    """Duplicate completion keys cannot override legacy-output migration evidence."""
+    root = tmp_path / "core"
+    ClioCoreQueue(root).initialize()
+    marker_path = root / "migrations" / "legacy-output-v1.json"
+    document = json.loads(marker_path.read_bytes())
+    payload = json.dumps(document, separators=(",", ":"))
+    assert '"complete":true' in payload
+    payload = payload.replace(
+        '"complete":true',
+        '"complete":true,"complete":false',
+        1,
+    ).encode("utf-8")
+    marker_path.write_bytes(payload)
+
+    with pytest.raises(LegacyQueueStateError, match="legacy-output marker"):
+        ClioCoreQueue(root).initialize()
+
+    assert marker_path.read_bytes() == payload
+
+
 def test_sealed_startup_bounded_transition_scan_rejects_unsafe_entry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

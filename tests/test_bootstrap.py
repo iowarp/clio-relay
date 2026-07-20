@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import tarfile
@@ -878,6 +879,30 @@ def test_bootstrap_archive_can_include_local_relay_wheel(tmp_path: Path) -> None
         names = archive.getnames()
     assert f"wheels/{wheel.name}" in names
     assert any(name.startswith("jarvis-packages/clio_relay/") for name in names)
+
+
+def test_packaged_bootstrap_archive_is_identical_across_source_mtime_changes(
+    tmp_path: Path,
+) -> None:
+    wheel = tmp_path / f"clio_relay-{__version__}-py3-none-any.whl"
+    _write_test_relay_wheel(wheel)
+    first = create_bootstrap_archive(
+        source_root=tmp_path / "not-a-repo",
+        archive=tmp_path / "first.tar",
+        relay_wheel=wheel,
+    )
+    first_digest = hashlib.sha256(first.archive.read_bytes()).hexdigest()
+
+    os.utime(wheel, ns=(1_800_000_000_000_000_000, 1_800_000_000_000_000_000))
+    second = create_bootstrap_archive(
+        source_root=tmp_path / "not-a-repo",
+        archive=tmp_path / "second.tar",
+        relay_wheel=wheel,
+    )
+    second_digest = hashlib.sha256(second.archive.read_bytes()).hexdigest()
+
+    assert second.archive.read_bytes() == first.archive.read_bytes()
+    assert second_digest == first_digest
 
 
 def test_bootstrap_archive_ignores_unrelated_git_checkout(tmp_path: Path) -> None:

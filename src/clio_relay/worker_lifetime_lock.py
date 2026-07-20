@@ -27,6 +27,7 @@ WORKER_LIFETIME_GUARD_FD_ENV = "CLIO_RELAY_WORKER_LIFETIME_GUARD_FD"
 WORKER_LIFETIME_GUARD_PID_ENV = "CLIO_RELAY_WORKER_LIFETIME_GUARD_PID"
 WORKER_LIFETIME_GUARD_READY_ENV = "CLIO_RELAY_WORKER_LIFETIME_GUARD_READY"
 _LOCK_RETRY_SECONDS = 0.05
+DEFAULT_WORKER_LIFETIME_LOCK_TIMEOUT_SECONDS = 30.0
 _LOCKED_CORE_AUTHORITY = object()
 
 
@@ -92,6 +93,8 @@ class LockedCoreIdentity:
     device: int
     inode: int
     _authority: object = field(repr=False)
+    _directory_fd: int | None = field(default=None, repr=False)
+    _pinned_root: Path | None = field(default=None, repr=False)
     _active: bool = field(default=True, repr=False)
 
     def require_active(self) -> None:
@@ -101,7 +104,34 @@ class LockedCoreIdentity:
 
     def deactivate(self) -> None:
         """End this identity's authorized lifetime scope."""
+        descriptor = self._directory_fd
+        self._directory_fd = None
+        self._pinned_root = None
         self._active = False
+        if descriptor is not None:
+            with suppress(OSError):
+                os.close(descriptor)
+
+    @property
+    def filesystem_root(self) -> Path:
+        """Return the descriptor-pinned root used for authorized filesystem I/O."""
+        self.require_active()
+        descriptor = self._directory_fd
+        pinned_root = self._pinned_root
+        if descriptor is None or pinned_root is None:
+            return self.root
+        try:
+            descriptor_stat = os.fstat(descriptor)
+            pinned_stat = os.stat(pinned_root)
+        except OSError as exc:
+            raise ConfigurationError("migration pinned-core descriptor is unavailable") from exc
+        expected = (self.device, self.inode)
+        if (
+            descriptor_stat.st_dev,
+            descriptor_stat.st_ino,
+        ) != expected or (pinned_stat.st_dev, pinned_stat.st_ino) != expected:
+            raise ConfigurationError("migration pinned-core descriptor identity changed")
+        return pinned_root
 
 
 def require_active_locked_core(identity: LockedCoreIdentity) -> None:
@@ -109,13 +139,77 @@ def require_active_locked_core(identity: LockedCoreIdentity) -> None:
     identity.require_active()
 
 
-def _locked_core_identity(root: Path, file_stat: os.stat_result) -> LockedCoreIdentity:
+def _locked_core_identity(
+    root: Path,
+    file_stat: os.stat_result,
+    *,
+    guard_fd: int,
+) -> LockedCoreIdentity:
+    directory_fd, pinned_root = _pin_locked_core_directory(
+        root,
+        expected_stat=file_stat,
+        guard_fd=guard_fd,
+    )
     return LockedCoreIdentity(
         root=root,
         device=file_stat.st_dev,
         inode=file_stat.st_ino,
         _authority=_LOCKED_CORE_AUTHORITY,
+        _directory_fd=directory_fd,
+        _pinned_root=pinned_root,
     )
+
+
+def _pin_locked_core_directory(
+    root: Path,
+    *,
+    expected_stat: os.stat_result,
+    guard_fd: int,
+) -> tuple[int | None, Path | None]:
+    """Pin the locked POSIX directory and bind it to the held lock inode."""
+    if os.name != "posix":
+        return None, None
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_fd = os.open(root, flags)
+        os.set_inheritable(directory_fd, False)
+        directory_stat = os.fstat(directory_fd)
+        guard_stat = os.fstat(guard_fd)
+        linked_guard_stat = os.stat(
+            WORKER_LIFETIME_LOCK_NAME,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        expected_identity = (expected_stat.st_dev, expected_stat.st_ino)
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or _is_reparse(directory_stat)
+            or (directory_stat.st_dev, directory_stat.st_ino) != expected_identity
+            or not stat.S_ISREG(linked_guard_stat.st_mode)
+            or _is_reparse(linked_guard_stat)
+            or linked_guard_stat.st_dev != guard_stat.st_dev
+            or linked_guard_stat.st_ino != guard_stat.st_ino
+        ):
+            raise ConfigurationError(
+                "migration core descriptor does not contain its acquired lifetime lock"
+            )
+        for candidate in (
+            Path("/proc/self/fd") / str(directory_fd),
+            Path("/dev/fd") / str(directory_fd),
+        ):
+            try:
+                candidate_stat = os.stat(candidate)
+            except OSError:
+                continue
+            if (candidate_stat.st_dev, candidate_stat.st_ino) == expected_identity:
+                return directory_fd, candidate
+        raise ConfigurationError("POSIX migration requires a descriptor filesystem alias")
+    except BaseException:
+        if "directory_fd" in locals():
+            with suppress(OSError):
+                os.close(directory_fd)
+        raise
 
 
 class WorkerLifetimeLock:
@@ -133,13 +227,22 @@ class WorkerLifetimeLock:
         *,
         mode: Literal["shared", "exclusive"],
         timeout_seconds: float | None = None,
+        lock_name: str = WORKER_LIFETIME_LOCK_NAME,
     ) -> None:
         if timeout_seconds is not None and timeout_seconds < 0:
             raise ValueError("worker lifetime lock timeout must be non-negative")
         self.core_dir = logical_filesystem_path(core_dir)
         self.mode = mode
         self.timeout_seconds = timeout_seconds
-        self.path = self.core_dir / WORKER_LIFETIME_LOCK_NAME
+        if (
+            not lock_name
+            or lock_name in {".", ".."}
+            or Path(lock_name).name != lock_name
+            or any(character in lock_name for character in "\x00\r\n")
+        ):
+            raise ValueError("lifetime lock name must be one safe path component")
+        self.lock_name = lock_name
+        self.path = self.core_dir / self.lock_name
         self._fd: int | None = None
         self._windows_overlapped: _WindowsOverlapped | None = None
 
@@ -148,31 +251,48 @@ class WorkerLifetimeLock:
         """Return whether this instance currently owns its OS lock."""
         return self._fd is not None
 
-    def acquire(self) -> WorkerLifetimeLock:
+    @property
+    def descriptor(self) -> int | None:
+        """Return the acquired guard descriptor for authenticated inheritance."""
+        return self._fd
+
+    def acquire(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> WorkerLifetimeLock:
         """Acquire the configured shared or exclusive OS lock."""
         if self._fd is not None:
             raise RuntimeError("worker lifetime lock is already acquired")
-        fd, canonical_core = _open_private_lock_file(self.core_dir)
+        effective_timeout = (
+            self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        )
+        if effective_timeout is not None and effective_timeout < 0:
+            raise ValueError("worker lifetime lock timeout must be non-negative")
+        fd, canonical_core = _open_private_lock_file(
+            self.core_dir,
+            lock_name=self.lock_name,
+        )
         try:
             if os.name == "nt":
                 overlapped = _acquire_windows_lock(
                     fd,
                     exclusive=self.mode == "exclusive",
-                    timeout_seconds=self.timeout_seconds,
+                    timeout_seconds=effective_timeout,
                 )
                 self._windows_overlapped = overlapped
             else:
                 _acquire_posix_lock(
                     fd,
                     exclusive=self.mode == "exclusive",
-                    timeout_seconds=self.timeout_seconds,
+                    timeout_seconds=effective_timeout,
                 )
         except BaseException:
             os.close(fd)
             raise
         self._fd = fd
         self.core_dir = logical_filesystem_path(canonical_core)
-        self.path = self.core_dir / WORKER_LIFETIME_LOCK_NAME
+        self.path = self.core_dir / self.lock_name
         return self
 
     def release(self) -> None:
@@ -208,7 +328,7 @@ class WorkerLifetimeLock:
             self.release()
 
 
-def _open_private_lock_file(core_dir: Path) -> tuple[int, Path]:
+def _open_private_lock_file(core_dir: Path, *, lock_name: str) -> tuple[int, Path]:
     internal_core = internal_filesystem_path(core_dir, force_extended=True)
     try:
         internal_core.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -228,7 +348,7 @@ def _open_private_lock_file(core_dir: Path) -> tuple[int, Path]:
                 "worker lifetime lock core must not be group- or world-writable"
             )
 
-    lock_path = resolved_core / WORKER_LIFETIME_LOCK_NAME
+    lock_path = resolved_core / lock_name
     flags = os.O_RDWR | os.O_CREAT
     flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOINHERIT", 0)
     flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -414,15 +534,33 @@ def _current_uid() -> int | None:
 @contextmanager
 def exclusive_migration_lifetime(
     core_dir: Path,
+    *,
+    timeout_seconds: float | None = None,
 ) -> Generator[LockedCoreIdentity, None, None]:
     """Hold or validate exclusive core ownership for an authorized migration."""
+    effective_timeout = (
+        DEFAULT_WORKER_LIFETIME_LOCK_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else timeout_seconds
+    )
     guard_fd = os.getenv(WORKER_LIFETIME_GUARD_FD_ENV)
     guard_pid = os.getenv(WORKER_LIFETIME_GUARD_PID_ENV)
     guard_ready = os.getenv(WORKER_LIFETIME_GUARD_READY_ENV)
     if guard_fd is None and guard_pid is None and guard_ready is None:
-        with WorkerLifetimeLock(core_dir, mode="exclusive") as lifetime_lock:
+        with WorkerLifetimeLock(
+            core_dir,
+            mode="exclusive",
+            timeout_seconds=effective_timeout,
+        ) as lifetime_lock:
             locked_stat = os.stat(lifetime_lock.core_dir)
-            identity = _locked_core_identity(lifetime_lock.core_dir, locked_stat)
+            descriptor = lifetime_lock.descriptor
+            if descriptor is None:
+                raise ConfigurationError("exclusive migration lifetime lock is not acquired")
+            identity = _locked_core_identity(
+                lifetime_lock.core_dir,
+                locked_stat,
+                guard_fd=descriptor,
+            )
             try:
                 yield identity
             finally:
@@ -435,6 +573,7 @@ def exclusive_migration_lifetime(
     locked_identity = _validate_and_acquire_inherited_migration_guard(
         core_dir,
         guard_fd=guard_fd,
+        timeout_seconds=effective_timeout,
     )
     # Do not unlock or close the inherited descriptor here. The bootstrap shell
     # owns the same open-file description and deliberately retains EX across
@@ -451,6 +590,7 @@ def _validate_and_acquire_inherited_migration_guard(
     core_dir: Path,
     *,
     guard_fd: str,
+    timeout_seconds: float,
 ) -> LockedCoreIdentity:
     """Validate and acquire EX on bootstrap's exact inherited lock descriptor."""
     current_uid = _current_uid()
@@ -503,9 +643,10 @@ def _validate_and_acquire_inherited_migration_guard(
     _acquire_posix_lock(
         descriptor,
         exclusive=True,
-        timeout_seconds=30.0,
+        timeout_seconds=timeout_seconds,
     )
     return _locked_core_identity(
         logical_filesystem_path(canonical_core),
         core_stat,
+        guard_fd=descriptor,
     )

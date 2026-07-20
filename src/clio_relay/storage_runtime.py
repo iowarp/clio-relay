@@ -48,6 +48,7 @@ from clio_relay.worker_concurrency import KindConcurrencyInput, normalize_kind_c
 from clio_relay.worker_lifetime_lock import (
     LockedCoreIdentity,
     WorkerLifetimeLock,
+    WorkerLifetimeLockUnavailable,
     exclusive_migration_lifetime,
 )
 
@@ -59,6 +60,7 @@ _MANAGED_UNSET = object()
 _MIGRATION_BATCH_SIZE = 10_000
 _MIGRATION_FAMILY_BOUND = 20
 _MIGRATION_FIXED_BATCHES = 32
+QUEUE_SEAL_LIFETIME_TIMEOUT_SECONDS = 30.0
 
 
 class StorageRuntimeError(RelayError):
@@ -821,7 +823,11 @@ def storage_managed_queue(
     owned_lifetime_lock: WorkerLifetimeLock | None = None
     lifetime_lock = writer_lifetime_lock
     if lifetime_lock is None:
-        owned_lifetime_lock = WorkerLifetimeLock(settings.core_dir, mode="shared").acquire()
+        owned_lifetime_lock = WorkerLifetimeLock(
+            settings.core_dir,
+            mode="shared",
+            timeout_seconds=QUEUE_SEAL_LIFETIME_TIMEOUT_SECONDS,
+        ).acquire()
         lifetime_lock = owned_lifetime_lock
     if not lifetime_lock.acquired or lifetime_lock.mode != "shared":
         raise ValueError("production queue requires acquired shared writer lifetime ownership")
@@ -864,7 +870,10 @@ def _initialize_queue_with_shared_writer_fencing(lifetime_lock: WorkerLifetimeLo
         lifetime_lock.release()
 
     try:
-        with exclusive_migration_lifetime(core_dir) as locked_core:
+        with exclusive_migration_lifetime(
+            core_dir,
+            timeout_seconds=QUEUE_SEAL_LIFETIME_TIMEOUT_SECONDS,
+        ) as locked_core:
             if (locked_core.device, locked_core.inode) != (
                 original_stat.st_dev,
                 original_stat.st_ino,
@@ -875,7 +884,14 @@ def _initialize_queue_with_shared_writer_fencing(lifetime_lock: WorkerLifetimeLo
             ClioCoreQueue(locked_core.root).initialize(locked_core=locked_core)
     finally:
         if not lifetime_lock.acquired:
-            lifetime_lock.acquire()
+            try:
+                lifetime_lock.acquire(
+                    timeout_seconds=QUEUE_SEAL_LIFETIME_TIMEOUT_SECONDS,
+                )
+            except WorkerLifetimeLockUnavailable as exc:
+                raise WorkerLifetimeLockUnavailable(
+                    "timed out restoring shared writer ownership after queue seal handoff"
+                ) from exc
 
     try:
         reacquired_stat = os.stat(lifetime_lock.core_dir)
