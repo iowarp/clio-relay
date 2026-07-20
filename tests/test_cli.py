@@ -1899,7 +1899,18 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
         }
 
     def recovered_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
-        return recovery
+        admission = queue.owner_session_generation_status(
+            "session-1",
+            session_generation_id="generation-1",
+        )
+        return recovery.model_copy(
+            update={
+                "process_state": (
+                    "already_closed" if admission.get("closed") is True else "cleanup_pending"
+                ),
+                "admission_status": admission,
+            }
+        )
 
     def no_worker_observation(
         _definition: ClusterDefinition,
@@ -1940,28 +1951,46 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
     monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", forbid_gateways)
     monkeypatch.setattr(cli, "teardown_remote_session", forbid_teardown)
     monkeypatch.setattr(cli, "finalize_remote_session_cleanup_report", forbid_finalization)
+    real_mark_closed = cli._mark_owner_session_closed  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    closure_attempts = 0
 
-    result = CliRunner().invoke(
-        app,
-        [
-            "session",
-            "teardown",
-            "--cluster",
-            "ares",
-            "--session-id",
-            "session-1",
-            "--keep-jobs",
-            "--keep-scheduler-jobs",
-            "--validation-report",
-            str(tmp_path / "retry-report.json"),
-        ],
-    )
+    def flaky_mark_closed(**kwargs: object) -> None:
+        nonlocal closure_attempts
+        closure_attempts += 1
+        if closure_attempts == 1:
+            raise RelayError("simulated crash before authoritative closure")
+        real_mark_closed(**kwargs)  # pyright: ignore[reportArgumentType]
 
+    monkeypatch.setattr(cli, "_mark_owner_session_closed", flaky_mark_closed)
+    command = [
+        "session",
+        "teardown",
+        "--cluster",
+        "ares",
+        "--session-id",
+        "session-1",
+        "--keep-jobs",
+        "--keep-scheduler-jobs",
+        "--validation-report",
+        str(tmp_path / "retry-report.json"),
+    ]
+    runner = CliRunner()
+
+    failed = runner.invoke(app, command)
+    result = runner.invoke(app, command)
+    already_closed = runner.invoke(app, command)
+
+    assert failed.exit_code == 1
+    assert "simulated crash before authoritative closure" in failed.output
     assert result.exit_code == 0, result.output
+    assert already_closed.exit_code == 0, already_closed.output
+    assert closure_attempts == 3
     assert destructive_calls == []
     payload = json.loads(result.output)
     assert payload["cleanup_operation_id"] == operation_id
     assert payload["cleanup_policy"] == policy
+    assert payload["recovery_evidence"]["process_state"] == "already_closed"
+    assert payload["recovery_evidence"]["admission_status"]["closed"] is True
     assert [
         resource["kind"] for resource in payload["resources"] if resource["kind"] == "owner_session"
     ] == ["owner_session"]

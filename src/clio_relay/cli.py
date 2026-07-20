@@ -4471,6 +4471,37 @@ def session_teardown(
                 session_generation_id=session_generation_id,
                 legacy_unversioned_job_ids=[],
             )
+            closed_recovery = _owned_session_recovery_status(
+                queue=queue,
+                definition=definition,
+                remote_execution=remote_execution,
+                cluster=cluster,
+                session_id=session_id,
+            )
+            if not (
+                closed_recovery.recovery_verified
+                and closed_recovery.cleanup_receipt
+                and closed_recovery.cleanup_paths_pending is False
+                and closed_recovery.coordinator_report_bound
+                and closed_recovery.session_generation_id == session_generation_id
+                and closed_recovery.process_state == "already_closed"
+                and isinstance(closed_recovery.admission_status, dict)
+                and closed_recovery.admission_status.get("closed") is True
+            ):
+                raise RelayError(
+                    "finalized cleanup retry was not authoritatively closed after commit"
+                )
+            closed_report = _verified_finalized_cleanup_report(
+                closed_recovery,
+                cluster=cluster,
+                session_id=session_id,
+            )
+            if session_lifecycle_report_sha256(closed_report) != session_lifecycle_report_sha256(
+                finalized_retry_report
+            ):
+                raise RelayError("finalized cleanup report reference changed during closure")
+            recovery_status = closed_recovery
+            recovery_resource = _owner_session_recovery_validation_resource(closed_recovery)
             report = finalized_retry_report.model_copy(deep=True)
             append_owner_session_closure(
                 report,
