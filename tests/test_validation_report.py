@@ -432,22 +432,45 @@ def test_uv_tool_receipt_binds_exact_remote_url_and_launcher(tmp_path: Path) -> 
     assert rejected["verified"] is False
 
 
-def test_persistent_uv_tool_discovers_uv_from_path_and_requires_receipt(
+@pytest.mark.parametrize(
+    ("launcher_case", "expected_verified"),
+    [
+        ("scoped", True),
+        ("missing", False),
+        ("invalid-override", False),
+        *([("non-executable", False)] if os.name != "nt" else []),
+    ],
+)
+def test_persistent_uv_tool_scopes_launcher_discovery_and_fails_closed(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    launcher_case: str,
+    expected_verified: bool,
 ) -> None:
     tool_directory = tmp_path / "uv" / "tools"
     environment = tool_directory / "clio-relay"
     tool_bin = tmp_path / "uv" / "bin"
     package = environment / "Lib" / "site-packages" / "clio_relay"
     interpreter = environment / "Scripts" / "python.exe"
-    launcher = tool_bin / "clio-relay.exe"
+    launcher_name = "clio-relay.exe" if os.name == "nt" else "clio-relay"
+    launcher = tool_bin / launcher_name
+    stale_launcher = tmp_path / "path-bin" / launcher_name
     uv = tmp_path / "bin" / "uv.exe"
     base_prefix = tmp_path / "python"
-    for directory in (package, interpreter.parent, tool_bin, uv.parent, base_prefix):
+    for directory in (
+        package,
+        interpreter.parent,
+        tool_bin,
+        stale_launcher.parent,
+        uv.parent,
+        base_prefix,
+    ):
         directory.mkdir(parents=True, exist_ok=True)
     interpreter.write_bytes(b"python")
     launcher.write_bytes(b"launcher")
+    launcher.chmod(0o755)
+    stale_launcher.write_bytes(b"stale launcher from PATH")
+    stale_launcher.chmod(0o755)
     uv.write_bytes(b"uv")
     source_url = (
         "https://github.com/iowarp/clio-relay/releases/download/"
@@ -478,9 +501,22 @@ def test_persistent_uv_tool_discovers_uv_from_path_and_requires_receipt(
             return None
 
     launcher_digest = hashlib.sha256(launcher.read_bytes()).hexdigest()
+    if launcher_case == "missing":
+        launcher.unlink()
+    elif launcher_case == "non-executable":
+        launcher.chmod(0o644)
+    real_which = shutil.which
 
-    def find_executable(name: str) -> str:
-        return str(uv) if name == "uv" else str(launcher)
+    def find_executable(
+        name: str,
+        mode: int = os.F_OK | os.X_OK,
+        path: str | None = None,
+    ) -> str | None:
+        if name == "uv":
+            assert path is None
+            return str(uv)
+        assert Path(name) == launcher
+        return real_which(name, mode=mode, path=path)
 
     def uv_identity(_path: str | None) -> tuple[bool, str | None, str | None]:
         return True, "0.11.28", hashlib.sha256(uv.read_bytes()).hexdigest()
@@ -499,6 +535,14 @@ def test_persistent_uv_tool_discovers_uv_from_path_and_requires_receipt(
         }
 
     monkeypatch.delenv("UV", raising=False)
+    if launcher_case == "invalid-override":
+        monkeypatch.setenv(
+            "CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE",
+            str(stale_launcher),
+        )
+    else:
+        monkeypatch.delenv("CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE", raising=False)
+    monkeypatch.chdir(stale_launcher.parent)
     monkeypatch.setattr(
         validation_report_module.shutil,
         "which",
@@ -534,10 +578,19 @@ def test_persistent_uv_tool_discovers_uv_from_path_and_requires_receipt(
         distribution=cast(metadata.Distribution, Distribution()),
     )
 
-    assert verified is True
+    assert verified is expected_verified
     assert receipt["uv_executable"] == str(uv)
-    assert receipt["uv_tool_receipt"]["verified"] is True
-    assert receipt["verified"] is True
+    assert receipt["verified"] is expected_verified
+    assert receipt["uv_tool_receipt"]["verified"] is expected_verified
+    if launcher_case == "scoped":
+        assert receipt["tool_executable"] == str(launcher)
+        assert receipt["tool_bin_bound"] is True
+    elif launcher_case in {"missing", "non-executable"}:
+        assert receipt["tool_executable"] is None
+        assert receipt["tool_bin_bound"] is False
+    else:
+        assert receipt["tool_executable"] == str(stale_launcher)
+        assert receipt["tool_bin_bound"] is False
 
 
 def test_uv_launcher_identity_hashes_exact_regular_executable(
@@ -580,8 +633,8 @@ def test_uv_launcher_identity_rejects_executable_replaced_during_probe(
 
 
 @pytest.fixture(scope="module")
-def real_uvx_relay_wheel(tmp_path_factory: pytest.TempPathFactory) -> tuple[str, Path]:
-    """Build one real wheel for cache-backed and no-cache uvx receipt probes."""
+def real_uv_relay_wheel(tmp_path_factory: pytest.TempPathFactory) -> tuple[str, str, Path]:
+    """Build one real wheel for persistent-tool and uvx receipt probes."""
     uv = shutil.which("uv")
     uvx = shutil.which("uvx")
     assert uv is not None and uvx is not None, "the production test suite requires uv and uvx"
@@ -610,14 +663,95 @@ def real_uvx_relay_wheel(tmp_path_factory: pytest.TempPathFactory) -> tuple[str,
     )
     wheels = list(artifact_dir.glob("clio_relay-*.whl"))
     assert len(wheels) == 1
-    return uvx, wheels[0].resolve()
+    return uv, uvx, wheels[0].resolve()
+
+
+def test_real_uv_tool_scopes_launcher_to_isolated_bin(
+    tmp_path: Path,
+    real_uv_relay_wheel: tuple[str, str, Path],
+) -> None:
+    uv, _uvx, wheel = real_uv_relay_wheel
+    tool_directory = tmp_path / "tools"
+    tool_bin_directory = tmp_path / "tool-bin"
+    isolated_home = tmp_path / "home"
+    uv_cache = tmp_path / "uv-cache"
+    collision_directory = tmp_path / "cwd-collision"
+    for directory in (
+        tool_directory,
+        tool_bin_directory,
+        isolated_home,
+        uv_cache,
+        collision_directory,
+    ):
+        directory.mkdir(parents=True)
+    collision_executable = collision_directory / (
+        "clio-relay.exe" if os.name == "nt" else "clio-relay"
+    )
+    collision_executable.write_bytes(b"unrelated current-directory launcher")
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(isolated_home),
+            "USERPROFILE": str(isolated_home),
+            "UV": uv,
+            "UV_CACHE_DIR": str(uv_cache),
+            "UV_TOOL_BIN_DIR": str(tool_bin_directory),
+            "UV_TOOL_DIR": str(tool_directory),
+        }
+    )
+    environment.pop("CLIO_RELAY_INSTALL_RECEIPT", None)
+    environment.pop("CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE", None)
+    environment["PATH"] = os.pathsep.join(
+        entry
+        for entry in environment.get("PATH", "").split(os.pathsep)
+        if entry and Path(entry).resolve() != tool_bin_directory.resolve()
+    )
+    subprocess.run(
+        [
+            uv,
+            "tool",
+            "install",
+            "--force",
+            "--no-config",
+            "--python",
+            f"{sys.version_info.major}.{sys.version_info.minor}",
+            str(wheel),
+        ],
+        capture_output=True,
+        check=True,
+        env=environment,
+        text=True,
+        timeout=180,
+    )
+    executable = tool_bin_directory / ("clio-relay.exe" if os.name == "nt" else "clio-relay")
+
+    completed = subprocess.run(
+        [str(executable), "installation-info"],
+        capture_output=True,
+        check=False,
+        cwd=collision_directory,
+        env=environment,
+        text=True,
+        timeout=60,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    installation = json.loads(completed.stdout)
+    source = installation["install_source"]
+    assert installation["receipt_origin"] == "uv-tool"
+    assert installation["receipt_matches_install"] is True
+    assert source["artifact_identity_verified"] is True
+    assert source["launcher_verified"] is True
+    assert Path(source["launcher_receipt"]["tool_executable"]).resolve() == executable.resolve()
+    assert source["launcher_receipt"]["tool_bin_bound"] is True
+    assert source["launcher_receipt"]["uv_tool_receipt"]["launcher_bound"] is True
 
 
 def test_real_uvx_0_11_28_produces_verified_os_bound_launcher_receipt(
     tmp_path: Path,
-    real_uvx_relay_wheel: tuple[str, Path],
+    real_uv_relay_wheel: tuple[str, str, Path],
 ) -> None:
-    uvx, wheel = real_uvx_relay_wheel
+    _uv, uvx, wheel = real_uv_relay_wheel
     report = tmp_path / "uvx-receipt.json"
     environment = os.environ.copy()
     environment["CLIO_RELAY_VALIDATION_INVOCATION_ID"] = "real-uvx-receipt-test"
@@ -680,9 +814,9 @@ def test_real_uvx_0_11_28_produces_verified_os_bound_launcher_receipt(
 
 def test_real_uvx_no_cache_temporary_environment_is_not_a_verified_receipt(
     tmp_path: Path,
-    real_uvx_relay_wheel: tuple[str, Path],
+    real_uv_relay_wheel: tuple[str, str, Path],
 ) -> None:
-    uvx, wheel = real_uvx_relay_wheel
+    _uv, uvx, wheel = real_uv_relay_wheel
     report = tmp_path / "uvx-no-cache-receipt.json"
     environment = os.environ.copy()
     environment["CLIO_RELAY_VALIDATION_INVOCATION_ID"] = "real-uvx-no-cache-test"
