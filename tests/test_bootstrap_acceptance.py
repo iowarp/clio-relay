@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from typing import cast
 
 import pytest
 
@@ -13,6 +14,7 @@ from clio_relay.errors import RelayError
 def _receipt(outcome: str = "noop_verified") -> dict[str, object]:
     service_start_count = 1 if outcome == "repaired" else 0
     return {
+        "schema_version": "clio-relay.bootstrap-receipt.v2",
         "outcome": outcome,
         "operations": {
             "download_count": 0,
@@ -37,6 +39,9 @@ def _receipt(outcome: str = "noop_verified") -> dict[str, object]:
             "clio-relay": {"action": "reused"},
             "clio-kit": {"action": "reused"},
             "jarvis-cd": {"action": "reused"},
+            "jarvis-util": {"action": "reused"},
+            "frp": {"action": "reused"},
+            "uv": {"action": "reused"},
         },
         "service": {"active_after": True, "enabled_after": True},
     }
@@ -68,11 +73,32 @@ def test_reuse_acceptance_records_public_deadline_and_zero_mutation(
 def test_non_reuse_bootstrap_is_outside_the_fast_path_gate() -> None:
     assert (
         bootstrap_reuse_acceptance_evidence(
-            {"outcome": "full"},
+            {
+                "schema_version": "clio-relay.bootstrap-receipt.v2",
+                "outcome": "full",
+            },
             elapsed_seconds=1_200,
         )
         is None
     )
+
+
+def test_reuse_acceptance_rejects_unsupported_receipt_schema() -> None:
+    receipt = _receipt()
+    receipt["schema_version"] = "clio-relay.bootstrap-receipt.v1"
+
+    with pytest.raises(RelayError, match="unsupported bootstrap receipt schema"):
+        bootstrap_reuse_acceptance_evidence(receipt, elapsed_seconds=1)
+
+
+def test_reuse_acceptance_rejects_missing_required_component() -> None:
+    receipt = _receipt()
+    components = receipt["components"]
+    assert isinstance(components, dict)
+    del components["uv"]
+
+    with pytest.raises(RelayError, match="omitted required components: uv"):
+        bootstrap_reuse_acceptance_evidence(receipt, elapsed_seconds=1)
 
 
 @pytest.mark.parametrize(
@@ -152,7 +178,7 @@ def test_reuse_acceptance_rejects_hidden_rebuild_or_unready_service(
     for key in path[:-1]:
         nested = target[key]
         assert isinstance(nested, dict)
-        target = nested
+        target = cast(dict[str, object], nested)
     target[path[-1]] = value
 
     with pytest.raises(RelayError, match=message):

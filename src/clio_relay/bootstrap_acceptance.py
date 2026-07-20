@@ -11,6 +11,14 @@ from clio_relay.errors import RelayError
 BOOTSTRAP_EXACT_REUSE_MAX_SECONDS = 30.0
 BOOTSTRAP_SERVICE_REPAIR_MAX_SECONDS = 60.0
 _REUSE_OUTCOMES = {"noop_verified", "repaired"}
+_REQUIRED_REUSE_COMPONENTS = {
+    "clio-relay",
+    "clio-kit",
+    "jarvis-cd",
+    "jarvis-util",
+    "frp",
+    "uv",
+}
 
 
 def bootstrap_reuse_acceptance_evidence(
@@ -24,6 +32,9 @@ def bootstrap_reuse_acceptance_evidence(
     gate and return ``None``. Reuse outcomes fail closed when their public
     end-to-end duration or any mutation evidence exceeds the contract.
     """
+    schema_version = _required_string(receipt, "schema_version", "bootstrap receipt")
+    if schema_version != "clio-relay.bootstrap-receipt.v2":
+        raise RelayError(f"unsupported bootstrap receipt schema: {schema_version}")
     outcome = _required_string(receipt, "outcome", "bootstrap receipt")
     if outcome not in _REUSE_OUTCOMES:
         return None
@@ -108,6 +119,11 @@ def bootstrap_reuse_acceptance_evidence(
     components = _required_mapping(receipt, "components", "bootstrap receipt")
     if not components:
         raise RelayError("bootstrap reuse omitted component evidence")
+    missing_components = sorted(_REQUIRED_REUSE_COMPONENTS - set(components))
+    if missing_components:
+        raise RelayError(
+            "bootstrap reuse omitted required components: " + ", ".join(missing_components)
+        )
     component_actions: dict[str, str] = {}
     for component_name, component_value in components.items():
         if not component_name:
