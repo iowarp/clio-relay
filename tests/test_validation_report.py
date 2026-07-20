@@ -83,6 +83,118 @@ def _timestamp() -> datetime:
     return datetime(2026, 7, 10, 18, 0, tzinfo=UTC)
 
 
+def test_validation_writer_recovers_current_pending_and_prunes_stale_pending(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "reports"
+    parent.mkdir(mode=0o700)
+    target = parent / "current.json"
+
+    def pending_path(name: str) -> Path:
+        identity = hashlib.sha256(name.encode("utf-8")).hexdigest()[:32]
+        return parent / f".clio-validation-{identity}.pending"
+
+    stale = pending_path("stale.json")
+    current = pending_path(target.name)
+    stale.write_bytes(b"stale")
+    current.write_bytes(b"partial")
+    if os.name == "posix":
+        stale.chmod(0o600)
+        current.chmod(0o600)
+
+    validation_report_module._atomic_write_text(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        target,
+        "exact",
+    )
+
+    assert target.read_text(encoding="utf-8") == "exact"
+    assert not stale.exists()
+    assert not current.exists()
+
+
+def test_validation_writer_refuses_a_concurrent_writer_without_corruption(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    target = tmp_path / "report.json"
+    entered = Event()
+    release = Event()
+    thread_errors: list[BaseException] = []
+    original = validation_report_module._atomic_write_text_locked  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def blocking_writer(
+        path: Path,
+        text: str,
+        *,
+        writer_lock: object,
+    ) -> None:
+        entered.set()
+        if not release.wait(timeout=5):
+            raise AssertionError("concurrent validation writer test timed out")
+        original(path, text, writer_lock=writer_lock)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(validation_report_module, "_atomic_write_text_locked", blocking_writer)
+
+    def first_writer() -> None:
+        try:
+            validation_report_module._atomic_write_text(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                target,
+                "first",
+            )
+        except BaseException as exc:  # pragma: no cover - asserted through the parent thread
+            thread_errors.append(exc)
+
+    thread = Thread(target=first_writer)
+    thread.start()
+    assert entered.wait(timeout=2)
+    try:
+        with pytest.raises(
+            (OSError, ConfigurationError),
+            match=(
+                "another validation writer|could not open private Windows file|"
+                "validation writer lock could not be acquired"
+            ),
+        ):
+            validation_report_module._atomic_write_text(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                target,
+                "second",
+            )
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert thread_errors == []
+    assert target.read_text(encoding="utf-8") == "first"
+
+
+def test_posix_validation_writer_rejects_parent_swap_after_lock(tmp_path: Path) -> None:
+    if os.name != "posix":
+        return
+    parent = tmp_path / "reports"
+    parent.mkdir(mode=0o700)
+    displaced = tmp_path / "displaced-reports"
+    writer_lock = validation_report_module._acquire_validation_writer_lock(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        parent
+    )
+    try:
+        parent.rename(displaced)
+        parent.mkdir(mode=0o700)
+        with pytest.raises(OSError, match="differs from its writer lock"):
+            validation_report_module._atomic_write_text_locked(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                parent / "report.json",
+                "outside",
+                writer_lock=writer_lock,
+            )
+    finally:
+        validation_report_module._release_validation_writer_lock(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            writer_lock
+        )
+
+    assert not (parent / "report.json").exists()
+    assert not (displaced / "report.json").exists()
+
+
 def test_install_source_records_unverified_uvx_without_crashing_report_creation(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

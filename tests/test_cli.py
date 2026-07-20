@@ -2200,6 +2200,42 @@ def test_cleanup_evidence_state_parent_rejects_cwd_relative_install_receipt(
         cli._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
+def test_local_cleanup_report_artifact_rejects_consistently_tampered_prior_report(
+    tmp_path: Path,
+) -> None:
+    validation_path = tmp_path / "cleanup.json"
+    report = _verified_teardown_report()
+    report.cleanup_operation_id = "cleanup-prior-one"
+    cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report,
+        validation_report_path=validation_path,
+    )
+    prior = report.model_copy(deep=True)
+    prior.cleanup_operation_id = "cleanup-prior-two"
+    artifact = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        prior,
+        validation_report_path=validation_path,
+    )
+    manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+    first_chunk = artifact.manifest_path.parent / manifest["chunks"][0]["name"]
+    altered = bytearray(first_chunk.read_bytes())
+    altered[0] ^= 1
+    first_chunk.write_bytes(altered)
+    manifest["chunks"][0]["sha256"] = hashlib.sha256(altered).hexdigest()
+    artifact.manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    replacement = report.model_copy(deep=True)
+    replacement.cleanup_operation_id = "cleanup-prior-three"
+
+    with pytest.raises(RelayError, match="report artifact .* inconsistent"):
+        cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            replacement,
+            validation_report_path=validation_path,
+        )
+
+
 @pytest.mark.parametrize("delta", [-1, 0, 1])
 def test_cleanup_public_json_boundary_is_byte_exact(delta: int) -> None:
     empty = cli._public_json({"detail": ""})  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
@@ -2230,11 +2266,13 @@ def test_local_cleanup_report_artifact_recovers_partial_pending_write(
     payload = session_lifecycle.session_lifecycle_report_bytes(report)
     digest = hashlib.sha256(payload).hexdigest()
     validation_path = tmp_path / f"{candidate_kind}.json"
-    artifact_directory = cli._cleanup_evidence_state_parent() / "cleanup-evidence-v1"  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    artifact_directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    artifact_directory.mkdir(mode=0o700)
-    if os.name == "posix":
-        artifact_directory.chmod(0o700)
+    seed = report.model_copy(deep=True)
+    seed.cleanup_operation_id = f"cleanup-partial-seed-{candidate_kind}"
+    seed_artifact = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        seed,
+        validation_report_path=tmp_path / "seed" / "cleanup.json",
+    )
+    artifact_directory = seed_artifact.manifest_path.parent
     final_name = f"r-{digest}.p0000" if candidate_kind == "chunk" else f"r-{digest}.manifest"
     pending = artifact_directory / f".{final_name}.pending"
     pending.write_bytes(b"interrupted")
@@ -2299,10 +2337,25 @@ def test_local_cleanup_report_artifact_rejects_external_aliases(
     )
     chunk = artifact.chunks[0].path
     outside = tmp_path / f"outside-{alias_kind}.bin"
+    expected_content = chunk.read_bytes()
+    outside_acl: str | None = None
     if alias_kind == "hardlink":
         os.link(chunk, outside)
+        if os.name == "nt":
+            subprocess.run(
+                ["icacls", str(outside), "/grant", "*S-1-1-0:(R)"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            outside_acl = subprocess.run(
+                ["icacls", str(outside)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
     else:
-        outside.write_bytes(chunk.read_bytes())
+        outside.write_bytes(expected_content)
         chunk.unlink()
         try:
             chunk.symlink_to(outside)
@@ -2316,6 +2369,17 @@ def test_local_cleanup_report_artifact_rejects_external_aliases(
         cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report,
             validation_report_path=validation_path,
+        )
+    assert outside.read_bytes() == expected_content
+    if outside_acl is not None:
+        assert (
+            subprocess.run(
+                ["icacls", str(outside)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            == outside_acl
         )
 
 
