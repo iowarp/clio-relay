@@ -13,6 +13,7 @@ import clio_relay.core_queue as core_queue_module
 from clio_relay.core_queue import ClioCoreQueue, LegacyQueueStateError
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import JarvisRunSpec, JobKind, RelayJob
+from clio_relay.worker_lifetime_lock import WorkerLifetimeLock, WorkerLifetimeLockUnavailable
 
 
 def _job(identity: str) -> RelayJob:
@@ -87,6 +88,50 @@ def test_sealed_startup_never_uses_path_glob(
     ClioCoreQueue(root).initialize()
 
 
+def test_sealed_startup_never_upgrades_shared_writer_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A healthy seal retains the bounded shared-writer startup path."""
+    root = tmp_path / "core"
+    ClioCoreQueue(root).initialize()
+    monkeypatch.setattr(
+        core_queue_module,
+        "exclusive_migration_lifetime",
+        _refuse_history_scan,
+    )
+
+    ClioCoreQueue(root).initialize()
+
+
+def test_missing_seal_is_written_once_while_exclusive_writer_ownership_is_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh initialization binds its one durable seal to exclusive writer fencing."""
+    root = tmp_path / "core"
+    sealed_phases: list[str] = []
+
+    def observe_seal(phase: str, _path: Path) -> None:
+        with pytest.raises(WorkerLifetimeLockUnavailable):
+            WorkerLifetimeLock(
+                root,
+                mode="shared",
+                timeout_seconds=0,
+            ).acquire()
+        sealed_phases.append(phase)
+
+    monkeypatch.setattr(
+        ClioCoreQueue,
+        "_after_legacy_record_audit_phase",
+        staticmethod(observe_seal),
+    )
+
+    ClioCoreQueue(root).initialize()
+
+    assert sealed_phases == ["marker"]
+
+
 def test_sealed_startup_refuses_malformed_index_state_without_repair_or_glob(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -159,7 +204,7 @@ def test_missing_seal_runs_exactly_one_full_audit_under_the_queue_lock(
         observe_audit,
     )
 
-    ClioCoreQueue(root).initialize()
+    queue.initialize()
 
     assert lock_observations == [True]
 

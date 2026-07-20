@@ -228,6 +228,10 @@ class LegacyQueueStateError(QueueConflictError):
         super().__init__(json.dumps(self.report, sort_keys=True))
 
 
+class QueueSealRequiresExclusive(ConfigurationError):
+    """Refuse to create the indexed-era seal without exclusive writer fencing."""
+
+
 _ORDER_FAMILIES = ("tasks", "artifacts", "progress")
 _GLOBAL_ORDER_FAMILIES = (
     "endpoints",
@@ -725,6 +729,10 @@ class ClioCoreQueue:
         """Durably seal one completed bounded audit for O(1) future startup."""
         if not self._lock.is_locked:
             raise RuntimeError("legacy-record audit seal requires the queue lock")
+        if not self._migration_lifetime_guarded:
+            raise QueueSealRequiresExclusive(
+                "legacy-record audit seal requires exclusive writer-lifetime ownership"
+            )
         marker_path = self._legacy_record_audit_marker_path()
         existing = self._read_legacy_record_audit_marker()
         if existing is not None:
@@ -2283,15 +2291,19 @@ class ClioCoreQueue:
         *,
         migrate_legacy_output: bool = False,
         locked_core: LockedCoreIdentity | None = None,
+        allow_exclusive_seal: bool = True,
     ) -> None:
         """Create the record families used by the queue."""
         if locked_core is not None:
-            if not migrate_legacy_output or self._migration_lifetime_guarded:
+            if self._migration_lifetime_guarded:
                 raise ConfigurationError(
-                    "locked-core authority is only valid for the outer migration scope"
+                    "locked-core authority is only valid for the outer initialization scope"
                 )
             require_active_locked_core(locked_core)
-            self._initialize_under_locked_core(locked_core)
+            self._initialize_under_locked_core(
+                locked_core,
+                migrate_legacy_output=migrate_legacy_output,
+            )
             return
         if migrate_legacy_output and not self._migration_lifetime_guarded:
             with exclusive_migration_lifetime(self.root) as locked_core:
@@ -2302,156 +2314,199 @@ class ClioCoreQueue:
             return
         if self._initialized:
             with self._lock:
-                self._read_sealed_index_migration_state()
+                indexed_audit = self._read_legacy_record_audit_marker()
+            if indexed_audit is not None:
+                return
+            self._initialized = False
+        if (
+            not self._migration_lifetime_guarded
+            and _path_lstat(self._legacy_record_audit_marker_path()) is None
+        ):
+            if not allow_exclusive_seal:
+                raise QueueSealRequiresExclusive(
+                    "missing legacy-record audit seal requires exclusive writer-lifetime ownership"
+                )
+            with exclusive_migration_lifetime(self.root) as locked_core:
+                self.initialize(
+                    migrate_legacy_output=migrate_legacy_output,
+                    locked_core=locked_core,
+                )
             return
         # The root and lock path are the only pre-lock filesystem state. A
         # missing seal is audited exactly once after taking that lock and before
         # any record-family, migration, or archive write.
         self._prepare_queue_root_for_lock()
-        with self._lock:
-            locked_indexed_audit = self._read_legacy_record_audit_marker()
-            if locked_indexed_audit is None:
-                legacy_output_audit = self._audit_legacy_state_before_initialization()
+        try:
+            with self._lock:
+                locked_indexed_audit = self._read_legacy_record_audit_marker()
+                if locked_indexed_audit is None:
+                    if not self._migration_lifetime_guarded:
+                        raise QueueSealRequiresExclusive(
+                            "missing legacy-record audit seal requires exclusive "
+                            "writer-lifetime ownership"
+                        )
+                    legacy_output_audit = self._audit_legacy_state_before_initialization()
+                    self._require_legacy_output_migration_authorized(
+                        legacy_output_audit,
+                        migrate_legacy_output=migrate_legacy_output,
+                    )
+                    for family in _INITIALIZED_QUEUE_FAMILIES:
+                        (self._storage_root / family).mkdir(parents=True, exist_ok=True)
+                    for family in _GLOBAL_ORDER_FAMILIES:
+                        (self._storage_root / "global_order" / family / "by_id").mkdir(
+                            parents=True,
+                            exist_ok=True,
+                        )
+                        (self._storage_root / "global_order" / family / "entries").mkdir(
+                            parents=True,
+                            exist_ok=True,
+                        )
+                else:
+                    legacy_output_audit = locked_indexed_audit
                 self._require_legacy_output_migration_authorized(
                     legacy_output_audit,
                     migrate_legacy_output=migrate_legacy_output,
                 )
-                for family in _INITIALIZED_QUEUE_FAMILIES:
-                    (self._storage_root / family).mkdir(parents=True, exist_ok=True)
-                for family in _GLOBAL_ORDER_FAMILIES:
-                    (self._storage_root / "global_order" / family / "by_id").mkdir(
-                        parents=True,
-                        exist_ok=True,
+                self._purge_write_staging_unlocked()
+                self._migrate_legacy_output_events_unlocked(legacy_output_audit)
+                migration_path = self._storage_root / "migrations" / "index-v1.json"
+                if not migration_path.exists():
+                    has_legacy_jobs = (
+                        next((self._storage_root / "jobs").glob("*.json"), None) is not None
                     )
-                    (self._storage_root / "global_order" / family / "entries").mkdir(
-                        parents=True,
-                        exist_ok=True,
-                    )
-            else:
-                legacy_output_audit = locked_indexed_audit
-            self._require_legacy_output_migration_authorized(
-                legacy_output_audit,
-                migrate_legacy_output=migrate_legacy_output,
-            )
-            self._purge_write_staging_unlocked()
-            self._migrate_legacy_output_events_unlocked(legacy_output_audit)
-            migration_path = self._storage_root / "migrations" / "index-v1.json"
-            if not migration_path.exists():
-                has_legacy_jobs = (
-                    next((self._storage_root / "jobs").glob("*.json"), None) is not None
-                )
-                retention_checkpoints = {
-                    family: {
-                        "cursor": None,
-                        "complete": (
-                            next((self._storage_root / family).glob("*.json"), None) is None
-                        ),
-                    }
-                    for family in _RETENTION_INDEX_FAMILIES
-                }
-                has_legacy_retention = any(
-                    checkpoint["complete"] is not True
-                    for checkpoint in retention_checkpoints.values()
-                )
-                global_order_checkpoints = {
-                    family: {
-                        "cursor": None,
-                        "complete": (
-                            next((self._storage_root / family).glob("*.json"), None) is None
-                        ),
-                    }
-                    for family in _GLOBAL_ORDER_FAMILIES
-                }
-                has_legacy_global_order = any(
-                    checkpoint["complete"] is not True
-                    for checkpoint in global_order_checkpoints.values()
-                )
-                operational_checkpoints = {
-                    family: {
-                        "cursor": None,
-                        "complete": (
-                            next((self._storage_root / family).glob("*.json"), None) is None
-                        ),
-                        **(
-                            {"schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA}
-                            if family == "leases"
-                            else {}
-                        ),
-                    }
-                    for family in _OPERATIONAL_INDEX_FAMILIES
-                }
-                has_legacy_operational = any(
-                    checkpoint["complete"] is not True
-                    for checkpoint in operational_checkpoints.values()
-                )
-                has_canonical_leases = (
-                    next((self._storage_root / "leases").glob("*.json"), None) is not None
-                )
-                lease_capacity_complete = (
-                    not has_canonical_leases
-                    and not _lease_operational_records_present(self._storage_root)
-                )
-                lease_capacity_checkpoint: dict[str, object] = {
-                    "complete": lease_capacity_complete,
-                    "schema_version": LEASE_CAPACITY_AGGREGATE_SCHEMA,
-                }
-                if lease_capacity_complete:
-                    empty_capacity = _new_lease_capacity_pair({}, generation=0)
-                    self._write_lease_capacity_pair_unlocked(empty_capacity)
-                    lease_capacity_checkpoint.update(
-                        {
-                            "epoch_id": empty_capacity.aggregate.epoch_id,
-                            "generation": empty_capacity.aggregate.generation,
-                            "record_count": 0,
+                    retention_checkpoints = {
+                        family: {
+                            "cursor": None,
+                            "complete": (
+                                next((self._storage_root / family).glob("*.json"), None) is None
+                            ),
                         }
+                        for family in _RETENTION_INDEX_FAMILIES
+                    }
+                    has_legacy_retention = any(
+                        checkpoint["complete"] is not True
+                        for checkpoint in retention_checkpoints.values()
                     )
-                self._write_json(
-                    migration_path,
-                    {
-                        "schema_version": INDEX_MIGRATION_SCHEMA,
-                        "complete": (
-                            not has_legacy_jobs
-                            and not has_legacy_retention
-                            and not has_legacy_global_order
-                            and not has_legacy_operational
-                            and lease_capacity_complete
-                            and not _lease_operational_records_present(self._storage_root)
-                        ),
-                        "families": {
-                            family: {"cursor": None, "complete": not has_legacy_jobs}
-                            for family in ("jobs", "tasks", "leases", "artifacts", "progress")
+                    global_order_checkpoints = {
+                        family: {
+                            "cursor": None,
+                            "complete": (
+                                next((self._storage_root / family).glob("*.json"), None) is None
+                            ),
+                        }
+                        for family in _GLOBAL_ORDER_FAMILIES
+                    }
+                    has_legacy_global_order = any(
+                        checkpoint["complete"] is not True
+                        for checkpoint in global_order_checkpoints.values()
+                    )
+                    operational_checkpoints = {
+                        family: {
+                            "cursor": None,
+                            "complete": (
+                                next((self._storage_root / family).glob("*.json"), None) is None
+                            ),
+                            **(
+                                {"schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA}
+                                if family == "leases"
+                                else {}
+                            ),
+                        }
+                        for family in _OPERATIONAL_INDEX_FAMILIES
+                    }
+                    has_legacy_operational = any(
+                        checkpoint["complete"] is not True
+                        for checkpoint in operational_checkpoints.values()
+                    )
+                    has_canonical_leases = (
+                        next((self._storage_root / "leases").glob("*.json"), None) is not None
+                    )
+                    lease_capacity_complete = (
+                        not has_canonical_leases
+                        and not _lease_operational_records_present(self._storage_root)
+                    )
+                    lease_capacity_checkpoint: dict[str, object] = {
+                        "complete": lease_capacity_complete,
+                        "schema_version": LEASE_CAPACITY_AGGREGATE_SCHEMA,
+                    }
+                    if lease_capacity_complete:
+                        empty_capacity = _new_lease_capacity_pair({}, generation=0)
+                        self._write_lease_capacity_pair_unlocked(empty_capacity)
+                        lease_capacity_checkpoint.update(
+                            {
+                                "epoch_id": empty_capacity.aggregate.epoch_id,
+                                "generation": empty_capacity.aggregate.generation,
+                                "record_count": 0,
+                            }
+                        )
+                    self._write_json(
+                        migration_path,
+                        {
+                            "schema_version": INDEX_MIGRATION_SCHEMA,
+                            "complete": (
+                                not has_legacy_jobs
+                                and not has_legacy_retention
+                                and not has_legacy_global_order
+                                and not has_legacy_operational
+                                and lease_capacity_complete
+                                and not _lease_operational_records_present(self._storage_root)
+                            ),
+                            "families": {
+                                family: {"cursor": None, "complete": not has_legacy_jobs}
+                                for family in (
+                                    "jobs",
+                                    "tasks",
+                                    "leases",
+                                    "artifacts",
+                                    "progress",
+                                )
+                            },
+                            "finalize": {"cursor": None, "complete": not has_legacy_jobs},
+                            "order_families": {
+                                family: {"cursor": None, "complete": not has_legacy_jobs}
+                                for family in _ORDER_FAMILIES
+                            },
+                            "global_order_families": global_order_checkpoints,
+                            "retention_families": retention_checkpoints,
+                            "operational_families": operational_checkpoints,
+                            "lease_operational_repair": {
+                                "complete": not _lease_operational_records_present(
+                                    self._storage_root
+                                ),
+                                "schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA,
+                            },
+                            "lease_capacity_aggregate": lease_capacity_checkpoint,
                         },
-                        "finalize": {"cursor": None, "complete": not has_legacy_jobs},
-                        "order_families": {
-                            family: {"cursor": None, "complete": not has_legacy_jobs}
-                            for family in _ORDER_FAMILIES
-                        },
-                        "global_order_families": global_order_checkpoints,
-                        "retention_families": retention_checkpoints,
-                        "operational_families": operational_checkpoints,
-                        "lease_operational_repair": {
-                            "complete": not _lease_operational_records_present(self._storage_root),
-                            "schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA,
-                        },
-                        "lease_capacity_aggregate": lease_capacity_checkpoint,
-                    },
-                )
-            else:
-                # A torn aggregate/checkpoint pair is valid only while its exact
-                # transition intent remains durable. Replay that authorization
-                # before deciding the migration checkpoint itself is corrupt.
+                    )
+                else:
+                    # A torn aggregate/checkpoint pair is valid only while its exact
+                    # transition intent remains durable. Replay that authorization
+                    # before deciding the migration checkpoint itself is corrupt.
+                    if locked_indexed_audit is None:
+                        self._recover_pending_transitions_unlocked()
+                        self._ensure_extended_migration_state()
+                self._recover_pending_transitions_unlocked()
                 if locked_indexed_audit is None:
-                    self._recover_pending_transitions_unlocked()
-                    self._ensure_extended_migration_state()
-            self._recover_pending_transitions_unlocked()
-            if locked_indexed_audit is None:
-                self._write_legacy_record_audit_marker_unlocked()
-            else:
-                self._read_sealed_index_migration_state()
-            self._initialized = True
+                    self._write_legacy_record_audit_marker_unlocked()
+                else:
+                    self._read_sealed_index_migration_state()
+                self._initialized = True
+        except QueueSealRequiresExclusive:
+            if not allow_exclusive_seal:
+                raise
+            with exclusive_migration_lifetime(self.root) as locked_core:
+                self.initialize(
+                    migrate_legacy_output=migrate_legacy_output,
+                    locked_core=locked_core,
+                )
 
-    def _initialize_under_locked_core(self, locked_core: LockedCoreIdentity) -> None:
-        """Pin all migration I/O to one authenticated locked core identity."""
+    def _initialize_under_locked_core(
+        self,
+        locked_core: LockedCoreIdentity,
+        *,
+        migrate_legacy_output: bool,
+    ) -> None:
+        """Pin initialization I/O to one authenticated exclusively locked core."""
         require_active_locked_core(locked_core)
         original_storage_root = self._storage_root
         try:
@@ -2477,7 +2532,7 @@ class ClioCoreQueue:
         )
         self._migration_lifetime_guarded = True
         try:
-            self.initialize(migrate_legacy_output=True)
+            self.initialize(migrate_legacy_output=migrate_legacy_output)
         finally:
             self._migration_lifetime_guarded = False
         try:

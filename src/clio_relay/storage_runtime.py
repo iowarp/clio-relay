@@ -23,6 +23,7 @@ from clio_relay.core_queue import (
     MAX_ACTIVE_JOB_RECORDS,
     MAX_LIVE_LEASE_RECORDS,
     ClioCoreQueue,
+    QueueSealRequiresExclusive,
     _job_matches_mcp_admission_class,  # pyright: ignore[reportPrivateUsage]
 )
 from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError, RelayError
@@ -376,13 +377,16 @@ class StorageManagedQueue(ClioCoreQueue):
         *,
         migrate_legacy_output: bool = False,
         locked_core: LockedCoreIdentity | None = None,
+        allow_exclusive_seal: bool = False,
     ) -> None:
         """Initialize only while this managed queue retains writer ownership."""
+        del allow_exclusive_seal
         if self._closed:
             raise ConfigurationError("managed queue is closed and cannot perform operations")
         super().initialize(
             migrate_legacy_output=migrate_legacy_output,
             locked_core=locked_core,
+            allow_exclusive_seal=False,
         )
 
     def close(self) -> None:
@@ -821,12 +825,12 @@ def storage_managed_queue(
         lifetime_lock = owned_lifetime_lock
     if not lifetime_lock.acquired or lifetime_lock.mode != "shared":
         raise ValueError("production queue requires acquired shared writer lifetime ownership")
-    pinned_settings = settings.model_copy(update={"core_dir": lifetime_lock.core_dir})
     try:
+        _initialize_queue_with_shared_writer_fencing(lifetime_lock)
+        pinned_settings = settings.model_copy(update={"core_dir": lifetime_lock.core_dir})
         # Audit and initialize before StorageRuntime or StoragePolicy can create
         # `.storage`. A normal startup that encounters legacy output remains a
         # read-only refusal with respect to storage accounting and spool state.
-        ClioCoreQueue(lifetime_lock.core_dir).initialize()
         runtime = storage_runtime_from_settings(pinned_settings)
         queue = StorageManagedQueue(
             lifetime_lock.core_dir,
@@ -842,6 +846,36 @@ def storage_managed_queue(
             owned_lifetime_lock.release()
         raise
     return queue
+
+
+def _initialize_queue_with_shared_writer_fencing(lifetime_lock: WorkerLifetimeLock) -> None:
+    """Create a missing queue seal under exclusive ownership, then restore shared ownership."""
+    core_dir = lifetime_lock.core_dir
+    try:
+        ClioCoreQueue(core_dir).initialize(allow_exclusive_seal=False)
+        return
+    except QueueSealRequiresExclusive:
+        lifetime_lock.release()
+
+    try:
+        ClioCoreQueue(core_dir).initialize()
+    finally:
+        if not lifetime_lock.acquired:
+            lifetime_lock.acquire()
+
+    try:
+        original_stat = os.stat(core_dir)
+        reacquired_stat = os.stat(lifetime_lock.core_dir)
+    except OSError as exc:
+        raise ConfigurationError(
+            f"queue root identity cannot be verified after seal fencing: {exc}"
+        ) from exc
+    if (original_stat.st_dev, original_stat.st_ino) != (
+        reacquired_stat.st_dev,
+        reacquired_stat.st_ino,
+    ):
+        raise ConfigurationError("queue root changed while establishing its indexed-era seal")
+    ClioCoreQueue(lifetime_lock.core_dir).initialize(allow_exclusive_seal=False)
 
 
 def _complete_bounded_index_migration(

@@ -100,6 +100,45 @@ def test_shared_workers_exclude_migration_across_processes(tmp_path: Path) -> No
         exclusive.release()
 
 
+def test_old_shared_writer_prevents_missing_seal_mutation_until_exclusive(
+    tmp_path: Path,
+) -> None:
+    """A pre-seal shared writer fences every queue record and marker creation."""
+    core_dir = tmp_path / "core"
+    started = tmp_path / "seal-started"
+    shared = WorkerLifetimeLock(core_dir, mode="shared").acquire()
+    source = """
+from pathlib import Path
+import sys
+from clio_relay.core_queue import ClioCoreQueue
+
+core, started = map(Path, sys.argv[1:])
+started.write_text("started", encoding="utf-8")
+ClioCoreQueue(core).initialize()
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", source, str(core_dir), str(started)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not started.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert started.exists()
+        time.sleep(0.1)
+        assert process.poll() is None
+        assert not (core_dir / "migrations").exists()
+        assert not (core_dir / "jobs").exists()
+        assert not (core_dir / ".lock").exists()
+    finally:
+        shared.release()
+    stdout, stderr = process.communicate(timeout=30)
+    assert process.returncode == 0, f"stdout={stdout!r} stderr={stderr!r}"
+    assert (core_dir / "migrations" / "legacy-record-audit-v1.json").is_file()
+
+
 def test_lifetime_locks_are_scoped_to_physical_core(tmp_path: Path) -> None:
     """An exclusive migration on one core never blocks a different core."""
     first = WorkerLifetimeLock(tmp_path / "first", mode="exclusive").acquire()
