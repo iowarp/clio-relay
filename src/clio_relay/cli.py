@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ctypes
 import hashlib
 import hmac
 import json
@@ -60,6 +61,8 @@ from clio_relay.cluster_config import (
     RemoteMcpServerConfig,
     WorkerCapacityPolicy,
     default_registry_path,
+    ensure_private_configuration_path,
+    open_private_atomic_file,
 )
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
@@ -72,6 +75,7 @@ from clio_relay.deployment import (
 from clio_relay.doctor import run_cluster_doctor, run_doctor
 from clio_relay.endpoint import EndpointWorker
 from clio_relay.errors import ConfigurationError, NotFoundError, RelayError
+from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.frp_check import run_frpc_connection_check
 from clio_relay.identifiers import validate_durable_record_id
 from clio_relay.installation import (
@@ -272,6 +276,7 @@ from clio_relay.validation_report import (
     ValidationResource,
     ValidationStatus,
     default_report_path,
+    durably_ensure_validation_directory,
     evaluate_release_gate,
     load_release_gate_policy,
     load_validation_report,
@@ -322,6 +327,115 @@ class _LocalCleanupReportArtifact:
     report_sha256: str
     report_size: int
     chunks: tuple[_LocalCleanupReportChunk, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _WindowsPinnedDirectory:
+    """Windows directory handle held without delete sharing to block path swaps."""
+
+    path: Path
+    status: os.stat_result
+    handle: ctypes.c_void_p
+
+
+def _open_windows_pinned_directory(
+    path: Path,
+    *,
+    expected: os.stat_result,
+) -> _WindowsPinnedDirectory:
+    """Open and verify one non-reparse Windows directory without delete sharing."""
+    if os.name != "nt":  # pragma: no cover - platform contract
+        raise RelayError("Windows directory pinning is unavailable")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_attributes = kernel32.GetFileAttributesW
+    get_attributes.argtypes = [ctypes.c_wchar_p]
+    get_attributes.restype = ctypes.c_uint32
+    invalid_attributes = 0xFFFFFFFF
+    file_attribute_directory = 0x00000010
+    file_attribute_reparse_point = 0x00000400
+    storage_path = internal_filesystem_path(path, force_extended=True)
+    attributes = int(get_attributes(str(storage_path)))
+    if (
+        attributes == invalid_attributes
+        or not attributes & file_attribute_directory
+        or attributes & file_attribute_reparse_point
+    ):
+        raise RelayError("local cleanup report artifact directory is a Windows reparse point")
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    raw_handle = create_file(
+        str(storage_path),
+        0x00000080,
+        0x00000001 | 0x00000002,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    if raw_handle in (None, ctypes.c_void_p(-1).value):
+        error_number = ctypes.get_last_error()
+        raise RelayError(
+            "local cleanup report artifact directory cannot be pinned: "
+            f"{ctypes.FormatError(error_number)}"
+        )
+    handle = ctypes.c_void_p(raw_handle)
+    try:
+        observed = os.stat(storage_path, follow_symlinks=False)
+        attributes = int(get_attributes(str(storage_path)))
+        if not (
+            os.path.samestat(expected, observed)
+            and stat.S_ISDIR(observed.st_mode)
+            and attributes != invalid_attributes
+            and attributes & file_attribute_directory
+            and not attributes & file_attribute_reparse_point
+        ):
+            raise RelayError("local cleanup report artifact directory changed while pinning")
+        return _WindowsPinnedDirectory(path=path, status=observed, handle=handle)
+    except BaseException:
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [ctypes.c_void_p]
+        close_handle.restype = ctypes.c_int
+        close_handle(handle)
+        raise
+
+
+def _verify_windows_pinned_directory(anchor: _WindowsPinnedDirectory) -> None:
+    """Revalidate the named directory while its no-delete-share handle remains open."""
+    storage_path = internal_filesystem_path(anchor.path, force_extended=True)
+    observed = os.stat(storage_path, follow_symlinks=False)
+    if not os.path.samestat(anchor.status, observed):
+        raise RelayError("local cleanup report artifact directory identity changed")
+    get_attributes = ctypes.WinDLL("kernel32", use_last_error=True).GetFileAttributesW
+    get_attributes.argtypes = [ctypes.c_wchar_p]
+    get_attributes.restype = ctypes.c_uint32
+    attributes = int(get_attributes(str(storage_path)))
+    if attributes == 0xFFFFFFFF or attributes & 0x00000400:
+        raise RelayError("local cleanup report artifact directory became a reparse point")
+
+
+def _close_windows_pinned_directory(anchor: _WindowsPinnedDirectory | None) -> None:
+    """Close one Windows directory anchor."""
+    if anchor is None:
+        return
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    close_handle.restype = ctypes.c_int
+    if not close_handle(anchor.handle):
+        error_number = ctypes.get_last_error()
+        raise RelayError(
+            "local cleanup report artifact directory handle could not be closed: "
+            f"{ctypes.FormatError(error_number)}"
+        )
 
 
 OWNED_SESSION_RECOVERY_TRANSITION_TIMEOUT_SECONDS = 90.0
@@ -3565,8 +3679,20 @@ def _persist_local_cleanup_report_artifact(
     report_basename = validation_report_path.name
     if not report_basename or report_basename in {".", ".."}:
         raise RelayError("validation report path has no safe artifact identity")
-    validation_report_path.parent.mkdir(parents=True, exist_ok=True)
-    parent_directory = validation_report_path.parent.resolve(strict=True)
+    requested_parent = validation_report_path.parent.absolute()
+    durably_ensure_validation_directory(requested_parent)
+    requested_parent_status = os.lstat(requested_parent)
+    if stat.S_ISLNK(requested_parent_status.st_mode):
+        raise RelayError("local cleanup report artifact parent cannot be a symlink")
+    if os.name == "nt":
+        requested_anchor = _open_windows_pinned_directory(
+            requested_parent,
+            expected=requested_parent_status,
+        )
+        _close_windows_pinned_directory(requested_anchor)
+    parent_directory = requested_parent.resolve(strict=True)
+    if os.path.normcase(str(parent_directory)) != os.path.normcase(str(requested_parent)):
+        raise RelayError("local cleanup report artifact parent cannot traverse a reparse point")
     parent_linked = os.lstat(parent_directory)
     if not stat.S_ISDIR(parent_linked.st_mode) or stat.S_ISLNK(parent_linked.st_mode):
         raise RelayError("local cleanup report artifact parent is not a real directory")
@@ -3580,6 +3706,8 @@ def _persist_local_cleanup_report_artifact(
     artifact_directory = parent_directory / artifact_directory_name
     parent_fd: int | None = None
     directory_fd: int | None = None
+    parent_windows_anchor: _WindowsPinnedDirectory | None = None
+    directory_windows_anchor: _WindowsPinnedDirectory | None = None
     if os.name == "posix":
         try:
             parent_fd = os.open(
@@ -3632,11 +3760,30 @@ def _persist_local_cleanup_report_artifact(
             os.close(parent_fd)
             raise RelayError("local cleanup report artifact directory changed while opening")
     else:
-        with suppress(FileExistsError):
-            artifact_directory.mkdir(mode=0o700, exist_ok=False)
-        directory_linked = os.lstat(artifact_directory)
-        if not stat.S_ISDIR(directory_linked.st_mode) or stat.S_ISLNK(directory_linked.st_mode):
-            raise RelayError("local cleanup report artifact directory is not a real directory")
+        try:
+            parent_windows_anchor = _open_windows_pinned_directory(
+                parent_directory,
+                expected=parent_linked,
+            )
+            durably_ensure_validation_directory(artifact_directory)
+            directory_linked = os.lstat(artifact_directory)
+            if not stat.S_ISDIR(directory_linked.st_mode) or stat.S_ISLNK(directory_linked.st_mode):
+                raise RelayError("local cleanup report artifact directory is not a real directory")
+            directory_windows_anchor = _open_windows_pinned_directory(
+                artifact_directory,
+                expected=directory_linked,
+            )
+            ensure_private_configuration_path(
+                internal_filesystem_path(artifact_directory, force_extended=True),
+                directory=True,
+            )
+            _verify_windows_pinned_directory(directory_windows_anchor)
+        except BaseException:
+            try:
+                _close_windows_pinned_directory(directory_windows_anchor)
+            finally:
+                _close_windows_pinned_directory(parent_windows_anchor)
+            raise
 
     def verify_directory() -> None:
         try:
@@ -3657,6 +3804,10 @@ def _persist_local_cleanup_report_artifact(
             and os.path.samestat(directory_linked, observed)
         ):
             raise RelayError("local cleanup report artifact directory identity changed")
+        if parent_windows_anchor is not None:
+            _verify_windows_pinned_directory(parent_windows_anchor)
+        if directory_windows_anchor is not None:
+            _verify_windows_pinned_directory(directory_windows_anchor)
 
     def stat_name(name: str) -> os.stat_result | None:
         if Path(name).name != name:
@@ -3688,6 +3839,13 @@ def _persist_local_cleanup_report_artifact(
         expected_nlink: int = 1,
     ) -> bytes | None:
         descriptor: int | None = None
+        if os.name == "nt":
+            candidate_path = internal_filesystem_path(
+                artifact_directory / name,
+                force_extended=True,
+            )
+            if candidate_path.exists():
+                ensure_private_configuration_path(candidate_path, directory=False)
         try:
             flags = (
                 os.O_RDONLY
@@ -3782,6 +3940,11 @@ def _persist_local_cleanup_report_artifact(
         *,
         expected_nlink: int,
     ) -> None:
+        if os.name == "nt":
+            ensure_private_configuration_path(
+                internal_filesystem_path(artifact_directory / name, force_extended=True),
+                directory=False,
+            )
         if not (
             stat.S_ISREG(observed.st_mode)
             and observed.st_nlink == expected_nlink
@@ -3963,30 +4126,47 @@ def _persist_local_cleanup_report_artifact(
                     )
                     pending_status = None
             if pending_status is None:
-                flags = (
-                    os.O_WRONLY
-                    | os.O_CREAT
-                    | os.O_EXCL
-                    | getattr(os, "O_BINARY", 0)
-                    | getattr(os, "O_NOFOLLOW", 0)
-                    | getattr(os, "O_CLOEXEC", 0)
-                )
-                descriptor = (
-                    os.open(pending_name, flags, 0o600, dir_fd=directory_fd)
-                    if directory_fd is not None
-                    else os.open(artifact_directory / pending_name, flags, 0o600)
-                )
-                if os.name == "posix":
-                    os.fchmod(descriptor, 0o600)
-                view = memoryview(content)
-                while view:
-                    written = os.write(descriptor, view)
-                    if written <= 0:
-                        raise RelayError("local cleanup report artifact write made no progress")
-                    view = view[written:]
-                os.fsync(descriptor)
-                os.close(descriptor)
-                descriptor = None
+                if os.name == "nt":
+                    pending_path = internal_filesystem_path(
+                        artifact_directory / pending_name,
+                        force_extended=True,
+                    )
+                    with open_private_atomic_file(pending_path) as stream:
+                        view = memoryview(content)
+                        while view:
+                            written = stream.write(view)
+                            if written is None or written <= 0:
+                                raise RelayError(
+                                    "local cleanup report artifact write made no progress"
+                                )
+                            view = view[written:]
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                else:
+                    flags = (
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_BINARY", 0)
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | getattr(os, "O_CLOEXEC", 0)
+                    )
+                    descriptor = (
+                        os.open(pending_name, flags, 0o600, dir_fd=directory_fd)
+                        if directory_fd is not None
+                        else os.open(artifact_directory / pending_name, flags, 0o600)
+                    )
+                    if os.name == "posix":
+                        os.fchmod(descriptor, 0o600)
+                    view = memoryview(content)
+                    while view:
+                        written = os.write(descriptor, view)
+                        if written <= 0:
+                            raise RelayError("local cleanup report artifact write made no progress")
+                        view = view[written:]
+                    os.fsync(descriptor)
+                    os.close(descriptor)
+                    descriptor = None
                 fsync_directory()
             staged = read_exact(pending_name, expected_size=len(content), required=True)
             if staged is None or not hmac.compare_digest(staged, content):
@@ -4082,6 +4262,10 @@ def _persist_local_cleanup_report_artifact(
             os.close(directory_fd)
         if parent_fd is not None:
             os.close(parent_fd)
+        try:
+            _close_windows_pinned_directory(directory_windows_anchor)
+        finally:
+            _close_windows_pinned_directory(parent_windows_anchor)
 
 
 def _persist_verified_cleanup_report_before_closure(
@@ -5132,8 +5316,8 @@ def session_teardown(
                     "validation_provenance_warning": False,
                 }
             )
-            preliminary = _public_json(payload)
-            if len(preliminary.encode("utf-8")) < MAX_FINALIZED_CLEANUP_RETRY_OUTPUT_BYTES:
+            preliminary = _bounded_cleanup_public_json(payload)
+            if preliminary is not None:
                 canonical = projection.to_live_validation_report(
                     stop_worker=stop_worker,
                     cancel_jobs=cancel_jobs,
@@ -5206,9 +5390,9 @@ def session_teardown(
                     )
                     payload["validation_status"] = canonical.status.value
                     payload["validation_provenance_warning"] = provenance_warning
-                    serialized = _public_json(payload)
+                    serialized = _bounded_cleanup_public_json(payload)
                     if (
-                        len(serialized.encode("utf-8")) < MAX_FINALIZED_CLEANUP_RETRY_OUTPUT_BYTES
+                        serialized is not None
                         and canonical_report_path.stat().st_size
                         < MAX_CLEANUP_VALIDATION_REPORT_BYTES
                     ):
@@ -5397,6 +5581,8 @@ def session_teardown(
                 observed_worker_info=cleanup_worker_info,
                 worker_observation_error=cleanup_worker_error,
             )
+            if canonical_report_path.stat().st_size >= MAX_CLEANUP_VALIDATION_REPORT_BYTES:
+                raise RelayError("finalized cleanup validation report exceeded its byte limit")
             payload: dict[str, object] = {
                 "schema_version": (
                     "clio-relay.finalized-cleanup-retry.v1"
@@ -5443,8 +5629,8 @@ def session_teardown(
                 "validation_provenance_warning": provenance_warning,
                 "ok": True,
             }
-            serialized = _public_json(payload)
-            if len(serialized.encode("utf-8")) > MAX_FINALIZED_CLEANUP_RETRY_OUTPUT_BYTES:
+            serialized = _bounded_cleanup_public_json(payload)
+            if serialized is None:
                 raise RelayError("finalized cleanup output exceeded its byte limit")
             typer.echo(serialized)
             if canonical.status is not ValidationStatus.PASSED and not provenance_warning:
@@ -10720,6 +10906,16 @@ def _optional_datetime(value: str | None) -> datetime | None:
 def _public_json(value: object) -> str:
     """Serialize operator-facing JSON without exposing durable credentials."""
     return json.dumps(redact_sensitive_values(value), indent=2)
+
+
+def _bounded_cleanup_public_json(value: object) -> str | None:
+    """Return public JSON only below the cleanup stdout compatibility boundary."""
+    serialized = _public_json(value)
+    return (
+        serialized
+        if len(serialized.encode("utf-8")) < MAX_FINALIZED_CLEANUP_RETRY_OUTPUT_BYTES
+        else None
+    )
 
 
 def _managed_queue_from_env() -> StorageManagedQueue:

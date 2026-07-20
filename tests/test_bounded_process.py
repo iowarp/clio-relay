@@ -180,3 +180,27 @@ def test_bounded_process_does_not_hide_failed_startup_cleanup(
 
     assert not isinstance(captured.value, BoundedProcessTimeout)
     assert isinstance(captured.value.__cause__, OwnedProcessSpawnError)
+
+
+def test_bounded_process_release_failure_overrides_primary_timeout(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A provider-release failure means cleanup is not verified after termination."""
+    real_release = bounded_process.release_owned_process
+
+    def release_then_fail(process: object) -> None:
+        real_release(process)  # pyright: ignore[reportArgumentType]
+        raise RuntimeError("simulated containment provider release failure")
+
+    monkeypatch.setattr(bounded_process, "release_owned_process", release_then_fail)
+
+    with pytest.raises(BoundedProcessError, match="could not be released") as captured:
+        run_bounded_process(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            timeout_seconds=0.5,
+            stdout_maximum_bytes=128,
+            stderr_maximum_bytes=128,
+        )
+
+    assert not isinstance(captured.value, BoundedProcessTimeout)
+    assert isinstance(captured.value.__cause__, RuntimeError)

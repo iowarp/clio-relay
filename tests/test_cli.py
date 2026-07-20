@@ -88,6 +88,7 @@ _REAL_PERSIST_VERIFIED_CLEANUP_REPORT = (
 @pytest.fixture(autouse=True)
 def _default_cli_mode(monkeypatch: MonkeyPatch) -> None:  # pyright: ignore[reportUnusedFunction]
     monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
+    finalized_statuses: dict[str, OwnedSessionRecoveryStatus] = {}
 
     def preserve_verified_report(
         *,
@@ -130,13 +131,38 @@ def _default_cli_mode(monkeypatch: MonkeyPatch) -> None:  # pyright: ignore[repo
                 "cleanup_intent": {"operation_id": operation_id, **report.cleanup_policy},
             },
         )
+        finalized_statuses[report.session_id] = status
         return report, status
+
+    real_recovery_status = cli._owned_session_recovery_status  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def recover_preserved_report(**kwargs: object) -> OwnedSessionRecoveryStatus:
+        session_id = cast(str, kwargs["session_id"])
+        finalized = finalized_statuses.get(session_id)
+        if finalized is None:
+            return real_recovery_status(**kwargs)  # pyright: ignore[reportArgumentType]
+        queue = cast(ClioCoreQueue, kwargs["queue"])
+        generation_id = finalized.session_generation_id
+        assert generation_id is not None
+        admission = queue.owner_session_generation_status(
+            session_id,
+            session_generation_id=generation_id,
+        )
+        return finalized.model_copy(
+            update={
+                "process_state": (
+                    "already_closed" if admission.get("closed") is True else "cleanup_pending"
+                ),
+                "admission_status": admission,
+            }
+        )
 
     monkeypatch.setattr(
         cli,
         "_persist_verified_cleanup_report_before_closure",
         preserve_verified_report,
     )
+    monkeypatch.setattr(cli, "_owned_session_recovery_status", recover_preserved_report)
 
 
 def _write_test_cluster(
@@ -491,7 +517,7 @@ def test_endpoint_worker_with_explicit_provider_does_not_require_remote_registry
         ],
     )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert captured["cluster"] == "homelab"
     assert captured["registered"] is True
     assert captured["ran_once"] is True
@@ -2067,6 +2093,216 @@ def test_session_teardown_never_closes_before_finalized_sidecar_reread(
     assert queue.owner_session_is_closing(local_session_id) is True
     assert queue.get_owner_session_closed("session-1") is None
     assert queue.get_owner_session_closed(local_session_id) is None
+
+
+def test_local_cleanup_report_artifact_is_chunked_reused_and_bounded_on_replacement(
+    tmp_path: Path,
+) -> None:
+    report = _verified_teardown_report()
+    report.cleanup_operation_id = "cleanup-artifact-large"
+    report.resources[0].detail = "x" * (9 * 1024 * 1024)
+    validation_path = tmp_path / "cleanup.json"
+
+    first = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report,
+        validation_report_path=validation_path,
+    )
+    second = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report,
+        validation_report_path=validation_path,
+    )
+
+    assert first == second
+    assert len(first.chunks) == 2
+    assert all(chunk.size <= 8 * 1024 * 1024 for chunk in first.chunks)
+    manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
+    reconstructed = b"".join(
+        (first.manifest_path.parent / item["name"]).read_bytes() for item in manifest["chunks"]
+    )
+    assert reconstructed == session_lifecycle.session_lifecycle_report_bytes(report)
+
+    replacement = report.model_copy(deep=True)
+    replacement.resources[0].detail = "y" * (9 * 1024 * 1024)
+    replaced = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        replacement,
+        validation_report_path=validation_path,
+    )
+
+    assert replaced.report_sha256 != first.report_sha256
+    assert replaced.manifest_path.parent == first.manifest_path.parent
+    retained_names = {path.name for path in replaced.manifest_path.parent.iterdir()}
+    assert retained_names == {
+        replaced.manifest_path.name,
+        *(chunk.path.name for chunk in replaced.chunks),
+    }
+    assert sum(path.stat().st_size for path in replaced.manifest_path.parent.iterdir()) < (
+        32 * 1024 * 1024 + 64 * 1024
+    )
+
+
+@pytest.mark.parametrize("delta", [-1, 0, 1])
+def test_cleanup_public_json_boundary_is_byte_exact(delta: int) -> None:
+    empty = cli._public_json({"detail": ""})  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    target = cli.MAX_FINALIZED_CLEANUP_RETRY_OUTPUT_BYTES + delta
+    payload = {"detail": "x" * (target - len(empty.encode("utf-8")))}
+    serialized = cli._public_json(payload)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    assert len(serialized.encode("utf-8")) == target
+    bounded = cli._bounded_cleanup_public_json(payload)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert (bounded is not None) is (delta < 0)
+
+
+def test_cleanup_public_json_bound_counts_non_ascii_encoding() -> None:
+    payload = {"detail": "π" * 100}
+    serialized = cli._public_json(payload)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    assert "\\u03c0" in serialized
+    assert cli._bounded_cleanup_public_json(payload) == serialized  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+
+@pytest.mark.parametrize("candidate_kind", ["chunk", "manifest"])
+def test_local_cleanup_report_artifact_recovers_partial_pending_write(
+    tmp_path: Path,
+    candidate_kind: str,
+) -> None:
+    report = _verified_teardown_report()
+    report.cleanup_operation_id = f"cleanup-partial-{candidate_kind}"
+    payload = session_lifecycle.session_lifecycle_report_bytes(report)
+    digest = hashlib.sha256(payload).hexdigest()
+    validation_path = tmp_path / f"{candidate_kind}.json"
+    path_identity = hashlib.sha256(validation_path.name.encode("utf-8")).hexdigest()[:32]
+    artifact_directory = tmp_path / f".clio-cleanup-{path_identity}"
+    artifact_directory.mkdir(mode=0o700)
+    if os.name == "posix":
+        artifact_directory.chmod(0o700)
+    final_name = f"r-{digest}.p0000" if candidate_kind == "chunk" else f"r-{digest}.manifest"
+    pending = artifact_directory / f".{final_name}.pending"
+    pending.write_bytes(b"interrupted")
+    if os.name == "posix":
+        pending.chmod(0o600)
+
+    artifact = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report,
+        validation_report_path=validation_path,
+    )
+
+    assert not pending.exists()
+    assert artifact.report_sha256 == digest
+    assert b"".join(chunk.path.read_bytes() for chunk in artifact.chunks) == payload
+
+
+def test_local_cleanup_report_artifact_validates_link_window_before_unlink(
+    tmp_path: Path,
+) -> None:
+    report = _verified_teardown_report()
+    report.cleanup_operation_id = "cleanup-linked-window"
+    validation_path = tmp_path / "linked.json"
+    artifact = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report,
+        validation_report_path=validation_path,
+    )
+    chunk = artifact.chunks[0].path
+    pending = chunk.with_name(f".{chunk.name}.pending")
+
+    os.link(chunk, pending)
+    recovered = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report,
+        validation_report_path=validation_path,
+    )
+    assert recovered == artifact
+    assert not pending.exists()
+    assert chunk.stat().st_nlink == 1
+
+    original = chunk.read_bytes()
+    chunk.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+    os.link(chunk, pending)
+    with pytest.raises(RelayError, match="linked file differs"):
+        cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            report,
+            validation_report_path=validation_path,
+        )
+    assert pending.exists()
+    assert chunk.stat().st_nlink == 2
+
+
+@pytest.mark.parametrize("alias_kind", ["hardlink", "symlink"])
+def test_local_cleanup_report_artifact_rejects_external_aliases(
+    tmp_path: Path,
+    alias_kind: str,
+) -> None:
+    report = _verified_teardown_report()
+    report.cleanup_operation_id = f"cleanup-{alias_kind}"
+    validation_path = tmp_path / f"{alias_kind}.json"
+    artifact = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report,
+        validation_report_path=validation_path,
+    )
+    chunk = artifact.chunks[0].path
+    outside = tmp_path / f"outside-{alias_kind}.bin"
+    if alias_kind == "hardlink":
+        os.link(chunk, outside)
+    else:
+        outside.write_bytes(chunk.read_bytes())
+        chunk.unlink()
+        try:
+            chunk.symlink_to(outside)
+        except OSError:
+            os.link(outside, chunk)
+
+    with pytest.raises(RelayError, match="exact regular file|candidate is unsafe"):
+        cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            report,
+            validation_report_path=validation_path,
+        )
+
+
+def test_normal_session_teardown_uses_compact_projection_for_large_report(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    queue = ClioCoreQueue(tmp_path / "core")
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(queue.root))
+    _activate_owner_session(queue)
+    report = _verified_teardown_report()
+    report.resources[0].detail = "large-normal-report:" + ("x" * (9 * 1024 * 1024))
+    monkeypatch.setattr(cli, "status_remote_session", _fake_owned_session_status)
+    monkeypatch.setattr(cli, "teardown_remote_session", lambda **_kwargs: report)
+    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", lambda _definition: (None, None))
+    validation_path = tmp_path / "large-normal.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "teardown",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--validation-report",
+            str(validation_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(result.output.encode("utf-8")) <= 1024 * 1024
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "clio-relay.finalized-cleanup.v1"
+    assert payload["report_inline"] is False
+    manifest_path = Path(payload["cleanup_report_artifact"]["manifest"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    retained_payload = b"".join(
+        (manifest_path.parent / item["name"]).read_bytes() for item in manifest["chunks"]
+    )
+    assert retained_payload == session_lifecycle.session_lifecycle_report_bytes(report)
+    assert validation_path.stat().st_size <= 8 * 1024 * 1024
+    validation = json.loads(validation_path.read_text(encoding="utf-8"))
+    assert {item["kind"] for item in validation["artifacts"]} == {
+        "cleanup_report_manifest",
+        "cleanup_report_chunk",
+    }
 
 
 def test_session_teardown_reuses_finalized_report_before_rediscovery(
@@ -4488,7 +4724,7 @@ def test_cli_session_teardown_defaults_to_keep_jobs(
         input="\n",
     )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert "Cancel queued or running jobs" not in result.output
     payload = json.loads(result.output)
     assert payload["relay_jobs"]["cancel_requested"] is False

@@ -18,6 +18,7 @@ from filelock import FileLock
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from clio_relay.errors import ConfigurationError
+from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.models import JobKind, validate_mcp_env_from
 from clio_relay.remote_values import validate_remote_path
 
@@ -819,7 +820,7 @@ def _create_private_windows_atomic_descriptor(path: Path) -> int:
     create_error = 0
     try:
         raw_handle = create_file(
-            str(path),
+            str(internal_filesystem_path(path, force_extended=True)),
             _WINDOWS_GENERIC_WRITE
             | _WINDOWS_READ_CONTROL
             | _WINDOWS_WRITE_DAC
@@ -922,7 +923,17 @@ def ensure_private_configuration_directory(path: Path) -> None:
             _close_windows_handle(handle, kernel32=kernel32)
 
 
-def _create_private_windows_directory(path: Path) -> None:
+def create_private_configuration_directory(path: Path) -> None:
+    """Create exactly one owner-private directory without accepting an existing path."""
+    if os.name != "nt":
+        os.mkdir(path, 0o700)
+        ensure_private_configuration_path(path, directory=True)
+        return
+    _create_private_windows_directory(path, exist_ok=False)
+    ensure_private_configuration_path(path, directory=True)
+
+
+def _create_private_windows_directory(path: Path, *, exist_ok: bool = True) -> None:
     kernel32 = _load_windows_library("kernel32")
     advapi32 = _load_windows_library("advapi32")
     owner_sid = _current_windows_user_sid(
@@ -948,10 +959,11 @@ def _create_private_windows_directory(path: Path) -> None:
     ]
     create_directory.restype = ctypes.c_int
     try:
-        created = create_directory(str(path), ctypes.byref(security_attributes))
+        storage_path = internal_filesystem_path(path, force_extended=True)
+        created = create_directory(str(storage_path), ctypes.byref(security_attributes))
         if not created:
             error = _windows_last_error()
-            if error != _WINDOWS_ERROR_ALREADY_EXISTS:
+            if error != _WINDOWS_ERROR_ALREADY_EXISTS or not exist_ok:
                 raise ConfigurationError(
                     f"could not create private Windows configuration directory ({error}): {path}"
                 )
@@ -984,7 +996,7 @@ def _open_windows_configuration_handle(
     if write_owner:
         desired_access |= _WINDOWS_WRITE_OWNER
     raw_handle = create_file(
-        str(path),
+        str(internal_filesystem_path(path, force_extended=True)),
         desired_access,
         _WINDOWS_FILE_SHARE_READ,
         None,

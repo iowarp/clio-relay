@@ -234,11 +234,10 @@ def run_bounded_process(
         try:
             release_owned_process(cast(subprocess.Popen[str], process))
         except RuntimeError as exc:
-            if failure is None:
-                failure = BoundedProcessTreeLeak(
-                    f"process containment could not be released: {command[0]}"
-                )
-                failure.__cause__ = exc
+            failure = BoundedProcessError(
+                f"process containment could not be released: {command[0]}"
+            )
+            failure.__cause__ = exc
         stdout_thread.join(timeout=5)
         stderr_thread.join(timeout=5)
         if stdin_thread is not None:
