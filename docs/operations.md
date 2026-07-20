@@ -1018,6 +1018,16 @@ recreate that evidence idempotently. Remote session commands are wall-clock
 bounded, so an unavailable host produces an explicit failed report instead of an
 unbounded shutdown.
 
+If `session start` times out locally after the remote command was accepted, a later
+`session teardown` waits on that session's protected transition lock before reading
+metadata. Recovery succeeds only when the exact generation agrees across the owned
+metadata, generation-scoped cluster registry, process identity or verified process
+absence, and durable core admission state. A lock that never materializes is not
+treated as proof that no delayed start exists; teardown fails closed and can be
+retried. Successful cleanup replaces secret-bearing metadata with a sanitized
+generation receipt, removes only the verified session PID, log, and cluster-registry
+files, and uses that receipt for same-policy idempotent retries.
+
 `session start` requires `CLIO_RELAY_API_TOKEN` by default and fails before opening
 the remote API when it is absent. An unauthenticated API requires the explicit
 `--no-require-token` operator choice and must not be used for release acceptance.

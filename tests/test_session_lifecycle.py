@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import subprocess
 from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
 
 import pytest
@@ -13,8 +17,10 @@ from clio_relay import __version__
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
     ClusterDefinition,
+    ClusterRegistry,
     RemoteMcpServerConfig,
 )
+from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import RelayError
 from clio_relay.session_lifecycle import (
     SESSION_CONNECTORS_CHECK_ID,
@@ -27,6 +33,7 @@ from clio_relay.session_lifecycle import (
     SessionLifecycleReport,
     challenge_remote_session_identity,
     detach_remote_session,
+    inspect_owned_session_recovery_status,
     start_remote_session,
     status_remote_session,
     teardown_remote_session,
@@ -46,6 +53,306 @@ def _api_release_identity() -> SessionApiReleaseIdentity:
             },
         }
     )
+
+
+def _owned_session_recovery_fixture(
+    root: Path,
+    *,
+    session_id: str = "session-1",
+    generation_id: str = "generation-1",
+    pid: int = 4321,
+) -> tuple[Path, Path, Path, ClioCoreQueue]:
+    home = root / "home"
+    session_dir = home / ".local" / "share" / "clio-relay" / "sessions" / session_id
+    session_dir.mkdir(parents=True)
+    (session_dir / "transition.lock").write_text("", encoding="utf-8")
+    definition = ClusterDefinition(name="ares", ssh_host="ares")
+    registry_bytes = ClusterRegistry(clusters={"ares": definition}).model_dump_json().encode()
+    registry_path = session_dir / f"cluster-registry-{generation_id}.json"
+    registry_path.write_bytes(registry_bytes)
+    release = _api_release_identity()
+    metadata = {
+        "cluster": "ares",
+        "session_id": session_id,
+        "remote_api_port": 8765,
+        "api_pid": pid,
+        "api_pgid": pid,
+        "owner_token": "b" * 64,
+        "session_generation_id": generation_id,
+        "api_release_identity": release.model_dump(mode="json"),
+        "api_release_identity_sha256": release.sha256(),
+        "cluster_registry_path": str(registry_path),
+        "cluster_registry_sha256": session_lifecycle.hashlib.sha256(registry_bytes).hexdigest(),
+        "cluster_route_revision": session_lifecycle.cluster_route_revision(definition),
+        "cluster_authority_verified": True,
+        "process_start_ticks": "123456",
+        "started_at": datetime.now(UTC).isoformat(),
+        "owner": "clio-relay",
+    }
+    (session_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+    proc_root = root / "proc"
+    proc_root.mkdir()
+    queue = ClioCoreQueue(root / "core")
+    assert (
+        queue.prepare_owner_session_start(
+            session_id,
+            recorded_generation_id=None,
+            candidate_generation_id=generation_id,
+        )
+        == generation_id
+    )
+    return home, session_dir, proc_root, queue
+
+
+def test_dead_owned_session_recovery_requires_metadata_registry_and_core(
+    tmp_path: Path,
+) -> None:
+    home, _session_dir, proc_root, queue = _owned_session_recovery_fixture(tmp_path)
+
+    status = inspect_owned_session_recovery_status(
+        cluster="ares",
+        session_id="session-1",
+        core_dir=queue.root,
+        home=home,
+        proc_root=proc_root,
+    )
+
+    assert status.recovery_verified is True
+    assert status.metadata_verified is True
+    assert status.cluster_registry_verified is True
+    assert status.durable_generation_verified is True
+    assert status.process_state == "absent"
+    assert status.process_absence_verified is True
+    assert status.running is False
+    assert status.ownership_verified is True
+    assert status.errors == []
+
+
+def test_dead_owned_session_recovery_rejects_reused_recorded_pid(tmp_path: Path) -> None:
+    home, _session_dir, proc_root, queue = _owned_session_recovery_fixture(tmp_path)
+    pid_dir = proc_root / "4321"
+    pid_dir.mkdir()
+    fields = ["S", "0", "4321", *(["0"] * 16), "999999"]
+    (pid_dir / "stat").write_text(f"4321 (foreign) {' '.join(fields)}", encoding="utf-8")
+
+    status = inspect_owned_session_recovery_status(
+        cluster="ares",
+        session_id="session-1",
+        core_dir=queue.root,
+        home=home,
+        proc_root=proc_root,
+    )
+
+    assert status.recovery_verified is False
+    assert status.process_state == "reused"
+    assert status.process_absence_verified is False
+    assert status.ownership_verified is False
+    assert any("was reused" in error for error in status.errors)
+
+
+def test_dead_owned_session_recovery_rejects_generation_mismatch(tmp_path: Path) -> None:
+    home, session_dir, proc_root, queue = _owned_session_recovery_fixture(tmp_path)
+    metadata_path = session_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["session_generation_id"] = "generation-2"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    status = inspect_owned_session_recovery_status(
+        cluster="ares",
+        session_id="session-1",
+        core_dir=queue.root,
+        home=home,
+        proc_root=proc_root,
+    )
+
+    assert status.recovery_verified is False
+    assert status.durable_generation_verified is False
+    assert status.ownership_verified is False
+
+
+def test_owned_session_recovery_rejects_mismatched_release_identity(tmp_path: Path) -> None:
+    home, session_dir, proc_root, queue = _owned_session_recovery_fixture(tmp_path)
+    metadata_path = session_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["api_release_identity_sha256"] = "f" * 64
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    status = inspect_owned_session_recovery_status(
+        cluster="ares",
+        session_id="session-1",
+        core_dir=queue.root,
+        home=home,
+        proc_root=proc_root,
+    )
+
+    assert status.recovery_verified is False
+    assert status.metadata_verified is False
+    assert status.ownership_verified is False
+
+
+def test_owned_session_recovery_rejects_symlinked_metadata(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    home, session_dir, proc_root, queue = _owned_session_recovery_fixture(tmp_path)
+    metadata_path = session_dir / "metadata.json"
+    original_lstat = Path.lstat
+
+    def symlinked_metadata_lstat(path: Path) -> os.stat_result | SimpleNamespace:
+        if path == metadata_path:
+            return SimpleNamespace(st_mode=stat.S_IFLNK, st_uid=0)
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", symlinked_metadata_lstat)
+
+    status = inspect_owned_session_recovery_status(
+        cluster="ares",
+        session_id="session-1",
+        core_dir=queue.root,
+        home=home,
+        proc_root=proc_root,
+    )
+
+    assert status.recovery_verified is False
+    assert status.metadata_verified is False
+    assert any("safely" in error or "regular file" in error for error in status.errors)
+
+
+def test_owned_session_recovery_rejects_symlinked_session_parent(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    home, session_dir, proc_root, queue = _owned_session_recovery_fixture(tmp_path)
+    sessions_parent = session_dir.parent
+    original_lstat = Path.lstat
+
+    def symlinked_parent_lstat(path: Path) -> os.stat_result | SimpleNamespace:
+        if path == sessions_parent:
+            return SimpleNamespace(st_mode=stat.S_IFLNK, st_uid=0)
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", symlinked_parent_lstat)
+
+    status = inspect_owned_session_recovery_status(
+        cluster="ares",
+        session_id="session-1",
+        core_dir=queue.root,
+        home=home,
+        proc_root=proc_root,
+    )
+
+    assert status.recovery_verified is False
+    assert status.metadata_verified is False
+    assert any("safely" in error or "directory" in error for error in status.errors)
+
+
+def test_cleanup_receipt_supports_idempotent_pending_retry(tmp_path: Path) -> None:
+    home, session_dir, proc_root, queue = _owned_session_recovery_fixture(tmp_path)
+    intent = queue.set_owner_session_closing(
+        "session-1",
+        session_generation_id="generation-1",
+    )
+    observed_at = datetime.now(UTC)
+    report = SessionLifecycleReport(
+        cluster="ares",
+        session_id="session-1",
+        session_generation_id="generation-1",
+        mode="teardown",
+        cleanup_operation_id=str(intent["operation_id"]),
+        cleanup_policy={
+            "stop_worker": False,
+            "cancel_jobs": False,
+            "cancel_scheduler_jobs": False,
+        },
+        prior_session_status=RemoteSessionStateEvidence(
+            api_pid=4321,
+            session_generation_id="generation-1",
+            process_start_marker="123456",
+            running=False,
+            ownership_verified=True,
+            observed_at=observed_at,
+        ),
+        post_session_status=RemoteSessionStateEvidence(
+            api_pid=4321,
+            session_generation_id="generation-1",
+            process_start_marker="123456",
+            running=False,
+            ownership_verified=True,
+            observed_at=observed_at,
+        ),
+        resources=[
+            CleanupResource(
+                kind="remote_relay_api",
+                resource_id="4321",
+                location="ares",
+                action="stop",
+                ownership_verified=True,
+                outcome="missing",
+                verified_after_operation=True,
+            ),
+            CleanupResource(
+                kind="remote_session_files",
+                resource_id="session-1:generation-1",
+                location="ares",
+                action="close",
+                ownership_verified=True,
+                outcome="closed",
+                verified_after_operation=True,
+                metadata={"metadata_sanitized": True},
+            ),
+        ],
+    )
+    receipt = {
+        "schema_version": "clio-relay.owner-session-cleanup-receipt.v1",
+        "owner": "clio-relay",
+        "cluster": "ares",
+        "session_id": "session-1",
+        "session_generation_id": "generation-1",
+        "api_pid": 4321,
+        "process_start_ticks": "123456",
+        "metadata_sha256": "a" * 64,
+        "cleanup_operation_id": intent["operation_id"],
+        "cleanup_policy": {
+            "stop_worker": False,
+            "cancel_jobs": False,
+            "cancel_scheduler_jobs": False,
+        },
+        "cleanup_paths": ["api.log", "api.pid", "cluster-registry-generation-1.json"],
+        "cleanup_paths_pending": True,
+        "cluster_registry_verified": True,
+        "cluster_registry_removed": False,
+        "completed_at": observed_at.isoformat(),
+        "report": report.model_dump(mode="json"),
+    }
+    (session_dir / "metadata.json").write_text(json.dumps(receipt), encoding="utf-8")
+
+    status = inspect_owned_session_recovery_status(
+        cluster="ares",
+        session_id="session-1",
+        core_dir=queue.root,
+        home=home,
+        proc_root=proc_root,
+    )
+
+    assert status.recovery_verified is True
+    assert status.cleanup_receipt is True
+    assert status.process_state == "cleanup_pending"
+    assert status.durable_generation_verified is True
+    assert status.errors == []
+
+    queue.set_owner_session_closed(
+        "session-1",
+        session_generation_id="generation-1",
+    )
+    closed_status = inspect_owned_session_recovery_status(
+        cluster="ares",
+        session_id="session-1",
+        core_dir=queue.root,
+        home=home,
+        proc_root=proc_root,
+    )
+    assert closed_status.recovery_verified is True
+    assert closed_status.process_state == "already_closed"
 
 
 def test_scheduler_cancellation_evidence_rejects_an_extra_relay_link() -> None:
@@ -921,6 +1228,23 @@ def test_owned_teardown_revalidates_exact_pidfd_identity_after_leader_pid_reuse(
     assert "os.killpg" not in script
     assert "running = bool(owned_group_pids)" in script
     assert "post_running = bool(token_group_processes())" in script
+    assert "recorded_pid_conflict" in script
+    assert "refused reused or foreign API pid" in script
+    assert "clio-relay.owner-session-cleanup-receipt.v1" in script
+    assert '"cleanup_paths_pending": True' in script
+    assert '"cluster_registry_verified": True' in script
+    assert '"cluster_registry_removed": False' in script
+    assert '"metadata_sanitized": cleanup_paths_safe' in script
+    assert "transition_lock_retained" in script
+    for marker in (
+        "__CLIO_RELAY_SESSION_DIRECTORY__",
+        "__CLIO_RELAY_METADATA_FILE__",
+        "__CLIO_RELAY_COMPLETED_RECEIPT__",
+        "__CLIO_RELAY_EXPECTED_GENERATION__",
+        "__CLIO_RELAY_OWNED_TEARDOWN__",
+    ):
+        program = script.split(f"<<'{marker}'\n", 1)[1].split(f"\n{marker}", 1)[0]
+        compile(program, marker, "exec")
     teardown_program = script.split("<<'__CLIO_RELAY_OWNED_TEARDOWN__'\n", 1)[1].split(
         "\n__CLIO_RELAY_OWNED_TEARDOWN__",
         1,

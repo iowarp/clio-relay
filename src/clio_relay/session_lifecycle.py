@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shlex
+import stat
 import subprocess
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -42,6 +46,7 @@ SESSION_RELAY_CANCELED_CHECK_ID = "cleanup.relay-jobs-canceled"
 SESSION_SCHEDULER_CANCELED_CHECK_ID = "cleanup.explicit-job-cancel"
 _REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS = 120.0
 _REMOTE_API_READINESS_TIMEOUT_SECONDS = 60.0
+_MAX_OWNED_SESSION_DOCUMENT_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -150,6 +155,598 @@ class RemoteSessionStateEvidence(BaseModel):
     ownership_verified: bool
     observed_at: datetime
     started_at: datetime | None = None
+
+
+class OwnedSessionRecoveryStatus(BaseModel):
+    """Fail-closed recovery evidence for one exact owned session generation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["clio-relay.owner-session-recovery-status.v1"] = (
+        "clio-relay.owner-session-recovery-status.v1"
+    )
+    cluster: str
+    session_id: str
+    session_generation_id: DurableRecordId | None = None
+    owner: str | None = None
+    api_pid: int | None = None
+    process_start_marker: str | None = None
+    process_state: Literal[
+        "absent",
+        "owned_running",
+        "owned_terminal",
+        "reused",
+        "foreign",
+        "cleanup_pending",
+        "already_closed",
+        "unverified",
+    ] = "unverified"
+    running: bool = False
+    process_absence_verified: bool = False
+    metadata_verified: bool = False
+    cluster_registry_verified: bool = False
+    durable_generation_verified: bool = False
+    cleanup_receipt: bool = False
+    ownership_verified: bool = False
+    recovery_verified: bool = False
+    admission_status: dict[str, object] | None = None
+    errors: list[str] = Field(default_factory=list[str])
+
+
+def inspect_owned_session_recovery_status(
+    *,
+    cluster: str,
+    session_id: str,
+    core_dir: Path,
+    home: Path | None = None,
+    proc_root: Path = Path("/proc"),
+    effective_uid: int | None = None,
+) -> OwnedSessionRecoveryStatus:
+    """Inspect durable metadata, process identity, and core admission for recovery.
+
+    This function is deliberately read-only.  A dead process is recoverable only
+    when its protected metadata, exact cluster registry, and authoritative core
+    generation all agree.  A live or reused PID must additionally pass the full
+    process identity check before any teardown coordinator may mutate state.
+    """
+    from clio_relay.core_queue import ClioCoreQueue
+
+    _validate_session(session_id=session_id, remote_api_port=1)
+    if not cluster:
+        raise RelayError("cluster must not be empty")
+    selected_home = home or Path.home()
+    session_dir = selected_home / ".local" / "share" / "clio-relay" / "sessions" / session_id
+    metadata_path = session_dir / "metadata.json"
+    errors: list[str] = []
+    get_effective_uid = cast(Callable[[], int] | None, getattr(os, "geteuid", None))
+    uid = (
+        get_effective_uid()
+        if effective_uid is None and get_effective_uid is not None
+        else effective_uid
+    )
+    try:
+        document, _ = _read_owned_session_document(
+            metadata_path,
+            label="owned session metadata",
+            effective_uid=uid,
+        )
+    except RelayError as exc:
+        return OwnedSessionRecoveryStatus(
+            cluster=cluster,
+            session_id=session_id,
+            errors=[str(exc)],
+        )
+
+    if document.get("schema_version") == "clio-relay.owner-session-cleanup-receipt.v1":
+        return _inspect_owned_session_cleanup_receipt(
+            cluster=cluster,
+            session_id=session_id,
+            document=document,
+            core_dir=core_dir,
+        )
+
+    owner = document.get("owner")
+    generation = document.get("session_generation_id")
+    recorded_cluster = document.get("cluster")
+    owner_token = document.get("owner_token")
+    api_pid = document.get("api_pid")
+    api_pgid = document.get("api_pgid")
+    process_start = document.get("process_start_ticks")
+    registry_path_raw = document.get("cluster_registry_path")
+    registry_sha256 = document.get("cluster_registry_sha256")
+    route_revision = document.get("cluster_route_revision")
+    release_identity = document.get("api_release_identity")
+    release_sha256 = document.get("api_release_identity_sha256")
+    started_at = document.get("started_at")
+    remote_api_port = document.get("remote_api_port")
+
+    try:
+        validated_release = SessionApiReleaseIdentity.model_validate(release_identity)
+    except ValueError:
+        validated_release = None
+    try:
+        parsed_started_at = (
+            datetime.fromisoformat(started_at) if isinstance(started_at, str) else None
+        )
+    except ValueError:
+        parsed_started_at = None
+
+    try:
+        validated_generation = (
+            validate_durable_record_id(generation) if isinstance(generation, str) else None
+        )
+    except ValueError:
+        validated_generation = None
+    expected_metadata_keys = {
+        "cluster",
+        "session_id",
+        "remote_api_port",
+        "api_pid",
+        "api_pgid",
+        "owner_token",
+        "session_generation_id",
+        "api_release_identity",
+        "api_release_identity_sha256",
+        "cluster_registry_path",
+        "cluster_registry_sha256",
+        "cluster_route_revision",
+        "cluster_authority_verified",
+        "process_start_ticks",
+        "started_at",
+        "owner",
+    }
+    metadata_verified = bool(
+        set(document) == expected_metadata_keys
+        and owner == "clio-relay"
+        and document.get("session_id") == session_id
+        and recorded_cluster == cluster
+        and isinstance(remote_api_port, int)
+        and not isinstance(remote_api_port, bool)
+        and remote_api_port > 0
+        and validated_generation is not None
+        and isinstance(owner_token, str)
+        and len(owner_token) == 64
+        and all(character in "0123456789abcdef" for character in owner_token)
+        and isinstance(api_pid, int)
+        and not isinstance(api_pid, bool)
+        and api_pid > 1
+        and api_pgid == api_pid
+        and isinstance(process_start, str)
+        and process_start.isdigit()
+        and isinstance(registry_path_raw, str)
+        and isinstance(registry_sha256, str)
+        and len(registry_sha256) == 64
+        and all(character in "0123456789abcdef" for character in registry_sha256)
+        and isinstance(route_revision, str)
+        and bool(route_revision)
+        and document.get("cluster_authority_verified") is True
+        and validated_release is not None
+        and isinstance(release_sha256, str)
+        and len(release_sha256) == 64
+        and all(character in "0123456789abcdef" for character in release_sha256)
+        and validated_release.sha256() == release_sha256
+        and parsed_started_at is not None
+        and parsed_started_at.tzinfo is not None
+    )
+    if not metadata_verified:
+        errors.append("owned session metadata identity is incomplete or mismatched")
+
+    cluster_registry_verified = False
+    registry_path: Path | None = None
+    if (
+        metadata_verified
+        and validated_generation is not None
+        and isinstance(registry_path_raw, str)
+    ):
+        registry_path = Path(registry_path_raw)
+        expected_registry_path = session_dir / f"cluster-registry-{validated_generation}.json"
+        if registry_path != expected_registry_path:
+            errors.append("owned session cluster registry path is not generation-scoped")
+        else:
+            try:
+                registry_document, registry_bytes = _read_owned_session_document(
+                    registry_path,
+                    label="owned session cluster registry",
+                    effective_uid=uid,
+                )
+                registry = ClusterRegistry.model_validate(registry_document)
+                cluster_registry_verified = bool(
+                    hashlib.sha256(registry_bytes).hexdigest() == registry_sha256
+                    and set(registry.clusters) == {cluster}
+                    and registry.clusters[cluster].name == cluster
+                    and cluster_route_revision(registry.clusters[cluster]) == route_revision
+                )
+            except (RelayError, ValueError) as exc:
+                errors.append(str(exc))
+            if not cluster_registry_verified and not any(
+                "cluster registry" in error for error in errors
+            ):
+                errors.append("owned session cluster registry digest or identity mismatched")
+
+    process_state: Literal[
+        "absent",
+        "owned_running",
+        "owned_terminal",
+        "reused",
+        "foreign",
+        "cleanup_pending",
+        "already_closed",
+        "unverified",
+    ] = "unverified"
+    running = False
+    process_absence_verified = False
+    if metadata_verified and isinstance(api_pid, int) and isinstance(process_start, str):
+        proc = proc_root / str(api_pid)
+        try:
+            stat_text = (proc / "stat").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            process_state = "absent"
+            process_absence_verified = True
+        except OSError as exc:
+            errors.append(f"could not inspect recorded API pid {api_pid}: {exc}")
+        else:
+            try:
+                fields = stat_text.rsplit(")", 1)[1].split()
+                observed_state = fields[0]
+                observed_pgid = int(fields[2])
+                observed_start = fields[19]
+            except (IndexError, ValueError) as exc:
+                errors.append(f"recorded API pid {api_pid} has invalid proc stat: {exc}")
+            else:
+                if observed_start != process_start:
+                    process_state = "reused"
+                    errors.append(f"recorded API pid {api_pid} was reused")
+                elif observed_pgid != api_pgid:
+                    process_state = "foreign"
+                    errors.append(f"recorded API pid {api_pid} changed process group")
+                elif observed_state == "Z":
+                    process_state = "owned_terminal"
+                else:
+                    try:
+                        command = (
+                            (proc / "cmdline")
+                            .read_bytes()
+                            .replace(bytes([0]), b" ")
+                            .decode(
+                                "utf-8",
+                                errors="replace",
+                            )
+                        )
+                        environment = (proc / "environ").read_bytes().split(bytes([0]))
+                    except OSError as exc:
+                        errors.append(f"could not verify recorded API pid {api_pid}: {exc}")
+                    else:
+                        expected_environment = {
+                            f"CLIO_RELAY_SESSION_OWNER_TOKEN={owner_token}".encode(),
+                            f"CLIO_RELAY_SESSION_GENERATION_ID={validated_generation}".encode(),
+                            f"CLIO_RELAY_OWNER_SESSION_ID={session_id}".encode(),
+                            f"CLIO_RELAY_OWNER_SESSION_CLUSTER={cluster}".encode(),
+                            f"CLIO_RELAY_REMOTE_CLUSTER={cluster}".encode(),
+                            f"CLIO_RELAY_API_RELEASE_IDENTITY_SHA256={release_sha256}".encode(),
+                            f"CLIO_RELAY_CLUSTER_REGISTRY={registry_path_raw}".encode(),
+                            f"CLIO_RELAY_SESSION_REGISTRY_SHA256={registry_sha256}".encode(),
+                            f"CLIO_RELAY_SESSION_ROUTE_REVISION={route_revision}".encode(),
+                        }
+                        release_canonical = json.dumps(
+                            release_identity,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        exact_process = bool(
+                            expected_environment.issubset(set(environment))
+                            and "clio-relay" in command
+                            and " api " in f" {command} "
+                            and " start" in command
+                            and hashlib.sha256(release_canonical.encode("utf-8")).hexdigest()
+                            == release_sha256
+                        )
+                        if exact_process:
+                            process_state = "owned_running"
+                            running = True
+                        else:
+                            process_state = "foreign"
+                            errors.append(f"recorded API pid {api_pid} failed process identity")
+
+    admission_status: dict[str, object] | None = None
+    durable_generation_verified = False
+    if validated_generation is not None:
+        try:
+            admission_status = ClioCoreQueue(core_dir).owner_session_generation_status(
+                session_id,
+                session_generation_id=validated_generation,
+            )
+            durable_generation_verified = bool(
+                admission_status.get("owner_session_id") == session_id
+                and admission_status.get("session_generation_id") == validated_generation
+                and (
+                    admission_status.get("open") is True or admission_status.get("closing") is True
+                )
+            )
+        except (OSError, RelayError, ValueError) as exc:
+            errors.append(f"could not verify durable owner-session generation: {exc}")
+        if not durable_generation_verified:
+            errors.append("durable owner-session generation is not active or closing")
+
+    acceptable_process_state = process_state in {
+        "absent",
+        "owned_running",
+        "owned_terminal",
+    }
+    recovery_verified = bool(
+        metadata_verified
+        and cluster_registry_verified
+        and durable_generation_verified
+        and acceptable_process_state
+        and not errors
+    )
+    return OwnedSessionRecoveryStatus(
+        cluster=cluster,
+        session_id=session_id,
+        session_generation_id=validated_generation,
+        owner=owner if isinstance(owner, str) else None,
+        api_pid=api_pid if isinstance(api_pid, int) and not isinstance(api_pid, bool) else None,
+        process_start_marker=process_start if isinstance(process_start, str) else None,
+        process_state=process_state,
+        running=running,
+        process_absence_verified=process_absence_verified,
+        metadata_verified=metadata_verified,
+        cluster_registry_verified=cluster_registry_verified,
+        durable_generation_verified=durable_generation_verified,
+        ownership_verified=recovery_verified,
+        recovery_verified=recovery_verified,
+        admission_status=admission_status,
+        errors=errors,
+    )
+
+
+def _inspect_owned_session_cleanup_receipt(
+    *,
+    cluster: str,
+    session_id: str,
+    document: dict[str, object],
+    core_dir: Path,
+) -> OwnedSessionRecoveryStatus:
+    """Validate a sanitized receipt for an idempotent teardown retry."""
+    from clio_relay.core_queue import ClioCoreQueue
+
+    queue = ClioCoreQueue(core_dir)
+    errors: list[str] = []
+    generation = document.get("session_generation_id")
+    try:
+        validated_generation = (
+            validate_durable_record_id(generation) if isinstance(generation, str) else None
+        )
+    except ValueError:
+        validated_generation = None
+    report: SessionLifecycleReport | None = None
+    try:
+        report = SessionLifecycleReport.model_validate(document.get("report"))
+    except (TypeError, ValueError) as exc:
+        errors.append(f"owned session cleanup receipt report is invalid: {exc}")
+    expected_keys = {
+        "schema_version",
+        "owner",
+        "cluster",
+        "session_id",
+        "session_generation_id",
+        "api_pid",
+        "process_start_ticks",
+        "metadata_sha256",
+        "cleanup_operation_id",
+        "cleanup_policy",
+        "cleanup_paths",
+        "cleanup_paths_pending",
+        "cluster_registry_verified",
+        "cluster_registry_removed",
+        "completed_at",
+        "report",
+    }
+    raw_policy = document.get("cleanup_policy")
+    policy = cast(dict[str, object], raw_policy) if isinstance(raw_policy, dict) else None
+    completed_at = document.get("completed_at")
+    try:
+        parsed_completed_at = (
+            datetime.fromisoformat(completed_at) if isinstance(completed_at, str) else None
+        )
+    except ValueError:
+        parsed_completed_at = None
+    receipt_file_resources = (
+        [resource for resource in report.resources if resource.kind == "remote_session_files"]
+        if report is not None
+        else []
+    )
+    metadata_verified = bool(
+        set(document) == expected_keys
+        and document.get("owner") == "clio-relay"
+        and document.get("cluster") == cluster
+        and document.get("session_id") == session_id
+        and validated_generation is not None
+        and isinstance(document.get("api_pid"), int)
+        and not isinstance(document.get("api_pid"), bool)
+        and isinstance(document.get("process_start_ticks"), str)
+        and cast(str, document.get("process_start_ticks")).isdigit()
+        and isinstance(document.get("metadata_sha256"), str)
+        and len(cast(str, document.get("metadata_sha256"))) == 64
+        and all(
+            character in "0123456789abcdef"
+            for character in cast(str, document.get("metadata_sha256"))
+        )
+        and document.get("cluster_registry_verified") is True
+        and isinstance(document.get("cluster_registry_removed"), bool)
+        and isinstance(document.get("cleanup_paths_pending"), bool)
+        and document.get("cleanup_paths")
+        == sorted(("api.log", "api.pid", f"cluster-registry-{validated_generation}.json"))
+        and policy is not None
+        and set(policy) == {"stop_worker", "cancel_jobs", "cancel_scheduler_jobs"}
+        and all(isinstance(value, bool) for value in policy.values())
+        and not (policy["cancel_scheduler_jobs"] and not policy["cancel_jobs"])
+        and parsed_completed_at is not None
+        and parsed_completed_at.tzinfo is not None
+        and report is not None
+        and report.cluster == cluster
+        and report.session_id == session_id
+        and report.session_generation_id == validated_generation
+        and report.mode == "teardown"
+        and report.cleanup_operation_id == document.get("cleanup_operation_id")
+        and report.cleanup_policy == policy
+        and report.relay_cancel_requested is policy["cancel_jobs"]
+        and report.scheduler_cancel_requested is policy["cancel_scheduler_jobs"]
+        and report.prior_session_status is not None
+        and report.prior_session_status.ownership_verified
+        and report.post_session_status is not None
+        and report.post_session_status.running is False
+        and report.post_session_status.ownership_verified
+        and len(receipt_file_resources) == 1
+        and receipt_file_resources[0].action == "close"
+        and receipt_file_resources[0].outcome == "closed"
+        and receipt_file_resources[0].ownership_verified
+        and receipt_file_resources[0].verified_after_operation
+        and receipt_file_resources[0].metadata.get("metadata_sanitized") is True
+        and not report.errors
+        and not report.residual_resources
+    )
+    if not metadata_verified:
+        errors.append("owned session cleanup receipt identity is invalid")
+
+    admission_status: dict[str, object] | None = None
+    durable_generation_verified = False
+    if validated_generation is not None:
+        try:
+            admission_status = queue.owner_session_generation_status(
+                session_id,
+                session_generation_id=validated_generation,
+            )
+            raw_intent = admission_status.get("cleanup_intent")
+            intent = cast(dict[str, object], raw_intent) if isinstance(raw_intent, dict) else None
+            durable_generation_verified = bool(
+                admission_status.get("owner_session_id") == session_id
+                and admission_status.get("session_generation_id") == validated_generation
+                and admission_status.get("closing") is True
+                and intent is not None
+                and intent.get("operation_id") == document.get("cleanup_operation_id")
+                and {
+                    key: intent.get(key)
+                    for key in ("stop_worker", "cancel_jobs", "cancel_scheduler_jobs")
+                }
+                == document.get("cleanup_policy")
+            )
+        except (OSError, RelayError, ValueError) as exc:
+            errors.append(f"could not verify closed owner-session generation: {exc}")
+        if not durable_generation_verified:
+            errors.append("cleanup receipt has no exact durable closed-generation proof")
+
+    recovery_verified = metadata_verified and durable_generation_verified and not errors
+    api_pid = document.get("api_pid")
+    process_start = document.get("process_start_ticks")
+    return OwnedSessionRecoveryStatus(
+        cluster=cluster,
+        session_id=session_id,
+        session_generation_id=validated_generation,
+        owner="clio-relay" if document.get("owner") == "clio-relay" else None,
+        api_pid=api_pid if isinstance(api_pid, int) and not isinstance(api_pid, bool) else None,
+        process_start_marker=process_start if isinstance(process_start, str) else None,
+        process_state=(
+            "already_closed"
+            if recovery_verified and admission_status is not None and admission_status.get("closed")
+            else "cleanup_pending"
+            if recovery_verified
+            else "unverified"
+        ),
+        running=False,
+        process_absence_verified=recovery_verified,
+        metadata_verified=metadata_verified,
+        cluster_registry_verified=document.get("cluster_registry_verified") is True,
+        durable_generation_verified=durable_generation_verified,
+        cleanup_receipt=True,
+        ownership_verified=recovery_verified,
+        recovery_verified=recovery_verified,
+        admission_status=admission_status,
+        errors=errors,
+    )
+
+
+def _read_owned_session_document(
+    path: Path,
+    *,
+    label: str,
+    effective_uid: int | None,
+) -> tuple[dict[str, object], bytes]:
+    """Read one bounded, regular, owner-scoped JSON document without following links."""
+    descriptor: int | None = None
+    parent_descriptor: int | None = None
+    session_descriptor: int | None = None
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    binary = getattr(os, "O_BINARY", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    try:
+        if os.name == "posix" and no_follow and directory_flag:
+            parent_descriptor = os.open(
+                path.parent.parent,
+                os.O_RDONLY | directory_flag | no_follow,
+            )
+            parent_status = os.fstat(parent_descriptor)
+            if not stat.S_ISDIR(parent_status.st_mode):
+                raise RelayError(f"{label} parent is not a directory")
+            if effective_uid is not None and parent_status.st_uid != effective_uid:
+                raise RelayError(f"{label} parent is not owned by the current user")
+            session_descriptor = os.open(
+                path.parent.name,
+                os.O_RDONLY | directory_flag | no_follow,
+                dir_fd=parent_descriptor,
+            )
+            session_status = os.fstat(session_descriptor)
+            if not stat.S_ISDIR(session_status.st_mode):
+                raise RelayError(f"{label} session path is not a directory")
+            if effective_uid is not None and session_status.st_uid != effective_uid:
+                raise RelayError(f"{label} session path is not owned by the current user")
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY | binary | no_follow,
+                dir_fd=session_descriptor,
+            )
+        else:
+            for directory, directory_label in (
+                (path.parent.parent, "parent"),
+                (path.parent, "session path"),
+            ):
+                directory_status = directory.lstat()
+                if not stat.S_ISDIR(directory_status.st_mode):
+                    raise RelayError(f"{label} {directory_label} is not a directory")
+                if effective_uid is not None and directory_status.st_uid != effective_uid:
+                    raise RelayError(f"{label} {directory_label} is not owned by the current user")
+            path_status = path.lstat()
+            if not stat.S_ISREG(path_status.st_mode):
+                raise RelayError(f"{label} is not a regular file")
+            if effective_uid is not None and path_status.st_uid != effective_uid:
+                raise RelayError(f"{label} is not owned by the current user")
+            descriptor = os.open(path, os.O_RDONLY | binary | no_follow)
+        file_status = os.fstat(descriptor)
+        if not stat.S_ISREG(file_status.st_mode):
+            raise RelayError(f"{label} is not a regular file")
+        if effective_uid is not None and file_status.st_uid != effective_uid:
+            raise RelayError(f"{label} is not owned by the current user")
+        if not 0 < file_status.st_size <= _MAX_OWNED_SESSION_DOCUMENT_BYTES:
+            raise RelayError(f"{label} has an invalid size")
+        payload = os.read(descriptor, _MAX_OWNED_SESSION_DOCUMENT_BYTES + 1)
+        if len(payload) != file_status.st_size:
+            raise RelayError(f"{label} changed while it was read")
+    except FileNotFoundError as exc:
+        raise RelayError(f"{label} is unavailable") from exc
+    except RelayError:
+        raise
+    except OSError as exc:
+        raise RelayError(f"{label} cannot be opened safely: {exc}") from exc
+    finally:
+        for open_descriptor in (descriptor, session_descriptor, parent_descriptor):
+            if open_descriptor is not None:
+                os.close(open_descriptor)
+    try:
+        raw = cast(object, json.loads(payload))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RelayError(f"{label} is not valid UTF-8 JSON: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise RelayError(f"{label} is not a JSON object")
+    return {str(key): value for key, value in cast(dict[object, object], raw).items()}, payload
 
 
 def cleanup_connectors_cover_gateways(
@@ -1738,11 +2335,222 @@ def _owned_teardown_script(
 {remote_env(definition)}
 session_id={shlex.quote(session_id)}
 session_dir="$HOME/.local/share/clio-relay/sessions/$session_id"
-mkdir -p "$session_dir"
+python3 - "$session_dir" "$session_id" <<'__CLIO_RELAY_SESSION_DIRECTORY__'
+import os
+import stat
+import sys
+from pathlib import Path
+
+session_dir = Path(sys.argv[1])
+session_id = sys.argv[2]
+if session_dir.name != session_id:
+    raise SystemExit("owned session directory identity changed")
+for path, label in ((session_dir.parent, "session parent"), (session_dir, "session directory")):
+    try:
+        path_status = path.lstat()
+    except FileNotFoundError as exc:
+        raise SystemExit(f"owned {{label}} is unavailable") from exc
+    if not stat.S_ISDIR(path_status.st_mode) or path_status.st_uid != os.geteuid():
+        raise SystemExit(f"owned {{label}} is unsafe")
+lock_path = session_dir / "transition.lock"
+try:
+    lock_status = lock_path.lstat()
+except FileNotFoundError as exc:
+    raise SystemExit("owned session transition lock is unavailable") from exc
+if not stat.S_ISREG(lock_status.st_mode) or lock_status.st_uid != os.geteuid():
+    raise SystemExit("owned session transition lock is unsafe")
+__CLIO_RELAY_SESSION_DIRECTORY__
 exec 9>"$session_dir/transition.lock"
 flock -w 10 -x 9 || {{ echo "session teardown lock timed out" >&2; exit 75; }}
 metadata_file="$session_dir/metadata.json"
 expected_session_generation_id={shlex.quote(expected_session_generation_id)}
+python3 - "$metadata_file" <<'__CLIO_RELAY_METADATA_FILE__'
+import os
+import stat
+import sys
+from pathlib import Path
+
+metadata_path = Path(sys.argv[1])
+try:
+    metadata_status = metadata_path.lstat()
+except FileNotFoundError as exc:
+    raise SystemExit("owned session metadata is unavailable") from exc
+if not stat.S_ISREG(metadata_status.st_mode) or metadata_status.st_uid != os.geteuid():
+    raise SystemExit("owned session metadata is unsafe")
+__CLIO_RELAY_METADATA_FILE__
+completed_receipt_report="$(python3 - \
+  "$session_dir" "$metadata_file" "$session_id" {shlex.quote(cluster_value)} \
+  "$expected_session_generation_id" {"1" if stop_worker else "0"} \
+  {"1" if cancel_jobs else "0"} {"1" if cancel_scheduler_jobs else "0"} \
+  <<'__CLIO_RELAY_COMPLETED_RECEIPT__'
+import json
+import os
+import stat
+import sys
+from datetime import datetime
+from pathlib import Path
+
+(
+    session_dir_raw,
+    metadata_path_raw,
+    session_id,
+    cluster,
+    generation_id,
+    stop_worker_raw,
+    cancel_jobs_raw,
+    cancel_scheduler_jobs_raw,
+) = sys.argv[1:]
+session_dir = Path(session_dir_raw)
+metadata_path = Path(metadata_path_raw)
+try:
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+except FileNotFoundError:
+    print("")
+    raise SystemExit(0)
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"owned session metadata is invalid: {{exc}}") from exc
+if metadata.get("schema_version") != "clio-relay.owner-session-cleanup-receipt.v1":
+    print("")
+    raise SystemExit(0)
+expected_policy = {{
+    "stop_worker": stop_worker_raw == "1",
+    "cancel_jobs": cancel_jobs_raw == "1",
+    "cancel_scheduler_jobs": cancel_scheduler_jobs_raw == "1",
+}}
+report = metadata.get("report")
+cleanup_paths = metadata.get("cleanup_paths")
+expected_receipt_keys = {{
+    "schema_version",
+    "owner",
+    "cluster",
+    "session_id",
+    "session_generation_id",
+    "api_pid",
+    "process_start_ticks",
+    "metadata_sha256",
+    "cleanup_operation_id",
+    "cleanup_policy",
+    "cleanup_paths",
+    "cleanup_paths_pending",
+    "cluster_registry_verified",
+    "cluster_registry_removed",
+    "completed_at",
+    "report",
+}}
+expected_paths = sorted(
+    (
+        "api.log",
+        "api.pid",
+        f"cluster-registry-{{generation_id}}.json",
+    )
+)
+completed_at = metadata.get("completed_at")
+try:
+    parsed_completed_at = (
+        datetime.fromisoformat(completed_at) if isinstance(completed_at, str) else None
+    )
+except ValueError:
+    parsed_completed_at = None
+resources = report.get("resources") if isinstance(report, dict) else None
+file_resources = (
+    [resource for resource in resources if resource.get("kind") == "remote_session_files"]
+    if isinstance(resources, list) and all(isinstance(resource, dict) for resource in resources)
+    else []
+)
+prior_status = report.get("prior_session_status") if isinstance(report, dict) else None
+post_status = report.get("post_session_status") if isinstance(report, dict) else None
+api_pid = metadata.get("api_pid")
+process_start_ticks = metadata.get("process_start_ticks")
+metadata_sha256 = metadata.get("metadata_sha256")
+cleanup_paths_pending = metadata.get("cleanup_paths_pending")
+cluster_registry_removed = metadata.get("cluster_registry_removed")
+if (
+    set(metadata) != expected_receipt_keys
+    or metadata.get("owner") != "clio-relay"
+    or metadata.get("cluster") != cluster
+    or metadata.get("session_id") != session_id
+    or metadata.get("session_generation_id") != generation_id
+    or not isinstance(api_pid, int)
+    or isinstance(api_pid, bool)
+    or api_pid <= 1
+    or not isinstance(process_start_ticks, str)
+    or not process_start_ticks.isdigit()
+    or not isinstance(metadata_sha256, str)
+    or len(metadata_sha256) != 64
+    or any(character not in "0123456789abcdef" for character in metadata_sha256)
+    or metadata.get("cleanup_policy") != expected_policy
+    or not isinstance(metadata.get("cleanup_operation_id"), str)
+    or cleanup_paths != expected_paths
+    or metadata.get("cluster_registry_verified") is not True
+    or not isinstance(cleanup_paths_pending, bool)
+    or not isinstance(cluster_registry_removed, bool)
+    or cleanup_paths_pending is cluster_registry_removed
+    or parsed_completed_at is None
+    or parsed_completed_at.tzinfo is None
+    or not isinstance(report, dict)
+    or report.get("cluster") != (cluster or None)
+    or report.get("session_id") != session_id
+    or report.get("session_generation_id") != generation_id
+    or report.get("mode") != "teardown"
+    or report.get("cleanup_operation_id") != metadata.get("cleanup_operation_id")
+    or report.get("cleanup_policy") != expected_policy
+    or report.get("relay_cancel_requested") is not expected_policy["cancel_jobs"]
+    or report.get("scheduler_cancel_requested")
+    is not expected_policy["cancel_scheduler_jobs"]
+    or not isinstance(prior_status, dict)
+    or prior_status.get("ownership_verified") is not True
+    or not isinstance(post_status, dict)
+    or post_status.get("running") is not False
+    or post_status.get("ownership_verified") is not True
+    or not isinstance(resources, list)
+    or any(not isinstance(resource, dict) for resource in resources)
+    or any(
+        resource.get("residual") is not False
+        for resource in resources
+        if isinstance(resource, dict)
+    )
+    or len(file_resources) != 1
+    or file_resources[0].get("action") != "close"
+    or file_resources[0].get("outcome") != "closed"
+    or file_resources[0].get("ownership_verified") is not True
+    or file_resources[0].get("verified_after_operation") is not True
+    or not isinstance(file_resources[0].get("metadata"), dict)
+    or file_resources[0]["metadata"].get("metadata_sanitized") is not True
+    or report.get("errors") != []
+):
+    raise SystemExit("owned session cleanup receipt does not match this teardown retry")
+for filename in expected_paths:
+    path = session_dir / filename
+    try:
+        path_status = path.lstat()
+    except FileNotFoundError:
+        continue
+    if not stat.S_ISREG(path_status.st_mode) or path_status.st_uid != os.geteuid():
+        raise SystemExit(f"refused unsafe owned session cleanup path: {{path}}")
+    path.unlink()
+for filename in expected_paths:
+    if (session_dir / filename).exists():
+        raise SystemExit(f"owned session cleanup path remained after retry: {{filename}}")
+if (
+    metadata.get("cleanup_paths_pending") is True
+    or metadata.get("cluster_registry_removed") is not True
+):
+    metadata["cleanup_paths_pending"] = False
+    metadata["cluster_registry_removed"] = True
+    temporary = metadata_path.with_name(f"metadata.json.{{os.getpid()}}.complete")
+    with temporary.open("x", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, metadata_path)
+print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+__CLIO_RELAY_COMPLETED_RECEIPT__
+)"
+if [ -n "$completed_receipt_report" ]; then
+  printf '%s\n' "$completed_receipt_report"
+  exit 0
+fi
 python3 - "$metadata_file" "$session_id" "$expected_session_generation_id" \
   <<'__CLIO_RELAY_EXPECTED_GENERATION__'
 import json
@@ -1767,9 +2575,11 @@ timeout --signal=TERM --kill-after=5s 90s \
   python3 - "$session_dir" "$session_id" {shlex.quote(cluster_value)} \
   {"1" if stop_worker else "0"} {shlex.quote(service)} "$cleanup_intake_result" \
   <<'__CLIO_RELAY_OWNED_TEARDOWN__'
+import hashlib
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -1800,9 +2610,9 @@ def process_state(pid):
     try:
         stat = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8")
     except OSError:
-        return None, None
+        return None, None, None
     fields = stat.rsplit(")", 1)[1].split()
-    return fields[0], fields[19]
+    return fields[0], fields[19], int(fields[2])
 
 
 def token_group_processes():
@@ -1906,11 +2716,8 @@ resource = {{
     "residual": False,
     "detail": None,
 }}
-state, observed_start = process_state(pid)
+state, observed_start, observed_pgid = process_state(pid)
 owned_group_pids = token_group_processes()
-running = bool(owned_group_pids)
-prior_running = running
-prior_observed_at = datetime.now(timezone.utc).isoformat()
 durable_identity = (
     metadata.get("owner") == "clio-relay"
     and metadata.get("session_id") == session_id
@@ -1948,13 +2755,35 @@ if state is not None and state != "Z" and isinstance(pid, int):
         )
     except (OSError, TypeError):
         leader_owned = False
+recorded_pid_conflict = bool(
+    state is not None
+    and state != "Z"
+    and (
+        observed_start != metadata.get("process_start_ticks")
+        or observed_pgid != metadata.get("api_pgid")
+        or not leader_owned
+    )
+)
+running = bool(owned_group_pids) or recorded_pid_conflict
+prior_running = running
+prior_observed_at = datetime.now(timezone.utc).isoformat()
 ownership_verified = durable_identity and bool(owned_group_pids)
-if running and not leader_owned:
+if recorded_pid_conflict:
+    resource["outcome"] = "refused"
+    resource["residual"] = True
+    resource["detail"] = (
+        "recorded API pid exists with a reused or foreign process identity; "
+        "no process was signaled and the pid record was retained"
+    )
+    errors.append(f"refused reused or foreign API pid {{pid}}")
+elif running and not leader_owned:
     resource["detail"] = (
         "recorded API leader was absent or replaced; only exact token-generation "
         "processes were targeted"
     )
-if running:
+if recorded_pid_conflict:
+    pass
+elif running:
     resource["ownership_verified"] = ownership_verified
     if not ownership_verified:
         resource["outcome"] = "refused"
@@ -1998,7 +2827,17 @@ resource["verified_after_operation"] = (
     and not resource["residual"]
 )
 resources.append(resource)
-post_running = bool(token_group_processes())
+post_state, post_start, post_pgid = process_state(pid)
+post_recorded_pid_conflict = bool(
+    recorded_pid_conflict
+    and post_state is not None
+    and (
+        post_start != metadata.get("process_start_ticks")
+        or post_pgid != metadata.get("api_pgid")
+        or post_state != "Z"
+    )
+)
+post_running = bool(token_group_processes()) or post_recorded_pid_conflict
 post_observed_at = datetime.now(timezone.utc).isoformat()
 
 
@@ -2076,48 +2915,168 @@ if stop_worker:
     if outcome in {{"failed", "refused"}}:
         errors.append(f"worker service cleanup {{outcome}}: {{service}}")
 
-metadata["last_cleanup"] = {{
-    "mode": "teardown",
-    "completed_at": datetime.now(timezone.utc).isoformat(),
-    "resources": resources,
-    "errors": errors,
+cleanup_policy = {{
+    "stop_worker": cleanup_intent.get("stop_worker"),
+    "cancel_jobs": cleanup_intent.get("cancel_jobs"),
+    "cancel_scheduler_jobs": cleanup_intent.get("cancel_scheduler_jobs"),
 }}
-session_dir.mkdir(parents=True, exist_ok=True)
-metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-print(json.dumps({{
-    "cluster": cluster or None,
-    "session_id": session_id,
-    "session_generation_id": metadata.get("session_generation_id"),
-    "mode": "teardown",
-    "cleanup_operation_id": cleanup_intent.get("operation_id"),
-    "cleanup_policy": {{
-        "stop_worker": cleanup_intent.get("stop_worker"),
-        "cancel_jobs": cleanup_intent.get("cancel_jobs"),
-        "cancel_scheduler_jobs": cleanup_intent.get("cancel_scheduler_jobs"),
-    }},
-    "relay_cancel_requested": cleanup_intent.get("cancel_jobs") is True,
-    "scheduler_cancel_requested": cleanup_intent.get("cancel_scheduler_jobs") is True,
-    "prior_session_status": {{
-        "api_pid": pid if isinstance(pid, int) else None,
+
+
+def lifecycle_report():
+    return {{
+        "cluster": cluster or None,
+        "session_id": session_id,
         "session_generation_id": metadata.get("session_generation_id"),
-        "process_start_marker": metadata.get("process_start_ticks"),
-        "running": prior_running,
-        "ownership_verified": ownership_verified,
-        "observed_at": prior_observed_at,
-        "started_at": metadata.get("started_at"),
+        "mode": "teardown",
+        "cleanup_operation_id": cleanup_intent.get("operation_id"),
+        "cleanup_policy": cleanup_policy,
+        "relay_cancel_requested": cleanup_intent.get("cancel_jobs") is True,
+        "scheduler_cancel_requested": cleanup_intent.get("cancel_scheduler_jobs") is True,
+        "prior_session_status": {{
+            "api_pid": pid if isinstance(pid, int) else None,
+            "session_generation_id": metadata.get("session_generation_id"),
+            "process_start_marker": metadata.get("process_start_ticks"),
+            "running": prior_running,
+            "ownership_verified": ownership_verified,
+            "observed_at": prior_observed_at,
+            "started_at": metadata.get("started_at"),
+        }},
+        "post_session_status": {{
+            "api_pid": pid if isinstance(pid, int) else None,
+            "session_generation_id": metadata.get("session_generation_id"),
+            "process_start_marker": metadata.get("process_start_ticks"),
+            "running": post_running,
+            "ownership_verified": ownership_verified,
+            "observed_at": post_observed_at,
+            "started_at": metadata.get("started_at"),
+        }},
+        "resources": resources,
+        "errors": errors,
+    }}
+
+
+generation_id = metadata.get("session_generation_id")
+registry_filename = f"cluster-registry-{{generation_id}}.json"
+cleanup_filenames = sorted(("api.log", "api.pid", registry_filename))
+cleanup_paths_safe = not errors and not post_running and ownership_verified
+registry_path_raw = metadata.get("cluster_registry_path")
+registry_sha256 = metadata.get("cluster_registry_sha256")
+expected_registry_path = session_dir / registry_filename
+if cleanup_paths_safe:
+    if (
+        registry_path_raw != str(expected_registry_path)
+        or not isinstance(registry_sha256, str)
+        or len(registry_sha256) != 64
+    ):
+        cleanup_paths_safe = False
+        errors.append("owned session registry cleanup identity is invalid")
+    else:
+        try:
+            registry_bytes = expected_registry_path.read_bytes()
+        except OSError as exc:
+            cleanup_paths_safe = False
+            errors.append(f"owned session registry is unavailable before cleanup: {{exc}}")
+        else:
+            if hashlib.sha256(registry_bytes).hexdigest() != registry_sha256:
+                cleanup_paths_safe = False
+                errors.append("owned session registry digest changed before cleanup")
+if cleanup_paths_safe:
+    for filename in cleanup_filenames:
+        path = session_dir / filename
+        try:
+            path_status = path.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(path_status.st_mode) or path_status.st_uid != os.geteuid():
+            cleanup_paths_safe = False
+            errors.append(f"refused unsafe owned session cleanup path: {{path}}")
+            break
+
+file_resource = {{
+    "kind": "remote_session_files",
+    "resource_id": f"{{session_id}}:{{generation_id}}",
+    "location": cluster or "remote",
+    "action": "close",
+    "ownership_verified": cleanup_paths_safe,
+    "outcome": "closed" if cleanup_paths_safe else "refused",
+    "verified_after_operation": cleanup_paths_safe,
+    "residual": not cleanup_paths_safe,
+    "detail": None if cleanup_paths_safe else "session files were retained after failed proof",
+    "metadata": {{
+        "cleanup_paths": cleanup_filenames,
+        "metadata_sanitized": cleanup_paths_safe,
+        "transition_lock_retained": True,
     }},
-    "post_session_status": {{
+}}
+resources.append(file_resource)
+report = lifecycle_report()
+if cleanup_paths_safe:
+    metadata_bytes = metadata_path.read_bytes()
+    receipt = {{
+        "schema_version": "clio-relay.owner-session-cleanup-receipt.v1",
+        "owner": "clio-relay",
+        "cluster": cluster,
+        "session_id": session_id,
+        "session_generation_id": generation_id,
         "api_pid": pid if isinstance(pid, int) else None,
-        "session_generation_id": metadata.get("session_generation_id"),
-        "process_start_marker": metadata.get("process_start_ticks"),
-        "running": post_running,
-        "ownership_verified": ownership_verified,
-        "observed_at": post_observed_at,
-        "started_at": metadata.get("started_at"),
-    }},
-    "resources": resources,
-    "errors": errors,
-}}))
+        "process_start_ticks": metadata.get("process_start_ticks"),
+        "metadata_sha256": hashlib.sha256(metadata_bytes).hexdigest(),
+        "cleanup_operation_id": cleanup_intent.get("operation_id"),
+        "cleanup_policy": cleanup_policy,
+        "cleanup_paths": cleanup_filenames,
+        "cleanup_paths_pending": True,
+        "cluster_registry_verified": True,
+        "cluster_registry_removed": False,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "report": report,
+    }}
+    receipt_temporary = metadata_path.with_name(f"metadata.json.{{os.getpid()}}.receipt")
+    with receipt_temporary.open("x", encoding="utf-8") as handle:
+        json.dump(receipt, handle, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(receipt_temporary, 0o600)
+    os.replace(receipt_temporary, metadata_path)
+    directory_descriptor = os.open(session_dir, os.O_RDONLY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+    removal_error = None
+    for filename in cleanup_filenames:
+        try:
+            (session_dir / filename).unlink(missing_ok=True)
+        except OSError as exc:
+            removal_error = f"failed to remove owned session file {{filename}}: {{exc}}"
+            break
+    if removal_error is None:
+        receipt["cleanup_paths_pending"] = False
+        receipt["cluster_registry_removed"] = True
+        receipt_temporary = metadata_path.with_name(f"metadata.json.{{os.getpid()}}.complete")
+        with receipt_temporary.open("x", encoding="utf-8") as handle:
+            json.dump(receipt, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(receipt_temporary, 0o600)
+        os.replace(receipt_temporary, metadata_path)
+    else:
+        file_resource.update({{
+            "outcome": "failed",
+            "verified_after_operation": False,
+            "residual": True,
+            "detail": removal_error,
+        }})
+        errors.append(removal_error)
+        report = lifecycle_report()
+else:
+    metadata["last_cleanup"] = {{
+        "mode": "teardown",
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "resources": resources,
+        "errors": errors,
+    }}
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+print(json.dumps(report))
 __CLIO_RELAY_OWNED_TEARDOWN__
 """
 

@@ -3,17 +3,22 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+import stat
 import subprocess
 import sys
+import time
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Thread
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from click import unstyle
+from filelock import FileLock
 from typer.testing import CliRunner
 
 from clio_relay import __version__, cli
@@ -56,6 +61,7 @@ from clio_relay.scheduler_providers import SchedulerProvider
 from clio_relay.service_runtime import ServiceRuntimeSupervisor
 from clio_relay.session_lifecycle import (
     CleanupResource,
+    OwnedSessionRecoveryStatus,
     RemoteSessionStateEvidence,
     SessionApiReleaseIdentity,
     SessionLifecycleReport,
@@ -1587,6 +1593,187 @@ def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch
     assert torn_down[0]["stop_worker"] is True
     assert torn_down[0]["cluster"] == "ares"
     assert torn_down[0]["expected_session_generation_id"] == "generation-1"
+
+
+def test_owned_session_recovery_waits_for_late_start_metadata(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    session_dir = home / ".local" / "share" / "clio-relay" / "sessions" / "late-session"
+    session_dir.mkdir(parents=True)
+    transition_path = session_dir / "transition.lock"
+    transition_path.write_text("", encoding="utf-8")
+    metadata_path = session_dir / "metadata.json"
+    observed: list[OwnedSessionRecoveryStatus] = []
+    failures: list[BaseException] = []
+
+    def inspect_after_start(**kwargs: object) -> OwnedSessionRecoveryStatus:
+        assert kwargs["home"] == home
+        assert metadata_path.read_text(encoding="utf-8") == "late metadata"
+        return OwnedSessionRecoveryStatus(
+            cluster="ares",
+            session_id="late-session",
+            session_generation_id="generation-late",
+            owner="clio-relay",
+            api_pid=4321,
+            process_start_marker="123456",
+            process_state="absent",
+            process_absence_verified=True,
+            metadata_verified=True,
+            cluster_registry_verified=True,
+            durable_generation_verified=True,
+            ownership_verified=True,
+            recovery_verified=True,
+        )
+
+    monkeypatch.setattr(cli, "inspect_owned_session_recovery_status", inspect_after_start)
+    held_transition = FileLock(str(transition_path), timeout=1, mode=0o600)
+    held_transition.acquire()
+
+    def recover() -> None:
+        try:
+            observed.append(
+                cli._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                    cluster="ares",
+                    session_id="late-session",
+                    core_dir=tmp_path / "core",
+                    home=home,
+                    timeout_seconds=2,
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    recovery_thread = Thread(target=recover)
+    recovery_thread.start()
+    time.sleep(0.1)
+    assert recovery_thread.is_alive()
+    assert observed == []
+    metadata_path.write_text("late metadata", encoding="utf-8")
+    held_transition.release()
+    recovery_thread.join(timeout=2)
+
+    assert recovery_thread.is_alive() is False
+    assert failures == []
+    assert observed[0].session_generation_id == "generation-late"
+    assert observed[0].recovery_verified is True
+
+
+def test_owned_session_recovery_waits_for_late_transition_lock_creation(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    session_dir = home / ".local" / "share" / "clio-relay" / "sessions" / "late-session"
+    transition_path = session_dir / "transition.lock"
+    metadata_path = session_dir / "metadata.json"
+    observed: list[OwnedSessionRecoveryStatus] = []
+    failures: list[BaseException] = []
+
+    def inspect_after_start(**kwargs: object) -> OwnedSessionRecoveryStatus:
+        assert kwargs["home"] == home
+        assert metadata_path.read_text(encoding="utf-8") == "late metadata"
+        return OwnedSessionRecoveryStatus(
+            cluster="ares",
+            session_id="late-session",
+            session_generation_id="generation-late",
+            owner="clio-relay",
+            api_pid=4321,
+            process_start_marker="123456",
+            process_state="absent",
+            process_absence_verified=True,
+            metadata_verified=True,
+            cluster_registry_verified=True,
+            durable_generation_verified=True,
+            ownership_verified=True,
+            recovery_verified=True,
+        )
+
+    monkeypatch.setattr(cli, "inspect_owned_session_recovery_status", inspect_after_start)
+
+    def recover() -> None:
+        try:
+            observed.append(
+                cli._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                    cluster="ares",
+                    session_id="late-session",
+                    core_dir=tmp_path / "core",
+                    home=home,
+                    timeout_seconds=2,
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    recovery_thread = Thread(target=recover)
+    recovery_thread.start()
+    time.sleep(0.1)
+    assert recovery_thread.is_alive()
+    assert observed == []
+
+    session_dir.mkdir(parents=True)
+    held_transition = FileLock(str(transition_path), timeout=1, mode=0o600)
+    held_transition.acquire()
+    metadata_path.write_text("late metadata", encoding="utf-8")
+    time.sleep(0.1)
+    assert recovery_thread.is_alive()
+    assert observed == []
+    held_transition.release()
+    recovery_thread.join(timeout=2)
+
+    assert recovery_thread.is_alive() is False
+    assert failures == []
+    assert observed[0].session_generation_id == "generation-late"
+    assert observed[0].recovery_verified is True
+
+
+def test_owned_session_recovery_fails_closed_when_transition_never_materializes(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+
+    def forbid_inspection(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        raise AssertionError("missing transition lock is not authoritative absence proof")
+
+    monkeypatch.setattr(cli, "inspect_owned_session_recovery_status", forbid_inspection)
+
+    with pytest.raises(RelayError, match="delayed remote start cannot be ruled out"):
+        cli._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cluster="ares",
+            session_id="late-session",
+            core_dir=tmp_path / "core",
+            home=home,
+            timeout_seconds=0.05,
+        )
+
+
+def test_owned_session_recovery_refuses_symlinked_transition_lock(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    transition_path = (
+        home / ".local" / "share" / "clio-relay" / "sessions" / "late-session" / "transition.lock"
+    )
+    original_lstat = Path.lstat
+
+    def symlinked_lock_lstat(path: Path) -> os.stat_result | SimpleNamespace:
+        if path == transition_path:
+            return SimpleNamespace(st_mode=stat.S_IFLNK, st_dev=1, st_ino=2)
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", symlinked_lock_lstat)
+
+    with pytest.raises(RelayError, match="transition lock is not a regular file"):
+        cli._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cluster="ares",
+            session_id="late-session",
+            core_dir=tmp_path / "core",
+            home=home,
+            timeout_seconds=1,
+        )
 
 
 def test_cli_session_start_does_not_reopen_intake_when_process_start_fails(
@@ -3362,6 +3549,112 @@ def test_cli_session_teardown_defaults_to_keep_jobs(
     assert closure.residual_resource_ids == []
     assert any(resource["kind"] == "owner_session" for resource in payload["resources"])
     assert torn_down[0]["stop_worker"] is False
+
+
+def test_cli_dead_session_teardown_uses_recovery_without_canceling_jobs(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    core_dir = tmp_path / "core"
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    _activate_owner_session(ClioCoreQueue(core_dir))
+    recovery = OwnedSessionRecoveryStatus(
+        cluster="ares",
+        session_id="session-1",
+        session_generation_id="generation-1",
+        owner="clio-relay",
+        api_pid=123,
+        process_start_marker="start-123",
+        process_state="absent",
+        process_absence_verified=True,
+        metadata_verified=True,
+        cluster_registry_verified=True,
+        durable_generation_verified=True,
+        ownership_verified=True,
+        recovery_verified=True,
+    )
+    teardown_calls: list[dict[str, object]] = []
+
+    def dead_status(**_kwargs: object) -> dict[str, object]:
+        raise RelayError("session metadata was not present before the late start completed")
+
+    def recovered_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        return recovery
+
+    monkeypatch.setattr(cli, "status_remote_session", dead_status)
+    monkeypatch.setattr(cli, "_owned_session_recovery_status", recovered_status)
+
+    def verified_teardown(**kwargs: object) -> SessionLifecycleReport:
+        teardown_calls.append(kwargs)
+        report = _verified_teardown_report()
+        report.prior_session_status = report.prior_session_status.model_copy(  # pyright: ignore[reportOptionalMemberAccess]
+            update={"running": False}
+        )
+        report.resources[0] = report.resources[0].model_copy(update={"outcome": "missing"})
+        return report
+
+    def forbid_cancellation(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("dead-session recovery must preserve jobs by default")
+
+    def observe_no_worker(_definition: ClusterDefinition) -> tuple[None, None]:
+        return None, None
+
+    written_reports: list[LiveValidationReport] = []
+    write_report = cli.write_validation_report
+
+    def capture_report(report: LiveValidationReport, path: Path) -> None:
+        written_reports.append(report.model_copy(deep=True))
+        write_report(report, path)
+
+    monkeypatch.setattr(cli, "teardown_remote_session", verified_teardown)
+    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
+    monkeypatch.setattr(cli, "_cancel_local_owned_jobs", forbid_cancellation)
+    monkeypatch.setattr(cli, "_cancel_owned_scheduler_jobs", forbid_cancellation)
+    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", observe_no_worker)
+    monkeypatch.setattr(cli, "write_validation_report", capture_report)
+
+    result = CliRunner().invoke(
+        app,
+        ["session", "teardown", "--cluster", "ares", "--session-id", "session-1"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["recovery_evidence"]["process_state"] == "absent"
+    assert payload["relay_cancel_requested"] is False
+    assert payload["scheduler_cancel_requested"] is False
+    assert payload["cleanup_policy"] == {
+        "stop_worker": False,
+        "cancel_jobs": False,
+        "cancel_scheduler_jobs": False,
+    }
+    assert teardown_calls[0]["cancel_jobs"] is False
+    assert teardown_calls[0]["cancel_scheduler_jobs"] is False
+    report = json.loads(
+        next((tmp_path / ".clio-relay" / "validation-reports").glob("*.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    recovery_resource = next(
+        resource for resource in report["resources"] if resource["kind"] == "owner_session_recovery"
+    )
+    assert recovery_resource["state"] == "verified"
+    assert recovery_resource["metadata"]["process_absence_verified"] is True
+    assert "late start completed" in recovery_resource["metadata"]["initial_status_error"]
+    quiesced_report = next(
+        report
+        for report in written_reports
+        if any(
+            resource.kind == "owner_session_admission" and resource.state == "quiesced"
+            for resource in report.resources
+        )
+    )
+    assert any(
+        resource.kind == "owner_session_recovery" and resource.state == "verified"
+        for resource in quiesced_report.resources
+    )
 
 
 def test_cli_teardown_refuses_implicit_legacy_job_ownership(

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -20,13 +22,14 @@ from datetime import datetime
 from json import JSONDecodeError
 from pathlib import Path, PurePosixPath
 from time import monotonic, sleep
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal, Protocol, cast
 from uuid import uuid4
 
 import typer
 import uvicorn
 import yaml
 from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
 from pydantic import ValidationError
 
 from clio_relay.application_profiles import install_cluster_app_over_ssh
@@ -211,10 +214,12 @@ from clio_relay.service_runtime import ServiceRuntimeSupervisor
 from clio_relay.session_api import submit_owned_session_job
 from clio_relay.session_lifecycle import (
     CleanupResource,
+    OwnedSessionRecoveryStatus,
     SessionApiReleaseIdentity,
     SessionLifecycleReport,
     cleanup_connectors_cover_gateways,
     detach_remote_session,
+    inspect_owned_session_recovery_status,
     start_remote_session,
     status_remote_session,
     teardown_remote_session,
@@ -256,9 +261,23 @@ DEFAULT_RELAY_CANCEL_POLL_SECONDS = 0.25
 MAX_RELAY_CANCEL_TIMEOUT_SECONDS = 3_600.0
 REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS = 120.0
 REMOTE_CLEANUP_WORKER_INFO_TIMEOUT_SECONDS = 20.0
+OWNED_SESSION_RECOVERY_TRANSITION_TIMEOUT_SECONDS = 90.0
 SPACK_CONFIGURATION_OBSERVATION_TIMEOUT_SECONDS = 60.0
 MAX_SPACK_CONFIGURATION_OBSERVATION_OUTPUT_BYTES = 128 * 1024
 MAX_SPACK_CONFIGURATION_TREE_ENTRIES = 1_024
+
+
+class _FcntlModule(Protocol):
+    """Typed POSIX advisory-lock surface loaded only on POSIX hosts."""
+
+    LOCK_EX: int
+    LOCK_NB: int
+    LOCK_UN: int
+
+    def flock(self, fd: int, operation: int) -> Any:
+        """Apply an advisory lock operation to an open descriptor."""
+
+
 SCHEDULER_SENTINEL_ACTIVE_PHASES = frozenset({"submitted", "pending", "allocated", "running"})
 SCHEDULER_SENTINEL_PRESERVED_PHASES = SCHEDULER_SENTINEL_ACTIVE_PHASES | {"completed"}
 _ACCEPTANCE_REPORT_COMMAND_ATTRIBUTE = "__clio_relay_acceptance_report_command__"
@@ -3448,6 +3467,235 @@ def session_admission_status(
     _run_or_exit(action)
 
 
+@session_app.command("recovery-status", hidden=True)
+def session_recovery_status(
+    cluster: Annotated[str, typer.Option(help="Exact cluster recorded by the owned session.")],
+    session_id: Annotated[str, typer.Option(help="Exact owned relay session id.")],
+) -> None:
+    """Return fail-closed recovery evidence for an ambiguous or dead session start."""
+
+    def action() -> None:
+        status = _inspect_owned_session_recovery_after_transition(
+            cluster=cluster,
+            session_id=session_id,
+            core_dir=RelaySettings.from_env().core_dir,
+        )
+        typer.echo(status.model_dump_json(indent=2))
+
+    _run_or_exit(action)
+
+
+def _inspect_owned_session_recovery_after_transition(
+    *,
+    cluster: str,
+    session_id: str,
+    core_dir: Path,
+    home: Path | None = None,
+    timeout_seconds: float = OWNED_SESSION_RECOVERY_TRANSITION_TIMEOUT_SECONDS,
+) -> OwnedSessionRecoveryStatus:
+    """Wait for an ambiguous start transition, then inspect its exact durable identity."""
+    if re.fullmatch(r"[A-Za-z0-9_-]+", session_id) is None:
+        raise RelayError("session_id must contain only letters, numbers, hyphen, or underscore")
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    selected_home = home or Path.home()
+    session_dir = selected_home / ".local" / "share" / "clio-relay" / "sessions" / session_id
+    transition_path = session_dir / "transition.lock"
+    deadline = monotonic() + timeout_seconds
+    transition_status: os.stat_result | None = None
+    while transition_status is None:
+        try:
+            transition_status = transition_path.lstat()
+        except FileNotFoundError:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise RelayError(
+                    "owned session transition lock did not materialize during the bounded "
+                    "recovery wait; a delayed remote start cannot be ruled out"
+                ) from None
+            sleep(min(0.05, remaining))
+    if not stat.S_ISREG(transition_status.st_mode):
+        raise RelayError("owned session transition lock is not a regular file")
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise RelayError(
+            "owned session start transition could not be inspected during the bounded recovery wait"
+        )
+    if os.name == "posix" and getattr(os, "O_NOFOLLOW", 0) and getattr(os, "O_DIRECTORY", 0):
+        return _inspect_owned_session_recovery_under_posix_transition_lock(
+            cluster=cluster,
+            session_id=session_id,
+            core_dir=core_dir,
+            home=selected_home,
+            session_dir=session_dir,
+            transition_status=transition_status,
+            deadline=deadline,
+        )
+    try:
+        with FileLock(
+            str(transition_path),
+            timeout=remaining,
+            mode=0o600,
+        ):
+            locked_status = transition_path.lstat()
+            lock_identity_changed = os.name == "posix" and (
+                locked_status.st_dev,
+                locked_status.st_ino,
+            ) != (transition_status.st_dev, transition_status.st_ino)
+            if not stat.S_ISREG(locked_status.st_mode) or lock_identity_changed:
+                raise RelayError("owned session transition lock changed during recovery")
+            return inspect_owned_session_recovery_status(
+                cluster=cluster,
+                session_id=session_id,
+                core_dir=core_dir,
+                home=selected_home,
+            )
+    except FileLockTimeout as exc:
+        raise RelayError(
+            "owned session start is still in progress after the bounded recovery wait"
+        ) from exc
+
+
+def _inspect_owned_session_recovery_under_posix_transition_lock(
+    *,
+    cluster: str,
+    session_id: str,
+    core_dir: Path,
+    home: Path,
+    session_dir: Path,
+    transition_status: os.stat_result,
+    deadline: float,
+) -> OwnedSessionRecoveryStatus:
+    """Inspect recovery state while holding the exact no-follow POSIX lock inode."""
+    try:
+        fcntl = cast(_FcntlModule, importlib.import_module("fcntl"))
+    except ImportError as exc:
+        raise RelayError("owned session recovery requires POSIX fcntl locking") from exc
+
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    close_on_exec = getattr(os, "O_CLOEXEC", 0)
+    sessions_descriptor: int | None = None
+    session_descriptor: int | None = None
+    transition_descriptor: int | None = None
+    lock_acquired = False
+    get_effective_uid = cast(Callable[[], int] | None, getattr(os, "geteuid", None))
+    if get_effective_uid is None:
+        raise RelayError("owned session recovery cannot verify the effective POSIX user")
+    current_uid = get_effective_uid()
+    try:
+        sessions_descriptor = os.open(
+            session_dir.parent,
+            os.O_RDONLY | directory_flag | no_follow | close_on_exec,
+        )
+        sessions_status = os.fstat(sessions_descriptor)
+        if not stat.S_ISDIR(sessions_status.st_mode) or sessions_status.st_uid != current_uid:
+            raise RelayError(
+                "owned session transition parent is not an owner-scoped real directory"
+            )
+        session_descriptor = os.open(
+            session_dir.name,
+            os.O_RDONLY | directory_flag | no_follow | close_on_exec,
+            dir_fd=sessions_descriptor,
+        )
+        session_status = os.fstat(session_descriptor)
+        if not stat.S_ISDIR(session_status.st_mode) or session_status.st_uid != current_uid:
+            raise RelayError("owned session transition path is not an owner-scoped real directory")
+        transition_descriptor = os.open(
+            "transition.lock",
+            os.O_RDWR | no_follow | close_on_exec,
+            dir_fd=session_descriptor,
+        )
+        os.set_inheritable(transition_descriptor, False)
+        opened_status = os.fstat(transition_descriptor)
+        linked_status = os.stat(
+            "transition.lock",
+            dir_fd=session_descriptor,
+            follow_symlinks=False,
+        )
+        expected_identity = (transition_status.st_dev, transition_status.st_ino)
+        opened_identity = (opened_status.st_dev, opened_status.st_ino)
+        linked_identity = (linked_status.st_dev, linked_status.st_ino)
+        if (
+            not stat.S_ISREG(opened_status.st_mode)
+            or not stat.S_ISREG(linked_status.st_mode)
+            or opened_status.st_nlink != 1
+            or opened_status.st_uid != current_uid
+            or stat.S_IMODE(opened_status.st_mode) & 0o077
+            or opened_identity != linked_identity
+            or opened_identity != expected_identity
+        ):
+            raise RelayError("owned session transition lock changed during recovery")
+
+        while True:
+            try:
+                fcntl.flock(transition_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_acquired = True
+                break
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise RelayError(
+                        f"could not acquire owned session transition lock: {exc}"
+                    ) from exc
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise RelayError(
+                        "owned session start is still in progress after the bounded recovery wait"
+                    ) from exc
+                sleep(min(0.05, remaining))
+
+        locked_status = os.fstat(transition_descriptor)
+        locked_link_status = os.stat(
+            "transition.lock",
+            dir_fd=session_descriptor,
+            follow_symlinks=False,
+        )
+        linked_session_status = session_dir.lstat()
+        if (
+            not stat.S_ISDIR(linked_session_status.st_mode)
+            or (linked_session_status.st_dev, linked_session_status.st_ino)
+            != (session_status.st_dev, session_status.st_ino)
+            or locked_status.st_nlink != 1
+            or (locked_status.st_dev, locked_status.st_ino) != opened_identity
+            or (locked_link_status.st_dev, locked_link_status.st_ino) != opened_identity
+        ):
+            raise RelayError("owned session transition path changed after locking")
+        result = inspect_owned_session_recovery_status(
+            cluster=cluster,
+            session_id=session_id,
+            core_dir=core_dir,
+            home=home,
+        )
+        final_link_status = os.stat(
+            "transition.lock",
+            dir_fd=session_descriptor,
+            follow_symlinks=False,
+        )
+        final_session_status = session_dir.lstat()
+        if (final_link_status.st_dev, final_link_status.st_ino) != opened_identity or (
+            final_session_status.st_dev,
+            final_session_status.st_ino,
+        ) != (session_status.st_dev, session_status.st_ino):
+            raise RelayError("owned session transition path changed during recovery inspection")
+        return result
+    except FileNotFoundError as exc:
+        raise RelayError("owned session transition path disappeared during recovery") from exc
+    except OSError as exc:
+        raise RelayError(f"could not safely open owned session transition lock: {exc}") from exc
+    finally:
+        if lock_acquired and transition_descriptor is not None:
+            with suppress(OSError):
+                fcntl.flock(transition_descriptor, fcntl.LOCK_UN)
+        for descriptor in (
+            transition_descriptor,
+            session_descriptor,
+            sessions_descriptor,
+        ):
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+
+
 @session_app.command("prepare-start", hidden=True)
 def session_prepare_start(
     session_id: Annotated[str, typer.Option(help="Owned relay session id.")],
@@ -3872,14 +4120,54 @@ def session_teardown(
         remote_execution = should_execute_on_cluster(definition)
         queue = _managed_queue_from_env()
         cleanup_worker_info, cleanup_worker_error = _observe_worker_before_cleanup(definition)
-        pre_teardown_status = status_remote_session(
-            definition=definition,
-            session_id=session_id,
-        )
-        session_generation_id = _verified_owner_session_generation(
-            pre_teardown_status,
-            session_id=session_id,
-        )
+        initial_status_error: str | None = None
+        try:
+            pre_teardown_status = status_remote_session(
+                definition=definition,
+                session_id=session_id,
+            )
+        except (JSONDecodeError, RelayError) as exc:
+            initial_status_error = f"{type(exc).__name__}: {exc}"
+            pre_teardown_status = {}
+        recovery_status: OwnedSessionRecoveryStatus | None = None
+        recovery_resource: ValidationResource | None = None
+        try:
+            session_generation_id = _verified_owner_session_generation(
+                pre_teardown_status,
+                session_id=session_id,
+            )
+        except RelayError:
+            session_generation_id = ""
+        if not session_generation_id or pre_teardown_status.get("running") is not True:
+            recovery_status = _owned_session_recovery_status(
+                queue=queue,
+                definition=definition,
+                remote_execution=remote_execution,
+                cluster=cluster,
+                session_id=session_id,
+            )
+            recovery_resource = _owner_session_recovery_validation_resource(recovery_status)
+            if initial_status_error is not None:
+                recovery_resource.metadata["initial_status_error"] = initial_status_error
+            seed_report.resources.append(recovery_resource)
+            canonical_report[0] = seed_report
+            write_validation_report(seed_report, canonical_report_path)
+            session_generation_id = _verified_recovered_owner_session_generation(
+                recovery_status,
+                cluster=cluster,
+                session_id=session_id,
+            )
+            pre_teardown_status = {
+                "owner": recovery_status.owner,
+                "session_id": recovery_status.session_id,
+                "session_generation_id": recovery_status.session_generation_id,
+                "api_pid": recovery_status.api_pid,
+                "process_start_ticks": recovery_status.process_start_marker,
+                "running": recovery_status.running,
+                "ownership_verified": recovery_status.ownership_verified,
+                "process_absence_verified": recovery_status.process_absence_verified,
+                "process_state": recovery_status.process_state,
+            }
         local_admission_session_id = _desktop_owner_session_admission_id(
             cluster=cluster,
             session_id=session_id,
@@ -3962,6 +4250,7 @@ def session_teardown(
                 "cleanup_operation_id": cleanup_operation_id,
             },
         )
+        admission_resource_index = len(partial.resources)
         partial.resources.extend([admission_resource, api_resource])
         partial.cleanup.remaining_resources.extend([admission_resource, api_resource])
         canonical_report[0] = partial
@@ -3978,8 +4267,10 @@ def session_teardown(
             cancel_jobs=cancel_jobs,
             cancel_scheduler_jobs=cancel_scheduler_jobs,
         )
-        partial.resources[0] = partial.resources[0].model_copy(update={"state": "quiesced"})
-        partial.cleanup.remaining_resources[0] = partial.resources[0]
+        partial.resources[admission_resource_index] = partial.resources[
+            admission_resource_index
+        ].model_copy(update={"state": "quiesced"})
+        partial.cleanup.remaining_resources[0] = partial.resources[admission_resource_index]
         partial.cleanup.actions[0].update(
             {
                 "outcome": "quiesced",
@@ -4229,6 +4520,8 @@ def session_teardown(
         partial = partial.model_copy(
             update={"report_id": seed_report.report_id, "started_at": seed_report.started_at}
         )
+        if recovery_resource is not None:
+            partial.resources.append(recovery_resource)
         canonical_report[0] = partial
         post_api_jobs = list_owned_jobs(include_terminal=True)
         initial_job_ids = {job.job_id for job in owned_jobs}
@@ -4369,6 +4662,8 @@ def session_teardown(
             "canceled_job_ids": canceled,
         }
         payload["gateway_sessions"] = gateway_reports
+        if recovery_status is not None:
+            payload["recovery_evidence"] = recovery_status.model_dump(mode="json")
         canonical = report.to_live_validation_report(
             stop_worker=stop_worker,
             cancel_jobs=cancel_jobs,
@@ -4381,6 +4676,8 @@ def session_teardown(
         canonical = canonical.model_copy(
             update={"report_id": seed_report.report_id, "started_at": seed_report.started_at}
         )
+        if recovery_resource is not None:
+            canonical.resources.append(recovery_resource)
         canonical_report[0] = canonical
         for job_id in canceled:
             canonical.resources.append(
@@ -10500,6 +10797,105 @@ def _verified_owner_session_generation(
     if status.get("running") is True and status.get("ownership_verified") is not True:
         raise RelayError("running remote session failed process ownership verification")
     return generation_id
+
+
+def _owned_session_recovery_status(
+    *,
+    queue: ClioCoreQueue,
+    definition: ClusterDefinition,
+    remote_execution: bool,
+    cluster: str,
+    session_id: str,
+) -> OwnedSessionRecoveryStatus:
+    """Read exact dead-session recovery evidence at the authoritative boundary."""
+    if remote_execution:
+        raw_status = cast(
+            object,
+            json.loads(
+                run_remote_clio(
+                    definition,
+                    [
+                        "session",
+                        "recovery-status",
+                        "--cluster",
+                        cluster,
+                        "--session-id",
+                        session_id,
+                    ],
+                )
+            ),
+        )
+        return OwnedSessionRecoveryStatus.model_validate(raw_status)
+    return _inspect_owned_session_recovery_after_transition(
+        cluster=cluster,
+        session_id=session_id,
+        core_dir=queue.root,
+    )
+
+
+def _verified_recovered_owner_session_generation(
+    status: OwnedSessionRecoveryStatus,
+    *,
+    cluster: str,
+    session_id: str,
+) -> str:
+    """Return an exact generation only from complete recovery evidence."""
+    generation_id = status.session_generation_id
+    if not (
+        status.cluster == cluster
+        and status.session_id == session_id
+        and status.owner == "clio-relay"
+        and status.metadata_verified
+        and status.cluster_registry_verified
+        and status.durable_generation_verified
+        and status.ownership_verified
+        and status.recovery_verified
+        and not status.errors
+        and generation_id is not None
+    ):
+        detail = "; ".join(status.errors) or "recovery proof was incomplete"
+        raise RelayError(f"owned session recovery was refused: {detail}")
+    _require_durable_session_identity(generation_id, field="session_generation_id")
+    if status.running and status.process_state != "owned_running":
+        raise RelayError("owned session recovery did not prove the running process identity")
+    if not status.running and status.process_state not in {
+        "absent",
+        "owned_terminal",
+        "cleanup_pending",
+        "already_closed",
+    }:
+        raise RelayError("owned session recovery did not prove the recorded process stopped")
+    return generation_id
+
+
+def _owner_session_recovery_validation_resource(
+    status: OwnedSessionRecoveryStatus,
+) -> ValidationResource:
+    """Project recovery evidence into the canonical machine-readable report."""
+    generation_id = status.session_generation_id or "generation-unverified"
+    return ValidationResource(
+        kind="owner_session_recovery",
+        resource_id=f"{status.session_id}:{generation_id}",
+        role="cleanup_identity_recovery",
+        cluster=status.cluster,
+        state="verified" if status.recovery_verified else "refused",
+        metadata={
+            "session_generation_id": status.session_generation_id,
+            "api_pid": status.api_pid,
+            "process_start_marker": status.process_start_marker,
+            "process_state": status.process_state,
+            "running": status.running,
+            "process_absence_verified": status.process_absence_verified,
+            "metadata_verified": status.metadata_verified,
+            "cluster_registry_verified": status.cluster_registry_verified,
+            "durable_generation_verified": status.durable_generation_verified,
+            "cleanup_receipt": status.cleanup_receipt,
+            "ownership_verified": status.ownership_verified,
+            "recovery_verified": status.recovery_verified,
+            "errors": status.errors,
+            "admission_status": status.admission_status,
+        },
+    )
 
 
 def _verified_owner_session_detach(
