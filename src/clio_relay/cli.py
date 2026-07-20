@@ -81,8 +81,10 @@ from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.frp_check import run_frpc_connection_check
 from clio_relay.identifiers import validate_durable_record_id
 from clio_relay.installation import (
+    INSTALL_RECEIPT_PATH_ENV,
     InstallReceipt,
     attach_verified_worker_identity,
+    default_install_receipt_path,
     installation_info,
     verify_remote_worker_info,
     worker_runtime_info,
@@ -305,11 +307,22 @@ MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_ENTRIES = 11
 MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_STORED_BYTES = 2 * (
     MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES + MAX_LOCAL_CLEANUP_REPORT_MANIFEST_BYTES
 )
-_LOCAL_CLEANUP_REPORT_ARTIFACT_DIRECTORY_NAME = ".clio-cleanup-artifacts-v1"
+_LOCAL_CLEANUP_REPORT_ARTIFACT_DIRECTORY_NAME = "cleanup-evidence-v1"
 _LOCAL_CLEANUP_REPORT_ARTIFACT_PATTERN = re.compile(r"^r-[0-9a-f]{64}\.(?:p[0-9]{4}|manifest)$")
 _LOCAL_CLEANUP_REPORT_PENDING_PATTERN = re.compile(
     r"^\.r-[0-9a-f]{64}\.(?:p[0-9]{4}|manifest)\.pending$"
 )
+
+
+def _cleanup_evidence_state_parent() -> Path:
+    """Return the one user-scoped parent for all local cleanup evidence."""
+    receipt_path = default_install_receipt_path().expanduser()
+    if not receipt_path.is_absolute():
+        raise ConfigurationError(
+            f"{INSTALL_RECEIPT_PATH_ENV} must be an absolute path when cleanup evidence "
+            "is persisted"
+        )
+    return receipt_path.parent
 
 
 @dataclass(frozen=True, slots=True)
@@ -499,9 +512,9 @@ def _windows_cleanup_file_information(
     return information
 
 
-def _acquire_cleanup_evidence_lock(validation_report_path: Path) -> _CleanupEvidenceLock:
+def _acquire_cleanup_evidence_lock() -> _CleanupEvidenceLock:
     """Acquire the crash-released lock shared by cleanup artifacts and validation output."""
-    requested_parent = validation_report_path.parent.absolute()
+    requested_parent = _cleanup_evidence_state_parent()
     durably_ensure_validation_directory(requested_parent)
     parent_directory = requested_parent.resolve(strict=True)
     if os.path.normcase(str(parent_directory)) != os.path.normcase(str(requested_parent)):
@@ -3972,10 +3985,9 @@ def _persist_local_cleanup_report_artifact(
     expected_names = {manifest_name, *(name for name, _chunk, _sha256 in chunk_specs)}
     expected_names.update(f".{name}.pending" for name in tuple(expected_names))
 
-    report_basename = validation_report_path.name
-    if not report_basename or report_basename in {".", ".."}:
+    if not validation_report_path.name or validation_report_path.name in {".", ".."}:
         raise RelayError("validation report path has no safe artifact identity")
-    requested_parent = validation_report_path.parent.absolute()
+    requested_parent = _cleanup_evidence_state_parent()
     durably_ensure_validation_directory(requested_parent)
     requested_parent_status = os.lstat(requested_parent)
     if stat.S_ISLNK(requested_parent_status.st_mode):
@@ -4168,7 +4180,8 @@ def _persist_local_cleanup_report_artifact(
                     internal_filesystem_path(
                         artifact_directory / name,
                         force_extended=True,
-                    )
+                    ),
+                    expected_nlink=expected_nlink,
                 )
             else:
                 descriptor = os.open(artifact_directory / name, flags)
@@ -4447,7 +4460,7 @@ def _persist_local_cleanup_report_artifact(
             report_hasher.update(chunk_bytes)
             retained.add(chunk_name)
         if observed_report_size != raw_report_size or report_hasher.hexdigest() != candidate_digest:
-            raise RelayError("retained cleanup report artifact size is inconsistent")
+            raise RelayError("retained cleanup report artifact size or digest is inconsistent")
         return retained
 
     def newest_previous_complete_report_names(
@@ -5526,7 +5539,7 @@ def session_teardown(
     canonical_report_path = validation_report or default_report_path(cluster)
     evidence_lock: _CleanupEvidenceLock | None = None
     try:
-        evidence_lock = _acquire_cleanup_evidence_lock(canonical_report_path)
+        evidence_lock = _acquire_cleanup_evidence_lock()
         seed_report = _new_cleanup_acceptance_report(
             scenario="cleanup",
             cluster=cluster,
@@ -5591,7 +5604,7 @@ def session_teardown(
             """Durably reference exact local evidence before authoritative closure."""
             _verify_cleanup_evidence_lock(
                 active_evidence_lock,
-                expected_parent=canonical_report_path.parent,
+                expected_parent=_cleanup_evidence_state_parent(),
             )
             reference = recovery.coordinator_report_ref
             generation_id = report.session_generation_id
@@ -5707,12 +5720,12 @@ def session_teardown(
             write_validation_report(pending, canonical_report_path)
             _verify_cleanup_evidence_lock(
                 active_evidence_lock,
-                expected_parent=canonical_report_path.parent,
+                expected_parent=_cleanup_evidence_state_parent(),
             )
             reread = load_validation_report(canonical_report_path)
             _verify_cleanup_evidence_lock(
                 active_evidence_lock,
-                expected_parent=canonical_report_path.parent,
+                expected_parent=_cleanup_evidence_state_parent(),
             )
             expected_checkpoint = LiveValidationReport.model_validate(
                 redact_sensitive_values(pending.model_dump(mode="json"))
@@ -6225,7 +6238,7 @@ def session_teardown(
             )
             _verify_cleanup_evidence_lock(
                 active_evidence_lock,
-                expected_parent=canonical_report_path.parent,
+                expected_parent=_cleanup_evidence_state_parent(),
             )
             _mark_owner_session_closed(
                 queue=queue,
@@ -6727,7 +6740,7 @@ def session_teardown(
         )
         _verify_cleanup_evidence_lock(
             active_evidence_lock,
-            expected_parent=canonical_report_path.parent,
+            expected_parent=_cleanup_evidence_state_parent(),
         )
         legacy_recovery = recovery_status
         legacy_unversioned_job_ids: list[str] = []

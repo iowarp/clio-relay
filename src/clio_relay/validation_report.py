@@ -4644,10 +4644,13 @@ def _acquire_validation_writer_lock(parent: Path) -> _ValidationWriterLock:
                     os.fsync(stream.fileno())
             except FileExistsError:
                 pass
-        descriptor = open_private_configuration_windows_descriptor(
-            storage_lock_path,
-            exclusive=True,
-        )
+        try:
+            descriptor = open_private_configuration_windows_descriptor(
+                storage_lock_path,
+                exclusive=True,
+            )
+        except ConfigurationError as exc:
+            raise OSError("validation writer lock could not be acquired") from exc
         _verify_windows_validation_directory(windows_parent)
         return _ValidationWriterLock(
             path=lock_path,

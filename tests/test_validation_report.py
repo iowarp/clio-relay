@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import zipfile
@@ -17,6 +18,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
+from threading import Event, Thread
 from typing import cast
 
 import pytest
@@ -1081,6 +1083,162 @@ def test_report_json_round_trip_is_stable(tmp_path: Path) -> None:
     assert payload["evidence_trust"]["invocation_id"] == "run-20260710-0001"
     assert path.read_text(encoding="utf-8").endswith("\n")
     assert not list(tmp_path.glob("*.tmp"))
+    assert not list(tmp_path.glob(".clio-validation-*.pending"))
+
+
+def test_atomic_report_writer_replaces_exactly_and_supports_new_nested_parent(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "nested" / "reports" / "report.json"
+    validation_report_module._atomic_write_text(path, "old\n")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    outside = tmp_path / "old-hardlink.json"
+    os.link(path, outside)
+
+    validation_report_module._atomic_write_text(path, "new\n")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    assert path.read_text(encoding="utf-8") == "new\n"
+    assert outside.read_text(encoding="utf-8") == "old\n"
+    assert path.stat().st_nlink == 1
+    if os.name == "posix":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+
+def test_atomic_report_writer_recovers_one_deterministic_partial_pending(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "report.json"
+    pending_digest = hashlib.sha256(path.name.encode("utf-8")).hexdigest()[:32]
+    pending = tmp_path / f".clio-validation-{pending_digest}.pending"
+    pending.write_bytes(b"partial")
+    if os.name == "posix":
+        pending.chmod(0o600)
+
+    validation_report_module._atomic_write_text(path, "complete\n")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    assert path.read_text(encoding="utf-8") == "complete\n"
+    assert not pending.exists()
+    assert not list(tmp_path.glob(".clio-validation-*.pending"))
+
+
+def test_atomic_report_writer_refuses_concurrent_same_parent_writer(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    entered = Event()
+    release = Event()
+    failures: list[BaseException] = []
+    original = validation_report_module._atomic_write_text_locked  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def blocked_writer(*args: object, **kwargs: object) -> None:
+        entered.set()
+        if not release.wait(10):
+            raise TimeoutError("test writer was not released")
+        original(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(validation_report_module, "_atomic_write_text_locked", blocked_writer)
+
+    def first_writer() -> None:
+        try:
+            validation_report_module._atomic_write_text(tmp_path / "first.json", "first\n")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        except BaseException as exc:
+            failures.append(exc)
+
+    thread = Thread(target=first_writer)
+    thread.start()
+    assert entered.wait(10)
+    try:
+        with pytest.raises((OSError, ConfigurationError), match="writer|lock"):
+            validation_report_module._atomic_write_text(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                tmp_path / "second.json",
+                "second\n",
+            )
+    finally:
+        release.set()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert failures == []
+    assert (tmp_path / "first.json").read_text(encoding="utf-8") == "first\n"
+    assert not (tmp_path / "second.json").exists()
+
+
+def test_validation_directory_creation_is_bound_to_pinned_ancestor(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    trusted = tmp_path / "trusted"
+    outside = tmp_path / "outside"
+    displaced = tmp_path / "displaced"
+    trusted.mkdir(mode=0o700)
+    outside.mkdir(mode=0o700)
+    requested = trusted / "a" / "b"
+
+    if os.name == "posix":
+        original = validation_report_module._create_posix_validation_directory_child  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        swapped = False
+
+        def swap_then_create(parent_fd: int, child_name: str) -> int:
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                trusted.rename(displaced)
+                trusted.symlink_to(outside, target_is_directory=True)
+            return original(parent_fd, child_name)
+
+        monkeypatch.setattr(
+            validation_report_module,
+            "_create_posix_validation_directory_child",
+            swap_then_create,
+        )
+        with pytest.raises(OSError, match="changed"):
+            validation_report_module.durably_ensure_validation_directory(requested)
+        assert not (outside / "a").exists()
+        assert (displaced / "a").is_dir()
+        return
+
+    original_windows = validation_report_module._create_windows_validation_directory_child  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    rename_errors: list[OSError] = []
+
+    def try_swap_then_create(parent: object, child_name: str) -> object:
+        try:
+            trusted.rename(displaced)
+        except OSError as exc:
+            rename_errors.append(exc)
+        return original_windows(parent, child_name)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(
+        validation_report_module,
+        "_create_windows_validation_directory_child",
+        try_swap_then_create,
+    )
+    with pytest.raises(OSError, match="changed|find the file"):
+        validation_report_module.durably_ensure_validation_directory(requested)
+    assert not rename_errors
+    assert displaced.is_dir()
+    assert not (outside / "a").exists()
+
+
+def test_report_writer_rejects_symlink_or_junction_parent(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real"
+    linked_parent = tmp_path / "linked"
+    real_parent.mkdir()
+    if os.name == "nt":
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(linked_parent), str(real_parent)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+    else:
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(OSError, match="symlink|reparse|not a real directory"):
+        validation_report_module._atomic_write_text(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            linked_parent / "report.json",
+            "blocked\n",
+        )
+    assert not (real_parent / "report.json").exists()
 
 
 def test_report_writer_redacts_nested_capability_values(tmp_path: Path) -> None:

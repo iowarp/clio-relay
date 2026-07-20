@@ -1580,13 +1580,18 @@ def open_private_configuration_windows_descriptor(
     path: Path,
     *,
     exclusive: bool = False,
+    expected_nlink: int = 1,
 ) -> int:
-    """Open one exact single-link Windows file and enforce its private ACL in place."""
+    """Open one exact Windows file and enforce its private ACL in place."""
     if os.name != "nt":  # pragma: no cover - explicit platform contract
         raise ConfigurationError("Windows private descriptor opening is unavailable")
     storage_path = internal_filesystem_path(path, force_extended=True)
     before = os.lstat(storage_path)
-    if not (stat.S_ISREG(before.st_mode) and not _is_reparse_stat(before) and before.st_nlink == 1):
+    if not (
+        stat.S_ISREG(before.st_mode)
+        and not _is_reparse_stat(before)
+        and before.st_nlink == expected_nlink
+    ):
         raise ConfigurationError(f"configuration path is not one regular owned file: {path}")
     kernel32 = _load_windows_library("kernel32")
     create_file = kernel32.CreateFileW
@@ -1629,10 +1634,10 @@ def open_private_configuration_windows_descriptor(
         if not (
             not information.attributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY
             and not information.attributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
-            and information.number_of_links == 1
+            and information.number_of_links == expected_nlink
             and before.st_ino == file_index
             and os.path.samestat(before, after)
-            and after.st_nlink == 1
+            and after.st_nlink == expected_nlink
         ):
             raise ConfigurationError(f"private Windows file changed while opening: {path}")
         ensure_private_configuration_windows_handle(
@@ -1641,7 +1646,7 @@ def open_private_configuration_windows_descriptor(
             directory=False,
         )
         confirmed = os.lstat(storage_path)
-        if not os.path.samestat(after, confirmed) or confirmed.st_nlink != 1:
+        if not os.path.samestat(after, confirmed) or confirmed.st_nlink != expected_nlink:
             raise ConfigurationError(f"private Windows file changed while securing: {path}")
         descriptor_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
         descriptor = _open_windows_os_file_handle(cast(int, raw_handle), descriptor_flags)
