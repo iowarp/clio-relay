@@ -557,19 +557,54 @@ def test_payload_script_uses_digest_bound_safe_extractor() -> None:
 def test_fresh_jarvis_hardware_graph_commands_are_exact_and_ordered() -> None:
     lines = bootstrap.render_linux_user_bootstrap_script(cluster="cluster-a").splitlines()
     init_argv = [
-        "jarvis",
+        '"$JARVIS_VENV/bin/jarvis"',
         "init",
         '"$HOME/.local/share/clio-relay/jarvis-config"',
         '"$HOME/.local/share/clio-relay/jarvis-private"',
         '"$HOME/.local/share/clio-relay/jarvis-shared"',
     ]
-    graph_argv = ["jarvis", "rg", "build", "+no_benchmark"]
+    graph_argv = ['"$JARVIS_VENV/bin/jarvis"', "rg", "build", "+no_benchmark"]
     init_indexes = [index for index, line in enumerate(lines) if line.split() == init_argv]
     graph_indexes = [index for index, line in enumerate(lines) if line.split() == graph_argv]
 
     assert len(init_indexes) == 1
     assert len(graph_indexes) == 1
     assert init_indexes[0] < graph_indexes[0]
+
+
+def test_fresh_journal_precedes_every_mutation_boundary() -> None:
+    """First-install state is owned durably before components or JARVIS can mutate."""
+    script = bootstrap.render_linux_user_bootstrap_script(cluster="cluster-a")
+    journal = script.index("bootstrap_journal_action create")
+    boundaries = (
+        'curl -L --fail --retry 3 -o "$ARCHIVE"',
+        "uv python install 3.12",
+        'uv venv --python 3.12 --seed "$JARVIS_VENV"',
+        '"$JARVIS_VENV/bin/jarvis" init',
+        '"$JARVIS_VENV/bin/jarvis" rg build +no_benchmark',
+        'ln -s "$MANAGED_JARVIS_REPO_TARGET" "$MANAGED_JARVIS_REPO"',
+        'mkdir -m 0700 -p "$BOOTSTRAP_GENERATION/bin"',
+        'ln -s "$BOOTSTRAP_GENERATION" "$HOME/.local/share/clio-relay/current"',
+        'bootstrap_journal_action advance "$BOOTSTRAP_TRANSACTION_JOURNAL" migration_started',
+    )
+
+    assert all(journal < script.index(boundary, journal) for boundary in boundaries)
+    assert 'rm -rf "$DEST"' not in script
+    assert '--clear "$JARVIS_VENV"' not in script
+    assert 'bootstrap_journal_action discard-full "$BOOTSTRAP_TRANSACTION_JOURNAL"' in script
+    for phase in (
+        "ownership_manifest",
+        "components_prepared",
+        "jarvis_initialized",
+        "resource_graph_built",
+        "managed_repository_reconciled",
+        "generation_prepared",
+        "generation_activated",
+        "queue_migrated",
+        "service_verified",
+        "final_inspection",
+    ):
+        assert phase in script[journal:]
 
 
 def test_packaged_payload_archive_has_only_safe_canonical_modes(tmp_path: Path) -> None:

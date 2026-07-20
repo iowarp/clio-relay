@@ -1840,12 +1840,23 @@ if action == "journal-create":
     journal = module.BootstrapTransactionJournal(
         invocation_id=os.environ["BOOTSTRAP_INVOCATION_ID"],
         desired_fingerprint=os.environ["BOOTSTRAP_DESIRED_FINGERPRINT"],
+        mode=os.environ.get("BOOTSTRAP_PLAN_MODE", "relay-only"),
         state=module.BootstrapTransactionState.LOCKED,
         previous_generation=os.environ["BOOTSTRAP_PREVIOUS_GENERATION"] or None,
         service_name=os.environ["WORKER_SERVICE_NAME"] or None,
         service_was_active=(
             True if service_value == "1" else (False if service_value == "0" else None)
         ),
+        service_was_enabled=(
+            True
+            if os.environ.get("BOOTSTRAP_SERVICE_ENABLED_BEFORE") == "1"
+            else (
+                False
+                if os.environ.get("BOOTSTRAP_SERVICE_ENABLED_BEFORE") == "0"
+                else None
+            )
+        ),
+        phase_identities={{"locked": os.environ["BOOTSTRAP_DESIRED_FINGERPRINT"]}},
     )
     journal.persist(journal_path)
 elif action == "journal-advance":
@@ -1854,6 +1865,10 @@ elif action == "journal-advance":
     if target is module.BootstrapTransactionState.PREPARED:
         journal.prepared_generation = os.environ["BOOTSTRAP_DESIRED_FINGERPRINT"]
     journal.advance(target)
+    journal.persist(journal_path)
+elif action == "journal-phase":
+    journal = module.BootstrapTransactionJournal.load(journal_path)
+    journal.record_phase(arguments[0], arguments[1])
     journal.persist(journal_path)
 elif action == "journal-state":
     print(module.BootstrapTransactionJournal.load(journal_path).state.value)
@@ -3119,6 +3134,8 @@ def render_linux_user_bootstrap_script(
     candidate_errors_source = Path(__file__).with_name("errors.py").read_bytes()
     rendered_candidate_errors_source = base64.b64encode(candidate_errors_source).decode("ascii")
     candidate_errors_sha256 = hashlib.sha256(candidate_errors_source).hexdigest()
+    bootstrap_journal_source = Path(__file__).with_name("bootstrap_journal.py").read_bytes()
+    rendered_bootstrap_journal_source = base64.b64encode(bootstrap_journal_source).decode("ascii")
     relay_only_reconcile = _relay_only_reconcile_script(
         worker_fence=worker_fence,
         worker_recheck=worker_recheck,
@@ -3137,11 +3154,12 @@ def render_linux_user_bootstrap_script(
     script = f"""set -euo pipefail
 umask 077
 export PATH="$HOME/.local/bin:$PATH"
-export UV_TOOL_DIR="$HOME/.local/share/uv/tools"
-export UV_TOOL_BIN_DIR="$HOME/.local/bin"
+export UV_TOOL_DIR="$HOME/.local/share/clio-relay/uv-tools"
+export UV_TOOL_BIN_DIR="$HOME/.local/share/clio-relay/uv-bin"
+export UV_PYTHON_INSTALL_DIR="$HOME/.local/share/clio-relay/uv-python"
 while IFS= read -r variable_name; do
   case "$variable_name" in
-    UV_TOOL_DIR|UV_TOOL_BIN_DIR|UV_CACHE_DIR) ;;
+    UV_TOOL_DIR|UV_TOOL_BIN_DIR|UV_PYTHON_INSTALL_DIR|UV_CACHE_DIR) ;;
     UV_*|PIP_*) unset "$variable_name" ;;
   esac
 done < <(compgen -e)
@@ -3252,6 +3270,46 @@ if [ -z "$AGENT_BIN" ] && [ -n "$AGENT_NPM_BIN" ]; then
 fi
 BOOTSTRAP_DESIRED_STATE={rendered_desired_state}
 export BOOTSTRAP_DESIRED_STATE AGENT_NPM_PACKAGE AGENT_NPM_BIN AGENT_BIN
+bootstrap_journal_action() {{
+  python3 - "$@" <<'__CLIO_RELAY_BOOTSTRAP_JOURNAL_ACTION__'
+import base64
+
+source = base64.b64decode(
+    "{rendered_bootstrap_journal_source}",
+    validate=True,
+)
+namespace = {{"__name__": "__main__", "__file__": "bootstrap_journal.py"}}
+exec(compile(source, "bootstrap_journal.py", "exec"), namespace)
+__CLIO_RELAY_BOOTSTRAP_JOURNAL_ACTION__
+}}
+bootstrap_path_set_identity() {{
+  python3 - "$@" <<'__CLIO_RELAY_BOOTSTRAP_PATH_SET_IDENTITY__'
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+evidence = []
+for value in sys.argv[1:]:
+    path = Path(value)
+    details = path.lstat()
+    if stat.S_ISREG(details.st_mode):
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        identity = {{"kind": "file", "sha256": digest.hexdigest(), "size": details.st_size}}
+    elif stat.S_ISLNK(details.st_mode):
+        identity = {{"kind": "symlink", "target": os.readlink(path)}}
+    else:
+        raise SystemExit(f"bootstrap phase path has an unsupported type: {{path}}")
+    evidence.append({{"path": str(path), "identity": identity}})
+payload = json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")
+print(hashlib.sha256(payload).hexdigest())
+__CLIO_RELAY_BOOTSTRAP_PATH_SET_IDENTITY__
+}}
 BOOTSTRAP_TRANSACTION_JOURNAL="$HOME/.local/share/clio-relay/bootstrap-transaction.json"
 BOOTSTRAP_RECOVERY_REQUIRED=0
 if [ -L "$BOOTSTRAP_TRANSACTION_JOURNAL" ]; then
@@ -3275,6 +3333,52 @@ __CLIO_RELAY_RECOVERY_REQUIRED__
   )"
 fi
 export BOOTSTRAP_TRANSACTION_JOURNAL BOOTSTRAP_RECOVERY_REQUIRED
+if [ "$BOOTSTRAP_RECOVERY_REQUIRED" = "1" ]; then
+  BOOTSTRAP_EARLY_MODE="$(
+    python3 - "$BOOTSTRAP_TRANSACTION_JOURNAL" \
+      <<'__CLIO_RELAY_EARLY_RECOVERY_MODE__'
+import json
+import sys
+from pathlib import Path
+
+value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(value.get("mode", "legacy") if isinstance(value, dict) else "invalid")
+__CLIO_RELAY_EARLY_RECOVERY_MODE__
+  )"
+  if [ "$BOOTSTRAP_EARLY_MODE" = "full" ]; then
+    BOOTSTRAP_EARLY_RECOVERY_JSON="$(
+      bootstrap_journal_action recovery-plan "$BOOTSTRAP_TRANSACTION_JOURNAL"
+    )"
+    export BOOTSTRAP_EARLY_RECOVERY_JSON
+    read -r BOOTSTRAP_EARLY_DIRECTION BOOTSTRAP_EARLY_SERVICE \
+      BOOTSTRAP_EARLY_SERVICE_ACTIVE < <(
+        python3 - <<'__CLIO_RELAY_EARLY_RECOVERY_FIELDS__'
+import json
+import os
+
+value = json.loads(os.environ["BOOTSTRAP_EARLY_RECOVERY_JSON"])
+service = value.get("service_name") or "-"
+active = value.get("service_was_active")
+active_text = "true" if active is True else ("false" if active is False else "unknown")
+print(value["recovery_mode"], service, active_text)
+__CLIO_RELAY_EARLY_RECOVERY_FIELDS__
+      )
+    if [ "$BOOTSTRAP_EARLY_DIRECTION" = "discard" ]; then
+      bootstrap_journal_action discard-full "$BOOTSTRAP_TRANSACTION_JOURNAL" "$HOME"
+      if [ "$BOOTSTRAP_EARLY_SERVICE_ACTIVE" = "true" ] && \
+         [ "$BOOTSTRAP_EARLY_SERVICE" != "-" ]; then
+        command -v timeout >/dev/null 2>&1 || {{
+          echo "timeout is required for bootstrap service recovery" >&2
+          exit 1
+        }}
+        timeout 55 systemctl --user start "$BOOTSTRAP_EARLY_SERVICE"
+      fi
+      exec 9>&-
+      unset CLIO_RELAY_BOOTSTRAP_LOCK_FD
+      exec bash "$0"
+    fi
+  fi
+fi
 BOOTSTRAP_CURRENT_RELAY="$HOME/.local/bin/clio-relay"
 BOOTSTRAP_CURRENT_PROVIDER=""
 if [ -x "$BOOTSTRAP_CURRENT_RELAY" ]; then
@@ -3642,17 +3746,218 @@ if [ "$BOOTSTRAP_PLAN_MODE" = "full" ] && \
     "refusing to clear the retained legacy JARVIS execution environment" >&2
   exit 1
 fi
-BOOTSTRAP_FULL_PREPARE_STARTED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
 BOOTSTRAP_INVOCATION_ID={shlex.quote(invocation_id)}
+BOOTSTRAP_DESIRED_FINGERPRINT="$(
+  python3 - <<'__CLIO_RELAY_FRESH_DESIRED_FINGERPRINT__'
+import hashlib
+import json
+import os
+
+value = json.loads(os.environ["BOOTSTRAP_DESIRED_STATE"])
+value["agent_npm_package"] = os.environ["AGENT_NPM_PACKAGE"] or None
+value["agent_npm_bin"] = os.environ["AGENT_NPM_BIN"] or None
+payload = json.dumps(
+    value,
+    ensure_ascii=True,
+    allow_nan=False,
+    sort_keys=True,
+    separators=(",", ":"),
+).encode("utf-8")
+print(hashlib.sha256(payload).hexdigest())
+__CLIO_RELAY_FRESH_DESIRED_FINGERPRINT__
+)"
+WORKER_SERVICE_NAME="$(
+  python3 - <<'__CLIO_RELAY_FRESH_WORKER_SERVICE__'
+import json
+import os
+
+print(json.loads(os.environ["BOOTSTRAP_DESIRED_STATE"])["worker_service"] or "")
+__CLIO_RELAY_FRESH_WORKER_SERVICE__
+)"
+BOOTSTRAP_SERVICE_ACTIVE_BEFORE=unknown
+BOOTSTRAP_SERVICE_ENABLED_BEFORE=unknown
+if [ -n "$WORKER_SERVICE_NAME" ]; then
+  if systemctl --user is-active --quiet "$WORKER_SERVICE_NAME"; then
+    BOOTSTRAP_SERVICE_ACTIVE_BEFORE=true
+  else
+    BOOTSTRAP_SERVICE_ACTIVE_BEFORE=false
+  fi
+  if systemctl --user is-enabled --quiet "$WORKER_SERVICE_NAME"; then
+    BOOTSTRAP_SERVICE_ENABLED_BEFORE=true
+  else
+    BOOTSTRAP_SERVICE_ENABLED_BEFORE=false
+  fi
+fi
+BOOTSTRAP_GENERATION="$HOME/.local/share/clio-relay/generations/$BOOTSTRAP_DESIRED_FINGERPRINT"
+BOOTSTRAP_TRANSACTION_ROOT="$HOME/.local/share/clio-relay/transactions/$BOOTSTRAP_INVOCATION_ID"
+BOOTSTRAP_OWNED_PATHS_JSON="$(
+  python3 - "$BOOTSTRAP_DESIRED_FINGERPRINT" "$BOOTSTRAP_INVOCATION_ID" \
+    <<'__CLIO_RELAY_FRESH_OWNERSHIP__'
+import hashlib
+import json
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+home = Path.home()
+fingerprint = sys.argv[1]
+invocation_id = sys.argv[2]
+
+def classify(path: Path) -> os.stat_result | None:
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+
+def require_regular_executable(path: Path, expected_sha256: str | None = None) -> None:
+    details = classify(path)
+    if details is None or not stat.S_ISREG(details.st_mode) or not os.access(path, os.X_OK):
+        raise SystemExit(f"bootstrap cannot adopt an existing executable: {{path}}")
+    if expected_sha256 is not None:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != expected_sha256:
+            raise SystemExit(f"bootstrap existing executable digest changed: {{path}}")
+
+owned: dict[str, dict[str, str]] = {{}}
+
+def absent(name: str, path: Path, kind: str) -> None:
+    if classify(path) is not None:
+        raise SystemExit(f"fresh bootstrap refuses a preexisting mutation target: {{path}}")
+    owned[name] = {{"path": str(path), "kind": kind}}
+
+frpc = home / ".local/bin/frpc"
+frps = home / ".local/bin/frps"
+if classify(frpc) is None and classify(frps) is None:
+    owned["frpc"] = {{"path": str(frpc), "kind": "file"}}
+    owned["frps"] = {{"path": str(frps), "kind": "file"}}
+else:
+    require_regular_executable(frpc, "{FRPC_LINUX_AMD64_SHA256}")
+    require_regular_executable(frps, "{FRPS_LINUX_AMD64_SHA256}")
+
+uv = home / ".local/bin/uv"
+uvx = home / ".local/bin/uvx"
+if classify(uv) is None and classify(uvx) is None:
+    owned["uv"] = {{"path": str(uv), "kind": "file"}}
+    owned["uvx"] = {{"path": str(uvx), "kind": "file"}}
+else:
+    require_regular_executable(uv, "{UV_LINUX_AMD64_SHA256}")
+    require_regular_executable(uvx)
+    completed = subprocess.run(
+        [str(uv), "--version"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if completed.returncode != 0 or completed.stdout.strip() != "uv {UV_VERSION}":
+        raise SystemExit("bootstrap cannot adopt an existing uv version")
+
+jarvis_util = home / ".local/src/jarvis-util"
+if classify(jarvis_util) is None:
+    owned["jarvis_util"] = {{"path": str(jarvis_util), "kind": "directory"}}
+else:
+    if jarvis_util.is_symlink() or not (jarvis_util / ".git").is_dir():
+        raise SystemExit("bootstrap cannot adopt the existing jarvis-util path")
+    commit = subprocess.run(
+        ["git", "-C", str(jarvis_util), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    ).stdout.strip()
+    status = subprocess.run(
+        ["git", "-C", str(jarvis_util), "status", "--porcelain=v1", "--untracked-files=all"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    ).stdout
+    if commit != "{JARVIS_UTIL_COMMIT}" or status:
+        raise SystemExit("bootstrap cannot mutate an existing jarvis-util checkout")
+
+for name, path, kind in (
+    ("jarvis_venv", home / ".local/share/clio-relay/jarvis-venv", "directory"),
+    ("clio_kit_wheels", home / ".local/share/clio-relay/component-wheels/clio-kit", "directory"),
+    ("jarvis_cd_wheels", home / ".local/share/clio-relay/component-wheels/jarvis-cd", "directory"),
+    ("uv_tools", home / ".local/share/clio-relay/uv-tools", "directory"),
+    ("uv_bin", home / ".local/share/clio-relay/uv-bin", "directory"),
+    ("uv_python", home / ".local/share/clio-relay/uv-python", "directory"),
+    (
+        "transaction_root",
+        home / ".local/share/clio-relay/transactions" / invocation_id,
+        "directory",
+    ),
+    ("relay_source", home / ".local/src/clio-relay", "directory"),
+    ("jarvis_state", home / ".ppi-jarvis", "directory"),
+    ("jarvis_config", home / ".local/share/clio-relay/jarvis-config", "directory"),
+    ("jarvis_private", home / ".local/share/clio-relay/jarvis-private", "directory"),
+    ("jarvis_shared", home / ".local/share/clio-relay/jarvis-shared", "directory"),
+    ("generation", home / ".local/share/clio-relay/generations" / fingerprint, "directory"),
+    ("current", home / ".local/share/clio-relay/current", "symlink"),
+    (
+        "install_receipt",
+        home / ".local/share/clio-relay/install-receipt.json",
+        "symlink",
+    ),
+    ("managed_repo", home / ".local/share/clio-relay/managed-jarvis-repo", "symlink"),
+    ("relay_launcher", home / ".local/bin/clio-relay", "symlink"),
+    ("jarvis_launcher", home / ".local/bin/jarvis", "symlink"),
+    (
+        "managed_repo_staging",
+        home / ".local/share/clio-relay" / f".managed-jarvis-repo.{{invocation_id}}",
+        "symlink",
+    ),
+):
+    absent(name, path, kind)
+
+print(json.dumps(owned, sort_keys=True, separators=(",", ":")))
+__CLIO_RELAY_FRESH_OWNERSHIP__
+)"
+export BOOTSTRAP_INVOCATION_ID BOOTSTRAP_DESIRED_FINGERPRINT
+export BOOTSTRAP_GENERATION BOOTSTRAP_TRANSACTION_ROOT WORKER_SERVICE_NAME
+export BOOTSTRAP_SERVICE_ACTIVE_BEFORE BOOTSTRAP_SERVICE_ENABLED_BEFORE
+bootstrap_journal_action create \
+  "$BOOTSTRAP_TRANSACTION_JOURNAL" \
+  "$BOOTSTRAP_INVOCATION_ID" \
+  "$BOOTSTRAP_DESIRED_FINGERPRINT" \
+  full \
+  "$WORKER_SERVICE_NAME" \
+  "$BOOTSTRAP_SERVICE_ACTIVE_BEFORE" \
+  "$BOOTSTRAP_SERVICE_ENABLED_BEFORE" \
+  "$BOOTSTRAP_OWNED_PATHS_JSON"
+BOOTSTRAP_OWNERSHIP_IDENTITY="$(
+  BOOTSTRAP_OWNED_PATHS_JSON="$BOOTSTRAP_OWNED_PATHS_JSON" \
+    python3 - <<'__CLIO_RELAY_FRESH_OWNERSHIP_IDENTITY__'
+import hashlib
+import json
+import os
+
+value = json.loads(os.environ["BOOTSTRAP_OWNED_PATHS_JSON"])
+payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+print(hashlib.sha256(payload).hexdigest())
+__CLIO_RELAY_FRESH_OWNERSHIP_IDENTITY__
+)"
+bootstrap_journal_action phase "$BOOTSTRAP_TRANSACTION_JOURNAL" \
+  ownership_manifest "$BOOTSTRAP_OWNERSHIP_IDENTITY"
+bootstrap_journal_action advance "$BOOTSTRAP_TRANSACTION_JOURNAL" inspected
+bootstrap_journal_action advance "$BOOTSTRAP_TRANSACTION_JOURNAL" fencing
+{worker_fence}
+bootstrap_journal_action advance "$BOOTSTRAP_TRANSACTION_JOURNAL" fenced
+{worker_recheck}
+bootstrap_journal_action advance "$BOOTSTRAP_TRANSACTION_JOURNAL" preparing
+mkdir -m 0700 -p "$BOOTSTRAP_TRANSACTION_ROOT/downloads"
+bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" transaction_root
+BOOTSTRAP_FULL_PREPARE_STARTED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
 BOOTSTRAP_FRP_DOWNLOADED=0
 BOOTSTRAP_UV_DOWNLOADED=0
 BOOTSTRAP_JARVIS_UTIL_DOWNLOADED=0
 BOOTSTRAP_JARVIS_CD_DOWNLOADED=0
 BOOTSTRAP_CLIO_KIT_DOWNLOADED=0
 BOOTSTRAP_RELAY_DOWNLOAD_COUNT=0
-{worker_fence}
 
-cd "$HOME/.local/src"
+cd "$BOOTSTRAP_TRANSACTION_ROOT/downloads"
 FRP_VERSION="{frp_version}"
 FRP_SHA256="{FRP_LINUX_AMD64_SHA256}"
 FRPC_SHA256="{FRPC_LINUX_AMD64_SHA256}"
@@ -3666,8 +3971,14 @@ if [ ! -x "$HOME/.local/bin/frpc" ] \
     "https://github.com/fatedier/frp/releases/download/v${{FRP_VERSION}}/${{ARCHIVE}}"
   echo "$FRP_SHA256 *$ARCHIVE" | sha256sum --check --strict -
   tar -xzf "$ARCHIVE"
-  install -m 0755 "frp_${{FRP_VERSION}}_linux_amd64/frpc" "$HOME/.local/bin/frpc"
-  install -m 0755 "frp_${{FRP_VERSION}}_linux_amd64/frps" "$HOME/.local/bin/frps"
+  install -m 0755 "frp_${{FRP_VERSION}}_linux_amd64/frpc" \
+    "$BOOTSTRAP_TRANSACTION_ROOT/downloads/frpc.install"
+  install -m 0755 "frp_${{FRP_VERSION}}_linux_amd64/frps" \
+    "$BOOTSTRAP_TRANSACTION_ROOT/downloads/frps.install"
+  ln "$BOOTSTRAP_TRANSACTION_ROOT/downloads/frpc.install" "$HOME/.local/bin/frpc"
+  ln "$BOOTSTRAP_TRANSACTION_ROOT/downloads/frps.install" "$HOME/.local/bin/frps"
+  bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" frpc
+  bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" frps
   echo "$FRPC_SHA256 *$HOME/.local/bin/frpc" | sha256sum --check --strict -
   echo "$FRPS_SHA256 *$HOME/.local/bin/frps" | sha256sum --check --strict -
   BOOTSTRAP_FRP_DOWNLOADED=1
@@ -3682,33 +3993,42 @@ if [ ! -x "$HOME/.local/bin/uv" ] \
     "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/$UV_ARCHIVE"
   echo "$UV_SHA256 *$UV_ARCHIVE" | sha256sum --check --strict -
   tar -xzf "$UV_ARCHIVE"
-  install -m 0755 "uv-x86_64-unknown-linux-gnu/uv" "$HOME/.local/bin/uv"
-  install -m 0755 "uv-x86_64-unknown-linux-gnu/uvx" "$HOME/.local/bin/uvx"
+  install -m 0755 "uv-x86_64-unknown-linux-gnu/uv" \
+    "$BOOTSTRAP_TRANSACTION_ROOT/downloads/uv.install"
+  install -m 0755 "uv-x86_64-unknown-linux-gnu/uvx" \
+    "$BOOTSTRAP_TRANSACTION_ROOT/downloads/uvx.install"
+  ln "$BOOTSTRAP_TRANSACTION_ROOT/downloads/uv.install" "$HOME/.local/bin/uv"
+  ln "$BOOTSTRAP_TRANSACTION_ROOT/downloads/uvx.install" "$HOME/.local/bin/uvx"
+  bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" uv
+  bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" uvx
   BOOTSTRAP_UV_DOWNLOADED=1
 fi
 uv python install 3.12
+bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" uv_python
 
 if [ ! -x "$AGENT_BIN" ] && [ -n "$AGENT_NPM_PACKAGE" ] && command -v npm >/dev/null 2>&1; then
   npm install -g "$AGENT_NPM_PACKAGE"
 fi
 
 JARVIS_VENV="$HOME/.local/share/clio-relay/jarvis-venv"
-uv venv --python 3.12 --seed --clear "$JARVIS_VENV"
+uv venv --python 3.12 --seed "$JARVIS_VENV"
+bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" jarvis_venv
 . "$JARVIS_VENV/bin/activate"
 JARVIS_UTIL_COMMIT="{JARVIS_UTIL_COMMIT}"
 if [ ! -d "$HOME/.local/src/jarvis-util/.git" ]; then
   git clone --no-checkout https://github.com/grc-iit/jarvis-util.git \
     "$HOME/.local/src/jarvis-util"
+  git -C "$HOME/.local/src/jarvis-util" fetch --depth 1 origin "$JARVIS_UTIL_COMMIT"
+  BOOTSTRAP_JARVIS_UTIL_DOWNLOADED=1
+  git -C "$HOME/.local/src/jarvis-util" checkout --detach "$JARVIS_UTIL_COMMIT"
+  bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" jarvis_util
+else
+  test "$(git -C "$HOME/.local/src/jarvis-util" rev-parse HEAD)" = \
+    "$JARVIS_UTIL_COMMIT"
+  test -z "$(
+    git -C "$HOME/.local/src/jarvis-util" status --porcelain=v1 --untracked-files=all
+  )"
 fi
-if [ -n "$(
-  git -C "$HOME/.local/src/jarvis-util" status --porcelain=v1 --untracked-files=all
-)" ]; then
-  echo "refusing to replace modified jarvis-util checkout" >&2
-  exit 1
-fi
-git -C "$HOME/.local/src/jarvis-util" fetch --depth 1 origin "$JARVIS_UTIL_COMMIT"
-BOOTSTRAP_JARVIS_UTIL_DOWNLOADED=1
-git -C "$HOME/.local/src/jarvis-util" checkout --detach "$JARVIS_UTIL_COMMIT"
 test "$(git -C "$HOME/.local/src/jarvis-util" rev-parse HEAD)" = "$JARVIS_UTIL_COMMIT"
 python -m pip install --isolated --index-url https://pypi.org/simple \\
   -r "$HOME/.local/src/jarvis-util/requirements.txt"
@@ -3718,15 +4038,15 @@ JARVIS_CD_WHEEL_URL="{JARVIS_CD_WHEEL_URL}"
 JARVIS_CD_WHEEL_SHA256="{JARVIS_CD_WHEEL_SHA256}"
 JARVIS_CD_WHEEL_DIR="$HOME/.local/share/clio-relay/component-wheels/jarvis-cd"
 JARVIS_CD_WHEEL="$JARVIS_CD_WHEEL_DIR/{JARVIS_CD_WHEEL_FILENAME}"
-rm -rf "$JARVIS_CD_WHEEL_DIR"
-mkdir -p "$JARVIS_CD_WHEEL_DIR"
+mkdir -m 0700 -p "$(dirname "$JARVIS_CD_WHEEL_DIR")"
+mkdir -m 0700 "$JARVIS_CD_WHEEL_DIR"
+bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" jarvis_cd_wheels
 JARVIS_CD_STAGING="$(mktemp "${{JARVIS_CD_WHEEL}}.XXXXXX")"
 curl -L --fail --retry 3 -o "$JARVIS_CD_STAGING" "$JARVIS_CD_WHEEL_URL"
 BOOTSTRAP_JARVIS_CD_DOWNLOADED=1
 echo "$JARVIS_CD_WHEEL_SHA256 *$JARVIS_CD_STAGING" | sha256sum --check --strict -
 mv "$JARVIS_CD_STAGING" "$JARVIS_CD_WHEEL"
 python -m pip install --isolated --index-url https://pypi.org/simple "$JARVIS_CD_WHEEL"
-ln -sf "$JARVIS_VENV/bin/jarvis" "$HOME/.local/bin/jarvis"
 JARVIS_MCP_INSTALL_SPEC={rendered_jarvis_mcp_install_spec}
 JARVIS_MCP_ARTIFACT_SHA256={rendered_jarvis_mcp_artifact_sha256}
 JARVIS_MCP_INSTALL_TARGET="$JARVIS_MCP_INSTALL_SPEC"
@@ -3737,8 +4057,8 @@ case "$JARVIS_MCP_INSTALL_SPEC" in
   "{CLIO_KIT_JARVIS_MCP_WHEEL_URL}")
     JARVIS_MCP_VERSION="{CLIO_KIT_JARVIS_MCP_VERSION}"
     COMPONENT_DOWNLOAD_DIR="$HOME/.local/share/clio-relay/component-wheels/clio-kit"
-    rm -rf "$COMPONENT_DOWNLOAD_DIR"
-    mkdir -p "$COMPONENT_DOWNLOAD_DIR"
+    mkdir -m 0700 -p "$(dirname "$COMPONENT_DOWNLOAD_DIR")"
+    mkdir -m 0700 "$COMPONENT_DOWNLOAD_DIR"
     JARVIS_MCP_ARTIFACT_PATH="$COMPONENT_DOWNLOAD_DIR/{CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME}"
     COMPONENT_STAGING="$(mktemp "${{JARVIS_MCP_ARTIFACT_PATH}}.XXXXXX")"
     curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
@@ -3755,8 +4075,8 @@ case "$JARVIS_MCP_INSTALL_SPEC" in
   clio-kit==*)
     JARVIS_MCP_VERSION="${{JARVIS_MCP_INSTALL_SPEC#clio-kit==}}"
     COMPONENT_DOWNLOAD_DIR="$HOME/.local/share/clio-relay/component-wheels/clio-kit"
-    rm -rf "$COMPONENT_DOWNLOAD_DIR"
-    mkdir -p "$COMPONENT_DOWNLOAD_DIR"
+    mkdir -m 0700 -p "$(dirname "$COMPONENT_DOWNLOAD_DIR")"
+    mkdir -m 0700 "$COMPONENT_DOWNLOAD_DIR"
     python -m pip download --isolated --disable-pip-version-check --no-cache-dir \
       --index-url https://pypi.org/simple --no-deps --only-binary=:all: \
       --dest "$COMPONENT_DOWNLOAD_DIR" "$JARVIS_MCP_INSTALL_SPEC"
@@ -3776,10 +4096,9 @@ case "$JARVIS_MCP_INSTALL_SPEC" in
     test -f "$JARVIS_MCP_INSTALL_SPEC"
     COMPONENT_DOWNLOAD_DIR="$HOME/.local/share/clio-relay/component-wheels/clio-kit"
     mkdir -p "$(dirname "$COMPONENT_DOWNLOAD_DIR")"
-    COMPONENT_STAGING="$(mktemp "${{COMPONENT_DOWNLOAD_DIR}}.XXXXXX.whl")"
+    mkdir -m 0700 "$COMPONENT_DOWNLOAD_DIR"
+    COMPONENT_STAGING="$(mktemp "$BOOTSTRAP_TRANSACTION_ROOT/downloads/clio-kit.XXXXXX.whl")"
     cp "$JARVIS_MCP_INSTALL_SPEC" "$COMPONENT_STAGING"
-    rm -rf "$COMPONENT_DOWNLOAD_DIR"
-    mkdir -p "$COMPONENT_DOWNLOAD_DIR"
     JARVIS_MCP_ARTIFACT_PATH="$COMPONENT_DOWNLOAD_DIR/$(basename "$JARVIS_MCP_INSTALL_SPEC")"
     mv "$COMPONENT_STAGING" "$JARVIS_MCP_ARTIFACT_PATH"
     JARVIS_MCP_INSTALL_TARGET="$JARVIS_MCP_ARTIFACT_PATH"
@@ -3790,11 +4109,14 @@ case "$JARVIS_MCP_INSTALL_SPEC" in
     exit 1
     ;;
 esac
+bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" clio_kit_wheels
 echo "$JARVIS_MCP_ARTIFACT_SHA256 *$JARVIS_MCP_ARTIFACT_PATH" | \
   sha256sum --check --strict -
 deactivate
 uv tool install --force --python 3.12 --no-config \\
   --default-index https://pypi.org/simple "$JARVIS_MCP_INSTALL_TARGET"
+bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" uv_tools
+bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" uv_bin
 JARVIS_MCP_UV_EXECUTABLE="$(command -v uv)"
 test -x "$JARVIS_MCP_UV_EXECUTABLE"
 JARVIS_MCP_EXECUTABLE="$(uv tool dir --bin --no-config)/clio-kit"
@@ -3812,13 +4134,13 @@ JARVIS_MCP_VERSION="$JARVIS_MCP_INSTALLED_VERSION"
 "$JARVIS_MCP_EXECUTABLE" --help >/dev/null
 
 DEST="$HOME/.local/src/clio-relay"
-rm -rf "$DEST"
 SOURCE_ARCHIVE={rendered_source_archive}
 SOURCE_ARCHIVE_SHA256={rendered_source_archive_sha256}
 if [ -n "$SOURCE_ARCHIVE_SHA256" ]; then
   echo "$SOURCE_ARCHIVE_SHA256 *$SOURCE_ARCHIVE" | sha256sum --check --strict -
 fi
 bootstrap_safe_extract "$JARVIS_VENV/bin/python" "$SOURCE_ARCHIVE" "$DEST"
+bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" relay_source
 RELAY_INSTALL_SPEC={rendered_relay_install_spec}
 RELAY_ARTIFACT_SHA256={rendered_relay_artifact_sha256}
 RELAY_INSTALL_TARGET="$RELAY_INSTALL_SPEC"
@@ -3951,7 +4273,7 @@ export CLIO_RELAY_BOOTSTRAP_JARVIS_CD_WHEEL_URL="$JARVIS_CD_WHEEL_URL"
 export CLIO_RELAY_BOOTSTRAP_JARVIS_CD_WHEEL="$JARVIS_CD_WHEEL"
 export CLIO_RELAY_BOOTSTRAP_JARVIS_CD_WHEEL_SHA256="$JARVIS_CD_WHEEL_SHA256"
 export CLIO_RELAY_BOOTSTRAP_JARVIS_CD_EXECUTION_PYTHON="$JARVIS_VENV/bin/python"
-export CLIO_RELAY_BOOTSTRAP_JARVIS_EXECUTABLE="$HOME/.local/bin/jarvis"
+export CLIO_RELAY_BOOTSTRAP_JARVIS_EXECUTABLE="$JARVIS_VENV/bin/jarvis"
 export CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_INSTALL_SPEC="$JARVIS_MCP_INSTALL_SPEC"
 export CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_ARTIFACT="$JARVIS_MCP_ARTIFACT_PATH"
 export CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_ARTIFACT_SHA256="$JARVIS_MCP_ARTIFACT_SHA256"
@@ -3961,6 +4283,7 @@ export CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_EXECUTABLE="$JARVIS_MCP_EXECUTABLE"
 export CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_PROVIDER_PYTHON="$JARVIS_MCP_PROVIDER_PYTHON"
 export CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_UV_EXECUTABLE="$JARVIS_MCP_UV_EXECUTABLE"
 export CLIO_RELAY_BOOTSTRAP_DESIRED_STATE="$BOOTSTRAP_DESIRED_STATE"
+export CLIO_RELAY_INSTALL_RECEIPT="$BOOTSTRAP_TRANSACTION_ROOT/install-receipt.json"
 "$RELAY_PROVIDER_PYTHON" - <<'__CLIO_RELAY_INSTALL_RECEIPT__'
 import json
 import os
@@ -4161,27 +4484,49 @@ receipt = write_install_receipt(
 print(f"relay_install_receipt={{receipt.schema_version}}")
 print(f"relay_artifact_sha256={{receipt.artifact_sha256 or 'none'}}")
 __CLIO_RELAY_INSTALL_RECEIPT__
+BOOTSTRAP_COMPONENTS_IDENTITY="$(bootstrap_path_set_identity \
+  "$CLIO_RELAY_INSTALL_RECEIPT" \
+  "$JARVIS_VENV/bin/python" \
+  "$JARVIS_VENV/bin/jarvis" \
+  "$RELAY_EXECUTABLE" \
+  "$JARVIS_MCP_EXECUTABLE" \
+  "$HOME/.local/bin/frpc" \
+  "$HOME/.local/bin/frps" \
+  "$HOME/.local/bin/uv")"
+bootstrap_journal_action phase "$BOOTSTRAP_TRANSACTION_JOURNAL" \
+  components_prepared "$BOOTSTRAP_COMPONENTS_IDENTITY"
 
 if [ "$JARVIS_EXISTING_FILE_COUNT" -eq 0 ]; then
   mkdir -p \
     "$HOME/.local/share/clio-relay/jarvis-config" \
     "$HOME/.local/share/clio-relay/jarvis-private" \
     "$HOME/.local/share/clio-relay/jarvis-shared"
+  bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" jarvis_config
+  bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" jarvis_private
+  bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" jarvis_shared
   BOOTSTRAP_JARVIS_INIT_STARTED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
-  jarvis init \
+  "$JARVIS_VENV/bin/jarvis" init \
     "$HOME/.local/share/clio-relay/jarvis-config" \
     "$HOME/.local/share/clio-relay/jarvis-private" \
     "$HOME/.local/share/clio-relay/jarvis-shared"
+  bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" jarvis_state
   BOOTSTRAP_JARVIS_INIT_COMPLETED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
   BOOTSTRAP_JARVIS_INIT_DURATION_NS=$((
     BOOTSTRAP_JARVIS_INIT_COMPLETED_NS - BOOTSTRAP_JARVIS_INIT_STARTED_NS
   ))
+  BOOTSTRAP_JARVIS_INIT_IDENTITY="$(bootstrap_path_set_identity \
+    "$JARVIS_CONFIG_FILE" "$JARVIS_REPOS_FILE" "$JARVIS_GRAPH_FILE")"
+  bootstrap_journal_action phase "$BOOTSTRAP_TRANSACTION_JOURNAL" \
+    jarvis_initialized "$BOOTSTRAP_JARVIS_INIT_IDENTITY"
   BOOTSTRAP_JARVIS_GRAPH_STARTED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
-  jarvis rg build +no_benchmark
+  "$JARVIS_VENV/bin/jarvis" rg build +no_benchmark
   BOOTSTRAP_JARVIS_GRAPH_COMPLETED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
   BOOTSTRAP_JARVIS_GRAPH_DURATION_NS=$((
     BOOTSTRAP_JARVIS_GRAPH_COMPLETED_NS - BOOTSTRAP_JARVIS_GRAPH_STARTED_NS
   ))
+  BOOTSTRAP_JARVIS_GRAPH_IDENTITY="$(bootstrap_path_set_identity "$JARVIS_GRAPH_FILE")"
+  bootstrap_journal_action phase "$BOOTSTRAP_TRANSACTION_JOURNAL" \
+    resource_graph_built "$BOOTSTRAP_JARVIS_GRAPH_IDENTITY"
   JARVIS_INIT_ACTION="initialized"
   JARVIS_GRAPH_ACTION="built"
   BOOTSTRAP_JARVIS_COMMANDS_JSON='[["jarvis","init","'$HOME'/.local/share/clio-relay/jarvis-config","'$HOME'/.local/share/clio-relay/jarvis-private","'$HOME'/.local/share/clio-relay/jarvis-shared"],["jarvis","rg","build","+no_benchmark"]]'
@@ -4204,6 +4549,7 @@ elif [ -e "$MANAGED_JARVIS_REPO" ]; then
   exit 1
 else
   ln -s "$MANAGED_JARVIS_REPO_TARGET" "$MANAGED_JARVIS_REPO"
+  bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" managed_repo
 fi
 export MANAGED_JARVIS_REPO JARVIS_REPOS_FILE
 "$RELAY_PROVIDER_PYTHON" - "$DEST/jarvis-packages/clio_relay" \
@@ -4221,8 +4567,12 @@ evidence = reconcile_managed_jarvis_repository(
 )
 print(f"jarvis_managed_repo={{evidence['action']}}")
 __CLIO_RELAY_JARVIS_REPO_RECONCILE__
+BOOTSTRAP_MANAGED_REPO_IDENTITY="$(bootstrap_path_set_identity \
+  "$JARVIS_REPOS_FILE" "$MANAGED_JARVIS_REPO")"
+bootstrap_journal_action phase "$BOOTSTRAP_TRANSACTION_JOURNAL" \
+  managed_repository_reconciled "$BOOTSTRAP_MANAGED_REPO_IDENTITY"
 
-BOOTSTRAP_DESIRED_FINGERPRINT="$(
+BOOTSTRAP_VERIFIED_DESIRED_FINGERPRINT="$(
   "$RELAY_PROVIDER_PYTHON" -c \
     'import json,os; from clio_relay.bootstrap_reconcile import BootstrapDesiredState; '\
 'value=json.loads(os.environ["BOOTSTRAP_DESIRED_STATE"]); '\
@@ -4230,8 +4580,11 @@ BOOTSTRAP_DESIRED_FINGERPRINT="$(
 'value["agent_npm_bin"]=os.environ["AGENT_NPM_BIN"] or None; '\
 'print(BootstrapDesiredState.model_validate(value).fingerprint)'
 )"
-BOOTSTRAP_GENERATION="$HOME/.local/share/clio-relay/generations/$BOOTSTRAP_DESIRED_FINGERPRINT"
-export BOOTSTRAP_DESIRED_FINGERPRINT BOOTSTRAP_INVOCATION_ID
+if [ "$BOOTSTRAP_VERIFIED_DESIRED_FINGERPRINT" != \
+     "$BOOTSTRAP_DESIRED_FINGERPRINT" ]; then
+  echo "fresh bootstrap desired fingerprint changed after provider installation" >&2
+  exit 1
+fi
 if [ -e "$BOOTSTRAP_GENERATION" ] || [ -L "$BOOTSTRAP_GENERATION" ]; then
   echo "fresh bootstrap generation path already exists" >&2
   exit 1
@@ -4242,14 +4595,15 @@ if [ -e "$HOME/.local/share/clio-relay/current" ] || \
   exit 1
 fi
 RELAY_TOOL_EXECUTABLE="$(readlink -f "$RELAY_EXECUTABLE")"
-JARVIS_TOOL_EXECUTABLE="$(readlink -f "$HOME/.local/bin/jarvis")"
+JARVIS_TOOL_EXECUTABLE="$(readlink -f "$JARVIS_VENV/bin/jarvis")"
 test -x "$RELAY_TOOL_EXECUTABLE"
 test -x "$JARVIS_TOOL_EXECUTABLE"
 mkdir -m 0700 -p "$BOOTSTRAP_GENERATION/bin"
+bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" generation
 ln -s "$RELAY_TOOL_EXECUTABLE" "$BOOTSTRAP_GENERATION/bin/clio-relay"
 ln -s "$DEST" "$BOOTSTRAP_GENERATION/source"
-mv "$HOME/.local/share/clio-relay/install-receipt.json" \
-  "$BOOTSTRAP_GENERATION/install-receipt.json"
+mv "$CLIO_RELAY_INSTALL_RECEIPT" "$BOOTSTRAP_GENERATION/install-receipt.json"
+export CLIO_RELAY_INSTALL_RECEIPT="$BOOTSTRAP_GENERATION/install-receipt.json"
 export BOOTSTRAP_GENERATION JARVIS_VENV JARVIS_TOOL_EXECUTABLE
 "$RELAY_PROVIDER_PYTHON" - "$BOOTSTRAP_GENERATION" \
   <<'__CLIO_RELAY_FULL_GENERATION_MANIFEST__'
@@ -4313,32 +4667,43 @@ try:
 finally:
     os.close(descriptor)
 __CLIO_RELAY_FULL_GENERATION_MANIFEST__
-ln -s "$BOOTSTRAP_GENERATION" \
-  "$HOME/.local/share/clio-relay/.current.$BOOTSTRAP_INVOCATION_ID"
-mv -Tf "$HOME/.local/share/clio-relay/.current.$BOOTSTRAP_INVOCATION_ID" \
-  "$HOME/.local/share/clio-relay/current"
+BOOTSTRAP_GENERATION_IDENTITY="$(bootstrap_path_set_identity \
+  "$BOOTSTRAP_GENERATION/manifest.json" \
+  "$BOOTSTRAP_GENERATION/.prepared" \
+  "$BOOTSTRAP_GENERATION/install-receipt.json" \
+  "$BOOTSTRAP_GENERATION/bin/clio-relay" \
+  "$BOOTSTRAP_GENERATION/bin/jarvis" \
+  "$BOOTSTRAP_GENERATION/source")"
+bootstrap_journal_action phase "$BOOTSTRAP_TRANSACTION_JOURNAL" \
+  generation_prepared "$BOOTSTRAP_GENERATION_IDENTITY"
+bootstrap_journal_action advance "$BOOTSTRAP_TRANSACTION_JOURNAL" \
+  prepared "$BOOTSTRAP_DESIRED_FINGERPRINT"
+bootstrap_journal_action advance "$BOOTSTRAP_TRANSACTION_JOURNAL" activating
+ln -s "$BOOTSTRAP_GENERATION" "$HOME/.local/share/clio-relay/current"
+bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" current
 ln -s "$HOME/.local/share/clio-relay/current/install-receipt.json" \
-  "$HOME/.local/share/clio-relay/.install-receipt.$BOOTSTRAP_INVOCATION_ID"
-mv -Tf "$HOME/.local/share/clio-relay/.install-receipt.$BOOTSTRAP_INVOCATION_ID" \
   "$HOME/.local/share/clio-relay/install-receipt.json"
+bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" install_receipt
 ln -s "$HOME/.local/share/clio-relay/current/bin/clio-relay" \
-  "$HOME/.local/bin/.clio-relay.$BOOTSTRAP_INVOCATION_ID"
-mv -Tf "$HOME/.local/bin/.clio-relay.$BOOTSTRAP_INVOCATION_ID" \
   "$HOME/.local/bin/clio-relay"
+bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" relay_launcher
 ln -s "$HOME/.local/share/clio-relay/current/bin/jarvis" \
-  "$HOME/.local/bin/.jarvis.$BOOTSTRAP_INVOCATION_ID"
-mv -Tf "$HOME/.local/bin/.jarvis.$BOOTSTRAP_INVOCATION_ID" \
   "$HOME/.local/bin/jarvis"
-ln -s "$HOME/.local/share/clio-relay/current/source/jarvis-packages/clio_relay" \
-  "$HOME/.local/share/clio-relay/.managed-jarvis-repo.$BOOTSTRAP_INVOCATION_ID"
-mv -Tf \
-  "$HOME/.local/share/clio-relay/.managed-jarvis-repo.$BOOTSTRAP_INVOCATION_ID" \
-  "$HOME/.local/share/clio-relay/managed-jarvis-repo"
+bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL" jarvis_launcher
+BOOTSTRAP_ACTIVATION_IDENTITY="$(bootstrap_path_set_identity \
+  "$HOME/.local/share/clio-relay/current" \
+  "$HOME/.local/share/clio-relay/install-receipt.json" \
+  "$HOME/.local/bin/clio-relay" \
+  "$HOME/.local/bin/jarvis" \
+  "$HOME/.local/share/clio-relay/managed-jarvis-repo")"
+bootstrap_journal_action phase "$BOOTSTRAP_TRANSACTION_JOURNAL" \
+  generation_activated "$BOOTSTRAP_ACTIVATION_IDENTITY"
+bootstrap_journal_action advance "$BOOTSTRAP_TRANSACTION_JOURNAL" activated
 BOOTSTRAP_FULL_PREPARE_COMPLETED_NS="$(
   python3 -c 'import time; print(time.monotonic_ns())'
 )"
 
-{worker_recheck}
+bootstrap_journal_action advance "$BOOTSTRAP_TRANSACTION_JOURNAL" migration_started
 BOOTSTRAP_QUEUE_ACTION=verified_read_only
 BOOTSTRAP_QUEUE_DURATION_NS=0
 BOOTSTRAP_QUEUE_BEFORE="$(
@@ -4366,6 +4731,25 @@ if ! python3 -c \
     BOOTSTRAP_QUEUE_COMPLETED_NS - BOOTSTRAP_QUEUE_STARTED_NS
   ))
 fi
+BOOTSTRAP_QUEUE_EVIDENCE="$(
+  CLIO_RELAY_CORE_DIR={rendered_core_dir} \
+    "$HOME/.local/bin/clio-relay" queue readiness-info
+)"
+BOOTSTRAP_QUEUE_IDENTITY="$(
+  BOOTSTRAP_QUEUE_EVIDENCE="$BOOTSTRAP_QUEUE_EVIDENCE" \
+    python3 - <<'__CLIO_RELAY_FRESH_QUEUE_IDENTITY__'
+import hashlib
+import json
+import os
+
+value = json.loads(os.environ["BOOTSTRAP_QUEUE_EVIDENCE"])
+payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+print(hashlib.sha256(payload).hexdigest())
+__CLIO_RELAY_FRESH_QUEUE_IDENTITY__
+)"
+bootstrap_journal_action phase "$BOOTSTRAP_TRANSACTION_JOURNAL" \
+  queue_migrated "$BOOTSTRAP_QUEUE_IDENTITY"
+bootstrap_journal_action advance "$BOOTSTRAP_TRANSACTION_JOURNAL" migrated
 
 BOOTSTRAP_SERVICE_RESTART_COUNT=0
 BOOTSTRAP_SERVICE_START_COUNT=0
@@ -4377,6 +4761,11 @@ BOOTSTRAP_SERVICE_PENDING_INSTALL=0
 if [ -n "$WORKER_SERVICE_NAME" ] && \
    systemctl --user is-enabled --quiet "$WORKER_SERVICE_NAME"; then
   BOOTSTRAP_SERVICE_ENABLED_BEFORE=1
+fi
+if [ "$WORKER_WAS_ACTIVE" = "1" ] || \
+   {{ [ -n "$WORKER_SERVICE_NAME" ] && \
+      [ "${{WORKER_LOAD_STATE:-unknown}}" = "loaded" ]; }}; then
+  bootstrap_journal_action advance "$BOOTSTRAP_TRANSACTION_JOURNAL" starting
 fi
 if [ "$WORKER_WAS_ACTIVE" = "1" ]; then
   BOOTSTRAP_SERVICE_STOP_COUNT=1
@@ -4400,10 +4789,6 @@ elif [ -n "$WORKER_SERVICE_NAME" ]; then
   fi
 fi
 
-BOOTSTRAP_QUEUE_EVIDENCE="$(
-  CLIO_RELAY_CORE_DIR={rendered_core_dir} \
-    "$HOME/.local/bin/clio-relay" queue readiness-info
-)"
 BOOTSTRAP_WORKER_EVIDENCE=""
 if [ "$BOOTSTRAP_SERVICE_ACTIVE_AFTER" = "1" ]; then
   for _BOOTSTRAP_READY_ATTEMPT in $(seq 1 90); do
@@ -4436,6 +4821,32 @@ elif [ -n "$WORKER_SERVICE_NAME" ]; then
   BOOTSTRAP_SERVICE_ACTIVE_AFTER_JSON=true
   BOOTSTRAP_SERVICE_ENABLED_AFTER_JSON=true
 fi
+BOOTSTRAP_SERVICE_IDENTITY="$(
+  BOOTSTRAP_QUEUE_EVIDENCE="$BOOTSTRAP_QUEUE_EVIDENCE" \
+  BOOTSTRAP_WORKER_EVIDENCE="$BOOTSTRAP_WORKER_EVIDENCE" \
+  BOOTSTRAP_SERVICE_ACTIVE_AFTER_JSON="$BOOTSTRAP_SERVICE_ACTIVE_AFTER_JSON" \
+  BOOTSTRAP_SERVICE_ENABLED_AFTER_JSON="$BOOTSTRAP_SERVICE_ENABLED_AFTER_JSON" \
+  BOOTSTRAP_SERVICE_PENDING_INSTALL="$BOOTSTRAP_SERVICE_PENDING_INSTALL" \
+    python3 - <<'__CLIO_RELAY_FRESH_SERVICE_IDENTITY__'
+import hashlib
+import json
+import os
+
+worker_text = os.environ["BOOTSTRAP_WORKER_EVIDENCE"]
+value = {{
+    "queue": json.loads(os.environ["BOOTSTRAP_QUEUE_EVIDENCE"]),
+    "worker": json.loads(worker_text) if worker_text else None,
+    "active": os.environ["BOOTSTRAP_SERVICE_ACTIVE_AFTER_JSON"],
+    "enabled": os.environ["BOOTSTRAP_SERVICE_ENABLED_AFTER_JSON"],
+    "pending_install": os.environ["BOOTSTRAP_SERVICE_PENDING_INSTALL"] == "1",
+}}
+payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+print(hashlib.sha256(payload).hexdigest())
+__CLIO_RELAY_FRESH_SERVICE_IDENTITY__
+)"
+bootstrap_journal_action phase "$BOOTSTRAP_TRANSACTION_JOURNAL" \
+  service_verified "$BOOTSTRAP_SERVICE_IDENTITY"
+bootstrap_journal_action advance "$BOOTSTRAP_TRANSACTION_JOURNAL" service_verified
 BOOTSTRAP_COMPLETED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
 export BOOTSTRAP_QUEUE_ACTION BOOTSTRAP_QUEUE_DURATION_NS BOOTSTRAP_QUEUE_EVIDENCE
 export BOOTSTRAP_WORKER_EVIDENCE BOOTSTRAP_SERVICE_ACTIVE_AFTER_JSON
@@ -4458,7 +4869,10 @@ from pathlib import Path
 
 from clio_relay.bootstrap_reconcile import (
     BootstrapDesiredState,
+    BootstrapTransactionJournal,
+    BootstrapTransactionState,
     JarvisStateEvidence,
+    canonical_json_sha256,
     inspect_exact_bootstrap_noop,
     make_bootstrap_receipt,
     write_bootstrap_receipt,
@@ -4535,6 +4949,17 @@ downloads = [
     for name, flag in download_flags.items()
     if os.environ[flag] == "1"
 ]
+transaction = BootstrapTransactionJournal.load(
+    Path(os.environ["BOOTSTRAP_TRANSACTION_JOURNAL"])
+)
+if transaction.mode != "full" or transaction.desired_fingerprint != desired.fingerprint:
+    raise SystemExit("full bootstrap transaction identity changed before commit")
+transaction.record_phase(
+    "final_inspection",
+    canonical_json_sha256(inspection.model_dump(mode="json")),
+)
+transaction.advance(BootstrapTransactionState.COMMITTED)
+transaction.persist(Path(os.environ["BOOTSTRAP_TRANSACTION_JOURNAL"]))
 completed_ns = int(os.environ["BOOTSTRAP_COMPLETED_NS"])
 started_ns = int(os.environ["BOOTSTRAP_INVOCATION_STARTED_NS"])
 receipt = make_bootstrap_receipt(
@@ -4543,7 +4968,7 @@ receipt = make_bootstrap_receipt(
     outcome="full",
     inspection=inspection,
     started_at=datetime.fromisoformat(os.environ["BOOTSTRAP_INVOCATION_STARTED_AT"]),
-    transaction=None,
+    transaction=transaction,
     previous_generation=None,
     active_generation=desired.fingerprint,
     components=components,
