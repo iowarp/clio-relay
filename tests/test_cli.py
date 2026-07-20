@@ -93,8 +93,44 @@ def _default_cli_mode(monkeypatch: MonkeyPatch) -> None:  # pyright: ignore[repo
         *,
         report: SessionLifecycleReport,
         **_kwargs: object,
-    ) -> SessionLifecycleReport:
-        return report
+    ) -> tuple[SessionLifecycleReport, OwnedSessionRecoveryStatus]:
+        reference, _payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            report
+        )
+        generation_id = report.session_generation_id
+        operation_id = report.cleanup_operation_id
+        assert generation_id is not None
+        assert operation_id is not None
+        status = OwnedSessionRecoveryStatus(
+            cluster=report.cluster,
+            session_id=report.session_id,
+            session_generation_id=generation_id,
+            owner="clio-relay",
+            api_pid=123,
+            process_start_marker="start-123",
+            leader_process_state="absent",
+            process_state="cleanup_pending",
+            process_absence_verified=True,
+            generation_process_absence_verified=True,
+            metadata_verified=True,
+            cluster_registry_verified=True,
+            durable_generation_verified=True,
+            cleanup_receipt=True,
+            cleanup_paths_pending=False,
+            coordinator_report_ref=reference,
+            coordinator_report_sha256=reference.sha256,
+            coordinator_report_bound=True,
+            ownership_verified=True,
+            recovery_verified=True,
+            admission_status={
+                "active_generation_id": generation_id,
+                "closing_generation_id": generation_id,
+                "closing": True,
+                "closed": False,
+                "cleanup_intent": {"operation_id": operation_id, **report.cleanup_policy},
+            },
+        )
+        return report, status
 
     monkeypatch.setattr(
         cli,
@@ -1811,6 +1847,13 @@ def test_cleanup_report_is_persisted_and_reread_before_authoritative_closure(
         return finalized_status
 
     monkeypatch.setattr(cli, "finalize_remote_session_cleanup_report", finalize)
+    reads: list[dict[str, object]] = []
+
+    def read_report(**kwargs: object) -> SessionLifecycleReport:
+        reads.append(kwargs)
+        return report
+
+    monkeypatch.setattr(cli, "read_remote_session_cleanup_report", read_report)
 
     observed = _REAL_PERSIST_VERIFIED_CLEANUP_REPORT(
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
@@ -1825,6 +1868,205 @@ def test_cleanup_report_is_persisted_and_reread_before_authoritative_closure(
     assert calls[0]["cleanup_operation_id"] == "cleanup_reconnect"
     assert calls[0]["cleanup_policy"] == report.cleanup_policy
     assert calls[0]["report"] == report
+    assert len(reads) == 1
+    assert reads[0]["status"] == finalized_status
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("policy", "immutable policy"),
+        ("operation", "operation identity"),
+        ("generation", "generation identity"),
+        ("report_digest", "size or digest"),
+        ("reference_digest", "size or digest"),
+        ("reference_size", "size or digest"),
+    ],
+)
+def test_finalized_cleanup_report_rejects_retry_identity_drift(
+    mutation: str,
+    expected_error: str,
+) -> None:
+    policy = {
+        "stop_worker": False,
+        "cancel_jobs": False,
+        "cancel_scheduler_jobs": False,
+    }
+    report = _verified_teardown_report()
+    report.cleanup_operation_id = "cleanup-retry"
+    report.cleanup_policy = policy
+    report.relay_cancel_requested = False
+    report.scheduler_cancel_requested = False
+    reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report
+    )
+    status = OwnedSessionRecoveryStatus(
+        cluster="ares",
+        session_id="session-1",
+        session_generation_id="generation-1",
+        owner="clio-relay",
+        api_pid=4321,
+        process_start_marker="123456",
+        leader_process_state="absent",
+        process_state="cleanup_pending",
+        process_absence_verified=True,
+        generation_process_absence_verified=True,
+        metadata_verified=True,
+        cluster_registry_verified=True,
+        durable_generation_verified=True,
+        cleanup_receipt=True,
+        cleanup_paths_pending=False,
+        coordinator_report_ref=reference,
+        coordinator_report_sha256=reference.sha256,
+        coordinator_report_bound=True,
+        ownership_verified=True,
+        recovery_verified=True,
+        admission_status={
+            "owner_session_id": "session-1",
+            "session_generation_id": "generation-1",
+            "active_generation_id": "generation-1",
+            "closing_generation_id": "generation-1",
+            "closing": True,
+            "closed": False,
+            "cleanup_intent": {"operation_id": "cleanup-retry", **policy},
+        },
+    )
+    selected_report = report
+    expected_generation = "generation-1"
+    expected_operation = "cleanup-retry"
+    expected_policy = policy
+    if mutation == "policy":
+        expected_policy = {**policy, "stop_worker": True}
+    elif mutation == "operation":
+        expected_operation = "cleanup-other"
+    elif mutation == "generation":
+        expected_generation = "generation-other"
+    elif mutation == "report_digest":
+        selected_report = report.model_copy(deep=True)
+        selected_report.resources[0].detail = "tampered"
+    elif mutation == "reference_digest":
+        drifted_reference = reference.model_copy(update={"sha256": "f" * 64})
+        status = status.model_copy(
+            update={
+                "coordinator_report_ref": drifted_reference,
+                "coordinator_report_sha256": drifted_reference.sha256,
+            }
+        )
+    else:
+        status = status.model_copy(
+            update={
+                "coordinator_report_ref": reference.model_copy(update={"size": reference.size + 1})
+            }
+        )
+
+    with pytest.raises(RelayError, match=expected_error):
+        cli._verified_finalized_cleanup_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            status,
+            report=selected_report,
+            cluster="ares",
+            session_id="session-1",
+            expected_generation_id=expected_generation,
+            expected_cleanup_operation_id=expected_operation,
+            expected_cleanup_policy=expected_policy,
+        )
+
+
+@pytest.mark.parametrize("reader_result", ["failure", "tamper"])
+def test_session_teardown_never_closes_before_finalized_sidecar_reread(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    reader_result: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    core_dir = tmp_path / "core"
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    queue = ClioCoreQueue(core_dir)
+    _activate_owner_session(queue)
+    monkeypatch.setattr(cli, "status_remote_session", _fake_owned_session_status)
+    monkeypatch.setattr(cli, "teardown_remote_session", _fake_verified_teardown)
+    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
+    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", lambda _definition: (None, None))
+    monkeypatch.setattr(
+        cli,
+        "_persist_verified_cleanup_report_before_closure",
+        _REAL_PERSIST_VERIFIED_CLEANUP_REPORT,
+    )
+
+    finalized_reports: list[SessionLifecycleReport] = []
+
+    def finalize(**kwargs: object) -> OwnedSessionRecoveryStatus:
+        report = cast(SessionLifecycleReport, kwargs["report"])
+        finalized_reports.append(report)
+        reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            report
+        )
+        return OwnedSessionRecoveryStatus(
+            cluster="ares",
+            session_id="session-1",
+            session_generation_id="generation-1",
+            owner="clio-relay",
+            api_pid=123,
+            process_start_marker="start-123",
+            leader_process_state="absent",
+            process_state="cleanup_pending",
+            process_absence_verified=True,
+            generation_process_absence_verified=True,
+            metadata_verified=True,
+            cluster_registry_verified=True,
+            durable_generation_verified=True,
+            cleanup_receipt=True,
+            cleanup_paths_pending=False,
+            coordinator_report_ref=reference,
+            coordinator_report_sha256=reference.sha256,
+            coordinator_report_bound=True,
+            ownership_verified=True,
+            recovery_verified=True,
+            admission_status=queue.owner_session_generation_status(
+                "session-1",
+                session_generation_id="generation-1",
+            ),
+        )
+
+    def read_report(**kwargs: object) -> SessionLifecycleReport:
+        if reader_result == "failure":
+            raise RelayError("simulated finalized sidecar read failure")
+        status = cast(OwnedSessionRecoveryStatus, kwargs["status"])
+        assert status.coordinator_report_bound is True
+        report = finalized_reports[0].model_copy(deep=True)
+        report.resources[0].detail = "tampered-after-finalization"
+        return report
+
+    closure_calls: list[str] = []
+
+    def forbid_closure(**_kwargs: object) -> None:
+        closure_calls.append("closed")
+        raise AssertionError("authoritative closure must follow exact sidecar re-read")
+
+    monkeypatch.setattr(cli, "finalize_remote_session_cleanup_report", finalize)
+    monkeypatch.setattr(cli, "read_remote_session_cleanup_report", read_report)
+    monkeypatch.setattr(cli, "_mark_owner_session_closed", forbid_closure)
+
+    result = CliRunner().invoke(
+        app,
+        ["session", "teardown", "--cluster", "ares", "--session-id", "session-1"],
+    )
+
+    local_session_id = cli._desktop_owner_session_admission_id(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster="ares",
+        session_id="session-1",
+    )
+    assert result.exit_code == 1
+    assert (
+        "simulated finalized sidecar read failure" in result.output
+        if reader_result == "failure"
+        else "size or digest" in result.output
+    )
+    assert closure_calls == []
+    assert queue.owner_session_is_closing("session-1") is True
+    assert queue.owner_session_is_closing(local_session_id) is True
+    assert queue.get_owner_session_closed("session-1") is None
+    assert queue.get_owner_session_closed(local_session_id) is None
 
 
 def test_session_teardown_reuses_finalized_report_before_rediscovery(
@@ -1868,7 +2110,64 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
     report.cleanup_policy = policy
     report.relay_cancel_requested = False
     report.scheduler_cancel_requested = False
-    report_payload = report.model_dump(mode="json")
+    report.resources.extend(
+        [
+            CleanupResource(
+                kind="gateway_record",
+                resource_id="gateway-1",
+                location="desktop",
+                action="close",
+                ownership_verified=True,
+                outcome="closed",
+                verified_after_operation=True,
+            ),
+            CleanupResource(
+                kind="desktop_connector",
+                resource_id="desktop-connector-1",
+                location="desktop",
+                action="stop",
+                ownership_verified=True,
+                outcome="stopped",
+                verified_after_operation=True,
+                metadata={"gateway_session_id": "gateway-1"},
+            ),
+            CleanupResource(
+                kind="remote_connector",
+                resource_id="remote-connector-1",
+                location="ares",
+                action="stop",
+                ownership_verified=True,
+                outcome="stopped",
+                verified_after_operation=True,
+                metadata={"gateway_session_id": "gateway-1"},
+            ),
+            CleanupResource(
+                kind="relay_job",
+                resource_id="relay-job-1",
+                location="ares",
+                action="retain",
+                ownership_verified=True,
+                outcome="retained",
+                verified_after_operation=True,
+            ),
+            CleanupResource(
+                kind="scheduler_job",
+                resource_id="scheduler-job-1",
+                location="ares",
+                action="retain",
+                ownership_verified=True,
+                outcome="retained",
+                provider="external",
+                verified_after_operation=True,
+                observed_state="running",
+                metadata={"relay_job_id": "relay-job-1"},
+            ),
+        ]
+    )
+    report.resources[0].detail = "large-report-body:" + ("x" * (1100 * 1024))
+    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report
+    )
     recovery = OwnedSessionRecoveryStatus(
         cluster="ares",
         session_id="session-1",
@@ -1885,7 +2184,7 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
         durable_generation_verified=True,
         cleanup_receipt=True,
         cleanup_paths_pending=False,
-        coordinator_report=report_payload,
+        coordinator_report_ref=report_reference,
         coordinator_report_sha256=session_lifecycle_report_sha256(report),
         coordinator_report_bound=True,
         ownership_verified=True,
@@ -1927,9 +2226,6 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
     ) -> tuple[dict[str, object] | None, Exception | None]:
         return None, None
 
-    def no_report_write(*_args: object, **_kwargs: object) -> bool:
-        return False
-
     monkeypatch.setattr(cli, "should_execute_on_cluster", local_execution)
     monkeypatch.setattr(
         cli,
@@ -1938,7 +2234,13 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
     )
     monkeypatch.setattr(cli, "_owned_session_recovery_status", recovered_status)
     monkeypatch.setattr(cli, "_observe_worker_before_cleanup", no_worker_observation)
-    monkeypatch.setattr(cli, "_write_cleanup_validation_report", no_report_write)
+    report_reads: list[OwnedSessionRecoveryStatus] = []
+
+    def read_report(**kwargs: object) -> SessionLifecycleReport:
+        report_reads.append(cast(OwnedSessionRecoveryStatus, kwargs["status"]))
+        return report
+
+    monkeypatch.setattr(cli, "read_remote_session_cleanup_report", read_report)
     destructive_calls: list[str] = []
 
     def forbidden(name: str) -> object:
@@ -1987,23 +2289,51 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
     runner = CliRunner()
 
     failed = runner.invoke(app, command)
+    failed_validation = json.loads((tmp_path / "retry-report.json").read_text(encoding="utf-8"))
     result = runner.invoke(app, command)
     already_closed = runner.invoke(app, command)
 
     assert failed.exit_code == 1
     assert "simulated crash before authoritative closure" in failed.output
+    assert {artifact["kind"] for artifact in failed_validation["artifacts"]} == {
+        "cleanup_report_manifest",
+        "cleanup_report_chunk",
+    }
+    assert failed_validation["cleanup"]["remaining_resources"][0]["state"] == "pending"
     assert result.exit_code == 0, result.output
     assert already_closed.exit_code == 0, already_closed.output
     assert closure_attempts == 3
+    assert len(report_reads) == 3
     assert destructive_calls == []
     payload = json.loads(result.output)
+    assert len(result.output.encode("utf-8")) < 1024 * 1024
     assert payload["cleanup_operation_id"] == operation_id
     assert payload["cleanup_policy"] == policy
+    assert payload["report_inline"] is False
+    assert payload["coordinator_report_ref"] == report_reference.model_dump(mode="json")
     assert payload["recovery_evidence"]["process_state"] == "already_closed"
-    assert payload["recovery_evidence"]["admission_status"]["closed"] is True
-    assert [
-        resource["kind"] for resource in payload["resources"] if resource["kind"] == "owner_session"
-    ] == ["owner_session"]
+    assert payload["recovery_evidence"]["closed"] is True
+    assert payload["authoritative_closure"] is True
+    assert payload["resource_summary"]["total"] == len(report.resources)
+    assert "resources" not in payload
+    manifest_path = Path(payload["cleanup_report_artifact"]["manifest"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    chunk_payloads = [
+        (manifest_path.parent / chunk["name"]).read_bytes() for chunk in manifest["chunks"]
+    ]
+    assert all(len(chunk) <= 8 * 1024 * 1024 for chunk in chunk_payloads)
+    retained_report = SessionLifecycleReport.model_validate_json(b"".join(chunk_payloads))
+    assert session_lifecycle_report_sha256(retained_report) == report_reference.sha256
+    assert {
+        "desktop_connector",
+        "gateway_record",
+        "relay_job",
+        "remote_connector",
+        "scheduler_job",
+    }.issubset({resource.kind for resource in retained_report.resources})
+    validation = json.loads((tmp_path / "retry-report.json").read_text(encoding="utf-8"))
+    artifact_kinds = {artifact["kind"] for artifact in validation["artifacts"]}
+    assert {"cleanup_report_manifest", "cleanup_report_chunk"}.issubset(artifact_kinds)
     assert (
         queue.get_owner_session_closed(
             "session-1",

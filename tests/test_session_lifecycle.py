@@ -119,6 +119,14 @@ class _FakeSessionTransaction:
             return
         path.write_bytes(payload)
 
+    def cleanup_report_candidate_names(self) -> list[str]:
+        return sorted(
+            path.name
+            for path in self.path.iterdir()
+            if path.name.startswith("coordinator-cleanup-report-")
+            or path.name.startswith(".coordinator-cleanup-report-")
+        )
+
     def stat_regular(self, name: str, *, required: bool = True) -> os.stat_result | None:
         path = self.path / name
         if not path.exists():
@@ -894,6 +902,68 @@ def test_cleanup_deletes_oversized_api_log_by_pinned_inode(tmp_path: Path) -> No
     assert not log_path.exists()
 
 
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("link_count", "owner-private regular"),
+        ("same_size_content", "changed while it was read"),
+    ],
+)
+def test_owned_session_read_revalidates_descriptor_and_path_after_read(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    mutation: str,
+    expected_error: str,
+) -> None:
+    payload = b"same-size-payload"
+
+    def status(*, links: int = 1, timestamp: int = 10) -> SimpleNamespace:
+        return SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600,
+            st_nlink=links,
+            st_uid=1000,
+            st_dev=7,
+            st_ino=11,
+            st_size=len(payload),
+            st_mtime_ns=timestamp,
+            st_ctime_ns=timestamp,
+        )
+
+    initial_opened = status()
+    initial_linked = status()
+    final_opened = status(
+        links=2 if mutation == "link_count" else 1,
+        timestamp=20 if mutation == "same_size_content" else 10,
+    )
+    final_linked = status(
+        links=2 if mutation == "link_count" else 1,
+        timestamp=20 if mutation == "same_size_content" else 10,
+    )
+    fstats = iter([initial_opened, final_opened])
+    stats = iter([initial_linked, final_linked])
+    reads = iter([payload, b""])
+    monkeypatch.setattr(os, "open", lambda *_args, **_kwargs: 41)
+    monkeypatch.setattr(os, "fstat", lambda _descriptor: next(fstats))
+    monkeypatch.setattr(os, "stat", lambda *_args, **_kwargs: next(stats))
+    monkeypatch.setattr(os, "read", lambda _descriptor, _size: next(reads))
+    monkeypatch.setattr(os, "close", lambda _descriptor: None)
+    transaction = session_lifecycle._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_id="session-1",
+        path=tmp_path,
+        sessions_fd=-1,
+        directory_fd=9,
+        lock_fd=-1,
+        uid=1000,
+        _fcntl=cast(
+            session_lifecycle._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            SimpleNamespace(),
+        ),
+    )
+
+    with pytest.raises(RelayError, match=expected_error):
+        transaction.read_bytes("metadata.json", maximum_bytes=1024)
+
+
 def test_cleanup_report_finalization_is_immutable_and_idempotent(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -1002,6 +1072,9 @@ def test_cleanup_report_finalization_is_immutable_and_idempotent(
             if existing is not None and existing != payload:
                 raise RelayError("owned session immutable file already differs")
             self.sidecars[name] = payload
+
+        def cleanup_report_candidate_names(self) -> list[str]:
+            return sorted(self.sidecars)
 
     transaction = FakeTransaction()
 
@@ -1481,6 +1554,19 @@ def test_immutable_sidecar_publication_recovers_and_rejects_hostile_links(
     assert (pending_only / reference.name).read_bytes() == payload
     assert not pending_path.exists()
 
+    partial_pending = tmp_path / "partial-pending"
+    pending_path = partial_pending / f".{reference.name}.pending"
+    with transaction_for(partial_pending) as transaction:
+        pending_path.write_bytes(payload[:37])
+        pending_path.chmod(0o600)
+        transaction.atomic_write_immutable(
+            reference.name,
+            payload,
+            maximum_bytes=session_lifecycle.MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
+        )
+    assert (partial_pending / reference.name).read_bytes() == payload
+    assert not pending_path.exists()
+
     linked_window = tmp_path / "linked-window"
     pending_path = linked_window / f".{reference.name}.pending"
     final_path = linked_window / reference.name
@@ -1497,6 +1583,22 @@ def test_immutable_sidecar_publication_recovers_and_rejects_hostile_links(
     assert final_path.read_bytes() == payload
     assert final_path.stat().st_nlink == 1
     assert not pending_path.exists()
+
+    corrupt_linked_window = tmp_path / "corrupt-linked-window"
+    pending_path = corrupt_linked_window / f".{reference.name}.pending"
+    final_path = corrupt_linked_window / reference.name
+    with transaction_for(corrupt_linked_window) as transaction:
+        pending_path.write_bytes(payload[:-1] + bytes([payload[-1] ^ 1]))
+        pending_path.chmod(0o600)
+        os.link(pending_path, final_path)
+        with pytest.raises(RelayError, match="linked file differs"):
+            transaction.atomic_write_immutable(
+                reference.name,
+                payload,
+                maximum_bytes=session_lifecycle.MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
+            )
+        assert final_path.stat().st_nlink == 2
+        assert pending_path.exists()
 
     ambiguous = tmp_path / "ambiguous"
     pending_path = ambiguous / f".{reference.name}.pending"
@@ -1539,6 +1641,204 @@ def test_immutable_sidecar_publication_recovers_and_rejects_hostile_links(
                 reference.name,
                 payload,
                 maximum_bytes=session_lifecycle.MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
+            )
+
+
+def test_cleanup_report_retention_prunes_one_old_generation_and_preserves_current(
+    tmp_path: Path,
+) -> None:
+    old_report = _cleanup_sidecar_report()
+    current_report = old_report.model_copy(
+        update={
+            "session_generation_id": "generation-2",
+            "cleanup_operation_id": "cleanup-sidecar-2",
+        }
+    )
+    old_reference, old_payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        old_report
+    )
+    current_reference, current_payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        current_report
+    )
+    transaction = _FakeSessionTransaction(tmp_path, session_id="session-1")
+    (tmp_path / old_reference.name).write_bytes(old_payload)
+    (tmp_path / current_reference.name).write_bytes(current_payload)
+
+    session_lifecycle._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction,  # pyright: ignore[reportArgumentType]
+        preserve_names={
+            current_reference.name,
+            f".{current_reference.name}.pending",
+        },
+    )
+
+    assert not (tmp_path / old_reference.name).exists()
+    assert (tmp_path / current_reference.name).read_bytes() == current_payload
+
+
+@pytest.mark.parametrize("mutation", ["multiple", "pending"])
+def test_cleanup_report_retention_refuses_ambiguous_old_candidates(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    current = _cleanup_sidecar_report().model_copy(
+        update={
+            "session_generation_id": "generation-current",
+            "cleanup_operation_id": "cleanup-current",
+        }
+    )
+    current_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        current
+    )
+    transaction = _FakeSessionTransaction(tmp_path, session_id="session-1")
+    if mutation == "pending":
+        old = _cleanup_sidecar_report()
+        old_reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            old
+        )
+        (tmp_path / f".{old_reference.name}.pending").write_bytes(payload)
+        expected = "unreferenced cleanup report pending"
+    else:
+        for index in range(2):
+            old = _cleanup_sidecar_report().model_copy(
+                update={
+                    "session_generation_id": f"generation-old-{index}",
+                    "cleanup_operation_id": f"cleanup-old-{index}",
+                }
+            )
+            old_reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                old
+            )
+            (tmp_path / old_reference.name).write_bytes(payload)
+        expected = "multiple unreferenced"
+
+    with pytest.raises(RelayError, match=expected):
+        session_lifecycle._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            transaction,  # pyright: ignore[reportArgumentType]
+            preserve_names={
+                current_reference.name,
+                f".{current_reference.name}.pending",
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("names", "expected_error"),
+    [
+        (["coordinator-cleanup-report-invalid.json"], "invalid name"),
+        (
+            [f"coordinator-cleanup-report-{index:064x}.json" for index in range(5)],
+            "too many cleanup report candidates",
+        ),
+        ([f"ordinary-{index}" for index in range(257)], "directory exceeds its entry limit"),
+    ],
+)
+def test_cleanup_report_candidate_scan_is_bounded_and_strict(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    names: list[str],
+    expected_error: str,
+) -> None:
+    class FakeScan:
+        def __enter__(self) -> object:
+            return iter(SimpleNamespace(name=name) for name in names)
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(os, "scandir", lambda _path: FakeScan())
+    transaction = session_lifecycle._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_id="session-1",
+        path=tmp_path,
+        sessions_fd=-1,
+        directory_fd=-1,
+        lock_fd=-1,
+        uid=0,
+        _fcntl=cast(
+            session_lifecycle._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            SimpleNamespace(),
+        ),
+    )
+
+    with pytest.raises(RelayError, match=expected_error):
+        transaction.cleanup_report_candidate_names()
+
+
+@pytest.mark.parametrize("mutation", ["symlink", "hardlink"])
+def test_cleanup_report_retention_refuses_hostile_old_links(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    mutation: str,
+) -> None:
+    report = _cleanup_sidecar_report()
+    reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report
+    )
+    preserved_report = report.model_copy(
+        update={
+            "session_generation_id": "generation-preserved",
+            "cleanup_operation_id": "cleanup-preserved",
+        }
+    )
+    preserved_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        preserved_report
+    )
+    if os.name != "posix":
+        transaction = _FakeSessionTransaction(tmp_path, session_id="session-1")
+        (tmp_path / reference.name).write_bytes(payload)
+
+        def refuse_hostile(
+            _name: str,
+            *,
+            required: bool = True,
+        ) -> os.stat_result | None:
+            assert required is True
+            raise RelayError("owned session file is not one owner-private regular file")
+
+        monkeypatch.setattr(transaction, "stat_regular", refuse_hostile)
+        with pytest.raises(RelayError, match="owner-private regular"):
+            session_lifecycle._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                transaction,  # pyright: ignore[reportArgumentType]
+                preserve_names={preserved_reference.name},
+            )
+        return
+
+    directory = tmp_path / mutation
+    directory.mkdir(mode=0o700)
+    directory_fd = os.open(
+        directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    lock_path = directory / "transition.lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    fcntl = cast(
+        session_lifecycle._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        importlib.import_module("fcntl"),
+    )
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    with session_lifecycle._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_id="session-1",
+        path=directory,
+        sessions_fd=os.dup(directory_fd),
+        directory_fd=directory_fd,
+        lock_fd=lock_fd,
+        uid=os.geteuid(),
+        _fcntl=fcntl,
+    ) as transaction:
+        candidate = directory / reference.name
+        if mutation == "symlink":
+            target = tmp_path / "retention-symlink-target"
+            target.write_bytes(payload)
+            target.chmod(0o600)
+            candidate.symlink_to(target)
+        else:
+            candidate.write_bytes(payload)
+            candidate.chmod(0o600)
+            os.link(candidate, tmp_path / "retention-outside-hardlink")
+        with pytest.raises(RelayError, match="owner-private regular"):
+            session_lifecycle._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                transaction,
+                preserve_names={preserved_reference.name},
             )
 
 

@@ -4355,15 +4355,202 @@ def _acceptance_scope(key: str) -> str:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
+    """Durably replace one text file through a pinned, revalidated parent."""
     logical_path = logical_filesystem_path(path)
     storage_path = internal_filesystem_path(logical_path, force_extended=True)
     storage_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = storage_path.with_name(f".{storage_path.name}.{uuid4().hex}.tmp")
+    payload = text.encode("utf-8")
+    parent_status = os.stat(storage_path.parent, follow_symlinks=False)
+    if not stat.S_ISDIR(parent_status.st_mode) or stat.S_ISLNK(parent_status.st_mode):
+        raise OSError(f"validation report parent is not a real directory: {storage_path.parent}")
+    temporary_name = f".{storage_path.name}.{uuid4().hex}.tmp"
+
+    if os.name == "posix":
+        directory_fd = os.open(
+            storage_path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        output_fd: int | None = None
+        try:
+            if not os.path.samestat(parent_status, os.fstat(directory_fd)):
+                raise OSError("validation report parent changed while opening")
+            output_fd = os.open(
+                temporary_name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            os.fchmod(output_fd, 0o600)
+            view = memoryview(payload)
+            while view:
+                written = os.write(output_fd, view)
+                if written <= 0:
+                    raise OSError("validation report write made no progress")
+                view = view[written:]
+            os.fsync(output_fd)
+            os.close(output_fd)
+            output_fd = None
+            os.replace(
+                temporary_name,
+                storage_path.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            os.fsync(directory_fd)
+            final_fd = os.open(
+                storage_path.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=directory_fd,
+            )
+            try:
+                opened = os.fstat(final_fd)
+                linked = os.stat(
+                    storage_path.name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                reread = bytearray()
+                while len(reread) <= len(payload):
+                    chunk = os.read(final_fd, min(64 * 1024, len(payload) + 1 - len(reread)))
+                    if not chunk:
+                        break
+                    reread.extend(chunk)
+                final_opened = os.fstat(final_fd)
+                final_linked = os.stat(
+                    storage_path.name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if not (
+                    bytes(reread) == payload
+                    and stat.S_ISREG(opened.st_mode)
+                    and opened.st_nlink == 1
+                    and linked.st_nlink == 1
+                    and opened.st_uid == os.geteuid()
+                    and linked.st_uid == os.geteuid()
+                    and stat.S_IMODE(opened.st_mode) == 0o600
+                    and stat.S_IMODE(linked.st_mode) == 0o600
+                    and (opened.st_dev, opened.st_ino) == (linked.st_dev, linked.st_ino)
+                    and (
+                        opened.st_dev,
+                        opened.st_ino,
+                        opened.st_size,
+                        opened.st_mtime_ns,
+                        opened.st_ctime_ns,
+                    )
+                    == (
+                        final_opened.st_dev,
+                        final_opened.st_ino,
+                        final_opened.st_size,
+                        final_opened.st_mtime_ns,
+                        final_opened.st_ctime_ns,
+                    )
+                    and (final_linked.st_dev, final_linked.st_ino)
+                    == (final_opened.st_dev, final_opened.st_ino)
+                    and os.path.samestat(
+                        parent_status,
+                        os.stat(storage_path.parent, follow_symlinks=False),
+                    )
+                ):
+                    raise OSError("validation report changed during durable replacement")
+            finally:
+                os.close(final_fd)
+        finally:
+            if output_fd is not None:
+                os.close(output_fd)
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            os.close(directory_fd)
+        return
+
+    temporary = storage_path.with_name(temporary_name)
+    parent_handle: ctypes.c_void_p | None = None
     try:
-        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+        if os.name == "nt":
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            get_attributes = kernel32.GetFileAttributesW
+            get_attributes.argtypes = [ctypes.c_wchar_p]
+            get_attributes.restype = ctypes.c_uint32
+            attributes = int(get_attributes(str(storage_path.parent)))
+            invalid_attributes = 0xFFFFFFFF
+            file_attribute_directory = 0x00000010
+            file_attribute_reparse_point = 0x00000400
+            if (
+                attributes == invalid_attributes
+                or not attributes & file_attribute_directory
+                or attributes & file_attribute_reparse_point
+            ):
+                raise OSError("validation report parent is not a stable Windows directory")
+            create_file = kernel32.CreateFileW
+            create_file.argtypes = [
+                ctypes.c_wchar_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+            ]
+            create_file.restype = ctypes.c_void_p
+            raw_handle = create_file(
+                str(storage_path.parent),
+                0x00000080,
+                0x00000001 | 0x00000002,
+                None,
+                3,
+                0x02000000 | 0x00200000,
+                None,
+            )
+            if raw_handle in (None, ctypes.c_void_p(-1).value):
+                error_number = ctypes.get_last_error()
+                raise OSError(error_number, ctypes.FormatError(error_number))
+            parent_handle = ctypes.c_void_p(raw_handle)
+            if not os.path.samestat(
+                parent_status,
+                os.stat(storage_path.parent, follow_symlinks=False),
+            ):
+                raise OSError("validation report parent changed while opening")
+        with temporary.open("x", encoding="utf-8", newline="\n") as stream:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, storage_path)
+        if os.name == "nt":
+            move_file_ex = kernel32.MoveFileExW
+            move_file_ex.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+            move_file_ex.restype = ctypes.c_int
+            if not move_file_ex(str(temporary), str(storage_path), 0x00000001 | 0x00000008):
+                error_number = ctypes.get_last_error()
+                raise OSError(error_number, ctypes.FormatError(error_number), str(storage_path))
+        else:
+            os.replace(temporary, storage_path)
+        with storage_path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            reread = stream.read(len(payload) + 1)
+            final_opened = os.fstat(stream.fileno())
+        linked = os.stat(storage_path, follow_symlinks=False)
+        if not (
+            reread == payload
+            and stat.S_ISREG(opened.st_mode)
+            and (opened.st_dev, opened.st_ino, opened.st_size)
+            == (final_opened.st_dev, final_opened.st_ino, final_opened.st_size)
+            == (linked.st_dev, linked.st_ino, linked.st_size)
+            and os.path.samestat(
+                parent_status,
+                os.stat(storage_path.parent, follow_symlinks=False),
+            )
+        ):
+            raise OSError("validation report changed during durable replacement")
     finally:
         temporary.unlink(missing_ok=True)
+        if parent_handle is not None:
+            close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+            close_handle.argtypes = [ctypes.c_void_p]
+            close_handle.restype = ctypes.c_int
+            close_handle(parent_handle)

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import BinaryIO, cast
 
 from clio_relay.process_containment import (
+    OwnedProcessSpawnError,
     release_owned_process,
     spawn_owned_process,
     terminate_owned_process,
@@ -68,17 +69,30 @@ def run_bounded_process(
                 command,
                 cwd=cwd,
                 env=(dict(environment) if environment is not None else None),
-                stdin_payload=input_bytes,
+                interactive_stdin=input_bytes is not None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=False,
-                startup_timeout_seconds=min(timeout_seconds, 10.0),
+                startup_timeout_seconds=min(10.0, max(0.001, deadline - time.monotonic())),
                 require_enforceable=require_enforceable,
             ),
         )
     except OSError:
         raise
     except Exception as exc:
+        cleanup_failed = isinstance(exc, OwnedProcessSpawnError) and not exc.cleanup_verified
+        if not cleanup_failed and (
+            time.monotonic() >= deadline
+            or isinstance(exc, subprocess.TimeoutExpired)
+            or "timed out"
+            in (
+                exc.startup_error_message if isinstance(exc, OwnedProcessSpawnError) else str(exc)
+            ).lower()
+        ):
+            raise BoundedProcessTimeout(
+                f"process tree exceeded {timeout_seconds:g} seconds during containment startup: "
+                f"{command[0]}"
+            ) from exc
         raise BoundedProcessError(
             f"process containment could not be established: {command[0]}"
         ) from exc
@@ -120,9 +134,44 @@ def run_bounded_process(
     )
     stdout_thread.start()
     stderr_thread.start()
+    stdin_errors: list[OSError | ValueError] = []
+    stdin_thread: threading.Thread | None = None
     failure: BoundedProcessError | None = None
+    if input_bytes is not None:
+        if process.stdin is None:
+            failure = BoundedProcessError(f"process stdin was unavailable: {command[0]}")
+
+        else:
+
+            def write_stdin() -> None:
+                stream = process.stdin
+                if stream is None:  # pragma: no cover - guarded before thread start
+                    stdin_errors.append(ValueError("process stdin disappeared"))
+                    return
+                try:
+                    view = memoryview(input_bytes)
+                    while view:
+                        written = stream.write(view)
+                        if written <= 0:
+                            raise OSError("process stdin write made no progress")
+                        view = view[written:]
+                    stream.flush()
+                except (OSError, ValueError) as exc:
+                    stdin_errors.append(exc)
+                finally:
+                    try:
+                        stream.close()
+                    except (OSError, ValueError) as exc:
+                        stdin_errors.append(exc)
+
+            stdin_thread = threading.Thread(
+                target=write_stdin,
+                name=f"clio-relay-bounded-stdin-{process.pid}",
+                daemon=True,
+            )
+            stdin_thread.start()
     try:
-        while process.poll() is None:
+        while failure is None and process.poll() is None:
             if stdout.overflow.is_set() or stderr.overflow.is_set():
                 stream_name = "stdout" if stdout.overflow.is_set() else "stderr"
                 failure = BoundedProcessOutputLimit(
@@ -136,6 +185,15 @@ def run_bounded_process(
                 )
                 break
             time.sleep(min(0.01, remaining))
+        if failure is None and stdin_thread is not None:
+            stdin_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if stdin_thread.is_alive():
+                failure = BoundedProcessTimeout(
+                    f"process stdin exceeded {timeout_seconds:g} seconds: {command[0]}"
+                )
+            elif stdin_errors:
+                failure = BoundedProcessError(f"process stdin could not be written: {command[0]}")
+                failure.__cause__ = stdin_errors[0]
         if failure is not None:
             try:
                 terminate_owned_process(cast(subprocess.Popen[str], process))
@@ -183,10 +241,14 @@ def run_bounded_process(
                 failure.__cause__ = exc
         stdout_thread.join(timeout=5)
         stderr_thread.join(timeout=5)
-    if stdout_thread.is_alive() or stderr_thread.is_alive():
-        raise BoundedProcessTreeLeak(f"process output collectors did not terminate: {command[0]}")
-    if stdout.errors or stderr.errors:
-        raise BoundedProcessError(f"process output could not be read: {command[0]}")
+        if stdin_thread is not None:
+            stdin_thread.join(timeout=5)
+    if (
+        stdout_thread.is_alive()
+        or stderr_thread.is_alive()
+        or (stdin_thread is not None and stdin_thread.is_alive())
+    ):
+        raise BoundedProcessTreeLeak(f"process I/O collectors did not terminate: {command[0]}")
     if failure is not None:
         raise failure
     if stdout.overflow.is_set() or stderr.overflow.is_set():
@@ -194,6 +256,12 @@ def run_bounded_process(
         raise BoundedProcessOutputLimit(
             f"process {stream_name} exceeded its byte bound: {command[0]}"
         )
+    if stdout.errors or stderr.errors:
+        raise BoundedProcessError(f"process output could not be read: {command[0]}")
+    if stdin_errors:
+        error = BoundedProcessError(f"process stdin could not be written: {command[0]}")
+        error.__cause__ = stdin_errors[0]
+        raise error
     return subprocess.CompletedProcess(
         args=command,
         returncode=process.returncode,

@@ -7,6 +7,7 @@ import hmac
 import importlib
 import json
 import os
+import re
 import secrets
 import shlex
 import socket
@@ -71,6 +72,12 @@ _SYSTEMD_UNIT_ENV = "CLIO_RELAY_SESSION_SYSTEMD_UNIT"
 _SYSTEMD_CGROUP_ENV = "CLIO_RELAY_SESSION_SYSTEMD_CGROUP"
 _SYSTEMD_INVOCATION_ENV = "CLIO_RELAY_SESSION_SYSTEMD_INVOCATION_ID"
 _SYSTEMD_DESCRIPTION_ENV = "CLIO_RELAY_SESSION_SYSTEMD_DESCRIPTION"
+_MAX_OWNED_SESSION_DIRECTORY_ENTRIES = 256
+_MAX_OWNED_SESSION_CLEANUP_REPORT_CANDIDATES = 4
+_CLEANUP_REPORT_SIDECAR_PATTERN = re.compile(r"^coordinator-cleanup-report-[0-9a-f]{64}\.json$")
+_CLEANUP_REPORT_PENDING_PATTERN = re.compile(
+    r"^\.coordinator-cleanup-report-[0-9a-f]{64}\.json\.pending$"
+)
 
 
 class _FcntlModule(Protocol):
@@ -165,9 +172,29 @@ class _OwnedSessionTransaction:
                 payload.extend(chunk)
             if len(payload) != opened.st_size or len(payload) > maximum_bytes:
                 raise RelayError(f"owned session file changed or exceeded its limit: {name}")
-            final = os.stat(name, dir_fd=self.directory_fd, follow_symlinks=False)
-            _verify_owned_session_file(opened, final, uid=self.uid, name=name)
-            if final.st_size != opened.st_size:
+            final_opened = os.fstat(descriptor)
+            final_linked = os.stat(name, dir_fd=self.directory_fd, follow_symlinks=False)
+            _verify_owned_session_file(
+                final_opened,
+                final_linked,
+                uid=self.uid,
+                name=name,
+            )
+            initial_identity = (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+                opened.st_mtime_ns,
+                opened.st_ctime_ns,
+            )
+            final_identity = (
+                final_opened.st_dev,
+                final_opened.st_ino,
+                final_opened.st_size,
+                final_opened.st_mtime_ns,
+                final_opened.st_ctime_ns,
+            )
+            if final_identity != initial_identity:
                 raise RelayError(f"owned session file changed while it was read: {name}")
             return bytes(payload)
         finally:
@@ -189,6 +216,33 @@ class _OwnedSessionTransaction:
         if not isinstance(raw, dict):
             raise RelayError(f"owned session file is not a JSON object: {name}")
         return {str(key): value for key, value in cast(dict[object, object], raw).items()}
+
+    def cleanup_report_candidate_names(self) -> list[str]:
+        """Enumerate bounded report sidecar names through the pinned directory fd."""
+        candidates: list[str] = []
+        scanned = 0
+        with os.scandir(self.directory_fd) as entries:
+            for entry in entries:
+                scanned += 1
+                if scanned > _MAX_OWNED_SESSION_DIRECTORY_ENTRIES:
+                    raise RelayError("owned session directory exceeds its entry limit")
+                name = entry.name
+                resembles_sidecar = name.startswith(
+                    "coordinator-cleanup-report-"
+                ) or name.startswith(".coordinator-cleanup-report-")
+                if not resembles_sidecar:
+                    continue
+                if not (
+                    _CLEANUP_REPORT_SIDECAR_PATTERN.fullmatch(name)
+                    or _CLEANUP_REPORT_PENDING_PATTERN.fullmatch(name)
+                ):
+                    raise RelayError(
+                        f"owned session cleanup report candidate has an invalid name: {name}"
+                    )
+                candidates.append(name)
+                if len(candidates) > _MAX_OWNED_SESSION_CLEANUP_REPORT_CANDIDATES:
+                    raise RelayError("owned session has too many cleanup report candidates")
+        return sorted(candidates)
 
     def atomic_write(
         self,
@@ -267,6 +321,79 @@ class _OwnedSessionTransaction:
             except FileNotFoundError:
                 return None
 
+        def read_candidate(candidate: str, *, expected_nlink: int) -> bytes:
+            """Read one pinned immutable candidate with an explicit link count."""
+            descriptor: int | None = None
+            try:
+                descriptor = os.open(
+                    candidate,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=self.directory_fd,
+                )
+                opened = os.fstat(descriptor)
+                linked = os.stat(candidate, dir_fd=self.directory_fd, follow_symlinks=False)
+                if not (
+                    stat.S_ISREG(opened.st_mode)
+                    and stat.S_ISREG(linked.st_mode)
+                    and opened.st_uid == self.uid
+                    and linked.st_uid == self.uid
+                    and stat.S_IMODE(opened.st_mode) == 0o600
+                    and stat.S_IMODE(linked.st_mode) == 0o600
+                    and opened.st_nlink == expected_nlink
+                    and linked.st_nlink == expected_nlink
+                    and (opened.st_dev, opened.st_ino) == (linked.st_dev, linked.st_ino)
+                    and 0 <= opened.st_size <= maximum_bytes
+                ):
+                    raise RelayError(f"owned session immutable candidate is unsafe: {candidate}")
+                value = bytearray()
+                while len(value) <= maximum_bytes:
+                    chunk = os.read(
+                        descriptor,
+                        min(64 * 1024, maximum_bytes + 1 - len(value)),
+                    )
+                    if not chunk:
+                        break
+                    value.extend(chunk)
+                final_opened = os.fstat(descriptor)
+                final_linked = os.stat(
+                    candidate,
+                    dir_fd=self.directory_fd,
+                    follow_symlinks=False,
+                )
+                initial_identity = (
+                    opened.st_dev,
+                    opened.st_ino,
+                    opened.st_size,
+                    opened.st_mtime_ns,
+                    opened.st_ctime_ns,
+                    opened.st_nlink,
+                )
+                final_identity = (
+                    final_opened.st_dev,
+                    final_opened.st_ino,
+                    final_opened.st_size,
+                    final_opened.st_mtime_ns,
+                    final_opened.st_ctime_ns,
+                    final_opened.st_nlink,
+                )
+                if (
+                    len(value) != opened.st_size
+                    or final_identity != initial_identity
+                    or (final_linked.st_dev, final_linked.st_ino, final_linked.st_nlink)
+                    != (final_opened.st_dev, final_opened.st_ino, expected_nlink)
+                ):
+                    raise RelayError(
+                        f"owned session immutable candidate changed while read: {candidate}"
+                    )
+                return bytes(value)
+            except OSError as exc:
+                raise RelayError(
+                    f"owned session immutable candidate cannot be read safely: {candidate}: {exc}"
+                ) from exc
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+
         final_status = linked_status(name)
         pending_status = linked_status(pending_name)
         if final_status is not None and pending_status is not None:
@@ -283,7 +410,11 @@ class _OwnedSessionTransaction:
             ):
                 raise RelayError(f"owned session immutable publication is unsafe: {name}")
             # Recover the one crash window after link publication and before the
-            # private pending link was removed. The final basename already won.
+            # private pending link was removed, but only after validating the
+            # linked bytes.  A corrupt final must remain visible for diagnosis.
+            linked_payload = read_candidate(pending_name, expected_nlink=2)
+            if not hmac.compare_digest(linked_payload, payload):
+                raise RelayError(f"owned session immutable linked file differs: {name}")
             os.unlink(pending_name, dir_fd=self.directory_fd)
             os.fsync(self.directory_fd)
             pending_status = None
@@ -296,6 +427,21 @@ class _OwnedSessionTransaction:
             if hmac.compare_digest(existing, payload):
                 return
             raise RelayError(f"owned session immutable file already differs: {name}")
+        if pending_status is not None:
+            staged = read_candidate(pending_name, expected_nlink=1)
+            if not hmac.compare_digest(staged, payload):
+                # A pending-only file is unreferenced staging.  Once its exact
+                # owner-private identity has been proven it is safe to remove
+                # and recreate after an interrupted/ENOSPC write.
+                self.unlink_verified(
+                    pending_name,
+                    expected_device=pending_status.st_dev,
+                    expected_inode=pending_status.st_ino,
+                    expected_size=pending_status.st_size,
+                    expected_sha256=None,
+                    maximum_bytes=None,
+                )
+                pending_status = None
         if pending_status is None:
             descriptor: int | None = None
             try:
@@ -326,6 +472,7 @@ class _OwnedSessionTransaction:
         staged = self.read_bytes(pending_name, maximum_bytes=maximum_bytes)
         if staged is None or not hmac.compare_digest(staged, payload):
             raise RelayError(f"owned session immutable pending file differs: {name}")
+        publication_complete = False
         try:
             os.link(
                 pending_name,
@@ -335,18 +482,21 @@ class _OwnedSessionTransaction:
                 follow_symlinks=False,
             )
             os.fsync(self.directory_fd)
+            publication_complete = True
         except FileExistsError:
             winner = self.read_bytes(name, maximum_bytes=maximum_bytes)
             if winner is None or not hmac.compare_digest(winner, payload):
                 raise RelayError(f"owned session immutable file already differs: {name}") from None
+            publication_complete = True
         except OSError as exc:
             raise RelayError(
                 f"owned session immutable file cannot be published safely: {name}: {exc}"
             ) from exc
         finally:
-            with suppress(FileNotFoundError):
-                os.unlink(pending_name, dir_fd=self.directory_fd)
-            os.fsync(self.directory_fd)
+            if publication_complete:
+                with suppress(FileNotFoundError):
+                    os.unlink(pending_name, dir_fd=self.directory_fd)
+                os.fsync(self.directory_fd)
         reread = self.read_bytes(name, maximum_bytes=maximum_bytes)
         if reread is None or not hmac.compare_digest(reread, payload):
             raise RelayError(f"owned session immutable file changed after commit: {name}")
@@ -451,8 +601,11 @@ def _verify_owned_session_file(
         not stat.S_ISREG(opened.st_mode)
         or not stat.S_ISREG(linked.st_mode)
         or opened.st_nlink != 1
+        or linked.st_nlink != 1
         or opened.st_uid != uid
+        or linked.st_uid != uid
         or stat.S_IMODE(opened.st_mode) != 0o600
+        or stat.S_IMODE(linked.st_mode) != 0o600
         or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
     ):
         raise RelayError(f"owned session file is not one owner-private regular file: {name}")
@@ -2749,6 +2902,49 @@ def _coordinator_report_reference(
     return reference, payload
 
 
+def _prune_unreferenced_cleanup_report_sidecars(
+    transaction: _OwnedSessionTransaction,
+    *,
+    preserve_names: set[str],
+) -> None:
+    """Remove at most one proven orphan while preserving the in-flight publication."""
+    candidates = transaction.cleanup_report_candidate_names()
+    unexpected_pending = [
+        name
+        for name in candidates
+        if _CLEANUP_REPORT_PENDING_PATTERN.fullmatch(name) and name not in preserve_names
+    ]
+    if unexpected_pending:
+        raise RelayError(
+            "owned session has an unreferenced cleanup report pending file: "
+            + ", ".join(unexpected_pending)
+        )
+    orphan_names = [
+        name
+        for name in candidates
+        if _CLEANUP_REPORT_SIDECAR_PATTERN.fullmatch(name) and name not in preserve_names
+    ]
+    if len(orphan_names) > 1:
+        raise RelayError("owned session has multiple unreferenced cleanup report sidecars")
+    for name in orphan_names:
+        linked = transaction.stat_regular(name)
+        if linked is None:  # pragma: no cover - required stat
+            raise RelayError(f"owned session cleanup report sidecar disappeared: {name}")
+        if not 0 < linked.st_size <= MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES:
+            raise RelayError(f"owned session cleanup report sidecar has an invalid size: {name}")
+        transaction.unlink_verified(
+            name,
+            expected_device=linked.st_dev,
+            expected_inode=linked.st_ino,
+            expected_size=linked.st_size,
+            expected_sha256=None,
+            maximum_bytes=None,
+        )
+    remaining = set(transaction.cleanup_report_candidate_names())
+    if not remaining.issubset(preserve_names):
+        raise RelayError("owned session cleanup report sidecar pruning was not exact")
+
+
 def _read_coordinator_report_sidecar(
     transaction: _OwnedSessionTransaction,
     reference: OwnedSessionCleanupReportReference,
@@ -4509,6 +4705,13 @@ def execute_owned_session_cleanup_finalize(
                 "coordinator cleanup report is immutable and cannot be replaced or downgraded"
             )
 
+        _prune_unreferenced_cleanup_report_sidecars(
+            transaction,
+            preserve_names={
+                report_reference.name,
+                f".{report_reference.name}.pending",
+            },
+        )
         transaction.atomic_write_immutable(
             report_reference.name,
             report_payload,

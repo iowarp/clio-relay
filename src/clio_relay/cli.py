@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -224,6 +225,7 @@ from clio_relay.service_runtime import ServiceRuntimeSupervisor
 from clio_relay.session_api import submit_owned_session_job
 from clio_relay.session_lifecycle import (
     MAX_OWNED_SESSION_CLEANUP_FINALIZE_BYTES,
+    MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
     CleanupResource,
     OwnedSessionCleanupFinalizeRequest,
     OwnedSessionCleanupReportReadRequest,
@@ -245,6 +247,7 @@ from clio_relay.session_lifecycle import (
     open_owned_session_transaction,
     publish_owned_session_api_startup_receipt,
     read_remote_session_cleanup_report,
+    session_lifecycle_report_bytes,
     session_lifecycle_report_sha256,
     start_remote_session,
     status_remote_session,
@@ -287,6 +290,40 @@ DEFAULT_RELAY_CANCEL_POLL_SECONDS = 0.25
 MAX_RELAY_CANCEL_TIMEOUT_SECONDS = 3_600.0
 REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS = 120.0
 REMOTE_CLEANUP_WORKER_INFO_TIMEOUT_SECONDS = 20.0
+MAX_FINALIZED_CLEANUP_RETRY_OUTPUT_BYTES = 1024 * 1024
+MAX_CLEANUP_VALIDATION_REPORT_BYTES = 8 * 1024 * 1024
+MAX_LOCAL_CLEANUP_REPORT_CHUNK_BYTES = 8 * 1024 * 1024
+MAX_LOCAL_CLEANUP_REPORT_MANIFEST_BYTES = 64 * 1024
+MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_ENTRIES = 10
+MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_STORED_BYTES = 2 * (
+    MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES + MAX_LOCAL_CLEANUP_REPORT_MANIFEST_BYTES
+)
+_LOCAL_CLEANUP_REPORT_ARTIFACT_PATTERN = re.compile(r"^r-[0-9a-f]{64}\.(?:p[0-9]{4}|manifest)$")
+_LOCAL_CLEANUP_REPORT_PENDING_PATTERN = re.compile(
+    r"^\.r-[0-9a-f]{64}\.(?:p[0-9]{4}|manifest)\.pending$"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _LocalCleanupReportChunk:
+    """One immutable bounded chunk of a locally retained cleanup report."""
+
+    path: Path
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _LocalCleanupReportArtifact:
+    """Manifest and chunks retaining one exact coordinator cleanup report."""
+
+    manifest_path: Path
+    manifest_sha256: str
+    report_sha256: str
+    report_size: int
+    chunks: tuple[_LocalCleanupReportChunk, ...]
+
+
 OWNED_SESSION_RECOVERY_TRANSITION_TIMEOUT_SECONDS = 90.0
 SPACK_CONFIGURATION_OBSERVATION_TIMEOUT_SECONDS = 60.0
 MAX_SPACK_CONFIGURATION_OBSERVATION_OUTPUT_BYTES = 128 * 1024
@@ -3346,6 +3383,9 @@ def _finalize_completed_cleanup_receipt_before_start(
         session_id=session_id,
     )
     generation_id = cast(str, report.session_generation_id)
+    operation_id = report.cleanup_operation_id
+    if operation_id is None:
+        raise RelayError("completed cleanup receipt omitted its operation identity")
     admission = status.admission_status
     if not isinstance(admission, dict):
         raise RelayError("completed cleanup receipt omitted authoritative admission evidence")
@@ -3386,12 +3426,26 @@ def _finalize_completed_cleanup_receipt_before_start(
             refreshed.recovery_verified
             and refreshed.cleanup_receipt
             and refreshed.cleanup_paths_pending is False
+            and refreshed.coordinator_report_bound
             and isinstance(refreshed.admission_status, dict)
             and refreshed.admission_status.get("closed") is True
         ):
             raise RelayError(
                 "owned session cleanup closure was not authoritative after reconnect recovery"
             )
+        if refreshed.coordinator_report_ref != status.coordinator_report_ref:
+            raise RelayError(
+                "coordinator cleanup report reference changed during reconnect closure"
+            )
+        _verified_finalized_cleanup_report(
+            refreshed,
+            report=report,
+            cluster=cluster,
+            session_id=session_id,
+            expected_generation_id=generation_id,
+            expected_cleanup_operation_id=operation_id,
+            expected_cleanup_policy=report.cleanup_policy,
+        )
 
 
 def _verified_finalized_cleanup_report(
@@ -3400,6 +3454,9 @@ def _verified_finalized_cleanup_report(
     report: SessionLifecycleReport,
     cluster: str,
     session_id: str,
+    expected_generation_id: str | None = None,
+    expected_cleanup_operation_id: str | None = None,
+    expected_cleanup_policy: dict[str, bool] | None = None,
 ) -> SessionLifecycleReport:
     """Return only a fully bound and semantically verified coordinator report."""
     generation_id = _verified_recovered_owner_session_generation(
@@ -3422,12 +3479,14 @@ def _verified_finalized_cleanup_report(
             "owned session cleanup has only cluster-local evidence; retry teardown to "
             "finalize desktop, connector, gateway, relay, and scheduler dispositions"
         )
-    report_sha256 = session_lifecycle_report_sha256(report)
+    report_payload = session_lifecycle_report_bytes(report)
+    report_sha256 = hashlib.sha256(report_payload).hexdigest()
     if not (
-        report_sha256 == status.coordinator_report_sha256
+        len(report_payload) == status.coordinator_report_ref.size
+        and report_sha256 == status.coordinator_report_sha256
         and report_sha256 == status.coordinator_report_ref.sha256
     ):
-        raise RelayError("coordinator cleanup report digest did not match its receipt")
+        raise RelayError("coordinator cleanup report size or digest did not match its receipt")
     policy = report.cleanup_policy
     if set(policy) != {"stop_worker", "cancel_jobs", "cancel_scheduler_jobs"}:
         raise RelayError("coordinator cleanup report policy is incomplete")
@@ -3445,6 +3504,15 @@ def _verified_finalized_cleanup_report(
         == policy
     ):
         raise RelayError("coordinator cleanup report does not match immutable cleanup intent")
+    if expected_generation_id is not None and generation_id != expected_generation_id:
+        raise RelayError("finalized cleanup retry changed its generation identity")
+    if (
+        expected_cleanup_operation_id is not None
+        and report.cleanup_operation_id != expected_cleanup_operation_id
+    ):
+        raise RelayError("finalized cleanup retry changed its operation identity")
+    if expected_cleanup_policy is not None and policy != expected_cleanup_policy:
+        raise RelayError("finalized cleanup retry changed its immutable policy")
     _verify_owner_session_teardown(
         report,
         session_id=session_id,
@@ -3454,6 +3522,568 @@ def _verified_finalized_cleanup_report(
     return report
 
 
+def _persist_local_cleanup_report_artifact(
+    report: SessionLifecycleReport,
+    *,
+    validation_report_path: Path,
+) -> _LocalCleanupReportArtifact:
+    """Persist one exact report in a private, report-owned bounded artifact directory."""
+    payload = session_lifecycle_report_bytes(report)
+    digest = hashlib.sha256(payload).hexdigest()
+    chunk_specs: list[tuple[str, bytes, str]] = []
+    for index, offset in enumerate(range(0, len(payload), MAX_LOCAL_CLEANUP_REPORT_CHUNK_BYTES)):
+        chunk = payload[offset : offset + MAX_LOCAL_CLEANUP_REPORT_CHUNK_BYTES]
+        chunk_specs.append(
+            (
+                f"r-{digest}.p{index:04d}",
+                chunk,
+                hashlib.sha256(chunk).hexdigest(),
+            )
+        )
+    manifest_payload = json.dumps(
+        {
+            "schema_version": "clio-relay.local-cleanup-report-artifact.v1",
+            "encoding": "canonical-json-chunks",
+            "report_sha256": digest,
+            "report_size": len(payload),
+            "chunk_size_limit": MAX_LOCAL_CLEANUP_REPORT_CHUNK_BYTES,
+            "chunks": [
+                {"name": name, "size": len(chunk), "sha256": sha256}
+                for name, chunk, sha256 in chunk_specs
+            ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(manifest_payload) > MAX_LOCAL_CLEANUP_REPORT_MANIFEST_BYTES:
+        raise RelayError("local cleanup report artifact manifest exceeds its byte limit")
+    manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
+    manifest_name = f"r-{digest}.manifest"
+    expected_names = {manifest_name, *(name for name, _chunk, _sha256 in chunk_specs)}
+    expected_names.update(f".{name}.pending" for name in tuple(expected_names))
+
+    report_basename = validation_report_path.name
+    if not report_basename or report_basename in {".", ".."}:
+        raise RelayError("validation report path has no safe artifact identity")
+    validation_report_path.parent.mkdir(parents=True, exist_ok=True)
+    parent_directory = validation_report_path.parent.resolve(strict=True)
+    parent_linked = os.lstat(parent_directory)
+    if not stat.S_ISDIR(parent_linked.st_mode) or stat.S_ISLNK(parent_linked.st_mode):
+        raise RelayError("local cleanup report artifact parent is not a real directory")
+    if os.name == "posix" and not (
+        (parent_linked.st_uid == os.geteuid() and stat.S_IMODE(parent_linked.st_mode) & 0o022 == 0)
+        or (parent_linked.st_uid == 0 and stat.S_IMODE(parent_linked.st_mode) & stat.S_ISVTX != 0)
+    ):
+        raise RelayError("local cleanup report artifact parent is not rename-safe")
+    report_path_identity = hashlib.sha256(report_basename.encode("utf-8")).hexdigest()
+    artifact_directory_name = f".clio-cleanup-{report_path_identity[:32]}"
+    artifact_directory = parent_directory / artifact_directory_name
+    parent_fd: int | None = None
+    directory_fd: int | None = None
+    if os.name == "posix":
+        try:
+            parent_fd = os.open(
+                parent_directory,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            if not os.path.samestat(parent_linked, os.fstat(parent_fd)):
+                raise RelayError("local cleanup report artifact parent changed while opening")
+            created = False
+            try:
+                os.mkdir(artifact_directory_name, 0o700, dir_fd=parent_fd)
+                created = True
+            except FileExistsError:
+                pass
+            if created:
+                os.fsync(parent_fd)
+            directory_linked = os.stat(
+                artifact_directory_name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            directory_fd = os.open(
+                artifact_directory_name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            if directory_fd is not None:
+                os.close(directory_fd)
+            if parent_fd is not None:
+                os.close(parent_fd)
+            raise RelayError(
+                f"local cleanup report artifact directory cannot be pinned: {exc}"
+            ) from exc
+        directory_opened = os.fstat(directory_fd)
+        if not (
+            stat.S_ISDIR(directory_linked.st_mode)
+            and not stat.S_ISLNK(directory_linked.st_mode)
+            and directory_linked.st_uid == os.geteuid()
+            and stat.S_IMODE(directory_linked.st_mode) & 0o077 == 0
+            and os.path.samestat(directory_linked, directory_opened)
+        ):
+            os.close(directory_fd)
+            os.close(parent_fd)
+            raise RelayError("local cleanup report artifact directory changed while opening")
+    else:
+        with suppress(FileExistsError):
+            artifact_directory.mkdir(mode=0o700, exist_ok=False)
+        directory_linked = os.lstat(artifact_directory)
+        if not stat.S_ISDIR(directory_linked.st_mode) or stat.S_ISLNK(directory_linked.st_mode):
+            raise RelayError("local cleanup report artifact directory is not a real directory")
+
+    def verify_directory() -> None:
+        try:
+            observed_parent = os.lstat(parent_directory)
+            observed = (
+                os.stat(
+                    artifact_directory_name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if parent_fd is not None
+                else os.lstat(artifact_directory)
+            )
+        except OSError as exc:
+            raise RelayError("local cleanup report artifact directory disappeared") from exc
+        if not (
+            os.path.samestat(parent_linked, observed_parent)
+            and os.path.samestat(directory_linked, observed)
+        ):
+            raise RelayError("local cleanup report artifact directory identity changed")
+
+    def stat_name(name: str) -> os.stat_result | None:
+        if Path(name).name != name:
+            raise RelayError("local cleanup report artifact name is unsafe")
+        try:
+            if directory_fd is not None:
+                return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            return os.lstat(artifact_directory / name)
+        except FileNotFoundError:
+            return None
+
+    def fsync_directory() -> None:
+        if directory_fd is not None:
+            os.fsync(directory_fd)
+        verify_directory()
+
+    def unlink_name(name: str) -> None:
+        if directory_fd is not None:
+            os.unlink(name, dir_fd=directory_fd)
+        else:
+            os.unlink(artifact_directory / name)
+        fsync_directory()
+
+    def read_exact(
+        name: str,
+        *,
+        expected_size: int,
+        required: bool,
+        expected_nlink: int = 1,
+    ) -> bytes | None:
+        descriptor: int | None = None
+        try:
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            descriptor = (
+                os.open(name, flags, dir_fd=directory_fd)
+                if directory_fd is not None
+                else os.open(artifact_directory / name, flags)
+            )
+        except FileNotFoundError:
+            if required:
+                raise RelayError("local cleanup report artifact disappeared") from None
+            return None
+        except OSError as exc:
+            raise RelayError(
+                f"local cleanup report artifact cannot be opened safely: {exc}"
+            ) from exc
+        try:
+            opened = os.fstat(descriptor)
+            linked = stat_name(name)
+            if linked is None:  # pragma: no cover - opened descriptor exists
+                raise RelayError("local cleanup report artifact pathname disappeared")
+            if not (
+                stat.S_ISREG(opened.st_mode)
+                and stat.S_ISREG(linked.st_mode)
+                and opened.st_nlink == expected_nlink
+                and linked.st_nlink == expected_nlink
+                and (opened.st_dev, opened.st_ino) == (linked.st_dev, linked.st_ino)
+                and opened.st_size == expected_size
+            ):
+                raise RelayError("local cleanup report artifact is not one exact regular file")
+            if os.name == "posix" and not (
+                opened.st_uid == os.geteuid()
+                and linked.st_uid == os.geteuid()
+                and stat.S_IMODE(opened.st_mode) == 0o600
+                and stat.S_IMODE(linked.st_mode) == 0o600
+            ):
+                raise RelayError("local cleanup report artifact is not owner-private")
+            value = bytearray()
+            while len(value) <= expected_size:
+                chunk = os.read(
+                    descriptor,
+                    min(64 * 1024, expected_size + 1 - len(value)),
+                )
+                if not chunk:
+                    break
+                value.extend(chunk)
+            final_opened = os.fstat(descriptor)
+            final_linked = stat_name(name)
+            initial_identity = (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+                opened.st_mtime_ns,
+                opened.st_ctime_ns,
+                opened.st_nlink,
+            )
+            final_identity = (
+                final_opened.st_dev,
+                final_opened.st_ino,
+                final_opened.st_size,
+                final_opened.st_mtime_ns,
+                final_opened.st_ctime_ns,
+                final_opened.st_nlink,
+            )
+            if (
+                len(value) != expected_size
+                or final_linked is None
+                or final_identity != initial_identity
+                or (final_linked.st_dev, final_linked.st_ino, final_linked.st_nlink)
+                != (final_opened.st_dev, final_opened.st_ino, expected_nlink)
+            ):
+                raise RelayError("local cleanup report artifact changed while it was read")
+            verify_directory()
+            return bytes(value)
+        finally:
+            os.close(descriptor)
+
+    def candidate_byte_limit(name: str) -> int:
+        return (
+            MAX_LOCAL_CLEANUP_REPORT_MANIFEST_BYTES
+            if ".manifest" in name
+            else MAX_LOCAL_CLEANUP_REPORT_CHUNK_BYTES
+        )
+
+    def verify_candidate_status(
+        name: str,
+        observed: os.stat_result,
+        *,
+        expected_nlink: int,
+    ) -> None:
+        if not (
+            stat.S_ISREG(observed.st_mode)
+            and observed.st_nlink == expected_nlink
+            and 0 <= observed.st_size <= candidate_byte_limit(name)
+        ):
+            raise RelayError("local cleanup report artifact candidate is unsafe")
+        if os.name == "posix" and not (
+            observed.st_uid == os.geteuid() and stat.S_IMODE(observed.st_mode) == 0o600
+        ):
+            raise RelayError("local cleanup report artifact candidate is not owner-private")
+
+    def unlink_verified_candidate(
+        name: str,
+        observed: os.stat_result,
+        *,
+        expected_nlink: int,
+    ) -> None:
+        verify_candidate_status(name, observed, expected_nlink=expected_nlink)
+        current = stat_name(name)
+        if current is None or (
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+            current.st_nlink,
+        ) != (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_size,
+            expected_nlink,
+        ):
+            raise RelayError("local cleanup report artifact changed before deletion")
+        unlink_name(name)
+
+    def scan_candidates() -> dict[str, os.stat_result]:
+        candidates: dict[str, os.stat_result] = {}
+        stored_bytes = 0
+        observed_inodes: set[tuple[int, int]] = set()
+        verify_directory()
+        try:
+            with os.scandir(directory_fd if directory_fd is not None else artifact_directory) as it:
+                for entry in it:
+                    name = entry.name
+                    if not (
+                        _LOCAL_CLEANUP_REPORT_ARTIFACT_PATTERN.fullmatch(name)
+                        or _LOCAL_CLEANUP_REPORT_PENDING_PATTERN.fullmatch(name)
+                    ):
+                        raise RelayError(
+                            "local cleanup report artifact directory contains an invalid entry"
+                        )
+                    if len(candidates) >= MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_ENTRIES:
+                        raise RelayError(
+                            "local cleanup report artifact directory exceeds its entry limit"
+                        )
+                    observed = stat_name(name)
+                    if observed is None:
+                        raise RelayError(
+                            "local cleanup report artifact disappeared during enumeration"
+                        )
+                    inode_identity = (observed.st_dev, observed.st_ino)
+                    if inode_identity not in observed_inodes:
+                        stored_bytes += observed.st_size
+                        observed_inodes.add(inode_identity)
+                    if stored_bytes > MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_STORED_BYTES:
+                        raise RelayError(
+                            "local cleanup report artifact directory exceeds its byte limit"
+                        )
+                    candidates[name] = observed
+        except OSError as exc:
+            raise RelayError(
+                f"local cleanup report artifact directory cannot be enumerated: {exc}"
+            ) from exc
+        verify_directory()
+        return candidates
+
+    def prune_unreferenced_candidates(*, preserve_names: set[str]) -> None:
+        candidates = scan_candidates()
+        remaining = set(candidates)
+        for pending_name in sorted(
+            name
+            for name in remaining
+            if _LOCAL_CLEANUP_REPORT_PENDING_PATTERN.fullmatch(name) and name not in preserve_names
+        ):
+            if pending_name not in remaining:
+                continue
+            final_name = pending_name[1 : -len(".pending")]
+            pending_status = candidates[pending_name]
+            if final_name in remaining and final_name not in preserve_names:
+                final_status = candidates[final_name]
+                if not (
+                    (pending_status.st_dev, pending_status.st_ino)
+                    == (final_status.st_dev, final_status.st_ino)
+                    and pending_status.st_nlink == 2
+                    and final_status.st_nlink == 2
+                ):
+                    raise RelayError(
+                        "local cleanup report artifact pruning found an ambiguous link pair"
+                    )
+                verify_candidate_status(pending_name, pending_status, expected_nlink=2)
+                verify_candidate_status(final_name, final_status, expected_nlink=2)
+                unlink_verified_candidate(pending_name, pending_status, expected_nlink=2)
+                refreshed_final = stat_name(final_name)
+                if refreshed_final is None:
+                    raise RelayError("local cleanup report artifact disappeared while pruning")
+                unlink_verified_candidate(final_name, refreshed_final, expected_nlink=1)
+                remaining.remove(pending_name)
+                remaining.remove(final_name)
+                continue
+            unlink_verified_candidate(pending_name, pending_status, expected_nlink=1)
+            remaining.remove(pending_name)
+        for name in sorted(remaining - preserve_names):
+            unlink_verified_candidate(name, candidates[name], expected_nlink=1)
+            remaining.remove(name)
+        observed = set(scan_candidates())
+        if not observed.issubset(preserve_names):
+            raise RelayError("local cleanup report artifact pruning was not exact")
+
+    def publish_exact(name: str, content: bytes, *, expected_sha256: str) -> None:
+        pending_name = f".{name}.pending"
+        final_status = stat_name(name)
+        pending_status = stat_name(pending_name)
+        if final_status is not None and pending_status is not None:
+            safe_link_window = bool(
+                stat.S_ISREG(final_status.st_mode)
+                and stat.S_ISREG(pending_status.st_mode)
+                and final_status.st_nlink == 2
+                and pending_status.st_nlink == 2
+                and (final_status.st_dev, final_status.st_ino)
+                == (pending_status.st_dev, pending_status.st_ino)
+            )
+            if os.name == "posix":
+                safe_link_window = bool(
+                    safe_link_window
+                    and final_status.st_uid == os.geteuid()
+                    and pending_status.st_uid == os.geteuid()
+                    and stat.S_IMODE(final_status.st_mode) == 0o600
+                    and stat.S_IMODE(pending_status.st_mode) == 0o600
+                )
+            if not safe_link_window:
+                raise RelayError("local cleanup report artifact publication is ambiguous")
+            linked = read_exact(
+                pending_name,
+                expected_size=len(content),
+                required=True,
+                expected_nlink=2,
+            )
+            if linked is None or not hmac.compare_digest(linked, content):
+                raise RelayError("local cleanup report artifact linked file differs")
+            unlink_name(pending_name)
+            final_status = stat_name(name)
+            pending_status = None
+        existing = read_exact(name, expected_size=len(content), required=False)
+        if existing is not None:
+            if hashlib.sha256(existing).hexdigest() != expected_sha256:
+                raise RelayError("local cleanup report artifact digest did not match its name")
+            return
+        if final_status is not None:
+            raise RelayError("local cleanup report artifact final path was not readable")
+        descriptor: int | None = None
+        try:
+            if pending_status is not None:
+                verify_candidate_status(pending_name, pending_status, expected_nlink=1)
+                staged = (
+                    read_exact(
+                        pending_name,
+                        expected_size=len(content),
+                        required=True,
+                    )
+                    if pending_status.st_size == len(content)
+                    else None
+                )
+                if staged is None or not hmac.compare_digest(staged, content):
+                    # Pending-only content is unreferenced staging.  A proven
+                    # owner-private single link may be removed and restaged
+                    # after an interrupted write.
+                    unlink_verified_candidate(
+                        pending_name,
+                        pending_status,
+                        expected_nlink=1,
+                    )
+                    pending_status = None
+            if pending_status is None:
+                flags = (
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_BINARY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0)
+                )
+                descriptor = (
+                    os.open(pending_name, flags, 0o600, dir_fd=directory_fd)
+                    if directory_fd is not None
+                    else os.open(artifact_directory / pending_name, flags, 0o600)
+                )
+                if os.name == "posix":
+                    os.fchmod(descriptor, 0o600)
+                view = memoryview(content)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise RelayError("local cleanup report artifact write made no progress")
+                    view = view[written:]
+                os.fsync(descriptor)
+                os.close(descriptor)
+                descriptor = None
+                fsync_directory()
+            staged = read_exact(pending_name, expected_size=len(content), required=True)
+            if staged is None or not hmac.compare_digest(staged, content):
+                raise RelayError("local cleanup report artifact pending file differs")
+            publication_complete = False
+            try:
+                if directory_fd is not None:
+                    os.link(
+                        pending_name,
+                        name,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                else:
+                    os.link(
+                        artifact_directory / pending_name,
+                        artifact_directory / name,
+                        follow_symlinks=False,
+                    )
+                fsync_directory()
+                final_linked = stat_name(name)
+                pending_linked = stat_name(pending_name)
+                if not (
+                    final_linked is not None
+                    and pending_linked is not None
+                    and (final_linked.st_dev, final_linked.st_ino)
+                    == (pending_linked.st_dev, pending_linked.st_ino)
+                    and final_linked.st_nlink == 2
+                    and pending_linked.st_nlink == 2
+                ):
+                    raise RelayError("local cleanup report artifact link publication was not exact")
+                linked = read_exact(
+                    name,
+                    expected_size=len(content),
+                    required=True,
+                    expected_nlink=2,
+                )
+                if linked is None or not hmac.compare_digest(linked, content):
+                    raise RelayError("local cleanup report artifact linked file differs")
+                publication_complete = True
+            except FileExistsError:
+                raise RelayError(
+                    "local cleanup report artifact concurrent publication is ambiguous"
+                ) from None
+            if publication_complete:
+                unlink_name(pending_name)
+        except OSError as exc:
+            raise RelayError(
+                f"local cleanup report artifact cannot be published safely: {exc}"
+            ) from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        committed = read_exact(name, expected_size=len(content), required=True)
+        if committed is None or hashlib.sha256(committed).hexdigest() != expected_sha256:
+            raise RelayError("local cleanup report artifact changed after publication")
+
+    try:
+        prune_unreferenced_candidates(preserve_names=expected_names)
+        chunks: list[_LocalCleanupReportChunk] = []
+        for chunk_name, chunk, chunk_sha256 in chunk_specs:
+            publish_exact(chunk_name, chunk, expected_sha256=chunk_sha256)
+            chunks.append(
+                _LocalCleanupReportChunk(
+                    path=artifact_directory / chunk_name,
+                    size=len(chunk),
+                    sha256=chunk_sha256,
+                )
+            )
+        publish_exact(manifest_name, manifest_payload, expected_sha256=manifest_sha256)
+        retained = scan_candidates()
+        final_names = {name for name in expected_names if not name.startswith(".")}
+        if set(retained) != final_names:
+            raise RelayError("local cleanup report artifact retention was not exact")
+        retained_size = sum(item.st_size for item in retained.values())
+        if (
+            len(retained) > 1 + len(chunk_specs)
+            or retained_size
+            > MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES + MAX_LOCAL_CLEANUP_REPORT_MANIFEST_BYTES
+        ):
+            raise RelayError("local cleanup report artifact retention exceeded its bound")
+        verify_directory()
+        return _LocalCleanupReportArtifact(
+            manifest_path=artifact_directory / manifest_name,
+            manifest_sha256=manifest_sha256,
+            report_sha256=digest,
+            report_size=len(payload),
+            chunks=tuple(chunks),
+        )
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
 def _persist_verified_cleanup_report_before_closure(
     *,
     definition: ClusterDefinition,
@@ -3461,7 +4091,7 @@ def _persist_verified_cleanup_report_before_closure(
     session_id: str,
     session_generation_id: str,
     report: SessionLifecycleReport,
-) -> SessionLifecycleReport:
+) -> tuple[SessionLifecycleReport, OwnedSessionRecoveryStatus]:
     """Persist, re-read, and verify the immutable full cleanup report."""
     cleanup_operation_id = report.cleanup_operation_id
     if cleanup_operation_id is None:
@@ -3475,15 +4105,24 @@ def _persist_verified_cleanup_report_before_closure(
         cleanup_policy=report.cleanup_policy,
         report=report,
     )
-    finalized_report = _verified_finalized_cleanup_report(
-        finalized_status,
-        report=report,
+    retrieved_report = read_remote_session_cleanup_report(
+        definition=definition,
         cluster=cluster,
         session_id=session_id,
+        status=finalized_status,
+    )
+    finalized_report = _verified_finalized_cleanup_report(
+        finalized_status,
+        report=retrieved_report,
+        cluster=cluster,
+        session_id=session_id,
+        expected_generation_id=session_generation_id,
+        expected_cleanup_operation_id=cleanup_operation_id,
+        expected_cleanup_policy=report.cleanup_policy,
     )
     if session_lifecycle_report_sha256(finalized_report) != session_lifecycle_report_sha256(report):
         raise RelayError("re-read coordinator cleanup report changed before closure")
-    return finalized_report
+    return finalized_report, finalized_status
 
 
 def _verify_session_start_worker_compatibility(
@@ -4312,94 +4951,155 @@ def session_teardown(
         queue = _managed_queue_from_env()
         cleanup_worker_info, cleanup_worker_error = _observe_worker_before_cleanup(definition)
 
+        def checkpoint_finalized_cleanup_artifact(
+            report: SessionLifecycleReport,
+            *,
+            recovery: OwnedSessionRecoveryStatus,
+            local_artifact: _LocalCleanupReportArtifact,
+        ) -> None:
+            """Durably reference exact local evidence before authoritative closure."""
+            reference = recovery.coordinator_report_ref
+            generation_id = report.session_generation_id
+            operation_id = report.cleanup_operation_id
+            if not (
+                reference is not None
+                and generation_id is not None
+                and operation_id is not None
+                and reference.sha256 == local_artifact.report_sha256
+                and reference.size == local_artifact.report_size
+            ):
+                raise RelayError("cleanup report artifact does not match its finalized reference")
+            report_metadata: dict[str, object] = {
+                "sha256": reference.sha256,
+                "size": reference.size,
+                "local_manifest": str(local_artifact.manifest_path.resolve()),
+                "local_manifest_sha256": local_artifact.manifest_sha256,
+                "local_chunk_count": len(local_artifact.chunks),
+                "session_generation_id": generation_id,
+                "cleanup_operation_id": operation_id,
+                "cleanup_policy": report.cleanup_policy,
+            }
+            pending = seed_report.model_copy(
+                deep=True,
+                update={
+                    "checks": [],
+                    "resources": [],
+                    "artifacts": [],
+                    "completed_at": None,
+                    "status": ValidationStatus.FAILED,
+                    "error": "authoritative owner-session closure pending",
+                    "cleanup": CleanupEvidence(
+                        requested=True,
+                        mode="teardown",
+                        operation_id=operation_id,
+                        cancel_relay_jobs=report.cleanup_policy["cancel_jobs"],
+                        cancel_scheduler_jobs=report.cleanup_policy["cancel_scheduler_jobs"],
+                        stop_worker=report.cleanup_policy["stop_worker"],
+                        actions=[
+                            {
+                                "kind": "cleanup_report",
+                                "resource_id": reference.name,
+                                "action": "verify",
+                                "outcome": "verified",
+                                "verified_after_operation": True,
+                                "residual": False,
+                            },
+                            {
+                                "kind": "owner_session",
+                                "resource_id": f"{session_id}:{generation_id}",
+                                "action": "close",
+                                "outcome": "pending",
+                                "verified_after_operation": False,
+                                "residual": True,
+                            },
+                        ],
+                        remaining_resources=[
+                            ValidationResource(
+                                kind="owner_session",
+                                resource_id=f"{session_id}:{generation_id}",
+                                role="cleanup_closure",
+                                cluster=cluster,
+                                state="pending",
+                                metadata={"cleanup_operation_id": operation_id},
+                            )
+                        ],
+                    ),
+                },
+            )
+            recorder = ValidationRecorder(pending)
+            manifest_evidence = EvidenceReference(
+                kind="cleanup_report_manifest",
+                reference=str(local_artifact.manifest_path.resolve()),
+                sha256=local_artifact.manifest_sha256,
+                metadata=report_metadata,
+            )
+            with recorder.check(
+                "session.teardown.cleanup-report-retained",
+                "retain exact finalized cleanup report before authoritative closure",
+            ) as evidence:
+                evidence.append(manifest_evidence)
+            pending.artifacts.append(manifest_evidence)
+            pending.artifacts.extend(
+                EvidenceReference(
+                    kind="cleanup_report_chunk",
+                    reference=str(chunk.path.resolve()),
+                    sha256=chunk.sha256,
+                    metadata={"size": chunk.size},
+                )
+                for chunk in local_artifact.chunks
+            )
+            recorder.add_resource(
+                ValidationResource(
+                    kind="cleanup_report",
+                    resource_id=reference.name,
+                    role="finalized_cleanup_report",
+                    cluster=cluster,
+                    state="verified",
+                    references=[str(local_artifact.manifest_path.resolve())],
+                    metadata=report_metadata,
+                )
+            )
+            recorder.add_resource(
+                ValidationResource(
+                    kind="owner_session",
+                    resource_id=f"{session_id}:{generation_id}",
+                    role="cleanup_closure",
+                    cluster=cluster,
+                    state="pending",
+                    metadata={"cleanup_operation_id": operation_id},
+                )
+            )
+            write_validation_report(pending, canonical_report_path)
+            reread = load_validation_report(canonical_report_path)
+            expected_checkpoint = LiveValidationReport.model_validate(
+                redact_sensitive_values(pending.model_dump(mode="json"))
+            )
+            if reread.model_dump(mode="json") != expected_checkpoint.model_dump(mode="json"):
+                raise RelayError(
+                    "cleanup report artifact checkpoint changed during durable re-read"
+                )
+            canonical_report[0] = reread
+
         def emit_completed_report(
             report: SessionLifecycleReport,
             *,
             canceled_job_ids: list[str],
             gateway_reports: list[dict[str, object]],
-            recovery: OwnedSessionRecoveryStatus | None,
+            recovery: OwnedSessionRecoveryStatus,
+            local_artifact: _LocalCleanupReportArtifact,
+            legacy_recovery: OwnedSessionRecoveryStatus | None,
         ) -> None:
-            """Emit one completed report without rediscovering its resource dispositions."""
-            payload = report.json_payload()
-            payload["cleanup_evidence"] = report.to_cleanup_evidence(
-                stop_worker=stop_worker
-            ).model_dump(mode="json")
-            payload["relay_jobs"] = {
-                "cancel_requested": cancel_jobs,
-                "scheduler_cancel_requested": cancel_jobs and cancel_scheduler_jobs,
-                "canceled_job_ids": canceled_job_ids,
-            }
-            payload["gateway_sessions"] = gateway_reports
-            if recovery is not None:
-                payload["recovery_evidence"] = recovery.model_dump(mode="json")
-            canonical = report.to_live_validation_report(
-                stop_worker=stop_worker,
-                cancel_jobs=cancel_jobs,
-                launcher=validation_launcher,
-                install_source=validation_install_source,
-                artifact_sha256=(
-                    sha256_file(validation_artifact) if validation_artifact is not None else None
-                ),
-            )
-            canonical = canonical.model_copy(
-                update={"report_id": seed_report.report_id, "started_at": seed_report.started_at}
-            )
-            if recovery_resource is not None:
-                canonical.resources.append(recovery_resource)
-            canonical_report[0] = canonical
-            for job_id in canceled_job_ids:
-                canonical.resources.append(
-                    ValidationResource(
-                        kind="relay_job",
-                        resource_id=job_id,
-                        role="cleanup_cancel",
-                        cluster=cluster,
-                        state="canceled",
-                    )
-                )
-            provenance_warning = _write_cleanup_validation_report(
-                canonical,
-                definition,
-                canonical_report_path,
-                observed_worker_info=cleanup_worker_info,
-                worker_observation_error=cleanup_worker_error,
-            )
-            payload["validation_report"] = str(canonical_report_path.resolve())
-            payload["validation_status"] = canonical.status.value
-            payload["validation_provenance_warning"] = provenance_warning
-            typer.echo(_public_json(payload))
-            canonical_ok = canonical.status is ValidationStatus.PASSED
-            if payload.get("ok") is not True or (not canonical_ok and not provenance_warning):
-                raise typer.Exit(code=1)
-
-        def append_owner_session_closure(
-            report: SessionLifecycleReport,
-            *,
-            generation_id: str,
-            operation_id: str,
-        ) -> None:
-            """Append the post-report authoritative closure evidence exactly once."""
-            resource_id = f"{session_id}:{generation_id}"
-            existing = [
-                resource
-                for resource in report.resources
-                if resource.kind == "owner_session" and resource.resource_id == resource_id
-            ]
-            if existing:
-                if len(existing) != 1 or not (
-                    existing[0].action == "close"
-                    and existing[0].outcome == "closed"
-                    and existing[0].ownership_verified
-                    and existing[0].verified_after_operation
-                    and not existing[0].residual
-                    and existing[0].metadata.get("cleanup_operation_id") == operation_id
-                ):
-                    raise RelayError("persisted owner-session closure evidence drifted")
-                return
-            report.resources.append(
+            """Keep the bounded legacy projection, falling back to compact evidence."""
+            generation_id = report.session_generation_id
+            operation_id = report.cleanup_operation_id
+            reference = recovery.coordinator_report_ref
+            if generation_id is None or operation_id is None or reference is None:
+                raise RelayError("finalized cleanup omitted its durable identity")
+            projection = report.model_copy(deep=True)
+            projection.resources.append(
                 CleanupResource(
                     kind="owner_session",
-                    resource_id=resource_id,
+                    resource_id=f"{session_id}:{generation_id}",
                     location=definition.ssh_host if remote_execution else str(queue.root),
                     action="close",
                     ownership_verified=True,
@@ -4413,6 +5113,342 @@ def session_teardown(
                     },
                 )
             )
+            payload = projection.json_payload()
+            payload["cleanup_evidence"] = projection.to_cleanup_evidence(
+                stop_worker=stop_worker
+            ).model_dump(mode="json")
+            payload["relay_jobs"] = {
+                "cancel_requested": cancel_jobs,
+                "scheduler_cancel_requested": cancel_jobs and cancel_scheduler_jobs,
+                "canceled_job_ids": canceled_job_ids,
+            }
+            payload["gateway_sessions"] = gateway_reports
+            if legacy_recovery is not None:
+                payload["recovery_evidence"] = legacy_recovery.model_dump(mode="json")
+            payload.update(
+                {
+                    "validation_report": str(canonical_report_path.resolve()),
+                    "validation_status": ValidationStatus.PASSED.value,
+                    "validation_provenance_warning": False,
+                }
+            )
+            preliminary = _public_json(payload)
+            if len(preliminary.encode("utf-8")) < MAX_FINALIZED_CLEANUP_RETRY_OUTPUT_BYTES:
+                canonical = projection.to_live_validation_report(
+                    stop_worker=stop_worker,
+                    cancel_jobs=cancel_jobs,
+                    launcher=validation_launcher,
+                    install_source=validation_install_source,
+                    artifact_sha256=(
+                        sha256_file(validation_artifact)
+                        if validation_artifact is not None
+                        else None
+                    ),
+                ).model_copy(
+                    update={
+                        "report_id": seed_report.report_id,
+                        "started_at": seed_report.started_at,
+                    }
+                )
+                report_metadata: dict[str, object] = {
+                    "sha256": reference.sha256,
+                    "size": reference.size,
+                    "local_manifest": str(local_artifact.manifest_path.resolve()),
+                    "local_manifest_sha256": local_artifact.manifest_sha256,
+                    "local_chunk_count": len(local_artifact.chunks),
+                    "session_generation_id": generation_id,
+                    "cleanup_operation_id": operation_id,
+                    "cleanup_policy": report.cleanup_policy,
+                }
+                manifest_evidence = EvidenceReference(
+                    kind="cleanup_report_manifest",
+                    reference=str(local_artifact.manifest_path.resolve()),
+                    sha256=local_artifact.manifest_sha256,
+                    metadata=report_metadata,
+                )
+                canonical.artifacts.append(manifest_evidence)
+                canonical.artifacts.extend(
+                    EvidenceReference(
+                        kind="cleanup_report_chunk",
+                        reference=str(chunk.path.resolve()),
+                        sha256=chunk.sha256,
+                        metadata={"size": chunk.size},
+                    )
+                    for chunk in local_artifact.chunks
+                )
+                canonical.resources.append(
+                    ValidationResource(
+                        kind="cleanup_report",
+                        resource_id=reference.name,
+                        role="finalized_cleanup_report",
+                        cluster=cluster,
+                        state="verified",
+                        references=[str(local_artifact.manifest_path.resolve())],
+                        metadata=report_metadata,
+                    )
+                )
+                projected_validation = (
+                    json.dumps(
+                        redact_sensitive_values(canonical.model_dump(mode="json")),
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+                if len(projected_validation.encode("utf-8")) < MAX_CLEANUP_VALIDATION_REPORT_BYTES:
+                    canonical_report[0] = canonical
+                    provenance_warning = _write_cleanup_validation_report(
+                        canonical,
+                        definition,
+                        canonical_report_path,
+                        observed_worker_info=cleanup_worker_info,
+                        worker_observation_error=cleanup_worker_error,
+                    )
+                    payload["validation_status"] = canonical.status.value
+                    payload["validation_provenance_warning"] = provenance_warning
+                    serialized = _public_json(payload)
+                    if (
+                        len(serialized.encode("utf-8")) < MAX_FINALIZED_CLEANUP_RETRY_OUTPUT_BYTES
+                        and canonical_report_path.stat().st_size
+                        < MAX_CLEANUP_VALIDATION_REPORT_BYTES
+                    ):
+                        typer.echo(serialized)
+                        canonical_ok = canonical.status is ValidationStatus.PASSED
+                        if payload.get("ok") is not True or (
+                            not canonical_ok and not provenance_warning
+                        ):
+                            raise typer.Exit(code=1)
+                        return
+            emit_finalized_retry_report(
+                report,
+                recovery=recovery,
+                local_artifact=local_artifact,
+                retry=False,
+            )
+
+        def emit_finalized_retry_report(
+            report: SessionLifecycleReport,
+            *,
+            recovery: OwnedSessionRecoveryStatus,
+            local_artifact: _LocalCleanupReportArtifact,
+            retry: bool = True,
+        ) -> None:
+            """Emit bounded evidence for a finalized report without re-inlining it."""
+            reference = recovery.coordinator_report_ref
+            generation_id = report.session_generation_id
+            operation_id = report.cleanup_operation_id
+            admission = recovery.admission_status
+            if not (
+                reference is not None
+                and generation_id is not None
+                and operation_id is not None
+                and isinstance(admission, dict)
+                and admission.get("closed") is True
+                and recovery.process_state == "already_closed"
+            ):
+                raise RelayError("finalized cleanup retry omitted authoritative closure evidence")
+
+            resource_summary: dict[str, object] = {
+                "total": len(report.resources),
+                "by_kind": dict(sorted(Counter(item.kind for item in report.resources).items())),
+                "by_action": dict(
+                    sorted(Counter(item.action for item in report.resources).items())
+                ),
+                "by_outcome": dict(
+                    sorted(Counter(item.outcome for item in report.resources).items())
+                ),
+                "residual_count": len(report.residual_resources),
+                "error_count": len(report.errors),
+            }
+            canceled_relay_count = sum(
+                1
+                for resource in report.resources
+                if resource.kind == "relay_job"
+                and resource.action == "cancel"
+                and resource.outcome == "canceled"
+                and resource.ownership_verified
+                and resource.verified_after_operation
+                and not resource.residual
+            )
+            gateway_resource_count = sum(
+                1
+                for resource in report.resources
+                if resource.kind in {"desktop_connector", "remote_connector", "gateway_record"}
+            )
+            report_metadata: dict[str, object] = {
+                "sha256": reference.sha256,
+                "size": reference.size,
+                "local_manifest": str(local_artifact.manifest_path.resolve()),
+                "local_manifest_sha256": local_artifact.manifest_sha256,
+                "local_chunk_count": len(local_artifact.chunks),
+                "session_generation_id": generation_id,
+                "cleanup_operation_id": operation_id,
+                "cleanup_policy": report.cleanup_policy,
+                "resource_summary": resource_summary,
+            }
+            canonical = seed_report.model_copy(
+                deep=True,
+                update={
+                    "checks": [],
+                    "resources": [],
+                    "artifacts": [],
+                    "completed_at": None,
+                    "status": ValidationStatus.FAILED,
+                    "error": None,
+                    "cleanup": CleanupEvidence(
+                        requested=True,
+                        mode="teardown",
+                        operation_id=operation_id,
+                        cancel_relay_jobs=report.cleanup_policy["cancel_jobs"],
+                        cancel_scheduler_jobs=report.cleanup_policy["cancel_scheduler_jobs"],
+                        stop_worker=report.cleanup_policy["stop_worker"],
+                        actions=[
+                            {
+                                "kind": "cleanup_report",
+                                "resource_id": reference.name,
+                                "action": "verify",
+                                "outcome": "verified",
+                                "verified_after_operation": True,
+                                "residual": False,
+                            },
+                            {
+                                "kind": "owner_session",
+                                "resource_id": f"{session_id}:{generation_id}",
+                                "action": "close",
+                                "outcome": "closed",
+                                "verified_after_operation": True,
+                                "residual": False,
+                            },
+                        ],
+                        remaining_resources=[],
+                    ),
+                },
+            )
+            recorder = ValidationRecorder(canonical)
+            manifest_evidence = EvidenceReference(
+                kind="cleanup_report_manifest",
+                reference=str(local_artifact.manifest_path.resolve()),
+                sha256=local_artifact.manifest_sha256,
+                metadata=report_metadata,
+            )
+            with recorder.check(
+                ("session.teardown.finalized-retry" if retry else "session.teardown.finalized"),
+                "verify finalized cleanup report and authoritative session closure",
+            ) as evidence:
+                evidence.append(manifest_evidence)
+            canonical.artifacts.append(manifest_evidence)
+            canonical.artifacts.extend(
+                EvidenceReference(
+                    kind="cleanup_report_chunk",
+                    reference=str(chunk.path.resolve()),
+                    sha256=chunk.sha256,
+                    metadata={"size": chunk.size},
+                )
+                for chunk in local_artifact.chunks
+            )
+            recorder.add_resource(
+                ValidationResource(
+                    kind="cleanup_report",
+                    resource_id=reference.name,
+                    role="finalized_cleanup_report",
+                    cluster=cluster,
+                    state="verified",
+                    references=[str(local_artifact.manifest_path.resolve())],
+                    metadata=report_metadata,
+                )
+            )
+            recorder.add_resource(
+                ValidationResource(
+                    kind="owner_session",
+                    resource_id=f"{session_id}:{generation_id}",
+                    role="cleanup_closure",
+                    cluster=cluster,
+                    state="closed",
+                    metadata={
+                        "cleanup_operation_id": operation_id,
+                        "coordinator_report_sha256": reference.sha256,
+                    },
+                )
+            )
+            recorder.add_resource(
+                ValidationResource(
+                    kind="owner_session_recovery",
+                    resource_id=f"{session_id}:{generation_id}",
+                    role="post_cleanup_recovery",
+                    cluster=cluster,
+                    state="verified",
+                    metadata={
+                        "process_state": recovery.process_state,
+                        "cleanup_receipt": recovery.cleanup_receipt,
+                        "cleanup_paths_pending": recovery.cleanup_paths_pending,
+                        "coordinator_report_bound": recovery.coordinator_report_bound,
+                        "ownership_verified": recovery.ownership_verified,
+                        "recovery_verified": recovery.recovery_verified,
+                        "closed": True,
+                    },
+                )
+            )
+            recorder.finish()
+            canonical_report[0] = canonical
+            provenance_warning = _write_cleanup_validation_report(
+                canonical,
+                definition,
+                canonical_report_path,
+                observed_worker_info=cleanup_worker_info,
+                worker_observation_error=cleanup_worker_error,
+            )
+            payload: dict[str, object] = {
+                "schema_version": (
+                    "clio-relay.finalized-cleanup-retry.v1"
+                    if retry
+                    else "clio-relay.finalized-cleanup.v1"
+                ),
+                "cluster": cluster,
+                "session_id": session_id,
+                "session_generation_id": generation_id,
+                "mode": report.mode,
+                "cleanup_operation_id": operation_id,
+                "cleanup_policy": report.cleanup_policy,
+                "coordinator_report_ref": reference.model_dump(mode="json"),
+                "coordinator_report_sha256": reference.sha256,
+                "report_inline": False,
+                "cleanup_report_artifact": {
+                    "manifest": str(local_artifact.manifest_path.resolve()),
+                    "manifest_sha256": local_artifact.manifest_sha256,
+                    "report_sha256": local_artifact.report_sha256,
+                    "report_size": local_artifact.report_size,
+                    "chunk_count": len(local_artifact.chunks),
+                    "chunk_size_limit": MAX_LOCAL_CLEANUP_REPORT_CHUNK_BYTES,
+                },
+                "resource_summary": resource_summary,
+                "relay_jobs": {
+                    "cancel_requested": report.cleanup_policy["cancel_jobs"],
+                    "scheduler_cancel_requested": report.cleanup_policy["cancel_scheduler_jobs"],
+                    "canceled_count": canceled_relay_count,
+                },
+                "gateway_sessions": {"resource_count": gateway_resource_count},
+                "authoritative_closure": True,
+                "recovery_evidence": {
+                    "process_state": recovery.process_state,
+                    "closed": True,
+                    "cleanup_receipt": recovery.cleanup_receipt,
+                    "cleanup_paths_pending": recovery.cleanup_paths_pending,
+                    "coordinator_report_bound": recovery.coordinator_report_bound,
+                    "coordinator_report_ref": reference.model_dump(mode="json"),
+                    "ownership_verified": recovery.ownership_verified,
+                    "recovery_verified": recovery.recovery_verified,
+                },
+                "validation_report": str(canonical_report_path.resolve()),
+                "validation_status": canonical.status.value,
+                "validation_provenance_warning": provenance_warning,
+                "ok": True,
+            }
+            serialized = _public_json(payload)
+            if len(serialized.encode("utf-8")) > MAX_FINALIZED_CLEANUP_RETRY_OUTPUT_BYTES:
+                raise RelayError("finalized cleanup output exceeded its byte limit")
+            typer.echo(serialized)
+            if canonical.status is not ValidationStatus.PASSED and not provenance_warning:
+                raise typer.Exit(code=1)
 
         initial_status_error: str | None = None
         try:
@@ -4462,24 +5498,33 @@ def session_teardown(
                 "process_absence_verified": recovery_status.process_absence_verified,
                 "process_state": recovery_status.process_state,
             }
+        requested_policy = {
+            "stop_worker": stop_worker,
+            "cancel_jobs": cancel_jobs,
+            "cancel_scheduler_jobs": cancel_scheduler_jobs,
+        }
         finalized_retry_report: SessionLifecycleReport | None = None
+        finalized_retry_reference = None
         if (
             recovery_status is not None
             and recovery_status.cleanup_receipt
             and recovery_status.coordinator_report_bound
         ):
-            finalized_retry_report = _verified_finalized_cleanup_report(
-                recovery_status,
+            retrieved_report = read_remote_session_cleanup_report(
+                definition=definition,
                 cluster=cluster,
                 session_id=session_id,
+                status=recovery_status,
             )
-            requested_policy = {
-                "stop_worker": stop_worker,
-                "cancel_jobs": cancel_jobs,
-                "cancel_scheduler_jobs": cancel_scheduler_jobs,
-            }
-            if finalized_retry_report.cleanup_policy != requested_policy:
-                raise RelayError("finalized cleanup retry changed its immutable policy")
+            finalized_retry_report = _verified_finalized_cleanup_report(
+                recovery_status,
+                report=retrieved_report,
+                cluster=cluster,
+                session_id=session_id,
+                expected_generation_id=session_generation_id,
+                expected_cleanup_policy=requested_policy,
+            )
+            finalized_retry_reference = recovery_status.coordinator_report_ref
         local_admission_session_id = _desktop_owner_session_admission_id(
             cluster=cluster,
             session_id=session_id,
@@ -4512,13 +5557,26 @@ def session_teardown(
             cancel_scheduler_jobs=cancel_scheduler_jobs,
         )
         if finalized_retry_report is not None:
-            if not (
-                finalized_retry_report.session_generation_id == session_generation_id
-                and finalized_retry_report.cleanup_operation_id == cleanup_operation_id
-            ):
-                raise RelayError(
-                    "finalized cleanup retry changed its operation or generation identity"
-                )
+            if recovery_status is None or finalized_retry_reference is None:
+                raise RelayError("finalized cleanup retry lost its exact report reference")
+            finalized_retry_report = _verified_finalized_cleanup_report(
+                recovery_status,
+                report=finalized_retry_report,
+                cluster=cluster,
+                session_id=session_id,
+                expected_generation_id=session_generation_id,
+                expected_cleanup_operation_id=cleanup_operation_id,
+                expected_cleanup_policy=requested_policy,
+            )
+            local_cleanup_artifact = _persist_local_cleanup_report_artifact(
+                finalized_retry_report,
+                validation_report_path=canonical_report_path,
+            )
+            checkpoint_finalized_cleanup_artifact(
+                finalized_retry_report,
+                recovery=recovery_status,
+                local_artifact=local_cleanup_artifact,
+            )
             _mark_owner_session_closed(
                 queue=queue,
                 definition=definition,
@@ -4548,10 +5606,16 @@ def session_teardown(
                 raise RelayError(
                     "finalized cleanup retry was not authoritatively closed after commit"
                 )
+            if closed_recovery.coordinator_report_ref != finalized_retry_reference:
+                raise RelayError("finalized cleanup report reference changed during closure")
             closed_report = _verified_finalized_cleanup_report(
                 closed_recovery,
+                report=finalized_retry_report,
                 cluster=cluster,
                 session_id=session_id,
+                expected_generation_id=session_generation_id,
+                expected_cleanup_operation_id=cleanup_operation_id,
+                expected_cleanup_policy=requested_policy,
             )
             if session_lifecycle_report_sha256(closed_report) != session_lifecycle_report_sha256(
                 finalized_retry_report
@@ -4559,48 +5623,10 @@ def session_teardown(
                 raise RelayError("finalized cleanup report reference changed during closure")
             recovery_status = closed_recovery
             recovery_resource = _owner_session_recovery_validation_resource(closed_recovery)
-            report = finalized_retry_report.model_copy(deep=True)
-            append_owner_session_closure(
-                report,
-                generation_id=session_generation_id,
-                operation_id=cleanup_operation_id,
-            )
-            canceled_job_ids = sorted(
-                {
-                    resource.resource_id
-                    for resource in report.resources
-                    if resource.kind == "relay_job"
-                    and resource.action == "cancel"
-                    and resource.outcome == "canceled"
-                    and resource.ownership_verified
-                    and resource.verified_after_operation
-                    and not resource.residual
-                }
-            )
-            gateway_resources = [
-                resource.model_dump(mode="json")
-                for resource in report.resources
-                if resource.kind in {"desktop_connector", "remote_connector", "gateway_record"}
-            ]
-            recovered_gateway_reports: list[dict[str, object]] = (
-                [
-                    {
-                        "schema_version": "clio-relay.finalized-gateway-cleanup.v1",
-                        "source": "finalized_coordinator_report",
-                        "resources": gateway_resources,
-                        "residual_resources": [],
-                        "errors": [],
-                        "ok": True,
-                    }
-                ]
-                if gateway_resources
-                else []
-            )
-            emit_completed_report(
-                report,
-                canceled_job_ids=canceled_job_ids,
-                gateway_reports=recovered_gateway_reports,
+            emit_finalized_retry_report(
+                finalized_retry_report,
                 recovery=recovery_status,
+                local_artifact=local_cleanup_artifact,
             )
             return
         partial = seed_report
@@ -5029,13 +6055,26 @@ def session_teardown(
             session_generation_id=session_generation_id,
             stop_worker=stop_worker,
         )
-        _persist_verified_cleanup_report_before_closure(
+        report, finalized_recovery = _persist_verified_cleanup_report_before_closure(
             definition=definition,
             cluster=cluster,
             session_id=session_id,
             session_generation_id=session_generation_id,
             report=report,
         )
+        finalized_reference = finalized_recovery.coordinator_report_ref
+        if finalized_reference is None:
+            raise RelayError("finalized cleanup omitted its exact report reference")
+        local_cleanup_artifact = _persist_local_cleanup_report_artifact(
+            report,
+            validation_report_path=canonical_report_path,
+        )
+        checkpoint_finalized_cleanup_artifact(
+            report,
+            recovery=finalized_recovery,
+            local_artifact=local_cleanup_artifact,
+        )
+        legacy_recovery = recovery_status
         legacy_unversioned_job_ids: list[str] = []
         _mark_owner_session_closed(
             queue=queue,
@@ -5046,16 +6085,45 @@ def session_teardown(
             session_generation_id=session_generation_id,
             legacy_unversioned_job_ids=legacy_unversioned_job_ids,
         )
-        append_owner_session_closure(
-            report,
-            generation_id=session_generation_id,
-            operation_id=report.cleanup_operation_id,
+        closed_recovery = _owned_session_recovery_status(
+            queue=queue,
+            definition=definition,
+            remote_execution=remote_execution,
+            cluster=cluster,
+            session_id=session_id,
         )
+        if not (
+            closed_recovery.recovery_verified
+            and closed_recovery.cleanup_receipt
+            and closed_recovery.cleanup_paths_pending is False
+            and closed_recovery.coordinator_report_bound
+            and closed_recovery.session_generation_id == session_generation_id
+            and closed_recovery.process_state == "already_closed"
+            and isinstance(closed_recovery.admission_status, dict)
+            and closed_recovery.admission_status.get("closed") is True
+            and closed_recovery.coordinator_report_ref == finalized_reference
+        ):
+            raise RelayError("cleanup was not authoritatively closed after commit")
+        closed_report = _verified_finalized_cleanup_report(
+            closed_recovery,
+            report=report,
+            cluster=cluster,
+            session_id=session_id,
+            expected_generation_id=session_generation_id,
+            expected_cleanup_operation_id=cleanup_operation_id,
+            expected_cleanup_policy=requested_policy,
+        )
+        if session_lifecycle_report_sha256(closed_report) != local_cleanup_artifact.report_sha256:
+            raise RelayError("finalized cleanup report changed during authoritative closure")
+        recovery_status = closed_recovery
+        recovery_resource = _owner_session_recovery_validation_resource(closed_recovery)
         emit_completed_report(
             report,
             canceled_job_ids=canceled,
             gateway_reports=gateway_reports,
-            recovery=recovery_status,
+            recovery=closed_recovery,
+            local_artifact=local_cleanup_artifact,
+            legacy_recovery=legacy_recovery,
         )
 
     def guarded_action() -> None:
