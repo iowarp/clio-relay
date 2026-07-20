@@ -351,6 +351,10 @@ function Assert-BootstrapReuse {
       -not [bool]$Receipt.jarvis_preservation.resource_graph_byte_identical) {
     throw "bootstrap reuse changed the existing JARVIS configuration or hardware graph"
   }
+  if ([string]$Receipt.jarvis_preservation.repositories.link_action -cne "reused" -or
+      [string]$Receipt.jarvis_preservation.repositories.repositories.action -cne "reused") {
+    throw "bootstrap reuse changed the JARVIS repository binding"
+  }
   foreach ($Component in @($Receipt.components.PSObject.Properties)) {
     if ([string]$Component.Value.action -cne "reused") {
       throw "bootstrap reuse replaced component $($Component.Name)"

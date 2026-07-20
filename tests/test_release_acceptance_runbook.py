@@ -112,6 +112,8 @@ def test_release_bootstrap_acceptance_proves_bounded_reuse_and_service_repair() 
     assert "operations.scheduler_submission_count" in runbook
     assert "jarvis_preservation.config_byte_identical" in runbook
     assert "jarvis_preservation.resource_graph_byte_identical" in runbook
+    assert "jarvis_preservation.repositories.link_action" in runbook
+    assert "jarvis_preservation.repositories.repositories.action" in runbook
     assert "systemctl --user stop '$AresServiceName'" in runbook
     assert 'Assert-BootstrapReuse $BootstrapReuseReceipt "noop_verified" 30' in runbook
     assert 'Assert-BootstrapReuse $BootstrapRepairReceipt "repaired" 60' in runbook
@@ -153,6 +155,10 @@ def test_bootstrap_reuse_runbook_helpers_execute_under_powershell(tmp_path: Path
         "jarvis_preservation": {
             "config_byte_identical": True,
             "resource_graph_byte_identical": True,
+            "repositories": {
+                "link_action": "reused",
+                "repositories": {"action": "reused"},
+            },
         },
         "components": {"clio-relay": {"action": "reused"}},
     }
