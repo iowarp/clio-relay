@@ -48,6 +48,40 @@ and per-kind capacity arguments against the persisted cluster policy before it
 restarts anything. A legacy or drifted unit is left untouched and must be
 reinstalled with `cluster install-endpoint-service`.
 
+Service installation, restart, and managed bootstrap serialize an exact
+state/job preflight and optional enqueue under a short per-service `flock`.
+They fail closed without mutation if either inventory cannot be read, and a
+fresh process observes an already queued exact job instead of duplicating it.
+Relay enqueues only when `LoadState=loaded` and the preflight `ActiveState` is
+stable (`active`, `inactive`, or `failed`). Non-loaded units and transitional,
+maintenance, refreshing, or future active states are reported without mutation.
+A requested `start` can adopt an exact existing `start` or `restart` job. A
+requested `restart` can adopt an exact `restart` job, including its later
+`start` phase under the same systemd job ID; a standalone pre-existing `start`
+is not restart provenance. Relay pins the first adopted job ID and rejects a
+later different job. A `start` first observed after relay's own successful
+restart enqueue can be bound to that request. A timed-out or failed restart
+enqueue cannot adopt a newly observed `start` or a jobless transition. Queued
+`reload`, `stop`, `verify-active`, `nop`, and unknown jobs are likewise
+nonpassing `in-progress` evidence without mutation; retry after the exact job
+clears. A transitional unit state without an exact queued job is also
+nonpassing and requires retry after the unit reaches a stable state.
+After enqueueing at most one systemd job with `--no-block`, they observe the
+exact unit and job for up to 5 minutes 30 seconds. The generated unit bounds
+`ExecStartPre` queue-index migration and process startup with
+`TimeoutStartSec=5min`; the SSH lifecycle command retains an additional
+90-second transport margin. State transitions
+and 15-second progress snapshots are emitted as
+`endpoint_service.activation` key/value records. A terminal systemd failure is
+returned immediately. If the observer itself expires while systemd still owns
+an activating job, relay reports `outcome=in-progress`, leaves that job intact,
+and does not enqueue a duplicate recovery start. Structured failure output
+includes the exact operator `journalctl --user --unit=...` command without
+copying journal contents into relay output.
+For a restart, known initial and final systemd `InvocationID` values must differ;
+an observed, provenance-bound state transition is used only when either ID is
+unavailable. An always-active unit with no new invocation remains unverified.
+
 ### Upgrade durable queue indexes
 
 The worker service runs this preflight before it accepts work:
@@ -96,9 +130,12 @@ bootstrap` performs this sequence itself: it stops the configured worker before
 replacing packages, refuses to continue while any installed `clio-relay`
 process still owns the same physical queue, runs a final bounded source-to-index
 reconciliation under the queue lock, and restarts the service only if it was
-previously active. New managed queues hold shared core ownership for their full
-lifetime, so later migrations cannot overlap an API, MCP server, worker, or new
-queue-backed writer. Explicit migration returns a closed inspection object,
+previously active. The complete remote bootstrap script has a 30-minute outer
+bound, which outlives its 5-minute 30-second service observer while preventing a
+lost SSH session from waiting forever. New managed queues hold shared core
+ownership for their full lifetime, so later migrations cannot overlap an API,
+MCP server, worker, or new queue-backed writer. Explicit migration returns a
+closed inspection object,
 never an unfenced writable queue. The migration does not delete jobs, logs, or
 scheduler work.
 

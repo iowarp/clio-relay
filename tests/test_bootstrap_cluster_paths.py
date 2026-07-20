@@ -58,7 +58,7 @@ def test_managed_bootstrap_fences_worker_around_migration() -> None:
     install = 'install -m 0755 "frp_${FRP_VERSION}_linux_amd64/frpc"'
     relay_replace = "uv tool install --force --python 3.12 --no-config"
     migrate = "clio-relay init --migrate-legacy-output"
-    restart = 'systemctl --user start "$WORKER_SERVICE_NAME"'
+    restart = 'systemctl --user "$CLIO_RELAY_ENDPOINT_ACTIVATION_ACTION" --no-block'
     first_proof = script.index(writer_proof)
     second_proof = script.index(writer_proof, first_proof + 1)
     relay_replacement = script.rindex(relay_replace)
@@ -71,6 +71,7 @@ def test_managed_bootstrap_fences_worker_around_migration() -> None:
         < script.rindex("if ! bootstrap_bounded_worker_restart; then")
     )
     assert restart in script
+    assert '"$CLIO_RELAY_ENDPOINT_SERVICE_NAME"' in script
     assert "WORKER_WRITER_PROOF=1" in script
     assert 'exec 9>"$HOME/.local/share/clio-relay/bootstrap.lock"' in script
     assert "if ! flock -n 9; then" in script
@@ -78,6 +79,8 @@ def test_managed_bootstrap_fences_worker_around_migration() -> None:
     assert "WORKER_LIFETIME_GUARD_FD=8" in script
     assert 'exec 9<>"$WORKER_LIFETIME_LOCK_PATH"' not in script
     assert "bootstrap_bounded_worker_restart" in script
+    assert "CLIO_RELAY_ENDPOINT_ACTIVATION_ACTION=start" in script
+    assert "list-jobs --no-legend --plain --no-pager" in script
     assert "worker_recovery=restored" in script
     assert "worker state is unknown and requires operator verification" in script
 
@@ -90,11 +93,15 @@ def test_managed_bootstrap_releases_lifetime_guard_before_normal_restart() -> No
     worker_fence, worker_recheck, _init, worker_restart = bootstrap._worker_upgrade_fence_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         "test-cluster",
         rendered_core_dir='"$test_root/core"',
+        activation_observation_timeout_seconds=2,
+        activation_poll_seconds=1,
+        activation_progress_seconds=1,
     )
     harness = f"""set -euo pipefail
 test_root="$(mktemp -d)"
 trap 'rm -rf -- "$test_root"' EXIT
-mkdir -p "$test_root/bin"
+mkdir -p "$test_root/bin" "$test_root/home"
+export HOME="$test_root/home"
 export BOOTSTRAP_TEST_STATE="$test_root/worker-state"
 echo active > "$BOOTSTRAP_TEST_STATE"
 cat > "$test_root/bin/python3" <<'__FAKE_PYTHON__'
@@ -106,12 +113,25 @@ cat > "$test_root/bin/systemctl" <<'__FAKE_SYSTEMCTL__'
 set -u
 case "${{2:-}}" in
   show)
+    state="$(cat "$BOOTSTRAP_TEST_STATE")"
     case " $* " in
-      *" --property=LoadState "*) echo loaded ;;
-      *" --property=ActiveState "*) cat "$BOOTSTRAP_TEST_STATE" ;;
-      *) exit 2 ;;
+      *--property=LoadState*--value*) echo loaded ;;
+      *--property=ActiveState*--value*) echo "$state" ;;
+      *)
+        invocation=old-invocation
+        sub_state=dead
+        if [ "$state" = active ]; then
+          invocation=new-invocation
+          sub_state=running
+        fi
+        printf '%s\n' 'LoadState=loaded' "ActiveState=$state" \
+          "SubState=$sub_state" 'Result=success' 'ControlPID=0' \
+          'ExecMainCode=0' 'ExecMainStatus=0' 'TimeoutStartUSec=5min' \
+          "InvocationID=$invocation"
+        ;;
     esac
     ;;
+  list-jobs) ;;
   stop)
     echo "fake-systemctl=stop" >&2
     echo inactive > "$BOOTSTRAP_TEST_STATE"
@@ -128,7 +148,11 @@ case "${{2:-}}" in
   *) exit 2 ;;
 esac
 __FAKE_SYSTEMCTL__
-chmod +x "$test_root/bin/python3" "$test_root/bin/systemctl"
+cat > "$test_root/bin/flock" <<'__FAKE_FLOCK__'
+#!/usr/bin/env bash
+case "${{1:-}}" in --exclusive|--unlock) exit 0 ;; *) exit 2 ;; esac
+__FAKE_FLOCK__
+chmod +x "$test_root/bin/python3" "$test_root/bin/systemctl" "$test_root/bin/flock"
 export PATH="$test_root/bin:$PATH"
 {worker_fence}
 {worker_recheck}
@@ -161,13 +185,17 @@ def test_failed_managed_bootstrap_restores_previously_active_worker(
     worker_fence, _recheck, _init, _restart = bootstrap._worker_upgrade_fence_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         "ares",
         rendered_core_dir='"$test_root/core"',
+        activation_observation_timeout_seconds=2,
+        activation_poll_seconds=1,
+        activation_progress_seconds=1,
     )
     restart_result = (
         'echo active > "$BOOTSTRAP_TEST_STATE"\nexit 0' if restart_succeeds else "exit 1"
     )
     harness = f"""set -euo pipefail
 test_root="$(mktemp -d)"
-mkdir -p "$test_root/bin"
+mkdir -p "$test_root/bin" "$test_root/home"
+export HOME="$test_root/home"
 export BOOTSTRAP_TEST_STATE="$test_root/worker-state"
 export BOOTSTRAP_TEST_STARTED="$test_root/start-attempted"
 echo active > "$BOOTSTRAP_TEST_STATE"
@@ -180,18 +208,28 @@ cat > "$test_root/bin/systemctl" <<'__FAKE_SYSTEMCTL__'
 set -u
 case "${{2:-}}" in
   show)
+    state="$(cat "$BOOTSTRAP_TEST_STATE")"
     case " $* " in
-      *" --property=LoadState "*) echo loaded ;;
-      *" --property=ActiveState "*)
-        state="$(cat "$BOOTSTRAP_TEST_STATE")"
-        echo "$state"
-        if [ -f "$BOOTSTRAP_TEST_STARTED" ]; then
-          rm -rf -- "$(dirname "$BOOTSTRAP_TEST_STATE")"
+      *--property=LoadState*--value*) echo loaded ;;
+      *--property=ActiveState*--value*) echo "$state" ;;
+      *)
+        invocation=old-invocation
+        sub_state=dead
+        result=success
+        if [ "$state" = active ]; then
+          invocation=new-invocation
+          sub_state=running
+        elif [ "$state" = failed ]; then
+          result=exit-code
         fi
+        printf '%s\n' 'LoadState=loaded' "ActiveState=$state" \
+          "SubState=$sub_state" "Result=$result" 'ControlPID=0' \
+          'ExecMainCode=0' 'ExecMainStatus=0' 'TimeoutStartUSec=5min' \
+          "InvocationID=$invocation"
         ;;
-      *) exit 2 ;;
     esac
     ;;
+  list-jobs) ;;
   stop)
     echo "fake-systemctl=stop" >&2
     echo inactive > "$BOOTSTRAP_TEST_STATE"
@@ -208,7 +246,11 @@ case "${{2:-}}" in
   *) exit 2 ;;
 esac
 __FAKE_SYSTEMCTL__
-chmod +x "$test_root/bin/python3" "$test_root/bin/systemctl"
+cat > "$test_root/bin/flock" <<'__FAKE_FLOCK__'
+#!/usr/bin/env bash
+case "${{1:-}}" in --exclusive|--unlock) exit 0 ;; *) exit 2 ;; esac
+__FAKE_FLOCK__
+chmod +x "$test_root/bin/python3" "$test_root/bin/systemctl" "$test_root/bin/flock"
 export PATH="$test_root/bin:$PATH"
 {worker_fence}
 echo "remote-bootstrap-step=sabotaged" >&2
@@ -810,7 +852,12 @@ def test_bootstrap_over_ssh_forwards_configured_data_directories(
         "completed_at": "2026-07-14T00:00:00Z",
     }
 
-    def fake_run(command: list[str]) -> subprocess.CompletedProcess[str]:
+    def fake_run(
+        command: list[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout_seconds
         stdout = (
             json.dumps(receipt)
             if command[-2:] == ["cat", "$HOME/.local/share/clio-relay/bootstrap-receipt.json"]

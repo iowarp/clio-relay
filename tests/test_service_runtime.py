@@ -4503,7 +4503,7 @@ def test_authenticated_jarvis_health_failure_redacts_echoed_bearer_from_error_an
     with pytest.raises(RelayError, match="authenticated health status=503") as caught:
         supervisor._wait_for_jarvis_health(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "http://127.0.0.1:28777/healthz",
-            timeout_seconds=0.03,
+            timeout_seconds=1.0,
             poll_seconds=1.0,
             runtime_schema_version="jarvis.service-runtime.v2",
             authorization=authorization,

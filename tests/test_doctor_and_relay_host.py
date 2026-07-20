@@ -43,6 +43,15 @@ def test_render_frps_config_has_no_application_state() -> None:
     assert "queue" not in rendered.lower()
 
 
+def test_endpoint_service_transport_budget_outlives_activation_observer() -> None:
+    """SSH setup and teardown cannot truncate the bounded systemd observer."""
+    assert deployment.ENDPOINT_SERVICE_SSH_SETUP_MARGIN_SECONDS >= 60
+    assert deployment.ENDPOINT_SERVICE_SSH_TIMEOUT_SECONDS == (
+        deployment.ENDPOINT_SERVICE_START_OBSERVATION_TIMEOUT_SECONDS
+        + deployment.ENDPOINT_SERVICE_SSH_SETUP_MARGIN_SECONDS
+    )
+
+
 def test_render_frpc_config_uses_configured_websocket_transport() -> None:
     rendered = render_frpc_config(
         FrpcConfig(
@@ -199,7 +208,1387 @@ def test_endpoint_user_service_is_sudo_less_and_configured() -> None:
     assert "Restart=always" in rendered
     assert "Restart=on-failure" not in rendered
     assert "RestartSec=5" in rendered
+    assert "TimeoutStartSec=300s" in rendered
     assert "sudo" not in rendered
+
+
+def _run_activation_observer_fixture(
+    *,
+    scenario: str,
+    observation_timeout_seconds: int,
+    activation_action: str = "start",
+    repeat_after_failure_count: int = 0,
+) -> subprocess.CompletedProcess[bytes]:
+    """Execute the rendered activation observer against a stateful fake systemd."""
+    if scenario not in {
+        "active-masked-no-job",
+        "ambiguous-replacement",
+        "confirmed-restart-first-start",
+        "confirmed-no-job-inactive",
+        "delayed",
+        "delayed-job-after-failed",
+        "delayed-job-after-inactive",
+        "failed",
+        "failed-same-result",
+        "job-read-failure-active",
+        "maintenance-after-enqueue",
+        "preexisting-future-active-no-job",
+        "preexisting-future-load-no-job",
+        "preflight-ambiguous-survivor",
+        "preexisting-maintenance-no-job",
+        "preexisting-masked-active-no-job",
+        "preexisting-masked-inactive-no-job",
+        "preexisting-merged-active-no-job",
+        "preexisting-reload",
+        "preexisting-restart-different-id",
+        "preexisting-restart-same-id",
+        "preexisting-restart-stable",
+        "preexisting-reloading-no-job",
+        "preexisting-start-activating",
+        "preexisting-start-stable",
+        "preexisting-refreshing-no-job",
+        "preexisting-stub-inactive-no-job",
+        "refreshing-after-enqueue",
+        "restart-active-unknown-invocation",
+        "restart-same-invocation",
+        "stuck",
+        "timeout-restart-start-job",
+        "timeout-restart-exact-job",
+        "timeout-restart-transition-no-job",
+        "timeout-restart-ambiguous-survivor",
+        "timeout-tracked-job-completes-on-retry",
+        "timeout-tracked-job-active-equal",
+        "timeout-tracked-job-active-unknown",
+        "timeout-tracked-job-failed",
+        "timeout-tracked-job-inactive",
+        "timeout-tracked-job-masked",
+        "timeout-tracked-job-replaced",
+        "timeout-tracked-job-transition-retry",
+        "unknown-initial",
+        "unknown-job-initial",
+    }:
+        raise ValueError(f"unsupported activation fixture scenario: {scenario}")
+    if activation_action not in {"start", "restart"}:
+        raise ValueError(f"unsupported activation fixture action: {activation_action}")
+    if type(repeat_after_failure_count) is not int or repeat_after_failure_count < 0:
+        raise ValueError("repeat_after_failure_count must be a non-negative integer")
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.fail("bash is required to validate bounded systemd activation")
+    helper = deployment.render_bounded_user_service_activation_helper(
+        observation_timeout_seconds=observation_timeout_seconds,
+        poll_seconds=1,
+        progress_seconds=1,
+    )
+    repeat = "clio_relay_endpoint_activate_bounded || true\n" * repeat_after_failure_count
+    harness = f"""set -u
+test_root="$(mktemp -d)"
+trap 'rm -rf -- "$test_root"' EXIT
+mkdir -p "$test_root/bin" "$test_root/home"
+export HOME="$test_root/home"
+export FAKE_SYSTEMD_ROOT="$test_root" FAKE_SYSTEMD_SCENARIO={scenario}
+cat > "$test_root/bin/systemctl" <<'__FAKE_SYSTEMCTL__'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "$FAKE_SYSTEMD_ROOT/calls"
+action="${{2:-}}"
+case "$action" in
+  start|restart)
+    attempts=0
+    if [ -f "$FAKE_SYSTEMD_ROOT/attempts" ]; then
+      attempts="$(cat "$FAKE_SYSTEMD_ROOT/attempts")"
+    fi
+    attempts=$((attempts + 1))
+    printf '%s\n' "$attempts" > "$FAKE_SYSTEMD_ROOT/attempts"
+    : > "$FAKE_SYSTEMD_ROOT/enqueued"
+    case "$FAKE_SYSTEMD_SCENARIO" in
+      timeout-restart-start-job|timeout-restart-exact-job|timeout-restart-transition-no-job|timeout-restart-ambiguous-survivor)
+        exit 124
+        ;;
+    esac
+    ;;
+  show)
+    if [ "$FAKE_SYSTEMD_SCENARIO" = unknown-initial ] && \
+       [ ! -f "$FAKE_SYSTEMD_ROOT/enqueued" ]; then
+      exit 1
+    fi
+    state=inactive
+    sub_state=dead
+    load_state=loaded
+    result=success
+    invocation_id=old-invocation
+    control_pid=0
+    post_count=0
+    if [ "$FAKE_SYSTEMD_SCENARIO" = failed-same-result ]; then
+      state=failed
+      sub_state=failed
+      result=exit-code
+    elif [ "$FAKE_SYSTEMD_SCENARIO" = delayed-job-after-failed ]; then
+      state=failed
+      sub_state=failed
+      result=exit-code
+    elif [ "$FAKE_SYSTEMD_SCENARIO" = preexisting-maintenance-no-job ]; then
+      state=maintenance
+      sub_state=maintenance
+    elif [ "$FAKE_SYSTEMD_SCENARIO" = preexisting-refreshing-no-job ]; then
+      state=refreshing
+      sub_state=refreshing
+    elif [ "$FAKE_SYSTEMD_SCENARIO" = preexisting-future-active-no-job ]; then
+      state=future-active
+      sub_state=future
+    elif [ "$FAKE_SYSTEMD_SCENARIO" = preexisting-masked-inactive-no-job ]; then
+      load_state=masked
+      state=inactive
+      sub_state=dead
+    elif [ "$FAKE_SYSTEMD_SCENARIO" = preexisting-masked-active-no-job ]; then
+      load_state=masked
+      state=active
+      sub_state=running
+    elif [ "$FAKE_SYSTEMD_SCENARIO" = preexisting-stub-inactive-no-job ]; then
+      load_state=stub
+      state=inactive
+      sub_state=dead
+    elif [ "$FAKE_SYSTEMD_SCENARIO" = preexisting-merged-active-no-job ]; then
+      load_state=merged
+      state=active
+      sub_state=running
+    elif [ "$FAKE_SYSTEMD_SCENARIO" = preexisting-future-load-no-job ]; then
+      load_state=future-load
+      state=inactive
+      sub_state=dead
+    elif [ "$FAKE_SYSTEMD_SCENARIO" = preflight-ambiguous-survivor ]; then
+      state=active
+      sub_state=running
+      if [ -f "$FAKE_SYSTEMD_ROOT/first-finished" ]; then
+        invocation_id=new-invocation
+      fi
+    elif [[ "$FAKE_SYSTEMD_SCENARIO" = timeout-tracked-job-active-equal ||
+            "$FAKE_SYSTEMD_SCENARIO" = timeout-tracked-job-active-unknown ||
+            "$FAKE_SYSTEMD_SCENARIO" = timeout-tracked-job-failed ||
+            "$FAKE_SYSTEMD_SCENARIO" = timeout-tracked-job-inactive ||
+            "$FAKE_SYSTEMD_SCENARIO" = timeout-tracked-job-masked ||
+            "$FAKE_SYSTEMD_SCENARIO" = timeout-tracked-job-transition-retry ]]; then
+      state=active
+      sub_state=running
+      if [[ "$FAKE_SYSTEMD_SCENARIO" = timeout-tracked-job-active-unknown ||
+            "$FAKE_SYSTEMD_SCENARIO" = timeout-tracked-job-transition-retry ]]; then
+        invocation_id=
+      fi
+    elif [ "$FAKE_SYSTEMD_SCENARIO" = preexisting-reload ]; then
+      state=active
+      sub_state=running
+    elif [ "$FAKE_SYSTEMD_SCENARIO" = preexisting-reloading-no-job ]; then
+      show_count=0
+      if [ -f "$FAKE_SYSTEMD_ROOT/show-count" ]; then
+        show_count="$(cat "$FAKE_SYSTEMD_ROOT/show-count")"
+      fi
+      show_count=$((show_count + 1))
+      printf '%s\n' "$show_count" > "$FAKE_SYSTEMD_ROOT/show-count"
+      if [ "$show_count" = 1 ]; then
+        state=reloading
+        sub_state=reload
+      else
+        state=active
+        sub_state=running
+      fi
+    elif [[ "$FAKE_SYSTEMD_SCENARIO" = preexisting-start-activating ||
+            "$FAKE_SYSTEMD_SCENARIO" = ambiguous-replacement ||
+            "$FAKE_SYSTEMD_SCENARIO" = preexisting-restart-same-id ||
+            "$FAKE_SYSTEMD_SCENARIO" = preexisting-restart-different-id ||
+            "$FAKE_SYSTEMD_SCENARIO" = preexisting-start-stable ||
+            "$FAKE_SYSTEMD_SCENARIO" = preexisting-restart-stable ||
+            "$FAKE_SYSTEMD_SCENARIO" = restart-active-unknown-invocation ||
+            "$FAKE_SYSTEMD_SCENARIO" = restart-same-invocation ]]; then
+      show_count=0
+      if [ -f "$FAKE_SYSTEMD_ROOT/show-count" ]; then
+        show_count="$(cat "$FAKE_SYSTEMD_ROOT/show-count")"
+      fi
+      show_count=$((show_count + 1))
+      printf '%s\n' "$show_count" > "$FAKE_SYSTEMD_ROOT/show-count"
+      case "$FAKE_SYSTEMD_SCENARIO:$show_count" in
+        restart-active-unknown-invocation:*)
+          state=active; sub_state=running; invocation_id=
+          ;;
+        preexisting-start-activating:1)
+          state=activating; sub_state=start
+          ;;
+        preexisting-start-stable:1)
+          state=inactive; sub_state=dead
+          ;;
+        *:1)
+          state=active; sub_state=running
+          ;;
+        *:2)
+          state=activating; sub_state=start
+          ;;
+        restart-same-invocation:*)
+          state=active; sub_state=running
+          ;;
+        *)
+          state=active; sub_state=running; invocation_id=new-invocation
+          ;;
+      esac
+    fi
+    if [ -f "$FAKE_SYSTEMD_ROOT/enqueued" ]; then
+      if [ -f "$FAKE_SYSTEMD_ROOT/post-count" ]; then
+        post_count="$(cat "$FAKE_SYSTEMD_ROOT/post-count")"
+      fi
+      post_count=$((post_count + 1))
+      printf '%s\n' "$post_count" > "$FAKE_SYSTEMD_ROOT/post-count"
+      invocation_id=new-invocation
+      case "$FAKE_SYSTEMD_SCENARIO:$post_count" in
+        delayed:1) state=inactive; sub_state=dead ;;
+        delayed:2) state=activating; sub_state=start-pre; control_pid=41 ;;
+        delayed:*) state=active; sub_state=running; control_pid=42 ;;
+        delayed-job-after-inactive:1)
+          state=inactive; sub_state=dead; invocation_id=old-invocation
+          ;;
+        delayed-job-after-failed:1)
+          state=failed; sub_state=failed; result=exit-code; invocation_id=old-invocation
+          ;;
+        delayed-job-after-inactive:2|delayed-job-after-failed:2)
+          state=activating; sub_state=start-pre; control_pid=43
+          ;;
+        delayed-job-after-inactive:*|delayed-job-after-failed:*)
+          state=active; sub_state=running; control_pid=44
+          ;;
+        failed:1) state=activating; sub_state=start-pre; control_pid=51 ;;
+        failed:*) state=failed; sub_state=failed; result=exit-code ;;
+        failed-same-result:*) state=failed; sub_state=failed; result=exit-code ;;
+        maintenance-after-enqueue:*)
+          state=maintenance; sub_state=maintenance; control_pid=65
+          ;;
+        refreshing-after-enqueue:*)
+          state=refreshing; sub_state=refreshing; control_pid=66
+          ;;
+        confirmed-restart-first-start:1)
+          state=activating; sub_state=start; control_pid=71
+          ;;
+        confirmed-restart-first-start:*)
+          state=active; sub_state=running; control_pid=72
+          ;;
+        confirmed-no-job-inactive:*)
+          state=inactive; sub_state=dead; invocation_id=old-invocation
+          ;;
+        active-masked-no-job:*)
+          state=active; sub_state=running
+          if [ ! -f "$FAKE_SYSTEMD_ROOT/first-finished" ]; then
+            load_state=masked
+          fi
+          ;;
+        job-read-failure-active:*) state=active; sub_state=running ;;
+        stuck:*) state=activating; sub_state=start-pre; control_pid=61 ;;
+        timeout-restart-start-job:1)
+          state=activating; sub_state=start; control_pid=81
+          ;;
+        timeout-restart-start-job:*) state=active; sub_state=running ;;
+        timeout-restart-exact-job:1|timeout-restart-exact-job:2)
+          state=activating; sub_state=start; control_pid=83
+          ;;
+        timeout-restart-exact-job:*) state=active; sub_state=running ;;
+        timeout-restart-ambiguous-survivor:*)
+          if [ -f "$FAKE_SYSTEMD_ROOT/first-finished" ]; then
+            state=active; sub_state=running; invocation_id=new-invocation
+          else
+            state=activating; sub_state=start; control_pid=85
+          fi
+          ;;
+        timeout-restart-transition-no-job:1)
+          state=reloading; sub_state=reload; control_pid=91
+          ;;
+        timeout-restart-transition-no-job:*) state=active; sub_state=running ;;
+        timeout-tracked-job-replaced:*)
+          if [ -f "$FAKE_SYSTEMD_ROOT/first-finished" ]; then
+            state=active; sub_state=running; invocation_id=replacement-invocation
+          else
+            state=activating; sub_state=start; invocation_id=old-invocation
+          fi
+          ;;
+        timeout-tracked-job-completes-on-retry:*)
+          if [ -f "$FAKE_SYSTEMD_ROOT/first-finished" ]; then
+            state=active; sub_state=running; invocation_id=new-invocation
+          else
+            state=activating; sub_state=start; invocation_id=old-invocation
+          fi
+          ;;
+        timeout-tracked-job-active-equal:*)
+          state=active; sub_state=running; invocation_id=old-invocation
+          ;;
+        timeout-tracked-job-active-unknown:*)
+          state=active; sub_state=running; invocation_id=
+          ;;
+        timeout-tracked-job-failed:*)
+          if [ -f "$FAKE_SYSTEMD_ROOT/first-finished" ]; then
+            state=failed; sub_state=failed; result=exit-code
+          else
+            state=active; sub_state=running; invocation_id=old-invocation
+          fi
+          ;;
+        timeout-tracked-job-inactive:*)
+          if [ -f "$FAKE_SYSTEMD_ROOT/first-finished" ]; then
+            state=inactive; sub_state=dead
+          else
+            state=active; sub_state=running; invocation_id=old-invocation
+          fi
+          ;;
+        timeout-tracked-job-masked:*)
+          state=active; sub_state=running; invocation_id=old-invocation
+          if [ -f "$FAKE_SYSTEMD_ROOT/first-finished" ]; then
+            load_state=masked
+          fi
+          ;;
+        timeout-tracked-job-transition-retry:*)
+          invocation_id=
+          if [ ! -f "$FAKE_SYSTEMD_ROOT/first-finished" ]; then
+            state=active; sub_state=running
+          elif [ ! -f "$FAKE_SYSTEMD_ROOT/transition-served" ]; then
+            state=activating; sub_state=start
+          else
+            state=active; sub_state=running
+          fi
+          ;;
+      esac
+    fi
+    printf '%s\n' \
+      "LoadState=$load_state" \
+      "ActiveState=$state" \
+      "SubState=$sub_state" \
+      "Result=$result" \
+      "ControlPID=$control_pid" \
+      'ExecMainCode=0' \
+      'ExecMainStatus=0' \
+      'TimeoutStartUSec=5min' \
+      "InvocationID=$invocation_id"
+    ;;
+  list-jobs)
+    if [ "$FAKE_SYSTEMD_SCENARIO" = unknown-job-initial ]; then
+      exit 1
+    fi
+    if [ "$FAKE_SYSTEMD_SCENARIO" = job-read-failure-active ] && \
+       [ -f "$FAKE_SYSTEMD_ROOT/enqueued" ]; then
+      exit 1
+    fi
+    post_count=0
+    if [ -f "$FAKE_SYSTEMD_ROOT/post-count" ]; then
+      post_count="$(cat "$FAKE_SYSTEMD_ROOT/post-count")"
+    fi
+    show_count=0
+    if [ -f "$FAKE_SYSTEMD_ROOT/show-count" ]; then
+      show_count="$(cat "$FAKE_SYSTEMD_ROOT/show-count")"
+    fi
+    case "$FAKE_SYSTEMD_SCENARIO:$post_count" in
+      delayed:1|delayed:2|failed:1)
+        printf '101 clio-relay-worker-test.service start running\n'
+        ;;
+      delayed-job-after-inactive:2|delayed-job-after-failed:2)
+        printf '102 clio-relay-worker-test.service start running\n'
+        ;;
+      stuck:*)
+        if [ -f "$FAKE_SYSTEMD_ROOT/enqueued" ]; then
+          printf '101 clio-relay-worker-test.service start running\n'
+        fi
+        ;;
+      preexisting-reload:*)
+        printf '202 clio-relay-worker-test.service reload waiting\n'
+        ;;
+      confirmed-restart-first-start:1)
+        printf '401 clio-relay-worker-test.service start running\n'
+        ;;
+      timeout-restart-start-job:1)
+        printf '501 clio-relay-worker-test.service start running\n'
+        ;;
+      timeout-restart-exact-job:1)
+        printf '502 clio-relay-worker-test.service restart running\n'
+        ;;
+      timeout-restart-exact-job:2)
+        printf '502 clio-relay-worker-test.service start running\n'
+        ;;
+      timeout-restart-ambiguous-survivor:*)
+        if [ -f "$FAKE_SYSTEMD_ROOT/enqueued" ] && \
+           [ ! -f "$FAKE_SYSTEMD_ROOT/first-finished" ]; then
+          printf '%s\n' \
+            '801 clio-relay-worker-test.service restart running' \
+            '802 clio-relay-worker-test.service start waiting'
+        elif [ -f "$FAKE_SYSTEMD_ROOT/first-finished" ] && \
+             [ ! -f "$FAKE_SYSTEMD_ROOT/survivor-served" ]; then
+          printf '801 clio-relay-worker-test.service restart running\n'
+          : > "$FAKE_SYSTEMD_ROOT/survivor-served"
+        fi
+        ;;
+      timeout-tracked-job-replaced:*)
+        if [ -f "$FAKE_SYSTEMD_ROOT/enqueued" ] && \
+           [ ! -f "$FAKE_SYSTEMD_ROOT/first-finished" ]; then
+          printf '601 clio-relay-worker-test.service restart running\n'
+        elif [ -f "$FAKE_SYSTEMD_ROOT/first-finished" ] && \
+             [ ! -f "$FAKE_SYSTEMD_ROOT/replacement-served" ]; then
+          printf '602 clio-relay-worker-test.service restart running\n'
+          : > "$FAKE_SYSTEMD_ROOT/replacement-served"
+        fi
+        ;;
+    esac
+    case "$FAKE_SYSTEMD_SCENARIO:$show_count" in
+      preexisting-start-activating:1)
+        printf '203 clio-relay-worker-test.service start running\n'
+        ;;
+      ambiguous-replacement:1)
+        printf '301 clio-relay-worker-test.service restart running\n'
+        ;;
+      ambiguous-replacement:2)
+        printf '%s\n' \
+          '301 clio-relay-worker-test.service restart running' \
+          '302 clio-relay-worker-test.service start waiting'
+        ;;
+      preexisting-restart-same-id:1|restart-same-invocation:1)
+        printf '301 clio-relay-worker-test.service restart running\n'
+        ;;
+      restart-active-unknown-invocation:1)
+        printf '301 clio-relay-worker-test.service restart running\n'
+        ;;
+      preexisting-restart-same-id:2|restart-same-invocation:2)
+        printf '301 clio-relay-worker-test.service start running\n'
+        ;;
+      preexisting-restart-different-id:1)
+        printf '301 clio-relay-worker-test.service restart running\n'
+        ;;
+      preexisting-restart-different-id:2)
+        printf '302 clio-relay-worker-test.service start running\n'
+        ;;
+      preexisting-start-stable:1|preexisting-start-stable:2)
+        printf '310 clio-relay-worker-test.service start running\n'
+        ;;
+      preexisting-restart-stable:1|preexisting-restart-stable:2)
+        printf '311 clio-relay-worker-test.service restart running\n'
+        ;;
+      preflight-ambiguous-survivor:*)
+        if [ ! -f "$FAKE_SYSTEMD_ROOT/first-finished" ]; then
+          printf '%s\n' \
+            '701 clio-relay-worker-test.service restart running' \
+            '702 clio-relay-worker-test.service start waiting'
+        elif [ ! -f "$FAKE_SYSTEMD_ROOT/survivor-served" ]; then
+          printf '701 clio-relay-worker-test.service restart running\n'
+          : > "$FAKE_SYSTEMD_ROOT/survivor-served"
+        fi
+        ;;
+      timeout-tracked-job-active-equal:*|timeout-tracked-job-active-unknown:*|timeout-tracked-job-failed:*|timeout-tracked-job-inactive:*|timeout-tracked-job-masked:*)
+        if [ -f "$FAKE_SYSTEMD_ROOT/enqueued" ] && \
+           {{ [ ! -f "$FAKE_SYSTEMD_ROOT/first-finished" ] || \
+              [ "$FAKE_SYSTEMD_SCENARIO" = timeout-tracked-job-masked ]; }}; then
+          printf '910 clio-relay-worker-test.service restart running\n'
+        fi
+        ;;
+      timeout-tracked-job-transition-retry:*)
+        if [ -f "$FAKE_SYSTEMD_ROOT/enqueued" ] && \
+           {{ [ ! -f "$FAKE_SYSTEMD_ROOT/first-finished" ] || \
+              [ ! -f "$FAKE_SYSTEMD_ROOT/transition-served" ]; }}; then
+          printf '920 clio-relay-worker-test.service restart running\n'
+          if [ -f "$FAKE_SYSTEMD_ROOT/first-finished" ]; then
+            : > "$FAKE_SYSTEMD_ROOT/transition-served"
+          fi
+        fi
+        ;;
+      timeout-tracked-job-completes-on-retry:*)
+        if [ -f "$FAKE_SYSTEMD_ROOT/enqueued" ] && \
+           [ ! -f "$FAKE_SYSTEMD_ROOT/first-finished" ]; then
+          printf '901 clio-relay-worker-test.service restart running\n'
+        fi
+        ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+__FAKE_SYSTEMCTL__
+cat > "$test_root/bin/flock" <<'__FAKE_FLOCK__'
+#!/usr/bin/env bash
+set -u
+case "${{1:-}}" in
+  --exclusive)
+    while ! mkdir "$FAKE_SYSTEMD_ROOT/activation-flock" 2>/dev/null; do sleep 0.05; done
+    ;;
+  --unlock) rmdir "$FAKE_SYSTEMD_ROOT/activation-flock" ;;
+  *) exit 2 ;;
+esac
+__FAKE_FLOCK__
+chmod +x "$test_root/bin/systemctl" "$test_root/bin/flock"
+export PATH="$test_root/bin:$PATH"
+CLIO_RELAY_ENDPOINT_SERVICE_NAME=clio-relay-worker-test.service
+CLIO_RELAY_ENDPOINT_ACTIVATION_ACTION={activation_action}
+{helper}
+fixture_started=$SECONDS
+first_status=0
+clio_relay_endpoint_activate_bounded || first_status=$?
+first_outcome="$CLIO_RELAY_ENDPOINT_ACTIVATION_OUTCOME"
+if [[ "$FAKE_SYSTEMD_SCENARIO" = timeout-tracked-job-replaced ||
+      "$FAKE_SYSTEMD_SCENARIO" = active-masked-no-job ||
+      "$FAKE_SYSTEMD_SCENARIO" = timeout-tracked-job-completes-on-retry ||
+      "$FAKE_SYSTEMD_SCENARIO" = timeout-tracked-job-active-equal ||
+      "$FAKE_SYSTEMD_SCENARIO" = timeout-tracked-job-active-unknown ||
+      "$FAKE_SYSTEMD_SCENARIO" = timeout-tracked-job-failed ||
+      "$FAKE_SYSTEMD_SCENARIO" = timeout-tracked-job-inactive ||
+      "$FAKE_SYSTEMD_SCENARIO" = timeout-tracked-job-masked ||
+      "$FAKE_SYSTEMD_SCENARIO" = timeout-tracked-job-transition-retry ||
+      "$FAKE_SYSTEMD_SCENARIO" = preflight-ambiguous-survivor ||
+      "$FAKE_SYSTEMD_SCENARIO" = timeout-restart-ambiguous-survivor ]]; then
+  : > "$FAKE_SYSTEMD_ROOT/first-finished"
+fi
+{repeat}printf 'fixture.first_status=%s\n' "$first_status"
+printf 'fixture.first_outcome=%s\n' "$first_outcome"
+printf 'fixture.final_outcome=%s\n' "$CLIO_RELAY_ENDPOINT_ACTIVATION_OUTCOME"
+printf 'fixture.elapsed=%s\n' "$((SECONDS - fixture_started))"
+attempts=0
+if [ -f "$test_root/attempts" ]; then attempts="$(cat "$test_root/attempts")"; fi
+printf 'fixture.attempts=%s\n' "$attempts"
+exit "$first_status"
+"""
+    return subprocess.run(
+        [bash, "-s"],
+        input=harness.encode("utf-8"),
+        capture_output=True,
+        check=False,
+        timeout=observation_timeout_seconds + 10,
+    )
+
+
+def test_endpoint_activation_waits_for_queued_delayed_dispatch() -> None:
+    """An inactive unit with an exact queued job is not a startup failure."""
+    result = _run_activation_observer_fixture(
+        scenario="delayed",
+        observation_timeout_seconds=5,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 0, stderr
+    assert "active_state=inactive" in stdout
+    assert "job_id=101" in stdout
+    assert "active_state=activating" in stdout
+    assert "active_state=active" in stdout
+    assert "outcome=not-attempted" not in stdout
+    assert "fixture.first_outcome=active" in stdout
+    assert "fixture.attempts=1" in stdout
+
+
+@pytest.mark.parametrize(
+    ("scenario", "active_state"),
+    [
+        ("delayed-job-after-inactive", "inactive"),
+        ("delayed-job-after-failed", "failed"),
+    ],
+)
+def test_endpoint_activation_enqueue_grace_precedes_late_exact_job(
+    scenario: str,
+    active_state: str,
+) -> None:
+    """A confirmed enqueue reports grace before its exact job becomes visible."""
+    result = _run_activation_observer_fixture(
+        scenario=scenario,
+        observation_timeout_seconds=5,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    grace_records = [
+        line
+        for line in stdout.splitlines()
+        if line.startswith("endpoint_service.activation ")
+        and f"active_state={active_state}" in line
+        and "job_id=none" in line
+        and "outcome=in-progress" in line
+    ]
+    assert result.returncode == 0, stderr
+    assert grace_records
+    assert "job_id=102 job_type=start" in stdout
+    assert "fixture.first_outcome=active" in stdout
+    assert "fixture.attempts=1" in stdout
+
+
+def test_endpoint_activation_reports_terminal_systemd_failure() -> None:
+    """A vanished observed job plus failed state is terminal evidence."""
+    result = _run_activation_observer_fixture(
+        scenario="failed",
+        observation_timeout_seconds=5,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=failed" in stdout
+    assert "active_state=failed" in stderr
+    assert "result=exit-code" in stderr
+    assert "activation.operator_hint=journalctl --user" in stderr
+    assert "fixture.attempts=1" in stdout
+
+
+def test_endpoint_activation_rejects_active_masked_unit() -> None:
+    """ActiveState cannot override a terminal non-loaded unit state."""
+    result = _run_activation_observer_fixture(
+        scenario="active-masked-no-job",
+        observation_timeout_seconds=5,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=failed" in stdout
+    assert "fixture.attempts=1" in stdout
+    assert "load_state=masked" in stderr
+    assert "active_state=active" in stderr
+    assert "job_id=none" in stderr
+    assert "outcome=active" not in stdout
+
+
+def test_endpoint_activation_masked_failure_requires_fresh_process_after_repair() -> None:
+    """A repaired unit cannot reuse provenance rejected by a masked snapshot."""
+    result = _run_activation_observer_fixture(
+        scenario="active-masked-no-job",
+        observation_timeout_seconds=5,
+        repeat_after_failure_count=1,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=failed" in stdout
+    assert "fixture.final_outcome=unverified" in stdout
+    assert "fixture.attempts=1" in stdout
+    assert "load_state=masked" in stderr
+    assert "load_state=loaded" in stderr
+    assert "active_state=active" in stderr
+    assert "outcome=active" not in stdout
+
+
+@pytest.mark.parametrize(
+    ("scenario", "active_state"),
+    [
+        ("preexisting-maintenance-no-job", "maintenance"),
+        ("preexisting-refreshing-no-job", "refreshing"),
+        ("preexisting-future-active-no-job", "future-active"),
+    ],
+)
+def test_endpoint_activation_preflight_rejects_nonstable_active_state(
+    scenario: str,
+    active_state: str,
+) -> None:
+    """Only stable systemd ActiveState values may reach the enqueue boundary."""
+    result = _run_activation_observer_fixture(
+        scenario=scenario,
+        observation_timeout_seconds=5,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=in-progress" in stdout
+    assert "fixture.attempts=0" in stdout
+    assert f"active_state={active_state}" in stderr
+    assert "job_id=none" in stderr
+    assert "outcome=active" not in stdout
+
+
+@pytest.mark.parametrize(
+    ("scenario", "active_state"),
+    [
+        ("maintenance-after-enqueue", "maintenance"),
+        ("refreshing-after-enqueue", "refreshing"),
+    ],
+)
+def test_endpoint_activation_observes_extended_transitional_state(
+    scenario: str,
+    active_state: str,
+) -> None:
+    """Maintenance and refreshing remain in-progress after a proven enqueue."""
+    result = _run_activation_observer_fixture(
+        scenario=scenario,
+        observation_timeout_seconds=2,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=in-progress" in stdout
+    assert "fixture.attempts=1" in stdout
+    assert f"active_state={active_state}" in stderr
+    assert "outcome=active" not in stdout
+
+
+@pytest.mark.parametrize(
+    ("scenario", "load_state", "active_state", "outcome"),
+    [
+        ("preexisting-masked-inactive-no-job", "masked", "inactive", "failed"),
+        ("preexisting-masked-active-no-job", "masked", "active", "failed"),
+        (
+            "preexisting-stub-inactive-no-job",
+            "stub",
+            "inactive",
+            "preflight-unverified",
+        ),
+        (
+            "preexisting-merged-active-no-job",
+            "merged",
+            "active",
+            "preflight-unverified",
+        ),
+        (
+            "preexisting-future-load-no-job",
+            "future-load",
+            "inactive",
+            "preflight-unverified",
+        ),
+    ],
+)
+def test_endpoint_activation_preflight_rejects_nonloaded_unit(
+    scenario: str,
+    load_state: str,
+    active_state: str,
+    outcome: str,
+) -> None:
+    """Every non-loaded systemd LoadState fails closed before mutation."""
+    result = _run_activation_observer_fixture(
+        scenario=scenario,
+        observation_timeout_seconds=5,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert f"fixture.first_outcome={outcome}" in stdout
+    assert "fixture.attempts=0" in stdout
+    assert f"load_state={load_state}" in stderr
+    assert f"active_state={active_state}" in stderr
+    assert "job_id=none" in stderr
+    assert "outcome=active" not in stdout
+
+
+def test_endpoint_activation_initial_state_failure_does_not_enqueue() -> None:
+    """An unreadable initial state fails closed before systemd mutation."""
+    result = _run_activation_observer_fixture(
+        scenario="unknown-initial",
+        observation_timeout_seconds=2,
+        activation_action="restart",
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=preflight-unverified" in stdout
+    assert "fixture.attempts=0" in stdout
+    assert "active_state=unknown" in stderr
+
+
+def test_endpoint_activation_initial_job_read_failure_reports_unknown_inventory() -> None:
+    """A failed list-jobs read cannot be represented as a proven empty inventory."""
+    result = _run_activation_observer_fixture(
+        scenario="unknown-job-initial",
+        observation_timeout_seconds=2,
+        activation_action="restart",
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=preflight-unverified" in stdout
+    assert "fixture.attempts=0" in stdout
+    assert "job_id=unknown" in stderr
+    assert "job_type=unknown" in stderr
+    assert "job_state=unknown" in stderr
+    assert "job_id=none" not in stderr
+
+
+def test_endpoint_activation_active_with_unreadable_job_inventory_is_unverified() -> None:
+    """Active state cannot pass while the exact job inventory is unreadable."""
+    result = _run_activation_observer_fixture(
+        scenario="job-read-failure-active",
+        observation_timeout_seconds=2,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=unverified" in stdout
+    assert "fixture.attempts=1" in stdout
+    assert "active_state=active" in stderr
+    assert "job_id=unknown" in stderr
+    assert "job_type=unknown" in stderr
+    assert "outcome=active" not in stdout
+
+
+def test_endpoint_activation_repeated_failure_uses_new_invocation_evidence() -> None:
+    """A new failed invocation is terminal even when Result stays unchanged."""
+    result = _run_activation_observer_fixture(
+        scenario="failed-same-result",
+        observation_timeout_seconds=5,
+        activation_action="restart",
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+    elapsed = int(
+        next(line for line in stdout.splitlines() if line.startswith("fixture.elapsed=")).split(
+            "=", 1
+        )[1]
+    )
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=failed" in stdout
+    assert elapsed < 5
+    assert "fixture.attempts=1" in stdout
+    assert "result=exit-code" in stderr
+    assert "invocation_id=new-invocation" in stderr
+
+
+def test_endpoint_activation_rejects_incompatible_preexisting_job() -> None:
+    """A queued reload is reported without mutating a requested restart."""
+    result = _run_activation_observer_fixture(
+        scenario="preexisting-reload",
+        observation_timeout_seconds=5,
+        activation_action="restart",
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+    elapsed = int(
+        next(line for line in stdout.splitlines() if line.startswith("fixture.elapsed=")).split(
+            "=", 1
+        )[1]
+    )
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=in-progress" in stdout
+    assert "fixture.attempts=0" in stdout
+    assert elapsed < 5
+    assert "active_state=active" in stderr
+    assert "job_id=202" in stderr
+    assert "job_type=reload" in stderr
+
+
+def test_endpoint_activation_rejects_bare_transitional_preflight_state() -> None:
+    """A jobless reload cannot be mistaken for evidence of our requested restart."""
+    result = _run_activation_observer_fixture(
+        scenario="preexisting-reloading-no-job",
+        observation_timeout_seconds=5,
+        activation_action="restart",
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+    elapsed = int(
+        next(line for line in stdout.splitlines() if line.startswith("fixture.elapsed=")).split(
+            "=", 1
+        )[1]
+    )
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=in-progress" in stdout
+    assert "fixture.attempts=0" in stdout
+    assert elapsed < 5
+    assert "active_state=reloading" in stderr
+    assert "job_id=none" in stderr
+    assert "active_state=active" not in stdout
+
+
+def test_endpoint_restart_rejects_preexisting_standalone_start() -> None:
+    """A standalone start job cannot prove the requested restart is in progress."""
+    result = _run_activation_observer_fixture(
+        scenario="preexisting-start-activating",
+        observation_timeout_seconds=5,
+        activation_action="restart",
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=in-progress" in stdout
+    assert "fixture.attempts=0" in stdout
+    assert "active_state=activating" in stderr
+    assert "job_id=203" in stderr
+    assert "job_type=start" in stderr
+    assert "outcome=active" not in stdout
+
+
+def test_endpoint_restart_adopts_same_job_restart_to_start_transition() -> None:
+    """An adopted restart may become start only while retaining its job ID."""
+    result = _run_activation_observer_fixture(
+        scenario="preexisting-restart-same-id",
+        observation_timeout_seconds=5,
+        activation_action="restart",
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 0, stderr
+    assert "job_id=301 job_type=restart" in stdout
+    assert "job_id=301 job_type=start" in stdout
+    assert "fixture.first_outcome=active" in stdout
+    assert "fixture.attempts=0" in stdout
+
+
+@pytest.mark.parametrize("activation_action", ["start", "restart"])
+def test_endpoint_activation_rejects_changed_adopted_job_id(
+    activation_action: str,
+) -> None:
+    """An unrelated job cannot replace the exact job first adopted by a request."""
+    result = _run_activation_observer_fixture(
+        scenario="preexisting-restart-different-id",
+        observation_timeout_seconds=5,
+        activation_action=activation_action,
+        repeat_after_failure_count=1,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=in-progress" in stdout
+    assert "fixture.final_outcome=unverified" in stdout
+    assert "fixture.attempts=0" in stdout
+    assert "job_id=302" in stderr
+    assert "job_type=start" in stderr
+    assert "outcome=active" not in stdout
+
+
+def test_endpoint_restart_rejects_ambiguous_replacement_jobs() -> None:
+    """Multiple replacement jobs invalidate an adopted restart's provenance."""
+    result = _run_activation_observer_fixture(
+        scenario="ambiguous-replacement",
+        observation_timeout_seconds=5,
+        activation_action="restart",
+        repeat_after_failure_count=1,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=in-progress" in stdout
+    assert "fixture.final_outcome=unverified" in stdout
+    assert "fixture.attempts=0" in stdout
+    assert "job_id=ambiguous" in stderr
+    assert "job_type=ambiguous" in stderr
+    assert "outcome=active" not in stdout
+
+
+@pytest.mark.parametrize(
+    ("scenario", "first_outcome", "attempts", "survivor_job_id"),
+    [
+        ("preflight-ambiguous-survivor", "preflight-unverified", 0, "701"),
+        ("timeout-restart-ambiguous-survivor", "enqueue-unverified", 1, "801"),
+    ],
+)
+def test_endpoint_restart_ambiguous_inventory_rejects_later_survivor(
+    scenario: str,
+    first_outcome: str,
+    attempts: int,
+    survivor_job_id: str,
+) -> None:
+    """Ambiguous inventory permanently rejects a later survivor and active state."""
+    result = _run_activation_observer_fixture(
+        scenario=scenario,
+        observation_timeout_seconds=5,
+        activation_action="restart",
+        repeat_after_failure_count=2,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert f"fixture.first_outcome={first_outcome}" in stdout
+    assert "fixture.final_outcome=unverified" in stdout
+    assert f"fixture.attempts={attempts}" in stdout
+    assert "job_id=ambiguous" in stderr
+    assert f"job_id={survivor_job_id}" in stderr
+    assert "outcome=active" not in stdout
+
+
+def test_endpoint_restart_confirmed_enqueue_can_bind_first_start_job() -> None:
+    """A successful restart enqueue may first expose its systemd job as start."""
+    result = _run_activation_observer_fixture(
+        scenario="confirmed-restart-first-start",
+        observation_timeout_seconds=5,
+        activation_action="restart",
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 0, stderr
+    assert "job_id=401 job_type=start" in stdout
+    assert "outcome=not-attempted" not in stdout
+    assert "fixture.first_outcome=active" in stdout
+    assert "fixture.attempts=1" in stdout
+
+
+def test_endpoint_restart_enqueue_grace_expires_before_retry() -> None:
+    """Confirmed enqueue grace does not survive timeout into a same-shell retry."""
+    result = _run_activation_observer_fixture(
+        scenario="confirmed-no-job-inactive",
+        observation_timeout_seconds=2,
+        activation_action="restart",
+        repeat_after_failure_count=1,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    progress_records = [
+        line
+        for line in stdout.splitlines()
+        if line.startswith("endpoint_service.activation ") and "outcome=in-progress" in line
+    ]
+    assert result.returncode == 1
+    assert progress_records
+    assert "fixture.first_outcome=unverified" in stdout
+    assert "fixture.final_outcome=unverified" in stdout
+    assert "fixture.attempts=1" in stdout
+    assert "active_state=inactive" in stderr
+    assert "job_id=none" in stderr
+    assert "outcome=active" not in stdout
+
+
+def test_endpoint_restart_timeout_does_not_adopt_start_job() -> None:
+    """A timed-out restart has no provenance for a newly observed start job."""
+    result = _run_activation_observer_fixture(
+        scenario="timeout-restart-start-job",
+        observation_timeout_seconds=5,
+        activation_action="restart",
+        repeat_after_failure_count=1,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=enqueue-unverified" in stdout
+    assert "fixture.final_outcome=unverified" in stdout
+    assert "fixture.attempts=1" in stdout
+    assert "active_state=activating" in stderr
+    assert "job_id=501" in stderr
+    assert "job_type=start" in stderr
+    assert "outcome=active" not in stdout
+
+
+def test_endpoint_restart_timeout_adopts_exact_restart_job() -> None:
+    """A timed-out enqueue can adopt an exact restart and its same-ID start phase."""
+    result = _run_activation_observer_fixture(
+        scenario="timeout-restart-exact-job",
+        observation_timeout_seconds=5,
+        activation_action="restart",
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 0, stderr
+    assert "job_id=502 job_type=start" in stdout
+    assert "outcome=in-progress" in stdout
+    assert "outcome=enqueue-unverified" not in stdout
+    assert "outcome=failed" not in stdout
+    assert "fixture.first_outcome=active" in stdout
+    assert "fixture.attempts=1" in stdout
+
+
+def test_endpoint_restart_timeout_does_not_adopt_bare_transition() -> None:
+    """A timed-out restart cannot claim a jobless transition or later active state."""
+    result = _run_activation_observer_fixture(
+        scenario="timeout-restart-transition-no-job",
+        observation_timeout_seconds=5,
+        activation_action="restart",
+        repeat_after_failure_count=1,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=enqueue-unverified" in stdout
+    assert "fixture.final_outcome=unverified" in stdout
+    assert "fixture.attempts=1" in stdout
+    assert "active_state=reloading" in stderr
+    assert "job_id=none" in stderr
+    assert "outcome=active" not in stdout
+
+
+def test_endpoint_restart_retry_rejects_replacement_after_timeout() -> None:
+    """A retry latches a replacement job before a later no-job active state."""
+    result = _run_activation_observer_fixture(
+        scenario="timeout-tracked-job-replaced",
+        observation_timeout_seconds=2,
+        activation_action="restart",
+        repeat_after_failure_count=2,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=in-progress" in stdout
+    assert "fixture.final_outcome=unverified" in stdout
+    assert "fixture.attempts=1" in stdout
+    assert "job_id=601" in stderr
+    assert "job_id=602" in stderr
+    assert "outcome=active" not in stdout
+
+
+def test_endpoint_restart_retry_emits_terminal_active_observation() -> None:
+    """A timed-out observer emits terminal evidence when a retry proves completion."""
+    result = _run_activation_observer_fixture(
+        scenario="timeout-tracked-job-completes-on-retry",
+        observation_timeout_seconds=2,
+        activation_action="restart",
+        repeat_after_failure_count=1,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+
+    terminal_records = [
+        line
+        for line in stdout.splitlines()
+        if line.startswith("endpoint_service.activation ") and "outcome=active" in line
+    ]
+    assert result.returncode == 1
+    assert "fixture.first_outcome=in-progress" in stdout
+    assert "fixture.final_outcome=active" in stdout
+    assert "fixture.attempts=1" in stdout
+    assert len(terminal_records) == 1
+    assert "active_state=active" in terminal_records[0]
+    assert "job_id=none" in terminal_records[0]
+
+
+def test_endpoint_restart_retry_preserves_same_job_transition_evidence() -> None:
+    """A same-job retry transition proves restart when InvocationID is unavailable."""
+    result = _run_activation_observer_fixture(
+        scenario="timeout-tracked-job-transition-retry",
+        observation_timeout_seconds=2,
+        activation_action="restart",
+        repeat_after_failure_count=2,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+
+    terminal_records = [
+        line
+        for line in stdout.splitlines()
+        if line.startswith("endpoint_service.activation ") and "outcome=active" in line
+    ]
+    assert result.returncode == 1
+    assert "fixture.first_outcome=in-progress" in stdout
+    assert "job_id=920 job_type=restart" in stdout
+    assert "active_state=activating" in stdout
+    assert "fixture.final_outcome=active" in stdout
+    assert "fixture.attempts=1" in stdout
+    assert len(terminal_records) == 1
+    assert "invocation_id=" in terminal_records[0]
+    assert "job_id=none" in terminal_records[0]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "active_state", "final_outcome", "final_job_id"),
+    [
+        ("timeout-tracked-job-active-equal", "active", "unverified", "none"),
+        ("timeout-tracked-job-active-unknown", "active", "unverified", "none"),
+        ("timeout-tracked-job-failed", "failed", "failed", "none"),
+        ("timeout-tracked-job-inactive", "inactive", "failed", "none"),
+        ("timeout-tracked-job-masked", "active", "failed", "910"),
+    ],
+)
+def test_endpoint_restart_retry_classifies_fresh_terminal_evidence(
+    scenario: str,
+    active_state: str,
+    final_outcome: str,
+    final_job_id: str,
+) -> None:
+    """A retry replaces the prior timeout outcome with its current exact evidence."""
+    result = _run_activation_observer_fixture(
+        scenario=scenario,
+        observation_timeout_seconds=2,
+        activation_action="restart",
+        repeat_after_failure_count=1,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=in-progress" in stdout
+    assert f"fixture.final_outcome={final_outcome}" in stdout
+    assert "fixture.attempts=1" in stdout
+    assert f"active_state={active_state}" in stderr
+    assert f"job_id={final_job_id}" in stderr
+    assert "outcome=active" not in stdout
+
+
+@pytest.mark.parametrize(
+    ("scenario", "job_type"),
+    [
+        ("preexisting-start-stable", "start"),
+        ("preexisting-restart-stable", "restart"),
+    ],
+)
+def test_endpoint_start_adopts_stable_compatible_job(
+    scenario: str,
+    job_type: str,
+) -> None:
+    """A start request can observe an exact stable start or restart job."""
+    result = _run_activation_observer_fixture(
+        scenario=scenario,
+        observation_timeout_seconds=5,
+        activation_action="start",
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 0, stderr
+    assert f"job_type={job_type}" in stdout
+    assert "fixture.first_outcome=active" in stdout
+    assert "fixture.attempts=0" in stdout
+
+
+def test_endpoint_restart_known_equal_invocation_does_not_use_transition_fallback() -> None:
+    """Known-equal invocation IDs disprove restart completion after a transition."""
+    result = _run_activation_observer_fixture(
+        scenario="restart-same-invocation",
+        observation_timeout_seconds=2,
+        activation_action="restart",
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=unverified" in stdout
+    assert "fixture.attempts=0" in stdout
+    assert "active_state=active" in stderr
+    assert "invocation_id=old-invocation" in stderr
+    assert "outcome=active" not in stdout
+
+
+def test_endpoint_restart_without_invocation_or_transition_remains_unverified() -> None:
+    """A vanished restart job alone cannot prove an always-active unit restarted."""
+    result = _run_activation_observer_fixture(
+        scenario="restart-active-unknown-invocation",
+        observation_timeout_seconds=2,
+        activation_action="restart",
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=unverified" in stdout
+    assert "fixture.attempts=0" in stdout
+    assert "active_state=active" in stderr
+    assert "invocation_id=" in stderr
+    assert "outcome=active" not in stdout
+
+
+def test_endpoint_activation_timeout_preserves_job_without_duplicate_start() -> None:
+    """Observer expiry leaves an activating job intact and retry only observes it."""
+    result = _run_activation_observer_fixture(
+        scenario="stuck",
+        observation_timeout_seconds=2,
+        repeat_after_failure_count=1,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 1
+    assert "fixture.first_outcome=in-progress" in stdout
+    assert "fixture.final_outcome=in-progress" in stdout
+    assert "fixture.attempts=1" in stdout
+    assert "active_state=activating" in stderr
+    assert "job_id=101" in stderr
+
+
+def test_endpoint_activation_concurrent_fresh_shell_does_not_duplicate_job() -> None:
+    """The per-service lock closes preflight/enqueue TOCTOU across processes."""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.fail("bash is required to validate cross-process activation locking")
+    helper = deployment.render_bounded_user_service_activation_helper(
+        observation_timeout_seconds=2,
+        poll_seconds=1,
+        progress_seconds=1,
+    )
+    harness = f"""set -u
+test_root="$(mktemp -d)"
+trap 'rm -rf -- "$test_root"' EXIT
+mkdir -p "$test_root/bin" "$test_root/home"
+export HOME="$test_root/home" FAKE_SYSTEMD_ROOT="$test_root"
+cat > "$test_root/bin/systemctl" <<'__FAKE_SYSTEMCTL__'
+#!/usr/bin/env bash
+set -u
+case "${{2:-}}" in
+  start|restart)
+    attempts=0
+    if [ -f "$FAKE_SYSTEMD_ROOT/attempts" ]; then
+      attempts="$(cat "$FAKE_SYSTEMD_ROOT/attempts")"
+    fi
+    printf '%s\n' "$((attempts + 1))" > "$FAKE_SYSTEMD_ROOT/attempts"
+    : > "$FAKE_SYSTEMD_ROOT/start-entered"
+    sleep 1
+    : > "$FAKE_SYSTEMD_ROOT/enqueued"
+    ;;
+  show)
+    state=inactive
+    sub_state=dead
+    invocation=old-invocation
+    control_pid=0
+    if [ -f "$FAKE_SYSTEMD_ROOT/enqueued" ]; then
+      state=active
+      sub_state=running
+      invocation=new-invocation
+      control_pid=61
+    fi
+    printf '%s\n' 'LoadState=loaded' "ActiveState=$state" \
+      "SubState=$sub_state" 'Result=success' "ControlPID=$control_pid" \
+      'ExecMainCode=0' 'ExecMainStatus=0' 'TimeoutStartUSec=5min' \
+      "InvocationID=$invocation"
+    ;;
+  list-jobs)
+    if [ -f "$FAKE_SYSTEMD_ROOT/enqueued" ]; then
+      printf '101 clio-relay-worker-test.service start running\n'
+    fi
+    ;;
+  *) exit 2 ;;
+esac
+__FAKE_SYSTEMCTL__
+cat > "$test_root/bin/flock" <<'__FAKE_FLOCK__'
+#!/usr/bin/env bash
+set -u
+case "${{1:-}}" in
+  --exclusive)
+    while ! mkdir "$FAKE_SYSTEMD_ROOT/activation-flock" 2>/dev/null; do sleep 0.05; done
+    ;;
+  --unlock) rmdir "$FAKE_SYSTEMD_ROOT/activation-flock" ;;
+  *) exit 2 ;;
+esac
+__FAKE_FLOCK__
+chmod +x "$test_root/bin/systemctl" "$test_root/bin/flock"
+export PATH="$test_root/bin:$PATH"
+cat > "$test_root/run-helper" <<'__RUN_HELPER__'
+set -u
+CLIO_RELAY_ENDPOINT_SERVICE_NAME=clio-relay-worker-test.service
+CLIO_RELAY_ENDPOINT_ACTIVATION_ACTION=start
+{helper}
+status=0
+clio_relay_endpoint_activate_bounded || status=$?
+printf 'fresh.outcome=%s\n' "$CLIO_RELAY_ENDPOINT_ACTIVATION_OUTCOME"
+exit "$status"
+__RUN_HELPER__
+bash "$test_root/run-helper" > "$test_root/first.out" 2> "$test_root/first.err" &
+first_pid=$!
+while [ ! -f "$test_root/start-entered" ]; do sleep 0.05; done
+bash "$test_root/run-helper" > "$test_root/second.out" 2> "$test_root/second.err" &
+second_pid=$!
+first_status=0
+wait "$first_pid" || first_status=$?
+second_status=0
+wait "$second_pid" || second_status=$?
+cat "$test_root/first.out" "$test_root/second.out"
+cat "$test_root/first.err" "$test_root/second.err" >&2
+printf 'fixture.first_status=%s\n' "$first_status"
+printf 'fixture.second_status=%s\n' "$second_status"
+printf 'fixture.attempts=%s\n' "$(cat "$test_root/attempts")"
+"""
+    result = subprocess.run(
+        [bash, "-s"],
+        input=harness.encode("utf-8"),
+        capture_output=True,
+        check=False,
+        timeout=15,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 0, stderr
+    assert "fixture.first_status=1" in stdout
+    assert "fixture.second_status=1" in stdout
+    assert stdout.count("fresh.outcome=in-progress") == 2
+    assert "fixture.attempts=1" in stdout
+    assert "active_state=active" in stderr
+    assert "job_id=101" in stderr
 
 
 def test_cluster_doctor_rejects_enabled_but_inactive_endpoint_service(
@@ -440,14 +1829,36 @@ test_root="$(mktemp -d)"
 trap 'rm -rf "$test_root"' EXIT
 export HOME="$test_root/home" USER=test-user FAKE_LINGER={linger}
 loginctl() {{ echo "$FAKE_LINGER"; }}
-systemctl() {{
-  echo "systemctl=$*" >&2
-  case "${{2:-}}" in
-    is-enabled) echo enabled ;;
-    is-active) echo active ;;
-    is-system-running) echo running ;;
-  esac
-}}
+mkdir -p "$test_root/bin"
+export FAKE_SYSTEMD_ROOT="$test_root"
+cat > "$test_root/bin/systemctl" <<'__FAKE_SYSTEMCTL__'
+#!/usr/bin/env bash
+set -u
+echo "systemctl=$*" >&2
+case "${{2:-}}" in
+  is-enabled) echo enabled ;;
+  is-active) echo active ;;
+  is-system-running) echo running ;;
+  restart) : > "$FAKE_SYSTEMD_ROOT/restarted" ;;
+  list-jobs) ;;
+  show)
+    invocation=old-invocation
+    if [ -f "$FAKE_SYSTEMD_ROOT/restarted" ]; then
+      invocation=new-invocation
+    fi
+    printf '%s\n' 'LoadState=loaded' 'ActiveState=active' \
+      'SubState=running' 'Result=success' 'ControlPID=42' \
+      'ExecMainCode=0' 'ExecMainStatus=0' 'TimeoutStartUSec=5min' \
+      "InvocationID=$invocation"
+    ;;
+esac
+__FAKE_SYSTEMCTL__
+cat > "$test_root/bin/flock" <<'__FAKE_FLOCK__'
+#!/usr/bin/env bash
+case "${{1:-}}" in --exclusive|--unlock) exit 0 ;; *) exit 2 ;; esac
+__FAKE_FLOCK__
+chmod +x "$test_root/bin/systemctl" "$test_root/bin/flock"
+export PATH="$test_root/bin:$PATH"
 {script}
 """
 
@@ -468,7 +1879,7 @@ systemctl() {{
     assert "endpoint_service.active=active" in stdout
     assert "systemctl=--user daemon-reload" in stderr
     assert "systemctl=--user enable clio-relay-worker-test.service" in stderr
-    assert "systemctl=--user restart clio-relay-worker-test.service" in stderr
+    assert "systemctl=--user restart --no-block clio-relay-worker-test.service" in stderr
     if expected_warning is None:
         assert "login-scoped" not in stderr
     else:
@@ -503,13 +1914,35 @@ test_root="$(mktemp -d)"
 trap 'rm -rf "$test_root"' EXIT
 export HOME="$test_root/home" USER=test-user
 loginctl() {{ echo yes; }}
-systemctl() {{
-  case "${{2:-}}" in
-    is-enabled) echo {enabled_state} ;;
-    is-active) echo {active_state} ;;
-    is-system-running) echo running ;;
-  esac
-}}
+mkdir -p "$test_root/bin"
+export FAKE_SYSTEMD_ROOT="$test_root"
+cat > "$test_root/bin/systemctl" <<'__FAKE_SYSTEMCTL__'
+#!/usr/bin/env bash
+set -u
+case "${{2:-}}" in
+  is-enabled) echo {enabled_state} ;;
+  is-active) echo {active_state} ;;
+  is-system-running) echo running ;;
+  restart) : > "$FAKE_SYSTEMD_ROOT/restarted" ;;
+  list-jobs) ;;
+  show)
+    invocation=old-invocation
+    if [ -f "$FAKE_SYSTEMD_ROOT/restarted" ]; then
+      invocation=new-invocation
+    fi
+    printf '%s\n' 'LoadState=loaded' 'ActiveState=active' \
+      'SubState=running' 'Result=success' 'ControlPID=42' \
+      'ExecMainCode=0' 'ExecMainStatus=0' 'TimeoutStartUSec=5min' \
+      "InvocationID=$invocation"
+    ;;
+esac
+__FAKE_SYSTEMCTL__
+cat > "$test_root/bin/flock" <<'__FAKE_FLOCK__'
+#!/usr/bin/env bash
+case "${{1:-}}" in --exclusive|--unlock) exit 0 ;; *) exit 2 ;; esac
+__FAKE_FLOCK__
+chmod +x "$test_root/bin/systemctl" "$test_root/bin/flock"
+export PATH="$test_root/bin:$PATH"
 {script}
 """
 

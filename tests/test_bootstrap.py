@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 import yaml
 
+import clio_relay.deployment as deployment
 from clio_relay import __version__
 from clio_relay.application_profiles import (
     install_cluster_app_over_ssh,
@@ -496,8 +497,15 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
         archive.write_bytes(b"bootstrap archive")
         return bootstrap.BootstrapArchive(archive=archive, install_spec="clio-relay==1.0.0")
 
-    def fake_run(command: list[str]) -> subprocess.CompletedProcess[str]:
+    observed_timeouts: list[float | None] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         calls.append(command)
+        observed_timeouts.append(timeout_seconds)
         if command[0] == "scp" and command[-1].endswith("/clio-relay-bootstrap.sh"):
             uploaded_scripts.append(Path(command[1]).read_text(encoding="utf-8"))
         if command[-2:] == [
@@ -556,6 +564,16 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
         command[-1] == "ares:/tmp/clio-relay-bootstrap_abc/clio-relay-head.tar" for command in calls
     )
     assert uploaded_scripts
+    remote_script_call = calls.index(
+        ["ssh", "ares", "bash", "/tmp/clio-relay-bootstrap_abc/clio-relay-bootstrap.sh"]
+    )
+    assert (
+        observed_timeouts[remote_script_call] == bootstrap.BOOTSTRAP_REMOTE_SCRIPT_TIMEOUT_SECONDS
+    )
+    assert (
+        bootstrap.BOOTSTRAP_REMOTE_SCRIPT_TIMEOUT_SECONDS
+        >= deployment.ENDPOINT_SERVICE_START_OBSERVATION_TIMEOUT_SECONDS + 60
+    )
     assert 'exec 9>"$HOME/.local/share/clio-relay/bootstrap.lock"' in uploaded_scripts[0]
     assert "sha256sum --check --strict" in uploaded_scripts[0]
     assert "/tmp/clio-relay-head.tar" not in uploaded_scripts[0]
