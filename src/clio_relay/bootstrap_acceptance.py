@@ -115,6 +115,17 @@ def bootstrap_reuse_acceptance_evidence(
         )
     ):
         raise RelayError("bootstrap reuse changed JARVIS configuration or resource graph bytes")
+    repositories = _required_mapping(preservation, "repositories", "JARVIS preservation")
+    repository_update = _required_mapping(
+        repositories,
+        "repositories",
+        "JARVIS repository binding",
+    )
+    if (
+        _required_string(repositories, "link_action", "JARVIS repository binding") != "reused"
+        or _required_string(repository_update, "action", "JARVIS repository update") != "reused"
+    ):
+        raise RelayError("bootstrap reuse changed the JARVIS repository binding")
 
     components = _required_mapping(receipt, "components", "bootstrap receipt")
     if not components:

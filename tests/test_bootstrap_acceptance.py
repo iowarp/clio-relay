@@ -34,6 +34,10 @@ def _receipt(outcome: str = "noop_verified") -> dict[str, object]:
         "jarvis_preservation": {
             "config_byte_identical": True,
             "resource_graph_byte_identical": True,
+            "repositories": {
+                "link_action": "reused",
+                "repositories": {"action": "reused"},
+            },
         },
         "components": {
             "clio-relay": {"action": "reused"},
@@ -164,6 +168,16 @@ def test_service_repair_rejects_multiple_activations() -> None:
         (("jarvis_initialization", "action"), "initialized", "rebuilt JARVIS"),
         (("jarvis_resource_graph", "action"), "built", "rebuilt JARVIS"),
         (("jarvis_preservation", "config_byte_identical"), False, "changed JARVIS"),
+        (
+            ("jarvis_preservation", "repositories", "link_action"),
+            "retargeted",
+            "changed the JARVIS repository binding",
+        ),
+        (
+            ("jarvis_preservation", "repositories", "repositories", "action"),
+            "updated",
+            "changed the JARVIS repository binding",
+        ),
         (("components", "clio-relay", "action"), "prepared", "replaced component"),
         (("service", "active_after"), False, "leave the managed endpoint persistent"),
     ),
