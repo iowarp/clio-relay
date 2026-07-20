@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import stat
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal
+from typing import Literal, cast
 
 import pytest
 from pytest import MonkeyPatch
@@ -28,12 +29,17 @@ from clio_relay.session_lifecycle import (
     SESSION_SCHEDULER_CANCELED_CHECK_ID,
     SESSION_WORKER_CHECK_ID,
     CleanupResource,
+    OwnedSessionCleanupFinalizeRequest,
+    OwnedSessionCleanupTarget,
+    OwnedSessionRecoveryStatus,
     RemoteSessionStateEvidence,
     SessionApiReleaseIdentity,
     SessionLifecycleReport,
     challenge_remote_session_identity,
     detach_remote_session,
+    execute_owned_session_cleanup_finalize,
     inspect_owned_session_recovery_status,
+    session_lifecycle_report_sha256,
     start_remote_session,
     status_remote_session,
     teardown_remote_session,
@@ -104,6 +110,36 @@ def _owned_session_recovery_fixture(
     return home, session_dir, proc_root, queue
 
 
+def _write_owned_generation_process(
+    *,
+    proc_root: Path,
+    metadata: dict[str, object],
+    pid: int,
+    command: bytes,
+    start_ticks: str = "654321",
+) -> None:
+    pid_dir = proc_root / str(pid)
+    pid_dir.mkdir()
+    fields = ["S", "0", str(pid), *("0" for _ in range(16)), start_ticks]
+    (pid_dir / "stat").write_text(
+        f"{pid} (owned-child) {' '.join(fields)}",
+        encoding="utf-8",
+    )
+    markers = [
+        f"CLIO_RELAY_SESSION_OWNER_TOKEN={metadata['owner_token']}",
+        f"CLIO_RELAY_SESSION_GENERATION_ID={metadata['session_generation_id']}",
+        f"CLIO_RELAY_OWNER_SESSION_ID={metadata['session_id']}",
+        f"CLIO_RELAY_OWNER_SESSION_CLUSTER={metadata['cluster']}",
+        f"CLIO_RELAY_REMOTE_CLUSTER={metadata['cluster']}",
+        (f"CLIO_RELAY_API_RELEASE_IDENTITY_SHA256={metadata['api_release_identity_sha256']}"),
+        f"CLIO_RELAY_CLUSTER_REGISTRY={metadata['cluster_registry_path']}",
+        f"CLIO_RELAY_SESSION_REGISTRY_SHA256={metadata['cluster_registry_sha256']}",
+        f"CLIO_RELAY_SESSION_ROUTE_REVISION={metadata['cluster_route_revision']}",
+    ]
+    (pid_dir / "environ").write_bytes("\0".join(markers).encode() + b"\0")
+    (pid_dir / "cmdline").write_bytes(command)
+
+
 def test_dead_owned_session_recovery_requires_metadata_registry_and_core(
     tmp_path: Path,
 ) -> None:
@@ -126,6 +162,87 @@ def test_dead_owned_session_recovery_requires_metadata_registry_and_core(
     assert status.running is False
     assert status.ownership_verified is True
     assert status.errors == []
+
+
+def test_recovery_counts_non_clio_generation_child_when_leader_is_absent(
+    tmp_path: Path,
+) -> None:
+    home, session_dir, proc_root, queue = _owned_session_recovery_fixture(tmp_path)
+    metadata = json.loads((session_dir / "metadata.json").read_text(encoding="utf-8"))
+    _write_owned_generation_process(
+        proc_root=proc_root,
+        metadata=metadata,
+        pid=5432,
+        command=b"frpc\0-c\0owned.toml\0",
+    )
+
+    status = inspect_owned_session_recovery_status(
+        cluster="ares",
+        session_id="session-1",
+        core_dir=queue.root,
+        home=home,
+        proc_root=proc_root,
+    )
+
+    assert status.recovery_verified is True
+    assert status.leader_process_state == "absent"
+    assert status.process_state == "owned_running"
+    assert status.running is True
+    assert status.generation_process_pids == [5432]
+    assert status.process_absence_verified is False
+    assert status.generation_process_absence_verified is False
+
+
+def test_pidfd_cleanup_refuses_identity_change_after_open(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    original = session_lifecycle._OwnedGenerationProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        pid=5432,
+        process_group_id=5432,
+        start_ticks="123",
+    )
+    changed = session_lifecycle._OwnedGenerationProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        pid=5432,
+        process_group_id=5432,
+        start_ticks="456",
+    )
+    signal_calls: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(
+        os,
+        "pidfd_open",
+        lambda _pid, _flags: os.open(os.devnull, os.O_RDONLY),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        session_lifecycle,
+        "_scan_owned_generation_processes",
+        lambda **_kwargs: [changed],
+    )
+    monkeypatch.setattr(
+        signal,
+        "pidfd_send_signal",
+        lambda descriptor, number, _siginfo, _flags: signal_calls.append((descriptor, number)),
+        raising=False,
+    )
+
+    signaled = session_lifecycle._signal_owned_generation_processes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        processes=[original],
+        signal_number=signal.SIGTERM,
+        proc_root=Path("/proc"),
+        owner_token_sha256="a" * 64,
+        generation_id="generation-1",
+        session_id="session-1",
+        cluster="ares",
+        release_sha256="b" * 64,
+        registry_path="/tmp/registry.json",
+        registry_sha256="c" * 64,
+        route_revision="route-1",
+        effective_uid=None,
+    )
+
+    assert signaled == []
+    assert signal_calls == []
 
 
 def test_dead_owned_session_recovery_rejects_reused_recorded_pid(tmp_path: Path) -> None:
@@ -167,6 +284,45 @@ def test_dead_owned_session_recovery_rejects_generation_mismatch(tmp_path: Path)
 
     assert status.recovery_verified is False
     assert status.durable_generation_verified is False
+    assert status.ownership_verified is False
+
+
+def test_recovery_rejects_conflicting_active_generation(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    home, _session_dir, proc_root, queue = _owned_session_recovery_fixture(tmp_path)
+
+    def conflicting_status(
+        _self: ClioCoreQueue,
+        owner_session_id: str,
+        *,
+        session_generation_id: str,
+    ) -> dict[str, object]:
+        return {
+            "owner_session_id": owner_session_id,
+            "session_generation_id": session_generation_id,
+            "active_generation_id": "generation-b",
+            "closing_generation_id": session_generation_id,
+            "active": False,
+            "closing": True,
+            "closed": False,
+            "open": False,
+            "cleanup_intent": None,
+        }
+
+    monkeypatch.setattr(ClioCoreQueue, "owner_session_generation_status", conflicting_status)
+
+    status = inspect_owned_session_recovery_status(
+        cluster="ares",
+        session_id="session-1",
+        core_dir=queue.root,
+        home=home,
+        proc_root=proc_root,
+    )
+
+    assert status.durable_generation_verified is False
+    assert status.recovery_verified is False
     assert status.ownership_verified is False
 
 
@@ -248,6 +404,23 @@ def test_owned_session_recovery_rejects_symlinked_session_parent(
 
 def test_cleanup_receipt_supports_idempotent_pending_retry(tmp_path: Path) -> None:
     home, session_dir, proc_root, queue = _owned_session_recovery_fixture(tmp_path)
+    (session_dir / "api.log").write_text("closed\n", encoding="utf-8")
+    (session_dir / "api.pid").write_text("4321\n", encoding="ascii")
+    target_names = ["api.log", "api.pid", "cluster-registry-generation-1.json"]
+    targets: list[OwnedSessionCleanupTarget] = []
+    for name in target_names:
+        path = session_dir / name
+        path_stat = path.stat()
+        targets.append(
+            OwnedSessionCleanupTarget(
+                name=name,
+                present=True,
+                device=path_stat.st_dev,
+                inode=path_stat.st_ino,
+                size=path_stat.st_size,
+                sha256=session_lifecycle.hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+        )
     intent = queue.set_owner_session_closing(
         "session-1",
         session_generation_id="generation-1",
@@ -298,7 +471,10 @@ def test_cleanup_receipt_supports_idempotent_pending_retry(tmp_path: Path) -> No
                 ownership_verified=True,
                 outcome="closed",
                 verified_after_operation=True,
-                metadata={"metadata_sanitized": True},
+                metadata={
+                    "metadata_sanitized": True,
+                    "target_identities": [target.model_dump(mode="json") for target in targets],
+                },
             ),
         ],
     )
@@ -309,7 +485,16 @@ def test_cleanup_receipt_supports_idempotent_pending_retry(tmp_path: Path) -> No
         "session_id": "session-1",
         "session_generation_id": "generation-1",
         "api_pid": 4321,
+        "api_pgid": 4321,
+        "remote_api_port": 8765,
         "process_start_ticks": "123456",
+        "owner_token_sha256": session_lifecycle.hashlib.sha256(("b" * 64).encode()).hexdigest(),
+        "api_release_identity_sha256": _api_release_identity().sha256(),
+        "cluster_registry_path": str(session_dir / "cluster-registry-generation-1.json"),
+        "cluster_registry_sha256": targets[2].sha256,
+        "cluster_route_revision": session_lifecycle.cluster_route_revision(
+            ClusterDefinition(name="ares", ssh_host="ares")
+        ),
         "metadata_sha256": "a" * 64,
         "cleanup_operation_id": intent["operation_id"],
         "cleanup_policy": {
@@ -317,12 +502,15 @@ def test_cleanup_receipt_supports_idempotent_pending_retry(tmp_path: Path) -> No
             "cancel_jobs": False,
             "cancel_scheduler_jobs": False,
         },
-        "cleanup_paths": ["api.log", "api.pid", "cluster-registry-generation-1.json"],
+        "cleanup_paths": target_names,
+        "cleanup_targets": [target.model_dump(mode="json") for target in targets],
         "cleanup_paths_pending": True,
         "cluster_registry_verified": True,
         "cluster_registry_removed": False,
         "completed_at": observed_at.isoformat(),
         "report": report.model_dump(mode="json"),
+        "coordinator_report": None,
+        "coordinator_report_sha256": None,
     }
     (session_dir / "metadata.json").write_text(json.dumps(receipt), encoding="utf-8")
 
@@ -353,6 +541,155 @@ def test_cleanup_receipt_supports_idempotent_pending_retry(tmp_path: Path) -> No
     )
     assert closed_status.recovery_verified is True
     assert closed_status.process_state == "already_closed"
+
+
+def test_cleanup_report_finalization_is_immutable_and_idempotent(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    observed_at = datetime.now(UTC)
+    policy = {
+        "stop_worker": False,
+        "cancel_jobs": False,
+        "cancel_scheduler_jobs": False,
+    }
+    remote_report = SessionLifecycleReport(
+        cluster="ares",
+        session_id="session-1",
+        session_generation_id="generation-1",
+        mode="teardown",
+        cleanup_operation_id="cleanup-finalize",
+        cleanup_policy=policy,
+        prior_session_status=RemoteSessionStateEvidence(
+            api_pid=4321,
+            session_generation_id="generation-1",
+            process_start_marker="123456",
+            running=True,
+            ownership_verified=True,
+            observed_at=observed_at,
+        ),
+        post_session_status=RemoteSessionStateEvidence(
+            api_pid=4321,
+            session_generation_id="generation-1",
+            process_start_marker="123456",
+            running=False,
+            ownership_verified=True,
+            observed_at=observed_at,
+        ),
+        resources=[
+            CleanupResource(
+                kind="remote_relay_api",
+                resource_id="4321",
+                location="ares",
+                action="stop",
+                ownership_verified=True,
+                outcome="stopped",
+                verified_after_operation=True,
+            )
+        ],
+    )
+
+    class FakeTransaction:
+        def __init__(self) -> None:
+            self.document: dict[str, object] = {
+                "cleanup_operation_id": "cleanup-finalize",
+                "cleanup_policy": policy,
+                "report": remote_report.model_dump(mode="json"),
+                "coordinator_report": None,
+                "coordinator_report_sha256": None,
+            }
+            self.writes: list[bytes] = []
+
+        def __enter__(self) -> FakeTransaction:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read_json(self, _name: str) -> dict[str, object]:
+            return dict(self.document)
+
+        def atomic_write(self, _name: str, payload: bytes) -> None:
+            self.writes.append(payload)
+            loaded = json.loads(payload)
+            assert isinstance(loaded, dict)
+            self.document = cast(dict[str, object], loaded)
+
+    transaction = FakeTransaction()
+
+    def inspect(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        coordinator = transaction.document.get("coordinator_report")
+        digest = transaction.document.get("coordinator_report_sha256")
+        bound = isinstance(coordinator, dict) and isinstance(digest, str)
+        return OwnedSessionRecoveryStatus(
+            cluster="ares",
+            session_id="session-1",
+            session_generation_id="generation-1",
+            cleanup_receipt=True,
+            cleanup_paths_pending=False,
+            coordinator_report=(cast(dict[str, object], coordinator) if bound else None),
+            coordinator_report_sha256=cast(str, digest) if bound else None,
+            coordinator_report_bound=bound,
+            ownership_verified=True,
+            recovery_verified=True,
+        )
+
+    monkeypatch.setattr(
+        session_lifecycle,
+        "open_owned_session_transaction",
+        lambda **_kwargs: transaction,
+    )
+    monkeypatch.setattr(session_lifecycle, "inspect_owned_session_recovery_status", inspect)
+    monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)
+    request = OwnedSessionCleanupFinalizeRequest(
+        cluster="ares",
+        session_id="session-1",
+        expected_session_generation_id="generation-1",
+        expected_cleanup_operation_id="cleanup-finalize",
+        expected_cleanup_policy=policy,
+        coordinator_report=remote_report,
+        coordinator_report_sha256=session_lifecycle_report_sha256(remote_report),
+    )
+
+    finalized = execute_owned_session_cleanup_finalize(
+        request,
+        home=tmp_path,
+        core_dir=tmp_path / "core",
+    )
+    repeated = execute_owned_session_cleanup_finalize(
+        request,
+        home=tmp_path,
+        core_dir=tmp_path / "core",
+    )
+
+    assert finalized.coordinator_report_bound is True
+    assert repeated.coordinator_report_sha256 == request.coordinator_report_sha256
+    assert len(transaction.writes) == 1
+
+    replacement = remote_report.model_copy(deep=True)
+    replacement.resources.append(
+        CleanupResource(
+            kind="owner_session",
+            resource_id="session-1:generation-1",
+            location="ares",
+            action="close",
+            ownership_verified=True,
+            outcome="closed",
+            verified_after_operation=True,
+        )
+    )
+    with pytest.raises(RelayError, match="immutable"):
+        execute_owned_session_cleanup_finalize(
+            request.model_copy(
+                update={
+                    "coordinator_report": replacement,
+                    "coordinator_report_sha256": session_lifecycle_report_sha256(replacement),
+                }
+            ),
+            home=tmp_path,
+            core_dir=tmp_path / "core",
+        )
+    assert len(transaction.writes) == 1
 
 
 def test_scheduler_cancellation_evidence_rejects_an_extra_relay_link() -> None:
@@ -532,28 +869,13 @@ def test_scheduler_cancellation_evidence_accepts_a_linked_gateway_cleanup() -> N
 
 
 def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyPatch) -> None:
-    calls: list[tuple[list[str], str]] = []
+    scripts: list[str] = []
 
-    def fake_run(
-        command: list[str],
-        *,
-        input: bytes,
-        capture_output: bool,
-        check: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[bytes]:
-        calls.append((command, input.decode("utf-8")))
-        assert capture_output is True
-        assert check is False
-        assert timeout == 120
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            b"session_started=session-1\napi_pid=123\nremote_api_port=9001\n",
-            b"",
-        )
+    def fake_ssh(_definition: ClusterDefinition, script: str) -> str:
+        scripts.append(script)
+        return "session_started=session-1\napi_pid=123\nremote_api_port=9001\n"
 
-    monkeypatch.setattr("clio_relay.session_lifecycle.subprocess.run", fake_run)
+    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
 
     lines = start_remote_session(
         cluster="ares",
@@ -565,71 +887,21 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
     )
 
     assert "session_started=session-1" in lines
-    assert calls[0][0] == ["ssh", "ares", "bash", "-s"]
-    script = calls[0][1]
+    script = scripts[0]
     assert "CLIO_RELAY_API_TOKEN='token'" in script
-    assert "clio-relay api start --host 127.0.0.1 --port 9001 --require-token" in script
-    assert "api.pid" in script
-    assert "metadata.json" in script
-    assert "is_owned_api_pid" in script
-    assert "refusing to replace an active session API without ownership proof" in script
-    assert "active session API group without a PID record" in script
-    assert "/proc/{pid}/cmdline" in script
-    assert "CLIO_RELAY_SESSION_OWNER_TOKEN" in script
-    assert "CLIO_RELAY_OWNER_SESSION_ID=$session_id" in script
-    assert "CLIO_RELAY_OWNER_SESSION_CLUSTER=ares" in script
-    assert "process_start_ticks" in script
-    assert "nohup setsid" in script
-    assert '>"$log_file" 2>&1 9>&- &' in script
+    assert "clio-relay session start-owned" in script
     assert "umask 077" in script
-    assert "trap cleanup_incomplete_start EXIT" in script
-    assert "flock -w 10 -x 9" in script
-    assert "CLIO_RELAY_SESSION_GENERATION_ID" in script
-    assert "CLIO_RELAY_API_RELEASE_IDENTITY_SHA256" in script
-    assert (
-        'cluster_registry_file="$session_dir/cluster-registry-$session_generation_id.json"'
-        in script
-    )
-    assert "printf '%s'" in script
-    assert (
-        '"$cluster_registry_candidate" "$cluster_registry_file" "$cluster_registry_sha256"'
-        in script
-    )
-    assert "CLIO_RELAY_SESSION_REGISTRY_SHA256" in script
-    assert "CLIO_RELAY_SESSION_ROUTE_REVISION" in script
-    assert "cluster_registry_path" in script
+    assert '"cluster":"ares"' in script
+    assert '"session_id":"session-1"' in script
+    assert '"remote_api_port":9001' in script
+    assert '"require_token":true' in script
+    assert '"replace":false' in script
     assert "cluster_registry_sha256" in script
     assert "cluster_route_revision" in script
-    assert '"cluster_authority_verified": True' in script
-    assert "Path(registry_path).unlink(missing_ok=True)" in script
-    assert "$cluster_registry_json" not in script
     assert "clio-relay.session-api-release.v1" in script
-    assert "session API installation changed after worker compatibility verification" in script
-    assert "existing owned session API has no release identity; use --replace" in script
-    assert "existing owned session API release identity differs; use --replace" in script
-    assert (
-        "existing owned session API release identity is not process-bound; use --replace" in script
-    )
-    assert "api_release_identity" in script
-    assert "api_release_identity_sha256" in script
-    assert "session_generation_id" in script
-    assert "clio-relay session prepare-start" in script
-    assert '--recorded-generation-id "$recorded_generation_id"' in script
-    assert script.index("clio-relay session prepare-start") < script.index(
-        'kill -- "-$existing_owned_pgid"'
-    )
-    assert "clio-relay session resume-intake" in script
-    assert '--session-generation-id "$session_generation_id"' in script
-    assert script.index("flock -w 10 -x 9") < script.index("clio-relay session resume-intake")
-    assert 'kill -0 -- "-$existing_owned_pgid"' in script
-    assert 'kill -0 -- "-$api_pid"' in script
-    assert "os.replace(temporary, path)" in script
-    assert 'url = f"http://127.0.0.1:{port}/healthz"' in script
-    assert "readiness_timeout_seconds = 60.0" in script
-    assert "while time.monotonic() < readiness_deadline" in script
-    assert "remote_api_ready_seconds=" in script
-    assert "for _ in range(100)" not in script
-    assert "owned API did not become ready" in script
+    assert "exec 9>" not in script
+    assert "kill --" not in script
+    assert "last_cleanup" not in script
     assert "\x00" not in script
     assert "pkill" not in script
 
@@ -639,19 +911,11 @@ def test_start_remote_session_checks_existing_api_release_before_reuse(
 ) -> None:
     scripts: list[str] = []
 
-    def fake_run(
-        command: list[str],
-        *,
-        input: bytes,
-        capture_output: bool,
-        check: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[bytes]:
-        del capture_output, check, timeout
-        scripts.append(input.decode("utf-8"))
-        return subprocess.CompletedProcess(command, 0, b"session_already_running=session-1\n", b"")
+    def fake_ssh(_definition: ClusterDefinition, script: str) -> str:
+        scripts.append(script)
+        return "session_already_running=session-1\n"
 
-    monkeypatch.setattr("clio_relay.session_lifecycle.subprocess.run", fake_run)
+    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
 
     start_remote_session(
         cluster="ares",
@@ -664,20 +928,10 @@ def test_start_remote_session_checks_existing_api_release_before_reuse(
     )
 
     script = scripts[0]
-    assert '[ -n "$existing_owned_pid" ] && [ "0" != "1" ]' in script
-    assert script.index("__CLIO_RELAY_EXISTING_API_RELEASE__") < script.index(
-        'echo "session_already_running=$session_id"'
-    )
-    assert '(Path("/proc") / pid / "environ")' in script
-    assert "CLIO_RELAY_API_RELEASE_IDENTITY_SHA256={observed_sha256}" in script
-    assert "existing owned session API cluster authority differs; use --replace" in script
-    assert (
-        "existing owned session API cluster authority is not process-bound; use --replace" in script
-    )
-    assert "cluster_authority_verified" in script
-    assert script.index("__CLIO_RELAY_EXISTING_API_RELEASE__") < script.index(
-        'echo "session_already_running=$session_id"'
-    )
+    assert "clio-relay session start-owned" in script
+    assert '"replace":false' in script
+    assert '"expected_api_release_identity"' in script
+    assert "exec 9>" not in script
 
 
 def test_start_remote_session_stages_large_registry_without_python_argv(
@@ -685,19 +939,11 @@ def test_start_remote_session_stages_large_registry_without_python_argv(
 ) -> None:
     scripts: list[str] = []
 
-    def fake_run(
-        command: list[str],
-        *,
-        input: bytes,
-        capture_output: bool,
-        check: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[bytes]:
-        del capture_output, check, timeout
-        scripts.append(input.decode("utf-8"))
-        return subprocess.CompletedProcess(command, 0, b"session_started=session-1\n", b"")
+    def fake_ssh(_definition: ClusterDefinition, script: str) -> str:
+        scripts.append(script)
+        return "session_started=session-1\n"
 
-    monkeypatch.setattr("clio_relay.session_lifecycle.subprocess.run", fake_run)
+    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
     registration = RemoteMcpServerConfig(
         command="science-mcp",
         args=[f"{index:03d}-" + ("x" * 4_000) for index in range(40)],
@@ -720,14 +966,8 @@ def test_start_remote_session_stages_large_registry_without_python_argv(
     script = scripts[0]
     assert len(script.encode("utf-8")) > 128 * 1024
     assert "printf '%s'" in script
-    registry_path_arguments = (
-        '"$cluster_registry_candidate" "$cluster_registry_file" "$cluster_registry_sha256"'
-    )
-    assert registry_path_arguments in script
-    assert script.index("python3 -", script.index("printf '%s'")) < script.index(
-        registry_path_arguments
-    )
-    assert 'python3 - "{\\"clusters\\"' not in script
+    assert "clio-relay session start-owned" in script
+    assert "python3 -" not in script
 
 
 def test_start_remote_session_rejects_registry_over_configuration_limit(
@@ -737,7 +977,7 @@ def test_start_remote_session_rejects_registry_over_configuration_limit(
         del args, kwargs
         pytest.fail("oversized session authority must fail before SSH")
 
-    monkeypatch.setattr("clio_relay.session_lifecycle.subprocess.run", unexpected_run)
+    monkeypatch.setattr(session_lifecycle, "_ssh_script", unexpected_run)
     registration = RemoteMcpServerConfig(
         command="science-mcp",
         args=["x" * 4_000 for _ in range(256)],
@@ -766,24 +1006,11 @@ def test_start_remote_session_rejects_registry_over_configuration_limit(
 def test_status_remote_session_returns_json(monkeypatch: MonkeyPatch) -> None:
     scripts: list[str] = []
 
-    def fake_run(
-        command: list[str],
-        *,
-        input: bytes,
-        capture_output: bool,
-        check: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[bytes]:
-        del capture_output, check, timeout
-        scripts.append(input.decode("utf-8"))
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            json.dumps({"session_id": "session-1", "running": True}).encode("utf-8"),
-            b"",
-        )
+    def fake_ssh(_definition: ClusterDefinition, script: str) -> str:
+        scripts.append(script)
+        return json.dumps({"session_id": "session-1", "running": True})
 
-    monkeypatch.setattr("clio_relay.session_lifecycle.subprocess.run", fake_run)
+    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
 
     status = status_remote_session(
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
@@ -791,7 +1018,8 @@ def test_status_remote_session_returns_json(monkeypatch: MonkeyPatch) -> None:
     )
 
     assert status == {"session_id": "session-1", "running": True}
-    assert 'metadata.pop("owner_token", None)' in scripts[0]
+    assert "clio-relay session recovery-status" in scripts[0]
+    assert "metadata.json" not in scripts[0]
 
 
 def test_remote_session_identity_challenge_binds_process_cluster_and_nonce(
@@ -808,19 +1036,11 @@ def test_remote_session_identity_challenge_binds_process_cluster_and_nonce(
         "hmac_sha256": "a" * 64,
     }
 
-    def fake_run(
-        command: list[str],
-        *,
-        input: bytes,
-        capture_output: bool,
-        check: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[bytes]:
-        del capture_output, check, timeout
-        scripts.append(input.decode("utf-8"))
-        return subprocess.CompletedProcess(command, 0, json.dumps(expected).encode(), b"")
+    def fake_ssh(_definition: ClusterDefinition, script: str) -> str:
+        scripts.append(script)
+        return json.dumps(expected)
 
-    monkeypatch.setattr("clio_relay.session_lifecycle.subprocess.run", fake_run)
+    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
 
     observed = challenge_remote_session_identity(
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
@@ -831,13 +1051,10 @@ def test_remote_session_identity_challenge_binds_process_cluster_and_nonce(
 
     assert observed == expected
     script = scripts[0]
-    assert "metadata_path, cluster, session_id, generation_id, nonce" in script
-    assert "CLIO_RELAY_REMOTE_CLUSTER={cluster}" in script
-    assert "CLIO_RELAY_OWNER_SESSION_CLUSTER={cluster}" in script
-    assert "owner_cluster_verified" in script
-    assert "os.getpgid(pid) != pid" in script
-    assert "hmac.new(token.encode" in script
-    assert "clio-relay.session-identity.v1" in script
+    assert "clio-relay session challenge-owned" in script
+    assert '"session_generation_id":"generation-1"' in script
+    assert f'"nonce":"{nonce}"' in script
+    assert "metadata.json" not in script
     with pytest.raises(ValueError, match="256-bit"):
         challenge_remote_session_identity(
             definition=ClusterDefinition(name="ares", ssh_host="ares"),
@@ -848,18 +1065,10 @@ def test_remote_session_identity_challenge_binds_process_cluster_and_nonce(
 
 
 def test_remote_session_command_timeout_is_reported(monkeypatch: MonkeyPatch) -> None:
-    def timed_out(
-        command: list[str],
-        *,
-        input: bytes,
-        capture_output: bool,
-        check: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[bytes]:
-        del input, capture_output, check
-        raise subprocess.TimeoutExpired(command, timeout)
+    def timed_out(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise RelayError("bounded command timed out after 120 seconds")
 
-    monkeypatch.setattr("clio_relay.session_lifecycle.subprocess.run", timed_out)
+    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", timed_out)
 
     with pytest.raises(RelayError, match="timed out after 120 seconds"):
         status_remote_session(
@@ -1102,59 +1311,46 @@ def test_teardown_remote_session_kills_owned_pid_and_optional_worker(
 ) -> None:
     scripts: list[str] = []
 
-    def fake_run(
-        command: list[str],
-        *,
-        input: bytes,
-        capture_output: bool,
-        check: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[bytes]:
-        del capture_output, check, timeout
-        scripts.append(input.decode("utf-8"))
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            json.dumps(
-                {
-                    "cluster": "ares",
-                    "session_id": "session-1",
-                    "mode": "teardown",
-                    "cleanup_operation_id": "cleanup-test",
-                    "cleanup_policy": {
-                        "stop_worker": True,
-                        "cancel_jobs": False,
-                        "cancel_scheduler_jobs": False,
+    def fake_ssh(_definition: ClusterDefinition, script: str) -> str:
+        scripts.append(script)
+        return json.dumps(
+            {
+                "cluster": "ares",
+                "session_id": "session-1",
+                "mode": "teardown",
+                "cleanup_operation_id": "cleanup-test",
+                "cleanup_policy": {
+                    "stop_worker": True,
+                    "cancel_jobs": False,
+                    "cancel_scheduler_jobs": False,
+                },
+                "relay_cancel_requested": False,
+                "scheduler_cancel_requested": False,
+                "resources": [
+                    {
+                        "kind": "remote_relay_api",
+                        "resource_id": "123",
+                        "location": "ares",
+                        "action": "stop",
+                        "ownership_verified": True,
+                        "outcome": "stopped",
+                        "residual": False,
                     },
-                    "relay_cancel_requested": False,
-                    "scheduler_cancel_requested": False,
-                    "resources": [
-                        {
-                            "kind": "remote_relay_api",
-                            "resource_id": "123",
-                            "location": "ares",
-                            "action": "stop",
-                            "ownership_verified": True,
-                            "outcome": "stopped",
-                            "residual": False,
-                        },
-                        {
-                            "kind": "worker_service",
-                            "resource_id": "clio-relay-worker-ares.service",
-                            "location": "ares",
-                            "action": "stop",
-                            "ownership_verified": True,
-                            "outcome": "stopped",
-                            "residual": False,
-                        },
-                    ],
-                    "errors": [],
-                }
-            ).encode("utf-8"),
-            b"",
+                    {
+                        "kind": "worker_service",
+                        "resource_id": "clio-relay-worker-ares.service",
+                        "location": "ares",
+                        "action": "stop",
+                        "ownership_verified": True,
+                        "outcome": "stopped",
+                        "residual": False,
+                    },
+                ],
+                "errors": [],
+            }
         )
 
-    monkeypatch.setattr("clio_relay.session_lifecycle.subprocess.run", fake_run)
+    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
 
     report = teardown_remote_session(
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
@@ -1168,36 +1364,12 @@ def test_teardown_remote_session_kills_owned_pid_and_optional_worker(
     assert report.resources[0].outcome == "stopped"
     assert report.resources[1].resource_id == "clio-relay-worker-ares.service"
     assert report.to_cleanup_evidence(stop_worker=True).stop_worker is True
+    assert "clio-relay session teardown-owned" in scripts[0]
+    assert '"expected_cleanup_operation_id":"cleanup-test"' in scripts[0]
+    assert '"expected_session_generation_id":"generation-1"' in scripts[0]
+    assert '"stop_worker":true' in scripts[0]
     assert "os.killpg" not in scripts[0]
-    assert "process_start_ticks" in scripts[0]
-    assert "ownership proof failed" in scripts[0]
-    assert "token_group_processes" in scripts[0]
-    token_scan = (
-        scripts[0].split("def token_group_processes():", 1)[1].split("\npid = metadata.get", 1)[0]
-    )
-    assert "process_group ==" not in token_scan
-    assert "proc.stat().st_uid != os.geteuid()" in token_scan
-    assert 'export PATH="$HOME/.local/bin:$PATH"' in scripts[0]
-    assert "observed_pgid = int(fields[2])" in token_scan
-    assert "observed_pgid != recorded_pgid" in token_scan
-    assert "cannot verify protected session process" in token_scan
-    assert "os.pidfd_open(owned_pid, 0)" in scripts[0]
-    assert "signal.pidfd_send_signal(process_fd, sig, None, 0)" in scripts[0]
-    assert "signal_token_processes(signal.SIGTERM)" in scripts[0]
-    assert "signal_token_processes(signal.SIGKILL)" in scripts[0]
-    assert "flock -w 10 -x 9" in scripts[0]
-    assert "timeout --signal=TERM --kill-after=5s 10s" in scripts[0]
-    assert "timeout --signal=TERM --kill-after=5s 90s" in scripts[0]
-    assert "owned session generation changed before teardown" in scripts[0]
-    assert '--session-generation-id "$expected_session_generation_id"' in scripts[0]
-    assert "--cleanup-stop-worker" in scripts[0]
-    assert '["systemctl", "--user", "stop", service]' in scripts[0]
-    assert 'active_state == "inactive"' in scripts[0]
-    assert 'observed_state = "not-found" if service_missing else active_state' in scripts[0]
-    assert '"verified_after_operation": verified_after_operation' in scripts[0]
-    assert '"observed_state": observed_state' in scripts[0]
-    assert "timeout=20" in scripts[0]
-    assert "cleanup command timed out after 20 seconds" in scripts[0]
+    assert "last_cleanup" not in scripts[0]
 
     with pytest.raises(RelayError, match="cleanup operation does not match"):
         teardown_remote_session(
@@ -1210,43 +1382,22 @@ def test_teardown_remote_session_kills_owned_pid_and_optional_worker(
         )
 
 
-def test_owned_teardown_revalidates_exact_pidfd_identity_after_leader_pid_reuse() -> None:
+def test_owned_teardown_delegates_to_pinned_cluster_local_executor() -> None:
     script = session_lifecycle._owned_teardown_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
         session_id="session-1",
         expected_session_generation_id="generation-1",
+        expected_cleanup_operation_id="cleanup-test",
         stop_worker=False,
         cancel_jobs=False,
         cancel_scheduler_jobs=False,
         cluster="ares",
     )
 
-    pidfd_open = script.index("process_fd = os.pidfd_open(owned_pid, 0)")
-    identity_recheck = script.index("if owned_pid not in token_group_processes():")
-    pidfd_signal = script.index("signal.pidfd_send_signal(process_fd, sig, None, 0)")
-    assert pidfd_open < identity_recheck < pidfd_signal
+    assert "clio-relay session teardown-owned" in script
+    assert '"expected_session_generation_id":"generation-1"' in script
+    assert '"expected_cleanup_operation_id":"cleanup-test"' in script
     assert "os.killpg" not in script
-    assert "running = bool(owned_group_pids)" in script
-    assert "post_running = bool(token_group_processes())" in script
-    assert "recorded_pid_conflict" in script
-    assert "refused reused or foreign API pid" in script
-    assert "clio-relay.owner-session-cleanup-receipt.v1" in script
-    assert '"cleanup_paths_pending": True' in script
-    assert '"cluster_registry_verified": True' in script
-    assert '"cluster_registry_removed": False' in script
-    assert '"metadata_sanitized": cleanup_paths_safe' in script
-    assert "transition_lock_retained" in script
-    for marker in (
-        "__CLIO_RELAY_SESSION_DIRECTORY__",
-        "__CLIO_RELAY_METADATA_FILE__",
-        "__CLIO_RELAY_COMPLETED_RECEIPT__",
-        "__CLIO_RELAY_EXPECTED_GENERATION__",
-        "__CLIO_RELAY_OWNED_TEARDOWN__",
-    ):
-        program = script.split(f"<<'{marker}'\n", 1)[1].split(f"\n{marker}", 1)[0]
-        compile(program, marker, "exec")
-    teardown_program = script.split("<<'__CLIO_RELAY_OWNED_TEARDOWN__'\n", 1)[1].split(
-        "\n__CLIO_RELAY_OWNED_TEARDOWN__",
-        1,
-    )[0]
-    compile(teardown_program, "owned-session-teardown", "exec")
+    assert "exec 9>" not in script
+    assert "metadata.json" not in script
+    assert "last_cleanup" not in script
