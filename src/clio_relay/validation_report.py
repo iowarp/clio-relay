@@ -1320,7 +1320,13 @@ def _detect_persistent_uv_tool_receipt(
     pyvenv_uv_version = _pyvenv_uv_version(prefix)
     pyvenv_matches_uv = uv_version is not None and pyvenv_uv_version == uv_version
     configured_tool = os.environ.get("CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE")
-    selected_tool = configured_tool or shutil.which("clio-relay")
+    tool_name = "clio-relay.exe" if os.name == "nt" else "clio-relay"
+    # Ambient PATH and the Windows current directory can name a different tool environment.
+    selected_tool = configured_tool or (
+        shutil.which(str(tool_bin_directory / tool_name))
+        if tool_bin_directory is not None
+        else None
+    )
     tool_path = Path(selected_tool).expanduser() if selected_tool is not None else None
     try:
         tool_path_absolute = tool_path.absolute() if tool_path is not None else None
