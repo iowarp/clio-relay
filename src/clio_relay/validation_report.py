@@ -23,12 +23,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from importlib import metadata, resources
+from importlib import import_module, metadata, resources
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 from uuid import uuid4
@@ -40,8 +40,9 @@ from clio_relay import __version__
 from clio_relay.ci_validation import ProvenanceError, load_release_acceptance_matrix
 from clio_relay.cluster_config import (
     create_private_configuration_directory,
-    ensure_private_configuration_path,
+    ensure_private_configuration_windows_handle,
     open_private_atomic_file,
+    open_private_configuration_windows_descriptor,
 )
 from clio_relay.errors import ConfigurationError
 from clio_relay.filesystem_paths import (
@@ -61,6 +62,9 @@ MAX_LAUNCHER_PROCESS_ANCESTORS = 64
 MAX_PYVENV_CONFIG_BYTES = 64 * 1024
 MAX_UV_TOOL_RECEIPT_BYTES = 256 * 1024
 MAX_DISTRIBUTION_WHEEL_BYTES = 128 * 1024 * 1024
+MAX_VALIDATION_REPORT_WRITE_BYTES = 64 * 1024 * 1024
+MAX_VALIDATION_PENDING_FILES = 16
+_VALIDATION_PENDING_PATTERN = re.compile(r"^\.clio-validation-[0-9a-f]{32}\.pending$")
 _OFFICIAL_RELEASE_WHEEL_PATH = re.compile(
     r"/iowarp/clio-relay/releases/download/v(?P<version>[0-9A-Za-z][0-9A-Za-z.+-]*)/"
     r"clio_relay-(?P=version)-py3-none-any\.whl"
@@ -4389,6 +4393,16 @@ class _WindowsValidationDirectoryAnchor:
     identity: tuple[int, int, int]
 
 
+@dataclass(frozen=True, slots=True)
+class _ValidationWriterLock:
+    """Parent-wide lock bounding deterministic validation staging files."""
+
+    path: Path
+    descriptor: int
+    parent_fd: int | None = None
+    windows_parent: _WindowsValidationDirectoryAnchor | None = None
+
+
 def _windows_validation_directory_identity(
     handle: ctypes.c_void_p,
     *,
@@ -4436,6 +4450,7 @@ def _open_windows_validation_handle(
     path: Path,
     *,
     allow_delete_share: bool,
+    acl_write: bool,
 ) -> ctypes.c_void_p:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     create_file = kernel32.CreateFileW
@@ -4453,7 +4468,7 @@ def _open_windows_validation_handle(
     share = 0x00000001 | 0x00000002 | (0x00000004 if allow_delete_share else 0)
     raw_handle = create_file(
         str(storage_path),
-        0x00000080,
+        0x00000080 | (0x00020000 | 0x00040000 | 0x00080000 if acl_write else 0),
         share,
         None,
         3,
@@ -4472,11 +4487,13 @@ def _open_windows_validation_directory(
     expected_status: os.stat_result,
     expected_identity: tuple[int, int, int] | None = None,
     allow_delete_share: bool = False,
+    acl_write: bool = False,
 ) -> _WindowsValidationDirectoryAnchor:
     storage_path = internal_filesystem_path(path, force_extended=True)
     handle = _open_windows_validation_handle(
         path,
         allow_delete_share=allow_delete_share,
+        acl_write=acl_write,
     )
     try:
         identity = _windows_validation_directory_identity(handle, path=path)
@@ -4498,6 +4515,7 @@ def _open_windows_validation_directory(
         verification_handle = _open_windows_validation_handle(
             path,
             allow_delete_share=False,
+            acl_write=False,
         )
         try:
             if _windows_validation_directory_identity(verification_handle, path=path) != identity:
@@ -4527,6 +4545,7 @@ def _verify_windows_validation_directory(
     verification_handle = _open_windows_validation_handle(
         anchor.path,
         allow_delete_share=False,
+        acl_write=False,
     )
     try:
         if (
@@ -4541,6 +4560,212 @@ def _verify_windows_validation_directory(
         _close_windows_validation_handle(verification_handle, path=anchor.path)
 
 
+def _acquire_validation_writer_lock(parent: Path) -> _ValidationWriterLock:
+    """Serialize validation replacement and stale-pending recovery in one parent."""
+    parent_status = os.lstat(parent)
+    lock_path = parent / ".clio-validation-writer-v1.lock"
+    if os.name == "posix":
+        parent_fd = os.open(
+            parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        descriptor: int | None = None
+        try:
+            if not os.path.samestat(parent_status, os.fstat(parent_fd)):
+                raise OSError("validation writer lock parent changed while opening")
+            try:
+                descriptor = os.open(
+                    lock_path.name,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                os.fchmod(descriptor, 0o600)
+                os.fsync(descriptor)
+                os.fsync(parent_fd)
+            except FileExistsError:
+                descriptor = os.open(
+                    lock_path.name,
+                    os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=parent_fd,
+                )
+            opened = os.fstat(descriptor)
+            linked = os.stat(lock_path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not (
+                stat.S_ISREG(opened.st_mode)
+                and stat.S_ISREG(linked.st_mode)
+                and opened.st_nlink == 1
+                and linked.st_nlink == 1
+                and opened.st_uid == os.geteuid()
+                and linked.st_uid == os.geteuid()
+                and stat.S_IMODE(opened.st_mode) == 0o600
+                and stat.S_IMODE(linked.st_mode) == 0o600
+                and os.path.samestat(opened, linked)
+            ):
+                raise OSError("validation writer lock is not one owner-private regular file")
+            try:
+                import_module("fcntl").flock(descriptor, 2 | 4)
+            except BlockingIOError:
+                raise OSError("another validation writer owns this directory") from None
+            confirmed = os.stat(lock_path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not os.path.samestat(opened, confirmed):
+                raise OSError("validation writer lock changed during acquisition")
+            return _ValidationWriterLock(
+                path=lock_path,
+                descriptor=descriptor,
+                parent_fd=parent_fd,
+            )
+        except BaseException:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(parent_fd)
+            raise
+
+    windows_parent = _open_windows_validation_directory(
+        parent,
+        expected_status=parent_status,
+    )
+    descriptor: int | None = None
+    try:
+        storage_lock_path = internal_filesystem_path(lock_path, force_extended=True)
+        try:
+            os.lstat(storage_lock_path)
+        except FileNotFoundError:
+            try:
+                with open_private_atomic_file(storage_lock_path) as stream:
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except FileExistsError:
+                pass
+        descriptor = open_private_configuration_windows_descriptor(
+            storage_lock_path,
+            exclusive=True,
+        )
+        _verify_windows_validation_directory(windows_parent)
+        return _ValidationWriterLock(
+            path=lock_path,
+            descriptor=descriptor,
+            windows_parent=windows_parent,
+        )
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        _close_windows_validation_directory(windows_parent)
+        raise
+
+
+def _release_validation_writer_lock(lock: _ValidationWriterLock) -> None:
+    """Release one validation writer lock, preserving its single stable inode."""
+    release_error: BaseException | None = None
+    if lock.parent_fd is not None:
+        try:
+            import_module("fcntl").flock(lock.descriptor, 8)
+        except BaseException as exc:  # pragma: no cover - OS release failure
+            release_error = exc
+    try:
+        os.close(lock.descriptor)
+    except BaseException as exc:  # pragma: no cover - OS release failure
+        release_error = release_error or exc
+    if lock.parent_fd is not None:
+        try:
+            os.close(lock.parent_fd)
+        except BaseException as exc:  # pragma: no cover - OS release failure
+            release_error = release_error or exc
+    try:
+        _close_windows_validation_directory(lock.windows_parent)
+    except BaseException as exc:  # pragma: no cover - OS release failure
+        release_error = release_error or exc
+    if release_error is not None:
+        raise OSError(f"validation writer lock could not be released: {release_error}")
+
+
+def _prune_stale_validation_pending_files(
+    parent: Path,
+    *,
+    current_name: str,
+    writer_lock: _ValidationWriterLock,
+) -> None:
+    """Bound crash-recovery staging to the current target under the parent-wide lock."""
+    candidates: list[tuple[str, os.stat_result]] = []
+    scan_target: int | Path = (
+        writer_lock.parent_fd
+        if writer_lock.parent_fd is not None
+        else internal_filesystem_path(parent, force_extended=True)
+    )
+    with os.scandir(scan_target) as entries:
+        for entry in entries:
+            if _VALIDATION_PENDING_PATTERN.fullmatch(entry.name) is None:
+                continue
+            if len(candidates) >= MAX_VALIDATION_PENDING_FILES:
+                raise OSError("validation report pending-file retention limit was exceeded")
+            observed = (
+                os.stat(
+                    entry.name,
+                    dir_fd=writer_lock.parent_fd,
+                    follow_symlinks=False,
+                )
+                if writer_lock.parent_fd is not None
+                else os.lstat(internal_filesystem_path(parent / entry.name, force_extended=True))
+            )
+            candidates.append((entry.name, observed))
+    for name, observed in candidates:
+        if name == current_name:
+            continue
+        if not (
+            stat.S_ISREG(observed.st_mode)
+            and not stat.S_ISLNK(observed.st_mode)
+            and observed.st_nlink == 1
+            and 0 <= observed.st_size <= MAX_VALIDATION_REPORT_WRITE_BYTES
+            and not getattr(observed, "st_file_attributes", 0) & 0x00000400
+        ):
+            raise OSError("stale validation report pending file is unsafe")
+        if os.name == "posix" and not (
+            observed.st_uid == os.geteuid() and stat.S_IMODE(observed.st_mode) == 0o600
+        ):
+            raise OSError("stale validation report pending file is not owner-private")
+        if os.name == "nt":
+            descriptor = open_private_configuration_windows_descriptor(
+                internal_filesystem_path(parent / name, force_extended=True)
+            )
+            os.close(descriptor)
+            confirmed = os.lstat(internal_filesystem_path(parent / name, force_extended=True))
+        else:
+            confirmed = os.stat(
+                name,
+                dir_fd=writer_lock.parent_fd,
+                follow_symlinks=False,
+            )
+        if not (
+            confirmed.st_nlink == 1
+            and (confirmed.st_dev, confirmed.st_ino, confirmed.st_size)
+            == (observed.st_dev, observed.st_ino, observed.st_size)
+        ):
+            raise OSError("stale validation report pending file changed before deletion")
+        if writer_lock.parent_fd is not None:
+            os.unlink(name, dir_fd=writer_lock.parent_fd)
+            os.fsync(writer_lock.parent_fd)
+        else:
+            os.unlink(internal_filesystem_path(parent / name, force_extended=True))
+
+    remaining: list[str] = []
+    with os.scandir(scan_target) as entries:
+        for entry in entries:
+            if (
+                _VALIDATION_PENDING_PATTERN.fullmatch(entry.name) is not None
+                and entry.name != current_name
+            ):
+                remaining.append(entry.name)
+    if remaining:
+        raise OSError("stale validation report pending-file pruning was incomplete")
+
+
 def _create_windows_validation_directory_child(
     parent: _WindowsValidationDirectoryAnchor,
     child_name: str,
@@ -4550,23 +4775,47 @@ def _create_windows_validation_directory_child(
         raise OSError(f"unsafe validation report directory component: {child_name}")
     _verify_windows_validation_directory(parent)
     child_path = parent.path / child_name
-    temporary_path = parent.path / f".{child_name}.{uuid4().hex}.tmpdir"
+    pending_identity = hashlib.sha256(child_name.encode("utf-8")).hexdigest()[:32]
+    temporary_path = parent.path / f".clio-validation-dir-{pending_identity}.pending"
     temporary_anchor: _WindowsValidationDirectoryAnchor | None = None
     child_anchor: _WindowsValidationDirectoryAnchor | None = None
     try:
-        create_private_configuration_directory(temporary_path)
-        temporary_status = os.lstat(internal_filesystem_path(temporary_path, force_extended=True))
+        temporary_storage_path = internal_filesystem_path(
+            temporary_path,
+            force_extended=True,
+        )
+        try:
+            temporary_status = os.lstat(temporary_storage_path)
+        except FileNotFoundError:
+            create_private_configuration_directory(temporary_storage_path)
+            temporary_status = os.lstat(temporary_storage_path)
+        if not (
+            stat.S_ISDIR(temporary_status.st_mode)
+            and not stat.S_ISLNK(temporary_status.st_mode)
+            and not getattr(temporary_status, "st_file_attributes", 0) & 0x00000400
+        ):
+            raise OSError(f"validation report pending directory is unsafe: {temporary_path}")
         temporary_anchor = _open_windows_validation_directory(
             temporary_path,
             expected_status=temporary_status,
             allow_delete_share=True,
+            acl_write=True,
         )
+        ensure_private_configuration_windows_handle(
+            temporary_storage_path,
+            handle=temporary_anchor.handle,
+            directory=True,
+        )
+        with os.scandir(temporary_storage_path) as entries:
+            if next(entries, None) is not None:
+                raise OSError(f"validation report pending directory is not empty: {temporary_path}")
+        _verify_windows_validation_directory(temporary_anchor)
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         move_file_ex = kernel32.MoveFileExW
         move_file_ex.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
         move_file_ex.restype = ctypes.c_int
         if not move_file_ex(
-            str(internal_filesystem_path(temporary_path, force_extended=True)),
+            str(temporary_storage_path),
             str(internal_filesystem_path(child_path, force_extended=True)),
             0x00000008,
         ):
@@ -4577,9 +4826,11 @@ def _create_windows_validation_directory_child(
             child_path,
             expected_status=child_status,
             expected_identity=temporary_anchor.identity,
+            acl_write=True,
         )
-        ensure_private_configuration_path(
+        ensure_private_configuration_windows_handle(
             internal_filesystem_path(child_path, force_extended=True),
+            handle=child_anchor.handle,
             directory=True,
         )
         _verify_windows_validation_directory(parent)
@@ -4590,7 +4841,7 @@ def _create_windows_validation_directory_child(
     finally:
         _close_windows_validation_directory(child_anchor)
         _close_windows_validation_directory(temporary_anchor)
-        with suppress(FileNotFoundError):
+        with suppress(OSError):
             os.rmdir(internal_filesystem_path(temporary_path, force_extended=True))
 
 
@@ -4617,6 +4868,9 @@ def _create_posix_validation_directory_child(
         raise OSError(f"unsafe validation report directory component: {child_name}")
     child_fd: int | None = None
     created = False
+    platform_os = cast(Any, os)
+    fchmod = cast(Callable[[int, int], None], platform_os.fchmod)
+    geteuid = cast(Callable[[], int], platform_os.geteuid)
     try:
         os.mkdir(child_name, 0o700, dir_fd=parent_fd)
         created = True
@@ -4628,14 +4882,14 @@ def _create_posix_validation_directory_child(
             | getattr(os, "O_CLOEXEC", 0),
             dir_fd=parent_fd,
         )
-        os.fchmod(child_fd, 0o700)
+        fchmod(child_fd, 0o700)
         opened = os.fstat(child_fd)
         linked = os.stat(child_name, dir_fd=parent_fd, follow_symlinks=False)
         if not (
             stat.S_ISDIR(opened.st_mode)
             and stat.S_ISDIR(linked.st_mode)
-            and opened.st_uid == os.geteuid()
-            and linked.st_uid == os.geteuid()
+            and opened.st_uid == geteuid()
+            and linked.st_uid == geteuid()
             and stat.S_IMODE(opened.st_mode) == 0o700
             and stat.S_IMODE(linked.st_mode) == 0o700
             and os.path.samestat(opened, linked)
@@ -4744,6 +4998,29 @@ def durably_ensure_validation_directory(path: Path) -> None:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
+    """Serialize and durably replace one validation text file."""
+    logical_path = logical_filesystem_path(path)
+    requested_parent = logical_path.parent.absolute()
+    durably_ensure_validation_directory(requested_parent)
+    resolved_parent = requested_parent.resolve(strict=True)
+    if os.path.normcase(str(resolved_parent)) != os.path.normcase(str(requested_parent)):
+        raise OSError(
+            "validation report parent cannot traverse a symlink or reparse point: "
+            f"{requested_parent}"
+        )
+    writer_lock = _acquire_validation_writer_lock(resolved_parent)
+    try:
+        _atomic_write_text_locked(path, text, writer_lock=writer_lock)
+    finally:
+        _release_validation_writer_lock(writer_lock)
+
+
+def _atomic_write_text_locked(
+    path: Path,
+    text: str,
+    *,
+    writer_lock: _ValidationWriterLock,
+) -> None:
     """Durably replace one text file through a pinned, revalidated parent."""
     logical_path = logical_filesystem_path(path)
     requested_parent = logical_path.parent.absolute()
@@ -4760,10 +5037,18 @@ def _atomic_write_text(path: Path, text: str) -> None:
     logical_path = resolved_parent / logical_path.name
     storage_path = internal_filesystem_path(logical_path, force_extended=True)
     payload = text.encode("utf-8")
+    if len(payload) > MAX_VALIDATION_REPORT_WRITE_BYTES:
+        raise OSError(f"validation report exceeds {MAX_VALIDATION_REPORT_WRITE_BYTES} bytes")
     parent_status = os.stat(storage_path.parent, follow_symlinks=False)
     if not stat.S_ISDIR(parent_status.st_mode) or stat.S_ISLNK(parent_status.st_mode):
         raise OSError(f"validation report parent is not a real directory: {storage_path.parent}")
-    temporary_name = f".{storage_path.name}.{uuid4().hex}.tmp"
+    pending_identity = hashlib.sha256(storage_path.name.encode("utf-8")).hexdigest()[:32]
+    temporary_name = f".clio-validation-{pending_identity}.pending"
+    _prune_stale_validation_pending_files(
+        resolved_parent,
+        current_name=temporary_name,
+        writer_lock=writer_lock,
+    )
 
     if os.name == "posix":
         directory_fd = os.open(
@@ -4777,26 +5062,84 @@ def _atomic_write_text(path: Path, text: str) -> None:
         try:
             if not os.path.samestat(parent_status, os.fstat(directory_fd)):
                 raise OSError("validation report parent changed while opening")
-            output_fd = os.open(
-                temporary_name,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_NOFOLLOW", 0)
-                | getattr(os, "O_CLOEXEC", 0),
-                0o600,
-                dir_fd=directory_fd,
-            )
-            os.fchmod(output_fd, 0o600)
-            view = memoryview(payload)
-            while view:
-                written = os.write(output_fd, view)
-                if written <= 0:
-                    raise OSError("validation report write made no progress")
-                view = view[written:]
-            os.fsync(output_fd)
-            os.close(output_fd)
-            output_fd = None
+            if writer_lock.parent_fd is None or not os.path.samestat(
+                os.fstat(writer_lock.parent_fd),
+                os.fstat(directory_fd),
+            ):
+                raise OSError("validation report parent differs from its writer lock")
+            pending_exact = False
+            pending_fd: int | None = None
+            with suppress(FileNotFoundError):
+                pending_fd = os.open(
+                    temporary_name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=directory_fd,
+                )
+            if pending_fd is not None:
+                try:
+                    pending_opened = os.fstat(pending_fd)
+                    pending_linked = os.stat(
+                        temporary_name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    if not (
+                        stat.S_ISREG(pending_opened.st_mode)
+                        and stat.S_ISREG(pending_linked.st_mode)
+                        and pending_opened.st_nlink == 1
+                        and pending_linked.st_nlink == 1
+                        and pending_opened.st_uid == os.geteuid()
+                        and pending_linked.st_uid == os.geteuid()
+                        and stat.S_IMODE(pending_opened.st_mode) == 0o600
+                        and stat.S_IMODE(pending_linked.st_mode) == 0o600
+                        and os.path.samestat(pending_opened, pending_linked)
+                    ):
+                        raise OSError("validation report pending file is unsafe")
+                    pending_value = os.read(pending_fd, len(payload) + 1)
+                    pending_final = os.fstat(pending_fd)
+                    pending_exact = bool(
+                        pending_value == payload
+                        and (
+                            pending_opened.st_dev,
+                            pending_opened.st_ino,
+                            pending_opened.st_size,
+                            pending_opened.st_mtime_ns,
+                            pending_opened.st_ctime_ns,
+                        )
+                        == (
+                            pending_final.st_dev,
+                            pending_final.st_ino,
+                            pending_final.st_size,
+                            pending_final.st_mtime_ns,
+                            pending_final.st_ctime_ns,
+                        )
+                    )
+                finally:
+                    os.close(pending_fd)
+                if not pending_exact:
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+            if not pending_exact:
+                output_fd = os.open(
+                    temporary_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+                os.fchmod(output_fd, 0o600)
+                view = memoryview(payload)
+                while view:
+                    written = os.write(output_fd, view)
+                    if written <= 0:
+                        raise OSError("validation report write made no progress")
+                    view = view[written:]
+                os.fsync(output_fd)
+                os.close(output_fd)
+                output_fd = None
             os.replace(
                 temporary_name,
                 storage_path.name,
@@ -4865,63 +5208,89 @@ def _atomic_write_text(path: Path, text: str) -> None:
         finally:
             if output_fd is not None:
                 os.close(output_fd)
-            with suppress(FileNotFoundError):
-                os.unlink(temporary_name, dir_fd=directory_fd)
             os.close(directory_fd)
         return
 
     temporary = storage_path.with_name(temporary_name)
-    parent_handle: ctypes.c_void_p | None = None
+    parent_anchor: _WindowsValidationDirectoryAnchor | None = None
     try:
         if os.name == "nt":
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            get_attributes = kernel32.GetFileAttributesW
-            get_attributes.argtypes = [ctypes.c_wchar_p]
-            get_attributes.restype = ctypes.c_uint32
-            attributes = int(get_attributes(str(storage_path.parent)))
-            invalid_attributes = 0xFFFFFFFF
-            file_attribute_directory = 0x00000010
-            file_attribute_reparse_point = 0x00000400
-            if (
-                attributes == invalid_attributes
-                or not attributes & file_attribute_directory
-                or attributes & file_attribute_reparse_point
-            ):
-                raise OSError("validation report parent is not a stable Windows directory")
-            create_file = kernel32.CreateFileW
-            create_file.argtypes = [
-                ctypes.c_wchar_p,
-                ctypes.c_uint32,
-                ctypes.c_uint32,
-                ctypes.c_void_p,
-                ctypes.c_uint32,
-                ctypes.c_uint32,
-                ctypes.c_void_p,
-            ]
-            create_file.restype = ctypes.c_void_p
-            raw_handle = create_file(
-                str(storage_path.parent),
-                0x00000080,
-                0x00000001 | 0x00000002,
-                None,
-                3,
-                0x02000000 | 0x00200000,
-                None,
+            parent_anchor = _open_windows_validation_directory(
+                resolved_parent,
+                expected_status=parent_status,
             )
-            if raw_handle in (None, ctypes.c_void_p(-1).value):
-                error_number = ctypes.get_last_error()
-                raise OSError(error_number, ctypes.FormatError(error_number))
-            parent_handle = ctypes.c_void_p(raw_handle)
-            if not os.path.samestat(
-                parent_status,
-                os.stat(storage_path.parent, follow_symlinks=False),
+            if (
+                writer_lock.windows_parent is None
+                or parent_anchor.identity != writer_lock.windows_parent.identity
             ):
-                raise OSError("validation report parent changed while opening")
+                raise OSError("validation report parent differs from its writer lock")
         if os.name == "nt":
-            with open_private_atomic_file(temporary) as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
+            pending_exact = False
+            try:
+                pending_status = os.lstat(temporary)
+            except FileNotFoundError:
+                pending_status = None
+            if pending_status is not None:
+                if not (
+                    stat.S_ISREG(pending_status.st_mode)
+                    and not stat.S_ISLNK(pending_status.st_mode)
+                    and pending_status.st_nlink == 1
+                ):
+                    raise OSError("validation report pending file is unsafe")
+                pending_descriptor = open_private_configuration_windows_descriptor(temporary)
+                with os.fdopen(pending_descriptor, "rb") as stream:
+                    pending_opened = os.fstat(stream.fileno())
+                    pending_linked = os.lstat(temporary)
+                    if not (
+                        stat.S_ISREG(pending_opened.st_mode)
+                        and stat.S_ISREG(pending_linked.st_mode)
+                        and pending_opened.st_nlink == 1
+                        and pending_linked.st_nlink == 1
+                        and os.path.samestat(pending_status, pending_opened)
+                        and os.path.samestat(pending_opened, pending_linked)
+                    ):
+                        raise OSError("validation report pending file changed before recovery")
+                    secured_pending = os.fstat(stream.fileno())
+                    secured_linked = os.lstat(temporary)
+                    if not (
+                        secured_pending.st_nlink == 1
+                        and secured_linked.st_nlink == 1
+                        and os.path.samestat(pending_opened, secured_pending)
+                        and os.path.samestat(secured_pending, secured_linked)
+                    ):
+                        raise OSError(
+                            "validation report pending file changed while securing its ACL"
+                        )
+                    pending_value = stream.read(len(payload) + 1)
+                    pending_final = os.fstat(stream.fileno())
+                    if (
+                        secured_pending.st_dev,
+                        secured_pending.st_ino,
+                        secured_pending.st_size,
+                        secured_pending.st_mtime_ns,
+                        secured_pending.st_ctime_ns,
+                    ) != (
+                        pending_final.st_dev,
+                        pending_final.st_ino,
+                        pending_final.st_size,
+                        pending_final.st_mtime_ns,
+                        pending_final.st_ctime_ns,
+                    ):
+                        raise OSError("validation report pending file changed during recovery")
+                pending_exact = pending_value == payload
+                if not pending_exact:
+                    temporary.unlink()
+            if not pending_exact:
+                with open_private_atomic_file(temporary) as stream:
+                    view = memoryview(payload)
+                    while view:
+                        written = stream.write(view)
+                        if written <= 0:
+                            raise OSError("validation report write made no progress")
+                        view = view[written:]
+                    stream.flush()
+                    os.fsync(stream.fileno())
         else:
             with temporary.open("x", encoding="utf-8", newline="\n") as stream:
                 stream.write(text)
@@ -4934,11 +5303,24 @@ def _atomic_write_text(path: Path, text: str) -> None:
             if not move_file_ex(str(temporary), str(storage_path), 0x00000001 | 0x00000008):
                 error_number = ctypes.get_last_error()
                 raise OSError(error_number, ctypes.FormatError(error_number), str(storage_path))
-            ensure_private_configuration_path(storage_path, directory=False)
         else:
             os.replace(temporary, storage_path)
-        with storage_path.open("rb") as stream:
+        final_descriptor = (
+            open_private_configuration_windows_descriptor(storage_path)
+            if os.name == "nt"
+            else os.open(storage_path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        )
+        with os.fdopen(final_descriptor, "rb") as stream:
             opened = os.fstat(stream.fileno())
+            linked = os.stat(storage_path, follow_symlinks=False)
+            if not (
+                stat.S_ISREG(opened.st_mode)
+                and stat.S_ISREG(linked.st_mode)
+                and opened.st_nlink == 1
+                and linked.st_nlink == 1
+                and os.path.samestat(opened, linked)
+            ):
+                raise OSError("validation report replacement is not one exact regular file")
             reread = stream.read(len(payload) + 1)
             final_opened = os.fstat(stream.fileno())
         linked = os.stat(storage_path, follow_symlinks=False)
@@ -4960,9 +5342,4 @@ def _atomic_write_text(path: Path, text: str) -> None:
         ):
             raise OSError("validation report changed during durable replacement")
     finally:
-        temporary.unlink(missing_ok=True)
-        if parent_handle is not None:
-            close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
-            close_handle.argtypes = [ctypes.c_void_p]
-            close_handle.restype = ctypes.c_int
-            close_handle(parent_handle)
+        _close_windows_validation_directory(parent_anchor)

@@ -20,6 +20,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from importlib import import_module
 from json import JSONDecodeError
 from pathlib import Path, PurePosixPath
 from time import monotonic, sleep
@@ -61,8 +62,9 @@ from clio_relay.cluster_config import (
     RemoteMcpServerConfig,
     WorkerCapacityPolicy,
     default_registry_path,
-    ensure_private_configuration_path,
+    ensure_private_configuration_windows_handle,
     open_private_atomic_file,
+    open_private_configuration_windows_descriptor,
 )
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
@@ -299,10 +301,11 @@ MAX_FINALIZED_CLEANUP_RETRY_OUTPUT_BYTES = 1024 * 1024
 MAX_CLEANUP_VALIDATION_REPORT_BYTES = 8 * 1024 * 1024
 MAX_LOCAL_CLEANUP_REPORT_CHUNK_BYTES = 8 * 1024 * 1024
 MAX_LOCAL_CLEANUP_REPORT_MANIFEST_BYTES = 64 * 1024
-MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_ENTRIES = 10
+MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_ENTRIES = 11
 MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_STORED_BYTES = 2 * (
     MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES + MAX_LOCAL_CLEANUP_REPORT_MANIFEST_BYTES
 )
+_LOCAL_CLEANUP_REPORT_ARTIFACT_DIRECTORY_NAME = ".clio-cleanup-artifacts-v1"
 _LOCAL_CLEANUP_REPORT_ARTIFACT_PATTERN = re.compile(r"^r-[0-9a-f]{64}\.(?:p[0-9]{4}|manifest)$")
 _LOCAL_CLEANUP_REPORT_PENDING_PATTERN = re.compile(
     r"^\.r-[0-9a-f]{64}\.(?:p[0-9]{4}|manifest)\.pending$"
@@ -338,10 +341,41 @@ class _WindowsPinnedDirectory:
     handle: ctypes.c_void_p
 
 
+class _WindowsCleanupFileTime(ctypes.Structure):
+    _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+
+class _WindowsCleanupFileInformation(ctypes.Structure):
+    _fields_ = [
+        ("attributes", ctypes.c_uint32),
+        ("creation_time", _WindowsCleanupFileTime),
+        ("last_access_time", _WindowsCleanupFileTime),
+        ("last_write_time", _WindowsCleanupFileTime),
+        ("volume_serial_number", ctypes.c_uint32),
+        ("file_size_high", ctypes.c_uint32),
+        ("file_size_low", ctypes.c_uint32),
+        ("number_of_links", ctypes.c_uint32),
+        ("file_index_high", ctypes.c_uint32),
+        ("file_index_low", ctypes.c_uint32),
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class _CleanupEvidenceLock:
+    """One process-owned lock serializing a local cleanup evidence store."""
+
+    path: Path
+    parent_fd: int | None = None
+    descriptor: int | None = None
+    windows_handle: ctypes.c_void_p | None = None
+    windows_parent: _WindowsPinnedDirectory | None = None
+
+
 def _open_windows_pinned_directory(
     path: Path,
     *,
     expected: os.stat_result,
+    acl_write: bool = False,
 ) -> _WindowsPinnedDirectory:
     """Open and verify one non-reparse Windows directory without delete sharing."""
     if os.name != "nt":  # pragma: no cover - platform contract
@@ -374,7 +408,7 @@ def _open_windows_pinned_directory(
     create_file.restype = ctypes.c_void_p
     raw_handle = create_file(
         str(storage_path),
-        0x00000080,
+        0x00000080 | (0x00020000 | 0x00040000 | 0x00080000 if acl_write else 0),
         0x00000001 | 0x00000002,
         None,
         3,
@@ -436,6 +470,267 @@ def _close_windows_pinned_directory(anchor: _WindowsPinnedDirectory | None) -> N
             "local cleanup report artifact directory handle could not be closed: "
             f"{ctypes.FormatError(error_number)}"
         )
+
+
+def _windows_cleanup_file_information(
+    handle: ctypes.c_void_p,
+    *,
+    path: Path,
+) -> _WindowsCleanupFileInformation:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_information = kernel32.GetFileInformationByHandle
+    get_information.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_WindowsCleanupFileInformation),
+    ]
+    get_information.restype = ctypes.c_int
+    information = _WindowsCleanupFileInformation()
+    if not get_information(handle, ctypes.byref(information)):
+        error_number = ctypes.get_last_error()
+        raise RelayError(
+            f"cleanup evidence lock cannot be inspected: {ctypes.FormatError(error_number)}"
+        )
+    if (
+        information.attributes & 0x00000010
+        or information.attributes & 0x00000400
+        or information.number_of_links != 1
+    ):
+        raise RelayError(f"cleanup evidence lock is not one private regular file: {path}")
+    return information
+
+
+def _acquire_cleanup_evidence_lock(validation_report_path: Path) -> _CleanupEvidenceLock:
+    """Acquire the crash-released lock shared by cleanup artifacts and validation output."""
+    requested_parent = validation_report_path.parent.absolute()
+    durably_ensure_validation_directory(requested_parent)
+    parent_directory = requested_parent.resolve(strict=True)
+    if os.path.normcase(str(parent_directory)) != os.path.normcase(str(requested_parent)):
+        raise RelayError("cleanup evidence lock parent traverses a symlink or reparse point")
+    parent_status = os.lstat(parent_directory)
+    if not stat.S_ISDIR(parent_status.st_mode) or stat.S_ISLNK(parent_status.st_mode):
+        raise RelayError("cleanup evidence lock parent is not a real directory")
+    lock_path = parent_directory / ".clio-cleanup-evidence-v1.lock"
+    if os.name == "posix":
+        parent_fd = os.open(
+            parent_directory,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        descriptor: int | None = None
+        try:
+            if not os.path.samestat(parent_status, os.fstat(parent_fd)):
+                raise RelayError("cleanup evidence lock parent changed while opening")
+            try:
+                descriptor = os.open(
+                    lock_path.name,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                os.fchmod(descriptor, 0o600)
+                os.fsync(descriptor)
+                os.fsync(parent_fd)
+            except FileExistsError:
+                descriptor = os.open(
+                    lock_path.name,
+                    os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=parent_fd,
+                )
+            opened = os.fstat(descriptor)
+            linked = os.stat(lock_path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not (
+                stat.S_ISREG(opened.st_mode)
+                and stat.S_ISREG(linked.st_mode)
+                and opened.st_nlink == 1
+                and linked.st_nlink == 1
+                and opened.st_uid == os.geteuid()
+                and linked.st_uid == os.geteuid()
+                and stat.S_IMODE(opened.st_mode) == 0o600
+                and stat.S_IMODE(linked.st_mode) == 0o600
+                and os.path.samestat(opened, linked)
+            ):
+                raise RelayError("cleanup evidence lock is not one owner-private regular file")
+            flock = import_module("fcntl").flock
+            try:
+                flock(descriptor, 2 | 4)
+            except BlockingIOError:
+                raise RelayError("another cleanup is writing evidence in this directory") from None
+            confirmed = os.stat(lock_path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not os.path.samestat(opened, confirmed):
+                raise RelayError("cleanup evidence lock changed during acquisition")
+            return _CleanupEvidenceLock(
+                path=lock_path,
+                parent_fd=parent_fd,
+                descriptor=descriptor,
+            )
+        except BaseException:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(parent_fd)
+            raise
+
+    windows_parent: _WindowsPinnedDirectory | None = None
+    windows_handle: ctypes.c_void_p | None = None
+    try:
+        windows_parent = _open_windows_pinned_directory(
+            parent_directory,
+            expected=parent_status,
+        )
+        storage_lock_path = internal_filesystem_path(lock_path, force_extended=True)
+        try:
+            lock_status = os.lstat(storage_lock_path)
+        except FileNotFoundError:
+            try:
+                with open_private_atomic_file(storage_lock_path) as stream:
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except FileExistsError:
+                pass
+            lock_status = os.lstat(storage_lock_path)
+        if not (
+            stat.S_ISREG(lock_status.st_mode)
+            and not stat.S_ISLNK(lock_status.st_mode)
+            and lock_status.st_nlink == 1
+            and not getattr(lock_status, "st_file_attributes", 0) & 0x00000400
+        ):
+            raise RelayError("cleanup evidence lock is not one private regular file")
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        create_file.restype = ctypes.c_void_p
+        raw_handle = create_file(
+            str(storage_lock_path),
+            0x80000000 | 0x00020000 | 0x00040000 | 0x00080000,
+            0,
+            None,
+            3,
+            0x00200000,
+            None,
+        )
+        if raw_handle in (None, ctypes.c_void_p(-1).value):
+            error_number = ctypes.get_last_error()
+            if error_number in {5, 32, 33}:
+                raise RelayError("another cleanup is writing evidence in this directory") from None
+            raise RelayError(
+                f"cleanup evidence lock cannot be opened: {ctypes.FormatError(error_number)}"
+            )
+        windows_handle = ctypes.c_void_p(raw_handle)
+        information = _windows_cleanup_file_information(
+            windows_handle,
+            path=lock_path,
+        )
+        observed = os.lstat(storage_lock_path)
+        file_index = (int(information.file_index_high) << 32) | int(information.file_index_low)
+        if not (
+            os.path.samestat(lock_status, observed)
+            and observed.st_nlink == 1
+            and observed.st_ino == file_index
+        ):
+            raise RelayError("cleanup evidence lock changed during acquisition")
+        ensure_private_configuration_windows_handle(
+            storage_lock_path,
+            handle=windows_handle,
+            directory=False,
+        )
+        _verify_windows_pinned_directory(windows_parent)
+        return _CleanupEvidenceLock(
+            path=lock_path,
+            windows_handle=windows_handle,
+            windows_parent=windows_parent,
+        )
+    except BaseException:
+        if windows_handle is not None:
+            close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+            close_handle.argtypes = [ctypes.c_void_p]
+            close_handle.restype = ctypes.c_int
+            close_handle(windows_handle)
+        _close_windows_pinned_directory(windows_parent)
+        raise
+
+
+def _release_cleanup_evidence_lock(lock: _CleanupEvidenceLock | None) -> None:
+    """Release one cleanup evidence lock without removing its private stable inode."""
+    if lock is None:
+        return
+    release_error: BaseException | None = None
+    if lock.descriptor is not None:
+        try:
+            import_module("fcntl").flock(lock.descriptor, 8)
+        except BaseException as exc:  # pragma: no cover - OS release failure
+            release_error = exc
+        try:
+            os.close(lock.descriptor)
+        except BaseException as exc:  # pragma: no cover - OS release failure
+            release_error = release_error or exc
+    if lock.parent_fd is not None:
+        try:
+            os.close(lock.parent_fd)
+        except BaseException as exc:  # pragma: no cover - OS release failure
+            release_error = release_error or exc
+    if lock.windows_handle is not None:
+        close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+        close_handle.argtypes = [ctypes.c_void_p]
+        close_handle.restype = ctypes.c_int
+        if not close_handle(lock.windows_handle):
+            error_number = ctypes.get_last_error()
+            release_error = release_error or OSError(
+                error_number,
+                ctypes.FormatError(error_number),
+                str(lock.path),
+            )
+    try:
+        _close_windows_pinned_directory(lock.windows_parent)
+    except BaseException as exc:  # pragma: no cover - OS release failure
+        release_error = release_error or exc
+    if release_error is not None:
+        raise RelayError(f"cleanup evidence lock could not be released: {release_error}")
+
+
+def _verify_cleanup_evidence_lock(
+    lock: _CleanupEvidenceLock,
+    *,
+    expected_parent: Path,
+) -> None:
+    """Verify that the retained cleanup lock still pins the named evidence parent."""
+    resolved_parent = expected_parent.absolute().resolve(strict=True)
+    if os.path.normcase(str(resolved_parent)) != os.path.normcase(str(lock.path.parent)):
+        raise RelayError("cleanup evidence lock does not cover the validation parent")
+    if lock.parent_fd is not None and lock.descriptor is not None:
+        parent_linked = os.lstat(resolved_parent)
+        lock_linked = os.stat(
+            lock.path.name,
+            dir_fd=lock.parent_fd,
+            follow_symlinks=False,
+        )
+        if not (
+            os.path.samestat(os.fstat(lock.parent_fd), parent_linked)
+            and os.path.samestat(os.fstat(lock.descriptor), lock_linked)
+            and lock_linked.st_nlink == 1
+        ):
+            raise RelayError("cleanup evidence lock identity changed")
+        return
+    if lock.windows_parent is None or lock.windows_handle is None:
+        raise RelayError("cleanup evidence lock has no platform ownership handle")
+    _verify_windows_pinned_directory(lock.windows_parent)
+    information = _windows_cleanup_file_information(lock.windows_handle, path=lock.path)
+    lock_linked = os.lstat(internal_filesystem_path(lock.path, force_extended=True))
+    file_index = (int(information.file_index_high) << 32) | int(information.file_index_low)
+    if lock_linked.st_ino != file_index or lock_linked.st_nlink != 1:
+        raise RelayError("cleanup evidence lock identity changed")
 
 
 OWNED_SESSION_RECOVERY_TRANSITION_TIMEOUT_SECONDS = 90.0
@@ -3640,6 +3935,7 @@ def _persist_local_cleanup_report_artifact(
     report: SessionLifecycleReport,
     *,
     validation_report_path: Path,
+    evidence_lock: _CleanupEvidenceLock | None = None,
 ) -> _LocalCleanupReportArtifact:
     """Persist one exact report in a private, report-owned bounded artifact directory."""
     payload = session_lifecycle_report_bytes(report)
@@ -3701,8 +3997,7 @@ def _persist_local_cleanup_report_artifact(
         or (parent_linked.st_uid == 0 and stat.S_IMODE(parent_linked.st_mode) & stat.S_ISVTX != 0)
     ):
         raise RelayError("local cleanup report artifact parent is not rename-safe")
-    report_path_identity = hashlib.sha256(report_basename.encode("utf-8")).hexdigest()
-    artifact_directory_name = f".clio-cleanup-{report_path_identity[:32]}"
+    artifact_directory_name = _LOCAL_CLEANUP_REPORT_ARTIFACT_DIRECTORY_NAME
     artifact_directory = parent_directory / artifact_directory_name
     parent_fd: int | None = None
     directory_fd: int | None = None
@@ -3749,6 +4044,13 @@ def _persist_local_cleanup_report_artifact(
                 f"local cleanup report artifact directory cannot be pinned: {exc}"
             ) from exc
         directory_opened = os.fstat(directory_fd)
+        if evidence_lock is not None and (
+            evidence_lock.parent_fd is None
+            or not os.path.samestat(os.fstat(evidence_lock.parent_fd), os.fstat(parent_fd))
+        ):
+            os.close(directory_fd)
+            os.close(parent_fd)
+            raise RelayError("local cleanup report artifact parent differs from its evidence lock")
         if not (
             stat.S_ISDIR(directory_linked.st_mode)
             and not stat.S_ISLNK(directory_linked.st_mode)
@@ -3772,12 +4074,26 @@ def _persist_local_cleanup_report_artifact(
             directory_windows_anchor = _open_windows_pinned_directory(
                 artifact_directory,
                 expected=directory_linked,
+                acl_write=True,
             )
-            ensure_private_configuration_path(
+            ensure_private_configuration_windows_handle(
                 internal_filesystem_path(artifact_directory, force_extended=True),
+                handle=directory_windows_anchor.handle,
                 directory=True,
             )
             _verify_windows_pinned_directory(directory_windows_anchor)
+            if evidence_lock is not None:
+                _verify_cleanup_evidence_lock(
+                    evidence_lock,
+                    expected_parent=parent_directory,
+                )
+                if evidence_lock.windows_parent is None or not os.path.samestat(
+                    evidence_lock.windows_parent.status,
+                    parent_windows_anchor.status,
+                ):
+                    raise RelayError(
+                        "local cleanup report artifact parent differs from its evidence lock"
+                    )
         except BaseException:
             try:
                 _close_windows_pinned_directory(directory_windows_anchor)
@@ -3804,9 +4120,8 @@ def _persist_local_cleanup_report_artifact(
             and os.path.samestat(directory_linked, observed)
         ):
             raise RelayError("local cleanup report artifact directory identity changed")
-        if parent_windows_anchor is not None:
+        if os.name == "nt":
             _verify_windows_pinned_directory(parent_windows_anchor)
-        if directory_windows_anchor is not None:
             _verify_windows_pinned_directory(directory_windows_anchor)
 
     def stat_name(name: str) -> os.stat_result | None:
@@ -3839,13 +4154,6 @@ def _persist_local_cleanup_report_artifact(
         expected_nlink: int = 1,
     ) -> bytes | None:
         descriptor: int | None = None
-        if os.name == "nt":
-            candidate_path = internal_filesystem_path(
-                artifact_directory / name,
-                force_extended=True,
-            )
-            if candidate_path.exists():
-                ensure_private_configuration_path(candidate_path, directory=False)
         try:
             flags = (
                 os.O_RDONLY
@@ -3853,11 +4161,17 @@ def _persist_local_cleanup_report_artifact(
                 | getattr(os, "O_NOFOLLOW", 0)
                 | getattr(os, "O_CLOEXEC", 0)
             )
-            descriptor = (
-                os.open(name, flags, dir_fd=directory_fd)
-                if directory_fd is not None
-                else os.open(artifact_directory / name, flags)
-            )
+            if directory_fd is not None:
+                descriptor = os.open(name, flags, dir_fd=directory_fd)
+            elif os.name == "nt":
+                descriptor = open_private_configuration_windows_descriptor(
+                    internal_filesystem_path(
+                        artifact_directory / name,
+                        force_extended=True,
+                    )
+                )
+            else:
+                descriptor = os.open(artifact_directory / name, flags)
         except FileNotFoundError:
             if required:
                 raise RelayError("local cleanup report artifact disappeared") from None
@@ -3940,11 +4254,6 @@ def _persist_local_cleanup_report_artifact(
         *,
         expected_nlink: int,
     ) -> None:
-        if os.name == "nt":
-            ensure_private_configuration_path(
-                internal_filesystem_path(artifact_directory / name, force_extended=True),
-                directory=False,
-            )
         if not (
             stat.S_ISREG(observed.st_mode)
             and observed.st_nlink == expected_nlink
@@ -4061,6 +4370,102 @@ def _persist_local_cleanup_report_artifact(
         if not observed.issubset(preserve_names):
             raise RelayError("local cleanup report artifact pruning was not exact")
 
+    def complete_report_names(
+        candidates: dict[str, os.stat_result],
+        *,
+        candidate_digest: str,
+    ) -> set[str]:
+        manifest_candidate_name = f"r-{candidate_digest}.manifest"
+        manifest_status = candidates.get(manifest_candidate_name)
+        if manifest_status is None:
+            raise RelayError("retained cleanup report artifact has no manifest")
+        verify_candidate_status(
+            manifest_candidate_name,
+            manifest_status,
+            expected_nlink=1,
+        )
+        manifest_bytes = read_exact(
+            manifest_candidate_name,
+            expected_size=manifest_status.st_size,
+            required=True,
+        )
+        try:
+            manifest_value = json.loads((manifest_bytes or b"").decode("utf-8"))
+        except (UnicodeDecodeError, JSONDecodeError) as exc:
+            raise RelayError("retained cleanup report artifact manifest is invalid") from exc
+        if not isinstance(manifest_value, dict):
+            raise RelayError("retained cleanup report artifact manifest is not an object")
+        manifest = cast(dict[str, object], manifest_value)
+        raw_report_size = manifest.get("report_size")
+        raw_chunks = manifest.get("chunks")
+        if not (
+            manifest.get("schema_version") == "clio-relay.local-cleanup-report-artifact.v1"
+            and manifest.get("encoding") == "canonical-json-chunks"
+            and manifest.get("report_sha256") == candidate_digest
+            and manifest.get("chunk_size_limit") == MAX_LOCAL_CLEANUP_REPORT_CHUNK_BYTES
+            and isinstance(raw_report_size, int)
+            and not isinstance(raw_report_size, bool)
+            and 0 < raw_report_size <= MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES
+            and isinstance(raw_chunks, list)
+            and 0
+            < len(cast(list[object], raw_chunks))
+            <= (MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES + MAX_LOCAL_CLEANUP_REPORT_CHUNK_BYTES - 1)
+            // MAX_LOCAL_CLEANUP_REPORT_CHUNK_BYTES
+        ):
+            raise RelayError("retained cleanup report artifact manifest is inconsistent")
+        retained = {manifest_candidate_name}
+        observed_report_size = 0
+        report_hasher = hashlib.sha256()
+        for index, raw_chunk in enumerate(cast(list[object], raw_chunks)):
+            if not isinstance(raw_chunk, dict):
+                raise RelayError("retained cleanup report artifact chunk is invalid")
+            chunk = cast(dict[str, object], raw_chunk)
+            chunk_name = f"r-{candidate_digest}.p{index:04d}"
+            chunk_size = chunk.get("size")
+            chunk_sha256 = chunk.get("sha256")
+            if not (
+                chunk.get("name") == chunk_name
+                and isinstance(chunk_size, int)
+                and not isinstance(chunk_size, bool)
+                and 0 < chunk_size <= MAX_LOCAL_CLEANUP_REPORT_CHUNK_BYTES
+                and isinstance(chunk_sha256, str)
+                and re.fullmatch(r"[0-9a-f]{64}", chunk_sha256)
+            ):
+                raise RelayError("retained cleanup report artifact chunk metadata is invalid")
+            chunk_status = candidates.get(chunk_name)
+            if chunk_status is None or chunk_status.st_size != chunk_size:
+                raise RelayError("retained cleanup report artifact chunk is missing")
+            verify_candidate_status(chunk_name, chunk_status, expected_nlink=1)
+            chunk_bytes = read_exact(
+                chunk_name,
+                expected_size=chunk_size,
+                required=True,
+            )
+            if chunk_bytes is None or hashlib.sha256(chunk_bytes).hexdigest() != chunk_sha256:
+                raise RelayError("retained cleanup report artifact chunk digest is invalid")
+            observed_report_size += chunk_size
+            report_hasher.update(chunk_bytes)
+            retained.add(chunk_name)
+        if observed_report_size != raw_report_size or report_hasher.hexdigest() != candidate_digest:
+            raise RelayError("retained cleanup report artifact size is inconsistent")
+        return retained
+
+    def newest_previous_complete_report_names(
+        candidates: dict[str, os.stat_result],
+    ) -> set[str]:
+        manifests: list[tuple[int, str]] = []
+        for name, observed in candidates.items():
+            match = re.fullmatch(r"r-([0-9a-f]{64})\.manifest", name)
+            if match is not None and match.group(1) != digest:
+                manifests.append((observed.st_mtime_ns, match.group(1)))
+        if not manifests:
+            return set()
+        _mtime_ns, previous_digest = max(manifests)
+        return complete_report_names(
+            candidates,
+            candidate_digest=previous_digest,
+        )
+
     def publish_exact(name: str, content: bytes, *, expected_sha256: str) -> None:
         pending_name = f".{name}.pending"
         final_status = stat_name(name)
@@ -4135,7 +4540,7 @@ def _persist_local_cleanup_report_artifact(
                         view = memoryview(content)
                         while view:
                             written = stream.write(view)
-                            if written is None or written <= 0:
+                            if written <= 0:
                                 raise RelayError(
                                     "local cleanup report artifact write made no progress"
                                 )
@@ -4171,6 +4576,37 @@ def _persist_local_cleanup_report_artifact(
             staged = read_exact(pending_name, expected_size=len(content), required=True)
             if staged is None or not hmac.compare_digest(staged, content):
                 raise RelayError("local cleanup report artifact pending file differs")
+            if os.name == "nt":
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                move_file_ex = kernel32.MoveFileExW
+                move_file_ex.argtypes = [
+                    ctypes.c_wchar_p,
+                    ctypes.c_wchar_p,
+                    ctypes.c_uint32,
+                ]
+                move_file_ex.restype = ctypes.c_int
+                pending_path = internal_filesystem_path(
+                    artifact_directory / pending_name,
+                    force_extended=True,
+                )
+                final_path = internal_filesystem_path(
+                    artifact_directory / name,
+                    force_extended=True,
+                )
+                if not move_file_ex(str(pending_path), str(final_path), 0x00000008):
+                    error_number = ctypes.get_last_error()
+                    raise OSError(
+                        error_number,
+                        ctypes.FormatError(error_number),
+                        str(final_path),
+                    )
+                fsync_directory()
+                committed = read_exact(name, expected_size=len(content), required=True)
+                if committed is None or not hmac.compare_digest(committed, content):
+                    raise RelayError(
+                        "local cleanup report artifact changed after durable publication"
+                    )
+                return
             publication_complete = False
             try:
                 if directory_fd is not None:
@@ -4226,7 +4662,9 @@ def _persist_local_cleanup_report_artifact(
             raise RelayError("local cleanup report artifact changed after publication")
 
     try:
-        prune_unreferenced_candidates(preserve_names=expected_names)
+        previous_names = newest_previous_complete_report_names(scan_candidates())
+        preserved_names = expected_names | previous_names
+        prune_unreferenced_candidates(preserve_names=preserved_names)
         chunks: list[_LocalCleanupReportChunk] = []
         for chunk_name, chunk, chunk_sha256 in chunk_specs:
             publish_exact(chunk_name, chunk, expected_sha256=chunk_sha256)
@@ -4240,13 +4678,12 @@ def _persist_local_cleanup_report_artifact(
         publish_exact(manifest_name, manifest_payload, expected_sha256=manifest_sha256)
         retained = scan_candidates()
         final_names = {name for name in expected_names if not name.startswith(".")}
-        if set(retained) != final_names:
+        if set(retained) != final_names | previous_names:
             raise RelayError("local cleanup report artifact retention was not exact")
         retained_size = sum(item.st_size for item in retained.values())
         if (
-            len(retained) > 1 + len(chunk_specs)
-            or retained_size
-            > MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES + MAX_LOCAL_CLEANUP_REPORT_MANIFEST_BYTES
+            len(retained) > MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_ENTRIES - 1
+            or retained_size > MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_STORED_BYTES
         ):
             raise RelayError("local cleanup report artifact retention exceeded its bound")
         verify_directory()
@@ -5087,22 +5524,29 @@ def session_teardown(
 ) -> None:
     """Stop owned remote relay session processes, optionally stopping the worker service."""
     canonical_report_path = validation_report or default_report_path(cluster)
-    seed_report = _new_cleanup_acceptance_report(
-        scenario="cleanup",
-        cluster=cluster,
-        mode="teardown",
-        resource_kind="owner_session",
-        resource_id=session_id,
-        action="teardown",
-        cancel_relay_jobs=cancel_jobs,
-        cancel_scheduler_jobs=cancel_scheduler_jobs,
-        stop_worker=stop_worker,
-        launcher=validation_launcher,
-        install_source=validation_install_source,
-        artifact=validation_artifact,
-    )
-    canonical_report: list[LiveValidationReport | None] = [seed_report]
-    write_validation_report(seed_report, canonical_report_path)
+    evidence_lock: _CleanupEvidenceLock | None = None
+    try:
+        evidence_lock = _acquire_cleanup_evidence_lock(canonical_report_path)
+        seed_report = _new_cleanup_acceptance_report(
+            scenario="cleanup",
+            cluster=cluster,
+            mode="teardown",
+            resource_kind="owner_session",
+            resource_id=session_id,
+            action="teardown",
+            cancel_relay_jobs=cancel_jobs,
+            cancel_scheduler_jobs=cancel_scheduler_jobs,
+            stop_worker=stop_worker,
+            launcher=validation_launcher,
+            install_source=validation_install_source,
+            artifact=validation_artifact,
+        )
+        canonical_report: list[LiveValidationReport | None] = [seed_report]
+        write_validation_report(seed_report, canonical_report_path)
+    except BaseException:
+        _release_cleanup_evidence_lock(evidence_lock)
+        raise
+    active_evidence_lock = evidence_lock
     try:
         definition = _require_cluster(cluster)
         scheduler_sentinel_ids = _normalize_scheduler_sentinel_ids(preserve_scheduler_job_ids or [])
@@ -5116,18 +5560,21 @@ def session_teardown(
                 "--cancel-scheduler-jobs"
             )
     except BaseException as exc:
-        _write_failed_acceptance_report(
-            path=canonical_report_path,
-            scenario="cleanup",
-            cluster=cluster,
-            check_id="session.teardown.preflight",
-            summary="validate owned session teardown inputs",
-            error=exc,
-            launcher=validation_launcher,
-            install_source=validation_install_source,
-            artifact=validation_artifact,
-            partial_report=canonical_report[0],
-        )
+        try:
+            _write_failed_acceptance_report(
+                path=canonical_report_path,
+                scenario="cleanup",
+                cluster=cluster,
+                check_id="session.teardown.preflight",
+                summary="validate owned session teardown inputs",
+                error=exc,
+                launcher=validation_launcher,
+                install_source=validation_install_source,
+                artifact=validation_artifact,
+                partial_report=canonical_report[0],
+            )
+        finally:
+            _release_cleanup_evidence_lock(evidence_lock)
         raise
 
     def action() -> None:
@@ -5142,6 +5589,10 @@ def session_teardown(
             local_artifact: _LocalCleanupReportArtifact,
         ) -> None:
             """Durably reference exact local evidence before authoritative closure."""
+            _verify_cleanup_evidence_lock(
+                active_evidence_lock,
+                expected_parent=canonical_report_path.parent,
+            )
             reference = recovery.coordinator_report_ref
             generation_id = report.session_generation_id
             operation_id = report.cleanup_operation_id
@@ -5254,7 +5705,15 @@ def session_teardown(
                 )
             )
             write_validation_report(pending, canonical_report_path)
+            _verify_cleanup_evidence_lock(
+                active_evidence_lock,
+                expected_parent=canonical_report_path.parent,
+            )
             reread = load_validation_report(canonical_report_path)
+            _verify_cleanup_evidence_lock(
+                active_evidence_lock,
+                expected_parent=canonical_report_path.parent,
+            )
             expected_checkpoint = LiveValidationReport.model_validate(
                 redact_sensitive_values(pending.model_dump(mode="json"))
             )
@@ -5757,11 +6216,16 @@ def session_teardown(
             local_cleanup_artifact = _persist_local_cleanup_report_artifact(
                 finalized_retry_report,
                 validation_report_path=canonical_report_path,
+                evidence_lock=active_evidence_lock,
             )
             checkpoint_finalized_cleanup_artifact(
                 finalized_retry_report,
                 recovery=recovery_status,
                 local_artifact=local_cleanup_artifact,
+            )
+            _verify_cleanup_evidence_lock(
+                active_evidence_lock,
+                expected_parent=canonical_report_path.parent,
             )
             _mark_owner_session_closed(
                 queue=queue,
@@ -6254,11 +6718,16 @@ def session_teardown(
         local_cleanup_artifact = _persist_local_cleanup_report_artifact(
             report,
             validation_report_path=canonical_report_path,
+            evidence_lock=active_evidence_lock,
         )
         checkpoint_finalized_cleanup_artifact(
             report,
             recovery=finalized_recovery,
             local_artifact=local_cleanup_artifact,
+        )
+        _verify_cleanup_evidence_lock(
+            active_evidence_lock,
+            expected_parent=canonical_report_path.parent,
         )
         legacy_recovery = recovery_status
         legacy_unversioned_job_ids: list[str] = []
@@ -6339,7 +6808,10 @@ def session_teardown(
         ):
             guarded_action()
 
-    _run_or_exit(locked_action)
+    try:
+        _run_or_exit(locked_action)
+    finally:
+        _release_cleanup_evidence_lock(evidence_lock)
 
 
 @app.command("install-frp")

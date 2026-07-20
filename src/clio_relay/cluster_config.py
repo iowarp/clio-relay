@@ -1560,6 +1560,98 @@ def ensure_private_configuration_path(path: Path, *, directory: bool) -> None:
     _set_private_windows_acl(path, directory=directory)
 
 
+def ensure_private_configuration_windows_handle(
+    path: Path,
+    *,
+    handle: ctypes.c_void_p,
+    directory: bool,
+) -> None:
+    """Enforce and verify a private ACL through an exact open Windows handle."""
+    if os.name != "nt":  # pragma: no cover - explicit platform contract
+        raise ConfigurationError("Windows handle ACL enforcement is unavailable")
+    _set_private_windows_acl(
+        path,
+        directory=directory,
+        existing_handle=handle,
+    )
+
+
+def open_private_configuration_windows_descriptor(
+    path: Path,
+    *,
+    exclusive: bool = False,
+) -> int:
+    """Open one exact single-link Windows file and enforce its private ACL in place."""
+    if os.name != "nt":  # pragma: no cover - explicit platform contract
+        raise ConfigurationError("Windows private descriptor opening is unavailable")
+    storage_path = internal_filesystem_path(path, force_extended=True)
+    before = os.lstat(storage_path)
+    if not (stat.S_ISREG(before.st_mode) and not _is_reparse_stat(before) and before.st_nlink == 1):
+        raise ConfigurationError(f"configuration path is not one regular owned file: {path}")
+    kernel32 = _load_windows_library("kernel32")
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    raw_handle = create_file(
+        str(storage_path),
+        _WINDOWS_GENERIC_READ | _WINDOWS_READ_CONTROL | _WINDOWS_WRITE_DAC | _WINDOWS_WRITE_OWNER,
+        0 if exclusive else _WINDOWS_FILE_SHARE_READ,
+        None,
+        _WINDOWS_OPEN_EXISTING,
+        _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if raw_handle in (None, ctypes.c_void_p(-1).value):
+        error = _windows_last_error()
+        raise ConfigurationError(f"could not open private Windows file ({error}): {path}")
+    handle = ctypes.c_void_p(raw_handle)
+    try:
+        get_information = kernel32.GetFileInformationByHandle
+        get_information.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_WindowsFileInformation),
+        ]
+        get_information.restype = ctypes.c_int
+        information = _WindowsFileInformation()
+        if not get_information(handle, ctypes.byref(information)):
+            error = _windows_last_error()
+            raise ConfigurationError(f"could not inspect private Windows file ({error}): {path}")
+        file_index = (int(information.file_index_high) << 32) | int(information.file_index_low)
+        after = os.lstat(storage_path)
+        if not (
+            not information.attributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+            and not information.attributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+            and information.number_of_links == 1
+            and before.st_ino == file_index
+            and os.path.samestat(before, after)
+            and after.st_nlink == 1
+        ):
+            raise ConfigurationError(f"private Windows file changed while opening: {path}")
+        ensure_private_configuration_windows_handle(
+            storage_path,
+            handle=handle,
+            directory=False,
+        )
+        confirmed = os.lstat(storage_path)
+        if not os.path.samestat(after, confirmed) or confirmed.st_nlink != 1:
+            raise ConfigurationError(f"private Windows file changed while securing: {path}")
+        descriptor_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        descriptor = _open_windows_os_file_handle(cast(int, raw_handle), descriptor_flags)
+        raw_handle = None
+        return descriptor
+    finally:
+        if raw_handle not in (None, ctypes.c_void_p(-1).value):
+            _close_windows_handle(handle, kernel32=kernel32)
+
+
 def default_registry_path() -> Path:
     """Return the default local cluster registry path."""
     configured = os.getenv(CLUSTER_REGISTRY_ENV)
