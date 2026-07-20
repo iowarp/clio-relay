@@ -339,8 +339,9 @@ function Assert-BootstrapReuse {
     throw "bootstrap reuse transferred or downloaded a payload"
   }
   if ([int64]$Receipt.operations.scheduler_submission_count -ne 0 -or
-      [int64]$Receipt.operations.scheduler_cancellation_count -ne 0) {
-    throw "bootstrap reuse touched scheduler state"
+      [int64]$Receipt.operations.scheduler_cancellation_count -ne 0 -or
+      [int64]$Receipt.operations.generation_gc_count -ne 0) {
+    throw "bootstrap reuse touched scheduler or generation state"
   }
   if ([int64]$Receipt.jarvis_commands.count -ne 0 -or
       [string]$Receipt.jarvis_initialization.action -cne "preserved" -or
@@ -656,8 +657,9 @@ foreach ($Cluster in @($AresCluster, $HomelabCluster)) {
   if ($LASTEXITCODE -ne 0) { throw "worker service installation failed: $Cluster" }
 }
 
-# Re-running the exact artifact is the normal cluster startup path. This
-# diagnostic report must prove a true no-op rather than hiding a reinstall.
+# Re-running the exact artifact is an explicit reconciliation diagnostic, not
+# a desktop reconnect requirement. It must prove a true no-op rather than hide
+# a reinstall; normal startup talks directly to the persistent endpoint.
 $BootstrapReuseTimer = [Diagnostics.Stopwatch]::StartNew()
 $BootstrapReuse = Invoke-RelayReport -Id "ares-bootstrap-exact-reuse" -Diagnostic -NoArtifactOption `
   -ReportOption "--report" `

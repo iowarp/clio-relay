@@ -110,6 +110,7 @@ def test_release_bootstrap_acceptance_proves_bounded_reuse_and_service_repair() 
     ) in runbook
     assert "operations.payload_transfer_count" in runbook
     assert "operations.scheduler_submission_count" in runbook
+    assert "operations.generation_gc_count" in runbook
     assert "jarvis_preservation.config_byte_identical" in runbook
     assert "jarvis_preservation.resource_graph_byte_identical" in runbook
     assert "jarvis_preservation.repositories.link_action" in runbook
@@ -148,6 +149,7 @@ def test_bootstrap_reuse_runbook_helpers_execute_under_powershell(tmp_path: Path
             "download_count": 0,
             "scheduler_submission_count": 0,
             "scheduler_cancellation_count": 0,
+            "generation_gc_count": 0,
         },
         "jarvis_commands": {"count": 0},
         "jarvis_initialization": {"action": "preserved"},
