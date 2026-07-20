@@ -631,3 +631,42 @@ def test_storage_migration_pins_runtime_when_alias_retargets(
     assert queue.storage_runtime.config.core_root == first_core.resolve()
     assert (first_core / ".storage").is_dir()
     assert list(second_core.iterdir()) == []
+
+
+def test_storage_startup_refuses_core_replacement_before_seal_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shared-to-exclusive seal handoff never initializes a replacement root."""
+    if os.name == "nt":
+        return
+    core_dir = tmp_path / "core"
+    displaced_core = tmp_path / "displaced-core"
+    core_dir.mkdir()
+    actual_guard = exclusive_migration_lifetime
+
+    @contextmanager
+    def replacing_guard(
+        root: Path,
+    ) -> Generator[LockedCoreIdentity, None, None]:
+        core_dir.rename(displaced_core)
+        core_dir.mkdir()
+        with actual_guard(root) as locked_core:
+            yield locked_core
+
+    monkeypatch.setattr(
+        storage_runtime_module,
+        "exclusive_migration_lifetime",
+        replacing_guard,
+    )
+
+    with pytest.raises(
+        ConfigurationError,
+        match="queue root changed before establishing its indexed-era seal",
+    ):
+        storage_managed_queue(
+            RelaySettings(core_dir=core_dir, spool_dir=tmp_path / "spool")
+        )
+
+    assert not (core_dir / "migrations").exists()
+    assert not (displaced_core / "migrations").exists()

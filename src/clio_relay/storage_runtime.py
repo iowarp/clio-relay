@@ -855,16 +855,29 @@ def _initialize_queue_with_shared_writer_fencing(lifetime_lock: WorkerLifetimeLo
         ClioCoreQueue(core_dir).initialize(allow_exclusive_seal=False)
         return
     except QueueSealRequiresExclusive:
+        try:
+            original_stat = os.stat(core_dir)
+        except OSError as exc:
+            raise ConfigurationError(
+                f"queue root identity cannot be captured before seal fencing: {exc}"
+            ) from exc
         lifetime_lock.release()
 
     try:
-        ClioCoreQueue(core_dir).initialize()
+        with exclusive_migration_lifetime(core_dir) as locked_core:
+            if (locked_core.device, locked_core.inode) != (
+                original_stat.st_dev,
+                original_stat.st_ino,
+            ):
+                raise ConfigurationError(
+                    "queue root changed before establishing its indexed-era seal"
+                )
+            ClioCoreQueue(locked_core.root).initialize(locked_core=locked_core)
     finally:
         if not lifetime_lock.acquired:
             lifetime_lock.acquire()
 
     try:
-        original_stat = os.stat(core_dir)
         reacquired_stat = os.stat(lifetime_lock.core_dir)
     except OSError as exc:
         raise ConfigurationError(
