@@ -37,6 +37,7 @@ from clio_relay.bootstrap import (
     install_local_frp,
     package_source_root,
 )
+from clio_relay.bootstrap_acceptance import bootstrap_reuse_acceptance_evidence
 from clio_relay.bootstrap_reconcile import (
     BootstrapDesiredState,
     bootstrap_invocation_lock,
@@ -2985,6 +2986,7 @@ def cluster_bootstrap(
         raise
 
     def action() -> None:
+        action_started = monotonic()
         expected_artifact_sha256 = relay_artifact_sha256
         if expected_artifact_sha256 is not None and (
             re.fullmatch(r"[0-9a-f]{64}", expected_artifact_sha256) is None
@@ -3096,6 +3098,26 @@ def cluster_bootstrap(
                     metadata=target_identity,
                 )
             )
+            if receipt.get("outcome") in {"noop_verified", "repaired"}:
+                with recorder.check(
+                    "cluster.bootstrap.reuse-slo",
+                    "enforce the bounded payload-free bootstrap reuse contract",
+                ) as reuse_evidence:
+                    reuse_acceptance = bootstrap_reuse_acceptance_evidence(
+                        receipt,
+                        elapsed_seconds=monotonic() - action_started,
+                    )
+                    if reuse_acceptance is None:
+                        raise RelayError(
+                            "bootstrap reuse receipt did not produce acceptance evidence"
+                        )
+                    reuse_evidence.append(
+                        EvidenceReference(
+                            kind="bootstrap_reuse_acceptance",
+                            reference=f"bootstrap-reuse:{invocation_id}",
+                            metadata=reuse_acceptance,
+                        )
+                    )
         except BaseException as exc:
             recorder.finish(exc)
             recorder.write(report_path)

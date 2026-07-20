@@ -7769,7 +7769,8 @@ def test_cli_cluster_bootstrap_uses_package_source_root(
     def fake_bootstrap_cluster_over_ssh(**kwargs: object) -> list[str]:
         captured.update(kwargs)
         receipt = {
-            "schema_version": "clio-relay.bootstrap-receipt.v1",
+            "schema_version": "clio-relay.bootstrap-receipt.v2",
+            "outcome": "noop_verified",
             "invocation_id": "bootstrap_test",
             "bootstrap_profile": "linux-user",
             "relay_install_spec": "clio-relay==1.0.0",
@@ -7805,9 +7806,33 @@ def test_cli_cluster_bootstrap_uses_package_source_root(
             "verified": True,
         }
 
+    def fake_bootstrap_reuse_acceptance_evidence(
+        receipt: dict[str, object],
+        *,
+        elapsed_seconds: float | int,
+    ) -> dict[str, object]:
+        assert receipt["outcome"] == "noop_verified"
+        assert 0 <= elapsed_seconds < 30
+        return {
+            "schema_version": "clio-relay.bootstrap-reuse-acceptance.v1",
+            "outcome": "noop_verified",
+            "elapsed_seconds": float(elapsed_seconds),
+            "maximum_seconds": 30.0,
+            "payload_free": True,
+            "scheduler_untouched": True,
+            "jarvis_preserved": True,
+            "component_actions": {},
+            "service_operations": {},
+        }
+
     monkeypatch.setattr(cli, "package_source_root", fake_package_source_root)
     monkeypatch.setattr(cli, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
     monkeypatch.setattr(cli, "_remote_target_identity", fake_remote_target_identity)
+    monkeypatch.setattr(
+        cli,
+        "bootstrap_reuse_acceptance_evidence",
+        fake_bootstrap_reuse_acceptance_evidence,
+    )
 
     result = CliRunner().invoke(
         app,
@@ -7833,7 +7858,8 @@ def test_cli_cluster_bootstrap_uses_package_source_root(
         "bootstrap_receipt_json="
         + json.dumps(
             {
-                "schema_version": "clio-relay.bootstrap-receipt.v1",
+                "schema_version": "clio-relay.bootstrap-receipt.v2",
+                "outcome": "noop_verified",
                 "invocation_id": "bootstrap_test",
                 "bootstrap_profile": "linux-user",
                 "relay_install_spec": "clio-relay==1.0.0",
@@ -7850,6 +7876,11 @@ def test_cli_cluster_bootstrap_uses_package_source_root(
     assert report["checks"][0]["check_id"] == "cluster.bootstrap"
     assert report["checks"][1]["check_id"] == "worker.target-identity"
     assert report["checks"][1]["evidence"][0]["kind"] == "cluster_target"
+    assert report["checks"][2]["check_id"] == "cluster.bootstrap.reuse-slo"
+    reuse_evidence = report["checks"][2]["evidence"][0]
+    assert reuse_evidence["kind"] == "bootstrap_reuse_acceptance"
+    assert reuse_evidence["reference"] == "bootstrap-reuse:bootstrap_test"
+    assert reuse_evidence["metadata"]["payload_free"] is True
     cluster_target = next(
         resource for resource in report["resources"] if resource["kind"] == "cluster_target"
     )
