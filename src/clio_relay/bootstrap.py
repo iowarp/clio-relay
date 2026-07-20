@@ -27,7 +27,10 @@ from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel
 from packaging.version import InvalidVersion, Version
 
 from clio_relay import __version__
-from clio_relay.deployment import endpoint_user_service_name
+from clio_relay.deployment import (
+    endpoint_user_service_name,
+    render_bounded_user_service_activation_helper,
+)
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_MCP_VERSION,
@@ -61,6 +64,7 @@ JARVIS_CD_WHEEL_SHA256 = "321ee1a23e96a4c97b3b0d6107c5f5299d7db362396dd748e87a44
 DEFAULT_REMOTE_CORE_DIR = "$HOME/.local/share/clio-relay/core"
 DEFAULT_REMOTE_SPOOL_DIR = "$HOME/.local/share/clio-relay/spool"
 MAX_RELAY_WHEEL_METADATA_BYTES = 1024 * 1024
+BOOTSTRAP_REMOTE_SCRIPT_TIMEOUT_SECONDS = 1800.0
 
 _WORKER_WRITER_PROOF_PYTHON = r'''from __future__ import annotations
 
@@ -745,7 +749,10 @@ def bootstrap_cluster_over_ssh(
                 newline="\n",
             )
             _run(["scp", str(script_path), f"{ssh_host}:{remote_script}"])
-        result = _run(["ssh", ssh_host, "bash", remote_script])
+        result = _run(
+            ["ssh", ssh_host, "bash", remote_script],
+            timeout_seconds=BOOTSTRAP_REMOTE_SCRIPT_TIMEOUT_SECONDS,
+        )
         receipt_result = _run(
             ["ssh", ssh_host, "cat", "$HOME/.local/share/clio-relay/bootstrap-receipt.json"]
         )
@@ -837,6 +844,9 @@ def _worker_upgrade_fence_script(
     cluster: str | None,
     *,
     rendered_core_dir: str,
+    activation_observation_timeout_seconds: int | None = None,
+    activation_poll_seconds: int | None = None,
+    activation_progress_seconds: int | None = None,
 ) -> tuple[str, str, str, str]:
     """Render managed fencing, recheck, migration command, and restart step."""
     service_name = endpoint_user_service_name(cluster) if cluster is not None else ""
@@ -853,6 +863,9 @@ def _worker_upgrade_fence_script(
             "WORKER_LIFETIME_LOCK_PATH=",
             "WORKER_RESTART_ATTEMPTED=0",
             "WORKER_RESTARTED=0",
+            "WORKER_POST_START_STATE=unknown",
+            "WORKER_POST_START_SUB_STATE=unknown",
+            "WORKER_RESTART_OUTCOME=not-attempted",
         ]
     )
     if not service_name:
@@ -884,6 +897,13 @@ def _worker_upgrade_fence_script(
     fence = "\n".join(
         [
             declarations,
+            f"CLIO_RELAY_ENDPOINT_SERVICE_NAME={shlex.quote(service_name)}",
+            "CLIO_RELAY_ENDPOINT_ACTIVATION_ACTION=start",
+            render_bounded_user_service_activation_helper(
+                observation_timeout_seconds=activation_observation_timeout_seconds,
+                poll_seconds=activation_poll_seconds,
+                progress_seconds=activation_progress_seconds,
+            ),
             "bootstrap_release_worker_lifetime_guard() {",
             '  case "$WORKER_LIFETIME_GUARD_FD" in',
             "    '') return 0 ;;",
@@ -902,23 +922,16 @@ def _worker_upgrade_fence_script(
             "}",
             "bootstrap_bounded_worker_restart() {",
             "  WORKER_RESTART_ATTEMPTED=1",
-            "  bootstrap_release_worker_lifetime_guard",
-            (
-                "  if ! timeout --signal=TERM --kill-after=5s 30s systemctl --user start "
-                '"$WORKER_SERVICE_NAME"; then'
-            ),
+            "  bootstrap_release_worker_lifetime_guard || return 1",
+            "  if ! clio_relay_endpoint_activate_bounded; then",
+            '    WORKER_POST_START_STATE="$CLIO_RELAY_ENDPOINT_ACTIVE_STATE"',
+            '    WORKER_POST_START_SUB_STATE="$CLIO_RELAY_ENDPOINT_SUB_STATE"',
+            '    WORKER_RESTART_OUTCOME="$CLIO_RELAY_ENDPOINT_ACTIVATION_OUTCOME"',
             "    return 1",
             "  fi",
-            (
-                '  if ! WORKER_POST_START_STATE="$(timeout --signal=TERM --kill-after=2s 5s '
-                'systemctl --user show "$WORKER_SERVICE_NAME" '
-                '--property=ActiveState --value)"; then'
-            ),
-            "    return 1",
-            "  fi",
-            '  if [ "$WORKER_POST_START_STATE" != "active" ]; then',
-            "    return 1",
-            "  fi",
+            '  WORKER_POST_START_STATE="$CLIO_RELAY_ENDPOINT_ACTIVE_STATE"',
+            '  WORKER_POST_START_SUB_STATE="$CLIO_RELAY_ENDPOINT_SUB_STATE"',
+            '  WORKER_RESTART_OUTCOME="$CLIO_RELAY_ENDPOINT_ACTIVATION_OUTCOME"',
             "  WORKER_RESTARTED=1",
             "}",
             "bootstrap_worker_fence_exit() {",
@@ -929,44 +942,50 @@ def _worker_upgrade_fence_script(
                 ' && [ "$WORKER_RESTARTED" != "1" ]; then'
             ),
             '    if [ "$WORKER_STOP_CONFIRMED" = "1" ]; then',
+            '      if [ "$WORKER_RESTART_ATTEMPTED" = "1" ]; then',
             (
-                '      echo "bootstrap failed; attempting bounded recovery of '
+                '        echo "bootstrap failed after the worker start was already '
+                'enqueued; observing $WORKER_SERVICE_NAME without a duplicate start" >&2'
+            ),
+            "      else",
+            (
+                '        echo "bootstrap failed; attempting bounded recovery of '
                 '$WORKER_SERVICE_NAME" >&2'
             ),
+            "      fi",
             "      if bootstrap_bounded_worker_restart; then",
             (
                 '        echo "bootstrap worker_recovery=restored '
                 'service=$WORKER_SERVICE_NAME state=active" >&2'
             ),
             "      else",
+            '        case "$WORKER_RESTART_OUTCOME" in',
+            "          in-progress)",
             (
-                '        if WORKER_EXIT_STATE="$(timeout --signal=TERM --kill-after=2s 5s '
-                'systemctl --user show "$WORKER_SERVICE_NAME" '
-                '--property=ActiveState --value 2>/dev/null)"; then'
+                '            echo "bootstrap worker_recovery=in-progress '
+                "service=$WORKER_SERVICE_NAME state=$WORKER_POST_START_STATE "
+                "sub_state=$WORKER_POST_START_SUB_STATE; systemd start job retained "
+                'without a duplicate request" >&2'
             ),
-            '          case "$WORKER_EXIT_STATE" in',
-            "            inactive|failed)",
+            "            ;;",
+            "          failed)",
             (
-                '              echo "bootstrap worker_recovery=failed '
-                "service=$WORKER_SERVICE_NAME state=$WORKER_EXIT_STATE; "
+                '            echo "bootstrap worker_recovery=failed '
+                "service=$WORKER_SERVICE_NAME state=$WORKER_POST_START_STATE "
+                "sub_state=$WORKER_POST_START_SUB_STATE; "
                 'operator action is required" >&2'
             ),
-            "              ;;",
-            "            *)",
+            "            ;;",
+            "          *)",
             (
-                '              echo "bootstrap worker_recovery=unverified '
-                "service=$WORKER_SERVICE_NAME state=$WORKER_EXIT_STATE; "
+                '            echo "bootstrap worker_recovery=unverified '
+                "service=$WORKER_SERVICE_NAME state=$WORKER_POST_START_STATE "
+                "sub_state=$WORKER_POST_START_SUB_STATE "
+                "outcome=$WORKER_RESTART_OUTCOME; "
                 'operator verification is required" >&2'
             ),
-            "              ;;",
-            "          esac",
-            "        else",
-            (
-                '          echo "bootstrap worker_recovery=unverified '
-                "service=$WORKER_SERVICE_NAME state=unknown; "
-                'operator verification is required" >&2'
-            ),
-            "        fi",
+            "            ;;",
+            "        esac",
             "      fi",
             "    else",
             (
@@ -1054,7 +1073,10 @@ def _worker_upgrade_fence_script(
             "  if ! bootstrap_bounded_worker_restart; then",
             (
                 '    echo "relay worker did not become active '
-                '(${WORKER_POST_START_STATE:-unknown}): $WORKER_SERVICE_NAME" >&2'
+                "state=${WORKER_POST_START_STATE:-unknown} "
+                "sub_state=${WORKER_POST_START_SUB_STATE:-unknown} "
+                "outcome=${WORKER_RESTART_OUTCOME:-unverified}: "
+                '$WORKER_SERVICE_NAME" >&2'
             ),
             "    exit 1",
             "  fi",
@@ -1972,18 +1994,24 @@ def _run(
     command: list[str],
     *,
     cwd: Path | None = None,
+    timeout_seconds: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    result = subprocess.run(
-        command,
-        cwd=cwd,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        capture_output=True,
-        check=False,
-        env=env,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+            env=env,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        timeout_label = "unbounded" if timeout_seconds is None else f"{timeout_seconds:g}"
+        raise RelayError(f"command exceeded {timeout_label} seconds ({' '.join(command)})") from exc
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         raise RelayError(f"command failed ({' '.join(command)}): {detail}")

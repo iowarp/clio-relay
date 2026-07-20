@@ -313,22 +313,49 @@ def test_remote_restart_script_controls_existing_unit_without_rewriting_it() -> 
     assert "daemon-reload" not in script
     assert "systemctl --user enable" not in script
     harness = f"""set -u
-export USER=test-user
+test_root="$(mktemp -d)"
+trap 'rm -rf -- "$test_root"' EXIT
+mkdir -p "$test_root/bin" "$test_root/home"
+export HOME="$test_root/home" USER=test-user FAKE_SYSTEMD_ROOT="$test_root"
 loginctl() {{ echo yes; }}
-systemctl() {{
-  echo "systemctl=$*" >&2
-  case "${{2:-}}" in
-    is-enabled) echo enabled ;;
-    show)
-      echo "argv[]=/home/test/.local/bin/clio-relay endpoint start --role worker" \
-        "--cluster test --concurrency 7 --control-query-concurrency 2" \
-        "--kind-concurrency jarvis=3 --kind-concurrency remote_agent=2" \
-        "--scheduler-provider external ;"
-      ;;
-    is-active) echo active ;;
-    is-system-running) echo running ;;
-  esac
-}}
+cat > "$test_root/bin/systemctl" <<'__FAKE_SYSTEMCTL__'
+#!/usr/bin/env bash
+set -u
+echo "systemctl=$*" >&2
+case "${{2:-}}" in
+  is-enabled) echo enabled ;;
+  show)
+    case " $* " in
+      *--property=ExecStart*--value*)
+        echo "argv[]=/home/test/.local/bin/clio-relay endpoint start --role worker" \
+          "--cluster test --concurrency 7 --control-query-concurrency 2" \
+          "--kind-concurrency jarvis=3 --kind-concurrency remote_agent=2" \
+          "--scheduler-provider external ;"
+        ;;
+      *)
+        invocation=old-invocation
+        if [ -f "$FAKE_SYSTEMD_ROOT/restarted" ]; then
+          invocation=new-invocation
+        fi
+        printf '%s\n' 'LoadState=loaded' 'ActiveState=active' \
+          'SubState=running' 'Result=success' 'ControlPID=42' \
+          'ExecMainCode=0' 'ExecMainStatus=0' 'TimeoutStartUSec=5min' \
+          "InvocationID=$invocation"
+        ;;
+    esac
+    ;;
+  restart) : > "$FAKE_SYSTEMD_ROOT/restarted" ;;
+  list-jobs) ;;
+  is-active) echo active ;;
+  is-system-running) echo running ;;
+esac
+__FAKE_SYSTEMCTL__
+cat > "$test_root/bin/flock" <<'__FAKE_FLOCK__'
+#!/usr/bin/env bash
+case "${{1:-}}" in --exclusive|--unlock) exit 0 ;; *) exit 2 ;; esac
+__FAKE_FLOCK__
+chmod +x "$test_root/bin/systemctl" "$test_root/bin/flock"
+export PATH="$test_root/bin:$PATH"
 {script}
 """
 
@@ -346,7 +373,7 @@ systemctl() {{
     assert "endpoint_service.unit_rewritten=false" in stdout
     assert "endpoint_service.policy_source=installed-unit" in stdout
     assert "endpoint_service.policy_validated=true" in stdout
-    assert "systemctl=--user restart clio-relay-worker-test.service" in stderr
+    assert "systemctl=--user restart --no-block clio-relay-worker-test.service" in stderr
     assert "daemon-reload" not in stderr
     assert "systemctl=--user enable " not in stderr
 
