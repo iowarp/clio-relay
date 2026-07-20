@@ -13,6 +13,7 @@ import socket
 import stat
 import subprocess
 import sys
+from collections import Counter
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -11073,6 +11074,52 @@ def _verify_owner_session_teardown(
             "session teardown left requested residual resources: " + ", ".join(residual_ids)
         )
 
+    policy = report.cleanup_policy
+    expected_policy_keys = {"stop_worker", "cancel_jobs", "cancel_scheduler_jobs"}
+    if set(policy) != expected_policy_keys or any(type(policy[key]) is not bool for key in policy):
+        raise RelayError("session teardown cleanup policy is incomplete or invalid")
+    cancel_jobs = policy["cancel_jobs"]
+    cancel_scheduler_jobs = policy["cancel_scheduler_jobs"]
+    if policy["stop_worker"] is not stop_worker:
+        raise RelayError("session teardown worker policy did not match the requested cleanup")
+    if cancel_scheduler_jobs and not cancel_jobs:
+        raise RelayError("session teardown scheduler cancellation requires relay cancellation")
+    if report.relay_cancel_requested is not cancel_jobs:
+        raise RelayError("session teardown relay-job disposition did not match cleanup policy")
+    if report.scheduler_cancel_requested is not cancel_scheduler_jobs:
+        raise RelayError("session teardown scheduler disposition did not match cleanup policy")
+
+    allowed_resource_kinds = {
+        "browser_proxy",
+        "desktop_connector",
+        "gateway_record",
+        "relay_job",
+        "remote_connector",
+        "remote_relay_api",
+        "remote_session_files",
+        "scheduler_job",
+        "scheduler_sentinel",
+        "worker_service",
+    }
+    unknown_kinds = sorted(
+        {resource.kind for resource in report.resources} - allowed_resource_kinds
+    )
+    if unknown_kinds:
+        raise RelayError(
+            "session teardown reported unknown cleanup resource kinds: " + ", ".join(unknown_kinds)
+        )
+    resource_keys = [(resource.kind, resource.resource_id) for resource in report.resources]
+    duplicate_resource_keys = sorted(
+        f"{kind}:{resource_id}"
+        for (kind, resource_id), count in Counter(resource_keys).items()
+        if count != 1
+    )
+    if duplicate_resource_keys:
+        raise RelayError(
+            "session teardown reported duplicate cleanup resources: "
+            + ", ".join(duplicate_resource_keys)
+        )
+
     prior_status = report.prior_session_status
     post_status = report.post_session_status
     if (
@@ -11104,6 +11151,22 @@ def _verify_owner_session_teardown(
     ):
         raise RelayError("session teardown did not verify remote relay API cleanup")
 
+    session_file_resources = [
+        resource for resource in report.resources if resource.kind == "remote_session_files"
+    ]
+    if len(session_file_resources) != 1:
+        raise RelayError("session teardown must contain exactly one remote session-file result")
+    session_files = session_file_resources[0]
+    if not (
+        session_files.resource_id == f"{session_id}:{session_generation_id}"
+        and session_files.action == "close"
+        and session_files.outcome == "closed"
+        and session_files.ownership_verified
+        and session_files.verified_after_operation
+        and not session_files.residual
+    ):
+        raise RelayError("session teardown did not verify remote session-file cleanup")
+
     gateway_resources = [
         resource for resource in report.resources if resource.kind == "gateway_record"
     ]
@@ -11124,6 +11187,24 @@ def _verify_owner_session_teardown(
         raise RelayError(
             "session teardown connector evidence did not cover each owned gateway exactly"
         )
+
+    browser_resources = [
+        resource for resource in report.resources if resource.kind == "browser_proxy"
+    ]
+    for resource in browser_resources:
+        linked_gateway_id = resource.metadata.get("gateway_session_id")
+        if not (
+            isinstance(linked_gateway_id, str)
+            and linked_gateway_id in gateway_resource_ids
+            and resource.action == "stop"
+            and resource.outcome in {"stopped", "missing"}
+            and resource.ownership_verified
+            and resource.verified_after_operation
+            and not resource.residual
+        ):
+            raise RelayError(
+                f"session teardown did not verify browser proxy cleanup: {resource.resource_id}"
+            )
 
     for resource in report.resources:
         if resource.kind in {"desktop_connector", "remote_connector"} and not (
@@ -11146,26 +11227,45 @@ def _verify_owner_session_teardown(
             raise RelayError(
                 f"session teardown did not verify gateway closure: {resource.resource_id}"
             )
+        if resource.kind == "relay_job":
+            retained = resource.action == "retain" and resource.outcome in {
+                "retained",
+                "terminal",
+            }
+            canceled = resource.action == "cancel" and resource.outcome in {
+                "canceled",
+                "terminal",
+            }
+            disposition_matches_policy = (retained and not cancel_jobs) or (
+                cancel_jobs
+                and (canceled or (resource.action == "retain" and resource.outcome == "terminal"))
+            )
+            if not (
+                disposition_matches_policy
+                and resource.ownership_verified
+                and resource.verified_after_operation
+                and not resource.residual
+            ):
+                raise RelayError(
+                    f"session teardown relay-job disposition contradicted cleanup policy: "
+                    f"{resource.resource_id}"
+                )
         if resource.kind == "scheduler_job":
             linked_relay_id = resource.metadata.get("relay_job_id")
             linked_gateway_id = resource.metadata.get("gateway_session_id")
             linked = (
                 isinstance(linked_relay_id, str) and linked_relay_id in relay_resource_ids
             ) or (isinstance(linked_gateway_id, str) and linked_gateway_id in gateway_resource_ids)
-            retained = (
-                resource.action == "retain"
-                and resource.outcome in {"retained", "terminal", "missing"}
-                and resource.observed_state
-                in {
-                    "submitted",
-                    "pending",
-                    "allocated",
-                    "running",
-                    "completed",
-                    "failed",
-                    "canceled",
-                    "missing",
-                }
+            retained = resource.action == "retain" and (
+                (
+                    resource.outcome == "retained"
+                    and resource.observed_state in {"submitted", "pending", "allocated", "running"}
+                )
+                or (
+                    resource.outcome == "terminal"
+                    and resource.observed_state in {"completed", "failed", "canceled"}
+                )
+                or (resource.outcome == "missing" and resource.observed_state == "missing")
             )
             canceled = resource.action == "cancel" and (
                 (resource.outcome == "canceled" and resource.observed_state == "canceled")
@@ -11177,7 +11277,9 @@ def _verify_owner_session_teardown(
             if not (
                 linked
                 and resource.provider is not None
-                and (retained or canceled)
+                and (
+                    (retained and not cancel_scheduler_jobs) or (canceled and cancel_scheduler_jobs)
+                )
                 and resource.ownership_verified
                 and resource.verified_after_operation
                 and not resource.residual
@@ -11185,6 +11287,23 @@ def _verify_owner_session_teardown(
                 raise RelayError(
                     f"session teardown did not verify scheduler disposition: {resource.resource_id}"
                 )
+
+        if resource.kind == "scheduler_sentinel" and not (
+            cancel_jobs
+            and cancel_scheduler_jobs
+            and resource.action == "retain"
+            and resource.outcome == "retained"
+            and not resource.ownership_verified
+            and resource.verified_after_operation
+            and resource.observed_state in SCHEDULER_SENTINEL_PRESERVED_PHASES
+            and not resource.residual
+            and resource.metadata.get("unowned_sentinel") is True
+            and resource.metadata.get("preservation_verified") is True
+        ):
+            raise RelayError(
+                "session teardown did not verify scheduler sentinel preservation: "
+                f"{resource.resource_id}"
+            )
 
     worker_resources = [
         resource for resource in report.resources if resource.kind == "worker_service"

@@ -272,6 +272,11 @@ def _verified_teardown_report(
         session_id=session_id,
         session_generation_id=generation_id,
         mode="teardown",
+        cleanup_policy={
+            "stop_worker": False,
+            "cancel_jobs": False,
+            "cancel_scheduler_jobs": False,
+        },
         prior_session_status=RemoteSessionStateEvidence(
             api_pid=123,
             session_generation_id=generation_id,
@@ -300,7 +305,16 @@ def _verified_teardown_report(
                 ownership_verified=True,
                 outcome="stopped",
                 verified_after_operation=True,
-            )
+            ),
+            CleanupResource(
+                kind="remote_session_files",
+                resource_id=f"{session_id}:{generation_id}",
+                location=cluster,
+                action="close",
+                ownership_verified=True,
+                outcome="closed",
+                verified_after_operation=True,
+            ),
         ],
     )
 
@@ -5014,6 +5028,11 @@ def test_scheduler_natural_completion_during_cancel_allows_cleanup_without_false
     )
     report.relay_cancel_requested = True
     report.scheduler_cancel_requested = True
+    report.cleanup_policy = {
+        "stop_worker": False,
+        "cancel_jobs": True,
+        "cancel_scheduler_jobs": True,
+    }
 
     cli._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
@@ -5134,6 +5153,116 @@ def test_owner_session_teardown_keeps_missing_scheduler_job_without_residual(
     assert scheduler.residual is False
     assert report.residual_resources == []
     assert checks["cleanup.jobs-preserved-default"] == "passed"
+
+
+@pytest.mark.parametrize(
+    ("contradictory_resource", "error_match"),
+    [
+        (
+            CleanupResource(
+                kind="relay_job",
+                resource_id="relay-1",
+                location="ares",
+                action="cancel",
+                ownership_verified=True,
+                outcome="canceled",
+                verified_after_operation=True,
+            ),
+            "relay-job disposition contradicted cleanup policy",
+        ),
+        (
+            CleanupResource(
+                kind="scheduler_job",
+                resource_id="scheduler-1",
+                location="ares",
+                action="cancel",
+                ownership_verified=True,
+                outcome="canceled",
+                provider="slurm",
+                verified_after_operation=True,
+                observed_state="canceled",
+                metadata={"relay_job_id": "relay-1"},
+            ),
+            "did not verify scheduler disposition",
+        ),
+    ],
+)
+def test_owner_session_teardown_rejects_cancellation_under_keep_policy(
+    contradictory_resource: CleanupResource,
+    error_match: str,
+) -> None:
+    """A forged cancel result cannot satisfy the safe default cleanup policy."""
+    base = _verified_teardown_report()
+    relay_resource = CleanupResource(
+        kind="relay_job",
+        resource_id="relay-1",
+        location="ares",
+        action="retain",
+        ownership_verified=True,
+        outcome="retained",
+        verified_after_operation=True,
+    )
+    resources = [*base.resources]
+    if contradictory_resource.kind == "scheduler_job":
+        resources.append(relay_resource)
+    resources.append(contradictory_resource)
+    report = _verified_teardown_report(resources=resources)
+
+    with pytest.raises(RelayError, match=error_match):
+        cli._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            report,
+            session_id="session-1",
+            session_generation_id="generation-1",
+            stop_worker=False,
+        )
+
+
+def test_owner_session_teardown_rejects_unknown_or_duplicate_cleanup_resources() -> None:
+    """Only one exact disposition for every known cleanup resource is accepted."""
+    base = _verified_teardown_report()
+    unknown = CleanupResource(
+        kind="unrecognized_cleanup",
+        resource_id="mystery-1",
+        location="ares",
+        action="retain",
+        ownership_verified=True,
+        outcome="retained",
+        verified_after_operation=True,
+    )
+    unknown_report = _verified_teardown_report(resources=[*base.resources, unknown])
+
+    with pytest.raises(RelayError, match="unknown cleanup resource kinds"):
+        cli._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            unknown_report,
+            session_id="session-1",
+            session_generation_id="generation-1",
+            stop_worker=False,
+        )
+
+    duplicate_report = _verified_teardown_report(
+        resources=[*base.resources, base.resources[-1].model_copy()]
+    )
+    with pytest.raises(RelayError, match="duplicate cleanup resources"):
+        cli._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            duplicate_report,
+            session_id="session-1",
+            session_generation_id="generation-1",
+            stop_worker=False,
+        )
+
+
+def test_owner_session_teardown_rejects_report_flags_that_drift_from_policy() -> None:
+    """Top-level requested-action fields must repeat the immutable cleanup policy."""
+    report = _verified_teardown_report()
+    report.relay_cancel_requested = True
+
+    with pytest.raises(RelayError, match="relay-job disposition did not match cleanup policy"):
+        cli._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            report,
+            session_id="session-1",
+            session_generation_id="generation-1",
+            stop_worker=False,
+        )
 
 
 def test_cli_session_rejects_scheduler_cancel_without_relay_cancel(
