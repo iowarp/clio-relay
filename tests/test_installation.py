@@ -336,8 +336,7 @@ def test_native_jarvis_record_closure_rejects_a_tampered_installed_member(
             b"Metadata-Version: 2.1\nName: fixture-jarvis\nVersion: 1.0\n\n"
         ),
         "fixture_jarvis-1.0.dist-info/WHEEL": (
-            b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\n"
-            b"Tag: py3-none-any\n\n"
+            b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n\n"
         ),
     }
     record_name = "fixture_jarvis-1.0.dist-info/RECORD"

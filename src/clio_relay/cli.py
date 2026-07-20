@@ -270,6 +270,8 @@ MAX_SPACK_CONFIGURATION_OBSERVATION_OUTPUT_BYTES = 128 * 1024
 MAX_SPACK_CONFIGURATION_TREE_ENTRIES = 1_024
 SCHEDULER_SENTINEL_ACTIVE_PHASES = frozenset({"submitted", "pending", "allocated", "running"})
 SCHEDULER_SENTINEL_PRESERVED_PHASES = SCHEDULER_SENTINEL_ACTIVE_PHASES | {"completed"}
+BOOTSTRAP_EXACT_INSPECTION_DEADLINE_SECONDS = 24.0
+BOOTSTRAP_REPAIR_DEADLINE_SECONDS = 55.0
 _ACCEPTANCE_REPORT_COMMAND_ATTRIBUTE = "__clio_relay_acceptance_report_command__"
 
 
@@ -2925,8 +2927,9 @@ def cluster_bootstrap(
         str | None,
         typer.Option(
             help=(
-                "Expected lowercase SHA-256 for --relay-wheel. Supplying released "
-                "artifact provenance keeps exact no-op bootstrap payload-free."
+                "Expected lowercase SHA-256 of the exact clio-relay wheel. Required "
+                "for release bootstrap, with or without --relay-wheel, so repeated "
+                "offline bootstrap has an artifact-distinct identity."
             ),
         ),
     ] = None,
@@ -8428,7 +8431,7 @@ def bootstrap_inspect(
             raise ConfigurationError("bootstrap desired state is invalid") from exc
         started_at = datetime.now(UTC)
         started = monotonic()
-        deadline = started + 50.0
+        deadline = started + BOOTSTRAP_EXACT_INSPECTION_DEADLINE_SECONDS
 
         def run_systemctl(
             arguments: list[str], *, timeout_seconds: float
@@ -8494,6 +8497,7 @@ def bootstrap_inspect(
         service_enable_count = 0
         service_restart_count = 0
         repository_reconciliation: dict[str, object] | None = None
+        repair_attempted = False
         repairable_reasons = {
             "managed endpoint service is inactive",
             "managed endpoint service is disabled",
@@ -8509,13 +8513,13 @@ def bootstrap_inspect(
             reason in repairable_reasons or reason in repository_reasons
             for reason in inspection.reasons
         ):
+            repair_attempted = True
+            deadline = started + BOOTSTRAP_REPAIR_DEADLINE_SECONDS
             binding = repair_managed_jarvis_binding(desired)
-            raw_repository_evidence = binding.get("repositories")
-            if not isinstance(raw_repository_evidence, dict):
+            if not isinstance(binding.get("repositories"), dict):
                 raise ConfigurationError("managed JARVIS repair omitted repository evidence")
             repository_reconciliation = {
-                str(key): value
-                for key, value in cast(dict[object, object], raw_repository_evidence).items()
+                str(key): value for key, value in cast(dict[object, object], binding).items()
             }
             inspection = inspect_exact_bootstrap_noop(
                 desired,
@@ -8530,6 +8534,8 @@ def bootstrap_inspect(
             and inspection.reasons
             and set(inspection.reasons).issubset(repairable_reasons)
         ):
+            repair_attempted = True
+            deadline = started + BOOTSTRAP_REPAIR_DEADLINE_SECONDS
             load_state = run_systemctl(
                 [
                     "show",
@@ -8539,11 +8545,16 @@ def bootstrap_inspect(
                 ],
                 timeout_seconds=5,
             )
-            if (
+            if not (
                 load_state.returncode == 0
                 and len(load_state.stdout.encode()) <= 1024
                 and load_state.stdout.strip() == "loaded"
             ):
+                raise ConfigurationError(
+                    "managed endpoint service is not installed; run "
+                    "cluster install-endpoint-service before requesting readiness repair"
+                )
+            else:
                 if service_enabled is not True:
                     enabled = run_systemctl(
                         ["enable", desired.worker_service],
@@ -8592,6 +8603,10 @@ def bootstrap_inspect(
                     worker_evidence=worker_evidence,
                     installation_snapshot=current_installation,
                 )
+        if repair_attempted and not inspection.exact_match:
+            raise ConfigurationError(
+                "payload-free bootstrap repair did not converge: " + "; ".join(inspection.reasons)
+            )
         payload: dict[str, object] = {
             "schema_version": "clio-relay.bootstrap-preflight.v1",
             "exact_match": inspection.exact_match,
@@ -8644,7 +8659,7 @@ def bootstrap_inspect(
         )
 
     def _inspect() -> None:
-        with bootstrap_invocation_lock(timeout_seconds=5):
+        with bootstrap_invocation_lock(timeout_seconds=2):
             _inspect_locked()
 
     _run_or_exit(_inspect)

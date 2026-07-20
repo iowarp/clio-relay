@@ -10,6 +10,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -29,6 +30,7 @@ from clio_relay.bootstrap_reconcile import (
     make_bootstrap_receipt,
     plan_bootstrap_reconcile,
     reconcile_managed_jarvis_repository,
+    repair_managed_jarvis_binding,
     write_jarvis_wrapper,
 )
 from clio_relay.errors import ConfigurationError
@@ -202,9 +204,7 @@ def test_exact_noop_is_read_only_and_preserves_operator_jarvis_bytes(
     assert inspection.current_generation_target == str(generation.resolve())
     assert (root / "jarvis_config.yaml").read_bytes() == config_before
     assert (root / "resource_graph.yaml").read_bytes() == graph_before
-    assert {
-        path: (path.read_bytes(), path.stat().st_mtime_ns) for path in before
-    } == before
+    assert {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in before} == before
 
 
 def test_matching_receipt_with_tampered_runtime_is_not_a_noop(
@@ -229,9 +229,7 @@ def test_matching_receipt_with_tampered_runtime_is_not_a_noop(
     runtime = info["component_runtime"]
     assert isinstance(runtime, dict)
     runtime["clio-relay"] = {"persistent_tool_verified": False}
-    monkeypatch.setattr(
-        "clio_relay.bootstrap_reconcile.installation_info", lambda _path: info
-    )
+    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", lambda _path: info)
     monkeypatch.setattr(
         subprocess,
         "run",
@@ -275,8 +273,10 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
         frps_sha256=_digest(b"frps"),
     )
     _write_jarvis_state(tmp_path, desired)
-    legacy_python = tmp_path / ".local/share/clio-relay/jarvis-venv" / (
-        "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    legacy_python = (
+        tmp_path
+        / ".local/share/clio-relay/jarvis-venv"
+        / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     )
     legacy_python.parent.mkdir(parents=True)
     legacy_python.write_bytes(b"python")
@@ -314,9 +314,8 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
             "runtime_executables": {"jarvis": str(legacy_python.parent / "jarvis")},
         },
     }
-    monkeypatch.setattr(
-        "clio_relay.bootstrap_reconcile.installation_info", lambda _path: info
-    )
+    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", lambda _path: info)
+
     def identity_command(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         if command[:2] != [str(bin_dir / "uv"), "--version"]:
             raise AssertionError(command)  # pragma: no cover
@@ -454,6 +453,38 @@ def test_managed_repo_reconcile_refuses_concurrent_operator_edit(
     assert not list(tmp_path.glob(".repos.yaml.*.tmp"))
 
 
+def test_managed_repo_repair_refuses_unproven_broken_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken link is existing untrusted state, not an absent managed path."""
+    desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
+    expected = (
+        tmp_path
+        / ".local/share/clio-relay/generations"
+        / desired.fingerprint
+        / "source/jarvis-packages/clio_relay"
+    )
+    expected.mkdir(parents=True)
+    managed = tmp_path / ".local/share/clio-relay/managed-jarvis-repo"
+    original_lstat = Path.lstat
+
+    def simulated_lstat(path: Path) -> os.stat_result | SimpleNamespace:
+        if path == managed:
+            return SimpleNamespace(st_mode=stat.S_IFLNK)
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", simulated_lstat)
+    monkeypatch.setattr(
+        bootstrap_reconcile_module.os,
+        "readlink",
+        lambda path: str(tmp_path / "attacker-controlled/missing"),
+    )
+
+    with pytest.raises(ConfigurationError, match="not proven by an earlier receipt"):
+        repair_managed_jarvis_binding(desired, home=tmp_path)
+
+
 def test_transaction_journal_enforces_irreversible_forward_recovery(tmp_path: Path) -> None:
     path = tmp_path / "transaction.json"
     journal = BootstrapTransactionJournal(
@@ -489,9 +520,10 @@ def test_bootstrap_invocation_lock_is_private_and_bounded(tmp_path: Path) -> Non
         assert path == tmp_path / ".local/share/clio-relay/bootstrap.lock"
         if os.name != "nt":
             assert stat.S_IMODE(path.stat().st_mode) == 0o600
-        with pytest.raises(
-            ConfigurationError, match="timed out acquiring"
-        ), bootstrap_invocation_lock(home=tmp_path, timeout_seconds=0.05):
+        with (
+            pytest.raises(ConfigurationError, match="timed out acquiring"),
+            bootstrap_invocation_lock(home=tmp_path, timeout_seconds=0.05),
+        ):
             raise AssertionError("a concurrent bootstrap lock was acquired")
 
 
@@ -515,9 +547,10 @@ def test_bootstrap_invocation_lock_refuses_redirected_lock_path(tmp_path: Path) 
         target.write_bytes(b"outside")
         lock_path.symlink_to(target)
 
-    with pytest.raises(
-        ConfigurationError, match="private bootstrap lock"
-    ), bootstrap_invocation_lock(home=tmp_path, timeout_seconds=0.1):
+    with (
+        pytest.raises(ConfigurationError, match="private bootstrap lock"),
+        bootstrap_invocation_lock(home=tmp_path, timeout_seconds=0.1),
+    ):
         raise AssertionError("a redirected bootstrap lock was acquired")
 
 
@@ -663,6 +696,81 @@ def test_prepared_generation_refuses_a_tampered_relay_owned_jarvis_wrapper(
             desired,
             generation=generation,
             legacy_execution_identity=execution_identity,
+        )
+
+
+def test_active_generation_rejects_coordinated_manifest_and_wrapper_tamper(
+    tmp_path: Path,
+) -> None:
+    """A rewritten manifest cannot authorize a different JARVIS interpreter."""
+    desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
+
+    def make_execution_root(name: str) -> tuple[Path, Path, Path, dict[str, object]]:
+        root = tmp_path / name
+        bin_dir = root / ("Scripts" if os.name == "nt" else "bin")
+        bin_dir.mkdir(parents=True)
+        python = bin_dir / ("python.exe" if os.name == "nt" else "python")
+        jarvis = bin_dir / ("jarvis.exe" if os.name == "nt" else "jarvis")
+        python.write_bytes((name + "-python").encode())
+        jarvis.write_bytes((name + "-jarvis").encode())
+        python.chmod(0o755)
+        jarvis.chmod(0o755)
+        identity = execution_environment_identity(
+            root,
+            executables={"python": python, "jarvis": jarvis},
+        )
+        return root, python, jarvis, identity
+
+    _original_root, original_python, _original_jarvis, original_identity = make_execution_root(
+        "original"
+    )
+    generation = tmp_path / "generation"
+    (generation / "bin").mkdir(parents=True)
+    wrapper = generation / "bin/jarvis"
+    wrapper_evidence = write_jarvis_wrapper(wrapper, original_python)
+    receipt_path = generation / "install-receipt.json"
+    receipt_path.write_text("{}\n", encoding="utf-8")
+    manifest: dict[str, object] = {
+        "schema_version": "clio-relay.bootstrap-generation.v1",
+        "fingerprint": desired.fingerprint,
+        "plan": {
+            "mode": "relay-only",
+            "desired_fingerprint": desired.fingerprint,
+            "component_actions": {"clio-relay": "replace"},
+        },
+        "legacy_execution_identity": original_identity,
+        "jarvis_wrapper_sha256": wrapper_evidence["sha256"],
+        "install_receipt": str(receipt_path),
+    }
+    manifest_path = generation / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    installation = _installation_info(desired)
+    receipt = installation["receipt"]
+    assert isinstance(receipt, dict)
+    receipt["component_artifacts"] = {
+        "jarvis-cd": {"runtime_interpreters": {"execution": str(original_python)}}
+    }
+
+    bootstrap_reconcile_module._verify_active_generation_jarvis_wrapper(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        generation,
+        desired=desired,
+        installation=installation,
+    )
+
+    _replacement_root, replacement_python, _replacement_jarvis, replacement_identity = (
+        make_execution_root("replacement")
+    )
+    wrapper.unlink()
+    replacement_wrapper = write_jarvis_wrapper(wrapper, replacement_python)
+    manifest["legacy_execution_identity"] = replacement_identity
+    manifest["jarvis_wrapper_sha256"] = replacement_wrapper["sha256"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match="not bound to its install receipt"):
+        bootstrap_reconcile_module._verify_active_generation_jarvis_wrapper(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            generation,
+            desired=desired,
+            installation=installation,
         )
 
 

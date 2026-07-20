@@ -1130,6 +1130,7 @@ def make_bootstrap_receipt(
     service_enabled_before: bool | None = None,
     service_active_after: bool | None = None,
     service_enabled_after: bool | None = None,
+    service_pending_install: bool = False,
     payload_transfer_count: int = 0,
     payload_transfer_bytes: int = 0,
 ) -> dict[str, object]:
@@ -1166,12 +1167,17 @@ def make_bootstrap_receipt(
         raise ValueError("JARVIS command evidence must contain non-empty argument vectors")
     before = jarvis_state_before or inspection.jarvis_state
     repo_evidence = jarvis_repo_reconciliation or {
-        "action": "reused",
-        "managed_repo": None,
-        "added_managed_repos": [],
-        "removed_previous_managed_repos": [],
-        "before_sha256": before.repos_sha256,
-        "after_sha256": inspection.jarvis_state.repos_sha256,
+        "link_action": "reused",
+        "link": desired.managed_jarvis_repo,
+        "target": None,
+        "repositories": {
+            "action": "reused",
+            "managed_repo": None,
+            "added_managed_repos": [],
+            "removed_previous_managed_repos": [],
+            "before_sha256": before.repos_sha256,
+            "after_sha256": inspection.jarvis_state.repos_sha256,
+        },
     }
     return {
         "schema_version": BOOTSTRAP_RECEIPT_SCHEMA,
@@ -1256,6 +1262,7 @@ def make_bootstrap_receipt(
         "worker": inspection.readiness.model_dump(mode="json"),
         "service": {
             "name": desired.worker_service,
+            "pending_install": service_pending_install,
             "active_before": service_active_before,
             "enabled_before": service_enabled_before,
             "active_after": (
@@ -1416,25 +1423,38 @@ def repair_managed_jarvis_binding(
     managed.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     link_action = "reused"
     try:
-        _verify_stable_symlink(managed, expected=expected_target, label="relay-managed repository")
+        managed_details = managed.lstat()
     except FileNotFoundError:
         link_action = "created"
-    except ConfigurationError:
-        try:
-            if not managed.is_symlink():
-                raise ConfigurationError(
-                    "relay-managed repository path is not a replaceable symbolic link"
-                )
-            prior_target = managed.resolve(strict=True)
-            generations = (resolved_home / ".local/share/clio-relay/generations").resolve(
-                strict=True
-            )
-            prior_target.relative_to(generations)
-        except (OSError, RuntimeError, ValueError) as exc:
+    except OSError as exc:
+        raise ConfigurationError("relay-managed repository link could not be classified") from exc
+    else:
+        if not stat.S_ISLNK(managed_details.st_mode):
             raise ConfigurationError(
-                "relay-managed repository link has no relay-owned generation provenance"
-            ) from exc
-        link_action = "retargeted"
+                "relay-managed repository path is not a replaceable symbolic link"
+            )
+        raw_target = Path(os.readlink(managed))
+        if not raw_target.is_absolute():
+            raw_target = managed.parent / raw_target
+        lexical_target = Path(os.path.abspath(raw_target))
+        if lexical_target == expected_target:
+            _verify_stable_symlink(
+                managed,
+                expected=expected_target,
+                label="relay-managed repository",
+            )
+        else:
+            proven_targets = {
+                Path(os.path.abspath(path.expanduser())) for path in previous_managed_repos
+            }
+            if lexical_target not in proven_targets or not _is_generation_repository_target(
+                lexical_target,
+                home=resolved_home,
+            ):
+                raise ConfigurationError(
+                    "relay-managed repository link target is not proven by an earlier receipt"
+                )
+            link_action = "retargeted"
     if link_action != "reused":
         temporary = managed.with_name(f".{managed.name}.{os.getpid()}.tmp")
         try:
@@ -1458,6 +1478,22 @@ def repair_managed_jarvis_binding(
         "target": str(expected_target),
         "repositories": repo_evidence,
     }
+
+
+def _is_generation_repository_target(path: Path, *, home: Path) -> bool:
+    """Return whether a proven path has the exact relay generation repository shape."""
+    generations = home / ".local/share/clio-relay/generations"
+    try:
+        relative = path.relative_to(generations)
+    except ValueError:
+        return False
+    fingerprint = relative.parts[0] if relative.parts else ""
+    return bool(
+        len(relative.parts) == 4
+        and len(fingerprint) == 64
+        and all(character in "0123456789abcdef" for character in fingerprint)
+        and relative.parts[1:] == ("source", "jarvis-packages", "clio_relay")
+    )
 
 
 def _inspect_installation_identity(
@@ -1572,15 +1608,24 @@ def _inspect_active_generation(
             expected=expected_target / "source/jarvis-packages/clio_relay",
             label="relay-managed JARVIS repository",
         )
-        _verify_active_generation_jarvis_wrapper(expected_target)
+        _verify_active_generation_jarvis_wrapper(
+            expected_target,
+            desired=desired,
+            installation=installation,
+        )
     except (ConfigurationError, OSError, RuntimeError, ValueError) as exc:
         reasons.append(str(exc))
         return active_generation, None
     return active_generation, str(resolved_target)
 
 
-def _verify_active_generation_jarvis_wrapper(generation: Path) -> None:
-    """Bind the active JARVIS launcher to its retained execution interpreter."""
+def _verify_active_generation_jarvis_wrapper(
+    generation: Path,
+    *,
+    desired: BootstrapDesiredState,
+    installation: dict[str, object] | None,
+) -> None:
+    """Bind the active launcher and manifest to immutable installed evidence."""
     raw_manifest = _read_regular_bounded(generation / "manifest.json", maximum=4 * 1024 * 1024)
     try:
         raw_value = cast(object, json.loads(raw_manifest))
@@ -1589,24 +1634,90 @@ def _verify_active_generation_jarvis_wrapper(generation: Path) -> None:
     if not isinstance(raw_value, dict):
         raise ConfigurationError("active generation manifest is not an object")
     manifest = cast(dict[str, object], raw_value)
+    expected_manifest_keys = {
+        "schema_version",
+        "fingerprint",
+        "plan",
+        "legacy_execution_identity",
+        "jarvis_wrapper_sha256",
+        "install_receipt",
+    }
+    if set(manifest) != expected_manifest_keys:
+        raise ConfigurationError("active generation manifest has an unknown shape")
+    expected_receipt_path = generation / "install-receipt.json"
+    if not (
+        manifest.get("schema_version") == "clio-relay.bootstrap-generation.v1"
+        and manifest.get("fingerprint") == desired.fingerprint
+        and manifest.get("install_receipt") == str(expected_receipt_path)
+    ):
+        raise ConfigurationError("active generation manifest identity changed")
+    raw_plan = manifest.get("plan")
+    try:
+        plan = BootstrapReconcilePlan.model_validate(raw_plan)
+    except ValueError as exc:
+        raise ConfigurationError("active generation reconcile plan is invalid") from exc
+    if plan.desired_fingerprint != desired.fingerprint:
+        raise ConfigurationError("active generation reconcile plan identity changed")
     raw_identity = manifest.get("legacy_execution_identity")
-    raw_executables = (
-        cast(dict[str, object], raw_identity).get("executables")
-        if isinstance(raw_identity, dict)
-        else None
-    )
-    raw_python = (
-        cast(dict[str, object], raw_executables).get("python")
-        if isinstance(raw_executables, dict)
-        else None
-    )
+    if not isinstance(raw_identity, dict):
+        raise ConfigurationError("active generation omitted JARVIS execution identity")
+    identity = cast(dict[str, object], raw_identity)
+    raw_root = identity.get("root")
+    raw_executables = identity.get("executables")
+    if not isinstance(raw_root, str) or not isinstance(raw_executables, dict):
+        raise ConfigurationError("active generation omitted JARVIS execution boundary")
+    typed_executables = cast(dict[str, object], raw_executables)
+    if set(typed_executables) != {"python", "jarvis"}:
+        raise ConfigurationError("active generation JARVIS executable set changed")
+    raw_python = typed_executables.get("python")
+    raw_jarvis = typed_executables.get("jarvis")
     python_path = (
-        cast(dict[str, object], raw_python).get("resolved_path")
+        cast(dict[str, object], raw_python).get("lexical_path")
         if isinstance(raw_python, dict)
         else None
     )
-    if not isinstance(python_path, str):
+    jarvis_path = (
+        cast(dict[str, object], raw_jarvis).get("lexical_path")
+        if isinstance(raw_jarvis, dict)
+        else None
+    )
+    if not isinstance(python_path, str) or not isinstance(jarvis_path, str):
         raise ConfigurationError("active generation omitted JARVIS interpreter identity")
+    recomputed_identity = execution_environment_identity(
+        Path(raw_root),
+        executables={
+            "python": Path(python_path),
+            "jarvis": Path(jarvis_path),
+        },
+    )
+    if recomputed_identity != identity:
+        raise ConfigurationError("active generation JARVIS execution identity changed")
+    receipt = installation.get("receipt") if installation is not None else None
+    raw_artifacts = (
+        cast(dict[str, object], receipt).get("component_artifacts")
+        if isinstance(receipt, dict)
+        else None
+    )
+    raw_jarvis_artifact = (
+        cast(dict[str, object], raw_artifacts).get("jarvis-cd")
+        if isinstance(raw_artifacts, dict)
+        else None
+    )
+    raw_interpreters = (
+        cast(dict[str, object], raw_jarvis_artifact).get("runtime_interpreters")
+        if isinstance(raw_jarvis_artifact, dict)
+        else None
+    )
+    receipt_execution_python = (
+        cast(dict[str, object], raw_interpreters).get("execution")
+        if isinstance(raw_interpreters, dict)
+        else None
+    )
+    if not isinstance(receipt_execution_python, str) or (
+        Path(receipt_execution_python).resolve(strict=True)
+        != Path(python_path).resolve(strict=True)
+    ):
+        raise ConfigurationError("active JARVIS interpreter is not bound to its install receipt")
     expected_payload = jarvis_wrapper_payload(Path(python_path))
     wrapper = generation / "bin/jarvis"
     observed_payload = _read_regular_bounded(wrapper, maximum=64 * 1024)

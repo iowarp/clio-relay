@@ -6800,6 +6800,8 @@ def test_cli_cluster_bootstrap_uses_package_source_root(
             "ares",
             "--relay-wheel",
             str(wheel),
+            "--relay-artifact-sha256",
+            hashlib.sha256(b"wheel").hexdigest(),
         ],
     )
 

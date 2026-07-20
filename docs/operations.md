@@ -11,9 +11,19 @@ homelab relay to a cluster worker and remote agent, see
 ```powershell
 uv tool install --python 3.12 --no-config clio-relay
 clio-relay cluster add --name my-cluster --ssh-host my-cluster-login --scheduler-provider slurm --agent-adapter exec --agent-bin agent
-clio-relay cluster bootstrap --cluster my-cluster
+$RelayWheelSha256 = "REPLACE_WITH_SHA256_FROM_THE_RELEASE"
+clio-relay cluster bootstrap --cluster my-cluster --relay-artifact-sha256 $RelayWheelSha256
 clio-relay cluster install-endpoint-service --cluster my-cluster --start --enable
 ```
+
+Use the SHA-256 published for the exact wheel installed on the desktop (from
+the GitHub Release `SHA256SUMS` asset or PyPI file details). Release-mode
+bootstrap requires this value even when `--relay-wheel` is omitted. It lets an
+unchanged cluster complete its preflight offline without reading, building, or
+transferring local payload bytes, while distinguishing rebuilt wheels that
+share a version string. A fresh bootstrap may finish with the endpoint service
+reported as `pending_install`; the explicit `install-endpoint-service` command
+above owns unit creation and activation.
 
 An enabled endpoint worker is expected to survive every desktop disconnect and
 the operator's final cluster logout. Before installing it, verify the cluster's
