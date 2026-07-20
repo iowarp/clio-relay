@@ -9,12 +9,10 @@ import json
 import os
 import secrets
 import shlex
-import signal
 import socket
 import stat
 import subprocess
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -59,15 +57,18 @@ SESSION_SCHEDULER_CANCELED_CHECK_ID = "cleanup.explicit-job-cancel"
 _REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS = 120.0
 _REMOTE_API_READINESS_TIMEOUT_SECONDS = 60.0
 _MAX_OWNED_SESSION_DOCUMENT_BYTES = 1024 * 1024
-_MAX_OWNED_SESSION_LOG_BYTES = 16 * 1024 * 1024
 _MAX_PROC_RECORD_BYTES = 1024 * 1024
-_MAX_PROC_ENTRIES = 131_072
 _OWNED_SESSION_LOCK_RETRY_SECONDS = 0.05
-_OWNED_SESSION_PROCESS_STOP_TIMEOUT_SECONDS = 5.0
 _MAX_REMOTE_SESSION_SCRIPT_BYTES = MAX_CLUSTER_REGISTRY_BYTES + 128 * 1024
 _MAX_REMOTE_SESSION_STDOUT_BYTES = 1024 * 1024
 _MAX_REMOTE_SESSION_STDERR_BYTES = 1024 * 1024
 _MAX_API_HEALTH_RESPONSE_BYTES = 64 * 1024
+_MAX_API_STARTUP_RECEIPT_BYTES = 64 * 1024
+_API_STARTUP_RECEIPT_ENV = "CLIO_RELAY_SESSION_STARTUP_RECEIPT"
+_SYSTEMD_UNIT_ENV = "CLIO_RELAY_SESSION_SYSTEMD_UNIT"
+_SYSTEMD_CGROUP_ENV = "CLIO_RELAY_SESSION_SYSTEMD_CGROUP"
+_SYSTEMD_INVOCATION_ENV = "CLIO_RELAY_SESSION_SYSTEMD_INVOCATION_ID"
+_SYSTEMD_DESCRIPTION_ENV = "CLIO_RELAY_SESSION_SYSTEMD_DESCRIPTION"
 
 
 class _FcntlModule(Protocol):
@@ -272,27 +273,6 @@ class _OwnedSessionTransaction:
             os.close(descriptor)
             raise
 
-    def unlink_regular(self, name: str, *, expected_sha256: str | None = None) -> bool:
-        """Delete one exact regular file after optional content proof."""
-        linked = self.stat_regular(name, required=False)
-        if linked is None:
-            return False
-        if expected_sha256 is not None:
-            payload = self.read_bytes(name, maximum_bytes=_MAX_OWNED_SESSION_LOG_BYTES)
-            if payload is None or hashlib.sha256(payload).hexdigest() != expected_sha256:
-                raise RelayError(f"owned session file digest changed before deletion: {name}")
-        final = os.stat(name, dir_fd=self.directory_fd, follow_symlinks=False)
-        if (final.st_dev, final.st_ino) != (linked.st_dev, linked.st_ino):
-            raise RelayError(f"owned session file changed before deletion: {name}")
-        try:
-            os.unlink(name, dir_fd=self.directory_fd)
-            os.fsync(self.directory_fd)
-        except OSError as exc:
-            raise RelayError(
-                f"owned session file could not be deleted safely: {name}: {exc}"
-            ) from exc
-        return True
-
     def unlink_verified(
         self,
         name: str,
@@ -300,8 +280,8 @@ class _OwnedSessionTransaction:
         expected_device: int,
         expected_inode: int,
         expected_size: int,
-        expected_sha256: str,
-        maximum_bytes: int,
+        expected_sha256: str | None,
+        maximum_bytes: int | None,
     ) -> bool:
         """Delete one file only when its complete pinned identity still matches."""
         linked = self.stat_regular(name, required=False)
@@ -313,11 +293,14 @@ class _OwnedSessionTransaction:
             expected_size,
         ):
             raise RelayError(f"owned session file identity changed before deletion: {name}")
-        payload = self.read_bytes(name, maximum_bytes=maximum_bytes)
-        if payload is None:  # pragma: no cover - required read
-            raise RelayError(f"owned session file disappeared before deletion: {name}")
-        if hashlib.sha256(payload).hexdigest() != expected_sha256:
-            raise RelayError(f"owned session file digest changed before deletion: {name}")
+        if expected_sha256 is not None:
+            if maximum_bytes is None:  # pragma: no cover - internal contract
+                raise RelayError(f"owned session file digest bound is missing: {name}")
+            payload = self.read_bytes(name, maximum_bytes=maximum_bytes)
+            if payload is None:  # pragma: no cover - required read
+                raise RelayError(f"owned session file disappeared before deletion: {name}")
+            if hashlib.sha256(payload).hexdigest() != expected_sha256:
+                raise RelayError(f"owned session file digest changed before deletion: {name}")
         final = os.stat(name, dir_fd=self.directory_fd, follow_symlinks=False)
         if (final.st_dev, final.st_ino, final.st_size) != (
             expected_device,
@@ -580,15 +563,16 @@ class OwnedSessionCleanupTarget(BaseModel):
     inode: int | None = Field(default=None, gt=0)
     size: int | None = Field(default=None, ge=0)
     sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    identity_mode: Literal["inode", "content_sha256"] = "content_sha256"
 
     def identity_is_complete(self) -> bool:
         """Return whether present/absent state has the exact permitted shape."""
-        identity = (self.device, self.inode, self.size, self.sha256)
-        return (
-            all(value is not None for value in identity)
-            if self.present
-            else all(value is None for value in identity)
-        )
+        stat_identity = (self.device, self.inode, self.size)
+        if not self.present:
+            return all(value is None for value in (*stat_identity, self.sha256))
+        if not all(value is not None for value in stat_identity):
+            return False
+        return self.sha256 is None if self.identity_mode == "inode" else self.sha256 is not None
 
 
 class CleanupResource(BaseModel):
@@ -753,106 +737,250 @@ def _read_bounded_proc_bytes(path: Path, *, maximum_bytes: int) -> bytes:
             os.close(descriptor)
 
 
-def _scan_owned_generation_processes(
+def _read_proc_identity(*, proc_root: Path, pid: int) -> _OwnedGenerationProcess:
+    """Read one bounded process-group and start identity from procfs."""
+    try:
+        stat_payload = _read_bounded_proc_bytes(
+            proc_root / str(pid) / "stat",
+            maximum_bytes=_MAX_PROC_RECORD_BYTES,
+        ).decode("utf-8")
+        fields = stat_payload.rsplit(")", 1)[1].split()
+        return _OwnedGenerationProcess(
+            pid=pid,
+            process_group_id=int(fields[2]),
+            start_ticks=fields[19],
+        )
+    except (FileNotFoundError, ProcessLookupError):
+        raise
+    except (IndexError, OSError, UnicodeDecodeError, ValueError) as exc:
+        raise RelayError(f"process identity record is invalid for pid {pid}: {exc}") from exc
+
+
+def _current_linux_cgroup_path(
+    *,
+    pid: int,
+    proc_root: Path = Path("/proc"),
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+) -> Path:
+    """Return the exact cgroup-v2 path containing one process."""
+    try:
+        payload = _read_bounded_proc_bytes(
+            proc_root / str(pid) / "cgroup",
+            maximum_bytes=_MAX_PROC_RECORD_BYTES,
+        ).decode("ascii")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RelayError(f"cannot inspect process cgroup for pid {pid}: {exc}") from exc
+    matches = [line[3:] for line in payload.splitlines() if line.startswith("0::/")]
+    relative = matches[0].lstrip("/") if len(matches) == 1 else ""
+    if not relative or any(part in {"", ".", ".."} for part in relative.split("/")):
+        raise RelayError(f"process cgroup-v2 identity is invalid for pid {pid}")
+    try:
+        root = cgroup_root.resolve(strict=True)
+        observed = (root / relative).resolve(strict=True)
+    except OSError as exc:
+        raise RelayError(f"process cgroup-v2 path is unavailable for pid {pid}: {exc}") from exc
+    if observed == root or not observed.is_relative_to(root):
+        raise RelayError(f"process cgroup-v2 identity escaped its root for pid {pid}")
+    return observed
+
+
+def _startup_receipt_signature(document: dict[str, object], *, owner_token: str) -> str:
+    unsigned = {key: value for key, value in document.items() if key != "hmac_sha256"}
+    payload = json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hmac.new(owner_token.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def _atomic_write_startup_receipt(path: Path, payload: bytes) -> None:
+    """Publish one owner-private startup receipt without acquiring the parent-held lock."""
+    if len(payload) > _MAX_API_STARTUP_RECEIPT_BYTES:
+        raise RelayError("owned API startup receipt exceeds its byte limit")
+    get_effective_uid = cast(Callable[[], int] | None, getattr(os, "geteuid", None))
+    if get_effective_uid is None:
+        raise RelayError("owned API startup receipt cannot verify the effective user")
+    uid = get_effective_uid()
+    parent = path.parent
+    parent_status = parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_status.st_mode)
+        or parent_status.st_uid != uid
+        or stat.S_IMODE(parent_status.st_mode) != 0o700
+    ):
+        raise RelayError("owned API startup receipt parent is not owner-private")
+    directory_fd = os.open(
+        parent,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    temporary_name = f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise RelayError("owned API startup receipt write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        existing = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(existing.st_mode)
+            or existing.st_uid != uid
+            or existing.st_nlink != 1
+            or stat.S_IMODE(existing.st_mode) != 0o600
+        ):
+            raise RelayError("owned API startup receipt target is not owner-private")
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    except FileNotFoundError:
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        with suppress(FileNotFoundError):
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        os.close(directory_fd)
+
+
+def publish_owned_session_api_startup_receipt() -> bool:
+    """Publish the signed API identity after gated environment and cgroup entry."""
+    receipt_path_raw = os.environ.get(_API_STARTUP_RECEIPT_ENV)
+    if receipt_path_raw is None:
+        return False
+    required_names = (
+        "CLIO_RELAY_SESSION_OWNER_TOKEN",
+        "CLIO_RELAY_SESSION_GENERATION_ID",
+        "CLIO_RELAY_OWNER_SESSION_ID",
+        "CLIO_RELAY_OWNER_SESSION_CLUSTER",
+        "CLIO_RELAY_API_RELEASE_IDENTITY_SHA256",
+        "CLIO_RELAY_CLUSTER_REGISTRY",
+        "CLIO_RELAY_SESSION_REGISTRY_SHA256",
+        "CLIO_RELAY_SESSION_ROUTE_REVISION",
+        _SYSTEMD_UNIT_ENV,
+        _SYSTEMD_CGROUP_ENV,
+        _SYSTEMD_INVOCATION_ENV,
+        _SYSTEMD_DESCRIPTION_ENV,
+    )
+    values = {name: os.environ.get(name) for name in required_names}
+    if any(not value for value in values.values()):
+        raise RelayError("owned API startup receipt environment is incomplete")
+    owner_token = cast(str, values["CLIO_RELAY_SESSION_OWNER_TOKEN"])
+    generation_id = validate_durable_record_id(
+        cast(str, values["CLIO_RELAY_SESSION_GENERATION_ID"])
+    )
+    receipt_path = Path(receipt_path_raw)
+    registry_path = Path(cast(str, values["CLIO_RELAY_CLUSTER_REGISTRY"]))
+    expected_receipt = registry_path.parent / f"api-startup-{generation_id}.json"
+    if receipt_path != expected_receipt:
+        raise RelayError("owned API startup receipt path is not generation-scoped")
+    invocation_id = cast(str, values[_SYSTEMD_INVOCATION_ENV])
+    if os.environ.get("INVOCATION_ID") != invocation_id:
+        raise RelayError("owned API process systemd invocation identity mismatched")
+    pid = os.getpid()
+    process_identity = _read_proc_identity(proc_root=Path("/proc"), pid=pid)
+    observed_cgroup = _current_linux_cgroup_path(pid=pid)
+    expected_cgroup = Path(cast(str, values[_SYSTEMD_CGROUP_ENV])).resolve(strict=True)
+    if observed_cgroup != expected_cgroup:
+        raise RelayError("owned API process is outside its persisted cgroup")
+    document: dict[str, object] = {
+        "schema_version": "clio-relay.owner-session-api-startup.v1",
+        "cluster": values["CLIO_RELAY_OWNER_SESSION_CLUSTER"],
+        "session_id": values["CLIO_RELAY_OWNER_SESSION_ID"],
+        "session_generation_id": generation_id,
+        "api_pid": pid,
+        "api_pgid": process_identity.process_group_id,
+        "process_start_ticks": process_identity.start_ticks,
+        "api_release_identity_sha256": values["CLIO_RELAY_API_RELEASE_IDENTITY_SHA256"],
+        "cluster_registry_path": str(registry_path),
+        "cluster_registry_sha256": values["CLIO_RELAY_SESSION_REGISTRY_SHA256"],
+        "cluster_route_revision": values["CLIO_RELAY_SESSION_ROUTE_REVISION"],
+        "systemd_unit": values[_SYSTEMD_UNIT_ENV],
+        "systemd_cgroup_path": str(expected_cgroup),
+        "systemd_invocation_id": invocation_id,
+        "systemd_description": values[_SYSTEMD_DESCRIPTION_ENV],
+        "observed_at": datetime.now(UTC).isoformat(),
+    }
+    document["hmac_sha256"] = _startup_receipt_signature(document, owner_token=owner_token)
+    _atomic_write_startup_receipt(
+        receipt_path,
+        json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+    )
+    os.environ.pop("CLIO_RELAY_SESSION_OWNER_TOKEN", None)
+    return True
+
+
+def _recorded_scope_processes(
     *,
     proc_root: Path,
-    owner_token_sha256: str,
-    generation_id: str,
-    session_id: str,
-    cluster: str,
-    release_sha256: str,
-    registry_path: str,
-    registry_sha256: str,
-    route_revision: str,
-    effective_uid: int | None,
+    systemd_unit: str,
+    systemd_cgroup_path: str,
+    systemd_invocation_id: str,
+    systemd_description: str,
 ) -> list[_OwnedGenerationProcess]:
-    """Scan every bounded live process for one exact owned-generation identity."""
-    expected_markers = {
-        f"CLIO_RELAY_SESSION_GENERATION_ID={generation_id}".encode(),
-        f"CLIO_RELAY_OWNER_SESSION_ID={session_id}".encode(),
-        f"CLIO_RELAY_OWNER_SESSION_CLUSTER={cluster}".encode(),
-        f"CLIO_RELAY_REMOTE_CLUSTER={cluster}".encode(),
-        f"CLIO_RELAY_API_RELEASE_IDENTITY_SHA256={release_sha256}".encode(),
-        f"CLIO_RELAY_CLUSTER_REGISTRY={registry_path}".encode(),
-        f"CLIO_RELAY_SESSION_REGISTRY_SHA256={registry_sha256}".encode(),
-        f"CLIO_RELAY_SESSION_ROUTE_REVISION={route_revision}".encode(),
-    }
-    matches: list[_OwnedGenerationProcess] = []
-    observed_entries = 0
+    """Enumerate only members of one exact persistent systemd generation scope."""
+    from clio_relay.process_containment import recorded_linux_systemd_scope_process_ids
+
     try:
-        entries = os.scandir(proc_root)
-    except OSError as exc:
-        raise RelayError(f"cannot scan process identities: {exc}") from exc
-    with entries:
-        for entry in entries:
-            if not entry.name.isdigit():
-                continue
-            observed_entries += 1
-            if observed_entries > _MAX_PROC_ENTRIES:
-                raise RelayError("process identity scan exceeded its entry limit")
-            pid = int(entry.name)
-            proc = proc_root / entry.name
-            try:
-                proc_status = entry.stat(follow_symlinks=False)
-                stat_payload = _read_bounded_proc_bytes(
-                    proc / "stat",
-                    maximum_bytes=_MAX_PROC_RECORD_BYTES,
-                ).decode("utf-8")
-                fields = stat_payload.rsplit(")", 1)[1].split()
-                state = fields[0]
-                process_group_id = int(fields[2])
-                start_ticks = fields[19]
-            except (FileNotFoundError, ProcessLookupError):
-                continue
-            except (IndexError, UnicodeDecodeError, ValueError) as exc:
-                raise RelayError(
-                    f"process identity record is invalid for pid {pid}: {exc}"
-                ) from exc
-            except OSError as exc:
-                raise RelayError(f"cannot inspect process identity for pid {pid}: {exc}") from exc
-            if effective_uid is not None and proc_status.st_uid != effective_uid:
-                continue
-            if state == "Z":
-                continue
-            try:
-                environment_entries = _read_bounded_proc_bytes(
-                    proc / "environ",
-                    maximum_bytes=_MAX_PROC_RECORD_BYTES,
-                ).split(bytes([0]))
-            except (FileNotFoundError, ProcessLookupError):
-                continue
-            except PermissionError as exc:
-                raise RelayError(f"cannot verify protected process identity for pid {pid}") from exc
-            except OSError as exc:
-                raise RelayError(
-                    f"cannot inspect process environment for pid {pid}: {exc}"
-                ) from exc
-            environment = [entry for entry in environment_entries if entry]
-            by_name: dict[bytes, list[bytes]] = {}
-            for marker in environment:
-                name, separator, value = marker.partition(b"=")
-                if not separator:
-                    continue
-                by_name.setdefault(name, []).append(value)
-            token_values = [value for value in by_name.get(b"CLIO_RELAY_SESSION_OWNER_TOKEN", [])]
-            token_matches = bool(
-                len(token_values) == 1
-                and hashlib.sha256(token_values[0]).hexdigest() == owner_token_sha256
-            )
-            exact_markers = all(
-                by_name.get(expected.partition(b"=")[0]) == [expected.partition(b"=")[2]]
-                for expected in expected_markers
-            )
-            if not (token_matches and exact_markers):
-                continue
-            matches.append(
-                _OwnedGenerationProcess(
-                    pid=pid,
-                    process_group_id=process_group_id,
-                    start_ticks=start_ticks,
-                )
-            )
-    return sorted(matches, key=lambda process: process.pid)
+        process_ids = recorded_linux_systemd_scope_process_ids(
+            unit=systemd_unit,
+            cgroup_path=systemd_cgroup_path,
+            invocation_id=systemd_invocation_id,
+            description=systemd_description,
+        )
+    except RuntimeError as exc:
+        raise RelayError(f"owned session scope identity could not be verified: {exc}") from exc
+    processes: list[_OwnedGenerationProcess] = []
+    for pid in process_ids:
+        try:
+            processes.append(_read_proc_identity(proc_root=proc_root, pid=pid))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    return sorted(processes, key=lambda process: process.pid)
+
+
+def _terminate_recorded_session_scope(
+    *,
+    systemd_unit: str,
+    systemd_cgroup_path: str,
+    systemd_invocation_id: str,
+    systemd_description: str,
+) -> None:
+    """Terminate one exact persisted session cgroup after InvocationID verification."""
+    from clio_relay.process_containment import terminate_recorded_linux_systemd_scope
+
+    try:
+        terminate_recorded_linux_systemd_scope(
+            unit=systemd_unit,
+            cgroup_path=systemd_cgroup_path,
+            invocation_id=systemd_invocation_id,
+            description=systemd_description,
+        )
+    except RuntimeError as exc:
+        raise RelayError(f"owned session scope termination failed: {exc}") from exc
 
 
 def _is_clio_relay_api_leader(*, proc_root: Path, pid: int) -> bool:
@@ -871,64 +999,6 @@ def _is_clio_relay_api_leader(*, proc_root: Path, pid: int) -> bool:
     except OSError as exc:
         raise RelayError(f"cannot inspect API leader command for pid {pid}: {exc}") from exc
     return "clio-relay" in command and " api " in f" {command} " and " start" in command
-
-
-def _signal_owned_generation_processes(
-    *,
-    processes: list[_OwnedGenerationProcess],
-    signal_number: int,
-    proc_root: Path,
-    owner_token_sha256: str,
-    generation_id: str,
-    session_id: str,
-    cluster: str,
-    release_sha256: str,
-    registry_path: str,
-    registry_sha256: str,
-    route_revision: str,
-    effective_uid: int | None,
-) -> list[int]:
-    """Signal exact generation processes through pidfds after an identity rescan."""
-    pidfd_open = cast(Callable[[int, int], int] | None, getattr(os, "pidfd_open", None))
-    pidfd_send_signal = cast(
-        Callable[[int, int, object | None, int], None] | None,
-        getattr(signal, "pidfd_send_signal", None),
-    )
-    if pidfd_open is None or pidfd_send_signal is None:
-        raise RelayError("race-safe pidfd session cleanup is unavailable")
-    signaled: list[int] = []
-    for process in processes:
-        try:
-            process_fd = pidfd_open(process.pid, 0)
-        except ProcessLookupError:
-            continue
-        except OSError as exc:
-            raise RelayError(f"cannot open session pidfd for {process.pid}: {exc}") from exc
-        try:
-            current = _scan_owned_generation_processes(
-                proc_root=proc_root,
-                owner_token_sha256=owner_token_sha256,
-                generation_id=generation_id,
-                session_id=session_id,
-                cluster=cluster,
-                release_sha256=release_sha256,
-                registry_path=registry_path,
-                registry_sha256=registry_sha256,
-                route_revision=route_revision,
-                effective_uid=effective_uid,
-            )
-            if process not in current:
-                continue
-            try:
-                pidfd_send_signal(process_fd, signal_number, None, 0)
-            except ProcessLookupError:
-                continue
-            except OSError as exc:
-                raise RelayError(f"cannot signal owned session pid {process.pid}: {exc}") from exc
-            signaled.append(process.pid)
-        finally:
-            os.close(process_fd)
-    return signaled
 
 
 def inspect_owned_session_recovery_status(
@@ -1008,6 +1078,15 @@ def inspect_owned_session_recovery_status(
     release_sha256 = document.get("api_release_identity_sha256")
     started_at = document.get("started_at")
     remote_api_port = document.get("remote_api_port")
+    containment_mode = document.get("containment_mode")
+    systemd_unit = document.get("systemd_unit")
+    systemd_cgroup_path = document.get("systemd_cgroup_path")
+    systemd_invocation_id = document.get("systemd_invocation_id")
+    systemd_description = document.get("systemd_description")
+    containment_broker_pid = document.get("containment_broker_pid")
+    containment_broker_start = document.get("containment_broker_start_identity")
+    startup_receipt_path_raw = document.get("api_startup_receipt_path")
+    startup_receipt_sha256 = document.get("api_startup_receipt_sha256")
 
     try:
         validated_release = SessionApiReleaseIdentity.model_validate(release_identity)
@@ -1041,6 +1120,15 @@ def inspect_owned_session_recovery_status(
         "cluster_route_revision",
         "cluster_authority_verified",
         "process_start_ticks",
+        "containment_mode",
+        "systemd_unit",
+        "systemd_cgroup_path",
+        "systemd_invocation_id",
+        "systemd_description",
+        "containment_broker_pid",
+        "containment_broker_start_identity",
+        "api_startup_receipt_path",
+        "api_startup_receipt_sha256",
         "started_at",
         "owner",
     }
@@ -1059,7 +1147,9 @@ def inspect_owned_session_recovery_status(
         and isinstance(api_pid, int)
         and not isinstance(api_pid, bool)
         and api_pid > 1
-        and api_pgid == api_pid
+        and isinstance(api_pgid, int)
+        and not isinstance(api_pgid, bool)
+        and api_pgid > 0
         and isinstance(process_start, str)
         and process_start.isdigit()
         and isinstance(registry_path_raw, str)
@@ -1074,11 +1164,107 @@ def inspect_owned_session_recovery_status(
         and len(release_sha256) == 64
         and all(character in "0123456789abcdef" for character in release_sha256)
         and validated_release.sha256() == release_sha256
+        and containment_mode == "linux_systemd_scope"
+        and systemd_unit == f"clio-relay-session-{validated_generation}.scope"
+        and isinstance(systemd_cgroup_path, str)
+        and bool(systemd_cgroup_path)
+        and isinstance(systemd_invocation_id, str)
+        and len(systemd_invocation_id) == 32
+        and all(character in "0123456789abcdef" for character in systemd_invocation_id)
+        and isinstance(systemd_description, str)
+        and systemd_description.startswith(
+            f"clio-relay-owned-session:{session_id}:{validated_generation}:"
+        )
+        and isinstance(containment_broker_pid, int)
+        and not isinstance(containment_broker_pid, bool)
+        and containment_broker_pid > 1
+        and isinstance(containment_broker_start, str)
+        and bool(containment_broker_start)
+        and startup_receipt_path_raw
+        == str(session_dir / f"api-startup-{validated_generation}.json")
+        and isinstance(startup_receipt_sha256, str)
+        and len(startup_receipt_sha256) == 64
+        and all(character in "0123456789abcdef" for character in startup_receipt_sha256)
         and parsed_started_at is not None
         and parsed_started_at.tzinfo is not None
     )
     if not metadata_verified:
         errors.append("owned session metadata identity is incomplete or mismatched")
+
+    startup_receipt_verified = False
+    if (
+        metadata_verified
+        and isinstance(startup_receipt_path_raw, str)
+        and isinstance(startup_receipt_sha256, str)
+        and isinstance(owner_token, str)
+        and isinstance(api_pid, int)
+        and isinstance(api_pgid, int)
+        and isinstance(process_start, str)
+        and isinstance(systemd_unit, str)
+        and isinstance(systemd_cgroup_path, str)
+        and isinstance(systemd_invocation_id, str)
+        and isinstance(systemd_description, str)
+        and isinstance(release_sha256, str)
+        and isinstance(registry_path_raw, str)
+        and isinstance(registry_sha256, str)
+        and isinstance(route_revision, str)
+    ):
+        try:
+            receipt_path = Path(startup_receipt_path_raw)
+            if transaction is None:
+                receipt_document, receipt_payload = _read_owned_session_document(
+                    receipt_path,
+                    label="owned API startup receipt",
+                    effective_uid=uid,
+                )
+            else:
+                receipt_payload = transaction.read_bytes(
+                    receipt_path.name,
+                    maximum_bytes=_MAX_API_STARTUP_RECEIPT_BYTES,
+                )
+                if receipt_payload is None:  # pragma: no cover - required read
+                    raise RelayError("owned API startup receipt is unavailable")
+                raw_receipt = cast(object, json.loads(receipt_payload))
+                if not isinstance(raw_receipt, dict):
+                    raise RelayError("owned API startup receipt is not a JSON object")
+                receipt_document = {
+                    str(key): value
+                    for key, value in cast(dict[object, object], raw_receipt).items()
+                }
+            expected_receipt = {
+                "cluster": cluster,
+                "session_id": session_id,
+                "session_generation_id": validated_generation,
+                "api_pid": api_pid,
+                "api_pgid": api_pgid,
+                "process_start_ticks": process_start,
+                "api_release_identity_sha256": release_sha256,
+                "cluster_registry_path": registry_path_raw,
+                "cluster_registry_sha256": registry_sha256,
+                "cluster_route_revision": route_revision,
+                "systemd_unit": systemd_unit,
+                "systemd_cgroup_path": systemd_cgroup_path,
+                "systemd_invocation_id": systemd_invocation_id,
+                "systemd_description": systemd_description,
+            }
+            signature = receipt_document.get("hmac_sha256")
+            startup_receipt_verified = bool(
+                hashlib.sha256(receipt_payload).hexdigest() == startup_receipt_sha256
+                and receipt_document.get("schema_version")
+                == "clio-relay.owner-session-api-startup.v1"
+                and all(
+                    receipt_document.get(key) == value for key, value in expected_receipt.items()
+                )
+                and isinstance(signature, str)
+                and hmac.compare_digest(
+                    signature,
+                    _startup_receipt_signature(receipt_document, owner_token=owner_token),
+                )
+            )
+        except (OSError, RelayError, ValueError) as exc:
+            errors.append(str(exc))
+        if not startup_receipt_verified:
+            errors.append("owned API startup receipt identity is invalid")
 
     cluster_registry_verified = False
     registry_path: Path | None = None
@@ -1151,28 +1337,23 @@ def inspect_owned_session_recovery_status(
     generation_process_scan_verified = False
     if (
         metadata_verified
+        and startup_receipt_verified
         and isinstance(api_pid, int)
         and isinstance(api_pgid, int)
         and isinstance(process_start, str)
-        and isinstance(owner_token, str)
         and validated_generation is not None
-        and isinstance(release_sha256, str)
-        and isinstance(registry_path_raw, str)
-        and isinstance(registry_sha256, str)
-        and isinstance(route_revision, str)
+        and isinstance(systemd_unit, str)
+        and isinstance(systemd_cgroup_path, str)
+        and isinstance(systemd_invocation_id, str)
+        and isinstance(systemd_description, str)
     ):
         try:
-            generation_processes = _scan_owned_generation_processes(
+            generation_processes = _recorded_scope_processes(
                 proc_root=proc_root,
-                owner_token_sha256=hashlib.sha256(owner_token.encode()).hexdigest(),
-                generation_id=validated_generation,
-                session_id=session_id,
-                cluster=cluster,
-                release_sha256=release_sha256,
-                registry_path=registry_path_raw,
-                registry_sha256=registry_sha256,
-                route_revision=route_revision,
-                effective_uid=uid,
+                systemd_unit=systemd_unit,
+                systemd_cgroup_path=systemd_cgroup_path,
+                systemd_invocation_id=systemd_invocation_id,
+                systemd_description=systemd_description,
             )
             generation_process_scan_verified = True
         except RelayError as exc:
@@ -1379,6 +1560,13 @@ def _inspect_owned_session_cleanup_receipt(
         "cluster_registry_path",
         "cluster_registry_sha256",
         "cluster_route_revision",
+        "containment_mode",
+        "systemd_unit",
+        "systemd_cgroup_path",
+        "systemd_invocation_id",
+        "systemd_description",
+        "containment_broker_pid",
+        "containment_broker_start_identity",
         "metadata_sha256",
         "cleanup_operation_id",
         "cleanup_policy",
@@ -1415,6 +1603,13 @@ def _inspect_owned_session_cleanup_receipt(
     registry_path = document.get("cluster_registry_path")
     registry_sha256 = document.get("cluster_registry_sha256")
     route_revision = document.get("cluster_route_revision")
+    containment_mode = document.get("containment_mode")
+    systemd_unit = document.get("systemd_unit")
+    systemd_cgroup_path = document.get("systemd_cgroup_path")
+    systemd_invocation_id = document.get("systemd_invocation_id")
+    systemd_description = document.get("systemd_description")
+    containment_broker_pid = document.get("containment_broker_pid")
+    containment_broker_start = document.get("containment_broker_start_identity")
     cleanup_targets_verified = False
     validated_targets: list[OwnedSessionCleanupTarget] = []
     if validated_generation is not None:
@@ -1435,7 +1630,9 @@ def _inspect_owned_session_cleanup_receipt(
         and isinstance(api_pid, int)
         and not isinstance(api_pid, bool)
         and api_pid > 1
-        and api_pgid == api_pid
+        and isinstance(api_pgid, int)
+        and not isinstance(api_pgid, bool)
+        and api_pgid > 0
         and isinstance(remote_api_port, int)
         and not isinstance(remote_api_port, bool)
         and remote_api_port > 0
@@ -1454,6 +1651,22 @@ def _inspect_owned_session_cleanup_receipt(
         and all(character in "0123456789abcdef" for character in registry_sha256)
         and isinstance(route_revision, str)
         and bool(route_revision)
+        and containment_mode == "linux_systemd_scope"
+        and systemd_unit == f"clio-relay-session-{validated_generation}.scope"
+        and isinstance(systemd_cgroup_path, str)
+        and bool(systemd_cgroup_path)
+        and isinstance(systemd_invocation_id, str)
+        and len(systemd_invocation_id) == 32
+        and all(character in "0123456789abcdef" for character in systemd_invocation_id)
+        and isinstance(systemd_description, str)
+        and systemd_description.startswith(
+            f"clio-relay-owned-session:{session_id}:{validated_generation}:"
+        )
+        and isinstance(containment_broker_pid, int)
+        and not isinstance(containment_broker_pid, bool)
+        and containment_broker_pid > 1
+        and isinstance(containment_broker_start, str)
+        and bool(containment_broker_start)
         and isinstance(document.get("metadata_sha256"), str)
         and len(cast(str, document.get("metadata_sha256"))) == 64
         and all(
@@ -1465,7 +1678,14 @@ def _inspect_owned_session_cleanup_receipt(
         and isinstance(document.get("cleanup_paths_pending"), bool)
         and document.get("cluster_registry_removed") is not document.get("cleanup_paths_pending")
         and document.get("cleanup_paths")
-        == sorted(("api.log", "api.pid", f"cluster-registry-{validated_generation}.json"))
+        == sorted(
+            (
+                "api.log",
+                "api.pid",
+                f"api-startup-{validated_generation}.json",
+                f"cluster-registry-{validated_generation}.json",
+            )
+        )
         and cleanup_targets_verified
         and policy is not None
         and set(policy) == {"stop_worker", "cancel_jobs", "cancel_scheduler_jobs"}
@@ -1507,24 +1727,18 @@ def _inspect_owned_session_cleanup_receipt(
     if (
         metadata_verified
         and validated_generation is not None
-        and isinstance(owner_token_sha256, str)
-        and isinstance(release_sha256, str)
-        and isinstance(registry_path, str)
-        and isinstance(registry_sha256, str)
-        and isinstance(route_revision, str)
+        and isinstance(systemd_unit, str)
+        and isinstance(systemd_cgroup_path, str)
+        and isinstance(systemd_invocation_id, str)
+        and isinstance(systemd_description, str)
     ):
         try:
-            generation_processes = _scan_owned_generation_processes(
+            generation_processes = _recorded_scope_processes(
                 proc_root=proc_root,
-                owner_token_sha256=owner_token_sha256,
-                generation_id=validated_generation,
-                session_id=session_id,
-                cluster=cluster,
-                release_sha256=release_sha256,
-                registry_path=registry_path,
-                registry_sha256=registry_sha256,
-                route_revision=route_revision,
-                effective_uid=effective_uid,
+                systemd_unit=systemd_unit,
+                systemd_cgroup_path=systemd_cgroup_path,
+                systemd_invocation_id=systemd_invocation_id,
+                systemd_description=systemd_description,
             )
             generation_process_scan_verified = True
         except RelayError as exc:
@@ -2283,131 +2497,33 @@ def _run_bounded_command(
     environment: dict[str, str] | None = None,
 ) -> _BoundedCommandResult:
     """Run one isolated process tree while bounding both pipes before allocation."""
-    from clio_relay.process_containment import (
-        ensure_owned_process_tree_empty,
-        owner_popen_kwargs,
-        terminate_process_tree,
+    from clio_relay.bounded_process import (
+        BoundedProcessError,
+        BoundedProcessOutputLimit,
+        BoundedProcessTimeout,
+        run_bounded_process,
     )
 
-    if timeout_seconds <= 0:
-        raise ValueError("timeout_seconds must be positive")
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=environment,
-        **owner_popen_kwargs(),
-    )
-    if process.stdin is None or process.stdout is None or process.stderr is None:
-        process.kill()
-        raise RelayError("bounded command pipes were not created")
-    process_stdin = process.stdin
-    process_stdout = process.stdout
-    process_stderr = process.stderr
-    stdout = bytearray()
-    stderr = bytearray()
-    overflow = threading.Event()
-    writer_error: list[BaseException] = []
-
-    def read_pipe(pipe: Any, target: bytearray, limit: int) -> None:
-        try:
-            while True:
-                chunk = pipe.read(min(64 * 1024, limit + 1 - len(target)))
-                if not chunk:
-                    return
-                target.extend(chunk)
-                if len(target) > limit:
-                    overflow.set()
-                    return
-        finally:
-            pipe.close()
-
-    def write_stdin() -> None:
-        try:
-            if input_bytes:
-                process_stdin.write(input_bytes)
-                process_stdin.flush()
-        except BrokenPipeError:
-            pass
-        except BaseException as exc:  # pragma: no cover - platform pipe failure
-            writer_error.append(exc)
-        finally:
-            with suppress(OSError):
-                process_stdin.close()
-
-    readers = [
-        threading.Thread(
-            target=read_pipe,
-            args=(process_stdout, stdout, stdout_limit),
-            daemon=True,
-        ),
-        threading.Thread(
-            target=read_pipe,
-            args=(process_stderr, stderr, stderr_limit),
-            daemon=True,
-        ),
-    ]
-    writer = threading.Thread(target=write_stdin, daemon=True)
-    for thread in readers:
-        thread.start()
-    writer.start()
-    deadline = time.monotonic() + timeout_seconds
-    timed_out = False
-    tree_cleanup_error: BaseException | None = None
-    while process.poll() is None:
-        if overflow.is_set():
-            break
-        if time.monotonic() >= deadline:
-            timed_out = True
-            break
-        time.sleep(0.01)
-    if overflow.is_set() or timed_out:
-        try:
-            terminate_process_tree(
-                process,
-                owns_group=True,
-                timeout_seconds=2.0,
-            )
-        except BaseException as exc:  # pragma: no cover - provider-specific failure
-            tree_cleanup_error = exc
-            if process.poll() is None:
-                process.kill()
-    with suppress(subprocess.TimeoutExpired):
-        process.wait(timeout=2.0)
-    writer.join(timeout=2.0)
-    for thread in readers:
-        thread.join(timeout=2.0)
-    if any(thread.is_alive() for thread in readers):
-        try:
-            terminate_process_tree(
-                process,
-                owns_group=True,
-                timeout_seconds=2.0,
-            )
-        except BaseException as exc:  # pragma: no cover - provider-specific failure
-            tree_cleanup_error = tree_cleanup_error or exc
-        for thread in readers:
-            thread.join(timeout=2.0)
-    elif not (overflow.is_set() or timed_out):
-        try:
-            ensure_owned_process_tree_empty(process)
-        except RuntimeError as exc:
-            tree_cleanup_error = exc
-    if any(thread.is_alive() for thread in (*readers, writer)):
-        raise RelayError("bounded command pipes did not close")
-    if tree_cleanup_error is not None:
-        raise RelayError(f"bounded command process-tree cleanup failed: {tree_cleanup_error}")
-    if overflow.is_set():
-        raise RelayError("bounded command output exceeded its byte limit")
-    if timed_out:
-        raise RelayError(f"bounded command timed out after {timeout_seconds:g} seconds")
-    if writer_error:
-        raise RelayError(f"bounded command input failed: {writer_error[0]}")
+    try:
+        result = run_bounded_process(
+            command,
+            environment=environment,
+            input_bytes=input_bytes,
+            timeout_seconds=timeout_seconds,
+            stdout_maximum_bytes=stdout_limit,
+            stderr_maximum_bytes=stderr_limit,
+            require_enforceable=os.name == "nt",
+        )
+    except BoundedProcessTimeout as exc:
+        raise RelayError(f"bounded command timed out after {timeout_seconds:g} seconds") from exc
+    except BoundedProcessOutputLimit as exc:
+        raise RelayError("bounded command output exceeded its byte limit") from exc
+    except BoundedProcessError as exc:
+        raise RelayError(f"bounded command process-tree cleanup failed: {exc}") from exc
     return _BoundedCommandResult(
-        returncode=cast(int, process.returncode),
-        stdout=bytes(stdout),
-        stderr=bytes(stderr),
+        returncode=result.returncode,
+        stdout=result.stdout.encode("utf-8"),
+        stderr=result.stderr.encode("utf-8"),
     )
 
 
@@ -2473,106 +2589,6 @@ def _validated_start_registry(
     return registry, payload
 
 
-def _generation_processes(
-    *,
-    proc_root: Path,
-    owner_token_sha256: str,
-    generation_id: str,
-    session_id: str,
-    cluster: str,
-    release_sha256: str,
-    registry_path: str,
-    registry_sha256: str,
-    route_revision: str,
-    effective_uid: int,
-) -> list[_OwnedGenerationProcess]:
-    """Return every exact process for one fully bound owned generation."""
-    return _scan_owned_generation_processes(
-        proc_root=proc_root,
-        owner_token_sha256=owner_token_sha256,
-        generation_id=generation_id,
-        session_id=session_id,
-        cluster=cluster,
-        release_sha256=release_sha256,
-        registry_path=registry_path,
-        registry_sha256=registry_sha256,
-        route_revision=route_revision,
-        effective_uid=effective_uid,
-    )
-
-
-def _stop_owned_generation_processes(
-    *,
-    processes: list[_OwnedGenerationProcess],
-    proc_root: Path,
-    owner_token_sha256: str,
-    generation_id: str,
-    session_id: str,
-    cluster: str,
-    release_sha256: str,
-    registry_path: str,
-    registry_sha256: str,
-    route_revision: str,
-    effective_uid: int,
-) -> list[int]:
-    """Stop every exact generation process by pidfd and prove bounded absence."""
-
-    def scan() -> list[_OwnedGenerationProcess]:
-        return _generation_processes(
-            proc_root=proc_root,
-            owner_token_sha256=owner_token_sha256,
-            generation_id=generation_id,
-            session_id=session_id,
-            cluster=cluster,
-            release_sha256=release_sha256,
-            registry_path=registry_path,
-            registry_sha256=registry_sha256,
-            route_revision=route_revision,
-            effective_uid=effective_uid,
-        )
-
-    def send(
-        selected: list[_OwnedGenerationProcess],
-        signal_number: int,
-    ) -> list[int]:
-        return _signal_owned_generation_processes(
-            processes=selected,
-            signal_number=signal_number,
-            proc_root=proc_root,
-            owner_token_sha256=owner_token_sha256,
-            generation_id=generation_id,
-            session_id=session_id,
-            cluster=cluster,
-            release_sha256=release_sha256,
-            registry_path=registry_path,
-            registry_sha256=registry_sha256,
-            route_revision=route_revision,
-            effective_uid=effective_uid,
-        )
-
-    targeted = [process.pid for process in processes]
-    if processes:
-        send(processes, signal.SIGTERM)
-    deadline = time.monotonic() + _OWNED_SESSION_PROCESS_STOP_TIMEOUT_SECONDS
-    remaining = scan()
-    while remaining and time.monotonic() < deadline:
-        time.sleep(0.1)
-        remaining = scan()
-    if remaining:
-        send(remaining, cast(int, getattr(signal, "SIGKILL", 9)))
-        deadline = time.monotonic() + _OWNED_SESSION_PROCESS_STOP_TIMEOUT_SECONDS
-        remaining = scan()
-        while remaining and time.monotonic() < deadline:
-            time.sleep(0.1)
-            remaining = scan()
-    if remaining:
-        raise RelayError(
-            "owned session generation processes remained after pidfd cleanup: "
-            + ", ".join(str(process.pid) for process in remaining)
-        )
-    return targeted
-
-
 def _write_session_attempt(
     transaction: _OwnedSessionTransaction,
     *,
@@ -2580,7 +2596,7 @@ def _write_session_attempt(
     identity: dict[str, object],
     error: str | None = None,
 ) -> None:
-    """Write non-authoritative atomic attempt evidence without an owner secret."""
+    """Write one atomic, resumable owner-session attempt record."""
     document = {
         "schema_version": "clio-relay.owner-session-attempt.v1",
         "operation": operation,
@@ -2635,6 +2651,99 @@ def _wait_for_api_ready(*, process: subprocess.Popen[bytes], port: int) -> float
     )
 
 
+def _wait_for_api_startup_receipt(
+    *,
+    transaction: _OwnedSessionTransaction,
+    process: subprocess.Popen[Any],
+    receipt_name: str,
+    owner_token: str,
+    expected: dict[str, object],
+    proc_root: Path,
+) -> _OwnedGenerationProcess:
+    """Wait for and verify the API child's signed cgroup-bound startup receipt."""
+    from clio_relay.process_containment import recorded_linux_systemd_scope_process_ids
+
+    expected_keys = {
+        "schema_version",
+        "cluster",
+        "session_id",
+        "session_generation_id",
+        "api_pid",
+        "api_pgid",
+        "process_start_ticks",
+        "api_release_identity_sha256",
+        "cluster_registry_path",
+        "cluster_registry_sha256",
+        "cluster_route_revision",
+        "systemd_unit",
+        "systemd_cgroup_path",
+        "systemd_invocation_id",
+        "systemd_description",
+        "observed_at",
+        "hmac_sha256",
+    }
+    deadline = time.monotonic() + _REMOTE_API_READINESS_TIMEOUT_SECONDS
+    last_error = "startup receipt did not materialize"
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RelayError("owned API containment exited before startup receipt")
+        try:
+            document = transaction.read_json(receipt_name, required=False)
+            if document is None:
+                time.sleep(0.05)
+                continue
+            observed_at = document.get("observed_at")
+            parsed_observed_at = (
+                datetime.fromisoformat(observed_at) if isinstance(observed_at, str) else None
+            )
+            api_pid = document.get("api_pid")
+            api_pgid = document.get("api_pgid")
+            process_start = document.get("process_start_ticks")
+            signature = document.get("hmac_sha256")
+            exact_expected = all(document.get(key) == value for key, value in expected.items())
+            if not (
+                set(document) == expected_keys
+                and document.get("schema_version") == "clio-relay.owner-session-api-startup.v1"
+                and exact_expected
+                and isinstance(api_pid, int)
+                and not isinstance(api_pid, bool)
+                and api_pid > 1
+                and isinstance(api_pgid, int)
+                and not isinstance(api_pgid, bool)
+                and api_pgid > 0
+                and isinstance(process_start, str)
+                and process_start.isdigit()
+                and parsed_observed_at is not None
+                and parsed_observed_at.tzinfo is not None
+                and isinstance(signature, str)
+                and hmac.compare_digest(
+                    signature,
+                    _startup_receipt_signature(document, owner_token=owner_token),
+                )
+            ):
+                raise RelayError("owned API startup receipt identity is invalid")
+            process_identity = _read_proc_identity(proc_root=proc_root, pid=api_pid)
+            if (
+                process_identity.process_group_id != api_pgid
+                or process_identity.start_ticks != process_start
+                or not _is_clio_relay_api_leader(proc_root=proc_root, pid=api_pid)
+            ):
+                raise RelayError("owned API startup receipt process identity changed")
+            pids = recorded_linux_systemd_scope_process_ids(
+                unit=cast(str, expected["systemd_unit"]),
+                cgroup_path=cast(str, expected["systemd_cgroup_path"]),
+                invocation_id=cast(str, expected["systemd_invocation_id"]),
+                description=cast(str, expected["systemd_description"]),
+            )
+            if api_pid not in pids:
+                raise RelayError("owned API startup receipt leader is outside its exact cgroup")
+            return process_identity
+        except (OSError, RelayError, ValueError) as exc:
+            last_error = str(exc)
+            time.sleep(0.05)
+    raise RelayError(f"owned API startup receipt was not verified: {last_error}")
+
+
 def _validated_resumable_start_attempt(
     transaction: _OwnedSessionTransaction,
     *,
@@ -2650,12 +2759,20 @@ def _validated_resumable_start_attempt(
         "cluster",
         "session_id",
         "session_generation_id",
+        "owner_token",
         "owner_token_sha256",
         "api_release_identity_sha256",
         "cluster_registry_path",
         "cluster_registry_sha256",
         "cluster_route_revision",
         "remote_api_port",
+        "start_phase",
+        "systemd_unit",
+        "systemd_description",
+        "systemd_cgroup_path",
+        "systemd_invocation_id",
+        "containment_broker_pid",
+        "containment_broker_start_identity",
         "observed_at",
         "error",
     }
@@ -2672,6 +2789,15 @@ def _validated_resumable_start_attempt(
         validated_generation = None
         parsed_observed_at = None
     registry_path = attempt.get("cluster_registry_path")
+    owner_token = attempt.get("owner_token")
+    owner_token_sha256 = attempt.get("owner_token_sha256")
+    start_phase = attempt.get("start_phase")
+    systemd_unit = attempt.get("systemd_unit")
+    systemd_description = attempt.get("systemd_description")
+    cgroup_path = attempt.get("systemd_cgroup_path")
+    invocation_id = attempt.get("systemd_invocation_id")
+    broker_pid = attempt.get("containment_broker_pid")
+    broker_start = attempt.get("containment_broker_start_identity")
     expected_registry_path = (
         transaction.path / f"cluster-registry-{validated_generation}.json"
         if validated_generation is not None
@@ -2684,14 +2810,50 @@ def _validated_resumable_start_attempt(
         and attempt.get("cluster") == request.cluster
         and attempt.get("session_id") == request.session_id
         and validated_generation is not None
-        and isinstance(attempt.get("owner_token_sha256"), str)
-        and len(cast(str, attempt.get("owner_token_sha256"))) == 64
+        and isinstance(owner_token, str)
+        and len(owner_token) == 64
+        and all(character in "0123456789abcdef" for character in owner_token)
+        and owner_token_sha256 == hashlib.sha256(owner_token.encode("utf-8")).hexdigest()
         and isinstance(attempt.get("api_release_identity_sha256"), str)
         and len(cast(str, attempt.get("api_release_identity_sha256"))) == 64
         and registry_path == str(expected_registry_path)
         and attempt.get("cluster_registry_sha256") == request.cluster_registry_sha256
         and attempt.get("cluster_route_revision") == request.cluster_route_revision
         and attempt.get("remote_api_port") == request.remote_api_port
+        and start_phase in {"pending", "admitted", "scope_bound", "contained"}
+        and systemd_unit == f"clio-relay-session-{validated_generation}.scope"
+        and isinstance(systemd_description, str)
+        and systemd_description.startswith(
+            f"clio-relay-owned-session:{request.session_id}:{validated_generation}:"
+        )
+        and (
+            (
+                start_phase in {"pending", "admitted"}
+                and cgroup_path is None
+                and invocation_id is None
+                and broker_pid is None
+                and broker_start is None
+            )
+            or (
+                start_phase in {"scope_bound", "contained"}
+                and isinstance(cgroup_path, str)
+                and bool(cgroup_path)
+                and isinstance(invocation_id, str)
+                and len(invocation_id) == 32
+                and all(character in "0123456789abcdef" for character in invocation_id)
+                and (
+                    (start_phase == "scope_bound" and broker_pid is None and broker_start is None)
+                    or (
+                        start_phase == "contained"
+                        and isinstance(broker_pid, int)
+                        and not isinstance(broker_pid, bool)
+                        and broker_pid > 1
+                        and isinstance(broker_start, str)
+                        and bool(broker_start)
+                    )
+                )
+            )
+        )
         and parsed_observed_at is not None
         and parsed_observed_at.tzinfo is not None
         and (attempt.get("error") is None or isinstance(attempt.get("error"), str))
@@ -2881,126 +3043,217 @@ def execute_owned_session_start(
                 if existing_status.generation_process_pids:
                     if not request.replace:
                         raise RelayError("owned generation processes remain; use --replace")
-                    owner_token = existing.get("owner_token")
-                    release_sha256 = existing.get("api_release_identity_sha256")
-                    registry_path = existing.get("cluster_registry_path")
-                    registry_sha256 = existing.get("cluster_registry_sha256")
-                    route_revision = existing.get("cluster_route_revision")
+                    existing_unit = existing.get("systemd_unit")
+                    existing_cgroup = existing.get("systemd_cgroup_path")
+                    existing_invocation = existing.get("systemd_invocation_id")
+                    existing_description = existing.get("systemd_description")
                     if not all(
                         isinstance(value, str)
                         for value in (
-                            owner_token,
-                            release_sha256,
-                            registry_path,
-                            registry_sha256,
-                            route_revision,
+                            existing_unit,
+                            existing_cgroup,
+                            existing_invocation,
+                            existing_description,
                         )
                     ):
                         raise RelayError("owned generation process identity is incomplete")
-                    _stop_owned_generation_processes(
-                        processes=[
-                            process
-                            for process in _generation_processes(
-                                proc_root=proc_root,
-                                owner_token_sha256=hashlib.sha256(
-                                    cast(str, owner_token).encode("utf-8")
-                                ).hexdigest(),
-                                generation_id=recorded_generation,
-                                session_id=request.session_id,
-                                cluster=request.cluster,
-                                release_sha256=cast(str, release_sha256),
-                                registry_path=cast(str, registry_path),
-                                registry_sha256=cast(str, registry_sha256),
-                                route_revision=cast(str, route_revision),
-                                effective_uid=uid,
-                            )
-                        ],
-                        proc_root=proc_root,
-                        owner_token_sha256=hashlib.sha256(
-                            cast(str, owner_token).encode("utf-8")
-                        ).hexdigest(),
-                        generation_id=recorded_generation,
-                        session_id=request.session_id,
-                        cluster=request.cluster,
-                        release_sha256=cast(str, release_sha256),
-                        registry_path=cast(str, registry_path),
-                        registry_sha256=cast(str, registry_sha256),
-                        route_revision=cast(str, route_revision),
-                        effective_uid=uid,
+                    _terminate_recorded_session_scope(
+                        systemd_unit=cast(str, existing_unit),
+                        systemd_cgroup_path=cast(str, existing_cgroup),
+                        systemd_invocation_id=cast(str, existing_invocation),
+                        systemd_description=cast(str, existing_description),
                     )
         elif resumable_attempt is not None:
             recorded_generation = cast(str, resumable_attempt["session_generation_id"])
-            attempt_token_sha256 = cast(str, resumable_attempt["owner_token_sha256"])
-            attempt_release_sha256 = cast(
-                str,
-                resumable_attempt["api_release_identity_sha256"],
-            )
-            attempt_registry_path = cast(str, resumable_attempt["cluster_registry_path"])
-            attempt_processes = _generation_processes(
-                proc_root=proc_root,
-                owner_token_sha256=attempt_token_sha256,
-                generation_id=recorded_generation,
-                session_id=request.session_id,
-                cluster=request.cluster,
-                release_sha256=attempt_release_sha256,
-                registry_path=attempt_registry_path,
-                registry_sha256=request.cluster_registry_sha256,
-                route_revision=request.cluster_route_revision,
-                effective_uid=uid,
-            )
-            if attempt_processes and not request.replace:
-                raise RelayError(
-                    "a prior start attempt still owns generation processes; use --replace"
-                )
-            if attempt_processes:
-                _stop_owned_generation_processes(
-                    processes=attempt_processes,
+            attempt_phase = cast(str, resumable_attempt["start_phase"])
+            if attempt_phase in {"pending", "admitted"}:
+                from clio_relay.process_containment import adopt_linux_systemd_scope_identity
+
+                try:
+                    adopted_scope = adopt_linux_systemd_scope_identity(
+                        unit=cast(str, resumable_attempt["systemd_unit"]),
+                        description=cast(str, resumable_attempt["systemd_description"]),
+                    )
+                except RuntimeError as exc:
+                    raise RelayError(f"prior owned-session scope recovery failed: {exc}") from exc
+                if adopted_scope is not None:
+                    resumable_attempt.update(
+                        {
+                            "start_phase": "scope_bound",
+                            "systemd_cgroup_path": adopted_scope["cgroup_path"],
+                            "systemd_invocation_id": adopted_scope["systemd_invocation_id"],
+                        }
+                    )
+                    _write_session_attempt(
+                        transaction,
+                        operation="start",
+                        identity={
+                            key: value
+                            for key, value in resumable_attempt.items()
+                            if key not in {"schema_version", "operation", "observed_at", "error"}
+                        },
+                    )
+                    attempt_phase = "scope_bound"
+            if attempt_phase in {"scope_bound", "contained"}:
+                attempt_processes = _recorded_scope_processes(
                     proc_root=proc_root,
-                    owner_token_sha256=attempt_token_sha256,
-                    generation_id=recorded_generation,
-                    session_id=request.session_id,
-                    cluster=request.cluster,
-                    release_sha256=attempt_release_sha256,
-                    registry_path=attempt_registry_path,
-                    registry_sha256=request.cluster_registry_sha256,
-                    route_revision=request.cluster_route_revision,
-                    effective_uid=uid,
+                    systemd_unit=cast(str, resumable_attempt["systemd_unit"]),
+                    systemd_cgroup_path=cast(str, resumable_attempt["systemd_cgroup_path"]),
+                    systemd_invocation_id=cast(
+                        str,
+                        resumable_attempt["systemd_invocation_id"],
+                    ),
+                    systemd_description=cast(str, resumable_attempt["systemd_description"]),
+                )
+                if attempt_processes and not request.replace:
+                    raise RelayError(
+                        "a prior start attempt still owns generation processes; use --replace"
+                    )
+                _terminate_recorded_session_scope(
+                    systemd_unit=cast(str, resumable_attempt["systemd_unit"]),
+                    systemd_cgroup_path=cast(str, resumable_attempt["systemd_cgroup_path"]),
+                    systemd_invocation_id=cast(
+                        str,
+                        resumable_attempt["systemd_invocation_id"],
+                    ),
+                    systemd_description=cast(str, resumable_attempt["systemd_description"]),
+                )
+                resumable_attempt.update(
+                    {
+                        "start_phase": "admitted",
+                        "systemd_cgroup_path": None,
+                        "systemd_invocation_id": None,
+                        "containment_broker_pid": None,
+                        "containment_broker_start_identity": None,
+                    }
+                )
+                _write_session_attempt(
+                    transaction,
+                    operation="start",
+                    identity={
+                        key: value
+                        for key, value in resumable_attempt.items()
+                        if key not in {"schema_version", "operation", "observed_at", "error"}
+                    },
                 )
 
         _assert_remote_port_available(request.remote_api_port)
-        candidate_generation = uuid4().hex
-        selected_generation = queue.prepare_owner_session_start(
-            request.session_id,
-            recorded_generation_id=recorded_generation,
-            candidate_generation_id=candidate_generation,
-        )
-        if (
-            existing is None
-            and resumable_attempt is None
-            and selected_generation != (candidate_generation)
-        ):
-            raise RelayError("core selected an unrecorded owned-session generation")
+        release_sha256 = release_identity.sha256()
+        if existing is None:
+            if resumable_attempt is None:
+                candidate_generation = uuid4().hex
+                owner_token = secrets.token_hex(32)
+                owner_token_sha256 = hashlib.sha256(owner_token.encode("utf-8")).hexdigest()
+                registry_name = f"cluster-registry-{candidate_generation}.json"
+                registry_path = transaction.path / registry_name
+                systemd_unit = f"clio-relay-session-{candidate_generation}.scope"
+                systemd_description = (
+                    f"clio-relay-owned-session:{request.session_id}:{candidate_generation}:"
+                    f"{secrets.token_hex(16)}"
+                )
+                attempt_identity: dict[str, object] = {
+                    "cluster": request.cluster,
+                    "session_id": request.session_id,
+                    "session_generation_id": candidate_generation,
+                    "owner_token": owner_token,
+                    "owner_token_sha256": owner_token_sha256,
+                    "api_release_identity_sha256": release_sha256,
+                    "cluster_registry_path": str(registry_path),
+                    "cluster_registry_sha256": request.cluster_registry_sha256,
+                    "cluster_route_revision": request.cluster_route_revision,
+                    "remote_api_port": request.remote_api_port,
+                    "start_phase": "pending",
+                    "systemd_unit": systemd_unit,
+                    "systemd_description": systemd_description,
+                    "systemd_cgroup_path": None,
+                    "systemd_invocation_id": None,
+                    "containment_broker_pid": None,
+                    "containment_broker_start_identity": None,
+                }
+                _write_session_attempt(
+                    transaction,
+                    operation="start",
+                    identity=attempt_identity,
+                )
+            else:
+                attempt_identity = {
+                    key: value
+                    for key, value in resumable_attempt.items()
+                    if key not in {"schema_version", "operation", "observed_at", "error"}
+                }
+                candidate_generation = cast(str, attempt_identity["session_generation_id"])
+                owner_token = cast(str, attempt_identity["owner_token"])
+                owner_token_sha256 = cast(str, attempt_identity["owner_token_sha256"])
+                registry_name = f"cluster-registry-{candidate_generation}.json"
+                registry_path = transaction.path / registry_name
+                systemd_unit = cast(str, attempt_identity["systemd_unit"])
+                systemd_description = cast(str, attempt_identity["systemd_description"])
+            admission = queue.owner_session_generation_status(
+                request.session_id,
+                session_generation_id=candidate_generation,
+            )
+            active_generation = admission.get("active_generation_id")
+            if active_generation is None:
+                selected_generation = queue.prepare_owner_session_start(
+                    request.session_id,
+                    recorded_generation_id=None,
+                    candidate_generation_id=candidate_generation,
+                )
+            elif active_generation == candidate_generation and admission.get("closing") is False:
+                selected_generation = candidate_generation
+            else:
+                raise RelayError("core selected a different unrecorded owned-session generation")
+            if selected_generation != candidate_generation:
+                raise RelayError("core selected an unrecorded owned-session generation")
+            if attempt_identity["start_phase"] != "contained":
+                attempt_identity["start_phase"] = "admitted"
+                _write_session_attempt(
+                    transaction,
+                    operation="start",
+                    identity=attempt_identity,
+                )
+        else:
+            candidate_generation = uuid4().hex
+            selected_generation = queue.prepare_owner_session_start(
+                request.session_id,
+                recorded_generation_id=recorded_generation,
+                candidate_generation_id=candidate_generation,
+            )
+            registry_name = f"cluster-registry-{selected_generation}.json"
+            registry_path = transaction.path / registry_name
+            owner_token = secrets.token_hex(32)
+            owner_token_sha256 = hashlib.sha256(owner_token.encode("utf-8")).hexdigest()
+            systemd_unit = f"clio-relay-session-{selected_generation}.scope"
+            systemd_description = (
+                f"clio-relay-owned-session:{request.session_id}:{selected_generation}:"
+                f"{secrets.token_hex(16)}"
+            )
+            attempt_identity = {
+                "cluster": request.cluster,
+                "session_id": request.session_id,
+                "session_generation_id": selected_generation,
+                "owner_token": owner_token,
+                "owner_token_sha256": owner_token_sha256,
+                "api_release_identity_sha256": release_sha256,
+                "cluster_registry_path": str(registry_path),
+                "cluster_registry_sha256": request.cluster_registry_sha256,
+                "cluster_route_revision": request.cluster_route_revision,
+                "remote_api_port": request.remote_api_port,
+                "start_phase": "admitted",
+                "systemd_unit": systemd_unit,
+                "systemd_description": systemd_description,
+                "systemd_cgroup_path": None,
+                "systemd_invocation_id": None,
+                "containment_broker_pid": None,
+                "containment_broker_start_identity": None,
+            }
+            _write_session_attempt(
+                transaction,
+                operation="start",
+                identity=attempt_identity,
+            )
         registry_name = f"cluster-registry-{selected_generation}.json"
         registry_path = transaction.path / registry_name
-        owner_token = secrets.token_hex(32)
-        owner_token_sha256 = hashlib.sha256(owner_token.encode("utf-8")).hexdigest()
-        release_sha256 = release_identity.sha256()
-        attempt_identity: dict[str, object] = {
-            "cluster": request.cluster,
-            "session_id": request.session_id,
-            "session_generation_id": selected_generation,
-            "owner_token_sha256": owner_token_sha256,
-            "api_release_identity_sha256": release_sha256,
-            "cluster_registry_path": str(registry_path),
-            "cluster_registry_sha256": request.cluster_registry_sha256,
-            "cluster_route_revision": request.cluster_route_revision,
-            "remote_api_port": request.remote_api_port,
-        }
-        _write_session_attempt(
-            transaction,
-            operation="start",
-            identity=attempt_identity,
-        )
         existing_registry = transaction.read_bytes(
             registry_name,
             maximum_bytes=MAX_CLUSTER_REGISTRY_BYTES,
@@ -3012,23 +3265,32 @@ def execute_owned_session_start(
             raise RelayError("owned generation cluster registry changed before restart")
 
         log_descriptor = transaction.open_output("api.log")
-        process: subprocess.Popen[bytes] | None = None
+        process: subprocess.Popen[Any] | None = None
         metadata_committed = False
         try:
-            environment = dict(os.environ)
-            environment.update(
-                {
-                    "CLIO_RELAY_SESSION_OWNER_TOKEN": owner_token,
-                    "CLIO_RELAY_SESSION_GENERATION_ID": selected_generation,
-                    "CLIO_RELAY_API_RELEASE_IDENTITY_SHA256": release_sha256,
-                    "CLIO_RELAY_CLUSTER_REGISTRY": str(registry_path),
-                    "CLIO_RELAY_SESSION_REGISTRY_SHA256": request.cluster_registry_sha256,
-                    "CLIO_RELAY_SESSION_ROUTE_REVISION": request.cluster_route_revision,
-                    "CLIO_RELAY_OWNER_SESSION_ID": request.session_id,
-                    "CLIO_RELAY_OWNER_SESSION_CLUSTER": request.cluster,
-                    "CLIO_RELAY_REMOTE_CLUSTER": request.cluster,
-                }
+            from clio_relay.process_containment import (
+                broker_child_environment_payload,
+                process_start_identity,
+                spawn_owned_process,
             )
+
+            child_environment = {
+                "CLIO_RELAY_SESSION_OWNER_TOKEN": owner_token,
+                "CLIO_RELAY_SESSION_GENERATION_ID": selected_generation,
+                "CLIO_RELAY_API_RELEASE_IDENTITY_SHA256": release_sha256,
+                "CLIO_RELAY_CLUSTER_REGISTRY": str(registry_path),
+                "CLIO_RELAY_SESSION_REGISTRY_SHA256": request.cluster_registry_sha256,
+                "CLIO_RELAY_SESSION_ROUTE_REVISION": request.cluster_route_revision,
+                "CLIO_RELAY_OWNER_SESSION_ID": request.session_id,
+                "CLIO_RELAY_OWNER_SESSION_CLUSTER": request.cluster,
+                "CLIO_RELAY_REMOTE_CLUSTER": request.cluster,
+            }
+            api_token = os.environ.get("CLIO_RELAY_API_TOKEN")
+            if api_token is not None:
+                child_environment["CLIO_RELAY_API_TOKEN"] = api_token
+            environment = dict(os.environ)
+            for name in child_environment:
+                environment.pop(name, None)
             provider_interpreter = Path(sys.executable).resolve(strict=True)
             interpreter_identity = provider_interpreter.stat()
             command = [
@@ -3045,14 +3307,78 @@ def execute_owned_session_start(
             ]
             if request.require_token:
                 command.append("--require-token")
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=log_descriptor,
-                stderr=subprocess.STDOUT,
-                env=environment,
-                start_new_session=True,
-                close_fds=True,
+            receipt_name = f"api-startup-{selected_generation}.json"
+            receipt_path = transaction.path / receipt_name
+            containment_identity: dict[str, object] = {}
+
+            def persist_containment(
+                broker_pid: int,
+                containment: dict[str, object],
+            ) -> None:
+                if not (
+                    containment.get("mode") == "linux_systemd_scope"
+                    and containment.get("enforceable") is True
+                    and containment.get("systemd_unit") == systemd_unit
+                    and containment.get("systemd_description") == systemd_description
+                    and isinstance(containment.get("cgroup_path"), str)
+                    and isinstance(containment.get("systemd_invocation_id"), str)
+                ):
+                    raise RelayError("owned API containment identity is incomplete")
+                broker_start = process_start_identity(broker_pid)
+                if broker_start is None:
+                    raise RelayError("owned API containment broker identity is unavailable")
+                containment_identity.update(containment)
+                attempt_identity.update(
+                    {
+                        "start_phase": "contained",
+                        "systemd_cgroup_path": containment["cgroup_path"],
+                        "systemd_invocation_id": containment["systemd_invocation_id"],
+                        "containment_broker_pid": broker_pid,
+                        "containment_broker_start_identity": broker_start,
+                    }
+                )
+                _write_session_attempt(
+                    transaction,
+                    operation="start",
+                    identity=attempt_identity,
+                )
+
+            def release_child_environment(
+                _broker_pid: int,
+                containment: dict[str, object],
+            ) -> str:
+                gated_environment = dict(child_environment)
+                gated_environment.update(
+                    {
+                        _API_STARTUP_RECEIPT_ENV: str(receipt_path),
+                        _SYSTEMD_UNIT_ENV: cast(str, containment["systemd_unit"]),
+                        _SYSTEMD_CGROUP_ENV: cast(str, containment["cgroup_path"]),
+                        _SYSTEMD_INVOCATION_ENV: cast(
+                            str,
+                            containment["systemd_invocation_id"],
+                        ),
+                        _SYSTEMD_DESCRIPTION_ENV: cast(
+                            str,
+                            containment["systemd_description"],
+                        ),
+                    }
+                )
+                return broker_child_environment_payload(gated_environment)
+
+            process = cast(
+                subprocess.Popen[Any],
+                spawn_owned_process(
+                    command,
+                    stdout=log_descriptor,
+                    stderr=subprocess.STDOUT,
+                    env=environment,
+                    close_fds=True,
+                    require_enforceable=True,
+                    linux_systemd_unit_base=systemd_unit.removesuffix(".scope"),
+                    linux_systemd_description=systemd_description,
+                    on_ready=persist_containment,
+                    credential_payload_factory=release_child_environment,
+                ),
             )
             final_interpreter_identity = provider_interpreter.stat()
             if (final_interpreter_identity.st_dev, final_interpreter_identity.st_ino) != (
@@ -3060,46 +3386,43 @@ def execute_owned_session_start(
                 interpreter_identity.st_ino,
             ):
                 raise RelayError("verified provider interpreter changed during API spawn")
-            process_identity: _OwnedGenerationProcess | None = None
-            identity_deadline = time.monotonic() + 2.0
-            while time.monotonic() < identity_deadline:
-                matches = _generation_processes(
-                    proc_root=proc_root,
-                    owner_token_sha256=owner_token_sha256,
-                    generation_id=selected_generation,
-                    session_id=request.session_id,
-                    cluster=request.cluster,
-                    release_sha256=release_sha256,
-                    registry_path=str(registry_path),
-                    registry_sha256=request.cluster_registry_sha256,
-                    route_revision=request.cluster_route_revision,
-                    effective_uid=uid,
-                )
-                process_identity = next(
-                    (candidate for candidate in matches if candidate.pid == process.pid),
-                    None,
-                )
-                if process_identity is not None:
-                    break
-                if process.poll() is not None:
-                    break
-                time.sleep(0.05)
-            if (
-                process_identity is None
-                or process_identity.process_group_id != process.pid
-                or not _is_clio_relay_api_leader(proc_root=proc_root, pid=process.pid)
-            ):
-                raise RelayError("owned API process did not establish its exact identity")
-            ready_seconds = _wait_for_api_ready(
+            expected_receipt = {
+                "cluster": request.cluster,
+                "session_id": request.session_id,
+                "session_generation_id": selected_generation,
+                "api_release_identity_sha256": release_sha256,
+                "cluster_registry_path": str(registry_path),
+                "cluster_registry_sha256": request.cluster_registry_sha256,
+                "cluster_route_revision": request.cluster_route_revision,
+                "systemd_unit": containment_identity["systemd_unit"],
+                "systemd_cgroup_path": containment_identity["cgroup_path"],
+                "systemd_invocation_id": containment_identity["systemd_invocation_id"],
+                "systemd_description": containment_identity["systemd_description"],
+            }
+            process_identity = _wait_for_api_startup_receipt(
+                transaction=transaction,
                 process=process,
+                receipt_name=receipt_name,
+                owner_token=owner_token,
+                expected=expected_receipt,
+                proc_root=proc_root,
+            )
+            ready_seconds = _wait_for_api_ready(
+                process=cast(subprocess.Popen[bytes], process),
                 port=request.remote_api_port,
             )
+            receipt_payload = transaction.read_bytes(
+                receipt_name,
+                maximum_bytes=_MAX_API_STARTUP_RECEIPT_BYTES,
+            )
+            if receipt_payload is None:  # pragma: no cover - required read
+                raise RelayError("owned API startup receipt disappeared before metadata commit")
             metadata = {
                 "cluster": request.cluster,
                 "session_id": request.session_id,
                 "remote_api_port": request.remote_api_port,
-                "api_pid": process.pid,
-                "api_pgid": process.pid,
+                "api_pid": process_identity.pid,
+                "api_pgid": process_identity.process_group_id,
                 "owner_token": owner_token,
                 "session_generation_id": selected_generation,
                 "api_release_identity": release_identity.model_dump(mode="json"),
@@ -3109,10 +3432,21 @@ def execute_owned_session_start(
                 "cluster_route_revision": request.cluster_route_revision,
                 "cluster_authority_verified": True,
                 "process_start_ticks": process_identity.start_ticks,
+                "containment_mode": "linux_systemd_scope",
+                "systemd_unit": containment_identity["systemd_unit"],
+                "systemd_cgroup_path": containment_identity["cgroup_path"],
+                "systemd_invocation_id": containment_identity["systemd_invocation_id"],
+                "systemd_description": containment_identity["systemd_description"],
+                "containment_broker_pid": process.pid,
+                "containment_broker_start_identity": attempt_identity[
+                    "containment_broker_start_identity"
+                ],
+                "api_startup_receipt_path": str(receipt_path),
+                "api_startup_receipt_sha256": hashlib.sha256(receipt_payload).hexdigest(),
                 "started_at": datetime.now(UTC).isoformat(),
                 "owner": "clio-relay",
             }
-            transaction.atomic_write("api.pid", f"{process.pid}\n".encode("ascii"))
+            transaction.atomic_write("api.pid", f"{process_identity.pid}\n".encode("ascii"))
             transaction.atomic_write(
                 "metadata.json",
                 json.dumps(metadata, indent=2).encode("utf-8"),
@@ -3125,7 +3459,7 @@ def execute_owned_session_start(
             return [
                 f"remote_api_ready_seconds={ready_seconds:.3f}",
                 f"session_started={request.session_id}",
-                f"api_pid={process.pid}",
+                f"api_pid={process_identity.pid}",
                 f"session_generation_id={selected_generation}",
                 f"remote_api_port={request.remote_api_port}",
                 f"metadata={transaction.path / 'metadata.json'}",
@@ -3133,32 +3467,29 @@ def execute_owned_session_start(
         except BaseException as exc:
             if not metadata_committed:
                 try:
-                    remaining = _generation_processes(
-                        proc_root=proc_root,
-                        owner_token_sha256=owner_token_sha256,
-                        generation_id=selected_generation,
-                        session_id=request.session_id,
-                        cluster=request.cluster,
-                        release_sha256=release_sha256,
-                        registry_path=str(registry_path),
-                        registry_sha256=request.cluster_registry_sha256,
-                        route_revision=request.cluster_route_revision,
-                        effective_uid=uid,
-                    )
-                    _stop_owned_generation_processes(
-                        processes=remaining,
-                        proc_root=proc_root,
-                        owner_token_sha256=owner_token_sha256,
-                        generation_id=selected_generation,
-                        session_id=request.session_id,
-                        cluster=request.cluster,
-                        release_sha256=release_sha256,
-                        registry_path=str(registry_path),
-                        registry_sha256=request.cluster_registry_sha256,
-                        route_revision=request.cluster_route_revision,
-                        effective_uid=uid,
-                    )
-                except RelayError as cleanup_error:
+                    if attempt_identity.get("start_phase") == "contained":
+                        _terminate_recorded_session_scope(
+                            systemd_unit=cast(str, attempt_identity["systemd_unit"]),
+                            systemd_cgroup_path=cast(
+                                str,
+                                attempt_identity["systemd_cgroup_path"],
+                            ),
+                            systemd_invocation_id=cast(
+                                str,
+                                attempt_identity["systemd_invocation_id"],
+                            ),
+                            systemd_description=cast(str, attempt_identity["systemd_description"]),
+                        )
+                        attempt_identity.update(
+                            {
+                                "start_phase": "admitted",
+                                "systemd_cgroup_path": None,
+                                "systemd_invocation_id": None,
+                                "containment_broker_pid": None,
+                                "containment_broker_start_identity": None,
+                            }
+                        )
+                except (RelayError, RuntimeError) as cleanup_error:
                     cleanup_detail = f"{exc}; cleanup failed: {cleanup_error}"
                 else:
                     cleanup_detail = str(exc)
@@ -3178,15 +3509,17 @@ def _capture_cleanup_target(
     transaction: _OwnedSessionTransaction,
     *,
     name: str,
-    maximum_bytes: int,
+    maximum_bytes: int | None,
 ) -> OwnedSessionCleanupTarget:
     """Capture an exact cleanup target identity through the pinned directory."""
     linked = transaction.stat_regular(name, required=False)
     if linked is None:
         return OwnedSessionCleanupTarget(name=name, present=False)
-    payload = transaction.read_bytes(name, maximum_bytes=maximum_bytes)
-    if payload is None:  # pragma: no cover - required read
-        raise RelayError(f"owned cleanup target disappeared: {name}")
+    payload = (
+        transaction.read_bytes(name, maximum_bytes=maximum_bytes)
+        if maximum_bytes is not None
+        else None
+    )
     final = transaction.stat_regular(name)
     if final is None:  # pragma: no cover - required stat
         raise RelayError(f"owned cleanup target disappeared: {name}")
@@ -3202,7 +3535,8 @@ def _capture_cleanup_target(
         device=linked.st_dev,
         inode=linked.st_ino,
         size=linked.st_size,
-        sha256=hashlib.sha256(payload).hexdigest(),
+        sha256=hashlib.sha256(payload).hexdigest() if payload is not None else None,
+        identity_mode="content_sha256" if payload is not None else "inode",
     )
 
 
@@ -3221,7 +3555,14 @@ def _validate_cleanup_targets(
         ]
     except ValueError as exc:
         raise RelayError(f"owned session cleanup receipt target is invalid: {exc}") from exc
-    expected_names = sorted(("api.log", "api.pid", f"cluster-registry-{generation_id}.json"))
+    expected_names = sorted(
+        (
+            "api.log",
+            "api.pid",
+            f"api-startup-{generation_id}.json",
+            f"cluster-registry-{generation_id}.json",
+        )
+    )
     if [target.name for target in targets] != expected_names:
         raise RelayError("owned session cleanup receipt target names are invalid")
     if not all(target.identity_is_complete() for target in targets):
@@ -3242,25 +3583,19 @@ def _delete_cleanup_targets(
             continue
         if current is None:
             continue
-        if (
-            target.device is None
-            or target.inode is None
-            or target.size is None
-            or target.sha256 is None
-        ):  # pragma: no cover - validated model shape
+        if target.device is None or target.inode is None or target.size is None:
             raise RelayError(f"cleanup target identity is incomplete: {target.name}")
-        maximum_bytes = (
-            _MAX_OWNED_SESSION_LOG_BYTES
-            if target.name == "api.log"
-            else _MAX_OWNED_SESSION_DOCUMENT_BYTES
-        )
         transaction.unlink_verified(
             target.name,
             expected_device=target.device,
             expected_inode=target.inode,
             expected_size=target.size,
             expected_sha256=target.sha256,
-            maximum_bytes=maximum_bytes,
+            maximum_bytes=(
+                _MAX_OWNED_SESSION_DOCUMENT_BYTES
+                if target.identity_mode == "content_sha256"
+                else None
+            ),
         )
 
 
@@ -3486,6 +3821,13 @@ def execute_owned_session_teardown(
         registry_path = document.get("cluster_registry_path")
         registry_sha256 = document.get("cluster_registry_sha256")
         route_revision = document.get("cluster_route_revision")
+        systemd_unit = document.get("systemd_unit")
+        systemd_cgroup_path = document.get("systemd_cgroup_path")
+        systemd_invocation_id = document.get("systemd_invocation_id")
+        systemd_description = document.get("systemd_description")
+        containment_broker_pid = document.get("containment_broker_pid")
+        containment_broker_start = document.get("containment_broker_start_identity")
+        startup_receipt_path = document.get("api_startup_receipt_path")
         started_at_raw = document.get("started_at")
         if not (
             isinstance(owner_token, str)
@@ -3500,6 +3842,14 @@ def execute_owned_session_teardown(
             and isinstance(registry_path, str)
             and isinstance(registry_sha256, str)
             and isinstance(route_revision, str)
+            and isinstance(systemd_unit, str)
+            and isinstance(systemd_cgroup_path, str)
+            and isinstance(systemd_invocation_id, str)
+            and isinstance(systemd_description, str)
+            and isinstance(containment_broker_pid, int)
+            and not isinstance(containment_broker_pid, bool)
+            and isinstance(containment_broker_start, str)
+            and isinstance(startup_receipt_path, str)
             and isinstance(started_at_raw, str)
         ):
             raise RelayError("owned session metadata became incomplete before teardown")
@@ -3519,47 +3869,35 @@ def execute_owned_session_teardown(
             "cluster_registry_path": registry_path,
             "cluster_registry_sha256": registry_sha256,
             "cluster_route_revision": route_revision,
+            "systemd_unit": systemd_unit,
+            "systemd_cgroup_path": systemd_cgroup_path,
+            "systemd_invocation_id": systemd_invocation_id,
+            "systemd_description": systemd_description,
         }
         receipt_committed = False
         try:
-            processes = _generation_processes(
+            processes = _recorded_scope_processes(
                 proc_root=proc_root,
-                owner_token_sha256=owner_token_sha256,
-                generation_id=request.expected_session_generation_id,
-                session_id=request.session_id,
-                cluster=request.cluster,
-                release_sha256=release_sha256,
-                registry_path=registry_path,
-                registry_sha256=registry_sha256,
-                route_revision=route_revision,
-                effective_uid=uid,
+                systemd_unit=systemd_unit,
+                systemd_cgroup_path=systemd_cgroup_path,
+                systemd_invocation_id=systemd_invocation_id,
+                systemd_description=systemd_description,
             )
             prior_running = bool(processes)
             prior_observed_at = datetime.now(UTC)
-            targeted_pids = _stop_owned_generation_processes(
-                processes=processes,
-                proc_root=proc_root,
-                owner_token_sha256=owner_token_sha256,
-                generation_id=request.expected_session_generation_id,
-                session_id=request.session_id,
-                cluster=request.cluster,
-                release_sha256=release_sha256,
-                registry_path=registry_path,
-                registry_sha256=registry_sha256,
-                route_revision=route_revision,
-                effective_uid=uid,
+            targeted_pids = [process.pid for process in processes]
+            _terminate_recorded_session_scope(
+                systemd_unit=systemd_unit,
+                systemd_cgroup_path=systemd_cgroup_path,
+                systemd_invocation_id=systemd_invocation_id,
+                systemd_description=systemd_description,
             )
-            final_processes = _generation_processes(
+            final_processes = _recorded_scope_processes(
                 proc_root=proc_root,
-                owner_token_sha256=owner_token_sha256,
-                generation_id=request.expected_session_generation_id,
-                session_id=request.session_id,
-                cluster=request.cluster,
-                release_sha256=release_sha256,
-                registry_path=registry_path,
-                registry_sha256=registry_sha256,
-                route_revision=route_revision,
-                effective_uid=uid,
+                systemd_unit=systemd_unit,
+                systemd_cgroup_path=systemd_cgroup_path,
+                systemd_invocation_id=systemd_invocation_id,
+                systemd_description=systemd_description,
             )
             if final_processes:
                 raise RelayError("owned generation process absence was not verified")
@@ -3574,7 +3912,7 @@ def execute_owned_session_teardown(
                 observed_state="absent",
                 residual=False,
                 detail=(
-                    "all exact owned-generation processes were stopped by pidfd"
+                    "the exact owned-generation systemd cgroup was stopped"
                     if targeted_pids
                     else "no exact owned-generation process remained"
                 ),
@@ -3590,14 +3928,23 @@ def execute_owned_session_teardown(
                     )
 
             generation_id = request.expected_session_generation_id
-            target_names = sorted(("api.log", "api.pid", f"cluster-registry-{generation_id}.json"))
+            target_names = sorted(
+                (
+                    "api.log",
+                    "api.pid",
+                    Path(startup_receipt_path).name,
+                    f"cluster-registry-{generation_id}.json",
+                )
+            )
             targets = [
                 _capture_cleanup_target(
                     transaction,
                     name=name,
                     maximum_bytes=(
-                        _MAX_OWNED_SESSION_LOG_BYTES
+                        None
                         if name == "api.log"
+                        else _MAX_API_STARTUP_RECEIPT_BYTES
+                        if name.startswith("api-startup-")
                         else _MAX_OWNED_SESSION_DOCUMENT_BYTES
                     ),
                 )
@@ -3679,6 +4026,13 @@ def execute_owned_session_teardown(
                 "cluster_registry_path": registry_path,
                 "cluster_registry_sha256": registry_sha256,
                 "cluster_route_revision": route_revision,
+                "containment_mode": "linux_systemd_scope",
+                "systemd_unit": systemd_unit,
+                "systemd_cgroup_path": systemd_cgroup_path,
+                "systemd_invocation_id": systemd_invocation_id,
+                "systemd_description": systemd_description,
+                "containment_broker_pid": containment_broker_pid,
+                "containment_broker_start_identity": containment_broker_start,
                 "metadata_sha256": hashlib.sha256(original_metadata).hexdigest(),
                 "cleanup_operation_id": request.expected_cleanup_operation_id,
                 "cleanup_policy": expected_policy,

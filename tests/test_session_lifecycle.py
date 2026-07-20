@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import stat
 import subprocess
 from datetime import UTC, datetime
@@ -32,12 +31,14 @@ from clio_relay.session_lifecycle import (
     OwnedSessionCleanupFinalizeRequest,
     OwnedSessionCleanupTarget,
     OwnedSessionRecoveryStatus,
+    OwnedSessionStartRequest,
     RemoteSessionStateEvidence,
     SessionApiReleaseIdentity,
     SessionLifecycleReport,
     challenge_remote_session_identity,
     detach_remote_session,
     execute_owned_session_cleanup_finalize,
+    execute_owned_session_start,
     inspect_owned_session_recovery_status,
     session_lifecycle_report_sha256,
     start_remote_session,
@@ -61,6 +62,129 @@ def _api_release_identity() -> SessionApiReleaseIdentity:
     )
 
 
+class _FakeSessionTransaction:
+    """Small filesystem-backed transaction seam for platform-neutral lifecycle tests."""
+
+    def __init__(self, path: Path, *, session_id: str = "session-start") -> None:
+        self.path = path
+        self.session_id = session_id
+        self.path.mkdir(parents=True, exist_ok=True)
+
+    def __enter__(self) -> _FakeSessionTransaction:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read_json(
+        self,
+        name: str,
+        *,
+        required: bool = True,
+    ) -> dict[str, object] | None:
+        path = self.path / name
+        if not path.exists():
+            if required:
+                raise AssertionError(f"missing required test document: {name}")
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+        assert isinstance(value, dict)
+        return cast(dict[str, object], value)
+
+    def atomic_write(self, name: str, payload: bytes) -> None:
+        (self.path / name).write_bytes(payload)
+
+    def stat_regular(self, name: str, *, required: bool = True) -> os.stat_result | None:
+        path = self.path / name
+        if not path.exists():
+            if required:
+                raise AssertionError(f"missing required test file: {name}")
+            return None
+        return path.stat()
+
+    def read_bytes(
+        self,
+        name: str,
+        *,
+        maximum_bytes: int,
+        required: bool = True,
+    ) -> bytes | None:
+        path = self.path / name
+        if not path.exists():
+            if required:
+                raise AssertionError(f"missing required test file: {name}")
+            return None
+        payload = path.read_bytes()
+        if len(payload) > maximum_bytes:
+            raise AssertionError("test transaction observed an unexpected bounded read")
+        return payload
+
+    def unlink_verified(
+        self,
+        name: str,
+        *,
+        expected_device: int,
+        expected_inode: int,
+        expected_size: int,
+        expected_sha256: str | None,
+        maximum_bytes: int | None,
+    ) -> bool:
+        path = self.path / name
+        observed = path.stat()
+        assert (observed.st_dev, observed.st_ino, observed.st_size) == (
+            expected_device,
+            expected_inode,
+            expected_size,
+        )
+        assert expected_sha256 is None
+        assert maximum_bytes is None
+        path.unlink()
+        return True
+
+
+@pytest.fixture(autouse=True)
+def _use_fake_recorded_scope(monkeypatch: MonkeyPatch) -> None:
+    """Represent exact cgroup membership without consulting the host's systemd."""
+
+    def recorded_scope_processes(
+        *,
+        proc_root: Path,
+        systemd_unit: str,
+        systemd_cgroup_path: str,
+        systemd_invocation_id: str,
+        systemd_description: str,
+    ) -> list[object]:
+        assert systemd_unit.startswith("clio-relay-session-")
+        assert systemd_unit.endswith(".scope")
+        assert systemd_cgroup_path
+        assert len(systemd_invocation_id) == 32
+        assert systemd_description.startswith("clio-relay-owned-session:")
+        membership = proc_root / "scope.procs"
+        process_ids = (
+            [int(line) for line in membership.read_text(encoding="ascii").splitlines()]
+            if membership.exists()
+            else []
+        )
+        processes = []
+        for process_id in process_ids:
+            try:
+                processes.append(
+                    session_lifecycle._read_proc_identity(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                        proc_root=proc_root,
+                        pid=process_id,
+                    )
+                )
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+        return processes
+
+    monkeypatch.setattr(
+        session_lifecycle,
+        "_recorded_scope_processes",
+        recorded_scope_processes,
+    )
+
+
 def _owned_session_recovery_fixture(
     root: Path,
     *,
@@ -77,13 +201,43 @@ def _owned_session_recovery_fixture(
     registry_path = session_dir / f"cluster-registry-{generation_id}.json"
     registry_path.write_bytes(registry_bytes)
     release = _api_release_identity()
+    owner_token = "b" * 64
+    systemd_unit = f"clio-relay-session-{generation_id}.scope"
+    systemd_cgroup_path = f"/sys/fs/cgroup/user.slice/{systemd_unit}"
+    systemd_invocation_id = "1" * 32
+    systemd_description = f"clio-relay-owned-session:{session_id}:{generation_id}:{'2' * 32}"
+    receipt_path = session_dir / f"api-startup-{generation_id}.json"
+    receipt: dict[str, object] = {
+        "schema_version": "clio-relay.owner-session-api-startup.v1",
+        "cluster": "ares",
+        "session_id": session_id,
+        "session_generation_id": generation_id,
+        "api_pid": pid,
+        "api_pgid": pid,
+        "process_start_ticks": "123456",
+        "api_release_identity_sha256": release.sha256(),
+        "cluster_registry_path": str(registry_path),
+        "cluster_registry_sha256": session_lifecycle.hashlib.sha256(registry_bytes).hexdigest(),
+        "cluster_route_revision": session_lifecycle.cluster_route_revision(definition),
+        "systemd_unit": systemd_unit,
+        "systemd_cgroup_path": systemd_cgroup_path,
+        "systemd_invocation_id": systemd_invocation_id,
+        "systemd_description": systemd_description,
+        "observed_at": datetime.now(UTC).isoformat(),
+    }
+    receipt["hmac_sha256"] = session_lifecycle._startup_receipt_signature(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        receipt,
+        owner_token=owner_token,
+    )
+    receipt_payload = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+    receipt_path.write_bytes(receipt_payload)
     metadata = {
         "cluster": "ares",
         "session_id": session_id,
         "remote_api_port": 8765,
         "api_pid": pid,
         "api_pgid": pid,
-        "owner_token": "b" * 64,
+        "owner_token": owner_token,
         "session_generation_id": generation_id,
         "api_release_identity": release.model_dump(mode="json"),
         "api_release_identity_sha256": release.sha256(),
@@ -92,12 +246,22 @@ def _owned_session_recovery_fixture(
         "cluster_route_revision": session_lifecycle.cluster_route_revision(definition),
         "cluster_authority_verified": True,
         "process_start_ticks": "123456",
+        "containment_mode": "linux_systemd_scope",
+        "systemd_unit": systemd_unit,
+        "systemd_cgroup_path": systemd_cgroup_path,
+        "systemd_invocation_id": systemd_invocation_id,
+        "systemd_description": systemd_description,
+        "containment_broker_pid": pid + 1,
+        "containment_broker_start_identity": "linux-proc:654321",
+        "api_startup_receipt_path": str(receipt_path),
+        "api_startup_receipt_sha256": session_lifecycle.hashlib.sha256(receipt_payload).hexdigest(),
         "started_at": datetime.now(UTC).isoformat(),
         "owner": "clio-relay",
     }
     (session_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
     proc_root = root / "proc"
     proc_root.mkdir()
+    (proc_root / "scope.procs").write_text("", encoding="ascii")
     queue = ClioCoreQueue(root / "core")
     assert (
         queue.prepare_owner_session_start(
@@ -108,6 +272,25 @@ def _owned_session_recovery_fixture(
         == generation_id
     )
     return home, session_dir, proc_root, queue
+
+
+def _owned_session_start_request() -> OwnedSessionStartRequest:
+    definition = ClusterDefinition(name="ares", ssh_host="ares")
+    registry = ClusterRegistry(clusters={"ares": definition})
+    payload = json.dumps(
+        registry.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return OwnedSessionStartRequest(
+        cluster="ares",
+        session_id="session-start",
+        remote_api_port=18765,
+        require_token=False,
+        cluster_registry=registry.model_dump(mode="json"),
+        cluster_registry_sha256=session_lifecycle.hashlib.sha256(payload).hexdigest(),
+        cluster_route_revision=session_lifecycle.cluster_route_revision(definition),
+    )
 
 
 def _write_owned_generation_process(
@@ -138,6 +321,8 @@ def _write_owned_generation_process(
     ]
     (pid_dir / "environ").write_bytes("\0".join(markers).encode() + b"\0")
     (pid_dir / "cmdline").write_bytes(command)
+    with (proc_root / "scope.procs").open("a", encoding="ascii") as membership:
+        membership.write(f"{pid}\n")
 
 
 def test_dead_owned_session_recovery_requires_metadata_registry_and_core(
@@ -162,6 +347,130 @@ def test_dead_owned_session_recovery_requires_metadata_registry_and_core(
     assert status.running is False
     assert status.ownership_verified is True
     assert status.errors == []
+
+
+def test_start_persists_candidate_before_core_admission(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    request = _owned_session_start_request()
+    monkeypatch.setattr(
+        session_lifecycle,
+        "_current_session_api_release_identity",
+        _api_release_identity,
+    )
+    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", lambda _port: None)
+    monkeypatch.setattr(
+        os, "geteuid", lambda: os.getuid() if hasattr(os, "getuid") else 0, raising=False
+    )
+    transaction = _FakeSessionTransaction(
+        tmp_path / "home" / ".local" / "share" / "clio-relay" / "sessions" / request.session_id,
+        session_id=request.session_id,
+    )
+    monkeypatch.setattr(
+        session_lifecycle,
+        "open_owned_session_transaction",
+        lambda **_kwargs: transaction,
+    )
+
+    def crash_before_admission(*_args: object, **_kwargs: object) -> str:
+        raise RuntimeError("simulated admission crash")
+
+    monkeypatch.setattr(
+        ClioCoreQueue,
+        "prepare_owner_session_start",
+        crash_before_admission,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated admission crash"):
+        execute_owned_session_start(
+            request,
+            home=tmp_path / "home",
+            core_dir=tmp_path / "core",
+            proc_root=tmp_path / "proc",
+        )
+
+    attempt_path = (
+        tmp_path
+        / "home"
+        / ".local"
+        / "share"
+        / "clio-relay"
+        / "sessions"
+        / request.session_id
+        / "start-attempt.json"
+    )
+    attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+    assert attempt["start_phase"] == "pending"
+    assert attempt["session_generation_id"]
+    assert attempt["systemd_unit"] == (
+        f"clio-relay-session-{attempt['session_generation_id']}.scope"
+    )
+    assert (
+        attempt["owner_token_sha256"]
+        == session_lifecycle.hashlib.sha256(attempt["owner_token"].encode()).hexdigest()
+    )
+
+
+@pytest.mark.parametrize(
+    ("phase", "cgroup_path", "invocation_id", "broker_pid", "broker_start"),
+    [
+        ("pending", None, None, None, None),
+        ("admitted", None, None, None, None),
+        ("scope_bound", "/sys/fs/cgroup/test.scope", "1" * 32, None, None),
+        ("contained", "/sys/fs/cgroup/test.scope", "1" * 32, 4322, "linux-proc:1"),
+    ],
+)
+def test_start_attempt_accepts_every_durable_crash_boundary(
+    tmp_path: Path,
+    phase: str,
+    cgroup_path: str | None,
+    invocation_id: str | None,
+    broker_pid: int | None,
+    broker_start: str | None,
+) -> None:
+    request = _owned_session_start_request()
+    transaction = _FakeSessionTransaction(
+        tmp_path / "session",
+        session_id=request.session_id,
+    )
+    with transaction:
+        generation = "generation-crash"
+        token = "a" * 64
+        identity: dict[str, object] = {
+            "cluster": request.cluster,
+            "session_id": request.session_id,
+            "session_generation_id": generation,
+            "owner_token": token,
+            "owner_token_sha256": session_lifecycle.hashlib.sha256(token.encode()).hexdigest(),
+            "api_release_identity_sha256": "b" * 64,
+            "cluster_registry_path": str(transaction.path / f"cluster-registry-{generation}.json"),
+            "cluster_registry_sha256": request.cluster_registry_sha256,
+            "cluster_route_revision": request.cluster_route_revision,
+            "remote_api_port": request.remote_api_port,
+            "start_phase": phase,
+            "systemd_unit": f"clio-relay-session-{generation}.scope",
+            "systemd_description": (
+                f"clio-relay-owned-session:{request.session_id}:{generation}:{'2' * 32}"
+            ),
+            "systemd_cgroup_path": cgroup_path,
+            "systemd_invocation_id": invocation_id,
+            "containment_broker_pid": broker_pid,
+            "containment_broker_start_identity": broker_start,
+        }
+        session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            transaction,
+            operation="start",
+            identity=identity,
+        )
+
+        recovered = session_lifecycle._validated_resumable_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            transaction,
+            request=request,
+        )
+
+    assert recovered is not None
+    assert recovered["start_phase"] == phase
 
 
 def test_recovery_counts_non_clio_generation_child_when_leader_is_absent(
@@ -193,56 +502,23 @@ def test_recovery_counts_non_clio_generation_child_when_leader_is_absent(
     assert status.generation_process_absence_verified is False
 
 
-def test_pidfd_cleanup_refuses_identity_change_after_open(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    original = session_lifecycle._OwnedGenerationProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        pid=5432,
-        process_group_id=5432,
-        start_ticks="123",
-    )
-    changed = session_lifecycle._OwnedGenerationProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        pid=5432,
-        process_group_id=5432,
-        start_ticks="456",
-    )
-    signal_calls: list[tuple[int, int]] = []
+def test_recovery_does_not_read_unrelated_process_environment(tmp_path: Path) -> None:
+    home, _session_dir, proc_root, queue = _owned_session_recovery_fixture(tmp_path)
+    unrelated = proc_root / "9999"
+    unrelated.mkdir()
+    (unrelated / "environ").write_text("protected", encoding="utf-8")
+    (unrelated / "environ").chmod(0)
 
-    monkeypatch.setattr(
-        os,
-        "pidfd_open",
-        lambda _pid, _flags: os.open(os.devnull, os.O_RDONLY),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        session_lifecycle,
-        "_scan_owned_generation_processes",
-        lambda **_kwargs: [changed],
-    )
-    monkeypatch.setattr(
-        signal,
-        "pidfd_send_signal",
-        lambda descriptor, number, _siginfo, _flags: signal_calls.append((descriptor, number)),
-        raising=False,
-    )
-
-    signaled = session_lifecycle._signal_owned_generation_processes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        processes=[original],
-        signal_number=signal.SIGTERM,
-        proc_root=Path("/proc"),
-        owner_token_sha256="a" * 64,
-        generation_id="generation-1",
-        session_id="session-1",
+    status = inspect_owned_session_recovery_status(
         cluster="ares",
-        release_sha256="b" * 64,
-        registry_path="/tmp/registry.json",
-        registry_sha256="c" * 64,
-        route_revision="route-1",
-        effective_uid=None,
+        session_id="session-1",
+        core_dir=queue.root,
+        home=home,
+        proc_root=proc_root,
     )
 
-    assert signaled == []
-    assert signal_calls == []
+    assert status.recovery_verified is True
+    assert status.process_absence_verified is True
 
 
 def test_dead_owned_session_recovery_rejects_reused_recorded_pid(tmp_path: Path) -> None:
@@ -406,7 +682,14 @@ def test_cleanup_receipt_supports_idempotent_pending_retry(tmp_path: Path) -> No
     home, session_dir, proc_root, queue = _owned_session_recovery_fixture(tmp_path)
     (session_dir / "api.log").write_text("closed\n", encoding="utf-8")
     (session_dir / "api.pid").write_text("4321\n", encoding="ascii")
-    target_names = ["api.log", "api.pid", "cluster-registry-generation-1.json"]
+    target_names = sorted(
+        [
+            "api.log",
+            "api.pid",
+            "api-startup-generation-1.json",
+            "cluster-registry-generation-1.json",
+        ]
+    )
     targets: list[OwnedSessionCleanupTarget] = []
     for name in target_names:
         path = session_dir / name
@@ -418,7 +701,12 @@ def test_cleanup_receipt_supports_idempotent_pending_retry(tmp_path: Path) -> No
                 device=path_stat.st_dev,
                 inode=path_stat.st_ino,
                 size=path_stat.st_size,
-                sha256=session_lifecycle.hashlib.sha256(path.read_bytes()).hexdigest(),
+                sha256=(
+                    None
+                    if name == "api.log"
+                    else session_lifecycle.hashlib.sha256(path.read_bytes()).hexdigest()
+                ),
+                identity_mode="inode" if name == "api.log" else "content_sha256",
             )
         )
     intent = queue.set_owner_session_closing(
@@ -491,10 +779,21 @@ def test_cleanup_receipt_supports_idempotent_pending_retry(tmp_path: Path) -> No
         "owner_token_sha256": session_lifecycle.hashlib.sha256(("b" * 64).encode()).hexdigest(),
         "api_release_identity_sha256": _api_release_identity().sha256(),
         "cluster_registry_path": str(session_dir / "cluster-registry-generation-1.json"),
-        "cluster_registry_sha256": targets[2].sha256,
+        "cluster_registry_sha256": next(
+            target.sha256
+            for target in targets
+            if target.name == "cluster-registry-generation-1.json"
+        ),
         "cluster_route_revision": session_lifecycle.cluster_route_revision(
             ClusterDefinition(name="ares", ssh_host="ares")
         ),
+        "containment_mode": "linux_systemd_scope",
+        "systemd_unit": "clio-relay-session-generation-1.scope",
+        "systemd_cgroup_path": ("/sys/fs/cgroup/user.slice/clio-relay-session-generation-1.scope"),
+        "systemd_invocation_id": "1" * 32,
+        "systemd_description": ("clio-relay-owned-session:session-1:generation-1:" + "2" * 32),
+        "containment_broker_pid": 4322,
+        "containment_broker_start_identity": "linux-proc:654321",
         "metadata_sha256": "a" * 64,
         "cleanup_operation_id": intent["operation_id"],
         "cleanup_policy": {
@@ -541,6 +840,29 @@ def test_cleanup_receipt_supports_idempotent_pending_retry(tmp_path: Path) -> No
     )
     assert closed_status.recovery_verified is True
     assert closed_status.process_state == "already_closed"
+
+
+def test_cleanup_deletes_oversized_api_log_by_pinned_inode(tmp_path: Path) -> None:
+    _home, session_dir, _proc_root, _queue = _owned_session_recovery_fixture(tmp_path)
+    log_path = session_dir / "api.log"
+    with log_path.open("wb") as log:
+        log.truncate(20 * 1024 * 1024)
+
+    with _FakeSessionTransaction(session_dir, session_id="session-1") as transaction:
+        target = session_lifecycle._capture_cleanup_target(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            transaction,
+            name="api.log",
+            maximum_bytes=None,
+        )
+        assert target.identity_mode == "inode"
+        assert target.sha256 is None
+        assert target.size == 20 * 1024 * 1024
+        session_lifecycle._delete_cleanup_targets(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            transaction,
+            [target],
+        )
+
+    assert not log_path.exists()
 
 
 def test_cleanup_report_finalization_is_immutable_and_idempotent(

@@ -79,3 +79,16 @@ def test_bounded_process_rejects_stderr_overflow_distinctly() -> None:
             stdout_maximum_bytes=128,
             stderr_maximum_bytes=128,
         )
+
+
+def test_bounded_process_delivers_fixed_stdin_payload() -> None:
+    """The gated child receives fixed input only after containment is ready."""
+    result = run_bounded_process(
+        [sys.executable, "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"],
+        input_bytes=b"owned-request\n",
+        timeout_seconds=5,
+        stdout_maximum_bytes=1024,
+        stderr_maximum_bytes=1024,
+    )
+
+    assert result.stdout == "owned-request\n"

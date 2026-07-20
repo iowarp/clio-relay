@@ -7,6 +7,7 @@ import errno
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import stat as stat_module
@@ -36,6 +37,7 @@ DISCOVERY_TIMEOUT_SECONDS = 5.0
 TERMINATION_TIMEOUT_SECONDS = 10.0
 POLL_SECONDS = 0.05
 DISCOVERY_ROUNDS = 3
+SYSTEMCTL_OUTPUT_MAX_BYTES = 64 * 1024
 
 
 class _ResourceModule(Protocol):
@@ -460,6 +462,8 @@ class _OwnedProcessState:
     job_handle: int | None = None
     cgroup_path: Path | None = None
     systemd_unit: str | None = None
+    systemd_invocation_id: str | None = None
+    systemd_description: str | None = None
 
 
 @dataclass(slots=True)
@@ -543,17 +547,22 @@ def spawn_owned_process(
     *,
     on_ready: Callable[[int, dict[str, object]], None] | None = None,
     credential_payload: str | None = None,
+    credential_payload_factory: Callable[[int, dict[str, object]], str] | None = None,
     stdin_payload: bytes | None = None,
     interactive_stdin: bool = False,
     target_environment: Mapping[str, str] | None = None,
     startup_timeout_seconds: float = BROKER_READY_TIMEOUT_SECONDS,
     require_enforceable: bool = False,
+    linux_systemd_unit_base: str | None = None,
+    linux_systemd_description: str | None = None,
     **popen_kwargs: Any,
 ) -> subprocess.Popen[str]:
     """Spawn a root process after establishing enforceable containment when available."""
     if not math.isfinite(startup_timeout_seconds) or startup_timeout_seconds <= 0:
         raise ValueError("owned process startup timeout must be finite and positive")
     startup_deadline = time.monotonic() + startup_timeout_seconds
+    if credential_payload is not None and credential_payload_factory is not None:
+        raise ValueError("owned process credential payload sources are mutually exclusive")
     _validate_broker_credential_payload(credential_payload)
     validated_target_environment = _validate_broker_target_environment(target_environment)
     if interactive_stdin and stdin_payload is not None:
@@ -563,6 +572,25 @@ def spawn_owned_process(
     enforceable = capability.get("enforceable") is True
     if require_enforceable and not enforceable:
         raise RuntimeError("enforceable owned process containment is unavailable")
+    if credential_payload_factory is not None and not (
+        enforceable and mode == "linux_systemd_scope"
+    ):
+        raise RuntimeError("deferred credential payload requires Linux systemd containment")
+    if linux_systemd_unit_base is not None:
+        if not (
+            sys.platform.startswith("linux")
+            and re.fullmatch(r"clio-relay-session-[A-Za-z0-9_-]+", linux_systemd_unit_base)
+        ):
+            raise ValueError("persistent Linux systemd unit identity is invalid")
+        if mode != "linux_systemd_scope" or not enforceable:
+            raise RuntimeError("persistent Linux session containment requires a systemd user scope")
+    if linux_systemd_description is not None and (
+        not linux_systemd_description
+        or len(linux_systemd_description.encode("utf-8")) > 512
+        or "\x00" in linux_systemd_description
+        or "\n" in linux_systemd_description
+    ):
+        raise ValueError("persistent Linux systemd description is invalid")
     if enforceable and mode == "windows_job_object":
         handle = _create_windows_job()
         process, readiness = _spawn_broker(command, popen_kwargs)
@@ -599,10 +627,12 @@ def spawn_owned_process(
             ) from exc
         return process
     if enforceable and mode == "linux_systemd_scope":
-        process, unit, scope, readiness = _spawn_linux_systemd_scope(
+        process, unit, scope, invocation_id, description, readiness = _spawn_linux_systemd_scope(
             command,
             popen_kwargs,
             startup_deadline=startup_deadline,
+            unit_base=linux_systemd_unit_base,
+            description=linux_systemd_description,
         )
         registered = False
         try:
@@ -613,14 +643,24 @@ def spawn_owned_process(
                     enforceable=True,
                     cgroup_path=scope,
                     systemd_unit=unit,
+                    systemd_invocation_id=invocation_id,
+                    systemd_description=description,
                 ),
             )
             registered = True
-            _notify_containment_ready(process, on_ready)
+            metadata = owned_process_metadata(process.pid)
+            if on_ready is not None:
+                on_ready(process.pid, metadata)
+            selected_credential_payload = (
+                credential_payload_factory(process.pid, metadata)
+                if credential_payload_factory is not None
+                else credential_payload
+            )
+            _validate_broker_credential_payload(selected_credential_payload)
             _release_broker(
                 process,
                 readiness=readiness,
-                credential_payload=credential_payload,
+                credential_payload=selected_credential_payload,
                 stdin_payload=stdin_payload,
                 interactive_stdin=interactive_stdin,
                 target_environment=validated_target_environment,
@@ -746,6 +786,8 @@ def owned_process_metadata(process_id: int) -> dict[str, object]:
         "enforceable": state.enforceable,
         "cgroup_path": None if state.cgroup_path is None else str(state.cgroup_path),
         "systemd_unit": state.systemd_unit,
+        "systemd_invocation_id": state.systemd_invocation_id,
+        "systemd_description": state.systemd_description,
     }
 
 
@@ -1015,6 +1057,8 @@ def terminate_recorded_process_tree(
     containment_mode: str | None = None,
     systemd_unit: str | None = None,
     cgroup_path: str | None = None,
+    systemd_invocation_id: str | None = None,
+    systemd_description: str | None = None,
 ) -> None:
     """Terminate a prior worker execution while refusing a reused process id."""
     observed_identity = process_start_identity(process_id)
@@ -1031,14 +1075,38 @@ def terminate_recorded_process_tree(
             or cgroup_path is None
         ):
             raise RuntimeError("recorded systemd execution has invalid scope identity")
-        scope = Path(cgroup_path).resolve()
-        cgroup_root = Path("/sys/fs/cgroup").resolve()
-        try:
-            scope.relative_to(cgroup_root)
-        except ValueError as exc:
-            raise RuntimeError(f"recorded cgroup is outside cgroup v2: {scope}") from exc
+        exact_persistent_identity = (
+            systemd_invocation_id is not None and systemd_description is not None
+        )
+        if (systemd_invocation_id is None) is not (systemd_description is None):
+            raise RuntimeError("recorded systemd execution has partial persistent identity")
+        if exact_persistent_identity:
+            existing_pids = recorded_linux_systemd_scope_process_ids(
+                unit=systemd_unit,
+                cgroup_path=cgroup_path,
+                invocation_id=cast(str, systemd_invocation_id),
+                description=cast(str, systemd_description),
+            )
+            if not existing_pids and not Path(cgroup_path).exists():
+                return
+        scope = Path(cgroup_path).resolve(strict=True)
+        if not exact_persistent_identity:
+            cgroup_root = Path("/sys/fs/cgroup").resolve()
+            try:
+                scope.relative_to(cgroup_root)
+            except ValueError as exc:
+                raise RuntimeError(f"recorded cgroup is outside cgroup v2: {scope}") from exc
         _terminate_linux_systemd_scope(systemd_unit, scope)
-        residual = _linux_cgroup_process_ids(scope)
+        residual = (
+            recorded_linux_systemd_scope_process_ids(
+                unit=systemd_unit,
+                cgroup_path=cgroup_path,
+                invocation_id=cast(str, systemd_invocation_id),
+                description=cast(str, systemd_description),
+            )
+            if exact_persistent_identity
+            else _linux_cgroup_process_ids(scope)
+        )
         if residual:
             raise RuntimeError(f"recorded systemd scope survived cleanup: {residual}")
         _release_linux_systemd_scope(systemd_unit)
@@ -1402,14 +1470,16 @@ def _spawn_linux_systemd_scope(
     popen_kwargs: dict[str, Any],
     *,
     startup_deadline: float,
-) -> tuple[subprocess.Popen[str], str, Path, _BrokerReadiness]:
+    unit_base: str | None = None,
+    description: str | None = None,
+) -> tuple[subprocess.Popen[str], str, Path, str, str | None, _BrokerReadiness]:
     if "stdin" in popen_kwargs:
         raise RuntimeError("owned process launch reserves stdin for containment setup")
     systemd_run = shutil.which("systemd-run")
     if systemd_run is None:
         raise RuntimeError("systemd-run disappeared after containment capability probing")
-    unit_base = f"clio-relay-{uuid4().hex}"
-    unit = f"{unit_base}.scope"
+    selected_unit_base = unit_base or f"clio-relay-{uuid4().hex}"
+    unit = f"{selected_unit_base}.scope"
     readiness = _precreate_broker_readiness()
     effective_kwargs = dict(popen_kwargs)
     requested_environment = effective_kwargs.get("env")
@@ -1428,7 +1498,7 @@ def _spawn_linux_systemd_scope(
         "--user",
         "--scope",
         "--quiet",
-        f"--unit={unit_base}",
+        f"--unit={selected_unit_base}",
         "--property=Delegate=yes",
         "--property=KillMode=control-group",
         "--",
@@ -1443,6 +1513,8 @@ def _spawn_linux_systemd_scope(
         json.dumps(readiness.anchor(), separators=(",", ":")),
         str(Path(__file__).resolve().parent.parent),
     ]
+    if description is not None:
+        wrapped[5:5] = [f"--description={description}"]
     try:
         process = subprocess.Popen(
             wrapped,
@@ -1455,12 +1527,17 @@ def _spawn_linux_systemd_scope(
         _remove_broker_readiness(readiness)
         raise
     try:
-        control_group = _wait_for_systemd_control_group(
+        properties = _wait_for_systemd_scope_identity(
             unit,
             process=process,
             startup_deadline=startup_deadline,
         )
+        control_group = properties["ControlGroup"]
+        invocation_id = properties["InvocationID"]
+        observed_description = properties.get("Description")
         scope = _validated_systemd_cgroup_path(control_group, unit=unit)
+        if description is not None and observed_description != description:
+            raise RuntimeError("systemd scope description did not match its launch identity")
     except BaseException as exc:
         cleanup_errors = _cleanup_failed_linux_systemd_spawn(
             process,
@@ -1474,7 +1551,7 @@ def _spawn_linux_systemd_scope(
             cleanup_errors=cleanup_errors,
             cause=exc,
         ) from exc
-    return process, unit, scope, readiness
+    return process, unit, scope, invocation_id, observed_description, readiness
 
 
 def _cleanup_failed_linux_systemd_spawn(
@@ -1536,12 +1613,12 @@ def _validated_systemd_cgroup_path(
     return candidate
 
 
-def _wait_for_systemd_control_group(
+def _wait_for_systemd_scope_identity(
     unit: str,
     *,
     process: subprocess.Popen[str],
     startup_deadline: float,
-) -> str:
+) -> dict[str, str]:
     deadline = startup_deadline
     last_error = "unit was not observable"
     while time.monotonic() < deadline:
@@ -1557,18 +1634,50 @@ def _wait_for_systemd_control_group(
                 + (f": {diagnostic}" if diagnostic else "")
             )
         result = _systemctl_user(
-            ["show", unit, "--property=ControlGroup", "--value"],
+            [
+                "show",
+                unit,
+                "--property=ControlGroup",
+                "--property=InvocationID",
+                "--property=Description",
+                "--property=LoadState",
+            ],
             timeout_seconds=_remaining_deadline_seconds(
                 deadline,
                 maximum=DISCOVERY_TIMEOUT_SECONDS,
             ),
         )
-        value = result.stdout.strip()
-        if result.returncode == 0 and value:
-            return value
+        try:
+            properties = _parse_systemd_properties(
+                result.stdout,
+                expected={"ControlGroup", "InvocationID", "Description", "LoadState"},
+            )
+        except RuntimeError as exc:
+            properties = {}
+            last_error = str(exc)
+        if (
+            result.returncode == 0
+            and properties.get("LoadState") == "loaded"
+            and properties.get("ControlGroup")
+            and re.fullmatch(r"[0-9a-f]{32}", properties.get("InvocationID", ""))
+        ):
+            return properties
         last_error = result.stderr.strip() or last_error
         time.sleep(min(POLL_SECONDS, max(0.0, deadline - time.monotonic())))
     raise RuntimeError(f"systemd scope setup timed out: {unit}: {last_error}")
+
+
+def _parse_systemd_properties(payload: str, *, expected: set[str]) -> dict[str, str]:
+    """Parse one bounded duplicate-free systemctl show response."""
+    properties: dict[str, str] = {}
+    for line in payload.splitlines():
+        name, separator, value = line.partition("=")
+        if not separator or name not in expected or name in properties:
+            raise RuntimeError("systemd scope returned invalid or duplicate properties")
+        properties[name] = value
+    if set(properties) != expected:
+        raise RuntimeError("systemd scope omitted required identity properties")
+    return properties
 
 
 def _terminate_linux_systemd_scope(unit: str, cgroup_path: Path) -> None:
@@ -1641,21 +1750,90 @@ def _systemctl_user(
     timeout_seconds: float,
 ) -> subprocess.CompletedProcess[str]:
     systemctl = shutil.which("systemctl") or "systemctl"
+    command = [systemctl, "--user", *arguments]
     try:
-        return subprocess.run(
-            [systemctl, "--user", *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         return subprocess.CompletedProcess(
-            [systemctl, "--user", *arguments],
+            command,
             1,
             "",
             str(exc),
         )
+
+    stdout = bytearray()
+    stderr = bytearray()
+    overflow = threading.Event()
+
+    def read_bounded(stream: Any, destination: bytearray) -> None:
+        try:
+            while True:
+                remaining = SYSTEMCTL_OUTPUT_MAX_BYTES + 1 - len(destination)
+                if remaining <= 0:
+                    overflow.set()
+                    return
+                chunk = stream.read(min(8192, remaining))
+                if not chunk:
+                    return
+                destination.extend(chunk)
+                if len(destination) > SYSTEMCTL_OUTPUT_MAX_BYTES:
+                    overflow.set()
+                    return
+        except OSError:
+            overflow.set()
+
+    if process.stdout is None or process.stderr is None:  # pragma: no cover - Popen contract
+        process.kill()
+        process.wait()
+        return subprocess.CompletedProcess(command, 1, "", "systemctl pipes were unavailable")
+    readers = [
+        threading.Thread(target=read_bounded, args=(process.stdout, stdout), daemon=True),
+        threading.Thread(target=read_bounded, args=(process.stderr, stderr), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    deadline = time.monotonic() + timeout_seconds
+    timed_out = False
+    while process.poll() is None and not overflow.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
+        time.sleep(min(POLL_SECONDS, remaining))
+    if process.poll() is None:
+        try:
+            killpg = cast(Callable[[int, int], None], vars(os)["killpg"])
+            sigkill = cast(int, vars(signal)["SIGKILL"])
+            killpg(process.pid, sigkill)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            process.kill()
+    try:
+        process.wait(timeout=DISCOVERY_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=DISCOVERY_TIMEOUT_SECONDS)
+    for reader in readers:
+        reader.join(timeout=DISCOVERY_TIMEOUT_SECONDS)
+    stdout_text = bytes(stdout[:SYSTEMCTL_OUTPUT_MAX_BYTES]).decode("utf-8", errors="replace")
+    stderr_text = bytes(stderr[:SYSTEMCTL_OUTPUT_MAX_BYTES]).decode("utf-8", errors="replace")
+    if overflow.is_set():
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            stdout_text,
+            "systemctl output exceeded its byte limit",
+        )
+    if timed_out:
+        return subprocess.CompletedProcess(command, 1, stdout_text, "systemctl timed out")
+    return subprocess.CompletedProcess(command, process.returncode, stdout_text, stderr_text)
 
 
 def _linux_cgroup_process_ids(cgroup_path: Path) -> list[int]:
@@ -1678,6 +1856,141 @@ def _linux_cgroup_process_ids(cgroup_path: Path) -> list[int]:
             except ValueError as exc:
                 raise RuntimeError(f"invalid process id in {path}: {line!r}") from exc
     return sorted(process_ids)
+
+
+def recorded_linux_systemd_scope_process_ids(
+    *,
+    unit: str,
+    cgroup_path: str,
+    invocation_id: str,
+    description: str,
+) -> list[int]:
+    """Return PIDs only after exact persistent systemd scope identity verification."""
+    if (
+        re.fullmatch(r"clio-relay-session-[A-Za-z0-9_-]+\.scope", unit) is None
+        or re.fullmatch(r"[0-9a-f]{32}", invocation_id) is None
+        or not description
+        or len(description.encode("utf-8")) > 512
+    ):
+        raise RuntimeError("recorded persistent systemd scope identity is invalid")
+    result = _systemctl_user(
+        [
+            "show",
+            unit,
+            "--property=ControlGroup",
+            "--property=InvocationID",
+            "--property=Description",
+            "--property=LoadState",
+        ],
+        timeout_seconds=DISCOVERY_TIMEOUT_SECONDS,
+    )
+    try:
+        properties = _parse_systemd_properties(
+            result.stdout,
+            expected={"ControlGroup", "InvocationID", "Description", "LoadState"},
+        )
+    except RuntimeError:
+        properties = {}
+    recorded_path = Path(cgroup_path)
+    if result.returncode != 0 or properties.get("LoadState") == "not-found":
+        if recorded_path.exists():
+            raise RuntimeError("recorded systemd unit vanished while its cgroup remained")
+        return []
+    if not (
+        properties.get("LoadState") == "loaded"
+        and properties.get("InvocationID") == invocation_id
+        and properties.get("Description") == description
+    ):
+        raise RuntimeError("recorded systemd unit identity drifted or was reused")
+    observed = _validated_systemd_cgroup_path(properties.get("ControlGroup", ""), unit=unit)
+    try:
+        expected = recorded_path.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("recorded systemd cgroup path is unavailable") from exc
+    if observed != expected:
+        raise RuntimeError("recorded systemd ControlGroup drifted")
+    return _linux_cgroup_process_ids(observed)
+
+
+def terminate_recorded_linux_systemd_scope(
+    *,
+    unit: str,
+    cgroup_path: str,
+    invocation_id: str,
+    description: str,
+) -> list[int]:
+    """Terminate an exact persisted scope and prove its cgroup became absent or empty."""
+    targeted = recorded_linux_systemd_scope_process_ids(
+        unit=unit,
+        cgroup_path=cgroup_path,
+        invocation_id=invocation_id,
+        description=description,
+    )
+    scope = Path(cgroup_path)
+    if not targeted and not scope.exists():
+        return []
+    try:
+        resolved_scope = scope.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("recorded systemd cgroup path is unavailable") from exc
+    _terminate_linux_systemd_scope(unit, resolved_scope)
+    residual = recorded_linux_systemd_scope_process_ids(
+        unit=unit,
+        cgroup_path=cgroup_path,
+        invocation_id=invocation_id,
+        description=description,
+    )
+    if residual:
+        raise RuntimeError(f"recorded systemd scope survived cleanup: {residual}")
+    _release_linux_systemd_scope(unit)
+    return targeted
+
+
+def adopt_linux_systemd_scope_identity(
+    *,
+    unit: str,
+    description: str,
+) -> dict[str, str] | None:
+    """Recover an on-disk-predeclared scope before its launcher callback persisted identity."""
+    if (
+        re.fullmatch(r"clio-relay-session-[A-Za-z0-9_-]+\.scope", unit) is None
+        or not description
+        or len(description.encode("utf-8")) > 512
+    ):
+        raise RuntimeError("predeclared persistent systemd scope identity is invalid")
+    result = _systemctl_user(
+        [
+            "show",
+            unit,
+            "--property=ControlGroup",
+            "--property=InvocationID",
+            "--property=Description",
+            "--property=LoadState",
+        ],
+        timeout_seconds=DISCOVERY_TIMEOUT_SECONDS,
+    )
+    try:
+        properties = _parse_systemd_properties(
+            result.stdout,
+            expected={"ControlGroup", "InvocationID", "Description", "LoadState"},
+        )
+    except RuntimeError:
+        properties = {}
+    if result.returncode != 0 or properties.get("LoadState") == "not-found":
+        return None
+    if not (
+        properties.get("LoadState") == "loaded"
+        and properties.get("Description") == description
+        and re.fullmatch(r"[0-9a-f]{32}", properties.get("InvocationID", ""))
+    ):
+        raise RuntimeError("predeclared systemd scope identity drifted or was reused")
+    scope = _validated_systemd_cgroup_path(properties.get("ControlGroup", ""), unit=unit)
+    return {
+        "systemd_unit": unit,
+        "systemd_description": description,
+        "systemd_invocation_id": properties["InvocationID"],
+        "cgroup_path": str(scope),
+    }
 
 
 def _wait_for_linux_cgroup_empty(

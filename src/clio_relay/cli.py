@@ -239,6 +239,7 @@ from clio_relay.session_lifecycle import (
     finalize_remote_session_cleanup_report,
     inspect_owned_session_recovery_status,
     open_owned_session_transaction,
+    publish_owned_session_api_startup_receipt,
     session_lifecycle_report_sha256,
     start_remote_session,
     status_remote_session,
@@ -8787,6 +8788,7 @@ def api_start(
         _require_process_bound_session_api_release()
     except ConfigurationError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    publish_owned_session_api_startup_receipt()
     uvicorn.run("clio_relay.http_api:app", host=host, port=port)
 
 

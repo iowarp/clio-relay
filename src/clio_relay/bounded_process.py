@@ -45,9 +45,11 @@ def run_bounded_process(
     *,
     cwd: Path | None = None,
     environment: Mapping[str, str] | None = None,
+    input_bytes: bytes | None = None,
     timeout_seconds: float,
     stdout_maximum_bytes: int,
     stderr_maximum_bytes: int,
+    require_enforceable: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Run one finite process tree while retaining only bounded output bytes."""
     if not command or any(not value for value in command):
@@ -66,10 +68,12 @@ def run_bounded_process(
                 command,
                 cwd=cwd,
                 env=(dict(environment) if environment is not None else None),
+                stdin_payload=input_bytes,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=False,
                 startup_timeout_seconds=min(timeout_seconds, 10.0),
+                require_enforceable=require_enforceable,
             ),
         )
     except OSError:
