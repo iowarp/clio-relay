@@ -7,7 +7,6 @@ import json
 import math
 import os
 import re
-import subprocess
 import sys
 import tomllib
 from datetime import UTC, datetime
@@ -1530,21 +1529,17 @@ print(json.dumps({{
 def _run_json_probe(command: list[str], *, label: str) -> dict[str, object]:
     """Run one bounded component probe and require exactly one JSON object."""
     try:
-        completed = subprocess.run(
+        completed = run_bounded_process(
             command,
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=30,
+            timeout_seconds=30,
+            stdout_maximum_bytes=4 * 1024 * 1024,
+            stderr_maximum_bytes=64 * 1024,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, BoundedProcessError) as exc:
         raise ConfigurationError(f"{label} failed: {type(exc).__name__}: {exc}") from exc
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic"
         raise ConfigurationError(f"{label} failed: {detail[:2000]}")
-    encoded = completed.stdout.encode("utf-8")
-    if len(encoded) > 4 * 1024 * 1024:
-        raise ConfigurationError(f"{label} exceeded the output limit")
     try:
         loaded = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
@@ -2228,14 +2223,13 @@ print(json.dumps({
 }, sort_keys=True))
 """
     try:
-        completed = subprocess.run(
+        completed = run_bounded_process(
             [python, "-c", script, distribution_name],
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=10,
+            timeout_seconds=10,
+            stdout_maximum_bytes=1024 * 1024,
+            stderr_maximum_bytes=16 * 1024,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, BoundedProcessError) as exc:
         return {"verified": False, "error": f"{type(exc).__name__}: {exc}"}
     if completed.returncode != 0:
         return {

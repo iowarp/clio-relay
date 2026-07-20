@@ -55,7 +55,8 @@ Add a cluster. The cluster name and agent executable are local configuration.
 
 ```powershell
 clio-relay cluster add --name my-cluster --ssh-host my-cluster-login --agent-adapter exec --agent-bin agent
-clio-relay cluster bootstrap --cluster my-cluster
+$RelayWheelSha256 = "REPLACE_WITH_SHA256_FROM_THE_RELEASE"
+clio-relay cluster bootstrap --cluster my-cluster --relay-artifact-sha256 $RelayWheelSha256
 clio-relay cluster install-endpoint-service --cluster my-cluster --concurrency 4 --kind-concurrency remote_agent=2 --kind-concurrency mcp_call=1 --start --enable
 ```
 

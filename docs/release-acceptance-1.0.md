@@ -234,7 +234,10 @@ if ($Stage -eq "candidate") {
   if ($LASTEXITCODE -ne 0) { throw "candidate uv tool installation failed" }
   $InstallSource = "wheel:$([Uri]::new($Wheel).AbsoluteUri)"
   $ArtifactEvidence = @("--validation-artifact", $Wheel)
-  $BootstrapArtifact = @("--relay-wheel", $Wheel)
+  $BootstrapArtifact = @(
+    "--relay-wheel", $Wheel,
+    "--relay-artifact-sha256", $ExpectedWheelSha256
+  )
   $env:CLIO_RELAY_VALIDATION_ARTIFACT_SHA256 = $Observed
 } else {
   $PublishedRoot = Join-Path $StageRoot "published-artifact"
@@ -256,7 +259,9 @@ if ($Stage -eq "candidate") {
   if ($LASTEXITCODE -ne 0) { throw "released uv tool installation failed" }
   $InstallSource = "pypi:clio-relay==$Version"
   $ArtifactEvidence = @()
-  $BootstrapArtifact = @()
+  $BootstrapArtifact = @(
+    "--relay-artifact-sha256", ([string]$Promotion.wheel_sha256)
+  )
   $env:CLIO_RELAY_VALIDATION_ARTIFACT_SHA256 = $Promotion.wheel_sha256
 }
 $Relay = (Get-Command clio-relay -ErrorAction Stop).Source

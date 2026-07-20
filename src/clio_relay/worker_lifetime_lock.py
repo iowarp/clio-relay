@@ -264,9 +264,7 @@ class WorkerLifetimeLock:
         """Acquire the configured shared or exclusive OS lock."""
         if self._fd is not None:
             raise RuntimeError("worker lifetime lock is already acquired")
-        effective_timeout = (
-            self.timeout_seconds if timeout_seconds is None else timeout_seconds
-        )
+        effective_timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
         if effective_timeout is not None and effective_timeout < 0:
             raise ValueError("worker lifetime lock timeout must be non-negative")
         fd, canonical_core = _open_private_lock_file(
@@ -539,9 +537,7 @@ def exclusive_migration_lifetime(
 ) -> Generator[LockedCoreIdentity, None, None]:
     """Hold or validate exclusive core ownership for an authorized migration."""
     effective_timeout = (
-        DEFAULT_WORKER_LIFETIME_LOCK_TIMEOUT_SECONDS
-        if timeout_seconds is None
-        else timeout_seconds
+        DEFAULT_WORKER_LIFETIME_LOCK_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
     )
     guard_fd = os.getenv(WORKER_LIFETIME_GUARD_FD_ENV)
     guard_pid = os.getenv(WORKER_LIFETIME_GUARD_PID_ENV)

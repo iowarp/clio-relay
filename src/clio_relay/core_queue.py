@@ -2599,9 +2599,7 @@ class ClioCoreQueue:
             try:
                 queue_root_after = os.stat(original_storage_root)
             except OSError as exc:
-                raise ConfigurationError(
-                    f"migration queue root identity changed: {exc}"
-                ) from exc
+                raise ConfigurationError(f"migration queue root identity changed: {exc}") from exc
             if (queue_root_after.st_dev, queue_root_after.st_ino) != expected_identity:
                 raise ConfigurationError("migration queue root identity changed while locked")
 
@@ -2632,9 +2630,7 @@ class ClioCoreQueue:
                 or _record_is_reparse(details)
                 or (current_uid is not None and details.st_uid != current_uid)
             ):
-                raise ConfigurationError(
-                    f"queue directory cannot be safely privatized: {path}"
-                )
+                raise ConfigurationError(f"queue directory cannot be safely privatized: {path}")
             if stat.S_IMODE(details.st_mode) != 0o700:
                 try:
                     os.chmod(path, 0o700, follow_symlinks=False)
@@ -4227,9 +4223,7 @@ class ClioCoreQueue:
         """
         readiness = self.readiness_info()
         if readiness.get("complete") is not True or readiness.get("sealed") is not True:
-            raise QueueConflictError(
-                "fresh endpoint readiness requires a sealed indexed queue"
-            )
+            raise QueueConflictError("fresh endpoint readiness requires a sealed indexed queue")
         return self._scan_fresh_endpoint_index(
             limit=limit,
             fresh_seconds=fresh_seconds,

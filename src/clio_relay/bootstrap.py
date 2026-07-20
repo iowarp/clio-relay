@@ -18,12 +18,10 @@ from dataclasses import dataclass
 from email.message import Message
 from email.parser import BytesParser
 from email.policy import default
-from functools import lru_cache
 from importlib import resources
 from pathlib import Path, PurePosixPath
 from typing import cast
-from urllib.parse import quote
-from urllib.request import urlopen, urlretrieve
+from urllib.request import urlretrieve
 from uuid import uuid4
 
 from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
@@ -650,68 +648,20 @@ def bootstrap_relay_identity(
             source_identity=f"git:commit:{first[0]}:tree:{first[1]}",
             deployment_artifact_sha256=None,
         )
-    if relay_artifact_sha256 is not None and not _is_sha256_value(relay_artifact_sha256):
-        raise ConfigurationError("relay release artifact SHA-256 must be lowercase hex")
-    released_digest = _pypi_release_wheel_sha256(__version__)
-    if relay_artifact_sha256 is not None and relay_artifact_sha256 != released_digest:
+    if relay_artifact_sha256 is None:
         raise ConfigurationError(
-            "validation artifact SHA-256 does not match the official PyPI release wheel"
+            "released bootstrap requires --relay-artifact-sha256 from the exact wheel; "
+            "this preserves offline identity and distinguishes rebuilt artifacts"
         )
+    if not _is_sha256_value(relay_artifact_sha256):
+        raise ConfigurationError("relay release artifact SHA-256 must be lowercase hex")
     install_spec = f"clio-relay=={__version__}"
     return BootstrapRelayIdentity(
         install_spec=install_spec,
         transport_install_spec=install_spec,
-        source_identity=(f"release:{install_spec}:sha256:{released_digest}"),
-        deployment_artifact_sha256=released_digest,
+        source_identity=f"release:{install_spec}:sha256:{relay_artifact_sha256}",
+        deployment_artifact_sha256=relay_artifact_sha256,
     )
-
-
-@lru_cache(maxsize=8)
-def _pypi_release_wheel_sha256(version: str) -> str:
-    """Resolve the one official pure-Python release wheel digest from PyPI metadata."""
-    try:
-        parsed_version = Version(version)
-    except InvalidVersion as exc:
-        raise ConfigurationError("clio-relay release version is invalid") from exc
-    endpoint = f"https://pypi.org/pypi/clio-relay/{quote(str(parsed_version))}/json"
-    try:
-        with urlopen(endpoint, timeout=10) as response:  # noqa: S310 - fixed PyPI endpoint
-            payload = response.read(4 * 1024 * 1024 + 1)
-    except OSError as exc:
-        raise ConfigurationError("official clio-relay PyPI metadata is unavailable") from exc
-    if len(payload) > 4 * 1024 * 1024:
-        raise ConfigurationError("official clio-relay PyPI metadata exceeds its bound")
-    try:
-        document = cast(object, json.loads(payload))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ConfigurationError("official clio-relay PyPI metadata is invalid") from exc
-    if not isinstance(document, dict):
-        raise ConfigurationError("official clio-relay PyPI metadata is not an object")
-    urls = cast(dict[str, object], document).get("urls")
-    expected_filename = f"clio_relay-{parsed_version}-py3-none-any.whl"
-    digests: list[str] = []
-    if isinstance(urls, list):
-        for raw in cast(list[object], urls):
-            if not isinstance(raw, dict):
-                continue
-            record = cast(dict[str, object], raw)
-            raw_digests = record.get("digests")
-            digest = (
-                cast(dict[str, object], raw_digests).get("sha256")
-                if isinstance(raw_digests, dict)
-                else None
-            )
-            if (
-                record.get("filename") == expected_filename
-                and record.get("packagetype") == "bdist_wheel"
-                and _is_sha256_value(digest)
-            ):
-                digests.append(cast(str, digest))
-    if len(digests) != 1:
-        raise ConfigurationError(
-            "official clio-relay PyPI metadata did not identify one exact release wheel"
-        )
-    return digests[0]
 
 
 def _git_checkout_identity(source_root: Path) -> tuple[str, str]:
@@ -862,24 +812,7 @@ def _bootstrap_preflight_over_ssh(
             "fi",
             "set +e",
             (
-                'BOOTSTRAP_HELP_OUTPUT="$(timeout --signal=TERM --kill-after=2s 3s '
-                '"$HOME/.local/bin/clio-relay" bootstrap-inspect --help 2>&1)"'
-            ),
-            "BOOTSTRAP_HELP_STATUS=$?",
-            "set -e",
-            'if [ "$BOOTSTRAP_HELP_STATUS" -ne 0 ]; then',
-            "  if printf '%s\\n' \"$BOOTSTRAP_HELP_OUTPUT\" | "
-            "grep -Eqi "
-            "'no such command.*bootstrap-inspect|bootstrap-inspect.*no such command'; then",
-            "    echo bootstrap_preflight_unsupported=missing_command",
-            "    exit 0",
-            "  fi",
-            "  printf '%s\\n' \"$BOOTSTRAP_HELP_OUTPUT\" >&2",
-            '  exit "$BOOTSTRAP_HELP_STATUS"',
-            "fi",
-            "set +e",
-            (
-                'BOOTSTRAP_PREFLIGHT_OUTPUT="$(timeout --signal=TERM --kill-after=2s 55s '
+                'BOOTSTRAP_PREFLIGHT_OUTPUT="$(timeout --signal=TERM --kill-after=2s 58s '
                 '"$HOME/.local/bin/clio-relay" '
                 f"bootstrap-inspect --invocation-id {shlex.quote(invocation_id)} "
                 '2>&1)"'
@@ -887,13 +820,19 @@ def _bootstrap_preflight_over_ssh(
             "BOOTSTRAP_PREFLIGHT_STATUS=$?",
             "set -e",
             'if [ "$BOOTSTRAP_PREFLIGHT_STATUS" -ne 0 ]; then',
+            "  if printf '%s\\n' \"$BOOTSTRAP_PREFLIGHT_OUTPUT\" | "
+            "grep -Eqi "
+            "'no such command.*bootstrap-inspect|bootstrap-inspect.*no such command'; then",
+            "    echo bootstrap_preflight_unsupported=missing_command",
+            "    exit 0",
+            "  fi",
             "  printf '%s\\n' \"$BOOTSTRAP_PREFLIGHT_OUTPUT\" >&2",
             '  exit "$BOOTSTRAP_PREFLIGHT_STATUS"',
             "fi",
             "printf '%s\\n' \"$BOOTSTRAP_PREFLIGHT_OUTPUT\"",
         ]
     )
-    result = _run(["ssh", ssh_host, "bash", "-c", command], timeout_seconds=65)
+    result = _run(["ssh", ssh_host, "bash", "-c", command], timeout_seconds=60)
     lines = result.stdout.splitlines()
     payload_lines = [
         line.removeprefix("bootstrap_preflight_json=")
@@ -929,6 +868,8 @@ def _bootstrap_preflight_over_ssh(
     ):
         raise RelayError("bootstrap preflight identity did not match the request")
     if payload.get("exact_match") is not True:
+        if payload.get("action") != "payload_required" or payload.get("receipt") is not None:
+            raise RelayError("bootstrap preflight returned ambiguous non-exact action evidence")
         return None, lines
     raw_receipt = payload.get("receipt")
     if not isinstance(raw_receipt, dict):
@@ -1018,8 +959,6 @@ def bootstrap_cluster_over_ssh(
     render_remote_shell_path(core_dir, field="core_dir")
     render_remote_shell_path(spool_dir, field="spool_dir")
     _validate_ssh_destination(ssh_host)
-    if shutil.which("ssh") is None or shutil.which("scp") is None:
-        raise ConfigurationError("ssh and scp are required for remote bootstrap")
     expected_jarvis_mcp_spec = os.environ.get(
         "CLIO_RELAY_JARVIS_MCP_INSTALL_SPEC",
         CLIO_KIT_JARVIS_MCP_WHEEL_URL,
@@ -1039,6 +978,8 @@ def bootstrap_cluster_over_ssh(
         relay_wheel=relay_wheel,
         relay_artifact_sha256=relay_artifact_sha256,
     )
+    if shutil.which("ssh") is None or shutil.which("scp") is None:
+        raise ConfigurationError("ssh and scp are required for remote bootstrap")
     expected_desired_state = _bootstrap_desired_state(
         identity=planned_identity,
         cluster=cluster,
@@ -1363,11 +1304,25 @@ def _validate_bootstrap_receipt(
     typed_worker = cast(dict[str, object], worker)
     if typed_worker.get("service_name") != expected_worker_service:
         raise RelayError("bootstrap worker service evidence does not match")
-    if expected_worker_service is not None and (
-        typed_worker.get("service_was_active") is not True
-        or typed_worker.get("worker_ready") is not True
-    ):
-        raise RelayError("managed bootstrap did not leave a ready endpoint service")
+    assert isinstance(service, dict)
+    typed_service = cast(dict[str, object], service)
+    service_pending_install = typed_service.get("pending_install")
+    if not isinstance(service_pending_install, bool):
+        raise RelayError("bootstrap service pending-install evidence is invalid")
+    if expected_worker_service is not None:
+        if outcome == "full" and service_pending_install:
+            if (
+                typed_worker.get("service_was_active") is not False
+                or typed_worker.get("service_was_enabled") is not False
+                or typed_worker.get("worker_ready") is not False
+            ):
+                raise RelayError("fresh bootstrap service-pending evidence is inconsistent")
+        elif (
+            typed_worker.get("service_was_active") is not True
+            or typed_worker.get("worker_ready") is not True
+            or service_pending_install
+        ):
+            raise RelayError("managed bootstrap did not leave a ready endpoint service")
     assert isinstance(generation, dict)
     typed_generation = cast(dict[str, object], generation)
     if (
@@ -1442,6 +1397,36 @@ def _validate_bootstrap_receipt(
         typed_jarvis_preservation.get("after"), dict
     ):
         raise RelayError("bootstrap JARVIS preservation evidence is invalid")
+    raw_binding = typed_jarvis_preservation.get("repositories")
+    if not isinstance(raw_binding, dict):
+        raise RelayError("bootstrap JARVIS repository binding evidence is invalid")
+    binding = cast(dict[str, object], raw_binding)
+    if set(binding) != {"link_action", "link", "target", "repositories"} or binding.get(
+        "link_action"
+    ) not in {"reused", "created", "retargeted"}:
+        raise RelayError("bootstrap JARVIS repository link evidence is invalid")
+    raw_repository_update = binding.get("repositories")
+    if not isinstance(raw_repository_update, dict):
+        raise RelayError("bootstrap JARVIS repository update evidence is invalid")
+    repository_update = cast(dict[str, object], raw_repository_update)
+    if set(repository_update) != {
+        "action",
+        "managed_repo",
+        "added_managed_repos",
+        "removed_previous_managed_repos",
+        "before_sha256",
+        "after_sha256",
+    } or repository_update.get("action") not in {"reused", "updated"}:
+        raise RelayError("bootstrap JARVIS repository update evidence is invalid")
+    before_state = cast(dict[str, object], typed_jarvis_preservation["before"])
+    after_state = cast(dict[str, object], typed_jarvis_preservation["after"])
+    if (
+        repository_update.get("before_sha256") != before_state.get("repos_sha256")
+        or repository_update.get("after_sha256") != after_state.get("repos_sha256")
+        or not isinstance(repository_update.get("added_managed_repos"), list)
+        or not isinstance(repository_update.get("removed_previous_managed_repos"), list)
+    ):
+        raise RelayError("bootstrap JARVIS repository hashes do not bind preservation evidence")
     if outcome == "noop_verified":
         if (
             any(action != "reused" for action in component_actions.values())
@@ -1459,6 +1444,8 @@ def _validate_bootstrap_receipt(
             or command_count != 0
             or typed_jarvis_preservation.get("config_byte_identical") is not True
             or typed_jarvis_preservation.get("resource_graph_byte_identical") is not True
+            or binding.get("link_action") != "reused"
+            or repository_update.get("action") != "reused"
         ):
             raise RelayError("bootstrap no-op receipt reported mutation")
     elif outcome == "verified_after_transfer":
@@ -1478,6 +1465,8 @@ def _validate_bootstrap_receipt(
             or command_count != 0
             or typed_jarvis_preservation.get("config_byte_identical") is not True
             or typed_jarvis_preservation.get("resource_graph_byte_identical") is not True
+            or binding.get("link_action") != "reused"
+            or repository_update.get("action") != "reused"
         ):
             raise RelayError("post-transfer verification receipt reported mutation")
     elif outcome == "repaired":
@@ -4187,10 +4176,21 @@ if [ "$JARVIS_EXISTING_FILE_COUNT" -eq 0 ]; then
   BOOTSTRAP_JARVIS_INIT_DURATION_NS=$((
     BOOTSTRAP_JARVIS_INIT_COMPLETED_NS - BOOTSTRAP_JARVIS_INIT_STARTED_NS
   ))
+  BOOTSTRAP_JARVIS_GRAPH_STARTED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
+  jarvis rg build +no_benchmark
+  BOOTSTRAP_JARVIS_GRAPH_COMPLETED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
+  BOOTSTRAP_JARVIS_GRAPH_DURATION_NS=$((
+    BOOTSTRAP_JARVIS_GRAPH_COMPLETED_NS - BOOTSTRAP_JARVIS_GRAPH_STARTED_NS
+  ))
   JARVIS_INIT_ACTION="initialized"
+  JARVIS_GRAPH_ACTION="built"
+  BOOTSTRAP_JARVIS_COMMANDS_JSON='[["jarvis","init","'$HOME'/.local/share/clio-relay/jarvis-config","'$HOME'/.local/share/clio-relay/jarvis-private","'$HOME'/.local/share/clio-relay/jarvis-shared"],["jarvis","rg","build","+no_benchmark"]]'
 else
   BOOTSTRAP_JARVIS_INIT_DURATION_NS=0
+  BOOTSTRAP_JARVIS_GRAPH_DURATION_NS=0
   JARVIS_INIT_ACTION="preserved"
+  JARVIS_GRAPH_ACTION="preserved"
+  BOOTSTRAP_JARVIS_COMMANDS_JSON='[]'
 fi
 MANAGED_JARVIS_REPO="$HOME/.local/share/clio-relay/managed-jarvis-repo"
 MANAGED_JARVIS_REPO_TARGET="$DEST/jarvis-packages/clio_relay"
@@ -4247,10 +4247,10 @@ test -x "$RELAY_TOOL_EXECUTABLE"
 test -x "$JARVIS_TOOL_EXECUTABLE"
 mkdir -m 0700 -p "$BOOTSTRAP_GENERATION/bin"
 ln -s "$RELAY_TOOL_EXECUTABLE" "$BOOTSTRAP_GENERATION/bin/clio-relay"
-ln -s "$JARVIS_TOOL_EXECUTABLE" "$BOOTSTRAP_GENERATION/bin/jarvis"
 ln -s "$DEST" "$BOOTSTRAP_GENERATION/source"
 mv "$HOME/.local/share/clio-relay/install-receipt.json" \
   "$BOOTSTRAP_GENERATION/install-receipt.json"
+export BOOTSTRAP_GENERATION JARVIS_VENV JARVIS_TOOL_EXECUTABLE
 "$RELAY_PROVIDER_PYTHON" - "$BOOTSTRAP_GENERATION" \
   <<'__CLIO_RELAY_FULL_GENERATION_MANIFEST__'
 import json
@@ -4258,11 +4258,45 @@ import os
 import sys
 from pathlib import Path
 
+from clio_relay.bootstrap_reconcile import (
+    BootstrapReconcilePlan,
+    execution_environment_identity,
+    write_jarvis_wrapper,
+)
+
 generation = Path(sys.argv[1])
+execution_root = Path(os.environ["JARVIS_VENV"])
+execution_python = execution_root / "bin/python"
+jarvis_executable = Path(os.environ["JARVIS_TOOL_EXECUTABLE"])
+execution_identity = execution_environment_identity(
+    execution_root,
+    executables={{
+        "python": execution_python,
+        "jarvis": jarvis_executable,
+    }},
+)
+wrapper = write_jarvis_wrapper(generation / "bin/jarvis", execution_python)
+fingerprint = os.environ["BOOTSTRAP_DESIRED_FINGERPRINT"]
+plan = BootstrapReconcilePlan(
+    mode="full",
+    desired_fingerprint=fingerprint,
+    reasons=["fresh cluster bootstrap"],
+    component_actions={{
+        "clio-relay": "replace",
+        "jarvis-cd": "replace",
+        "jarvis-util": "replace",
+        "clio-kit": "replace",
+        "frp": "replace",
+        "uv": "replace",
+    }},
+)
 manifest = {{
     "schema_version": "clio-relay.bootstrap-generation.v1",
-    "fingerprint": os.environ["BOOTSTRAP_DESIRED_FINGERPRINT"],
-    "source": "fresh-full-bootstrap",
+    "fingerprint": fingerprint,
+    "plan": plan.model_dump(mode="json"),
+    "legacy_execution_identity": execution_identity,
+    "jarvis_wrapper_sha256": wrapper["sha256"],
+    "install_receipt": str(generation / "install-receipt.json"),
 }}
 for name, payload in (
     ("manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\\n"),
@@ -4339,6 +4373,7 @@ BOOTSTRAP_SERVICE_STOP_COUNT=0
 BOOTSTRAP_SERVICE_ENABLE_COUNT=0
 BOOTSTRAP_SERVICE_ACTIVE_AFTER=0
 BOOTSTRAP_SERVICE_ENABLED_BEFORE=0
+BOOTSTRAP_SERVICE_PENDING_INSTALL=0
 if [ -n "$WORKER_SERVICE_NAME" ] && \
    systemctl --user is-enabled --quiet "$WORKER_SERVICE_NAME"; then
   BOOTSTRAP_SERVICE_ENABLED_BEFORE=1
@@ -4350,20 +4385,19 @@ if [ "$WORKER_WAS_ACTIVE" = "1" ]; then
   BOOTSTRAP_SERVICE_ACTIVE_AFTER=1
 elif [ -n "$WORKER_SERVICE_NAME" ]; then
   if [ "${{WORKER_LOAD_STATE:-unknown}}" != "loaded" ]; then
-    echo "managed endpoint unit is unavailable; install it before bootstrap:" \
-      "$WORKER_SERVICE_NAME" >&2
-    exit 1
+    BOOTSTRAP_SERVICE_PENDING_INSTALL=1
+  else
+    if [ "$BOOTSTRAP_SERVICE_ENABLED_BEFORE" != "1" ]; then
+      systemctl --user enable "$WORKER_SERVICE_NAME"
+      BOOTSTRAP_SERVICE_ENABLE_COUNT=1
+    fi
+    BOOTSTRAP_SERVICE_START_COUNT=1
+    if ! bootstrap_bounded_worker_restart; then
+      echo "managed endpoint worker did not become ready after full bootstrap" >&2
+      exit 1
+    fi
+    BOOTSTRAP_SERVICE_ACTIVE_AFTER=1
   fi
-  if [ "$BOOTSTRAP_SERVICE_ENABLED_BEFORE" != "1" ]; then
-    systemctl --user enable "$WORKER_SERVICE_NAME"
-    BOOTSTRAP_SERVICE_ENABLE_COUNT=1
-  fi
-  BOOTSTRAP_SERVICE_START_COUNT=1
-  if ! bootstrap_bounded_worker_restart; then
-    echo "managed endpoint worker did not become ready after full bootstrap" >&2
-    exit 1
-  fi
-  BOOTSTRAP_SERVICE_ACTIVE_AFTER=1
 fi
 
 BOOTSTRAP_QUEUE_EVIDENCE="$(
@@ -4394,16 +4428,24 @@ if [ "$BOOTSTRAP_SERVICE_ACTIVE_AFTER" = "1" ]; then
   fi
 fi
 BOOTSTRAP_SERVICE_ACTIVE_AFTER_JSON=unknown
-if [ -n "$WORKER_SERVICE_NAME" ]; then
+BOOTSTRAP_SERVICE_ENABLED_AFTER_JSON=unknown
+if [ "$BOOTSTRAP_SERVICE_PENDING_INSTALL" = "1" ]; then
+  BOOTSTRAP_SERVICE_ACTIVE_AFTER_JSON=false
+  BOOTSTRAP_SERVICE_ENABLED_AFTER_JSON=false
+elif [ -n "$WORKER_SERVICE_NAME" ]; then
   BOOTSTRAP_SERVICE_ACTIVE_AFTER_JSON=true
+  BOOTSTRAP_SERVICE_ENABLED_AFTER_JSON=true
 fi
 BOOTSTRAP_COMPLETED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
 export BOOTSTRAP_QUEUE_ACTION BOOTSTRAP_QUEUE_DURATION_NS BOOTSTRAP_QUEUE_EVIDENCE
 export BOOTSTRAP_WORKER_EVIDENCE BOOTSTRAP_SERVICE_ACTIVE_AFTER_JSON
+export BOOTSTRAP_SERVICE_ENABLED_AFTER_JSON BOOTSTRAP_SERVICE_PENDING_INSTALL
 export BOOTSTRAP_SERVICE_RESTART_COUNT BOOTSTRAP_SERVICE_START_COUNT
 export BOOTSTRAP_SERVICE_STOP_COUNT BOOTSTRAP_SERVICE_ENABLE_COUNT
 export BOOTSTRAP_FULL_PREPARE_STARTED_NS BOOTSTRAP_FULL_PREPARE_COMPLETED_NS
 export BOOTSTRAP_JARVIS_INIT_DURATION_NS BOOTSTRAP_COMPLETED_NS
+export BOOTSTRAP_JARVIS_GRAPH_DURATION_NS BOOTSTRAP_JARVIS_COMMANDS_JSON
+export JARVIS_INIT_ACTION JARVIS_GRAPH_ACTION
 export BOOTSTRAP_FRP_DOWNLOADED BOOTSTRAP_UV_DOWNLOADED
 export BOOTSTRAP_JARVIS_UTIL_DOWNLOADED BOOTSTRAP_JARVIS_CD_DOWNLOADED
 export BOOTSTRAP_CLIO_KIT_DOWNLOADED BOOTSTRAP_RELAY_DOWNLOAD_COUNT
@@ -4416,6 +4458,7 @@ from pathlib import Path
 
 from clio_relay.bootstrap_reconcile import (
     BootstrapDesiredState,
+    JarvisStateEvidence,
     inspect_exact_bootstrap_noop,
     make_bootstrap_receipt,
     write_bootstrap_receipt,
@@ -4427,16 +4470,29 @@ desired_payload["agent_npm_package"] = os.environ["AGENT_NPM_PACKAGE"] or None
 desired_payload["agent_npm_bin"] = os.environ["AGENT_NPM_BIN"] or None
 desired = BootstrapDesiredState.model_validate(desired_payload)
 service_value = os.environ["BOOTSTRAP_SERVICE_ACTIVE_AFTER_JSON"]
-service_active = True if service_value == "true" else None
+service_active = (
+    True if service_value == "true" else (False if service_value == "false" else None)
+)
+enabled_value = os.environ["BOOTSTRAP_SERVICE_ENABLED_AFTER_JSON"]
+service_enabled = (
+    True if enabled_value == "true" else (False if enabled_value == "false" else None)
+)
 worker_text = os.environ["BOOTSTRAP_WORKER_EVIDENCE"]
 inspection = inspect_exact_bootstrap_noop(
     desired,
     service_was_active=service_active,
-    service_was_enabled=(True if desired.worker_service is not None else None),
+    service_was_enabled=service_enabled,
     queue_evidence=json.loads(os.environ["BOOTSTRAP_QUEUE_EVIDENCE"]),
     worker_evidence=json.loads(worker_text) if worker_text else None,
 )
-if not inspection.exact_match:
+service_pending_install = os.environ["BOOTSTRAP_SERVICE_PENDING_INSTALL"] == "1"
+pending_reasons = {{
+    "managed endpoint service is inactive",
+    "managed endpoint service is disabled",
+}}
+if not inspection.exact_match and not (
+    service_pending_install and set(inspection.reasons) == pending_reasons
+):
     raise SystemExit(
         "full bootstrap did not pass exact inspection: " + repr(inspection.reasons)
     )
@@ -4497,13 +4553,23 @@ receipt = make_bootstrap_receipt(
     service_start_count=int(os.environ["BOOTSTRAP_SERVICE_START_COUNT"]),
     service_stop_count=int(os.environ["BOOTSTRAP_SERVICE_STOP_COUNT"]),
     service_enable_count=int(os.environ["BOOTSTRAP_SERVICE_ENABLE_COUNT"]),
+    service_pending_install=service_pending_install,
     queue_action=os.environ["BOOTSTRAP_QUEUE_ACTION"],
     queue_duration_seconds=(
         int(os.environ["BOOTSTRAP_QUEUE_DURATION_NS"]) / 1_000_000_000
     ),
-    jarvis_init_action="initialized",
+    jarvis_init_action=os.environ["JARVIS_INIT_ACTION"],
     jarvis_init_duration_seconds=(
         int(os.environ["BOOTSTRAP_JARVIS_INIT_DURATION_NS"]) / 1_000_000_000
+    ),
+    jarvis_graph_action=os.environ["JARVIS_GRAPH_ACTION"],
+    jarvis_graph_duration_seconds=(
+        int(os.environ["BOOTSTRAP_JARVIS_GRAPH_DURATION_NS"]) / 1_000_000_000
+    ),
+    jarvis_commands=json.loads(os.environ["BOOTSTRAP_JARVIS_COMMANDS_JSON"]),
+    jarvis_state_before=JarvisStateEvidence(
+        initialized=False,
+        root=inspection.jarvis_state.root,
     ),
     payload_transfer_count=int(os.environ["BOOTSTRAP_PAYLOAD_TRANSFER_COUNT"]),
     payload_transfer_bytes=int(os.environ["BOOTSTRAP_PAYLOAD_TRANSFER_BYTES"]),
@@ -4737,16 +4803,13 @@ def _add_canonical_archive_member(
 
 def assert_clean_git_checkout(source_root: Path) -> None:
     """Raise if source_root has uncommitted changes that git archive would omit."""
-    result = subprocess.run(
+    result = _run(
         ["git", "status", "--porcelain"],
         cwd=source_root,
-        text=True,
-        capture_output=True,
-        check=False,
+        timeout_seconds=20,
+        stdout_maximum_bytes=1024 * 1024,
+        stderr_maximum_bytes=64 * 1024,
     )
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip()
-        raise RelayError(f"failed to inspect git checkout before bootstrap: {detail}")
     if result.stdout.strip():
         raise ConfigurationError(
             "remote bootstrap deploys git HEAD; commit or stash local changes before bootstrap"
@@ -4755,8 +4818,13 @@ def assert_clean_git_checkout(source_root: Path) -> None:
 
 def _assert_executable(path: Path) -> None:
     try:
-        subprocess.run([str(path), "--version"], check=True, capture_output=True, text=True)
-    except (OSError, subprocess.CalledProcessError) as exc:
+        _run(
+            [str(path), "--version"],
+            timeout_seconds=10,
+            stdout_maximum_bytes=4096,
+            stderr_maximum_bytes=4096,
+        )
+    except (OSError, RelayError) as exc:
         raise ConfigurationError(f"installed executable cannot run: {path}: {exc}") from exc
 
 

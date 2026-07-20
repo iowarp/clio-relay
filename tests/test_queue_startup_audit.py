@@ -163,11 +163,7 @@ def test_sealed_startup_rejects_duplicate_index_keys_at_every_depth(
     index_path = root / "migrations" / "index-v1.json"
     document = json.loads(index_path.read_bytes())
     payload = json.dumps(document, separators=(",", ":"))
-    needle = (
-        '"jobs":{"cursor":null,"complete":true}'
-        if nested
-        else '"complete":true'
-    )
+    needle = '"jobs":{"cursor":null,"complete":true}' if nested else '"complete":true'
     replacement = (
         '"jobs":{"cursor":null,"complete":true,"complete":false}'
         if nested

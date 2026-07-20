@@ -84,6 +84,15 @@ def test_candidate_manifest_parser_accepts_the_exact_gnu_checksum_separator() ->
     assert selector.fullmatch(f"{digest}*{wheel_name}") is None
 
 
+def test_release_bootstrap_arguments_bind_candidate_and_pypi_wheel_sha256() -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+
+    assert '"--relay-wheel", $Wheel,' in runbook
+    assert '"--relay-artifact-sha256", $ExpectedWheelSha256' in runbook
+    assert '"--relay-artifact-sha256", ([string]$Promotion.wheel_sha256)' in runbook
+    assert runbook.count("+ $BootstrapArtifact)") == 2
+
+
 def test_spack_json_array_fallback_is_safe_under_powershell_strict_mode() -> None:
     runbook = RUNBOOK.read_text(encoding="utf-8")
 

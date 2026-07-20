@@ -667,9 +667,7 @@ def test_storage_startup_refuses_core_replacement_before_seal_mutation(
         ConfigurationError,
         match="queue root changed before establishing its indexed-era seal",
     ):
-        storage_managed_queue(
-            RelaySettings(core_dir=core_dir, spool_dir=tmp_path / "spool")
-        )
+        storage_managed_queue(RelaySettings(core_dir=core_dir, spool_dir=tmp_path / "spool"))
 
     assert not (core_dir / "migrations").exists()
     assert not (displaced_core / "migrations").exists()
@@ -690,9 +688,7 @@ def test_storage_startup_bounds_initial_shared_lifetime_wait(
     try:
         started = time.monotonic()
         with pytest.raises(WorkerLifetimeLockUnavailable, match="timed out acquiring"):
-            storage_managed_queue(
-                RelaySettings(core_dir=core_dir, spool_dir=tmp_path / "spool")
-            )
+            storage_managed_queue(RelaySettings(core_dir=core_dir, spool_dir=tmp_path / "spool"))
         assert time.monotonic() - started < 1
     finally:
         exclusive.release()
@@ -744,9 +740,7 @@ def test_queue_seal_handoff_bounds_shared_reacquire(
         assert isinstance(timeout, float)
         with actual_guard(root, timeout_seconds=timeout) as locked_core:
             yield locked_core
-        blockers.append(
-            WorkerLifetimeLock(root, mode="exclusive", timeout_seconds=0).acquire()
-        )
+        blockers.append(WorkerLifetimeLock(root, mode="exclusive", timeout_seconds=0).acquire())
 
     monkeypatch.setattr(
         storage_runtime_module,

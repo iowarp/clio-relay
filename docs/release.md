@@ -95,6 +95,10 @@ $lines = foreach ($file in $files | Sort-Object Name) {
   "$digest  $($file.Name)"
 }
 Set-Content -Encoding ascii -Path dist/SHA256SUMS -Value $lines
+$Wheel = @(Get-ChildItem dist -File -Filter "clio_relay-*.whl")
+if ($Wheel.Count -ne 1) { throw "expected one clio-relay wheel" }
+$Wheel = $Wheel[0]
+$RelayWheelSha256 = (Get-FileHash -Algorithm SHA256 $Wheel.FullName).Hash.ToLower()
 ```
 
 `CLIO_RELAY_RELEASE_BUILD=1` makes the build hook require a commit, a clean
@@ -147,3 +151,15 @@ Live released-artifact validation can begin as soon as the GitHub Release is
 public. The acceptance procedure and machine-readable report schema remain in
 [`release-acceptance-1.0.md`](release-acceptance-1.0.md) and
 [`release-gate-1.0.yaml`](release-gate-1.0.yaml).
+
+Every release bootstrap command must carry the exact wheel identity computed
+above, whether it asks the target to install from PyPI or transports the local
+release wheel:
+
+```powershell
+clio-relay cluster bootstrap --cluster $Cluster `
+  --relay-artifact-sha256 $RelayWheelSha256
+# Candidate bytes instead of PyPI transport:
+clio-relay cluster bootstrap --cluster $Cluster --relay-wheel $Wheel.FullName `
+  --relay-artifact-sha256 $RelayWheelSha256
+```

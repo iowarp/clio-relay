@@ -151,9 +151,7 @@ def test_posix_queue_initialization_creates_owner_private_fixed_directories(
 
     assert stat.S_IMODE(root.stat().st_mode) == 0o700
     assert stat.S_IMODE((root / "jobs").stat().st_mode) == 0o700
-    assert stat.S_IMODE(
-        (root / "global_order" / "jobs" / "entries").stat().st_mode
-    ) == 0o700
+    assert stat.S_IMODE((root / "global_order" / "jobs" / "entries").stat().st_mode) == 0o700
 
 
 def test_posix_readiness_refuses_nonprivate_sealed_root_without_repair(
