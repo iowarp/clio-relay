@@ -302,6 +302,62 @@ function Invoke-RelayReport {
   [pscustomobject]@{ Path = (Resolve-Path $Path).Path; Output = ($Output -join "`n"); Report = $Report }
 }
 
+function Get-BootstrapReceipt {
+  param([Parameter(Mandatory)] [pscustomobject] $Result)
+  $ReceiptPrefix = "bootstrap_receipt_json="
+  $ReceiptLines = @(
+    $Result.Output -split "`n" | Where-Object {
+      $_.StartsWith($ReceiptPrefix, [StringComparison]::Ordinal)
+    }
+  )
+  if ($ReceiptLines.Count -ne 1) {
+    throw "bootstrap output did not contain exactly one machine-readable receipt"
+  }
+  $Receipt = $ReceiptLines[0].Substring($ReceiptPrefix.Length) | ConvertFrom-Json
+  if ([string]$Receipt.schema_version -cne "clio-relay.bootstrap-receipt.v2") {
+    throw "bootstrap returned an unsupported receipt schema"
+  }
+  $Receipt
+}
+
+function Assert-BootstrapReuse {
+  param(
+    [Parameter(Mandatory)] [pscustomobject] $Receipt,
+    [Parameter(Mandatory)] [string] $ExpectedOutcome,
+    [Parameter(Mandatory)] [double] $MaximumSeconds,
+    [Parameter(Mandatory)] [double] $ObservedSeconds
+  )
+  if ([string]$Receipt.outcome -cne $ExpectedOutcome) {
+    throw "bootstrap outcome was $($Receipt.outcome), expected $ExpectedOutcome"
+  }
+  if ($ObservedSeconds -gt $MaximumSeconds) {
+    throw "bootstrap exceeded the $MaximumSeconds-second end-to-end reuse gate: $ObservedSeconds"
+  }
+  if ([int64]$Receipt.operations.payload_transfer_count -ne 0 -or
+      [int64]$Receipt.operations.payload_transfer_bytes -ne 0 -or
+      [int64]$Receipt.operations.download_count -ne 0) {
+    throw "bootstrap reuse transferred or downloaded a payload"
+  }
+  if ([int64]$Receipt.operations.scheduler_submission_count -ne 0 -or
+      [int64]$Receipt.operations.scheduler_cancellation_count -ne 0) {
+    throw "bootstrap reuse touched scheduler state"
+  }
+  if ([int64]$Receipt.jarvis_commands.count -ne 0 -or
+      [string]$Receipt.jarvis_initialization.action -cne "preserved" -or
+      [string]$Receipt.jarvis_resource_graph.action -cne "preserved") {
+    throw "bootstrap reuse invoked or rebuilt JARVIS"
+  }
+  if (-not [bool]$Receipt.jarvis_preservation.config_byte_identical -or
+      -not [bool]$Receipt.jarvis_preservation.resource_graph_byte_identical) {
+    throw "bootstrap reuse changed the existing JARVIS configuration or hardware graph"
+  }
+  foreach ($Component in @($Receipt.components.PSObject.Properties)) {
+    if ([string]$Component.Value.action -cne "reused") {
+      throw "bootstrap reuse replaced component $($Component.Name)"
+    }
+  }
+}
+
 function ConvertTo-LfText {
   param(
     [Parameter(Mandatory)] [AllowEmptyString()] [string] $Text,
@@ -594,6 +650,53 @@ foreach ($Cluster in @($AresCluster, $HomelabCluster)) {
     --kind-concurrency jarvis=2 --kind-concurrency remote_agent=2 `
     --kind-concurrency mcp_call=1 --start --enable --require-persistent
   if ($LASTEXITCODE -ne 0) { throw "worker service installation failed: $Cluster" }
+}
+
+# Re-running the exact artifact is the normal cluster startup path. This
+# diagnostic report must prove a true no-op rather than hiding a reinstall.
+$BootstrapReuseTimer = [Diagnostics.Stopwatch]::StartNew()
+$BootstrapReuse = Invoke-RelayReport -Id "ares-bootstrap-exact-reuse" -Diagnostic -NoArtifactOption `
+  -ReportOption "--report" `
+  -Command (@("cluster", "bootstrap", "--cluster", $AresCluster) + $BootstrapArtifact)
+$BootstrapReuseTimer.Stop()
+$BootstrapReuseReceipt = Get-BootstrapReceipt $BootstrapReuse
+Assert-BootstrapReuse $BootstrapReuseReceipt "noop_verified" 30 $BootstrapReuseTimer.Elapsed.TotalSeconds
+if ([int64]$BootstrapReuseReceipt.operations.service_start_count -ne 0 -or
+    [int64]$BootstrapReuseReceipt.operations.service_restart_count -ne 0 -or
+    [int64]$BootstrapReuseReceipt.operations.service_stop_count -ne 0 -or
+    [int64]$BootstrapReuseReceipt.operations.service_enable_count -ne 0) {
+  throw "exact bootstrap reuse changed the managed endpoint service"
+}
+
+# Stop only the receipt-named managed unit to exercise bounded service repair.
+# This fixture mutation is not a scheduler operation and never cancels jobs.
+$AresServiceName = [string]$BootstrapReuseReceipt.service.name
+if ($AresServiceName -cnotmatch '^clio-relay-worker-[a-z0-9_-]+\.service$') {
+  throw "bootstrap receipt returned an unsafe managed service name"
+}
+& $OpenSsh $AresSshHost "systemctl --user stop '$AresServiceName'"
+if ($LASTEXITCODE -ne 0) { throw "could not stop the managed endpoint service fixture" }
+& $OpenSsh $AresSshHost "systemctl --user is-active --quiet '$AresServiceName'"
+if ($LASTEXITCODE -ne 3) {
+  throw "managed endpoint service did not reach the expected inactive state"
+}
+
+$BootstrapRepairTimer = [Diagnostics.Stopwatch]::StartNew()
+$BootstrapRepair = Invoke-RelayReport -Id "ares-bootstrap-service-repair" -Diagnostic -NoArtifactOption `
+  -ReportOption "--report" `
+  -Command (@("cluster", "bootstrap", "--cluster", $AresCluster) + $BootstrapArtifact)
+$BootstrapRepairTimer.Stop()
+$BootstrapRepairReceipt = Get-BootstrapReceipt $BootstrapRepair
+Assert-BootstrapReuse $BootstrapRepairReceipt "repaired" 60 $BootstrapRepairTimer.Elapsed.TotalSeconds
+if (-not [bool]$BootstrapRepairReceipt.service.active_after -or
+    -not [bool]$BootstrapRepairReceipt.service.enabled_after) {
+  throw "bootstrap service repair did not restore the persistent managed endpoint"
+}
+if (([int64]$BootstrapRepairReceipt.operations.service_start_count +
+     [int64]$BootstrapRepairReceipt.operations.service_restart_count) -ne 1 -or
+    [int64]$BootstrapRepairReceipt.operations.service_stop_count -ne 0 -or
+    [int64]$BootstrapRepairReceipt.operations.service_enable_count -ne 0) {
+  throw "bootstrap service repair performed work outside one bounded service activation"
 }
 
 $BootstrapYaml = Join-Path $RenderedRoot "ares-bootstrap.yaml"

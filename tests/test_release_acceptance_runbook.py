@@ -90,7 +90,31 @@ def test_release_bootstrap_arguments_bind_candidate_and_pypi_wheel_sha256() -> N
     assert '"--relay-wheel", $Wheel,' in runbook
     assert '"--relay-artifact-sha256", $ExpectedWheelSha256' in runbook
     assert '"--relay-artifact-sha256", ([string]$Promotion.wheel_sha256)' in runbook
-    assert runbook.count("+ $BootstrapArtifact)") == 2
+    assert runbook.count("+ $BootstrapArtifact)") == 4
+
+
+def test_release_bootstrap_acceptance_proves_bounded_reuse_and_service_repair() -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+
+    assert "function Get-BootstrapReceipt {" in runbook
+    assert "function Assert-BootstrapReuse {" in runbook
+    assert '-Id "ares-bootstrap-exact-reuse" -Diagnostic' in runbook
+    assert '-Id "ares-bootstrap-service-repair" -Diagnostic' in runbook
+    assert (
+        'Assert-BootstrapReuse $BootstrapReuseReceipt "noop_verified" 30 '
+        "$BootstrapReuseTimer.Elapsed.TotalSeconds"
+    ) in runbook
+    assert (
+        'Assert-BootstrapReuse $BootstrapRepairReceipt "repaired" 60 '
+        "$BootstrapRepairTimer.Elapsed.TotalSeconds"
+    ) in runbook
+    assert "operations.payload_transfer_count" in runbook
+    assert "operations.scheduler_submission_count" in runbook
+    assert "jarvis_preservation.config_byte_identical" in runbook
+    assert "jarvis_preservation.resource_graph_byte_identical" in runbook
+    assert "systemctl --user stop '$AresServiceName'" in runbook
+    assert 'Assert-BootstrapReuse $BootstrapReuseReceipt "noop_verified" 30' in runbook
+    assert 'Assert-BootstrapReuse $BootstrapRepairReceipt "repaired" 60' in runbook
 
 
 def test_spack_json_array_fallback_is_safe_under_powershell_strict_mode() -> None:
