@@ -21,6 +21,7 @@ from click import unstyle
 from filelock import FileLock
 from typer.testing import CliRunner
 
+import clio_relay.session_lifecycle as session_lifecycle
 from clio_relay import __version__, cli
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
@@ -1659,8 +1660,10 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
     }
     report.relay_cancel_requested = False
     report.scheduler_cancel_requested = False
-    report_payload = report.model_dump(mode="json")
     report_sha256 = session_lifecycle_report_sha256(report)
+    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report
+    )
     status_calls = 0
 
     def fake_status(**_kwargs: object) -> dict[str, object]:
@@ -1683,7 +1686,7 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
             durable_generation_verified=True,
             cleanup_receipt=True,
             cleanup_paths_pending=False,
-            coordinator_report=report_payload,
+            coordinator_report_ref=report_reference,
             coordinator_report_sha256=report_sha256,
             coordinator_report_bound=True,
             ownership_verified=True,
@@ -1719,6 +1722,11 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
         )
 
     monkeypatch.setattr(cli, "status_remote_session", fake_status)
+    monkeypatch.setattr(
+        cli,
+        "read_remote_session_cleanup_report",
+        lambda **_kwargs: report,
+    )
     monkeypatch.setattr(cli, "run_remote_clio", fake_remote)
     monkeypatch.setattr(cli, "should_execute_on_cluster", lambda _definition: True)
 
@@ -1756,8 +1764,10 @@ def test_cleanup_report_is_persisted_and_reread_before_authoritative_closure(
         "cancel_jobs": False,
         "cancel_scheduler_jobs": False,
     }
-    report_payload = report.model_dump(mode="json")
     report_sha256 = session_lifecycle_report_sha256(report)
+    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report
+    )
     finalized_status = OwnedSessionRecoveryStatus(
         cluster="ares",
         session_id="session-1",
@@ -1774,7 +1784,7 @@ def test_cleanup_report_is_persisted_and_reread_before_authoritative_closure(
         durable_generation_verified=True,
         cleanup_receipt=True,
         cleanup_paths_pending=False,
-        coordinator_report=report_payload,
+        coordinator_report_ref=report_reference,
         coordinator_report_sha256=report_sha256,
         coordinator_report_bound=True,
         ownership_verified=True,
@@ -2073,7 +2083,7 @@ def test_session_start_never_closes_from_remote_only_cleanup_receipt(
 
     monkeypatch.setattr(cli, "run_remote_clio", forbidden_remote)
 
-    with pytest.raises(RelayError, match="only cluster-local evidence"):
+    with pytest.raises(RelayError, match="reference is not exact"):
         cli._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             definition=ClusterDefinition(name="ares", ssh_host="ares"),
             cluster="ares",
@@ -2143,7 +2153,9 @@ def test_session_start_rejects_invalid_finalized_cleanup_before_closure(
                 observed_state="running",
             )
         )
-    report_payload = report.model_dump(mode="json")
+    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report
+    )
     status = OwnedSessionRecoveryStatus(
         cluster="ares",
         session_id="session-1",
@@ -2160,7 +2172,7 @@ def test_session_start_rejects_invalid_finalized_cleanup_before_closure(
         durable_generation_verified=True,
         cleanup_receipt=True,
         cleanup_paths_pending=False,
-        coordinator_report=report_payload,
+        coordinator_report_ref=report_reference,
         coordinator_report_sha256=session_lifecycle_report_sha256(report),
         coordinator_report_bound=True,
         ownership_verified=True,
@@ -2184,6 +2196,11 @@ def test_session_start_rejects_invalid_finalized_cleanup_before_closure(
     ).model_dump(mode="json")
 
     monkeypatch.setattr(cli, "status_remote_session", lambda **_kwargs: status)
+    monkeypatch.setattr(
+        cli,
+        "read_remote_session_cleanup_report",
+        lambda **_kwargs: report,
+    )
 
     def forbidden_remote(*_args: object, **_kwargs: object) -> str:
         raise AssertionError("authoritative closure must not run")

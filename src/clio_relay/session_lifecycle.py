@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
@@ -57,6 +57,8 @@ SESSION_SCHEDULER_CANCELED_CHECK_ID = "cleanup.explicit-job-cancel"
 _REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS = 120.0
 _REMOTE_API_READINESS_TIMEOUT_SECONDS = 60.0
 _MAX_OWNED_SESSION_DOCUMENT_BYTES = 1024 * 1024
+MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES = 32 * 1024 * 1024
+MAX_OWNED_SESSION_CLEANUP_FINALIZE_BYTES = MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES + 256 * 1024
 _MAX_PROC_RECORD_BYTES = 1024 * 1024
 _OWNED_SESSION_LOCK_RETRY_SECONDS = 0.05
 _MAX_REMOTE_SESSION_SCRIPT_BYTES = MAX_CLUSTER_REGISTRY_BYTES + 128 * 1024
@@ -164,7 +166,8 @@ class _OwnedSessionTransaction:
             if len(payload) != opened.st_size or len(payload) > maximum_bytes:
                 raise RelayError(f"owned session file changed or exceeded its limit: {name}")
             final = os.stat(name, dir_fd=self.directory_fd, follow_symlinks=False)
-            if (final.st_dev, final.st_ino) != (opened.st_dev, opened.st_ino):
+            _verify_owned_session_file(opened, final, uid=self.uid, name=name)
+            if final.st_size != opened.st_size:
                 raise RelayError(f"owned session file changed while it was read: {name}")
             return bytes(payload)
         finally:
@@ -187,10 +190,18 @@ class _OwnedSessionTransaction:
             raise RelayError(f"owned session file is not a JSON object: {name}")
         return {str(key): value for key, value in cast(dict[object, object], raw).items()}
 
-    def atomic_write(self, name: str, payload: bytes) -> None:
+    def atomic_write(
+        self,
+        name: str,
+        payload: bytes,
+        *,
+        maximum_bytes: int = _MAX_OWNED_SESSION_DOCUMENT_BYTES,
+    ) -> None:
         """Atomically replace one owner-private regular file through the pinned directory."""
         _validate_owned_session_filename(name)
-        if len(payload) > _MAX_OWNED_SESSION_DOCUMENT_BYTES:
+        if maximum_bytes <= 0:
+            raise ValueError("maximum_bytes must be positive")
+        if len(payload) > maximum_bytes:
             raise RelayError(f"owned session write exceeds its byte limit: {name}")
         temporary_name = f".{name}.{os.getpid()}.{uuid4().hex}.tmp"
         descriptor: int | None = None
@@ -233,6 +244,112 @@ class _OwnedSessionTransaction:
                 os.close(descriptor)
             with suppress(FileNotFoundError):
                 os.unlink(temporary_name, dir_fd=self.directory_fd)
+
+    def atomic_write_immutable(
+        self,
+        name: str,
+        payload: bytes,
+        *,
+        maximum_bytes: int,
+    ) -> None:
+        """Install one immutable sidecar, accepting only exact idempotent reuse."""
+        _validate_owned_session_filename(name)
+        if maximum_bytes <= 0:
+            raise ValueError("maximum_bytes must be positive")
+        if not payload or len(payload) > maximum_bytes:
+            raise RelayError(f"owned session immutable write exceeds its byte limit: {name}")
+        pending_name = f".{name}.pending"
+        _validate_owned_session_filename(pending_name)
+
+        def linked_status(candidate: str) -> os.stat_result | None:
+            try:
+                return os.stat(candidate, dir_fd=self.directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+
+        final_status = linked_status(name)
+        pending_status = linked_status(pending_name)
+        if final_status is not None and pending_status is not None:
+            if (final_status.st_dev, final_status.st_ino) != (
+                pending_status.st_dev,
+                pending_status.st_ino,
+            ):
+                raise RelayError(f"owned session immutable publication is ambiguous: {name}")
+            if not (
+                stat.S_ISREG(final_status.st_mode)
+                and final_status.st_uid == self.uid
+                and stat.S_IMODE(final_status.st_mode) == 0o600
+                and final_status.st_nlink == 2
+            ):
+                raise RelayError(f"owned session immutable publication is unsafe: {name}")
+            # Recover the one crash window after link publication and before the
+            # private pending link was removed. The final basename already won.
+            os.unlink(pending_name, dir_fd=self.directory_fd)
+            os.fsync(self.directory_fd)
+            pending_status = None
+        existing = self.read_bytes(
+            name,
+            maximum_bytes=maximum_bytes,
+            required=False,
+        )
+        if existing is not None:
+            if hmac.compare_digest(existing, payload):
+                return
+            raise RelayError(f"owned session immutable file already differs: {name}")
+        if pending_status is None:
+            descriptor: int | None = None
+            try:
+                descriptor = os.open(
+                    pending_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=self.directory_fd,
+                )
+                view = memoryview(payload)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise RelayError(f"owned session immutable write made no progress: {name}")
+                    view = view[written:]
+                os.fsync(descriptor)
+            except OSError as exc:
+                raise RelayError(
+                    f"owned session immutable file cannot be staged safely: {name}: {exc}"
+                ) from exc
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+        staged = self.read_bytes(pending_name, maximum_bytes=maximum_bytes)
+        if staged is None or not hmac.compare_digest(staged, payload):
+            raise RelayError(f"owned session immutable pending file differs: {name}")
+        try:
+            os.link(
+                pending_name,
+                name,
+                src_dir_fd=self.directory_fd,
+                dst_dir_fd=self.directory_fd,
+                follow_symlinks=False,
+            )
+            os.fsync(self.directory_fd)
+        except FileExistsError:
+            winner = self.read_bytes(name, maximum_bytes=maximum_bytes)
+            if winner is None or not hmac.compare_digest(winner, payload):
+                raise RelayError(f"owned session immutable file already differs: {name}") from None
+        except OSError as exc:
+            raise RelayError(
+                f"owned session immutable file cannot be published safely: {name}: {exc}"
+            ) from exc
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(pending_name, dir_fd=self.directory_fd)
+            os.fsync(self.directory_fd)
+        reread = self.read_bytes(name, maximum_bytes=maximum_bytes)
+        if reread is None or not hmac.compare_digest(reread, payload):
+            raise RelayError(f"owned session immutable file changed after commit: {name}")
 
     def stat_regular(self, name: str, *, required: bool = True) -> os.stat_result | None:
         """Return exact no-follow status for one owner-private regular file."""
@@ -649,6 +766,23 @@ class RemoteSessionStateEvidence(BaseModel):
     started_at: datetime | None = None
 
 
+class OwnedSessionCleanupReportReference(BaseModel):
+    """Immutable owner-private sidecar identity for one coordinator report."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["clio-relay.owner-session-cleanup-report-ref.v1"] = (
+        "clio-relay.owner-session-cleanup-report-ref.v1"
+    )
+    name: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^coordinator-cleanup-report-[0-9a-f]{64}\.json$",
+    )
+    size: int = Field(gt=0, le=MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class OwnedSessionRecoveryStatus(BaseModel):
     """Fail-closed recovery evidence for one exact owned session generation."""
 
@@ -691,7 +825,9 @@ class OwnedSessionRecoveryStatus(BaseModel):
     durable_generation_verified: bool = False
     cleanup_receipt: bool = False
     cleanup_paths_pending: bool | None = None
-    coordinator_report: dict[str, object] | None = None
+    # Compatibility-null only. Full reports are never copied into status responses.
+    coordinator_report: None = None
+    coordinator_report_ref: OwnedSessionCleanupReportReference | None = None
     coordinator_report_sha256: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{64}$",
@@ -704,6 +840,16 @@ class OwnedSessionRecoveryStatus(BaseModel):
     ownership_token_present: bool = False
     admission_status: dict[str, object] | None = None
     errors: list[str] = Field(default_factory=list[str])
+
+    @model_validator(mode="after")
+    def _validate_coordinator_report_reference(self) -> OwnedSessionRecoveryStatus:
+        """Keep the compatibility digest identical to the compact sidecar reference."""
+        if (
+            self.coordinator_report_ref is not None
+            and self.coordinator_report_sha256 != self.coordinator_report_ref.sha256
+        ):
+            raise ValueError("coordinator report reference digest does not match status")
+        return self
 
 
 @dataclass(frozen=True)
@@ -1055,6 +1201,29 @@ def inspect_owned_session_recovery_status(
         )
 
     if document.get("schema_version") == "clio-relay.owner-session-cleanup-receipt.v1":
+        if transaction is None and document.get("coordinator_report_ref") is not None:
+            try:
+                with open_owned_session_transaction(
+                    session_id=session_id,
+                    create=False,
+                    timeout_seconds=10.0,
+                    home=selected_home,
+                ) as pinned_transaction:
+                    return inspect_owned_session_recovery_status(
+                        cluster=cluster,
+                        session_id=session_id,
+                        core_dir=core_dir,
+                        home=selected_home,
+                        proc_root=proc_root,
+                        effective_uid=uid,
+                        transaction=pinned_transaction,
+                    )
+            except RelayError as exc:
+                return OwnedSessionRecoveryStatus(
+                    cluster=cluster,
+                    session_id=session_id,
+                    errors=[str(exc)],
+                )
         return _inspect_owned_session_cleanup_receipt(
             cluster=cluster,
             session_id=session_id,
@@ -1062,6 +1231,7 @@ def inspect_owned_session_recovery_status(
             core_dir=core_dir,
             proc_root=proc_root,
             effective_uid=uid,
+            transaction=transaction,
         )
 
     owner = document.get("owner")
@@ -1492,6 +1662,7 @@ def _inspect_owned_session_cleanup_receipt(
     core_dir: Path,
     proc_root: Path,
     effective_uid: int | None,
+    transaction: _OwnedSessionTransaction | None,
 ) -> OwnedSessionRecoveryStatus:
     """Validate a sanitized receipt for an idempotent teardown retry."""
     from clio_relay.core_queue import ClioCoreQueue
@@ -1511,21 +1682,38 @@ def _inspect_owned_session_cleanup_receipt(
     except (TypeError, ValueError) as exc:
         errors.append(f"owned session cleanup receipt report is invalid: {exc}")
     coordinator_report: SessionLifecycleReport | None = None
+    coordinator_report_ref: OwnedSessionCleanupReportReference | None = None
     coordinator_report_bound = False
-    coordinator_report_sha256 = document.get("coordinator_report_sha256")
+    coordinator_report_sha256: object = None
+    raw_coordinator_report_ref = document.get("coordinator_report_ref")
     raw_coordinator_report = document.get("coordinator_report")
+    legacy_coordinator_sha256 = document.get("coordinator_report_sha256")
     coordinator_fields_valid = bool(
-        raw_coordinator_report is None and coordinator_report_sha256 is None
+        raw_coordinator_report_ref is None
+        and raw_coordinator_report is None
+        and legacy_coordinator_sha256 is None
     )
-    if raw_coordinator_report is not None or coordinator_report_sha256 is not None:
+    if raw_coordinator_report_ref is not None:
         try:
-            coordinator_report = SessionLifecycleReport.model_validate(raw_coordinator_report)
-            observed_coordinator_sha256 = session_lifecycle_report_sha256(coordinator_report)
+            if transaction is None:
+                raise RelayError("coordinator cleanup report sidecar has no pinned directory")
+            coordinator_report_ref = OwnedSessionCleanupReportReference.model_validate(
+                raw_coordinator_report_ref
+            )
+            if validated_generation is None or not isinstance(
+                document.get("cleanup_operation_id"), str
+            ):
+                raise RelayError("coordinator cleanup report reference has no durable identity")
+            coordinator_report = _read_coordinator_report_sidecar(
+                transaction,
+                coordinator_report_ref,
+                expected_session_generation_id=validated_generation,
+                expected_cleanup_operation_id=cast(str, document.get("cleanup_operation_id")),
+            )
+            coordinator_report_sha256 = coordinator_report_ref.sha256
             remote_resources = report.resources if report is not None else []
             coordinator_report_bound = bool(
-                isinstance(coordinator_report_sha256, str)
-                and coordinator_report_sha256 == observed_coordinator_sha256
-                and report is not None
+                report is not None
                 and coordinator_report.cluster == report.cluster
                 and coordinator_report.session_id == report.session_id
                 and coordinator_report.session_generation_id == report.session_generation_id
@@ -1541,11 +1729,42 @@ def _inspect_owned_session_cleanup_receipt(
                 and coordinator_report.resources[: len(remote_resources)] == remote_resources
             )
             coordinator_fields_valid = coordinator_report_bound
-        except (TypeError, ValueError) as exc:
+        except (RelayError, TypeError, ValueError) as exc:
             errors.append(f"owned session coordinator cleanup report is invalid: {exc}")
         if not coordinator_fields_valid:
             errors.append("owned session coordinator cleanup report binding is invalid")
-    expected_keys = {
+    elif raw_coordinator_report is not None or legacy_coordinator_sha256 is not None:
+        # Transitional support for receipts written by the unreleased inline
+        # implementation. Status still never returns the resource array.
+        try:
+            coordinator_report = SessionLifecycleReport.model_validate(raw_coordinator_report)
+            observed_coordinator_sha256 = session_lifecycle_report_sha256(coordinator_report)
+            remote_resources = report.resources if report is not None else []
+            coordinator_report_bound = bool(
+                isinstance(legacy_coordinator_sha256, str)
+                and legacy_coordinator_sha256 == observed_coordinator_sha256
+                and report is not None
+                and coordinator_report.cluster == report.cluster
+                and coordinator_report.session_id == report.session_id
+                and coordinator_report.session_generation_id == report.session_generation_id
+                and coordinator_report.mode == report.mode
+                and coordinator_report.cleanup_operation_id == report.cleanup_operation_id
+                and coordinator_report.cleanup_policy == report.cleanup_policy
+                and coordinator_report.relay_cancel_requested == report.relay_cancel_requested
+                and coordinator_report.scheduler_cancel_requested
+                == report.scheduler_cancel_requested
+                and coordinator_report.prior_session_status == report.prior_session_status
+                and coordinator_report.post_session_status == report.post_session_status
+                and len(coordinator_report.resources) >= len(remote_resources)
+                and coordinator_report.resources[: len(remote_resources)] == remote_resources
+            )
+            coordinator_report_sha256 = legacy_coordinator_sha256
+            coordinator_fields_valid = coordinator_report_bound
+        except (RelayError, TypeError, ValueError) as exc:
+            errors.append(f"owned session legacy coordinator cleanup report is invalid: {exc}")
+        if not coordinator_fields_valid:
+            errors.append("owned session coordinator cleanup report binding is invalid")
+    common_expected_keys = {
         "schema_version",
         "owner",
         "cluster",
@@ -1577,9 +1796,11 @@ def _inspect_owned_session_cleanup_receipt(
         "cluster_registry_removed",
         "completed_at",
         "report",
-        "coordinator_report",
-        "coordinator_report_sha256",
     }
+    expected_key_sets = (
+        common_expected_keys | {"coordinator_report_ref"},
+        common_expected_keys | {"coordinator_report", "coordinator_report_sha256"},
+    )
     raw_policy = document.get("cleanup_policy")
     policy = cast(dict[str, object], raw_policy) if isinstance(raw_policy, dict) else None
     completed_at = document.get("completed_at")
@@ -1622,7 +1843,7 @@ def _inspect_owned_session_cleanup_receipt(
         except RelayError as exc:
             errors.append(str(exc))
     metadata_verified = bool(
-        set(document) == expected_keys
+        set(document) in expected_key_sets
         and document.get("owner") == "clio-relay"
         and document.get("cluster") == cluster
         and document.get("session_id") == session_id
@@ -1835,11 +2056,8 @@ def _inspect_owned_session_cleanup_receipt(
             if isinstance(document.get("cleanup_paths_pending"), bool)
             else None
         ),
-        coordinator_report=(
-            coordinator_report.model_dump(mode="json")
-            if coordinator_report_bound and coordinator_report is not None
-            else None
-        ),
+        coordinator_report=None,
+        coordinator_report_ref=(coordinator_report_ref if coordinator_report_bound else None),
         coordinator_report_sha256=(
             coordinator_report_sha256
             if coordinator_report_bound and isinstance(coordinator_report_sha256, str)
@@ -2468,14 +2686,121 @@ class OwnedSessionCleanupFinalizeRequest(BaseModel):
     coordinator_report_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
-def session_lifecycle_report_sha256(report: SessionLifecycleReport) -> str:
-    """Return the canonical digest for an exact lifecycle report."""
+class OwnedSessionCleanupReportReadRequest(BaseModel):
+    """Exact request for reading one finalized coordinator-report sidecar."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cluster: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    expected_session_generation_id: DurableRecordId
+    coordinator_report_ref: OwnedSessionCleanupReportReference
+
+
+def session_lifecycle_report_bytes(report: SessionLifecycleReport) -> bytes:
+    """Return the canonical bounded sidecar encoding for one lifecycle report."""
     payload = json.dumps(
         report.model_dump(mode="json"),
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    if not payload or len(payload) > MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES:
+        raise RelayError("coordinator cleanup report exceeds its byte limit")
+    return payload
+
+
+def session_lifecycle_report_sha256(report: SessionLifecycleReport) -> str:
+    """Return the canonical digest for an exact lifecycle report."""
+    return hashlib.sha256(session_lifecycle_report_bytes(report)).hexdigest()
+
+
+def _coordinator_report_sidecar_name(
+    *,
+    session_generation_id: str,
+    cleanup_operation_id: str,
+) -> str:
+    """Derive a stable basename without exposing variable-length identifiers."""
+    validate_durable_record_id(session_generation_id)
+    validate_durable_record_id(cleanup_operation_id)
+    identity = (
+        "clio-relay.owner-session-cleanup-report.v1\0"
+        f"{session_generation_id}\0{cleanup_operation_id}"
+    ).encode("ascii")
+    return f"coordinator-cleanup-report-{hashlib.sha256(identity).hexdigest()}.json"
+
+
+def _coordinator_report_reference(
+    report: SessionLifecycleReport,
+) -> tuple[OwnedSessionCleanupReportReference, bytes]:
+    """Build the exact immutable sidecar reference and canonical payload."""
+    generation_id = report.session_generation_id
+    operation_id = report.cleanup_operation_id
+    if generation_id is None or operation_id is None:
+        raise RelayError("coordinator cleanup report omitted its durable identity")
+    payload = session_lifecycle_report_bytes(report)
+    reference = OwnedSessionCleanupReportReference(
+        name=_coordinator_report_sidecar_name(
+            session_generation_id=generation_id,
+            cleanup_operation_id=operation_id,
+        ),
+        size=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    return reference, payload
+
+
+def _read_coordinator_report_sidecar(
+    transaction: _OwnedSessionTransaction,
+    reference: OwnedSessionCleanupReportReference,
+    *,
+    expected_session_generation_id: str,
+    expected_cleanup_operation_id: str,
+) -> SessionLifecycleReport:
+    """Read and verify one exact coordinator report through the pinned dirfd."""
+    expected_name = _coordinator_report_sidecar_name(
+        session_generation_id=expected_session_generation_id,
+        cleanup_operation_id=expected_cleanup_operation_id,
+    )
+    if reference.name != expected_name:
+        raise RelayError("coordinator cleanup report sidecar name does not match its identity")
+    payload = transaction.read_bytes(
+        reference.name,
+        maximum_bytes=reference.size,
+    )
+    if payload is None:  # pragma: no cover - required read
+        raise RelayError("coordinator cleanup report sidecar is unavailable")
+    if len(payload) != reference.size:
+        raise RelayError("coordinator cleanup report sidecar size does not match its reference")
+    if not hmac.compare_digest(hashlib.sha256(payload).hexdigest(), reference.sha256):
+        raise RelayError("coordinator cleanup report sidecar digest does not match its reference")
+    try:
+        report = SessionLifecycleReport.model_validate_json(payload)
+    except ValueError as exc:
+        raise RelayError(f"coordinator cleanup report sidecar is invalid: {exc}") from exc
+    if not hmac.compare_digest(session_lifecycle_report_bytes(report), payload):
+        raise RelayError("coordinator cleanup report sidecar is not canonically encoded")
+    return report
+
+
+def _coordinator_report_extends_remote_report(
+    report: SessionLifecycleReport,
+    remote_report: SessionLifecycleReport,
+) -> bool:
+    """Return whether the full coordinator report preserves the remote prefix exactly."""
+    return bool(
+        report.cluster == remote_report.cluster
+        and report.session_id == remote_report.session_id
+        and report.session_generation_id == remote_report.session_generation_id
+        and report.mode == remote_report.mode
+        and report.cleanup_operation_id == remote_report.cleanup_operation_id
+        and report.cleanup_policy == remote_report.cleanup_policy
+        and report.relay_cancel_requested == remote_report.relay_cancel_requested
+        and report.scheduler_cancel_requested == remote_report.scheduler_cancel_requested
+        and report.prior_session_status == remote_report.prior_session_status
+        and report.post_session_status == remote_report.post_session_status
+        and len(report.resources) >= len(remote_report.resources)
+        and report.resources[: len(remote_report.resources)] == remote_report.resources
+    )
 
 
 @dataclass(frozen=True)
@@ -4043,8 +4368,7 @@ def execute_owned_session_teardown(
                 "cluster_registry_removed": False,
                 "completed_at": datetime.now(UTC).isoformat(),
                 "report": report.model_dump(mode="json"),
-                "coordinator_report": None,
-                "coordinator_report_sha256": None,
+                "coordinator_report_ref": None,
             }
             transaction.atomic_write(
                 "metadata.json",
@@ -4094,8 +4418,8 @@ def execute_owned_session_cleanup_finalize(
     ):
         raise RelayError("cancel_scheduler_jobs requires cancel_jobs")
     report = request.coordinator_report
-    observed_sha256 = session_lifecycle_report_sha256(report)
-    if observed_sha256 != request.coordinator_report_sha256:
+    report_reference, report_payload = _coordinator_report_reference(report)
+    if report_reference.sha256 != request.coordinator_report_sha256:
         raise RelayError("coordinator cleanup report digest does not match its request")
     if not (
         report.cluster == request.cluster
@@ -4147,38 +4471,53 @@ def execute_owned_session_cleanup_finalize(
             raise RelayError("cleanup receipt policy does not match coordinator report")
 
         remote_report = SessionLifecycleReport.model_validate(document.get("report"))
-        if not (
-            report.cluster == remote_report.cluster
-            and report.session_id == remote_report.session_id
-            and report.session_generation_id == remote_report.session_generation_id
-            and report.mode == remote_report.mode
-            and report.cleanup_operation_id == remote_report.cleanup_operation_id
-            and report.cleanup_policy == remote_report.cleanup_policy
-            and report.relay_cancel_requested == remote_report.relay_cancel_requested
-            and report.scheduler_cancel_requested == remote_report.scheduler_cancel_requested
-            and report.prior_session_status == remote_report.prior_session_status
-            and report.post_session_status == remote_report.post_session_status
-            and len(report.resources) >= len(remote_report.resources)
-            and report.resources[: len(remote_report.resources)] == remote_report.resources
-        ):
+        if not _coordinator_report_extends_remote_report(report, remote_report):
             raise RelayError("coordinator cleanup report does not extend the exact remote report")
 
+        existing_reference_raw = document.get("coordinator_report_ref")
         existing_report = document.get("coordinator_report")
         existing_sha256 = document.get("coordinator_report_sha256")
-        if existing_report is not None or existing_sha256 is not None:
+        if existing_reference_raw is not None:
+            try:
+                existing_reference = OwnedSessionCleanupReportReference.model_validate(
+                    existing_reference_raw
+                )
+            except ValueError as exc:
+                raise RelayError(
+                    "existing coordinator cleanup report reference is invalid"
+                ) from exc
             if not (
-                existing_sha256 == request.coordinator_report_sha256
-                and existing_report == report.model_dump(mode="json")
+                existing_reference == report_reference
                 and status.coordinator_report_bound
+                and status.coordinator_report_ref == report_reference
+                and status.coordinator_report_sha256 == report_reference.sha256
+                and status.coordinator_report is None
             ):
                 raise RelayError(
                     "coordinator cleanup report is immutable and cannot be replaced or downgraded"
                 )
             return status
 
+        legacy_bound = existing_report is not None or existing_sha256 is not None
+        if legacy_bound and not (
+            existing_sha256 == request.coordinator_report_sha256
+            and existing_report == report.model_dump(mode="json")
+            and status.coordinator_report_bound
+            and status.coordinator_report_ref is None
+        ):
+            raise RelayError(
+                "coordinator cleanup report is immutable and cannot be replaced or downgraded"
+            )
+
+        transaction.atomic_write_immutable(
+            report_reference.name,
+            report_payload,
+            maximum_bytes=MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
+        )
         finalized = dict(document)
-        finalized["coordinator_report"] = report.model_dump(mode="json")
-        finalized["coordinator_report_sha256"] = request.coordinator_report_sha256
+        finalized.pop("coordinator_report", None)
+        finalized.pop("coordinator_report_sha256", None)
+        finalized["coordinator_report_ref"] = report_reference.model_dump(mode="json")
         transaction.atomic_write(
             "metadata.json",
             json.dumps(finalized, indent=2).encode("utf-8"),
@@ -4195,11 +4534,69 @@ def execute_owned_session_cleanup_finalize(
         if not (
             reread.recovery_verified
             and reread.coordinator_report_bound
-            and reread.coordinator_report_sha256 == request.coordinator_report_sha256
-            and reread.coordinator_report == report.model_dump(mode="json")
+            and reread.coordinator_report_ref == report_reference
+            and reread.coordinator_report_sha256 == report_reference.sha256
+            and reread.coordinator_report is None
         ):
             raise RelayError("coordinator cleanup report was not durably re-read after commit")
         return reread
+
+
+def execute_owned_session_cleanup_report_read(
+    request: OwnedSessionCleanupReportReadRequest,
+    *,
+    home: Path | None = None,
+    core_dir: Path | None = None,
+    proc_root: Path = Path("/proc"),
+) -> SessionLifecycleReport:
+    """Read one exact finalized report only through its pinned receipt reference."""
+    from clio_relay.config import RelaySettings
+
+    _validate_session(session_id=request.session_id, remote_api_port=1)
+    settings_core_dir = RelaySettings.from_env().core_dir if core_dir is None else core_dir
+    get_effective_uid = cast(Callable[[], int] | None, getattr(os, "geteuid", None))
+    if get_effective_uid is None:
+        raise RelayError("owned cleanup report read cannot verify the effective user")
+    uid = get_effective_uid()
+    with open_owned_session_transaction(
+        session_id=request.session_id,
+        create=False,
+        timeout_seconds=10.0,
+        home=home,
+    ) as transaction:
+        document = transaction.read_json("metadata.json")
+        if document is None:  # pragma: no cover - required read
+            raise RelayError("owned session cleanup receipt is unavailable")
+        status = inspect_owned_session_recovery_status(
+            cluster=request.cluster,
+            session_id=request.session_id,
+            core_dir=settings_core_dir,
+            home=home,
+            proc_root=proc_root,
+            effective_uid=uid,
+            transaction=transaction,
+        )
+        if not (
+            status.recovery_verified
+            and status.cleanup_receipt
+            and status.cleanup_paths_pending is False
+            and status.session_generation_id == request.expected_session_generation_id
+            and status.coordinator_report_bound
+            and status.coordinator_report is None
+            and status.coordinator_report_ref == request.coordinator_report_ref
+            and status.coordinator_report_sha256 == request.coordinator_report_ref.sha256
+        ):
+            detail = "; ".join(status.errors) or "finalized report reference was not exact"
+            raise RelayError(f"owned cleanup report read was refused: {detail}")
+        cleanup_operation_id = document.get("cleanup_operation_id")
+        if not isinstance(cleanup_operation_id, str):
+            raise RelayError("owned cleanup report receipt omitted its operation id")
+        return _read_coordinator_report_sidecar(
+            transaction,
+            request.coordinator_report_ref,
+            expected_session_generation_id=request.expected_session_generation_id,
+            expected_cleanup_operation_id=cleanup_operation_id,
+        )
 
 
 def start_remote_session(
@@ -4347,22 +4744,80 @@ def finalize_remote_session_cleanup_report(
         coordinator_report=report,
         coordinator_report_sha256=session_lifecycle_report_sha256(report),
     )
-    output = _ssh_script(
+    request_payload = request.model_dump_json().encode("utf-8")
+    output = _ssh_stdin_command(
         definition,
-        _owned_cleanup_finalize_script(definition=definition, request=request),
+        _owned_cleanup_finalize_script(definition=definition),
+        input_bytes=request_payload,
+        input_limit=MAX_OWNED_SESSION_CLEANUP_FINALIZE_BYTES,
+        stdout_limit=_MAX_REMOTE_SESSION_STDOUT_BYTES,
     )
     status = OwnedSessionRecoveryStatus.model_validate_json(output)
+    expected_reference, _ = _coordinator_report_reference(report)
     if not (
         status.recovery_verified
         and status.cleanup_receipt
         and status.cleanup_paths_pending is False
         and status.session_generation_id == session_generation_id
         and status.coordinator_report_bound
-        and status.coordinator_report_sha256 == request.coordinator_report_sha256
-        and status.coordinator_report == report.model_dump(mode="json")
+        and status.coordinator_report is None
+        and status.coordinator_report_ref == expected_reference
+        and status.coordinator_report_sha256 == expected_reference.sha256
     ):
         raise RelayError("remote coordinator cleanup report finalization was not exact")
     return status
+
+
+def read_remote_session_cleanup_report(
+    *,
+    definition: ClusterDefinition,
+    cluster: str,
+    session_id: str,
+    status: OwnedSessionRecoveryStatus,
+) -> SessionLifecycleReport:
+    """Retrieve one finalized report through its exact bounded sidecar reference."""
+    reference = status.coordinator_report_ref
+    generation_id = status.session_generation_id
+    if not (
+        status.cluster == cluster
+        and status.session_id == session_id
+        and status.recovery_verified
+        and status.cleanup_receipt
+        and status.cleanup_paths_pending is False
+        and generation_id is not None
+        and status.coordinator_report_bound
+        and status.coordinator_report is None
+        and reference is not None
+        and status.coordinator_report_sha256 == reference.sha256
+    ):
+        raise RelayError("remote coordinator cleanup report reference is not exact")
+    request = OwnedSessionCleanupReportReadRequest(
+        cluster=cluster,
+        session_id=session_id,
+        expected_session_generation_id=generation_id,
+        coordinator_report_ref=reference,
+    )
+    output = _ssh_stdin_command(
+        definition,
+        _owned_cleanup_report_read_script(definition=definition),
+        input_bytes=request.model_dump_json().encode("utf-8"),
+        input_limit=256 * 1024,
+        stdout_limit=MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES + 64 * 1024,
+    )
+    try:
+        report = SessionLifecycleReport.model_validate_json(output)
+    except ValueError as exc:
+        raise RelayError(f"remote coordinator cleanup report is invalid: {exc}") from exc
+    payload = session_lifecycle_report_bytes(report)
+    if not (
+        len(payload) == reference.size
+        and hmac.compare_digest(hashlib.sha256(payload).hexdigest(), reference.sha256)
+        and report.cluster == cluster
+        and report.session_id == session_id
+        and report.session_generation_id == generation_id
+    ):
+        raise RelayError("remote coordinator cleanup report did not match its exact reference")
+    return report
 
 
 def detach_remote_session(
@@ -4512,15 +4967,23 @@ def _owned_identity_challenge_script(
 def _owned_cleanup_finalize_script(
     *,
     definition: ClusterDefinition,
-    request: OwnedSessionCleanupFinalizeRequest,
 ) -> str:
-    """Carry one bounded coordinator cleanup report over the remote stdin contract."""
+    """Run the bounded coordinator-report finalizer with SSH stdin left intact."""
     return (
         "set -euo pipefail\n"
         "umask 077\n"
         f"{remote_env(definition)}\n"
-        f"printf '%s' {_shell_single_quote(request.model_dump_json())} | "
         "clio-relay session finalize-cleanup-owned\n"
+    )
+
+
+def _owned_cleanup_report_read_script(*, definition: ClusterDefinition) -> str:
+    """Run the pinned coordinator-report reader with SSH stdin left intact."""
+    return (
+        "set -euo pipefail\n"
+        "umask 077\n"
+        f"{remote_env(definition)}\n"
+        "clio-relay session read-cleanup-report-owned\n"
     )
 
 
@@ -4582,6 +5045,46 @@ def _ssh_script(definition: ClusterDefinition, script: str) -> str:
             input_bytes=encoded_script,
             timeout_seconds=_REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS,
             stdout_limit=_MAX_REMOTE_SESSION_STDOUT_BYTES,
+            stderr_limit=_MAX_REMOTE_SESSION_STDERR_BYTES,
+        )
+    except RelayError as exc:
+        if "timed out" in str(exc):
+            raise RelayError(
+                "remote session command timed out after "
+                f"{_REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS:g} seconds"
+            ) from exc
+        raise RelayError(f"remote session command failed safely: {exc}") from exc
+    if result.returncode != 0:
+        stdout = result.stdout.decode("utf-8", errors="replace").strip()
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        detail = stderr or stdout
+        raise RelayError(f"remote session command failed: {detail}")
+    return result.stdout.decode("utf-8", errors="replace")
+
+
+def _ssh_stdin_command(
+    definition: ClusterDefinition,
+    script: str,
+    *,
+    input_bytes: bytes,
+    input_limit: int,
+    stdout_limit: int,
+) -> str:
+    """Run a small remote command while carrying a separately bounded stdin payload."""
+    encoded_script = script.encode("utf-8")
+    if len(encoded_script) > _MAX_REMOTE_SESSION_SCRIPT_BYTES:
+        raise RelayError("remote session command exceeds its byte limit")
+    if input_limit <= 0 or stdout_limit <= 0:
+        raise ValueError("remote session input and output limits must be positive")
+    if len(input_bytes) > input_limit:
+        raise RelayError("remote session stdin exceeds its byte limit")
+    remote_command = f"bash -lc {shlex.quote(script)}"
+    try:
+        result = _run_bounded_command(
+            ["ssh", definition.ssh_host, remote_command],
+            input_bytes=input_bytes,
+            timeout_seconds=_REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS,
+            stdout_limit=stdout_limit,
             stderr_limit=_MAX_REMOTE_SESSION_STDERR_BYTES,
         )
     except RelayError as exc:

@@ -91,8 +91,30 @@ class _FakeSessionTransaction:
         assert isinstance(value, dict)
         return cast(dict[str, object], value)
 
-    def atomic_write(self, name: str, payload: bytes) -> None:
+    def atomic_write(
+        self,
+        name: str,
+        payload: bytes,
+        *,
+        maximum_bytes: int = 1024 * 1024,
+    ) -> None:
+        assert len(payload) <= maximum_bytes
         (self.path / name).write_bytes(payload)
+
+    def atomic_write_immutable(
+        self,
+        name: str,
+        payload: bytes,
+        *,
+        maximum_bytes: int,
+    ) -> None:
+        assert len(payload) <= maximum_bytes
+        path = self.path / name
+        if path.exists():
+            if path.read_bytes() != payload:
+                raise RelayError(f"owned session immutable file already differs: {name}")
+            return
+        path.write_bytes(payload)
 
     def stat_regular(self, name: str, *, required: bool = True) -> os.stat_result | None:
         path = self.path / name
@@ -110,10 +132,14 @@ class _FakeSessionTransaction:
         required: bool = True,
     ) -> bytes | None:
         path = self.path / name
-        if not path.exists():
+        try:
+            linked = path.lstat()
+        except FileNotFoundError:
             if required:
-                raise AssertionError(f"missing required test file: {name}")
+                raise AssertionError(f"missing required test file: {name}") from None
             return None
+        if not stat.S_ISREG(linked.st_mode):
+            raise RelayError(f"owned session file is not one owner-private regular file: {name}")
         payload = path.read_bytes()
         if len(payload) > maximum_bytes:
             raise AssertionError("test transaction observed an unexpected bounded read")
@@ -910,6 +936,23 @@ def test_cleanup_report_finalization_is_immutable_and_idempotent(
             )
         ],
     )
+    coordinator_report = remote_report.model_copy(deep=True)
+    coordinator_report.resources.extend(
+        CleanupResource(
+            kind="relay_job",
+            resource_id=f"job-{index:05d}",
+            location="ares",
+            action="retain",
+            ownership_verified=True,
+            outcome="retained",
+            verified_after_operation=True,
+            observed_state="running",
+        )
+        for index in range(9_999)
+    )
+    coordinator_payload = session_lifecycle.session_lifecycle_report_bytes(coordinator_report)
+    assert len(coordinator_payload) > 1024 * 1024
+    assert len(coordinator_report.resources) == 10_000
 
     class FakeTransaction:
         def __init__(self) -> None:
@@ -917,10 +960,10 @@ def test_cleanup_report_finalization_is_immutable_and_idempotent(
                 "cleanup_operation_id": "cleanup-finalize",
                 "cleanup_policy": policy,
                 "report": remote_report.model_dump(mode="json"),
-                "coordinator_report": None,
-                "coordinator_report_sha256": None,
+                "coordinator_report_ref": None,
             }
             self.writes: list[bytes] = []
+            self.sidecars: dict[str, bytes] = {}
 
         def __enter__(self) -> FakeTransaction:
             return self
@@ -931,26 +974,52 @@ def test_cleanup_report_finalization_is_immutable_and_idempotent(
         def read_json(self, _name: str) -> dict[str, object]:
             return dict(self.document)
 
-        def atomic_write(self, _name: str, payload: bytes) -> None:
+        def atomic_write(
+            self,
+            _name: str,
+            payload: bytes,
+            *,
+            maximum_bytes: int = 1024 * 1024,
+        ) -> None:
+            assert len(payload) <= maximum_bytes
             self.writes.append(payload)
             loaded = json.loads(payload)
             assert isinstance(loaded, dict)
             self.document = cast(dict[str, object], loaded)
 
+        def atomic_write_immutable(
+            self,
+            name: str,
+            payload: bytes,
+            *,
+            maximum_bytes: int,
+        ) -> None:
+            assert len(payload) <= maximum_bytes
+            existing = self.sidecars.get(name)
+            if existing is not None and existing != payload:
+                raise RelayError("owned session immutable file already differs")
+            self.sidecars[name] = payload
+
     transaction = FakeTransaction()
 
     def inspect(**_kwargs: object) -> OwnedSessionRecoveryStatus:
-        coordinator = transaction.document.get("coordinator_report")
-        digest = transaction.document.get("coordinator_report_sha256")
-        bound = isinstance(coordinator, dict) and isinstance(digest, str)
+        raw_reference = transaction.document.get("coordinator_report_ref")
+        reference = (
+            session_lifecycle.OwnedSessionCleanupReportReference.model_validate(raw_reference)
+            if isinstance(raw_reference, dict)
+            else None
+        )
+        bound = reference is not None and reference.name in transaction.sidecars
         return OwnedSessionRecoveryStatus(
             cluster="ares",
             session_id="session-1",
             session_generation_id="generation-1",
             cleanup_receipt=True,
             cleanup_paths_pending=False,
-            coordinator_report=(cast(dict[str, object], coordinator) if bound else None),
-            coordinator_report_sha256=cast(str, digest) if bound else None,
+            coordinator_report_ref=reference if bound else None,
+            coordinator_report_sha256=(
+                reference.sha256 if bound and reference is not None else None
+            ),
             coordinator_report_bound=bound,
             ownership_verified=True,
             recovery_verified=True,
@@ -969,8 +1038,8 @@ def test_cleanup_report_finalization_is_immutable_and_idempotent(
         expected_session_generation_id="generation-1",
         expected_cleanup_operation_id="cleanup-finalize",
         expected_cleanup_policy=policy,
-        coordinator_report=remote_report,
-        coordinator_report_sha256=session_lifecycle_report_sha256(remote_report),
+        coordinator_report=coordinator_report,
+        coordinator_report_sha256=session_lifecycle_report_sha256(coordinator_report),
     )
 
     finalized = execute_owned_session_cleanup_finalize(
@@ -987,8 +1056,12 @@ def test_cleanup_report_finalization_is_immutable_and_idempotent(
     assert finalized.coordinator_report_bound is True
     assert repeated.coordinator_report_sha256 == request.coordinator_report_sha256
     assert len(transaction.writes) == 1
+    assert len(transaction.sidecars) == 1
+    assert len(transaction.writes[0]) < 1024 * 1024
+    assert next(iter(transaction.sidecars.values())) == coordinator_payload
+    assert len(finalized.model_dump_json().encode("utf-8")) < 1024 * 1024
 
-    replacement = remote_report.model_copy(deep=True)
+    replacement = coordinator_report.model_copy(deep=True)
     replacement.resources.append(
         CleanupResource(
             kind="owner_session",
@@ -1012,6 +1085,178 @@ def test_cleanup_report_finalization_is_immutable_and_idempotent(
             core_dir=tmp_path / "core",
         )
     assert len(transaction.writes) == 1
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("truncate", "size"),
+        ("tamper", "digest"),
+        ("symlink", "owner-private regular"),
+        ("reference", "name"),
+    ],
+)
+def test_coordinator_report_sidecar_rejects_identity_drift(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    mutation: str,
+    expected_error: str,
+) -> None:
+    report = SessionLifecycleReport(
+        cluster="ares",
+        session_id="session-1",
+        session_generation_id="generation-1",
+        mode="teardown",
+        cleanup_operation_id="cleanup-sidecar",
+        cleanup_policy={
+            "stop_worker": False,
+            "cancel_jobs": False,
+            "cancel_scheduler_jobs": False,
+        },
+    )
+    reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report
+    )
+    transaction = _FakeSessionTransaction(tmp_path, session_id="session-1")
+    transaction.atomic_write_immutable(
+        reference.name,
+        payload,
+        maximum_bytes=session_lifecycle.MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
+    )
+    selected_reference = reference
+    if mutation == "truncate":
+        (tmp_path / reference.name).write_bytes(payload[:-1])
+    elif mutation == "tamper":
+        (tmp_path / reference.name).write_bytes(payload[:-1] + bytes([payload[-1] ^ 1]))
+    elif mutation == "symlink":
+        original_read = transaction.read_bytes
+
+        def reject_symlink(
+            name: str,
+            *,
+            maximum_bytes: int,
+            required: bool = True,
+        ) -> bytes | None:
+            if name == reference.name:
+                raise RelayError(
+                    f"owned session file is not one owner-private regular file: {name}"
+                )
+            return original_read(name, maximum_bytes=maximum_bytes, required=required)
+
+        monkeypatch.setattr(transaction, "read_bytes", reject_symlink)
+    else:
+        selected_reference = reference.model_copy(
+            update={"name": f"coordinator-cleanup-report-{'f' * 64}.json"}
+        )
+
+    with pytest.raises(RelayError, match=expected_error):
+        session_lifecycle._read_coordinator_report_sidecar(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            transaction,  # pyright: ignore[reportArgumentType]
+            selected_reference,
+            expected_session_generation_id="generation-1",
+            expected_cleanup_operation_id="cleanup-sidecar",
+        )
+
+
+def test_large_cleanup_finalize_uses_separate_bounded_ssh_stdin(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    marker = "report-body-must-not-enter-the-shell"
+    report = SessionLifecycleReport(
+        cluster="ares",
+        session_id="session-1",
+        session_generation_id="generation-1",
+        mode="teardown",
+        cleanup_operation_id="cleanup-transport",
+        cleanup_policy={
+            "stop_worker": False,
+            "cancel_jobs": False,
+            "cancel_scheduler_jobs": False,
+        },
+        resources=[
+            CleanupResource(
+                kind="relay_job",
+                resource_id="job-1",
+                location="ares",
+                action="retain",
+                ownership_verified=True,
+                outcome="retained",
+                verified_after_operation=True,
+                detail=marker + ("x" * (1100 * 1024)),
+            )
+        ],
+    )
+    reference, report_payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report
+    )
+    assert len(report_payload) > 1024 * 1024
+    status = OwnedSessionRecoveryStatus(
+        cluster="ares",
+        session_id="session-1",
+        session_generation_id="generation-1",
+        cleanup_receipt=True,
+        cleanup_paths_pending=False,
+        coordinator_report_ref=reference,
+        coordinator_report_sha256=reference.sha256,
+        coordinator_report_bound=True,
+        ownership_verified=True,
+        recovery_verified=True,
+    )
+    status_payload = status.model_dump_json().encode("utf-8")
+    assert len(status_payload) < 1024 * 1024
+    assert status.coordinator_report is None
+    observed: dict[str, object] = {}
+
+    def run_bounded(
+        command: list[str],
+        *,
+        input_bytes: bytes,
+        timeout_seconds: float,
+        stdout_limit: int,
+        stderr_limit: int,
+        environment: dict[str, str] | None = None,
+    ) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        observed.update(
+            command=command,
+            input_bytes=input_bytes,
+            timeout_seconds=timeout_seconds,
+            stdout_limit=stdout_limit,
+            stderr_limit=stderr_limit,
+            environment=environment,
+        )
+        return session_lifecycle._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            returncode=0,
+            stdout=status_payload,
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", run_bounded)
+    finalized = session_lifecycle.finalize_remote_session_cleanup_report(
+        definition=ClusterDefinition(name="ares", ssh_host="ares"),
+        cluster="ares",
+        session_id="session-1",
+        session_generation_id="generation-1",
+        cleanup_operation_id="cleanup-transport",
+        cleanup_policy=report.cleanup_policy,
+        report=report,
+    )
+
+    command = cast(list[str], observed["command"])
+    input_bytes = cast(bytes, observed["input_bytes"])
+    assert finalized.coordinator_report_ref == reference
+    assert len(input_bytes) > 1024 * 1024
+    assert marker.encode("utf-8") in input_bytes
+    assert marker not in " ".join(command)
+    assert len(" ".join(command).encode("utf-8")) < 64 * 1024
+    assert observed["stdout_limit"] == 1024 * 1024
+    with pytest.raises(RelayError, match="stdin exceeds"):
+        session_lifecycle._ssh_stdin_command(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            ClusterDefinition(name="ares", ssh_host="ares"),
+            "true",
+            input_bytes=b"oversized",
+            input_limit=1,
+            stdout_limit=1,
+        )
 
 
 def test_scheduler_cancellation_evidence_rejects_an_extra_relay_link() -> None:

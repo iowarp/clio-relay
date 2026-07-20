@@ -223,8 +223,10 @@ from clio_relay.scheduler_validation import run_scheduler_lifecycle_validation
 from clio_relay.service_runtime import ServiceRuntimeSupervisor
 from clio_relay.session_api import submit_owned_session_job
 from clio_relay.session_lifecycle import (
+    MAX_OWNED_SESSION_CLEANUP_FINALIZE_BYTES,
     CleanupResource,
     OwnedSessionCleanupFinalizeRequest,
+    OwnedSessionCleanupReportReadRequest,
     OwnedSessionIdentityChallengeRequest,
     OwnedSessionRecoveryStatus,
     OwnedSessionStartRequest,
@@ -234,6 +236,7 @@ from clio_relay.session_lifecycle import (
     cleanup_connectors_cover_gateways,
     detach_remote_session,
     execute_owned_session_cleanup_finalize,
+    execute_owned_session_cleanup_report_read,
     execute_owned_session_identity_challenge,
     execute_owned_session_start,
     execute_owned_session_teardown,
@@ -241,6 +244,7 @@ from clio_relay.session_lifecycle import (
     inspect_owned_session_recovery_status,
     open_owned_session_transaction,
     publish_owned_session_api_startup_receipt,
+    read_remote_session_cleanup_report,
     session_lifecycle_report_sha256,
     start_remote_session,
     status_remote_session,
@@ -3329,8 +3333,15 @@ def _finalize_completed_cleanup_receipt_before_start(
         return
     if not status.cleanup_receipt:
         return
+    report = read_remote_session_cleanup_report(
+        definition=definition,
+        cluster=cluster,
+        session_id=session_id,
+        status=status,
+    )
     report = _verified_finalized_cleanup_report(
         status,
+        report=report,
         cluster=cluster,
         session_id=session_id,
     )
@@ -3386,6 +3397,7 @@ def _finalize_completed_cleanup_receipt_before_start(
 def _verified_finalized_cleanup_report(
     status: OwnedSessionRecoveryStatus,
     *,
+    report: SessionLifecycleReport,
     cluster: str,
     session_id: str,
 ) -> SessionLifecycleReport:
@@ -3402,18 +3414,19 @@ def _verified_finalized_cleanup_report(
         )
     if not (
         status.coordinator_report_bound
-        and status.coordinator_report is not None
+        and status.coordinator_report is None
+        and status.coordinator_report_ref is not None
         and status.coordinator_report_sha256 is not None
     ):
         raise RelayError(
             "owned session cleanup has only cluster-local evidence; retry teardown to "
             "finalize desktop, connector, gateway, relay, and scheduler dispositions"
         )
-    try:
-        report = SessionLifecycleReport.model_validate(status.coordinator_report)
-    except ValidationError as exc:
-        raise RelayError(f"coordinator cleanup report is invalid: {exc}") from exc
-    if session_lifecycle_report_sha256(report) != status.coordinator_report_sha256:
+    report_sha256 = session_lifecycle_report_sha256(report)
+    if not (
+        report_sha256 == status.coordinator_report_sha256
+        and report_sha256 == status.coordinator_report_ref.sha256
+    ):
         raise RelayError("coordinator cleanup report digest did not match its receipt")
     policy = report.cleanup_policy
     if set(policy) != {"stop_worker", "cancel_jobs", "cancel_scheduler_jobs"}:
@@ -3464,6 +3477,7 @@ def _persist_verified_cleanup_report_before_closure(
     )
     finalized_report = _verified_finalized_cleanup_report(
         finalized_status,
+        report=report,
         cluster=cluster,
         session_id=session_id,
     )
@@ -3761,7 +3775,7 @@ def session_finalize_cleanup_owned() -> None:
     """Bind a bounded coordinator-verified report to one cleanup receipt."""
 
     def action() -> None:
-        maximum_bytes = 1024 * 1024
+        maximum_bytes = MAX_OWNED_SESSION_CLEANUP_FINALIZE_BYTES
         payload = sys.stdin.buffer.read(maximum_bytes + 1)
         if len(payload) > maximum_bytes:
             raise RelayError("owned session cleanup finalization exceeds its byte limit")
@@ -3770,6 +3784,24 @@ def session_finalize_cleanup_owned() -> None:
         except ValueError as exc:
             raise RelayError(f"owned session cleanup finalization is invalid: {exc}") from exc
         typer.echo(execute_owned_session_cleanup_finalize(request).model_dump_json())
+
+    _run_or_exit(action)
+
+
+@session_app.command("read-cleanup-report-owned", hidden=True)
+def session_read_cleanup_report_owned() -> None:
+    """Read one finalized cleanup report through its exact sidecar reference."""
+
+    def action() -> None:
+        maximum_bytes = 256 * 1024
+        payload = sys.stdin.buffer.read(maximum_bytes + 1)
+        if len(payload) > maximum_bytes:
+            raise RelayError("owned session cleanup report read exceeds its byte limit")
+        try:
+            request = OwnedSessionCleanupReportReadRequest.model_validate_json(payload)
+        except ValueError as exc:
+            raise RelayError(f"owned session cleanup report read is invalid: {exc}") from exc
+        typer.echo(execute_owned_session_cleanup_report_read(request).model_dump_json())
 
     _run_or_exit(action)
 
