@@ -117,6 +117,84 @@ def test_release_bootstrap_acceptance_proves_bounded_reuse_and_service_repair() 
     assert 'Assert-BootstrapReuse $BootstrapRepairReceipt "repaired" 60' in runbook
 
 
+def test_bootstrap_reuse_runbook_helpers_execute_under_powershell(tmp_path: Path) -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    function_sources: list[str] = []
+    for name in ("Get-BootstrapReceipt", "Assert-BootstrapReuse"):
+        function_match = re.search(
+            rf"^function {re.escape(name)} \{{.*?^\}}",
+            runbook,
+            flags=re.DOTALL | re.MULTILINE,
+        )
+        assert function_match is not None
+        function_sources.append(function_match.group(0))
+    powershell = next(
+        (
+            executable
+            for name in ("powershell.exe", "pwsh", "powershell")
+            if (executable := shutil.which(name)) is not None
+        ),
+        None,
+    )
+    assert powershell is not None, "PowerShell is required to validate the release runbook"
+    receipt = {
+        "schema_version": "clio-relay.bootstrap-receipt.v2",
+        "outcome": "noop_verified",
+        "operations": {
+            "payload_transfer_count": 0,
+            "payload_transfer_bytes": 0,
+            "download_count": 0,
+            "scheduler_submission_count": 0,
+            "scheduler_cancellation_count": 0,
+        },
+        "jarvis_commands": {"count": 0},
+        "jarvis_initialization": {"action": "preserved"},
+        "jarvis_resource_graph": {"action": "preserved"},
+        "jarvis_preservation": {
+            "config_byte_identical": True,
+            "resource_graph_byte_identical": True,
+        },
+        "components": {"clio-relay": {"action": "reused"}},
+    }
+    receipt_json = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    script_path = tmp_path / "bootstrap-reuse-helpers.ps1"
+    script_path.write_text(
+        "\n".join(
+            (
+                "param([string] $ReceiptJson)",
+                "Set-StrictMode -Version Latest",
+                "$ErrorActionPreference = 'Stop'",
+                *function_sources,
+                '$Result = [pscustomobject]@{ Output = "bootstrap_receipt_json=$ReceiptJson" }',
+                "$Receipt = Get-BootstrapReceipt $Result",
+                'Assert-BootstrapReuse $Receipt "noop_verified" 30 1.25',
+                'Write-Output "ok"',
+            )
+        ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            powershell,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script_path),
+            receipt_json,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
+
+
 def test_spack_json_array_fallback_is_safe_under_powershell_strict_mode() -> None:
     runbook = RUNBOOK.read_text(encoding="utf-8")
 
