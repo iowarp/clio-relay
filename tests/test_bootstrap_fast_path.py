@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tarfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn
@@ -168,3 +169,28 @@ def test_release_identity_rejects_validation_digest_different_from_pypi(
             relay_wheel=None,
             relay_artifact_sha256="e" * 64,
         )
+
+
+def test_payload_script_uses_digest_bound_safe_extractor() -> None:
+    """Payload bootstrap never dispatches the source archive through raw tar."""
+    script = bootstrap.render_linux_user_bootstrap_script(cluster="cluster-a")
+
+    assert 'tar -xf "$SOURCE_ARCHIVE"' not in script
+    assert "stream.extractall(destination" not in script
+    assert "from clio_relay.safe_archive import safe_extract_tar" in script
+    assert "candidate_safe_archive" not in script
+    assert "BOOTSTRAP_CANDIDATE_PACKAGE/safe_archive.py" in script
+
+
+def test_packaged_payload_archive_has_only_safe_canonical_modes(tmp_path: Path) -> None:
+    """Windows host modes cannot leak group/world write bits into the wire tar."""
+    deployment = bootstrap.create_bootstrap_archive(
+        source_root=tmp_path / "not-a-checkout",
+        archive=tmp_path / "bootstrap.tar",
+    )
+
+    with tarfile.open(deployment.archive, "r:") as archive:
+        members = archive.getmembers()
+    assert members
+    assert all(member.isdir() or member.isreg() for member in members)
+    assert all(member.mode == (0o755 if member.isdir() else 0o644) for member in members)
