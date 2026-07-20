@@ -4254,6 +4254,109 @@ def session_teardown(
         remote_execution = should_execute_on_cluster(definition)
         queue = _managed_queue_from_env()
         cleanup_worker_info, cleanup_worker_error = _observe_worker_before_cleanup(definition)
+
+        def emit_completed_report(
+            report: SessionLifecycleReport,
+            *,
+            canceled_job_ids: list[str],
+            gateway_reports: list[dict[str, object]],
+            recovery: OwnedSessionRecoveryStatus | None,
+        ) -> None:
+            """Emit one completed report without rediscovering its resource dispositions."""
+            payload = report.json_payload()
+            payload["cleanup_evidence"] = report.to_cleanup_evidence(
+                stop_worker=stop_worker
+            ).model_dump(mode="json")
+            payload["relay_jobs"] = {
+                "cancel_requested": cancel_jobs,
+                "scheduler_cancel_requested": cancel_jobs and cancel_scheduler_jobs,
+                "canceled_job_ids": canceled_job_ids,
+            }
+            payload["gateway_sessions"] = gateway_reports
+            if recovery is not None:
+                payload["recovery_evidence"] = recovery.model_dump(mode="json")
+            canonical = report.to_live_validation_report(
+                stop_worker=stop_worker,
+                cancel_jobs=cancel_jobs,
+                launcher=validation_launcher,
+                install_source=validation_install_source,
+                artifact_sha256=(
+                    sha256_file(validation_artifact) if validation_artifact is not None else None
+                ),
+            )
+            canonical = canonical.model_copy(
+                update={"report_id": seed_report.report_id, "started_at": seed_report.started_at}
+            )
+            if recovery_resource is not None:
+                canonical.resources.append(recovery_resource)
+            canonical_report[0] = canonical
+            for job_id in canceled_job_ids:
+                canonical.resources.append(
+                    ValidationResource(
+                        kind="relay_job",
+                        resource_id=job_id,
+                        role="cleanup_cancel",
+                        cluster=cluster,
+                        state="canceled",
+                    )
+                )
+            provenance_warning = _write_cleanup_validation_report(
+                canonical,
+                definition,
+                canonical_report_path,
+                observed_worker_info=cleanup_worker_info,
+                worker_observation_error=cleanup_worker_error,
+            )
+            payload["validation_report"] = str(canonical_report_path.resolve())
+            payload["validation_status"] = canonical.status.value
+            payload["validation_provenance_warning"] = provenance_warning
+            typer.echo(_public_json(payload))
+            canonical_ok = canonical.status is ValidationStatus.PASSED
+            if payload.get("ok") is not True or (not canonical_ok and not provenance_warning):
+                raise typer.Exit(code=1)
+
+        def append_owner_session_closure(
+            report: SessionLifecycleReport,
+            *,
+            generation_id: str,
+            operation_id: str,
+        ) -> None:
+            """Append the post-report authoritative closure evidence exactly once."""
+            resource_id = f"{session_id}:{generation_id}"
+            existing = [
+                resource
+                for resource in report.resources
+                if resource.kind == "owner_session" and resource.resource_id == resource_id
+            ]
+            if existing:
+                if len(existing) != 1 or not (
+                    existing[0].action == "close"
+                    and existing[0].outcome == "closed"
+                    and existing[0].ownership_verified
+                    and existing[0].verified_after_operation
+                    and not existing[0].residual
+                    and existing[0].metadata.get("cleanup_operation_id") == operation_id
+                ):
+                    raise RelayError("persisted owner-session closure evidence drifted")
+                return
+            report.resources.append(
+                CleanupResource(
+                    kind="owner_session",
+                    resource_id=resource_id,
+                    location=definition.ssh_host if remote_execution else str(queue.root),
+                    action="close",
+                    ownership_verified=True,
+                    outcome="closed",
+                    verified_after_operation=True,
+                    metadata={
+                        "session_generation_id": generation_id,
+                        "cleanup_operation_id": operation_id,
+                        "cleanup_policy": report.cleanup_policy,
+                        "covered_legacy_job_ids": [],
+                    },
+                )
+            )
+
         initial_status_error: str | None = None
         try:
             pre_teardown_status = status_remote_session(
@@ -4302,6 +4405,24 @@ def session_teardown(
                 "process_absence_verified": recovery_status.process_absence_verified,
                 "process_state": recovery_status.process_state,
             }
+        finalized_retry_report: SessionLifecycleReport | None = None
+        if (
+            recovery_status is not None
+            and recovery_status.cleanup_receipt
+            and recovery_status.coordinator_report_bound
+        ):
+            finalized_retry_report = _verified_finalized_cleanup_report(
+                recovery_status,
+                cluster=cluster,
+                session_id=session_id,
+            )
+            requested_policy = {
+                "stop_worker": stop_worker,
+                "cancel_jobs": cancel_jobs,
+                "cancel_scheduler_jobs": cancel_scheduler_jobs,
+            }
+            if finalized_retry_report.cleanup_policy != requested_policy:
+                raise RelayError("finalized cleanup retry changed its immutable policy")
         local_admission_session_id = _desktop_owner_session_admission_id(
             cluster=cluster,
             session_id=session_id,
@@ -4333,6 +4454,67 @@ def session_teardown(
             cancel_jobs=cancel_jobs,
             cancel_scheduler_jobs=cancel_scheduler_jobs,
         )
+        if finalized_retry_report is not None:
+            if not (
+                finalized_retry_report.session_generation_id == session_generation_id
+                and finalized_retry_report.cleanup_operation_id == cleanup_operation_id
+            ):
+                raise RelayError(
+                    "finalized cleanup retry changed its operation or generation identity"
+                )
+            _mark_owner_session_closed(
+                queue=queue,
+                definition=definition,
+                remote_execution=remote_execution,
+                session_id=session_id,
+                local_admission_session_id=local_admission_session_id,
+                session_generation_id=session_generation_id,
+                legacy_unversioned_job_ids=[],
+            )
+            report = finalized_retry_report.model_copy(deep=True)
+            append_owner_session_closure(
+                report,
+                generation_id=session_generation_id,
+                operation_id=cleanup_operation_id,
+            )
+            canceled_job_ids = sorted(
+                {
+                    resource.resource_id
+                    for resource in report.resources
+                    if resource.kind == "relay_job"
+                    and resource.action == "cancel"
+                    and resource.outcome == "canceled"
+                    and resource.ownership_verified
+                    and resource.verified_after_operation
+                    and not resource.residual
+                }
+            )
+            gateway_resources = [
+                resource.model_dump(mode="json")
+                for resource in report.resources
+                if resource.kind in {"desktop_connector", "remote_connector", "gateway_record"}
+            ]
+            recovered_gateway_reports: list[dict[str, object]] = (
+                [
+                    {
+                        "schema_version": "clio-relay.finalized-gateway-cleanup.v1",
+                        "source": "finalized_coordinator_report",
+                        "resources": gateway_resources,
+                        "residual_resources": [],
+                        "errors": [],
+                        "ok": True,
+                    }
+                ]
+                if gateway_resources
+                else []
+            )
+            emit_completed_report(
+                report,
+                canceled_job_ids=canceled_job_ids,
+                gateway_reports=recovered_gateway_reports,
+                recovery=recovery_status,
+            )
+            return
         partial = seed_report
         partial.cleanup = CleanupEvidence(
             requested=True,
@@ -4776,74 +4958,17 @@ def session_teardown(
             session_generation_id=session_generation_id,
             legacy_unversioned_job_ids=legacy_unversioned_job_ids,
         )
-        report.resources.append(
-            CleanupResource(
-                kind="owner_session",
-                resource_id=f"{session_id}:{session_generation_id}",
-                location=definition.ssh_host if remote_execution else str(queue.root),
-                action="close",
-                ownership_verified=True,
-                outcome="closed",
-                verified_after_operation=True,
-                metadata={
-                    "session_generation_id": session_generation_id,
-                    "cleanup_operation_id": report.cleanup_operation_id,
-                    "cleanup_policy": report.cleanup_policy,
-                    "covered_legacy_job_ids": legacy_unversioned_job_ids,
-                },
-            )
+        append_owner_session_closure(
+            report,
+            generation_id=session_generation_id,
+            operation_id=report.cleanup_operation_id,
         )
-        payload = report.json_payload()
-        payload["cleanup_evidence"] = report.to_cleanup_evidence(
-            stop_worker=stop_worker
-        ).model_dump(mode="json")
-        payload["relay_jobs"] = {
-            "cancel_requested": cancel_jobs,
-            "scheduler_cancel_requested": cancel_jobs and cancel_scheduler_jobs,
-            "canceled_job_ids": canceled,
-        }
-        payload["gateway_sessions"] = gateway_reports
-        if recovery_status is not None:
-            payload["recovery_evidence"] = recovery_status.model_dump(mode="json")
-        canonical = report.to_live_validation_report(
-            stop_worker=stop_worker,
-            cancel_jobs=cancel_jobs,
-            launcher=validation_launcher,
-            install_source=validation_install_source,
-            artifact_sha256=(
-                sha256_file(validation_artifact) if validation_artifact is not None else None
-            ),
+        emit_completed_report(
+            report,
+            canceled_job_ids=canceled,
+            gateway_reports=gateway_reports,
+            recovery=recovery_status,
         )
-        canonical = canonical.model_copy(
-            update={"report_id": seed_report.report_id, "started_at": seed_report.started_at}
-        )
-        if recovery_resource is not None:
-            canonical.resources.append(recovery_resource)
-        canonical_report[0] = canonical
-        for job_id in canceled:
-            canonical.resources.append(
-                ValidationResource(
-                    kind="relay_job",
-                    resource_id=job_id,
-                    role="cleanup_cancel",
-                    cluster=cluster,
-                    state="canceled",
-                )
-            )
-        provenance_warning = _write_cleanup_validation_report(
-            canonical,
-            definition,
-            canonical_report_path,
-            observed_worker_info=cleanup_worker_info,
-            worker_observation_error=cleanup_worker_error,
-        )
-        payload["validation_report"] = str(canonical_report_path.resolve())
-        payload["validation_status"] = canonical.status.value
-        payload["validation_provenance_warning"] = provenance_warning
-        typer.echo(_public_json(payload))
-        canonical_ok = canonical.status is ValidationStatus.PASSED
-        if payload.get("ok") is not True or (not canonical_ok and not provenance_warning):
-            raise typer.Exit(code=1)
 
     def guarded_action() -> None:
         try:
