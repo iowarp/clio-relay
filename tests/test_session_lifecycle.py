@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import stat
@@ -29,6 +30,7 @@ from clio_relay.session_lifecycle import (
     SESSION_WORKER_CHECK_ID,
     CleanupResource,
     OwnedSessionCleanupFinalizeRequest,
+    OwnedSessionCleanupReportReadRequest,
     OwnedSessionCleanupTarget,
     OwnedSessionRecoveryStatus,
     OwnedSessionStartRequest,
@@ -38,6 +40,7 @@ from clio_relay.session_lifecycle import (
     challenge_remote_session_identity,
     detach_remote_session,
     execute_owned_session_cleanup_finalize,
+    execute_owned_session_cleanup_report_read,
     execute_owned_session_start,
     inspect_owned_session_recovery_status,
     session_lifecycle_report_sha256,
@@ -1085,6 +1088,458 @@ def test_cleanup_report_finalization_is_immutable_and_idempotent(
             core_dir=tmp_path / "core",
         )
     assert len(transaction.writes) == 1
+
+
+def _cleanup_sidecar_report() -> SessionLifecycleReport:
+    """Build one exact coordinator report for cleanup-sidecar boundary tests."""
+    return SessionLifecycleReport(
+        cluster="ares",
+        session_id="session-1",
+        session_generation_id="generation-1",
+        mode="teardown",
+        cleanup_operation_id="cleanup-sidecar",
+        cleanup_policy={
+            "stop_worker": False,
+            "cancel_jobs": False,
+            "cancel_scheduler_jobs": False,
+        },
+        relay_cancel_requested=False,
+        scheduler_cancel_requested=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "cluster",
+        "session",
+        "generation",
+        "operation",
+        "policy",
+        "relay_disposition",
+        "scheduler_disposition",
+    ],
+)
+def test_cleanup_finalize_rejects_request_report_identity_drift(mutation: str) -> None:
+    report = _cleanup_sidecar_report()
+    request_values: dict[str, object] = {
+        "cluster": "ares",
+        "session_id": "session-1",
+        "expected_session_generation_id": "generation-1",
+        "expected_cleanup_operation_id": "cleanup-sidecar",
+        "expected_cleanup_policy": dict(report.cleanup_policy),
+        "coordinator_report": report,
+        "coordinator_report_sha256": session_lifecycle_report_sha256(report),
+    }
+    if mutation == "cluster":
+        request_values["cluster"] = "other-cluster"
+    elif mutation == "session":
+        request_values["session_id"] = "other-session"
+    elif mutation == "generation":
+        request_values["expected_session_generation_id"] = "generation-other"
+    elif mutation == "operation":
+        request_values["expected_cleanup_operation_id"] = "cleanup-other"
+    elif mutation == "policy":
+        request_values["expected_cleanup_policy"] = {
+            "stop_worker": True,
+            "cancel_jobs": False,
+            "cancel_scheduler_jobs": False,
+        }
+    elif mutation == "relay_disposition":
+        report.relay_cancel_requested = True
+        request_values["coordinator_report_sha256"] = session_lifecycle_report_sha256(report)
+    else:
+        report.scheduler_cancel_requested = True
+        request_values["coordinator_report_sha256"] = session_lifecycle_report_sha256(report)
+
+    request = OwnedSessionCleanupFinalizeRequest.model_validate(request_values)
+    with pytest.raises(RelayError, match="identity or policy"):
+        execute_owned_session_cleanup_finalize(request)
+
+
+@pytest.mark.parametrize("mutation", ["operation", "policy"])
+def test_cleanup_finalize_rejects_receipt_identity_drift(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    mutation: str,
+) -> None:
+    report = _cleanup_sidecar_report()
+    transaction = _FakeSessionTransaction(tmp_path, session_id="session-1")
+    receipt_operation = "cleanup-other" if mutation == "operation" else "cleanup-sidecar"
+    receipt_policy = dict(report.cleanup_policy)
+    if mutation == "policy":
+        receipt_policy["stop_worker"] = True
+    transaction.atomic_write(
+        "metadata.json",
+        json.dumps(
+            {
+                "cleanup_operation_id": receipt_operation,
+                "cleanup_policy": receipt_policy,
+                "report": report.model_dump(mode="json"),
+                "coordinator_report_ref": None,
+            }
+        ).encode("utf-8"),
+    )
+    status = OwnedSessionRecoveryStatus(
+        cluster="ares",
+        session_id="session-1",
+        session_generation_id="generation-1",
+        cleanup_receipt=True,
+        cleanup_paths_pending=False,
+        ownership_verified=True,
+        recovery_verified=True,
+    )
+
+    def open_transaction(**_kwargs: object) -> _FakeSessionTransaction:
+        return transaction
+
+    def inspect_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        return status
+
+    monkeypatch.setattr(
+        session_lifecycle,
+        "open_owned_session_transaction",
+        open_transaction,
+    )
+    monkeypatch.setattr(
+        session_lifecycle,
+        "inspect_owned_session_recovery_status",
+        inspect_status,
+    )
+    monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)
+    request = OwnedSessionCleanupFinalizeRequest(
+        cluster="ares",
+        session_id="session-1",
+        expected_session_generation_id="generation-1",
+        expected_cleanup_operation_id="cleanup-sidecar",
+        expected_cleanup_policy=report.cleanup_policy,
+        coordinator_report=report,
+        coordinator_report_sha256=session_lifecycle_report_sha256(report),
+    )
+
+    with pytest.raises(RelayError, match=f"receipt {mutation}"):
+        execute_owned_session_cleanup_finalize(
+            request,
+            home=tmp_path,
+            core_dir=tmp_path / "core",
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("truncate", "size"),
+        ("tamper", "digest"),
+        ("metadata_operation", "name"),
+        ("request_reference", "refused"),
+        ("request_generation", "refused"),
+    ],
+)
+def test_cleanup_report_read_server_boundary_rejects_drift(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    mutation: str,
+    expected_error: str,
+) -> None:
+    report = _cleanup_sidecar_report()
+    reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report
+    )
+    transaction = _FakeSessionTransaction(tmp_path, session_id="session-1")
+    (tmp_path / reference.name).write_bytes(payload)
+    operation_id = "cleanup-other" if mutation == "metadata_operation" else "cleanup-sidecar"
+    transaction.atomic_write(
+        "metadata.json",
+        json.dumps({"cleanup_operation_id": operation_id}).encode("utf-8"),
+    )
+    if mutation == "truncate":
+        (tmp_path / reference.name).write_bytes(payload[:-1])
+    elif mutation == "tamper":
+        (tmp_path / reference.name).write_bytes(payload[:-1] + bytes([payload[-1] ^ 1]))
+    request_reference = (
+        reference.model_copy(update={"name": f"coordinator-cleanup-report-{'f' * 64}.json"})
+        if mutation == "request_reference"
+        else reference
+    )
+    request_generation = "generation-other" if mutation == "request_generation" else "generation-1"
+    status = OwnedSessionRecoveryStatus(
+        cluster="ares",
+        session_id="session-1",
+        session_generation_id="generation-1",
+        cleanup_receipt=True,
+        cleanup_paths_pending=False,
+        coordinator_report_ref=reference,
+        coordinator_report_sha256=reference.sha256,
+        coordinator_report_bound=True,
+        ownership_verified=True,
+        recovery_verified=True,
+    )
+
+    def open_transaction(**_kwargs: object) -> _FakeSessionTransaction:
+        return transaction
+
+    def inspect_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        return status
+
+    monkeypatch.setattr(
+        session_lifecycle,
+        "open_owned_session_transaction",
+        open_transaction,
+    )
+    monkeypatch.setattr(
+        session_lifecycle,
+        "inspect_owned_session_recovery_status",
+        inspect_status,
+    )
+    monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)
+    request = OwnedSessionCleanupReportReadRequest(
+        cluster="ares",
+        session_id="session-1",
+        expected_session_generation_id=request_generation,
+        coordinator_report_ref=request_reference,
+    )
+
+    with pytest.raises(RelayError, match=expected_error):
+        execute_owned_session_cleanup_report_read(
+            request,
+            home=tmp_path,
+            core_dir=tmp_path / "core",
+        )
+
+
+def test_legacy_inline_cleanup_report_migration_recovers_after_metadata_write_failure(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    report = _cleanup_sidecar_report()
+    report_sha256 = session_lifecycle_report_sha256(report)
+
+    class CrashOnceTransaction(_FakeSessionTransaction):
+        """Fail once after sidecar publication but before metadata compaction."""
+
+        def __init__(self, path: Path) -> None:
+            super().__init__(path, session_id="session-1")
+            self.fail_metadata_write = True
+            self.successful_metadata_writes = 0
+
+        def atomic_write(
+            self,
+            name: str,
+            payload: bytes,
+            *,
+            maximum_bytes: int = 1024 * 1024,
+        ) -> None:
+            if name == "metadata.json" and self.fail_metadata_write:
+                self.fail_metadata_write = False
+                raise RelayError("simulated metadata compaction failure")
+            super().atomic_write(name, payload, maximum_bytes=maximum_bytes)
+            if name == "metadata.json":
+                self.successful_metadata_writes += 1
+
+    transaction = CrashOnceTransaction(tmp_path)
+    initial_document = {
+        "cleanup_operation_id": "cleanup-sidecar",
+        "cleanup_policy": report.cleanup_policy,
+        "report": report.model_dump(mode="json"),
+        "coordinator_report": report.model_dump(mode="json"),
+        "coordinator_report_sha256": report_sha256,
+    }
+    (tmp_path / "metadata.json").write_text(json.dumps(initial_document), encoding="utf-8")
+
+    def inspect(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        document = transaction.read_json("metadata.json")
+        assert document is not None
+        raw_reference = document.get("coordinator_report_ref")
+        reference = (
+            session_lifecycle.OwnedSessionCleanupReportReference.model_validate(raw_reference)
+            if isinstance(raw_reference, dict)
+            else None
+        )
+        return OwnedSessionRecoveryStatus(
+            cluster="ares",
+            session_id="session-1",
+            session_generation_id="generation-1",
+            cleanup_receipt=True,
+            cleanup_paths_pending=False,
+            coordinator_report_ref=reference,
+            coordinator_report_sha256=reference.sha256 if reference is not None else report_sha256,
+            coordinator_report_bound=True,
+            ownership_verified=True,
+            recovery_verified=True,
+        )
+
+    def open_transaction(**_kwargs: object) -> CrashOnceTransaction:
+        return transaction
+
+    monkeypatch.setattr(
+        session_lifecycle,
+        "open_owned_session_transaction",
+        open_transaction,
+    )
+    monkeypatch.setattr(session_lifecycle, "inspect_owned_session_recovery_status", inspect)
+    monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)
+    request = OwnedSessionCleanupFinalizeRequest(
+        cluster="ares",
+        session_id="session-1",
+        expected_session_generation_id="generation-1",
+        expected_cleanup_operation_id="cleanup-sidecar",
+        expected_cleanup_policy=report.cleanup_policy,
+        coordinator_report=report,
+        coordinator_report_sha256=report_sha256,
+    )
+
+    with pytest.raises(RelayError, match="simulated metadata compaction failure"):
+        execute_owned_session_cleanup_finalize(
+            request,
+            home=tmp_path,
+            core_dir=tmp_path / "core",
+        )
+    reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report
+    )
+    assert (tmp_path / reference.name).read_bytes() == payload
+    assert transaction.read_json("metadata.json") == initial_document
+
+    recovered = execute_owned_session_cleanup_finalize(
+        request,
+        home=tmp_path,
+        core_dir=tmp_path / "core",
+    )
+    compacted = transaction.read_json("metadata.json")
+
+    assert recovered.coordinator_report_ref == reference
+    assert compacted is not None
+    assert compacted["coordinator_report_ref"] == reference.model_dump(mode="json")
+    assert "coordinator_report" not in compacted
+    assert "coordinator_report_sha256" not in compacted
+    assert transaction.successful_metadata_writes == 1
+
+
+def test_immutable_sidecar_publication_recovers_and_rejects_hostile_links(
+    tmp_path: Path,
+) -> None:
+    report = _cleanup_sidecar_report()
+    reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report
+    )
+    if os.name != "posix":
+        transaction = _FakeSessionTransaction(tmp_path, session_id="session-1")
+        transaction.atomic_write_immutable(
+            reference.name,
+            payload,
+            maximum_bytes=session_lifecycle.MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
+        )
+        transaction.atomic_write_immutable(
+            reference.name,
+            payload,
+            maximum_bytes=session_lifecycle.MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
+        )
+        with pytest.raises(RelayError, match="differs"):
+            transaction.atomic_write_immutable(
+                reference.name,
+                payload + b"x",
+                maximum_bytes=session_lifecycle.MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
+            )
+        return
+
+    fcntl = cast(
+        session_lifecycle._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        importlib.import_module("fcntl"),
+    )
+
+    def transaction_for(path: Path) -> session_lifecycle._OwnedSessionTransaction:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        path.mkdir(mode=0o700)
+        path.chmod(0o700)
+        directory_fd = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        lock_path = path / "transition.lock"
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        lock_path.chmod(0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        return session_lifecycle._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            session_id="session-1",
+            path=path,
+            sessions_fd=os.dup(directory_fd),
+            directory_fd=directory_fd,
+            lock_fd=lock_fd,
+            uid=os.geteuid(),
+            _fcntl=fcntl,
+        )
+
+    pending_only = tmp_path / "pending-only"
+    pending_path = pending_only / f".{reference.name}.pending"
+    with transaction_for(pending_only) as transaction:
+        pending_path.write_bytes(payload)
+        pending_path.chmod(0o600)
+        transaction.atomic_write_immutable(
+            reference.name,
+            payload,
+            maximum_bytes=session_lifecycle.MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
+        )
+    assert (pending_only / reference.name).read_bytes() == payload
+    assert not pending_path.exists()
+
+    linked_window = tmp_path / "linked-window"
+    pending_path = linked_window / f".{reference.name}.pending"
+    final_path = linked_window / reference.name
+    with transaction_for(linked_window) as transaction:
+        pending_path.write_bytes(payload)
+        pending_path.chmod(0o600)
+        os.link(pending_path, final_path)
+        assert final_path.stat().st_nlink == 2
+        transaction.atomic_write_immutable(
+            reference.name,
+            payload,
+            maximum_bytes=session_lifecycle.MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
+        )
+    assert final_path.read_bytes() == payload
+    assert final_path.stat().st_nlink == 1
+    assert not pending_path.exists()
+
+    ambiguous = tmp_path / "ambiguous"
+    pending_path = ambiguous / f".{reference.name}.pending"
+    final_path = ambiguous / reference.name
+    with transaction_for(ambiguous) as transaction:
+        pending_path.write_bytes(payload)
+        pending_path.chmod(0o600)
+        final_path.write_bytes(payload)
+        final_path.chmod(0o600)
+        with pytest.raises(RelayError, match="ambiguous"):
+            transaction.atomic_write_immutable(
+                reference.name,
+                payload,
+                maximum_bytes=session_lifecycle.MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
+            )
+
+    hardlinked = tmp_path / "hardlinked"
+    final_path = hardlinked / reference.name
+    outside_link = tmp_path / "outside-hardlink.json"
+    with transaction_for(hardlinked) as transaction:
+        final_path.write_bytes(payload)
+        final_path.chmod(0o600)
+        os.link(final_path, outside_link)
+        with pytest.raises(RelayError, match="owner-private regular"):
+            transaction.atomic_write_immutable(
+                reference.name,
+                payload,
+                maximum_bytes=session_lifecycle.MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
+            )
+
+    symlinked = tmp_path / "symlinked"
+    final_path = symlinked / reference.name
+    symlink_target = tmp_path / "symlink-target.json"
+    symlink_target.write_bytes(payload)
+    symlink_target.chmod(0o600)
+    with transaction_for(symlinked) as transaction:
+        final_path.symlink_to(symlink_target)
+        with pytest.raises(RelayError, match="opened safely|owner-private regular"):
+            transaction.atomic_write_immutable(
+                reference.name,
+                payload,
+                maximum_bytes=session_lifecycle.MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
+            )
 
 
 @pytest.mark.parametrize(
