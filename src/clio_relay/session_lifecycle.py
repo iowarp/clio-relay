@@ -2175,6 +2175,7 @@ def inspect_owned_session_recovery_status(
     start_replace: bool | None = None
     start_require_token: bool | None = None
     start_expected_release_sha256: str | None = None
+    start_attempt_release_sha256: str | None = None
     start_error: str | None = None
     if transaction is not None:
         attempt_status = _inspect_owned_session_start_attempt_status(
@@ -2204,6 +2205,19 @@ def inspect_owned_session_recovery_status(
             start_expected_release_sha256 = (
                 attempt_status.start_expected_api_release_identity_sha256
             )
+            bound_attempt = _validated_start_attempt(
+                transaction,
+                cluster=cluster,
+                session_id=session_id,
+                start_operation_id=start_operation_id,
+                cluster_route_revision_value=cast(str, route_revision),
+            )
+            if bound_attempt is None:  # pragma: no cover - status validated the same journal
+                raise RelayError("owned-session start journal disappeared during inspection")
+            start_attempt_release_sha256 = cast(
+                str,
+                bound_attempt["api_release_identity_sha256"],
+            )
             start_error = attempt_status.start_error
         elif expected_start_operation_id is not None:
             errors.extend(
@@ -2211,6 +2225,17 @@ def inspect_owned_session_recovery_status(
                 if attempt_status is not None and attempt_status.errors
                 else ["owned-session start selector has no exact durable journal"]
             )
+
+    start_release_committed = bool(
+        start_attempt_verified
+        and isinstance(release_sha256, str)
+        and start_attempt_release_sha256 == release_sha256
+    )
+    replacement_in_progress = bool(
+        start_attempt_verified and start_replace is True and not start_release_committed
+    )
+    if start_attempt_verified and not (start_release_committed or replacement_in_progress):
+        errors.append("owned-session start journal release does not match committed metadata")
 
     acceptable_process_state = process_state in {
         "absent",
@@ -2255,10 +2280,16 @@ def inspect_owned_session_recovery_status(
         api_release_identity_verified=bool(validated_release is not None and running),
         ownership_token_present=isinstance(owner_token, str) and bool(owner_token),
         admission_status=admission_status,
-        start_state=("ready" if recovery_verified and start_attempt_verified else "unknown"),
+        start_state=(
+            "ready"
+            if recovery_verified and start_release_committed
+            else "starting"
+            if recovery_verified and replacement_in_progress
+            else "unknown"
+        ),
         start_phase=start_phase,
         start_attempt_verified=start_attempt_verified,
-        start_retryable=False,
+        start_retryable=bool(recovery_verified and replacement_in_progress),
         start_replace=start_replace,
         start_require_token=start_require_token,
         start_expected_api_release_identity_sha256=start_expected_release_sha256,
