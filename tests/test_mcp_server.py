@@ -735,6 +735,71 @@ def test_mcp_submit_jarvis_job_creates_named_pipeline_job(tmp_path: Path) -> Non
     assert job.spec.pipeline_name == "site_simulation_4node"
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "source_arguments"),
+    [
+        (
+            "relay_submit_jarvis_pipeline",
+            {"pipeline_yaml": "name: observation-only\npkgs: []\n"},
+        ),
+        (
+            "relay_submit_jarvis_job",
+            {"pipeline_name": "observation-only"},
+        ),
+    ],
+)
+def test_mcp_jarvis_wait_timeout_never_becomes_an_execution_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    source_arguments: dict[str, object],
+) -> None:
+    """Agent wait bounds must not become JARVIS or scheduler runtime limits."""
+    queue = ClioCoreQueue(tmp_path / "core")
+    observations: list[tuple[float, float]] = []
+
+    def bounded_wait(
+        _queue: ClioCoreQueue,
+        _job_id: str,
+        *,
+        timeout_seconds: float,
+        poll_seconds: float,
+    ) -> RelayJob:
+        observations.append((timeout_seconds, poll_seconds))
+        raise TimeoutError("bounded observation ended")
+
+    monkeypatch.setattr(mcp_server_module, "wait_for_terminal", bounded_wait)
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 120,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": {
+                    "cluster": "test-cluster",
+                    **source_arguments,
+                    "wait_for_terminal": True,
+                    "timeout_seconds": 1,
+                    "poll_seconds": 0.25,
+                },
+            },
+        },
+        queue=queue,
+    )
+
+    assert response is not None and "error" in response
+    assert observations == [(1.0, 0.25)]
+    jobs = queue.list_jobs()
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert isinstance(job.spec, JarvisRunSpec)
+    assert job.spec.timeout_seconds is None
+    assert job.state is JobState.QUEUED
+    assert "cancellation_request" not in job.metadata
+
+
 def test_mcp_submit_remote_agent_creates_real_job(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path / "core")
     prompt_path = tmp_path / "prompt.md"

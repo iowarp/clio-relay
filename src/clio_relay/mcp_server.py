@@ -3673,7 +3673,11 @@ def _submit_jarvis_job(
         ),
         settings=settings,
     )
-    return _submission_result(job, arguments, queue=queue, definition=definition)
+    wait_arguments = {
+        **arguments,
+        "wait_timeout_seconds": arguments.get("timeout_seconds", 600),
+    }
+    return _submission_result(job, wait_arguments, queue=queue, definition=definition)
 
 
 def _submit_remote_agent(
