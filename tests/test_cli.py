@@ -3924,6 +3924,85 @@ def test_owned_session_recovery_fails_closed_when_transition_never_materializes(
         )
 
 
+def test_owned_session_pre_start_probe_observes_uninitialized_transition_without_writes(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+
+    status = cli._inspect_owned_session_recovery_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster="ares",
+        session_id="fresh-session",
+        core_dir=tmp_path / "core",
+        home=home,
+        timeout_seconds=0.05,
+    )
+
+    assert status.cluster == "ares"
+    assert status.session_id == "fresh-session"
+    assert status.cleanup_receipt is False
+    assert status.ownership_verified is False
+    assert status.recovery_verified is False
+    assert status.errors == [
+        "owned session transition is not currently observable; "
+        "start-owned remains the mutation authority"
+    ]
+    assert home.exists() is False
+
+
+def test_owned_session_pre_start_probe_delegates_existing_transition_to_strict_recovery(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    transition_path = (
+        home
+        / ".local"
+        / "share"
+        / "clio-relay"
+        / "sessions"
+        / "existing-session"
+        / "transition.lock"
+    )
+    transition_path.parent.mkdir(parents=True)
+    transition_path.write_text("", encoding="utf-8")
+    expected = OwnedSessionRecoveryStatus(
+        cluster="ares",
+        session_id="existing-session",
+        cleanup_receipt=True,
+        recovery_verified=True,
+    )
+    calls: list[dict[str, object]] = []
+
+    def strict_recovery(**kwargs: object) -> OwnedSessionRecoveryStatus:
+        calls.append(kwargs)
+        return expected
+
+    monkeypatch.setattr(
+        cli,
+        "_inspect_owned_session_recovery_after_transition",
+        strict_recovery,
+    )
+
+    observed = cli._inspect_owned_session_recovery_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster="ares",
+        session_id="existing-session",
+        core_dir=tmp_path / "core",
+        home=home,
+        timeout_seconds=12.5,
+    )
+
+    assert observed is expected
+    assert calls == [
+        {
+            "cluster": "ares",
+            "session_id": "existing-session",
+            "core_dir": tmp_path / "core",
+            "home": home,
+            "timeout_seconds": 12.5,
+        }
+    ]
+
+
 def test_owned_session_recovery_refuses_symlinked_transition_lock(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -4115,6 +4194,60 @@ def test_cli_session_start_verifies_exact_worker_inside_lock_before_mutation(
         "start-remote-session",
         "lock-exit",
     ]
+
+
+def test_cli_session_start_fresh_session_proceeds_after_uninitialized_cleanup_probe(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
+    events: list[str] = []
+
+    def verify_worker_compatibility(
+        _definition: ClusterDefinition,
+    ) -> SessionApiReleaseIdentity:
+        return _session_api_release_identity()
+
+    def observe_fresh_session(**kwargs: object) -> dict[str, object]:
+        assert kwargs["session_id"] == "fresh-session"
+        assert kwargs["pre_start_cleanup_probe"] is True
+        events.append("probe")
+        return OwnedSessionRecoveryStatus(
+            cluster="ares",
+            session_id="fresh-session",
+            cleanup_receipt=False,
+            recovery_verified=False,
+            errors=["owned session transition is not currently observable"],
+        ).model_dump(mode="json")
+
+    def start(**kwargs: object) -> list[str]:
+        events.append("start")
+        return [
+            "session_started=fresh-session",
+            f"start_operation_id={kwargs['start_operation_id']}",
+            "session_generation_id=generation-fresh",
+            f"remote_api_port={kwargs['remote_api_port']}",
+        ]
+
+    monkeypatch.setattr(
+        cli,
+        "_verify_session_start_worker_compatibility",
+        verify_worker_compatibility,
+    )
+    monkeypatch.setattr(cli, "status_remote_session", observe_fresh_session)
+    monkeypatch.setattr(cli, "start_remote_session", start)
+
+    result = CliRunner().invoke(
+        app,
+        ["session", "start", "--cluster", "ares", "--session-id", "fresh-session"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "session_started=fresh-session" in result.output
+    assert "session_generation_id=generation-fresh" in result.output
+    assert events == ["probe", "start"]
 
 
 def test_cli_session_start_json_returns_self_contained_current_selector(
