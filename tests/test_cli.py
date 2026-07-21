@@ -30,6 +30,7 @@ from clio_relay.cluster_config import (
     ClusterTargetIdentity,
     FrpTransportConfig,
     RemoteMcpServerConfig,
+    cluster_route_revision,
 )
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
@@ -1671,7 +1672,12 @@ def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch
 
     def fake_start(**kwargs: object) -> list[str]:
         started.append(kwargs)
-        return ["session_started=session-1", "session_generation_id=generation-1"]
+        return [
+            "session_started=session-1",
+            f"start_operation_id={kwargs['start_operation_id']}",
+            "session_generation_id=generation-1",
+            f"remote_api_port={kwargs['remote_api_port']}",
+        ]
 
     def fake_status(**kwargs: object) -> dict[str, object]:
         return _owned_session_status(session_id=cast(str, kwargs["session_id"]))
@@ -3892,12 +3898,22 @@ def test_cli_session_start_verifies_exact_worker_inside_lock_before_mutation(
     def start(**kwargs: object) -> list[str]:
         assert isinstance(kwargs["expected_api_release_identity"], SessionApiReleaseIdentity)
         events.append("start-remote-session")
-        return ["session_started=session-1", "session_generation_id=generation-1"]
+        return [
+            "session_started=session-1",
+            f"start_operation_id={kwargs['start_operation_id']}",
+            "session_generation_id=generation-1",
+            f"remote_api_port={kwargs['remote_api_port']}",
+        ]
 
     monkeypatch.setattr(cli, "_session_transition_lock", transition_lock)
     monkeypatch.setattr(cli, "installation_info", local_info)
     monkeypatch.setattr(cli, "_remote_worker_info", remote_info)
     monkeypatch.setattr(cli, "start_remote_session", start)
+    monkeypatch.setattr(
+        cli,
+        "_finalize_completed_cleanup_receipt_before_start",
+        lambda **_kwargs: None,
+    )
 
     result = CliRunner().invoke(
         app,
@@ -3912,6 +3928,132 @@ def test_cli_session_start_verifies_exact_worker_inside_lock_before_mutation(
         "start-remote-session",
         "lock-exit",
     ]
+
+
+def test_cli_session_start_json_returns_self_contained_current_selector(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    definition = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json").clusters["ares"]
+    route_revision = cluster_route_revision(definition)
+    release = _session_api_release_identity()
+    starts: list[dict[str, object]] = []
+
+    def start(**kwargs: object) -> list[str]:
+        starts.append(kwargs)
+        return [
+            "session_started=session-1",
+            f"start_operation_id={kwargs['start_operation_id']}",
+            "session_generation_id=generation-1",
+            f"remote_api_port={kwargs['remote_api_port']}",
+        ]
+
+    monkeypatch.setattr(cli, "start_remote_session", start)
+    monkeypatch.setattr(
+        cli,
+        "_verify_session_start_worker_compatibility",
+        lambda _definition: release,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_finalize_completed_cleanup_receipt_before_start",
+        lambda **_kwargs: None,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "start",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--remote-api-port",
+            "9001",
+            "--start-operation-id",
+            "start_cli_json",
+            "--expected-cluster-route-revision",
+            route_revision,
+            "--expected-api-release-identity-sha256",
+            release.sha256(),
+            "--no-require-token",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["state"] == "ready"
+    assert payload["session_generation_id"] == "generation-1"
+    assert payload["status_selector"] == {
+        "operation": "session.start-status",
+        "cluster": "ares",
+        "session_id": "session-1",
+        "start_operation_id": "start_cli_json",
+        "cluster_route_revision": route_revision,
+        "remote_api_port": 9001,
+        "replace": False,
+        "require_token": False,
+        "expected_api_release_identity_sha256": release.sha256(),
+    }
+    assert starts[0]["start_operation_id"] == "start_cli_json"
+
+
+@pytest.mark.parametrize("stale_selector", ["route", "release"])
+def test_cli_session_start_rejects_stale_plan_before_cleanup_mutation(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    stale_selector: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    definition = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json").clusters["ares"]
+    release = _session_api_release_identity()
+    cleanup_calls = 0
+    starts = 0
+
+    def finalize(**_kwargs: object) -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+
+    def start(**_kwargs: object) -> list[str]:
+        nonlocal starts
+        starts += 1
+        return []
+
+    monkeypatch.setattr(
+        cli,
+        "_verify_session_start_worker_compatibility",
+        lambda _definition: release,
+    )
+    monkeypatch.setattr(cli, "_finalize_completed_cleanup_receipt_before_start", finalize)
+    monkeypatch.setattr(cli, "start_remote_session", start)
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "start",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--start-operation-id",
+            "start_stale_plan",
+            "--expected-cluster-route-revision",
+            ("stale-route" if stale_selector == "route" else cluster_route_revision(definition)),
+            "--expected-api-release-identity-sha256",
+            "b" * 64 if stale_selector == "release" else release.sha256(),
+            "--no-require-token",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert cleanup_calls == 0
+    assert starts == 0
 
 
 def test_cli_api_start_verifies_process_bound_release_identity(

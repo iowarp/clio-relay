@@ -199,6 +199,12 @@ clio-relay session detach --cluster my-cluster --session-id desktop-session
 clio-relay session teardown --cluster my-cluster --session-id desktop-session
 ```
 
+Automation that must recover an interrupted start should persist the JSON from
+`session plan-start`, invoke `session start --json` with those exact selectors,
+and query the returned current-transition `status_selector`. Per-observation
+transport deadlines never imply terminal failure, and session lifecycle operations
+never cancel or time out queued scheduler/JARVIS jobs.
+
 Use `session teardown --stop-worker` only when the user chooses to clean up the persistent remote worker too. Teardown keeps relay and scheduler jobs running without prompting. Use `--cancel-jobs` only for an explicit user choice, and add `--cancel-scheduler-jobs` only when the scheduler allocation should also be canceled. The JSON result identifies verified ownership and any residual resources.
 
 ## Documentation

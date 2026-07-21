@@ -56,6 +56,7 @@ SESSION_SCHEDULER_RETAINED_CHECK_ID = "cleanup.jobs-preserved-default"
 SESSION_RELAY_CANCELED_CHECK_ID = "cleanup.relay-jobs-canceled"
 SESSION_SCHEDULER_CANCELED_CHECK_ID = "cleanup.explicit-job-cancel"
 _REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS = 120.0
+_REMOTE_SESSION_START_RECOVERY_TIMEOUT_SECONDS = 15.0
 _REMOTE_API_READINESS_TIMEOUT_SECONDS = 60.0
 _MAX_OWNED_SESSION_DOCUMENT_BYTES = 1024 * 1024
 MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES = 32 * 1024 * 1024
@@ -67,6 +68,7 @@ _MAX_REMOTE_SESSION_STDOUT_BYTES = 1024 * 1024
 _MAX_REMOTE_SESSION_STDERR_BYTES = 1024 * 1024
 _MAX_API_HEALTH_RESPONSE_BYTES = 64 * 1024
 _MAX_API_STARTUP_RECEIPT_BYTES = 64 * 1024
+_MAX_SESSION_START_ERROR_CHARS = 8192
 _API_STARTUP_RECEIPT_ENV = "CLIO_RELAY_SESSION_STARTUP_RECEIPT"
 _SYSTEMD_UNIT_ENV = "CLIO_RELAY_SESSION_SYSTEMD_UNIT"
 _SYSTEMD_CGROUP_ENV = "CLIO_RELAY_SESSION_SYSTEMD_CGROUP"
@@ -89,6 +91,20 @@ class _FcntlModule(Protocol):
 
     def flock(self, fd: int, operation: int) -> Any:
         """Apply an advisory lock operation to an open descriptor."""
+
+
+class _OwnedSessionQueue(Protocol):
+    """Typed core-queue surface required by crash-surviving start promotion."""
+
+    root: Path
+
+    def clear_owner_session_closing(
+        self,
+        owner_session_id: str,
+        *,
+        session_generation_id: str,
+    ) -> None:
+        """Clear a matching closing marker after exact API recovery."""
 
 
 @dataclass
@@ -788,6 +804,7 @@ class OwnedSessionStartRequest(BaseModel):
 
     cluster: str = Field(min_length=1)
     session_id: str = Field(min_length=1)
+    start_operation_id: DurableRecordId
     remote_api_port: int = Field(gt=0, le=65_535)
     replace: bool = False
     require_token: bool = True
@@ -795,6 +812,60 @@ class OwnedSessionStartRequest(BaseModel):
     cluster_registry: dict[str, object]
     cluster_registry_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     cluster_route_revision: str = Field(min_length=1)
+
+
+class OwnedSessionStartRejection(BaseModel):
+    """Exact rejection of one invocation, not proof the durable operation failed."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["clio-relay.owner-session-start-rejection.v1"] = (
+        "clio-relay.owner-session-start-rejection.v1"
+    )
+    cluster: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    start_operation_id: DurableRecordId
+    cluster_route_revision: str = Field(min_length=1)
+    invocation_rejected: Literal[True] = True
+    error: str = Field(min_length=1, max_length=_MAX_SESSION_START_ERROR_CHARS)
+
+
+class OwnedSessionStartStatusSelector(BaseModel):
+    """Selector for the current transition until a later start supersedes it."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operation: Literal["session.start-status"] = "session.start-status"
+    cluster: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    start_operation_id: DurableRecordId
+    cluster_route_revision: str = Field(min_length=1)
+    remote_api_port: int = Field(gt=0, le=65_535)
+    replace: bool
+    require_token: bool
+    expected_api_release_identity_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+
+class OwnedSessionStartRetrySelector(BaseModel):
+    """Secret-free selector for safely retrying one owned-session start."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operation: Literal["session.start"] = "session.start"
+    cluster: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    start_operation_id: DurableRecordId
+    cluster_route_revision: str = Field(min_length=1)
+    remote_api_port: int = Field(gt=0, le=65_535)
+    replace: bool
+    require_token: bool
+    expected_api_release_identity_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
 
 class OwnedSessionTeardownRequest(BaseModel):
@@ -947,6 +1018,8 @@ class OwnedSessionRecoveryStatus(BaseModel):
     cluster: str
     session_id: str
     session_generation_id: DurableRecordId | None = None
+    start_operation_id: DurableRecordId | None = None
+    cluster_route_revision: str | None = None
     owner: str | None = None
     api_pid: int | None = None
     remote_api_port: int | None = None
@@ -992,6 +1065,17 @@ class OwnedSessionRecoveryStatus(BaseModel):
     api_release_identity_verified: bool = False
     ownership_token_present: bool = False
     admission_status: dict[str, object] | None = None
+    start_state: Literal["unknown", "starting", "ready", "failed", "not_current"] = "unknown"
+    start_phase: Literal["pending", "admitted", "scope_bound", "contained"] | None = None
+    start_attempt_verified: bool = False
+    start_retryable: bool = False
+    start_replace: bool | None = None
+    start_require_token: bool | None = None
+    start_expected_api_release_identity_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    start_error: str | None = Field(default=None, max_length=_MAX_SESSION_START_ERROR_CHARS)
     errors: list[str] = Field(default_factory=list[str])
 
     @model_validator(mode="after")
@@ -1002,6 +1086,134 @@ class OwnedSessionRecoveryStatus(BaseModel):
             and self.coordinator_report_sha256 != self.coordinator_report_ref.sha256
         ):
             raise ValueError("coordinator report reference digest does not match status")
+        return self
+
+
+class OwnedSessionStartResult(BaseModel):
+    """Desktop-visible outcome for a possibly asynchronous remote session start."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["clio-relay.owner-session-start-result.v1"] = (
+        "clio-relay.owner-session-start-result.v1"
+    )
+    cluster: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    start_operation_id: DurableRecordId
+    cluster_route_revision: str = Field(min_length=1)
+    session_generation_id: DurableRecordId | None = None
+    remote_api_port: int = Field(gt=0, le=65_535)
+    state: Literal["ready", "starting", "ambiguous", "failed", "not_current"]
+    terminal: bool
+    retryable: bool
+    transition_accepted: bool | None = None
+    transport_deadline_exceeded: bool = False
+    running: bool = False
+    ownership_verified: bool = False
+    recovery_verified: bool = False
+    start_phase: Literal["pending", "admitted", "scope_bound", "contained"] | None = None
+    error: str | None = Field(default=None, max_length=_MAX_SESSION_START_ERROR_CHARS)
+    status_selector: OwnedSessionStartStatusSelector
+    retry_selector: OwnedSessionStartRetrySelector
+    compatibility_lines: list[str] = Field(default_factory=list[str], max_length=32)
+
+    @model_validator(mode="after")
+    def _validate_start_result(self) -> OwnedSessionStartResult:
+        """Keep state, identity, and the advertised recovery operations exact."""
+        if not (
+            self.status_selector.cluster == self.cluster
+            and self.status_selector.session_id == self.session_id
+            and self.status_selector.start_operation_id == self.start_operation_id
+            and self.status_selector.cluster_route_revision == self.cluster_route_revision
+            and self.status_selector.remote_api_port == self.remote_api_port
+            and self.status_selector.replace == self.retry_selector.replace
+            and self.status_selector.require_token == self.retry_selector.require_token
+            and self.status_selector.expected_api_release_identity_sha256
+            == self.retry_selector.expected_api_release_identity_sha256
+            and self.retry_selector.cluster == self.cluster
+            and self.retry_selector.session_id == self.session_id
+            and self.retry_selector.start_operation_id == self.start_operation_id
+            and self.retry_selector.cluster_route_revision == self.cluster_route_revision
+            and self.retry_selector.remote_api_port == self.remote_api_port
+        ):
+            raise ValueError("owned-session start selectors changed result identity")
+        if self.state == "ready":
+            if not (
+                self.terminal
+                and not self.retryable
+                and self.transition_accepted is True
+                and self.session_generation_id is not None
+                and self.ownership_verified
+                and self.recovery_verified
+            ):
+                raise ValueError("ready owned-session start result is incomplete")
+        elif self.state == "starting":
+            if not (
+                not self.terminal
+                and self.retryable
+                and self.transition_accepted is True
+                and self.session_generation_id is not None
+                and self.start_phase is not None
+            ):
+                raise ValueError("starting owned-session result lacks a durable attempt")
+        elif self.state == "ambiguous":
+            if self.terminal or not self.retryable or self.transition_accepted is not None:
+                raise ValueError("ambiguous owned-session result claimed a terminal transition")
+        elif self.state == "not_current":
+            if (
+                not self.terminal
+                or self.retryable
+                or self.transition_accepted is not None
+                or self.error is None
+            ):
+                raise ValueError("non-current owned-session selector is incomplete")
+        elif not self.terminal or self.retryable or self.error is None:
+            raise ValueError("failed owned-session start result is incomplete")
+        return self
+
+
+class OwnedSessionStartPlan(BaseModel):
+    """Read-only, persistable selector set for one future session start."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["clio-relay.owner-session-start-plan.v1"] = (
+        "clio-relay.owner-session-start-plan.v1"
+    )
+    cluster: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    start_operation_id: DurableRecordId
+    cluster_route_revision: str = Field(min_length=1)
+    remote_api_port: int = Field(gt=0, le=65_535)
+    expected_api_release_identity_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    status_selector: OwnedSessionStartStatusSelector
+    retry_selector: OwnedSessionStartRetrySelector
+
+    @model_validator(mode="after")
+    def _validate_plan_selectors(self) -> OwnedSessionStartPlan:
+        """Require both plan selectors to bind the same immutable request identity."""
+        if not (
+            self.status_selector.cluster == self.cluster
+            and self.status_selector.session_id == self.session_id
+            and self.status_selector.start_operation_id == self.start_operation_id
+            and self.status_selector.cluster_route_revision == self.cluster_route_revision
+            and self.status_selector.remote_api_port == self.remote_api_port
+            and self.status_selector.replace == self.retry_selector.replace
+            and self.status_selector.require_token == self.retry_selector.require_token
+            and self.status_selector.expected_api_release_identity_sha256
+            == self.expected_api_release_identity_sha256
+            and self.retry_selector.cluster == self.cluster
+            and self.retry_selector.session_id == self.session_id
+            and self.retry_selector.start_operation_id == self.start_operation_id
+            and self.retry_selector.cluster_route_revision == self.cluster_route_revision
+            and self.retry_selector.remote_api_port == self.remote_api_port
+            and self.retry_selector.expected_api_release_identity_sha256
+            == self.expected_api_release_identity_sha256
+        ):
+            raise ValueError("owned-session start plan selectors changed identity")
         return self
 
 
@@ -1300,6 +1512,186 @@ def _is_clio_relay_api_leader(*, proc_root: Path, pid: int) -> bool:
     return "clio-relay" in command and " api " in f" {command} " and " start" in command
 
 
+def _inspect_owned_session_start_attempt_status(
+    *,
+    cluster: str,
+    session_id: str,
+    core_dir: Path,
+    proc_root: Path,
+    transaction: _OwnedSessionTransaction,
+    metadata_error: str,
+    expected_start_operation_id: str | None = None,
+    expected_cluster_route_revision: str | None = None,
+) -> OwnedSessionRecoveryStatus | None:
+    """Project one exact pre-metadata start journal into read-only status evidence."""
+    from clio_relay.core_queue import ClioCoreQueue
+
+    try:
+        current_attempt = _validated_start_attempt(
+            transaction,
+            cluster=cluster,
+            session_id=session_id,
+        )
+    except RelayError:
+        return OwnedSessionRecoveryStatus(
+            cluster=cluster,
+            session_id=session_id,
+            errors=[metadata_error, "owned-session start attempt identity is invalid"],
+        )
+    if (
+        expected_start_operation_id is not None
+        and current_attempt is not None
+        and current_attempt.get("start_operation_id") != expected_start_operation_id
+    ):
+        return OwnedSessionRecoveryStatus(
+            cluster=cluster,
+            session_id=session_id,
+            start_operation_id=expected_start_operation_id,
+            cluster_route_revision=expected_cluster_route_revision,
+            start_state="not_current",
+            start_retryable=False,
+            errors=[
+                "another operation owns the current transition; this selector was never "
+                "accepted or is no longer current"
+            ],
+        )
+    try:
+        attempt = _validated_start_attempt(
+            transaction,
+            cluster=cluster,
+            session_id=session_id,
+            start_operation_id=expected_start_operation_id,
+            cluster_route_revision_value=expected_cluster_route_revision,
+        )
+    except RelayError:
+        return OwnedSessionRecoveryStatus(
+            cluster=cluster,
+            session_id=session_id,
+            errors=[metadata_error, "owned-session start attempt identity is invalid"],
+        )
+    if attempt is None:
+        return None
+    generation_id = cast(str, attempt["session_generation_id"])
+    validated_start_operation_id = cast(str, attempt["start_operation_id"])
+    registry_sha256 = attempt.get("cluster_registry_sha256")
+    route_revision = attempt.get("cluster_route_revision")
+    remote_api_port = attempt.get("remote_api_port")
+    start_phase = attempt.get("start_phase")
+    systemd_unit = attempt.get("systemd_unit")
+    systemd_description = attempt.get("systemd_description")
+    cgroup_path = attempt.get("systemd_cgroup_path")
+    invocation_id = attempt.get("systemd_invocation_id")
+    phase = cast(Literal["pending", "admitted", "scope_bound", "contained"], start_phase)
+    errors: list[str] = []
+    admission_status: dict[str, object] | None = None
+    durable_generation_verified = False
+    try:
+        admission_status = ClioCoreQueue(core_dir).owner_session_generation_status(
+            session_id,
+            session_generation_id=generation_id,
+        )
+        active_generation = admission_status.get("active_generation_id")
+        closing_generation = admission_status.get("closing_generation_id")
+        common_admission_identity = bool(
+            admission_status.get("owner_session_id") == session_id
+            and admission_status.get("session_generation_id") == generation_id
+            and closing_generation is None
+        )
+        if phase == "pending":
+            admission_consistent = common_admission_identity and active_generation in {
+                None,
+                generation_id,
+            }
+        else:
+            admission_consistent = bool(
+                common_admission_identity
+                and active_generation == generation_id
+                and admission_status.get("open") is True
+            )
+        durable_generation_verified = bool(
+            common_admission_identity
+            and active_generation == generation_id
+            and admission_status.get("open") is True
+        )
+        if not admission_consistent:
+            errors.append("owned-session start attempt conflicts with durable core admission")
+    except (OSError, RelayError, ValueError) as exc:
+        errors.append(f"could not verify owned-session start admission: {exc}")
+
+    cluster_registry_verified = False
+    registry_payload = transaction.read_bytes(
+        f"cluster-registry-{generation_id}.json",
+        maximum_bytes=MAX_CLUSTER_REGISTRY_BYTES,
+        required=False,
+    )
+    if registry_payload is not None:
+        try:
+            raw_registry = cast(object, json.loads(registry_payload))
+            registry = ClusterRegistry.model_validate(raw_registry)
+            cluster_registry_verified = bool(
+                hashlib.sha256(registry_payload).hexdigest() == registry_sha256
+                and set(registry.clusters) == {cluster}
+                and registry.clusters[cluster].name == cluster
+                and cluster_route_revision(registry.clusters[cluster]) == route_revision
+            )
+        except (TypeError, ValueError):
+            cluster_registry_verified = False
+        if not cluster_registry_verified:
+            errors.append("owned-session start registry identity is invalid")
+
+    generation_processes: list[_OwnedGenerationProcess] = []
+    generation_process_scan_verified = False
+    if phase in {"scope_bound", "contained"}:
+        try:
+            generation_processes = _recorded_scope_processes(
+                proc_root=proc_root,
+                systemd_unit=cast(str, systemd_unit),
+                systemd_cgroup_path=cast(str, cgroup_path),
+                systemd_invocation_id=cast(str, invocation_id),
+                systemd_description=cast(str, systemd_description),
+            )
+            generation_process_scan_verified = True
+        except RelayError as exc:
+            errors.append(str(exc))
+
+    attempt_verified = not errors
+    start_error = cast(str | None, attempt.get("error"))
+    return OwnedSessionRecoveryStatus(
+        cluster=cluster,
+        session_id=session_id,
+        session_generation_id=generation_id,
+        start_operation_id=validated_start_operation_id,
+        cluster_route_revision=cast(str, route_revision),
+        owner="clio-relay",
+        remote_api_port=cast(int, remote_api_port),
+        process_state="unverified",
+        running=False,
+        generation_process_pids=[process.pid for process in generation_processes],
+        generation_process_absence_verified=(
+            generation_process_scan_verified and not generation_processes
+        ),
+        metadata_verified=False,
+        cluster_registry_verified=cluster_registry_verified,
+        durable_generation_verified=durable_generation_verified,
+        ownership_verified=False,
+        recovery_verified=False,
+        ownership_token_present=True,
+        admission_status=admission_status,
+        start_state=("failed" if start_error is not None else "starting"),
+        start_phase=phase,
+        start_attempt_verified=attempt_verified,
+        start_retryable=bool(attempt_verified and start_error is None),
+        start_replace=cast(bool, attempt["replace"]),
+        start_require_token=cast(bool, attempt["require_token"]),
+        start_expected_api_release_identity_sha256=cast(
+            str | None,
+            attempt["expected_api_release_identity_sha256"],
+        ),
+        start_error=start_error,
+        errors=errors,
+    )
+
+
 def inspect_owned_session_recovery_status(
     *,
     cluster: str,
@@ -1309,6 +1701,8 @@ def inspect_owned_session_recovery_status(
     proc_root: Path = Path("/proc"),
     effective_uid: int | None = None,
     transaction: _OwnedSessionTransaction | None = None,
+    expected_start_operation_id: str | None = None,
+    expected_cluster_route_revision: str | None = None,
 ) -> OwnedSessionRecoveryStatus:
     """Inspect durable metadata, process identity, and core admission for recovery.
 
@@ -1347,6 +1741,19 @@ def inspect_owned_session_recovery_status(
                 raise RelayError("owned session metadata is unavailable")
             document = transaction_document
     except RelayError as exc:
+        if transaction is not None:
+            attempt_status = _inspect_owned_session_start_attempt_status(
+                cluster=cluster,
+                session_id=session_id,
+                core_dir=core_dir,
+                proc_root=proc_root,
+                transaction=transaction,
+                metadata_error=str(exc),
+                expected_start_operation_id=expected_start_operation_id,
+                expected_cluster_route_revision=expected_cluster_route_revision,
+            )
+            if attempt_status is not None:
+                return attempt_status
         return OwnedSessionRecoveryStatus(
             cluster=cluster,
             session_id=session_id,
@@ -1762,6 +2169,49 @@ def inspect_owned_session_recovery_status(
         if not durable_generation_verified:
             errors.append("durable owner-session generation is not active or closing")
 
+    start_operation_id: str | None = None
+    start_phase: Literal["pending", "admitted", "scope_bound", "contained"] | None = None
+    start_attempt_verified = False
+    start_replace: bool | None = None
+    start_require_token: bool | None = None
+    start_expected_release_sha256: str | None = None
+    start_error: str | None = None
+    if transaction is not None:
+        attempt_status = _inspect_owned_session_start_attempt_status(
+            cluster=cluster,
+            session_id=session_id,
+            core_dir=core_dir,
+            proc_root=proc_root,
+            transaction=transaction,
+            metadata_error="owned session metadata exists without its start journal",
+            expected_start_operation_id=expected_start_operation_id,
+            expected_cluster_route_revision=expected_cluster_route_revision,
+        )
+        if attempt_status is not None and attempt_status.start_state == "not_current":
+            return attempt_status
+        if (
+            attempt_status is not None
+            and attempt_status.start_attempt_verified
+            and attempt_status.session_generation_id == validated_generation
+            and attempt_status.remote_api_port == remote_api_port
+            and attempt_status.cluster_route_revision == route_revision
+        ):
+            start_operation_id = attempt_status.start_operation_id
+            start_phase = attempt_status.start_phase
+            start_attempt_verified = True
+            start_replace = attempt_status.start_replace
+            start_require_token = attempt_status.start_require_token
+            start_expected_release_sha256 = (
+                attempt_status.start_expected_api_release_identity_sha256
+            )
+            start_error = attempt_status.start_error
+        elif expected_start_operation_id is not None:
+            errors.extend(
+                attempt_status.errors
+                if attempt_status is not None and attempt_status.errors
+                else ["owned-session start selector has no exact durable journal"]
+            )
+
     acceptable_process_state = process_state in {
         "absent",
         "owned_running",
@@ -1778,6 +2228,8 @@ def inspect_owned_session_recovery_status(
         cluster=cluster,
         session_id=session_id,
         session_generation_id=validated_generation,
+        start_operation_id=start_operation_id,
+        cluster_route_revision=route_revision if isinstance(route_revision, str) else None,
         owner=owner if isinstance(owner, str) else None,
         api_pid=api_pid if isinstance(api_pid, int) and not isinstance(api_pid, bool) else None,
         remote_api_port=(
@@ -1803,8 +2255,67 @@ def inspect_owned_session_recovery_status(
         api_release_identity_verified=bool(validated_release is not None and running),
         ownership_token_present=isinstance(owner_token, str) and bool(owner_token),
         admission_status=admission_status,
+        start_state=("ready" if recovery_verified and start_attempt_verified else "unknown"),
+        start_phase=start_phase,
+        start_attempt_verified=start_attempt_verified,
+        start_retryable=False,
+        start_replace=start_replace,
+        start_require_token=start_require_token,
+        start_expected_api_release_identity_sha256=start_expected_release_sha256,
+        start_error=start_error,
         errors=errors,
     )
+
+
+def inspect_owned_session_start_status(
+    *,
+    cluster: str,
+    session_id: str,
+    start_operation_id: str,
+    cluster_route_revision: str,
+    core_dir: Path,
+    home: Path | None = None,
+    proc_root: Path = Path("/proc"),
+    lock_timeout_seconds: float = 0.05,
+) -> OwnedSessionRecoveryStatus:
+    """Inspect one exact start selector without waiting for its transition writer."""
+    _validate_session(session_id=session_id, remote_api_port=1)
+    try:
+        validated_operation_id = validate_durable_record_id(start_operation_id)
+    except (TypeError, ValueError) as exc:
+        raise RelayError(f"invalid start_operation_id: {exc}") from exc
+    if not cluster_route_revision:
+        raise RelayError("cluster_route_revision must not be empty")
+    if lock_timeout_seconds <= 0:
+        raise ValueError("lock_timeout_seconds must be positive")
+    selected_home = home or Path.home()
+    try:
+        with open_owned_session_transaction(
+            session_id=session_id,
+            create=False,
+            timeout_seconds=lock_timeout_seconds,
+            home=selected_home,
+        ) as transaction:
+            return inspect_owned_session_recovery_status(
+                cluster=cluster,
+                session_id=session_id,
+                core_dir=core_dir,
+                home=selected_home,
+                proc_root=proc_root,
+                transaction=transaction,
+                expected_start_operation_id=validated_operation_id,
+                expected_cluster_route_revision=cluster_route_revision,
+            )
+    except RelayError as exc:
+        return OwnedSessionRecoveryStatus(
+            cluster=cluster,
+            session_id=session_id,
+            start_operation_id=validated_operation_id,
+            cluster_route_revision=cluster_route_revision,
+            start_state="starting",
+            start_retryable=True,
+            errors=[str(exc)[:_MAX_SESSION_START_ERROR_CHARS]],
+        )
 
 
 def _inspect_owned_session_cleanup_receipt(
@@ -3008,6 +3519,22 @@ class _BoundedCommandResult:
     stderr: bytes
 
 
+class _RemoteSessionCommandDeadline(RelayError):
+    """The local transport deadline expired without proving remote completion."""
+
+
+class _RemoteSessionCommandRejected(RelayError):
+    """The authenticated remote command rejected this invocation."""
+
+    def __init__(self, rejection: OwnedSessionStartRejection) -> None:
+        super().__init__(rejection.error)
+        self.rejection = rejection
+
+
+class _RemoteSessionCommandAmbiguous(RelayError):
+    """The SSH transport ended without proving whether the remote command completed."""
+
+
 def _run_bounded_command(
     command: list[str],
     *,
@@ -3119,11 +3646,15 @@ def _write_session_attempt(
 ) -> None:
     """Write one atomic, resumable owner-session attempt record."""
     document = {
-        "schema_version": "clio-relay.owner-session-attempt.v1",
+        "schema_version": (
+            "clio-relay.owner-session-attempt.v2"
+            if operation == "start"
+            else "clio-relay.owner-session-attempt.v1"
+        ),
         "operation": operation,
         **identity,
         "observed_at": datetime.now(UTC).isoformat(),
-        "error": error,
+        "error": error[:_MAX_SESSION_START_ERROR_CHARS] if error is not None else None,
     }
     transaction.atomic_write(
         f"{operation}-attempt.json",
@@ -3141,8 +3672,21 @@ def _assert_remote_port_available(port: int) -> None:
             raise RelayError(f"remote API port is already occupied: {port}") from exc
 
 
-def _wait_for_api_ready(*, process: subprocess.Popen[bytes], port: int) -> float:
-    """Wait boundedly for an API child to answer its local health probe."""
+def _owned_session_api_token(*, require_token: bool) -> str | None:
+    """Select the child API token while honoring an explicit auth-disabled plan."""
+    ambient_token = os.environ.get("CLIO_RELAY_API_TOKEN")
+    if require_token and not ambient_token:
+        raise RelayError("owned session API token is required but unavailable")
+    return ambient_token if require_token else None
+
+
+def _wait_for_api_ready(
+    *,
+    process: subprocess.Popen[bytes],
+    port: int,
+    require_token: bool,
+) -> float:
+    """Wait boundedly for an API child to report the exact planned auth policy."""
     started = time.monotonic()
     deadline = started + _REMOTE_API_READINESS_TIMEOUT_SECONDS
     url = f"http://127.0.0.1:{port}/healthz"
@@ -3160,6 +3704,7 @@ def _wait_for_api_ready(*, process: subprocess.Popen[bytes], port: int) -> float
                     response.status == 200
                     and isinstance(payload, dict)
                     and cast(dict[str, object], payload).get("ok") is True
+                    and cast(dict[str, object], payload).get("auth") is require_token
                 ):
                     return time.monotonic() - started
                 last_error = f"unexpected health response: {payload!r}"
@@ -3265,12 +3810,21 @@ def _wait_for_api_startup_receipt(
     raise RelayError(f"owned API startup receipt was not verified: {last_error}")
 
 
-def _validated_resumable_start_attempt(
+def _validated_start_attempt(
     transaction: _OwnedSessionTransaction,
     *,
-    request: OwnedSessionStartRequest,
+    cluster: str,
+    session_id: str,
+    start_operation_id: str | None = None,
+    cluster_registry_sha256: str | None = None,
+    cluster_route_revision_value: str | None = None,
+    remote_api_port: int | None = None,
+    replace: bool | None = None,
+    require_token: bool | None = None,
+    expected_api_release_identity_sha256: str | None = None,
+    allow_legacy: bool = False,
 ) -> dict[str, object] | None:
-    """Return an exact prior start attempt that can resume one orphan generation."""
+    """Return one structurally exact start journal matching optional selectors."""
     attempt = transaction.read_json("start-attempt.json", required=False)
     if attempt is None:
         return None
@@ -3279,14 +3833,18 @@ def _validated_resumable_start_attempt(
         "operation",
         "cluster",
         "session_id",
+        "start_operation_id",
         "session_generation_id",
         "owner_token",
         "owner_token_sha256",
         "api_release_identity_sha256",
+        "expected_api_release_identity_sha256",
         "cluster_registry_path",
         "cluster_registry_sha256",
         "cluster_route_revision",
         "remote_api_port",
+        "replace",
+        "require_token",
         "start_phase",
         "systemd_unit",
         "systemd_description",
@@ -3297,17 +3855,29 @@ def _validated_resumable_start_attempt(
         "observed_at",
         "error",
     }
+    legacy_keys = expected_keys - {
+        "start_operation_id",
+        "expected_api_release_identity_sha256",
+        "replace",
+        "require_token",
+    }
+    legacy = attempt.get("schema_version") == "clio-relay.owner-session-attempt.v1"
     generation = attempt.get("session_generation_id")
+    operation_id = attempt.get("start_operation_id")
     observed_at = attempt.get("observed_at")
     try:
         validated_generation = (
             validate_durable_record_id(generation) if isinstance(generation, str) else None
+        )
+        validated_operation_id = (
+            validate_durable_record_id(operation_id) if isinstance(operation_id, str) else None
         )
         parsed_observed_at = (
             datetime.fromisoformat(observed_at) if isinstance(observed_at, str) else None
         )
     except ValueError:
         validated_generation = None
+        validated_operation_id = None
         parsed_observed_at = None
     registry_path = attempt.get("cluster_registry_path")
     owner_token = attempt.get("owner_token")
@@ -3325,27 +3895,81 @@ def _validated_resumable_start_attempt(
         else None
     )
     if not (
-        set(attempt) == expected_keys
-        and attempt.get("schema_version") == "clio-relay.owner-session-attempt.v1"
+        set(attempt) == (legacy_keys if legacy else expected_keys)
+        and (
+            attempt.get("schema_version") == "clio-relay.owner-session-attempt.v2"
+            or (allow_legacy and legacy)
+        )
         and attempt.get("operation") == "start"
-        and attempt.get("cluster") == request.cluster
-        and attempt.get("session_id") == request.session_id
+        and attempt.get("cluster") == cluster
+        and attempt.get("session_id") == session_id
+        and (
+            (not legacy and validated_operation_id is not None)
+            or (legacy and validated_operation_id is None)
+        )
+        and (
+            start_operation_id is None
+            or (not legacy and validated_operation_id == start_operation_id)
+        )
         and validated_generation is not None
         and isinstance(owner_token, str)
         and len(owner_token) == 64
         and all(character in "0123456789abcdef" for character in owner_token)
         and owner_token_sha256 == hashlib.sha256(owner_token.encode("utf-8")).hexdigest()
         and isinstance(attempt.get("api_release_identity_sha256"), str)
-        and len(cast(str, attempt.get("api_release_identity_sha256"))) == 64
+        and re.fullmatch(r"[0-9a-f]{64}", cast(str, attempt.get("api_release_identity_sha256")))
+        is not None
+        and (
+            legacy
+            or (
+                attempt.get("expected_api_release_identity_sha256") is None
+                or (
+                    isinstance(attempt.get("expected_api_release_identity_sha256"), str)
+                    and re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        cast(str, attempt.get("expected_api_release_identity_sha256")),
+                    )
+                    is not None
+                )
+            )
+        )
+        and (
+            expected_api_release_identity_sha256 is None
+            or (
+                not legacy
+                and attempt.get("expected_api_release_identity_sha256")
+                == expected_api_release_identity_sha256
+            )
+        )
         and registry_path == str(expected_registry_path)
-        and attempt.get("cluster_registry_sha256") == request.cluster_registry_sha256
-        and attempt.get("cluster_route_revision") == request.cluster_route_revision
-        and attempt.get("remote_api_port") == request.remote_api_port
+        and isinstance(attempt.get("cluster_registry_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", cast(str, attempt.get("cluster_registry_sha256")))
+        is not None
+        and (
+            cluster_registry_sha256 is None
+            or attempt.get("cluster_registry_sha256") == cluster_registry_sha256
+        )
+        and isinstance(attempt.get("cluster_route_revision"), str)
+        and bool(attempt.get("cluster_route_revision"))
+        and (
+            cluster_route_revision_value is None
+            or attempt.get("cluster_route_revision") == cluster_route_revision_value
+        )
+        and isinstance(attempt.get("remote_api_port"), int)
+        and not isinstance(attempt.get("remote_api_port"), bool)
+        and 0 < cast(int, attempt.get("remote_api_port")) <= 65_535
+        and (remote_api_port is None or attempt.get("remote_api_port") == remote_api_port)
+        and (legacy or isinstance(attempt.get("replace"), bool))
+        and (replace is None or (not legacy and attempt.get("replace") is replace))
+        and (legacy or isinstance(attempt.get("require_token"), bool))
+        and (
+            require_token is None or (not legacy and attempt.get("require_token") is require_token)
+        )
         and start_phase in {"pending", "admitted", "scope_bound", "contained"}
         and systemd_unit == f"clio-relay-session-{validated_generation}.scope"
         and isinstance(systemd_description, str)
         and systemd_description.startswith(
-            f"clio-relay-owned-session:{request.session_id}:{validated_generation}:"
+            f"clio-relay-owned-session:{session_id}:{validated_generation}:"
         )
         and (
             (
@@ -3377,10 +4001,282 @@ def _validated_resumable_start_attempt(
         )
         and parsed_observed_at is not None
         and parsed_observed_at.tzinfo is not None
-        and (attempt.get("error") is None or isinstance(attempt.get("error"), str))
+        and (
+            attempt.get("error") is None
+            or (
+                isinstance(attempt.get("error"), str)
+                and len(cast(str, attempt.get("error"))) <= _MAX_SESSION_START_ERROR_CHARS
+            )
+        )
     ):
         raise RelayError("prior owned-session start attempt identity is invalid")
     return attempt
+
+
+def _validated_resumable_start_attempt(
+    transaction: _OwnedSessionTransaction,
+    *,
+    request: OwnedSessionStartRequest,
+    release_identity_sha256: str,
+) -> dict[str, object] | None:
+    """Return the exact prior start attempt selected by a retry request."""
+    expected_release_sha256 = (
+        request.expected_api_release_identity.sha256()
+        if request.expected_api_release_identity is not None
+        else None
+    )
+    attempt = _validated_start_attempt(
+        transaction,
+        cluster=request.cluster,
+        session_id=request.session_id,
+        start_operation_id=request.start_operation_id,
+        cluster_registry_sha256=request.cluster_registry_sha256,
+        cluster_route_revision_value=request.cluster_route_revision,
+        remote_api_port=request.remote_api_port,
+        replace=request.replace,
+        require_token=request.require_token,
+        expected_api_release_identity_sha256=expected_release_sha256,
+    )
+    if attempt is not None and (
+        attempt.get("expected_api_release_identity_sha256") != expected_release_sha256
+        or attempt.get("api_release_identity_sha256") != release_identity_sha256
+    ):
+        raise RelayError("prior owned-session start release identity changed")
+    return attempt
+
+
+def _legacy_start_attempt_matches_metadata(
+    *,
+    attempt: dict[str, object],
+    metadata: dict[str, object],
+) -> bool:
+    """Return whether a v1 start journal names the exact committed generation."""
+    identity_fields = (
+        "cluster",
+        "session_id",
+        "session_generation_id",
+        "owner_token",
+        "api_release_identity_sha256",
+        "cluster_registry_path",
+        "cluster_registry_sha256",
+        "cluster_route_revision",
+        "remote_api_port",
+        "systemd_unit",
+        "systemd_description",
+        "systemd_cgroup_path",
+        "systemd_invocation_id",
+        "containment_broker_pid",
+        "containment_broker_start_identity",
+    )
+    owner_token = metadata.get("owner_token")
+    return bool(
+        attempt.get("start_phase") == "contained"
+        and all(attempt.get(field) == metadata.get(field) for field in identity_fields)
+        and isinstance(owner_token, str)
+        and attempt.get("owner_token_sha256")
+        == hashlib.sha256(owner_token.encode("utf-8")).hexdigest()
+    )
+
+
+def _migrate_legacy_start_attempt(
+    transaction: _OwnedSessionTransaction,
+    *,
+    request: OwnedSessionStartRequest,
+    release_identity_sha256: str,
+    replacement_identity_verified: bool = False,
+) -> dict[str, object] | None:
+    """Bind a valid pre-v2 attempt to a caller-supplied planned operation.
+
+    Version 1 did not contain an operation selector or the complete request
+    policy, so it is never exposed as a queryable start.  A new planned request
+    may adopt its exact generation only after every identity v1 did record has
+    matched; a failed legacy attempt additionally requires explicit replacement.
+    """
+    attempt = _validated_start_attempt(
+        transaction,
+        cluster=request.cluster,
+        session_id=request.session_id,
+        cluster_registry_sha256=request.cluster_registry_sha256,
+        cluster_route_revision_value=request.cluster_route_revision,
+        remote_api_port=request.remote_api_port,
+        allow_legacy=True,
+    )
+    if attempt is None or attempt.get("schema_version") != ("clio-relay.owner-session-attempt.v1"):
+        return attempt
+    release_changed = attempt.get("api_release_identity_sha256") != release_identity_sha256
+    if release_changed and not (request.replace and replacement_identity_verified):
+        raise RelayError("legacy owned-session start release identity changed")
+    if attempt.get("error") is not None and not request.replace:
+        raise RelayError("a failed legacy owned-session start requires --replace")
+    identity = {
+        key: value
+        for key, value in attempt.items()
+        if key not in {"schema_version", "operation", "observed_at", "error"}
+    }
+    identity.update(
+        {
+            "start_operation_id": request.start_operation_id,
+            "api_release_identity_sha256": release_identity_sha256,
+            "expected_api_release_identity_sha256": (
+                request.expected_api_release_identity.sha256()
+                if request.expected_api_release_identity is not None
+                else None
+            ),
+            "replace": request.replace,
+            "require_token": request.require_token,
+        }
+    )
+    _write_session_attempt(transaction, operation="start", identity=identity)
+    return _validated_resumable_start_attempt(
+        transaction,
+        request=request,
+        release_identity_sha256=release_identity_sha256,
+    )
+
+
+def _owned_api_requires_token(*, proc_root: Path, pid: int) -> bool:
+    """Read the exact verified API leader argv and return its auth policy."""
+    try:
+        arguments = _read_bounded_proc_bytes(
+            proc_root / str(pid) / "cmdline",
+            maximum_bytes=_MAX_PROC_RECORD_BYTES,
+        ).split(bytes([0]))
+    except (FileNotFoundError, ProcessLookupError) as exc:
+        raise RelayError("owned API leader disappeared during auth verification") from exc
+    if not _is_clio_relay_api_leader(proc_root=proc_root, pid=pid):
+        raise RelayError("owned API auth policy cannot be tied to the verified leader")
+    return b"--require-token" in arguments
+
+
+class _RecoveredStartProbe:
+    """Minimal process observation used while adopting an exact persistent scope."""
+
+    def poll(self) -> None:
+        """The receipt and scope checks, not a stale parent handle, prove liveness."""
+        return None
+
+
+def _promote_resumable_contained_start(
+    *,
+    transaction: _OwnedSessionTransaction,
+    attempt: dict[str, object],
+    request: OwnedSessionStartRequest,
+    release_identity: SessionApiReleaseIdentity,
+    queue: _OwnedSessionQueue,
+    proc_root: Path,
+    home: Path | None,
+) -> list[str] | None:
+    """Commit ready metadata when an exact crash-surviving API already exists."""
+    if attempt.get("start_phase") != "contained" or attempt.get("error") is not None:
+        return None
+    generation_id = cast(str, attempt["session_generation_id"])
+    owner_token = cast(str, attempt["owner_token"])
+    receipt_name = f"api-startup-{generation_id}.json"
+    receipt_path = transaction.path / receipt_name
+    expected_receipt = {
+        "cluster": request.cluster,
+        "session_id": request.session_id,
+        "session_generation_id": generation_id,
+        "api_release_identity_sha256": release_identity.sha256(),
+        "cluster_registry_path": attempt["cluster_registry_path"],
+        "cluster_registry_sha256": request.cluster_registry_sha256,
+        "cluster_route_revision": request.cluster_route_revision,
+        "systemd_unit": attempt["systemd_unit"],
+        "systemd_cgroup_path": attempt["systemd_cgroup_path"],
+        "systemd_invocation_id": attempt["systemd_invocation_id"],
+        "systemd_description": attempt["systemd_description"],
+    }
+    probe = cast(subprocess.Popen[Any], _RecoveredStartProbe())
+    try:
+        process_identity = _wait_for_api_startup_receipt(
+            transaction=transaction,
+            process=probe,
+            receipt_name=receipt_name,
+            owner_token=owner_token,
+            expected=expected_receipt,
+            proc_root=proc_root,
+        )
+        ready_seconds = _wait_for_api_ready(
+            process=cast(subprocess.Popen[bytes], probe),
+            port=request.remote_api_port,
+            require_token=request.require_token,
+        )
+        final_process_identity = _wait_for_api_startup_receipt(
+            transaction=transaction,
+            process=probe,
+            receipt_name=receipt_name,
+            owner_token=owner_token,
+            expected=expected_receipt,
+            proc_root=proc_root,
+        )
+        if final_process_identity != process_identity:
+            raise RelayError("recovered owned API identity changed after health verification")
+    except RelayError:
+        return None
+    receipt_payload = transaction.read_bytes(
+        receipt_name,
+        maximum_bytes=_MAX_API_STARTUP_RECEIPT_BYTES,
+    )
+    if receipt_payload is None:  # pragma: no cover - required read
+        return None
+    metadata = {
+        "cluster": request.cluster,
+        "session_id": request.session_id,
+        "remote_api_port": request.remote_api_port,
+        "api_pid": process_identity.pid,
+        "api_pgid": process_identity.process_group_id,
+        "owner_token": owner_token,
+        "session_generation_id": generation_id,
+        "api_release_identity": release_identity.model_dump(mode="json"),
+        "api_release_identity_sha256": release_identity.sha256(),
+        "cluster_registry_path": attempt["cluster_registry_path"],
+        "cluster_registry_sha256": request.cluster_registry_sha256,
+        "cluster_route_revision": request.cluster_route_revision,
+        "cluster_authority_verified": True,
+        "process_start_ticks": process_identity.start_ticks,
+        "containment_mode": "linux_systemd_scope",
+        "systemd_unit": attempt["systemd_unit"],
+        "systemd_cgroup_path": attempt["systemd_cgroup_path"],
+        "systemd_invocation_id": attempt["systemd_invocation_id"],
+        "systemd_description": attempt["systemd_description"],
+        "containment_broker_pid": attempt["containment_broker_pid"],
+        "containment_broker_start_identity": attempt["containment_broker_start_identity"],
+        "api_startup_receipt_path": str(receipt_path),
+        "api_startup_receipt_sha256": hashlib.sha256(receipt_payload).hexdigest(),
+        "started_at": datetime.now(UTC).isoformat(),
+        "owner": "clio-relay",
+    }
+    transaction.atomic_write("api.pid", f"{process_identity.pid}\n".encode("ascii"))
+    transaction.atomic_write("metadata.json", json.dumps(metadata, indent=2).encode("utf-8"))
+    queue.clear_owner_session_closing(request.session_id, session_generation_id=generation_id)
+    promoted_status = inspect_owned_session_recovery_status(
+        cluster=request.cluster,
+        session_id=request.session_id,
+        core_dir=queue.root,
+        home=home,
+        proc_root=proc_root,
+        transaction=transaction,
+        expected_start_operation_id=request.start_operation_id,
+        expected_cluster_route_revision=request.cluster_route_revision,
+    )
+    if not (
+        promoted_status.recovery_verified
+        and promoted_status.leader_process_state == "owned_running"
+        and promoted_status.api_pid == process_identity.pid
+        and promoted_status.ownership_verified
+        and promoted_status.session_generation_id == generation_id
+        and promoted_status.start_attempt_verified
+    ):
+        raise RelayError("recovered owned API did not pass post-commit identity verification")
+    return [
+        f"remote_api_ready_seconds={ready_seconds:.3f}",
+        f"session_started={request.session_id}",
+        f"start_operation_id={request.start_operation_id}",
+        f"api_pid={process_identity.pid}",
+        f"session_generation_id={generation_id}",
+        f"remote_api_port={request.remote_api_port}",
+        f"metadata={transaction.path / 'metadata.json'}",
+    ]
 
 
 def execute_owned_session_identity_challenge(
@@ -3475,9 +4371,7 @@ def execute_owned_session_start(
         and release_identity != request.expected_api_release_identity
     ):
         raise RelayError("session API installation changed after compatibility verification")
-    api_token = os.environ.get("CLIO_RELAY_API_TOKEN")
-    if request.require_token and not api_token:
-        raise RelayError("owned session API token is required but unavailable")
+    api_token = _owned_session_api_token(require_token=request.require_token)
     settings_core_dir = RelaySettings.from_env().core_dir if core_dir is None else core_dir
     queue = ClioCoreQueue(settings_core_dir)
     get_effective_uid = cast(Callable[[], int] | None, getattr(os, "geteuid", None))
@@ -3492,8 +4386,197 @@ def execute_owned_session_start(
         home=home,
     ) as transaction:
         existing = transaction.read_json("metadata.json", required=False)
+        raw_attempt = transaction.read_json("start-attempt.json", required=False)
+        legacy_migrated = bool(
+            raw_attempt is not None
+            and raw_attempt.get("schema_version") == "clio-relay.owner-session-attempt.v1"
+        )
+        if legacy_migrated:
+            legacy_attempt = _validated_start_attempt(
+                transaction,
+                cluster=request.cluster,
+                session_id=request.session_id,
+                cluster_registry_sha256=request.cluster_registry_sha256,
+                cluster_route_revision_value=request.cluster_route_revision,
+                remote_api_port=request.remote_api_port,
+                allow_legacy=True,
+            )
+            if legacy_attempt is None:  # pragma: no cover - raw attempt exists
+                raise RelayError("legacy owned-session start attempt disappeared")
+            replacement_identity_verified = False
+            if existing is not None:
+                legacy_status = inspect_owned_session_recovery_status(
+                    cluster=request.cluster,
+                    session_id=request.session_id,
+                    core_dir=settings_core_dir,
+                    home=home,
+                    proc_root=proc_root,
+                    effective_uid=uid,
+                )
+                if not (
+                    legacy_status.recovery_verified
+                    and legacy_status.ownership_verified
+                    and legacy_status.session_generation_id
+                    == legacy_attempt.get("session_generation_id")
+                    and legacy_status.cluster_route_revision
+                    == legacy_attempt.get("cluster_route_revision")
+                    and legacy_status.remote_api_port == legacy_attempt.get("remote_api_port")
+                    and legacy_status.api_release_identity is not None
+                    and legacy_status.api_release_identity.sha256()
+                    == legacy_attempt.get("api_release_identity_sha256")
+                    and _legacy_start_attempt_matches_metadata(
+                        attempt=legacy_attempt,
+                        metadata=existing,
+                    )
+                ):
+                    raise RelayError(
+                        "legacy start journal does not match exact verified session metadata"
+                    )
+                replacement_identity_verified = True
+                if not request.replace:
+                    if not (
+                        legacy_status.running
+                        and legacy_status.leader_process_state == "owned_running"
+                        and legacy_status.api_pid is not None
+                    ):
+                        raise RelayError(
+                            "legacy owned session cannot be adopted without exact live proof; "
+                            "use --replace"
+                        )
+                    if (
+                        _owned_api_requires_token(
+                            proc_root=proc_root,
+                            pid=legacy_status.api_pid,
+                        )
+                        is not request.require_token
+                    ):
+                        raise RelayError("legacy owned session auth policy differs; use --replace")
+            elif (
+                request.replace
+                and legacy_attempt.get("api_release_identity_sha256") != release_identity.sha256()
+            ):
+                legacy_generation = cast(str, legacy_attempt["session_generation_id"])
+                legacy_phase = cast(str, legacy_attempt["start_phase"])
+                admission = queue.owner_session_generation_status(
+                    request.session_id,
+                    session_generation_id=legacy_generation,
+                )
+                active_generation = admission.get("active_generation_id")
+                admission_verified = bool(
+                    admission.get("owner_session_id") == request.session_id
+                    and admission.get("session_generation_id") == legacy_generation
+                    and admission.get("closing_generation_id") is None
+                    and (
+                        (
+                            legacy_phase == "pending"
+                            and active_generation in {None, legacy_generation}
+                        )
+                        or (
+                            legacy_phase != "pending"
+                            and active_generation == legacy_generation
+                            and admission.get("open") is True
+                        )
+                    )
+                )
+                if not admission_verified:
+                    raise RelayError(
+                        "legacy owned-session generation conflicts with durable core admission"
+                    )
+                if legacy_phase in {"scope_bound", "contained"}:
+                    _recorded_scope_processes(
+                        proc_root=proc_root,
+                        systemd_unit=cast(str, legacy_attempt["systemd_unit"]),
+                        systemd_cgroup_path=cast(
+                            str,
+                            legacy_attempt["systemd_cgroup_path"],
+                        ),
+                        systemd_invocation_id=cast(
+                            str,
+                            legacy_attempt["systemd_invocation_id"],
+                        ),
+                        systemd_description=cast(
+                            str,
+                            legacy_attempt["systemd_description"],
+                        ),
+                    )
+                replacement_identity_verified = True
+            elif (
+                existing is None
+                and legacy_attempt.get("start_phase") == "contained"
+                and not request.replace
+            ):
+                raise RelayError(
+                    "legacy contained start requires --replace because v1 did not bind auth policy"
+                )
+            prior_attempt = _migrate_legacy_start_attempt(
+                transaction,
+                request=request,
+                release_identity_sha256=release_identity.sha256(),
+                replacement_identity_verified=replacement_identity_verified,
+            )
+        else:
+            prior_attempt = _validated_start_attempt(
+                transaction,
+                cluster=request.cluster,
+                session_id=request.session_id,
+            )
+        exact_prior_attempt: dict[str, object] | None = None
+        if (
+            prior_attempt is not None
+            and prior_attempt.get("start_operation_id") == request.start_operation_id
+        ):
+            exact_prior_attempt = _validated_resumable_start_attempt(
+                transaction,
+                request=request,
+                release_identity_sha256=release_identity.sha256(),
+            )
+        if (
+            existing is None
+            and prior_attempt is not None
+            and prior_attempt.get("error") is not None
+        ):
+            if prior_attempt.get("start_operation_id") == request.start_operation_id:
+                raise RelayError("owned-session start operation already failed terminally")
+            if not request.replace:
+                raise RelayError("a new start operation requires --replace after terminal failure")
+            if not (
+                prior_attempt.get("api_release_identity_sha256") == release_identity.sha256()
+                and prior_attempt.get("cluster_registry_sha256") == request.cluster_registry_sha256
+                and prior_attempt.get("cluster_route_revision") == request.cluster_route_revision
+                and prior_attempt.get("remote_api_port") == request.remote_api_port
+            ):
+                raise RelayError(
+                    "failed owned-session generation identity changed before replacement"
+                )
+            replacement_attempt = {
+                key: value
+                for key, value in prior_attempt.items()
+                if key not in {"schema_version", "operation", "observed_at", "error"}
+            }
+            replacement_attempt.update(
+                {
+                    "start_operation_id": request.start_operation_id,
+                    "replace": request.replace,
+                    "require_token": request.require_token,
+                    "expected_api_release_identity_sha256": (
+                        request.expected_api_release_identity.sha256()
+                        if request.expected_api_release_identity is not None
+                        else None
+                    ),
+                }
+            )
+            _write_session_attempt(
+                transaction,
+                operation="start",
+                identity=replacement_attempt,
+            )
         resumable_attempt = (
-            _validated_resumable_start_attempt(transaction, request=request)
+            exact_prior_attempt
+            or _validated_resumable_start_attempt(
+                transaction,
+                request=request,
+                release_identity_sha256=release_identity.sha256(),
+            )
             if existing is None
             else None
         )
@@ -3529,6 +4612,17 @@ def execute_owned_session_start(
                         "is still closing; retry after the teardown coordinator marks it closed"
                     )
             else:
+                same_completed_operation = bool(
+                    not legacy_migrated
+                    and prior_attempt is not None
+                    and prior_attempt.get("start_operation_id") == request.start_operation_id
+                    and existing_status.start_attempt_verified
+                    and existing_status.start_state == "ready"
+                )
+                if same_completed_operation and (request.replace or not existing_status.running):
+                    raise RelayError(
+                        "owned-session start operation already completed; use a fresh operation id"
+                    )
                 existing_release = existing_status.api_release_identity
                 registry_matches = bool(
                     existing.get("cluster_registry_sha256") == request.cluster_registry_sha256
@@ -3547,12 +4641,56 @@ def execute_owned_session_start(
                 elif existing_status.running and not request.replace:
                     if not (registry_matches and release_matches and port_matches):
                         raise RelayError("existing owned session identity differs; use --replace")
+                    if (
+                        prior_attempt is None
+                        or prior_attempt.get("require_token") is not request.require_token
+                    ):
+                        raise RelayError(
+                            "existing owned session token policy is not proven; use --replace"
+                        )
+                    existing_owner_token = cast(str, existing["owner_token"])
+                    _write_session_attempt(
+                        transaction,
+                        operation="start",
+                        identity={
+                            "cluster": request.cluster,
+                            "session_id": request.session_id,
+                            "start_operation_id": request.start_operation_id,
+                            "session_generation_id": recorded_generation,
+                            "owner_token": existing_owner_token,
+                            "owner_token_sha256": hashlib.sha256(
+                                existing_owner_token.encode("utf-8")
+                            ).hexdigest(),
+                            "api_release_identity_sha256": release_identity.sha256(),
+                            "expected_api_release_identity_sha256": (
+                                request.expected_api_release_identity.sha256()
+                                if request.expected_api_release_identity is not None
+                                else None
+                            ),
+                            "cluster_registry_path": existing["cluster_registry_path"],
+                            "cluster_registry_sha256": request.cluster_registry_sha256,
+                            "cluster_route_revision": request.cluster_route_revision,
+                            "remote_api_port": request.remote_api_port,
+                            "replace": request.replace,
+                            "require_token": request.require_token,
+                            "start_phase": "contained",
+                            "systemd_unit": existing["systemd_unit"],
+                            "systemd_description": existing["systemd_description"],
+                            "systemd_cgroup_path": existing["systemd_cgroup_path"],
+                            "systemd_invocation_id": existing["systemd_invocation_id"],
+                            "containment_broker_pid": existing["containment_broker_pid"],
+                            "containment_broker_start_identity": existing[
+                                "containment_broker_start_identity"
+                            ],
+                        },
+                    )
                     queue.clear_owner_session_closing(
                         request.session_id,
                         session_generation_id=recorded_generation,
                     )
                     return [
                         f"session_already_running={request.session_id}",
+                        f"start_operation_id={request.start_operation_id}",
                         f"api_pid={existing_status.api_pid}",
                         f"session_generation_id={recorded_generation}",
                         f"remote_api_port={request.remote_api_port}",
@@ -3616,7 +4754,23 @@ def execute_owned_session_start(
                     )
                     attempt_phase = "scope_bound"
             if attempt_phase in {"scope_bound", "contained"}:
-                attempt_processes = _recorded_scope_processes(
+                if attempt_phase == "contained":
+                    promoted = _promote_resumable_contained_start(
+                        transaction=transaction,
+                        attempt=resumable_attempt,
+                        request=request,
+                        release_identity=release_identity,
+                        queue=queue,
+                        proc_root=proc_root,
+                        home=home,
+                    )
+                    if promoted is not None:
+                        return promoted
+                    if legacy_migrated and not request.replace:
+                        raise RelayError(
+                            "legacy contained start could not be adopted exactly; use --replace"
+                        )
+                _recorded_scope_processes(
                     proc_root=proc_root,
                     systemd_unit=cast(str, resumable_attempt["systemd_unit"]),
                     systemd_cgroup_path=cast(str, resumable_attempt["systemd_cgroup_path"]),
@@ -3626,10 +4780,6 @@ def execute_owned_session_start(
                     ),
                     systemd_description=cast(str, resumable_attempt["systemd_description"]),
                 )
-                if attempt_processes and not request.replace:
-                    raise RelayError(
-                        "a prior start attempt still owns generation processes; use --replace"
-                    )
                 _terminate_recorded_session_scope(
                     systemd_unit=cast(str, resumable_attempt["systemd_unit"]),
                     systemd_cgroup_path=cast(str, resumable_attempt["systemd_cgroup_path"]),
@@ -3660,6 +4810,11 @@ def execute_owned_session_start(
 
         _assert_remote_port_available(request.remote_api_port)
         release_sha256 = release_identity.sha256()
+        expected_release_sha256 = (
+            request.expected_api_release_identity.sha256()
+            if request.expected_api_release_identity is not None
+            else None
+        )
         if existing is None:
             if resumable_attempt is None:
                 candidate_generation = uuid4().hex
@@ -3675,14 +4830,18 @@ def execute_owned_session_start(
                 attempt_identity: dict[str, object] = {
                     "cluster": request.cluster,
                     "session_id": request.session_id,
+                    "start_operation_id": request.start_operation_id,
                     "session_generation_id": candidate_generation,
                     "owner_token": owner_token,
                     "owner_token_sha256": owner_token_sha256,
                     "api_release_identity_sha256": release_sha256,
+                    "expected_api_release_identity_sha256": expected_release_sha256,
                     "cluster_registry_path": str(registry_path),
                     "cluster_registry_sha256": request.cluster_registry_sha256,
                     "cluster_route_revision": request.cluster_route_revision,
                     "remote_api_port": request.remote_api_port,
+                    "replace": request.replace,
+                    "require_token": request.require_token,
                     "start_phase": "pending",
                     "systemd_unit": systemd_unit,
                     "systemd_description": systemd_description,
@@ -3752,14 +4911,18 @@ def execute_owned_session_start(
             attempt_identity = {
                 "cluster": request.cluster,
                 "session_id": request.session_id,
+                "start_operation_id": request.start_operation_id,
                 "session_generation_id": selected_generation,
                 "owner_token": owner_token,
                 "owner_token_sha256": owner_token_sha256,
                 "api_release_identity_sha256": release_sha256,
+                "expected_api_release_identity_sha256": expected_release_sha256,
                 "cluster_registry_path": str(registry_path),
                 "cluster_registry_sha256": request.cluster_registry_sha256,
                 "cluster_route_revision": request.cluster_route_revision,
                 "remote_api_port": request.remote_api_port,
+                "replace": request.replace,
+                "require_token": request.require_token,
                 "start_phase": "admitted",
                 "systemd_unit": systemd_unit,
                 "systemd_description": systemd_description,
@@ -3806,7 +4969,6 @@ def execute_owned_session_start(
                 "CLIO_RELAY_OWNER_SESSION_CLUSTER": request.cluster,
                 "CLIO_RELAY_REMOTE_CLUSTER": request.cluster,
             }
-            api_token = os.environ.get("CLIO_RELAY_API_TOKEN")
             if api_token is not None:
                 child_environment["CLIO_RELAY_API_TOKEN"] = api_token
             environment = dict(os.environ)
@@ -3931,6 +5093,7 @@ def execute_owned_session_start(
             ready_seconds = _wait_for_api_ready(
                 process=cast(subprocess.Popen[bytes], process),
                 port=request.remote_api_port,
+                require_token=request.require_token,
             )
             receipt_payload = transaction.read_bytes(
                 receipt_name,
@@ -3980,6 +5143,7 @@ def execute_owned_session_start(
             return [
                 f"remote_api_ready_seconds={ready_seconds:.3f}",
                 f"session_started={request.session_id}",
+                f"start_operation_id={request.start_operation_id}",
                 f"api_pid={process_identity.pid}",
                 f"session_generation_id={selected_generation}",
                 f"remote_api_port={request.remote_api_port}",
@@ -4802,6 +5966,63 @@ def execute_owned_session_cleanup_report_read(
         )
 
 
+def plan_remote_session_start(
+    *,
+    cluster: str,
+    definition: ClusterDefinition,
+    session_id: str,
+    remote_api_port: int,
+    replace: bool,
+    require_token: bool,
+    start_operation_id: str | None = None,
+    expected_cluster_route_revision: str | None = None,
+    expected_api_release_identity_sha256: str | None = None,
+) -> OwnedSessionStartPlan:
+    """Create a read-only exact selector plan before any remote mutation."""
+    _validate_session(session_id=session_id, remote_api_port=remote_api_port)
+    _, _, route_revision = _session_cluster_registry_authority(
+        cluster=cluster,
+        definition=definition,
+    )
+    if (
+        expected_cluster_route_revision is not None
+        and expected_cluster_route_revision != route_revision
+    ):
+        raise RelayError("owned-session start plan route revision changed")
+    operation_id = start_operation_id or f"start_{uuid4().hex}"
+    _validate_durable_session_identity(operation_id, field="start_operation_id")
+    status_selector = OwnedSessionStartStatusSelector(
+        cluster=cluster,
+        session_id=session_id,
+        start_operation_id=operation_id,
+        cluster_route_revision=route_revision,
+        remote_api_port=remote_api_port,
+        replace=replace,
+        require_token=require_token,
+        expected_api_release_identity_sha256=expected_api_release_identity_sha256,
+    )
+    retry_selector = OwnedSessionStartRetrySelector(
+        cluster=cluster,
+        session_id=session_id,
+        start_operation_id=operation_id,
+        cluster_route_revision=route_revision,
+        remote_api_port=remote_api_port,
+        replace=replace,
+        require_token=require_token,
+        expected_api_release_identity_sha256=expected_api_release_identity_sha256,
+    )
+    return OwnedSessionStartPlan(
+        cluster=cluster,
+        session_id=session_id,
+        start_operation_id=operation_id,
+        cluster_route_revision=route_revision,
+        remote_api_port=remote_api_port,
+        expected_api_release_identity_sha256=expected_api_release_identity_sha256,
+        status_selector=status_selector,
+        retry_selector=retry_selector,
+    )
+
+
 def start_remote_session(
     *,
     cluster: str,
@@ -4811,19 +6032,37 @@ def start_remote_session(
     api_token: str | None,
     expected_api_release_identity: SessionApiReleaseIdentity | None = None,
     replace: bool = False,
+    start_operation_id: str | None = None,
+    expected_cluster_route_revision: str | None = None,
 ) -> list[str]:
     """Start a cluster-side relay API owned by a session id."""
-    _validate_session(session_id=session_id, remote_api_port=remote_api_port)
+    plan = plan_remote_session_start(
+        cluster=cluster,
+        definition=definition,
+        session_id=session_id,
+        remote_api_port=remote_api_port,
+        replace=replace,
+        require_token=api_token is not None,
+        start_operation_id=start_operation_id,
+        expected_cluster_route_revision=expected_cluster_route_revision,
+        expected_api_release_identity_sha256=(
+            expected_api_release_identity.sha256()
+            if expected_api_release_identity is not None
+            else None
+        ),
+    )
     result = _ssh_script(
         definition,
         _start_script(
             cluster=cluster,
             definition=definition,
             session_id=session_id,
+            start_operation_id=plan.start_operation_id,
             remote_api_port=remote_api_port,
             api_token=api_token,
             expected_api_release_identity=expected_api_release_identity,
             replace=replace,
+            expected_cluster_route_revision=plan.cluster_route_revision,
         ),
     )
     return result.splitlines()
@@ -4841,6 +6080,336 @@ def status_remote_session(
         _owned_status_script(cluster=definition.name, session_id=session_id),
     )
     return cast(dict[str, object], json.loads(output))
+
+
+def status_remote_session_start(
+    *,
+    definition: ClusterDefinition,
+    selector: OwnedSessionStartStatusSelector,
+) -> OwnedSessionRecoveryStatus:
+    """Return a nonblocking remote observation for one exact start operation."""
+    if definition.name != selector.cluster:
+        raise RelayError("owned-session start status selector changed cluster")
+    try:
+        output = _ssh_script(
+            definition,
+            _owned_start_status_script(selector),
+            timeout_seconds=_REMOTE_SESSION_START_RECOVERY_TIMEOUT_SECONDS,
+        )
+    except _RemoteSessionCommandDeadline as exc:
+        return OwnedSessionRecoveryStatus(
+            cluster=selector.cluster,
+            session_id=selector.session_id,
+            start_operation_id=selector.start_operation_id,
+            cluster_route_revision=selector.cluster_route_revision,
+            start_state="starting",
+            start_retryable=True,
+            errors=[str(exc)],
+        )
+    try:
+        status = OwnedSessionRecoveryStatus.model_validate_json(output)
+    except ValueError as exc:
+        raise RelayError(f"owned-session start status is invalid: {exc}") from exc
+    if not (
+        status.cluster == selector.cluster
+        and status.session_id == selector.session_id
+        and status.start_operation_id == selector.start_operation_id
+        and status.cluster_route_revision == selector.cluster_route_revision
+    ):
+        raise RelayError("owned-session start status changed its exact selector")
+    return status
+
+
+def _owned_session_start_result(
+    *,
+    plan: OwnedSessionStartPlan,
+    state: Literal["ready", "starting", "ambiguous", "failed", "not_current"],
+    terminal: bool,
+    retryable: bool,
+    transition_accepted: bool | None,
+    transport_deadline_exceeded: bool,
+    compatibility_lines: list[str],
+    session_generation_id: str | None = None,
+    running: bool = False,
+    ownership_verified: bool = False,
+    recovery_verified: bool = False,
+    start_phase: Literal["pending", "admitted", "scope_bound", "contained"] | None = None,
+    error: str | None = None,
+) -> OwnedSessionStartResult:
+    """Build one typed result while copying the exact immutable plan identity."""
+    return OwnedSessionStartResult(
+        cluster=plan.cluster,
+        session_id=plan.session_id,
+        start_operation_id=plan.start_operation_id,
+        cluster_route_revision=plan.cluster_route_revision,
+        session_generation_id=session_generation_id,
+        remote_api_port=plan.remote_api_port,
+        state=state,
+        terminal=terminal,
+        retryable=retryable,
+        transition_accepted=transition_accepted,
+        transport_deadline_exceeded=transport_deadline_exceeded,
+        running=running,
+        ownership_verified=ownership_verified,
+        recovery_verified=recovery_verified,
+        start_phase=start_phase,
+        error=error,
+        status_selector=plan.status_selector,
+        retry_selector=plan.retry_selector,
+        compatibility_lines=compatibility_lines,
+    )
+
+
+def _session_start_result_from_status(
+    *,
+    plan: OwnedSessionStartPlan,
+    status: OwnedSessionRecoveryStatus,
+    transport_deadline_exceeded: bool,
+) -> OwnedSessionStartResult:
+    """Project exact remote recovery evidence into the public start contract."""
+    generation_id = status.session_generation_id
+    if status.start_state == "not_current":
+        detail = "; ".join(status.errors) or "owned-session start selector is no longer current"
+        return _owned_session_start_result(
+            plan=plan,
+            state="not_current",
+            terminal=True,
+            retryable=False,
+            transition_accepted=None,
+            transport_deadline_exceeded=transport_deadline_exceeded,
+            error=detail[:_MAX_SESSION_START_ERROR_CHARS],
+            compatibility_lines=[
+                "session_start_state=not_current",
+                f"session_id={plan.session_id}",
+                f"start_operation_id={plan.start_operation_id}",
+                "session_generation_id=",
+            ],
+        )
+    if status.start_attempt_verified and not (
+        status.start_replace is plan.retry_selector.replace
+        and status.start_require_token is plan.retry_selector.require_token
+        and status.start_expected_api_release_identity_sha256
+        == plan.expected_api_release_identity_sha256
+        and status.remote_api_port == plan.remote_api_port
+    ):
+        return _owned_session_start_result(
+            plan=plan,
+            state="failed",
+            terminal=True,
+            retryable=False,
+            transition_accepted=None,
+            transport_deadline_exceeded=transport_deadline_exceeded,
+            error="remote start journal does not match the persisted retry selector",
+            compatibility_lines=[
+                "session_start_state=failed",
+                f"session_id={plan.session_id}",
+                f"start_operation_id={plan.start_operation_id}",
+                "session_generation_id=",
+            ],
+        )
+    if (
+        status.recovery_verified
+        and status.ownership_verified
+        and generation_id is not None
+        and status.start_attempt_verified
+        and status.start_state == "ready"
+    ):
+        return _owned_session_start_result(
+            plan=plan,
+            session_generation_id=generation_id,
+            state="ready",
+            terminal=True,
+            retryable=False,
+            transition_accepted=True,
+            transport_deadline_exceeded=transport_deadline_exceeded,
+            running=status.leader_process_state == "owned_running",
+            ownership_verified=True,
+            recovery_verified=True,
+            start_phase=status.start_phase,
+            compatibility_lines=[
+                "session_start_state=ready",
+                f"session_started={plan.session_id}",
+                f"start_operation_id={plan.start_operation_id}",
+                f"session_generation_id={generation_id}",
+                f"remote_api_port={plan.remote_api_port}",
+            ],
+        )
+    if status.start_attempt_verified and generation_id is not None:
+        if status.start_state == "failed":
+            detail = status.start_error or "owned-session start attempt failed"
+            return _owned_session_start_result(
+                plan=plan,
+                session_generation_id=generation_id,
+                state="failed",
+                terminal=True,
+                retryable=False,
+                transition_accepted=True,
+                transport_deadline_exceeded=transport_deadline_exceeded,
+                start_phase=status.start_phase,
+                error=detail,
+                compatibility_lines=[
+                    "session_start_state=failed",
+                    f"session_id={plan.session_id}",
+                    f"start_operation_id={plan.start_operation_id}",
+                    f"session_generation_id={generation_id}",
+                    f"error={detail}",
+                ],
+            )
+        return _owned_session_start_result(
+            plan=plan,
+            session_generation_id=generation_id,
+            state="starting",
+            terminal=False,
+            retryable=True,
+            transition_accepted=True,
+            transport_deadline_exceeded=transport_deadline_exceeded,
+            start_phase=status.start_phase,
+            compatibility_lines=[
+                "session_start_state=starting",
+                f"session_id={plan.session_id}",
+                f"start_operation_id={plan.start_operation_id}",
+                f"session_generation_id={generation_id}",
+            ],
+        )
+    detail = "; ".join(status.errors) or "remote start transition is not yet observable"
+    return _owned_session_start_result(
+        plan=plan,
+        state="ambiguous",
+        terminal=False,
+        retryable=True,
+        transition_accepted=None,
+        transport_deadline_exceeded=transport_deadline_exceeded,
+        error=detail[:_MAX_SESSION_START_ERROR_CHARS],
+        compatibility_lines=[
+            "session_start_state=ambiguous",
+            f"session_id={plan.session_id}",
+            f"start_operation_id={plan.start_operation_id}",
+            "session_generation_id=",
+        ],
+    )
+
+
+def query_remote_session_start(
+    *,
+    definition: ClusterDefinition,
+    plan: OwnedSessionStartPlan,
+    transport_deadline_exceeded: bool = False,
+) -> OwnedSessionStartResult:
+    """Query one exact start once; callers choose any aggregate polling policy."""
+    try:
+        status = status_remote_session_start(
+            definition=definition,
+            selector=plan.status_selector,
+        )
+    except RelayError as exc:
+        status = OwnedSessionRecoveryStatus(
+            cluster=plan.cluster,
+            session_id=plan.session_id,
+            start_operation_id=plan.start_operation_id,
+            cluster_route_revision=plan.cluster_route_revision,
+            start_state="starting",
+            start_retryable=True,
+            errors=[str(exc)[:_MAX_SESSION_START_ERROR_CHARS]],
+        )
+    return _session_start_result_from_status(
+        plan=plan,
+        status=status,
+        transport_deadline_exceeded=transport_deadline_exceeded,
+    )
+
+
+def start_remote_session_durable(
+    *,
+    definition: ClusterDefinition,
+    plan: OwnedSessionStartPlan,
+    api_token: str | None,
+    expected_api_release_identity: SessionApiReleaseIdentity | None = None,
+    starter: Callable[..., list[str]] | None = None,
+) -> OwnedSessionStartResult:
+    """Start or recover one exact remote transition without erasing deadline ambiguity."""
+    if (api_token is not None) is not plan.retry_selector.require_token:
+        raise RelayError("owned-session start token policy changed after planning")
+    observed_release_sha256 = (
+        expected_api_release_identity.sha256()
+        if expected_api_release_identity is not None
+        else None
+    )
+    if observed_release_sha256 != plan.expected_api_release_identity_sha256:
+        raise RelayError("owned-session start release identity changed after planning")
+    start_callable = starter or start_remote_session
+    try:
+        lines = start_callable(
+            cluster=plan.cluster,
+            definition=definition,
+            session_id=plan.session_id,
+            remote_api_port=plan.remote_api_port,
+            api_token=api_token,
+            expected_api_release_identity=expected_api_release_identity,
+            replace=plan.retry_selector.replace,
+            start_operation_id=plan.start_operation_id,
+            expected_cluster_route_revision=plan.cluster_route_revision,
+        )
+    except _RemoteSessionCommandDeadline:
+        return query_remote_session_start(
+            definition=definition,
+            plan=plan,
+            transport_deadline_exceeded=True,
+        )
+    except _RemoteSessionCommandRejected as exc:
+        rejection = exc.rejection
+        if not (
+            rejection.cluster == plan.cluster
+            and rejection.session_id == plan.session_id
+            and rejection.start_operation_id == plan.start_operation_id
+            and rejection.cluster_route_revision == plan.cluster_route_revision
+        ):
+            return query_remote_session_start(definition=definition, plan=plan)
+        observed = query_remote_session_start(definition=definition, plan=plan)
+        if observed.state != "ambiguous":
+            return observed
+        return observed.model_copy(update={"error": str(exc)[:_MAX_SESSION_START_ERROR_CHARS]})
+    except RelayError:
+        observed = query_remote_session_start(definition=definition, plan=plan)
+        return observed
+    values: dict[str, str] = {}
+    for line in lines:
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in values and values[key] != value:
+            return query_remote_session_start(definition=definition, plan=plan)
+        values[key] = value
+    generation = values.get("session_generation_id")
+    marker = values.get("session_started") or values.get("session_already_running")
+    try:
+        validated_generation = validate_durable_record_id(generation)
+    except (TypeError, ValueError):
+        return query_remote_session_start(definition=definition, plan=plan)
+    if (
+        marker != plan.session_id
+        or values.get("start_operation_id") != plan.start_operation_id
+        or values.get("remote_api_port") != str(plan.remote_api_port)
+    ):
+        return query_remote_session_start(definition=definition, plan=plan)
+    return OwnedSessionStartResult(
+        cluster=plan.cluster,
+        session_id=plan.session_id,
+        start_operation_id=plan.start_operation_id,
+        cluster_route_revision=plan.cluster_route_revision,
+        session_generation_id=validated_generation,
+        remote_api_port=plan.remote_api_port,
+        state="ready",
+        terminal=True,
+        retryable=False,
+        transition_accepted=True,
+        running=True,
+        ownership_verified=True,
+        recovery_verified=True,
+        start_phase="contained",
+        status_selector=plan.status_selector,
+        retry_selector=plan.retry_selector,
+        compatibility_lines=["session_start_state=ready", *lines],
+    )
 
 
 def challenge_remote_session_identity(
@@ -5075,17 +6644,22 @@ def _start_script(
     cluster: str,
     definition: ClusterDefinition,
     session_id: str,
+    start_operation_id: str,
     remote_api_port: int,
     api_token: str | None,
     expected_api_release_identity: SessionApiReleaseIdentity | None,
     replace: bool,
+    expected_cluster_route_revision: str,
 ) -> str:
     cluster_registry_json, cluster_registry_sha256, route_revision = (
         _session_cluster_registry_authority(cluster=cluster, definition=definition)
     )
+    if route_revision != expected_cluster_route_revision:
+        raise RelayError("owned-session start route revision changed after planning")
     request = OwnedSessionStartRequest(
         cluster=cluster,
         session_id=session_id,
+        start_operation_id=start_operation_id,
         remote_api_port=remote_api_port,
         replace=replace,
         require_token=api_token is not None,
@@ -5141,6 +6715,18 @@ def _owned_status_script(*, cluster: str, session_id: str) -> str:
         "set -euo pipefail\n"
         f"clio-relay session recovery-status --cluster {shlex.quote(cluster)} "
         f"--session-id {shlex.quote(session_id)}\n"
+    )
+
+
+def _owned_start_status_script(selector: OwnedSessionStartStatusSelector) -> str:
+    """Render the nonblocking exact-operation start-status command."""
+    return (
+        "set -euo pipefail\n"
+        f"clio-relay session start-status-owned --cluster {shlex.quote(selector.cluster)} "
+        f"--session-id {shlex.quote(selector.session_id)} "
+        f"--start-operation-id {shlex.quote(selector.start_operation_id)} "
+        "--cluster-route-revision "
+        f"{shlex.quote(selector.cluster_route_revision)}\n"
     )
 
 
@@ -5238,7 +6824,14 @@ def _validate_durable_session_identity(value: str, *, field: str) -> str:
         raise RelayError(f"invalid {field}: {error}") from error
 
 
-def _ssh_script(definition: ClusterDefinition, script: str) -> str:
+def _ssh_script(
+    definition: ClusterDefinition,
+    script: str,
+    *,
+    timeout_seconds: float = _REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS,
+) -> str:
+    if timeout_seconds <= 0:
+        raise ValueError("remote session command timeout must be positive")
     encoded_script = script.encode("utf-8")
     if len(encoded_script) > _MAX_REMOTE_SESSION_SCRIPT_BYTES:
         raise RelayError("remote session command exceeds its byte limit")
@@ -5246,22 +6839,28 @@ def _ssh_script(definition: ClusterDefinition, script: str) -> str:
         result = _run_bounded_command(
             ["ssh", definition.ssh_host, "bash", "-s"],
             input_bytes=encoded_script,
-            timeout_seconds=_REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS,
+            timeout_seconds=timeout_seconds,
             stdout_limit=_MAX_REMOTE_SESSION_STDOUT_BYTES,
             stderr_limit=_MAX_REMOTE_SESSION_STDERR_BYTES,
         )
     except RelayError as exc:
         if "timed out" in str(exc):
-            raise RelayError(
-                "remote session command timed out after "
-                f"{_REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS:g} seconds"
+            raise _RemoteSessionCommandDeadline(
+                f"remote session command timed out after {timeout_seconds:g} seconds"
             ) from exc
         raise RelayError(f"remote session command failed safely: {exc}") from exc
     if result.returncode != 0:
         stdout = result.stdout.decode("utf-8", errors="replace").strip()
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
         detail = stderr or stdout
-        raise RelayError(f"remote session command failed: {detail}")
+        try:
+            rejection = OwnedSessionStartRejection.model_validate_json(stdout)
+        except ValueError:
+            raise _RemoteSessionCommandAmbiguous(
+                "remote session transport ended without an exact structured response: "
+                f"{detail or f'exit {result.returncode}'}"
+            ) from None
+        raise _RemoteSessionCommandRejected(rejection)
     return result.stdout.decode("utf-8", errors="replace")
 
 

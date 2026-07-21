@@ -241,6 +241,7 @@ from clio_relay.session_lifecycle import (
     OwnedSessionCleanupReportReadRequest,
     OwnedSessionIdentityChallengeRequest,
     OwnedSessionRecoveryStatus,
+    OwnedSessionStartRejection,
     OwnedSessionStartRequest,
     OwnedSessionTeardownRequest,
     SessionApiReleaseIdentity,
@@ -254,12 +255,16 @@ from clio_relay.session_lifecycle import (
     execute_owned_session_teardown,
     finalize_remote_session_cleanup_report,
     inspect_owned_session_recovery_status,
+    inspect_owned_session_start_status,
     open_owned_session_transaction,
+    plan_remote_session_start,
     publish_owned_session_api_startup_receipt,
+    query_remote_session_start,
     read_remote_session_cleanup_report,
     session_lifecycle_report_bytes,
     session_lifecycle_report_sha256,
     start_remote_session,
+    start_remote_session_durable,
     status_remote_session,
     teardown_remote_session,
 )
@@ -3775,6 +3780,45 @@ def cluster_restart_endpoint_service(
     )
 
 
+@session_app.command("plan-start")
+def session_plan_start(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    session_id: Annotated[str, typer.Option(help="Owned remote relay session id.")],
+    remote_api_port: Annotated[int, typer.Option(help="Remote cluster API port.")] = 8765,
+    replace: Annotated[
+        bool,
+        typer.Option("--replace/--no-replace", help="Plan replacement of an existing API."),
+    ] = False,
+    require_token: Annotated[
+        bool,
+        typer.Option(help="Plan a token-protected remote API."),
+    ] = True,
+    start_operation_id: Annotated[
+        str | None,
+        typer.Option(help="Reuse an existing exact operation id; omitted mints one."),
+    ] = None,
+) -> None:
+    """Emit a read-only exact plan that can survive loss of the start client."""
+    definition = _require_cluster(cluster)
+
+    def action() -> None:
+        release_identity = _verify_session_start_worker_compatibility(definition)
+        typer.echo(
+            plan_remote_session_start(
+                cluster=cluster,
+                definition=definition,
+                session_id=session_id,
+                remote_api_port=remote_api_port,
+                replace=replace,
+                require_token=require_token,
+                start_operation_id=start_operation_id,
+                expected_api_release_identity_sha256=release_identity.sha256(),
+            ).model_dump_json(indent=2)
+        )
+
+    _run_or_exit(action)
+
+
 @session_app.command("start")
 def session_start(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
@@ -3788,6 +3832,22 @@ def session_start(
         bool,
         typer.Option(help="Require CLIO_RELAY_API_TOKEN on the remote API."),
     ] = True,
+    start_operation_id: Annotated[
+        str | None,
+        typer.Option(help="Exact id from session plan-start; omitted mints a fresh operation."),
+    ] = None,
+    expected_cluster_route_revision: Annotated[
+        str | None,
+        typer.Option(help="Fail before mutation if the planned cluster route changed."),
+    ] = None,
+    expected_api_release_identity_sha256: Annotated[
+        str | None,
+        typer.Option(help="Exact release digest from session plan-start."),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json/--text", help="Emit the stable start-result JSON contract."),
+    ] = False,
 ) -> None:
     """Start an owned remote relay API session for detach/reattach workflows."""
     settings = RelaySettings.from_env()
@@ -3795,26 +3855,65 @@ def session_start(
         raise typer.BadParameter(
             "CLIO_RELAY_API_TOKEN is required unless --no-require-token is explicit"
         )
+    if json_output and (
+        start_operation_id is None
+        or expected_cluster_route_revision is None
+        or expected_api_release_identity_sha256 is None
+    ):
+        raise typer.BadParameter(
+            "--json requires persisted operation, route, and release selectors from "
+            "session plan-start"
+        )
     definition = _require_cluster(cluster)
 
     def action() -> None:
+        preliminary_plan = plan_remote_session_start(
+            cluster=cluster,
+            definition=definition,
+            session_id=session_id,
+            remote_api_port=remote_api_port,
+            replace=replace,
+            require_token=require_token,
+            start_operation_id=start_operation_id,
+            expected_cluster_route_revision=expected_cluster_route_revision,
+            expected_api_release_identity_sha256=expected_api_release_identity_sha256,
+        )
         with _session_transition_lock(cluster=cluster, session_id=session_id):
+            api_release_identity = _verify_session_start_worker_compatibility(definition)
+            if (
+                expected_api_release_identity_sha256 is not None
+                and api_release_identity.sha256() != expected_api_release_identity_sha256
+            ):
+                raise RelayError("session API release identity changed after planning")
+            plan = plan_remote_session_start(
+                cluster=cluster,
+                definition=definition,
+                session_id=session_id,
+                remote_api_port=remote_api_port,
+                replace=replace,
+                require_token=require_token,
+                start_operation_id=preliminary_plan.start_operation_id,
+                expected_cluster_route_revision=preliminary_plan.cluster_route_revision,
+                expected_api_release_identity_sha256=api_release_identity.sha256(),
+            )
             _finalize_completed_cleanup_receipt_before_start(
                 definition=definition,
                 cluster=cluster,
                 session_id=session_id,
             )
-            api_release_identity = _verify_session_start_worker_compatibility(definition)
-            lines = start_remote_session(
-                cluster=cluster,
+            result = start_remote_session_durable(
                 definition=definition,
-                session_id=session_id,
-                remote_api_port=remote_api_port,
+                plan=plan,
                 api_token=settings.api_token if require_token else None,
                 expected_api_release_identity=api_release_identity,
-                replace=replace,
+                starter=start_remote_session,
             )
-            _echo_lines(lines)
+            if json_output:
+                typer.echo(result.model_dump_json(indent=2))
+            else:
+                _echo_lines(result.compatibility_lines)
+            if result.state in {"failed", "not_current"}:
+                raise typer.Exit(code=1)
 
     _run_or_exit(action)
 
@@ -4919,6 +5018,51 @@ def session_status(
     )
 
 
+@session_app.command("start-status")
+def session_start_status(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    session_id: Annotated[str, typer.Option(help="Exact owned relay session id.")],
+    start_operation_id: Annotated[str, typer.Option(help="Exact planned start operation id.")],
+    cluster_route_revision: Annotated[
+        str,
+        typer.Option(help="Exact route revision from session plan-start."),
+    ],
+    remote_api_port: Annotated[int, typer.Option(help="Planned remote API port.")],
+    expected_api_release_identity_sha256: Annotated[
+        str,
+        typer.Option(help="Exact release digest from session plan-start."),
+    ],
+    replace: Annotated[
+        bool,
+        typer.Option("--replace/--no-replace", help="Planned replacement policy."),
+    ] = False,
+    require_token: Annotated[
+        bool,
+        typer.Option(help="Planned API token policy."),
+    ] = True,
+) -> None:
+    """Query one exact start once without imposing an aggregate wait deadline."""
+    definition = _require_cluster(cluster)
+
+    def action() -> None:
+        plan = plan_remote_session_start(
+            cluster=cluster,
+            definition=definition,
+            session_id=session_id,
+            remote_api_port=remote_api_port,
+            replace=replace,
+            require_token=require_token,
+            start_operation_id=start_operation_id,
+            expected_cluster_route_revision=cluster_route_revision,
+            expected_api_release_identity_sha256=expected_api_release_identity_sha256,
+        )
+        typer.echo(
+            query_remote_session_start(definition=definition, plan=plan).model_dump_json(indent=2)
+        )
+
+    _run_or_exit(action)
+
+
 @session_app.command("submit-jarvis")
 def session_submit_jarvis(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
@@ -5062,6 +5206,31 @@ def session_recovery_status(
     _run_or_exit(action)
 
 
+@session_app.command("start-status-owned", hidden=True)
+def session_start_status_owned(
+    cluster: Annotated[str, typer.Option(help="Exact cluster selected by the start plan.")],
+    session_id: Annotated[str, typer.Option(help="Exact owned relay session id.")],
+    start_operation_id: Annotated[str, typer.Option(help="Exact start operation id.")],
+    cluster_route_revision: Annotated[
+        str,
+        typer.Option(help="Exact cluster route revision selected by the start plan."),
+    ],
+) -> None:
+    """Return one nonblocking cluster-local start observation."""
+
+    def action() -> None:
+        status = inspect_owned_session_start_status(
+            cluster=cluster,
+            session_id=session_id,
+            start_operation_id=start_operation_id,
+            cluster_route_revision=cluster_route_revision,
+            core_dir=RelaySettings.from_env().core_dir,
+        )
+        typer.echo(status.model_dump_json(indent=2))
+
+    _run_or_exit(action)
+
+
 @session_app.command("start-owned", hidden=True)
 def session_start_owned() -> None:
     """Execute a bounded stdin-carried owned-session start on the cluster."""
@@ -5075,8 +5244,20 @@ def session_start_owned() -> None:
             request = OwnedSessionStartRequest.model_validate_json(payload)
         except ValueError as exc:
             raise RelayError(f"owned session start request is invalid: {exc}") from exc
-        for line in execute_owned_session_start(request):
-            typer.echo(line)
+        try:
+            for line in execute_owned_session_start(request):
+                typer.echo(line)
+        except RelayError as exc:
+            typer.echo(
+                OwnedSessionStartRejection(
+                    cluster=request.cluster,
+                    session_id=request.session_id,
+                    start_operation_id=request.start_operation_id,
+                    cluster_route_revision=request.cluster_route_revision,
+                    error=str(exc)[:8192] or "owned-session start was rejected",
+                ).model_dump_json()
+            )
+            raise typer.Exit(code=1) from exc
 
     _run_or_exit(action)
 
@@ -8965,7 +9146,11 @@ _GENERIC_GATEWAY_RUNTIME_KEYS = frozenset(
     }
 )
 _GENERIC_GATEWAY_CONNECTOR_KEYS = frozenset(
-    {"browser_proxy", "desktop_connector", "remote_connector"}
+    {
+        "browser_proxy",
+        "desktop_connector",
+        "remote_connector",
+    }
 )
 _GENERIC_GATEWAY_OWNER_METADATA_KEYS = frozenset(
     {
@@ -10190,7 +10375,10 @@ def mcp_call(
             remote_command.extend(["--env-from", f"{child_name}={source_name}"])
         if expected_server_artifact_digest is not None:
             remote_command.extend(
-                ["--expected-server-artifact-digest", expected_server_artifact_digest]
+                [
+                    "--expected-server-artifact-digest",
+                    expected_server_artifact_digest,
+                ]
             )
         for value in used_artifact or []:
             remote_command.extend(["--used-artifact", value])
@@ -10413,7 +10601,10 @@ def jarvis_mcp_call(
             remote_command.extend(["--tool", tool, "--arguments-json-file", remote_args])
         if expected_server_artifact_digest is not None:
             remote_command.extend(
-                ["--expected-server-artifact-digest", expected_server_artifact_digest]
+                [
+                    "--expected-server-artifact-digest",
+                    expected_server_artifact_digest,
+                ]
             )
         for value in used_artifact or []:
             remote_command.extend(["--used-artifact", value])

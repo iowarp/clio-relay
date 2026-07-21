@@ -1021,6 +1021,28 @@ clio-relay session detach --cluster my-cluster --session-id desktop-session
 clio-relay session teardown --cluster my-cluster --session-id desktop-session
 ```
 
+For a recorder or other client that must survive loss of the initiating process,
+run `session plan-start` first and persist its JSON. Pass the plan's operation id,
+route revision, and release digest to `session start --json`. The returned
+`status_selector` is self-contained and can be submitted to `session start-status`
+one observation at a time. A start result has one of these states:
+
+- `starting`: the exact durable transition is accepted; poll again whenever the
+  client chooses.
+- `ambiguous`: transport or lock evidence cannot yet prove acceptance or failure;
+  retry or query with the exact same selector.
+- `ready`: the transition completed and `session_generation_id` is the durable
+  session handle.
+- `failed`: the exact journal proves terminal failure; do not retry that operation.
+- `not_current`: another operation owns the current transition, so this selector
+  was never accepted or is no longer current; it is not retryable.
+
+There is deliberately no aggregate start wait deadline in the relay contract.
+Each SSH/status observation is bounded so a client remains responsive, but a
+deadline produces `starting` or `ambiguous`, never a fabricated terminal failure.
+The same operation id and immutable route/port/auth/release policy must be reused
+until it becomes terminal. A changed route or policy fails closed before mutation.
+
 Detach succeeds only after the exact owned remote API generation is observed
 running after the desktop resources are removed. Teardown closes the owner
 generation only after the API, connectors, gateway records, scheduler
@@ -1041,15 +1063,22 @@ recreate that evidence idempotently. Remote session commands are wall-clock
 bounded, so an unavailable host produces an explicit failed report instead of an
 unbounded shutdown.
 
-If `session start` times out locally after the remote command was accepted, a later
-`session teardown` waits on that session's protected transition lock before reading
-metadata. Recovery succeeds only when the exact generation agrees across the owned
-metadata, generation-scoped cluster registry, process identity or verified process
-absence, and durable core admission state. A lock that never materializes is not
-treated as proof that no delayed start exists; teardown fails closed and can be
-retried. Successful cleanup replaces secret-bearing metadata with a sanitized
-generation receipt, removes only the verified session PID, log, and cluster-registry
-files, and uses that receipt for same-policy idempotent retries.
+If `session start` reaches its local transport deadline after the remote command was
+accepted, query `session start-status` with the persisted selector. A later ready
+transition is adopted only after the signed startup receipt, exact systemd scope,
+API leader, auth policy, generation-scoped registry, and durable core admission all
+agree. A concurrent transition lock remains `starting` or `ambiguous`; it is not
+converted into terminal failure. A later `session teardown` also waits on that
+protected transition lock before reading metadata. Successful cleanup replaces
+secret-bearing metadata with a sanitized generation receipt, removes only the
+verified session PID, log, and cluster-registry files, and uses that receipt for
+same-policy idempotent retries.
+
+Owned-session start/status is control-plane lifecycle only. It does not wait for,
+cancel, or assign a terminal deadline to scheduler or JARVIS work. A scheduler job
+may remain queued or `PENDING` for hours or days and remains queryable by its own
+durable execution/job handle. Scheduler cancellation is performed only by the
+explicit teardown flags documented below; the default remains to preserve jobs.
 
 `session start` requires `CLIO_RELAY_API_TOKEN` by default and fails before opening
 the remote API when it is absent. An unauthenticated API requires the explicit

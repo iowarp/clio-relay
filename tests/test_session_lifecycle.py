@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import subprocess
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +34,7 @@ from clio_relay.session_lifecycle import (
     OwnedSessionCleanupReportReadRequest,
     OwnedSessionCleanupTarget,
     OwnedSessionRecoveryStatus,
+    OwnedSessionStartPlan,
     OwnedSessionStartRequest,
     RemoteSessionStateEvidence,
     SessionApiReleaseIdentity,
@@ -155,6 +157,10 @@ class _FakeSessionTransaction:
         if len(payload) > maximum_bytes:
             raise AssertionError("test transaction observed an unexpected bounded read")
         return payload
+
+    def open_output(self, name: str) -> int:
+        """Open one test-owned output file like the pinned production transaction."""
+        return os.open(self.path / name, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
 
     def unlink_verified(
         self,
@@ -322,11 +328,209 @@ def _owned_session_start_request() -> OwnedSessionStartRequest:
     return OwnedSessionStartRequest(
         cluster="ares",
         session_id="session-start",
+        start_operation_id="start_test",
         remote_api_port=18765,
         require_token=False,
         cluster_registry=registry.model_dump(mode="json"),
         cluster_registry_sha256=session_lifecycle.hashlib.sha256(payload).hexdigest(),
         cluster_route_revision=session_lifecycle.cluster_route_revision(definition),
+    )
+
+
+def _legacy_existing_start_fixture(
+    root: Path,
+) -> tuple[
+    OwnedSessionStartRequest,
+    _FakeSessionTransaction,
+    dict[str, object],
+    SessionApiReleaseIdentity,
+    ClioCoreQueue,
+]:
+    """Create one internally exact v1 journal and old-release metadata pair."""
+    current_release = _api_release_identity()
+    old_release = current_release.model_copy(update={"artifact_sha256": "f" * 64})
+    request = _owned_session_start_request().model_copy(
+        update={
+            "start_operation_id": "start_replace_old_release",
+            "replace": True,
+            "expected_api_release_identity": current_release,
+        }
+    )
+    transaction = _FakeSessionTransaction(
+        root / "home" / ".local" / "share" / "clio-relay" / "sessions" / request.session_id,
+        session_id=request.session_id,
+    )
+    generation = "generation-legacy"
+    owner_token = "b" * 64
+    registry_path = transaction.path / f"cluster-registry-{generation}.json"
+    registry_payload = json.dumps(
+        request.cluster_registry,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    registry_path.write_bytes(registry_payload)
+    systemd_unit = f"clio-relay-session-{generation}.scope"
+    systemd_description = f"clio-relay-owned-session:{request.session_id}:{generation}:{'2' * 32}"
+    metadata: dict[str, object] = {
+        "cluster": request.cluster,
+        "session_id": request.session_id,
+        "remote_api_port": request.remote_api_port,
+        "api_pid": 4321,
+        "api_pgid": 4321,
+        "owner_token": owner_token,
+        "session_generation_id": generation,
+        "api_release_identity": old_release.model_dump(mode="json"),
+        "api_release_identity_sha256": old_release.sha256(),
+        "cluster_registry_path": str(registry_path),
+        "cluster_registry_sha256": request.cluster_registry_sha256,
+        "cluster_route_revision": request.cluster_route_revision,
+        "cluster_authority_verified": True,
+        "process_start_ticks": "123456",
+        "containment_mode": "linux_systemd_scope",
+        "systemd_unit": systemd_unit,
+        "systemd_cgroup_path": f"/sys/fs/cgroup/user.slice/{systemd_unit}",
+        "systemd_invocation_id": "1" * 32,
+        "systemd_description": systemd_description,
+        "containment_broker_pid": 4322,
+        "containment_broker_start_identity": "linux-proc:654321",
+        "api_startup_receipt_path": str(transaction.path / f"api-startup-{generation}.json"),
+        "api_startup_receipt_sha256": "3" * 64,
+        "started_at": datetime.now(UTC).isoformat(),
+        "owner": "clio-relay",
+    }
+    transaction.atomic_write("metadata.json", json.dumps(metadata).encode())
+    legacy = {
+        "schema_version": "clio-relay.owner-session-attempt.v1",
+        "operation": "start",
+        "cluster": request.cluster,
+        "session_id": request.session_id,
+        "session_generation_id": generation,
+        "owner_token": owner_token,
+        "owner_token_sha256": session_lifecycle.hashlib.sha256(owner_token.encode()).hexdigest(),
+        "api_release_identity_sha256": old_release.sha256(),
+        "cluster_registry_path": str(registry_path),
+        "cluster_registry_sha256": request.cluster_registry_sha256,
+        "cluster_route_revision": request.cluster_route_revision,
+        "remote_api_port": request.remote_api_port,
+        "start_phase": "contained",
+        "systemd_unit": systemd_unit,
+        "systemd_description": systemd_description,
+        "systemd_cgroup_path": metadata["systemd_cgroup_path"],
+        "systemd_invocation_id": metadata["systemd_invocation_id"],
+        "containment_broker_pid": metadata["containment_broker_pid"],
+        "containment_broker_start_identity": metadata["containment_broker_start_identity"],
+        "observed_at": datetime.now(UTC).isoformat(),
+        "error": None,
+    }
+    transaction.atomic_write(
+        "start-attempt.json",
+        json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode(),
+    )
+    queue = ClioCoreQueue(root / "core")
+    assert (
+        queue.prepare_owner_session_start(
+            request.session_id,
+            recorded_generation_id=None,
+            candidate_generation_id=generation,
+        )
+        == generation
+    )
+    return request, transaction, metadata, old_release, queue
+
+
+def _legacy_existing_status(
+    *,
+    request: OwnedSessionStartRequest,
+    metadata: dict[str, object],
+    old_release: SessionApiReleaseIdentity,
+    journal_bound: bool,
+) -> OwnedSessionRecoveryStatus:
+    """Return verified old-generation evidence for executor boundary tests."""
+    return OwnedSessionRecoveryStatus(
+        cluster=request.cluster,
+        session_id=request.session_id,
+        session_generation_id=cast(str, metadata["session_generation_id"]),
+        start_operation_id=request.start_operation_id if journal_bound else None,
+        cluster_route_revision=request.cluster_route_revision,
+        api_pid=cast(int, metadata["api_pid"]),
+        remote_api_port=request.remote_api_port,
+        leader_process_state="absent",
+        process_state="absent",
+        running=False,
+        process_absence_verified=True,
+        generation_process_absence_verified=True,
+        metadata_verified=True,
+        cluster_registry_verified=True,
+        durable_generation_verified=True,
+        ownership_verified=True,
+        recovery_verified=True,
+        api_release_identity=old_release,
+        api_release_identity_verified=True,
+        start_state="ready" if journal_bound else "unknown",
+        start_phase="contained" if journal_bound else None,
+        start_attempt_verified=journal_bound,
+        start_replace=request.replace if journal_bound else None,
+        start_require_token=request.require_token if journal_bound else None,
+        start_expected_api_release_identity_sha256=(
+            request.expected_api_release_identity.sha256()
+            if journal_bound and request.expected_api_release_identity is not None
+            else None
+        ),
+    )
+
+
+def _durable_start_plan() -> tuple[
+    ClusterDefinition,
+    SessionApiReleaseIdentity,
+    OwnedSessionStartPlan,
+]:
+    definition = ClusterDefinition(name="ares", ssh_host="ares")
+    release = _api_release_identity()
+    plan = session_lifecycle.plan_remote_session_start(
+        cluster="ares",
+        definition=definition,
+        session_id="session-start",
+        remote_api_port=18765,
+        replace=False,
+        require_token=False,
+        start_operation_id="start_test",
+        expected_api_release_identity_sha256=release.sha256(),
+    )
+    return definition, release, plan
+
+
+def _durable_start_status(
+    plan: OwnedSessionStartPlan,
+    *,
+    state: Literal["starting", "ready", "failed", "not_current"] = "starting",
+) -> OwnedSessionRecoveryStatus:
+    generation = None if state == "not_current" else "generation-start"
+    verified = state != "not_current"
+    ready = state == "ready"
+    return OwnedSessionRecoveryStatus(
+        cluster=plan.cluster,
+        session_id=plan.session_id,
+        session_generation_id=generation,
+        start_operation_id=plan.start_operation_id,
+        cluster_route_revision=plan.cluster_route_revision,
+        remote_api_port=plan.remote_api_port if verified else None,
+        leader_process_state="owned_running" if ready else "absent",
+        running=ready,
+        ownership_verified=ready,
+        recovery_verified=ready,
+        start_state=state,
+        start_phase="contained" if ready else ("admitted" if verified else None),
+        start_attempt_verified=verified,
+        start_retryable=state == "starting",
+        start_replace=plan.retry_selector.replace if verified else None,
+        start_require_token=plan.retry_selector.require_token if verified else None,
+        start_expected_api_release_identity_sha256=(
+            plan.expected_api_release_identity_sha256 if verified else None
+        ),
+        start_error="remote start failed" if state == "failed" else None,
+        errors=(
+            ["another operation owns the current transition"] if state == "not_current" else []
+        ),
     )
 
 
@@ -477,14 +681,18 @@ def test_start_attempt_accepts_every_durable_crash_boundary(
         identity: dict[str, object] = {
             "cluster": request.cluster,
             "session_id": request.session_id,
+            "start_operation_id": request.start_operation_id,
             "session_generation_id": generation,
             "owner_token": token,
             "owner_token_sha256": session_lifecycle.hashlib.sha256(token.encode()).hexdigest(),
             "api_release_identity_sha256": "b" * 64,
+            "expected_api_release_identity_sha256": None,
             "cluster_registry_path": str(transaction.path / f"cluster-registry-{generation}.json"),
             "cluster_registry_sha256": request.cluster_registry_sha256,
             "cluster_route_revision": request.cluster_route_revision,
             "remote_api_port": request.remote_api_port,
+            "replace": request.replace,
+            "require_token": request.require_token,
             "start_phase": phase,
             "systemd_unit": f"clio-relay-session-{generation}.scope",
             "systemd_description": (
@@ -504,10 +712,930 @@ def test_start_attempt_accepts_every_durable_crash_boundary(
         recovered = session_lifecycle._validated_resumable_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             transaction,
             request=request,
+            release_identity_sha256="b" * 64,
         )
 
     assert recovered is not None
     assert recovered["start_phase"] == phase
+
+
+def test_distinct_operation_cannot_overwrite_nonterminal_start_transition(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    original_request = _owned_session_start_request().model_copy(
+        update={"start_operation_id": "start_original"}
+    )
+    retry_request = original_request.model_copy(update={"start_operation_id": "start_distinct"})
+    transaction = _FakeSessionTransaction(
+        tmp_path / "home" / ".local" / "share" / "clio-relay" / "sessions" / "session-start",
+        session_id=original_request.session_id,
+    )
+    generation = "generation-pending"
+    token = "a" * 64
+    identity: dict[str, object] = {
+        "cluster": original_request.cluster,
+        "session_id": original_request.session_id,
+        "start_operation_id": original_request.start_operation_id,
+        "session_generation_id": generation,
+        "owner_token": token,
+        "owner_token_sha256": session_lifecycle.hashlib.sha256(token.encode()).hexdigest(),
+        "api_release_identity_sha256": _api_release_identity().sha256(),
+        "expected_api_release_identity_sha256": None,
+        "cluster_registry_path": str(transaction.path / f"cluster-registry-{generation}.json"),
+        "cluster_registry_sha256": original_request.cluster_registry_sha256,
+        "cluster_route_revision": original_request.cluster_route_revision,
+        "remote_api_port": original_request.remote_api_port,
+        "replace": original_request.replace,
+        "require_token": original_request.require_token,
+        "start_phase": "pending",
+        "systemd_unit": f"clio-relay-session-{generation}.scope",
+        "systemd_description": (
+            f"clio-relay-owned-session:{original_request.session_id}:{generation}:{'2' * 32}"
+        ),
+        "systemd_cgroup_path": None,
+        "systemd_invocation_id": None,
+        "containment_broker_pid": None,
+        "containment_broker_start_identity": None,
+    }
+    session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        operation="start",
+        identity=identity,
+    )
+    before = (transaction.path / "start-attempt.json").read_bytes()
+    monkeypatch.setattr(
+        session_lifecycle,
+        "open_owned_session_transaction",
+        lambda **_kwargs: transaction,
+    )
+    monkeypatch.setattr(
+        session_lifecycle,
+        "_current_session_api_release_identity",
+        _api_release_identity,
+    )
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    mutation_attempted = False
+
+    def refuse_mutation(*_args: object, **_kwargs: object) -> None:
+        nonlocal mutation_attempted
+        mutation_attempted = True
+        raise AssertionError("distinct operation reached start mutation")
+
+    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", refuse_mutation)
+    monkeypatch.setattr(session_lifecycle, "_terminate_recorded_session_scope", refuse_mutation)
+
+    with pytest.raises(RelayError, match="prior owned-session start attempt identity is invalid"):
+        execute_owned_session_start(
+            retry_request,
+            home=tmp_path / "home",
+            core_dir=tmp_path / "core",
+            proc_root=tmp_path / "proc",
+        )
+
+    assert mutation_attempted is False
+    assert (transaction.path / "start-attempt.json").read_bytes() == before
+
+
+def test_same_completed_operation_cannot_create_a_second_generation(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    request = _owned_session_start_request()
+    transaction = _FakeSessionTransaction(
+        tmp_path / "home" / ".local" / "share" / "clio-relay" / "sessions" / request.session_id,
+        session_id=request.session_id,
+    )
+    generation = "generation-completed"
+    token = "a" * 64
+    identity: dict[str, object] = {
+        "cluster": request.cluster,
+        "session_id": request.session_id,
+        "start_operation_id": request.start_operation_id,
+        "session_generation_id": generation,
+        "owner_token": token,
+        "owner_token_sha256": session_lifecycle.hashlib.sha256(token.encode()).hexdigest(),
+        "api_release_identity_sha256": _api_release_identity().sha256(),
+        "expected_api_release_identity_sha256": None,
+        "cluster_registry_path": str(transaction.path / f"cluster-registry-{generation}.json"),
+        "cluster_registry_sha256": request.cluster_registry_sha256,
+        "cluster_route_revision": request.cluster_route_revision,
+        "remote_api_port": request.remote_api_port,
+        "replace": request.replace,
+        "require_token": request.require_token,
+        "start_phase": "contained",
+        "systemd_unit": f"clio-relay-session-{generation}.scope",
+        "systemd_description": (
+            f"clio-relay-owned-session:{request.session_id}:{generation}:{'2' * 32}"
+        ),
+        "systemd_cgroup_path": "/sys/fs/cgroup/test.scope",
+        "systemd_invocation_id": "1" * 32,
+        "containment_broker_pid": 4322,
+        "containment_broker_start_identity": "linux-proc:1",
+    }
+    session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        operation="start",
+        identity=identity,
+    )
+    transaction.atomic_write("metadata.json", b"{}")
+    before = (transaction.path / "start-attempt.json").read_bytes()
+    monkeypatch.setattr(
+        session_lifecycle,
+        "open_owned_session_transaction",
+        lambda **_kwargs: transaction,
+    )
+    monkeypatch.setattr(
+        session_lifecycle,
+        "_current_session_api_release_identity",
+        _api_release_identity,
+    )
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(
+        session_lifecycle,
+        "inspect_owned_session_recovery_status",
+        lambda **_kwargs: OwnedSessionRecoveryStatus(
+            cluster=request.cluster,
+            session_id=request.session_id,
+            session_generation_id=generation,
+            start_operation_id=request.start_operation_id,
+            cluster_route_revision=request.cluster_route_revision,
+            remote_api_port=request.remote_api_port,
+            recovery_verified=True,
+            ownership_verified=True,
+            running=False,
+            start_state="ready",
+            start_phase="contained",
+            start_attempt_verified=True,
+            api_release_identity=_api_release_identity(),
+        ),
+    )
+    mutation_attempted = False
+
+    def refuse_mutation(*_args: object, **_kwargs: object) -> None:
+        nonlocal mutation_attempted
+        mutation_attempted = True
+        raise AssertionError("completed operation reached generation mutation")
+
+    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", refuse_mutation)
+    monkeypatch.setattr(ClioCoreQueue, "prepare_owner_session_start", refuse_mutation)
+
+    with pytest.raises(RelayError, match="already completed; use a fresh operation id"):
+        execute_owned_session_start(
+            request,
+            home=tmp_path / "home",
+            core_dir=tmp_path / "core",
+            proc_root=tmp_path / "proc",
+        )
+
+    assert mutation_attempted is False
+    assert (transaction.path / "start-attempt.json").read_bytes() == before
+
+
+def test_legacy_start_attempt_migrates_only_to_caller_planned_v2_operation(
+    tmp_path: Path,
+) -> None:
+    request = _owned_session_start_request().model_copy(
+        update={"start_operation_id": "start_planned_after_upgrade"}
+    )
+    transaction = _FakeSessionTransaction(tmp_path / "session", session_id=request.session_id)
+    generation = "generation-legacy"
+    token = "a" * 64
+    legacy = {
+        "schema_version": "clio-relay.owner-session-attempt.v1",
+        "operation": "start",
+        "cluster": request.cluster,
+        "session_id": request.session_id,
+        "session_generation_id": generation,
+        "owner_token": token,
+        "owner_token_sha256": session_lifecycle.hashlib.sha256(token.encode()).hexdigest(),
+        "api_release_identity_sha256": _api_release_identity().sha256(),
+        "cluster_registry_path": str(transaction.path / f"cluster-registry-{generation}.json"),
+        "cluster_registry_sha256": request.cluster_registry_sha256,
+        "cluster_route_revision": request.cluster_route_revision,
+        "remote_api_port": request.remote_api_port,
+        "start_phase": "pending",
+        "systemd_unit": f"clio-relay-session-{generation}.scope",
+        "systemd_description": (
+            f"clio-relay-owned-session:{request.session_id}:{generation}:{'2' * 32}"
+        ),
+        "systemd_cgroup_path": None,
+        "systemd_invocation_id": None,
+        "containment_broker_pid": None,
+        "containment_broker_start_identity": None,
+        "observed_at": datetime.now(UTC).isoformat(),
+        "error": None,
+    }
+    transaction.atomic_write(
+        "start-attempt.json",
+        json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode(),
+    )
+
+    with pytest.raises(RelayError, match="identity is invalid"):
+        session_lifecycle._validated_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cluster=request.cluster,
+            session_id=request.session_id,
+            start_operation_id=request.start_operation_id,
+        )
+
+    migrated = session_lifecycle._migrate_legacy_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        request=request,
+        release_identity_sha256=_api_release_identity().sha256(),
+    )
+
+    assert migrated is not None
+    assert migrated["schema_version"] == "clio-relay.owner-session-attempt.v2"
+    assert migrated["start_operation_id"] == request.start_operation_id
+    assert migrated["replace"] is False
+    assert migrated["require_token"] is False
+
+
+def test_legacy_old_release_replacement_requires_exact_identity_proof(
+    tmp_path: Path,
+) -> None:
+    request = _owned_session_start_request().model_copy(
+        update={
+            "start_operation_id": "start_planned_replacement",
+            "replace": True,
+        }
+    )
+    transaction = _FakeSessionTransaction(tmp_path / "session", session_id=request.session_id)
+    generation = "generation-legacy"
+    token = "a" * 64
+    legacy = {
+        "schema_version": "clio-relay.owner-session-attempt.v1",
+        "operation": "start",
+        "cluster": request.cluster,
+        "session_id": request.session_id,
+        "session_generation_id": generation,
+        "owner_token": token,
+        "owner_token_sha256": session_lifecycle.hashlib.sha256(token.encode()).hexdigest(),
+        "api_release_identity_sha256": "f" * 64,
+        "cluster_registry_path": str(transaction.path / f"cluster-registry-{generation}.json"),
+        "cluster_registry_sha256": request.cluster_registry_sha256,
+        "cluster_route_revision": request.cluster_route_revision,
+        "remote_api_port": request.remote_api_port,
+        "start_phase": "pending",
+        "systemd_unit": f"clio-relay-session-{generation}.scope",
+        "systemd_description": (
+            f"clio-relay-owned-session:{request.session_id}:{generation}:{'2' * 32}"
+        ),
+        "systemd_cgroup_path": None,
+        "systemd_invocation_id": None,
+        "containment_broker_pid": None,
+        "containment_broker_start_identity": None,
+        "observed_at": datetime.now(UTC).isoformat(),
+        "error": None,
+    }
+    transaction.atomic_write(
+        "start-attempt.json",
+        json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode(),
+    )
+    current_release_sha256 = _api_release_identity().sha256()
+
+    with pytest.raises(RelayError, match="release identity changed"):
+        session_lifecycle._migrate_legacy_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            request=request,
+            release_identity_sha256=current_release_sha256,
+        )
+
+    migrated = session_lifecycle._migrate_legacy_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        request=request,
+        release_identity_sha256=current_release_sha256,
+        replacement_identity_verified=True,
+    )
+
+    assert migrated is not None
+    assert migrated["schema_version"] == "clio-relay.owner-session-attempt.v2"
+    assert migrated["start_operation_id"] == request.start_operation_id
+    assert migrated["api_release_identity_sha256"] == current_release_sha256
+    assert migrated["replace"] is True
+
+
+def test_executor_replaces_exact_legacy_old_release_session(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    request, transaction, metadata, old_release, queue = _legacy_existing_start_fixture(tmp_path)
+    current_release = _api_release_identity()
+    home = tmp_path / "home"
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    monkeypatch.setattr(
+        session_lifecycle,
+        "open_owned_session_transaction",
+        lambda **_kwargs: transaction,
+    )
+    monkeypatch.setattr(
+        session_lifecycle,
+        "_current_session_api_release_identity",
+        lambda: current_release,
+    )
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    inspection_count = 0
+
+    def inspect(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        nonlocal inspection_count
+        inspection_count += 1
+        if inspection_count <= 2:
+            return _legacy_existing_status(
+                request=request,
+                metadata=metadata,
+                old_release=old_release,
+                journal_bound=inspection_count == 2,
+            )
+        committed = transaction.read_json("metadata.json")
+        assert committed is not None
+        return OwnedSessionRecoveryStatus(
+            cluster=request.cluster,
+            session_id=request.session_id,
+            session_generation_id=cast(str, committed["session_generation_id"]),
+            start_operation_id=request.start_operation_id,
+            cluster_route_revision=request.cluster_route_revision,
+            api_pid=7001,
+            remote_api_port=request.remote_api_port,
+            leader_process_state="owned_running",
+            process_state="owned_running",
+            running=True,
+            metadata_verified=True,
+            cluster_registry_verified=True,
+            durable_generation_verified=True,
+            ownership_verified=True,
+            recovery_verified=True,
+            api_release_identity=current_release,
+            api_release_identity_verified=True,
+            start_state="ready",
+            start_phase="contained",
+            start_attempt_verified=True,
+            start_replace=True,
+            start_require_token=request.require_token,
+            start_expected_api_release_identity_sha256=current_release.sha256(),
+        )
+
+    monkeypatch.setattr(session_lifecycle, "inspect_owned_session_recovery_status", inspect)
+    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", lambda _port: None)
+    containment_module = importlib.import_module("clio_relay.process_containment")
+    monkeypatch.setattr(
+        containment_module,
+        "process_start_identity",
+        lambda _pid: "linux-proc:7000",
+    )
+
+    def spawn(*_args: object, **kwargs: object) -> object:
+        containment = {
+            "mode": "linux_systemd_scope",
+            "enforceable": True,
+            "systemd_unit": f"{kwargs['linux_systemd_unit_base']}.scope",
+            "systemd_description": kwargs["linux_systemd_description"],
+            "cgroup_path": "/sys/fs/cgroup/user.slice/replacement.scope",
+            "systemd_invocation_id": "4" * 32,
+        }
+        cast(Callable[[int, dict[str, object]], None], kwargs["on_ready"])(
+            7000,
+            containment,
+        )
+        cast(Callable[[int, dict[str, object]], str], kwargs["credential_payload_factory"])(
+            7000,
+            containment,
+        )
+        return SimpleNamespace(
+            pid=7000,
+            poll=lambda: None,
+            terminate=lambda: None,
+            wait=lambda **_kwargs: 0,
+        )
+
+    monkeypatch.setattr(containment_module, "spawn_owned_process", spawn)
+
+    def receipt(**kwargs: object) -> object:
+        transaction.atomic_write(cast(str, kwargs["receipt_name"]), b"{}")
+        return session_lifecycle._OwnedGenerationProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            pid=7001,
+            process_group_id=7001,
+            start_ticks="999999",
+        )
+
+    monkeypatch.setattr(session_lifecycle, "_wait_for_api_startup_receipt", receipt)
+    monkeypatch.setattr(session_lifecycle, "_wait_for_api_ready", lambda **_kwargs: 0.125)
+
+    lines = execute_owned_session_start(
+        request,
+        home=home,
+        core_dir=queue.root,
+        proc_root=proc_root,
+    )
+
+    attempt = transaction.read_json("start-attempt.json")
+    assert attempt is not None
+    assert inspection_count == 2
+    assert attempt["schema_version"] == "clio-relay.owner-session-attempt.v2"
+    assert attempt["start_operation_id"] == request.start_operation_id
+    assert attempt["api_release_identity_sha256"] == current_release.sha256()
+    committed = transaction.read_json("metadata.json")
+    assert committed is not None
+    assert committed["api_release_identity_sha256"] == current_release.sha256()
+    assert committed["api_pid"] == 7001
+    assert f"start_operation_id={request.start_operation_id}" in lines
+    assert f"remote_api_port={request.remote_api_port}" in lines
+
+
+def test_executor_refuses_mismatched_legacy_journal_without_mutation(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    request, transaction, metadata, old_release, queue = _legacy_existing_start_fixture(tmp_path)
+    legacy = transaction.read_json("start-attempt.json")
+    assert legacy is not None
+    stale_token = "c" * 64
+    legacy["owner_token"] = stale_token
+    legacy["owner_token_sha256"] = session_lifecycle.hashlib.sha256(
+        stale_token.encode()
+    ).hexdigest()
+    transaction.atomic_write(
+        "start-attempt.json",
+        json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode(),
+    )
+    before = (transaction.path / "start-attempt.json").read_bytes()
+    monkeypatch.setattr(
+        session_lifecycle,
+        "open_owned_session_transaction",
+        lambda **_kwargs: transaction,
+    )
+    monkeypatch.setattr(
+        session_lifecycle,
+        "_current_session_api_release_identity",
+        _api_release_identity,
+    )
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(
+        session_lifecycle,
+        "inspect_owned_session_recovery_status",
+        lambda **_kwargs: _legacy_existing_status(
+            request=request,
+            metadata=metadata,
+            old_release=old_release,
+            journal_bound=False,
+        ),
+    )
+    mutation_attempted = False
+
+    def refuse_mutation(_port: int) -> None:
+        nonlocal mutation_attempted
+        mutation_attempted = True
+
+    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", refuse_mutation)
+
+    with pytest.raises(
+        RelayError,
+        match="legacy start journal does not match exact verified session metadata",
+    ):
+        execute_owned_session_start(
+            request,
+            home=tmp_path / "home",
+            core_dir=queue.root,
+            proc_root=tmp_path / "proc",
+        )
+
+    assert mutation_attempted is False
+    assert (transaction.path / "start-attempt.json").read_bytes() == before
+
+
+def test_durable_start_deadline_observes_late_ready_transition(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    definition, release, plan = _durable_start_plan()
+
+    def deadline(**_kwargs: object) -> list[str]:
+        raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            "start transport deadline"
+        )
+
+    monkeypatch.setattr(
+        session_lifecycle,
+        "status_remote_session_start",
+        lambda **_kwargs: _durable_start_status(plan, state="ready"),
+    )
+
+    result = session_lifecycle.start_remote_session_durable(
+        definition=definition,
+        plan=plan,
+        api_token=None,
+        expected_api_release_identity=release,
+        starter=deadline,
+    )
+
+    assert result.state == "ready"
+    assert result.terminal is True
+    assert result.transport_deadline_exceeded is True
+    assert result.session_generation_id == "generation-start"
+
+
+def test_synchronous_start_output_must_bind_exact_remote_port(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    definition, release, plan = _durable_start_plan()
+
+    def incomplete(**_kwargs: object) -> list[str]:
+        return [
+            f"session_started={plan.session_id}",
+            f"start_operation_id={plan.start_operation_id}",
+            "session_generation_id=generation-start",
+        ]
+
+    def unavailable(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        raise RelayError("status unavailable")
+
+    monkeypatch.setattr(
+        session_lifecycle,
+        "status_remote_session_start",
+        unavailable,
+    )
+
+    result = session_lifecycle.start_remote_session_durable(
+        definition=definition,
+        plan=plan,
+        api_token=None,
+        expected_api_release_identity=release,
+        starter=incomplete,
+    )
+
+    assert result.state == "ambiguous"
+    assert result.recovery_verified is False
+
+
+def test_durable_start_keeps_verified_transition_pending_without_aggregate_timeout(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    definition, release, plan = _durable_start_plan()
+    observations = 0
+
+    def deadline(**_kwargs: object) -> list[str]:
+        raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            "start transport deadline"
+        )
+
+    def observe(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        nonlocal observations
+        observations += 1
+        return _durable_start_status(plan, state="starting")
+
+    monkeypatch.setattr(session_lifecycle, "status_remote_session_start", observe)
+
+    result = session_lifecycle.start_remote_session_durable(
+        definition=definition,
+        plan=plan,
+        api_token=None,
+        expected_api_release_identity=release,
+        starter=deadline,
+    )
+
+    assert observations == 1
+    assert result.state == "starting"
+    assert result.terminal is False
+    assert result.retryable is True
+    assert result.transition_accepted is True
+    assert result.session_generation_id == "generation-start"
+
+
+def test_durable_start_status_transport_failure_is_ambiguous(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    definition, release, plan = _durable_start_plan()
+
+    def deadline(**_kwargs: object) -> list[str]:
+        raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            "start transport deadline"
+        )
+
+    def unavailable(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        raise RelayError("status transport unavailable")
+
+    monkeypatch.setattr(session_lifecycle, "status_remote_session_start", unavailable)
+
+    result = session_lifecycle.start_remote_session_durable(
+        definition=definition,
+        plan=plan,
+        api_token=None,
+        expected_api_release_identity=release,
+        starter=deadline,
+    )
+
+    assert result.state == "ambiguous"
+    assert result.terminal is False
+    assert result.retryable is True
+    assert result.transition_accepted is None
+    assert result.session_generation_id is None
+
+
+def test_exact_start_rejection_during_lock_contention_is_not_terminal(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    definition, release, plan = _durable_start_plan()
+    rejection = session_lifecycle.OwnedSessionStartRejection(
+        cluster=plan.cluster,
+        session_id=plan.session_id,
+        start_operation_id=plan.start_operation_id,
+        cluster_route_revision=plan.cluster_route_revision,
+        error="owned session transition lock timed out",
+    )
+
+    def rejected(**_kwargs: object) -> list[str]:
+        raise session_lifecycle._RemoteSessionCommandRejected(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            rejection
+        )
+
+    def locked(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        raise RelayError("owned session transition lock is held")
+
+    monkeypatch.setattr(session_lifecycle, "status_remote_session_start", locked)
+
+    result = session_lifecycle.start_remote_session_durable(
+        definition=definition,
+        plan=plan,
+        api_token=None,
+        expected_api_release_identity=release,
+        starter=rejected,
+    )
+
+    assert result.state == "ambiguous"
+    assert result.terminal is False
+    assert result.retryable is True
+
+
+def test_unstructured_ssh_nonzero_is_ambiguous_not_terminal(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_lifecycle,
+        "_run_bounded_command",
+        lambda *_args, **_kwargs: session_lifecycle._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            returncode=255,
+            stdout=b"",
+            stderr=b"connection reset after remote acceptance",
+        ),
+    )
+
+    with pytest.raises(
+        session_lifecycle._RemoteSessionCommandAmbiguous,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        match="without an exact structured response",
+    ):
+        session_lifecycle._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            ClusterDefinition(name="ares", ssh_host="ares"),
+            "true\n",
+        )
+
+
+def test_durable_start_projects_terminal_failure_and_stops_retrying(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    definition, release, plan = _durable_start_plan()
+
+    def deadline(**_kwargs: object) -> list[str]:
+        raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            "start transport deadline"
+        )
+
+    monkeypatch.setattr(
+        session_lifecycle,
+        "status_remote_session_start",
+        lambda **_kwargs: _durable_start_status(plan, state="failed"),
+    )
+
+    result = session_lifecycle.start_remote_session_durable(
+        definition=definition,
+        plan=plan,
+        api_token=None,
+        expected_api_release_identity=release,
+        starter=deadline,
+    )
+
+    assert result.state == "failed"
+    assert result.terminal is True
+    assert result.retryable is False
+    assert result.error == "remote start failed"
+
+
+def test_completed_ready_operation_stays_terminal_after_api_exit() -> None:
+    _definition, _release, plan = _durable_start_plan()
+    status = _durable_start_status(plan, state="ready").model_copy(update={"running": False})
+
+    result = session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        plan=plan,
+        status=status,
+        transport_deadline_exceeded=False,
+    )
+
+    assert result.state == "ready"
+    assert result.terminal is True
+    assert result.retryable is False
+    assert result.running is False
+    assert result.session_generation_id == "generation-start"
+
+
+def test_completed_ready_operation_reports_api_down_when_only_child_remains() -> None:
+    _definition, _release, plan = _durable_start_plan()
+    status = _durable_start_status(plan, state="ready").model_copy(
+        update={
+            "leader_process_state": "absent",
+            "process_state": "owned_running",
+            "running": True,
+            "generation_process_pids": [5432],
+        }
+    )
+
+    result = session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        plan=plan,
+        status=status,
+        transport_deadline_exceeded=False,
+    )
+
+    assert result.state == "ready"
+    assert result.terminal is True
+    assert result.running is False
+    assert status.running is True
+
+
+def test_superseded_start_selector_is_terminal_not_current() -> None:
+    _definition, _release, plan = _durable_start_plan()
+
+    result = session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        plan=plan,
+        status=_durable_start_status(plan, state="not_current"),
+        transport_deadline_exceeded=False,
+    )
+
+    assert result.state == "not_current"
+    assert result.terminal is True
+    assert result.retryable is False
+    assert result.transition_accepted is None
+
+
+def test_start_selector_intent_drift_is_terminally_refused() -> None:
+    _definition, _release, plan = _durable_start_plan()
+    status = _durable_start_status(plan, state="starting").model_copy(
+        update={"remote_api_port": plan.remote_api_port + 1}
+    )
+
+    result = session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        plan=plan,
+        status=status,
+        transport_deadline_exceeded=False,
+    )
+
+    assert result.state == "failed"
+    assert result.terminal is True
+    assert result.retryable is False
+    assert "does not match" in cast(str, result.error)
+
+
+def test_api_readiness_rejects_wrong_auth_policy(monkeypatch: MonkeyPatch) -> None:
+    class Response:
+        status = 200
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _size: int) -> bytes:
+            return b'{"ok":true,"auth":false}'
+
+    moments = iter((0.0, 0.0, 61.0))
+    monkeypatch.setattr(session_lifecycle.time, "monotonic", lambda: next(moments))
+    monkeypatch.setattr(session_lifecycle.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        session_lifecycle.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: Response(),
+    )
+    process = cast(subprocess.Popen[bytes], SimpleNamespace(poll=lambda: None))
+
+    with pytest.raises(RelayError, match="did not become ready"):
+        session_lifecycle._wait_for_api_ready(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            process=process,
+            port=18765,
+            require_token=True,
+        )
+
+
+def test_no_require_token_suppresses_ambient_api_token(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "ambient-token")
+
+    assert (
+        session_lifecycle._owned_session_api_token(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            require_token=False
+        )
+        is None
+    )
+    assert (
+        session_lifecycle._owned_session_api_token(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            require_token=True
+        )
+        == "ambient-token"
+    )
+
+
+def test_contained_start_crash_is_promoted_only_after_full_identity_recheck(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    generation = "generation-crash"
+    custom_home, session_dir, proc_root, queue = _owned_session_recovery_fixture(
+        tmp_path,
+        session_id="session-start",
+        generation_id=generation,
+    )
+    recovered_metadata = json.loads((session_dir / "metadata.json").read_text(encoding="utf-8"))
+    registry_path = session_dir / f"cluster-registry-{generation}.json"
+    registry_bytes = registry_path.read_bytes()
+    request = _owned_session_start_request().model_copy(
+        update={
+            "remote_api_port": 8765,
+            "cluster_registry": json.loads(registry_bytes),
+            "cluster_registry_sha256": recovered_metadata["cluster_registry_sha256"],
+            "cluster_route_revision": recovered_metadata["cluster_route_revision"],
+        }
+    )
+    release = _api_release_identity()
+    _write_owned_generation_process(
+        proc_root=proc_root,
+        metadata=recovered_metadata,
+        pid=4321,
+        command=b"python\0-I\0-c\0clio-relay\0api\0start\0",
+        start_ticks="123456",
+    )
+    (session_dir / "metadata.json").unlink()
+    transaction = _FakeSessionTransaction(session_dir, session_id=request.session_id)
+    attempt_identity: dict[str, object] = {
+        "cluster": request.cluster,
+        "session_id": request.session_id,
+        "start_operation_id": request.start_operation_id,
+        "session_generation_id": generation,
+        "owner_token": recovered_metadata["owner_token"],
+        "owner_token_sha256": session_lifecycle.hashlib.sha256(
+            cast(str, recovered_metadata["owner_token"]).encode()
+        ).hexdigest(),
+        "api_release_identity_sha256": release.sha256(),
+        "expected_api_release_identity_sha256": None,
+        "cluster_registry_path": str(registry_path),
+        "cluster_registry_sha256": request.cluster_registry_sha256,
+        "cluster_route_revision": request.cluster_route_revision,
+        "remote_api_port": request.remote_api_port,
+        "replace": request.replace,
+        "require_token": request.require_token,
+        "start_phase": "contained",
+        "systemd_unit": recovered_metadata["systemd_unit"],
+        "systemd_description": recovered_metadata["systemd_description"],
+        "systemd_cgroup_path": recovered_metadata["systemd_cgroup_path"],
+        "systemd_invocation_id": recovered_metadata["systemd_invocation_id"],
+        "containment_broker_pid": recovered_metadata["containment_broker_pid"],
+        "containment_broker_start_identity": recovered_metadata[
+            "containment_broker_start_identity"
+        ],
+    }
+    session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        operation="start",
+        identity=attempt_identity,
+    )
+    attempt = transaction.read_json("start-attempt.json")
+    assert attempt is not None
+    process_identity = session_lifecycle._OwnedGenerationProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        pid=4321,
+        process_group_id=4321,
+        start_ticks="123456",
+    )
+    receipt_checks = 0
+
+    def verify_receipt(**_kwargs: object) -> object:
+        nonlocal receipt_checks
+        receipt_checks += 1
+        return process_identity
+
+    monkeypatch.setattr(session_lifecycle, "_wait_for_api_startup_receipt", verify_receipt)
+    monkeypatch.setattr(session_lifecycle, "_wait_for_api_ready", lambda **_kwargs: 0.25)
+
+    lines = session_lifecycle._promote_resumable_contained_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        attempt=attempt,
+        request=request,
+        release_identity=release,
+        queue=queue,
+        proc_root=proc_root,
+        home=custom_home,
+    )
+
+    assert receipt_checks == 2
+    assert lines is not None
+    assert f"session_generation_id={generation}" in lines
+    metadata = transaction.read_json("metadata.json")
+    assert metadata is not None
+    assert metadata["api_pid"] == 4321
 
 
 def test_recovery_counts_non_clio_generation_child_when_leader_is_absent(
