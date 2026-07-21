@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 from contextlib import nullcontext
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Thread
 from types import SimpleNamespace
@@ -33,7 +33,12 @@ from clio_relay.cluster_config import (
     cluster_route_revision,
 )
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
+from clio_relay.errors import (
+    ConfigurationError,
+    ObservationTimeoutError,
+    QueueConflictError,
+    RelayError,
+)
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_MCP_VERSION,
     CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
@@ -41,6 +46,7 @@ from clio_relay.jarvis_mcp import (
     jarvis_cd_lock_binding_expectation,
     jarvis_user_contract,
 )
+from clio_relay.live_acceptance import LiveAcceptanceOptions
 from clio_relay.models import (
     ArtifactRef,
     Cursor,
@@ -61,8 +67,12 @@ from clio_relay.models import (
     SchedulerPhase,
     SchedulerStatus,
 )
+from clio_relay.runtime_metadata import RUNTIME_METADATA_SCHEMA
 from clio_relay.scheduler_providers import SchedulerProvider
-from clio_relay.service_runtime import ServiceRuntimeSupervisor
+from clio_relay.service_runtime import (
+    ServiceRuntimePendingResult,
+    ServiceRuntimeSupervisor,
+)
 from clio_relay.session_lifecycle import (
     CleanupResource,
     OwnedSessionRecoveryStatus,
@@ -74,9 +84,12 @@ from clio_relay.session_lifecycle import (
 from clio_relay.validation_report import (
     EvidenceReference,
     LiveValidationReport,
+    ValidationCheck,
     ValidationRecorder,
     ValidationResource,
+    ValidationStatus,
     new_live_validation_report,
+    write_validation_report,
 )
 from tests.queue_validation_fixtures import (
     DeterministicQueueValidationProvider,
@@ -689,6 +702,44 @@ def test_endpoint_worker_without_explicit_provider_uses_cluster_registry(
     assert captured["closed"] is True
     provider = cast(SchedulerProvider, captured["scheduler_provider"])
     assert provider.name == "slurm"
+
+
+def test_endpoint_worker_info_exposes_bounded_readiness_mode(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Bootstrap can request readiness without exporting detailed installation records."""
+    observed: dict[str, object] = {}
+
+    def worker_info(**kwargs: object) -> dict[str, object]:
+        observed.update(kwargs)
+        return {
+            "schema_version": "clio-relay.worker-readiness.v1",
+            "cluster": kwargs["cluster"],
+            "running": True,
+        }
+
+    monkeypatch.setattr(cli, "worker_runtime_info", worker_info)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "endpoint",
+            "worker-info",
+            "--cluster",
+            "ares",
+            "--freshness-seconds",
+            "90",
+            "--readiness-only",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["schema_version"] == "clio-relay.worker-readiness.v1"
+    assert observed == {
+        "cluster": "ares",
+        "freshness_seconds": 90.0,
+        "readiness_only": True,
+    }
 
 
 def test_cli_lists_artifacts(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -5761,6 +5812,64 @@ def test_live_test_replaces_stale_success_when_secret_resolution_fails(
     assert "frp token" in (current.error or "")
 
 
+def test_live_test_resume_uses_sibling_report_and_preserves_checkpoint(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The CLI never seeds or overwrites the PENDING report selected for resume."""
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text("name: generic\npkgs: []\n", encoding="utf-8")
+    source_path = tmp_path / "pending-live-test.json"
+    source = new_live_validation_report(scenario="live-test", cluster="ares")
+    source.status = ValidationStatus.PENDING
+    source.completed_at = datetime.now(UTC)
+    write_validation_report(source, source_path)
+    source_bytes = source_path.read_bytes()
+    captured: list[LiveAcceptanceOptions] = []
+
+    def fake_run(options: LiveAcceptanceOptions) -> list[str]:
+        captured.append(options)
+        report_path = options.report_path
+        assert report_path is not None
+        report_id = options.report_id
+        report = new_live_validation_report(
+            scenario="live-test",
+            cluster="ares",
+            report_id=report_id,
+        )
+        report.status = ValidationStatus.PENDING
+        report.completed_at = datetime.now(UTC)
+        write_validation_report(report, report_path)
+        return ["validation.status=pending", f"validation.report={report_path.resolve()}"]
+
+    monkeypatch.setattr(cli, "run_live_acceptance", fake_run)
+    result = CliRunner().invoke(
+        app,
+        [
+            "live-test",
+            "--cluster",
+            "ares",
+            "--jarvis-yaml",
+            str(pipeline),
+            "--resume-report",
+            str(source_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert source_path.read_bytes() == source_bytes
+    assert len(captured) == 1
+    options = captured[0]
+    assert options.resume_report_path == source_path
+    output_path = options.report_path
+    assert output_path is not None
+    assert output_path != source_path
+    assert output_path.exists()
+    assert output_path.parent == source_path.parent
+
+
 def test_cli_session_teardown_defaults_to_keep_jobs(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -10030,6 +10139,186 @@ def test_cli_gateway_update_closed_session_reports_clean_error(
     assert "Traceback" not in updated.stderr
 
 
+def test_gateway_resume_reenters_exact_owner_session_admission(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Owned pending runtimes cannot resume outside their authoritative generation lock."""
+    core_dir = tmp_path / "core"
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
+    queue = ClioCoreQueue(core_dir)
+    queue.initialize()
+    owner_session_id = "desktop-session"
+    owner_generation_id = "generation-1"
+    owner_admission_id = cli._desktop_owner_session_admission_id(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster="test-cluster",
+        session_id=owner_session_id,
+    )
+    queue.mirror_owner_session_generation_open(
+        owner_admission_id,
+        session_generation_id=owner_generation_id,
+    )
+    gateway = queue.create_gateway_session(
+        GatewaySession(
+            cluster="test-cluster",
+            name="pending-runtime",
+            state=GatewaySessionState.PENDING,
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": owner_session_id,
+                "owner_session_generation_id": owner_generation_id,
+                "owner_session_admission_id": owner_admission_id,
+            },
+        )
+    )
+    definition = ClusterDefinition(name="test-cluster", ssh_host="test-login")
+    events: list[str] = []
+
+    class FakeResult:
+        def __init__(self, session: GatewaySession) -> None:
+            self.session = session
+
+        def to_live_validation_report(self, **_kwargs: object) -> LiveValidationReport:
+            report = new_live_validation_report(
+                scenario="gateway-runtime",
+                cluster="test-cluster",
+            )
+            recorder = ValidationRecorder(report)
+            with recorder.check("gateway.resume", "resume exact gateway"):
+                pass
+            recorder.finish()
+            return report
+
+    class FakeSupervisor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def resume_start(self, *, session_id: str) -> FakeResult:
+            events.append("resume")
+            assert session_id == gateway.session_id
+            return FakeResult(queue.get_gateway_session(session_id))
+
+    def admit(**kwargs: object) -> nullcontext[SimpleNamespace]:
+        events.append("admit")
+        assert kwargs["session_id"] == owner_session_id
+        assert kwargs["session_generation_id"] == owner_generation_id
+        return nullcontext(
+            SimpleNamespace(
+                owner_session_id=owner_session_id,
+                owner_session_generation_id=owner_generation_id,
+                owner_session_admission_id=owner_admission_id,
+            )
+        )
+
+    def require_cluster(_cluster: str) -> ClusterDefinition:
+        return definition
+
+    def selected_queue(_settings: cli.RelaySettings) -> ClioCoreQueue:
+        return queue
+
+    def ignore_verified_report(
+        _report: LiveValidationReport,
+        _definition: ClusterDefinition,
+        _path: Path,
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(cli, "_require_cluster", require_cluster)
+    monkeypatch.setattr(cli, "storage_managed_queue", selected_queue)
+    monkeypatch.setattr(cli, "ServiceRuntimeSupervisor", FakeSupervisor)
+    monkeypatch.setattr(cli, "owner_session_gateway_admission", admit)
+    monkeypatch.setattr(cli, "_write_remote_verified_report", ignore_verified_report)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "gateway",
+            "resume-runtime",
+            gateway.session_id,
+            "--cluster",
+            "test-cluster",
+            "--token",
+            "token",
+            "--secret-key",
+            "secret",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert events == ["admit", "resume"]
+
+
+def test_gateway_attach_runtime_prints_pending_resume_contract(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Attach must not strip a nonterminal gateway's exact retry selector."""
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
+    definition = ClusterDefinition(name="test-cluster", ssh_host="test-login")
+    gateway = GatewaySession(
+        session_id="gateway_pending_attach",
+        cluster="test-cluster",
+        name="pending-runtime",
+        state=GatewaySessionState.STARTING,
+        scheduler="slurm",
+        scheduler_job_id="12345",
+        gateway={
+            "connect_url": "http://127.0.0.1:28777",
+            "health_url": "http://127.0.0.1:28777/healthz",
+            "stream_url": "http://127.0.0.1:28777/live-data",
+        },
+        metadata={"owner": "clio-relay"},
+    )
+
+    class FakeSupervisor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def attach(self, *, session_id: str) -> ServiceRuntimePendingResult:
+            assert session_id == gateway.session_id
+            return ServiceRuntimePendingResult(session=gateway)
+
+    def require_cluster(_cluster: str) -> ClusterDefinition:
+        return definition
+
+    monkeypatch.setattr(cli, "_require_cluster", require_cluster)
+    monkeypatch.setattr(cli, "ServiceRuntimeSupervisor", FakeSupervisor)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "gateway",
+            "attach-runtime",
+            gateway.session_id,
+            "--cluster",
+            definition.name,
+            "--token",
+            "token",
+            "--secret-key",
+            "secret",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["session_id"] == gateway.session_id
+    assert payload["outcome"] == "pending"
+    assert payload["retry_selector"] == {
+        "cluster": definition.name,
+        "gateway_session_id": gateway.session_id,
+        "scheduler_provider": "slurm",
+        "scheduler_job_id": "12345",
+    }
+    assert payload["scheduler_action"] == "none"
+    assert payload["relay_action"] == "none"
+    assert payload["scheduler_cancel_requested"] is False
+    assert "connect_url" not in payload["gateway"]
+    assert "health_url" not in payload["gateway"]
+    assert "stream_url" not in payload["gateway"]
+
+
 def test_cli_remote_agent_run_preserves_posix_prompt_path(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -10192,11 +10481,2156 @@ def test_post_run_execution_query_polls_progress_then_requests_artifacts_once(
 
     assert ["artifacts" in arguments for arguments in calls] == [False, False, True]
     assert all(0 < value <= 60 for value in timeout_values)
+    assert isinstance(result, cli._JarvisExecutionQueryAcceptance)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     assert result.call_job_id == "job-query-3"
     assert [item["state"] for item in result.lifecycle_observations] == [
         "running",
         "completed",
+        "completed",
     ]
+
+
+def test_post_run_execution_query_returns_exact_resumable_nonterminal_snapshot(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+    clock = iter((0.0, 0.0, 2.0, 6.0))
+
+    def evidence() -> dict[str, object]:
+        return {"transport": "stdio"}
+
+    session = SimpleNamespace(
+        tools_list_response={"tools": []},
+        tools_call_response={"result": {"structuredContent": {"job_id": "job-query-1"}}},
+        initialize_response={"protocolVersion": "2025-06-18"},
+        evidence=evidence,
+    )
+    mcp_result: dict[str, object] = {
+        "structured_result": {
+            "pipeline_id": "pipeline",
+            "execution_id": "execution",
+            "execution_handle": {
+                "schema_version": "jarvis.execution.handle.v1",
+                "pipeline_id": "pipeline",
+                "execution_id": "execution",
+                "mode": "scheduler",
+                "scheduler_provider": "slurm",
+                "scheduler_native_id": "4242",
+                "cluster": "ares",
+            },
+            "execution_record": {
+                "schema_version": "jarvis.execution.record.v1",
+                "pipeline_id": "pipeline",
+                "execution_id": "execution",
+                "mode": "scheduler",
+                "scheduler_provider": "slurm",
+                "scheduler_native_id": "4242",
+                "cluster": "ares",
+                "state": "submitted",
+                "terminal": False,
+                "return_code": None,
+                "error": None,
+            },
+            "progress": {
+                "schema_version": "jarvis.execution.progress.v1",
+                "pipeline_id": "pipeline",
+                "execution_id": "execution",
+                "execution_state": "submitted",
+                "terminal": False,
+                "packages": [],
+            },
+            "runtime_metadata": None,
+            "artifact_page": None,
+            "service_runtimes": None,
+        }
+    }
+
+    def execute_query(**kwargs: object) -> cli._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        calls.append(cast(dict[str, object], kwargs["arguments"]))
+        return cli._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            session=cast(cli.PackagedMcpStdioSession, session),
+            call_job_id="job-query-1",
+            call_status={"job": {"job_id": "job-query-1", "state": "succeeded"}},
+            artifacts=[{"artifact_id": "artifact-query-1"}],
+            mcp_result=cast(dict[str, Any], mcp_result),
+            provenance={"job": {"job_id": "job-query-1"}},
+        )
+
+    def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(cli, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(cli, "_execute_jarvis_execution_query", execute_query)
+    monkeypatch.setattr(cli, "sleep", no_sleep)
+
+    result = cli._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster="ares",
+        definition=cast(ClusterDefinition, SimpleNamespace()),
+        queue=cast(ClioCoreQueue, SimpleNamespace()),
+        profile="user",
+        pipeline_id="pipeline",
+        execution_id="execution",
+        wait_timeout_seconds=5,
+        poll_seconds=2,
+    )
+
+    assert result.outcome == "observation_unknown"
+    assert calls == [
+        {
+            "cluster": "ares",
+            "pipeline_id": "pipeline",
+            "execution_id": "execution",
+            "include_progress": True,
+        }
+    ]
+    assert result.retry_selector() == {
+        "cluster": "ares",
+        "scheduler_cluster": "ares",
+        "pipeline_id": "pipeline",
+        "execution_id": "execution",
+        "scheduler_provider": "slurm",
+        "scheduler_native_id": "4242",
+        "last_query_job_id": "job-query-1",
+    }
+    assert result.scheduler_action == "none"
+    assert result.relay_action == "none"
+    assert [item["state"] for item in result.lifecycle_observations] == ["submitted"]
+
+
+def test_later_query_observation_timeout_preserves_latest_durable_snapshot(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A later transport deadline cannot discard an already proven execution handle."""
+
+    def evidence() -> dict[str, object]:
+        return {"transport": "stdio"}
+
+    session = SimpleNamespace(
+        tools_list_response={"tools": []},
+        tools_call_response={"result": {"structuredContent": {"job_id": "job-query-1"}}},
+        initialize_response={"protocolVersion": "2025-06-18"},
+        evidence=evidence,
+    )
+    attempt = cli._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session=cast(cli.PackagedMcpStdioSession, session),
+        call_job_id="job-query-1",
+        call_status={"terminal": True},
+        artifacts=[],
+        mcp_result={},
+        provenance={"job": {"job_id": "job-query-1"}},
+    )
+    calls = 0
+
+    def execute_query(**_kwargs: object) -> cli._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return attempt
+        raise ObservationTimeoutError("later query observation expired")
+
+    def submitted_observation(
+        _mcp_result: dict[str, Any] | None,
+        **_kwargs: object,
+    ) -> dict[str, Any]:
+        return {
+            "query_job_id": "job-query-1",
+            "pipeline_id": "pipeline",
+            "execution_id": "execution",
+            "state": "submitted",
+            "terminal": False,
+            "execution_handle": {
+                "schema_version": "jarvis.execution.handle.v1",
+                "pipeline_id": "pipeline",
+                "execution_id": "execution",
+                "mode": "scheduler",
+                "scheduler_provider": "slurm",
+                "scheduler_native_id": "4242",
+                "cluster": "ares",
+            },
+            "execution_record": {
+                "schema_version": "jarvis.execution.record.v1",
+                "pipeline_id": "pipeline",
+                "execution_id": "execution",
+                "mode": "scheduler",
+                "scheduler_provider": "slurm",
+                "scheduler_native_id": "4242",
+                "cluster": "ares",
+                "state": "submitted",
+                "terminal": False,
+                "return_code": None,
+                "error": None,
+            },
+            "progress": {
+                "schema_version": "jarvis.execution.progress.v1",
+                "pipeline_id": "pipeline",
+                "execution_id": "execution",
+                "execution_state": "submitted",
+                "terminal": False,
+                "packages": [],
+            },
+        }
+
+    monkeypatch.setattr(cli, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(cli, "_execute_jarvis_execution_query", execute_query)
+    monkeypatch.setattr(
+        cli,
+        "_jarvis_execution_lifecycle_observation",
+        submitted_observation,
+    )
+
+    def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(cli, "sleep", no_sleep)
+
+    result = cli._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster="ares",
+        definition=cast(ClusterDefinition, SimpleNamespace()),
+        queue=cast(ClioCoreQueue, SimpleNamespace()),
+        profile="user",
+        pipeline_id="pipeline",
+        execution_id="execution",
+        wait_timeout_seconds=5.0,
+        poll_seconds=1.0,
+    )
+
+    assert calls == 2
+    assert result.outcome == "observation_unknown"
+    assert result.call_job_id == "job-query-1"
+    assert result.retry_selector()["scheduler_native_id"] == "4242"
+    assert [item["state"] for item in result.lifecycle_observations] == ["submitted"]
+
+
+def test_first_query_observation_timeout_returns_exact_query_only_pending(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A first observation timeout retains the known execution instead of failing it."""
+    selector: dict[str, object] = {
+        "cluster": "ares",
+        "scheduler_cluster": "ares",
+        "pipeline_id": "pipeline",
+        "execution_id": "execution",
+        "scheduler_provider": "slurm",
+        "scheduler_native_id": None,
+        "last_query_job_id": None,
+    }
+
+    def timeout(**_kwargs: object) -> None:
+        raise ObservationTimeoutError("first query remains queued")
+
+    monkeypatch.setattr(cli, "_execute_jarvis_execution_query", timeout)
+
+    result = cli._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster="ares",
+        definition=ClusterDefinition(name="ares", ssh_host="ares"),
+        queue=cast(ClioCoreQueue, SimpleNamespace()),
+        profile="user",
+        pipeline_id="pipeline",
+        execution_id="execution",
+        retry_selector=selector,
+        wait_timeout_seconds=5,
+        poll_seconds=1,
+    )
+
+    assert isinstance(result, cli._JarvisExecutionQueryPending)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert result.outcome == "observation_pending"
+    assert result.lifecycle_observations == ()
+    assert result.retry_selector() == selector
+    assert result.scheduler_action == "none"
+    assert result.relay_action == "retain"
+
+
+def test_terminal_execution_without_artifact_query_time_is_query_only_pending(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A terminal workload is never failed merely because artifact retrieval must resume."""
+    clock = iter((0.0, 0.0, 6.0))
+
+    def evidence() -> dict[str, object]:
+        return {"transport": "stdio"}
+
+    session = SimpleNamespace(
+        tools_list_response={"tools": []},
+        tools_call_response={"result": {"structuredContent": {"job_id": "job-query-1"}}},
+        initialize_response={"protocolVersion": "2025-06-18"},
+        evidence=evidence,
+    )
+    mcp_result: dict[str, Any] = {
+        "structured_result": {
+            "pipeline_id": "pipeline",
+            "execution_id": "execution",
+            "execution_handle": {
+                "schema_version": "jarvis.execution.handle.v1",
+                "pipeline_id": "pipeline",
+                "execution_id": "execution",
+                "mode": "scheduler",
+                "scheduler_provider": "slurm",
+                "scheduler_native_id": "4242",
+                "cluster": "ares",
+            },
+            "execution_record": {
+                "schema_version": "jarvis.execution.record.v1",
+                "pipeline_id": "pipeline",
+                "execution_id": "execution",
+                "mode": "scheduler",
+                "scheduler_provider": "slurm",
+                "scheduler_native_id": "4242",
+                "cluster": "ares",
+                "state": "completed",
+                "terminal": True,
+                "return_code": 0,
+                "error": None,
+            },
+            "progress": {
+                "schema_version": "jarvis.execution.progress.v1",
+                "pipeline_id": "pipeline",
+                "execution_id": "execution",
+                "execution_state": "completed",
+                "terminal": True,
+                "packages": [],
+            },
+            "runtime_metadata": None,
+            "artifact_page": None,
+            "service_runtimes": None,
+        }
+    }
+
+    def execute_query(**_kwargs: object) -> cli._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return cli._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            session=cast(cli.PackagedMcpStdioSession, session),
+            call_job_id="job-query-1",
+            call_status={"terminal": True},
+            artifacts=[],
+            mcp_result=mcp_result,
+            provenance={"job_id": "job-query-1"},
+        )
+
+    monkeypatch.setattr(cli, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(cli, "_execute_jarvis_execution_query", execute_query)
+
+    result = cli._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster="ares",
+        definition=cast(ClusterDefinition, SimpleNamespace()),
+        queue=cast(ClioCoreQueue, SimpleNamespace()),
+        profile="user",
+        pipeline_id="pipeline",
+        execution_id="execution",
+        wait_timeout_seconds=5,
+        poll_seconds=1,
+    )
+
+    assert result.outcome == "terminal_artifacts_pending"
+    assert result.retry_selector()["scheduler_native_id"] == "4242"
+    assert result.scheduler_action == "none"
+    assert result.relay_action == "none"
+    assert result.lifecycle_observations[-1]["terminal"] is True
+
+
+@pytest.mark.parametrize(
+    ("failure_type", "is_retryable"),
+    [
+        (ObservationTimeoutError, True),
+        (RelayError, False),
+    ],
+)
+def test_terminal_artifact_query_only_defers_typed_observation_timeout(
+    monkeypatch: MonkeyPatch,
+    failure_type: type[RelayError],
+    is_retryable: bool,
+) -> None:
+    """Contract and artifact-integrity failures cannot masquerade as pending work."""
+
+    def evidence() -> dict[str, object]:
+        return {"transport": "stdio"}
+
+    session = SimpleNamespace(
+        tools_list_response={"tools": []},
+        tools_call_response={"result": {"structuredContent": {"job_id": "job-query-1"}}},
+        initialize_response={"protocolVersion": "2025-06-18"},
+        evidence=evidence,
+    )
+    attempt = cli._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session=cast(cli.PackagedMcpStdioSession, session),
+        call_job_id="job-query-1",
+        call_status={"terminal": True},
+        artifacts=[],
+        mcp_result={},
+        provenance={"job": {"job_id": "job-query-1"}},
+    )
+    calls = 0
+
+    def execute_query(**_kwargs: object) -> cli._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return attempt
+        raise failure_type("artifact query failed")
+
+    def terminal_observation(
+        _mcp_result: dict[str, Any] | None,
+        **_kwargs: object,
+    ) -> dict[str, Any]:
+        return {
+            "query_job_id": "job-query-1",
+            "pipeline_id": "pipeline",
+            "execution_id": "execution",
+            "state": "completed",
+            "terminal": True,
+            "execution_handle": {
+                "pipeline_id": "pipeline",
+                "execution_id": "execution",
+                "scheduler_provider": "slurm",
+                "scheduler_native_id": "4242",
+            },
+            "execution_record": {"state": "completed", "return_code": 0, "error": None},
+            "progress": {},
+        }
+
+    monkeypatch.setattr(cli, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(cli, "_execute_jarvis_execution_query", execute_query)
+    monkeypatch.setattr(
+        cli,
+        "_jarvis_execution_lifecycle_observation",
+        terminal_observation,
+    )
+
+    def run_query() -> cli._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        result = cli._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cluster="ares",
+            definition=cast(ClusterDefinition, SimpleNamespace()),
+            queue=cast(ClioCoreQueue, SimpleNamespace()),
+            profile="user",
+            pipeline_id="pipeline",
+            execution_id="execution",
+            wait_timeout_seconds=5.0,
+            poll_seconds=1.0,
+        )
+        assert isinstance(result, cli._JarvisExecutionQueryAcceptance)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return result
+
+    if is_retryable:
+        result = run_query()
+        assert result.outcome == "terminal_artifacts_pending"
+        assert result.lifecycle_observations[-1]["state"] == "completed"
+    else:
+        with pytest.raises(RelayError, match="artifact query failed"):
+            run_query()
+
+
+def test_nonterminal_jarvis_acceptance_report_is_pending_not_passed_or_failed() -> None:
+    now = datetime.now(UTC)
+    report = new_live_validation_report(scenario="remote-mcp", cluster="ares")
+    report.checks = [
+        ValidationCheck(
+            check_id="remote-mcp.jarvis-call",
+            summary="run dispatch is durable",
+            status=ValidationStatus.PASSED,
+            started_at=now,
+            completed_at=now,
+            evidence=[EvidenceReference(kind="test", excerpt="durable")],
+        ),
+        ValidationCheck(
+            check_id="remote-mcp.jarvis-live-progress",
+            summary="execution lifecycle reached terminal",
+            status=ValidationStatus.FAILED,
+            started_at=now,
+            completed_at=now,
+            evidence=[
+                EvidenceReference(
+                    kind="test",
+                    excerpt="valid nonterminal lifecycle",
+                    metadata={
+                        "assertions": {
+                            "observation_count_bounded": True,
+                            "query_identities_coherent": True,
+                            "scheduler_identity_optional_coherent_and_stable": True,
+                            "lifecycle_prefix_coherent": True,
+                            "package_progress_nonregressing": True,
+                        }
+                    },
+                )
+            ],
+            error="execution remains submitted",
+        ),
+        ValidationCheck(
+            check_id="remote-mcp.jarvis-execution-query",
+            summary="execution query includes final artifacts",
+            status=ValidationStatus.FAILED,
+            started_at=now,
+            completed_at=now,
+            evidence=[
+                EvidenceReference(
+                    kind="test",
+                    excerpt="valid durable query",
+                    metadata={
+                        "assertions": {
+                            "local_query_surface_verified": True,
+                            "server_artifact_binding_verified": True,
+                            "resumable_query_job_verified": True,
+                            "resumable_result_transport_verified": True,
+                            "resumable_result_envelope_verified": True,
+                            "resumable_identity_coherent": True,
+                            "resumable_lifecycle_coherent": True,
+                            "resumable_runner_semantic_validation_verified": True,
+                        }
+                    },
+                )
+            ],
+            error="artifact page is not terminal yet",
+        ),
+    ]
+
+    def evidence() -> dict[str, object]:
+        return {}
+
+    query = cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster="ares",
+        pipeline_id="pipeline",
+        execution_id="execution",
+        outcome="observation_unknown",
+        tools_list_response={},
+        call_response={},
+        call_job_id="job-query-1",
+        call_status={},
+        artifacts=[],
+        mcp_result=None,
+        provenance=None,
+        initialize_response={},
+        stdio_evidence=evidence(),
+        lifecycle_observations=[
+            {
+                "state": "submitted",
+                "terminal": False,
+                "execution_handle": {
+                    "cluster": "linux",
+                    "scheduler_provider": "slurm",
+                    "scheduler_native_id": "4242",
+                },
+            }
+        ],
+    )
+
+    pending = cli._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report,
+        execution_query=query,
+    )
+
+    assert pending.status is ValidationStatus.PENDING
+    assert pending.error is None
+    assert [check.status for check in pending.checks] == [
+        ValidationStatus.PASSED,
+        ValidationStatus.PENDING,
+        ValidationStatus.PENDING,
+    ]
+    execution_resource = next(
+        resource for resource in pending.resources if resource.kind == "jarvis_execution"
+    )
+    assert execution_resource.resource_id == "execution"
+    assert execution_resource.metadata["retry_selector"] == {
+        "cluster": "ares",
+        "scheduler_cluster": "linux",
+        "pipeline_id": "pipeline",
+        "execution_id": "execution",
+        "scheduler_provider": "slurm",
+        "scheduler_native_id": "4242",
+        "last_query_job_id": "job-query-1",
+    }
+
+
+def test_nonterminal_jarvis_acceptance_does_not_mask_unrelated_failure() -> None:
+    now = datetime.now(UTC)
+    report = new_live_validation_report(scenario="remote-mcp", cluster="ares")
+    report.checks = [
+        ValidationCheck(
+            check_id="remote-mcp.jarvis-remote-contract",
+            summary="contract must match",
+            status=ValidationStatus.FAILED,
+            started_at=now,
+            completed_at=now,
+            error="contract mismatch",
+        )
+    ]
+    query = cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster="ares",
+        pipeline_id="pipeline",
+        execution_id="execution",
+        outcome="observation_unknown",
+        tools_list_response={},
+        call_response={},
+        call_job_id="job-query-1",
+        call_status={},
+        artifacts=[],
+        mcp_result=None,
+        provenance=None,
+        initialize_response={},
+        stdio_evidence={},
+        lifecycle_observations=[
+            {
+                "state": "submitted",
+                "terminal": False,
+                "execution_handle": {
+                    "cluster": "linux",
+                    "scheduler_provider": "slurm",
+                    "scheduler_native_id": "4242",
+                },
+            }
+        ],
+    )
+
+    unchanged = cli._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report,
+        execution_query=query,
+    )
+
+    assert unchanged.status is ValidationStatus.FAILED
+    assert unchanged.checks[0].status is ValidationStatus.FAILED
+    assert unchanged.resources == []
+
+
+def _jarvis_resume_observation(
+    *,
+    query_job_id: str,
+    state: str,
+    terminal: bool,
+    scheduler_native_id: str | None,
+    scheduler_cluster: str | None = "test-cluster",
+) -> dict[str, Any]:
+    """Build one real-shape native execution observation for resume-loader tests."""
+    handle = {
+        "schema_version": "jarvis.execution.handle.v1",
+        "pipeline_id": "pipeline",
+        "execution_id": "execution",
+        "mode": "scheduler",
+        "scheduler_provider": "slurm",
+        "scheduler_native_id": scheduler_native_id,
+        "cluster": scheduler_cluster,
+    }
+    record = {
+        "schema_version": "jarvis.execution.record.v1",
+        "pipeline_id": "pipeline",
+        "execution_id": "execution",
+        "mode": "scheduler",
+        "scheduler_provider": "slurm",
+        "scheduler_native_id": scheduler_native_id,
+        "cluster": scheduler_cluster,
+        "state": state,
+        "terminal": terminal,
+        "return_code": 0 if terminal else None,
+        "error": None,
+    }
+    progress: dict[str, Any] = {
+        "schema_version": "jarvis.execution.progress.v1",
+        "pipeline_id": "pipeline",
+        "execution_id": "execution",
+        "execution_state": state,
+        "terminal": terminal,
+        "packages": [],
+    }
+    return {
+        "query_job_id": query_job_id,
+        "pipeline_id": "pipeline",
+        "execution_id": "execution",
+        "state": state,
+        "terminal": terminal,
+        "execution_handle": handle,
+        "execution_record": record,
+        "progress": progress,
+        "runtime_metadata": None,
+    }
+
+
+def _jarvis_resume_runtime_metadata(
+    *,
+    state: str,
+    scheduler_native_id: str | None,
+    scheduler_cluster: str | None = "test-cluster",
+) -> dict[str, Any]:
+    """Build the real native authority required by a resumable checkpoint."""
+    submitted = scheduler_native_id is not None
+    handle = {
+        "schema_version": "jarvis.execution.handle.v1",
+        "pipeline_id": "pipeline",
+        "execution_id": "execution",
+        "mode": "scheduler",
+        "scheduler_provider": "slurm",
+        "scheduler_native_id": scheduler_native_id,
+        "cluster": scheduler_cluster,
+    }
+    record = {
+        "schema_version": "jarvis.execution.record.v1",
+        "pipeline_id": "pipeline",
+        "pipeline_name": "pipeline",
+        "execution_id": "execution",
+        "mode": "scheduler",
+        "scheduler_provider": "slurm",
+        "scheduler_native_id": scheduler_native_id,
+        "cluster": scheduler_cluster,
+        "state": state,
+        "submitted": submitted,
+        "terminal": False,
+        "created_at": "2026-07-21T12:00:00Z",
+        "updated_at": "2026-07-21T12:00:01Z",
+        "return_code": None,
+        "error": None,
+        "metadata": {
+            "submission": {
+                "schema_version": "jarvis.scheduler.submission.v1",
+                "execution_id": "execution",
+                "provider": "slurm",
+                "scheduler_job_id": scheduler_native_id,
+                "scheduler_cluster": scheduler_cluster,
+                "submitted": submitted,
+                "identity_source": "scheduler_submit_api" if submitted else None,
+            }
+        },
+    }
+    progress: dict[str, Any] = {
+        "schema_version": "jarvis.execution.progress.v1",
+        "pipeline_id": "pipeline",
+        "execution_id": "execution",
+        "execution_state": state,
+        "terminal": False,
+        "packages": [],
+    }
+    return {
+        "schema_version": RUNTIME_METADATA_SCHEMA,
+        "source": "jarvis_mcp",
+        "pipeline_id": "pipeline",
+        "execution_id": "execution",
+        "scheduler_provider": "slurm",
+        "scheduler_job_id": scheduler_native_id,
+        "terminal": {
+            "state": state,
+            "terminal": False,
+            "returncode": None,
+            "reason": None,
+        },
+        "details": {
+            "native_execution": {
+                "execution_handle": handle,
+                "execution_record": record,
+                "progress": progress,
+            }
+        },
+    }
+
+
+def test_unobserved_query_checkpoint_resumes_after_multiday_delay_without_new_run(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Checkpoint age never turns a queued HPC execution into a failed or duplicate run."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
+    _write_test_cluster(tmp_path, name="test-cluster")
+    selector: dict[str, object] = {
+        "cluster": "test-cluster",
+        "scheduler_cluster": "test-cluster",
+        "pipeline_id": "pipeline",
+        "execution_id": "execution",
+        "scheduler_provider": "slurm",
+        "scheduler_native_id": "4242",
+        "last_query_job_id": None,
+    }
+    checkpoint: dict[str, Any] = {
+        "schema_version": cli._JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "phase": "execution_query",
+        "observation_state": "not_observed",
+        "profile": "user",
+        "retry_selector": selector,
+        "builder_inputs": {
+            "cluster": "test-cluster",
+            "scheduler_cluster": "test-cluster",
+            "tool": "jarvis_run",
+            "runtime_metadata": _jarvis_resume_runtime_metadata(
+                state="submitted",
+                scheduler_native_id="4242",
+            ),
+        },
+        "lifecycle_observations": [],
+    }
+    report = new_live_validation_report(scenario="remote-mcp", cluster="test-cluster")
+    old_time = datetime.now(UTC) - timedelta(days=30)
+    report.started_at = old_time
+    report.completed_at = old_time
+    report.status = ValidationStatus.PENDING
+    report.resources = [
+        ValidationResource(
+            kind="jarvis_execution",
+            resource_id="execution",
+            role="resumable_acceptance_workload",
+            cluster="test-cluster",
+            provider="slurm",
+            state="observation_pending",
+            metadata={
+                "retry_selector": selector,
+                "outcome": "observation_pending",
+                "scheduler_action": "none",
+                "relay_action": "retain",
+                "resume_checkpoint": checkpoint,
+            },
+        )
+    ]
+    resume_path = tmp_path / "multiday-query-pending.json"
+    write_validation_report(report, resume_path)
+    query_calls: list[dict[str, object]] = []
+
+    def still_pending(**kwargs: object) -> cli._JarvisExecutionQueryPending:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        query_calls.append(dict(kwargs))
+        return cli._JarvisExecutionQueryPending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cluster="test-cluster",
+            pipeline_id="pipeline",
+            execution_id="execution",
+            selector=cast(dict[str, object], kwargs["retry_selector"]),
+        )
+
+    def forbid_new_run(**_kwargs: object) -> None:
+        raise AssertionError("query-only resume must not dispatch jarvis_run")
+
+    def execute_locally(_definition: ClusterDefinition) -> bool:
+        return False
+
+    monkeypatch.setattr(cli, "_run_post_run_jarvis_execution_query", still_pending)
+    monkeypatch.setattr(cli, "run_packaged_mcp_stdio_session", forbid_new_run)
+    monkeypatch.setattr(cli, "should_execute_on_cluster", execute_locally)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "jarvis-mcp-validate",
+            "--cluster",
+            "test-cluster",
+            "--resume-report",
+            str(resume_path),
+            "--wait-timeout-seconds",
+            "5",
+            "--poll-seconds",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(query_calls) == 1
+    assert query_calls[0]["pipeline_id"] == "pipeline"
+    assert query_calls[0]["execution_id"] == "execution"
+    persisted = LiveValidationReport.model_validate_json(resume_path.read_text(encoding="utf-8"))
+    assert persisted.status is ValidationStatus.PENDING
+    persisted_selector = persisted.resources[0].metadata["retry_selector"]
+    assert persisted_selector["execution_id"] == "execution"
+    assert persisted.started_at == old_time
+
+
+def test_initial_relay_dispatch_timeout_resumes_exact_job_without_duplicate_run(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Once jarvis_run returns a receipt, resume observes that job and never calls it again."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
+    _write_test_cluster(tmp_path, name="test-cluster")
+    pending_path = tmp_path / "dispatch-pending.json"
+    stdio_calls: list[dict[str, object]] = []
+    dispatch_calls: list[str] = []
+
+    def discover(**_kwargs: object) -> tuple[str, dict[str, Any], list[dict[str, Any]], bytes]:
+        return "job-discovery", {}, [], b"{}"
+
+    def persist_discovery(**_kwargs: object) -> None:
+        return None
+
+    package_search = cli._JarvisPackageSearchAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        tools_list_response={},
+        call_response={},
+        call_job_id="job-search",
+        call_status={},
+        artifacts=[],
+        mcp_result=None,
+        provenance=None,
+        initialize_response={},
+        stdio_evidence={},
+    )
+
+    def search(**_kwargs: object) -> cli._JarvisPackageSearchAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return package_search
+
+    def run_session(**kwargs: object) -> SimpleNamespace:
+        stdio_calls.append(dict(kwargs))
+        call_response = {"result": {"structuredContent": {"job_id": "job-run"}}}
+        return SimpleNamespace(
+            tools_list_response={},
+            tools_call_response=call_response,
+            initialize_response={},
+            evidence=lambda: {"call_job_id": "job-run", "transport": "stdio"},
+        )
+
+    def complete_dispatch(**kwargs: object) -> dict[str, Any]:
+        checkpoint = cast(dict[str, Any], kwargs["checkpoint"])
+        selector = cast(dict[str, object], checkpoint["retry_selector"])
+        dispatch_calls.append(cast(str, selector["relay_job_id"]))
+        assert selector["relay_job_id"] == "job-run"
+        if len(dispatch_calls) == 1:
+            raise ObservationTimeoutError("relay dispatch remains queued")
+        return {
+            **cast(dict[str, Any], checkpoint["builder_inputs"]),
+            "call_status": {"terminal": True},
+            "runtime_metadata": _jarvis_resume_runtime_metadata(
+                state="submitted",
+                scheduler_native_id="4242",
+            ),
+        }
+
+    def build_report(**kwargs: Any) -> LiveValidationReport:
+        report = new_live_validation_report(
+            scenario="remote-mcp",
+            cluster=cast(str, kwargs["cluster"]),
+        )
+        if kwargs["query_call_job_id"] == "":
+            now = datetime.now(UTC)
+            report.completed_at = now
+            report.status = ValidationStatus.FAILED
+            report.checks = [
+                ValidationCheck(
+                    check_id="remote-mcp.jarvis-call",
+                    summary="relay dispatch reaches terminal observation",
+                    status=ValidationStatus.FAILED,
+                    started_at=report.started_at,
+                    completed_at=now,
+                    error="observation pending",
+                )
+            ]
+            return report
+        recorder = ValidationRecorder(report)
+        with recorder.check("jarvis.complete", "same execution completed") as evidence:
+            evidence.append(EvidenceReference(kind="test", excerpt="same durable execution"))
+        recorder.finish()
+        return report
+
+    def terminal_query(**kwargs: object) -> cli._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        pipeline_id = cast(str, kwargs["pipeline_id"])
+        execution_id = cast(str, kwargs["execution_id"])
+        return cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cluster="test-cluster",
+            pipeline_id=pipeline_id,
+            execution_id=execution_id,
+            outcome="terminal",
+            tools_list_response={},
+            call_response={},
+            call_job_id="job-query",
+            call_status={},
+            artifacts=[],
+            mcp_result=None,
+            provenance=None,
+            initialize_response={},
+            stdio_evidence={},
+            lifecycle_observations=[
+                _jarvis_resume_observation(
+                    query_job_id="job-query",
+                    state="completed",
+                    terminal=True,
+                    scheduler_native_id="4242",
+                )
+            ],
+        )
+
+    def execute_locally(_definition: ClusterDefinition) -> bool:
+        return False
+
+    monkeypatch.setattr(cli, "_run_jarvis_remote_contract_discovery", discover)
+    monkeypatch.setattr(cli, "_persist_jarvis_remote_contract_discovery", persist_discovery)
+    monkeypatch.setattr(cli, "_run_jarvis_package_search_query", search)
+    monkeypatch.setattr(cli, "run_packaged_mcp_stdio_session", run_session)
+    monkeypatch.setattr(cli, "_complete_jarvis_run_dispatch", complete_dispatch)
+    monkeypatch.setattr(cli, "_run_post_run_jarvis_execution_query", terminal_query)
+    monkeypatch.setattr(cli, "build_jarvis_mcp_validation_report", build_report)
+    monkeypatch.setattr(cli, "should_execute_on_cluster", execute_locally)
+
+    initial = CliRunner().invoke(
+        app,
+        [
+            "jarvis-mcp-validate",
+            "--cluster",
+            "test-cluster",
+            "--package-search-query",
+            "paraview",
+            "--arguments-json",
+            '{"pipeline_id":"pipeline"}',
+            "--wait-timeout-seconds",
+            "5",
+            "--poll-seconds",
+            "1",
+            "--report",
+            str(pending_path),
+        ],
+    )
+
+    assert initial.exit_code == 0, initial.output
+    assert len(stdio_calls) == 1
+    initial_arguments = cast(dict[str, object], stdio_calls[0]["arguments"])
+    assert isinstance(initial_arguments["idempotency_key"], str)
+    pending = LiveValidationReport.model_validate_json(pending_path.read_text(encoding="utf-8"))
+    checkpoint = pending.resources[-1].metadata["resume_checkpoint"]
+    assert checkpoint["phase"] == "jarvis_run_dispatch"
+    assert checkpoint["retry_selector"]["relay_job_id"] == "job-run"
+
+    resumed = CliRunner().invoke(
+        app,
+        [
+            "jarvis-mcp-validate",
+            "--cluster",
+            "test-cluster",
+            "--resume-report",
+            str(pending_path),
+            "--wait-timeout-seconds",
+            "5",
+            "--poll-seconds",
+            "1",
+        ],
+    )
+
+    assert resumed.exit_code == 0, resumed.output
+    assert len(stdio_calls) == 1
+    assert dispatch_calls == ["job-run", "job-run"]
+    final = LiveValidationReport.model_validate_json(pending_path.read_text(encoding="utf-8"))
+    assert final.status is ValidationStatus.PASSED
+
+
+def test_stdio_receipt_timeout_replays_only_the_same_idempotent_intent(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """An ambiguous stdio boundary may replay its key, but may not mint a new workload key."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
+    _write_test_cluster(tmp_path, name="test-cluster")
+    pending_path = tmp_path / "intent-pending.json"
+    observed_arguments: list[dict[str, object]] = []
+
+    def discover(
+        **_kwargs: object,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]], bytes]:
+        return "job-discovery", {}, [], b"{}"
+
+    def persist_discovery(**_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(cli, "_run_jarvis_remote_contract_discovery", discover)
+    monkeypatch.setattr(cli, "_persist_jarvis_remote_contract_discovery", persist_discovery)
+    package_search = cli._JarvisPackageSearchAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        tools_list_response={},
+        call_response={},
+        call_job_id="job-search",
+        call_status={},
+        artifacts=[],
+        mcp_result=None,
+        provenance=None,
+        initialize_response={},
+        stdio_evidence={},
+    )
+
+    def search(**_kwargs: object) -> cli._JarvisPackageSearchAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return package_search
+
+    monkeypatch.setattr(cli, "_run_jarvis_package_search_query", search)
+
+    def run_session(**kwargs: object) -> SimpleNamespace:
+        observed_arguments.append(cast(dict[str, object], kwargs["arguments"]))
+        if len(observed_arguments) == 1:
+            pre_dispatch = LiveValidationReport.model_validate_json(
+                pending_path.read_text(encoding="utf-8")
+            )
+            assert (
+                pre_dispatch.resources[0].metadata["resume_checkpoint"]["phase"]
+                == "jarvis_run_intent"
+            )
+            raise ObservationTimeoutError("stdio response was not observed")
+        return SimpleNamespace(
+            tools_list_response={},
+            tools_call_response={"result": {"structuredContent": {"job_id": "job-run"}}},
+            initialize_response={},
+            evidence=lambda: {"call_job_id": "job-run", "transport": "stdio"},
+        )
+
+    def still_queued(**_kwargs: object) -> None:
+        raise ObservationTimeoutError("accepted relay job remains queued")
+
+    def build_pending(**kwargs: Any) -> LiveValidationReport:
+        report = new_live_validation_report(
+            scenario="remote-mcp",
+            cluster=cast(str, kwargs["cluster"]),
+        )
+        now = datetime.now(UTC)
+        report.completed_at = now
+        report.status = ValidationStatus.FAILED
+        report.checks = [
+            ValidationCheck(
+                check_id="remote-mcp.jarvis-call",
+                summary="relay dispatch reaches terminal observation",
+                status=ValidationStatus.FAILED,
+                started_at=report.started_at,
+                completed_at=now,
+                error="observation pending",
+            )
+        ]
+        return report
+
+    def execute_locally(_definition: ClusterDefinition) -> bool:
+        return False
+
+    monkeypatch.setattr(cli, "run_packaged_mcp_stdio_session", run_session)
+    monkeypatch.setattr(cli, "_complete_jarvis_run_dispatch", still_queued)
+    monkeypatch.setattr(cli, "build_jarvis_mcp_validation_report", build_pending)
+    monkeypatch.setattr(cli, "should_execute_on_cluster", execute_locally)
+
+    initial = CliRunner().invoke(
+        app,
+        [
+            "jarvis-mcp-validate",
+            "--cluster",
+            "test-cluster",
+            "--package-search-query",
+            "paraview",
+            "--arguments-json",
+            '{"pipeline_id":"pipeline"}',
+            "--wait-timeout-seconds",
+            "5",
+            "--poll-seconds",
+            "1",
+            "--report",
+            str(pending_path),
+        ],
+    )
+    assert initial.exit_code == 0, initial.output
+    first = LiveValidationReport.model_validate_json(pending_path.read_text(encoding="utf-8"))
+    assert first.resources[0].metadata["resume_checkpoint"]["phase"] == "jarvis_run_intent"
+
+    resumed = CliRunner().invoke(
+        app,
+        [
+            "jarvis-mcp-validate",
+            "--cluster",
+            "test-cluster",
+            "--resume-report",
+            str(pending_path),
+            "--wait-timeout-seconds",
+            "5",
+            "--poll-seconds",
+            "1",
+        ],
+    )
+
+    assert resumed.exit_code == 0, resumed.output
+    assert len(observed_arguments) == 2
+    assert observed_arguments[0] == observed_arguments[1]
+    assert observed_arguments[0]["idempotency_key"] == observed_arguments[1]["idempotency_key"]
+    second = LiveValidationReport.model_validate_json(pending_path.read_text(encoding="utf-8"))
+    second_checkpoint = second.resources[-1].metadata["resume_checkpoint"]
+    assert second_checkpoint["phase"] == "jarvis_run_dispatch"
+    assert second_checkpoint["retry_selector"]["relay_job_id"] == "job-run"
+
+
+def test_multiday_dispatch_intent_rejects_tampering_without_expiry(tmp_path: Path) -> None:
+    """Old checkpoints remain valid, while any change to their exact intent remains invalid."""
+    execution_intent = cli._jarvis_run_execution_intent(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster="test-cluster",
+        profile="user",
+        arguments={"pipeline_id": "pipeline"},
+        idempotency_key="validation:jarvis-run:test-cluster:stable-key",
+    )
+    checkpoint = cli._new_jarvis_intent_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        execution_intent=execution_intent,
+        pre_dispatch_inputs={
+            "cluster": "test-cluster",
+            "tool": "jarvis_run",
+            "package_search_query": "paraview",
+            "launcher": None,
+            "install_source": None,
+            "artifact_sha256": None,
+        },
+    )
+    report = cli._new_jarvis_intent_pending_report(checkpoint)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    old_time = datetime.now(UTC) - timedelta(days=45)
+    report.started_at = old_time
+    report.completed_at = old_time
+    path = tmp_path / "old-intent.json"
+    write_validation_report(report, path)
+
+    loaded = cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        path,
+        cluster="test-cluster",
+    )
+    assert loaded["retry_selector"]["pipeline_id"] == "pipeline"
+
+    tampered = LiveValidationReport.model_validate_json(path.read_text(encoding="utf-8"))
+    resource = tampered.resources[0]
+    tampered_checkpoint = cast(dict[str, Any], resource.metadata["resume_checkpoint"])
+    tampered_intent = cast(dict[str, Any], tampered_checkpoint["execution_intent"])
+    tampered_arguments = cast(dict[str, Any], tampered_intent["arguments"])
+    tampered_arguments["pipeline_id"] = "different-pipeline"
+    tampered_path = tmp_path / "tampered-intent.json"
+    write_validation_report(tampered, tampered_path)
+
+    with pytest.raises(ConfigurationError, match="dispatch identity changed"):
+        cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            tampered_path,
+            cluster="test-cluster",
+        )
+
+
+def test_jarvis_validation_rejects_unresumable_secret_arguments(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """A resume checkpoint never persists credentials needed to replay a workload call."""
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path, name="test-cluster")
+    report_path = tmp_path / "secret-rejected.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "jarvis-mcp-validate",
+            "--cluster",
+            "test-cluster",
+            "--package-search-query",
+            "paraview",
+            "--arguments-json",
+            '{"pipeline_id":"pipeline","api_token":"must-not-leak"}',
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "credential-redacted" in result.output
+    assert "must-not-leak" not in result.output
+    assert "must-not-leak" not in report_path.read_text(encoding="utf-8")
+
+
+def test_jarvis_mcp_validate_resume_report_queries_exact_execution_without_new_run(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    cluster_path = tmp_path / ".clio-relay" / "clusters.json"
+    cluster_path.parent.mkdir(parents=True)
+    cluster_path.write_text(
+        json.dumps(
+            {
+                "clusters": {
+                    "test-cluster": ClusterDefinition(
+                        name="test-cluster",
+                        ssh_host="test-login",
+                    ).model_dump(mode="json")
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
+    resume_path = tmp_path / "jarvis-pending.json"
+    prior_observation = _jarvis_resume_observation(
+        query_job_id="job-query-old",
+        state="submitted",
+        terminal=False,
+        scheduler_native_id="4242",
+    )
+    checkpoint = {
+        "schema_version": cli._JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "phase": "execution_query",
+        "observation_state": "observed",
+        "profile": "user",
+        "retry_selector": {
+            "cluster": "test-cluster",
+            "scheduler_cluster": "test-cluster",
+            "pipeline_id": "pipeline",
+            "execution_id": "execution",
+            "scheduler_provider": "slurm",
+            "scheduler_native_id": "4242",
+            "last_query_job_id": "job-query-old",
+        },
+        "builder_inputs": {
+            "cluster": "test-cluster",
+            "scheduler_cluster": "test-cluster",
+            "tool": "jarvis_run",
+            "runtime_metadata": _jarvis_resume_runtime_metadata(
+                state="submitted",
+                scheduler_native_id="4242",
+            ),
+        },
+        "lifecycle_observations": [prior_observation],
+    }
+    pending_report = new_live_validation_report(
+        scenario="remote-mcp",
+        cluster="test-cluster",
+    )
+    pending_report.status = ValidationStatus.PENDING
+    pending_report.completed_at = datetime.now(UTC)
+    pending_report.resources.append(
+        ValidationResource(
+            kind="jarvis_execution",
+            resource_id="execution",
+            role="resumable_acceptance_workload",
+            cluster="test-cluster",
+            provider="slurm",
+            state="submitted",
+            metadata={
+                "retry_selector": checkpoint["retry_selector"],
+                "resume_checkpoint": checkpoint,
+            },
+        )
+    )
+    write_validation_report(pending_report, resume_path)
+    query_calls: list[tuple[str, str, str]] = []
+
+    def query_exact_execution(
+        *,
+        cluster: str,
+        definition: ClusterDefinition,
+        queue: ClioCoreQueue,
+        profile: str,
+        pipeline_id: str,
+        execution_id: str,
+        retry_selector: dict[str, object] | None,
+        wait_timeout_seconds: float,
+        poll_seconds: float,
+    ) -> cli._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        del definition, queue, retry_selector, wait_timeout_seconds, poll_seconds
+        query_calls.append((profile, pipeline_id, execution_id))
+        terminal_observation = _jarvis_resume_observation(
+            query_job_id="job-query-new",
+            state="completed",
+            terminal=True,
+            scheduler_native_id="4242",
+        )
+        return cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cluster=cluster,
+            pipeline_id=pipeline_id,
+            execution_id=execution_id,
+            outcome="terminal",
+            tools_list_response={},
+            call_response={},
+            call_job_id="job-query-new",
+            call_status={},
+            artifacts=[],
+            mcp_result=None,
+            provenance=None,
+            initialize_response={},
+            stdio_evidence={},
+            lifecycle_observations=[terminal_observation],
+        )
+
+    builder_calls: list[dict[str, Any]] = []
+
+    def build_report(**kwargs: Any) -> LiveValidationReport:
+        builder_calls.append(kwargs)
+        report = new_live_validation_report(
+            scenario="remote-mcp",
+            cluster="test-cluster",
+        )
+        recorder = ValidationRecorder(report)
+        with recorder.check("jarvis.resume", "resume exact execution") as evidence:
+            evidence.append(EvidenceReference(kind="test", excerpt="same execution"))
+        recorder.finish()
+        return report
+
+    def forbid_new_run(**_kwargs: object) -> None:
+        raise AssertionError("resume must not dispatch jarvis_run")
+
+    def execute_locally(_definition: ClusterDefinition) -> bool:
+        return False
+
+    monkeypatch.setattr(cli, "_run_post_run_jarvis_execution_query", query_exact_execution)
+    monkeypatch.setattr(cli, "build_jarvis_mcp_validation_report", build_report)
+    monkeypatch.setattr(cli, "run_packaged_mcp_stdio_session", forbid_new_run)
+    monkeypatch.setattr(cli, "should_execute_on_cluster", execute_locally)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "jarvis-mcp-validate",
+            "--cluster",
+            "test-cluster",
+            "--resume-report",
+            str(resume_path),
+            "--wait-timeout-seconds",
+            "5",
+            "--poll-seconds",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert query_calls == [("user", "pipeline", "execution")]
+    assert len(builder_calls) == 1
+    assert [
+        observation["state"] for observation in builder_calls[0]["query_lifecycle_observations"]
+    ] == ["submitted", "completed"]
+    completed = LiveValidationReport.model_validate_json(resume_path.read_text(encoding="utf-8"))
+    assert completed.status is ValidationStatus.PASSED
+
+
+def test_jarvis_resume_pending_returns_before_release_provenance_observation(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A durable pending workload survives an ancillary worker-info failure boundary."""
+    cluster_path = tmp_path / ".clio-relay" / "clusters.json"
+    cluster_path.parent.mkdir(parents=True)
+    cluster_path.write_text(
+        json.dumps(
+            {
+                "clusters": {
+                    "test-cluster": ClusterDefinition(
+                        name="test-cluster",
+                        ssh_host="test-login",
+                    ).model_dump(mode="json")
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
+    resume_path = tmp_path / "jarvis-pending.json"
+    prior_observation = _jarvis_resume_observation(
+        query_job_id="job-query-old",
+        state="submitting",
+        terminal=False,
+        scheduler_native_id=None,
+        scheduler_cluster=None,
+    )
+    selector = {
+        "cluster": "test-cluster",
+        "scheduler_cluster": None,
+        "pipeline_id": "pipeline",
+        "execution_id": "execution",
+        "scheduler_provider": "slurm",
+        "scheduler_native_id": None,
+        "last_query_job_id": "job-query-old",
+    }
+    checkpoint = {
+        "schema_version": cli._JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "phase": "execution_query",
+        "observation_state": "observed",
+        "profile": "user",
+        "retry_selector": selector,
+        "builder_inputs": {
+            "cluster": "test-cluster",
+            "scheduler_cluster": None,
+            "tool": "jarvis_run",
+            "runtime_metadata": _jarvis_resume_runtime_metadata(
+                state="submitting",
+                scheduler_native_id=None,
+                scheduler_cluster=None,
+            ),
+        },
+        "lifecycle_observations": [prior_observation],
+    }
+    pending_report = new_live_validation_report(scenario="remote-mcp", cluster="test-cluster")
+    pending_report.status = ValidationStatus.PENDING
+    pending_report.completed_at = datetime.now(UTC)
+    pending_report.resources.append(
+        ValidationResource(
+            kind="jarvis_execution",
+            resource_id="execution",
+            role="resumable_acceptance_workload",
+            cluster="test-cluster",
+            provider="slurm",
+            state="submitting",
+            metadata={"retry_selector": selector, "resume_checkpoint": checkpoint},
+        )
+    )
+    write_validation_report(pending_report, resume_path)
+
+    def query_exact_execution(**kwargs: object) -> cli._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        observation = _jarvis_resume_observation(
+            query_job_id="job-query-new",
+            state="submitted",
+            terminal=False,
+            scheduler_native_id="4242",
+            scheduler_cluster="linux",
+        )
+        return cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cluster=cast(str, kwargs["cluster"]),
+            pipeline_id=cast(str, kwargs["pipeline_id"]),
+            execution_id=cast(str, kwargs["execution_id"]),
+            outcome="observation_unknown",
+            tools_list_response={},
+            call_response={},
+            call_job_id="job-query-new",
+            call_status={},
+            artifacts=[],
+            mcp_result=None,
+            provenance=None,
+            initialize_response={},
+            stdio_evidence={},
+            lifecycle_observations=[observation],
+        )
+
+    builder_calls: list[dict[str, Any]] = []
+
+    def build_pending_report(**kwargs: Any) -> LiveValidationReport:
+        builder_calls.append(kwargs)
+        report = new_live_validation_report(scenario="remote-mcp", cluster="test-cluster")
+        now = datetime.now(UTC)
+        report.status = ValidationStatus.FAILED
+        report.completed_at = now
+        report.checks = [
+            ValidationCheck(
+                check_id="remote-mcp.jarvis-live-progress",
+                summary="execution lifecycle remains nonterminal",
+                status=ValidationStatus.FAILED,
+                started_at=now,
+                completed_at=now,
+                evidence=[
+                    EvidenceReference(
+                        kind="test",
+                        excerpt="coherent pending lifecycle",
+                        metadata={
+                            "assertions": {
+                                "observation_count_bounded": True,
+                                "query_identities_coherent": True,
+                                "scheduler_identity_optional_coherent_and_stable": True,
+                                "lifecycle_prefix_coherent": True,
+                                "package_progress_nonregressing": True,
+                            }
+                        },
+                    )
+                ],
+                error="execution remains submitted",
+            ),
+            ValidationCheck(
+                check_id="remote-mcp.jarvis-execution-query",
+                summary="execution query remains resumable",
+                status=ValidationStatus.FAILED,
+                started_at=now,
+                completed_at=now,
+                evidence=[
+                    EvidenceReference(
+                        kind="test",
+                        excerpt="coherent resumable query",
+                        metadata={
+                            "assertions": {
+                                "local_query_surface_verified": True,
+                                "server_artifact_binding_verified": True,
+                                "resumable_query_job_verified": True,
+                                "resumable_result_transport_verified": True,
+                                "resumable_result_envelope_verified": True,
+                                "resumable_identity_coherent": True,
+                                "resumable_lifecycle_coherent": True,
+                                "resumable_runner_semantic_validation_verified": True,
+                            }
+                        },
+                    )
+                ],
+                error="artifact page is not terminal yet",
+            ),
+        ]
+        return report
+
+    worker_info_calls: list[str] = []
+
+    def fail_worker_info(_definition: ClusterDefinition) -> dict[str, object]:
+        worker_info_calls.append("called")
+        raise AssertionError("pending resume must not require release provenance")
+
+    def execute_remotely(_definition: ClusterDefinition) -> bool:
+        return True
+
+    def forbid_new_run(**_kwargs: object) -> None:
+        raise AssertionError("resume must not submit")
+
+    monkeypatch.setattr(cli, "_run_post_run_jarvis_execution_query", query_exact_execution)
+    monkeypatch.setattr(cli, "build_jarvis_mcp_validation_report", build_pending_report)
+    monkeypatch.setattr(cli, "should_execute_on_cluster", execute_remotely)
+    monkeypatch.setattr(cli, "_remote_worker_info", fail_worker_info)
+    monkeypatch.setattr(cli, "run_packaged_mcp_stdio_session", forbid_new_run)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "jarvis-mcp-validate",
+            "--cluster",
+            "test-cluster",
+            "--resume-report",
+            str(resume_path),
+            "--wait-timeout-seconds",
+            "5",
+            "--poll-seconds",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert worker_info_calls == []
+    assert len(builder_calls) == 1
+    assert builder_calls[0]["scheduler_cluster"] == "linux"
+    assert [
+        observation["state"] for observation in builder_calls[0]["query_lifecycle_observations"]
+    ] == ["submitting", "submitted"]
+    persisted = LiveValidationReport.model_validate_json(resume_path.read_text(encoding="utf-8"))
+    assert persisted.status is ValidationStatus.PENDING
+    resource = next(item for item in persisted.resources if item.kind == "jarvis_execution")
+    persisted_checkpoint = cast(dict[str, Any], resource.metadata["resume_checkpoint"])
+    assert persisted_checkpoint["retry_selector"]["cluster"] == "test-cluster"
+    assert persisted_checkpoint["retry_selector"]["scheduler_cluster"] == "linux"
+    assert persisted_checkpoint["builder_inputs"]["scheduler_cluster"] == "linux"
+
+
+def test_jarvis_resume_query_failure_preserves_pending_checkpoint(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A transient resume failure writes separate evidence and preserves its selector."""
+    cluster_path = tmp_path / ".clio-relay" / "clusters.json"
+    cluster_path.parent.mkdir(parents=True)
+    cluster_path.write_text(
+        json.dumps(
+            {
+                "clusters": {
+                    "test-cluster": ClusterDefinition(
+                        name="test-cluster",
+                        ssh_host="test-login",
+                    ).model_dump(mode="json")
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
+    resume_path = tmp_path / "jarvis-pending.json"
+    checkpoint = {
+        "schema_version": cli._JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "phase": "execution_query",
+        "observation_state": "observed",
+        "profile": "user",
+        "retry_selector": {
+            "cluster": "test-cluster",
+            "scheduler_cluster": "test-cluster",
+            "pipeline_id": "pipeline",
+            "execution_id": "execution",
+            "scheduler_provider": "slurm",
+            "scheduler_native_id": "4242",
+            "last_query_job_id": "job-query-old",
+        },
+        "builder_inputs": {
+            "cluster": "test-cluster",
+            "scheduler_cluster": "test-cluster",
+            "tool": "jarvis_run",
+            "runtime_metadata": _jarvis_resume_runtime_metadata(
+                state="submitted",
+                scheduler_native_id="4242",
+            ),
+        },
+        "lifecycle_observations": [
+            _jarvis_resume_observation(
+                query_job_id="job-query-old",
+                state="submitted",
+                terminal=False,
+                scheduler_native_id="4242",
+            )
+        ],
+    }
+    pending_report = new_live_validation_report(
+        scenario="remote-mcp",
+        cluster="test-cluster",
+    )
+    pending_report.status = ValidationStatus.PENDING
+    pending_report.completed_at = datetime.now(UTC)
+    pending_report.resources.append(
+        ValidationResource(
+            kind="jarvis_execution",
+            resource_id="execution",
+            role="resumable_acceptance_workload",
+            cluster="test-cluster",
+            provider="slurm",
+            state="submitted",
+            metadata={
+                "retry_selector": checkpoint["retry_selector"],
+                "resume_checkpoint": checkpoint,
+            },
+        )
+    )
+    write_validation_report(pending_report, resume_path)
+    original = resume_path.read_bytes()
+
+    def fail_query(**_kwargs: object) -> None:
+        raise TimeoutError("temporary relay observation timeout")
+
+    monkeypatch.setattr(cli, "_run_post_run_jarvis_execution_query", fail_query)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "jarvis-mcp-validate",
+            "--cluster",
+            "test-cluster",
+            "--resume-report",
+            str(resume_path),
+            "--wait-timeout-seconds",
+            "5",
+            "--poll-seconds",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert resume_path.read_bytes() == original
+    failure_paths = list(tmp_path.glob("jarvis-pending.resume-failure-*.json"))
+    assert len(failure_paths) == 1
+    failure = LiveValidationReport.model_validate_json(failure_paths[0].read_text(encoding="utf-8"))
+    assert failure.status is ValidationStatus.FAILED
+    loaded = cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        resume_path,
+        cluster="test-cluster",
+    )
+    assert loaded["retry_selector"]["scheduler_native_id"] == "4242"
+
+    tampered_path = tmp_path / "jarvis-tampered.json"
+    tampered = LiveValidationReport.model_validate_json(original)
+    resource = tampered.resources[0]
+    resource.metadata["retry_selector"]["execution_id"] = "different-execution"
+    resource.metadata["resume_checkpoint"]["retry_selector"]["execution_id"] = "different-execution"
+    write_validation_report(tampered, tampered_path)
+    with pytest.raises(
+        ConfigurationError,
+        match="resume identity is invalid|observation identity changed",
+    ):
+        cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            tampered_path,
+            cluster="test-cluster",
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_record",
+        "record_identity",
+        "state",
+        "terminal",
+        "return_code",
+        "missing_progress",
+        "progress_identity",
+        "integrity_marker",
+        "gap_marker",
+        "coordinated_cluster",
+        "coordinated_mode",
+        "coordinated_provider",
+        "coordinated_pipeline",
+        "coordinated_execution",
+        "runtime_missing_native_execution",
+        "runtime_missing_handle",
+        "runtime_missing_record",
+        "runtime_missing_progress",
+        "runtime_handle_schema",
+        "runtime_handle_native_id",
+        "runtime_record_native_id",
+        "runtime_progress_execution",
+        "runtime_progress_schema",
+        "runtime_terminal_state",
+    ],
+)
+def test_jarvis_resume_rejects_tampered_checkpoint_before_remote_query(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    mutation: str,
+) -> None:
+    """Checkpoint-native documents are an admission boundary, not later report evidence."""
+    cluster_path = tmp_path / ".clio-relay" / "clusters.json"
+    cluster_path.parent.mkdir(parents=True)
+    cluster_path.write_text(
+        json.dumps(
+            {
+                "clusters": {
+                    "test-cluster": ClusterDefinition(
+                        name="test-cluster",
+                        ssh_host="test-login",
+                    ).model_dump(mode="json")
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    observation = _jarvis_resume_observation(
+        query_job_id="job-query-old",
+        state="submitted",
+        terminal=False,
+        scheduler_native_id="4242",
+    )
+    if mutation == "missing_record":
+        observation.pop("execution_record")
+    elif mutation == "record_identity":
+        record = cast(dict[str, Any], observation["execution_record"])
+        record["execution_id"] = "different-execution"
+    elif mutation == "state":
+        observation["state"] = "running"
+    elif mutation == "terminal":
+        observation["terminal"] = True
+    elif mutation == "return_code":
+        record = cast(dict[str, Any], observation["execution_record"])
+        record["return_code"] = 1
+    elif mutation == "missing_progress":
+        observation.pop("progress")
+    elif mutation == "progress_identity":
+        progress = cast(dict[str, Any], observation["progress"])
+        progress["execution_id"] = "different-execution"
+    elif mutation == "integrity_marker":
+        observation["relay_query_integrity"] = {}
+    elif mutation == "gap_marker":
+        observation["relay_query_verified_gap"] = {}
+    elif mutation in {"coordinated_cluster", "coordinated_mode", "coordinated_provider"}:
+        field, value = {
+            "coordinated_cluster": ("cluster", "different-cluster"),
+            "coordinated_mode": ("mode", "direct"),
+            "coordinated_provider": ("scheduler_provider", "pbs"),
+        }[mutation]
+        for document_name in ("execution_handle", "execution_record"):
+            document = cast(dict[str, Any], observation[document_name])
+            document[field] = value
+    elif mutation.startswith("runtime_"):
+        pass
+    else:
+        field = "pipeline_id" if mutation == "coordinated_pipeline" else "execution_id"
+        value = (
+            "different-pipeline" if mutation == "coordinated_pipeline" else "different-execution"
+        )
+        observation[field] = value
+        for document_name in ("execution_handle", "execution_record", "progress"):
+            document = cast(dict[str, Any], observation[document_name])
+            document[field] = value
+    selector = {
+        "cluster": "test-cluster",
+        "scheduler_cluster": "test-cluster",
+        "pipeline_id": "pipeline",
+        "execution_id": "execution",
+        "scheduler_provider": "slurm",
+        "scheduler_native_id": "4242",
+        "last_query_job_id": "job-query-old",
+    }
+    checkpoint = {
+        "schema_version": cli._JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "phase": "execution_query",
+        "observation_state": "observed",
+        "profile": "user",
+        "retry_selector": selector,
+        "builder_inputs": {
+            "cluster": "test-cluster",
+            "scheduler_cluster": "test-cluster",
+            "tool": "jarvis_run",
+            "runtime_metadata": _jarvis_resume_runtime_metadata(
+                state="submitted",
+                scheduler_native_id="4242",
+            ),
+        },
+        "lifecycle_observations": [observation],
+    }
+    if mutation.startswith("runtime_"):
+        builder = cast(dict[str, Any], checkpoint["builder_inputs"])
+        runtime = cast(dict[str, Any], builder["runtime_metadata"])
+        details = cast(dict[str, Any], runtime["details"])
+        native = cast(dict[str, Any], details["native_execution"])
+        if mutation == "runtime_missing_native_execution":
+            details.pop("native_execution")
+        elif mutation in {
+            "runtime_missing_handle",
+            "runtime_missing_record",
+            "runtime_missing_progress",
+        }:
+            native.pop(
+                {
+                    "runtime_missing_handle": "execution_handle",
+                    "runtime_missing_record": "execution_record",
+                    "runtime_missing_progress": "progress",
+                }[mutation]
+            )
+        elif mutation == "runtime_terminal_state":
+            terminal = cast(dict[str, Any], runtime["terminal"])
+            terminal["state"] = "running"
+        else:
+            document_name, field, value = {
+                "runtime_handle_schema": (
+                    "execution_handle",
+                    "schema_version",
+                    "jarvis.execution.handle.v0",
+                ),
+                "runtime_handle_native_id": (
+                    "execution_handle",
+                    "scheduler_native_id",
+                    "9999",
+                ),
+                "runtime_record_native_id": (
+                    "execution_record",
+                    "scheduler_native_id",
+                    "9999",
+                ),
+                "runtime_progress_execution": (
+                    "progress",
+                    "execution_id",
+                    "different-execution",
+                ),
+                "runtime_progress_schema": (
+                    "progress",
+                    "schema_version",
+                    "jarvis.execution.progress.v0",
+                ),
+            }[mutation]
+            document = cast(dict[str, Any], native[document_name])
+            document[field] = value
+    pending_report = new_live_validation_report(
+        scenario="remote-mcp",
+        cluster="test-cluster",
+    )
+    pending_report.status = ValidationStatus.PENDING
+    pending_report.completed_at = datetime.now(UTC)
+    pending_report.resources.append(
+        ValidationResource(
+            kind="jarvis_execution",
+            resource_id="execution",
+            role="resumable_acceptance_workload",
+            cluster="test-cluster",
+            provider="slurm",
+            state=str(observation.get("state")),
+            metadata={"retry_selector": selector, "resume_checkpoint": checkpoint},
+        )
+    )
+    resume_path = tmp_path / f"tampered-{mutation}.json"
+    write_validation_report(pending_report, resume_path)
+    query_calls: list[str] = []
+
+    def forbid_query(**_kwargs: object) -> None:
+        query_calls.append("called")
+        raise AssertionError("tampered checkpoint reached a remote query")
+
+    monkeypatch.setattr(cli, "_run_post_run_jarvis_execution_query", forbid_query)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "jarvis-mcp-validate",
+            "--cluster",
+            "test-cluster",
+            "--resume-report",
+            str(resume_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert query_calls == []
+
+
+def test_jarvis_resume_checkpoint_accepts_only_monotonic_scheduler_id_assignment(
+    tmp_path: Path,
+) -> None:
+    """A persisted checkpoint remains resumable after its scheduler ID first appears."""
+    selector: dict[str, object] = {
+        "cluster": "test-cluster",
+        "scheduler_cluster": "test-cluster",
+        "pipeline_id": "pipeline",
+        "execution_id": "execution",
+        "scheduler_provider": "slurm",
+        "scheduler_native_id": "4242",
+        "last_query_job_id": "job-query-assigned",
+    }
+    observations: list[dict[str, object]] = [
+        _jarvis_resume_observation(
+            query_job_id="job-query-before-assignment",
+            state="submitting",
+            terminal=False,
+            scheduler_native_id=None,
+            scheduler_cluster=None,
+        ),
+        _jarvis_resume_observation(
+            query_job_id="job-query-assigned",
+            state="submitted",
+            terminal=False,
+            scheduler_native_id="4242",
+        ),
+    ]
+    checkpoint: dict[str, object] = {
+        "schema_version": cli._JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "phase": "execution_query",
+        "observation_state": "observed",
+        "profile": "user",
+        "retry_selector": selector,
+        "builder_inputs": {
+            "cluster": "test-cluster",
+            "scheduler_cluster": "test-cluster",
+            "tool": "jarvis_run",
+            "runtime_metadata": _jarvis_resume_runtime_metadata(
+                state="submitting",
+                scheduler_native_id=None,
+                scheduler_cluster=None,
+            ),
+        },
+        "lifecycle_observations": observations,
+    }
+    report = new_live_validation_report(scenario="remote-mcp", cluster="test-cluster")
+    report.status = ValidationStatus.PENDING
+    report.completed_at = datetime.now(UTC)
+    report.resources.append(
+        ValidationResource(
+            kind="jarvis_execution",
+            resource_id="execution",
+            role="resumable_acceptance_workload",
+            cluster="test-cluster",
+            provider="slurm",
+            state="submitted",
+            metadata={"retry_selector": selector, "resume_checkpoint": checkpoint},
+        )
+    )
+    checkpoint_path = tmp_path / "scheduler-id-assigned.json"
+    write_validation_report(report, checkpoint_path)
+
+    loaded = cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        checkpoint_path,
+        cluster="test-cluster",
+    )
+    assert loaded["retry_selector"]["scheduler_native_id"] == "4242"
+
+    stable_unknown_cluster = LiveValidationReport.model_validate_json(
+        checkpoint_path.read_text(encoding="utf-8")
+    )
+    stable_resource = stable_unknown_cluster.resources[0]
+    stable_checkpoint = cast(dict[str, Any], stable_resource.metadata["resume_checkpoint"])
+    stable_selector = cast(dict[str, Any], stable_checkpoint["retry_selector"])
+    stable_selector["scheduler_cluster"] = None
+    stable_builder = cast(dict[str, Any], stable_checkpoint["builder_inputs"])
+    stable_builder["scheduler_cluster"] = None
+    for stable_observation in cast(
+        list[dict[str, Any]], stable_checkpoint["lifecycle_observations"]
+    ):
+        for document_name in ("execution_handle", "execution_record"):
+            stable_document = cast(dict[str, Any], stable_observation[document_name])
+            stable_document["cluster"] = None
+    stable_resource.metadata["retry_selector"] = stable_selector
+    stable_path = tmp_path / "scheduler-cluster-unavailable.json"
+    write_validation_report(stable_unknown_cluster, stable_path)
+    stable_loaded = cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        stable_path,
+        cluster="test-cluster",
+    )
+    assert stable_loaded["retry_selector"]["scheduler_cluster"] is None
+
+    for mutation, changed_cluster in (
+        ("reverted", None),
+        ("changed", "different-cluster"),
+    ):
+        cluster_tampered = LiveValidationReport.model_validate_json(
+            checkpoint_path.read_text(encoding="utf-8")
+        )
+        cluster_resource = cluster_tampered.resources[0]
+        cluster_checkpoint = cast(dict[str, Any], cluster_resource.metadata["resume_checkpoint"])
+        cluster_observations = cast(
+            list[dict[str, Any]], cluster_checkpoint["lifecycle_observations"]
+        )
+        cluster_observations.append(
+            _jarvis_resume_observation(
+                query_job_id=f"job-query-cluster-{mutation}",
+                state="submitted",
+                terminal=False,
+                scheduler_native_id="4242",
+                scheduler_cluster=changed_cluster,
+            )
+        )
+        cluster_selector = cast(dict[str, Any], cluster_checkpoint["retry_selector"])
+        cluster_selector["last_query_job_id"] = f"job-query-cluster-{mutation}"
+        cluster_resource.metadata["retry_selector"] = cluster_selector
+        cluster_path = tmp_path / f"scheduler-cluster-{mutation}.json"
+        write_validation_report(cluster_tampered, cluster_path)
+        with pytest.raises(ConfigurationError, match="observation identity changed"):
+            cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                cluster_path,
+                cluster="test-cluster",
+            )
+
+    for mutation in (
+        "missing_runtime",
+        "non_object_runtime",
+        "pipeline",
+        "execution",
+        "provider",
+        "native_id",
+    ):
+        tampered_runtime_report = LiveValidationReport.model_validate_json(
+            checkpoint_path.read_text(encoding="utf-8")
+        )
+        tampered_resource = tampered_runtime_report.resources[0]
+        tampered_checkpoint = cast(dict[str, Any], tampered_resource.metadata["resume_checkpoint"])
+        tampered_builder = cast(dict[str, Any], tampered_checkpoint["builder_inputs"])
+        if mutation == "missing_runtime":
+            tampered_builder.pop("runtime_metadata")
+        elif mutation == "non_object_runtime":
+            tampered_builder["runtime_metadata"] = []
+        else:
+            tampered_runtime = cast(dict[str, Any], tampered_builder["runtime_metadata"])
+            field, value = {
+                "pipeline": ("pipeline_id", "different-pipeline"),
+                "execution": ("execution_id", "different-execution"),
+                "provider": ("scheduler_provider", "different-provider"),
+                "native_id": ("scheduler_job_id", "different-job"),
+            }[mutation]
+            tampered_runtime[field] = value
+        tampered_runtime_path = tmp_path / f"runtime-{mutation}.json"
+        write_validation_report(tampered_runtime_report, tampered_runtime_path)
+        with pytest.raises(
+            ConfigurationError,
+            match="resume checkpoint is invalid|runtime identity changed",
+        ):
+            cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                tampered_runtime_path,
+                cluster="test-cluster",
+            )
+
+    empty_query_report = LiveValidationReport.model_validate_json(
+        checkpoint_path.read_text(encoding="utf-8")
+    )
+    empty_query_resource = empty_query_report.resources[0]
+    empty_query_checkpoint = cast(
+        dict[str, Any], empty_query_resource.metadata["resume_checkpoint"]
+    )
+    empty_query_observations = cast(
+        list[dict[str, Any]], empty_query_checkpoint["lifecycle_observations"]
+    )
+    empty_query_observations[-1]["query_job_id"] = ""
+    empty_query_path = tmp_path / "empty-query-job-id.json"
+    write_validation_report(empty_query_report, empty_query_path)
+    with pytest.raises(ConfigurationError, match="observation identity changed"):
+        cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            empty_query_path,
+            cluster="test-cluster",
+        )
+
+    tampered = LiveValidationReport.model_validate_json(checkpoint_path.read_text(encoding="utf-8"))
+    resource = tampered.resources[0]
+    stored_checkpoint = cast(dict[str, Any], resource.metadata["resume_checkpoint"])
+    stored_observations = cast(list[dict[str, Any]], stored_checkpoint["lifecycle_observations"])
+    stored_observations.append(
+        _jarvis_resume_observation(
+            query_job_id="job-query-reverted",
+            state="submitted",
+            terminal=False,
+            scheduler_native_id=None,
+        )
+    )
+    stored_selector = cast(dict[str, Any], stored_checkpoint["retry_selector"])
+    stored_selector["last_query_job_id"] = "job-query-reverted"
+    resource.metadata["retry_selector"] = stored_selector
+    tampered_path = tmp_path / "scheduler-id-reverted.json"
+    write_validation_report(tampered, tampered_path)
+
+    with pytest.raises(ConfigurationError, match="observation identity changed"):
+        cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            tampered_path,
+            cluster="test-cluster",
+        )
 
 
 def test_execution_query_remote_boundaries_share_one_deadline(

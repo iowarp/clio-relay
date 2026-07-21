@@ -57,10 +57,16 @@ from clio_relay.models import (
     McpCallSpec,
     RelayJob,
     SchedulerConnectorStepIdentity,
+    SchedulerPhase,
+    SchedulerStatus,
     ServiceRuntimeSpec,
 )
 from clio_relay.remote_mcp import remote_mcp_server_artifact_digest
-from clio_relay.service_runtime import ServiceRuntimeStopResult, ServiceRuntimeSupervisor
+from clio_relay.service_runtime import (
+    ServiceRuntimePendingResult,
+    ServiceRuntimeStopResult,
+    ServiceRuntimeSupervisor,
+)
 from clio_relay.session_lifecycle import CleanupResource
 from tests.jarvis_mcp_fakes import verified_jarvis_server_artifact
 
@@ -1988,6 +1994,10 @@ def test_agent_bind_persists_urls_and_rejects_runtime_commands(
 
     assert response is not None and "error" not in response
     result = cast(dict[str, Any], response["result"]["structuredContent"])
+    assert result["outcome"] == "ready"
+    assert result["retry_selector"] is None
+    assert result["scheduler_action"] == "none"
+    assert result["relay_action"] == "none"
     connect_url = cast(str, result["connect_url"])
     local_port = urllib.parse.urlparse(connect_url).port
     assert local_port is not None
@@ -2131,6 +2141,221 @@ def test_agent_bind_persists_urls_and_rejects_runtime_commands(
     assert closed is not None
     assert "must be closed with stop-runtime" in closed["error"]["message"]
     assert queue.get_gateway_session(gateway["session_id"]).gateway["jarvis_runtime_binding"]
+
+
+def test_agent_bind_pending_replays_same_gateway_and_connector_intents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A health observation miss is a successful checkpoint, not another bind."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(clusters={definition.name: definition}).save(registry_path)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "token")
+    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "secret")
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    launches = {"remote": 0, "desktop": 0}
+
+    def start_remote(
+        _self: ServiceRuntimeSupervisor,
+        *,
+        session: GatewaySession,
+        spec: ServiceRuntimeSpec,
+        node: str,
+        proxy_name: str,
+        ownership_intent: dict[str, object],
+        allocation_provider: str | None = None,
+        allocation_job_id: str | None = None,
+    ) -> dict[str, object]:
+        del spec, node, proxy_name, allocation_provider, allocation_job_id
+        launches["remote"] += 1
+        return {
+            "owner": "clio-relay",
+            "session_id": session.session_id,
+            "pid": 444,
+            "process_group_id": 444,
+            "connector_generation_id": ownership_intent["connector_generation_id"],
+            "owner_token": ownership_intent["owner_token"],
+            "config_path": "/runtime/remote-frpc.toml",
+            "log_path": "/runtime/remote-frpc.log",
+        }
+
+    def start_local(
+        _self: ServiceRuntimeSupervisor,
+        *,
+        session: GatewaySession,
+        spec: ServiceRuntimeSpec,
+        proxy_name: str,
+        ownership_intent: dict[str, object],
+    ) -> dict[str, object]:
+        del spec, proxy_name
+        launches["desktop"] += 1
+        return {
+            "owner": "clio-relay",
+            "session_id": session.session_id,
+            "pid": 555,
+            "process_group_id": 555,
+            "process_start_marker": "start-555",
+            "connector_generation_id": ownership_intent["connector_generation_id"],
+            "owner_token": ownership_intent["owner_token"],
+            "config_path": ownership_intent["config_path"],
+            "stdout_path": ownership_intent["stdout_path"],
+            "stderr_path": ownership_intent["stderr_path"],
+            "metadata_path": ownership_intent["metadata_path"],
+        }
+
+    health_observations = 0
+
+    def observe_health(*_args: object, **_kwargs: object) -> None:
+        nonlocal health_observations
+        health_observations += 1
+        if health_observations == 1:
+            raise RelayError("bounded health observation did not become ready")
+
+    def reconcile(
+        self: ServiceRuntimeSupervisor,
+        session: GatewaySession,
+    ) -> GatewaySession:
+        transport = cast(dict[str, object], session.gateway.get("transport", {}))
+        roles = ("remote_connector", "desktop_connector")
+        if not all(isinstance(transport.get(role), dict) for role in roles):
+            return session
+        gateway = dict(session.gateway)
+        intents = dict(cast(dict[str, object], gateway["ownership_intents"]))
+        for role in roles:
+            intent = dict(cast(dict[str, object], intents[role]))
+            intent["live_identity_verified"] = True
+            intent.pop("reconciliation_error", None)
+            intents[role] = intent
+        gateway["ownership_intents"] = intents
+        return self.queue.update_gateway_session(
+            session.session_id,
+            gateway=gateway,
+            expected_updated_at=session.updated_at,
+        )
+
+    monkeypatch.setattr(ServiceRuntimeSupervisor, "_start_remote_connector", start_remote)
+    monkeypatch.setattr(ServiceRuntimeSupervisor, "_start_local_visitor", start_local)
+    monkeypatch.setattr(ServiceRuntimeSupervisor, "_wait_for_jarvis_health", observe_health)
+    monkeypatch.setattr(ServiceRuntimeSupervisor, "_reconcile_ownership_intents", reconcile)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+    )
+    arguments = {
+        "cluster": definition.name,
+        "source_job_id": job.job_id,
+        "source_artifact_id": artifact.artifact_id,
+        "package_id": "paraview-1",
+        "package_name": "builtin.paraview",
+    }
+
+    first_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "relay_bind_jarvis_runtime", "arguments": arguments},
+        },
+        queue=queue,
+        settings=settings,
+        profile="user",
+    )
+    second_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "relay_bind_jarvis_runtime", "arguments": arguments},
+        },
+        queue=queue,
+        settings=settings,
+        profile="user",
+    )
+
+    assert first_response is not None and "error" not in first_response, first_response
+    assert second_response is not None and "error" not in second_response, second_response
+    first = cast(dict[str, Any], first_response["result"]["structuredContent"])
+    second = cast(dict[str, Any], second_response["result"]["structuredContent"])
+    assert first["outcome"] == "pending"
+    assert first["scheduler_action"] == "none"
+    assert first["relay_action"] == "none"
+    assert first["scheduler_cancel_requested"] is False
+    assert all(
+        first[key] is None
+        for key in (
+            "connect_url",
+            "health_url",
+            "stream_url",
+            "events_url",
+            "state_url",
+            "command_url",
+        )
+    )
+    retry = cast(dict[str, Any], first["retry_selector"])
+    assert retry["resume_tool"] == "relay_bind_jarvis_runtime"
+    assert retry["binding"]["source_job_id"] == job.job_id
+    pending_report = ServiceRuntimePendingResult(
+        session=GatewaySession.model_validate(first["gateway_session"])
+    ).to_live_validation_report()
+    assert pending_report.status.value == "pending"
+    assert {resource.kind for resource in pending_report.resources} == {
+        "gateway_session",
+        "jarvis_service_runtime",
+        "scheduler_job",
+    }
+    assert second["outcome"] == "ready"
+    assert second["retry_selector"] is None
+    assert second["gateway_session_id"] == first["gateway_session_id"]
+    assert launches == {"remote": 1, "desktop": 1}
+    assert health_observations == 2
+    assert len(queue.list_gateway_sessions(cluster=definition.name)) == 1
+
+
+def test_pending_direct_jarvis_binding_does_not_invent_scheduler_submission() -> None:
+    """A direct JARVIS service resumes by binding identity with no fake job handle."""
+    session = GatewaySession(
+        session_id="gateway_direct_jarvis_pending",
+        cluster="direct-cluster",
+        name="direct-paraview",
+        state=GatewaySessionState.STARTING,
+        scheduler="external",
+        scheduler_job_id=None,
+        queue_state="ready",
+        gateway={
+            "jarvis_runtime_binding": {
+                "source_relay_job_id": "job_source",
+                "source_relay_artifact_id": "artifact_source",
+                "jarvis_execution_id": "execution-1",
+                "package_id": "paraview-1",
+                "package_name": "builtin.paraview",
+                "service_instance_id": "paraview-live-1",
+            }
+        },
+        metadata={"owner": "clio-relay"},
+    )
+    pending = ServiceRuntimePendingResult(session=session)
+
+    selector = pending.retry_selector()
+    report = pending.to_live_validation_report()
+
+    assert selector["scheduler_job_id"] is None
+    assert selector["resume_tool"] == "relay_bind_jarvis_runtime"
+    assert selector["binding"] == {
+        "cluster": "direct-cluster",
+        "source_job_id": "job_source",
+        "source_artifact_id": "artifact_source",
+        "package_id": "paraview-1",
+        "package_name": "builtin.paraview",
+        "service_instance_id": "paraview-live-1",
+    }
+    assert [resource.kind for resource in report.resources] == [
+        "gateway_session",
+        "jarvis_service_runtime",
+    ]
+    assert all(resource.kind != "scheduler_submission" for resource in report.resources)
 
 
 def test_owned_agent_bind_uses_shared_cluster_scoped_gateway_admission(
@@ -3374,11 +3599,11 @@ def test_public_jarvis_bind_uses_the_durable_allocation_connector_revision(
     assert remote_intent["state"] == "recorded"
 
 
-def test_jarvis_bind_recovers_and_stops_allocation_connector_after_lost_start_response(
+def test_jarvis_bind_preserves_and_resumes_allocation_connector_after_lost_start_response(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A lost SSH response cannot orphan its already-started scheduler step."""
+    """A lost SSH response stays pending and adopts the exact scheduler step on replay."""
     queue, definition, job, artifact, envelope = _source_result(tmp_path)
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
     verified = resolve_jarvis_service_runtime(
@@ -3455,7 +3680,9 @@ def test_jarvis_bind_recovers_and_stops_allocation_connector_after_lost_start_re
             )
         if "__CLIO_WRITE_ALLOCATION_FRPC__" in script:
             events.append("start-side-effect")
-            raise RelayError("lost allocation connector start response")
+            raise service_runtime_module._AmbiguousRemoteSideEffectError(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                "lost allocation connector start response"
+            )
         _session, intent, connector, step = allocation_context()
         if "__CLIO_DISCOVER_CONNECTOR__" in script:
             events.append("discover")
@@ -3513,34 +3740,82 @@ def test_jarvis_bind_recovers_and_stops_allocation_connector_after_lost_start_re
         raise AssertionError("unexpected remote connector script")
 
     monkeypatch.setattr(supervisor, "_ssh", ssh)
+    first = supervisor.bind_verified_jarvis_runtime(
+        name="paraview-lost-allocation-response",
+        verified=verified,
+        desktop_bind_port=28777,
+    )
 
-    with pytest.raises(RelayError, match="lost allocation connector start response"):
-        supervisor.bind_verified_jarvis_runtime(
-            name="paraview-lost-allocation-response",
-            verified=verified,
-            desktop_bind_port=28777,
-        )
+    assert isinstance(first, ServiceRuntimePendingResult)
+    assert first.session.state is GatewaySessionState.STARTING
+    assert first.scheduler_action == "none"
+    assert first.relay_action == "none"
+    assert events == ["placement", "start-side-effect"]
+    assert "cancel-step" not in events
+    remote_intent = cast(
+        dict[str, object],
+        cast(dict[str, object], first.session.gateway["ownership_intents"])["remote_connector"],
+    )
+    assert remote_intent["state"] == "starting"
+    assert remote_intent["scheduler_native_id"] == "12345"
 
-    persisted = queue.list_gateway_sessions(cluster=definition.name)[0]
-    assert persisted.state is GatewaySessionState.FAILED
+    def start_local(
+        *,
+        session: GatewaySession,
+        spec: ServiceRuntimeSpec,
+        proxy_name: str,
+        ownership_intent: dict[str, object],
+    ) -> dict[str, object]:
+        del spec, proxy_name
+        return {
+            "owner": "clio-relay",
+            "session_id": session.session_id,
+            "pid": 555,
+            "process_group_id": 555,
+            "process_start_marker": "start-555",
+            "connector_generation_id": ownership_intent["connector_generation_id"],
+            "owner_token": ownership_intent["owner_token"],
+            "config_path": ownership_intent["config_path"],
+            "stdout_path": ownership_intent["stdout_path"],
+            "stderr_path": ownership_intent["stderr_path"],
+            "metadata_path": ownership_intent["metadata_path"],
+        }
+
+    monkeypatch.setattr(supervisor, "_start_local_visitor", start_local)
+
+    def health_ready(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(
+        supervisor,
+        "_wait_for_jarvis_health",
+        health_ready,
+    )
+    resumed = supervisor.bind_verified_jarvis_runtime(
+        name="paraview-lost-allocation-response",
+        verified=verified,
+        desktop_bind_port=28777,
+    )
+
+    assert not isinstance(resumed, ServiceRuntimePendingResult)
+    assert resumed.session.session_id == first.session.session_id
+    assert resumed.session.state is GatewaySessionState.READY
+    assert len(queue.list_gateway_sessions(cluster=definition.name)) == 1
     assert events == [
         "placement",
         "start-side-effect",
         "discover",
         "reconcile-step",
         "status-active",
-        "status-active",
-        "cancel-step",
-        "status-absent",
     ]
-    assert persisted.metadata["cleanup_error"] is None
+    assert "cancel-step" not in events
 
 
-def test_jarvis_bind_recovers_and_stops_local_connector_after_lost_start_response(
+def test_jarvis_bind_preserves_local_connector_intent_after_lost_start_response(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A local sidecar recovers a visitor whose successful response was lost."""
+    """A local sidecar and intent survive ambiguity without cleanup or replacement."""
     queue, definition, job, artifact, envelope = _source_result(tmp_path)
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
     _patch_connector_start(monkeypatch)
@@ -3620,17 +3895,141 @@ def test_jarvis_bind_recovers_and_stops_local_connector_after_lost_start_respons
     monkeypatch.setattr(supervisor, "_stop_local_connector", stop_local)
     monkeypatch.setattr(supervisor, "_ssh", _fake_connector_ssh)
 
-    with pytest.raises(RelayError, match="lost desktop connector start response"):
+    pending = supervisor.bind_verified_jarvis_runtime(
+        name="paraview-lost-desktop-response",
+        verified=verified,
+        desktop_bind_port=28777,
+    )
+
+    assert isinstance(pending, ServiceRuntimePendingResult)
+    persisted = queue.get_gateway_session(pending.session.session_id)
+    assert persisted.state is GatewaySessionState.STARTING
+    assert stopped == []
+    local_intent = cast(
+        dict[str, object],
+        cast(dict[str, object], persisted.gateway["ownership_intents"])["desktop_connector"],
+    )
+    assert local_intent["state"] == "starting"
+    assert Path(str(local_intent["metadata_path"])).exists()
+    assert persisted.metadata["runtime_observation_error"] == (
+        "lost desktop connector start response"
+    )
+
+
+def test_jarvis_bind_rejects_policy_change_without_creating_another_gateway(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry may change observation bounds, but not connector side-effect policy."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    _patch_connector_start(monkeypatch)
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    supervisor = ServiceRuntimeSupervisor(
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+        queue=queue,
+        cluster=definition.name,
+        definition=definition,
+        token="token",
+        secret_key="secret",
+        sleep=lambda _seconds: None,
+    )
+
+    def not_ready(*_args: object, **_kwargs: object) -> None:
+        raise RelayError("health observation expired")
+
+    monkeypatch.setattr(supervisor, "_wait_for_jarvis_health", not_ready)
+    first = supervisor.bind_verified_jarvis_runtime(
+        name="paraview-live",
+        verified=verified,
+        desktop_bind_port=28777,
+        readiness_timeout_seconds=1,
+    )
+    assert isinstance(first, ServiceRuntimePendingResult)
+
+    with pytest.raises(
+        ConfigurationError,
+        match="already bound with a different immutable policy",
+    ):
         supervisor.bind_verified_jarvis_runtime(
-            name="paraview-lost-desktop-response",
+            name="renamed-paraview-live",
+            verified=verified,
+            desktop_bind_port=28777,
+            # Observation policy is deliberately different and remains mutable.
+            readiness_timeout_seconds=5,
+        )
+
+    sessions = queue.list_gateway_sessions(cluster=definition.name)
+    assert [session.session_id for session in sessions] == [first.session.session_id]
+    assert sessions[0].name == "paraview-live"
+    assert sessions[0].state is GatewaySessionState.STARTING
+
+
+def test_jarvis_bind_fails_closed_on_definitive_scheduler_terminal_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proven terminal allocation is failure evidence, not a pending observation."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+    supervisor = ServiceRuntimeSupervisor(
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+        queue=queue,
+        cluster=definition.name,
+        definition=definition,
+        token="token",
+        secret_key="secret",
+        sleep=lambda _seconds: None,
+    )
+
+    def fail_connector(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise RelayError("scheduler connector placement is unavailable")
+
+    def completed_status(**_kwargs: object) -> SchedulerStatus:
+        return SchedulerStatus(
+            scheduler="slurm",
+            scheduler_job_id="12345",
+            phase=SchedulerPhase.COMPLETED,
+            record_found=True,
+            active_record_found=False,
+        )
+
+    def no_connectors(session: GatewaySession) -> GatewaySession:
+        return session
+
+    monkeypatch.setattr(supervisor, "_start_remote_connector", fail_connector)
+    monkeypatch.setattr(supervisor, "_poll_scheduler_provider", completed_status)
+    monkeypatch.setattr(supervisor, "_reconcile_ownership_intents", no_connectors)
+
+    with pytest.raises(
+        RelayError,
+        match="scheduler job reached a terminal state before its verified JARVIS service",
+    ):
+        supervisor.bind_verified_jarvis_runtime(
+            name="paraview-terminal",
             verified=verified,
             desktop_bind_port=28777,
         )
 
     persisted = queue.list_gateway_sessions(cluster=definition.name)[0]
     assert persisted.state is GatewaySessionState.FAILED
-    assert stopped == [555]
-    assert persisted.metadata["cleanup_error"] is None
+    assert persisted.scheduler_job_id == "12345"
+    assert "terminal state" in str(persisted.metadata["last_error"])
 
 
 @pytest.mark.parametrize("operation", ["stop", "detach"])

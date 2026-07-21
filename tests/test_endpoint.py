@@ -144,6 +144,88 @@ def test_worker_failure_persists_only_logical_windows_paths(tmp_path: Path) -> N
     assert str(logical_failure_path) in failed.last_error
 
 
+def test_worker_provider_uses_receipt_bound_jarvis_interpreter(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Cluster workers pass the managed execution boundary into their provider."""
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        jarvis_bin=str(tmp_path / ".local/bin/jarvis"),
+    )
+    execution_python = tmp_path / "generation/jarvis-venv/bin/python"
+    calls: list[str] = []
+
+    def resolve(jarvis_bin: str) -> str:
+        calls.append(jarvis_bin)
+        return str(execution_python)
+
+    monkeypatch.setattr(endpoint_module, "resolve_receipt_bound_jarvis_python", resolve)
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=ClioCoreQueue(settings.core_dir),
+    )
+    try:
+        pipeline = tmp_path / "pipeline.yaml"
+        pipeline.write_text("name: direct\npkgs: []\n", encoding="utf-8")
+
+        command = worker.provider.pipeline_command(pipeline)
+
+        assert calls == [settings.jarvis_bin]
+        assert command[0] == str(execution_python)
+    finally:
+        worker.close()
+
+
+def test_worker_provider_keeps_unmanaged_conventional_jarvis_fallback(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A manual local-bin JARVIS install does not require a relay receipt."""
+    home = tmp_path / "operator-home"
+    local_bin = home / ".local/bin"
+    local_bin.mkdir(parents=True)
+    jarvis = local_bin / "jarvis"
+    jarvis.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    jarvis.chmod(0o755)
+    unmanaged_python = local_bin / "python"
+    unmanaged_python.write_text("unmanaged interpreter placeholder\n", encoding="utf-8")
+    unmanaged_python.chmod(0o755)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        jarvis_bin=str(jarvis),
+    )
+    resolver = endpoint_module.resolve_receipt_bound_jarvis_python
+
+    def resolve_from_operator_home(jarvis_bin: str) -> str | None:
+        return resolver(jarvis_bin, home=home)
+
+    monkeypatch.setattr(
+        endpoint_module,
+        "resolve_receipt_bound_jarvis_python",
+        resolve_from_operator_home,
+    )
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="configured-target",
+        queue=ClioCoreQueue(settings.core_dir),
+    )
+    try:
+        pipeline = tmp_path / "pipeline.yaml"
+        pipeline.write_text("name: direct\npkgs: []\n", encoding="utf-8")
+
+        command = worker.provider.pipeline_command(pipeline)
+
+        assert command[0] == str(unmanaged_python)
+    finally:
+        worker.close()
+
+
 def test_replacement_worker_reconciles_owned_process_before_cancel_acknowledgment(
     tmp_path: Path,
 ) -> None:

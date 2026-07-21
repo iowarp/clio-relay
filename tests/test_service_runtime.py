@@ -5,6 +5,7 @@ import errno
 import gzip
 import hashlib
 import json
+import os
 import shlex
 import signal
 import socket
@@ -40,6 +41,7 @@ from clio_relay.models import (
 from clio_relay.service_runtime import (
     CommandRunner,
     LocalConnectorIdentity,
+    ServiceRuntimePendingResult,
     ServiceRuntimeStartResult,
     ServiceRuntimeStopResult,
     ServiceRuntimeSupervisor,
@@ -58,6 +60,8 @@ from tests.gateway_ownership_crash_fixture import (
 from tests.gateway_ownership_crash_fixture import (
     definition as crash_fixture_definition,
 )
+
+_REAL_OBSERVE_LOCAL_PROCESS = service_runtime._observe_local_process  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 class FakeProcess:
@@ -362,6 +366,7 @@ class FakeRunner(CommandRunner):
         self.canceled_jobs: list[str] = []
         self.provider_canceled_jobs: list[str] = []
         self.submission_record: dict[str, object] | None = None
+        self.remote_connector: dict[str, object] | None = None
 
     def run(
         self,
@@ -379,7 +384,18 @@ class FakeRunner(CommandRunner):
         if "remote-frpc.toml" in script and "nohup" in script:
             session_id = _script_assignment(script, "session_id")
             generation_id = _script_assignment(script, "connector_generation_id")
+            owner_token = _script_assignment(script, "owner_token")
             session_root = f"/home/user/.local/share/clio-relay/service-sessions/{session_id}"
+            self.remote_connector = {
+                "owner": "clio-relay",
+                "session_id": session_id,
+                "pid": 444,
+                "process_group_id": 444,
+                "connector_generation_id": generation_id,
+                "owner_token": owner_token,
+                "config_path": f"{session_root}/remote-frpc.toml",
+                "log_path": f"{session_root}/remote-frpc.log",
+            }
             return subprocess.CompletedProcess(
                 command,
                 0,
@@ -395,6 +411,33 @@ class FakeRunner(CommandRunner):
                 + "\n",
                 "",
             )
+        if "__CLIO_DISCOVER_CONNECTOR__" in script:
+            expected_session = _script_assignment(script, "session_id")
+            expected_token = _script_assignment(script, "owner_token")
+            expected_generation = _script_assignment(script, "generation_id")
+            connector = self.remote_connector
+            verified = bool(
+                connector is not None
+                and connector.get("session_id") == expected_session
+                and connector.get("owner_token") == expected_token
+                and connector.get("connector_generation_id") == expected_generation
+            )
+            payload: dict[str, object] = (
+                {
+                    "present": True,
+                    "ownership_verified": True,
+                    "matching_pids": [444],
+                    "connector": connector,
+                }
+                if verified
+                else {
+                    "present": False,
+                    "ownership_verified": connector is None,
+                    "matching_pids": [],
+                    "error": (None if connector is None else "remote connector identity mismatch"),
+                }
+            )
+            return subprocess.CompletedProcess(command, 0, json.dumps(payload) + "\n", "")
         if "__CLIO_CAPTURE_SUBMISSION__" in script:
             output = '{"scheduler_job_id":"12345","service_host":"compute-01"}\n'
             self.submission_record = {
@@ -422,6 +465,7 @@ class FakeRunner(CommandRunner):
                 "",
             )
         if "__CLIO_STOP_CONNECTOR__" in script:
+            self.remote_connector = None
             return subprocess.CompletedProcess(
                 command,
                 0,
@@ -520,6 +564,248 @@ class FakeRunner(CommandRunner):
             process_group_id=pid,
             process_start_marker=f"start-{pid}",
             owner_token=owner_token,
+        )
+
+
+class TransientConnectorDiscoveryRunner(FakeRunner):
+    """Inject a bounded remote discovery outage after one connector is durable."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_remote_discovery = False
+
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        input_text: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        if self.fail_remote_discovery and "__CLIO_DISCOVER_CONNECTOR__" in (input_text or ""):
+            self.commands.append(list(command))
+            self.inputs.append(input_text)
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                "",
+                "temporary remote connector sidecar read failure",
+            )
+        return super().run(
+            command,
+            input_text=input_text,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+class AmbiguousSubmissionRunner(FakeRunner):
+    """Lose the first submit response after optionally publishing its exact sidecar."""
+
+    def __init__(self, *, publish_sidecar: bool) -> None:
+        super().__init__()
+        self.publish_sidecar = publish_sidecar
+        self.submit_attempts = 0
+
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        input_text: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        script = input_text or ""
+        if "__CLIO_CAPTURE_SUBMISSION__" in script:
+            self.commands.append(list(command))
+            self.inputs.append(input_text)
+            self.submit_attempts += 1
+            if self.submit_attempts > 1:
+                pytest.fail("an ambiguous scheduler submission must never be resubmitted")
+            if self.publish_sidecar:
+                output = '{"scheduler_job_id":"12345","service_host":"compute-01"}\n'
+                self.submission_record = {
+                    "schema_version": "clio-relay.gateway-submission-sidecar.v1",
+                    "present": True,
+                    "session_id": _script_assignment(script, "session_id"),
+                    "submission_id": _script_assignment(script, "submission_id"),
+                    "scheduler_provider": _script_assignment(
+                        script,
+                        "scheduler_provider",
+                    ),
+                    "submission_marker": _script_assignment(script, "submission_marker"),
+                    "returncode": 0,
+                    "output": output,
+                    "output_truncated": False,
+                }
+            raise subprocess.TimeoutExpired(command, timeout_seconds or 120.0)
+        return super().run(
+            command,
+            input_text=input_text,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+class ProductionSubmissionVerifierRunner(AmbiguousSubmissionRunner):
+    """Execute the generated verifier against a corrupt or incomplete sidecar set."""
+
+    def __init__(self, *, sidecar_state: str) -> None:
+        if sidecar_state not in {"record_identity_mismatch", "output_incomplete"}:
+            raise ValueError(f"unsupported test sidecar state: {sidecar_state}")
+        super().__init__(publish_sidecar=False)
+        self.sidecar_state = sidecar_state
+        self.verifier_runs = 0
+
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        input_text: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        script = input_text or ""
+        if "__CLIO_READ_SUBMISSION__" not in script:
+            return super().run(
+                command,
+                input_text=input_text,
+                timeout_seconds=timeout_seconds,
+            )
+        self.commands.append(list(command))
+        self.inputs.append(input_text)
+        self.verifier_runs += 1
+        session_id = _script_assignment(script, "session_id")
+        submission_id = _script_assignment(script, "submission_id")
+        scheduler_provider = _script_assignment(script, "scheduler_provider")
+        submission_marker = _script_assignment(script, "submission_marker")
+        expected = {
+            "session_id": session_id,
+            "submission_id": submission_id,
+            "scheduler_provider": scheduler_provider,
+            "submission_marker": submission_marker,
+        }
+        intent = {
+            "schema_version": "clio-relay.gateway-submission-intent.v1",
+            **expected,
+        }
+        output = b'{"scheduler_job_id":"should-not-be-trusted"}\n'
+        record = {
+            "schema_version": "clio-relay.gateway-submission-sidecar.v1",
+            **expected,
+            "session_id": "corrupt-session-identity",
+            "returncode": 0,
+            "output": output.decode(),
+            "output_sha256": hashlib.sha256(output).hexdigest(),
+            "output_size": len(output),
+            "output_truncated": False,
+        }
+        wrapper = f"""set -euo pipefail
+test_home=$(mktemp -d)
+trap 'rm -rf -- "$test_home"' EXIT
+export HOME="$test_home"
+root="$HOME/.local/share/clio-relay/service-sessions/{shlex.quote(session_id)}/submissions"
+mkdir -p "$root"
+python3 - "$root/{shlex.quote(submission_id)}.intent.json" \
+  "$root/{shlex.quote(submission_id)}.json" \
+  "$root/{shlex.quote(submission_id)}.out" \
+  {shlex.quote(json.dumps(intent, sort_keys=True))} \
+  {shlex.quote(json.dumps(record, sort_keys=True))} \
+  {shlex.quote(self.sidecar_state)} <<'__CLIO_TEST_SUBMISSION_SIDECARS__'
+import os
+import sys
+from pathlib import Path
+
+intent_raw, record_raw, output_raw, intent, record, sidecar_state = sys.argv[1:]
+Path(intent_raw).write_text(intent, encoding="utf-8")
+os.chmod(intent_raw, 0o600)
+if sidecar_state == "record_identity_mismatch":
+    Path(record_raw).write_text(record, encoding="utf-8")
+    os.chmod(record_raw, 0o600)
+else:
+    Path(output_raw).write_bytes(b'{{"scheduler_job_id":"in-flight"}}\\n')
+    os.chmod(output_raw, 0o600)
+__CLIO_TEST_SUBMISSION_SIDECARS__
+{script}
+"""
+        if sys.platform == "win32":
+            wsl = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "wsl.exe"
+            if not wsl.is_file():
+                return self._emulate_verifier_result(command, script)
+            shell_command = [str(wsl), "-e", "bash", "-s"]
+        else:
+            shell_command = ["bash", "-s"]
+        completed = subprocess.run(  # noqa: S603
+            shell_command,
+            input=wrapper.encode("utf-8"),
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        return subprocess.CompletedProcess(
+            command,
+            completed.returncode,
+            completed.stdout.decode("utf-8", errors="replace"),
+            completed.stderr.decode("utf-8", errors="replace"),
+        )
+
+    def _emulate_verifier_result(
+        self,
+        command: Sequence[str],
+        script: str,
+    ) -> subprocess.CompletedProcess[str]:
+        """Preserve the generated verifier contract where no POSIX shell is installed."""
+        assert "scheduler submission record identity mismatch" in script
+        if self.sidecar_state == "output_incomplete":
+            payload: dict[str, object] = {
+                "schema_version": "clio-relay.gateway-submission-verification.v1",
+                "present": False,
+                "anchored": True,
+                "verification_outcome": "retryable",
+                "error_code": "output_incomplete",
+            }
+        else:
+            payload = {
+                "schema_version": "clio-relay.gateway-submission-verification.v1",
+                "present": True,
+                "verification_outcome": "definitive_invalid",
+                "failure_kind": "relay_integrity_failure",
+                "error_code": "record_identity_mismatch",
+                "error": "scheduler submission record identity mismatch",
+                "invalid_component": "record",
+                "observed_identity": {"session_id": "corrupt-session-identity"},
+            }
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload) + "\n", "")
+
+
+class AmbiguousRemoteConnectorStartRunner(FakeRunner):
+    """Lose one remote start response after the owned connector is live."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lose_remote_start_response = True
+        self.remote_start_attempts = 0
+
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        input_text: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        script = input_text or ""
+        if "remote-frpc.toml" in script and "nohup" in script:
+            self.remote_start_attempts += 1
+            if self.remote_start_attempts > 1:
+                pytest.fail("an ambiguous remote connector start must not be repeated")
+            completed = super().run(
+                command,
+                input_text=input_text,
+                timeout_seconds=timeout_seconds,
+            )
+            if self.lose_remote_start_response:
+                self.lose_remote_start_response = False
+                raise subprocess.TimeoutExpired(command, timeout_seconds or 120.0)
+            return completed
+        return super().run(
+            command,
+            input_text=input_text,
+            timeout_seconds=timeout_seconds,
         )
 
 
@@ -804,6 +1090,113 @@ class DeferredHostRunner(FakeRunner):
         return subprocess.CompletedProcess(command, 1, "", f"unexpected script: {script}")
 
 
+class LongPendingDeferredHostRunner(FakeRunner):
+    """Hold one exact scheduler job pending before reporting its allocation."""
+
+    def __init__(self, *, pending_polls: int) -> None:
+        super().__init__()
+        self.pending_polls = pending_polls
+        self.scheduler_polls = 0
+        self.fail_submission_reads = False
+
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        input_text: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        script = input_text or ""
+        if self.fail_submission_reads and "__CLIO_READ_SUBMISSION__" in script:
+            self.commands.append(list(command))
+            self.inputs.append(input_text)
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                "",
+                "temporary sidecar read failure",
+            )
+        if "__CLIO_CAPTURE_SUBMISSION__" in script:
+            self.commands.append(list(command))
+            self.inputs.append(input_text)
+            output = '{"scheduler_job_id":"12345"}\n'
+            self.submission_record = {
+                "schema_version": "clio-relay.gateway-submission-sidecar.v1",
+                "present": True,
+                "session_id": _script_assignment(script, "session_id"),
+                "submission_id": _script_assignment(script, "submission_id"),
+                "scheduler_provider": _script_assignment(script, "scheduler_provider"),
+                "submission_marker": _script_assignment(script, "submission_marker"),
+                "returncode": 0,
+                "output": output,
+                "output_truncated": False,
+            }
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                output,
+                "",
+            )
+        if "clio-relay scheduler status 12345" in script:
+            self.commands.append(list(command))
+            self.inputs.append(input_text)
+            self.scheduler_polls += 1
+            phase = "pending" if self.scheduler_polls <= self.pending_polls else "running"
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps(
+                    {
+                        "scheduler": "slurm",
+                        "scheduler_job_id": "12345",
+                        "phase": phase,
+                        "raw_state": phase.upper(),
+                    }
+                )
+                + "\n",
+                "",
+            )
+        if "jarvis runtime status 12345" in script:
+            self.commands.append(list(command))
+            self.inputs.append(input_text)
+            status = (
+                {"state": "pending"}
+                if self.scheduler_polls <= self.pending_polls
+                else {"state": "allocated", "service_host": "compute-02"}
+            )
+            return subprocess.CompletedProcess(command, 0, json.dumps(status) + "\n", "")
+        return super().run(command, input_text=input_text, timeout_seconds=timeout_seconds)
+
+
+class NotReadyThenHealthyRunner(LongPendingDeferredHostRunner):
+    """Report an allocated service whose first bounded health observation is not ready."""
+
+    def __init__(self) -> None:
+        super().__init__(pending_polls=0)
+        self.health_observations = 0
+
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        input_text: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        script = input_text or ""
+        if "http.client.HTTPConnection" in script:
+            self.commands.append(list(command))
+            self.inputs.append(input_text)
+            self.health_observations += 1
+            if self.health_observations == 1:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "service_health=not_ready\nservice_status=503\n",
+                    "",
+                )
+        return super().run(command, input_text=input_text, timeout_seconds=timeout_seconds)
+
+
 def test_service_runtime_supervisor_starts_generic_streaming_service(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path / "core")
     queue.prepare_owner_session_start(
@@ -837,6 +1230,7 @@ def test_service_runtime_supervisor_starts_generic_streaming_service(tmp_path: P
         owner_session_generation_id="generation-1",
     )
 
+    assert isinstance(result, ServiceRuntimeStartResult)
     session = result.session
     assert session.state == GatewaySessionState.READY
     assert session.scheduler_job_id == "12345"
@@ -939,6 +1333,87 @@ def test_gateway_ownership_hard_exit_reconciles_before_closure(
         assert intents["remote_connector"]["state"] == "recorded"
     if mode == "local":
         assert intents["desktop_connector"]["state"] == "recorded"
+
+
+@pytest.mark.parametrize("mode", ["remote", "local"])
+def test_gateway_connector_hard_exit_resumes_exact_live_sidecar_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """A real process crash is recovered from sidecars without connector relaunch."""
+    state_path = tmp_path / "remote-state.json"
+    crashed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tests.gateway_ownership_crash_fixture",
+            str(tmp_path),
+            str(state_path),
+            mode,
+        ],
+        cwd=Path(__file__).parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert crashed.returncode == 84, crashed.stderr
+    monkeypatch.setattr(
+        service_runtime,
+        "_observe_local_process",
+        _REAL_OBSERVE_LOCAL_PROCESS,
+    )
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="fixture-frpc",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    session = queue.list_gateway_sessions(cluster="configured-target")[0]
+    before_intents = cast(dict[str, object], session.gateway["ownership_intents"])
+    expected_remote_generation = str(
+        cast(dict[str, object], before_intents["remote_connector"])["connector_generation_id"]
+    )
+    expected_local_generation = (
+        str(cast(dict[str, object], before_intents["desktop_connector"])["connector_generation_id"])
+        if mode == "local"
+        else None
+    )
+    runner = DurableFixtureRunner(state_path)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="configured-target",
+        definition=crash_fixture_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("crash recovery must not poll or sleep"),
+    )
+    supervisor._wait_for_local_health = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+
+    resumed = supervisor.resume_start(session_id=session.session_id)
+
+    assert isinstance(resumed, ServiceRuntimeStartResult)
+    assert resumed.session.session_id == session.session_id
+    assert resumed.session.scheduler_job_id == "fixture-job"
+    transport = cast(dict[str, object], resumed.session.gateway["transport"])
+    remote = cast(dict[str, object], transport["remote_connector"])
+    local = cast(dict[str, object], transport["desktop_connector"])
+    assert remote["connector_generation_id"] == expected_remote_generation
+    if expected_local_generation is not None:
+        assert local["connector_generation_id"] == expected_local_generation
+    intents = cast(dict[str, object], resumed.session.gateway["ownership_intents"])
+    assert cast(dict[str, object], intents["remote_connector"])["live_identity_verified"] is True
+    if mode == "local":
+        assert (
+            cast(dict[str, object], intents["desktop_connector"])["live_identity_verified"] is True
+        )
+
+    stopped = supervisor.stop(session_id=session.session_id)
+    assert stopped.errors == []
+    assert stopped.canceled_scheduler_job is None
 
 
 def test_service_runtime_stop_keeps_scheduler_job_by_default(tmp_path: Path) -> None:
@@ -1537,7 +2012,7 @@ def test_service_runtime_uses_explicit_slurm_provider_for_tracking_and_cancel(
     assert scheduler_resource.verified_after_operation is True
 
 
-def test_service_runtime_keep_scheduler_accepts_provider_proven_no_active_record(
+def test_service_runtime_keep_scheduler_rejects_transient_missing_record(
     tmp_path: Path,
 ) -> None:
     runner = ProviderRetentionRunner()
@@ -1572,22 +2047,19 @@ def test_service_runtime_keep_scheduler_accepts_provider_proven_no_active_record
     retention_check = next(
         check for check in report.checks if check.check_id == "gateway.jobs-preserved-default"
     )
-    assert result.session.state is GatewaySessionState.CLOSED
-    assert result.errors == []
+    assert result.session.state is GatewaySessionState.DEGRADED
+    assert result.errors != []
     assert result.canceled_scheduler_job is None
     assert runner.provider_canceled_jobs == []
     assert scheduler.action == "retain"
-    assert scheduler.outcome == "missing"
+    assert scheduler.outcome == "failed"
     assert scheduler.ownership_verified is True
-    assert scheduler.verified_after_operation is True
-    assert scheduler.observed_state == "missing"
-    assert scheduler.residual is False
-    scheduler_status = cast(dict[str, object], scheduler.metadata["scheduler_status"])
-    assert scheduler_status["phase"] == "unknown"
-    assert scheduler_status["active_record_found"] is False
-    assert "no completed or canceled state is claimed" in (scheduler.detail or "")
-    assert retention_check.status is ValidationStatus.PASSED
-    assert report.status is ValidationStatus.PASSED
+    assert scheduler.verified_after_operation is False
+    assert scheduler.observed_state == "unknown"
+    assert scheduler.residual is True
+    assert "verification remained unresolved: unknown" in (scheduler.detail or "")
+    assert retention_check.status is ValidationStatus.FAILED
+    assert report.status is ValidationStatus.FAILED
 
 
 def test_service_runtime_keep_scheduler_rejects_ambiguous_unknown_provider_state(
@@ -2186,6 +2658,108 @@ def test_service_runtime_detach_stops_only_desktop_connector(tmp_path: Path) -> 
     attached = supervisor.attach(session_id=session_id)
     assert attached.session.state == GatewaySessionState.READY
     assert len(runner.popen_commands) == 2
+
+
+def test_detached_starting_runtime_attach_is_single_observation_and_resumable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+    )
+    runner = FakeRunner()
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("one attach observation must not sleep"),
+    )
+
+    def health_pending(*_args: object, **_kwargs: object) -> None:
+        raise RelayError("desktop readiness is still pending")
+
+    supervisor._wait_for_local_health = health_pending  # type: ignore[method-assign]
+    first = supervisor.start(name="detached-starting-runtime", spec=_runtime_spec())
+    assert isinstance(first, ServiceRuntimePendingResult)
+    first_transport = cast(dict[str, object], first.session.gateway["transport"])
+    remote_generation = str(
+        cast(dict[str, object], first_transport["remote_connector"])["connector_generation_id"]
+    )
+    detached = supervisor.detach(session_id=first.session.session_id)
+    assert detached.errors == []
+
+    pending = supervisor.attach(session_id=first.session.session_id)
+
+    assert isinstance(pending, ServiceRuntimePendingResult)
+    assert pending.session.state is GatewaySessionState.STARTING
+    assert pending.session.session_id == first.session.session_id
+    assert pending.session.scheduler_job_id == first.session.scheduler_job_id == "12345"
+    pending_transport = cast(dict[str, object], pending.session.gateway["transport"])
+    pending_remote = cast(dict[str, object], pending_transport["remote_connector"])
+    pending_local = cast(dict[str, object], pending_transport["desktop_connector"])
+    assert pending_remote["connector_generation_id"] == remote_generation
+    local_generation = str(pending_local["connector_generation_id"])
+    assert sum("__CLIO_CAPTURE_SUBMISSION__" in (script or "") for script in runner.inputs) == 1
+    assert (
+        sum(
+            "remote-frpc.toml" in (script or "") and "nohup" in (script or "")
+            for script in runner.inputs
+        )
+        == 1
+    )
+
+    def prove_persisted_fake_connector_live(
+        intent: dict[str, object],
+        *,
+        session_id: str,
+    ) -> tuple[dict[str, object] | None, bool]:
+        metadata_path = Path(str(intent["metadata_path"]))
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        assert payload["session_id"] == session_id
+        return (
+            {key: value for key, value in payload.items() if key != "schema_version"},
+            False,
+        )
+
+    monkeypatch.setattr(
+        service_runtime,
+        "_discover_local_connector",
+        prove_persisted_fake_connector_live,
+    )
+    observed: list[tuple[str, str, str, str]] = []
+    for _day in range(3):
+        repeated = supervisor.attach(session_id=first.session.session_id)
+        assert isinstance(repeated, ServiceRuntimePendingResult)
+        transport = cast(dict[str, object], repeated.session.gateway["transport"])
+        observed.append(
+            (
+                repeated.session.session_id,
+                str(repeated.session.scheduler_job_id),
+                str(
+                    cast(dict[str, object], transport["remote_connector"])[
+                        "connector_generation_id"
+                    ]
+                ),
+                str(
+                    cast(dict[str, object], transport["desktop_connector"])[
+                        "connector_generation_id"
+                    ]
+                ),
+            )
+        )
+    assert set(observed) == {
+        (first.session.session_id, "12345", remote_generation, local_generation)
+    }
+    assert len(runner.popen_commands) == 2
+    assert runner.canceled_jobs == []
+    assert runner.provider_canceled_jobs == []
 
 
 def test_committed_gateway_teardown_intent_cannot_be_overwritten(tmp_path: Path) -> None:
@@ -3400,7 +3974,7 @@ def test_service_runtime_failure_record_conflict_does_not_mask_original_error(
     )
 
 
-def test_service_runtime_failed_health_cleans_owned_connectors_without_canceling_job(
+def test_service_runtime_local_health_delay_retains_connectors_for_resume(
     tmp_path: Path,
 ) -> None:
     queue = ClioCoreQueue(tmp_path / "core")
@@ -3423,15 +3997,31 @@ def test_service_runtime_failed_health_cleans_owned_connectors_without_canceling
         raise RelayError("desktop health failed")
 
     supervisor._wait_for_local_health = fail_health  # type: ignore[method-assign]
-    with pytest.raises(RelayError, match="desktop health failed"):
-        supervisor.start(name="failed-health", spec=_runtime_spec())
+    pending = supervisor.start(name="delayed-health", spec=_runtime_spec())
 
-    session = queue.list_gateway_sessions(cluster="test-cluster")[0]
-    assert session.state == GatewaySessionState.FAILED
-    assert session.gateway["teardown"]["stopped_remote_pid"] == 444
-    assert session.gateway["teardown"]["canceled_scheduler_job"] is None
+    assert isinstance(pending, ServiceRuntimePendingResult)
+    session = pending.session
+    assert session.state is GatewaySessionState.STARTING
+    assert session.queue_state == "running"
+    assert session.metadata["runtime_observation_error"] == "desktop health failed"
+    assert cast(dict[str, object], session.gateway["scheduler_status"])["state"] == "allocated"
+    assert cast(dict[str, object], session.gateway["runtime_observation"])["state"] == ("not_ready")
+    assert "teardown_intent" not in session.gateway
+    transport = cast(dict[str, object], session.gateway["transport"])
+    assert cast(dict[str, object], transport["remote_connector"])["pid"] == 444
+    assert cast(dict[str, object], transport["desktop_connector"])["pid"] == 555
+    assert not any("__CLIO_STOP_CONNECTOR__" in (script or "") for script in runner.inputs)
     assert runner.canceled_jobs == []
-    assert session.metadata["last_error"] == "desktop health failed"
+
+    supervisor._wait_for_local_health = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    resumed = supervisor.resume_start(session_id=session.session_id)
+
+    assert isinstance(resumed, ServiceRuntimeStartResult)
+    assert resumed.session.state is GatewaySessionState.READY
+    assert "runtime_observation" not in resumed.session.gateway
+    # The fake process has no live OS identity. Exact absence authorizes one new
+    # desktop generation; the durable remote connector is still reused.
+    assert len(runner.popen_commands) == 2
 
 
 def test_service_runtime_supports_xtcp_transport_mode(tmp_path: Path) -> None:
@@ -3503,6 +4093,1127 @@ def test_service_runtime_uses_package_status_command_for_deferred_service_host(
     ]
     scripts = "\n".join(script or "" for script in runner.inputs)
     assert "jarvis runtime status 12345" in scripts
+
+
+def test_service_runtime_pending_queue_time_does_not_consume_readiness_deadline(
+    tmp_path: Path,
+) -> None:
+    clock = [0.0]
+
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+    )
+    runner = LongPendingDeferredHostRunner(pending_polls=3)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("queued runtime observation must not sleep"),
+    )
+    supervisor._wait_for_local_health = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    spec = _runtime_spec().model_copy(
+        update={"readiness_timeout_seconds": 1.0, "scheduler": "slurm"}
+    )
+
+    pending = supervisor.start(name="long-queued-service", spec=spec)
+    assert isinstance(pending, ServiceRuntimePendingResult)
+    session_id = pending.session.session_id
+    assert pending.session.state is GatewaySessionState.PENDING
+    assert pending.retry_selector() == {
+        "cluster": "test-cluster",
+        "gateway_session_id": session_id,
+        "scheduler_provider": "slurm",
+        "scheduler_job_id": "12345",
+    }
+
+    for expected_poll in (2, 3):
+        clock[0] += 86_400.0
+        pending = supervisor.resume_start(session_id=session_id)
+        assert isinstance(pending, ServiceRuntimePendingResult)
+        assert pending.session.session_id == session_id
+        assert pending.session.scheduler_job_id == "12345"
+        assert runner.scheduler_polls == expected_poll
+    assert not any("jarvis runtime status 12345" in (script or "") for script in runner.inputs)
+
+    clock[0] += 86_400.0
+    result = supervisor.resume_start(session_id=session_id)
+
+    assert isinstance(result, ServiceRuntimeStartResult)
+    assert clock[0] == 259_200.0
+    assert runner.scheduler_polls == 4
+    assert result.session.state is GatewaySessionState.READY
+    assert result.session.session_id == session_id
+    assert result.session.scheduler_job_id == "12345"
+    assert result.session.node == "compute-02"
+    assert sum("jarvis runtime status 12345" in (script or "") for script in runner.inputs) == 1
+    assert runner.canceled_jobs == []
+    assert runner.provider_canceled_jobs == []
+    assert sum("__CLIO_CAPTURE_SUBMISSION__" in (script or "") for script in runner.inputs) == 1
+    assert not any("__CLIO_STOP_CONNECTOR__" in (script or "") for script in runner.inputs)
+
+
+def test_service_runtime_transient_scheduler_observation_stays_resumable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+    )
+    runner = LongPendingDeferredHostRunner(pending_polls=0)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("runtime observation must not sleep"),
+    )
+    supervisor._wait_for_local_health = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    original_poll = supervisor._poll_scheduler_provider  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    observations = 0
+
+    def transient_poll(*, provider: str, scheduler_job_id: str) -> SchedulerStatus:
+        nonlocal observations
+        observations += 1
+        if observations == 1:
+            raise RelayError("scheduler status transport interrupted")
+        return original_poll(provider=provider, scheduler_job_id=scheduler_job_id)
+
+    monkeypatch.setattr(supervisor, "_poll_scheduler_provider", transient_poll)
+    spec = _runtime_spec().model_copy(update={"scheduler": "slurm"})
+
+    pending = supervisor.start(name="transient-observation", spec=spec)
+
+    assert isinstance(pending, ServiceRuntimePendingResult)
+    assert pending.session.state is GatewaySessionState.PENDING
+    assert pending.session.queue_state == "observation_unknown"
+    assert pending.session.metadata["runtime_observation_error"] == (
+        "scheduler status transport interrupted"
+    )
+    assert "teardown_intent" not in pending.session.gateway
+    assert pending.session.metadata.get("last_error") is None
+
+    resumed = supervisor.resume_start(session_id=pending.session.session_id)
+
+    assert isinstance(resumed, ServiceRuntimeStartResult)
+    assert resumed.session.state is GatewaySessionState.READY
+    assert sum("__CLIO_CAPTURE_SUBMISSION__" in (script or "") for script in runner.inputs) == 1
+    assert runner.canceled_jobs == []
+    assert runner.provider_canceled_jobs == []
+
+
+def test_service_runtime_transient_submission_query_stays_resumable(
+    tmp_path: Path,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+    )
+    runner = LongPendingDeferredHostRunner(pending_polls=1)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("runtime observation must not sleep"),
+    )
+    supervisor._wait_for_local_health = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    spec = _runtime_spec().model_copy(update={"scheduler": "slurm"})
+    first = supervisor.start(name="transient-submission-query", spec=spec)
+    assert isinstance(first, ServiceRuntimePendingResult)
+    runner.fail_submission_reads = True
+
+    pending = supervisor.resume_start(session_id=first.session.session_id)
+
+    assert isinstance(pending, ServiceRuntimePendingResult)
+    assert pending.session.state is GatewaySessionState.PENDING
+    assert pending.session.queue_state == "observation_unknown"
+    assert "temporary sidecar read failure" in str(
+        pending.session.metadata["runtime_observation_error"]
+    )
+    assert "teardown_intent" not in pending.session.gateway
+    assert runner.scheduler_polls == 1
+
+    runner.fail_submission_reads = False
+    resumed = supervisor.resume_start(session_id=first.session.session_id)
+
+    assert isinstance(resumed, ServiceRuntimeStartResult)
+    assert resumed.session.state is GatewaySessionState.READY
+    assert sum("__CLIO_CAPTURE_SUBMISSION__" in (script or "") for script in runner.inputs) == 1
+
+
+def test_service_runtime_allocated_but_unhealthy_returns_pending_without_waiting(
+    tmp_path: Path,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+    )
+    runner = NotReadyThenHealthyRunner()
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("runtime observation must not sleep"),
+    )
+    supervisor._wait_for_local_health = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    spec = _runtime_spec().model_copy(update={"scheduler": "slurm"})
+
+    pending = supervisor.start(name="allocated-not-healthy", spec=spec)
+
+    assert isinstance(pending, ServiceRuntimePendingResult)
+    assert pending.session.state is GatewaySessionState.ALLOCATED
+    assert pending.session.node == "compute-02"
+    assert pending.session.queue_state == "observation_unknown"
+    assert runner.health_observations == 1
+    assert "teardown_intent" not in pending.session.gateway
+
+    resumed = supervisor.resume_start(session_id=pending.session.session_id)
+
+    assert isinstance(resumed, ServiceRuntimeStartResult)
+    assert resumed.session.state is GatewaySessionState.READY
+    assert runner.health_observations == 2
+    assert sum("__CLIO_CAPTURE_SUBMISSION__" in (script or "") for script in runner.inputs) == 1
+
+
+def test_service_runtime_terminal_scheduler_job_is_not_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    runner = FakeRunner()
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("runtime observation must not sleep"),
+    )
+
+    def scheduler_status(*, provider: str, scheduler_job_id: str) -> SchedulerStatus:
+        del provider, scheduler_job_id
+        return SchedulerStatus(
+            scheduler="slurm",
+            scheduler_job_id="12345",
+            phase=SchedulerPhase.FAILED,
+            active_record_found=False,
+        )
+
+    monkeypatch.setattr(supervisor, "_poll_scheduler_provider", scheduler_status)
+
+    with pytest.raises(RelayError, match="terminal state"):
+        supervisor.start(
+            name="terminal-before-ready",
+            spec=_runtime_spec().model_copy(update={"scheduler": "slurm"}),
+        )
+
+    session = queue.list_gateway_sessions(cluster="test-cluster")[0]
+    assert session.state is GatewaySessionState.FAILED
+    assert session.queue_state != "pending"
+    assert runner.canceled_jobs == []
+    assert runner.provider_canceled_jobs == []
+
+
+def test_service_runtime_missing_scheduler_observation_remains_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient scheduler visibility gap cannot terminalize a submitted job."""
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    runner = FakeRunner()
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("runtime observation must not sleep"),
+    )
+
+    def scheduler_status(*, provider: str, scheduler_job_id: str) -> SchedulerStatus:
+        del provider, scheduler_job_id
+        return SchedulerStatus(
+            scheduler="slurm",
+            scheduler_job_id="12345",
+            phase=SchedulerPhase.UNKNOWN,
+            record_found=False,
+            active_record_found=False,
+        )
+
+    monkeypatch.setattr(supervisor, "_poll_scheduler_provider", scheduler_status)
+
+    pending = supervisor.start(
+        name="temporarily-unobservable",
+        spec=_runtime_spec().model_copy(update={"scheduler": "slurm"}),
+    )
+
+    assert isinstance(pending, ServiceRuntimePendingResult)
+    assert pending.session.state is GatewaySessionState.ALLOCATED
+    assert pending.session.queue_state == "observation_unknown"
+    assert pending.session.scheduler_job_id == "12345"
+    assert pending.retry_selector()["scheduler_job_id"] == "12345"
+    assert "absence is not terminal proof" in str(
+        pending.session.metadata["runtime_observation_error"]
+    )
+    assert sum("__CLIO_CAPTURE_SUBMISSION__" in (script or "") for script in runner.inputs) == 1
+    assert runner.canceled_jobs == []
+    assert runner.provider_canceled_jobs == []
+
+
+def test_resume_terminal_scheduler_observation_fails_without_canceling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    runner = LongPendingDeferredHostRunner(pending_polls=10)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("runtime observation must not sleep"),
+    )
+    pending = supervisor.start(
+        name="terminal-after-pending",
+        spec=_runtime_spec().model_copy(update={"scheduler": "slurm"}),
+    )
+    assert isinstance(pending, ServiceRuntimePendingResult)
+    terminal = SchedulerStatus(
+        scheduler="slurm",
+        scheduler_job_id="12345",
+        phase=SchedulerPhase.FAILED,
+        active_record_found=False,
+    )
+
+    def terminal_status(*, provider: str, scheduler_job_id: str) -> SchedulerStatus:
+        del provider, scheduler_job_id
+        return terminal
+
+    monkeypatch.setattr(supervisor, "_poll_scheduler_provider", terminal_status)
+
+    with pytest.raises(RelayError, match="terminal state"):
+        supervisor.resume_start(session_id=pending.session.session_id)
+
+    session = queue.get_gateway_session(pending.session.session_id)
+    assert session.state is GatewaySessionState.FAILED
+    assert session.scheduler_job_id == "12345"
+    assert runner.canceled_jobs == []
+    assert runner.provider_canceled_jobs == []
+
+
+def test_resume_recovers_exact_scheduler_job_from_submission_sidecar(
+    tmp_path: Path,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    runner = LongPendingDeferredHostRunner(pending_polls=10)
+    spec = _runtime_spec().model_copy(update={"scheduler": "slurm"})
+    submission_id = "submission-after-hard-exit"
+    submission_marker = "marker-after-hard-exit"
+    session = GatewaySession(
+        cluster="test-cluster",
+        name="sidecar-recovery",
+        state=GatewaySessionState.SUBMITTED,
+        scheduler="slurm",
+        gateway={
+            "runtime_spec": spec.model_dump(mode="json"),
+            "transport": {"mode": spec.transport_mode},
+            "ownership_intents": {
+                "scheduler_submission": {
+                    "schema_version": "clio-relay.gateway-ownership-intent.v1",
+                    "state": "starting",
+                    "submission_id": submission_id,
+                    "scheduler_provider": "slurm",
+                    "submission_marker": submission_marker,
+                },
+                "remote_connector": {
+                    "schema_version": "clio-relay.gateway-ownership-intent.v1",
+                    "state": "not_started",
+                },
+                "desktop_connector": {
+                    "schema_version": "clio-relay.gateway-ownership-intent.v1",
+                    "state": "not_started",
+                },
+            },
+        },
+        metadata={"owner": "clio-relay", "runtime_kind": spec.kind},
+    )
+    session = queue.create_gateway_session(session)
+    runner.submission_record = {
+        "schema_version": "clio-relay.gateway-submission-sidecar.v1",
+        "present": True,
+        "session_id": session.session_id,
+        "submission_id": submission_id,
+        "scheduler_provider": "slurm",
+        "submission_marker": submission_marker,
+        "returncode": 0,
+        "output": '{"scheduler_job_id":"12345"}\n',
+        "output_truncated": False,
+    }
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("runtime observation must not sleep"),
+    )
+
+    pending = supervisor.resume_start(session_id=session.session_id)
+
+    assert isinstance(pending, ServiceRuntimePendingResult)
+    assert pending.session.scheduler_job_id == "12345"
+    assert pending.session.state is GatewaySessionState.PENDING
+    scheduler_intent = cast(
+        dict[str, object],
+        cast(dict[str, object], pending.session.gateway["ownership_intents"])[
+            "scheduler_submission"
+        ],
+    )
+    assert scheduler_intent["state"] == "recorded"
+    assert scheduler_intent["scheduler_job_id"] == "12345"
+    assert scheduler_intent["reconciled"] is True
+    assert not any("__CLIO_CAPTURE_SUBMISSION__" in (script or "") for script in runner.inputs)
+
+
+@pytest.mark.parametrize("publish_sidecar", [False, True])
+def test_ambiguous_scheduler_submit_is_query_only_and_resumable(
+    tmp_path: Path,
+    publish_sidecar: bool,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+    )
+    runner = AmbiguousSubmissionRunner(publish_sidecar=publish_sidecar)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("ambiguous submit recovery must not sleep"),
+    )
+    supervisor._wait_for_local_health = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+
+    pending = supervisor.start(name="ambiguous-submit", spec=_runtime_spec())
+
+    assert isinstance(pending, ServiceRuntimePendingResult)
+    assert pending.session.state is GatewaySessionState.PENDING
+    assert pending.session.scheduler_job_id is None
+    selector = pending.retry_selector()
+    assert selector["gateway_session_id"] == pending.session.session_id
+    assert selector["scheduler_job_id"] is None
+    assert isinstance(selector["submission_id"], str)
+    assert isinstance(selector["submission_marker"], str)
+    report = pending.to_live_validation_report()
+    assert report.status is ValidationStatus.PENDING
+    assert report.checks[0].summary == (
+        "exact scheduler submission intent is durable; submission outcome is unresolved"
+    )
+    rendered_report = report.model_dump_json()
+    assert "durably submitted" not in rendered_report
+    assert "scheduler job preserved" not in rendered_report
+    submission_resource = next(
+        resource for resource in report.resources if resource.kind == "scheduler_submission"
+    )
+    assert submission_resource.resource_id == selector["submission_id"]
+    assert submission_resource.metadata["scheduler_job_id"] is None
+    assert "retained" not in submission_resource.metadata
+    assert submission_resource.metadata["submission_outcome"] == "unresolved"
+    assert submission_resource.metadata["cancel_requested"] is False
+    assert submission_resource.metadata["resubmit_requested"] is False
+    intent = cast(
+        dict[str, object],
+        cast(dict[str, object], pending.session.gateway["ownership_intents"])[
+            "scheduler_submission"
+        ],
+    )
+    assert intent["state"] == "starting"
+    assert runner.submit_attempts == 1
+    assert runner.canceled_jobs == []
+    assert runner.provider_canceled_jobs == []
+
+    if not publish_sidecar:
+        observed: list[dict[str, object]] = []
+        for _day in range(3):
+            still_pending = supervisor.resume_start(session_id=pending.session.session_id)
+            assert isinstance(still_pending, ServiceRuntimePendingResult)
+            observed.append(still_pending.retry_selector())
+        assert observed == [selector, selector, selector]
+        assert runner.submit_attempts == 1
+        runner.publish_sidecar = True
+        output = '{"scheduler_job_id":"12345","service_host":"compute-01"}\n'
+        runner.submission_record = {
+            "schema_version": "clio-relay.gateway-submission-sidecar.v1",
+            "present": True,
+            "session_id": pending.session.session_id,
+            "submission_id": selector["submission_id"],
+            "scheduler_provider": "external",
+            "submission_marker": selector["submission_marker"],
+            "returncode": 0,
+            "output": output,
+            "output_truncated": False,
+        }
+
+    resumed = supervisor.resume_start(session_id=pending.session.session_id)
+
+    assert isinstance(resumed, ServiceRuntimeStartResult)
+    assert resumed.session.session_id == pending.session.session_id
+    assert resumed.session.scheduler_job_id == "12345"
+    assert runner.submit_attempts == 1
+    assert runner.canceled_jobs == []
+    assert runner.provider_canceled_jobs == []
+
+
+@pytest.mark.parametrize("failure_kind", ["nonzero", "identity"])
+def test_exact_failed_submission_sidecar_is_definitive_without_resubmit_or_cancel(
+    tmp_path: Path,
+    failure_kind: str,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+    )
+    runner = AmbiguousSubmissionRunner(publish_sidecar=False)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("definitive reconciliation must not sleep"),
+    )
+    pending = supervisor.start(name="definitive-submit-failure", spec=_runtime_spec())
+    assert isinstance(pending, ServiceRuntimePendingResult)
+    selector = pending.retry_selector()
+    output = (
+        "scheduler rejected the request\n"
+        if failure_kind == "nonzero"
+        else ('{"scheduler_job_id":"unexpected-job"}\n')
+    )
+    runner.submission_record = {
+        "schema_version": "clio-relay.gateway-submission-sidecar.v1",
+        "present": True,
+        "session_id": (
+            pending.session.session_id if failure_kind == "nonzero" else "tampered-session-identity"
+        ),
+        "submission_id": selector["submission_id"],
+        "scheduler_provider": "external",
+        "submission_marker": selector["submission_marker"],
+        "returncode": 64 if failure_kind == "nonzero" else 0,
+        "output": output,
+        "output_truncated": False,
+    }
+
+    with pytest.raises(RelayError, match="sidecar identity|completed unsuccessfully"):
+        supervisor.resume_start(session_id=pending.session.session_id)
+
+    failed = queue.get_gateway_session(pending.session.session_id)
+    assert failed.state is GatewaySessionState.FAILED
+    assert failed.scheduler_job_id is None
+    intents = cast(dict[str, object], failed.gateway["ownership_intents"])
+    intent = cast(dict[str, object], intents["scheduler_submission"])
+    assert intent["state"] == "starting"
+    assert intent["submission_id"] == selector["submission_id"]
+    assert intent["submission_marker"] == selector["submission_marker"]
+    assert intent["reconciliation_outcome"] == "definitive_failure"
+    expected_failure_kind = "command_failure" if failure_kind == "nonzero" else "integrity_failure"
+    expected_queue_state = (
+        "submission_failed" if failure_kind == "nonzero" else "submission_integrity_failed"
+    )
+    expected_submission_outcome = (
+        "submit_command_failed" if failure_kind == "nonzero" else "unknown_due_to_integrity_failure"
+    )
+    assert intent["reconciliation_failure_kind"] == expected_failure_kind
+    assert failed.queue_state == expected_queue_state
+    assert failed.metadata["scheduler_submission_outcome"] == expected_submission_outcome
+    evidence = cast(dict[str, object], intent["failure_evidence"])
+    assert evidence["sidecar_present"] is True
+    assert evidence["failure_kind"] == expected_failure_kind
+    assert evidence["scheduler_submission_outcome"] == expected_submission_outcome
+    assert evidence["cancel_requested"] is False
+    assert evidence["resubmit_requested"] is False
+    assert runner.submit_attempts == 1
+    assert runner.canceled_jobs == []
+    assert runner.provider_canceled_jobs == []
+    assert not runner.popen_commands
+
+
+def test_production_submission_verifier_mismatch_is_integrity_failure(
+    tmp_path: Path,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+    )
+    runner = ProductionSubmissionVerifierRunner(
+        sidecar_state="record_identity_mismatch",
+    )
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("integrity reconciliation must not sleep"),
+    )
+    pending = supervisor.start(name="production-verifier-corruption", spec=_runtime_spec())
+    assert isinstance(pending, ServiceRuntimePendingResult)
+
+    with pytest.raises(RelayError, match="scheduler submission record identity mismatch"):
+        supervisor.resume_start(session_id=pending.session.session_id)
+
+    failed = queue.get_gateway_session(pending.session.session_id)
+    assert failed.state is GatewaySessionState.FAILED
+    assert failed.queue_state == "submission_integrity_failed"
+    assert failed.scheduler_job_id is None
+    assert failed.metadata["scheduler_submission_outcome"] == "unknown_due_to_integrity_failure"
+    intents = cast(dict[str, object], failed.gateway["ownership_intents"])
+    intent = cast(dict[str, object], intents["scheduler_submission"])
+    assert intent["state"] == "starting"
+    assert intent["reconciliation_outcome"] == "definitive_failure"
+    assert intent["reconciliation_failure_kind"] == "integrity_failure"
+    evidence = cast(dict[str, object], intent["failure_evidence"])
+    assert evidence["failure_kind"] == "integrity_failure"
+    assert evidence["error_code"] == "record_identity_mismatch"
+    assert evidence["invalid_component"] == "record"
+    assert evidence["scheduler_submission_outcome"] == ("unknown_due_to_integrity_failure")
+    assert evidence["cancel_requested"] is False
+    assert evidence["resubmit_requested"] is False
+    assert runner.verifier_runs == 1
+    assert runner.submit_attempts == 1
+    assert runner.canceled_jobs == []
+    assert runner.provider_canceled_jobs == []
+    assert not runner.popen_commands
+
+
+def test_production_submission_verifier_incomplete_output_remains_pending(
+    tmp_path: Path,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+    )
+    runner = ProductionSubmissionVerifierRunner(sidecar_state="output_incomplete")
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("in-flight reconciliation must not sleep"),
+    )
+    pending = supervisor.start(name="production-verifier-in-flight", spec=_runtime_spec())
+    assert isinstance(pending, ServiceRuntimePendingResult)
+    selector = pending.retry_selector()
+
+    resumed = supervisor.resume_start(session_id=pending.session.session_id)
+
+    assert isinstance(resumed, ServiceRuntimePendingResult)
+    assert resumed.session.state is GatewaySessionState.PENDING
+    assert resumed.session.scheduler_job_id is None
+    assert resumed.retry_selector() == selector
+    assert resumed.session.metadata.get("scheduler_submission_outcome") != (
+        "unknown_due_to_integrity_failure"
+    )
+    assert runner.verifier_runs == 1
+    assert runner.submit_attempts == 1
+    assert runner.canceled_jobs == []
+    assert runner.provider_canceled_jobs == []
+    assert not runner.popen_commands
+
+
+def test_unresolved_submission_detach_replay_and_three_day_reconnect_are_exact(
+    tmp_path: Path,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+    )
+    runner = AmbiguousSubmissionRunner(publish_sidecar=False)
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("detached unresolved submission must not sleep"),
+    )
+    pending = supervisor.start(name="unresolved-detach", spec=_runtime_spec())
+    assert isinstance(pending, ServiceRuntimePendingResult)
+    selector = pending.retry_selector()
+
+    detached = supervisor.detach(session_id=pending.session.session_id)
+
+    assert detached.errors == []
+    assert detached.residual_resources == []
+    assert detached.session.state is GatewaySessionState.DEGRADED
+    assert detached.session.scheduler_job_id is None
+    assert detached.canceled_scheduler_job is None
+    resources = {resource.kind: resource for resource in detached.resources}
+    assert "scheduler_job" not in resources
+    submission = resources["scheduler_submission"]
+    assert submission.resource_id == selector["submission_id"]
+    assert submission.outcome == "retained"
+    assert submission.observed_state == "intent_recorded"
+    assert submission.metadata["scheduler_job_id"] is None
+    assert submission.metadata["cancel_requested"] is False
+    assert submission.metadata["resubmit_requested"] is False
+    assert resources["desktop_connector"].outcome == "missing"
+    assert resources["remote_connector"].outcome == "missing"
+    assert resources["remote_connector"].observed_state == "not_created"
+    report = detached.to_live_validation_report()
+    assert report.status is ValidationStatus.PASSED
+    rendered_report = report.model_dump_json()
+    assert "scheduler job preserved" not in rendered_report
+    assert "remote connector retained" not in rendered_report
+    assert "no job, cancellation, or resubmission is claimed" in rendered_report
+
+    replay = supervisor.detach(session_id=pending.session.session_id)
+    assert replay == detached
+
+    observed: list[dict[str, object]] = []
+    for _day in range(3):
+        reconnected = supervisor.attach(session_id=pending.session.session_id)
+        assert isinstance(reconnected, ServiceRuntimePendingResult)
+        observed.append(reconnected.retry_selector())
+        assert reconnected.session.scheduler_job_id is None
+        intents = cast(dict[str, object], reconnected.session.gateway["ownership_intents"])
+        scheduler_intent = cast(dict[str, object], intents["scheduler_submission"])
+        assert scheduler_intent["state"] == "starting"
+        assert scheduler_intent["submission_id"] == selector["submission_id"]
+        assert scheduler_intent["submission_marker"] == selector["submission_marker"]
+        assert cast(dict[str, object], intents["remote_connector"])["state"] == ("not_started")
+        assert cast(dict[str, object], intents["desktop_connector"])["state"] == ("not_started")
+
+    assert observed == [selector, selector, selector]
+    assert runner.submit_attempts == 1
+    assert runner.canceled_jobs == []
+    assert runner.provider_canceled_jobs == []
+    assert not runner.popen_commands
+
+
+def test_ambiguous_remote_connector_start_recovers_same_generation_without_relaunch(
+    tmp_path: Path,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+    )
+    runner = AmbiguousRemoteConnectorStartRunner()
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("connector recovery must not sleep"),
+    )
+    supervisor._wait_for_local_health = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+
+    pending = supervisor.start(name="ambiguous-remote-connector", spec=_runtime_spec())
+
+    assert isinstance(pending, ServiceRuntimePendingResult)
+    assert pending.session.state is GatewaySessionState.STARTING
+    intent = cast(
+        dict[str, object],
+        cast(dict[str, object], pending.session.gateway["ownership_intents"])["remote_connector"],
+    )
+    generation_id = str(intent["connector_generation_id"])
+    assert intent["state"] == "starting"
+    assert runner.remote_start_attempts == 1
+
+    resumed = supervisor.resume_start(session_id=pending.session.session_id)
+
+    assert isinstance(resumed, ServiceRuntimeStartResult)
+    transport = cast(dict[str, object], resumed.session.gateway["transport"])
+    remote = cast(dict[str, object], transport["remote_connector"])
+    assert remote["connector_generation_id"] == generation_id
+    assert runner.remote_start_attempts == 1
+    assert sum("__CLIO_CAPTURE_SUBMISSION__" in (script or "") for script in runner.inputs) == 1
+    assert runner.canceled_jobs == []
+    assert runner.provider_canceled_jobs == []
+
+
+def test_resume_rejects_incomplete_published_connector_records_without_relaunch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+    )
+    runner = LongPendingDeferredHostRunner(pending_polls=0)
+    spec = _runtime_spec().model_copy(update={"scheduler": "slurm"})
+    submission_id = "connector-sidecar-submission"
+    submission_marker = "connector-sidecar-marker"
+    session = GatewaySession(
+        cluster="test-cluster",
+        name="connector-sidecar-recovery",
+        state=GatewaySessionState.STARTING,
+        scheduler="slurm",
+        scheduler_job_id="12345",
+        queue_state="running",
+        node="compute-02",
+        metadata={"owner": "clio-relay", "runtime_kind": spec.kind},
+    )
+    remote_connector: dict[str, object] = {
+        "owner": "clio-relay",
+        "session_id": session.session_id,
+        "pid": 444,
+        "connector_generation_id": "remote-generation",
+    }
+    desktop_connector: dict[str, object] = {
+        "owner": "clio-relay",
+        "session_id": session.session_id,
+        "pid": 555,
+        "connector_generation_id": "desktop-generation",
+    }
+    session = session.model_copy(
+        update={
+            "gateway": {
+                "runtime_spec": spec.model_dump(mode="json"),
+                "transport": {
+                    "mode": spec.transport_mode,
+                    "proxy_name": "connector-sidecar-recovery",
+                    "remote_connector": remote_connector,
+                    "desktop_connector": desktop_connector,
+                },
+                "ownership_intents": {
+                    "scheduler_submission": {
+                        "schema_version": "clio-relay.gateway-ownership-intent.v1",
+                        "state": "recorded",
+                        "submission_id": submission_id,
+                        "scheduler_provider": "slurm",
+                        "submission_marker": submission_marker,
+                        "scheduler_job_id": "12345",
+                    },
+                    "remote_connector": {
+                        "schema_version": "clio-relay.gateway-ownership-intent.v1",
+                        "state": "recorded",
+                        **remote_connector,
+                    },
+                    "desktop_connector": {
+                        "schema_version": "clio-relay.gateway-ownership-intent.v1",
+                        "state": "recorded",
+                        **desktop_connector,
+                    },
+                },
+            }
+        }
+    )
+    session = queue.create_gateway_session(session)
+    runner.submission_record = {
+        "schema_version": "clio-relay.gateway-submission-sidecar.v1",
+        "present": True,
+        "session_id": session.session_id,
+        "submission_id": submission_id,
+        "scheduler_provider": "slurm",
+        "submission_marker": submission_marker,
+        "returncode": 0,
+        "output": '{"scheduler_job_id":"12345"}\n',
+        "output_truncated": False,
+    }
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("runtime observation must not sleep"),
+    )
+    supervisor._wait_for_local_health = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+
+    def refuse_relaunch(**_kwargs: object) -> dict[str, object]:
+        pytest.fail("a published connector sidecar must be adopted, not relaunched")
+
+    monkeypatch.setattr(supervisor, "_start_remote_connector", refuse_relaunch)
+    monkeypatch.setattr(supervisor, "_start_local_visitor", refuse_relaunch)
+
+    resumed = supervisor.resume_start(session_id=session.session_id)
+
+    assert isinstance(resumed, ServiceRuntimePendingResult)
+    assert resumed.session.state is GatewaySessionState.STARTING
+    transport = cast(dict[str, object], resumed.session.gateway["transport"])
+    assert transport["remote_connector"] == remote_connector
+    assert transport["desktop_connector"] == desktop_connector
+    assert not runner.popen_commands
+    assert "owner_token" in str(resumed.session.metadata["runtime_observation_error"])
+
+
+@pytest.mark.parametrize("role", ["remote_connector", "desktop_connector"])
+def test_transient_connector_discovery_preserves_exact_intent_and_returns_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+    )
+    runner = TransientConnectorDiscoveryRunner()
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("connector recovery must not sleep"),
+    )
+
+    def health_pending(*_args: object, **_kwargs: object) -> None:
+        raise RelayError("desktop health is still starting")
+
+    supervisor._wait_for_local_health = health_pending  # type: ignore[method-assign]
+    first = supervisor.start(name="connector-recovery-pending", spec=_runtime_spec())
+    assert isinstance(first, ServiceRuntimePendingResult)
+    before_intents = cast(dict[str, object], first.session.gateway["ownership_intents"])
+    before_intent = dict(cast(dict[str, object], before_intents[role]))
+    before_transport = cast(dict[str, object], first.session.gateway["transport"])
+    before_connector = dict(cast(dict[str, object], before_transport[role]))
+    remote_starts = sum(
+        "remote-frpc.toml" in (script or "") and "nohup" in (script or "")
+        for script in runner.inputs
+    )
+    local_starts = len(runner.popen_commands)
+
+    if role == "remote_connector":
+        runner.fail_remote_discovery = True
+    else:
+
+        def fail_local_discovery(
+            _intent: dict[str, object],
+            *,
+            session_id: str,
+        ) -> tuple[dict[str, object] | None, bool]:
+            del session_id
+            raise RelayError("temporary desktop connector sidecar read failure")
+
+        monkeypatch.setattr(
+            service_runtime,
+            "_discover_local_connector",
+            fail_local_discovery,
+        )
+
+    observed_ids: list[tuple[str, str, str, str]] = []
+    for _day in range(3):
+        pending = supervisor.resume_start(session_id=first.session.session_id)
+        assert isinstance(pending, ServiceRuntimePendingResult)
+        assert pending.session.state is GatewaySessionState.STARTING
+        intents = cast(dict[str, object], pending.session.gateway["ownership_intents"])
+        intent = cast(dict[str, object], intents[role])
+        transport = cast(dict[str, object], pending.session.gateway["transport"])
+        connector = cast(dict[str, object], transport[role])
+        observed_ids.append(
+            (
+                pending.session.session_id,
+                str(pending.session.scheduler_job_id),
+                str(intent["connector_generation_id"]),
+                str(connector["connector_generation_id"]),
+            )
+        )
+        assert intent["state"] == before_intent["state"] == "recorded"
+        assert intent["owner_token"] == before_intent["owner_token"]
+        assert connector == before_connector
+        assert "temporary" in str(pending.session.metadata["runtime_observation_error"])
+
+    assert len(set(observed_ids)) == 1
+    assert remote_starts == sum(
+        "remote-frpc.toml" in (script or "") and "nohup" in (script or "")
+        for script in runner.inputs
+    )
+    assert len(runner.popen_commands) == local_starts
+    assert sum("__CLIO_CAPTURE_SUBMISSION__" in (script or "") for script in runner.inputs) == 1
+    assert runner.canceled_jobs == []
+    assert runner.provider_canceled_jobs == []
+
+
+@pytest.mark.parametrize("role", ["remote_connector", "desktop_connector"])
+def test_tampered_connector_record_is_not_adopted_or_replaced(
+    tmp_path: Path,
+    role: str,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+    )
+    runner = TransientConnectorDiscoveryRunner()
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("tamper rejection must not sleep"),
+    )
+
+    def health_pending(*_args: object, **_kwargs: object) -> None:
+        raise RelayError("desktop health is still starting")
+
+    supervisor._wait_for_local_health = health_pending  # type: ignore[method-assign]
+    first = supervisor.start(name="connector-record-tamper", spec=_runtime_spec())
+    assert isinstance(first, ServiceRuntimePendingResult)
+    current = queue.get_gateway_session(first.session.session_id)
+    transport = dict(cast(dict[str, object], current.gateway["transport"]))
+    connector = dict(cast(dict[str, object], transport[role]))
+    connector["owner_token"] = "tampered-owner-token"
+    transport[role] = connector
+    queue.update_gateway_session(
+        current.session_id,
+        expected_updated_at=current.updated_at,
+        gateway={**current.gateway, "transport": transport},
+    )
+    remote_starts = sum(
+        "remote-frpc.toml" in (script or "") and "nohup" in (script or "")
+        for script in runner.inputs
+    )
+    local_starts = len(runner.popen_commands)
+
+    pending = supervisor.resume_start(session_id=current.session_id)
+
+    assert isinstance(pending, ServiceRuntimePendingResult)
+    assert pending.session.state is GatewaySessionState.STARTING
+    persisted_transport = cast(dict[str, object], pending.session.gateway["transport"])
+    assert cast(dict[str, object], persisted_transport[role])["owner_token"] == (
+        "tampered-owner-token"
+    )
+    assert "durable intent" in str(pending.session.metadata["runtime_observation_error"])
+    assert remote_starts == sum(
+        "remote-frpc.toml" in (script or "") and "nohup" in (script or "")
+        for script in runner.inputs
+    )
+    assert len(runner.popen_commands) == local_starts
+    assert runner.canceled_jobs == []
+    assert runner.provider_canceled_jobs == []
+
+
+def test_pending_runtime_detach_and_reconnect_resumes_exact_submission(
+    tmp_path: Path,
+) -> None:
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    runner = LongPendingDeferredHostRunner(pending_polls=2)
+    spec = _runtime_spec().model_copy(update={"scheduler": "slurm"})
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("runtime observation must not sleep"),
+    )
+
+    pending = supervisor.start(name="overnight-queued", spec=spec)
+    assert isinstance(pending, ServiceRuntimePendingResult)
+
+    detached = supervisor.detach(session_id=pending.session.session_id)
+
+    assert detached.session.state is GatewaySessionState.DEGRADED
+    assert detached.errors == []
+    assert detached.residual_resources == []
+    assert detached.session.scheduler_job_id == "12345"
+    assert detached.canceled_scheduler_job is None
+
+    reconnected = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=ClioCoreQueue(settings.core_dir),
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: pytest.fail("runtime observation must not sleep"),
+    )
+    reconnected._wait_for_local_health = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    resumed = reconnected.resume_start(session_id=pending.session.session_id)
+
+    assert isinstance(resumed, ServiceRuntimeStartResult)
+    assert resumed.session.state is GatewaySessionState.READY
+    assert resumed.session.scheduler_job_id == "12345"
+    assert "detach_intent" not in resumed.session.gateway
+    assert "detach" not in resumed.session.gateway
+    assert sum("__CLIO_CAPTURE_SUBMISSION__" in (script or "") for script in runner.inputs) == 1
+    assert runner.canceled_jobs == []
+    assert runner.provider_canceled_jobs == []
 
 
 def test_service_runtime_requires_status_command_for_deferred_service_host(
@@ -3645,6 +5356,136 @@ def test_gateway_start_runtime_cli_uses_service_runtime_spec(
     report = json.loads(validation_report.read_text(encoding="utf-8"))
     assert "worker.artifact-version" in {check["check_id"] for check in report["checks"]}
     assert "relay_worker" in {resource["kind"] for resource in report["resources"]}
+
+
+def test_gateway_start_runtime_cli_returns_resumable_pending_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path = tmp_path / "runtime.json"
+    spec = _runtime_spec().model_copy(update={"scheduler": "slurm"})
+    spec_path.write_text(spec.model_dump_json(), encoding="utf-8")
+    cluster_path = tmp_path / ".clio-relay" / "clusters.json"
+    cluster_path.parent.mkdir(parents=True)
+    cluster_path.write_text(
+        '{"clusters":{"test-cluster":' + _definition().model_dump_json() + "}}",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
+    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "token")
+    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "secret")
+
+    def fake_start(
+        self: ServiceRuntimeSupervisor,
+        *,
+        name: str,
+        spec: ServiceRuntimeSpec,
+        owner_session_id: str | None = None,
+        owner_session_generation_id: str | None = None,
+        owner_session_admission_id: str | None = None,
+    ) -> ServiceRuntimePendingResult:
+        del owner_session_id, owner_session_generation_id, owner_session_admission_id
+        session = self.queue.create_gateway_session(
+            GatewaySession(
+                cluster="test-cluster",
+                name=name,
+                state=GatewaySessionState.PENDING,
+                scheduler="slurm",
+                scheduler_job_id="998877",
+                queue_state="pending",
+                gateway={"runtime_spec": spec.model_dump(mode="json")},
+                metadata={"owner": "clio-relay", "runtime_kind": spec.kind},
+            )
+        )
+        return ServiceRuntimePendingResult(session=session)
+
+    def forbid_worker_identity(
+        _report: LiveValidationReport,
+        _definition: ClusterDefinition,
+        *,
+        observed_worker_info: dict[str, object] | None = None,
+    ) -> None:
+        del observed_worker_info
+        pytest.fail("pending runtime must return before worker provenance observation")
+
+    monkeypatch.setattr(ServiceRuntimeSupervisor, "start", fake_start)
+    monkeypatch.setattr(relay_cli, "_attach_verified_remote_worker", forbid_worker_identity)
+    report_path = tmp_path / "gateway-pending.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "gateway",
+            "start-runtime",
+            "--cluster",
+            "test-cluster",
+            "--name",
+            "queued-runtime",
+            "--runtime-json-file",
+            str(spec_path),
+            "--validation-report",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["outcome"] == "pending"
+    assert payload["scheduler_job_id"] == "998877"
+    assert payload["scheduler_action"] == "none"
+    assert payload["relay_action"] == "none"
+    assert payload["retry_selector"] == {
+        "cluster": "test-cluster",
+        "gateway_session_id": payload["session_id"],
+        "scheduler_provider": "slurm",
+        "scheduler_job_id": "998877",
+    }
+    report = LiveValidationReport.model_validate_json(report_path.read_text(encoding="utf-8"))
+    assert report.status is ValidationStatus.PENDING
+    assert report.checks[0].status is ValidationStatus.PENDING
+    assert report.error is None
+    assert any(
+        resource.kind == "scheduler_job"
+        and resource.resource_id == "998877"
+        and resource.metadata["retained"] is True
+        for resource in report.resources
+    )
+
+    resumed_session_ids: list[str] = []
+
+    def fake_resume(
+        self: ServiceRuntimeSupervisor,
+        *,
+        session_id: str,
+    ) -> ServiceRuntimePendingResult:
+        resumed_session_ids.append(session_id)
+        return ServiceRuntimePendingResult(session=self.queue.get_gateway_session(session_id))
+
+    monkeypatch.setattr(ServiceRuntimeSupervisor, "resume_start", fake_resume)
+    resume_report_path = tmp_path / "gateway-resume-pending.json"
+    resumed = CliRunner().invoke(
+        app,
+        [
+            "gateway",
+            "resume-runtime",
+            payload["session_id"],
+            "--cluster",
+            "test-cluster",
+            "--validation-report",
+            str(resume_report_path),
+        ],
+    )
+
+    assert resumed.exit_code == 0, resumed.output
+    assert resumed_session_ids == [payload["session_id"]]
+    resumed_payload = json.loads(resumed.output)
+    assert resumed_payload["retry_selector"] == payload["retry_selector"]
+    resumed_report = LiveValidationReport.model_validate_json(
+        resume_report_path.read_text(encoding="utf-8")
+    )
+    assert resumed_report.status is ValidationStatus.PENDING
 
 
 @pytest.mark.parametrize(

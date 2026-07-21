@@ -94,6 +94,12 @@ success and after preflight or runtime failure unless the operator supplies an
 explicit path. `release gate` consumes those reports; it is not an acceptance-report
 producer.
 
+Long scheduler residence is represented as `pending`, never as workload failure.
+Resume `live-test` with `--resume-report`; the new sibling report observes the
+same run, job, idempotency key, and phase-specific JARVIS identities without a
+TTL, resubmission, or scheduler cancellation. Pending reports are diagnostic and
+are rejected by the release gate until the exact run produces a passed report.
+
 Use `clio-relay release validate-local` for the local quality report. Candidate
 wheel reports are sealed before PyPI publication and remain valuable regression
 evidence, but the final

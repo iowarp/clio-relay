@@ -294,6 +294,10 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         ),
     }
     assert bind_output_schema["required"] == [
+        "outcome",
+        "retry_selector",
+        "scheduler_action",
+        "relay_action",
         "gateway_session_id",
         "gateway_session",
         "connect_url",
@@ -304,8 +308,12 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         "command_url",
         "scheduler_cancel_requested",
     ]
+    assert bind_output_schema["properties"]["connect_url"] == {"type": ["string", "null"]}
+    assert bind_output_schema["properties"]["scheduler_action"] == {"const": "none"}
+    assert bind_output_schema["properties"]["relay_action"] == {"const": "none"}
     assert "top-level gateway_session_id" in bind_runtime_tool["description"]
     assert "service_instance_id is not a gateway identity" in bind_runtime_tool["description"]
+    assert "Reissue this tool" in bind_runtime_tool["description"]
     create_pipeline_tool = next(
         tool for tool in response["result"]["tools"] if tool["name"] == "jarvis_create_pipeline"
     )
@@ -511,6 +519,46 @@ def test_user_mcp_schemas_avoid_root_unions_and_preserve_exclusive_forms(
     ):
         with pytest.raises(ValidationError):
             bind_runtime.validate(rejected)
+
+    bind_output = cast(
+        _SchemaValidator,
+        Draft202012Validator(tools["relay_bind_jarvis_runtime"]["outputSchema"]),
+    )
+    base_output: dict[str, object] = {
+        "gateway_session_id": f"gateway_{'a' * 32}",
+        "gateway_session": cast(dict[str, object], {}),
+        "scheduler_action": "none",
+        "relay_action": "none",
+        "scheduler_cancel_requested": False,
+    }
+    ready_output: dict[str, object] = {
+        **base_output,
+        "outcome": "ready",
+        "retry_selector": None,
+        "connect_url": "http://127.0.0.1:28777",
+        "health_url": "http://127.0.0.1:28777/healthz",
+        "stream_url": "http://127.0.0.1:28777/live-data",
+        "events_url": "http://127.0.0.1:28777/events",
+        "state_url": "http://127.0.0.1:28777/state",
+        "command_url": "http://127.0.0.1:28777/commands",
+    }
+    pending_output: dict[str, object] = {
+        **base_output,
+        "outcome": "pending",
+        "retry_selector": {"gateway_session_id": f"gateway_{'a' * 32}"},
+        "connect_url": None,
+        "health_url": None,
+        "stream_url": None,
+        "events_url": None,
+        "state_url": None,
+        "command_url": None,
+    }
+    bind_output.validate(ready_output)
+    bind_output.validate(pending_output)
+    with pytest.raises(ValidationError):
+        bind_output.validate({**pending_output, "connect_url": ready_output["connect_url"]})
+    with pytest.raises(ValidationError):
+        bind_output.validate({**ready_output, "retry_selector": {}})
 
 
 def test_mcp_admin_profile_lists_operational_tools(tmp_path: Path) -> None:

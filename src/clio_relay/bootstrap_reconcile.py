@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -38,6 +39,7 @@ from clio_relay.validation_report import sha256_file
 from clio_relay.worker_lifetime_lock import (
     WorkerLifetimeLock,
     WorkerLifetimeLockUnavailable,
+    exclusive_migration_lifetime,
 )
 
 BOOTSTRAP_DESIRED_STATE_SCHEMA = "clio-relay.bootstrap-desired-state.v1"
@@ -56,6 +58,72 @@ _FCHMOD = cast(
 _GETUID = cast(Callable[[], int] | None, getattr(os, "getuid", None))
 _AT_FDCWD = -100
 _RENAME_EXCHANGE = 2
+
+
+def repair_legacy_cursor_permissions_for_upgrade(core_dir: Path) -> dict[str, object]:
+    """Privatize the fixed legacy cursor directory through a pinned queue root.
+
+    Forward recovery can execute a generation whose queue initializer predates
+    cursor-directory repair. The current candidate calls this compatibility
+    operation while holding the inherited exclusive writer-lifetime guard, so
+    the old generation can finish its journal before the candidate replaces it.
+    Missing cursors are a no-op; links, foreign ownership, and identity changes
+    fail closed.
+    """
+    if os.name != "posix" or _FCHMOD is None or _GETUID is None:
+        raise ConfigurationError("legacy cursor permission repair requires POSIX fchmod")
+    with exclusive_migration_lifetime(core_dir) as locked_core:
+        root_descriptor = locked_core.filesystem_root_descriptor
+        if root_descriptor is None:
+            raise ConfigurationError("legacy cursor permission repair has no pinned root")
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open("cursors", flags, dir_fd=root_descriptor)
+        except FileNotFoundError:
+            return {
+                "schema_version": "clio-relay.bootstrap-legacy-cursor-repair.v1",
+                "action": "absent",
+            }
+        except OSError as exc:
+            raise ConfigurationError(
+                "legacy cursor directory cannot be safely opened through the pinned root"
+            ) from exc
+        try:
+            try:
+                os.set_inheritable(descriptor, False)
+                before = os.fstat(descriptor)
+                if not stat.S_ISDIR(before.st_mode) or before.st_uid != _GETUID():
+                    raise ConfigurationError(
+                        "legacy cursor directory is not one owned real directory"
+                    )
+                action = "reused"
+                if stat.S_IMODE(before.st_mode) != 0o700:
+                    _FCHMOD(descriptor, 0o700)
+                    action = "repaired"
+                after = os.fstat(descriptor)
+                if (
+                    (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+                    or not stat.S_ISDIR(after.st_mode)
+                    or after.st_uid != _GETUID()
+                    or stat.S_IMODE(after.st_mode) != 0o700
+                ):
+                    raise ConfigurationError(
+                        "legacy cursor directory identity changed during permission repair"
+                    )
+                return {
+                    "schema_version": "clio-relay.bootstrap-legacy-cursor-repair.v1",
+                    "action": action,
+                    "device": after.st_dev,
+                    "inode": after.st_ino,
+                }
+            except OSError as exc:
+                raise ConfigurationError(
+                    "legacy cursor directory permissions could not be repaired"
+                ) from exc
+        finally:
+            with suppress(OSError):
+                os.close(descriptor)
 
 
 @contextmanager
@@ -625,21 +693,27 @@ def execution_environment_identity(
     executables: dict[str, Path],
 ) -> dict[str, object]:
     """Identify a reused execution boundary without scanning or copying its tree."""
+    lexical_root = Path(os.path.abspath(root.expanduser()))
     try:
-        root_details = root.lstat()
+        root_details = lexical_root.lstat()
     except OSError as exc:
         raise ConfigurationError("execution environment is unavailable") from exc
-    if root.is_symlink() or not root.is_dir():
+    if lexical_root.is_symlink() or not lexical_root.is_dir():
         raise ConfigurationError("execution environment is not one owned directory")
     identities: dict[str, object] = {}
-    resolved_root = root.resolve(strict=True)
+    resolved_root = lexical_root.resolve(strict=True)
     for name, executable in sorted(executables.items()):
         try:
-            lexical = executable.absolute()
-            lexical.relative_to(root.absolute())
+            lexical = Path(os.path.abspath(executable.expanduser()))
             before = lexical.lstat()
+            located = lexical.parent.resolve(strict=True) / lexical.name
             resolved = lexical.resolve(strict=True)
-            if not resolved.is_file() or not os.access(resolved, os.X_OK):
+            if (
+                located == resolved_root
+                or not located.is_relative_to(resolved_root)
+                or not resolved.is_file()
+                or not os.access(resolved, os.X_OK)
+            ):
                 raise ConfigurationError(f"execution boundary executable is invalid: {name}")
             digest = sha256_file(resolved)
             if _stat_identity(lexical.lstat()) != _stat_identity(before):
@@ -652,13 +726,13 @@ def execution_environment_identity(
             "sha256": digest,
             "size_bytes": resolved.stat().st_size,
         }
-    config_path = root / "pyvenv.cfg"
+    config_path = lexical_root / "pyvenv.cfg"
     config_sha256 = sha256_file(config_path) if config_path.is_file() else None
-    if _stat_identity(root.lstat()) != _stat_identity(root_details):
+    if _stat_identity(lexical_root.lstat()) != _stat_identity(root_details):
         raise ConfigurationError("execution environment changed during inspection")
     return {
         "schema_version": "clio-relay.execution-boundary.v1",
-        "root": str(resolved_root),
+        "root": str(lexical_root),
         "root_identity": {
             "device": root_details.st_dev,
             "inode": root_details.st_ino,
@@ -750,9 +824,9 @@ def inspect_exact_bootstrap_noop(
     The caller obtains systemd state and invokes the bounded queue/worker read
     commands.  No scheduler command is part of this contract.
     """
-    resolved_home = (home or Path.home()).resolve()
+    lexical_home = Path(os.path.abspath((home or Path.home()).expanduser()))
     reasons: list[str] = []
-    receipt_path = resolved_home / ".local/share/clio-relay/install-receipt.json"
+    receipt_path = lexical_home / ".local/share/clio-relay/install-receipt.json"
     install_receipt_sha256: str | None = None
     info: dict[str, object] | None = installation_snapshot
     try:
@@ -765,25 +839,25 @@ def inspect_exact_bootstrap_noop(
         _inspect_installation_identity(desired, info, reasons)
     active_generation, current_generation_target = _inspect_active_generation(
         desired,
-        home=resolved_home,
+        home=lexical_home,
         installation=info,
         reasons=reasons,
     )
 
     _verify_binary(
-        resolved_home / ".local/bin/frpc",
+        lexical_home / ".local/bin/frpc",
         desired.frpc_sha256,
         label="frpc",
         reasons=reasons,
     )
     _verify_binary(
-        resolved_home / ".local/bin/frps",
+        lexical_home / ".local/bin/frps",
         desired.frps_sha256,
         label="frps",
         reasons=reasons,
     )
-    _verify_uv(resolved_home / ".local/bin/uv", desired=desired, reasons=reasons)
-    jarvis_state = inspect_jarvis_state(desired, home=resolved_home)
+    _verify_uv(lexical_home / ".local/bin/uv", desired=desired, reasons=reasons)
+    jarvis_state = inspect_jarvis_state(desired, home=lexical_home)
     if not jarvis_state.initialized:
         reasons.append("JARVIS is not initialized")
     if not jarvis_state.managed_repo_registered:
@@ -837,8 +911,8 @@ def inspect_jarvis_state(
     home: Path | None = None,
 ) -> JarvisStateEvidence:
     """Validate initialized JARVIS roots and hash operator-owned state read-only."""
-    resolved_home = (home or Path.home()).resolve()
-    jarvis_root = _expand_home(desired.jarvis_root, resolved_home)
+    lexical_home = Path(os.path.abspath((home or Path.home()).expanduser()))
+    jarvis_root = _expand_home(desired.jarvis_root, lexical_home)
     config_file = jarvis_root / "jarvis_config.yaml"
     repos_file = jarvis_root / "repos.yaml"
     resource_graph_file = jarvis_root / "resource_graph.yaml"
@@ -902,8 +976,15 @@ def inspect_jarvis_state(
         not isinstance(value, str) or not value for value in typed_repo_values
     ):
         raise ConfigurationError("JARVIS repositories must contain a string list")
-    managed_repo = str(_expand_home(desired.managed_jarvis_repo, resolved_home).absolute())
+    managed_repo_path = _expand_home(desired.managed_jarvis_repo, lexical_home)
+    managed_repo = str(_canonical_path_preserving_final(managed_repo_path))
+    managed_aliases = {str(managed_repo_path.absolute()), managed_repo}
     repo_values = cast(list[str], raw_repo_values)
+    managed_matches = [value for value in repo_values if value in managed_aliases]
+    if len(managed_matches) > 1:
+        raise ConfigurationError(
+            "relay-managed JARVIS repository is registered through multiple path aliases"
+        )
     return JarvisStateEvidence(
         initialized=True,
         root=str(jarvis_root),
@@ -911,7 +992,7 @@ def inspect_jarvis_state(
         config_sha256=hashlib.sha256(raw_config).hexdigest(),
         repos_sha256=hashlib.sha256(raw_repos).hexdigest(),
         resource_graph_sha256=hashlib.sha256(raw_graph).hexdigest(),
-        managed_repo_registered=managed_repo in repo_values,
+        managed_repo_registered=len(managed_matches) == 1,
     )
 
 
@@ -1016,13 +1097,24 @@ def inspect_prepared_generation(
         raise ConfigurationError("prepared generation omitted runtime identity")
     typed_receipt = cast(dict[str, object], receipt)
     typed_runtime = cast(dict[str, object], runtime)
-    if not (
-        info.get("receipt_matches_install") is True
-        and typed_receipt.get("deployment_fingerprint") == desired.fingerprint
-        and typed_receipt.get("deployment_manifest") == desired.model_dump(mode="json")
-        and typed_receipt.get("generation") == desired.fingerprint
-    ):
-        raise ConfigurationError("prepared generation install receipt identity changed")
+    receipt_checks = {
+        "receipt_matches_install": info.get("receipt_matches_install") is True,
+        "deployment_fingerprint": (
+            typed_receipt.get("deployment_fingerprint") == desired.fingerprint
+        ),
+        "deployment_manifest": (
+            typed_receipt.get("deployment_manifest") == desired.model_dump(mode="json")
+        ),
+        "generation": typed_receipt.get("generation") == desired.fingerprint,
+    }
+    failed_receipt_checks = sorted(
+        name for name, verified in receipt_checks.items() if not verified
+    )
+    if failed_receipt_checks:
+        raise ConfigurationError(
+            "prepared generation install receipt identity changed: "
+            + ", ".join(failed_receipt_checks)
+        )
     raw_artifacts = typed_receipt.get("component_artifacts")
     raw_jarvis_artifact = (
         cast(dict[str, object], raw_artifacts).get("jarvis-cd")
@@ -1161,6 +1253,11 @@ def finish_staged_activation(
         expected=expected_managed_target,
         label="relay-managed repository",
     )
+    canonical_home = lexical_home.resolve(strict=True)
+    reported_managed_repo = canonical_home / ".local/share/clio-relay/managed-jarvis-repo"
+    reported_managed_target = (
+        canonical_home / ".local/share/clio-relay/current/source/jarvis-packages/clio_relay"
+    )
     actions = activation.get("actions")
     if not isinstance(actions, dict):  # pragma: no cover - produced above
         raise ConfigurationError("staged activation omitted link actions")
@@ -1170,8 +1267,8 @@ def finish_staged_activation(
         "activation": activation,
         "jarvis_repository": {
             "link_action": cast(dict[str, object], actions).get("managed_repo"),
-            "link": str(managed_repo),
-            "target": os.readlink(managed_repo),
+            "link": str(reported_managed_repo),
+            "target": str(reported_managed_target),
             "repositories": repositories,
         },
     }
@@ -1308,11 +1405,22 @@ def _verify_bootstrap_replacement_provider(
             identity.provider_interpreter
         ).resolve(strict=True) != current_provider.resolve(strict=True):
             raise ConfigurationError("candidate planner is not running under its attested provider")
-        expected_uv = root_lexical / "pinned-uv"
-        if Path(identity.uv_executable).absolute() != expected_uv or expected_uv.resolve(
-            strict=True
-        ) != Path(identity.uv_executable).resolve(strict=True):
-            raise ConfigurationError("candidate replacement did not use the pinned uv executable")
+        expected_uv_lexical = root_lexical / "pinned-uv"
+        expected_uv_details = expected_uv_lexical.lstat()
+        expected_uv = expected_uv_lexical.resolve(strict=True)
+        observed_uv = Path(identity.uv_executable).resolve(strict=True)
+        if (
+            expected_uv_lexical.is_symlink()
+            or not stat.S_ISREG(expected_uv_details.st_mode)
+            or expected_uv.parent != root
+            or expected_uv != observed_uv
+        ):
+            raise ConfigurationError(
+                "candidate replacement did not use the pinned uv executable: "
+                f"expected={expected_uv}, observed={observed_uv}, root={root}, "
+                f"lexical_symlink={expected_uv_lexical.is_symlink()}, "
+                f"regular={stat.S_ISREG(expected_uv_details.st_mode)}"
+            )
         environment = Path(identity.environment_prefix).resolve(strict=True)
         imported_module = Path(__file__).resolve(strict=True)
         provider_target = current_provider.resolve(strict=True)
@@ -1339,13 +1447,28 @@ def _verify_bootstrap_replacement_provider(
         identity.record_path,
     )
     try:
-        if any(
-            (lexical := Path(os.path.abspath(Path(value).expanduser()))) == root
-            or not lexical.is_relative_to(root)
-            or not lexical.exists()
-            for value in staged_paths
-        ):
-            raise ConfigurationError("candidate replacement runtime escaped its preparing root")
+        escaped_paths: list[dict[str, str]] = []
+        for value in staged_paths:
+            lexical = Path(os.path.abspath(Path(value).expanduser()))
+            located = lexical.parent.resolve(strict=True) / lexical.name
+            if (
+                not lexical.is_absolute()
+                or ".." in lexical.parts
+                or located == root
+                or not located.is_relative_to(root)
+                or not lexical.exists()
+            ):
+                escaped_paths.append(
+                    {
+                        "lexical": str(lexical)[:512],
+                        "located": str(located)[:512],
+                    }
+                )
+        if escaped_paths:
+            raise ConfigurationError(
+                "candidate replacement runtime escaped its preparing root: "
+                + json.dumps(escaped_paths[:16], sort_keys=True, separators=(",", ":"))
+            )
     except (OSError, RuntimeError, ValueError) as exc:
         raise ConfigurationError("candidate replacement runtime path is unavailable") from exc
     if imported_module == environment or not imported_module.is_relative_to(environment):
@@ -1443,7 +1566,9 @@ def plan_bootstrap_reconcile(
         if isinstance(raw_relay_executables, dict):
             relay_executable = cast(dict[str, object], raw_relay_executables).get("clio-relay")
     expected_relay_executable = lexical_home / ".local/bin/clio-relay"
-    if not isinstance(relay_executable, str) or relay_executable != str(expected_relay_executable):
+    if not replacement_verified and (
+        not isinstance(relay_executable, str) or relay_executable != str(expected_relay_executable)
+    ):
         return _full_plan(desired, "clio-relay launcher is not bound to its install receipt")
     expected_components = {
         "clio-kit": (desired.clio_kit_version, desired.clio_kit_artifact_sha256),
@@ -1514,12 +1639,13 @@ def plan_bootstrap_reconcile(
             )
         ):
             reasons.append("clio-kit live runtime is not reusable")
-    jarvis_runtime = runtime.get("jarvis-cd")
-    if (
-        not isinstance(jarvis_runtime, dict)
-        or cast(dict[str, object], jarvis_runtime).get("verified") is not True
-    ):
-        reasons.append("JARVIS-CD live execution runtime is not reusable")
+    if "jarvis-cd" not in upgrade_components:
+        jarvis_runtime = runtime.get("jarvis-cd")
+        if (
+            not isinstance(jarvis_runtime, dict)
+            or cast(dict[str, object], jarvis_runtime).get("verified") is not True
+        ):
+            reasons.append("JARVIS-CD live execution runtime is not reusable")
 
     _verify_binary(
         resolved_home / ".local/bin/frpc",
@@ -1557,7 +1683,20 @@ def plan_bootstrap_reconcile(
         else legacy_python.parent / ("jarvis.exe" if os.name == "nt" else "jarvis")
     )
     lexical_legacy_venv = legacy_python.parent.parent
+    supported_execution_roots: set[Path] = set()
     supported_legacy_venv = resolved_home / ".local/share/clio-relay/jarvis-venv"
+    try:
+        if supported_legacy_venv.is_dir() and not _path_is_directory_alias(supported_legacy_venv):
+            supported_execution_roots.add(supported_legacy_venv.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        pass
+    managed_execution_root = _managed_generation_jarvis_environment(
+        receipt,
+        execution_environment=lexical_legacy_venv,
+        home=resolved_home,
+    )
+    if managed_execution_root is not None:
+        supported_execution_roots.add(managed_execution_root)
     expected_legacy_executable = legacy_python.parent / (
         "jarvis.exe" if os.name == "nt" else "jarvis"
     )
@@ -1567,7 +1706,6 @@ def plan_bootstrap_reconcile(
         legacy_executable_before = legacy_executable.lstat()
         expected_executable_before = expected_legacy_executable.lstat()
         resolved_legacy_venv = lexical_legacy_venv.resolve(strict=True)
-        resolved_supported_venv = supported_legacy_venv.resolve(strict=True)
         resolved_legacy_python_target = legacy_python.resolve(strict=True)
         legacy_python_target_before = resolved_legacy_python_target.lstat()
         resolved_legacy_executable = legacy_executable.resolve(strict=True)
@@ -1581,7 +1719,7 @@ def plan_bootstrap_reconcile(
             lexical_legacy_venv.is_absolute()
             and ".." not in lexical_legacy_venv.parts
             and not lexical_legacy_venv.is_symlink()
-            and resolved_legacy_venv == resolved_supported_venv
+            and resolved_legacy_venv in supported_execution_roots
             and legacy_python.is_file()
             and expected_legacy_executable.is_file()
             and bool(executable_payload)
@@ -1679,6 +1817,102 @@ def plan_bootstrap_reconcile(
     )
 
 
+def _path_is_directory_alias(path: Path) -> bool:
+    """Return whether a directory path is a symbolic-link or junction alias."""
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    return bool(is_junction()) if callable(is_junction) else False
+
+
+def _managed_generation_jarvis_environment(
+    receipt: dict[str, object],
+    *,
+    execution_environment: Path,
+    home: Path,
+) -> Path | None:
+    """Return a receipt-bound relay generation's real JARVIS execution root.
+
+    Relay-only generations intentionally retain the JARVIS environment from
+    the preceding component generation.  The active receipt therefore binds
+    both the active generation and an execution root that may belong to a
+    different retained generation.
+    """
+    active_generation = receipt.get("generation")
+    if not isinstance(active_generation, str) or not _is_sha256(active_generation):
+        return None
+    relay_root = home / ".local/share/clio-relay"
+    generations_root = relay_root / "generations"
+    active_generation_root = generations_root / active_generation
+    current = relay_root / "current"
+    environment = Path(os.path.abspath(execution_environment.expanduser()))
+    try:
+        current_before = current.lstat()
+        generations_before = generations_root.lstat()
+        active_generation_before = active_generation_root.lstat()
+        environment_before = environment.lstat()
+        if (
+            not _path_is_directory_alias(current)
+            or not stat.S_ISDIR(generations_before.st_mode)
+            or _path_is_directory_alias(generations_root)
+            or not stat.S_ISDIR(active_generation_before.st_mode)
+            or _path_is_directory_alias(active_generation_root)
+            or not stat.S_ISDIR(environment_before.st_mode)
+            or _path_is_directory_alias(environment)
+            or not environment.is_absolute()
+            or ".." in environment.parts
+        ):
+            return None
+        resolved_generations = generations_root.resolve(strict=True)
+        resolved_active_generation = active_generation_root.resolve(strict=True)
+        resolved_environment = environment.resolve(strict=True)
+        if current.resolve(strict=True) != resolved_active_generation:
+            return None
+        relative_environment = resolved_environment.relative_to(resolved_generations)
+        if (
+            len(relative_environment.parts) != 2
+            or relative_environment.parts[1] != "jarvis-venv"
+            or not _is_sha256(relative_environment.parts[0])
+        ):
+            return None
+        execution_generation_root = generations_root / relative_environment.parts[0]
+        execution_generation_before = execution_generation_root.lstat()
+        if (
+            not stat.S_ISDIR(execution_generation_before.st_mode)
+            or _path_is_directory_alias(execution_generation_root)
+            or execution_generation_root.resolve(strict=True) != resolved_environment.parent
+        ):
+            return None
+        current_after = current.lstat()
+        generations_after = generations_root.lstat()
+        active_generation_after = active_generation_root.lstat()
+        execution_generation_after = execution_generation_root.lstat()
+        environment_after = environment.lstat()
+        if (
+            _stat_identity(current_after) != _stat_identity(current_before)
+            or _stat_identity(generations_after) != _stat_identity(generations_before)
+            or _stat_identity(active_generation_after) != _stat_identity(active_generation_before)
+            or _stat_identity(execution_generation_after)
+            != _stat_identity(execution_generation_before)
+            or _stat_identity(environment_after) != _stat_identity(environment_before)
+        ):
+            return None
+        getuid = getattr(os, "getuid", None)
+        if callable(getuid) and any(
+            details.st_uid != getuid()
+            for details in (
+                generations_after,
+                active_generation_after,
+                execution_generation_after,
+                environment_after,
+            )
+        ):
+            return None
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved_environment
+
+
 def _full_plan(desired: BootstrapDesiredState, reason: str) -> BootstrapReconcilePlan:
     return BootstrapReconcilePlan(
         mode="full",
@@ -1723,8 +1957,11 @@ def _verify_jarvis_util_reuse(
         )
         if commit != desired.jarvis_util_commit or status:
             raise ConfigurationError("jarvis-util checkout commit or cleanliness changed")
+        receipt_python = reusable_paths.get("jarvis-cd_execution_interpreter")
         legacy_python = (
-            home
+            Path(receipt_python).expanduser()
+            if receipt_python is not None
+            else home
             / ".local/share/clio-relay/jarvis-venv"
             / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         )
@@ -2141,7 +2378,8 @@ def _managed_repository_payload(
     raw: bytes,
     *,
     managed: str,
-    previous: set[str],
+    managed_aliases: set[str],
+    previous_aliases: dict[str, str],
 ) -> tuple[bytes, list[str], list[str]]:
     """Return the exact converged repository bytes and mutation evidence."""
     document = _yaml_mapping(raw, label="JARVIS repositories")
@@ -2152,21 +2390,29 @@ def _managed_repository_payload(
     ):
         raise ConfigurationError("JARVIS repositories must contain a string list")
     repos = list(cast(list[str], raw_repos))
-    managed_count = repos.count(managed)
-    if managed_count > 1:
-        raise ConfigurationError("relay-managed JARVIS repository is registered more than once")
-    if any(repos.count(value) > 1 for value in previous):
+    managed_matches = [value for value in repos if value in managed_aliases]
+    if len(managed_matches) > 1:
         raise ConfigurationError(
-            "a proven previous relay-managed JARVIS repository is registered more than once"
+            "relay-managed JARVIS repository is registered through multiple path aliases"
         )
-    removed_previous = sorted(previous.intersection(repos))
-    if managed_count == 1 and not removed_previous:
+    previous_matches: dict[str, list[str]] = {}
+    for value in repos:
+        normalized = previous_aliases.get(value)
+        if normalized is not None:
+            previous_matches.setdefault(normalized, []).append(value)
+    if any(len(values) > 1 for values in previous_matches.values()):
+        raise ConfigurationError(
+            "a proven previous relay-managed JARVIS repository is registered through "
+            "multiple path aliases"
+        )
+    removed_previous = sorted(previous_matches)
+    if managed_matches == [managed] and not removed_previous:
         return raw, [], []
-    updated = [value for value in repos if value not in previous]
-    added_managed: list[str] = []
-    if managed_count == 0:
-        updated.insert(0, managed)
-        added_managed.append(managed)
+    updated = [
+        value for value in repos if value not in managed_aliases and value not in previous_aliases
+    ]
+    updated.insert(0, managed)
+    added_managed = [managed] if managed_matches != [managed] else []
     document["repos"] = updated
     return (
         yaml.safe_dump(document, sort_keys=False).encode("utf-8"),
@@ -2193,9 +2439,20 @@ def reconcile_managed_jarvis_repository(
     bootstrap lock; the final byte-and-file-identity comparison also detects
     non-cooperating writers before the atomic replacement.
     """
-    managed = str(managed_repo.absolute())
-    previous = {str(path.absolute()) for path in previous_managed_repos}
-    previous.discard(managed)
+    lexical_managed = str(Path(os.path.abspath(managed_repo.expanduser())))
+    managed = str(_canonical_path_preserving_final(managed_repo))
+    managed_aliases = {lexical_managed, managed}
+    previous_aliases: dict[str, str] = {}
+    for path in previous_managed_repos:
+        lexical_previous = str(Path(os.path.abspath(path.expanduser())))
+        try:
+            canonical_previous = str(_canonical_path_preserving_final(path))
+        except ConfigurationError:
+            canonical_previous = lexical_previous
+        if canonical_previous in managed_aliases:
+            continue
+        previous_aliases[lexical_previous] = canonical_previous
+        previous_aliases[canonical_previous] = canonical_previous
     token = exchange_identity or hashlib.sha256(managed.encode("utf-8")).hexdigest()
     try:
         _require_sha256(token, field="repository_exchange_identity")
@@ -2209,7 +2466,8 @@ def reconcile_managed_jarvis_repository(
     payload, added_managed, removed_previous = _managed_repository_payload(
         raw,
         managed=managed,
-        previous=previous,
+        managed_aliases=managed_aliases,
+        previous_aliases=previous_aliases,
     )
     if temporary.exists() or temporary.is_symlink():
         displaced, _displaced_identity = _read_regular_bounded_with_identity(
@@ -2219,7 +2477,8 @@ def reconcile_managed_jarvis_repository(
         displaced_payload, displaced_added, displaced_removed = _managed_repository_payload(
             displaced,
             managed=managed,
-            previous=previous,
+            managed_aliases=managed_aliases,
+            previous_aliases=previous_aliases,
         )
         if displaced != displaced_payload and displaced_payload == raw:
             temporary.unlink()
@@ -2339,7 +2598,12 @@ def repair_managed_jarvis_binding(
     resolved_home = lexical_home.resolve(strict=True)
     generation_path = lexical_home / ".local/share/clio-relay/generations" / desired.fingerprint
     generation = generation_path.resolve(strict=True)
-    if generation_path.is_symlink() or generation != generation_path:
+    generations = (lexical_home / ".local/share/clio-relay/generations").resolve(strict=True)
+    if (
+        generation_path.is_symlink()
+        or generation.parent != generations
+        or generation.name != desired.fingerprint
+    ):
         raise ConfigurationError("desired generation path is not one owned directory")
     current = lexical_home / ".local/share/clio-relay/current"
     _verify_stable_symlink(current, expected=generation, label="active generation")
@@ -2356,14 +2620,33 @@ def repair_managed_jarvis_binding(
     )
     if snapshot.before is not None:
         lexical_target = _activation_symlink_lexical_target(snapshot)
-        if lexical_target != expected_target:
+        try:
+            target_is_current = lexical_target.resolve(strict=True) == expected_target.resolve(
+                strict=True
+            )
+        except (OSError, RuntimeError, ValueError):
+            target_is_current = False
+        if lexical_target != expected_target and not target_is_current:
             proven_targets = {
                 Path(os.path.abspath(path.expanduser())) for path in previous_managed_repos
             }
-            if lexical_target not in proven_targets or not _is_generation_repository_target(
-                lexical_target.resolve(strict=True),
-                home=resolved_home,
-            ):
+            fixed_legacy_target = lexical_home / ".local/src/clio-relay/jarvis-packages/clio_relay"
+            try:
+                target_is_fixed_legacy = (
+                    lexical_target == fixed_legacy_target
+                    or lexical_target.resolve(strict=True)
+                    == fixed_legacy_target.resolve(strict=True)
+                )
+            except (OSError, RuntimeError, ValueError):
+                target_is_fixed_legacy = lexical_target == fixed_legacy_target
+            target_is_proven_generation = bool(
+                lexical_target in proven_targets
+                and _is_generation_repository_target(
+                    lexical_target.resolve(strict=True),
+                    home=resolved_home,
+                )
+            )
+            if not target_is_fixed_legacy and not target_is_proven_generation:
                 raise ConfigurationError(
                     "relay-managed repository link target is not proven by an earlier receipt"
                 )
@@ -2380,10 +2663,13 @@ def repair_managed_jarvis_binding(
         previous_managed_repos=previous_managed_repos,
         exchange_identity=desired.fingerprint,
     )
+    canonical_home = lexical_home.resolve(strict=True)
     return {
         "link_action": link_action,
-        "link": str(managed),
-        "target": str(expected_target),
+        "link": str(canonical_home / ".local/share/clio-relay/managed-jarvis-repo"),
+        "target": str(
+            canonical_home / ".local/share/clio-relay/current/source/jarvis-packages/clio_relay"
+        ),
         "repositories": repo_evidence,
     }
 
@@ -2555,10 +2841,28 @@ def _verify_active_generation_jarvis_wrapper(
     if set(manifest) != expected_manifest_keys:
         raise ConfigurationError("active generation manifest has an unknown shape")
     expected_receipt_path = generation / "install-receipt.json"
+    manifest_receipt_value = manifest.get("install_receipt")
+    manifest_receipt_matches = False
+    if isinstance(manifest_receipt_value, str):
+        manifest_receipt_path = Path(manifest_receipt_value)
+        if (
+            manifest_receipt_path.is_absolute()
+            and os.path.normpath(manifest_receipt_value) == manifest_receipt_value
+            and not any(character in manifest_receipt_value for character in "\x00\r\n")
+            and manifest_receipt_path.name == "install-receipt.json"
+        ):
+            try:
+                manifest_receipt_matches = manifest_receipt_path.parent.resolve(
+                    strict=True
+                ) == generation.resolve(strict=True) and manifest_receipt_path.resolve(
+                    strict=True
+                ) == expected_receipt_path.resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                manifest_receipt_matches = False
     if not (
         manifest.get("schema_version") == "clio-relay.bootstrap-generation.v1"
         and manifest.get("fingerprint") == desired.fingerprint
-        and manifest.get("install_receipt") == str(expected_receipt_path)
+        and manifest_receipt_matches
         and manifest.get("install_receipt_sha256") == sha256_file(expected_receipt_path)
     ):
         raise ConfigurationError("active generation manifest identity changed")
@@ -2643,6 +2947,188 @@ def _verify_active_generation_jarvis_wrapper(
         or not os.access(wrapper, os.X_OK)
     ):
         raise ConfigurationError("active generation JARVIS wrapper identity changed")
+
+
+def _relay_managed_jarvis_launcher_selected(
+    stable_launcher: Path,
+    *,
+    lexical_home: Path,
+) -> bool:
+    """Return whether one stable launcher names the relay activation namespace.
+
+    ``~/.local/bin`` is a conventional location shared by uv, pipx, and manual
+    installations.  The path alone therefore proves no relay ownership.  A
+    relay-managed launcher is distinguished by its stable symlink target: the
+    current relay generation, or the equivalent direct generation target used
+    by an older activation.  Receipt and generation validation remains the
+    caller's fail-closed responsibility after this ownership boundary is met.
+    """
+    try:
+        before = stable_launcher.lstat()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if not stat.S_ISLNK(before.st_mode):
+        return False
+    try:
+        raw_target = os.readlink(stable_launcher)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    target = Path(raw_target)
+    if not target.is_absolute():
+        target = stable_launcher.parent / target
+    target = Path(os.path.abspath(target))
+    try:
+        canonical_home = lexical_home.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    home_aliases = {lexical_home, canonical_home}
+    current_targets = {root / ".local/share/clio-relay/current/bin/jarvis" for root in home_aliases}
+    relay_target = target in current_targets
+    if not relay_target and target.name == "jarvis" and target.parent.name == "bin":
+        generation = target.parent.parent
+        generation_name = generation.name
+        generation_roots = {root / ".local/share/clio-relay/generations" for root in home_aliases}
+        relay_target = bool(
+            generation.parent in generation_roots
+            and len(generation_name) == 64
+            and all(character in "0123456789abcdef" for character in generation_name)
+        )
+    if not relay_target:
+        return False
+    try:
+        after = stable_launcher.lstat()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigurationError(
+            "relay-managed JARVIS launcher changed during ownership inspection"
+        ) from exc
+    if _stat_identity(after) != _stat_identity(before):
+        raise ConfigurationError(
+            "relay-managed JARVIS launcher changed during ownership inspection"
+        )
+    return True
+
+
+def resolve_receipt_bound_jarvis_python(
+    jarvis_bin: str,
+    *,
+    home: Path | None = None,
+) -> str | None:
+    """Return the verified interpreter for a relay-managed JARVIS launcher.
+
+    Non-managed launchers return ``None`` so an explicitly unmanaged provider can
+    retain its compatibility discovery.  A conventional ``~/.local/bin/jarvis``
+    file or external symlink is not relay ownership evidence.  Once the exact
+    relay activation symlink is selected, every receipt, generation, runtime,
+    and wrapper mismatch fails closed instead of falling back to an ambient
+    Python interpreter.
+    """
+    lexical_home = Path(os.path.abspath((home or Path.home()).expanduser()))
+    launcher = Path(jarvis_bin).expanduser()
+    if not launcher.is_absolute():
+        discovered = shutil.which(jarvis_bin)
+        if discovered is None:
+            return None
+        launcher = Path(discovered)
+    lexical_launcher = Path(os.path.abspath(launcher))
+    stable_launcher = lexical_home / ".local/bin/jarvis"
+    if lexical_launcher != stable_launcher:
+        try:
+            canonical_launcher = (
+                lexical_launcher.parent.resolve(strict=True) / lexical_launcher.name
+            )
+            canonical_stable = stable_launcher.parent.resolve(strict=True) / stable_launcher.name
+        except (OSError, RuntimeError, ValueError):
+            return None
+        if canonical_launcher != canonical_stable:
+            return None
+    if not _relay_managed_jarvis_launcher_selected(
+        stable_launcher,
+        lexical_home=lexical_home,
+    ):
+        return None
+
+    stable_receipt = lexical_home / ".local/share/clio-relay/install-receipt.json"
+    try:
+        installation = installation_info(stable_receipt)
+    except (ConfigurationError, OSError, ValueError) as exc:
+        raise ConfigurationError("relay-managed JARVIS installation receipt is invalid") from exc
+    if (
+        installation.get("schema_version") != "clio-relay.installation-info.v1"
+        or installation.get("receipt_matches_install") is not True
+    ):
+        raise ConfigurationError(
+            "relay-managed JARVIS installation receipt does not match this worker"
+        )
+    raw_receipt = installation.get("receipt")
+    raw_runtime = installation.get("component_runtime")
+    if not isinstance(raw_receipt, dict) or not isinstance(raw_runtime, dict):
+        raise ConfigurationError("relay-managed JARVIS installation identity is incomplete")
+    receipt = cast(dict[str, object], raw_receipt)
+    runtime = cast(dict[str, object], raw_runtime)
+    jarvis_runtime = runtime.get("jarvis-cd")
+    if (
+        not isinstance(jarvis_runtime, dict)
+        or cast(dict[str, object], jarvis_runtime).get("verified") is not True
+    ):
+        raise ConfigurationError("relay-managed JARVIS runtime did not verify its receipt")
+
+    raw_manifest = receipt.get("deployment_manifest")
+    fingerprint = receipt.get("deployment_fingerprint")
+    generation_name = receipt.get("generation")
+    try:
+        desired = BootstrapDesiredState.model_validate(raw_manifest)
+    except ValueError as exc:
+        raise ConfigurationError(
+            "relay-managed JARVIS receipt omitted a valid deployment manifest"
+        ) from exc
+    if (
+        not isinstance(fingerprint, str)
+        or fingerprint != desired.fingerprint
+        or generation_name != fingerprint
+    ):
+        raise ConfigurationError("relay-managed JARVIS generation identity changed")
+
+    generation = lexical_home / ".local/share/clio-relay/generations" / fingerprint
+    _verify_stable_symlink(
+        lexical_home / ".local/share/clio-relay/current",
+        expected=generation,
+        label="current generation pointer",
+    )
+    _verify_stable_symlink(
+        stable_receipt,
+        expected=generation / "install-receipt.json",
+        label="stable install receipt",
+    )
+    _verify_stable_symlink(
+        stable_launcher,
+        expected=generation / "bin/jarvis",
+        label="stable JARVIS launcher",
+    )
+    _verify_active_generation_jarvis_wrapper(
+        generation,
+        desired=desired,
+        installation=installation,
+    )
+
+    raw_artifacts = receipt.get("component_artifacts")
+    raw_jarvis_artifact = (
+        cast(dict[str, object], raw_artifacts).get("jarvis-cd")
+        if isinstance(raw_artifacts, dict)
+        else None
+    )
+    raw_interpreters = (
+        cast(dict[str, object], raw_jarvis_artifact).get("runtime_interpreters")
+        if isinstance(raw_jarvis_artifact, dict)
+        else None
+    )
+    execution_python = (
+        cast(dict[str, object], raw_interpreters).get("execution")
+        if isinstance(raw_interpreters, dict)
+        else None
+    )
+    if not isinstance(execution_python, str):
+        raise ConfigurationError("relay-managed JARVIS receipt omitted its interpreter")
+    return execution_python
 
 
 def _verify_stable_symlink(path: Path, *, expected: Path, label: str) -> Path:
@@ -2827,9 +3313,20 @@ def _capture_reconcile_activation_paths(
             lexical_home / ".local/src/clio-relay/jarvis-packages/clio_relay",
             share / "current/source/jarvis-packages/clio_relay",
         }
-        if managed_target not in allowed_targets and not _is_generation_repository_target(
-            managed_target.resolve(strict=True),
-            home=lexical_home.resolve(strict=True),
+        try:
+            target_matches_allowed_alias = any(
+                managed_target.resolve(strict=True) == target.resolve(strict=True)
+                for target in allowed_targets
+            )
+        except (OSError, RuntimeError, ValueError):
+            target_matches_allowed_alias = False
+        if (
+            managed_target not in allowed_targets
+            and not target_matches_allowed_alias
+            and not _is_generation_repository_target(
+                managed_target.resolve(strict=True),
+                home=lexical_home.resolve(strict=True),
+            )
         ):
             raise ConfigurationError(
                 "relay-managed repository link is not one proven legacy binding"
@@ -3129,7 +3626,11 @@ def _worker_readiness_verified(
 ) -> bool:
     return bool(
         evidence is not None
-        and evidence.get("schema_version") == "clio-relay.worker-runtime-info.v1"
+        and evidence.get("schema_version")
+        in {
+            "clio-relay.worker-runtime-info.v1",
+            "clio-relay.worker-readiness.v1",
+        }
         and evidence.get("cluster") == cluster
         and evidence.get("fresh") is True
         and evidence.get("process_running") is True
@@ -3211,6 +3712,20 @@ def _expand_home(value: str, home: Path) -> Path:
     if not path.is_absolute():
         raise ConfigurationError(f"bootstrap state path is not absolute: {value}")
     return path
+
+
+def _canonical_path_preserving_final(path: Path) -> Path:
+    """Canonicalize ancestor aliases without following the final path component."""
+    lexical = Path(os.path.abspath(path.expanduser()))
+    if any(character in str(lexical) for character in "\x00\r\n"):
+        raise ConfigurationError("managed path contains unsafe characters")
+    try:
+        parent = lexical.parent.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigurationError("managed path parent is unavailable") from exc
+    if not parent.is_dir():  # pragma: no cover - resolve(strict=True) normally proves this
+        raise ConfigurationError("managed path parent is not a directory")
+    return parent / lexical.name
 
 
 def _yaml_mapping(raw: bytes, *, label: str) -> dict[str, object]:

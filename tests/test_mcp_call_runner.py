@@ -915,6 +915,47 @@ def test_windows_uv_trampoline_fails_closed_on_unsupported_zip(
     )
 
 
+def test_posix_uv_shell_trampoline_resolves_exact_provider() -> None:
+    """Long-path uv launchers bind identity probes to their tool interpreter."""
+    runner = _load_runner()
+    provider = "/home/operator/.local/share/uv/tools/clio-kit/bin/python"
+    launcher = (
+        f"#!/bin/sh\n'''exec' '{provider}' \"$0\" \"$@\"\n' '''\n# -*- coding: utf-8 -*-\n"
+    ).encode()
+
+    shebang = cast(Any, runner)._persistent_tool_launcher_shebang(
+        launcher,
+        executable_name="clio-kit",
+    )
+
+    assert shebang == f"#!{provider}"
+
+
+@mark.parametrize(
+    "execution_line,closing_line",
+    [
+        ("'''exec' '/absolute/python' \"$0\" \"$@\"; echo injected", "' '''"),
+        ('exec \'/absolute/python\' "$0" "$@"', "' '''"),
+        ("'''exec' 'relative/python' \"$0\" \"$@\"", "' '''"),
+        ("'''exec' '/absolute/python' \"$0\"", "' '''"),
+        ("'''exec' '/absolute/python' \"$0\" \"$@\"", "not-the-python-quote-close"),
+    ],
+)
+def test_posix_uv_shell_trampoline_rejects_ambiguous_contracts(
+    execution_line: str,
+    closing_line: str,
+) -> None:
+    """Shell syntax outside uv's exact trampoline form fails closed."""
+    runner = _load_runner()
+    launcher = f"#!/bin/sh\n{execution_line}\n{closing_line}\nprint('never run')\n".encode()
+
+    with raises(ValueError, match="persistent uv shell trampoline"):
+        cast(Any, runner)._persistent_tool_launcher_shebang(
+            launcher,
+            executable_name="clio-kit",
+        )
+
+
 def test_mcp_call_runner_supports_server_arguments(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

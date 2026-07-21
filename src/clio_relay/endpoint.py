@@ -30,6 +30,7 @@ import yaml
 from filelock import FileLock, Timeout
 
 from clio_relay import process_containment
+from clio_relay.bootstrap_reconcile import resolve_receipt_bound_jarvis_python
 from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import DEFAULT_EXACT_RECORD_LIMIT, ClioCoreQueue
@@ -342,12 +343,20 @@ class EndpointWorker:
                     "worker storage runtime must match its managed queue instance"
                 )
             self.queue = resolved_queue
-            self.provider = provider or JarvisCdProvider(
-                jarvis_bin=settings.jarvis_bin,
-                agent_bin=settings.agent_bin,
-                agent_adapter=settings.agent_adapter,
-                agent_args=settings.agent_args,
-            )
+            if provider is None:
+                execution_python = (
+                    resolve_receipt_bound_jarvis_python(settings.jarvis_bin)
+                    if self.role == EndpointRole.WORKER
+                    else None
+                )
+                provider = JarvisCdProvider(
+                    jarvis_bin=settings.jarvis_bin,
+                    execution_python=execution_python,
+                    agent_bin=settings.agent_bin,
+                    agent_adapter=settings.agent_adapter,
+                    agent_args=settings.agent_args,
+                )
+            self.provider = provider
             self.scheduler_provider = scheduler_provider
             self.storage_runtime = storage_runtime or managed_runtime
             self._scheduler_last_poll: dict[tuple[str, str], float] = {}

@@ -286,6 +286,221 @@ exit 37
         assert "state=inactive" in stderr
 
 
+def test_failed_readiness_repair_restores_previously_active_worker() -> None:
+    """The repair transaction trap composes the worker-fence recovery contract."""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.fail("bash is required to validate the Linux bootstrap recovery trap")
+    worker_fence, _recheck, _init, _restart = bootstrap._worker_upgrade_fence_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "ares",
+        rendered_core_dir='"$test_root/core"',
+        activation_observation_timeout_seconds=2,
+        activation_poll_seconds=1,
+        activation_progress_seconds=1,
+    )
+    harness = f"""set -euo pipefail
+test_root="$(mktemp -d)"
+mkdir -p "$test_root/bin" "$test_root/home"
+export HOME="$test_root/home"
+export BOOTSTRAP_TEST_STATE="$test_root/worker-state"
+echo active > "$BOOTSTRAP_TEST_STATE"
+cat > "$test_root/bin/python3" <<'__FAKE_PYTHON__'
+#!/usr/bin/env bash
+cat >/dev/null
+__FAKE_PYTHON__
+cat > "$test_root/bin/systemctl" <<'__FAKE_SYSTEMCTL__'
+#!/usr/bin/env bash
+set -u
+case "${{2:-}}" in
+  show)
+    state="$(cat "$BOOTSTRAP_TEST_STATE")"
+    case " $* " in
+      *--property=LoadState*--value*) echo loaded ;;
+      *--property=ActiveState*--value*) echo "$state" ;;
+      *)
+        invocation=old-invocation
+        sub_state=dead
+        if [ "$state" = active ]; then
+          invocation=new-invocation
+          sub_state=running
+        fi
+        printf '%s\n' 'LoadState=loaded' "ActiveState=$state" \
+          "SubState=$sub_state" 'Result=success' 'ControlPID=0' \
+          'ExecMainCode=0' 'ExecMainStatus=0' 'TimeoutStartUSec=5min' \
+          "InvocationID=$invocation"
+        ;;
+    esac
+    ;;
+  list-jobs) ;;
+  stop)
+    echo "fake-systemctl=stop" >&2
+    echo inactive > "$BOOTSTRAP_TEST_STATE"
+    ;;
+  start)
+    echo "fake-systemctl=start" >&2
+    echo active > "$BOOTSTRAP_TEST_STATE"
+    ;;
+  *) exit 2 ;;
+esac
+__FAKE_SYSTEMCTL__
+cat > "$test_root/bin/flock" <<'__FAKE_FLOCK__'
+#!/usr/bin/env bash
+case "${{1:-}}" in --exclusive|--unlock) exit 0 ;; *) exit 2 ;; esac
+__FAKE_FLOCK__
+chmod +x "$test_root/bin/python3" "$test_root/bin/systemctl" "$test_root/bin/flock"
+export PATH="$test_root/bin:$PATH"
+{worker_fence}
+bootstrap_repair_transaction_exit() {{
+  local status=$?
+  trap - EXIT
+  bootstrap_restore_fenced_worker_on_failure "$status"
+  bootstrap_release_worker_lifetime_guard 2>/dev/null || true
+  exit "$status"
+}}
+trap bootstrap_repair_transaction_exit EXIT
+echo "readiness-repair-step=sabotaged" >&2
+exit 37
+"""
+
+    result = subprocess.run(
+        [bash, "-s"],
+        input=harness.encode("utf-8"),
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 37
+    assert "readiness-repair-step=sabotaged" in stderr
+    assert stderr.count("fake-systemctl=stop") == 1
+    assert stderr.count("fake-systemctl=start") == 1
+    assert "worker_recovery=restored" in stderr
+
+
+def test_failed_unmanaged_readiness_repair_preserves_original_status() -> None:
+    """A no-service repair has no-op fence helpers and cannot mask its failure."""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.fail("bash is required to validate the Linux bootstrap recovery trap")
+    worker_fence, _recheck, _init, _restart = bootstrap._worker_upgrade_fence_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        None,
+        rendered_core_dir='"$HOME/.local/share/clio-relay/core"',
+    )
+    harness = f"""set -euo pipefail
+{worker_fence}
+bootstrap_repair_transaction_exit() {{
+  local status=$?
+  trap - EXIT
+  bootstrap_restore_fenced_worker_on_failure "$status"
+  bootstrap_release_worker_lifetime_guard 2>/dev/null || true
+  exit "$status"
+}}
+trap bootstrap_repair_transaction_exit EXIT
+exit 37
+"""
+
+    result = subprocess.run(
+        [bash, "-s"],
+        input=harness.encode("utf-8"),
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 37
+
+
+def test_interrupted_repair_failure_restores_worker_without_masking_error() -> None:
+    """Recovery retains its exact failing status while restoring journaled service state."""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.fail("bash is required to validate interrupted repair recovery")
+    cluster = "cluster-a"
+    service_name = endpoint_user_service_name(cluster)
+    script = render_linux_user_bootstrap_script(cluster=cluster)
+    start = script.index("bootstrap_recover_interrupted_repair() {")
+    end = script.index("\n}\n\nbootstrap_recover_previous_transaction()", start) + 3
+    helper = script[start:end].replace("\r\n", "\n")
+    harness = f"""set -euo pipefail
+test_root="$(mktemp -d)"
+mkdir -p "$test_root/bin" "$test_root/home"
+export HOME="$test_root/home"
+export BOOTSTRAP_TEST_STATE="$test_root/worker-state"
+echo inactive > "$BOOTSTRAP_TEST_STATE"
+cat > "$test_root/bin/python3" <<'__FAKE_PYTHON__'
+#!/usr/bin/env bash
+cat >/dev/null
+__FAKE_PYTHON__
+cat > "$test_root/bin/systemctl" <<'__FAKE_SYSTEMCTL__'
+#!/usr/bin/env bash
+set -u
+case "${{2:-}}" in
+  show)
+    state="$(cat "$BOOTSTRAP_TEST_STATE")"
+    case " $* " in
+      *--property=LoadState*--value*) echo loaded ;;
+      *--property=ActiveState*--value*) echo "$state" ;;
+      *)
+        invocation=old-invocation
+        sub_state=dead
+        if [ "$state" = active ]; then
+          invocation=new-invocation
+          sub_state=running
+        fi
+        printf '%s\n' 'LoadState=loaded' "ActiveState=$state" \
+          "SubState=$sub_state" 'Result=success' 'ControlPID=0' \
+          'ExecMainCode=0' 'ExecMainStatus=0' 'TimeoutStartUSec=5min' \
+          "InvocationID=$invocation"
+        ;;
+    esac
+    ;;
+  list-jobs) ;;
+  stop)
+    echo "fake-systemctl=stop" >&2
+    echo inactive > "$BOOTSTRAP_TEST_STATE"
+    ;;
+  start)
+    echo "fake-systemctl=start" >&2
+    if {{ true <&8; }} 2>/dev/null; then
+      echo "fake-systemctl=start-with-lifetime-guard" >&2
+      exit 99
+    fi
+    echo active > "$BOOTSTRAP_TEST_STATE"
+    ;;
+  *) exit 2 ;;
+esac
+__FAKE_SYSTEMCTL__
+cat > "$test_root/bin/flock" <<'__FAKE_FLOCK__'
+#!/usr/bin/env bash
+case "${{1:-}}" in --exclusive|--unlock) exit 0 ;; *) exit 2 ;; esac
+__FAKE_FLOCK__
+chmod +x "$test_root/bin/python3" "$test_root/bin/systemctl" "$test_root/bin/flock"
+export PATH="$test_root/bin:$PATH"
+bootstrap_candidate_action() {{
+  echo "candidate-action=$1" >&2
+  return 37
+}}
+bootstrap_cleanup_preparing_root() {{ :; }}
+{helper}
+bootstrap_recover_interrupted_repair 1 {cluster} {service_name}
+"""
+    result = subprocess.run(
+        [bash, "-s"],
+        input=harness.encode("utf-8"),
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 37
+    assert "candidate-action=repair-managed-binding" in stderr
+    assert stderr.count("fake-systemctl=start") == 1
+    assert "fake-systemctl=start-with-lifetime-guard" not in stderr
+    assert "worker_recovery=restored" in stderr
+
+
 def test_standalone_bootstrap_cannot_mutate_legacy_output() -> None:
     """Without a managed cluster identity bootstrap uses the fail-closed ordinary init path."""
     script = render_linux_user_bootstrap_script()

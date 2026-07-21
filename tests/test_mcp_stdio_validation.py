@@ -22,7 +22,7 @@ from clio_relay import __version__
 from clio_relay import mcp_stdio_validation as mcp_stdio_validation_module
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import RelayError
+from clio_relay.errors import ObservationTimeoutError, RelayError
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_USER_CONTRACT_ID,
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
@@ -388,7 +388,7 @@ time.sleep(10)
     monkeypatch.setenv("CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE", str(executable))
 
     started = time.monotonic()
-    with pytest.raises(RelayError, match="total wall-clock deadline"):
+    with pytest.raises(ObservationTimeoutError, match="total wall-clock deadline"):
         run_packaged_mcp_stdio_session(
             profile="user",
             tool="jarvis_run",

@@ -161,9 +161,11 @@ generation match.
 `jarvis_get_execution(include_service_runtimes=true)` response supplies compact
 `service_runtime_bindings`; pass one exact entry unchanged as `binding`. It carries
 the configured cluster, completed source job and `mcp_result` artifact, exact
-package id/name, and service-instance id. Its output includes the
-durable gateway session and six local URLs: connect, health, stream, events, state,
-and command. The gateway stores the immutable source job/artifact digest,
+package id/name, and service-instance id. Its fixed output reports `ready` or
+`pending`; pending carries the exact same-gateway retry selector, no relay or
+scheduler action, and six null URLs. Reissue the identical bind to resume it.
+Ready includes the durable gateway session and six local URLs: connect, health,
+stream, events, state, and command. The gateway stores the immutable source job/artifact digest,
 execution and scheduler identities, service revision/report digest, and exact
 dataset descriptor/digest. The tool does not accept submit, status, cancel, host,
 port, path, descriptor overrides, or mixed compact/legacy selectors.

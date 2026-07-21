@@ -312,6 +312,7 @@ _INITIALIZED_QUEUE_FAMILIES = (
     "gc_trash",
     "global_order",
 )
+_LEGACY_ONLY_QUEUE_FAMILIES = ("cursors",)
 _GC_TERMINAL_SCHEDULER_PHASES = {
     SchedulerPhase.COMPLETED.value,
     SchedulerPhase.FAILED.value,
@@ -2636,6 +2637,7 @@ class ClioCoreQueue:
             raise ConfigurationError("locked queue permission repair has no pinned root descriptor")
         relative_paths = [Path()]
         relative_paths.extend(Path(family) for family in _INITIALIZED_QUEUE_FAMILIES)
+        relative_paths.extend(Path(family) for family in _LEGACY_ONLY_QUEUE_FAMILIES)
         relative_paths.extend(Path("global_order") / family for family in _GLOBAL_ORDER_FAMILIES)
         relative_paths.extend(
             Path("global_order") / family / child

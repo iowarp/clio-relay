@@ -81,11 +81,13 @@ class JarvisCdProvider:
         self,
         *,
         jarvis_bin: str = "jarvis",
+        execution_python: str | None = None,
         agent_bin: str = "agent",
         agent_adapter: str = "exec",
         agent_args: list[str] | None = None,
     ) -> None:
         self.jarvis_bin = jarvis_bin
+        self.execution_python = execution_python
         self.agent_bin = agent_bin
         self.agent_adapter = agent_adapter
         self.agent_args = agent_args or []
@@ -467,7 +469,7 @@ class JarvisCdProvider:
     def named_pipeline_command(self, pipeline_name: str) -> list[str]:
         """Return the command used to execute a named JARVIS pipeline."""
         return named_jarvis_command(
-            python_bin=_jarvis_python(self.jarvis_bin),
+            python_bin=self._execution_python(),
             pipeline_name=pipeline_name,
         )
 
@@ -478,13 +480,19 @@ class JarvisCdProvider:
             provider_for_scheduler(scheduler_name)
             return scheduled_jarvis_command(
                 scheduler_name,
-                python_bin=_jarvis_python(self.jarvis_bin),
+                python_bin=self._execution_python(),
                 pipeline_path=pipeline_path,
             )
         return yaml_jarvis_command(
-            python_bin=_jarvis_python(self.jarvis_bin),
+            python_bin=self._execution_python(),
             pipeline_path=pipeline_path,
         )
+
+    def _execution_python(self) -> str:
+        """Return the receipt-bound interpreter or use unmanaged discovery explicitly."""
+        if self.execution_python is not None:
+            return self.execution_python
+        return _unmanaged_jarvis_python(self.jarvis_bin)
 
 
 def _drop_none(value: Any) -> Any:
@@ -591,7 +599,8 @@ def _document_scheduler_name(document: object) -> str | None:
     return None
 
 
-def _jarvis_python(jarvis_bin: str) -> str:
+def _unmanaged_jarvis_python(jarvis_bin: str) -> str:
+    """Best-effort interpreter discovery for unmanaged and development launchers."""
     jarvis_path = Path(jarvis_bin)
     if jarvis_path.parent.name == "bin":
         candidate = jarvis_path.parent / "python"

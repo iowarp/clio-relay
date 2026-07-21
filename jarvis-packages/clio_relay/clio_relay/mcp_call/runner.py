@@ -11,6 +11,7 @@ import math
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import stat
@@ -3223,7 +3224,8 @@ def _persistent_tool_launcher_shebang(payload: bytes, *, executable_name: str) -
                 candidates[0].filename,
                 max_bytes=CLIO_KIT_WHEEL_MAX_LAUNCHER_BYTES,
             )
-    first_line = script.split(b"\n", 1)[0]
+    lines = script.split(b"\n", 3)
+    first_line = lines[0]
     if len(first_line) > 4096:
         raise ValueError("persistent tool launcher shebang exceeded its byte limit")
     shebang = first_line.decode("utf-8", errors="strict").rstrip("\r")
@@ -3231,6 +3233,28 @@ def _persistent_tool_launcher_shebang(payload: bytes, *, executable_name: str) -
         raise ValueError("persistent tool launcher has no direct Python interpreter shebang")
     if "\x00" in shebang:
         raise ValueError("persistent tool launcher shebang contains a null byte")
+    if shebang == "#!/bin/sh":
+        if len(lines) < 3 or any(len(line) > 4096 for line in lines[1:3]):
+            raise ValueError("persistent uv shell trampoline is incomplete or oversized")
+        execution_line = lines[1].decode("utf-8", errors="strict").rstrip("\r")
+        closing_line = lines[2].decode("utf-8", errors="strict").rstrip("\r")
+        try:
+            execution = shlex.split(execution_line, posix=True)
+        except ValueError as exc:
+            raise ValueError("persistent uv shell trampoline has invalid quoting") from exc
+        if len(execution) != 4 or execution[0] != "exec" or execution[2:] != ["$0", "$@"]:
+            raise ValueError("persistent uv shell trampoline has an unsupported exec contract")
+        provider = execution[1]
+        quoted_provider = "'" + provider.replace("'", "'\"'\"'") + "'"
+        canonical_execution_line = f"'''exec' {quoted_provider} \"$0\" \"$@\""
+        if (
+            not provider.startswith("/")
+            or "\x00" in provider
+            or execution_line != canonical_execution_line
+            or closing_line != "' '''"
+        ):
+            raise ValueError("persistent uv shell trampoline has an invalid provider contract")
+        return f"#!{provider}"
     return shebang
 
 

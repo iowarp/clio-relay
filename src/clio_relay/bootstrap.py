@@ -78,6 +78,8 @@ JARVIS_CD_WHEEL_URL = (
 JARVIS_CD_WHEEL_SHA256 = "ebf5e5f375b921f20c79075d461926431a5a017ca8b45e598878a89b229b3935"
 DEFAULT_REMOTE_CORE_DIR = "$HOME/.local/share/clio-relay/core"
 DEFAULT_REMOTE_SPOOL_DIR = "$HOME/.local/share/clio-relay/spool"
+
+
 _STAGED_PROVIDER_ENVIRONMENT_SANITIZER = r"""
 while IFS= read -r bootstrap_environment_name; do
   case "$bootstrap_environment_name" in
@@ -91,6 +93,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shlex
 import stat
 import struct
 import sys
@@ -357,8 +360,30 @@ try:
         os.close(relay_descriptor)
     if hashlib.sha256(relay_payload).hexdigest() != relay_sha256:
         raise SystemExit("staged relay launcher digest changed")
-    first_line = relay_payload.splitlines()[0].decode("utf-8")
-    if first_line != "#!" + provider:
+    launcher_lines = relay_payload.splitlines()
+    direct_shebang = bool(
+        launcher_lines and launcher_lines[0] == ("#!" + provider).encode("utf-8")
+    )
+    quoted_provider = {
+        shlex.quote(provider),
+        "'" + provider.replace("'", "'\"'\"'") + "'",
+    }
+    trampoline_lines = {
+        "'''exec' " + value + ' "$0" "$@"' for value in quoted_provider
+    }
+    try:
+        trampoline_command = (
+            launcher_lines[1].decode("utf-8") if len(launcher_lines) >= 2 else ""
+        )
+    except UnicodeDecodeError as exc:
+        raise SystemExit("staged relay launcher is not valid UTF-8") from exc
+    uv_shell_trampoline = bool(
+        len(launcher_lines) >= 3
+        and launcher_lines[0] == b"#!/bin/sh"
+        and trampoline_command in trampoline_lines
+        and launcher_lines[2] == b"' '''"
+    )
+    if not direct_shebang and not uv_shell_trampoline:
         raise SystemExit("staged relay launcher is not bound to its provider")
     provider_descriptor = os.open(
         os.path.relpath(provider, generation),
@@ -1347,7 +1372,7 @@ try:
         if set(wheel_rows) != set(names) or len(wheel_rows) != len(rows):
             raise SystemExit("candidate wheel RECORD does not close over its members")
 
-        environment_prefix = tool_directory / "clio-relay"
+        environment_prefix = (tool_directory / "clio-relay").resolve(strict=True)
         site_package_matches = list(environment_prefix.glob("lib/python*/site-packages"))
         if len(site_package_matches) != 1:
             raise SystemExit("candidate uv environment has no exact site-packages root")
@@ -1384,15 +1409,27 @@ try:
             str(dist_info / "uv_cache.json"),
         }
         wheel_names = set(names)
+        required_names = wheel_names | required_generated
+        allowed_names = required_names | optional_generated
+        missing_names = required_names - installed_names
+        unexpected_names = installed_names - allowed_names
         if (
             len(installed_names) != len(installed_rows)
-            or not wheel_names.issubset(installed_names)
-            or not required_generated.issubset(installed_names)
-            or not installed_names.issubset(
-                wheel_names | required_generated | optional_generated
-            )
+            or missing_names
+            or unexpected_names
         ):
-            raise SystemExit("installed candidate distribution contains unpinned members")
+            details = {
+                "row_count": len(installed_rows),
+                "unique_name_count": len(installed_names),
+                "missing_count": len(missing_names),
+                "missing": [name[:256] for name in sorted(missing_names)[:16]],
+                "unexpected_count": len(unexpected_names),
+                "unexpected": [name[:256] for name in sorted(unexpected_names)[:16]],
+            }
+            raise SystemExit(
+                "installed candidate distribution contains unpinned members: "
+                + json.dumps(details, sort_keys=True, separators=(",", ":"))
+            )
         installed_row_map = {row[0]: row for row in installed_rows}
         generated_payloads = {}
         for name in installed_names - wheel_names:
@@ -2346,6 +2383,51 @@ def _bootstrap_preflight_over_ssh(
             "    echo bootstrap_preflight_unsupported=missing_command",
             "    exit 0",
             "  fi",
+            '  if BOOTSTRAP_PREFLIGHT_OUTPUT="$BOOTSTRAP_PREFLIGHT_OUTPUT" '
+            "python3 -I - <<'__CLIO_RELAY_REPAIRABLE_QUEUE_ROOT__'",
+            "import json",
+            "import os",
+            "import sys",
+            "from pathlib import Path",
+            "",
+            'prefix = "error: "',
+            "matches = [line.removeprefix(prefix) for line in "
+            'os.environ["BOOTSTRAP_PREFLIGHT_OUTPUT"].splitlines() '
+            "if line.startswith(prefix)]",
+            "if len(matches) != 1:",
+            "    raise SystemExit(1)",
+            "try:",
+            "    report = json.loads(matches[0])",
+            "except json.JSONDecodeError:",
+            "    raise SystemExit(1) from None",
+            "expected = {",
+            '    "schema_version": "clio-relay.legacy-state-audit.v1",',
+            '    "family": "root",',
+            '    "reason": "queue directory is readable or writable by another user",',
+            '    "action": (',
+            '        "move the unsafe state aside or export records with portable durable IDs "',
+            '        "before retrying"',
+            "    ),",
+            "}",
+            'if not isinstance(report, dict) or set(report) != {*expected, "path"}:',
+            "    raise SystemExit(1)",
+            "if any(report.get(name) != value for name, value in expected.items()):",
+            "    raise SystemExit(1)",
+            'path = report.get("path")',
+            "if not isinstance(path, str):",
+            "    raise SystemExit(1)",
+            "try:",
+            "    observed = Path(path).resolve(strict=True)",
+            '    configured = Path(os.environ["CLIO_RELAY_CORE_DIR"]).resolve(strict=True)',
+            "except OSError:",
+            "    raise SystemExit(1) from None",
+            "if observed != configured:",
+            "    raise SystemExit(1)",
+            "__CLIO_RELAY_REPAIRABLE_QUEUE_ROOT__",
+            "  then",
+            "    echo bootstrap_preflight_unsupported=repairable_queue_permissions",
+            "    exit 0",
+            "  fi",
             "  printf '%s\\n' \"$BOOTSTRAP_PREFLIGHT_OUTPUT\" >&2",
             '  exit "$BOOTSTRAP_PREFLIGHT_STATUS"',
             "fi",
@@ -2371,6 +2453,7 @@ def _bootstrap_preflight_over_ssh(
                 "bootstrap_preflight_unsupported=not_installed",
                 "bootstrap_preflight_unsupported=missing_command",
                 "bootstrap_preflight_unsupported=legacy_relay_provider",
+                "bootstrap_preflight_unsupported=repairable_queue_permissions",
             }
         ]
         if len(unsupported) != 1:
@@ -3112,14 +3195,53 @@ def _validate_bootstrap_receipt(
             raise RelayError("bootstrap repair receipt reported JARVIS initialization")
         if jarvis_graph_action != "preserved" or command_count != 0:
             raise RelayError("bootstrap repair receipt reported JARVIS commands")
+        managed_repo = repository_update.get("managed_repo")
+        added_repositories = repository_update.get("added_managed_repos")
+        removed_repositories = repository_update.get("removed_previous_managed_repos")
         if (
             typed_jarvis_preservation.get("config_byte_identical") is not True
             or typed_jarvis_preservation.get("resource_graph_byte_identical") is not True
-            or typed_jarvis_preservation.get("repositories_byte_identical") is not True
-            or binding.get("link_action") != "reused"
-            or repository_update.get("action") != "reused"
         ):
             raise RelayError("bootstrap repair receipt reported JARVIS state mutation")
+        if (
+            not isinstance(managed_repo, str)
+            or not PurePosixPath(managed_repo).is_absolute()
+            or any(character in managed_repo for character in "\x00\r\n")
+            or binding.get("link") != managed_repo
+            or binding.get("link_action") not in {"reused", "created", "retargeted"}
+            or not isinstance(added_repositories, list)
+            or not isinstance(removed_repositories, list)
+            or not _is_sha256_value(typed_generation.get("previous"))
+        ):
+            raise RelayError("bootstrap managed JARVIS binding repair is invalid")
+        managed_suffix = "/.local/share/clio-relay/managed-jarvis-repo"
+        if not managed_repo.endswith(managed_suffix):
+            raise RelayError("bootstrap managed JARVIS binding repair is invalid")
+        remote_home = managed_repo[: -len(managed_suffix)]
+        expected_target = (
+            remote_home + "/.local/share/clio-relay/current/source/jarvis-packages/clio_relay"
+        )
+        expected_previous = remote_home + "/.local/src/clio-relay/jarvis-packages/clio_relay"
+        repository_action = repository_update.get("action")
+        if binding.get("target") != expected_target:
+            raise RelayError("bootstrap managed JARVIS binding repair is invalid")
+        if repository_action == "reused":
+            if (
+                typed_jarvis_preservation.get("repositories_byte_identical") is not True
+                or added_repositories
+                or removed_repositories
+            ):
+                raise RelayError("bootstrap managed JARVIS repository reuse is invalid")
+        elif repository_action == "updated":
+            if (
+                typed_jarvis_preservation.get("repositories_byte_identical") is not False
+                or added_repositories not in ([], [managed_repo])
+                or removed_repositories not in ([], [expected_previous])
+                or (not added_repositories and not removed_repositories)
+            ):
+                raise RelayError("bootstrap managed JARVIS repository repair is invalid")
+        else:
+            raise RelayError("bootstrap managed JARVIS repository repair is invalid")
     elif outcome == "reconciled":
         raw_transaction = receipt.get("transaction")
         transaction_mode = (
@@ -3297,7 +3419,14 @@ def _worker_upgrade_fence_script(
         ]
     )
     if not service_name:
-        return declarations, "", "clio-relay init", ""
+        no_service_fence = "\n".join(
+            [
+                declarations,
+                "bootstrap_restore_fenced_worker_on_failure() { :; }",
+                "bootstrap_release_worker_lifetime_guard() { :; }",
+            ]
+        )
+        return no_service_fence, "", "clio-relay init", ""
     initial_proof = _worker_writer_proof_shell(
         rendered_core_dir=rendered_core_dir,
         success_variable="WORKER_WRITER_PROOF",
@@ -3362,9 +3491,8 @@ def _worker_upgrade_fence_script(
             '  WORKER_RESTART_OUTCOME="$CLIO_RELAY_ENDPOINT_ACTIVATION_OUTCOME"',
             "  WORKER_RESTARTED=1",
             "}",
-            "bootstrap_worker_fence_exit() {",
-            "  status=$?",
-            "  trap - EXIT",
+            "bootstrap_restore_fenced_worker_on_failure() {",
+            '  local status="$1"',
             (
                 '  if [ "$status" -ne 0 ] && [ "$WORKER_WAS_ACTIVE" = "1" ]'
                 ' && [ "$WORKER_RESTARTED" != "1" ]; then'
@@ -3422,6 +3550,11 @@ def _worker_upgrade_fence_script(
             ),
             "    fi",
             "  fi",
+            "}",
+            "bootstrap_worker_fence_exit() {",
+            "  status=$?",
+            "  trap - EXIT",
+            '  bootstrap_restore_fenced_worker_on_failure "$status"',
             "  bootstrap_release_worker_lifetime_guard || true",
             "  if declare -F bootstrap_cleanup_preparing_root >/dev/null; then",
             "    bootstrap_cleanup_preparing_root || true",
@@ -3588,16 +3721,19 @@ import sys
 from pathlib import Path
 
 path, action, *arguments = sys.argv[1:]
-candidate_root = os.environ["BOOTSTRAP_CANDIDATE_PYTHON_ROOT"]
-if not sys.path or sys.path[0] != candidate_root:
-    sys.path.insert(0, candidate_root)
-name = "clio_relay.bootstrap_reconcile_candidate_action"
-spec = importlib.util.spec_from_file_location(name, path)
-if spec is None or spec.loader is None:
-    raise SystemExit("could not load candidate bootstrap reconciler")
-module = importlib.util.module_from_spec(spec)
-sys.modules[name] = module
-spec.loader.exec_module(module)
+if os.environ.get("BOOTSTRAP_STAGED_GENERATION") and action != "repair-legacy-cursors":
+    from clio_relay import bootstrap_reconcile as module
+else:
+    candidate_root = os.environ["BOOTSTRAP_CANDIDATE_PYTHON_ROOT"]
+    if not sys.path or sys.path[0] != candidate_root:
+        sys.path.insert(0, candidate_root)
+    name = "clio_relay.bootstrap_reconcile_candidate_action"
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise SystemExit("could not load candidate bootstrap reconciler")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
 journal_path = Path(os.environ["BOOTSTRAP_TRANSACTION_JOURNAL"])
 if action == "journal-create":
     service_value = os.environ["BOOTSTRAP_SERVICE_ACTIVE_BEFORE"]
@@ -3669,9 +3805,19 @@ elif action == "jarvis-wrapper":
         )
     )
 elif action == "finish-activation":
-    desired_payload = json.loads(os.environ["BOOTSTRAP_DESIRED_STATE"])
-    desired_payload["agent_npm_package"] = os.environ["AGENT_NPM_PACKAGE"] or None
-    desired_payload["agent_npm_bin"] = os.environ["AGENT_NPM_BIN"] or None
+    if os.environ.get("BOOTSTRAP_STAGED_GENERATION"):
+        receipt_payload = module._read_regular_bounded(
+            Path(arguments[0]) / "install-receipt.json",
+            maximum=4 * 1024 * 1024,
+        )
+        receipt_document = json.loads(receipt_payload)
+        desired_payload = receipt_document.get("deployment_manifest")
+        if not isinstance(desired_payload, dict):
+            raise SystemExit("staged install receipt omitted its desired state")
+    else:
+        desired_payload = json.loads(os.environ["BOOTSTRAP_DESIRED_STATE"])
+        desired_payload["agent_npm_package"] = os.environ["AGENT_NPM_PACKAGE"] or None
+        desired_payload["agent_npm_bin"] = os.environ["AGENT_NPM_BIN"] or None
     desired = module.BootstrapDesiredState.model_validate(desired_payload)
     print(
         json.dumps(
@@ -3680,6 +3826,39 @@ elif action == "finish-activation":
                 generation=Path(arguments[0]),
                 expected_manifest_sha256=arguments[1],
             ),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+elif action == "repair-legacy-cursors":
+    print(
+        json.dumps(
+            module.repair_legacy_cursor_permissions_for_upgrade(Path(arguments[0])),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+elif action == "repair-managed-binding":
+    desired_payload = json.loads(os.environ["BOOTSTRAP_DESIRED_STATE"])
+    desired_payload["agent_npm_package"] = os.environ["AGENT_NPM_PACKAGE"] or None
+    desired_payload["agent_npm_bin"] = os.environ["AGENT_NPM_BIN"] or None
+    desired = module.BootstrapDesiredState.model_validate(desired_payload)
+    before = module.inspect_jarvis_state(desired)
+    binding = module.repair_managed_jarvis_binding(
+        desired,
+        previous_managed_repos=(
+            Path.home() / ".local/src/clio-relay/jarvis-packages/clio_relay",
+        ),
+    )
+    after = module.inspect_jarvis_state(desired)
+    print(
+        json.dumps(
+            {{
+                "schema_version": "clio-relay.bootstrap-binding-repair.v1",
+                "before": before.model_dump(mode="json"),
+                "after": after.model_dump(mode="json"),
+                "binding": binding,
+            }},
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -3751,7 +3930,7 @@ bootstrap_active_generation_identity() {{
     return 1
   fi
   target="$(readlink -f "$current")"
-  prefix="$HOME/.local/share/clio-relay/generations/"
+  prefix="$(readlink -f "$HOME/.local/share/clio-relay/generations")/"
   case "$target" in
     "$prefix"*) identity="${{target#"$prefix"}}" ;;
     *)
@@ -3770,6 +3949,18 @@ bootstrap_active_generation_identity() {{
     return 1
   fi
   echo "$identity"
+}}
+
+bootstrap_active_generation_provider() {{
+  local identity generations provider
+  identity="$(bootstrap_active_generation_identity)" || return 1
+  generations="$(readlink -f "$HOME/.local/share/clio-relay/generations")"
+  provider="$generations/$identity/tools/clio-relay/bin/python"
+  if [ ! -f "$provider" ] || [ ! -x "$provider" ]; then
+    echo "bootstrap active generation provider is unavailable" >&2
+    return 1
+  fi
+  echo "$provider"
 }}
 
 bootstrap_reconcile_transaction_exit() {{
@@ -3835,13 +4026,145 @@ bootstrap_recover_service() {{
   return 1
 }}
 
+bootstrap_fence_recovered_service() {{
+  local service_name="$1"
+  local load_state active_state stopped_state
+  [ -n "$service_name" ] || return 0
+  load_state="$(
+    systemctl --user show "$service_name" --property=LoadState --value
+  )" || return 1
+  active_state="$(
+    systemctl --user show "$service_name" --property=ActiveState --value
+  )" || return 1
+  case "$load_state:$active_state" in
+    loaded:active|loaded:activating|loaded:reloading|loaded:deactivating)
+      systemctl --user stop "$service_name"
+      stopped_state="$(
+        systemctl --user show "$service_name" --property=ActiveState --value
+      )" || return 1
+      case "$stopped_state" in
+        inactive|failed) return 0 ;;
+        *)
+          echo "bootstrap recovery could not fence endpoint service: $service_name" >&2
+          return 1
+          ;;
+      esac
+      ;;
+    loaded:inactive|loaded:failed|masked:inactive|not-found:inactive) return 0 ;;
+    *)
+      echo "bootstrap recovery found unknown endpoint service state: " \
+        "$load_state:$active_state:$service_name" >&2
+      return 1
+      ;;
+  esac
+}}
+
+bootstrap_recover_interrupted_repair() {{
+  local service_was_active="$1"
+  local cluster_name="$2"
+  local interrupted_service_name="$3"
+  local recovery_service_should_run=0
+  local recovery_queue recovery_worker recovery_worker_ready
+  if [ "$service_was_active" = "1" ]; then
+    recovery_service_should_run=1
+  fi
+
+{worker_fence}
+
+  if [ -n "$interrupted_service_name" ] && \
+     [ "$interrupted_service_name" != "$WORKER_SERVICE_NAME" ]; then
+    echo "bootstrap repair recovery service identity changed:" \
+      "$interrupted_service_name != $WORKER_SERVICE_NAME" >&2
+    return 1
+  fi
+
+  # A power loss releases the lifetime lock after the original fence.  Preserve
+  # both the journaled pre-transaction state and an operator restart observed
+  # at recovery entry, then keep the exact queue writer fence until readiness is
+  # sealed or the service restart relinquishes it.
+  if [ "$WORKER_WAS_ACTIVE" = "1" ]; then
+    recovery_service_should_run=1
+  elif [ "$service_was_active" = "1" ]; then
+    WORKER_WAS_ACTIVE=1
+    WORKER_STOP_CONFIRMED=1
+  fi
+
+{worker_recheck}
+
+  # The managed repository/link operation is exact and idempotent.  Re-running
+  # it covers interruption before, during, or after the original activation
+  # without depending on staged-generation evidence that repair never records.
+  bootstrap_candidate_action repair-managed-binding >/dev/null
+
+  recovery_queue="$(
+    CLIO_RELAY_CORE_DIR={rendered_core_dir} \
+      "$HOME/.local/bin/clio-relay" queue readiness-info 2>/dev/null || true
+  )"
+  export recovery_queue
+  if ! python3 -c \
+    'import json,os,sys; value=json.loads(os.environ["recovery_queue"]); '\
+'sys.exit(0 if value.get("complete") is True else 1)' \
+    2>/dev/null; then
+    CLIO_RELAY_CORE_DIR={rendered_core_dir} \
+    CLIO_RELAY_SPOOL_DIR={rendered_spool_dir} \
+    CLIO_RELAY_JARVIS_BIN="$HOME/.local/bin/jarvis" \
+    CLIO_RELAY_FRPC_BIN="$HOME/.local/bin/frpc" \
+    CLIO_RELAY_AGENT_BIN="${{AGENT_BIN:-agent}}" \
+    CLIO_RELAY_AGENT_ADAPTER={rendered_agent_adapter} \
+    CLIO_RELAY_AGENT_ARGS={rendered_agent_args} \
+    {WORKER_LIFETIME_GUARD_FD_ENV}="$WORKER_LIFETIME_GUARD_FD" \
+    {init_command}
+  fi
+  recovery_queue="$(
+    CLIO_RELAY_CORE_DIR={rendered_core_dir} \
+      "$HOME/.local/bin/clio-relay" queue readiness-info
+  )"
+  export recovery_queue
+  if ! python3 -c \
+    'import json,os,sys; value=json.loads(os.environ["recovery_queue"]); '\
+'sys.exit(0 if value.get("complete") is True else 1)'; then
+    echo "bootstrap repair recovery did not establish queue readiness" >&2
+    return 1
+  fi
+
+  if [ "$recovery_service_should_run" = "1" ] && [ -n "$WORKER_SERVICE_NAME" ]; then
+    if ! bootstrap_bounded_worker_restart; then
+      echo "bootstrap repair recovery could not restore endpoint service:" \
+        "$WORKER_SERVICE_NAME" >&2
+      return 1
+    fi
+    recovery_worker_ready=0
+    for _BOOTSTRAP_REPAIR_RECOVERY_WORKER_ATTEMPT in $(seq 1 90); do
+      recovery_worker="$(
+        CLIO_RELAY_CORE_DIR={rendered_core_dir} \
+          "$HOME/.local/bin/clio-relay" endpoint worker-info \
+            --cluster "$cluster_name" --freshness-seconds 120 2>/dev/null || true
+      )"
+      if printf '%s\\n' "$recovery_worker" | python3 -c \
+        'import json,sys; value=json.load(sys.stdin); '\
+'sys.exit(0 if value.get("running") is True else 1)' 2>/dev/null; then
+        recovery_worker_ready=1
+        break
+      fi
+      sleep 2
+    done
+    if [ "$recovery_worker_ready" != "1" ]; then
+      echo "bootstrap repair recovery did not observe a ready worker" >&2
+      return 1
+    fi
+  fi
+  BOOTSTRAP_REPAIR_RECOVERY_ACTIVE=1
+}}
+
 bootstrap_recover_previous_transaction() {{
   BOOTSTRAP_TRANSACTION_JOURNAL="$HOME/.local/share/clio-relay/bootstrap-transaction.json"
   export BOOTSTRAP_TRANSACTION_JOURNAL
   BOOTSTRAP_RECOVERY_JSON="$(bootstrap_candidate_action recovery-plan)"
   export BOOTSTRAP_RECOVERY_JSON
-  local recovery_mode interrupted_invocation service_name service_was_active cluster_name
+  local recovery_mode interrupted_mode interrupted_invocation service_name
+  local service_was_active cluster_name
   recovery_mode="$(bootstrap_recovery_value recovery_mode)"
+  interrupted_mode="$(bootstrap_recovery_value mode)"
   interrupted_invocation="$(bootstrap_recovery_value invocation_id)"
   service_name="$(bootstrap_recovery_value service_name)"
   service_was_active="$(bootstrap_recovery_value service_was_active)"
@@ -3870,8 +4193,12 @@ bootstrap_recover_previous_transaction() {{
       return 1
       ;;
     forward)
-      local prepared_generation prepared_manifest_sha256 recovery_generation
-      prepared_generation="$(bootstrap_recovery_value prepared_generation)"
+      if [ "$interrupted_mode" = "repair" ]; then
+        bootstrap_recover_interrupted_repair \
+          "$service_was_active" "$cluster_name" "$service_name"
+      else
+        local prepared_generation prepared_manifest_sha256 recovery_generation
+        prepared_generation="$(bootstrap_recovery_value prepared_generation)"
       case "$prepared_generation" in
         (*[!0-9a-f]*|'')
           echo "bootstrap forward recovery has an invalid generation" >&2
@@ -3913,6 +4240,7 @@ __CLIO_RELAY_RECOVERY_MANIFEST__
         sha256sum --check --strict -
       echo "$BOOTSTRAP_JARVIS_GRAPH_SHA256_BEFORE *$JARVIS_GRAPH_FILE" | \
         sha256sum --check --strict -
+      bootstrap_fence_recovered_service "$service_name"
       bootstrap_use_staged_provider "$recovery_generation" "$prepared_manifest_sha256"
       bootstrap_candidate_action finish-activation \
         "$recovery_generation" "$prepared_manifest_sha256" >/dev/null
@@ -3923,17 +4251,21 @@ __CLIO_RELAY_RECOVERY_MANIFEST__
         sha256sum --check --strict -
       mkdir -p -- {rendered_core_dir}
       exec 8<>"{rendered_core_dir}/{WORKER_LIFETIME_LOCK_NAME}"
+      WORKER_LIFETIME_GUARD_FD=8
       if ! flock -n 8; then
         echo "bootstrap forward recovery cannot prove exclusive queue ownership" >&2
         return 1
       fi
+      {WORKER_LIFETIME_GUARD_FD_ENV}="$WORKER_LIFETIME_GUARD_FD" \
+        bootstrap_candidate_action repair-legacy-cursors {rendered_core_dir} >/dev/null
       CLIO_RELAY_CORE_DIR={rendered_core_dir} \
       CLIO_RELAY_SPOOL_DIR={rendered_spool_dir} \
+      {WORKER_LIFETIME_GUARD_FD_ENV}="$WORKER_LIFETIME_GUARD_FD" \
         "$HOME/.local/bin/clio-relay" init --migrate-legacy-output
       CLIO_RELAY_CORE_DIR={rendered_core_dir} \
         "$HOME/.local/bin/clio-relay" queue readiness-info >/dev/null
       exec 8>&-
-      if [ "$service_was_active" = "1" ] && [ -n "$service_name" ]; then
+        if [ "$service_was_active" = "1" ] && [ -n "$service_name" ]; then
         bootstrap_recover_service "$service_name"
         local recovery_worker recovery_worker_ready
         recovery_worker_ready=0
@@ -3943,9 +4275,8 @@ __CLIO_RELAY_RECOVERY_MANIFEST__
               "$HOME/.local/bin/clio-relay" endpoint worker-info \
                 --cluster "$cluster_name" --freshness-seconds 120 2>/dev/null || true
           )"
-          export recovery_worker
-          if python3 -c \
-            'import json,os,sys; value=json.loads(os.environ["recovery_worker"]); '\
+          if printf '%s\\n' "$recovery_worker" | python3 -c \
+            'import json,sys; value=json.load(sys.stdin); '\
 'sys.exit(0 if value.get("running") is True else 1)' 2>/dev/null; then
             recovery_worker_ready=1
             break
@@ -3955,6 +4286,7 @@ __CLIO_RELAY_RECOVERY_MANIFEST__
         if [ "$recovery_worker_ready" != "1" ]; then
           echo "bootstrap forward recovery did not observe a ready worker" >&2
           return 1
+        fi
         fi
       fi
       ;;
@@ -3967,6 +4299,10 @@ __CLIO_RELAY_RECOVERY_MANIFEST__
       ;;
   esac
   bootstrap_candidate_action recovery-complete
+  if [ "${{BOOTSTRAP_REPAIR_RECOVERY_ACTIVE:-0}}" = "1" ]; then
+    bootstrap_release_worker_lifetime_guard
+    trap - EXIT
+  fi
 }}
 
 bootstrap_relay_only_reconcile() {{
@@ -4134,7 +4470,7 @@ bootstrap_relay_only_reconcile() {{
         "$HOME/.local/bin/uv" tool install --force --python 3.12 --no-config \
           --default-index https://pypi.org/simple "$JARVIS_MCP_ARTIFACT_PATH"
       test -x "$CLIO_KIT_EXECUTABLE"
-      CLIO_KIT_PROVIDER_PYTHON="$(sed -n '1{{s/^#!//;p;}}' "$CLIO_KIT_EXECUTABLE")"
+      CLIO_KIT_PROVIDER_PYTHON="$BOOTSTRAP_GENERATION/tools/clio-kit/bin/python"
       test -x "$CLIO_KIT_PROVIDER_PYTHON"
       test "$("$CLIO_KIT_PROVIDER_PYTHON" -c \
         'from importlib.metadata import version; print(version("clio-kit"))')" = \
@@ -4213,7 +4549,7 @@ __CLIO_RELAY_RECONCILE_PYPI_DIGEST__
         --default-index https://pypi.org/simple --with "$JARVIS_CD_WHEEL" \
         "$RELAY_INSTALL_TARGET"
     RELAY_EXECUTABLE="$BOOTSTRAP_GENERATION/bin/clio-relay"
-    RELAY_PROVIDER_PYTHON="$(sed -n '1{{s/^#!//;p;}}' "$RELAY_EXECUTABLE")"
+    RELAY_PROVIDER_PYTHON="$BOOTSTRAP_GENERATION/tools/clio-relay/bin/python"
     test -x "$RELAY_EXECUTABLE" -a -x "$RELAY_PROVIDER_PYTHON"
     bootstrap_candidate_action jarvis-wrapper \
       "$BOOTSTRAP_GENERATION/bin/jarvis" "$ACTIVE_JARVIS_PYTHON"
@@ -4393,14 +4729,65 @@ from pathlib import Path
 
 info = json.loads(Path(os.environ["BOOTSTRAP_GENERATION"] + "/installation-info.json").read_text())
 runtime = info.get("component_runtime", {{}})
-if not (
-    info.get("receipt_matches_install") is True
-    and runtime.get("clio-relay", {{}}).get("persistent_tool_verified") is True
-    and runtime.get("clio-kit", {{}}).get("persistent_tool_verified") is True
-    and runtime.get("clio-kit", {{}}).get("native_execution_capability_verified") is True
-    and runtime.get("jarvis-cd", {{}}).get("verified") is True
-):
-    raise SystemExit("prepared relay generation runtime identity did not verify")
+jarvis_runtime = runtime.get("jarvis-cd", {{}})
+checks = {{
+    "receipt_matches_install": info.get("receipt_matches_install") is True,
+    "clio-relay.persistent_tool_verified": (
+        runtime.get("clio-relay", {{}}).get("persistent_tool_verified") is True
+    ),
+    "clio-kit.persistent_tool_verified": (
+        runtime.get("clio-kit", {{}}).get("persistent_tool_verified") is True
+    ),
+    "clio-kit.native_execution_capability_verified": (
+        runtime.get("clio-kit", {{}}).get("native_execution_capability_verified") is True
+    ),
+    "jarvis-cd.verified": jarvis_runtime.get("verified") is True,
+}}
+if checks["jarvis-cd.verified"] is False:
+    record_closure = jarvis_runtime.get("execution_record_closure", {{}})
+    record_closure_error_code = (
+        record_closure.get("error_code") if isinstance(record_closure, dict) else None
+    )
+    checks.update({{
+        "jarvis-cd.distribution_identity_verified": (
+            jarvis_runtime.get("distribution_identity_verified") is True
+        ),
+        "jarvis-cd.runtime_artifact_path_verified": (
+            jarvis_runtime.get("runtime_artifact_path_verified") is True
+        ),
+        "jarvis-cd.artifact_sha256_verified": (
+            jarvis_runtime.get("artifact_sha256_verified") is True
+        ),
+        "jarvis-cd.execution_interpreter_verified": (
+            jarvis_runtime.get("execution_interpreter_verified") is True
+        ),
+        "jarvis-cd.execution_record_closure_verified": (
+            jarvis_runtime.get("execution_record_closure_verified") is True
+        ),
+        "jarvis-cd.native_execution_capability_verified": (
+            jarvis_runtime.get("native_execution_capability_verified") is True
+        ),
+        "jarvis-cd.jarvis_executable_verified": (
+            jarvis_runtime.get("jarvis_executable_verified") is True
+        ),
+    }})
+    if (
+        isinstance(record_closure_error_code, str)
+        and 0 < len(record_closure_error_code) <= 96
+        and all(
+            character.isascii() and (character.isalnum() or character == "-")
+            for character in record_closure_error_code
+        )
+    ):
+        checks[
+            "jarvis-cd.execution_record_closure_error." + record_closure_error_code
+        ] = False
+failed_checks = sorted(name for name, verified in checks.items() if not verified)
+if failed_checks:
+    raise SystemExit(
+        "prepared relay generation runtime identity did not verify: "
+        + ", ".join(failed_checks)
+    )
 __CLIO_RELAY_VERIFY_GENERATION__
     unset CLIO_RELAY_INSTALL_RECEIPT
     BOOTSTRAP_LEGACY_IDENTITY_AFTER="$(
@@ -4463,7 +4850,7 @@ __CLIO_RELAY_GENERATION_MANIFEST__
     echo "prepared generation relay launcher is not a symbolic link" >&2
     return 1
   fi
-  RELAY_PROVIDER_PYTHON="$(sed -n '1{{s/^#!//;p;}}' "$RELAY_EXECUTABLE")"
+  RELAY_PROVIDER_PYTHON="$BOOTSTRAP_GENERATION/tools/clio-relay/bin/python"
   if [ ! -x "$RELAY_PROVIDER_PYTHON" ]; then
     echo "prepared generation provider is unavailable" >&2
     return 1
@@ -4647,7 +5034,8 @@ __CLIO_RELAY_STAGED_REPOSITORY_EVIDENCE__
       if BOOTSTRAP_WORKER_EVIDENCE="$(
         CLIO_RELAY_CORE_DIR={rendered_core_dir} \
           "$HOME/.local/bin/clio-relay" endpoint worker-info \
-            --cluster "$WORKER_CLUSTER_NAME" --freshness-seconds 120 2>/dev/null
+            --cluster "$WORKER_CLUSTER_NAME" --freshness-seconds 120 \
+            --readiness-only 2>/dev/null
       )"; then
         export BOOTSTRAP_WORKER_EVIDENCE
         if python3 -c \
@@ -4678,7 +5066,7 @@ __CLIO_RELAY_STAGED_REPOSITORY_EVIDENCE__
 
   BOOTSTRAP_COMPLETED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
   export BOOTSTRAP_COMPLETED_NS
-  "$CURRENT_RELAY_PROVIDER" - <<'__CLIO_RELAY_RECONCILE_RECEIPT__'
+  bootstrap_provider_exec - <<'__CLIO_RELAY_RECONCILE_RECEIPT__'
 import json
 import os
 from datetime import datetime
@@ -4823,6 +5211,7 @@ bootstrap_repair_transaction_exit() {{
   if [ "$status" -ne 0 ]; then
     echo "bootstrap readiness repair did not complete; queue migration state is retained" >&2
   fi
+  bootstrap_restore_fenced_worker_on_failure "$status"
   bootstrap_release_worker_lifetime_guard 2>/dev/null || true
   bootstrap_cleanup_preparing_root || true
   exit "$status"
@@ -4872,6 +5261,15 @@ bootstrap_reuse_repair() {{
 
   bootstrap_candidate_action journal-advance fenced
   bootstrap_candidate_action journal-advance activating
+  BOOTSTRAP_JARVIS_BINDING_REPAIR="$(
+    bootstrap_candidate_action repair-managed-binding
+  )"
+  export BOOTSTRAP_JARVIS_BINDING_REPAIR
+  BOOTSTRAP_JARVIS_BINDING_REPAIR_SHA256="$(
+    printf '%s' "$BOOTSTRAP_JARVIS_BINDING_REPAIR" | sha256sum | awk '{{print $1}}'
+  )"
+  bootstrap_candidate_action journal-phase managed_repository_repaired \
+    "$BOOTSTRAP_JARVIS_BINDING_REPAIR_SHA256"
   bootstrap_candidate_action journal-advance activated
   bootstrap_candidate_action journal-advance migration_started
   trap bootstrap_repair_transaction_exit EXIT
@@ -4941,7 +5339,8 @@ bootstrap_reuse_repair() {{
       if BOOTSTRAP_WORKER_EVIDENCE="$(
         CLIO_RELAY_CORE_DIR={rendered_core_dir} \
           "$HOME/.local/bin/clio-relay" endpoint worker-info \
-            --cluster "$WORKER_CLUSTER_NAME" --freshness-seconds 120 2>/dev/null
+            --cluster "$WORKER_CLUSTER_NAME" --freshness-seconds 120 \
+            --readiness-only 2>/dev/null
       )"; then
         export BOOTSTRAP_WORKER_EVIDENCE
         if python3 -c \
@@ -4967,7 +5366,8 @@ bootstrap_reuse_repair() {{
   bootstrap_candidate_action journal-advance committed
   BOOTSTRAP_COMPLETED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
   export BOOTSTRAP_COMPLETED_NS
-  CURRENT_RELAY_PROVIDER="$(sed -n '1{{s/^#!//;p;}}' "$HOME/.local/bin/clio-relay")"
+  CURRENT_RELAY_PROVIDER="$BOOTSTRAP_CURRENT_PROVIDER"
+  test -x "$CURRENT_RELAY_PROVIDER"
   "$CURRENT_RELAY_PROVIDER" - <<'__CLIO_RELAY_REPAIR_RECEIPT__'
 import json
 import os
@@ -4977,6 +5377,7 @@ from pathlib import Path
 from clio_relay.bootstrap_reconcile import (
     BootstrapDesiredState,
     BootstrapTransactionJournal,
+    JarvisStateEvidence,
     inspect_exact_bootstrap_noop,
     make_bootstrap_receipt,
     write_bootstrap_receipt,
@@ -4998,6 +5399,14 @@ inspection = inspect_exact_bootstrap_noop(
 )
 if not inspection.exact_match:
     raise SystemExit("readiness repair did not pass exact inspection: " + repr(inspection.reasons))
+binding_repair = json.loads(os.environ["BOOTSTRAP_JARVIS_BINDING_REPAIR"])
+if (
+    binding_repair.get("schema_version") != "clio-relay.bootstrap-binding-repair.v1"
+    or binding_repair.get("after") != inspection.jarvis_state.model_dump(mode="json")
+    or not isinstance(binding_repair.get("before"), dict)
+    or not isinstance(binding_repair.get("binding"), dict)
+):
+    raise SystemExit("readiness repair JARVIS binding evidence is invalid")
 started_ns = int(os.environ["BOOTSTRAP_INVOCATION_STARTED_NS"])
 completed_ns = int(os.environ["BOOTSTRAP_COMPLETED_NS"])
 duration = (completed_ns - started_ns) / 1_000_000_000
@@ -5022,6 +5431,8 @@ receipt = make_bootstrap_receipt(
     queue_duration_seconds=(
         int(os.environ["BOOTSTRAP_QUEUE_DURATION_NS"]) / 1_000_000_000
     ),
+    jarvis_state_before=JarvisStateEvidence.model_validate(binding_repair["before"]),
+    jarvis_repo_reconciliation=binding_repair["binding"],
     payload_transfer_count=int(os.environ["BOOTSTRAP_PAYLOAD_TRANSFER_COUNT"]),
     payload_transfer_bytes=int(os.environ["BOOTSTRAP_PAYLOAD_TRANSFER_BYTES"]),
 )
@@ -5224,6 +5635,45 @@ while IFS= read -r variable_name; do
   esac
 done < <(compgen -e)
 mkdir -p "$HOME/.local/bin" "$HOME/.local/src" "$HOME/.local/share/clio-relay"
+bootstrap_active_generation_identity() {{
+  local current target prefix identity
+  current="$HOME/.local/share/clio-relay/current"
+  if [ ! -L "$current" ]; then
+    echo "bootstrap current generation pointer is not a symbolic link" >&2
+    return 1
+  fi
+  target="$(readlink -f "$current")"
+  prefix="$(readlink -f "$HOME/.local/share/clio-relay/generations")/"
+  case "$target" in
+    "$prefix"*) identity="${{target#"$prefix"}}" ;;
+    *)
+      echo "bootstrap current pointer does not name one managed generation" >&2
+      return 1
+      ;;
+  esac
+  case "$identity" in
+    (*[!0-9a-f]*|'')
+      echo "bootstrap current generation identity is invalid" >&2
+      return 1
+      ;;
+  esac
+  if [ "${{#identity}}" -ne 64 ]; then
+    echo "bootstrap current generation identity has an invalid length" >&2
+    return 1
+  fi
+  echo "$identity"
+}}
+bootstrap_active_generation_provider() {{
+  local identity generations provider
+  identity="$(bootstrap_active_generation_identity)" || return 1
+  generations="$(readlink -f "$HOME/.local/share/clio-relay/generations")"
+  provider="$generations/$identity/tools/clio-relay/bin/python"
+  if [ ! -f "$provider" ] || [ ! -x "$provider" ]; then
+    echo "bootstrap active generation provider is unavailable" >&2
+    return 1
+  fi
+  echo "$provider"
+}}
 command -v flock >/dev/null 2>&1 || {{
   echo "flock is required to serialize clio-relay bootstrap" >&2
   exit 1
@@ -5540,7 +5990,12 @@ __CLIO_RELAY_RECEIPT_CLASSIFY__
   fi
 fi
 if [ -x "$BOOTSTRAP_CURRENT_RELAY" ]; then
-  BOOTSTRAP_CURRENT_PROVIDER="$(sed -n '1{{s/^#!//;p;}}' "$BOOTSTRAP_CURRENT_RELAY")"
+  BOOTSTRAP_CURRENT_PROVIDER="$(bootstrap_active_generation_provider 2>/dev/null || true)"
+  if [ -z "$BOOTSTRAP_CURRENT_PROVIDER" ] && \
+     [ -f "$UV_TOOL_DIR/clio-relay/bin/python" ] && \
+     [ -x "$UV_TOOL_DIR/clio-relay/bin/python" ]; then
+    BOOTSTRAP_CURRENT_PROVIDER="$UV_TOOL_DIR/clio-relay/bin/python"
+  fi
 fi
 if [ "$BOOTSTRAP_RECOVERY_REQUIRED" = "0" ] && \
    [ "$BOOTSTRAP_LEGACY_RELAY_PROVIDER" = "0" ] && \
@@ -5575,7 +6030,7 @@ if [ "$BOOTSTRAP_RECOVERY_REQUIRED" = "0" ] && \
           CLIO_RELAY_CORE_DIR={rendered_core_dir} \
             timeout 20 "$BOOTSTRAP_CURRENT_RELAY" endpoint worker-info \
               --cluster {shlex.quote(cluster or "")} --freshness-seconds 120 \
-              2>/dev/null || true
+              --readiness-only 2>/dev/null || true
         )"
       fi
     fi
@@ -6498,7 +6953,7 @@ JARVIS_MCP_UV_EXECUTABLE="$(command -v uv)"
 test -x "$JARVIS_MCP_UV_EXECUTABLE"
 JARVIS_MCP_EXECUTABLE="$(uv tool dir --bin --no-config)/clio-kit"
 test -x "$JARVIS_MCP_EXECUTABLE"
-JARVIS_MCP_PROVIDER_PYTHON="$(sed -n '1{{s/^#!//;p;}}' "$JARVIS_MCP_EXECUTABLE")"
+JARVIS_MCP_PROVIDER_PYTHON="$UV_TOOL_DIR/clio-kit/bin/python"
 test -x "$JARVIS_MCP_PROVIDER_PYTHON"
 JARVIS_MCP_INSTALLED_VERSION="$("$JARVIS_MCP_PROVIDER_PYTHON" -c \
   'from importlib.metadata import version; print(version("clio-kit"))')"
@@ -6592,7 +7047,7 @@ RELAY_UV_EXECUTABLE="$(command -v uv)"
 test -x "$RELAY_UV_EXECUTABLE"
 RELAY_EXECUTABLE="$(uv tool dir --bin --no-config)/clio-relay"
 test -x "$RELAY_EXECUTABLE"
-RELAY_PROVIDER_PYTHON="$(sed -n '1{{s/^#!//;p;}}' "$RELAY_EXECUTABLE")"
+RELAY_PROVIDER_PYTHON="$UV_TOOL_DIR/clio-relay/bin/python"
 test -x "$RELAY_PROVIDER_PYTHON"
 uv pip install --python "$JARVIS_VENV/bin/python" \\
   --default-index https://pypi.org/simple \\
@@ -7284,7 +7739,8 @@ if [ "$BOOTSTRAP_SERVICE_ACTIVE_AFTER" = "1" ]; then
     if BOOTSTRAP_WORKER_EVIDENCE="$(
       CLIO_RELAY_CORE_DIR={rendered_core_dir} \
         "$HOME/.local/bin/clio-relay" endpoint worker-info \
-          --cluster "$WORKER_CLUSTER_NAME" --freshness-seconds 120 2>/dev/null
+          --cluster "$WORKER_CLUSTER_NAME" --freshness-seconds 120 \
+          --readiness-only 2>/dev/null
     )"; then
       export BOOTSTRAP_WORKER_EVIDENCE
       if python3 -c \

@@ -17,12 +17,14 @@ from pytest import MonkeyPatch
 from clio_relay.browser_gateway import BrowserAttachmentGrant, BrowserDetachmentResult
 from clio_relay.cluster_config import ClusterDefinition, LiveTestConfig
 from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.jarvis_service_runtime import JarvisServiceRuntimeHandoff
 from clio_relay.live_acceptance import (
     CommandRunner,
     LiveAcceptanceOptions,
     SecureRuntimeHttpEvidence,
     SecureRuntimeProbeConfig,
     SecureRuntimeProtocolAdapter,
+    _AcceptanceObservationPending,  # pyright: ignore[reportPrivateUsage]
     _assert_progress_adapter,  # pyright: ignore[reportPrivateUsage]
     _assert_secret_free_document,  # pyright: ignore[reportPrivateUsage]
     _browser_json_observation,  # pyright: ignore[reportPrivateUsage]
@@ -36,6 +38,7 @@ from clio_relay.live_acceptance import (
     _require_secure_runtime_control_capacity,  # pyright: ignore[reportPrivateUsage]
     _secure_runtime_probe_config,  # pyright: ignore[reportPrivateUsage]
     _select_secure_runtime_handoff,  # pyright: ignore[reportPrivateUsage]
+    _validated_secure_runtime_pending_bind,  # pyright: ignore[reportPrivateUsage]
     _verify_cluster_deployment,  # pyright: ignore[reportPrivateUsage]
     _verify_live_package_progress,  # pyright: ignore[reportPrivateUsage]
     _verify_runtime_metadata_artifact,  # pyright: ignore[reportPrivateUsage]
@@ -58,6 +61,7 @@ from clio_relay.validation_report import (
     TransportCleanupResourceEvidence,
     TransportProbeEvidence,
     ValidationRecorder,
+    ValidationStatus,
     load_validation_report,
     new_live_validation_report,
     transport_probe_evidence_line,
@@ -452,7 +456,10 @@ def test_secure_runtime_acceptance_metadata_poll_is_bounded() -> None:
         calls += 1
         return _completed(command, json.dumps(_live_source_status(JobState.RUNNING)))
 
-    with pytest.raises(RelayError, match="timed out waiting for structured runtime metadata"):
+    with pytest.raises(
+        RelayError,
+        match="timed out waiting for structured runtime metadata",
+    ) as pending:
         _wait_for_live_structured_runtime_metadata(
             ClusterDefinition(name="test-cluster", ssh_host="test-host"),
             _LIVE_SOURCE_JOB_ID,
@@ -464,6 +471,9 @@ def test_secure_runtime_acceptance_metadata_poll_is_bounded() -> None:
         )
 
     assert calls == 1
+    pending_observation = cast(_AcceptanceObservationPending, pending.value)
+    assert pending_observation.phase == "secure_runtime_metadata"
+    assert pending_observation.identifiers == {"primary_job_id": _LIVE_SOURCE_JOB_ID}
 
 
 def test_secure_runtime_acceptance_rejects_unsupported_metadata_schema() -> None:
@@ -656,6 +666,152 @@ def test_secure_runtime_orchestration_never_waits_for_outer_job_terminal(
     assert source.state == "running"
     assert source.metadata["retained"] is True
     assert source.metadata["cancel_scheduler_job"] is False
+
+
+def test_secure_runtime_query_pending_report_resumes_exact_execution(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A secure query deadline retains source and execution IDs without resubmission."""
+    pipeline = tmp_path / "secure-runtime.yaml"
+    pipeline.write_text("name: secure-runtime\npkgs: []\n", encoding="utf-8")
+    pending_path = tmp_path / "secure-pending.json"
+    passed_path = tmp_path / "secure-passed.json"
+    submitted = 0
+    remote_calls = 0
+    verifier_calls = 0
+    config = SecureRuntimeProbeConfig(
+        package_name="builtin.paraview",
+        command={"command_id": "view-command-41"},
+        protocol_adapter=_secure_runtime_protocol_adapter(),
+    )
+
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        nonlocal submitted, remote_calls
+        del input
+        remote_calls += 1
+        script = command[-1]
+        if "mkdir -p" in script or "cat >" in script:
+            return _completed(command, "")
+        if "worker status --cluster test-cluster" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    {
+                        "configured_workload_concurrency": 2,
+                        "configured_control_query_concurrency": 1,
+                        "control_query_concurrency_consistent": True,
+                        "active_leases_by_mcp_admission_class": {
+                            "workload": 0,
+                            "control_query": 0,
+                        },
+                        "scan_truncated": False,
+                    }
+                ),
+            )
+        if "job submit" in script:
+            submitted += 1
+            return _completed(command, f"{_LIVE_SOURCE_JOB_ID}\n")
+        if f"job status {_LIVE_SOURCE_JOB_ID}" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    _live_source_status(
+                        JobState.RUNNING,
+                        runtime_metadata=_structured_live_runtime_metadata(),
+                    )
+                ),
+            )
+        raise AssertionError(f"unexpected command: {command}")
+
+    def verify_secure_runtime(
+        _options: LiveAcceptanceOptions,
+        *,
+        config: SecureRuntimeProbeConfig,
+        runtime_metadata: dict[str, Any],
+        recorder: ValidationRecorder,
+    ) -> set[str]:
+        nonlocal verifier_calls
+        del config, recorder
+        verifier_calls += 1
+        assert runtime_metadata["pipeline_id"] == "pipeline-live-41"
+        assert runtime_metadata["execution_id"] == "execution-live-41"
+        if verifier_calls == 1:
+            raise _AcceptanceObservationPending(
+                "timed out waiting for one ready JARVIS service runtime binding",
+                phase="secure_runtime_query",
+                identifiers={
+                    "pipeline_id": "pipeline-live-41",
+                    "execution_id": "execution-live-41",
+                },
+            )
+        return set()
+
+    def fake_cluster_doctor(_definition: ClusterDefinition) -> list[str]:
+        return ["cluster: test-cluster"]
+
+    def configured_probe(_pipeline_yaml: str) -> SecureRuntimeProbeConfig:
+        return config
+
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.run_cluster_doctor",
+        fake_cluster_doctor,
+    )
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance._secure_runtime_probe_config",
+        configured_probe,
+    )
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance._verify_secure_runtime_acceptance",
+        verify_secure_runtime,
+    )
+    definition = ClusterDefinition(name="test-cluster", ssh_host="test-host")
+
+    def acceptance_options(
+        report_path: Path,
+        *,
+        resume_report_path: Path | None = None,
+    ) -> LiveAcceptanceOptions:
+        return LiveAcceptanceOptions(
+            cluster="test-cluster",
+            definition=definition,
+            jarvis_yaml=pipeline,
+            timeout_seconds=1,
+            poll_seconds=0.01,
+            report_path=report_path,
+            resume_report_path=resume_report_path,
+        )
+
+    run_live_acceptance(
+        acceptance_options(pending_path),
+        runner=fake_runner,
+    )
+    pending = load_validation_report(pending_path)
+    checkpoint = next(
+        resource.metadata["checkpoint"]
+        for resource in pending.resources
+        if resource.kind == "live_acceptance_checkpoint"
+    )
+    assert pending.status is ValidationStatus.PENDING
+    assert checkpoint["phase"] == "secure_runtime_query"
+    assert checkpoint["pipeline_id"] == "pipeline-live-41"
+    assert checkpoint["execution_id"] == "execution-live-41"
+    assert checkpoint["primary_job_id"] == _LIVE_SOURCE_JOB_ID
+    first_remote_calls = remote_calls
+
+    run_live_acceptance(
+        acceptance_options(passed_path, resume_report_path=pending_path),
+        runner=fake_runner,
+    )
+    passed = load_validation_report(passed_path)
+    assert passed.status is ValidationStatus.PASSED
+    assert submitted == 1
+    assert verifier_calls == 2
+    assert remote_calls == first_remote_calls
 
 
 def test_secure_runtime_capacity_failure_records_pre_submission_evidence() -> None:
@@ -1893,6 +2049,223 @@ def test_live_acceptance_uses_fresh_idempotency_key_per_run(
     assert "live-test:test-cluster:" in submitted_scripts[1]
 
 
+def test_live_acceptance_pending_wait_resumes_exact_job_without_resubmission(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Repeated bounded observations retain one exact HPC workload indefinitely."""
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text("name: generic\npkgs: []\n", encoding="utf-8")
+    first_report_path = tmp_path / "pending.json"
+    second_report_path = tmp_path / "pending-again.json"
+    final_report_path = tmp_path / "passed.json"
+    job_id = "job_11111111111111111111111111111111"
+    submitted = 0
+
+    def fake_cluster_doctor(_definition: ClusterDefinition) -> list[str]:
+        return ["cluster: test-cluster"]
+
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.run_cluster_doctor",
+        fake_cluster_doctor,
+    )
+
+    def runner_for_state(state: str) -> CommandRunner:
+        def fake_runner(
+            command: list[str],
+            *,
+            input: bytes | None = None,
+        ) -> subprocess.CompletedProcess[bytes]:
+            nonlocal submitted
+            del input
+            script = command[-1]
+            if "mkdir -p" in script or "cat >" in " ".join(command):
+                return _completed(command, "")
+            if "job submit" in script:
+                submitted += 1
+                return _completed(command, f"{job_id}\n")
+            if "job wait" in script:
+                return _completed(command, json.dumps({"job_id": job_id, "state": state}))
+            if "job monitor" in script:
+                return _completed(
+                    command,
+                    json.dumps(
+                        {
+                            "events": [
+                                {"event_type": "job.queued"},
+                                {"event_type": "job.running"},
+                                {"event_type": "jarvis.started"},
+                                {"event_type": "job.succeeded"},
+                            ]
+                        }
+                    ),
+                )
+            if "job tasks" in script:
+                return _completed(
+                    command,
+                    json.dumps([{"task_id": "task_abc", "state": "succeeded"}]),
+                )
+            if "read-log" in script and "--stream stdout" in script:
+                return _completed(command, json.dumps({"next_offset": 12}))
+            if "read-log" in script and "--stream stderr" in script:
+                return _completed(command, json.dumps({"next_offset": 0}))
+            if "list-artifacts" in script:
+                return _completed(
+                    command,
+                    json.dumps(
+                        [
+                            {"artifact_id": "artifact_pipeline", "kind": "jarvis_pipeline"},
+                            {"artifact_id": "artifact_stdout", "kind": "stdout"},
+                            {"artifact_id": "artifact_stderr", "kind": "stderr"},
+                            {"artifact_id": "artifact_provenance", "kind": "provenance"},
+                        ]
+                    ),
+                )
+            if "read-artifact" in script:
+                return _completed(
+                    command,
+                    json.dumps({"encoding": "base64", "data": "aGVsbG8="}),
+                )
+            raise AssertionError(f"unexpected command: {command}")
+
+        return fake_runner
+
+    definition = ClusterDefinition(name="test-cluster", ssh_host="test-host")
+
+    def acceptance_options(
+        report_path: Path,
+        *,
+        resume_report_path: Path | None = None,
+    ) -> LiveAcceptanceOptions:
+        return LiveAcceptanceOptions(
+            cluster="test-cluster",
+            definition=definition,
+            jarvis_yaml=pipeline,
+            timeout_seconds=1,
+            poll_seconds=0.01,
+            report_path=report_path,
+            resume_report_path=resume_report_path,
+        )
+
+    first_lines = run_live_acceptance(
+        acceptance_options(first_report_path),
+        runner=runner_for_state("queued"),
+    )
+    first = load_validation_report(first_report_path)
+    assert first.status is ValidationStatus.PENDING
+    assert "validation.status=pending" in first_lines
+    checkpoint_resource = next(
+        resource for resource in first.resources if resource.kind == "live_acceptance_checkpoint"
+    )
+    first_selector = checkpoint_resource.metadata["retry_selector"]
+    assert first_selector["primary_job_id"] == job_id
+    assert checkpoint_resource.metadata["checkpoint_has_ttl"] is False
+    assert submitted == 1
+
+    second_lines = run_live_acceptance(
+        acceptance_options(second_report_path, resume_report_path=first_report_path),
+        runner=runner_for_state("running"),
+    )
+    second = load_validation_report(second_report_path)
+    second_checkpoint = next(
+        resource for resource in second.resources if resource.kind == "live_acceptance_checkpoint"
+    )
+    assert second.status is ValidationStatus.PENDING
+    assert "validation.status=pending" in second_lines
+    assert second_checkpoint.metadata["retry_selector"] == first_selector
+    assert submitted == 1
+
+    final_lines = run_live_acceptance(
+        acceptance_options(final_report_path, resume_report_path=second_report_path),
+        runner=runner_for_state("succeeded"),
+    )
+    final = load_validation_report(final_report_path)
+    assert final.status is ValidationStatus.PASSED
+    assert "acceptance.job_state=succeeded" in final_lines
+    assert submitted == 1
+    assert not any(resource.kind == "live_acceptance_checkpoint" for resource in final.resources)
+
+
+def test_live_acceptance_rejects_tampered_resume_before_remote_mutation(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Checkpoint identity and integrity are verified before SSH or relay submission."""
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text("name: generic\npkgs: []\n", encoding="utf-8")
+    pending_path = tmp_path / "pending.json"
+    tampered_path = tmp_path / "tampered.json"
+    resumed_path = tmp_path / "resume-failure.json"
+    job_id = "job_22222222222222222222222222222222"
+
+    def fake_cluster_doctor(_definition: ClusterDefinition) -> list[str]:
+        return ["cluster: test-cluster"]
+
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance.run_cluster_doctor",
+        fake_cluster_doctor,
+    )
+
+    def initial_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        script = command[-1]
+        if "mkdir -p" in script or "cat >" in " ".join(command):
+            return _completed(command, "")
+        if "job submit" in script:
+            return _completed(command, f"{job_id}\n")
+        if "job wait" in script:
+            return _completed(command, json.dumps({"job_id": job_id, "state": "queued"}))
+        raise AssertionError(f"unexpected command: {command}")
+
+    options = LiveAcceptanceOptions(
+        cluster="test-cluster",
+        definition=ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+        jarvis_yaml=pipeline,
+        report_path=pending_path,
+        timeout_seconds=1,
+        poll_seconds=0.01,
+    )
+    run_live_acceptance(options, runner=initial_runner)
+    document = json.loads(pending_path.read_text(encoding="utf-8"))
+    checkpoint = next(
+        resource
+        for resource in document["resources"]
+        if resource["kind"] == "live_acceptance_checkpoint"
+    )
+    checkpoint["metadata"]["checkpoint"]["primary_job_id"] = "job_ffffffffffffffffffffffffffffffff"
+    tampered_path.write_text(json.dumps(document), encoding="utf-8")
+    remote_calls = 0
+
+    def forbidden_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        nonlocal remote_calls
+        del input
+        remote_calls += 1
+        raise AssertionError(f"resume must fail before remote command: {command}")
+
+    with pytest.raises(ConfigurationError, match="checkpoint is invalid"):
+        run_live_acceptance(
+            LiveAcceptanceOptions(
+                cluster="test-cluster",
+                definition=options.definition,
+                jarvis_yaml=pipeline,
+                report_path=resumed_path,
+                resume_report_path=tampered_path,
+                timeout_seconds=1,
+                poll_seconds=0.01,
+            ),
+            runner=forbidden_runner,
+        )
+    assert remote_calls == 0
+
+
 def test_live_acceptance_requires_agent_child_job_when_mcp_configured(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -3078,7 +3451,7 @@ def test_secure_runtime_ready_binding_wait_is_bounded(
     with pytest.raises(
         RelayError,
         match="timed out waiting for one ready JARVIS service runtime binding",
-    ):
+    ) as pending:
         _verify_secure_runtime_acceptance(
             LiveAcceptanceOptions(
                 cluster=cluster,
@@ -3101,6 +3474,70 @@ def test_secure_runtime_ready_binding_wait_is_bounded(
         )
 
     assert calls == 1
+    pending_observation = cast(_AcceptanceObservationPending, pending.value)
+    assert pending_observation.phase == "secure_runtime_query"
+    assert pending_observation.identifiers == {
+        "pipeline_id": "pipeline-readiness-timeout",
+        "execution_id": "execution-readiness-timeout",
+    }
+
+
+def test_secure_runtime_pending_bind_retains_exact_gateway_without_urls() -> None:
+    """A bind observation boundary exposes only its durable resume identity."""
+    handoff = {
+        "cluster": "operator-pending-bind",
+        "source_job_id": "job_pending_bind",
+        "source_artifact_id": "artifact_pending_bind",
+        "package_id": "paraview-pending",
+        "package_name": "builtin.paraview",
+        "service_instance_id": "visualizer-pending",
+    }
+    gateway_session_id = "gateway_pending_bind"
+    gateway = GatewaySession(
+        session_id=gateway_session_id,
+        cluster=handoff["cluster"],
+        name="pending-viewer",
+        state=GatewaySessionState.STARTING,
+        scheduler="slurm",
+        scheduler_job_id="99123",
+        gateway={
+            "jarvis_runtime_binding": {
+                "source_relay_job_id": handoff["source_job_id"],
+                "source_relay_artifact_id": handoff["source_artifact_id"],
+                "package_id": handoff["package_id"],
+                "package_name": handoff["package_name"],
+                "service_instance_id": handoff["service_instance_id"],
+            }
+        },
+        metadata={"owner": "clio-relay"},
+    )
+    result = {
+        "outcome": "pending",
+        "gateway_session_id": gateway_session_id,
+        "gateway_session": gateway.model_dump(mode="json"),
+        "retry_selector": {
+            "cluster": handoff["cluster"],
+            "gateway_session_id": gateway_session_id,
+            "scheduler_provider": "slurm",
+            "scheduler_job_id": "99123",
+        },
+        "scheduler_action": "none",
+        "relay_action": "none",
+        "scheduler_cancel_requested": False,
+        "connect_url": None,
+        "health_url": None,
+        "stream_url": None,
+        "events_url": None,
+        "state_url": None,
+        "command_url": None,
+    }
+
+    observed = _validated_secure_runtime_pending_bind(
+        result,
+        handoff=JarvisServiceRuntimeHandoff.model_validate(handoff),
+    )
+
+    assert observed == gateway_session_id
 
 
 def test_secure_runtime_late_ready_binding_fails_deadline(
