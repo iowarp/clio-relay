@@ -571,7 +571,13 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
             return subprocess.CompletedProcess(
                 command,
                 0,
-                "bootstrap_receipt=/home/test/.local/share/clio-relay/bootstrap-receipt.json\n",
+                (
+                    "bootstrap_receipt="
+                    "/home/test/.local/share/clio-relay/bootstrap-receipt.json\n"
+                    "bootstrap_receipt_json="
+                    + json.dumps(receipt_document, sort_keys=True, separators=(",", ":"))
+                    + "\n"
+                ),
                 "",
             )
         if command[-2:] == ["cat", "$HOME/.local/share/clio-relay/bootstrap-receipt.json"]:
@@ -607,6 +613,7 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
         ssh_host="ares",
         source_root=tmp_path,
         relay_artifact_sha256="a" * 64,
+        jarvis_resource_graph_profile="ares",
     )
 
     assert lines[0].startswith("bootstrap_receipt=")
@@ -641,7 +648,11 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
         bootstrap.BOOTSTRAP_REMOTE_SCRIPT_TIMEOUT_SECONDS
         >= deployment.ENDPOINT_SERVICE_START_OBSERVATION_TIMEOUT_SECONDS + 60
     )
-    assert 'exec 9>"$HOME/.local/share/clio-relay/bootstrap.lock"' in uploaded_scripts[0]
+    assert (
+        'descriptor = os.open("bootstrap.lock", flags, 0o600, dir_fd=directory_descriptor)'
+        in uploaded_scripts[0]
+    )
+    assert "fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)" in uploaded_scripts[0]
     assert "sha256sum --check --strict" in uploaded_scripts[0]
     assert "/tmp/clio-relay-head.tar" not in uploaded_scripts[0]
 
@@ -652,6 +663,7 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
             ssh_host="ares",
             source_root=tmp_path,
             relay_artifact_sha256="a" * 64,
+            jarvis_resource_graph_profile="ares",
         )
     assert calls[-1][-1] == "/tmp/clio-relay-bootstrap_abc"
 

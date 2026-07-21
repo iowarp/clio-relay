@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import base64
+import ctypes
+import errno
 import hashlib
 import json
 import math
 import os
+import platform
 import secrets
 import shlex
 import signal
@@ -116,6 +119,11 @@ _REMOTE_RUNTIME_COMMAND_TIMEOUT_SECONDS = 120.0
 _LOCAL_CLEANUP_COMMAND_TIMEOUT_SECONDS = 30.0
 _CONNECTOR_STEP_CLEANUP_TIMEOUT_SECONDS = 30.0
 _CONNECTOR_STEP_CLEANUP_POLL_SECONDS = 0.25
+# Linux assigns these values to both x86-64 and asm-generic syscall ABIs.
+# libc symbols remain the preferred fallback when CPython omits its wrappers.
+_LINUX_PIDFD_SEND_SIGNAL_SYSCALL_NUMBER = 424
+_LINUX_PIDFD_OPEN_SYSCALL_NUMBER = 434
+_LINUX_PIDFD_RAW_SYSCALL_MACHINES = frozenset({"aarch64", "amd64", "arm64", "x86_64"})
 _TERMINAL_RUNTIME_STATES = {
     "canceled",
     "cancelled",
@@ -6567,8 +6575,11 @@ mkdir -p "$session_dir"
 exec 9>"$session_dir/transition.lock"
 flock -w 10 -x 9 || {{ echo "connector stop lock timed out" >&2; exit 75; }}
 python3 - "$metadata_file" "$pid_file" "$pid" "$session_id" <<'__CLIO_STOP_CONNECTOR__'
+import ctypes
+import errno
 import json
 import os
+import platform
 import signal
 import sys
 import time
@@ -6636,13 +6647,72 @@ def owned_group_processes():
     return sorted(matches)
 
 
+def open_process_fd(member_pid):
+    native_open = getattr(os, "pidfd_open", None)
+    if callable(native_open):
+        return native_open(member_pid, 0)
+    library = ctypes.CDLL(None, use_errno=True)
+    libc_open = getattr(library, "pidfd_open", None)
+    ctypes.set_errno(0)
+    if libc_open is not None:
+        libc_open.argtypes = [ctypes.c_int, ctypes.c_uint]
+        libc_open.restype = ctypes.c_int
+        descriptor = libc_open(member_pid, 0)
+    else:
+        if platform.machine().lower() not in ("aarch64", "amd64", "arm64", "x86_64"):
+            raise RuntimeError("raw pidfd_open syscall ABI is unavailable")
+        syscall = library.syscall
+        syscall.restype = ctypes.c_long
+        descriptor = syscall(
+            ctypes.c_long({_LINUX_PIDFD_OPEN_SYSCALL_NUMBER}),
+            ctypes.c_int(member_pid),
+            ctypes.c_uint(0),
+        )
+    if descriptor < 0:
+        error = ctypes.get_errno() or errno.ENOSYS
+        raise OSError(error, os.strerror(error))
+    return descriptor
+
+
+def send_process_fd_signal(process_fd, sig):
+    native_send = getattr(signal, "pidfd_send_signal", None)
+    if callable(native_send):
+        native_send(process_fd, sig, None, 0)
+        return
+    library = ctypes.CDLL(None, use_errno=True)
+    libc_send = getattr(library, "pidfd_send_signal", None)
+    ctypes.set_errno(0)
+    if libc_send is not None:
+        libc_send.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        ]
+        libc_send.restype = ctypes.c_int
+        result = libc_send(process_fd, sig, None, 0)
+    else:
+        if platform.machine().lower() not in ("aarch64", "amd64", "arm64", "x86_64"):
+            raise RuntimeError("raw pidfd_send_signal syscall ABI is unavailable")
+        syscall = library.syscall
+        syscall.restype = ctypes.c_long
+        result = syscall(
+            ctypes.c_long({_LINUX_PIDFD_SEND_SIGNAL_SYSCALL_NUMBER}),
+            ctypes.c_int(process_fd),
+            ctypes.c_int(sig),
+            ctypes.c_void_p(),
+            ctypes.c_uint(0),
+        )
+    if result < 0:
+        error = ctypes.get_errno() or errno.ENOSYS
+        raise OSError(error, os.strerror(error))
+
+
 def signal_owned_processes(sig):
-    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
-        raise RuntimeError("race-safe pidfd connector cleanup is unavailable")
     signaled = []
     for member_pid in owned_group_processes():
         try:
-            process_fd = os.pidfd_open(member_pid, 0)
+            process_fd = open_process_fd(member_pid)
         except ProcessLookupError:
             continue
         except OSError as exc:
@@ -6651,7 +6721,7 @@ def signal_owned_processes(sig):
             if member_pid not in owned_group_processes():
                 continue
             try:
-                signal.pidfd_send_signal(process_fd, sig, None, 0)
+                send_process_fd_signal(process_fd, sig)
             except ProcessLookupError:
                 continue
             except OSError as exc:
@@ -7926,26 +7996,20 @@ def _signal_owned_posix_connector_processes(
     sig: int,
 ) -> list[int]:
     """Signal only revalidated connector identities through race-safe pidfds."""
-    pidfd_open = getattr(os, "pidfd_open", None)
-    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
-    if not callable(pidfd_open) or not callable(pidfd_send_signal):
-        raise RelayError("race-safe pidfd connector cleanup is unavailable on this platform")
     signaled: list[int] = []
     for member_pid in _local_connector_group_members(connector):
         try:
-            raw_process_fd = pidfd_open(member_pid, 0)
+            raw_process_fd = _open_posix_process_fd(member_pid)
         except ProcessLookupError:
             continue
         except OSError as exc:
             raise RelayError(f"cannot open connector pidfd for {member_pid}: {exc}") from exc
-        if not isinstance(raw_process_fd, int):
-            raise RelayError(f"connector pidfd for {member_pid} is not an integer")
         process_fd = raw_process_fd
         try:
             if member_pid not in _local_connector_group_members(connector):
                 continue
             try:
-                pidfd_send_signal(process_fd, sig, None, 0)
+                _send_posix_process_fd_signal(process_fd, sig)
             except ProcessLookupError:
                 continue
             except OSError as exc:
@@ -7954,6 +8018,90 @@ def _signal_owned_posix_connector_processes(
         finally:
             os.close(process_fd)
     return signaled
+
+
+def _open_posix_process_fd(pid: int) -> int:
+    """Open a Linux process descriptor even when CPython omitted pidfd wrappers."""
+    native_open = getattr(os, "pidfd_open", None)
+    descriptor = native_open(pid, 0) if callable(native_open) else _linux_pidfd_open(pid)
+    if not isinstance(descriptor, int):
+        raise OSError("pidfd_open returned a non-integer descriptor")
+    return descriptor
+
+
+def _send_posix_process_fd_signal(process_fd: int, sig: int) -> None:
+    """Signal a Linux process descriptor through CPython or libc."""
+    native_send = getattr(signal, "pidfd_send_signal", None)
+    if callable(native_send):
+        native_send(process_fd, sig, None, 0)
+        return
+    _linux_pidfd_send_signal(process_fd, sig)
+
+
+def _linux_pidfd_open(pid: int) -> int:
+    """Invoke pidfd_open through libc, falling back to the Linux syscall ABI."""
+    if not sys.platform.startswith("linux"):
+        raise RelayError("race-safe pidfd connector cleanup is unavailable on this platform")
+    library = ctypes.CDLL(None, use_errno=True)
+    libc_open = getattr(library, "pidfd_open", None)
+    ctypes.set_errno(0)
+    if libc_open is not None:
+        libc_open.argtypes = [ctypes.c_int, ctypes.c_uint]
+        libc_open.restype = ctypes.c_int
+        descriptor = int(libc_open(pid, 0))
+    else:
+        if platform.machine().lower() not in _LINUX_PIDFD_RAW_SYSCALL_MACHINES:
+            raise RelayError("raw pidfd_open syscall ABI is unavailable on this architecture")
+        syscall = library.syscall
+        syscall.restype = ctypes.c_long
+        descriptor = int(
+            syscall(
+                ctypes.c_long(_LINUX_PIDFD_OPEN_SYSCALL_NUMBER),
+                ctypes.c_int(pid),
+                ctypes.c_uint(0),
+            )
+        )
+    if descriptor < 0:
+        error_number = ctypes.get_errno() or errno.ENOSYS
+        raise OSError(error_number, os.strerror(error_number))
+    return descriptor
+
+
+def _linux_pidfd_send_signal(process_fd: int, sig: int) -> None:
+    """Invoke pidfd_send_signal through libc or the stable Linux syscall ABI."""
+    if not sys.platform.startswith("linux"):
+        raise RelayError("race-safe pidfd connector cleanup is unavailable on this platform")
+    library = ctypes.CDLL(None, use_errno=True)
+    libc_send = getattr(library, "pidfd_send_signal", None)
+    ctypes.set_errno(0)
+    if libc_send is not None:
+        libc_send.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        ]
+        libc_send.restype = ctypes.c_int
+        result = int(libc_send(process_fd, sig, None, 0))
+    else:
+        if platform.machine().lower() not in _LINUX_PIDFD_RAW_SYSCALL_MACHINES:
+            raise RelayError(
+                "raw pidfd_send_signal syscall ABI is unavailable on this architecture"
+            )
+        syscall = library.syscall
+        syscall.restype = ctypes.c_long
+        result = int(
+            syscall(
+                ctypes.c_long(_LINUX_PIDFD_SEND_SIGNAL_SYSCALL_NUMBER),
+                ctypes.c_int(process_fd),
+                ctypes.c_int(sig),
+                ctypes.c_void_p(),
+                ctypes.c_uint(0),
+            )
+        )
+    if result < 0:
+        error_number = ctypes.get_errno() or errno.ENOSYS
+        raise OSError(error_number, os.strerror(error_number))
 
 
 def _terminate_local_connector(connector: dict[str, object]) -> int | None:

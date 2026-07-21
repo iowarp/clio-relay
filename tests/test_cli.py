@@ -195,12 +195,41 @@ def _default_cli_mode(  # pyright: ignore[reportUnusedFunction]
         if finalized is None:
             return real_recovery_status(**kwargs)  # pyright: ignore[reportArgumentType]
         queue = cast(ClioCoreQueue, kwargs["queue"])
+        cluster = cast(str, kwargs["cluster"])
+        remote_execution = cast(bool, kwargs["remote_execution"])
         generation_id = finalized.session_generation_id
         assert generation_id is not None
-        admission = queue.owner_session_generation_status(
-            session_id,
+        admission_session_id = (
+            cli._desktop_owner_session_admission_id(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                cluster=cluster,
+                session_id=session_id,
+            )
+            if remote_execution
+            else session_id
+        )
+        local_admission = queue.owner_session_generation_status(
+            admission_session_id,
             session_generation_id=generation_id,
         )
+        admission = local_admission
+        if remote_execution and local_admission.get("closed") is True:
+            local_closure = OwnerSessionClosure.model_validate(local_admission["closure"])
+            remote_closure = local_closure.model_copy(update={"owner_session_id": session_id})
+            finalized_admission = finalized.admission_status
+            assert isinstance(finalized_admission, dict)
+            admission = {
+                "schema_version": "clio-relay.owner-session-admission-status.v1",
+                "owner_session_id": session_id,
+                "session_generation_id": generation_id,
+                "active_generation_id": None,
+                "closing_generation_id": generation_id,
+                "active": False,
+                "closing": True,
+                "closed": True,
+                "open": False,
+                "cleanup_intent": finalized_admission["cleanup_intent"],
+                "closure": remote_closure.model_dump(mode="json"),
+            }
         return finalized.model_copy(
             update={
                 "process_state": (
@@ -5821,8 +5850,27 @@ def test_cli_dead_session_teardown_uses_recovery_without_canceling_jobs(
     def dead_status(**_kwargs: object) -> dict[str, object]:
         raise RelayError("session metadata was not present before the late start completed")
 
-    def recovered_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+    def recovered_status(
+        *,
+        queue: ClioCoreQueue,
+        definition: ClusterDefinition,
+        remote_execution: bool,
+        cluster: str,
+        session_id: str,
+    ) -> OwnedSessionRecoveryStatus:
+        if recovery_calls:
+            return recover_after_finalization(
+                queue=queue,
+                definition=definition,
+                remote_execution=remote_execution,
+                cluster=cluster,
+                session_id=session_id,
+            )
+        recovery_calls.append("initial")
         return recovery
+
+    recover_after_finalization = cli._owned_session_recovery_status  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    recovery_calls: list[str] = []
 
     monkeypatch.setattr(cli, "status_remote_session", dead_status)
     monkeypatch.setattr(cli, "_owned_session_recovery_status", recovered_status)
@@ -5878,12 +5926,7 @@ def test_cli_dead_session_teardown_uses_recovery_without_canceling_jobs(
             encoding="utf-8"
         )
     )
-    recovery_resource = next(
-        resource for resource in report["resources"] if resource["kind"] == "owner_session_recovery"
-    )
-    assert recovery_resource["state"] == "verified"
-    assert recovery_resource["metadata"]["process_absence_verified"] is True
-    assert "late start completed" in recovery_resource["metadata"]["initial_status_error"]
+    assert report["status"] == "passed"
     quiesced_report = next(
         report
         for report in written_reports
@@ -5892,9 +5935,16 @@ def test_cli_dead_session_teardown_uses_recovery_without_canceling_jobs(
             for resource in report.resources
         )
     )
-    assert any(
-        resource.kind == "owner_session_recovery" and resource.state == "verified"
+    recovery_resource = next(
+        resource
         for resource in quiesced_report.resources
+        if resource.kind == "owner_session_recovery"
+    )
+    assert recovery_resource.state == "verified"
+    assert recovery_resource.metadata["process_absence_verified"] is True
+    assert "late start completed" in cast(
+        str,
+        recovery_resource.metadata["initial_status_error"],
     )
 
 

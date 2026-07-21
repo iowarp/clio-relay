@@ -1325,7 +1325,15 @@ def _detect_persistent_uv_tool_receipt(
     process_executable_resolved = process_executable.resolve()
     package = Path(package_path).resolve()
     package_in_environment = _within_or_equal(package, prefix)
-    executable_in_environment = _within_or_equal(process_executable_resolved, prefix)
+    # POSIX virtual environments normally expose ``bin/python`` as a symlink to
+    # the base interpreter. Keep the launcher location and its resolved target
+    # as separate trust claims: the lexical executable must belong to the uv
+    # tool environment, while the target may belong to that environment or to
+    # the interpreter's exact base prefix.
+    executable_in_environment = _within_or_equal(process_executable, prefix)
+    executable_target_bound = _within_or_equal(process_executable_resolved, prefix) or (
+        _within_or_equal(process_executable_resolved, base_prefix)
+    )
     environment_in_tool_directory = tool_directory is not None and _strictly_contains(
         tool_directory, prefix
     )
@@ -1383,6 +1391,7 @@ def _detect_persistent_uv_tool_receipt(
         and pyvenv_matches_uv
         and package_in_environment
         and executable_in_environment
+        and executable_target_bound
         and tool_bin_bound
         and tool_target_bound
         and record_identity.get("verified") is True
@@ -1414,6 +1423,7 @@ def _detect_persistent_uv_tool_receipt(
         "process_executable_resolved": str(process_executable_resolved),
         "package_in_process_environment": package_in_environment,
         "executable_in_process_environment": executable_in_environment,
+        "executable_target_bound": executable_target_bound,
         "pyvenv_uv_version": pyvenv_uv_version,
         "pyvenv_matches_uv": pyvenv_matches_uv,
         "isolated_environment": isolated_environment,
@@ -2640,6 +2650,7 @@ def _launcher_identity_failures(
             "pyvenv_matches_uv",
             "package_in_process_environment",
             "executable_in_process_environment",
+            "executable_target_bound",
             "isolated_environment",
         ):
             if receipt.get(field) is not True:

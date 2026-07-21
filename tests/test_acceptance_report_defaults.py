@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -40,8 +41,11 @@ from clio_relay.service_runtime import (
 )
 from clio_relay.session_lifecycle import (
     CleanupResource,
+    OwnedSessionCleanupReportReference,
+    OwnedSessionRecoveryStatus,
     RemoteSessionStateEvidence,
     SessionLifecycleReport,
+    session_lifecycle_report_bytes,
 )
 from clio_relay.validation_report import (
     EvidenceReference,
@@ -504,7 +508,22 @@ def _session_report(*, mode: Literal["detach", "teardown"]) -> SessionLifecycleR
                 ownership_verified=True,
                 outcome=outcome,
                 verified_after_operation=True,
-            )
+            ),
+            *(
+                [
+                    CleanupResource(
+                        kind="remote_session_files",
+                        resource_id="owned:generation-1",
+                        location="test-cluster",
+                        action="close",
+                        ownership_verified=True,
+                        outcome="closed",
+                        verified_after_operation=True,
+                    )
+                ]
+                if mode == "teardown"
+                else []
+            ),
         ],
     )
 
@@ -873,12 +892,89 @@ def _install_success_fakes(
         return
     if case.name in {"session-detach", "session-teardown"}:
         _activate_owner_session(root / "core")
+
+        def execute_locally(_definition: ClusterDefinition) -> bool:
+            return False
+
+        monkeypatch.setattr(cli, "should_execute_on_cluster", execute_locally)
         monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _empty_runtime_cleanup)
         if case.name == "session-detach":
             monkeypatch.setattr(cli, "detach_remote_session", _detached_session)
         else:
+            finalized_status: list[OwnedSessionRecoveryStatus] = []
+
+            def persist_cleanup_report(
+                *,
+                definition: ClusterDefinition,
+                cluster: str,
+                session_id: str,
+                session_generation_id: str,
+                report: SessionLifecycleReport,
+            ) -> tuple[SessionLifecycleReport, OwnedSessionRecoveryStatus]:
+                del definition
+                payload = session_lifecycle_report_bytes(report)
+                digest = hashlib.sha256(payload).hexdigest()
+                reference = OwnedSessionCleanupReportReference(
+                    name=f"coordinator-cleanup-report-{digest}.json",
+                    size=len(payload),
+                    sha256=digest,
+                )
+                status = OwnedSessionRecoveryStatus(
+                    cluster=cluster,
+                    session_id=session_id,
+                    session_generation_id=session_generation_id,
+                    owner="clio-relay",
+                    process_state="already_closed",
+                    process_absence_verified=True,
+                    generation_process_absence_verified=True,
+                    metadata_verified=True,
+                    cluster_registry_verified=True,
+                    durable_generation_verified=True,
+                    cleanup_receipt=True,
+                    cleanup_paths_pending=False,
+                    coordinator_report_ref=reference,
+                    coordinator_report_sha256=digest,
+                    coordinator_report_bound=True,
+                    ownership_verified=True,
+                    recovery_verified=True,
+                    admission_status={"closed": True},
+                )
+                finalized_status[:] = [status]
+                return report, status
+
+            def closed_recovery_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+                assert finalized_status
+                return finalized_status[0]
+
+            def verified_cleanup_report(
+                _status: OwnedSessionRecoveryStatus,
+                *,
+                report: SessionLifecycleReport,
+                **_kwargs: object,
+            ) -> SessionLifecycleReport:
+                return report
+
+            def mark_closed(**_kwargs: object) -> None:
+                return None
+
             monkeypatch.setattr(cli, "status_remote_session", _owned_session_status)
             monkeypatch.setattr(cli, "teardown_remote_session", _torn_down_session)
+            monkeypatch.setattr(
+                cli,
+                "_persist_verified_cleanup_report_before_closure",
+                persist_cleanup_report,
+            )
+            monkeypatch.setattr(cli, "_mark_owner_session_closed", mark_closed)
+            monkeypatch.setattr(
+                cli,
+                "_owned_session_recovery_status",
+                closed_recovery_status,
+            )
+            monkeypatch.setattr(
+                cli,
+                "_verified_finalized_cleanup_report",
+                verified_cleanup_report,
+            )
         return
     if case.name == "queue-validate":
         monkeypatch.setattr(

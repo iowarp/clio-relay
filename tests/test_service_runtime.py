@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import gzip
 import hashlib
 import json
@@ -61,6 +63,30 @@ from tests.gateway_ownership_crash_fixture import (
 class FakeProcess:
     def __init__(self, pid: int) -> None:
         self.pid = pid
+
+
+class _PidfdSyscallFixture:
+    def __init__(self, outcomes: dict[int, tuple[int, int]]) -> None:
+        self.outcomes = outcomes
+        self.calls: list[int] = []
+        self.restype: object = None
+
+    def __call__(self, *arguments: object) -> int:
+        number = getattr(arguments[0], "value", None)
+        if not isinstance(number, int):
+            raise AssertionError("pidfd syscall number is not an integer")
+        self.calls.append(number)
+        result, error_number = self.outcomes[number]
+        ctypes.set_errno(error_number)
+        return result
+
+
+class _PidfdLibcWithoutSymbols:
+    pidfd_open: None = None
+    pidfd_send_signal: None = None
+
+    def __init__(self, syscall: _PidfdSyscallFixture) -> None:
+        self.syscall = syscall
 
 
 def test_local_connector_does_not_retain_captured_cli_pipes(tmp_path: Path) -> None:
@@ -960,8 +986,10 @@ def test_service_runtime_stop_keeps_scheduler_job_by_default(tmp_path: Path) -> 
     assert "process_group != pgid" not in owned_scan
     assert "proc.stat().st_uid != os.geteuid()" in stop_script
     assert "os.killpg" not in stop_script
-    assert "os.pidfd_open(member_pid, 0)" in stop_script
-    assert "signal.pidfd_send_signal(process_fd, sig, None, 0)" in stop_script
+    assert 'native_open = getattr(os, "pidfd_open", None)' in stop_script
+    assert "ctypes.c_long(434)" in stop_script
+    assert 'native_send = getattr(signal, "pidfd_send_signal", None)' in stop_script
+    assert "ctypes.c_long(424)" in stop_script
     assert "signal_owned_processes(signal.SIGTERM)" in stop_script
     assert "signal_owned_processes(signal.SIGKILL)" in stop_script
 
@@ -3096,6 +3124,143 @@ def test_posix_connector_cleanup_signals_only_revalidated_pidfd(
     assert result == [555]
     assert signaled == [(92, sigkill)]
     assert closed == [92]
+
+
+def test_posix_connector_cleanup_uses_libc_when_python_omits_pidfd_wrappers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scans = iter([[555], [555]])
+    opened: list[int] = []
+    closed: list[int] = []
+    signaled: list[tuple[int, int]] = []
+    connector: dict[str, object] = {
+        "pid": 555,
+        "process_group_id": 555,
+        "owner_token": "owner-token",
+        "connector_generation_id": "generation-1",
+        "config_path": "/owned/desktop-frpc.toml",
+    }
+
+    def group_members(_connector: dict[str, object]) -> list[int]:
+        return next(scans)
+
+    def libc_open(pid: int) -> int:
+        opened.append(pid)
+        return 93
+
+    def libc_send(process_fd: int, sig: int) -> None:
+        signaled.append((process_fd, sig))
+
+    monkeypatch.setattr(
+        service_runtime,
+        "_local_connector_group_members",
+        group_members,
+    )
+    monkeypatch.setattr(service_runtime.os, "pidfd_open", None, raising=False)
+    monkeypatch.setattr(
+        service_runtime.signal,
+        "pidfd_send_signal",
+        None,
+        raising=False,
+    )
+    monkeypatch.setattr(service_runtime, "_linux_pidfd_open", libc_open)
+    monkeypatch.setattr(service_runtime, "_linux_pidfd_send_signal", libc_send)
+    monkeypatch.setattr(service_runtime.os, "close", closed.append)
+
+    result = service_runtime._signal_owned_posix_connector_processes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        connector,
+        signal.SIGTERM,
+    )
+
+    assert result == [555]
+    assert opened == [555]
+    assert signaled == [(93, signal.SIGTERM)]
+    assert closed == [93]
+
+
+def test_linux_pidfd_raw_syscall_fallback_preserves_errno(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    syscall = _PidfdSyscallFixture(
+        {
+            424: (-1, errno.EPERM),
+            434: (-1, errno.ESRCH),
+        }
+    )
+    library = _PidfdLibcWithoutSymbols(syscall)
+
+    def load_libc(_name: object, *, use_errno: bool) -> _PidfdLibcWithoutSymbols:
+        assert use_errno is True
+        return library
+
+    monkeypatch.setattr(service_runtime.sys, "platform", "linux")
+    monkeypatch.setattr(service_runtime.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(service_runtime.ctypes, "CDLL", load_libc)
+
+    with pytest.raises(ProcessLookupError) as open_error:
+        service_runtime._linux_pidfd_open(555)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert open_error.value.errno == errno.ESRCH
+
+    with pytest.raises(PermissionError) as send_error:
+        service_runtime._linux_pidfd_send_signal(93, signal.SIGTERM)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert send_error.value.errno == errno.EPERM
+    assert syscall.calls == [434, 424]
+
+
+def test_remote_pidfd_helpers_fall_back_and_preserve_errno(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    syscall = _PidfdSyscallFixture(
+        {
+            424: (-1, errno.EPERM),
+            434: (93, 0),
+        }
+    )
+    library = _PidfdLibcWithoutSymbols(syscall)
+
+    def load_libc(_name: object, *, use_errno: bool) -> _PidfdLibcWithoutSymbols:
+        assert use_errno is True
+        return library
+
+    monkeypatch.setattr(service_runtime.os, "pidfd_open", None, raising=False)
+    monkeypatch.setattr(
+        service_runtime.signal,
+        "pidfd_send_signal",
+        None,
+        raising=False,
+    )
+    monkeypatch.setattr(service_runtime.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(service_runtime.ctypes, "CDLL", load_libc)
+    stop_script = service_runtime._remote_stop_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_id="gateway-fixture",
+        pid=555,
+    )
+    stop_program = stop_script.split("<<'__CLIO_STOP_CONNECTOR__'\n", 1)[1].split(
+        "\n__CLIO_STOP_CONNECTOR__",
+        1,
+    )[0]
+    helper_start = stop_program.index("def open_process_fd")
+    helper_end = stop_program.index("\ndef signal_owned_processes", helper_start)
+    helper_program = stop_program[helper_start:helper_end]
+    namespace: dict[str, object] = {
+        "ctypes": service_runtime.ctypes,
+        "errno": errno,
+        "os": service_runtime.os,
+        "platform": service_runtime.platform,
+        "signal": service_runtime.signal,
+    }
+    exec(compile(helper_program, "remote-pidfd-helpers", "exec"), namespace)
+    open_process_fd = cast(Callable[[int], int], namespace["open_process_fd"])
+    send_process_fd_signal = cast(
+        Callable[[int, int], None],
+        namespace["send_process_fd_signal"],
+    )
+
+    assert open_process_fd(555) == 93
+    with pytest.raises(PermissionError) as send_error:
+        send_process_fd_signal(93, signal.SIGTERM)
+    assert send_error.value.errno == errno.EPERM
+    assert syscall.calls == [434, 424]
 
 
 def test_windows_connector_pid_reuse_is_not_authorized_by_descendant_scan(

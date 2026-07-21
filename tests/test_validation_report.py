@@ -934,6 +934,8 @@ def test_real_uv_tool_scopes_launcher_to_isolated_bin(
     assert source["launcher_verified"] is True
     assert Path(source["launcher_receipt"]["tool_executable"]).resolve() == executable.resolve()
     assert source["launcher_receipt"]["tool_bin_bound"] is True
+    assert source["launcher_receipt"]["executable_in_process_environment"] is True
+    assert source["launcher_receipt"]["executable_target_bound"] is True
     assert source["launcher_receipt"]["uv_tool_receipt"]["launcher_bound"] is True
 
 
@@ -1109,6 +1111,7 @@ def _report(
                 "pyvenv_matches_uv": True,
                 "package_in_process_environment": True,
                 "executable_in_process_environment": True,
+                "executable_target_bound": True,
                 "isolated_environment": True,
                 "distribution_record": {
                     "verified": True,
