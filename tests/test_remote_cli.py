@@ -5,7 +5,7 @@ import subprocess
 from pytest import MonkeyPatch, raises
 
 from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.errors import RelayError
+from clio_relay.errors import ObservationTimeoutError, RelayError
 from clio_relay.remote_cli import (
     remote_command_timeout,
     remote_env,
@@ -132,5 +132,8 @@ def test_bounded_remote_command_timeout_is_translated(monkeypatch: MonkeyPatch) 
 
     monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", timed_out)
 
-    with raises(RelayError, match="timed out after 12 seconds"), remote_command_timeout(12):
+    with (
+        raises(ObservationTimeoutError, match="timed out after 12 seconds"),
+        remote_command_timeout(12),
+    ):
         run_remote_shell(definition, "true")

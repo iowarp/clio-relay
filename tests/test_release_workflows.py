@@ -75,6 +75,10 @@ def test_tag_push_uploads_exact_release_distributions_asynchronously() -> None:
     assert "releases/tags/$TAG_NAME" in text
     assert "for attempt in $(seq 1 20)" in text
     assert "sleep 3" in text
+    assert 'source_commit="$(gh api "repos/$REPOSITORY/commits/$TAG_NAME" --jq .sha)"' in text
+    assert 'test "$source_commit" = "$SOURCE_COMMIT"' in text
+    assert 'test "$source_commit" = "$(git rev-parse HEAD)"' in text
+    assert 'test "$(jq -r .target_commitish' not in text
     assert "releases/assets/$asset_id" in text
     assert "sha256sum --check --strict SHA256SUMS" in text
     assert "distribution-archives" in text

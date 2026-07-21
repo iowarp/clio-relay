@@ -245,17 +245,27 @@ def test_native_jarvis_runtime_accepts_canonical_source_aliases(
     ) -> bool:
         return bool(runtime_command)
 
+    def probe_record_closure(
+        _python: str | None,
+        _distribution_name: str,
+        _expected_artifact: Path | None,
+        *,
+        environment: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        del environment
+        return {
+            "schema_version": "clio-relay.python-record-closure.v1",
+            "verified": True,
+            "tree_scanned": False,
+            "tree_copied": False,
+        }
+
     monkeypatch.setattr(installation_module.metadata, "distribution", find_distribution)
     monkeypatch.setattr(installation_module, "_probe_python_distribution", probe_execution)
     monkeypatch.setattr(
         installation_module,
         "_probe_python_distribution_record_closure",
-        lambda *_args: {
-            "schema_version": "clio-relay.python-record-closure.v1",
-            "verified": True,
-            "tree_scanned": False,
-            "tree_copied": False,
-        },
+        probe_record_closure,
     )
     monkeypatch.setattr(
         installation_module,
@@ -340,7 +350,7 @@ def test_native_jarvis_record_closure_rejects_a_tampered_installed_member(
         ),
     }
     record_name = "fixture_jarvis-1.0.dist-info/RECORD"
-    record_lines = []
+    record_lines: list[str] = []
     for relative, payload in sorted(members.items()):
         encoded = urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
         record_lines.append(f"{relative},sha256={encoded},{len(payload)}")
@@ -884,7 +894,15 @@ def test_worker_runtime_info_reads_only_the_sealed_fresh_endpoint_index(
     from clio_relay.models import EndpointRegistration, EndpointRole
 
     root = tmp_path / "core"
-    identity: dict[str, object] = {"distribution_version": "test"}
+    wheel = tmp_path / "clio_relay-1.0.0-py3-none-any.whl"
+    wheel.write_bytes(b"worker-index-candidate-wheel")
+    receipt_path = tmp_path / "worker-index-receipt.json"
+    write_install_receipt(
+        install_spec=str(wheel),
+        artifact_path=wheel,
+        path=receipt_path,
+    )
+    identity = installation_info(receipt_path)
     queue = ClioCoreQueue(root)
     endpoint = queue.register_endpoint(
         EndpointRegistration(
@@ -900,8 +918,16 @@ def test_worker_runtime_info_reads_only_the_sealed_fresh_endpoint_index(
         )
     )
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(root))
-    monkeypatch.setattr(installation_module, "installation_info", lambda: identity)
-    monkeypatch.setattr(installation_module, "_worker_process_matches", lambda _pid: True)
+
+    def current_installation() -> dict[str, object]:
+        return identity
+
+    monkeypatch.setattr(installation_module, "installation_info", current_installation)
+
+    def worker_process_matches(_pid: int) -> bool:
+        return True
+
+    monkeypatch.setattr(installation_module, "_worker_process_matches", worker_process_matches)
 
     def reject_history(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("worker readiness must not scan endpoint history")

@@ -5,6 +5,10 @@ class RelayError(RuntimeError):
     """Base class for relay errors."""
 
 
+class ObservationTimeoutError(RelayError):
+    """A bounded observation transport expired without changing durable work."""
+
+
 class ConfigurationError(RelayError):
     """Raised when required external configuration is absent."""
 

@@ -711,7 +711,7 @@ def test_queue_seal_handoff_bounds_exclusive_wait_and_restores_shared(
     try:
         started = time.monotonic()
         with pytest.raises(WorkerLifetimeLockUnavailable, match="timed out acquiring"):
-            storage_runtime_module._initialize_queue_with_shared_writer_fencing(  # noqa: SLF001
+            storage_runtime_module._initialize_queue_with_shared_writer_fencing(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 candidate
             )
         assert time.monotonic() - started < 1
@@ -759,7 +759,7 @@ def test_queue_seal_handoff_bounds_shared_reacquire(
             WorkerLifetimeLockUnavailable,
             match="restoring shared writer ownership",
         ):
-            storage_runtime_module._initialize_queue_with_shared_writer_fencing(  # noqa: SLF001
+            storage_runtime_module._initialize_queue_with_shared_writer_fencing(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 candidate
             )
         assert time.monotonic() - started < 1
@@ -783,7 +783,7 @@ def test_locked_initialization_never_writes_replacement_root_after_path_swap(
     core_dir = tmp_path / "core"
     displaced_core = tmp_path / "displaced-core"
     core_dir.mkdir()
-    original_audit = ClioCoreQueue._audit_legacy_state_before_initialization  # noqa: SLF001
+    original_audit = ClioCoreQueue._audit_legacy_state_before_initialization  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     swapped = False
 
     def swap_during_audit(queue: ClioCoreQueue) -> object:

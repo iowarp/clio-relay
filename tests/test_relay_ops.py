@@ -11,9 +11,13 @@ import pytest
 import clio_relay.relay_ops as relay_ops_module
 import clio_relay.spool as spool_module
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import RelayError
-from clio_relay.models import ArtifactRef, JarvisRunSpec, JobKind, RelayJob
-from clio_relay.relay_ops import MAX_ARTIFACT_CONTENT_BYTES, read_artifact_bytes
+from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.models import ArtifactRef, JarvisRunSpec, JobKind, JobState, RelayJob
+from clio_relay.relay_ops import (
+    MAX_ARTIFACT_CONTENT_BYTES,
+    observe_until_terminal,
+    read_artifact_bytes,
+)
 from clio_relay.spool import ARTIFACT_OWNERSHIP_SCHEMA, MAX_LOG_READ_BYTES, JobSpool
 
 
@@ -22,6 +26,66 @@ def _owned_artifact_metadata(root: Path) -> dict[str, str]:
         "ownership_schema": ARTIFACT_OWNERSHIP_SCHEMA,
         "owned_root_uri": root.absolute().as_uri(),
     }
+
+
+def test_observe_until_terminal_returns_current_durable_job_on_expiry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_name="long-queued-run"),
+            idempotency_key="long-queued-run",
+        )
+    )
+
+    def expire(
+        _queue: ClioCoreQueue,
+        _job_id: str,
+        *,
+        timeout_seconds: float,
+        poll_seconds: float,
+    ) -> RelayJob:
+        assert timeout_seconds == 1
+        assert poll_seconds == 0.1
+        raise TimeoutError("observation expired")
+
+    monkeypatch.setattr(relay_ops_module, "wait_for_terminal", expire)
+    observed = observe_until_terminal(
+        queue,
+        job.job_id,
+        timeout_seconds=1,
+        poll_seconds=0.1,
+    )
+
+    assert observed.job_id == job.job_id
+    assert observed.state is JobState.QUEUED
+    assert observed.observation.outcome == "observation_unknown"
+    assert observed.observation.scheduler_action == "none"
+    assert queue.get_job(job.job_id).state is JobState.QUEUED
+
+
+@pytest.mark.parametrize(
+    ("timeout_seconds", "poll_seconds"),
+    [(float("inf"), 0.1), (1.0, float("inf"))],
+)
+def test_observe_until_terminal_rejects_nonfinite_bounds(
+    tmp_path: Path,
+    timeout_seconds: float,
+    poll_seconds: float,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+
+    with pytest.raises(ConfigurationError, match="positive and finite"):
+        observe_until_terminal(
+            queue,
+            "job_00000000000000000000000000000001",
+            timeout_seconds=timeout_seconds,
+            poll_seconds=poll_seconds,
+        )
 
 
 def test_read_artifact_rejects_tampered_backing_file(tmp_path: Path) -> None:

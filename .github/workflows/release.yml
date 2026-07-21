@@ -138,7 +138,9 @@ jobs:
           source_commit="$(gh api "repos/$REPOSITORY/commits/$TAG_NAME" --jq .sha)"
           test "$source_commit" = "$SOURCE_COMMIT"
           test "$source_commit" = "$(git rev-parse HEAD)"
-          test "$(jq -r .target_commitish "$RUNNER_TEMP/release.json")" = "$source_commit"
+          # GitHub may retain the default-branch spelling in target_commitish when a
+          # Release is created for an existing tag. The authoritative source
+          # identity is the tag resolution above, not this display field.
 
           version="$(python - "$TAG_NAME" <<'PY'
           import re

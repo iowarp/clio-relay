@@ -11,7 +11,7 @@ import pytest
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
-from clio_relay.errors import RelayError
+from clio_relay.errors import ObservationTimeoutError, RelayError
 from clio_relay.models import (
     MCP_ADMISSION_AUTHORITY_METADATA_KEY,
     JobKind,
@@ -45,6 +45,11 @@ class _Response:
 
     def read(self, _amount: int) -> bytes:
         return self._payload
+
+
+class _TimeoutResponse(_Response):
+    def read(self, _amount: int) -> bytes:
+        raise TimeoutError("bounded response observation expired")
 
 
 class _Socket:
@@ -518,6 +523,38 @@ def test_owned_session_client_scopes_long_response_timeout_to_one_request(
 
     assert len(connections) == 1
     assert connections[0].socket.timeout_changes == [610, 30]
+
+
+def test_owned_session_client_types_only_a_bounded_response_deadline_as_observation_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = session_identity_document(
+        owner_token="owner-token",
+        cluster="ares",
+        session_id="desktop-session-1",
+        generation_id="generation-1",
+        nonce="1" * 64,
+    )
+    _captured, connections = _install_transport(
+        monkeypatch,
+        responses=[_Response(identity), _TimeoutResponse({})],
+    )
+
+    with (
+        OwnedSessionApiClient(
+            definition=ClusterDefinition(name="ares", ssh_host="ares-login"),
+            settings=_settings(tmp_path),
+        ) as client,
+        pytest.raises(ObservationTimeoutError, match="response observation timed out"),
+    ):
+        client.request_json(
+            method="POST",
+            path="/jobs/job_1/wait",
+            response_timeout_seconds=0.25,
+        )
+
+    assert connections[0].socket.timeout_changes == [0.25, 30]
 
 
 def test_owned_session_client_never_reconnects_after_identity_proof(

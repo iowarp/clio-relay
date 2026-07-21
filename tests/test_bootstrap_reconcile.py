@@ -5,24 +5,28 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import yaml
 
 import clio_relay.bootstrap_reconcile as bootstrap_reconcile_module
 from clio_relay.bootstrap_reconcile import (
+    BootstrapActivationPath,
     BootstrapDesiredState,
+    BootstrapReconcilePlan,
     BootstrapTransactionJournal,
     BootstrapTransactionState,
     bootstrap_invocation_lock,
     execution_environment_identity,
+    finish_staged_activation,
     inspect_exact_bootstrap_noop,
     inspect_jarvis_state,
     inspect_prepared_generation,
@@ -30,6 +34,7 @@ from clio_relay.bootstrap_reconcile import (
     make_bootstrap_receipt,
     plan_bootstrap_reconcile,
     reconcile_managed_jarvis_repository,
+    reconcile_staged_activation_links,
     repair_managed_jarvis_binding,
     validate_jarvis_builtin_result,
     write_jarvis_wrapper,
@@ -151,9 +156,16 @@ def test_exact_noop_is_read_only_and_preserves_operator_jarvis_bytes(
     root, config_before, graph_before = _write_jarvis_state(tmp_path, desired)
     generation = tmp_path / ".local/share/clio-relay/generations" / desired.fingerprint
     generation.mkdir(parents=True)
+
+    def inspect_active_generation(
+        *_args: object,
+        **_kwargs: object,
+    ) -> tuple[str, str]:
+        return desired.fingerprint, str(generation.resolve())
+
     monkeypatch.setattr(
         "clio_relay.bootstrap_reconcile._inspect_active_generation",
-        lambda *_args, **_kwargs: (desired.fingerprint, str(generation.resolve())),
+        inspect_active_generation,
     )
     receipt_path = tmp_path / ".local/share/clio-relay/install-receipt.json"
     receipt_path.write_text("{}\n", encoding="utf-8")
@@ -166,16 +178,21 @@ def test_exact_noop_is_read_only_and_preserves_operator_jarvis_bytes(
             root / "resource_graph.yaml",
         )
     }
-    monkeypatch.setattr(
-        "clio_relay.bootstrap_reconcile.installation_info",
-        lambda _path: _installation_info(desired),
-    )
+
+    def read_installation(_path: Path | None = None) -> dict[str, object]:
+        return _installation_info(desired)
+
+    def run_identity(
+        *_args: object,
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(["uv", "--version"], 0, "uv 0.11.28\n", "")
+
+    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", read_installation)
     monkeypatch.setattr(
         bootstrap_reconcile_module,
         "run_bounded_process",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(
-            ["uv", "--version"], 0, "uv 0.11.28\n", ""
-        ),
+        run_identity,
     )
 
     inspection = inspect_exact_bootstrap_noop(
@@ -230,13 +247,21 @@ def test_matching_receipt_with_tampered_runtime_is_not_a_noop(
     runtime = info["component_runtime"]
     assert isinstance(runtime, dict)
     runtime["clio-relay"] = {"persistent_tool_verified": False}
-    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", lambda _path: info)
+
+    def read_installation(_path: Path | None = None) -> dict[str, object]:
+        return info
+
+    def run_identity(
+        *_args: object,
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(["uv", "--version"], 0, "uv 0.11.28\n", "")
+
+    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", read_installation)
     monkeypatch.setattr(
         subprocess,
         "run",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(
-            ["uv", "--version"], 0, "uv 0.11.28\n", ""
-        ),
+        run_identity,
     )
 
     inspection = inspect_exact_bootstrap_noop(
@@ -264,7 +289,12 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
 ) -> None:
     bin_dir = tmp_path / ".local/bin"
     bin_dir.mkdir(parents=True)
-    for name, content in (("uv", b"uv"), ("frpc", b"frpc"), ("frps", b"frps")):
+    for name, content in (
+        ("uv", b"uv"),
+        ("frpc", b"frpc"),
+        ("frps", b"frps"),
+        ("clio-relay", b"relay"),
+    ):
         path = bin_dir / name
         path.write_bytes(content)
         path.chmod(0o755)
@@ -274,6 +304,7 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
         frps_sha256=_digest(b"frps"),
     )
     _write_jarvis_state(tmp_path, desired)
+    (tmp_path / ".local/share/clio-relay/managed-jarvis-repo").rmdir()
     legacy_python = (
         tmp_path
         / ".local/share/clio-relay/jarvis-venv"
@@ -285,6 +316,9 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
     legacy_jarvis = legacy_python.parent / ("jarvis.exe" if os.name == "nt" else "jarvis")
     legacy_jarvis.write_bytes(b"jarvis")
     legacy_jarvis.chmod(0o755)
+    stable_jarvis = bin_dir / "jarvis"
+    stable_jarvis.write_bytes(b"stable-jarvis")
+    stable_jarvis.chmod(0o755)
     jarvis_util_checkout = tmp_path / ".local/src/jarvis-util"
     (jarvis_util_checkout / ".git").mkdir(parents=True)
     receipt_path = tmp_path / ".local/share/clio-relay/install-receipt.json"
@@ -300,11 +334,13 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
         }
     )
     info = _installation_info(desired)
-    receipt = info["receipt"]
-    assert isinstance(receipt, dict)
+    receipt = cast(dict[str, object], info["receipt"])
     receipt.pop("deployment_fingerprint")
     receipt.pop("deployment_manifest")
     receipt["component_artifacts"] = {
+        "clio-relay": {
+            "runtime_executables": {"clio-relay": str(bin_dir / "clio-relay")},
+        },
         "clio-kit": {
             "artifact_sha256": desired.clio_kit_artifact_sha256,
             "runtime_artifact_path": str(clio_kit_wheel),
@@ -318,7 +354,11 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
             "runtime_executables": {"jarvis": str(legacy_jarvis)},
         },
     }
-    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", lambda _path: info)
+
+    def read_installation(_path: Path | None = None) -> dict[str, object]:
+        return info
+
+    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", read_installation)
 
     def identity_command(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         if command[:2] != [str(bin_dir / "uv"), "--version"]:
@@ -363,19 +403,29 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
     assert plan.reusable_paths["jarvis_execution_environment"] == str(
         (tmp_path / ".local/share/clio-relay/jarvis-venv").resolve()
     )
+    assert plan.activation_paths["current"].before is None
+    assert plan.activation_paths["managed_repo"].before is None
+    assert plan.activation_paths["install_receipt"].before is not None
 
 
 def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A released runtime upgrade preserves state instead of falling into fresh bootstrap."""
+    """The exact legacy Ares layout enters the fenced staged-upgrade path."""
     bin_dir = tmp_path / ".local/bin"
     bin_dir.mkdir(parents=True)
-    for name, content in (("uv", b"uv"), ("frpc", b"frpc"), ("frps", b"frps")):
+    for name, content in (
+        ("uv", b"uv"),
+        ("frpc", b"frpc"),
+        ("frps", b"frps"),
+        ("clio-relay", b"relay"),
+    ):
         path = bin_dir / name
         path.write_bytes(content)
         path.chmod(0o755)
+    clio_kit_wheel = tmp_path / "clio_kit-2.5.23-py3-none-any.whl"
+    clio_kit_wheel.write_bytes(b"clio-kit-2.5.23")
     desired = _desired(
         uv_sha256=_digest(b"uv"),
         frpc_sha256=_digest(b"frpc"),
@@ -391,9 +441,16 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
             "jarvis_cd_wheel_sha256": (
                 "ebf5e5f375b921f20c79075d461926431a5a017ca8b45e598878a89b229b3935"
             ),
+            "clio_kit_version": "2.5.23",
+            "clio_kit_artifact_sha256": _digest(b"clio-kit-2.5.23"),
         }
     )
-    _write_jarvis_state(tmp_path, desired)
+    jarvis_root, _config_before, _graph_before = _write_jarvis_state(tmp_path, desired)
+    (tmp_path / ".local/share/clio-relay/managed-jarvis-repo").rmdir()
+    (jarvis_root / "repos.yaml").write_text(
+        yaml.safe_dump({"repos": ["/operator/clio_relay"]}, sort_keys=False),
+        encoding="utf-8",
+    )
     legacy_python = (
         tmp_path
         / ".local/share/clio-relay/jarvis-venv"
@@ -402,21 +459,45 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
     legacy_python.parent.mkdir(parents=True)
     legacy_python.write_bytes(b"python")
     legacy_python.chmod(0o755)
-    legacy_jarvis = legacy_python.parent / ("jarvis.exe" if os.name == "nt" else "jarvis")
-    legacy_jarvis.write_bytes(b"jarvis")
+    base_python = tmp_path / "uv-python" / legacy_python.name
+    base_python.parent.mkdir()
+    base_python.write_bytes(b"base-python")
+    base_python.chmod(0o755)
+    legacy_jarvis_target = legacy_python.parent / ("jarvis.exe" if os.name == "nt" else "jarvis")
+    legacy_jarvis_target.write_bytes(b"jarvis")
+    legacy_jarvis_target.chmod(0o755)
+    legacy_jarvis = bin_dir / "jarvis"
+    legacy_jarvis.write_bytes(b"stable-wrapper-link")
     legacy_jarvis.chmod(0o755)
+    resolve_path = Path.resolve
+
+    def resolve_stable_wrapper(path: Path, strict: bool = False) -> Path:
+        if path == legacy_python:
+            return resolve_path(base_python, strict=strict)
+        if path == legacy_jarvis:
+            return resolve_path(legacy_jarvis_target, strict=strict)
+        return resolve_path(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve_stable_wrapper)
     jarvis_util_checkout = tmp_path / ".local/src/jarvis-util"
     (jarvis_util_checkout / ".git").mkdir(parents=True)
     receipt_path = tmp_path / ".local/share/clio-relay/install-receipt.json"
     receipt_path.write_text("{}\n", encoding="utf-8")
     info = _installation_info(desired)
-    receipt = info["receipt"]
-    assert isinstance(receipt, dict)
-    components = receipt["components"]
-    assert isinstance(components, dict)
+    receipt = cast(dict[str, object], info["receipt"])
+    components = cast(dict[str, object], receipt["components"])
     components["jarvis-cd"] = "1.4.4"
     components["clio-kit"] = "2.5.22"
-    receipt["component_artifacts"] = {
+    component_runtime = info["component_runtime"]
+    assert isinstance(component_runtime, dict)
+    component_runtime["clio-kit"] = {
+        "error": "uv tool directory is unavailable",
+        "persistent_tool_verified": False,
+    }
+    component_artifacts: dict[str, object] = {
+        "clio-relay": {
+            "runtime_executables": {"clio-relay": str(bin_dir / "clio-relay")},
+        },
         "clio-kit": {
             "runtime_interpreters": {"provider": "/old/clio-kit/python"},
             "runtime_executables": {"clio-kit": "/old/clio-kit/clio-kit"},
@@ -426,7 +507,12 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
             "runtime_executables": {"jarvis": str(legacy_jarvis)},
         },
     }
-    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", lambda _path: info)
+    receipt["component_artifacts"] = component_artifacts
+
+    def read_installation(_path: Path | None = None) -> dict[str, object]:
+        return info
+
+    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", read_installation)
 
     def identity_command(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         assert command[:2] == [str(bin_dir / "uv"), "--version"]
@@ -464,7 +550,91 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
         "frp": "reuse",
         "uv": "reuse",
     }
-    assert plan.reusable_paths["jarvis_execution_python"] == str(legacy_python.resolve())
+    assert plan.reusable_paths["jarvis_execution_python"] == str(legacy_python)
+    assert plan.reusable_paths["jarvis_execution_executable"] == str(legacy_jarvis_target.resolve())
+    assert plan.reasons == [
+        "clio-kit version requires a staged upgrade",
+        "jarvis-cd version requires a staged upgrade",
+    ]
+    assert plan.activation_paths["current"].before is None
+    assert plan.activation_paths["managed_repo"].before is None
+    assert plan.activation_paths["relay_launcher"].before is not None
+    assert plan.activation_paths["jarvis_launcher"].before is not None
+
+    read_regular = bootstrap_reconcile_module._read_regular_bounded_with_identity  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    swapped = False
+
+    def swap_launcher_after_read(
+        path: Path,
+        *,
+        maximum: int,
+    ) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
+        nonlocal swapped
+        payload, identity = read_regular(path, maximum=maximum)
+        if path == legacy_jarvis_target.resolve() and not swapped:
+            swapped = True
+            path.unlink()
+            path.write_bytes(b"replacement-jarvis")
+            path.chmod(0o755)
+        return payload, identity
+
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "_read_regular_bounded_with_identity",
+        swap_launcher_after_read,
+    )
+    raced = plan_bootstrap_reconcile(desired, home=tmp_path)
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "_read_regular_bounded_with_identity",
+        read_regular,
+    )
+
+    assert raced.mode == "full"
+    assert "legacy JARVIS execution environment is not reusable" in raced.reasons
+
+    components["clio-kit"] = desired.clio_kit_version
+    artifacts = receipt["component_artifacts"]
+    artifacts["clio-kit"] = {
+        "artifact_sha256": desired.clio_kit_artifact_sha256,
+        "runtime_artifact_path": str(clio_kit_wheel),
+        "runtime_interpreters": {"provider": "/old/clio-kit/python"},
+        "runtime_executables": {"clio-kit": "/old/clio-kit/clio-kit"},
+    }
+
+    unsafe_reuse = plan_bootstrap_reconcile(desired, home=tmp_path)
+
+    assert unsafe_reuse.mode == "full"
+    assert unsafe_reuse.reasons == [
+        "jarvis-cd version requires a staged upgrade",
+        "clio-kit live runtime is not reusable",
+    ]
+
+
+def test_uv_version_output_accepts_only_pinned_bounded_target_triple() -> None:
+    """Accept uv's real target suffix without weakening the pinned version boundary."""
+    matches = bootstrap_reconcile_module._uv_version_output_matches  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    for accepted in (
+        "uv 0.11.28",
+        "uv 0.11.28\n",
+        "uv 0.11.28\r\n",
+        "uv 0.11.28 (x86_64-unknown-linux-gnu)",
+        "uv 0.11.28 (x86_64-unknown-linux-gnu)\n",
+    ):
+        assert matches(accepted, expected_version="0.11.28")
+
+    for rejected in (
+        "uv 0.11.27",
+        "uv 0.11.28 ()",
+        "uv 0.11.28 (x86_64 unknown linux gnu)",
+        "uv 0.11.28 (x86_64-unknown-linux-gnu) extra",
+        "uv 0.11.28 (x86_64-unknown-linux-gnu)(extra)",
+        "uv 0.11.28\n\n",
+        " uv 0.11.28",
+        "uv 0.11.28\x00",
+        "uv 0.11.28 (" + "a" * 129 + ")",
+    ):
+        assert not matches(rejected, expected_version="0.11.28")
 
 
 def test_existing_operator_jarvis_roots_are_adopted_without_mutation(tmp_path: Path) -> None:
@@ -529,7 +699,7 @@ def test_managed_repo_reconcile_refuses_concurrent_operator_edit(
     repos_file = tmp_path / "repos.yaml"
     repos_file.write_text("repos:\n  - /operator/original\n", encoding="utf-8")
     operator_update = b"repos:\n  - /operator/concurrent\n"
-    original_read = bootstrap_reconcile_module._read_regular_bounded_with_identity  # noqa: SLF001
+    original_read = bootstrap_reconcile_module._read_regular_bounded_with_identity  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     call_count = 0
 
     def mutate_before_compare(
@@ -549,7 +719,7 @@ def test_managed_repo_reconcile_refuses_concurrent_operator_edit(
         mutate_before_compare,
     )
 
-    with pytest.raises(ConfigurationError, match="changed during reconciliation"):
+    with pytest.raises(ConfigurationError, match="changed .*reconciliation"):
         reconcile_managed_jarvis_repository(
             repos_file,
             tmp_path / "relay/managed-jarvis-repo",
@@ -559,32 +729,749 @@ def test_managed_repo_reconcile_refuses_concurrent_operator_edit(
     assert not list(tmp_path.glob(".repos.yaml.*.tmp"))
 
 
+def test_managed_repo_reconcile_cleans_a_proven_previous_registration(tmp_path: Path) -> None:
+    """An existing managed alias does not prevent exact legacy-path cleanup."""
+    repos_file = tmp_path / "repos.yaml"
+    managed = tmp_path / "managed-jarvis-repo"
+    previous = tmp_path / "legacy/clio_relay"
+    operator = tmp_path / "operator/clio_relay"
+    repos_file.write_text(
+        yaml.safe_dump(
+            {
+                "repos": [
+                    str(managed.absolute()),
+                    str(previous.absolute()),
+                    str(operator.absolute()),
+                ]
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    evidence = reconcile_managed_jarvis_repository(
+        repos_file,
+        managed,
+        previous_managed_repos=(previous,),
+        exchange_identity="a" * 64,
+    )
+
+    assert evidence["action"] == "updated"
+    assert evidence["added_managed_repos"] == []
+    assert evidence["removed_previous_managed_repos"] == [str(previous.absolute())]
+    assert yaml.safe_load(repos_file.read_text(encoding="utf-8"))["repos"] == [
+        str(managed.absolute()),
+        str(operator.absolute()),
+    ]
+
+
+@pytest.mark.parametrize("race_boundary", ["before_exchange", "after_exchange", "crash"])
+def test_managed_repo_atomic_exchange_preserves_or_recovers_racing_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    race_boundary: str,
+) -> None:
+    """The exact exchange boundary never silently overwrites an operator edit."""
+    repos_file = tmp_path / "repos.yaml"
+    repos_file.write_text("repos:\n  - /operator/original\n", encoding="utf-8")
+    operator_update = b"repos:\n  - /operator/concurrent\n"
+    managed = tmp_path / "managed-jarvis-repo"
+    original_exchange = bootstrap_reconcile_module._atomic_exchange_paths  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    exchanged = False
+
+    def raced_exchange(left: Path, right: Path) -> None:
+        nonlocal exchanged
+        if exchanged:
+            original_exchange(left, right)
+            return
+        exchanged = True
+        if race_boundary == "before_exchange":
+            repos_file.write_bytes(operator_update)
+        original_exchange(left, right)
+        if race_boundary == "after_exchange":
+            repos_file.write_bytes(operator_update)
+        if race_boundary == "crash":
+            raise RuntimeError("crash after atomic exchange")
+
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "_atomic_exchange_paths",
+        raced_exchange,
+    )
+
+    if race_boundary == "crash":
+        with pytest.raises(RuntimeError, match="crash after atomic exchange"):
+            reconcile_managed_jarvis_repository(
+                repos_file,
+                managed,
+                exchange_identity="b" * 64,
+            )
+        monkeypatch.setattr(
+            bootstrap_reconcile_module,
+            "_atomic_exchange_paths",
+            original_exchange,
+        )
+        recovered = reconcile_managed_jarvis_repository(
+            repos_file,
+            managed,
+            exchange_identity="b" * 64,
+        )
+        assert recovered["action"] == "updated"
+        assert yaml.safe_load(repos_file.read_text(encoding="utf-8"))["repos"] == [
+            str(managed.absolute()),
+            "/operator/original",
+        ]
+    else:
+        with pytest.raises(ConfigurationError, match="changed .*reconciliation"):
+            reconcile_managed_jarvis_repository(
+                repos_file,
+                managed,
+                exchange_identity="b" * 64,
+            )
+        assert repos_file.read_bytes() == operator_update
+    assert not list(tmp_path.glob(".repos.yaml.*.exchange"))
+
+
+@pytest.mark.parametrize("race_boundary", ["before_exchange", "after_exchange", "crash"])
+def test_stable_link_atomic_exchange_preserves_or_recovers_racing_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    race_boundary: str,
+) -> None:
+    """Stable launcher exchange restores a raced object or resumes after a crash."""
+    destination = tmp_path / "launcher"
+    destination.write_bytes(b"legacy")
+    destination.chmod(0o755)
+    snapshot = bootstrap_reconcile_module._capture_activation_path(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        destination,
+        kind="file_or_symlink",
+        maximum=1024,
+        allow_absent=False,
+    )
+    target = tmp_path / "new-launcher"
+    target.write_bytes(b"new")
+    target.chmod(0o755)
+    operator_update = b"operator-concurrent"
+    original_exchange = bootstrap_reconcile_module._atomic_exchange_paths  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    simulated_links: dict[Path, Path] = {}
+    if os.name == "nt":
+        real_is_symlink = Path.is_symlink
+        real_resolve = Path.resolve
+        real_readlink = os.readlink
+
+        def simulated_symlink_to(
+            path: Path,
+            link_target: Path | str,
+            target_is_directory: bool = False,
+        ) -> None:
+            del target_is_directory
+            if path.exists() or path in simulated_links:
+                raise FileExistsError(path)
+            path.write_bytes(b"simulated-symlink")
+            simulated_links[path] = Path(link_target)
+
+        def simulated_is_symlink(path: Path) -> bool:
+            return path in simulated_links or real_is_symlink(path)
+
+        def simulated_readlink(path: Path | str) -> str:
+            candidate = Path(path)
+            if candidate in simulated_links:
+                return str(simulated_links[candidate])
+            return real_readlink(path)
+
+        def simulated_resolve(path: Path, strict: bool = False) -> Path:
+            candidate = path
+            for _ in range(4):
+                if candidate not in simulated_links:
+                    return real_resolve(candidate, strict=strict)
+                candidate = simulated_links[candidate]
+            raise AssertionError("simulated symlink chain did not terminate")
+
+        real_exchange = original_exchange
+
+        def simulated_exchange(left: Path, right: Path) -> None:
+            left_target = simulated_links.pop(left, None)
+            right_target = simulated_links.pop(right, None)
+            real_exchange(left, right)
+            if left_target is not None:
+                simulated_links[right] = left_target
+            if right_target is not None:
+                simulated_links[left] = right_target
+
+        original_exchange = simulated_exchange
+        monkeypatch.setattr(Path, "symlink_to", simulated_symlink_to)
+        monkeypatch.setattr(Path, "is_symlink", simulated_is_symlink)
+        monkeypatch.setattr(Path, "resolve", simulated_resolve)
+        monkeypatch.setattr(bootstrap_reconcile_module.os, "readlink", simulated_readlink)
+    exchanged = False
+
+    def raced_exchange(left: Path, right: Path) -> None:
+        nonlocal exchanged
+        if exchanged:
+            original_exchange(left, right)
+            return
+        exchanged = True
+        if race_boundary == "before_exchange":
+            destination.write_bytes(operator_update)
+        original_exchange(left, right)
+        if race_boundary == "after_exchange":
+            destination.unlink()
+            simulated_links.pop(destination, None)
+            destination.write_bytes(operator_update)
+        if race_boundary == "crash":
+            raise RuntimeError("crash after atomic exchange")
+
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "_atomic_exchange_paths",
+        raced_exchange,
+    )
+    reconcile = bootstrap_reconcile_module._reconcile_activation_symlink  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    if race_boundary == "crash":
+        with pytest.raises(RuntimeError, match="crash after atomic exchange"):
+            reconcile(
+                snapshot,
+                expected_target=target,
+                label="stable launcher",
+                exchange_identity="c" * 64,
+            )
+        monkeypatch.setattr(
+            bootstrap_reconcile_module,
+            "_atomic_exchange_paths",
+            original_exchange,
+        )
+        assert (
+            reconcile(
+                snapshot,
+                expected_target=target,
+                label="stable launcher",
+                exchange_identity="c" * 64,
+            )
+            == "retargeted"
+        )
+        assert os.readlink(destination) == str(target)
+    else:
+        with pytest.raises(ConfigurationError, match="changed .*atomic activation"):
+            reconcile(
+                snapshot,
+                expected_target=target,
+                label="stable launcher",
+                exchange_identity="c" * 64,
+            )
+        assert destination.read_bytes() == operator_update
+    assert not list(tmp_path.glob(".launcher.*.exchange"))
+
+
+def test_atomic_exchange_preflight_restores_and_cleans_every_directory(
+    tmp_path: Path,
+) -> None:
+    """The exact exchange primitive is exercised without retaining probe state."""
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+
+    evidence = bootstrap_reconcile_module.verify_atomic_exchange_support(
+        (first, second, first),
+        identity="d" * 64,
+    )
+
+    assert evidence["directories"] == [str(first), str(second)]
+    assert list(first.iterdir()) == []
+    assert list(second.iterdir()) == []
+
+
+def test_staged_activation_adopts_legacy_paths_idempotently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-generation install converges every stable path to canonical links."""
+    desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
+    share = tmp_path / ".local/share/clio-relay"
+    bin_dir = tmp_path / ".local/bin"
+    generation = share / "generations" / desired.fingerprint
+    (generation / "bin").mkdir(parents=True)
+    (generation / "source/jarvis-packages/clio_relay").mkdir(parents=True)
+    bin_dir.mkdir(parents=True)
+    for path, payload in (
+        (share / "install-receipt.json", b"legacy-receipt"),
+        (bin_dir / "clio-relay", b"legacy-relay"),
+        (bin_dir / "jarvis", b"legacy-jarvis"),
+        (generation / "install-receipt.json", b"new-receipt"),
+        (generation / "bin/clio-relay", b"new-relay"),
+        (generation / "bin/jarvis", b"new-jarvis"),
+    ):
+        path.write_bytes(payload)
+        path.chmod(0o755)
+    activation_paths = bootstrap_reconcile_module._capture_reconcile_activation_paths(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        home=tmp_path,
+    )
+    plan = BootstrapReconcilePlan(
+        mode="component-upgrade",
+        desired_fingerprint=desired.fingerprint,
+        component_actions={"clio-relay": "replace"},
+        activation_paths=activation_paths,
+    )
+
+    simulated_links: dict[Path, Path] = {}
+    if os.name == "nt":
+        original_is_symlink = Path.is_symlink
+        original_resolve = Path.resolve
+        original_readlink = os.readlink
+        original_replace = os.replace
+
+        def simulated_target(path: Path) -> Path:
+            candidate = path
+            for _ in range(10):
+                matches: list[tuple[int, Path, Path]] = []
+                for link, target in simulated_links.items():
+                    try:
+                        relative = candidate.relative_to(link)
+                    except ValueError:
+                        continue
+                    matches.append((len(link.parts), target, relative))
+                if not matches:
+                    return candidate
+                _length, target, relative = max(matches, key=lambda item: item[0])
+                candidate = target / relative
+            raise AssertionError("simulated symlink chain did not terminate")
+
+        def simulated_symlink_to(
+            path: Path,
+            target: Path | str,
+            target_is_directory: bool = False,
+        ) -> None:
+            del target_is_directory
+            if path.exists() or path in simulated_links:
+                raise FileExistsError(path)
+            path.write_bytes(b"simulated-symlink")
+            simulated_links[path] = Path(target)
+
+        def simulated_is_symlink(path: Path) -> bool:
+            return path in simulated_links or original_is_symlink(path)
+
+        def simulated_resolve(path: Path, strict: bool = False) -> Path:
+            return original_resolve(simulated_target(path), strict=strict)
+
+        def simulated_readlink(path: Path | str) -> str:
+            candidate = Path(path)
+            if candidate in simulated_links:
+                return str(simulated_links[candidate])
+            return original_readlink(path)
+
+        def simulated_replace(source: Path | str, destination: Path | str) -> None:
+            source_path = Path(source)
+            destination_path = Path(destination)
+            original_replace(source_path, destination_path)
+            if source_path in simulated_links:
+                simulated_links[destination_path] = simulated_links.pop(source_path)
+
+        monkeypatch.setattr(Path, "symlink_to", simulated_symlink_to)
+        monkeypatch.setattr(Path, "is_symlink", simulated_is_symlink)
+        monkeypatch.setattr(Path, "resolve", simulated_resolve)
+        monkeypatch.setattr(bootstrap_reconcile_module.os, "readlink", simulated_readlink)
+        monkeypatch.setattr(bootstrap_reconcile_module.os, "replace", simulated_replace)
+
+    first = reconcile_staged_activation_links(plan, generation=generation, home=tmp_path)
+    second = reconcile_staged_activation_links(plan, generation=generation, home=tmp_path)
+    first_actions = cast(dict[str, str], first["actions"])
+    second_actions = cast(dict[str, str], second["actions"])
+
+    assert first_actions == {
+        "current": "created",
+        "install_receipt": "retargeted",
+        "relay_launcher": "retargeted",
+        "jarvis_launcher": "retargeted",
+        "managed_repo": "created",
+    }
+    assert set(second_actions.values()) == {"reused"}
+    expected_targets = {
+        share / "current": generation,
+        share / "install-receipt.json": share / "current/install-receipt.json",
+        bin_dir / "clio-relay": share / "current/bin/clio-relay",
+        bin_dir / "jarvis": share / "current/bin/jarvis",
+        share / "managed-jarvis-repo": share / "current/source/jarvis-packages/clio_relay",
+    }
+    assert {path: bootstrap_reconcile_module.os.readlink(path) for path in expected_targets} == {
+        path: str(target) for path, target in expected_targets.items()
+    }
+
+
+def test_staged_activation_rejects_manifest_path_substitution_before_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A signed plan cannot redirect any stable activation destination."""
+    desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
+    share = tmp_path / ".local/share/clio-relay"
+    generation = share / "generations" / desired.fingerprint
+    generation.mkdir(parents=True)
+    activation_paths = {
+        "current": BootstrapActivationPath(
+            path=str(tmp_path / "attacker/current"),
+            kind="symlink",
+        ),
+        "install_receipt": BootstrapActivationPath(
+            path=str(share / "install-receipt.json"),
+            kind="file_or_symlink",
+        ),
+        "relay_launcher": BootstrapActivationPath(
+            path=str(tmp_path / ".local/bin/clio-relay"),
+            kind="file_or_symlink",
+        ),
+        "jarvis_launcher": BootstrapActivationPath(
+            path=str(tmp_path / ".local/bin/jarvis"),
+            kind="file_or_symlink",
+        ),
+        "managed_repo": BootstrapActivationPath(
+            path=str(share / "managed-jarvis-repo"),
+            kind="symlink",
+        ),
+    }
+    plan = BootstrapReconcilePlan(
+        mode="component-upgrade",
+        desired_fingerprint=desired.fingerprint,
+        component_actions={"clio-relay": "replace"},
+        activation_paths=activation_paths,
+    )
+
+    def unexpected_symlink(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("activation wrote before validating destinations")
+
+    monkeypatch.setattr(Path, "symlink_to", unexpected_symlink)
+
+    with pytest.raises(ConfigurationError, match="destination changed: current"):
+        reconcile_staged_activation_links(plan, generation=generation, home=tmp_path)
+
+    assert not (tmp_path / "attacker/current").exists()
+
+
+def test_finish_staged_activation_rejects_manifest_tamper_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery uses the journaled manifest digest instead of trusting disk state."""
+    desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
+    generation = tmp_path / "generation"
+    generation.mkdir()
+    (generation / "manifest.json").write_bytes(b'{"tampered":true}\n')
+
+    def unexpected_mutation(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("tampered manifest reached activation")
+
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "reconcile_staged_activation_links",
+        unexpected_mutation,
+    )
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "reconcile_managed_jarvis_repository",
+        unexpected_mutation,
+    )
+
+    with pytest.raises(ConfigurationError, match="manifest changed before activation"):
+        finish_staged_activation(
+            desired,
+            generation=generation,
+            expected_manifest_sha256="f" * 64,
+            home=tmp_path,
+        )
+
+
+def test_staged_activation_preserves_a_raced_absent_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exclusive link creation fails closed without clobbering a racing writer."""
+    destination = tmp_path / "stable-link"
+    target = tmp_path / "target"
+    target.mkdir()
+    snapshot = BootstrapActivationPath(path=str(destination), kind="symlink")
+
+    def race_symlink(
+        path: Path,
+        _target: Path,
+        target_is_directory: bool = False,
+    ) -> None:
+        del target_is_directory
+        assert path == destination
+        path.write_bytes(b"operator-owned")
+        raise FileExistsError(path)
+
+    monkeypatch.setattr(Path, "symlink_to", race_symlink)
+
+    with pytest.raises(ConfigurationError, match="appeared before activation"):
+        bootstrap_reconcile_module._reconcile_activation_symlink(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            snapshot,
+            expected_target=target,
+            label="stable test link",
+        )
+
+    assert destination.read_bytes() == b"operator-owned"
+
+
+def test_staged_activation_refuses_a_changed_legacy_launcher(tmp_path: Path) -> None:
+    """The activation fence cannot replace a launcher changed after planning."""
+    destination = tmp_path / "legacy-launcher"
+    destination.write_bytes(b"original")
+    destination.chmod(0o755)
+    snapshot = bootstrap_reconcile_module._capture_activation_path(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        destination,
+        kind="file_or_symlink",
+        maximum=1024,
+        allow_absent=False,
+    )
+    destination.write_bytes(b"operator-replacement")
+    target = tmp_path / "new-launcher"
+    target.write_bytes(b"new")
+
+    with pytest.raises(ConfigurationError, match="changed after bootstrap inspection"):
+        bootstrap_reconcile_module._reconcile_activation_symlink(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            snapshot,
+            expected_target=target,
+            label="stable relay launcher",
+        )
+
+    assert destination.read_bytes() == b"operator-replacement"
+
+
+@pytest.mark.parametrize("crash_boundary", ["before_repository", "after_replace", "completed"])
+def test_staged_activation_resumes_across_repository_crash_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_boundary: str,
+) -> None:
+    """Forward recovery completes exact repository migration after every boundary."""
+    desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
+    execution_root = tmp_path / ".local/share/clio-relay/jarvis-venv"
+    execution_bin = execution_root / ("Scripts" if os.name == "nt" else "bin")
+    execution_bin.mkdir(parents=True)
+    execution_python = execution_bin / ("python.exe" if os.name == "nt" else "python")
+    execution_jarvis = execution_bin / ("jarvis.exe" if os.name == "nt" else "jarvis")
+    for path in (execution_python, execution_jarvis):
+        path.write_bytes(path.name.encode())
+        path.chmod(0o755)
+    legacy_identity = execution_environment_identity(
+        execution_root,
+        executables={"python": execution_python, "jarvis": execution_jarvis},
+    )
+    generation = tmp_path / ".local/share/clio-relay/generations" / desired.fingerprint
+    generation.mkdir(parents=True)
+    generation_receipt = generation / "install-receipt.json"
+    generation_receipt.write_text("{}\n", encoding="utf-8")
+    plan = BootstrapReconcilePlan(
+        mode="component-upgrade",
+        desired_fingerprint=desired.fingerprint,
+        component_actions={"clio-relay": "replace"},
+        reusable_paths={
+            "jarvis_execution_environment": str(execution_root),
+            "jarvis_execution_python": str(execution_python),
+            "jarvis_execution_executable": str(execution_jarvis),
+        },
+    )
+    manifest = {
+        "schema_version": "clio-relay.bootstrap-generation.v1",
+        "fingerprint": desired.fingerprint,
+        "plan": plan.model_dump(mode="json"),
+        "legacy_execution_identity": legacy_identity,
+        "active_execution_identity": legacy_identity,
+        "jarvis_wrapper_sha256": "1" * 64,
+        "install_receipt": str(generation_receipt),
+        "install_receipt_sha256": _digest(generation_receipt.read_bytes()),
+    }
+    manifest_bytes = (json.dumps(manifest, sort_keys=True) + "\n").encode()
+    (generation / "manifest.json").write_bytes(manifest_bytes)
+    manifest_sha256 = _digest(manifest_bytes)
+    jarvis_root = tmp_path / ".ppi-jarvis"
+    jarvis_root.mkdir()
+    repos_file = jarvis_root / "repos.yaml"
+    previous_repo = tmp_path / ".local/src/clio-relay/jarvis-packages/clio_relay"
+    operator_repo = tmp_path / "operator/clio_relay"
+    repos_file.write_text(
+        yaml.safe_dump(
+            {"repos": [str(operator_repo.absolute()), str(previous_repo.absolute())]},
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    link_calls = 0
+
+    def simulated_links(
+        _plan: BootstrapReconcilePlan,
+        *,
+        generation: Path,
+        home: Path | None = None,
+    ) -> dict[str, object]:
+        nonlocal link_calls
+        del generation, home
+        link_calls += 1
+        action = "created" if link_calls == 1 else "reused"
+        return {
+            "schema_version": "clio-relay.bootstrap-activation.v1",
+            "generation": desired.fingerprint,
+            "actions": {"managed_repo": action},
+        }
+
+    def simulated_inspection(
+        _desired: BootstrapDesiredState,
+        *,
+        generation: Path,
+        legacy_execution_identity: dict[str, object],
+    ) -> dict[str, object]:
+        del generation, legacy_execution_identity
+        return {"manifest_sha256": manifest_sha256}
+
+    def simulated_stable_link(path: Path, *, expected: Path, label: str) -> Path:
+        del path, label
+        return expected
+
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "inspect_prepared_generation",
+        simulated_inspection,
+    )
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "reconcile_staged_activation_links",
+        simulated_links,
+    )
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "_verify_stable_symlink",
+        simulated_stable_link,
+    )
+    original_readlink = os.readlink
+    managed_repo = tmp_path / ".local/share/clio-relay/managed-jarvis-repo"
+    managed_target = tmp_path / ".local/share/clio-relay/current/source/jarvis-packages/clio_relay"
+
+    def simulated_readlink(path: Path | str) -> str:
+        if Path(path) == managed_repo:
+            return str(managed_target)
+        return original_readlink(path)
+
+    monkeypatch.setattr(
+        bootstrap_reconcile_module.os,
+        "readlink",
+        simulated_readlink,
+    )
+    original_reconcile = reconcile_managed_jarvis_repository
+    repository_calls = 0
+
+    def crashable_reconcile(
+        path: Path,
+        managed: Path,
+        *,
+        previous_managed_repos: tuple[Path, ...] = (),
+        exchange_identity: str | None = None,
+    ) -> dict[str, object]:
+        nonlocal repository_calls
+        repository_calls += 1
+        if repository_calls == 1 and crash_boundary == "before_repository":
+            raise RuntimeError("crash before repository migration")
+        evidence = original_reconcile(
+            path,
+            managed,
+            previous_managed_repos=previous_managed_repos,
+            exchange_identity=exchange_identity,
+        )
+        if repository_calls == 1 and crash_boundary == "after_replace":
+            raise RuntimeError("crash after repository replacement")
+        return evidence
+
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "reconcile_managed_jarvis_repository",
+        crashable_reconcile,
+    )
+
+    if crash_boundary != "completed":
+        with pytest.raises(RuntimeError, match="crash"):
+            finish_staged_activation(
+                desired,
+                generation=generation,
+                expected_manifest_sha256=manifest_sha256,
+                home=tmp_path,
+            )
+    first_completed = finish_staged_activation(
+        desired,
+        generation=generation,
+        expected_manifest_sha256=manifest_sha256,
+        home=tmp_path,
+    )
+    second_completed = finish_staged_activation(
+        desired,
+        generation=generation,
+        expected_manifest_sha256=manifest_sha256,
+        home=tmp_path,
+    )
+
+    repositories = yaml.safe_load(repos_file.read_text(encoding="utf-8"))["repos"]
+    assert repositories == [str(managed_repo.absolute()), str(operator_repo.absolute())]
+    first_repository = cast(dict[str, object], first_completed["jarvis_repository"])
+    second_repository = cast(dict[str, object], second_completed["jarvis_repository"])
+    second_update = cast(dict[str, object], second_repository["repositories"])
+    assert second_update["action"] == "reused"
+    assert first_repository["target"] == str(managed_target)
+    assert link_calls >= 2
+
+
 def test_managed_repo_repair_refuses_unproven_broken_link(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A broken link is existing untrusted state, not an absent managed path."""
     desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
-    expected = (
-        tmp_path
-        / ".local/share/clio-relay/generations"
-        / desired.fingerprint
-        / "source/jarvis-packages/clio_relay"
-    )
+    generation = tmp_path / ".local/share/clio-relay/generations" / desired.fingerprint
+    expected = generation / "source/jarvis-packages/clio_relay"
     expected.mkdir(parents=True)
+    current = tmp_path / ".local/share/clio-relay/current"
     managed = tmp_path / ".local/share/clio-relay/managed-jarvis-repo"
     original_lstat = Path.lstat
+    original_readlink = os.readlink
+    original_resolve = Path.resolve
+    original_verify = bootstrap_reconcile_module._verify_stable_symlink  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    managed_identity = original_lstat(expected)
+
+    def simulated_resolve(path: Path, strict: bool = False) -> Path:
+        if path == current / "source/jarvis-packages/clio_relay":
+            return original_resolve(expected, strict=strict)
+        return original_resolve(path, strict=strict)
+
+    def simulated_verify(path: Path, *, expected: Path, label: str) -> Path:
+        if path == current:
+            return generation
+        return original_verify(path, expected=expected, label=label)
 
     def simulated_lstat(path: Path) -> os.stat_result | SimpleNamespace:
         if path == managed:
-            return SimpleNamespace(st_mode=stat.S_IFLNK)
+            return SimpleNamespace(
+                st_dev=managed_identity.st_dev,
+                st_ino=managed_identity.st_ino,
+                st_mode=stat.S_IFLNK,
+                st_size=1,
+                st_mtime_ns=managed_identity.st_mtime_ns,
+                st_ctime_ns=managed_identity.st_ctime_ns,
+            )
         return original_lstat(path)
 
+    def simulated_readlink(path: Path | str) -> str:
+        if Path(path) == managed:
+            return str(tmp_path / "attacker-controlled/missing")
+        return original_readlink(path)
+
     monkeypatch.setattr(Path, "lstat", simulated_lstat)
+    monkeypatch.setattr(Path, "resolve", simulated_resolve)
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "_verify_stable_symlink",
+        simulated_verify,
+    )
     monkeypatch.setattr(
         bootstrap_reconcile_module.os,
         "readlink",
-        lambda path: str(tmp_path / "attacker-controlled/missing"),
+        simulated_readlink,
     )
 
     with pytest.raises(ConfigurationError, match="not proven by an earlier receipt"):
@@ -754,7 +1641,7 @@ def test_prepared_generation_refuses_a_tampered_relay_owned_jarvis_wrapper(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
-    execution_root = tmp_path / "jarvis-venv"
+    execution_root = tmp_path / "legacy-jarvis-venv"
     execution_bin = execution_root / ("Scripts" if os.name == "nt" else "bin")
     execution_bin.mkdir(parents=True)
     execution_python = execution_bin / ("python.exe" if os.name == "nt" else "python")
@@ -769,11 +1656,26 @@ def test_prepared_generation_refuses_a_tampered_relay_owned_jarvis_wrapper(
         execution_root,
         executables={"python": execution_python, "jarvis": legacy_jarvis},
     )
+    active_root = tmp_path / "active-jarvis-venv"
+    active_bin = active_root / ("Scripts" if os.name == "nt" else "bin")
+    active_bin.mkdir(parents=True)
+    active_python = active_bin / ("python.exe" if os.name == "nt" else "python")
+    active_jarvis = active_bin / ("jarvis.exe" if os.name == "nt" else "jarvis")
+    for path, payload in (
+        (active_python, b"active-python-runtime"),
+        (active_jarvis, b"active-jarvis-launcher"),
+    ):
+        path.write_bytes(payload)
+        path.chmod(0o755)
+    active_identity = execution_environment_identity(
+        active_root,
+        executables={"python": active_python, "jarvis": active_jarvis},
+    )
     generation = tmp_path / "generation"
     generation_bin = generation / "bin"
     generation_bin.mkdir(parents=True)
     wrapper = generation_bin / "jarvis"
-    wrapper_evidence = write_jarvis_wrapper(wrapper, execution_python)
+    wrapper_evidence = write_jarvis_wrapper(wrapper, active_python)
     simulated_launchers: set[Path] = set()
     for name in ("clio-relay", "clio-kit"):
         target = tmp_path / f"{name}-target"
@@ -791,7 +1693,7 @@ def test_prepared_generation_refuses_a_tampered_relay_owned_jarvis_wrapper(
     receipt_path = generation / "install-receipt.json"
     receipt_path.write_text("{}\n", encoding="utf-8")
     plan = {
-        "mode": "relay-only",
+        "mode": "component-upgrade",
         "desired_fingerprint": desired.fingerprint,
         "component_actions": {"clio-relay": "replace"},
     }
@@ -800,8 +1702,10 @@ def test_prepared_generation_refuses_a_tampered_relay_owned_jarvis_wrapper(
         "fingerprint": desired.fingerprint,
         "plan": plan,
         "legacy_execution_identity": execution_identity,
+        "active_execution_identity": active_identity,
         "jarvis_wrapper_sha256": wrapper_evidence["sha256"],
         "install_receipt": str(receipt_path),
+        "install_receipt_sha256": _digest(receipt_path.read_bytes()),
     }
     (generation / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -809,9 +1713,18 @@ def test_prepared_generation_refuses_a_tampered_relay_owned_jarvis_wrapper(
     )
     with (generation / ".prepared").open("w", encoding="ascii", newline="\n") as stream:
         stream.write(desired.fingerprint + "\n")
+    installation = _installation_info(desired)
+    receipt = cast(dict[str, object], installation["receipt"])
+    receipt["component_artifacts"] = {
+        "jarvis-cd": {"runtime_interpreters": {"execution": str(active_python)}}
+    }
+
+    def read_installation(_path: Path | None = None) -> dict[str, object]:
+        return installation
+
     monkeypatch.setattr(
         "clio_relay.bootstrap_reconcile.installation_info",
-        lambda _path: _installation_info(desired),
+        read_installation,
     )
 
     evidence = inspect_prepared_generation(
@@ -820,8 +1733,31 @@ def test_prepared_generation_refuses_a_tampered_relay_owned_jarvis_wrapper(
         legacy_execution_identity=execution_identity,
     )
 
-    assert evidence["launcher_targets"]["jarvis"] == str(wrapper)
-    assert wrapper.read_bytes() == jarvis_wrapper_payload(execution_python)
+    launcher_targets = cast(dict[str, object], evidence["launcher_targets"])
+    assert launcher_targets["jarvis"] == str(wrapper)
+    assert wrapper.read_bytes() == jarvis_wrapper_payload(active_python)
+
+    artifacts = cast(dict[str, object], receipt["component_artifacts"])
+    jarvis_artifact = cast(dict[str, object], artifacts["jarvis-cd"])
+    interpreters = cast(dict[str, object], jarvis_artifact["runtime_interpreters"])
+    interpreters["execution"] = str(execution_python)
+    with pytest.raises(ConfigurationError, match="not bound to its install receipt"):
+        inspect_prepared_generation(
+            desired,
+            generation=generation,
+            legacy_execution_identity=execution_identity,
+        )
+    interpreters["execution"] = str(active_python)
+
+    receipt_before = receipt_path.read_bytes()
+    receipt_path.write_text('{"changed":true}\n', encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="manifest identity changed"):
+        inspect_prepared_generation(
+            desired,
+            generation=generation,
+            legacy_execution_identity=execution_identity,
+        )
+    receipt_path.write_bytes(receipt_before)
 
     wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     wrapper.chmod(0o755)
@@ -831,6 +1767,33 @@ def test_prepared_generation_refuses_a_tampered_relay_owned_jarvis_wrapper(
             generation=generation,
             legacy_execution_identity=execution_identity,
         )
+
+
+def test_jarvis_wrapper_executes_the_lexical_venv_python(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resolving a venv Python must not bypass its installed site-packages."""
+    lexical_python = tmp_path / "venv/bin/python"
+    resolved_python = tmp_path / "base/bin/python3"
+    lexical_python.parent.mkdir(parents=True)
+    resolved_python.parent.mkdir(parents=True)
+    for path in (lexical_python, resolved_python):
+        path.write_bytes(b"python")
+        path.chmod(0o755)
+    original_resolve = Path.resolve
+
+    def simulated_venv_resolve(path: Path, strict: bool = False) -> Path:
+        if path == lexical_python:
+            return original_resolve(resolved_python, strict=strict)
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", simulated_venv_resolve)
+
+    payload = jarvis_wrapper_payload(lexical_python).decode("utf-8")
+
+    assert f"exec {shlex.quote(str(lexical_python))}" in payload
+    assert f"exec {shlex.quote(str(resolved_python))}" not in payload
 
 
 def test_active_generation_rejects_coordinated_manifest_and_wrapper_tamper(
@@ -873,8 +1836,10 @@ def test_active_generation_rejects_coordinated_manifest_and_wrapper_tamper(
             "component_actions": {"clio-relay": "replace"},
         },
         "legacy_execution_identity": original_identity,
+        "active_execution_identity": original_identity,
         "jarvis_wrapper_sha256": wrapper_evidence["sha256"],
         "install_receipt": str(receipt_path),
+        "install_receipt_sha256": _digest(receipt_path.read_bytes()),
     }
     manifest_path = generation / "manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -896,7 +1861,7 @@ def test_active_generation_rejects_coordinated_manifest_and_wrapper_tamper(
     )
     wrapper.unlink()
     replacement_wrapper = write_jarvis_wrapper(wrapper, replacement_python)
-    manifest["legacy_execution_identity"] = replacement_identity
+    manifest["active_execution_identity"] = replacement_identity
     manifest["jarvis_wrapper_sha256"] = replacement_wrapper["sha256"]
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 

@@ -8,7 +8,7 @@ import re
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -686,6 +686,31 @@ class RelayJob(BaseModel):
         if len(artifact_ids) != len(set(artifact_ids)):
             raise ValueError("used_artifact_refs must contain unique artifact_id values")
         return sorted(value, key=lambda item: item.artifact_id)
+
+
+class WaitObservation(BaseModel):
+    """Machine-readable outcome of one bounded terminal-state observation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    outcome: Literal["terminal", "observation_unknown"]
+    timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
+    scheduler_action: Literal["none"] = "none"
+    relay_action: Literal["none"] = "none"
+
+
+class JobWaitResult(RelayJob):
+    """A durable job snapshot plus the outcome of one bounded observation."""
+
+    observation: WaitObservation
+
+    @model_validator(mode="after")
+    def observation_must_match_durable_state(self) -> Self:
+        """Reject contradictory terminal claims from local or remote wait surfaces."""
+        expected = "terminal" if self.state in TERMINAL_STATES else "observation_unknown"
+        if self.observation.outcome != expected:
+            raise ValueError("wait observation outcome disagrees with durable job state")
+        return self
 
 
 def prepare_owned_jarvis_run_submission(job: RelayJob) -> RelayJob:

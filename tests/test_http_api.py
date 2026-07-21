@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from clio_relay import http_api as http_api_module
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     ClusterDefinition,
@@ -34,6 +35,7 @@ from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
     JobState,
+    JobWaitResult,
     McpAdmissionAuthority,
     McpAdmissionClass,
     McpCallSpec,
@@ -46,6 +48,7 @@ from clio_relay.models import (
     TaskTimelineEvent,
     utc_now,
 )
+from clio_relay.relay_ops import job_wait_result
 from clio_relay.remote_mcp import (
     cache_entry_from_discovery_artifact,
     remote_mcp_registration_revision,
@@ -122,6 +125,73 @@ def test_http_monitor_logs_and_artifact_content(tmp_path: Path) -> None:
     assert artifact_response.status_code == 200
     assert artifact_response.json()["artifact"]["artifact_id"] == artifact.artifact_id
     assert [response.status_code for response in invalid_log_responses] == [422, 422, 422]
+
+
+def test_http_wait_returns_nonterminal_durable_state_when_observation_expires(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_name="long-http-run"),
+            idempotency_key="long-http-run",
+        )
+    )
+    observed_arguments: list[tuple[str, float, float]] = []
+
+    def observe(
+        selected_queue: ClioCoreQueue,
+        job_id: str,
+        *,
+        timeout_seconds: float,
+        poll_seconds: float,
+    ) -> JobWaitResult:
+        observed_arguments.append((job_id, timeout_seconds, poll_seconds))
+        return job_wait_result(
+            selected_queue.get_job(job_id),
+            timeout_seconds=timeout_seconds,
+        )
+
+    monkeypatch.setattr(http_api_module, "observe_until_terminal", observe)
+    response = cast(Any, TestClient(create_app(settings))).post(
+        f"/jobs/{job.job_id}/wait",
+        params={"timeout_seconds": 0.25, "poll_seconds": 0.05},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["job_id"] == job.job_id
+    assert response.json()["state"] == "queued"
+    assert response.json()["observation"] == {
+        "outcome": "observation_unknown",
+        "timeout_seconds": 0.25,
+        "scheduler_action": "none",
+        "relay_action": "none",
+    }
+    assert observed_arguments == [(job.job_id, 0.25, 0.05)]
+    assert queue.get_job(job.job_id).state is JobState.QUEUED
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("timeout_seconds", "inf"), ("poll_seconds", "inf")],
+)
+def test_http_wait_rejects_nonfinite_observation_bounds(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    response = cast(Any, TestClient(create_app(settings))).post(
+        "/jobs/job_00000000000000000000000000000001/wait",
+        params={field: value},
+    )
+
+    assert response.status_code == 422
+    assert "positive and finite" in response.json()["detail"]
 
 
 def test_http_monitor_sse_streams_monitor_and_terminal_events(tmp_path: Path) -> None:

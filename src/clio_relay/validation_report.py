@@ -4410,6 +4410,8 @@ def _windows_validation_directory_identity(
     *,
     path: Path,
 ) -> tuple[int, int, int]:
+    if os.name != "nt":  # pragma: no cover - platform contract
+        raise OSError("Windows validation handles cannot be inspected on this platform")
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     get_information = kernel32.GetFileInformationByHandle
     get_information.argtypes = [
@@ -4439,6 +4441,8 @@ def _close_windows_validation_directory(
 
 
 def _close_windows_validation_handle(handle: ctypes.c_void_p, *, path: Path) -> None:
+    if os.name != "nt":  # pragma: no cover - platform contract
+        raise OSError("Windows validation handles cannot be closed on this platform")
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     close_handle = kernel32.CloseHandle
     close_handle.argtypes = [ctypes.c_void_p]
@@ -4454,6 +4458,8 @@ def _open_windows_validation_handle(
     allow_delete_share: bool,
     acl_write: bool,
 ) -> ctypes.c_void_p:
+    if os.name != "nt":  # pragma: no cover - platform contract
+        raise OSError("Windows validation handles cannot be opened on this platform")
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     create_file = kernel32.CreateFileW
     create_file.argtypes = [
@@ -4825,6 +4831,8 @@ def _create_windows_validation_directory_child(
     child_name: str,
 ) -> _WindowsValidationDirectoryAnchor:
     """Create, durably name, and pin one private child below a pinned parent."""
+    if os.name != "nt":  # pragma: no cover - platform contract
+        raise OSError("Windows validation directories cannot be created on this platform")
     if Path(child_name).name != child_name or child_name in {".", ".."}:
         raise OSError(f"unsafe validation report directory component: {child_name}")
     _verify_windows_validation_directory(parent)

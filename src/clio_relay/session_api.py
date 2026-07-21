@@ -21,7 +21,7 @@ from pydantic import ValidationError
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
-from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.errors import ConfigurationError, ObservationTimeoutError, RelayError
 from clio_relay.jarvis_mcp import is_virtual_jarvis_control_query
 from clio_relay.models import (
     MCP_ADMISSION_AUTHORITY_METADATA_KEY,
@@ -657,6 +657,10 @@ def _request_json_on_connection(
             )
         return document
     except (OSError, http.client.HTTPException) as exc:
+        if response_timeout_applied and isinstance(exc, TimeoutError):
+            raise ObservationTimeoutError(
+                f"owned session API response observation timed out for {method} {path}"
+            ) from exc
         raise RelayError(
             f"owned session API identity-bound request failed for {method} {path}: {exc}"
         ) from exc

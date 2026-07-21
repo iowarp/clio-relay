@@ -7,9 +7,11 @@ import copy
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import sys
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from json import JSONDecodeError
@@ -27,7 +29,11 @@ from clio_relay.cluster_config import (
 )
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import ConfigurationError, NotFoundError
+from clio_relay.errors import (
+    ConfigurationError,
+    NotFoundError,
+    ObservationTimeoutError,
+)
 from clio_relay.filesystem_paths import logical_filesystem_text
 from clio_relay.identifiers import (
     durable_record_id_json_schema,
@@ -54,6 +60,7 @@ from clio_relay.jarvis_service_runtime import (
 )
 from clio_relay.models import (
     MCP_ADMISSION_AUTHORITY_METADATA_KEY,
+    TERMINAL_STATES,
     ArtifactRef,
     ArtifactUse,
     Cursor,
@@ -62,6 +69,7 @@ from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
     JobState,
+    JobWaitResult,
     McpAdmissionClass,
     McpCallSpec,
     McpControlQueryEvidence,
@@ -101,6 +109,7 @@ from clio_relay.relay_ops import (
     wait_for_terminal,
 )
 from clio_relay.remote_cli import (
+    remote_command_timeout,
     remove_remote_file,
     run_remote_clio,
     should_execute_on_cluster,
@@ -147,8 +156,27 @@ MCP_RESULT_INLINE_LIMIT_MESSAGE = (
     "preserved for operator diagnosis. Remote side effects may have occurred; inspect the "
     "job before retrying."
 )
+JARVIS_WAIT_FOR_TERMINAL_DESCRIPTION = (
+    "Observe this submission until it becomes terminal within the current call. "
+    "The observation bound never becomes a relay, JARVIS, or scheduler execution "
+    "deadline and never fails, cancels, or resubmits the underlying job. Expiry returns "
+    "the same receipt with observation.outcome=observation_unknown."
+)
+JARVIS_WAIT_TIMEOUT_DESCRIPTION = (
+    "Maximum seconds to observe this submission in the current call when "
+    "wait_for_terminal is true. Observation expiry never fails, cancels, or "
+    "resubmits the underlying relay, JARVIS, or scheduler job; expiry returns the same "
+    "receipt with observation.outcome=observation_unknown so it can be observed again later."
+)
+JARVIS_LEGACY_WAIT_TIMEOUT_DESCRIPTION = (
+    "Deprecated observation-only alias for wait_timeout_seconds. It is not an "
+    "execution deadline and never fails, cancels, or resubmits the underlying "
+    "relay, JARVIS, or scheduler job. If both aliases are supplied, their values "
+    "must be equal."
+)
 MAX_OBSERVE_MATCHES = 100
 MAX_OBSERVE_MATCH_TEXT_CHARS = 1_024
+REMOTE_WAIT_STATUS_TIMEOUT_SECONDS = 30.0
 USER_MCP_TOOL_NAMES = {
     "relay_remote_mcp_context",
     "relay_submit_agent",
@@ -581,8 +609,13 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
         {
             "name": "relay_wait",
             "description": (
-                "Wait for a relay job to finish and return final status, verified MCP result "
-                "evidence, and optional logs. For a remote job, copy cluster, job_id, and "
+                "Observe a relay job for a bounded period and return final status, verified "
+                "MCP result evidence, and optional logs if it finishes. Observation expiry "
+                "never fails, cancels, or resubmits the underlying relay, JARVIS, or scheduler "
+                "job; it returns current durable status with "
+                "observation.outcome=observation_unknown. Preserve the receipt and call "
+                "relay_wait again later. For a remote job, "
+                "copy cluster, job_id, and "
                 "route_revision unchanged from its submission receipt on every follow-up "
                 "call, including on the same MCP connection. job_id alone is only for a "
                 "local relay job. Treat mcp_result.structured_result as the authoritative "
@@ -598,7 +631,16 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     "job_id": durable_record_id_json_schema(),
                     "cluster": {"type": "string"},
                     "route_revision": cluster_route_revision_json_schema(),
-                    "timeout_seconds": {"type": "number", "default": 600},
+                    "timeout_seconds": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "default": 600,
+                        "description": (
+                            "Maximum seconds for this observation call. Expiry never changes "
+                            "the underlying relay, JARVIS, or scheduler job state and never "
+                            "fails, cancels, or resubmits that work."
+                        ),
+                    },
                     "poll_seconds": {"type": "number", "default": 2},
                     "include_logs": {"type": "boolean", "default": False},
                     "log_limit": {
@@ -618,7 +660,12 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
         },
         {
             "name": "relay_submit_jarvis_pipeline",
-            "description": "Submit a JARVIS pipeline YAML document to a configured relay cluster.",
+            "description": (
+                "Submit a JARVIS pipeline YAML document to a configured relay cluster. "
+                "Submission is asynchronous by default. Any requested wait bounds only the "
+                "current observation; it never limits, fails, cancels, or resubmits the "
+                "underlying relay, JARVIS, or scheduler job."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -626,8 +673,23 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     "pipeline_yaml": {"type": "string"},
                     "idempotency_key": {"type": "string"},
                     "used_artifact_refs": _artifact_use_refs_json_schema(),
-                    "wait_for_terminal": {"type": "boolean", "default": False},
-                    "timeout_seconds": {"type": "number", "default": 600},
+                    "wait_for_terminal": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": JARVIS_WAIT_FOR_TERMINAL_DESCRIPTION,
+                    },
+                    "wait_timeout_seconds": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "default": 600,
+                        "description": JARVIS_WAIT_TIMEOUT_DESCRIPTION,
+                    },
+                    "timeout_seconds": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "deprecated": True,
+                        "description": JARVIS_LEGACY_WAIT_TIMEOUT_DESCRIPTION,
+                    },
                     "poll_seconds": {"type": "number", "default": 2},
                 },
                 "required": ["cluster", "pipeline_yaml"],
@@ -637,7 +699,10 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
         {
             "name": "relay_submit_jarvis_job",
             "description": (
-                "Submit an existing JARVIS pipeline by name on a configured relay cluster."
+                "Submit an existing JARVIS pipeline by name on a configured relay cluster. "
+                "Submission is asynchronous by default. Any requested wait bounds only the "
+                "current observation; it never limits, fails, cancels, or resubmits the "
+                "underlying relay, JARVIS, or scheduler job."
             ),
             "inputSchema": {
                 "type": "object",
@@ -646,8 +711,23 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     "pipeline_name": {"type": "string"},
                     "idempotency_key": {"type": "string"},
                     "used_artifact_refs": _artifact_use_refs_json_schema(),
-                    "wait_for_terminal": {"type": "boolean", "default": False},
-                    "timeout_seconds": {"type": "number", "default": 600},
+                    "wait_for_terminal": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": JARVIS_WAIT_FOR_TERMINAL_DESCRIPTION,
+                    },
+                    "wait_timeout_seconds": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "default": 600,
+                        "description": JARVIS_WAIT_TIMEOUT_DESCRIPTION,
+                    },
+                    "timeout_seconds": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "deprecated": True,
+                        "description": JARVIS_LEGACY_WAIT_TIMEOUT_DESCRIPTION,
+                    },
                     "poll_seconds": {"type": "number", "default": 2},
                 },
                 "required": ["cluster", "pipeline_name"],
@@ -3323,26 +3403,31 @@ def _observe_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettin
 def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -> JSON:
     job_id = _required_durable_record_id(arguments, "job_id")
     target = _job_target(arguments)
+    timeout_seconds = _observation_timeout_seconds(arguments, "timeout_seconds")
+    poll_seconds = _observation_timeout_seconds(arguments, "poll_seconds", default=2.0)
     logs: JSON | None = None
     if target is not None and should_execute_on_cluster(target):
         if settings.owner_session_id is not None:
+            try:
+                with OwnedSessionApiClient(definition=target, settings=settings) as client:
+                    waited = _owned_json(
+                        client,
+                        method="POST",
+                        path=f"/jobs/{job_id}/wait",
+                        query={
+                            "timeout_seconds": timeout_seconds,
+                            "poll_seconds": poll_seconds,
+                        },
+                        label="owned remote job wait",
+                        response_timeout_seconds=(
+                            timeout_seconds + OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS
+                        ),
+                    )
+                    if waited.get("job_id") != job_id or waited.get("cluster") != target.name:
+                        raise ValueError("owned remote wait returned a different job")
+            except ObservationTimeoutError:
+                pass
             with OwnedSessionApiClient(definition=target, settings=settings) as client:
-                waited = _owned_json(
-                    client,
-                    method="POST",
-                    path=f"/jobs/{job_id}/wait",
-                    query={
-                        "timeout_seconds": float(arguments.get("timeout_seconds", 600)),
-                        "poll_seconds": float(arguments.get("poll_seconds", 2)),
-                    },
-                    label="owned remote job wait",
-                    response_timeout_seconds=(
-                        float(arguments.get("timeout_seconds", 600))
-                        + OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS
-                    ),
-                )
-                if waited.get("job_id") != job_id or waited.get("cluster") != target.name:
-                    raise ValueError("owned remote wait returned a different job")
                 result = _owned_json(
                     client,
                     method="GET",
@@ -3350,11 +3435,20 @@ def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings)
                     label="owned remote job status",
                 )
                 _validate_owned_job_status(result, job_id=job_id, cluster=target.name)
-                source_job = _terminal_remote_wait_job(
+                source_job, observation_unknown = _observed_remote_wait_job(
                     result,
                     job_id=job_id,
                     cluster=target.name,
                 )
+                if observation_unknown:
+                    _attach_wait_observation(
+                        result,
+                        observation_unknown=True,
+                        timeout_seconds=timeout_seconds,
+                    )
+                    result["cluster"] = target.name
+                    result["route_revision"] = _route_revision(target)
+                    return result
                 if arguments.get("include_logs", False) is True:
                     logs = _owned_job_logs(
                         client,
@@ -3369,24 +3463,40 @@ def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings)
                 )
                 parsed_result = _verified_owned_mcp_result(client, job_id, artifact_records)
         else:
-            run_remote_clio(
-                target,
-                [
-                    "job",
-                    "wait",
-                    job_id,
-                    "--timeout-seconds",
-                    str(float(arguments.get("timeout_seconds", 600))),
-                    "--poll-seconds",
-                    str(float(arguments.get("poll_seconds", 2))),
-                ],
-            )
-            result = _remote_json(target, ["job", "status", job_id], "remote job status")
-            source_job = _terminal_remote_wait_job(
+            try:
+                with remote_command_timeout(
+                    timeout_seconds + OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS
+                ):
+                    run_remote_clio(
+                        target,
+                        [
+                            "job",
+                            "wait",
+                            job_id,
+                            "--timeout-seconds",
+                            str(timeout_seconds),
+                            "--poll-seconds",
+                            str(poll_seconds),
+                        ],
+                    )
+            except ObservationTimeoutError:
+                pass
+            with remote_command_timeout(REMOTE_WAIT_STATUS_TIMEOUT_SECONDS):
+                result = _remote_json(target, ["job", "status", job_id], "remote job status")
+            source_job, observation_unknown = _observed_remote_wait_job(
                 result,
                 job_id=job_id,
                 cluster=target.name,
             )
+            if observation_unknown:
+                _attach_wait_observation(
+                    result,
+                    observation_unknown=True,
+                    timeout_seconds=timeout_seconds,
+                )
+                result["cluster"] = target.name
+                result["route_revision"] = _route_revision(target)
+                return result
             if arguments.get("include_logs", False) is True:
                 logs = _remote_job_logs(
                     target,
@@ -3402,13 +3512,24 @@ def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings)
             parsed_result = _verified_mcp_result(target, job_id, artifact_records)
     else:
         _require_local_job_cluster(queue, job_id, target)
-        source_job = wait_for_terminal(
-            queue,
-            job_id,
-            timeout_seconds=float(arguments.get("timeout_seconds", 600)),
-            poll_seconds=float(arguments.get("poll_seconds", 2)),
-        )
-        result = job_status(queue, source_job.job_id)
+        with suppress(TimeoutError):
+            wait_for_terminal(
+                queue,
+                job_id,
+                timeout_seconds=timeout_seconds,
+                poll_seconds=poll_seconds,
+            )
+        result = job_status(queue, job_id)
+        source_job = RelayJob.model_validate(_object(result.get("job")))
+        if source_job.job_id != job_id:
+            raise ValueError("local wait status returned a different job")
+        if source_job.state not in TERMINAL_STATES:
+            _attach_wait_observation(
+                result,
+                observation_unknown=True,
+                timeout_seconds=timeout_seconds,
+            )
+            return result
         if arguments.get("include_logs", False) is True:
             logs = _job_logs(
                 queue,
@@ -3426,6 +3547,11 @@ def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings)
     if target is not None:
         result["cluster"] = target.name
         result["route_revision"] = _route_revision(target)
+    _attach_wait_observation(
+        result,
+        observation_unknown=False,
+        timeout_seconds=timeout_seconds,
+    )
     if parsed_result is not None:
         _attach_terminal_mcp_evidence(
             result,
@@ -3440,23 +3566,33 @@ def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings)
     return result
 
 
-def _terminal_remote_wait_job(
+def _observed_remote_wait_job(
     result: JSON,
     *,
     job_id: str,
     cluster: str,
-) -> RelayJob:
-    """Validate the exact terminal remote job backing a generic wait result."""
+) -> tuple[RelayJob, bool]:
+    """Validate an exact remote job after one bounded terminal observation."""
 
     source_job = RelayJob.model_validate(_object(result.get("job")))
     if source_job.job_id != job_id or source_job.cluster != cluster:
         raise ValueError("remote wait returned a different job")
-    if (
-        source_job.state not in {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELED}
-        or result.get("terminal") is not True
-    ):
-        raise ValueError("remote wait did not return one terminal job")
-    return source_job
+    terminal = source_job.state in TERMINAL_STATES
+    if result.get("terminal") is not terminal:
+        raise ValueError("remote wait status disagrees with its durable job state")
+    return source_job, not terminal
+
+
+def _relay_job_from_wait_document(document: JSON) -> RelayJob:
+    """Validate current and legacy HTTP wait documents without discarding the outcome."""
+    if "observation" not in document:
+        return RelayJob.model_validate(document)
+    result = JobWaitResult.model_validate(document)
+    terminal = result.state in TERMINAL_STATES
+    expected_outcome = "terminal" if terminal else "observation_unknown"
+    if result.observation.outcome != expected_outcome:
+        raise ValueError("remote wait observation disagrees with its durable job state")
+    return result
 
 
 def _job_logs(
@@ -3542,6 +3678,7 @@ def _submit_jarvis_pipeline(
 ) -> JSON:
     cluster = _required_str(arguments, "cluster")
     pipeline_yaml = _required_str(arguments, "pipeline_yaml")
+    wait_timeout_seconds = _jarvis_submission_wait_timeout_seconds(arguments)
     used_artifact_refs = _artifact_use_refs(arguments)
     digest = hashlib.sha256(pipeline_yaml.encode("utf-8")).hexdigest()
     dependency_digest = _stable_digest(
@@ -3573,7 +3710,7 @@ def _submit_jarvis_pipeline(
             definition=definition,
             settings=settings,
             wait_for_terminal_result=bool(arguments.get("wait_for_terminal", False)),
-            wait_timeout_seconds=float(arguments.get("timeout_seconds", 600)),
+            wait_timeout_seconds=wait_timeout_seconds,
             poll_seconds=float(arguments.get("poll_seconds", 2)),
         )
     job = _submit_local_job(
@@ -3587,19 +3724,12 @@ def _submit_jarvis_pipeline(
         ),
         settings=settings,
     )
-    if bool(arguments.get("wait_for_terminal", False)):
-        job = wait_for_terminal(
-            queue,
-            job.job_id,
-            timeout_seconds=float(arguments.get("timeout_seconds", 600)),
-            poll_seconds=float(arguments.get("poll_seconds", 2)),
-        )
-    return {
-        "job_id": job.job_id,
-        "state": job.state.value,
-        "kind": job.kind.value,
-        "terminal": job.state.value in {"succeeded", "failed", "canceled"},
-    }
+    return _submission_result(
+        job,
+        {**arguments, "wait_timeout_seconds": wait_timeout_seconds},
+        queue=queue,
+        definition=definition,
+    )
 
 
 def _submit_jarvis_job(
@@ -3609,6 +3739,7 @@ def _submit_jarvis_job(
     settings: RelaySettings,
 ) -> JSON:
     cluster = _required_str(arguments, "cluster")
+    wait_timeout_seconds = _jarvis_submission_wait_timeout_seconds(arguments)
     used_artifact_refs = _artifact_use_refs(arguments)
     dependency_digest = _stable_digest(
         {"used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs]}
@@ -3640,8 +3771,15 @@ def _submit_jarvis_job(
                 definition=definition,
                 settings=settings,
                 wait_for_terminal_result=bool(arguments.get("wait_for_terminal", False)),
-                wait_timeout_seconds=float(arguments.get("timeout_seconds", 600)),
+                wait_timeout_seconds=wait_timeout_seconds,
                 poll_seconds=float(arguments.get("poll_seconds", 2)),
+            )
+        if bool(arguments.get("wait_for_terminal", False)):
+            raise ValueError(
+                "wait_for_terminal is unavailable for a direct remote JARVIS pipeline "
+                "submission without an owned relay session; submit asynchronously, preserve "
+                "the remote receipt, and call relay_wait with its cluster, job_id, and "
+                "route_revision"
             )
         remote_args = [
             "job",
@@ -3673,7 +3811,11 @@ def _submit_jarvis_job(
         ),
         settings=settings,
     )
-    return _submission_result(job, arguments, queue=queue, definition=definition)
+    wait_arguments = {
+        **arguments,
+        "wait_timeout_seconds": wait_timeout_seconds,
+    }
+    return _submission_result(job, wait_arguments, queue=queue, definition=definition)
 
 
 def _submit_remote_agent(
@@ -4081,25 +4223,52 @@ def _remote_mcp_submission_result(
     if not bool(arguments.get("wait_for_terminal", False)):
         return result
     job_id = _required_durable_record_id(result, "job_id")
-    run_remote_clio(
-        definition,
-        [
-            "job",
-            "wait",
-            job_id,
-            "--timeout-seconds",
-            str(float(arguments.get("wait_timeout_seconds", 600))),
-            "--poll-seconds",
-            str(float(arguments.get("poll_seconds", 2))),
-        ],
+    wait_timeout_seconds = _observation_timeout_seconds(
+        arguments,
+        "wait_timeout_seconds",
     )
-    status = _remote_json(definition, ["job", "status", job_id], "remote job status")
+    try:
+        with remote_command_timeout(
+            wait_timeout_seconds + OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS
+        ):
+            run_remote_clio(
+                definition,
+                [
+                    "job",
+                    "wait",
+                    job_id,
+                    "--timeout-seconds",
+                    str(wait_timeout_seconds),
+                    "--poll-seconds",
+                    str(
+                        _observation_timeout_seconds(
+                            arguments,
+                            "poll_seconds",
+                            default=2.0,
+                        )
+                    ),
+                ],
+            )
+    except ObservationTimeoutError:
+        pass
+    with remote_command_timeout(REMOTE_WAIT_STATUS_TIMEOUT_SECONDS):
+        status = _remote_json(definition, ["job", "status", job_id], "remote job status")
     job = _object(status.get("job"))
     if job.get("job_id") != job_id or job.get("cluster") != definition.name:
         raise ValueError("remote MCP wait returned a different job")
-    state = job.get("state")
-    if state not in {"succeeded", "failed", "canceled"} or status.get("terminal") is not True:
-        raise ValueError("remote MCP wait did not return one terminal job")
+    source_job = RelayJob.model_validate(job)
+    state = source_job.state.value
+    terminal = source_job.state in TERMINAL_STATES
+    if status.get("terminal") is not terminal:
+        raise ValueError("remote MCP wait status disagrees with its durable job state")
+    result.update({"state": state, "terminal": terminal})
+    _attach_wait_observation(
+        result,
+        observation_unknown=not terminal,
+        timeout_seconds=wait_timeout_seconds,
+    )
+    if not terminal:
+        return result
     artifacts = _complete_remote_collection(
         definition,
         ["job", "list-artifacts", job_id],
@@ -4107,7 +4276,6 @@ def _remote_mcp_submission_result(
         label=f"remote artifacts for {job_id}",
     )
     parsed_result = _verified_mcp_result(definition, job_id, artifacts)
-    result.update({"state": state, "terminal": True})
     logs: JSON | None = None
     if arguments.get("include_logs", False) is True:
         logs = _remote_job_logs(
@@ -4118,7 +4286,6 @@ def _remote_mcp_submission_result(
     last_error = job.get("last_error")
     if last_error is not None and not isinstance(last_error, str):
         raise ValueError("remote MCP job returned an invalid last_error")
-    source_job = RelayJob.model_validate(job)
     _attach_terminal_mcp_evidence(
         result,
         source_job=source_job,
@@ -4147,36 +4314,38 @@ def _owned_session_submission_result(
     artifacts: list[JSON] = []
     parsed_result: _VerifiedMcpResult | None = None
     logs: JSON | None = None
+    observation_unknown = False
     if wait_for_terminal_result:
-        with OwnedSessionApiClient(definition=definition, settings=settings) as client:
-            document = _owned_json(
-                client,
-                method="POST",
-                path=f"/jobs/{job.job_id}/wait",
-                query={
-                    "timeout_seconds": wait_timeout_seconds,
-                    "poll_seconds": poll_seconds,
-                },
-                label="owned remote submitted job wait",
-                response_timeout_seconds=(
-                    wait_timeout_seconds + OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS
-                ),
-            )
-            waited = RelayJob.model_validate(document)
-            if include_terminal_mcp_result:
-                artifacts = _complete_owned_collection(
+        try:
+            with OwnedSessionApiClient(definition=definition, settings=settings) as client:
+                document = _owned_json(
                     client,
-                    path=f"/jobs/{job.job_id}/artifacts",
-                    record_key="artifacts",
-                    label=f"owned remote artifacts for {job.job_id}",
+                    method="POST",
+                    path=f"/jobs/{job.job_id}/wait",
+                    query={
+                        "timeout_seconds": wait_timeout_seconds,
+                        "poll_seconds": poll_seconds,
+                    },
+                    label="owned remote submitted job wait",
+                    response_timeout_seconds=(
+                        wait_timeout_seconds + OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS
+                    ),
                 )
-                parsed_result = _verified_owned_mcp_result(client, job.job_id, artifacts)
-            if include_terminal_logs:
-                logs = _owned_job_logs(
+                waited = _relay_job_from_wait_document(document)
+        except ObservationTimeoutError:
+            with OwnedSessionApiClient(definition=definition, settings=settings) as client:
+                status = _owned_json(
                     client,
-                    job.job_id,
-                    limit=terminal_log_limit,
+                    method="GET",
+                    path=f"/jobs/{job.job_id}/status",
+                    label="owned remote submitted job status after bounded wait",
                 )
+                _validate_owned_job_status(
+                    status,
+                    job_id=job.job_id,
+                    cluster=definition.name,
+                )
+                waited = RelayJob.model_validate(_object(status.get("job")))
         if (
             waited.job_id != job.job_id
             or waited.cluster != definition.name
@@ -4185,7 +4354,24 @@ def _owned_session_submission_result(
             != settings.owner_session_generation_id
         ):
             raise ValueError("owned remote wait returned a different submission receipt")
+        observation_unknown = waited.state not in TERMINAL_STATES
         job = waited
+        if not observation_unknown and (include_terminal_mcp_result or include_terminal_logs):
+            with OwnedSessionApiClient(definition=definition, settings=settings) as client:
+                if include_terminal_mcp_result:
+                    artifacts = _complete_owned_collection(
+                        client,
+                        path=f"/jobs/{job.job_id}/artifacts",
+                        record_key="artifacts",
+                        label=f"owned remote artifacts for {job.job_id}",
+                    )
+                    parsed_result = _verified_owned_mcp_result(client, job.job_id, artifacts)
+                if include_terminal_logs:
+                    logs = _owned_job_logs(
+                        client,
+                        job.job_id,
+                        limit=terminal_log_limit,
+                    )
     result: JSON = {
         "cluster": definition.name,
         "job_id": job.job_id,
@@ -4195,7 +4381,13 @@ def _owned_session_submission_result(
         "remote": True,
         "route_revision": _route_revision(definition),
     }
-    if wait_for_terminal_result and include_terminal_mcp_result:
+    if wait_for_terminal_result:
+        _attach_wait_observation(
+            result,
+            observation_unknown=observation_unknown,
+            timeout_seconds=wait_timeout_seconds,
+        )
+    if wait_for_terminal_result and not observation_unknown and include_terminal_mcp_result:
         _attach_terminal_mcp_evidence(
             result,
             source_job=job,
@@ -4203,7 +4395,7 @@ def _owned_session_submission_result(
             artifacts=artifacts,
             parsed_result=parsed_result,
         )
-    if wait_for_terminal_result and logs is not None:
+    if wait_for_terminal_result and not observation_unknown and logs is not None:
         result["logs"] = logs
     return result
 
@@ -4427,13 +4619,26 @@ def _submission_result(
     include_terminal_mcp_result: bool = False,
 ) -> JSON:
     waited = bool(arguments.get("wait_for_terminal", False))
+    observation_unknown = False
+    wait_timeout_seconds = _observation_timeout_seconds(
+        arguments,
+        "wait_timeout_seconds",
+    )
     if waited:
-        job = wait_for_terminal(
-            queue,
-            job.job_id,
-            timeout_seconds=float(arguments.get("wait_timeout_seconds", 600)),
-            poll_seconds=float(arguments.get("poll_seconds", 2)),
-        )
+        try:
+            job = wait_for_terminal(
+                queue,
+                job.job_id,
+                timeout_seconds=wait_timeout_seconds,
+                poll_seconds=_observation_timeout_seconds(
+                    arguments,
+                    "poll_seconds",
+                    default=2.0,
+                ),
+            )
+        except TimeoutError:
+            job = queue.get_job(job.job_id)
+        observation_unknown = job.state not in TERMINAL_STATES
     result: JSON = {
         "cluster": job.cluster,
         "job_id": job.job_id,
@@ -4443,7 +4648,13 @@ def _submission_result(
     }
     if definition is not None:
         result["route_revision"] = _route_revision(definition)
-    if waited and include_terminal_mcp_result:
+    if waited:
+        _attach_wait_observation(
+            result,
+            observation_unknown=observation_unknown,
+            timeout_seconds=wait_timeout_seconds,
+        )
+    if waited and not observation_unknown and include_terminal_mcp_result:
         artifacts = _complete_local_artifacts(queue, job.job_id)
         _attach_terminal_mcp_evidence(
             result,
@@ -4452,7 +4663,7 @@ def _submission_result(
             artifacts=artifacts,
             parsed_result=_verified_local_mcp_result(queue, job.job_id),
         )
-    if waited and arguments.get("include_logs", False) is True:
+    if waited and not observation_unknown and arguments.get("include_logs", False) is True:
         if settings is None:
             raise ValueError("local waited log retrieval requires relay settings")
         result["logs"] = _job_logs(
@@ -4921,6 +5132,64 @@ def _positive_float_argument(
     if value <= 0 or value > maximum:
         raise ValueError(f"{field_name} must be greater than 0 and at most {maximum:g}")
     return value
+
+
+def _observation_timeout_seconds(
+    arguments: JSON,
+    field_name: str,
+    *,
+    default: float = 600.0,
+) -> float:
+    """Read one finite positive observation bound without creating an execution deadline."""
+    raw = arguments.get(field_name, default)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError(f"{field_name} must be a number")
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{field_name} must be a finite number greater than 0")
+    return value
+
+
+def _attach_wait_observation(
+    result: JSON,
+    *,
+    observation_unknown: bool,
+    timeout_seconds: float,
+) -> None:
+    """Attach a machine-readable outcome for one bounded wait without mutating its job."""
+    result["observation"] = {
+        "outcome": "observation_unknown" if observation_unknown else "terminal",
+        "timeout_seconds": timeout_seconds,
+        "scheduler_action": "none",
+        "relay_action": "none",
+    }
+
+
+def _jarvis_submission_wait_timeout_seconds(arguments: JSON) -> float:
+    """Resolve canonical and legacy JARVIS submission observation bounds."""
+    resolved: dict[str, float] = {}
+    for field_name in ("wait_timeout_seconds", "timeout_seconds"):
+        if field_name not in arguments:
+            continue
+        raw = arguments[field_name]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValueError(f"{field_name} must be a number")
+        value = float(raw)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{field_name} must be a finite number greater than 0")
+        resolved[field_name] = value
+    canonical = resolved.get("wait_timeout_seconds")
+    legacy = resolved.get("timeout_seconds")
+    if canonical is not None and legacy is not None and canonical != legacy:
+        raise ValueError(
+            "wait_timeout_seconds and legacy timeout_seconds must be equal when both are "
+            "provided; both fields bound observation only"
+        )
+    if canonical is not None:
+        return canonical
+    if legacy is not None:
+        return legacy
+    return 600.0
 
 
 def _required_environment_secret(name: str, label: str) -> str:

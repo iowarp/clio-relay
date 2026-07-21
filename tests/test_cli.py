@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import Thread
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
@@ -51,6 +51,7 @@ from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
     JobState,
+    JobWaitResult,
     McpAdmissionClass,
     McpCallSpec,
     McpOperation,
@@ -85,6 +86,18 @@ from tests.queue_validation_fixtures import (
 _REAL_PERSIST_VERIFIED_CLEANUP_REPORT = (
     cli._persist_verified_cleanup_report_before_closure  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
+
+
+def _fake_no_worker_observation(
+    _definition: ClusterDefinition,
+) -> tuple[None, None]:
+    """Return the typed no-worker observation used by teardown tests."""
+
+    return None, None
+
+
+def _fake_no_completed_cleanup(**_kwargs: object) -> None:
+    """Model an absent completed cleanup receipt without untyped lambdas."""
 
 
 def _owner_session_closure_payload(
@@ -959,6 +972,81 @@ def test_cli_job_status_includes_relay_queue(tmp_path: Path, monkeypatch: Monkey
     status = json.loads(result.output)
     assert status["job"]["job_id"] == job.job_id
     assert status["relay_queue"] == {"state": "queued", "jobs_ahead": 0, "position": 1}
+
+
+def test_cli_job_wait_returns_current_state_when_observation_expires(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_name="long-cli-run"),
+            idempotency_key="long-cli-run",
+        )
+    )
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+    observations: list[tuple[str, float, float]] = []
+
+    def observe(
+        selected_queue: ClioCoreQueue,
+        job_id: str,
+        *,
+        timeout_seconds: float,
+        poll_seconds: float,
+    ) -> JobWaitResult:
+        observations.append((job_id, timeout_seconds, poll_seconds))
+        return cli.job_wait_result(
+            selected_queue.get_job(job_id),
+            timeout_seconds=timeout_seconds,
+        )
+
+    monkeypatch.setattr(cli, "observe_until_terminal", observe)
+    result = CliRunner().invoke(
+        app,
+        [
+            "job",
+            "wait",
+            job.job_id,
+            "--timeout-seconds",
+            "0.25",
+            "--poll-seconds",
+            "0.05",
+        ],
+    )
+
+    assert result.exit_code == 0
+    observed = json.loads(result.output)
+    assert observed["job_id"] == job.job_id
+    assert observed["state"] == "queued"
+    assert observed["observation"] == {
+        "outcome": "observation_unknown",
+        "timeout_seconds": 0.25,
+        "scheduler_action": "none",
+        "relay_action": "none",
+    }
+    assert observations == [(job.job_id, 0.25, 0.05)]
+    assert queue.get_job(job.job_id).state is JobState.QUEUED
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [("--timeout-seconds", "inf"), ("--poll-seconds", "inf")],
+)
+def test_cli_job_wait_rejects_nonfinite_observation_bounds(
+    option: str,
+    value: str,
+) -> None:
+    result = CliRunner().invoke(
+        app,
+        ["job", "wait", "job_00000000000000000000000000000001", option, value],
+    )
+
+    assert result.exit_code != 0
+    assert "positive and finite" in result.output
 
 
 def test_cli_queue_management_commands(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -1882,14 +1970,20 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
             }
         )
 
+    def read_report(**_kwargs: object) -> SessionLifecycleReport:
+        return report
+
+    def execute_on_cluster(_definition: ClusterDefinition) -> bool:
+        return True
+
     monkeypatch.setattr(cli, "status_remote_session", fake_status)
     monkeypatch.setattr(
         cli,
         "read_remote_session_cleanup_report",
-        lambda **_kwargs: report,
+        read_report,
     )
     monkeypatch.setattr(cli, "run_remote_clio", fake_remote)
-    monkeypatch.setattr(cli, "should_execute_on_cluster", lambda _definition: True)
+    monkeypatch.setattr(cli, "should_execute_on_cluster", execute_on_cluster)
     real_set_closed = ClioCoreQueue.set_owner_session_closed
     local_mutations = 0
 
@@ -2143,7 +2237,7 @@ def test_session_teardown_never_closes_before_finalized_sidecar_reread(
     monkeypatch.setattr(cli, "status_remote_session", _fake_owned_session_status)
     monkeypatch.setattr(cli, "teardown_remote_session", _fake_verified_teardown)
     monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
-    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", lambda _definition: (None, None))
+    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", _fake_no_worker_observation)
     monkeypatch.setattr(
         cli,
         "_persist_verified_cleanup_report_before_closure",
@@ -2672,8 +2766,12 @@ def test_normal_session_teardown_uses_compact_projection_for_large_report(
     report = _verified_teardown_report()
     report.resources[0].detail = "large-normal-report:" + ("x" * (9 * 1024 * 1024))
     monkeypatch.setattr(cli, "status_remote_session", _fake_owned_session_status)
-    monkeypatch.setattr(cli, "teardown_remote_session", lambda **_kwargs: report)
-    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", lambda _definition: (None, None))
+
+    def teardown(**_kwargs: object) -> SessionLifecycleReport:
+        return report
+
+    monkeypatch.setattr(cli, "teardown_remote_session", teardown)
+    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", _fake_no_worker_observation)
     validation_path = tmp_path / "large-normal.json"
 
     result = CliRunner().invoke(
@@ -2877,6 +2975,9 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
     ) -> tuple[dict[str, object] | None, Exception | None]:
         return None, None
 
+    def read_authoritative_admission(**_kwargs: object) -> dict[str, object]:
+        return authoritative_admission()
+
     monkeypatch.setattr(cli, "should_execute_on_cluster", remote_execution)
     monkeypatch.setattr(
         cli,
@@ -2887,7 +2988,7 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
     monkeypatch.setattr(
         cli,
         "_owner_session_admission_status",
-        lambda **_kwargs: authoritative_admission(),
+        read_authoritative_admission,
     )
     monkeypatch.setattr(cli, "_observe_worker_before_cleanup", no_worker_observation)
     report_reads: list[OwnedSessionRecoveryStatus] = []
@@ -3094,7 +3195,11 @@ def test_session_start_never_closes_from_remote_only_cleanup_receipt(
             },
         },
     ).model_dump(mode="json")
-    monkeypatch.setattr(cli, "status_remote_session", lambda **_kwargs: status)
+
+    def read_status(**_kwargs: object) -> dict[str, object]:
+        return status
+
+    monkeypatch.setattr(cli, "status_remote_session", read_status)
 
     def forbidden_remote(*_args: object, **_kwargs: object) -> str:
         raise AssertionError("remote-only cleanup evidence must not close admission")
@@ -3160,7 +3265,9 @@ def test_local_owner_session_closure_replay_is_read_only_after_split_failure(
         report
     )
 
-    def recovery(process_state: str) -> OwnedSessionRecoveryStatus:
+    def recovery(
+        process_state: Literal["cleanup_pending", "already_closed"],
+    ) -> OwnedSessionRecoveryStatus:
         return OwnedSessionRecoveryStatus(
             cluster="ares",
             session_id=session_id,
@@ -3202,23 +3309,23 @@ def test_local_owner_session_closure_replay_is_read_only_after_split_failure(
         return real_set_closed(self, owner_session_id, **kwargs)  # pyright: ignore[reportArgumentType]
 
     monkeypatch.setattr(ClioCoreQueue, "set_owner_session_closed", fail_first_mirror_close)
-    arguments = {
-        "queue": queue,
-        "definition": ClusterDefinition(name="ares", ssh_host="ares"),
-        "cluster": "ares",
-        "remote_execution": False,
-        "session_id": session_id,
-        "local_admission_session_id": local_session_id,
-        "session_generation_id": generation_id,
-        "legacy_unversioned_job_ids": [],
-        "finalized_report": report,
-    }
+
+    def mark_closed(finalized_recovery: OwnedSessionRecoveryStatus) -> None:
+        cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            queue=queue,
+            definition=ClusterDefinition(name="ares", ssh_host="ares"),
+            cluster="ares",
+            remote_execution=False,
+            session_id=session_id,
+            local_admission_session_id=local_session_id,
+            session_generation_id=generation_id,
+            legacy_unversioned_job_ids=[],
+            finalized_recovery=finalized_recovery,
+            finalized_report=report,
+        )
 
     with pytest.raises(RelayError, match="simulated local mirror crash"):
-        cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            **arguments,
-            finalized_recovery=recovery("cleanup_pending"),
-        )
+        mark_closed(recovery("cleanup_pending"))
     assert (
         queue.owner_session_generation_status(
             session_id,
@@ -3235,14 +3342,8 @@ def test_local_owner_session_closure_replay_is_read_only_after_split_failure(
     )
 
     closed_recovery = recovery("already_closed")
-    cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        **arguments,
-        finalized_recovery=closed_recovery,
-    )
-    cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        **arguments,
-        finalized_recovery=closed_recovery,
-    )
+    mark_closed(closed_recovery)
+    mark_closed(closed_recovery)
 
     assert setter_calls[session_id] == 1
     assert setter_calls[local_session_id] == 2
@@ -3556,11 +3657,17 @@ def test_session_start_rejects_invalid_finalized_cleanup_before_closure(
         },
     ).model_dump(mode="json")
 
-    monkeypatch.setattr(cli, "status_remote_session", lambda **_kwargs: status)
+    def read_status(**_kwargs: object) -> dict[str, object]:
+        return status
+
+    def read_report(**_kwargs: object) -> SessionLifecycleReport:
+        return report
+
+    monkeypatch.setattr(cli, "status_remote_session", read_status)
     monkeypatch.setattr(
         cli,
         "read_remote_session_cleanup_report",
-        lambda **_kwargs: report,
+        read_report,
     )
 
     def forbidden_remote(*_args: object, **_kwargs: object) -> str:
@@ -3912,7 +4019,7 @@ def test_cli_session_start_verifies_exact_worker_inside_lock_before_mutation(
     monkeypatch.setattr(
         cli,
         "_finalize_completed_cleanup_receipt_before_start",
-        lambda **_kwargs: None,
+        _fake_no_completed_cleanup,
     )
 
     result = CliRunner().invoke(
@@ -3950,16 +4057,21 @@ def test_cli_session_start_json_returns_self_contained_current_selector(
             f"remote_api_port={kwargs['remote_api_port']}",
         ]
 
+    def verify_worker_compatibility(
+        _definition: ClusterDefinition,
+    ) -> SessionApiReleaseIdentity:
+        return release
+
     monkeypatch.setattr(cli, "start_remote_session", start)
     monkeypatch.setattr(
         cli,
         "_verify_session_start_worker_compatibility",
-        lambda _definition: release,
+        verify_worker_compatibility,
     )
     monkeypatch.setattr(
         cli,
         "_finalize_completed_cleanup_receipt_before_start",
-        lambda **_kwargs: None,
+        _fake_no_completed_cleanup,
     )
 
     result = CliRunner().invoke(
@@ -4024,10 +4136,15 @@ def test_cli_session_start_rejects_stale_plan_before_cleanup_mutation(
         starts += 1
         return []
 
+    def verify_worker_compatibility(
+        _definition: ClusterDefinition,
+    ) -> SessionApiReleaseIdentity:
+        return release
+
     monkeypatch.setattr(
         cli,
         "_verify_session_start_worker_compatibility",
-        lambda _definition: release,
+        verify_worker_compatibility,
     )
     monkeypatch.setattr(cli, "_finalize_completed_cleanup_receipt_before_start", finalize)
     monkeypatch.setattr(cli, "start_remote_session", start)
@@ -9231,17 +9348,33 @@ def test_cli_remote_wait_passthrough_uses_cluster_core(
     monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
     _write_test_cluster(tmp_path)
     commands: list[list[str]] = []
+    remote_job = RelayJob(
+        job_id="job_00000000000000000000000000000001",
+        cluster="ares",
+        kind=JobKind.JARVIS,
+        state=JobState.QUEUED,
+        spec=JarvisRunSpec(pipeline_name="long-remote-run"),
+        idempotency_key="long-remote-run",
+    )
+    wait_result = cli.job_wait_result(remote_job, timeout_seconds=1.0)
 
     def fake_run(
         command: list[str],
         *,
         capture_output: bool,
         check: bool,
+        timeout: float | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         commands.append(command)
         assert capture_output is True
         assert check is False
-        return subprocess.CompletedProcess(command, 0, b'{"job_id":"job_remote"}\n', b"")
+        assert timeout == 11.0
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            wait_result.model_dump_json().encode("utf-8"),
+            b"",
+        )
 
     monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
 
@@ -9250,7 +9383,7 @@ def test_cli_remote_wait_passthrough_uses_cluster_core(
         [
             "job",
             "wait",
-            "job_remote",
+            remote_job.job_id,
             "--cluster",
             "ares",
             "--timeout-seconds",
@@ -9261,9 +9394,144 @@ def test_cli_remote_wait_passthrough_uses_cluster_core(
     )
 
     assert result.exit_code == 0
-    assert json.loads(result.output)["job_id"] == "job_remote"
+    observed = json.loads(result.output)
+    assert observed["job_id"] == remote_job.job_id
+    assert observed["observation"]["outcome"] == "observation_unknown"
     assert len(commands) == 1
-    assert "clio-relay job wait job_remote" in commands[0][2]
+    assert f"clio-relay job wait {remote_job.job_id}" in commands[0][2]
+
+
+def test_cli_remote_wait_transport_expiry_reobserves_exact_status(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+    _write_test_cluster(tmp_path)
+    remote_job = RelayJob(
+        job_id="job_00000000000000000000000000000002",
+        cluster="ares",
+        kind=JobKind.JARVIS,
+        state=JobState.QUEUED,
+        spec=JarvisRunSpec(pipeline_name="long-remote-run"),
+        idempotency_key="long-remote-run-timeout",
+    )
+    commands: list[list[str]] = []
+    timeouts: list[float | None] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        capture_output: bool,
+        check: bool,
+        timeout: float | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        commands.append(command)
+        timeouts.append(timeout)
+        assert capture_output is True
+        assert check is False
+        if "clio-relay job wait" in command[2]:
+            raise subprocess.TimeoutExpired(command, timeout or 0)
+        if "clio-relay job status" in command[2]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps(
+                    {
+                        "job": remote_job.model_dump(mode="json"),
+                        "relay_queue": {"state": "queued"},
+                        "scheduler": [{"scheduler_job_id": "42", "raw_state": "PENDING"}],
+                        "terminal": False,
+                    }
+                ).encode("utf-8"),
+                b"",
+            )
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
+    result = CliRunner().invoke(
+        app,
+        [
+            "job",
+            "wait",
+            remote_job.job_id,
+            "--cluster",
+            "ares",
+            "--timeout-seconds",
+            "1",
+            "--poll-seconds",
+            "0.1",
+        ],
+    )
+
+    assert result.exit_code == 0
+    observed = json.loads(result.output)
+    assert observed["job_id"] == remote_job.job_id
+    assert observed["state"] == "queued"
+    assert observed["observation"]["outcome"] == "observation_unknown"
+    assert observed["observation"]["scheduler_action"] == "none"
+    assert len(commands) == 2
+    assert timeouts == [11.0, 30.0]
+
+
+def test_cli_remote_wait_rejects_contradictory_terminal_claim(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+    _write_test_cluster(tmp_path)
+    remote_job = RelayJob(
+        job_id="job_00000000000000000000000000000003",
+        cluster="ares",
+        kind=JobKind.JARVIS,
+        state=JobState.QUEUED,
+        spec=JarvisRunSpec(pipeline_name="hostile-remote-run"),
+        idempotency_key="hostile-remote-run",
+    )
+
+    def fake_run(
+        command: list[str],
+        *,
+        capture_output: bool,
+        check: bool,
+        timeout: float | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        assert capture_output is True
+        assert check is False
+        assert timeout == 11.0
+        contradictory = {
+            **remote_job.model_dump(mode="json"),
+            "observation": {
+                "outcome": "terminal",
+                "timeout_seconds": 1,
+                "scheduler_action": "none",
+                "relay_action": "none",
+            },
+        }
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            json.dumps(contradictory).encode("utf-8"),
+            b"",
+        )
+
+    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
+    result = CliRunner().invoke(
+        app,
+        [
+            "job",
+            "wait",
+            remote_job.job_id,
+            "--cluster",
+            "ares",
+            "--timeout-seconds",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "remote job wait returned an invalid result" in result.output
 
 
 def test_cli_cluster_bootstrap_uses_package_source_root(
