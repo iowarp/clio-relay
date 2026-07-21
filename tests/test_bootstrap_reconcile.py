@@ -561,7 +561,7 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
     assert "legacy JARVIS execution environment is not reusable" in raced.reasons
 
     components["clio-kit"] = desired.clio_kit_version
-    artifacts = cast(dict[str, object], receipt["component_artifacts"])
+    artifacts = receipt["component_artifacts"]
     artifacts["clio-kit"] = {
         "artifact_sha256": desired.clio_kit_artifact_sha256,
         "runtime_artifact_path": str(clio_kit_wheel),
