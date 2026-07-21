@@ -90,6 +90,7 @@ _BOOTSTRAP_CANDIDATE_PACKAGE_OVERLAY = (
     b"    pass\n"
 )
 _BOOTSTRAP_CANDIDATE_SOURCE_NAMES = (
+    "bootstrap_provider_build_info.py",
     "bootstrap_reconcile.py",
     "bounded_process.py",
     "errors.py",
@@ -3501,6 +3502,9 @@ def render_linux_user_bootstrap_script(
         for name, payload in candidate_package_sources.items()
     }
     candidate_reconcile_sha256 = candidate_package_sha256["bootstrap_reconcile.py"]
+    candidate_provider_build_info_sha256 = candidate_package_sha256[
+        "bootstrap_provider_build_info.py"
+    ]
     candidate_bounded_process_sha256 = candidate_package_sha256["bounded_process.py"]
     candidate_errors_sha256 = candidate_package_sha256["errors.py"]
     candidate_process_containment_sha256 = candidate_package_sha256["process_containment.py"]
@@ -4082,8 +4086,11 @@ for name, payload in sources.items():
     print(f"bootstrap_candidate_source={{name}}:{{hashlib.sha256(observed).hexdigest()}}")
 __CLIO_RELAY_CANDIDATE_PACKAGE__
 BOOTSTRAP_CANDIDATE_RECONCILE="$BOOTSTRAP_CANDIDATE_PACKAGE/bootstrap_reconcile.py"
+BOOTSTRAP_CANDIDATE_PROVIDER_BUILD_INFO="$BOOTSTRAP_CANDIDATE_PACKAGE/bootstrap_provider_build_info.py"
 BOOTSTRAP_CANDIDATE_PROCESS_CONTAINMENT="$BOOTSTRAP_CANDIDATE_PACKAGE/process_containment.py"
 echo "{candidate_reconcile_sha256} *$BOOTSTRAP_CANDIDATE_RECONCILE" | \
+  sha256sum --check --strict -
+echo "{candidate_provider_build_info_sha256} *$BOOTSTRAP_CANDIDATE_PROVIDER_BUILD_INFO" | \
   sha256sum --check --strict -
 echo "{candidate_bounded_process_sha256} *$BOOTSTRAP_CANDIDATE_PACKAGE/bounded_process.py" | \
   sha256sum --check --strict -
@@ -4134,6 +4141,10 @@ elif [ -x "$HOME/.local/share/clio-relay/jarvis-venv/bin/python" ]; then
   BOOTSTRAP_PLAN_PROVIDER="$HOME/.local/share/clio-relay/jarvis-venv/bin/python"
 fi
 export BOOTSTRAP_PLAN_PROVIDER BOOTSTRAP_CANDIDATE_RECONCILE
+if [ -n "$BOOTSTRAP_PLAN_PROVIDER" ]; then
+  "$BOOTSTRAP_PLAN_PROVIDER" -I "$BOOTSTRAP_CANDIDATE_PROVIDER_BUILD_INFO" \
+    "$BOOTSTRAP_CANDIDATE_PACKAGE"
+fi
 if [ "$BOOTSTRAP_RECOVERY_REQUIRED" = "1" ]; then
   if [ -z "$BOOTSTRAP_PLAN_PROVIDER" ]; then
     echo "bootstrap recovery has no trusted installed Python provider" >&2
