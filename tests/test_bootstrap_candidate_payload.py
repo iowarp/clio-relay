@@ -5,13 +5,17 @@ from __future__ import annotations
 import base64
 import json
 import shutil
+import stat
 import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
+
+import pytest
 
 from clio_relay import bootstrap
+from clio_relay import bootstrap_provider_build_info as provider_build_info
 
 
 def _extract_candidate_sources(script: str) -> dict[str, bytes]:
@@ -38,6 +42,7 @@ def test_extracted_candidate_reconciler_runs_without_provider_bounded_process(
     )
     assert set(sources) == {
         "__init__.py",
+        "bootstrap_provider_build_info.py",
         "bootstrap_reconcile.py",
         "bounded_process.py",
         "errors.py",
@@ -115,7 +120,7 @@ print(json.dumps({
         timeout=30,
     )
     assert completed.returncode == 0, completed.stderr
-    evidence = json.loads(completed.stdout)
+    evidence = json.loads(completed.stdout.splitlines()[-1])
     assert Path(evidence["bounded_process"]) == (candidate_package / "bounded_process.py").resolve()
     assert (
         Path(evidence["process_containment"])
@@ -138,6 +143,7 @@ def test_candidate_overlay_preserves_legacy_provider_install_identity(
         (candidate_package / name).write_bytes(payload)
 
     legacy_version = "1.4.12"
+    legacy_commit = "dc6d36682598d466f8512f8082edfaf5c92af02b"
     legacy_root = tmp_path / "legacy-provider"
     installed_package = Path(bootstrap.__file__).resolve().parent
     shutil.copytree(
@@ -149,6 +155,20 @@ def test_candidate_overlay_preserves_legacy_provider_install_identity(
     distribution_metadata.mkdir()
     (distribution_metadata / "METADATA").write_text(
         f"Metadata-Version: 2.1\nName: clio-relay\nVersion: {legacy_version}\n",
+        encoding="utf-8",
+    )
+    build_info = {
+        "version": legacy_version,
+        "commit": legacy_commit,
+        "tag": f"v{legacy_version}",
+        "dirty": False,
+    }
+    (legacy_root / "clio_relay" / "_build_info.json").write_text(
+        json.dumps(build_info),
+        encoding="utf-8",
+    )
+    (distribution_metadata / "RECORD").write_text(
+        "clio_relay/_build_info.json,,\n",
         encoding="utf-8",
     )
     receipt = tmp_path / "install-receipt.json"
@@ -164,9 +184,9 @@ def test_candidate_overlay_preserves_legacy_provider_install_identity(
                 "distribution_version": legacy_version,
                 "software": {
                     "version": legacy_version,
-                    "commit": None,
-                    "tag": None,
-                    "dirty": None,
+                    "commit": legacy_commit,
+                    "tag": f"v{legacy_version}",
+                    "dirty": False,
                 },
                 "components": {},
                 "component_artifacts": {},
@@ -180,13 +200,21 @@ def test_candidate_overlay_preserves_legacy_provider_install_identity(
 
     probe = r"""
 import json
+import runpy
 import sys
 from pathlib import Path
 
-candidate_root = Path(sys.argv[1]).resolve()
-legacy_root = Path(sys.argv[2]).resolve()
-receipt = Path(sys.argv[3]).resolve()
+stager = Path(sys.argv[1]).resolve()
+candidate_root = Path(sys.argv[2]).resolve()
+legacy_root = Path(sys.argv[3]).resolve()
+receipt = Path(sys.argv[4]).resolve()
 sys.path.insert(0, str(legacy_root))
+sys.argv = [str(stager), str(candidate_root / "clio_relay")]
+try:
+    runpy.run_path(str(stager), run_name="__main__")
+except SystemExit as exc:
+    if exc.code not in (None, 0):
+        raise
 sys.path.insert(0, str(candidate_root))
 
 import clio_relay
@@ -196,7 +224,7 @@ info = installation_info(receipt)
 print(json.dumps({
     "package_version": clio_relay.__version__,
     "distribution_version": info["distribution_version"],
-    "software_version": info["software"]["version"],
+    "software": info["software"],
     "receipt_matches_install": info["receipt_matches_install"],
 }, sort_keys=True))
 """
@@ -206,6 +234,7 @@ print(json.dumps({
             "-I",
             "-c",
             probe,
+            str(candidate_package / "bootstrap_provider_build_info.py"),
             str(candidate_root),
             str(legacy_root),
             str(receipt),
@@ -216,10 +245,142 @@ print(json.dumps({
         timeout=30,
     )
     assert completed.returncode == 0, completed.stderr
-    evidence = json.loads(completed.stdout)
+    evidence = json.loads(completed.stdout.splitlines()[-1])
     assert evidence == {
         "distribution_version": legacy_version,
         "package_version": legacy_version,
         "receipt_matches_install": True,
-        "software_version": legacy_version,
+        "software": build_info,
     }
+
+
+def test_provider_build_info_stager_rejects_hostile_provider_records(tmp_path: Path) -> None:
+    """Missing, malformed, and oversized recorded provider files are fatal."""
+    sources = _extract_candidate_sources(
+        bootstrap.render_linux_user_bootstrap_script(cluster="candidate-test")
+    )
+    stager = tmp_path / "bootstrap_provider_build_info.py"
+    stager.write_bytes(sources["bootstrap_provider_build_info.py"])
+    candidate_package = tmp_path / "candidate-python" / "clio_relay"
+    candidate_package.mkdir(parents=True)
+
+    probe = r"""
+import runpy
+import sys
+from pathlib import Path
+
+stager = Path(sys.argv[1]).resolve()
+provider_root = Path(sys.argv[2]).resolve()
+candidate_package = Path(sys.argv[3]).resolve()
+sys.path.insert(0, str(provider_root))
+sys.argv = [str(stager), str(candidate_package)]
+runpy.run_path(str(stager), run_name="__main__")
+"""
+    for case, payload in (
+        ("missing", None),
+        ("malformed", b"not-json"),
+        ("oversized", b"{" + b"x" * (64 * 1024)),
+    ):
+        provider_root = tmp_path / f"provider-{case}"
+        provider_package = provider_root / "clio_relay"
+        provider_package.mkdir(parents=True)
+        metadata = provider_root / "clio_relay-1.4.12.dist-info"
+        metadata.mkdir()
+        (metadata / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: clio-relay\nVersion: 1.4.12\n",
+            encoding="utf-8",
+        )
+        (metadata / "RECORD").write_text(
+            "clio_relay/_build_info.json,,\n",
+            encoding="utf-8",
+        )
+        if payload is not None:
+            (provider_package / "_build_info.json").write_bytes(payload)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                probe,
+                str(stager),
+                str(provider_root),
+                str(candidate_package),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=30,
+        )
+        assert completed.returncode != 0, case
+        assert "provider build info" in completed.stderr, (case, completed.stderr)
+
+
+def test_provider_build_info_stager_keeps_fresh_bootstrap_free_of_candidate_identity(
+    tmp_path: Path,
+) -> None:
+    """No-provider bootstrap is safe and cannot consume a candidate identity."""
+    sources = _extract_candidate_sources(
+        bootstrap.render_linux_user_bootstrap_script(cluster="candidate-test")
+    )
+    stager = tmp_path / "bootstrap_provider_build_info.py"
+    stager.write_bytes(sources["bootstrap_provider_build_info.py"])
+    candidate_package = tmp_path / "candidate-python" / "clio_relay"
+    candidate_package.mkdir(parents=True)
+
+    clean = subprocess.run(
+        [sys.executable, "-I", "-S", str(stager), str(candidate_package)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    assert clean.returncode == 0, clean.stderr
+    assert clean.stdout.strip() == "bootstrap_provider_build_info=unavailable"
+
+    (candidate_package / "_build_info.json").write_text(
+        '{"version":"candidate"}',
+        encoding="utf-8",
+    )
+    substituted = subprocess.run(
+        [sys.executable, "-I", "-S", str(stager), str(candidate_package)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    assert substituted.returncode != 0
+    assert "candidate build info exists without an installed provider" in substituted.stderr
+
+
+def test_provider_build_info_stager_rejects_existing_candidate_links_and_mismatches(
+    tmp_path: Path,
+) -> None:
+    """A preexisting candidate must be an exact independent regular copy."""
+    source = tmp_path / "provider-build-info.json"
+    source.write_text("provider", encoding="utf-8")
+    candidate = tmp_path / "candidate-build-info.json"
+    candidate.write_text("candidate", encoding="utf-8")
+    write_candidate_copy = cast(Any, provider_build_info)._write_candidate_copy
+    with pytest.raises(RuntimeError, match="does not match the installed provider"):
+        write_candidate_copy(
+            candidate,
+            b"provider",
+            source_details=source.lstat(),
+        )
+
+    class SyntheticSymlink:
+        """Path-shaped hostile candidate used where Windows cannot create symlinks."""
+
+        def lstat(self) -> object:
+            return type(
+                "SymlinkDetails",
+                (),
+                {"st_mode": stat.S_IFLNK, "st_size": 8, "st_nlink": 1},
+            )()
+
+    with pytest.raises(RuntimeError, match="bounded regular file"):
+        write_candidate_copy(
+            cast(Path, SyntheticSymlink()),
+            b"provider",
+            source_details=source.lstat(),
+        )
