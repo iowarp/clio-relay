@@ -363,6 +363,29 @@ def test_fresh_bootstrap_loads_packaged_graph_before_explicit_build_fallback() -
     assert "\r" not in script
 
 
+def test_fresh_bootstrap_publishes_verified_clio_kit_in_generation() -> None:
+    """Keep component discovery on the active content-addressed generation."""
+    script = render_linux_user_bootstrap_script(cluster="operator-target")
+    full_prepare = script.index('RELAY_TOOL_EXECUTABLE="$(readlink -f "$RELAY_EXECUTABLE")"')
+    generation_identity = script.index(
+        'BOOTSTRAP_GENERATION_IDENTITY="$(bootstrap_path_set_identity',
+        full_prepare,
+    )
+    prepare = script[full_prepare:generation_identity]
+    identity = script[
+        generation_identity : script.index("bootstrap_journal_action phase", generation_identity)
+    ]
+
+    resolve = 'CLIO_KIT_TOOL_EXECUTABLE="$(readlink -f "$JARVIS_MCP_EXECUTABLE")"'
+    verify = 'test -x "$CLIO_KIT_TOOL_EXECUTABLE"'
+    publish = 'ln -s "$CLIO_KIT_TOOL_EXECUTABLE" "$BOOTSTRAP_GENERATION/bin/clio-kit"'
+    assert resolve in prepare
+    assert verify in prepare
+    assert publish in prepare
+    assert prepare.index(resolve) < prepare.index(verify) < prepare.index(publish)
+    assert '"$BOOTSTRAP_GENERATION/bin/clio-kit"' in identity
+
+
 def test_wheel_embeds_jarvis_package_modules_in_the_installed_namespace() -> None:
     """JARVIS must import relay packages after the relay distribution is installed."""
     with Path("pyproject.toml").open("rb") as stream:
