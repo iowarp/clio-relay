@@ -7611,10 +7611,13 @@ if [ -e "$HOME/.local/share/clio-relay/current" ] || \
 fi
 RELAY_TOOL_EXECUTABLE="$(readlink -f "$RELAY_EXECUTABLE")"
 JARVIS_TOOL_EXECUTABLE="$(readlink -f "$JARVIS_VENV/bin/jarvis")"
+CLIO_KIT_TOOL_EXECUTABLE="$(readlink -f "$JARVIS_MCP_EXECUTABLE")"
 test -x "$RELAY_TOOL_EXECUTABLE"
 test -x "$JARVIS_TOOL_EXECUTABLE"
+test -x "$CLIO_KIT_TOOL_EXECUTABLE"
 mkdir -m 0700 "$BOOTSTRAP_GENERATION/bin"
 ln -s "$RELAY_TOOL_EXECUTABLE" "$BOOTSTRAP_GENERATION/bin/clio-relay"
+ln -s "$CLIO_KIT_TOOL_EXECUTABLE" "$BOOTSTRAP_GENERATION/bin/clio-kit"
 mv "$CLIO_RELAY_INSTALL_RECEIPT" "$BOOTSTRAP_GENERATION/install-receipt.json"
 export CLIO_RELAY_INSTALL_RECEIPT="$BOOTSTRAP_GENERATION/install-receipt.json"
 export BOOTSTRAP_GENERATION JARVIS_VENV JARVIS_TOOL_EXECUTABLE
@@ -7688,6 +7691,7 @@ BOOTSTRAP_GENERATION_IDENTITY="$(bootstrap_path_set_identity \
   "$BOOTSTRAP_GENERATION/.prepared" \
   "$BOOTSTRAP_GENERATION/install-receipt.json" \
   "$BOOTSTRAP_GENERATION/bin/clio-relay" \
+  "$BOOTSTRAP_GENERATION/bin/clio-kit" \
   "$BOOTSTRAP_GENERATION/bin/jarvis" \
   "$BOOTSTRAP_GENERATION/source")"
 bootstrap_journal_action phase "$BOOTSTRAP_TRANSACTION_JOURNAL" \
