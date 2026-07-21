@@ -1147,6 +1147,7 @@ def inspect_prepared_generation(
     if not (
         isinstance(relay_runtime, dict)
         and cast(dict[str, object], relay_runtime).get("persistent_tool_verified") is True
+        and cast(dict[str, object], relay_runtime).get("execution_runtime_verified") is True
         and isinstance(clio_kit_runtime, dict)
         and cast(dict[str, object], clio_kit_runtime).get("persistent_tool_verified") is True
         and cast(dict[str, object], clio_kit_runtime).get("native_execution_capability_verified")
@@ -1541,6 +1542,7 @@ def plan_bootstrap_reconcile(
     if not replacement_verified and (
         not isinstance(relay_runtime, dict)
         or cast(dict[str, object], relay_runtime).get("persistent_tool_verified") is not True
+        or cast(dict[str, object], relay_runtime).get("execution_runtime_verified") is not True
     ):
         relay_runtime_error = (
             cast(dict[str, object], relay_runtime).get("error")
@@ -1570,6 +1572,38 @@ def plan_bootstrap_reconcile(
         not isinstance(relay_executable, str) or relay_executable != str(expected_relay_executable)
     ):
         return _full_plan(desired, "clio-relay launcher is not bound to its install receipt")
+    relay_execution_reusable = False
+    resolved_relay_artifact: Path | None = None
+    if isinstance(raw_relay_artifact, dict):
+        relay_artifact = cast(dict[str, object], raw_relay_artifact)
+        relay_artifact_path = relay_artifact.get("runtime_artifact_path")
+        relay_artifact_sha256 = relay_artifact.get("artifact_sha256")
+        relay_execution_runtime = runtime.get("clio-relay")
+        if (
+            isinstance(relay_artifact_path, str)
+            and isinstance(relay_artifact_sha256, str)
+            and desired.relay_artifact_sha256 is not None
+            and relay_artifact.get("install_spec") == desired.relay_install_spec
+            and relay_artifact_sha256 == desired.relay_artifact_sha256
+            and isinstance(relay_execution_runtime, dict)
+            and cast(dict[str, object], relay_execution_runtime).get("execution_runtime_verified")
+            is True
+        ):
+            try:
+                lexical_relay_artifact = Path(relay_artifact_path).expanduser()
+                relay_artifact_before = lexical_relay_artifact.lstat()
+                resolved_relay_artifact = lexical_relay_artifact.resolve(strict=True)
+                relay_execution_reusable = (
+                    not lexical_relay_artifact.is_symlink()
+                    and resolved_relay_artifact.is_file()
+                    and sha256_file(resolved_relay_artifact) == relay_artifact_sha256
+                    and _stat_identity(lexical_relay_artifact.lstat())
+                    == _stat_identity(relay_artifact_before)
+                )
+            except (OSError, RuntimeError, ValueError):
+                relay_execution_reusable = False
+            if relay_execution_reusable and resolved_relay_artifact is not None:
+                reusable_paths["clio-relay_artifact"] = str(resolved_relay_artifact)
     expected_components = {
         "clio-kit": (desired.clio_kit_version, desired.clio_kit_artifact_sha256),
         "jarvis-cd": (desired.jarvis_cd_version, desired.jarvis_cd_wheel_sha256),
@@ -1800,6 +1834,22 @@ def plan_bootstrap_reconcile(
         activation_paths = _capture_reconcile_activation_paths(home=lexical_home)
     except (ConfigurationError, OSError, RuntimeError, ValueError) as exc:
         return _full_plan(desired, f"legacy activation boundary is not reusable: {exc}")
+    if not relay_execution_reusable:
+        return BootstrapReconcilePlan(
+            mode="component-upgrade",
+            desired_fingerprint=desired.fingerprint,
+            reasons=["relay JARVIS execution runtime requires a staged replacement"],
+            component_actions={
+                "clio-relay": "replace",
+                "jarvis-cd": "replace",
+                "jarvis-util": "reuse",
+                "clio-kit": "replace",
+                "frp": "reuse",
+                "uv": "reuse",
+            },
+            reusable_paths=reusable_paths,
+            activation_paths=activation_paths,
+        )
     return BootstrapReconcilePlan(
         mode="relay-only",
         desired_fingerprint=desired.fingerprint,
@@ -2738,6 +2788,8 @@ def _inspect_installation_identity(
         or cast(dict[str, object], relay_runtime).get("persistent_tool_verified") is not True
     ):
         reasons.append("clio-relay persistent tool identity did not verify")
+    elif cast(dict[str, object], relay_runtime).get("execution_runtime_verified") is not True:
+        reasons.append("clio-relay JARVIS execution runtime did not verify")
     clio_kit_runtime = runtime.get("clio-kit")
     required_clio_kit = (
         "artifact_identity_verified",
@@ -3071,6 +3123,14 @@ def resolve_receipt_bound_jarvis_python(
         or cast(dict[str, object], jarvis_runtime).get("verified") is not True
     ):
         raise ConfigurationError("relay-managed JARVIS runtime did not verify its receipt")
+    relay_runtime = runtime.get("clio-relay")
+    if (
+        not isinstance(relay_runtime, dict)
+        or cast(dict[str, object], relay_runtime).get("execution_runtime_verified") is not True
+    ):
+        raise ConfigurationError(
+            "relay-managed JARVIS execution runtime did not verify its relay receipt"
+        )
 
     raw_manifest = receipt.get("deployment_manifest")
     fingerprint = receipt.get("deployment_fingerprint")

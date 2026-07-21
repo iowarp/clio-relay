@@ -102,6 +102,7 @@ OWNER_SESSION_CLOSURE_WRITE_ATTEMPTS = 3
 JOB_INDEX_SCHEMA = "clio-relay.job-index.v1"
 INDEX_MIGRATION_SCHEMA = "clio-relay.index-migration.v1"
 LEASE_OPERATIONAL_INDEX_SCHEMA = "clio-relay.lease-operational-index.v2"
+_LEGACY_LEASE_OPERATIONAL_INDEX_SCHEMA = "clio-relay.lease-operational-index.v1"
 LEASE_CAPACITY_AGGREGATE_SCHEMA = "clio-relay.lease-capacity-aggregate.v1"
 LEASE_CAPACITY_CHECKPOINT_SCHEMA = "clio-relay.lease-capacity-checkpoint.v1"
 LEASE_CAPACITY_AUDIT_SCHEMA = "clio-relay.lease-capacity-audit.v1"
@@ -738,7 +739,11 @@ class ClioCoreQueue:
                 reason="queue directory is readable or writable by another user",
             )
 
-    def _read_legacy_record_audit_marker(self) -> _LegacyOutputAudit | None:
+    def _read_legacy_record_audit_marker(
+        self,
+        *,
+        allow_legacy_lease_schema: bool = False,
+    ) -> _LegacyOutputAudit | None:
         """Return constant-size indexed-era evidence, or ``None`` for bounded repair."""
         marker_path = self._legacy_record_audit_marker_path()
         if _path_lstat(marker_path) is None:
@@ -774,7 +779,7 @@ class ClioCoreQueue:
                 path=marker_path,
                 reason="legacy-record audit marker has an unknown or incomplete contract",
             )
-        self._read_sealed_index_migration_state()
+        self._read_sealed_index_migration_state(allow_legacy_lease_schema=allow_legacy_lease_schema)
         legacy_output = self._read_legacy_output_marker()
         if legacy_output is None:
             raise LegacyQueueStateError(
@@ -884,7 +889,11 @@ class ClioCoreQueue:
         ):
             raise QueueConflictError(f"sealed {label} record count is invalid")
 
-    def _read_sealed_index_migration_state(self) -> dict[str, object]:
+    def _read_sealed_index_migration_state(
+        self,
+        *,
+        allow_legacy_lease_schema: bool = False,
+    ) -> dict[str, object]:
         """Read and strictly validate indexed-era state without repairing or scanning."""
         path = self._storage_root / "migrations" / "index-v1.json"
         try:
@@ -932,11 +941,27 @@ class ClioCoreQueue:
                 label="retention family",
                 families=_RETENTION_INDEX_FAMILIES,
             )
+            raw_operational: object = state.get("operational_families")
+            operational = (
+                cast(dict[str, object], raw_operational)
+                if isinstance(raw_operational, dict)
+                else {}
+            )
+            raw_lease_checkpoint = operational.get("leases")
+            lease_checkpoint = (
+                cast(dict[str, object], raw_lease_checkpoint)
+                if isinstance(raw_lease_checkpoint, dict)
+                else {}
+            )
+            lease_schema = lease_checkpoint.get("schema_version")
+            accepted_lease_schema = LEASE_OPERATIONAL_INDEX_SCHEMA
+            if allow_legacy_lease_schema and lease_schema == _LEGACY_LEASE_OPERATIONAL_INDEX_SCHEMA:
+                accepted_lease_schema = _LEGACY_LEASE_OPERATIONAL_INDEX_SCHEMA
             self._require_sealed_checkpoint_group(
-                state.get("operational_families"),
+                cast(object, raw_operational),
                 label="operational family",
                 families=_OPERATIONAL_INDEX_FAMILIES,
-                schema_by_family={"leases": LEASE_OPERATIONAL_INDEX_SCHEMA},
+                schema_by_family={"leases": accepted_lease_schema},
             )
             raw_repair = state.get("lease_operational_repair")
             if not isinstance(raw_repair, dict):
@@ -949,7 +974,7 @@ class ClioCoreQueue:
                 raise QueueConflictError("sealed lease repair checkpoint has an unknown shape")
             if (
                 not isinstance(repair.get("complete"), bool)
-                or repair.get("schema_version") != LEASE_OPERATIONAL_INDEX_SCHEMA
+                or repair.get("schema_version") != accepted_lease_schema
             ):
                 raise QueueConflictError("sealed lease repair checkpoint is invalid")
             self._require_optional_bounded_record_count(repair, label="lease repair")
@@ -989,6 +1014,34 @@ class ClioCoreQueue:
                 reason=f"sealed index migration state is invalid: {type(error).__name__}",
             ) from error
         return state
+
+    def _upgrade_sealed_lease_operational_schema_unlocked(self) -> None:
+        """Invalidate exact v1 lease indexes so the bounded v2 migration can rebuild them."""
+        if not self._lock.is_locked:
+            raise RuntimeError("sealed lease index upgrade requires the queue lock")
+        state = self._read_sealed_index_migration_state(allow_legacy_lease_schema=True)
+        operational = cast(dict[str, object], state["operational_families"])
+        lease_checkpoint = cast(dict[str, object], operational["leases"])
+        repair = cast(dict[str, object], state["lease_operational_repair"])
+        if lease_checkpoint.get("schema_version") == LEASE_OPERATIONAL_INDEX_SCHEMA:
+            return
+        lease_checkpoint.clear()
+        lease_checkpoint.update(
+            {
+                "cursor": None,
+                "complete": False,
+                "schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA,
+            }
+        )
+        repair.clear()
+        repair.update(
+            {
+                "complete": False,
+                "schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA,
+            }
+        )
+        state["complete"] = False
+        self._write_index_migration_state(state)
 
     def _audit_legacy_state_before_initialization(self) -> _LegacyOutputAudit:
         """Refuse unsafe v0.9 canonical state before creating or changing files."""
@@ -2403,7 +2456,9 @@ class ClioCoreQueue:
         self._prepare_queue_root_for_lock()
         try:
             with self._lock:
-                locked_indexed_audit = self._read_legacy_record_audit_marker()
+                locked_indexed_audit = self._read_legacy_record_audit_marker(
+                    allow_legacy_lease_schema=True
+                )
                 if locked_indexed_audit is None:
                     if not self._migration_lifetime_guarded:
                         raise QueueSealRequiresExclusive(
@@ -2563,6 +2618,7 @@ class ClioCoreQueue:
                 if locked_indexed_audit is None:
                     self._write_legacy_record_audit_marker_unlocked()
                 else:
+                    self._upgrade_sealed_lease_operational_schema_unlocked()
                     self._read_sealed_index_migration_state()
                 self._initialized = True
         except QueueSealRequiresExclusive:

@@ -1090,7 +1090,8 @@ def test_executor_replaces_exact_legacy_old_release_session(
         "_current_session_api_release_identity",
         lambda: current_release,
     )
-    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    effective_uid = getattr(os, "geteuid", lambda: 0)()
+    monkeypatch.setattr(os, "geteuid", lambda: effective_uid, raising=False)
     inspection_count = 0
 
     def inspect(**_kwargs: object) -> OwnedSessionRecoveryStatus:
@@ -1361,7 +1362,8 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
         "_current_session_api_release_identity",
         lambda: current_release,
     )
-    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    effective_uid = getattr(os, "geteuid", lambda: 0)()
+    monkeypatch.setattr(os, "geteuid", lambda: effective_uid, raising=False)
     migrate = session_lifecycle._migrate_legacy_start_attempt  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     class MigrationCrash(RuntimeError):
@@ -1407,7 +1409,7 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
         core_dir=queue.root,
         home=home,
         proc_root=proc_root,
-        effective_uid=0,
+        effective_uid=effective_uid,
         transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         expected_start_operation_id=request.start_operation_id,
         expected_cluster_route_revision=request.cluster_route_revision,

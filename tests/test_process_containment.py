@@ -1008,6 +1008,44 @@ time.sleep(60)
     assert _wait_until_pid_exits(child_pid, timeout_seconds=3)
 
 
+def _broker_startup_record(
+    token: str,
+    *,
+    ready: bool = False,
+    stage: str = "child_spawn",
+    code: str = "executable_not_found",
+    exception_type: str | None = "FileNotFoundError",
+    error_number: int | None = 2,
+    child_return_code: int | None = None,
+) -> bytes:
+    """Build an exact broker record for readiness protocol tests."""
+    diagnostic: dict[str, object] | None = None
+    if not ready:
+        diagnostic = {
+            "stage": stage,
+            "code": code,
+            "exception_type": exception_type,
+            "errno": error_number,
+            "child_return_code": child_return_code,
+        }
+    return (
+        json.dumps(
+            {
+                "schema_version": "clio-relay.broker-startup.v1",
+                "token": token,
+                "complete": True,
+                "ready": ready,
+                "diagnostic": diagnostic,
+            },
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        + b"\n"
+    )
+
+
 @pytest.mark.parametrize(
     ("payload_kind", "error_match"),
     [
@@ -1023,7 +1061,11 @@ def test_broker_readiness_rejects_forged_and_oversized_payloads_boundedly(
     private = cast(Any, process_containment)
     readiness = private._precreate_broker_readiness()
     descriptor = cast(int, readiness.descriptor)
-    payload = b"1" if payload_kind == "forged" else readiness.token.encode("ascii") + b"x"
+    payload = (
+        b"1"
+        if payload_kind == "forged"
+        else b"x" * (process_containment.BROKER_STARTUP_RECORD_MAX_BYTES + 1)
+    )
     os.lseek(descriptor, 0, os.SEEK_SET)
     assert os.write(descriptor, payload) == len(payload)
     os.fsync(descriptor)
@@ -1038,6 +1080,236 @@ def test_broker_readiness_rejects_forged_and_oversized_payloads_boundedly(
     assert time.monotonic() - started < 1
     assert readiness.descriptor is None
     assert not readiness.path.exists()
+
+
+@pytest.mark.parametrize(
+    "payload_kind",
+    ["wrong-token", "duplicate-key", "partial", "forged-code"],
+)
+def test_broker_startup_record_is_strict_and_authenticated(
+    payload_kind: str,
+) -> None:
+    """Only a complete exact record carrying the pinned token is trusted."""
+    private = cast(Any, process_containment)
+    token = "1" * 32
+    if payload_kind == "wrong-token":
+        encoded = _broker_startup_record("0" * len(token))
+    elif payload_kind == "duplicate-key":
+        encoded = (
+            b'{"complete":true,"diagnostic":null,"ready":true,'
+            b'"ready":true,"schema_version":"clio-relay.broker-startup.v1",'
+            + json.dumps("token").encode("ascii")
+            + b":"
+            + json.dumps(token).encode("ascii")
+            + b"}\n"
+        )
+    elif payload_kind == "partial":
+        encoded = _broker_startup_record(token)[:-1]
+    else:
+        encoded = _broker_startup_record(token, code="unbounded-secret-code")
+
+    if not encoded.endswith(b"\n"):
+        assert private._parse_broker_startup_record(encoded, expected_token=token) is None
+        return
+    with pytest.raises(RuntimeError, match="readiness record was invalid"):
+        private._parse_broker_startup_record(encoded, expected_token=token)
+
+
+def test_broker_exit_performs_final_authenticated_record_read() -> None:
+    """A terminal broker record written just before exit wins the poll/read race."""
+    private = cast(Any, process_containment)
+    readiness = private._precreate_broker_readiness()
+    descriptor = cast(int, readiness.descriptor)
+    polls = 0
+
+    def poll() -> int | None:
+        nonlocal polls
+        polls += 1
+        if polls == 1:
+            record = _broker_startup_record(
+                readiness.token,
+                stage="credential_ack",
+                code="child_exited",
+                exception_type="RuntimeError",
+                error_number=None,
+                child_return_code=9,
+            )
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.ftruncate(descriptor, 0)
+            assert os.write(descriptor, record) == len(record)
+            os.fsync(descriptor)
+        return 125
+
+    process = SimpleNamespace(poll=poll, returncode=125)
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "stage=credential_ack code=child_exited exception_type=RuntimeError child_return_code=9"
+        ),
+    ):
+        private._await_broker_readiness(process, readiness)
+
+    assert polls == 1
+    assert readiness.descriptor is None
+    assert not readiness.path.exists()
+
+
+def test_missing_executable_reports_only_structured_startup_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """Executable launch errors expose a fixed code without leaking their command path."""
+    secret = "must-not-leak-from-command"
+    missing_executable = tmp_path / secret / "missing-program"
+
+    with pytest.raises(OwnedProcessSpawnError) as failure:
+        process_containment.spawn_owned_process(
+            [str(missing_executable), "also-must-not-leak"],
+            startup_timeout_seconds=5,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    rendered = str(failure.value)
+    assert "stage=child_spawn" in rendered
+    assert "code=executable_not_found" in rendered
+    assert "exception_type=FileNotFoundError" in rendered
+    assert secret not in rendered
+    assert "also-must-not-leak" not in rendered
+    assert str(missing_executable) not in rendered
+
+
+def test_malicious_child_stderr_cannot_enter_startup_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Credential-bearing child output is discarded when its startup handshake fails."""
+    if os.name == "nt":
+        private = cast(Any, process_containment)
+        record = private._parse_broker_startup_record(
+            _broker_startup_record(
+                "1" * 32,
+                stage="credential_ack",
+                code="ack_mismatch",
+                exception_type="RuntimeError",
+                error_number=None,
+            ),
+            expected_token="1" * 32,
+        )
+        assert record.diagnostic.safe_message() == (
+            "containment broker startup failed: "
+            "stage=credential_ack code=ack_mismatch exception_type=RuntimeError"
+        )
+        return
+
+    private = cast(Any, process_containment)
+    monkeypatch.setattr(
+        process_containment,
+        "containment_capability",
+        lambda **_kwargs: {
+            "mode": "cooperative_process_group",
+            "enforceable": False,
+            "reason": "focused test",
+        },
+    )
+    secret = "credential-and-stderr-must-not-leak"
+    script = r"""
+import os
+import sys
+import time
+
+credential_fd = int(os.environ["CLIO_RELAY_BROKER_CREDENTIAL_FD"])
+ready_fd = int(os.environ["CLIO_RELAY_BROKER_READY_FD"])
+payload = bytearray()
+while True:
+    chunk = os.read(credential_fd, 4096)
+    if not chunk:
+        break
+    payload.extend(chunk)
+os.close(credential_fd)
+os.close(ready_fd)
+sys.stderr.buffer.write(payload)
+sys.stderr.buffer.flush()
+time.sleep(1)
+"""
+
+    with pytest.raises(OwnedProcessSpawnError) as failure:
+        process_containment.spawn_owned_process(
+            [sys.executable, "-I", "-S", "-c", script],
+            credential_payload=secret,
+            startup_timeout_seconds=5,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    rendered = str(failure.value)
+    assert "stage=credential_ack" in rendered
+    assert "code=ack_mismatch" in rendered
+    assert secret not in rendered
+    assert secret not in repr(failure.value.__cause__)
+
+
+def test_startup_output_flood_fails_boundedly_without_being_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blocked child output pipe cannot make credential startup unbounded."""
+    private = cast(Any, process_containment)
+    if os.name == "nt":
+
+        class CloseOnlyStream:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        streams = [CloseOnlyStream(), CloseOnlyStream(), CloseOnlyStream()]
+        process = SimpleNamespace(stdin=streams[0], stdout=streams[1], stderr=streams[2])
+        assert private._close_failed_broker_streams(process) == []
+        assert all(stream.closed for stream in streams)
+        assert process.stdin is None and process.stdout is None and process.stderr is None
+        return
+
+    shortened = private._BROKER_SCRIPT.replace(
+        "HANDSHAKE_TIMEOUT_SECONDS = 5.0",
+        "HANDSHAKE_TIMEOUT_SECONDS = 0.2",
+    )
+    monkeypatch.setattr(process_containment, "_BROKER_SCRIPT", shortened)
+    monkeypatch.setattr(
+        process_containment,
+        "containment_capability",
+        lambda **_kwargs: {
+            "mode": "cooperative_process_group",
+            "enforceable": False,
+            "reason": "focused test",
+        },
+    )
+    script = r"""
+import os
+import sys
+
+credential_fd = int(os.environ["CLIO_RELAY_BROKER_CREDENTIAL_FD"])
+while os.read(credential_fd, 4096):
+    pass
+os.close(credential_fd)
+chunk = b"untrusted-output" * 4096
+while True:
+    sys.stderr.buffer.write(chunk)
+    sys.stderr.buffer.flush()
+"""
+    started = time.monotonic()
+    with pytest.raises(OwnedProcessSpawnError) as failure:
+        process_containment.spawn_owned_process(
+            [sys.executable, "-I", "-S", "-c", script],
+            credential_payload="bounded-test-credential",
+            startup_timeout_seconds=3,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    assert time.monotonic() - started < 3
+    rendered = str(failure.value)
+    assert "stage=credential_ack" in rendered
+    assert "code=ack_timeout" in rendered
+    assert "untrusted-output" not in rendered
 
 
 def test_broker_readiness_rejects_replaced_path_and_closes_anchor(
@@ -1124,6 +1396,7 @@ def test_broker_readiness_replacement_is_rejected_without_truncation(tmp_path: P
             timeout=10,
         )
         assert result.returncode != 0
+        assert result.stderr == ""
         assert readiness.path.read_bytes() == replacement
     finally:
         readiness.path.unlink(missing_ok=True)
