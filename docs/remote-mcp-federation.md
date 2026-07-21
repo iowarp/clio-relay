@@ -276,7 +276,7 @@ that returns the handle, never for workload completion. Use
 an explicit `idempotency_key` only when retry de-duplication is intentional; an
 identical second `jarvis_run` is otherwise a new execution.
 
-The released clio-kit 2.5.22 artifact carries jarvis-mcp 3.5.3 and the pinned
+The released clio-kit 2.5.23 artifact carries jarvis-mcp 3.5.4 and the pinned
 six-tool JARVIS v3.5 contract.
 Bootstrap
 downloads and hashes the exact coordinated wheel, installs it once with
@@ -296,21 +296,21 @@ relay's exact JARVIS-CD release pin. That dependency edge is recorded in the
 install receipt and call result. Operator-registered MCP servers remain bound
 by their own discovery artifact and are not constrained to the relay's
 JARVIS-CD version.
-The release gate requires that exact 2.5.22 artifact to be rerun on every target
+The release gate requires that exact 2.5.23 artifact to be rerun on every target
 selected by the release policy. Other servers use the operator registry and
 generated `remote_...` aliases.
 
 The exact release wheel is
-`clio_kit-2.5.22-py3-none-any.whl` with SHA-256
-`b5cefc77a726a59c6fefcaf3a4fc5ec99882c2dda2cc9fc2c7908db93799bc13`.
+`clio_kit-2.5.23-py3-none-any.whl` with SHA-256
+`a2fb747fb2cdf4fdfcfd7c1056bcee8a84b3ea7a06c63e5b2a12defb11ad2de5`.
 Its canonical contract is `clio-kit-jarvis-user-v3.5`, with contract SHA-256
 `9933815ca7ee913d56a7cb1081d7702474bc984efcc97bf16434980172d0469d`
 and canonical tools-wire SHA-256
 `05f7d8a6286e211657ca40b64f0645bbd529e402fbf55770c845403695ddd366`.
 The nested runtime lock is bound to the public
-[`jarvis_cd-1.4.4-py3-none-any.whl`](https://github.com/grc-iit/jarvis-cd/releases/download/v1.4.4/jarvis_cd-1.4.4-py3-none-any.whl)
+[`jarvis_cd-1.4.8-py3-none-any.whl`](https://github.com/grc-iit/jarvis-cd/releases/download/v1.4.8/jarvis_cd-1.4.8-py3-none-any.whl)
 release artifact with SHA-256
-`321ee1a23e96a4c97b3b0d6107c5f5299d7db362396dd748e87a44d2a30d3db3`;
+`ebf5e5f375b921f20c79075d461926431a5a017ca8b45e598878a89b229b3935`;
 bootstrap and call-time validation reject any other URL, version, or bytes.
 
 ## Register the Spack MCP
@@ -328,7 +328,7 @@ against their distinct preserved contract digest.
 
 ## Register the scientific catalog MCP
 
-clio-kit 2.5.22 also ships the two-tool
+clio-kit 2.5.23 also ships the two-tool
 `clio-kit-scientific-catalog-user-v1.1` contract. It separates dataset discovery
 from visualization control: `scientific_dataset_search` finds operator catalog
 records and `scientific_dataset_describe` returns the complete catalog record

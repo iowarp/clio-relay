@@ -415,7 +415,7 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
     components = receipt["components"]
     assert isinstance(components, dict)
     components["jarvis-cd"] = "1.4.4"
-    components["clio-kit"] = "2.5.21"
+    components["clio-kit"] = "2.5.22"
     receipt["component_artifacts"] = {
         "clio-kit": {
             "runtime_interpreters": {"provider": "/old/clio-kit/python"},
