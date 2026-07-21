@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
 import os
 import re
 import sys
 import tomllib
+from contextlib import redirect_stdout
 from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
@@ -53,6 +55,88 @@ CLIO_KIT_NATIVE_OPERATIONS = (
     "jarvis_get_execution",
     "jarvis_run",
 )
+_UV_FD_EXEC_SOURCE = r"""import hashlib
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+
+def identity(details):
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_mode,
+        details.st_size,
+        details.st_mtime_ns,
+        details.st_ctime_ns,
+    )
+
+
+def cross_identity(details):
+    if os.name == "nt":
+        return (
+            details.st_dev,
+            details.st_ino,
+            stat.S_IFMT(details.st_mode),
+            details.st_size,
+        )
+    return identity(details)
+
+
+path = Path(sys.argv[1])
+expected_sha256 = sys.argv[2]
+arguments = sys.argv[3:]
+before = path.lstat()
+if (
+    not stat.S_ISREG(before.st_mode)
+    or not 1 <= before.st_size <= 256 * 1024 * 1024
+    or len(expected_sha256) != 64
+    or any(character not in "0123456789abcdef" for character in expected_sha256)
+):
+    raise SystemExit("uv executable identity is invalid")
+flags = (
+    os.O_RDONLY
+    | getattr(os, "O_BINARY", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+descriptor = os.open(path, flags)
+try:
+    opened = os.fstat(descriptor)
+    if cross_identity(opened) != cross_identity(before):
+        raise SystemExit("uv executable changed before its pinned read")
+    digest = hashlib.sha256()
+    size = 0
+    while chunk := os.read(descriptor, 1024 * 1024):
+        size += len(chunk)
+        if size > 256 * 1024 * 1024:
+            raise SystemExit("uv executable exceeded its byte bound")
+        digest.update(chunk)
+    after = os.fstat(descriptor)
+    linked_after = path.lstat()
+    if (
+        size != opened.st_size
+        or digest.hexdigest() != expected_sha256
+        or cross_identity(after) != cross_identity(opened)
+        or cross_identity(linked_after) != cross_identity(opened)
+    ):
+        raise SystemExit("uv executable changed or did not match its release pin")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("LD_", "PYTHON")) and name not in {"BASH_ENV", "ENV"}
+    }
+    if os.execve in os.supports_fd:
+        os.execve(descriptor, [str(path), *arguments], environment)
+    if os.name == "nt":
+        raise SystemExit(subprocess.run([str(path), *arguments], env=environment).returncode)
+    os.execve(str(path), [str(path), *arguments], environment)
+finally:
+    os.close(descriptor)
+"""
 OFFICIAL_COMPONENT_RELEASE_REPOSITORIES = {
     "clio-kit": ("iowarp", "clio-kit"),
     "jarvis-cd": ("grc-iit", "jarvis-cd"),
@@ -358,6 +442,8 @@ def probe_persistent_uv_tool_identity(
     entry_point: str,
     tool_directory: str | None = None,
     tool_bin_directory: str | None = None,
+    expected_uv_executable_sha256: str | None = None,
+    expected_provider_interpreter_sha256: str | None = None,
 ) -> PersistentUvToolIdentity:
     """Capture and verify an install-once uv tool environment and wheel closure."""
     if (tool_directory is None) is not (tool_bin_directory is None):
@@ -385,12 +471,43 @@ def probe_persistent_uv_tool_identity(
         provider_location,
         label="tool provider interpreter",
     )
+    provider_interpreter_sha256 = sha256_file(provider_path)
+    if (
+        expected_provider_interpreter_sha256 is not None
+        and provider_interpreter_sha256 != expected_provider_interpreter_sha256
+    ):
+        raise ConfigurationError(
+            "persistent tool provider interpreter did not match its coordinator pin"
+        )
     provider_environment_location = _resolved_parent_location(
         provider_location,
         label="tool provider interpreter",
     )
     source_path = _required_regular_file(source_artifact, label="tool source artifact")
-    uv_version_output = _bounded_identity_command([str(uv_path), "--version"])
+    uv_executable_sha256 = sha256_file(uv_path)
+    if (
+        expected_uv_executable_sha256 is not None
+        and uv_executable_sha256 != expected_uv_executable_sha256
+    ):
+        raise ConfigurationError("persistent tool uv executable did not match its release pin")
+
+    def uv_command(
+        *arguments: str,
+        environment: dict[str, str] | None = None,
+    ) -> str:
+        if expected_uv_executable_sha256 is not None:
+            return _bounded_uv_identity_command(
+                uv_path,
+                uv_executable_sha256,
+                list(arguments),
+                environment=environment,
+            )
+        return _bounded_identity_command(
+            [str(uv_path), *arguments],
+            environment=environment,
+        )
+
+    uv_version_output = uv_command("--version")
     version_match = re.fullmatch(
         r"uv ([0-9]+\.[0-9]+\.[0-9]+(?:[A-Za-z0-9.+-]*))(?: .*)?",
         uv_version_output,
@@ -399,17 +516,11 @@ def probe_persistent_uv_tool_identity(
         raise ConfigurationError("persistent tool uv executable returned no exact version")
     uv_version = version_match.group(1)
     observed_tool_directory = _required_directory_output(
-        _bounded_identity_command(
-            [str(uv_path), "tool", "dir", "--no-config"],
-            environment=uv_environment,
-        ),
+        uv_command("tool", "dir", "--no-config", environment=uv_environment),
         label="uv tool directory",
     )
     observed_tool_bin_directory = _required_directory_output(
-        _bounded_identity_command(
-            [str(uv_path), "tool", "dir", "--bin", "--no-config"],
-            environment=uv_environment,
-        ),
+        uv_command("tool", "dir", "--bin", "--no-config", environment=uv_environment),
         label="uv tool bin directory",
     )
     if executable_location.parent.resolve() != observed_tool_bin_directory:
@@ -526,19 +637,27 @@ print(json.dumps({
     "runtime_bytes": runtime_bytes,
 }, sort_keys=True))
 """
-    raw_probe = _bounded_identity_command(
-        [
-            str(provider_location),
-            "-I",
-            "-c",
-            probe_source,
-            distribution,
-            entry_point,
-            str(executable_location),
-        ],
-        maximum_bytes=256 * 1024,
-        timeout_seconds=60,
-    )
+    probe_arguments = [distribution, entry_point, str(executable_location)]
+    if expected_provider_interpreter_sha256 is not None and os.name == "posix":
+        raw_probe = _in_process_candidate_provider_probe(
+            source=probe_source,
+            arguments=probe_arguments,
+            provider_location=provider_location,
+            expected_provider_sha256=expected_provider_interpreter_sha256,
+            maximum_bytes=256 * 1024,
+        )
+    else:
+        raw_probe = _bounded_identity_command(
+            [
+                str(provider_location),
+                "-I",
+                "-c",
+                probe_source,
+                *probe_arguments,
+            ],
+            maximum_bytes=256 * 1024,
+            timeout_seconds=60,
+        )
     try:
         decoded = json.loads(raw_probe)
     except json.JSONDecodeError as exc:
@@ -629,12 +748,14 @@ print(json.dumps({
         return PersistentUvToolIdentity(
             uv_executable=str(uv_path),
             uv_version=uv_version,
-            uv_executable_sha256=sha256_file(uv_path),
+            uv_executable_sha256=uv_executable_sha256,
             tool_directory=str(observed_tool_directory),
             tool_bin_directory=str(observed_tool_bin_directory),
             environment_prefix=str(environment_prefix),
             provider_interpreter=str(provider_location),
-            provider_interpreter_sha256=sha256_file(provider_path),
+            provider_interpreter_sha256=(
+                expected_provider_interpreter_sha256 or provider_interpreter_sha256
+            ),
             tool_executable=str(executable_location),
             tool_executable_resolved=str(executable_path),
             tool_executable_sha256=external_launcher_sha256,
@@ -659,12 +780,98 @@ print(json.dumps({
         raise ConfigurationError("persistent uv tool probe returned invalid identity") from exc
 
 
+def _in_process_candidate_provider_probe(
+    *,
+    source: str,
+    arguments: list[str],
+    provider_location: Path,
+    expected_provider_sha256: str,
+    maximum_bytes: int,
+) -> str:
+    """Run a fixed identity probe inside the coordinator-bound provider process."""
+    if sys.flags.isolated != 1:
+        raise ConfigurationError("candidate provider probe is not isolated")
+    if any(
+        name.startswith(("LD_", "PYTHON")) or name in {"BASH_ENV", "ENV"} for name in os.environ
+    ):
+        raise ConfigurationError("candidate provider probe environment was not sanitized")
+    if os.environ.get("BOOTSTRAP_PLAN_PROVIDER") != str(provider_location):
+        raise ConfigurationError("candidate provider lexical path was not coordinator-bound")
+    if os.environ.get("BOOTSTRAP_PLAN_PROVIDER_SHA256") != expected_provider_sha256:
+        raise ConfigurationError("candidate provider digest was not coordinator-bound")
+    execution_sha256 = os.environ.get("BOOTSTRAP_PLAN_PROVIDER_EXEC_SHA256", "")
+    if len(execution_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in execution_sha256
+    ):
+        raise ConfigurationError("candidate provider execution digest is invalid")
+    try:
+        executable_link = os.readlink("/proc/self/exe")
+        executable_sha256 = sha256_file(Path("/proc/self/exe"))
+    except OSError as exc:
+        raise ConfigurationError("candidate provider execution image is unavailable") from exc
+    if (
+        not executable_link.startswith("/memfd:clio-relay-candidate-provider")
+        or not executable_link.endswith(" (deleted)")
+        or executable_sha256 != execution_sha256
+    ):
+        raise ConfigurationError("candidate provider process is not the sealed execution image")
+
+    output = io.StringIO()
+    previous_argv = sys.argv
+    try:
+        sys.argv = [str(provider_location), *arguments]
+        with redirect_stdout(output):
+            exec(compile(source, "<clio-relay-candidate-provider-probe>", "exec"), {})
+    finally:
+        sys.argv = previous_argv
+    value = output.getvalue()
+    if not value or len(value.encode("utf-8")) > maximum_bytes:
+        raise ConfigurationError("candidate provider probe returned invalid bounded output")
+    return value.strip()
+
+
+def _bounded_uv_identity_command(
+    uv_executable: Path,
+    expected_sha256: str,
+    arguments: list[str],
+    *,
+    environment: dict[str, str] | None = None,
+) -> str:
+    """Run one uv command from its verified open descriptor on POSIX."""
+    sanitized = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("LD_", "PYTHON")) and name not in {"BASH_ENV", "ENV"}
+    }
+    if environment is not None:
+        sanitized.update(environment)
+    wrapper_provider = (
+        "/proc/self/exe"
+        if os.name == "posix" and "BOOTSTRAP_PLAN_PROVIDER_EXEC_SHA256" in os.environ
+        else sys.executable
+    )
+    return _bounded_identity_command(
+        [
+            wrapper_provider,
+            "-I",
+            "-c",
+            _UV_FD_EXEC_SOURCE,
+            str(uv_executable),
+            expected_sha256,
+            *arguments,
+        ],
+        environment=sanitized,
+        replace_environment=True,
+    )
+
+
 def _bounded_identity_command(
     command: list[str],
     *,
     maximum_bytes: int = 65_536,
     timeout_seconds: int = 30,
     environment: dict[str, str] | None = None,
+    replace_environment: bool = False,
 ) -> str:
     """Run one identity command and return one bounded non-empty line."""
     try:
@@ -673,7 +880,11 @@ def _bounded_identity_command(
             timeout_seconds=timeout_seconds,
             stdout_maximum_bytes=maximum_bytes,
             stderr_maximum_bytes=4096,
-            environment=({**os.environ, **environment} if environment is not None else None),
+            environment=(
+                environment
+                if replace_environment
+                else ({**os.environ, **environment} if environment is not None else None)
+            ),
         )
     except (OSError, BoundedProcessError) as exc:
         raise ConfigurationError(f"persistent tool identity command failed: {exc}") from exc

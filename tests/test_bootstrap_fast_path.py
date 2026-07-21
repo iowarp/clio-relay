@@ -45,6 +45,478 @@ def _which(executable: str) -> str:
     return executable
 
 
+def _run_posix_embedded_driver(
+    driver: str,
+    *sources: str,
+    timeout_seconds: float = 60,
+) -> subprocess.CompletedProcess[str]:
+    """Run one embedded bootstrap security probe on Linux or the local WSL runtime."""
+    executable = ["wsl.exe", "-e", "python3"] if os.name == "nt" else [sys.executable]
+    encoded = [base64.b64encode(source.encode()).decode("ascii") for source in sources]
+    launcher = (
+        "import json,sys; payload=json.load(sys.stdin); "
+        "sys.argv=['embedded-driver',*payload['arguments']]; "
+        "exec(compile(payload['driver'],'<embedded-driver>','exec'))"
+    )
+    return subprocess.run(
+        [*executable, "-I", "-c", launcher],
+        input=json.dumps({"driver": driver, "arguments": encoded}),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+    )
+
+
+def test_receipt_classifier_accepts_stable_generation_symlink() -> None:
+    """Warm bootstraps classify the supported stable receipt link without following others."""
+    driver = r"""
+import base64
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+source = base64.b64decode(sys.argv[1]).decode()
+with tempfile.TemporaryDirectory() as value:
+    home = Path(value)
+    relay = home / ".local/share/clio-relay"
+    generation = relay / "generations" / ("a" * 64)
+    generation.mkdir(parents=True)
+    receipt = generation / "install-receipt.json"
+    receipt.write_text(
+        json.dumps({"component_artifacts": {"clio-relay": {"persistent_tool": {}}}}),
+        encoding="utf-8",
+    )
+    (relay / "current").symlink_to(generation, target_is_directory=True)
+    stable = relay / "install-receipt.json"
+    stable.symlink_to(relay / "current/install-receipt.json")
+    environment = {**os.environ, "HOME": str(home)}
+    result = subprocess.run(
+        [sys.executable, "-I", "-", str(stable)],
+        input=source,
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit(result.stdout + result.stderr)
+    if result.stdout.strip() != "current":
+        raise SystemExit("stable generation receipt was not classified as current")
+print("stable-receipt-ok")
+"""
+    result = _run_posix_embedded_driver(
+        driver,
+        bootstrap._BOOTSTRAP_RECEIPT_CLASSIFIER_SOURCE,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "stable-receipt-ok"
+
+
+def test_preparing_root_and_uv_copy_recover_without_following_links() -> None:
+    """Power-loss scratch is reclaimed fd-relatively and uv executes from a private copy."""
+    driver = r"""
+import base64
+import hashlib
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+preparing = base64.b64decode(sys.argv[1]).decode()
+copy_uv = base64.b64decode(sys.argv[2]).decode()
+with tempfile.TemporaryDirectory() as value:
+    workspace = Path(value)
+    parent = workspace / "preparing"
+    parent.mkdir(mode=0o700)
+    active = parent / "active"
+    quarantine = parent / ".active.quarantine"
+    sentinel = workspace / "outside-sentinel"
+    sentinel.write_text("preserve", encoding="utf-8")
+    for stale in (active, quarantine):
+        (stale / "nested").mkdir(parents=True, mode=0o700)
+        stale.chmod(0o700)
+        (stale / "nested/outbound").symlink_to(sentinel)
+    subprocess.run(
+        [sys.executable, "-I", "-c", preparing, str(parent), str(active), "prepare"],
+        check=True,
+    )
+    if not active.is_dir() or list(active.iterdir()) or not sentinel.is_file():
+        raise SystemExit("fixed scratch preparation did not safely reclaim stale state")
+    if quarantine.exists() or quarantine.is_symlink():
+        raise SystemExit("scratch quarantine leaked after reclamation")
+
+    source = workspace / "uv-source"
+    payload = b"#!/bin/sh\nexit 0\n"
+    source.write_bytes(payload)
+    source.chmod(0o500)
+    digest = hashlib.sha256(payload).hexdigest()
+    copied = subprocess.run(
+        [sys.executable, "-I", "-c", copy_uv, str(source), str(active), digest],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    private_uv = Path(copied.stdout.strip())
+    if private_uv != active / "pinned-uv":
+        raise SystemExit("candidate uv copy returned the wrong private path")
+    if private_uv.stat().st_ino == source.stat().st_ino:
+        raise SystemExit("candidate uv copy reused the mutable source inode")
+    if hashlib.sha256(private_uv.read_bytes()).hexdigest() != digest:
+        raise SystemExit("candidate uv private copy digest changed")
+    if private_uv.stat().st_mode & 0o777 != 0o500:
+        raise SystemExit("candidate uv private copy mode is not sealed")
+
+    subprocess.run(
+        [sys.executable, "-I", "-c", preparing, str(parent), str(active), "cleanup"],
+        check=True,
+    )
+    if active.exists() or quarantine.exists() or not sentinel.is_file():
+        raise SystemExit("scratch cleanup did not preserve its outbound target")
+
+    for stale in (active, quarantine):
+        (stale / "nested").mkdir(parents=True, mode=0o700)
+        stale.chmod(0o700)
+    subprocess.run(
+        [sys.executable, "-I", "-c", preparing, str(parent), str(active), "prepare"],
+        check=True,
+    )
+    rejected = subprocess.run(
+        [sys.executable, "-I", "-c", copy_uv, str(source), str(active), "0" * 64],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if rejected.returncode == 0 or (active / "pinned-uv").exists():
+        raise SystemExit("a digest-mismatched uv copy was retained")
+print("scratch-and-uv-ok")
+"""
+    result = _run_posix_embedded_driver(
+        driver,
+        bootstrap._BOOTSTRAP_PREPARING_ROOT_SOURCE,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        bootstrap._BOOTSTRAP_PINNED_UV_COPY_SOURCE,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "scratch-and-uv-ok"
+
+
+def test_fd_bound_candidate_verifier_rejects_swapped_wheel_install() -> None:
+    """Installed relay bytes must match the wheel fd held across uv installation."""
+    driver = r"""
+import base64
+import csv
+import hashlib
+import io
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+
+verifier = base64.b64decode(sys.argv[1]).decode()
+uv = shutil.which("uv") or str(Path.home() / ".local/bin/uv")
+with tempfile.TemporaryDirectory() as value:
+    workspace = Path(value)
+    built = workspace / "built"
+    subprocess.run(
+        [uv, "build", "--wheel", "--out-dir", str(built)],
+        check=True,
+        capture_output=True,
+    )
+    original = next(built.glob("clio_relay-*.whl"))
+    tampered = workspace / original.name
+    with zipfile.ZipFile(original) as archive:
+        entries = [(item, archive.read(item.filename)) for item in archive.infolist()]
+    record_name = next(
+        item.filename
+        for item, _payload in entries
+        if item.filename.endswith(".dist-info/RECORD")
+    )
+    target_name = "clio_relay/__init__.py"
+    payloads = {item.filename: payload for item, payload in entries}
+    payloads[target_name] += b"\nSWAPPED_WHEEL_SENTINEL = True\n"
+    rows = list(csv.reader(io.StringIO(payloads[record_name].decode()), strict=True))
+    for row in rows:
+        if row[0] == target_name:
+            digest = hashlib.sha256(payloads[target_name]).digest()
+            row[1] = "sha256=" + base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+            row[2] = str(len(payloads[target_name]))
+    record_stream = io.StringIO(newline="")
+    csv.writer(record_stream, lineterminator="\n").writerows(rows)
+    payloads[record_name] = record_stream.getvalue().encode()
+    with zipfile.ZipFile(tampered, "w") as archive:
+        for item, _payload in entries:
+            archive.writestr(item, payloads[item.filename])
+
+    tool_directory = workspace / "tools"
+    tool_bin_directory = workspace / "bin"
+    cache_directory = workspace / "cache"
+    python_directory = Path.home() / ".local/share/clio-relay/uv-python"
+    environment = {
+        **os.environ,
+        "UV_TOOL_DIR": str(tool_directory),
+        "UV_TOOL_BIN_DIR": str(tool_bin_directory),
+        "UV_CACHE_DIR": str(cache_directory),
+        "UV_PYTHON_INSTALL_DIR": str(python_directory),
+        "UV_PYTHON_DOWNLOADS": "never",
+    }
+    subprocess.run(
+        [
+            uv,
+            "tool",
+            "install",
+            "--force",
+            "--python",
+            "3.12",
+            "--no-config",
+            "--default-index",
+            "https://pypi.org/simple",
+            str(tampered),
+        ],
+        check=True,
+        capture_output=True,
+        env=environment,
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            verifier,
+            "verify-installed",
+            uv,
+            hashlib.sha256(Path(uv).read_bytes()).hexdigest(),
+            str(original),
+            hashlib.sha256(original.read_bytes()).hexdigest(),
+            str(tool_directory),
+            str(tool_bin_directory),
+            str(cache_directory),
+            str(python_directory),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        raise SystemExit("swapped wheel installation passed pinned-fd verification")
+    if "installed candidate differs from the pinned wheel fd" not in result.stderr:
+        raise SystemExit(result.stdout + result.stderr)
+print("swapped-wheel-rejected")
+"""
+    result = _run_posix_embedded_driver(
+        driver,
+        bootstrap._BOOTSTRAP_CANDIDATE_UV_INSTALL_SOURCE,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "swapped-wheel-rejected"
+
+
+def test_candidate_coordinator_rejects_provider_path_swap_after_open() -> None:
+    """A provider pathname replacement cannot execute after its coordinator opens it."""
+    driver = r"""
+import base64
+import ctypes
+import hashlib
+import os
+import select
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+coordinator = base64.b64decode(sys.argv[1]).decode()
+uv = shutil.which("uv") or str(Path.home() / ".local/bin/uv")
+with tempfile.TemporaryDirectory() as value:
+    workspace = Path(value)
+    built = workspace / "built"
+    subprocess.run(
+        [uv, "build", "--wheel", "--out-dir", str(built)],
+        check=True,
+        capture_output=True,
+    )
+    wheel = next(built.glob("clio_relay-*.whl"))
+    tool_directory = workspace / "tools"
+    tool_bin_directory = workspace / "bin"
+    cache_directory = workspace / "cache"
+    python_directory = Path.home() / ".local/share/clio-relay/uv-python"
+    environment = {
+        **os.environ,
+        "UV_TOOL_DIR": str(tool_directory),
+        "UV_TOOL_BIN_DIR": str(tool_bin_directory),
+        "UV_CACHE_DIR": str(cache_directory),
+        "UV_PYTHON_INSTALL_DIR": str(python_directory),
+        "UV_PYTHON_DOWNLOADS": "never",
+    }
+    subprocess.run(
+        [
+            uv,
+            "tool",
+            "install",
+            "--force",
+            "--python",
+            "3.12",
+            "--no-config",
+            "--default-index",
+            "https://pypi.org/simple",
+            str(wheel),
+        ],
+        check=True,
+        capture_output=True,
+        env=environment,
+    )
+    provider = tool_directory / "clio-relay/bin/python"
+    provider_target = provider.resolve(strict=True)
+    provider_sha256 = hashlib.sha256(provider_target.read_bytes()).hexdigest()
+    uv_sha256 = hashlib.sha256(Path(uv).read_bytes()).hexdigest()
+    wheel_sha256 = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    probe_source = f'''
+import os
+from importlib.metadata import version
+from pathlib import Path
+from clio_relay.installation import probe_persistent_uv_tool_identity
+identity = probe_persistent_uv_tool_identity(
+    uv_executable={uv!r},
+    tool_executable={str(tool_bin_directory / 'clio-relay')!r},
+    provider_interpreter=os.environ['BOOTSTRAP_PLAN_PROVIDER'],
+    source_artifact=Path({str(wheel)!r}),
+    distribution='clio-relay',
+    distribution_version=version('clio-relay'),
+    entry_point='clio-relay',
+    tool_directory={str(tool_directory)!r},
+    tool_bin_directory={str(tool_bin_directory)!r},
+    expected_uv_executable_sha256={uv_sha256!r},
+    expected_provider_interpreter_sha256={provider_sha256!r},
+)
+print('in-process-provider=' + identity.provider_interpreter_sha256)
+'''
+    positive = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            coordinator,
+            "verify-installed-and-exec",
+            uv,
+            uv_sha256,
+            str(wheel),
+            wheel_sha256,
+            str(tool_directory),
+            str(tool_bin_directory),
+            str(cache_directory),
+            str(python_directory),
+            provider_sha256,
+            "-I",
+            "-",
+        ],
+        input=probe_source,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if positive.returncode != 0 or positive.stdout.strip() != (
+        "in-process-provider=" + provider_sha256
+    ):
+        raise SystemExit(positive.stdout + positive.stderr)
+    executed_a = workspace / "provider-a-executed"
+    executed_b = workspace / "provider-b-executed"
+    libc = ctypes.CDLL(None, use_errno=True)
+    inotify_descriptor = libc.inotify_init1(os.O_CLOEXEC)
+    if inotify_descriptor < 0:
+        raise SystemExit("could not initialize the provider-open observer")
+    watch = libc.inotify_add_watch(
+        inotify_descriptor,
+        os.fsencode(provider_target),
+        0x00000020,
+    )
+    if watch < 0:
+        os.close(inotify_descriptor)
+        raise SystemExit("could not observe the provider target opening")
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            coordinator,
+            "verify-installed-and-exec",
+            uv,
+            uv_sha256,
+            str(wheel),
+            wheel_sha256,
+            str(tool_directory),
+            str(tool_bin_directory),
+            str(cache_directory),
+            str(python_directory),
+            provider_sha256,
+            "-I",
+            "-",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    readable, _writable, _exceptional = select.select(
+        [inotify_descriptor],
+        [],
+        [],
+        10,
+    )
+    if not readable:
+        process.kill()
+        process.wait(timeout=5)
+        os.close(inotify_descriptor)
+        raise SystemExit("provider swap test did not observe the coordinator opening it")
+    os.read(inotify_descriptor, 4096)
+    os.close(inotify_descriptor)
+    provider.unlink()
+    provider.write_text(
+        "#!/bin/sh\nprintf hostile > " + str(executed_b) + "\nexit 91\n",
+        encoding="utf-8",
+    )
+    provider.chmod(0o700)
+    stdout, stderr = process.communicate(
+        input=(
+            "from pathlib import Path\n"
+            f"Path({str(executed_a)!r}).write_text('trusted', encoding='utf-8')\n"
+        ),
+        timeout=30,
+    )
+    if process.returncode == 0:
+        if not executed_a.exists():
+            raise SystemExit("the sealed provider did not execute the trusted payload")
+    elif not any(
+        message in stderr
+        for message in (
+            "candidate provider path changed while it was pinned",
+            "candidate provider changed after its planning pin",
+        )
+    ):
+        raise SystemExit(stdout + stderr)
+    if executed_b.exists():
+        raise SystemExit("the replacement provider pathname was executed")
+print("provider-swap-rejected")
+"""
+    result = _run_posix_embedded_driver(
+        driver,
+        bootstrap._BOOTSTRAP_CANDIDATE_UV_INSTALL_SOURCE,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        timeout_seconds=120,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "provider-swap-rejected"
+
+
 def test_staged_provider_exec_is_hash_bound_sealed_and_venv_aware(tmp_path: Path) -> None:
     """The staged provider is executed from sealed bytes with lexical venv semantics."""
     if sys.platform != "linux":
@@ -301,6 +773,135 @@ def test_exact_remote_bootstrap_never_reads_or_builds_payload(
     assert isinstance(operations, dict)
     assert operations["payload_transfer_count"] == 0
     assert operations["payload_transfer_bytes"] == 0
+
+
+def test_legacy_preflight_classifies_receipt_before_invoking_old_relay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A receipt without persistent-tool proof forces the candidate payload path."""
+    identity = bootstrap.bootstrap_relay_identity(
+        source_root=tmp_path / "release",
+        relay_wheel=None,
+        relay_artifact_sha256="a" * 64,
+    )
+    desired = bootstrap._bootstrap_desired_state(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        identity=identity,
+        cluster="ares",
+        core_dir=bootstrap.DEFAULT_REMOTE_CORE_DIR,
+        spool_dir=bootstrap.DEFAULT_REMOTE_SPOOL_DIR,
+        frp_version=bootstrap.FRP_VERSION,
+        clio_kit_install_spec=bootstrap.CLIO_KIT_JARVIS_MCP_WHEEL_URL,
+        clio_kit_artifact_sha256=bootstrap.CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
+        agent_adapter="exec",
+        agent_npm_package=None,
+        agent_npm_bin=None,
+        agent_args=[],
+        jarvis_resource_graph_profile="ares",
+    )
+    observed: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "bootstrap_preflight_unsupported=legacy_relay_provider\n",
+            "",
+        )
+
+    monkeypatch.setattr(bootstrap, "_run", run)
+    result = bootstrap._bootstrap_preflight_over_ssh(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        ssh_host="ares",
+        invocation_id="bootstrap_test",
+        desired=desired,
+        core_dir=bootstrap.DEFAULT_REMOTE_CORE_DIR,
+        spool_dir=bootstrap.DEFAULT_REMOTE_SPOOL_DIR,
+        repair=False,
+        timeout_seconds=30,
+    )
+
+    assert result.action == "payload_required"
+    assert len(observed) == 1
+    remote_script = observed[0][-1]
+    classifier = remote_script.index('relay.get("persistent_tool")')
+    old_relay = remote_script.index('"$HOME/.local/bin/clio-relay" bootstrap-inspect')
+    assert classifier < old_relay
+    assert "bootstrap_preflight_unsupported=legacy_relay_provider" in remote_script
+    assert 'if ! BOOTSTRAP_RELAY_RECEIPT_CLASS="$(' in remote_script
+    assert "python3 -I -" in remote_script
+    sanitizer = remote_script.index("while IFS= read -r bootstrap_environment_name")
+    assert 'LD_*|PYTHON*|BASH_ENV|ENV) unset "$bootstrap_environment_name"' in remote_script
+    assert sanitizer < remote_script.index("python3 -I -")
+    assert sanitizer < remote_script.index("timeout --signal=TERM")
+    assert "env -u PYTHONPATH" not in remote_script
+    shell = (
+        ["wsl.exe", "-e", "bash", "-lc", "tr -d '\r' | bash -n"]
+        if os.name == "nt"
+        else ["bash", "-n"]
+    )
+    syntax = subprocess.run(
+        shell,
+        input=remote_script,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert syntax.returncode == 0, syntax.stderr
+    execution_driver = r"""
+import base64
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+script = base64.b64decode(sys.argv[1]).decode()
+script = (
+    "export LD_AUDIT=/definitely/missing/LD_AUDIT_SENTINEL.so\n"
+    "export PYTHONWARNINGS=error::DefinitelyMissingWarning\n"
+    + script
+)
+with tempfile.TemporaryDirectory() as value:
+    home = Path(value)
+    relay = home / ".local/bin/clio-relay"
+    relay.parent.mkdir(parents=True)
+    marker = home / "legacy-relay-executed"
+    relay.write_text(
+        "#!/bin/sh\nprintf invoked > " + str(marker) + "\nexit 99\n",
+        encoding="utf-8",
+    )
+    relay.chmod(0o700)
+    receipt = home / ".local/share/clio-relay/install-receipt.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text(
+        json.dumps({"component_artifacts": {"clio-relay": {}}}),
+        encoding="utf-8",
+    )
+    environment = {**os.environ, "HOME": str(home)}
+    result = subprocess.run(
+        ["bash"],
+        input=script,
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit(result.stdout + result.stderr)
+    if marker.exists():
+        raise SystemExit("legacy relay provider executed before candidate staging")
+    if "LD_AUDIT_SENTINEL" in result.stderr or "Invalid -W option" in result.stderr:
+        raise SystemExit("preflight leaked hostile loader or Python environment")
+    if result.stdout.strip() != "bootstrap_preflight_unsupported=legacy_relay_provider":
+        raise SystemExit("legacy relay receipt did not force the candidate payload path")
+print("legacy-preflight-ok")
+"""
+    execution = _run_posix_embedded_driver(execution_driver, remote_script)
+    assert execution.returncode == 0, execution.stdout + execution.stderr
+    assert execution.stdout.strip() == "legacy-preflight-ok"
 
 
 def test_public_cluster_bootstrap_noop_never_touches_nonexistent_wheel(
@@ -1081,6 +1682,77 @@ def test_payload_script_uses_digest_bound_safe_extractor() -> None:
     assert "BOOTSTRAP_CANDIDATE_PACKAGE/safe_archive.py" in script
 
 
+def test_legacy_planning_attests_private_candidate_before_transaction_or_fence() -> None:
+    """A legacy relay cannot authorize its own replacement or touch stable state."""
+    script = bootstrap.render_linux_user_bootstrap_script(
+        cluster="cluster-a",
+        relay_install_spec="$DEST/wheels/clio_relay-1.4.18-py3-none-any.whl",
+        relay_deployment_install_spec="clio-relay==1.4.18",
+        relay_artifact_sha256="a" * 64,
+        source_archive_sha256="b" * 64,
+    )
+    planning = script.index('BOOTSTRAP_PLAN_MODE="full"')
+    archive = script.index("  SOURCE_ARCHIVE=/tmp/clio-relay-head.tar", planning)
+    archive_digest = script.index(
+        'echo "$SOURCE_ARCHIVE_SHA256 *$SOURCE_ARCHIVE" | sha256sum --check --strict -',
+        archive,
+    )
+    extraction = script.index('bootstrap_safe_extract python3 "$SOURCE_ARCHIVE"', archive_digest)
+    wheel_digest = script.index(
+        'echo "$BOOTSTRAP_CANDIDATE_ARTIFACT_SHA256 *$BOOTSTRAP_CANDIDATE_ARTIFACT"',
+        extraction,
+    )
+    uv_copy = script.index('BOOTSTRAP_PINNED_UV="$(', wheel_digest)
+    uv_digest = script.index(
+        "candidate uv source changed or did not match its release pin",
+        uv_copy,
+    )
+    install = script.index("bootstrap_candidate_install=fd-bound-wheel-verified:", uv_digest)
+    chain_exec = script.index(" install-verify-and-exec ", install)
+    attestation = script.index("prove_bootstrap_replacement_provider(", install)
+    plan = script.index(
+        "plan_bootstrap_reconcile(desired, replacement_provider=evidence)",
+        attestation,
+    )
+    dispatch = script.index("  bootstrap_relay_only_reconcile", plan)
+    planning_heredoc = script[chain_exec:dispatch]
+    retained_planning = script[planning:dispatch]
+
+    assert archive < archive_digest < extraction < wheel_digest < uv_copy < uv_digest
+    assert uv_digest < install < chain_exec < attestation < plan < dispatch
+    assert "spec_from_file_location" not in planning_heredoc
+    assert "from clio_relay.bootstrap_reconcile import (" in planning_heredoc
+    assert '"UV_TOOL_DIR": str(tool_directory)' in script
+    assert '"UV_CACHE_DIR": str(cache_directory)' in script
+    assert 'BOOTSTRAP_PREPARING_ROOT="$BOOTSTRAP_PREPARING_PARENT/active"' in script
+    assert "BOOTSTRAP_CANDIDATE_INSTALL_SPEC='$DEST/wheels/" in script
+    assert 'UV_PYTHON_INSTALL_DIR="$HOME/.local/share/clio-relay/uv-python"' in script
+    assert 'UV_PYTHON_INSTALL_DIR="$BOOTSTRAP_PREPARING_ROOT/' not in script
+    assert '"$BOOTSTRAP_PINNED_UV" tool install' not in script
+    assert 'executable=f"/proc/self/fd/{uv_descriptor}"' in script
+    assert "installed candidate differs from the pinned wheel fd" in script
+    assert "install-and-verify" in script
+    assert "install-verify-and-exec" in planning_heredoc
+    assert 'BOOTSTRAP_PLAN_PROVIDER="$(sed' not in retained_planning
+    assert '"$BOOTSTRAP_PLAN_PROVIDER" -I' not in retained_planning
+    assert 'bootstrap_provider_exec "$@"' in script
+    assert '"$provider" -I - "$BOOTSTRAP_CANDIDATE_PYTHON_ROOT"' not in script
+    assert "expected_provider_interpreter_sha256" in planning_heredoc
+    assert planning_heredoc.index("from clio_relay.bootstrap_reconcile import (") < (
+        planning_heredoc.index("prove_bootstrap_replacement_provider(")
+    )
+    assert planning_heredoc.index("prove_bootstrap_replacement_provider(") < (
+        planning_heredoc.index("plan_bootstrap_reconcile(desired, replacement_provider=evidence)")
+    )
+    assert "shutil.rmtree" not in script
+    no_downloads = script.index('"UV_PYTHON_DOWNLOADS": "never"', uv_digest)
+    assert uv_digest < no_downloads < install
+    assert "bootstrap_cleanup_preparing_root" in script
+    assert script.index("BOOTSTRAP_LEGACY_RELAY_PROVIDER=1") < script.index(
+        '"$BOOTSTRAP_CURRENT_PROVIDER" -c'
+    )
+
+
 def test_staged_upgrade_uses_journal_bound_idempotent_forward_activation() -> None:
     """Legacy adoption and recovery share one staged-provider activation path."""
     script = bootstrap.render_linux_user_bootstrap_script(cluster="cluster-a")
@@ -1103,11 +1775,12 @@ def test_staged_upgrade_uses_journal_bound_idempotent_forward_activation() -> No
     assert "bootstrap_use_staged_provider()" in script
     assert "journal-phase prepared_manifest" in script
     assert provider_function.index("compgen -e") < provider_function.index("exec python3 -I -c")
-    assert 'LD_*|PYTHON*) unset "$bootstrap_environment_name"' in provider_function
+    assert 'LD_*|PYTHON*|BASH_ENV|ENV) unset "$bootstrap_environment_name"' in provider_function
     assert activation < finish < verify < activated < migration
     assert "bootstrap_candidate_action finish-activation" in recovery
     assert "phase_identities" in recovery
     assert "sha256sum --check --strict -" in recovery
+    assert "printf '%s\\n' \"bootstrap_reconcile_plan=$BOOTSTRAP_PLAN_JSON\" >&2" in script
     assert 'mv -Tf "$HOME/.local/share/clio-relay/.current.' not in script
     assert 'readlink "$HOME/.local/share/clio-relay/current"' not in script
     assert (
