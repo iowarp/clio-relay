@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from clio_relay.bootstrap_reconcile import (
     BootstrapActivationPath,
     BootstrapDesiredState,
     BootstrapReconcilePlan,
+    BootstrapReplacementProviderEvidence,
     BootstrapTransactionJournal,
     BootstrapTransactionState,
     bootstrap_invocation_lock,
@@ -40,6 +42,8 @@ from clio_relay.bootstrap_reconcile import (
     write_jarvis_wrapper,
 )
 from clio_relay.errors import ConfigurationError
+from clio_relay.installation import PersistentUvToolIdentity
+from clio_relay.validation_report import sha256_file
 
 
 def _digest(value: bytes) -> str:
@@ -283,9 +287,14 @@ def test_matching_receipt_with_tampered_runtime_is_not_a_noop(
     assert "managed endpoint service is inactive" in inspection.reasons
 
 
+@pytest.mark.parametrize(
+    "relay_provider",
+    ["verified-old", "unverified-old", "staged-candidate", "tampered-candidate"],
+)
 def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    relay_provider: str,
 ) -> None:
     bin_dir = tmp_path / ".local/bin"
     bin_dir.mkdir(parents=True)
@@ -334,6 +343,41 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
         }
     )
     info = _installation_info(desired)
+    if relay_provider != "verified-old":
+        component_runtime = cast(dict[str, object], info["component_runtime"])
+        component_runtime["clio-relay"] = {
+            "persistent_tool_verified": False,
+            "error": "source artifact is unavailable",
+        }
+    replacement_provider = None
+    if relay_provider in {"staged-candidate", "tampered-candidate"}:
+        info["receipt_matches_install"] = False
+        replacement_provider = BootstrapReplacementProviderEvidence.model_construct(
+            desired_fingerprint=desired.fingerprint,
+            relay_install_spec=desired.relay_install_spec,
+            preparing_root=str(tmp_path / ".local/share/clio-relay/preparing/invocation"),
+            extracted_source_root=str(
+                tmp_path / ".local/share/clio-relay/preparing/invocation/source"
+            ),
+            source_archive_sha256="f" * 64,
+            persistent_tool=PersistentUvToolIdentity.model_construct(),
+        )
+
+        def verify_replacement(
+            _desired: BootstrapDesiredState,
+            _evidence: BootstrapReplacementProviderEvidence,
+            *,
+            home: Path | None = None,
+        ) -> None:
+            assert home == tmp_path
+            if relay_provider == "tampered-candidate":
+                raise ConfigurationError("candidate RECORD closure changed")
+
+        monkeypatch.setattr(
+            bootstrap_reconcile_module,
+            "_verify_bootstrap_replacement_provider",
+            verify_replacement,
+        )
     receipt = cast(dict[str, object], info["receipt"])
     receipt.pop("deployment_fingerprint")
     receipt.pop("deployment_manifest")
@@ -389,7 +433,24 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
         bounded_identity,
     )
 
-    plan = plan_bootstrap_reconcile(desired, home=tmp_path)
+    plan = plan_bootstrap_reconcile(
+        desired,
+        home=tmp_path,
+        replacement_provider=replacement_provider,
+    )
+
+    if relay_provider == "unverified-old":
+        assert plan.mode == "full"
+        assert plan.reasons == [
+            "clio-relay live provider is not reusable: source artifact is unavailable"
+        ]
+        return
+    if relay_provider == "tampered-candidate":
+        assert plan.mode == "full"
+        assert plan.reasons == [
+            "candidate replacement provider did not verify: candidate RECORD closure changed"
+        ]
+        return
 
     assert plan.mode == "relay-only", plan.reasons
     assert plan.component_actions == {
@@ -406,6 +467,161 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
     assert plan.activation_paths["current"].before is None
     assert plan.activation_paths["managed_repo"].before is None
     assert plan.activation_paths["install_receipt"].before is not None
+    if relay_provider == "staged-candidate":
+        component_runtime = cast(dict[str, object], info["component_runtime"])
+        clio_kit_runtime = cast(dict[str, object], component_runtime["clio-kit"])
+        clio_kit_runtime["native_execution_capability_verified"] = False
+        rejected = plan_bootstrap_reconcile(
+            desired,
+            home=tmp_path,
+            replacement_provider=replacement_provider,
+        )
+        assert rejected.mode == "full"
+        assert rejected.reasons == ["clio-kit live runtime is not reusable"]
+
+
+def test_replacement_provider_attests_real_private_uv_tool(
+    tmp_path: Path,
+) -> None:
+    """The replacement proof is derived from a real wheel, uv receipt, and RECORD."""
+    uv_source = shutil.which("uv")
+    assert uv_source is not None
+    project = Path(__file__).parents[1]
+    built = tmp_path / "built"
+    subprocess.run(
+        [uv_source, "build", "--wheel", "--out-dir", str(built)],
+        cwd=project,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    wheels = list(built.glob("clio_relay-*.whl"))
+    assert len(wheels) == 1
+    version = wheels[0].name.removeprefix("clio_relay-").removesuffix("-py3-none-any.whl")
+
+    home = tmp_path / "home"
+    preparing_parent = home / ".local/share/clio-relay/preparing"
+    preparing_root = preparing_parent / "active"
+    preparing_root.mkdir(parents=True, mode=0o700)
+    preparing_parent.chmod(0o700)
+    preparing_root.chmod(0o700)
+    uv_executable = preparing_root / "pinned-uv"
+    shutil.copy2(uv_source, uv_executable)
+    uv_executable.chmod(0o500)
+    uv_version = (
+        subprocess.run(
+            [str(uv_executable), "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        .stdout.strip()
+        .split()[1]
+    )
+    source_root = preparing_root / "source"
+    source_root.mkdir()
+    wheel = preparing_root / wheels[0].name
+    shutil.copy2(wheels[0], wheel)
+    tool_directory = preparing_root / "uv-tools"
+    tool_bin_directory = preparing_root / "uv-bin"
+    environment = {
+        **os.environ,
+        "UV_TOOL_DIR": str(tool_directory),
+        "UV_TOOL_BIN_DIR": str(tool_bin_directory),
+        "UV_CACHE_DIR": str(preparing_root / "uv-cache"),
+        "UV_PYTHON_INSTALL_DIR": str(home / ".local/share/clio-relay/uv-python"),
+        "UV_PYTHON_DOWNLOADS": "never",
+    }
+    subprocess.run(
+        [
+            str(uv_executable),
+            "tool",
+            "install",
+            "--force",
+            "--python",
+            "3.12",
+            "--no-config",
+            "--default-index",
+            "https://pypi.org/simple",
+            str(wheel),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=environment,
+    )
+    launcher = tool_bin_directory / ("clio-relay.exe" if os.name == "nt" else "clio-relay")
+    provider = (
+        tool_directory / "clio-relay" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    )
+    assert launcher.is_file()
+    assert provider.is_file()
+    wheel_sha256 = sha256_file(wheel)
+    desired = _desired(
+        uv_sha256=sha256_file(uv_executable),
+        frpc_sha256="b" * 64,
+        frps_sha256="c" * 64,
+    ).model_copy(
+        update={
+            "relay_install_spec": f"clio-relay=={version}",
+            "relay_artifact_sha256": wheel_sha256,
+            "relay_source_identity": f"wheel:sha256:{wheel_sha256}",
+            "uv_version": uv_version,
+        }
+    )
+    desired_path = tmp_path / "desired.json"
+    desired_path.write_text(desired.model_dump_json(), encoding="utf-8")
+    proof = subprocess.run(
+        [
+            str(provider),
+            "-I",
+            "-c",
+            "\n".join(
+                [
+                    "import json,sys",
+                    "from pathlib import Path",
+                    "from clio_relay.bootstrap_reconcile import (",
+                    "    BootstrapDesiredState,prove_bootstrap_replacement_provider,",
+                    ")",
+                    "desired=BootstrapDesiredState.model_validate_json(Path(sys.argv[1]).read_text())",
+                    "evidence=prove_bootstrap_replacement_provider(",
+                    "    desired,",
+                    "    uv_executable=Path(sys.argv[2]),",
+                    "    tool_executable=Path(sys.argv[3]),",
+                    "    source_artifact=Path(sys.argv[4]),",
+                    "    tool_directory=Path(sys.argv[5]),",
+                    "    tool_bin_directory=Path(sys.argv[6]),",
+                    "    preparing_root=Path(sys.argv[7]),",
+                    "    extracted_source_root=Path(sys.argv[8]),",
+                    "    source_archive_sha256='f'*64,",
+                    "    home=Path(sys.argv[9]),",
+                    ")",
+                    "print(json.dumps(evidence.model_dump(mode='json'),sort_keys=True))",
+                ]
+            ),
+            str(desired_path),
+            str(uv_executable),
+            str(launcher),
+            str(wheel),
+            str(tool_directory),
+            str(tool_bin_directory),
+            str(preparing_root),
+            str(source_root),
+            str(home),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+    assert proof.returncode == 0, proof.stdout + proof.stderr
+    evidence = json.loads(proof.stdout)
+    assert evidence["schema_version"] == "clio-relay.bootstrap-replacement-provider.v1"
+    assert evidence["persistent_tool"]["source_artifact_sha256"] == wheel_sha256
 
 
 def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(

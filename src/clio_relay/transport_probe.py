@@ -29,10 +29,11 @@ from clio_relay.relay_host import (
 from clio_relay.remote_values import render_remote_shell_path, render_remote_shell_value
 from clio_relay.session_lifecycle import (
     CleanupResource,
+    OwnedSessionStartResult,
     SessionLifecycleReport,
     detach_remote_session,
-    start_remote_session,
-    status_remote_session,
+    plan_remote_session_start,
+    start_remote_session_durable,
     teardown_remote_session,
 )
 from clio_relay.validation_report import (
@@ -427,48 +428,32 @@ def run_ssh_forward_http_probe(
             "SSH transport probes require CLIO_RELAY_API_TOKEN for the owned remote API"
         )
     _assert_local_bind_port_available(local_bind_port)
-    try:
-        start_lines = start_remote_session(
-            cluster=cluster,
+    start_plan = plan_remote_session_start(
+        cluster=cluster,
+        definition=definition,
+        session_id=session_id,
+        remote_api_port=remote_api_port,
+        replace=replace_remote,
+        require_token=True,
+    )
+    start_result = start_remote_session_durable(
+        definition=definition,
+        plan=start_plan,
+        api_token=api_token,
+    )
+    if start_result.state != "ready":
+        raise _remote_session_start_not_ready_error(
+            result=start_result,
             definition=definition,
-            session_id=session_id,
-            remote_api_port=remote_api_port,
-            api_token=api_token,
-            replace=replace_remote,
         )
-        session_generation_id = _started_session_generation_id(
-            start_lines,
-            definition=definition,
-            session_id=session_id,
-        )
-    except BaseException as exc:
-        evidence_line = _transport_resource_line(
-            probe_id=f"ssh-probe:{session_id}:generation-unverified",
-            cluster=cluster,
-            cleanup_mode=(
-                "transport_probe_detach" if detach_remote else "transport_probe_teardown"
-            ),
-            resources=[
-                _process_cleanup_resource(
-                    kind="relay_session",
-                    resource_id=session_id,
-                    role="remote_transport_session",
-                    location=definition.ssh_host,
-                    action="retain" if detach_remote else "stop",
-                    ownership_verified=False,
-                    outcome="unknown",
-                    verified_after_operation=False,
-                    observed_state="running_or_unknown",
-                    residual=True,
-                    detail=f"remote session start was not verified: {type(exc).__name__}: {exc}",
-                    metadata={"session_id": session_id, "session_generation_id": None},
-                )
-            ],
-        )
-        attached = _attach_transport_evidence(exc, [evidence_line])
-        if attached is not exc:
-            raise attached from exc
-        raise
+    session_generation_id = start_result.session_generation_id
+    if (
+        session_generation_id is None
+        or not start_result.ownership_verified
+        or not start_result.recovery_verified
+    ):
+        raise RelayError("ready remote session start omitted its verified generation identity")
+    start_lines = start_result.compatibility_lines
     factory = process_factory or _popen
     forward: ManagedProcess | None = None
     lines: list[str] = []
@@ -657,31 +642,67 @@ def run_ssh_forward_http_probe(
     return lines
 
 
-def _started_session_generation_id(
-    start_lines: list[str],
+def _remote_session_start_not_ready_error(
     *,
+    result: OwnedSessionStartResult,
     definition: ClusterDefinition,
-    session_id: str,
-) -> str:
-    """Recover the exact generation created or reused by a remote session start."""
-    prefix = "session_generation_id="
-    values = [line.removeprefix(prefix) for line in start_lines if line.startswith(prefix)]
-    if len(values) == 1 and values[0]:
-        return values[0]
-    status = status_remote_session(definition=definition, session_id=session_id)
-    generation_id = status.get("session_generation_id")
-    owned_session = status.get("session_id") == session_id and status.get("owner") == "clio-relay"
-    running_ownership_verified = (
-        status.get("running") is not True or status.get("ownership_verified") is True
+) -> RelayError:
+    """Preserve a non-ready durable start operation without opening a connector."""
+    status_selector = result.status_selector.model_dump(mode="json")
+    retry_selector = result.retry_selector.model_dump(mode="json")
+    status_selector_json = json.dumps(status_selector, sort_keys=True, separators=(",", ":"))
+    retry_selector_json = json.dumps(retry_selector, sort_keys=True, separators=(",", ":"))
+    detail = (
+        "owned remote session start is not ready; "
+        f"state={result.state}; terminal={str(result.terminal).lower()}; "
+        f"start_operation_id={result.start_operation_id}; "
+        f"status_selector={status_selector_json}; retry_selector={retry_selector_json}"
     )
-    if (
-        owned_session
-        and running_ownership_verified
-        and isinstance(generation_id, str)
-        and generation_id
-    ):
-        return generation_id
-    raise RelayError("remote session start did not return a verifiable session generation id")
+    if result.error is not None:
+        detail = f"{detail}; observation={result.error}"
+    outcome: TransportCleanupOutcome
+    if result.state in {"starting", "ambiguous"}:
+        outcome = "retained"
+    elif result.state == "not_current":
+        outcome = "replaced"
+    else:
+        outcome = "terminal"
+    evidence_line = _transport_resource_line(
+        probe_id=f"ssh-probe:{result.session_id}:start:{result.start_operation_id}",
+        cluster=result.cluster,
+        cleanup_mode="transport_probe_start_observation",
+        resources=[
+            _process_cleanup_resource(
+                kind="relay_session_start_operation",
+                resource_id=result.start_operation_id,
+                role="remote_transport_session_start_operation",
+                location=definition.ssh_host,
+                action="retain",
+                ownership_verified=True,
+                outcome=outcome,
+                verified_after_operation=True,
+                observed_state=result.state,
+                residual=False,
+                detail=detail,
+                metadata={
+                    "ownership_scope": "start_operation_selector",
+                    "session_id": result.session_id,
+                    "session_generation_id": result.session_generation_id,
+                    "start_operation_id": result.start_operation_id,
+                    "cluster_route_revision": result.cluster_route_revision,
+                    "remote_api_port": result.remote_api_port,
+                    "terminal": result.terminal,
+                    "retryable": result.retryable,
+                    "transition_accepted": result.transition_accepted,
+                    "transport_deadline_exceeded": result.transport_deadline_exceeded,
+                    "status_selector": status_selector,
+                    "retry_selector": retry_selector,
+                },
+            )
+        ],
+    )
+    error = RelayError(detail)
+    return cast(RelayError, _attach_transport_evidence(error, [evidence_line]))
 
 
 def _verified_session_detach_lines(

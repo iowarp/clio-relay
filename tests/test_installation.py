@@ -321,7 +321,7 @@ def test_native_jarvis_record_closure_rejects_a_tampered_installed_member(
     tmp_path: Path,
 ) -> None:
     environment = tmp_path / "environment"
-    venv.EnvBuilder(with_pip=False).create(environment)
+    venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(environment)
     python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     completed = subprocess.run(
         [

@@ -2072,14 +2072,21 @@ def test_owned_session_recovery_rejects_symlinked_metadata(
 ) -> None:
     home, session_dir, proc_root, queue = _owned_session_recovery_fixture(tmp_path)
     metadata_path = session_dir / "metadata.json"
-    original_lstat = Path.lstat
+    if os.name == "posix":
+        # The POSIX reader opens metadata through the pinned session descriptor
+        # with O_NOFOLLOW, so exercise the real filesystem boundary.
+        symlink_target = metadata_path.with_name("metadata-symlink-target.json")
+        metadata_path.rename(symlink_target)
+        metadata_path.symlink_to(symlink_target)
+    else:
+        original_lstat = Path.lstat
 
-    def symlinked_metadata_lstat(path: Path) -> os.stat_result | SimpleNamespace:
-        if path == metadata_path:
-            return SimpleNamespace(st_mode=stat.S_IFLNK, st_uid=0)
-        return original_lstat(path)
+        def symlinked_metadata_lstat(path: Path) -> os.stat_result | SimpleNamespace:
+            if path == metadata_path:
+                return SimpleNamespace(st_mode=stat.S_IFLNK, st_uid=0)
+            return original_lstat(path)
 
-    monkeypatch.setattr(Path, "lstat", symlinked_metadata_lstat)
+        monkeypatch.setattr(Path, "lstat", symlinked_metadata_lstat)
 
     status = inspect_owned_session_recovery_status(
         cluster="ares",
@@ -2100,14 +2107,22 @@ def test_owned_session_recovery_rejects_symlinked_session_parent(
 ) -> None:
     home, session_dir, proc_root, queue = _owned_session_recovery_fixture(tmp_path)
     sessions_parent = session_dir.parent
-    original_lstat = Path.lstat
+    if os.name == "posix":
+        # The POSIX reader intentionally pins directories with openat/fstat and
+        # never consults Path.lstat. Exercise that real boundary instead of
+        # mocking an API the implementation correctly does not use.
+        symlink_target = sessions_parent.with_name("sessions-symlink-target")
+        sessions_parent.rename(symlink_target)
+        sessions_parent.symlink_to(symlink_target, target_is_directory=True)
+    else:
+        original_lstat = Path.lstat
 
-    def symlinked_parent_lstat(path: Path) -> os.stat_result | SimpleNamespace:
-        if path == sessions_parent:
-            return SimpleNamespace(st_mode=stat.S_IFLNK, st_uid=0)
-        return original_lstat(path)
+        def symlinked_parent_lstat(path: Path) -> os.stat_result | SimpleNamespace:
+            if path == sessions_parent:
+                return SimpleNamespace(st_mode=stat.S_IFLNK, st_uid=0)
+            return original_lstat(path)
 
-    monkeypatch.setattr(Path, "lstat", symlinked_parent_lstat)
+        monkeypatch.setattr(Path, "lstat", symlinked_parent_lstat)
 
     status = inspect_owned_session_recovery_status(
         cluster="ares",

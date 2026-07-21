@@ -81,7 +81,7 @@ DEFAULT_REMOTE_SPOOL_DIR = "$HOME/.local/share/clio-relay/spool"
 _STAGED_PROVIDER_ENVIRONMENT_SANITIZER = r"""
 while IFS= read -r bootstrap_environment_name; do
   case "$bootstrap_environment_name" in
-    LD_*|PYTHON*) unset "$bootstrap_environment_name" ;;
+    LD_*|PYTHON*|BASH_ENV|ENV) unset "$bootstrap_environment_name" ;;
   esac
 done < <(compgen -e)
 """.strip()
@@ -481,6 +481,962 @@ finally:
     os.close(generation_descriptor)
 """
 MAX_RELAY_WHEEL_METADATA_BYTES = 1024 * 1024
+_BOOTSTRAP_RECEIPT_CLASSIFIER_SOURCE = r"""import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+
+def identity(details):
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_mode,
+        details.st_size,
+        details.st_mtime_ns,
+        details.st_ctime_ns,
+    )
+
+
+path = Path(sys.argv[1])
+home = Path.home()
+stable_details = path.lstat()
+stable_target = None
+current = None
+current_details = None
+current_target_text = None
+if stat.S_ISLNK(stable_details.st_mode):
+    stable_target = os.readlink(path)
+    expected_target = str(home / ".local/share/clio-relay/current/install-receipt.json")
+    if stable_target != expected_target:
+        raise SystemExit("bootstrap install receipt link has an unsupported target")
+    current = home / ".local/share/clio-relay/current"
+    current_details = current.lstat()
+    if not stat.S_ISLNK(current_details.st_mode):
+        raise SystemExit("bootstrap current generation pointer is not a symbolic link")
+    current_target_text = os.readlink(current)
+    if not current_target_text or any(character in current_target_text for character in "\x00\r\n"):
+        raise SystemExit("bootstrap current generation target is invalid")
+    current_target = Path(current_target_text)
+    if not current_target.is_absolute():
+        current_target = current.parent / current_target
+    if ".." in current_target.parts:
+        raise SystemExit("bootstrap current generation target is not normalized")
+    generations = (home / ".local/share/clio-relay/generations").resolve(strict=True)
+    resolved_generation = current_target.resolve(strict=True)
+    try:
+        relative_generation = resolved_generation.relative_to(generations)
+    except ValueError as exc:
+        raise SystemExit("bootstrap current pointer escaped managed generations") from exc
+    if (
+        len(relative_generation.parts) != 1
+        or len(relative_generation.name) != 64
+        or any(character not in "0123456789abcdef" for character in relative_generation.name)
+    ):
+        raise SystemExit("bootstrap current pointer has an invalid generation identity")
+    generation_details = current_target.lstat()
+    if current_target.is_symlink() or not stat.S_ISDIR(generation_details.st_mode):
+        raise SystemExit("bootstrap current pointer target is not one real generation")
+    read_path = resolved_generation / "install-receipt.json"
+    details = read_path.lstat()
+elif stat.S_ISREG(stable_details.st_mode):
+    read_path = path
+    details = stable_details
+else:
+    raise SystemExit("bootstrap install receipt has an unsupported file type")
+if read_path.is_symlink() or not stat.S_ISREG(details.st_mode):
+    raise SystemExit("bootstrap install receipt target is not one regular file")
+if not 1 <= details.st_size <= 4 * 1024 * 1024:
+    raise SystemExit("bootstrap install receipt size is invalid")
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(read_path, flags)
+try:
+    opened = os.fstat(descriptor)
+    if identity(opened) != identity(details):
+        raise SystemExit("bootstrap install receipt changed before reading")
+    with os.fdopen(descriptor, "rb", closefd=False) as stream:
+        payload = stream.read(4 * 1024 * 1024 + 1)
+    after = os.fstat(descriptor)
+finally:
+    os.close(descriptor)
+if (
+    len(payload) > 4 * 1024 * 1024
+    or identity(after) != identity(opened)
+    or identity(read_path.lstat()) != identity(details)
+    or identity(path.lstat()) != identity(stable_details)
+):
+    raise SystemExit("bootstrap install receipt changed while reading")
+if stable_target is not None:
+    assert current is not None
+    assert current_details is not None
+    assert current_target_text is not None
+    if (
+        os.readlink(path) != stable_target
+        or identity(current.lstat()) != identity(current_details)
+        or os.readlink(current) != current_target_text
+    ):
+        raise SystemExit("bootstrap generation links changed while reading the receipt")
+value = json.loads(payload)
+if not isinstance(value, dict):
+    raise SystemExit("bootstrap install receipt is not an object")
+artifacts = value.get("component_artifacts")
+relay = artifacts.get("clio-relay") if isinstance(artifacts, dict) else None
+print(
+    "current"
+    if isinstance(relay, dict) and relay.get("persistent_tool") is not None
+    else "legacy"
+)"""
+_BOOTSTRAP_PREPARING_ROOT_SOURCE = r"""import os
+import stat
+import sys
+from pathlib import Path
+
+
+def identity(details):
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_mode,
+        details.st_size,
+        details.st_mtime_ns,
+        details.st_ctime_ns,
+    )
+
+
+def object_identity(details):
+    return (details.st_dev, details.st_ino, details.st_mode, details.st_uid)
+
+
+def owned_private_directory(details, label):
+    if not stat.S_ISDIR(details.st_mode):
+        raise SystemExit(f"{label} is not one real directory")
+    if hasattr(os, "getuid") and details.st_uid != os.getuid():
+        raise SystemExit(f"{label} is not owned by the current user")
+    if stat.S_IMODE(details.st_mode) & 0o077:
+        raise SystemExit(f"{label} is not owner-private")
+
+
+def entry_details(parent_descriptor, name):
+    try:
+        return os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def remove_entry(parent_descriptor, name):
+    details = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    if not stat.S_ISDIR(details.st_mode):
+        if not (stat.S_ISREG(details.st_mode) or stat.S_ISLNK(details.st_mode)):
+            raise SystemExit("bootstrap scratch contains an unsupported entry")
+        os.unlink(name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+        return
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    try:
+        opened = os.fstat(descriptor)
+        if identity(opened) != identity(details):
+            raise SystemExit("bootstrap scratch entry changed before pinned cleanup")
+        for child in os.listdir(descriptor):
+            if child in {"", ".", ".."} or "/" in child or "\x00" in child:
+                raise SystemExit("bootstrap scratch contains an invalid child name")
+            remove_entry(descriptor, child)
+        if object_identity(os.fstat(descriptor)) != object_identity(opened):
+            raise SystemExit("bootstrap scratch directory changed during pinned cleanup")
+    finally:
+        os.close(descriptor)
+    os.rmdir(name, dir_fd=parent_descriptor)
+    os.fsync(parent_descriptor)
+
+
+def remove_owned_root(parent_descriptor, name):
+    details = entry_details(parent_descriptor, name)
+    if details is None:
+        return
+    owned_private_directory(details, "bootstrap scratch quarantine")
+    remove_entry(parent_descriptor, name)
+
+
+parent = Path(sys.argv[1])
+root = Path(sys.argv[2])
+action = sys.argv[3]
+if action not in {"prepare", "cleanup"}:
+    raise SystemExit("bootstrap scratch action is invalid")
+if not parent.is_absolute() or root.parent != parent or root.name != "active":
+    raise SystemExit("bootstrap scratch path escaped its fixed private parent")
+parent_before = parent.lstat()
+owned_private_directory(parent_before, "bootstrap preparing parent")
+flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+flags |= getattr(os, "O_NOFOLLOW", 0)
+parent_descriptor = os.open(parent, flags)
+try:
+    parent_opened = os.fstat(parent_descriptor)
+    if identity(parent_opened) != identity(parent_before):
+        raise SystemExit("bootstrap preparing parent changed before it was pinned")
+    quarantine = ".active.quarantine"
+    remove_owned_root(parent_descriptor, quarantine)
+    active = entry_details(parent_descriptor, root.name)
+    if active is not None:
+        owned_private_directory(active, "bootstrap preparing root")
+        os.rename(
+            root.name,
+            quarantine,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        os.fsync(parent_descriptor)
+        moved = os.stat(quarantine, dir_fd=parent_descriptor, follow_symlinks=False)
+        if object_identity(moved) != object_identity(active):
+            raise SystemExit("bootstrap preparing root changed during quarantine")
+        remove_owned_root(parent_descriptor, quarantine)
+    if action == "prepare":
+        os.mkdir(root.name, mode=0o700, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+        created = os.stat(root.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        owned_private_directory(created, "bootstrap preparing root")
+    parent_after = parent.lstat()
+    if object_identity(parent_after) != object_identity(parent_opened):
+        raise SystemExit("bootstrap preparing parent changed while it was pinned")
+finally:
+    os.close(parent_descriptor)"""
+_BOOTSTRAP_PINNED_UV_COPY_SOURCE = r"""import hashlib
+import os
+import stat
+import sys
+from pathlib import Path
+
+
+def identity(details):
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_mode,
+        details.st_size,
+        details.st_mtime_ns,
+        details.st_ctime_ns,
+    )
+
+
+def object_identity(details):
+    return (details.st_dev, details.st_ino, details.st_mode, details.st_uid)
+
+
+source = Path(sys.argv[1])
+root = Path(sys.argv[2])
+expected_sha256 = sys.argv[3]
+if (
+    not source.is_absolute()
+    or not root.is_absolute()
+    or len(expected_sha256) != 64
+    or any(character not in "0123456789abcdef" for character in expected_sha256)
+):
+    raise SystemExit("candidate uv copy arguments are invalid")
+source_before = source.lstat()
+root_before = root.lstat()
+if (
+    not stat.S_ISREG(source_before.st_mode)
+    or source_before.st_nlink != 1
+    or source_before.st_mode & 0o111 == 0
+    or not 1 <= source_before.st_size <= 256 * 1024 * 1024
+    or (hasattr(os, "getuid") and source_before.st_uid != os.getuid())
+    or stat.S_IMODE(source_before.st_mode) & 0o022
+):
+    raise SystemExit("candidate uv source is not one private bounded executable")
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+source_descriptor = os.open(source, flags)
+directory_flags = flags | os.O_DIRECTORY
+root_descriptor = os.open(root, directory_flags)
+destination_descriptor = None
+destination_created = False
+try:
+    source_opened = os.fstat(source_descriptor)
+    root_opened = os.fstat(root_descriptor)
+    if identity(source_opened) != identity(source_before):
+        raise SystemExit("candidate uv source changed before its pinned copy")
+    if object_identity(root_opened) != object_identity(root_before) or (
+        not stat.S_ISDIR(root_opened.st_mode)
+        or (hasattr(os, "getuid") and root_opened.st_uid != os.getuid())
+        or stat.S_IMODE(root_opened.st_mode) & 0o077
+    ):
+        raise SystemExit("candidate uv destination root is not owner-private")
+    destination_flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    destination_descriptor = os.open(
+        "pinned-uv",
+        destination_flags,
+        0o500,
+        dir_fd=root_descriptor,
+    )
+    destination_created = True
+    digest = hashlib.sha256()
+    copied = 0
+    while chunk := os.read(source_descriptor, 1024 * 1024):
+        copied += len(chunk)
+        if copied > 256 * 1024 * 1024:
+            raise SystemExit("candidate uv source exceeded its copy bound")
+        digest.update(chunk)
+        view = memoryview(chunk)
+        while view:
+            written = os.write(destination_descriptor, view)
+            if written < 1:
+                raise SystemExit("candidate uv copy made no progress")
+            view = view[written:]
+    os.fchmod(destination_descriptor, 0o500)
+    os.fsync(destination_descriptor)
+    destination_written = os.fstat(destination_descriptor)
+    source_after = os.fstat(source_descriptor)
+    source_linked_after = source.lstat()
+    if (
+        copied != source_opened.st_size
+        or digest.hexdigest() != expected_sha256
+        or identity(source_after) != identity(source_opened)
+        or identity(source_linked_after) != identity(source_opened)
+        or destination_written.st_size != copied
+        or destination_written.st_nlink != 1
+        or stat.S_IMODE(destination_written.st_mode) != 0o500
+        or (destination_written.st_dev, destination_written.st_ino)
+        == (source_opened.st_dev, source_opened.st_ino)
+    ):
+        raise SystemExit("candidate uv source changed or did not match its release pin")
+    os.close(destination_descriptor)
+    destination_descriptor = None
+    verification_descriptor = os.open("pinned-uv", flags, dir_fd=root_descriptor)
+    try:
+        verification_opened = os.fstat(verification_descriptor)
+        if identity(verification_opened) != identity(destination_written):
+            raise SystemExit("candidate uv private copy changed before verification")
+        verified_digest = hashlib.sha256()
+        verified_size = 0
+        while chunk := os.read(verification_descriptor, 1024 * 1024):
+            verified_size += len(chunk)
+            verified_digest.update(chunk)
+        verification_after = os.fstat(verification_descriptor)
+    finally:
+        os.close(verification_descriptor)
+    linked_copy = os.stat("pinned-uv", dir_fd=root_descriptor, follow_symlinks=False)
+    if (
+        verified_size != copied
+        or verified_digest.hexdigest() != expected_sha256
+        or identity(verification_after) != identity(verification_opened)
+        or identity(linked_copy) != identity(verification_opened)
+    ):
+        raise SystemExit("candidate uv private copy did not retain its pinned identity")
+    os.fsync(root_descriptor)
+    if object_identity(root.lstat()) != object_identity(root_opened):
+        raise SystemExit("candidate uv destination root changed while it was pinned")
+except BaseException:
+    if destination_descriptor is not None:
+        os.close(destination_descriptor)
+    if destination_created:
+        try:
+            os.unlink("pinned-uv", dir_fd=root_descriptor)
+            os.fsync(root_descriptor)
+        except FileNotFoundError:
+            pass
+    raise
+finally:
+    os.close(root_descriptor)
+    os.close(source_descriptor)
+print(root / "pinned-uv")"""
+_BOOTSTRAP_CANDIDATE_UV_INSTALL_SOURCE = r"""import base64
+import ctypes
+import csv
+import fcntl
+import hashlib
+import os
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import zipfile
+from pathlib import Path, PurePosixPath
+
+
+MAX_PROVIDER = 256 * 1024 * 1024
+MAX_RUNTIME_LIBRARY = 512 * 1024 * 1024
+
+
+def create_memfd(name, flags):
+    creator = getattr(os, "memfd_create", None)
+    if creator is not None:
+        return creator(name, flags)
+    library = ctypes.CDLL(None, use_errno=True)
+    creator = library.memfd_create
+    creator.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+    creator.restype = ctypes.c_int
+    descriptor = creator(name.encode(), flags)
+    if descriptor < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return descriptor
+
+
+def origin_dependency_relocations(payload):
+    if payload[:4] != b"\x7fELF":
+        return []
+    if len(payload) < 64 or payload[4:6] != b"\x02\x01":
+        raise SystemExit("candidate provider is not a supported ELF64 executable")
+    program_offset = struct.unpack_from("<Q", payload, 32)[0]
+    program_entry_size = struct.unpack_from("<H", payload, 54)[0]
+    program_count = struct.unpack_from("<H", payload, 56)[0]
+    if (
+        program_entry_size < 56
+        or program_count < 1
+        or program_offset + program_entry_size * program_count > len(payload)
+    ):
+        raise SystemExit("candidate provider ELF program table is invalid")
+    load_segments = []
+    dynamic_segment = None
+    for index in range(program_count):
+        offset = program_offset + index * program_entry_size
+        (
+            program_type,
+            _flags,
+            file_offset,
+            virtual_address,
+            _physical_address,
+            file_size,
+            _memory_size,
+            _alignment,
+        ) = struct.unpack_from("<IIQQQQQQ", payload, offset)
+        if file_offset + file_size > len(payload):
+            raise SystemExit("candidate provider ELF segment is out of bounds")
+        if program_type == 1:
+            load_segments.append((file_offset, virtual_address, file_size))
+        elif program_type == 2:
+            if dynamic_segment is not None:
+                raise SystemExit("candidate provider has multiple ELF dynamic segments")
+            dynamic_segment = (file_offset, file_size)
+    if dynamic_segment is None:
+        return []
+    dynamic_offset, dynamic_size = dynamic_segment
+    if dynamic_size % 16:
+        raise SystemExit("candidate provider ELF dynamic segment is invalid")
+    string_address = None
+    string_size = None
+    needed_offsets = []
+    for offset in range(dynamic_offset, dynamic_offset + dynamic_size, 16):
+        tag, value = struct.unpack_from("<qQ", payload, offset)
+        if tag == 0:
+            break
+        if tag == 1:
+            needed_offsets.append(value)
+        elif tag == 5:
+            string_address = value
+        elif tag == 10:
+            string_size = value
+    if not needed_offsets:
+        return []
+    if string_address is None or string_size is None or string_size < 1:
+        raise SystemExit("candidate provider ELF string table is missing")
+    string_candidates = [
+        file_offset + string_address - virtual_address
+        for file_offset, virtual_address, file_size in load_segments
+        if virtual_address <= string_address
+        and string_address + string_size <= virtual_address + file_size
+    ]
+    if len(string_candidates) != 1:
+        raise SystemExit("candidate provider ELF string table is ambiguous")
+    string_offset = string_candidates[0]
+    string_end = string_offset + string_size
+    origin_prefix = b"$ORIGIN/../lib/"
+    relocations = []
+    for needed_offset in needed_offsets:
+        start = string_offset + needed_offset
+        if start < string_offset or start >= string_end:
+            raise SystemExit("candidate provider ELF dependency is out of bounds")
+        end = payload.find(b"\0", start, string_end)
+        if end < 0:
+            raise SystemExit("candidate provider ELF dependency is unterminated")
+        dependency = payload[start:end]
+        if not dependency.startswith(origin_prefix):
+            continue
+        library_name_bytes = dependency[len(origin_prefix) :]
+        try:
+            library_name = library_name_bytes.decode("ascii")
+        except UnicodeDecodeError as error:
+            raise SystemExit("candidate provider ELF origin dependency is invalid") from error
+        if (
+            not library_name
+            or library_name != os.path.basename(library_name)
+            or any(
+                character
+                not in (
+                    "abcdefghijklmnopqrstuvwxyz"
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                    "0123456789._+-"
+                )
+                for character in library_name
+            )
+        ):
+            raise SystemExit("candidate provider ELF origin dependency is unsafe")
+        relocations.append((start, len(dependency), library_name))
+    return relocations
+
+
+def sealed_memfd(name, payload, *, inheritable):
+    flags = getattr(os, "MFD_ALLOW_SEALING", 2) | getattr(os, "MFD_EXEC", 0)
+    if not inheritable:
+        flags |= getattr(os, "MFD_CLOEXEC", 1)
+    descriptor = create_memfd(name, flags)
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written < 1:
+                raise SystemExit(f"could not copy {name} into sealed memory")
+            view = view[written:]
+        os.fchmod(descriptor, 0o500)
+        seals = (
+            getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+            | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+            | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+            | getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+        )
+        add_seals = getattr(fcntl, "F_ADD_SEALS", 1033)
+        get_seals = getattr(fcntl, "F_GET_SEALS", 1034)
+        fcntl.fcntl(descriptor, add_seals, seals)
+        if fcntl.fcntl(descriptor, get_seals) & seals != seals:
+            raise SystemExit(f"{name} memfd did not seal")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.set_inheritable(descriptor, inheritable)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def exec_candidate_provider(
+    provider,
+    source_provider,
+    provider_payload,
+    provider_arguments,
+    environment,
+):
+    relocations = origin_dependency_relocations(provider_payload)
+    relocated_provider = bytearray(provider_payload)
+    runtime_library_memfds = []
+    library_memfds_by_name = {}
+    try:
+        if relocations:
+            provider_library = os.path.normpath(
+                os.path.join(os.path.dirname(source_provider), "..", "lib")
+            )
+            library_directory_descriptor = os.open(
+                provider_library,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                for _start, _size, library_name in relocations:
+                    if library_name in library_memfds_by_name:
+                        continue
+                    library_descriptor = os.open(
+                        library_name,
+                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=library_directory_descriptor,
+                    )
+                    try:
+                        library_payload, _details = read_descriptor(
+                            library_descriptor,
+                            MAX_RUNTIME_LIBRARY,
+                            f"candidate provider origin dependency {library_name}",
+                        )
+                    finally:
+                        os.close(library_descriptor)
+                    library_memfd = sealed_memfd(
+                        f"clio-relay-{library_name}",
+                        library_payload,
+                        inheritable=True,
+                    )
+                    runtime_library_memfds.append(library_memfd)
+                    library_memfds_by_name[library_name] = library_memfd
+            finally:
+                os.close(library_directory_descriptor)
+            for start, size, library_name in relocations:
+                replacement = f"/proc/self/fd/{library_memfds_by_name[library_name]}".encode()
+                if len(replacement) > size:
+                    raise SystemExit("candidate provider origin dependency fd path is too long")
+                relocated_provider[start : start + size] = replacement + b"\0" * (
+                    size - len(replacement)
+                )
+        provider_memfd = sealed_memfd(
+            "clio-relay-candidate-provider",
+            relocated_provider,
+            inheritable=False,
+        )
+        try:
+            if os.execve not in os.supports_fd:
+                raise SystemExit("candidate provider fd execution is unavailable")
+            environment["BOOTSTRAP_PLAN_PROVIDER_EXEC_SHA256"] = hashlib.sha256(
+                relocated_provider
+            ).hexdigest()
+            os.execve(provider_memfd, [str(provider), *provider_arguments], environment)
+        finally:
+            os.close(provider_memfd)
+    finally:
+        for runtime_library_memfd in runtime_library_memfds:
+            os.close(runtime_library_memfd)
+
+
+def identity(details):
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_mode,
+        details.st_size,
+        details.st_mtime_ns,
+        details.st_ctime_ns,
+    )
+
+
+def read_descriptor(descriptor, maximum, label):
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode) or not 1 <= before.st_size <= maximum:
+        raise SystemExit(f"{label} is not one bounded regular file")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks = []
+    remaining = maximum + 1
+    while remaining:
+        chunk = os.read(descriptor, min(1024 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    payload = b"".join(chunks)
+    after = os.fstat(descriptor)
+    if (
+        len(payload) != before.st_size
+        or len(payload) > maximum
+        or identity(after) != identity(before)
+    ):
+        raise SystemExit(f"{label} changed while it was pinned")
+    return payload, before
+
+
+def read_path(path, maximum, label):
+    before = path.lstat()
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        payload, opened = read_descriptor(descriptor, maximum, label)
+    finally:
+        os.close(descriptor)
+    if identity(opened) != identity(before) or identity(path.lstat()) != identity(opened):
+        raise SystemExit(f"{label} path changed while it was pinned")
+    return payload
+
+
+action, *values = sys.argv[1:]
+if action not in {
+    "install-and-verify",
+    "install-verify-and-exec",
+    "verify-installed",
+    "verify-installed-and-exec",
+}:
+    raise SystemExit("candidate uv installation action is invalid")
+if len(values) < 8:
+    raise SystemExit("candidate uv installation arguments are incomplete")
+identity_values = values[:8]
+remaining_values = values[8:]
+expected_provider_sha256 = None
+if action == "verify-installed-and-exec":
+    if not remaining_values:
+        raise SystemExit("candidate provider execution omitted its expected digest")
+    expected_provider_sha256, *provider_arguments = remaining_values
+    if len(expected_provider_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in expected_provider_sha256
+    ):
+        raise SystemExit("candidate provider expected digest is invalid")
+else:
+    provider_arguments = remaining_values
+if action.endswith("-and-exec"):
+    if not provider_arguments or provider_arguments[0] != "-I":
+        raise SystemExit("candidate provider execution must be isolated")
+elif provider_arguments:
+    raise SystemExit("candidate uv verification received unexpected arguments")
+(
+    uv_value,
+    expected_uv_sha256,
+    wheel_value,
+    expected_wheel_sha256,
+    tool_directory_value,
+    tool_bin_directory_value,
+    cache_directory_value,
+    python_install_directory_value,
+) = identity_values
+if os.name != "posix" or os.execve not in os.supports_fd:
+    raise SystemExit("candidate uv installation requires POSIX fd execution")
+for digest, label in (
+    (expected_uv_sha256, "uv"),
+    (expected_wheel_sha256, "wheel"),
+):
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise SystemExit(f"candidate {label} digest is invalid")
+uv_path = Path(uv_value)
+wheel_path = Path(wheel_value)
+tool_directory = Path(tool_directory_value)
+tool_bin_directory = Path(tool_bin_directory_value)
+cache_directory = Path(cache_directory_value)
+python_install_directory = Path(python_install_directory_value)
+if any(
+    not path.is_absolute()
+    for path in (
+        uv_path,
+        wheel_path,
+        tool_directory,
+        tool_bin_directory,
+        cache_directory,
+        python_install_directory,
+    )
+):
+    raise SystemExit("candidate uv installation paths must be absolute")
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+uv_before = uv_path.lstat()
+wheel_before = wheel_path.lstat()
+uv_descriptor = os.open(uv_path, flags)
+wheel_descriptor = os.open(wheel_path, flags)
+provider_descriptor = None
+try:
+    uv_payload, uv_opened = read_descriptor(
+        uv_descriptor,
+        256 * 1024 * 1024,
+        "candidate uv executable",
+    )
+    wheel_payload, wheel_opened = read_descriptor(
+        wheel_descriptor,
+        256 * 1024 * 1024,
+        "candidate relay wheel",
+    )
+    if (
+        identity(uv_before) != identity(uv_opened)
+        or identity(wheel_before) != identity(wheel_opened)
+        or hashlib.sha256(uv_payload).hexdigest() != expected_uv_sha256
+        or hashlib.sha256(wheel_payload).hexdigest() != expected_wheel_sha256
+    ):
+        raise SystemExit("candidate uv or wheel changed before fd-bound installation")
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("LD_", "PYTHON", "UV_", "PIP_"))
+        and name not in {"BASH_ENV", "ENV", "VIRTUAL_ENV", "CONDA_PREFIX"}
+    }
+    environment.update(
+        {
+            "UV_TOOL_DIR": str(tool_directory),
+            "UV_TOOL_BIN_DIR": str(tool_bin_directory),
+            "UV_CACHE_DIR": str(cache_directory),
+            "UV_PYTHON_INSTALL_DIR": str(python_install_directory),
+            "UV_PYTHON_DOWNLOADS": "never",
+        }
+    )
+    if action in {"install-and-verify", "install-verify-and-exec"}:
+        command = [
+            str(uv_path),
+            "tool",
+            "install",
+            "--force",
+            "--python",
+            "3.12",
+            "--no-config",
+            "--default-index",
+            "https://pypi.org/simple",
+            str(wheel_path),
+        ]
+        process = subprocess.Popen(
+            command,
+            executable=f"/proc/self/fd/{uv_descriptor}",
+            pass_fds=(uv_descriptor,),
+            env=environment,
+            start_new_session=True,
+            stdout=sys.stderr,
+            stderr=sys.stderr,
+        )
+        try:
+            returncode = process.wait(timeout=300)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+            raise SystemExit("candidate fd-bound uv installation timed out") from None
+        if returncode != 0:
+            raise SystemExit(f"candidate fd-bound uv installation failed: {returncode}")
+
+    provider_location = tool_directory / "clio-relay/bin/python"
+    try:
+        provider_target = provider_location.resolve(strict=True)
+        provider_before = provider_target.lstat()
+        provider_descriptor = os.open(
+            provider_target,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except (OSError, RuntimeError) as error:
+        raise SystemExit("candidate provider target is unavailable") from error
+
+    stream = os.fdopen(os.dup(wheel_descriptor), "rb")
+    with stream, zipfile.ZipFile(stream) as archive:
+        infos = archive.infolist()
+        names = [item.filename for item in infos if not item.is_dir()]
+        if not names or len(names) > 100_000 or len(names) != len(set(names)):
+            raise SystemExit("candidate wheel has an invalid bounded member set")
+        for item in infos:
+            path = PurePosixPath(item.filename)
+            mode = item.external_attr >> 16
+            if (
+                path.is_absolute()
+                or ".." in path.parts
+                or any(part in {"", "."} for part in path.parts)
+                or (mode and stat.S_IFMT(mode) not in {0, stat.S_IFREG})
+                or item.file_size > 256 * 1024 * 1024
+            ):
+                raise SystemExit("candidate wheel contains an unsafe member")
+        record_names = [name for name in names if name.endswith(".dist-info/RECORD")]
+        if len(record_names) != 1:
+            raise SystemExit("candidate wheel RECORD ownership is ambiguous")
+        record_name = record_names[0]
+        record_bytes = archive.read(record_name)
+        if len(record_bytes) > 8 * 1024 * 1024:
+            raise SystemExit("candidate wheel RECORD exceeds its byte bound")
+        try:
+            rows = list(csv.reader(record_bytes.decode("utf-8").splitlines(), strict=True))
+        except (UnicodeDecodeError, csv.Error) as error:
+            raise SystemExit("candidate wheel RECORD is malformed") from error
+        wheel_rows = {row[0]: row for row in rows if len(row) == 3}
+        if set(wheel_rows) != set(names) or len(wheel_rows) != len(rows):
+            raise SystemExit("candidate wheel RECORD does not close over its members")
+
+        environment_prefix = tool_directory / "clio-relay"
+        site_package_matches = list(environment_prefix.glob("lib/python*/site-packages"))
+        if len(site_package_matches) != 1:
+            raise SystemExit("candidate uv environment has no exact site-packages root")
+        site_packages = site_package_matches[0].resolve(strict=True)
+        dist_info = PurePosixPath(record_name).parent
+        installed_record = site_packages.joinpath(*PurePosixPath(record_name).parts)
+        if installed_record.is_symlink() or not installed_record.resolve(
+            strict=True
+        ).is_relative_to(site_packages):
+            raise SystemExit("installed candidate RECORD escaped site-packages")
+        installed_record_bytes = read_path(
+            installed_record,
+            8 * 1024 * 1024,
+            "installed candidate RECORD",
+        )
+        try:
+            installed_rows = list(
+                csv.reader(installed_record_bytes.decode("utf-8").splitlines(), strict=True)
+            )
+        except (UnicodeDecodeError, csv.Error) as error:
+            raise SystemExit("installed candidate RECORD is malformed") from error
+        installed_names = {row[0] for row in installed_rows if len(row) == 3}
+        generated = {
+            os.path.relpath(environment_prefix / "bin/clio-relay", site_packages).replace(
+                os.sep, "/"
+            ),
+            *(str(dist_info / name) for name in (
+                "INSTALLER",
+                "REQUESTED",
+                "direct_url.json",
+                "uv_cache.json",
+            )),
+        }
+        if len(installed_names) != len(installed_rows) or installed_names != set(names) | generated:
+            raise SystemExit("installed candidate distribution contains unpinned members")
+
+        total = 0
+        for name in names:
+            row = wheel_rows[name]
+            installed_path = site_packages.joinpath(*PurePosixPath(name).parts)
+            if name == record_name:
+                continue
+            if installed_path.is_symlink() or not installed_path.resolve(
+                strict=True
+            ).is_relative_to(site_packages):
+                raise SystemExit("installed candidate member escaped site-packages")
+            expected_hash, expected_size_text = row[1:]
+            if not expected_hash.startswith("sha256=") or not expected_size_text.isdigit():
+                raise SystemExit("candidate wheel RECORD member omitted its identity")
+            expected_size = int(expected_size_text)
+            total += expected_size
+            if total > 2 * 1024 * 1024 * 1024:
+                raise SystemExit("candidate wheel expanded closure exceeds its byte bound")
+            wheel_member = archive.read(name)
+            installed_member = read_path(
+                installed_path,
+                256 * 1024 * 1024,
+                "installed candidate member",
+            )
+            digest = hashlib.sha256(wheel_member).digest()
+            encoded = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+            if (
+                len(wheel_member) != expected_size
+                or expected_hash != "sha256=" + encoded
+                or installed_member != wheel_member
+            ):
+                raise SystemExit("installed candidate differs from the pinned wheel fd")
+    if (
+        identity(os.fstat(uv_descriptor)) != identity(uv_opened)
+        or identity(os.fstat(wheel_descriptor)) != identity(wheel_opened)
+    ):
+        raise SystemExit("candidate uv or wheel descriptor changed during installation")
+    assert provider_descriptor is not None
+    try:
+        provider_payload, provider_opened = read_descriptor(
+            provider_descriptor,
+            256 * 1024 * 1024,
+            "candidate provider",
+        )
+        source_provider = os.path.realpath(f"/proc/self/fd/{provider_descriptor}")
+        source_details = os.stat(source_provider, follow_symlinks=False)
+        if (
+            identity(provider_before) != identity(provider_opened)
+            or provider_location.resolve(strict=True) != provider_target
+            or identity(provider_target.lstat()) != identity(provider_opened)
+            or (source_details.st_dev, source_details.st_ino)
+            != (provider_opened.st_dev, provider_opened.st_ino)
+            or provider_opened.st_mode & 0o111 == 0
+        ):
+            raise SystemExit("candidate provider path changed while it was pinned")
+        provider_sha256 = hashlib.sha256(provider_payload).hexdigest()
+        if (
+            expected_provider_sha256 is not None
+            and provider_sha256 != expected_provider_sha256
+        ):
+            raise SystemExit("candidate provider changed after its planning pin")
+    finally:
+        os.close(provider_descriptor)
+        provider_descriptor = None
+finally:
+    if provider_descriptor is not None:
+        os.close(provider_descriptor)
+    os.close(wheel_descriptor)
+    os.close(uv_descriptor)
+if action.endswith("-and-exec"):
+    provider_environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("LD_", "PYTHON")) and name not in {"BASH_ENV", "ENV"}
+    }
+    provider_environment["BOOTSTRAP_PLAN_PROVIDER"] = str(provider_location)
+    provider_environment["BOOTSTRAP_PLAN_PROVIDER_SHA256"] = provider_sha256
+    exec_candidate_provider(
+        provider_location,
+        source_provider,
+        provider_payload,
+        provider_arguments,
+        provider_environment,
+    )
+print("bootstrap_candidate_provider_sha256=" + provider_sha256)
+print("bootstrap_candidate_install=fd-bound-wheel-verified:" + action)"""
 BOOTSTRAP_REMOTE_SCRIPT_TIMEOUT_SECONDS = 1800.0
 BOOTSTRAP_PUBLIC_EXACT_DEADLINE_SECONDS = 29.0
 BOOTSTRAP_PUBLIC_REPAIR_DEADLINE_SECONDS = 58.0
@@ -1261,11 +2217,30 @@ def _bootstrap_preflight_over_ssh(
     command = "\n".join(
         [
             "set -u",
+            *_STAGED_PROVIDER_ENVIRONMENT_SANITIZER.splitlines(),
             f"export CLIO_RELAY_CORE_DIR={render_remote_shell_path(core_dir, field='core_dir')}",
             f"export CLIO_RELAY_SPOOL_DIR={render_remote_shell_path(spool_dir, field='spool_dir')}",
             ("export CLIO_RELAY_BOOTSTRAP_DESIRED_STATE_BASE64=" + shlex.quote(encoded)),
             'if [ ! -x "$HOME/.local/bin/clio-relay" ]; then '
             "echo bootstrap_preflight_unsupported=not_installed; exit 0; fi",
+            'BOOTSTRAP_INSTALL_RECEIPT="$HOME/.local/share/clio-relay/install-receipt.json"',
+            'if [ -e "$BOOTSTRAP_INSTALL_RECEIPT" ] || [ -L "$BOOTSTRAP_INSTALL_RECEIPT" ]; then',
+            '  if ! BOOTSTRAP_RELAY_RECEIPT_CLASS="$(python3 -I - '
+            "\"$BOOTSTRAP_INSTALL_RECEIPT\" <<'__CLIO_RELAY_PREFLIGHT_RECEIPT__'",
+            *_BOOTSTRAP_RECEIPT_CLASSIFIER_SOURCE.splitlines(),
+            "__CLIO_RELAY_PREFLIGHT_RECEIPT__",
+            '  )"; then',
+            "    echo bootstrap_preflight_unsupported=legacy_relay_provider",
+            "    exit 0",
+            "  fi",
+            '  if [ "$BOOTSTRAP_RELAY_RECEIPT_CLASS" != "current" ]; then',
+            "    echo bootstrap_preflight_unsupported=legacy_relay_provider",
+            "    exit 0",
+            "  fi",
+            "else",
+            "  echo bootstrap_preflight_unsupported=legacy_relay_provider",
+            "  exit 0",
+            "fi",
             "if ! command -v timeout >/dev/null 2>&1; then",
             '  echo "timeout is required" >&2',
             "  exit 1",
@@ -1312,6 +2287,7 @@ def _bootstrap_preflight_over_ssh(
             in {
                 "bootstrap_preflight_unsupported=not_installed",
                 "bootstrap_preflight_unsupported=missing_command",
+                "bootstrap_preflight_unsupported=legacy_relay_provider",
             }
         ]
         if len(unsupported) != 1:
@@ -2364,6 +3340,9 @@ def _worker_upgrade_fence_script(
             "    fi",
             "  fi",
             "  bootstrap_release_worker_lifetime_guard || true",
+            "  if declare -F bootstrap_cleanup_preparing_root >/dev/null; then",
+            "    bootstrap_cleanup_preparing_root || true",
+            "  fi",
             '  exit "$status"',
             "}",
             "trap bootstrap_worker_fence_exit EXIT",
@@ -2472,6 +3451,7 @@ def _relay_only_reconcile_script(
     rendered_source_archive: str,
     rendered_source_archive_sha256: str,
     invocation_id: str,
+    candidate_uv_install_program: str,
 ) -> str:
     """Render the staged relay-only generation transaction."""
     staged_provider_exec_program = shlex.quote(_STAGED_PROVIDER_EXEC_PROGRAM)
@@ -2499,8 +3479,17 @@ bootstrap_provider_exec() (
     exec python3 -I -c {staged_provider_exec_program} \
       "$BOOTSTRAP_STAGED_GENERATION" \
       "$BOOTSTRAP_STAGED_MANIFEST_SHA256" "$@"
+  elif [ "${{BOOTSTRAP_CANDIDATE_PROVIDER_READY:-0}}" = "1" ]; then
+    exec python3 -I -c {candidate_uv_install_program} \
+      verify-installed-and-exec \
+      "$BOOTSTRAP_PINNED_UV" {UV_LINUX_AMD64_EXECUTABLE_SHA256} \
+      "$BOOTSTRAP_CANDIDATE_ARTIFACT" "$BOOTSTRAP_CANDIDATE_ARTIFACT_SHA256" \
+      "$BOOTSTRAP_CANDIDATE_TOOL_DIR" "$BOOTSTRAP_CANDIDATE_BIN_DIR" \
+      "$BOOTSTRAP_CANDIDATE_CACHE_DIR" \
+      "$BOOTSTRAP_CANDIDATE_PYTHON_INSTALL_DIR" \
+      "$BOOTSTRAP_CANDIDATE_PROVIDER_SHA256" -I "$@"
   else
-    exec "$BOOTSTRAP_PLAN_PROVIDER" "$@"
+    exec "$BOOTSTRAP_RECOVERY_PROVIDER" -I "$@"
   fi
 )
 
@@ -2719,6 +3708,7 @@ bootstrap_reconcile_transaction_exit() {{
     esac
   fi
   bootstrap_release_worker_lifetime_guard 2>/dev/null || true
+  bootstrap_cleanup_preparing_root || true
   exit "$status"
 }}
 
@@ -3741,6 +4731,7 @@ print("bootstrap_receipt_json=" + json.dumps(receipt, sort_keys=True, separators
 __CLIO_RELAY_RECONCILE_RECEIPT__
   trap - EXIT
   bootstrap_release_worker_lifetime_guard || true
+  bootstrap_cleanup_preparing_root
 }}
 
 bootstrap_repair_transaction_exit() {{
@@ -3750,6 +4741,7 @@ bootstrap_repair_transaction_exit() {{
     echo "bootstrap readiness repair did not complete; queue migration state is retained" >&2
   fi
   bootstrap_release_worker_lifetime_guard 2>/dev/null || true
+  bootstrap_cleanup_preparing_root || true
   exit "$status"
 }}
 
@@ -3957,6 +4949,7 @@ print("bootstrap_receipt_json=" + json.dumps(receipt, sort_keys=True, separators
 __CLIO_RELAY_REPAIR_RECEIPT__
   trap - EXIT
   bootstrap_release_worker_lifetime_guard || true
+  bootstrap_cleanup_preparing_root
 }}
 """
 
@@ -3997,6 +4990,7 @@ def render_linux_user_bootstrap_script(
     rendered_jarvis_resource_graph_profile = shlex.quote(jarvis_resource_graph_profile or "")
     rendered_allow_jarvis_resource_graph_build = "1" if allow_jarvis_resource_graph_build else "0"
     rendered_relay_install_spec = _render_relay_install_spec(relay_install_spec)
+    rendered_candidate_relay_install_spec = shlex.quote(relay_install_spec)
     resolved_relay_deployment_install_spec = relay_deployment_install_spec or relay_install_spec
     source_archive_path = PurePosixPath(source_archive)
     if (
@@ -4094,6 +5088,9 @@ def render_linux_user_bootstrap_script(
         sort_keys=True,
         separators=(",", ":"),
     )
+    preparing_root_program = shlex.quote(_BOOTSTRAP_PREPARING_ROOT_SOURCE)
+    pinned_uv_copy_program = shlex.quote(_BOOTSTRAP_PINNED_UV_COPY_SOURCE)
+    candidate_uv_install_program = shlex.quote(_BOOTSTRAP_CANDIDATE_UV_INSTALL_SOURCE)
     candidate_package_sha256 = {
         name: hashlib.sha256(payload).hexdigest()
         for name, payload in candidate_package_sources.items()
@@ -4124,10 +5121,16 @@ def render_linux_user_bootstrap_script(
         rendered_source_archive=rendered_source_archive,
         rendered_source_archive_sha256=rendered_source_archive_sha256,
         invocation_id=invocation_id,
+        candidate_uv_install_program=candidate_uv_install_program,
     )
     script = f"""set -euo pipefail
 umask 077
 export PATH="$HOME/.local/bin:$PATH"
+while IFS= read -r variable_name; do
+  case "$variable_name" in
+    LD_*|PYTHON*|BASH_ENV|ENV) unset "$variable_name" ;;
+  esac
+done < <(compgen -e)
 export UV_TOOL_DIR="$HOME/.local/share/clio-relay/uv-tools"
 export UV_TOOL_BIN_DIR="$HOME/.local/share/clio-relay/uv-bin"
 export UV_PYTHON_INSTALL_DIR="$HOME/.local/share/clio-relay/uv-python"
@@ -4437,10 +5440,27 @@ __CLIO_RELAY_EARLY_RECOVERY_FIELDS__
 fi
 BOOTSTRAP_CURRENT_RELAY="$HOME/.local/bin/clio-relay"
 BOOTSTRAP_CURRENT_PROVIDER=""
+BOOTSTRAP_LEGACY_RELAY_PROVIDER=1
+BOOTSTRAP_INSTALL_RECEIPT="$HOME/.local/share/clio-relay/install-receipt.json"
+if [ -e "$BOOTSTRAP_INSTALL_RECEIPT" ] || [ -L "$BOOTSTRAP_INSTALL_RECEIPT" ]; then
+  if BOOTSTRAP_RELAY_RECEIPT_CLASS="$(
+    env -u PYTHONPATH -u PYTHONHOME -u LD_PRELOAD -u LD_LIBRARY_PATH \
+      python3 -I - "$BOOTSTRAP_INSTALL_RECEIPT" <<'__CLIO_RELAY_RECEIPT_CLASSIFY__'
+{_BOOTSTRAP_RECEIPT_CLASSIFIER_SOURCE}
+__CLIO_RELAY_RECEIPT_CLASSIFY__
+  )"; then
+    if [ "$BOOTSTRAP_RELAY_RECEIPT_CLASS" = "current" ]; then
+      BOOTSTRAP_LEGACY_RELAY_PROVIDER=0
+    fi
+  else
+    echo "bootstrap receipt classification failed; candidate payload is required" >&2
+  fi
+fi
 if [ -x "$BOOTSTRAP_CURRENT_RELAY" ]; then
   BOOTSTRAP_CURRENT_PROVIDER="$(sed -n '1{{s/^#!//;p;}}' "$BOOTSTRAP_CURRENT_RELAY")"
 fi
 if [ "$BOOTSTRAP_RECOVERY_REQUIRED" = "0" ] && \
+   [ "$BOOTSTRAP_LEGACY_RELAY_PROVIDER" = "0" ] && \
    [ -x "$BOOTSTRAP_CURRENT_RELAY" ]; then
   if [ -x "$BOOTSTRAP_CURRENT_PROVIDER" ] && \
      "$BOOTSTRAP_CURRENT_PROVIDER" -c \
@@ -4604,6 +5624,10 @@ BOOTSTRAP_JARVIS_CONFIG_SHA256_BEFORE=""
 BOOTSTRAP_JARVIS_REPOS_SHA256_BEFORE=""
 BOOTSTRAP_JARVIS_GRAPH_SHA256_BEFORE=""
 if [ "$JARVIS_EXISTING_FILE_COUNT" -eq 3 ]; then
+  command -v timeout >/dev/null 2>&1 || {{
+    echo "timeout is required for bounded candidate staging" >&2
+    exit 1
+  }}
   BOOTSTRAP_JARVIS_CONFIG_SHA256_BEFORE="$(sha256sum "$JARVIS_CONFIG_FILE" | awk '{{print $1}}')"
   BOOTSTRAP_JARVIS_REPOS_SHA256_BEFORE="$(sha256sum "$JARVIS_REPOS_FILE" | awk '{{print $1}}')"
   BOOTSTRAP_JARVIS_GRAPH_SHA256_BEFORE="$(sha256sum "$JARVIS_GRAPH_FILE" | awk '{{print $1}}')"
@@ -4618,7 +5642,7 @@ if [ "$JARVIS_EXISTING_FILE_COUNT" -eq 3 ] && \
 fi
 if [ "$JARVIS_EXISTING_FILE_COUNT" -eq 3 ]; then
   export JARVIS_CONFIG_FILE
-  "$HOME/.local/share/clio-relay/jarvis-venv/bin/python" - <<'__CLIO_RELAY_JARVIS_ROOT_PROBE__'
+  "$HOME/.local/share/clio-relay/jarvis-venv/bin/python" -I - <<'__CLIO_RELAY_JARVIS_ROOT_PROBE__'
 import os
 from pathlib import Path
 
@@ -4639,8 +5663,19 @@ print("jarvis_existing_roots=verified")
 __CLIO_RELAY_JARVIS_ROOT_PROBE__
 fi
 {relay_only_reconcile}
-BOOTSTRAP_PREPARING_ROOT="$HOME/.local/share/clio-relay/preparing/{invocation_id}"
-mkdir -p "$BOOTSTRAP_PREPARING_ROOT"
+BOOTSTRAP_PREPARING_PARENT="$HOME/.local/share/clio-relay/preparing"
+BOOTSTRAP_PREPARING_ROOT="$BOOTSTRAP_PREPARING_PARENT/active"
+export BOOTSTRAP_PREPARING_PARENT BOOTSTRAP_PREPARING_ROOT
+mkdir -m 0700 -p "$BOOTSTRAP_PREPARING_PARENT"
+env -u PYTHONPATH -u PYTHONHOME -u LD_PRELOAD -u LD_LIBRARY_PATH \
+  python3 -I -c {preparing_root_program} \
+  "$BOOTSTRAP_PREPARING_PARENT" "$BOOTSTRAP_PREPARING_ROOT" prepare
+bootstrap_cleanup_preparing_root() {{
+  env -u PYTHONPATH -u PYTHONHOME -u LD_PRELOAD -u LD_LIBRARY_PATH \
+    python3 -I -c {preparing_root_program} \
+    "$BOOTSTRAP_PREPARING_PARENT" "$BOOTSTRAP_PREPARING_ROOT" cleanup
+}}
+trap bootstrap_cleanup_preparing_root EXIT
 BOOTSTRAP_CANDIDATE_PYTHON_ROOT="$BOOTSTRAP_PREPARING_ROOT/candidate-python"
 BOOTSTRAP_CANDIDATE_PACKAGE="$BOOTSTRAP_CANDIDATE_PYTHON_ROOT/clio_relay"
 if [ -L "$BOOTSTRAP_CANDIDATE_PYTHON_ROOT" ] || \
@@ -4649,7 +5684,7 @@ if [ -L "$BOOTSTRAP_CANDIDATE_PYTHON_ROOT" ] || \
   exit 1
 fi
 mkdir -m 0700 -p "$BOOTSTRAP_CANDIDATE_PACKAGE"
-python3 - "$BOOTSTRAP_CANDIDATE_PACKAGE" <<'__CLIO_RELAY_CANDIDATE_PACKAGE__'
+python3 -I - "$BOOTSTRAP_CANDIDATE_PACKAGE" <<'__CLIO_RELAY_CANDIDATE_PACKAGE__'
 import base64
 import hashlib
 import json
@@ -4702,16 +5737,26 @@ bootstrap_safe_extract() {{
   local provider="$1"
   local archive="$2"
   local destination="$3"
-  PYTHONPATH="$BOOTSTRAP_CANDIDATE_PYTHON_ROOT" \
-    "$provider" - "$archive" "$destination" \
+  bootstrap_safe_extract_provider() {{
+    if [ "${{BOOTSTRAP_CANDIDATE_PROVIDER_READY:-0}}" = "1" ] && \
+       [ "$provider" = "${{BOOTSTRAP_PLAN_PROVIDER:-}}" ]; then
+      bootstrap_provider_exec "$@"
+    else
+      "$provider" -I "$@"
+    fi
+  }}
+  bootstrap_safe_extract_provider - "$BOOTSTRAP_CANDIDATE_PYTHON_ROOT" \
+    "$archive" "$destination" \
       <<'__CLIO_RELAY_SAFE_EXTRACT__'
 import json
 import sys
 from pathlib import Path
 
+candidate_root, archive_value, destination_value = sys.argv[1:]
+sys.path.insert(0, candidate_root)
 from clio_relay.safe_archive import safe_extract_tar
 
-receipt = safe_extract_tar(Path(sys.argv[1]), Path(sys.argv[2]))
+receipt = safe_extract_tar(Path(archive_value), Path(destination_value))
 print(
     "bootstrap_archive_extraction="
     + json.dumps(
@@ -4731,56 +5776,238 @@ __CLIO_RELAY_SAFE_EXTRACT__
 }}
 BOOTSTRAP_PLAN_MODE="full"
 BOOTSTRAP_PLAN_JSON=""
-BOOTSTRAP_PLAN_PROVIDER=""
+BOOTSTRAP_RECOVERY_PROVIDER=""
+BOOTSTRAP_CANDIDATE_PROVIDER_READY=0
 if [ -x "$BOOTSTRAP_CURRENT_PROVIDER" ]; then
-  BOOTSTRAP_PLAN_PROVIDER="$BOOTSTRAP_CURRENT_PROVIDER"
+  BOOTSTRAP_RECOVERY_PROVIDER="$BOOTSTRAP_CURRENT_PROVIDER"
 elif [ -x "$HOME/.local/share/clio-relay/jarvis-venv/bin/python" ]; then
-  BOOTSTRAP_PLAN_PROVIDER="$HOME/.local/share/clio-relay/jarvis-venv/bin/python"
+  BOOTSTRAP_RECOVERY_PROVIDER="$HOME/.local/share/clio-relay/jarvis-venv/bin/python"
 fi
-export BOOTSTRAP_PLAN_PROVIDER BOOTSTRAP_CANDIDATE_RECONCILE
-if [ -n "$BOOTSTRAP_PLAN_PROVIDER" ]; then
-  "$BOOTSTRAP_PLAN_PROVIDER" -I "$BOOTSTRAP_CANDIDATE_PROVIDER_BUILD_INFO" \
-    "$BOOTSTRAP_CANDIDATE_PACKAGE"
-fi
+export BOOTSTRAP_RECOVERY_PROVIDER BOOTSTRAP_CANDIDATE_PROVIDER_READY
+export BOOTSTRAP_CANDIDATE_RECONCILE
 if [ "$BOOTSTRAP_RECOVERY_REQUIRED" = "1" ]; then
-  if [ -z "$BOOTSTRAP_PLAN_PROVIDER" ]; then
+  if [ -z "$BOOTSTRAP_RECOVERY_PROVIDER" ]; then
     echo "bootstrap recovery has no trusted installed Python provider" >&2
     exit 1
   fi
+  env -u PYTHONPATH -u PYTHONHOME -u LD_PRELOAD -u LD_LIBRARY_PATH \
+    "$BOOTSTRAP_RECOVERY_PROVIDER" -I "$BOOTSTRAP_CANDIDATE_PROVIDER_BUILD_INFO" \
+      "$BOOTSTRAP_CANDIDATE_PACKAGE"
   bootstrap_recover_previous_transaction
   exec 9>&-
   unset CLIO_RELAY_BOOTSTRAP_LOCK_FD
+  bootstrap_cleanup_preparing_root
+  trap - EXIT
   exec bash "$0"
 fi
-if [ -n "$BOOTSTRAP_PLAN_PROVIDER" ] && [ "$JARVIS_EXISTING_FILE_COUNT" -eq 3 ]; then
-  export BOOTSTRAP_CANDIDATE_RECONCILE
+if [ "$JARVIS_EXISTING_FILE_COUNT" -eq 3 ]; then
+  SOURCE_ARCHIVE={rendered_source_archive}
+  SOURCE_ARCHIVE_SHA256={rendered_source_archive_sha256}
+  if [ -z "$SOURCE_ARCHIVE_SHA256" ]; then
+    echo "retained-state reconcile requires a verified source archive digest" >&2
+    exit 1
+  fi
+  echo "$SOURCE_ARCHIVE_SHA256 *$SOURCE_ARCHIVE" | sha256sum --check --strict -
+  BOOTSTRAP_CANDIDATE_SOURCE_ROOT="$BOOTSTRAP_PREPARING_ROOT/source"
+  bootstrap_safe_extract python3 "$SOURCE_ARCHIVE" "$BOOTSTRAP_CANDIDATE_SOURCE_ROOT"
+
+  BOOTSTRAP_CANDIDATE_INSTALL_SPEC={rendered_candidate_relay_install_spec}
+  BOOTSTRAP_CANDIDATE_ARTIFACT_SHA256={rendered_relay_artifact_sha256}
+  if [ -z "$BOOTSTRAP_CANDIDATE_ARTIFACT_SHA256" ]; then
+    echo "retained-state reconcile requires an exact relay wheel SHA-256" >&2
+    exit 1
+  fi
+  BOOTSTRAP_CANDIDATE_ARTIFACT=""
+  case "$BOOTSTRAP_CANDIDATE_INSTALL_SPEC" in
+    '$DEST/'*)
+      BOOTSTRAP_CANDIDATE_ARTIFACT="$(
+        python3 -I - "$BOOTSTRAP_CANDIDATE_INSTALL_SPEC" \
+          "$BOOTSTRAP_CANDIDATE_SOURCE_ROOT" <<'__CLIO_RELAY_CANDIDATE_WHEEL_PATH__'
+import sys
+from pathlib import Path
+
+specification, source_value = sys.argv[1:]
+if not specification.startswith("$DEST/"):
+    raise SystemExit("transported relay wheel did not use the archive destination")
+source = Path(source_value).resolve(strict=True)
+lexical_candidate = source / specification.removeprefix("$DEST/")
+candidate_details = lexical_candidate.lstat()
+if lexical_candidate.is_symlink() or not lexical_candidate.is_file():
+    raise SystemExit("transported relay wheel is not one regular file")
+candidate = lexical_candidate.resolve(strict=True)
+if candidate == source or not candidate.is_relative_to(source):
+    raise SystemExit("transported relay wheel escaped the verified source archive")
+observed = lexical_candidate.lstat()
+identity = lambda value: (
+    value.st_dev,
+    value.st_ino,
+    value.st_mode,
+    value.st_size,
+    value.st_mtime_ns,
+    value.st_ctime_ns,
+)
+if identity(observed) != identity(candidate_details) or candidate.suffix != ".whl":
+    raise SystemExit("transported relay wheel is not one regular wheel file")
+print(candidate)
+__CLIO_RELAY_CANDIDATE_WHEEL_PATH__
+      )"
+      ;;
+    clio-relay==*)
+      BOOTSTRAP_CANDIDATE_ARTIFACT="$BOOTSTRAP_PREPARING_ROOT/candidate-relay.whl"
+      timeout --signal=TERM --kill-after=5s 180 \
+        python3 -I - "$BOOTSTRAP_CANDIDATE_INSTALL_SPEC" \
+        "$BOOTSTRAP_CANDIDATE_ARTIFACT_SHA256" \
+        "$BOOTSTRAP_CANDIDATE_ARTIFACT" <<'__CLIO_RELAY_CANDIDATE_PYPI_WHEEL__'
+import hashlib
+import json
+import sys
+from pathlib import Path
+from urllib.parse import quote, urlsplit
+from urllib.request import urlopen
+
+specification, expected_sha256, destination_value = sys.argv[1:]
+version = specification.removeprefix("clio-relay==")
+if not version or specification != f"clio-relay=={{version}}":
+    raise SystemExit("candidate PyPI install spec is not exact")
+with urlopen(
+    f"https://pypi.org/pypi/clio-relay/{{quote(version, safe='')}}/json",
+    timeout=30,
+) as response:
+    metadata = response.read(4 * 1024 * 1024 + 1)
+if len(metadata) > 4 * 1024 * 1024:
+    raise SystemExit("candidate PyPI metadata exceeds its bound")
+document = json.loads(metadata)
+expected_filename = f"clio_relay-{{version}}-py3-none-any.whl"
+matches = [
+    item
+    for item in document.get("urls", [])
+    if isinstance(item, dict)
+    and item.get("filename") == expected_filename
+    and item.get("packagetype") == "bdist_wheel"
+    and item.get("digests", {{}}).get("sha256") == expected_sha256
+]
+if len(matches) != 1:
+    raise SystemExit("PyPI did not return the exact digest-pinned relay wheel")
+url = matches[0].get("url")
+if not isinstance(url, str):
+    raise SystemExit("PyPI relay wheel URL is missing")
+parsed = urlsplit(url)
+if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith(
+    ".pythonhosted.org"
+):
+    raise SystemExit("PyPI relay wheel URL has an unsupported origin")
+destination = Path(destination_value)
+digest = hashlib.sha256()
+size = 0
+with urlopen(url, timeout=60) as response, destination.open("xb") as stream:
+    while chunk := response.read(1024 * 1024):
+        size += len(chunk)
+        if size > 256 * 1024 * 1024:
+            raise SystemExit("candidate relay wheel exceeds its bound")
+        digest.update(chunk)
+        stream.write(chunk)
+if size < 1 or digest.hexdigest() != expected_sha256:
+    destination.unlink(missing_ok=True)
+    raise SystemExit("downloaded candidate relay wheel did not match its digest")
+__CLIO_RELAY_CANDIDATE_PYPI_WHEEL__
+      ;;
+    *)
+      echo "retained-state reconcile supports only an exact released relay wheel" >&2
+      exit 1
+      ;;
+  esac
+  echo "$BOOTSTRAP_CANDIDATE_ARTIFACT_SHA256 *$BOOTSTRAP_CANDIDATE_ARTIFACT" | \
+    sha256sum --check --strict -
+
+  BOOTSTRAP_PINNED_UV_SOURCE="$HOME/.local/bin/uv"
+  BOOTSTRAP_PINNED_UV="$(
+    env -u PYTHONPATH -u PYTHONHOME -u LD_PRELOAD -u LD_LIBRARY_PATH \
+      python3 -I -c {pinned_uv_copy_program} \
+      "$BOOTSTRAP_PINNED_UV_SOURCE" "$BOOTSTRAP_PREPARING_ROOT" \
+      {UV_LINUX_AMD64_EXECUTABLE_SHA256}
+  )"
+  BOOTSTRAP_CANDIDATE_TOOL_DIR="$BOOTSTRAP_PREPARING_ROOT/uv-tools"
+  BOOTSTRAP_CANDIDATE_BIN_DIR="$BOOTSTRAP_PREPARING_ROOT/uv-bin"
+  BOOTSTRAP_CANDIDATE_CACHE_DIR="$BOOTSTRAP_PREPARING_ROOT/uv-cache"
+  BOOTSTRAP_CANDIDATE_PYTHON_INSTALL_DIR="$HOME/.local/share/clio-relay/uv-python"
+  mkdir -m 0700 "$BOOTSTRAP_CANDIDATE_CACHE_DIR"
+  BOOTSTRAP_CANDIDATE_RELAY="$BOOTSTRAP_CANDIDATE_BIN_DIR/clio-relay"
+  BOOTSTRAP_PLAN_PROVIDER="$BOOTSTRAP_CANDIDATE_TOOL_DIR/clio-relay/bin/python"
+  export BOOTSTRAP_PLAN_PROVIDER BOOTSTRAP_CANDIDATE_RECONCILE
+  export BOOTSTRAP_CANDIDATE_SOURCE_ROOT BOOTSTRAP_CANDIDATE_ARTIFACT
+  export BOOTSTRAP_CANDIDATE_TOOL_DIR BOOTSTRAP_CANDIDATE_BIN_DIR
+  export BOOTSTRAP_CANDIDATE_CACHE_DIR BOOTSTRAP_CANDIDATE_PYTHON_INSTALL_DIR
+  export BOOTSTRAP_CANDIDATE_RELAY BOOTSTRAP_PINNED_UV SOURCE_ARCHIVE_SHA256
   BOOTSTRAP_PLAN_STARTED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
-  BOOTSTRAP_PLAN_JSON="$(
-    "$BOOTSTRAP_PLAN_PROVIDER" - <<'__CLIO_RELAY_RECONCILE_PLAN__'
-import importlib.util
+  BOOTSTRAP_PLAN_CAPTURE="$(
+    python3 -I -c {candidate_uv_install_program} \
+      install-verify-and-exec \
+      "$BOOTSTRAP_PINNED_UV" {UV_LINUX_AMD64_EXECUTABLE_SHA256} \
+      "$BOOTSTRAP_CANDIDATE_ARTIFACT" "$BOOTSTRAP_CANDIDATE_ARTIFACT_SHA256" \
+      "$BOOTSTRAP_CANDIDATE_TOOL_DIR" "$BOOTSTRAP_CANDIDATE_BIN_DIR" \
+      "$BOOTSTRAP_CANDIDATE_CACHE_DIR" \
+      "$BOOTSTRAP_CANDIDATE_PYTHON_INSTALL_DIR" -I - \
+      <<'__CLIO_RELAY_RECONCILE_PLAN__'
 import json
 import os
-import sys
+from pathlib import Path
 
-path = os.environ["BOOTSTRAP_CANDIDATE_RECONCILE"]
-candidate_root = os.environ["BOOTSTRAP_CANDIDATE_PYTHON_ROOT"]
-if not sys.path or sys.path[0] != candidate_root:
-    sys.path.insert(0, candidate_root)
-name = "clio_relay.bootstrap_reconcile_candidate"
-spec = importlib.util.spec_from_file_location(name, path)
-if spec is None or spec.loader is None:
-    raise SystemExit("could not load candidate bootstrap reconciler")
-module = importlib.util.module_from_spec(spec)
-sys.modules[name] = module
-spec.loader.exec_module(module)
+from clio_relay.bootstrap_reconcile import (
+    BootstrapDesiredState,
+    plan_bootstrap_reconcile,
+    prove_bootstrap_replacement_provider,
+)
+
 desired_payload = json.loads(os.environ["BOOTSTRAP_DESIRED_STATE"])
 desired_payload["agent_npm_package"] = os.environ["AGENT_NPM_PACKAGE"] or None
 desired_payload["agent_npm_bin"] = os.environ["AGENT_NPM_BIN"] or None
-desired = module.BootstrapDesiredState.model_validate(desired_payload)
-plan = module.plan_bootstrap_reconcile(desired)
+desired = BootstrapDesiredState.model_validate(desired_payload)
+evidence = prove_bootstrap_replacement_provider(
+    desired,
+    uv_executable=Path(os.environ["BOOTSTRAP_PINNED_UV"]),
+    tool_executable=Path(os.environ["BOOTSTRAP_CANDIDATE_RELAY"]),
+    source_artifact=Path(os.environ["BOOTSTRAP_CANDIDATE_ARTIFACT"]),
+    tool_directory=Path(os.environ["BOOTSTRAP_CANDIDATE_TOOL_DIR"]),
+    tool_bin_directory=Path(os.environ["BOOTSTRAP_CANDIDATE_BIN_DIR"]),
+    preparing_root=Path(os.environ["BOOTSTRAP_PREPARING_ROOT"]),
+    extracted_source_root=Path(os.environ["BOOTSTRAP_CANDIDATE_SOURCE_ROOT"]),
+    source_archive_sha256=os.environ["SOURCE_ARCHIVE_SHA256"],
+    expected_provider_interpreter_sha256=os.environ["BOOTSTRAP_PLAN_PROVIDER_SHA256"],
+)
+plan = plan_bootstrap_reconcile(desired, replacement_provider=evidence)
+print("bootstrap_candidate_provider_sha256=" + os.environ["BOOTSTRAP_PLAN_PROVIDER_SHA256"])
 print(json.dumps(plan.model_dump(mode="json"), sort_keys=True, separators=(",", ":")))
 __CLIO_RELAY_RECONCILE_PLAN__
   )"
+  BOOTSTRAP_PLAN_JSON=""
+  BOOTSTRAP_CANDIDATE_PROVIDER_SHA256=""
+  while IFS= read -r bootstrap_plan_line; do
+    case "$bootstrap_plan_line" in
+      bootstrap_candidate_provider_sha256=*)
+        BOOTSTRAP_CANDIDATE_PROVIDER_SHA256="${{bootstrap_plan_line#*=}}"
+        ;;
+      '{{'*'}}')
+        if [ -n "$BOOTSTRAP_PLAN_JSON" ]; then
+          echo "candidate planner returned multiple plan objects" >&2
+          exit 1
+        fi
+        BOOTSTRAP_PLAN_JSON="$bootstrap_plan_line"
+        ;;
+      *)
+        echo "candidate planner returned unrecognized output" >&2
+        exit 1
+        ;;
+    esac
+  done <<< "$BOOTSTRAP_PLAN_CAPTURE"
+  if [ "${{#BOOTSTRAP_CANDIDATE_PROVIDER_SHA256}}" -ne 64 ]; then
+    echo "candidate planner omitted its pinned provider digest" >&2
+    exit 1
+  fi
+  case "$BOOTSTRAP_CANDIDATE_PROVIDER_SHA256" in
+    *[!0-9a-f]*) echo "candidate planner provider digest is invalid" >&2; exit 1 ;;
+  esac
+  BOOTSTRAP_CANDIDATE_PROVIDER_READY=1
+  export BOOTSTRAP_CANDIDATE_PROVIDER_READY BOOTSTRAP_CANDIDATE_PROVIDER_SHA256
   BOOTSTRAP_PLAN_COMPLETED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
   export BOOTSTRAP_PLAN_JSON
   BOOTSTRAP_PLAN_MODE="$(
@@ -4801,6 +6028,7 @@ fi
 if [ "$BOOTSTRAP_PLAN_MODE" = "full" ] && \
    {{ [ "$JARVIS_EXISTING_FILE_COUNT" -eq 3 ] || \
       [ -e "$HOME/.local/share/clio-relay/jarvis-venv" ]; }}; then
+  printf '%s\\n' "bootstrap_reconcile_plan=$BOOTSTRAP_PLAN_JSON" >&2
   echo "full component reconcile requires a staged generation;" \
     "refusing to clear the retained legacy JARVIS execution environment" >&2
   exit 1
