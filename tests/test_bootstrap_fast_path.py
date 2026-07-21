@@ -320,6 +320,137 @@ print("swapped-wheel-rejected")
     assert result.stdout.strip() == "swapped-wheel-rejected"
 
 
+def test_candidate_verifier_accepts_pinned_uv_metadata_subset_only() -> None:
+    """Pinned uv metadata may vary by build path, while unknown members fail closed."""
+    driver = r"""
+import base64
+import csv
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+
+verifier = base64.b64decode(sys.argv[1]).decode()
+uv = shutil.which("uv") or str(Path.home() / ".local/bin/uv")
+with tempfile.TemporaryDirectory() as value:
+    workspace = Path(value)
+    built = workspace / "built"
+    subprocess.run(
+        [uv, "build", "--wheel", "--out-dir", str(built)],
+        check=True,
+        capture_output=True,
+    )
+    wheel = next(built.glob("clio_relay-*.whl"))
+    tool_directory = workspace / "tools"
+    tool_bin_directory = workspace / "bin"
+    cache_directory = workspace / "cache"
+    python_directory = Path.home() / ".local/share/clio-relay/uv-python"
+    arguments = [
+        sys.executable,
+        "-I",
+        "-c",
+        verifier,
+        "install-and-verify",
+        uv,
+        hashlib.sha256(Path(uv).read_bytes()).hexdigest(),
+        str(wheel),
+        hashlib.sha256(wheel.read_bytes()).hexdigest(),
+        str(tool_directory),
+        str(tool_bin_directory),
+        str(cache_directory),
+        str(python_directory),
+    ]
+    accepted = subprocess.run(arguments, check=False, capture_output=True, text=True)
+    if accepted.returncode != 0:
+        raise SystemExit(accepted.stdout + accepted.stderr)
+
+    site_packages = next((tool_directory / "clio-relay").glob("lib/python*/site-packages"))
+    record = next(site_packages.glob("clio_relay-*.dist-info/RECORD"))
+    rows = list(csv.reader(record.read_text(encoding="utf-8").splitlines(), strict=True))
+    with zipfile.ZipFile(wheel) as archive:
+        wheel_names = {item.filename for item in archive.infolist() if not item.is_dir()}
+    launcher = os.path.relpath(
+        tool_directory / "clio-relay/bin/clio-relay", site_packages
+    ).replace(os.sep, "/")
+    installed_names = {row[0] for row in rows if len(row) == 3}
+    dist_info = record.parent.relative_to(site_packages).as_posix()
+    generated = {
+        launcher,
+        *(f"{dist_info}/{name}" for name in (
+            "INSTALLER",
+            "REQUESTED",
+            "direct_url.json",
+            "uv_build.json",
+            "uv_cache.json",
+        )),
+    }
+    if (
+        len(installed_names) != len(rows)
+        or not wheel_names.issubset(installed_names)
+        or not {
+            launcher,
+            f"{dist_info}/INSTALLER",
+            f"{dist_info}/REQUESTED",
+            f"{dist_info}/direct_url.json",
+        }.issubset(installed_names)
+        or not installed_names.issubset(wheel_names | generated)
+    ):
+        raise SystemExit("candidate install exposed an invalid uv metadata set")
+
+    uv_build = record.parent / "uv_build.json"
+    if not uv_build.exists():
+        payload = b'{"source":"focused-test"}'
+        uv_build.write_bytes(payload)
+        digest = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
+        rows.append([
+            uv_build.relative_to(site_packages).as_posix(),
+            "sha256=" + digest,
+            str(len(payload)),
+        ])
+        with record.open("w", encoding="utf-8", newline="") as stream:
+            csv.writer(stream, lineterminator="\n").writerows(rows)
+    arguments[4] = "verify-installed"
+    accepted_with_build_metadata = subprocess.run(
+        arguments, check=False, capture_output=True, text=True
+    )
+    if accepted_with_build_metadata.returncode != 0:
+        raise SystemExit(
+            accepted_with_build_metadata.stdout + accepted_with_build_metadata.stderr
+        )
+
+    uv_build_payload = uv_build.read_bytes()
+    uv_build.write_bytes(uv_build_payload + b"tampered")
+    rejected_tamper = subprocess.run(arguments, check=False, capture_output=True, text=True)
+    if (
+        rejected_tamper.returncode == 0
+        or "generated member differs from its RECORD identity" not in rejected_tamper.stderr
+    ):
+        raise SystemExit(rejected_tamper.stdout + rejected_tamper.stderr)
+    uv_build.write_bytes(uv_build_payload)
+
+    unexpected = record.parent / "unexpected.json"
+    unexpected.write_text("{}", encoding="utf-8")
+    rows.append([unexpected.relative_to(site_packages).as_posix(), "", ""])
+    with record.open("w", encoding="utf-8", newline="") as stream:
+        csv.writer(stream, lineterminator="\n").writerows(rows)
+    rejected = subprocess.run(arguments, check=False, capture_output=True, text=True)
+    if rejected.returncode == 0 or "contains unpinned members" not in rejected.stderr:
+        raise SystemExit(rejected.stdout + rejected.stderr)
+print("bounded-uv-metadata-ok")
+"""
+    result = _run_posix_embedded_driver(
+        driver,
+        bootstrap._BOOTSTRAP_CANDIDATE_UV_INSTALL_SOURCE,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "bounded-uv-metadata-ok"
+
+
 def test_candidate_coordinator_rejects_provider_path_swap_after_open() -> None:
     """A provider pathname replacement cannot execute after its coordinator opens it."""
     driver = r"""
@@ -1747,6 +1878,7 @@ def test_legacy_planning_attests_private_candidate_before_transaction_or_fence()
     assert "shutil.rmtree" not in script
     no_downloads = script.index('"UV_PYTHON_DOWNLOADS": "never"', uv_digest)
     assert uv_digest < no_downloads < install
+    assert '"uv_build.json"' in script
     assert "bootstrap_cleanup_preparing_root" in script
     assert script.index("BOOTSTRAP_LEGACY_RELAY_PROVIDER=1") < script.index(
         '"$BOOTSTRAP_CURRENT_PROVIDER" -c'
