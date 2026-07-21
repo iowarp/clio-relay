@@ -11485,8 +11485,13 @@ def api_start(
         _require_process_bound_session_api_release()
     except ConfigurationError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    # Import the process-bound app while its one-time gated environment is intact.
+    # The startup receipt then scrubs the owner token from the environment, while
+    # the app retains the validated settings needed to prove this session's identity.
+    from clio_relay.http_api import app as relay_http_app
+
     publish_owned_session_api_startup_receipt()
-    uvicorn.run("clio_relay.http_api:app", host=host, port=port)
+    uvicorn.run(relay_http_app, host=host, port=port)
 
 
 @agent_app.command("render-mcp-config")
