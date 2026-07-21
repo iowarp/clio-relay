@@ -850,6 +850,7 @@ import ctypes
 import csv
 import fcntl
 import hashlib
+import json
 import os
 import signal
 import stat
@@ -1134,6 +1135,37 @@ def read_path(path, maximum, label):
     return payload
 
 
+def read_path_allow_empty(path, maximum, label):
+    before = path.lstat()
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or not 0 <= opened.st_size <= maximum:
+            raise SystemExit(f"{label} is not one bounded regular file")
+        chunks = []
+        remaining = maximum + 1
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        len(payload) != opened.st_size
+        or len(payload) > maximum
+        or identity(before) != identity(opened)
+        or identity(after) != identity(opened)
+        or identity(path.lstat()) != identity(opened)
+    ):
+        raise SystemExit(f"{label} changed while it was pinned")
+    return payload
+
+
 action, *values = sys.argv[1:]
 if action not in {
     "install-and-verify",
@@ -1338,19 +1370,70 @@ try:
         except (UnicodeDecodeError, csv.Error) as error:
             raise SystemExit("installed candidate RECORD is malformed") from error
         installed_names = {row[0] for row in installed_rows if len(row) == 3}
-        generated = {
-            os.path.relpath(environment_prefix / "bin/clio-relay", site_packages).replace(
-                os.sep, "/"
-            ),
-            *(str(dist_info / name) for name in (
-                "INSTALLER",
-                "REQUESTED",
-                "direct_url.json",
-                "uv_cache.json",
-            )),
+        launcher_name = os.path.relpath(
+            environment_prefix / "bin/clio-relay", site_packages
+        ).replace(os.sep, "/")
+        required_generated = {
+            launcher_name,
+            str(dist_info / "INSTALLER"),
+            str(dist_info / "REQUESTED"),
+            str(dist_info / "direct_url.json"),
         }
-        if len(installed_names) != len(installed_rows) or installed_names != set(names) | generated:
+        optional_generated = {
+            str(dist_info / "uv_build.json"),
+            str(dist_info / "uv_cache.json"),
+        }
+        wheel_names = set(names)
+        if (
+            len(installed_names) != len(installed_rows)
+            or not wheel_names.issubset(installed_names)
+            or not required_generated.issubset(installed_names)
+            or not installed_names.issubset(
+                wheel_names | required_generated | optional_generated
+            )
+        ):
             raise SystemExit("installed candidate distribution contains unpinned members")
+        installed_row_map = {row[0]: row for row in installed_rows}
+        generated_payloads = {}
+        for name in installed_names - wheel_names:
+            row = installed_row_map[name]
+            generated_path = site_packages.joinpath(*PurePosixPath(name).parts)
+            if generated_path.is_symlink() or not generated_path.resolve(
+                strict=True
+            ).is_relative_to(environment_prefix):
+                raise SystemExit("installed candidate generated member escaped its environment")
+            payload = read_path_allow_empty(
+                generated_path,
+                8 * 1024 * 1024,
+                "installed candidate generated member",
+            )
+            expected_hash, expected_size_text = row[1:]
+            digest = hashlib.sha256(payload).digest()
+            encoded = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+            if (
+                expected_hash != "sha256=" + encoded
+                or not expected_size_text.isdigit()
+                or int(expected_size_text) != len(payload)
+            ):
+                raise SystemExit(
+                    "installed candidate generated member differs from its RECORD identity"
+                )
+            generated_payloads[name] = payload
+        if (
+            generated_payloads[str(dist_info / "INSTALLER")] != b"uv"
+            or generated_payloads[str(dist_info / "REQUESTED")] != b""
+        ):
+            raise SystemExit("installed candidate generated ownership metadata is invalid")
+        for name in (
+            str(dist_info / "direct_url.json"),
+            *(sorted(optional_generated & installed_names)),
+        ):
+            try:
+                document = json.loads(generated_payloads[name])
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise SystemExit("installed candidate generated JSON is invalid") from error
+            if not isinstance(document, dict):
+                raise SystemExit("installed candidate generated JSON must contain an object")
 
         total = 0
         for name in names:
