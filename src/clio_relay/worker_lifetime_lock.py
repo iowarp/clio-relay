@@ -186,6 +186,7 @@ def _pin_locked_core_directory(
         return None, None
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd: int | None = None
     try:
         directory_fd = os.open(root, flags)
         os.set_inheritable(directory_fd, False)
@@ -221,7 +222,7 @@ def _pin_locked_core_directory(
                 return directory_fd, candidate
         raise ConfigurationError("POSIX migration requires a descriptor filesystem alias")
     except BaseException:
-        if "directory_fd" in locals():
+        if directory_fd is not None:
             with suppress(OSError):
                 os.close(directory_fd)
         raise

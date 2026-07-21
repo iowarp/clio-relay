@@ -391,6 +391,11 @@ class _CleanupEvidenceLock:
     windows_parent: _WindowsPinnedDirectory | None = None
 
 
+def _optional_runtime_descriptor(descriptor: int | None) -> int | None:
+    """Preserve an OS-selected descriptor as optional across nested helpers."""
+    return descriptor
+
+
 def _windows_parent_guard_names(
     guard: tuple[Path, ctypes.c_void_p] | None,
 ) -> frozenset[str]:
@@ -471,6 +476,8 @@ def _open_windows_pinned_directory(
 
 def _verify_windows_pinned_directory(anchor: _WindowsPinnedDirectory) -> None:
     """Revalidate the named directory while its no-delete-share handle remains open."""
+    if os.name != "nt":  # pragma: no cover - platform contract
+        raise RelayError("Windows directory verification is unavailable")
     storage_path = internal_filesystem_path(anchor.path, force_extended=True)
     observed = os.stat(storage_path, follow_symlinks=False)
     if not os.path.samestat(anchor.status, observed):
@@ -487,6 +494,8 @@ def _close_windows_pinned_directory(anchor: _WindowsPinnedDirectory | None) -> N
     """Close one Windows directory anchor."""
     if anchor is None:
         return
+    if os.name != "nt":  # pragma: no cover - platform contract
+        raise RelayError("Windows directory handles cannot be closed on this platform")
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     close_handle = kernel32.CloseHandle
     close_handle.argtypes = [ctypes.c_void_p]
@@ -504,6 +513,8 @@ def _windows_cleanup_file_information(
     *,
     path: Path,
 ) -> _WindowsCleanupFileInformation:
+    if os.name != "nt":  # pragma: no cover - platform contract
+        raise RelayError("Windows cleanup handles cannot be inspected on this platform")
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     get_information = kernel32.GetFileInformationByHandle
     get_information.argtypes = [
@@ -716,6 +727,8 @@ def _release_cleanup_evidence_lock(lock: _CleanupEvidenceLock | None) -> None:
         except BaseException as exc:  # pragma: no cover - OS release failure
             release_error = release_error or exc
     if lock.windows_handle is not None:
+        if os.name != "nt":  # pragma: no cover - corrupt cross-platform state
+            raise RelayError("Windows cleanup evidence handle exists on a non-Windows platform")
         close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
         close_handle.argtypes = [ctypes.c_void_p]
         close_handle.restype = ctypes.c_int
@@ -4279,6 +4292,8 @@ def _persist_local_cleanup_report_artifact(
                     release_private_configuration_windows_parent_guard(directory_windows_guard)
             raise
 
+    parent_fd = _optional_runtime_descriptor(parent_fd)
+    directory_fd = _optional_runtime_descriptor(directory_fd)
     ignored_internal_names = _windows_parent_guard_names(directory_windows_guard)
 
     def verify_directory() -> None:
