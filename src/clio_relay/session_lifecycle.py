@@ -18,7 +18,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -3748,6 +3748,29 @@ def _wait_for_api_ready(
     )
 
 
+def _owned_api_startup_log_detail(
+    transaction: _OwnedSessionTransaction,
+    *,
+    secret_values: Iterable[str],
+) -> str:
+    """Return one bounded credential-redacted API startup diagnostic."""
+    try:
+        payload = transaction.read_bytes(
+            "api.log",
+            maximum_bytes=_MAX_SESSION_START_ERROR_CHARS,
+            required=False,
+        )
+    except RelayError:
+        return ""
+    if not payload:
+        return ""
+    detail = payload.decode("utf-8", errors="replace").strip()
+    for value in secret_values:
+        if len(value) >= 4:
+            detail = detail.replace(value, "<redacted>")
+    return detail[-_MAX_SESSION_START_ERROR_CHARS:]
+
+
 def _wait_for_api_startup_receipt(
     *,
     transaction: _OwnedSessionTransaction,
@@ -4982,6 +5005,7 @@ def execute_owned_session_start(
         log_descriptor = transaction.open_output("api.log")
         process: subprocess.Popen[Any] | None = None
         metadata_committed = False
+        child_environment: dict[str, str] = {}
         try:
             from clio_relay.process_containment import (
                 broker_child_environment_payload,
@@ -5182,6 +5206,10 @@ def execute_owned_session_start(
             ]
         except BaseException as exc:
             if not metadata_committed:
+                startup_detail = _owned_api_startup_log_detail(
+                    transaction,
+                    secret_values=child_environment.values(),
+                )
                 try:
                     if attempt_identity.get("start_phase") == "contained":
                         _terminate_recorded_session_scope(
@@ -5209,6 +5237,8 @@ def execute_owned_session_start(
                     cleanup_detail = f"{exc}; cleanup failed: {cleanup_error}"
                 else:
                     cleanup_detail = str(exc)
+                if startup_detail:
+                    cleanup_detail = f"{cleanup_detail}; api_log={startup_detail}"
                 with suppress(RelayError):
                     _write_session_attempt(
                         transaction,
