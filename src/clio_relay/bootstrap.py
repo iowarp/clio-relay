@@ -80,6 +80,30 @@ BOOTSTRAP_REMOTE_SCRIPT_TIMEOUT_SECONDS = 1800.0
 BOOTSTRAP_PUBLIC_EXACT_DEADLINE_SECONDS = 29.0
 BOOTSTRAP_PUBLIC_REPAIR_DEADLINE_SECONDS = 58.0
 
+_BOOTSTRAP_CANDIDATE_PACKAGE_OVERLAY = (
+    b"\nfrom pkgutil import extend_path\n\n__path__ = extend_path(__path__, __name__)\n"
+)
+_BOOTSTRAP_CANDIDATE_SOURCE_NAMES = (
+    "bootstrap_reconcile.py",
+    "bounded_process.py",
+    "errors.py",
+    "process_containment.py",
+    "safe_archive.py",
+)
+
+
+def _bootstrap_candidate_package_sources() -> dict[str, bytes]:
+    """Return the exact sources overlaid during candidate reconciliation."""
+    package_root = Path(__file__).parent
+    sources = {
+        "__init__.py": (package_root / "__init__.py").read_bytes()
+        + _BOOTSTRAP_CANDIDATE_PACKAGE_OVERLAY
+    }
+    for name in _BOOTSTRAP_CANDIDATE_SOURCE_NAMES:
+        sources[name] = (package_root / name).read_bytes()
+    return sources
+
+
 _WORKER_WRITER_PROOF_PYTHON = r'''from __future__ import annotations
 
 import errno
@@ -2018,6 +2042,9 @@ import sys
 from pathlib import Path
 
 path, action, *arguments = sys.argv[1:]
+candidate_root = os.environ["BOOTSTRAP_CANDIDATE_PYTHON_ROOT"]
+if not sys.path or sys.path[0] != candidate_root:
+    sys.path.insert(0, candidate_root)
 name = "clio_relay.bootstrap_reconcile_candidate_action"
 spec = importlib.util.spec_from_file_location(name, path)
 if spec is None or spec.loader is None:
@@ -3454,19 +3481,24 @@ def render_linux_user_bootstrap_script(
     rendered_desired_state = shlex.quote(
         json.dumps(desired_state.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
     )
-    candidate_reconcile_source = Path(__file__).with_name("bootstrap_reconcile.py").read_bytes()
-    rendered_candidate_reconcile_source = base64.b64encode(candidate_reconcile_source).decode(
-        "ascii"
+    candidate_package_sources = _bootstrap_candidate_package_sources()
+    rendered_candidate_package_sources = json.dumps(
+        {
+            name: base64.b64encode(payload).decode("ascii")
+            for name, payload in sorted(candidate_package_sources.items())
+        },
+        sort_keys=True,
+        separators=(",", ":"),
     )
-    candidate_reconcile_sha256 = hashlib.sha256(candidate_reconcile_source).hexdigest()
-    candidate_safe_archive_source = Path(__file__).with_name("safe_archive.py").read_bytes()
-    rendered_candidate_safe_archive_source = base64.b64encode(candidate_safe_archive_source).decode(
-        "ascii"
-    )
-    candidate_safe_archive_sha256 = hashlib.sha256(candidate_safe_archive_source).hexdigest()
-    candidate_errors_source = Path(__file__).with_name("errors.py").read_bytes()
-    rendered_candidate_errors_source = base64.b64encode(candidate_errors_source).decode("ascii")
-    candidate_errors_sha256 = hashlib.sha256(candidate_errors_source).hexdigest()
+    candidate_package_sha256 = {
+        name: hashlib.sha256(payload).hexdigest()
+        for name, payload in candidate_package_sources.items()
+    }
+    candidate_reconcile_sha256 = candidate_package_sha256["bootstrap_reconcile.py"]
+    candidate_bounded_process_sha256 = candidate_package_sha256["bounded_process.py"]
+    candidate_errors_sha256 = candidate_package_sha256["errors.py"]
+    candidate_process_containment_sha256 = candidate_package_sha256["process_containment.py"]
+    candidate_safe_archive_sha256 = candidate_package_sha256["safe_archive.py"]
     bootstrap_journal_source = Path(__file__).with_name("bootstrap_journal.py").read_bytes()
     rendered_bootstrap_journal_source = base64.b64encode(bootstrap_journal_source).decode("ascii")
     relay_only_reconcile = _relay_only_reconcile_script(
@@ -4002,32 +4034,6 @@ fi
 {relay_only_reconcile}
 BOOTSTRAP_PREPARING_ROOT="$HOME/.local/share/clio-relay/preparing/{invocation_id}"
 mkdir -p "$BOOTSTRAP_PREPARING_ROOT"
-BOOTSTRAP_CANDIDATE_RECONCILE="$BOOTSTRAP_PREPARING_ROOT/bootstrap_reconcile.py"
-if [ -L "$BOOTSTRAP_CANDIDATE_RECONCILE" ]; then
-  echo "bootstrap candidate reconciler must not be a symbolic link" >&2
-  exit 1
-fi
-if [ ! -f "$BOOTSTRAP_CANDIDATE_RECONCILE" ]; then
-  python3 - "$BOOTSTRAP_CANDIDATE_RECONCILE" <<'__CLIO_RELAY_CANDIDATE_RECONCILE__'
-import base64
-import os
-import sys
-from pathlib import Path
-
-destination = Path(sys.argv[1])
-payload = base64.b64decode(
-    "{rendered_candidate_reconcile_source}",
-    validate=True,
-)
-with destination.open("xb") as stream:
-    stream.write(payload)
-    stream.flush()
-    os.fsync(stream.fileno())
-os.chmod(destination, 0o600)
-__CLIO_RELAY_CANDIDATE_RECONCILE__
-fi
-echo "{candidate_reconcile_sha256} *$BOOTSTRAP_CANDIDATE_RECONCILE" | \
-  sha256sum --check --strict -
 BOOTSTRAP_CANDIDATE_PYTHON_ROOT="$BOOTSTRAP_PREPARING_ROOT/candidate-python"
 BOOTSTRAP_CANDIDATE_PACKAGE="$BOOTSTRAP_CANDIDATE_PYTHON_ROOT/clio_relay"
 if [ -L "$BOOTSTRAP_CANDIDATE_PYTHON_ROOT" ] || \
@@ -4036,27 +4042,26 @@ if [ -L "$BOOTSTRAP_CANDIDATE_PYTHON_ROOT" ] || \
   exit 1
 fi
 mkdir -m 0700 -p "$BOOTSTRAP_CANDIDATE_PACKAGE"
-python3 - "$BOOTSTRAP_CANDIDATE_PACKAGE" <<'__CLIO_RELAY_CANDIDATE_SAFE_ARCHIVE__'
+python3 - "$BOOTSTRAP_CANDIDATE_PACKAGE" <<'__CLIO_RELAY_CANDIDATE_PACKAGE__'
 import base64
 import hashlib
+import json
 import os
 import sys
 from pathlib import Path
 
 destination = Path(sys.argv[1])
+encoded_sources = json.loads(r'''{rendered_candidate_package_sources}''')
+if not isinstance(encoded_sources, dict):
+    raise SystemExit("bootstrap candidate source manifest is invalid")
 sources = {{
-    "__init__.py": b"# Bootstrap candidate package.\\n",
-    "errors.py": base64.b64decode(
-        "{rendered_candidate_errors_source}",
-        validate=True,
-    ),
-    "safe_archive.py": base64.b64decode(
-        "{rendered_candidate_safe_archive_source}",
-        validate=True,
-    ),
+    name: base64.b64decode(encoded, validate=True)
+    for name, encoded in encoded_sources.items()
 }}
 for name, payload in sources.items():
     path = destination / name
+    if path.is_symlink():
+        raise SystemExit(f"bootstrap candidate source must not be a symbolic link: {{name}}")
     try:
         observed = path.read_bytes()
     except FileNotFoundError:
@@ -4069,12 +4074,20 @@ for name, payload in sources.items():
     if observed != payload:
         raise SystemExit(f"bootstrap candidate source identity changed: {{name}}")
     print(f"bootstrap_candidate_source={{name}}:{{hashlib.sha256(observed).hexdigest()}}")
-__CLIO_RELAY_CANDIDATE_SAFE_ARCHIVE__
+__CLIO_RELAY_CANDIDATE_PACKAGE__
+BOOTSTRAP_CANDIDATE_RECONCILE="$BOOTSTRAP_CANDIDATE_PACKAGE/bootstrap_reconcile.py"
+BOOTSTRAP_CANDIDATE_PROCESS_CONTAINMENT="$BOOTSTRAP_CANDIDATE_PACKAGE/process_containment.py"
+echo "{candidate_reconcile_sha256} *$BOOTSTRAP_CANDIDATE_RECONCILE" | \
+  sha256sum --check --strict -
+echo "{candidate_bounded_process_sha256} *$BOOTSTRAP_CANDIDATE_PACKAGE/bounded_process.py" | \
+  sha256sum --check --strict -
 echo "{candidate_errors_sha256} *$BOOTSTRAP_CANDIDATE_PACKAGE/errors.py" | \
+  sha256sum --check --strict -
+echo "{candidate_process_containment_sha256} *$BOOTSTRAP_CANDIDATE_PROCESS_CONTAINMENT" | \
   sha256sum --check --strict -
 echo "{candidate_safe_archive_sha256} *$BOOTSTRAP_CANDIDATE_PACKAGE/safe_archive.py" | \
   sha256sum --check --strict -
-export BOOTSTRAP_CANDIDATE_PYTHON_ROOT
+export BOOTSTRAP_CANDIDATE_PYTHON_ROOT BOOTSTRAP_CANDIDATE_RECONCILE
 bootstrap_safe_extract() {{
   local provider="$1"
   local archive="$2"
@@ -4136,6 +4149,9 @@ import os
 import sys
 
 path = os.environ["BOOTSTRAP_CANDIDATE_RECONCILE"]
+candidate_root = os.environ["BOOTSTRAP_CANDIDATE_PYTHON_ROOT"]
+if not sys.path or sys.path[0] != candidate_root:
+    sys.path.insert(0, candidate_root)
 name = "clio_relay.bootstrap_reconcile_candidate"
 spec = importlib.util.spec_from_file_location(name, path)
 if spec is None or spec.loader is None:
