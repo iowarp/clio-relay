@@ -894,7 +894,15 @@ def test_worker_runtime_info_reads_only_the_sealed_fresh_endpoint_index(
     from clio_relay.models import EndpointRegistration, EndpointRole
 
     root = tmp_path / "core"
-    identity: dict[str, object] = {"distribution_version": "test"}
+    wheel = tmp_path / "clio_relay-1.0.0-py3-none-any.whl"
+    wheel.write_bytes(b"worker-index-candidate-wheel")
+    receipt_path = tmp_path / "worker-index-receipt.json"
+    write_install_receipt(
+        install_spec=str(wheel),
+        artifact_path=wheel,
+        path=receipt_path,
+    )
+    identity = installation_info(receipt_path)
     queue = ClioCoreQueue(root)
     endpoint = queue.register_endpoint(
         EndpointRegistration(
@@ -910,7 +918,11 @@ def test_worker_runtime_info_reads_only_the_sealed_fresh_endpoint_index(
         )
     )
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(root))
-    monkeypatch.setattr(installation_module, "installation_info", lambda: identity)
+
+    def current_installation() -> dict[str, object]:
+        return identity
+
+    monkeypatch.setattr(installation_module, "installation_info", current_installation)
 
     def worker_process_matches(_pid: int) -> bool:
         return True
