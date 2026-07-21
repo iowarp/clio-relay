@@ -1134,6 +1134,17 @@ def test_executor_replaces_exact_legacy_old_release_session(
 
     monkeypatch.setattr(session_lifecycle, "inspect_owned_session_recovery_status", inspect)
     monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", _ignore_remote_port)
+    base_interpreter = tmp_path / "uv-python" / "python3.12"
+    base_interpreter.parent.mkdir(parents=True)
+    base_interpreter.write_bytes(b"test interpreter")
+    provider_interpreter = tmp_path / "uv-tools" / "clio-relay" / "bin" / "python"
+    provider_interpreter.parent.mkdir(parents=True)
+    if os.name == "nt":
+        provider_interpreter.write_bytes(base_interpreter.read_bytes())
+    else:
+        provider_interpreter.symlink_to(base_interpreter)
+        assert provider_interpreter.absolute() != provider_interpreter.resolve(strict=True)
+    monkeypatch.setattr(session_lifecycle.sys, "executable", str(provider_interpreter))
     containment_module = importlib.import_module("clio_relay.process_containment")
     monkeypatch.setattr(
         containment_module,
@@ -1141,7 +1152,10 @@ def test_executor_replaces_exact_legacy_old_release_session(
         _fixed_process_start_identity,
     )
 
-    def spawn(*_args: object, **kwargs: object) -> object:
+    launch_commands: list[list[str]] = []
+
+    def spawn(command: list[str], **kwargs: object) -> object:
+        launch_commands.append(command)
         containment = {
             "mode": "linux_systemd_scope",
             "enforceable": True,
@@ -1195,6 +1209,7 @@ def test_executor_replaces_exact_legacy_old_release_session(
     assert committed is not None
     assert committed["api_release_identity_sha256"] == current_release.sha256()
     assert committed["api_pid"] == 7001
+    assert launch_commands[0][0] == str(provider_interpreter.absolute())
     assert f"start_operation_id={request.start_operation_id}" in lines
     assert f"remote_api_port={request.remote_api_port}" in lines
 

@@ -5005,7 +5005,7 @@ def execute_owned_session_start(
             environment = dict(os.environ)
             for name in child_environment:
                 environment.pop(name, None)
-            provider_interpreter = Path(sys.executable).resolve(strict=True)
+            provider_interpreter = Path(sys.executable).absolute()
             interpreter_identity = provider_interpreter.stat()
             command = [
                 str(provider_interpreter),
