@@ -14630,6 +14630,13 @@ def _run_jarvis_remote_contract_discovery(
             "tools/list",
             "--idempotency-key",
             idempotency_key,
+            "--timeout-seconds",
+            str(
+                min(
+                    MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS,
+                    max(1, math.ceil(wait_timeout_seconds)),
+                )
+            ),
         ]
         job_id = _last_nonempty_line(run_remote_clio(definition, remote_args))
         terminal = _json_output(

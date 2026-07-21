@@ -65,7 +65,7 @@ if TYPE_CHECKING:
     from clio_relay.validation_report import LiveValidationReport, ValidationResource
 
 JSON = dict[str, Any]
-MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS = 60
+MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS = 600
 REMOTE_MCP_CACHE_ENV = "CLIO_RELAY_REMOTE_MCP_CACHE"
 REMOTE_MCP_CACHE_VERSION = 1
 REMOTE_MCP_CACHE_SOURCE = "durable_relay_mcp_tools_list"
