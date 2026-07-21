@@ -15,6 +15,7 @@ import sys
 import tarfile
 from contextlib import nullcontext
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 from typing import NoReturn, cast
 
@@ -1116,7 +1117,7 @@ with tempfile.TemporaryDirectory() as value:
             path=str(home / ".local/bin/jarvis"), kind="file_or_symlink"
         ),
         "managed_repo": BootstrapActivationPath(
-            path=str(home / ".local/share/clio-relay/managed-jarvis-repo"),
+            path=str(home / ".local/share/clio-relay/clio_relay"),
             kind="symlink",
         ),
     }
@@ -1170,7 +1171,7 @@ with tempfile.TemporaryDirectory() as value:
     (jarvis_root / "resource_graph.yaml").write_text(
         "storage:\n  nvme:\n    capacity: 100\n", encoding="utf-8"
     )
-    managed_repo = home / ".local/share/clio-relay/managed-jarvis-repo"
+    managed_repo = home / ".local/share/clio-relay/clio_relay"
     first_repository = reconcile_managed_jarvis_repository(
         repos_file,
         managed_repo,
@@ -1263,7 +1264,7 @@ with tempfile.TemporaryDirectory() as value:
     if first_repository["action"] != "updated" or second_repository["action"] != "reused":
         raise SystemExit("repository alias did not converge exactly once")
     canonical_managed = str(
-        canonical_home / ".local/share/clio-relay/managed-jarvis-repo"
+        canonical_home / ".local/share/clio-relay/clio_relay"
     )
     if yaml.safe_load(repos_file.read_text(encoding="utf-8"))["repos"] != [
         canonical_managed,
@@ -2082,7 +2083,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
         }
         for name, action in actions.items()
     }
-    managed_repo = "/home/operator/.local/share/clio-relay/managed-jarvis-repo"
+    managed_repo = "/home/operator/.local/share/clio-relay/clio_relay"
     repository_update: dict[str, object] = {
         "link_action": "created",
         "link": managed_repo,
@@ -2094,7 +2095,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
             "managed_repo": managed_repo,
             "added_managed_repos": [managed_repo],
             "removed_previous_managed_repos": [
-                "/home/operator/.local/src/clio-relay/jarvis-packages/clio_relay"
+                "/home/operator/.local/share/clio-relay/managed-jarvis-repo"
             ],
             "before_sha256": before.repos_sha256,
             "after_sha256": after.repos_sha256,
@@ -2461,6 +2462,126 @@ def test_release_identity_requires_exact_artifact_digest(tmp_path: Path) -> None
             relay_wheel=None,
             relay_artifact_sha256=None,
         )
+
+
+def test_retained_release_download_preserves_verified_wheel_filename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The fd-bound installer receives a canonical wheel filename, not a placeholder."""
+    wheel_payload = b"verified release wheel payload"
+    wheel_sha256 = hashlib.sha256(wheel_payload).hexdigest()
+    wheel_filename = f"clio_relay-{__version__}-py3-none-any.whl"
+    wheel_url = f"https://files.pythonhosted.org/packages/release/{wheel_filename}"
+    metadata = json.dumps(
+        {
+            "urls": [
+                {
+                    "filename": wheel_filename,
+                    "packagetype": "bdist_wheel",
+                    "digests": {"sha256": wheel_sha256},
+                    "url": wheel_url,
+                }
+            ]
+        }
+    ).encode()
+    script = bootstrap.render_linux_user_bootstrap_script(
+        cluster="cluster-a",
+        relay_install_spec=f"clio-relay=={__version__}",
+        relay_artifact_sha256=wheel_sha256,
+        source_archive_sha256="b" * 64,
+    )
+    marker = "<<'__CLIO_RELAY_CANDIDATE_PYPI_WHEEL__'\n"
+    program = script.split(marker, 1)[1].split("\n__CLIO_RELAY_CANDIDATE_PYPI_WHEEL__", 1)[0]
+    responses = iter((metadata, wheel_payload))
+    requested_urls: list[str] = []
+
+    def fake_urlopen(url: str, *, timeout: int) -> BytesIO:
+        requested_urls.append(url)
+        assert timeout in {30, 60}
+        return BytesIO(next(responses))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "candidate-wheel-download",
+            f"clio-relay=={__version__}",
+            wheel_sha256,
+            str(tmp_path),
+        ],
+    )
+
+    exec(compile(program, "<candidate-wheel-download>", "exec"), {"__name__": "__main__"})
+
+    destination = tmp_path / wheel_filename
+    assert capsys.readouterr().out.strip() == str(destination)
+    assert destination.read_bytes() == wheel_payload
+    assert "candidate-relay.whl" not in script
+    assert requested_urls == [
+        f"https://pypi.org/pypi/clio-relay/{__version__}/json",
+        wheel_url,
+    ]
+
+
+def test_retained_release_download_rejects_changed_url_basename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A digest-pinned metadata entry cannot rename the wheel at its download URL."""
+    wheel_payload = b"verified release wheel payload"
+    wheel_sha256 = hashlib.sha256(wheel_payload).hexdigest()
+    wheel_filename = f"clio_relay-{__version__}-py3-none-any.whl"
+    metadata = json.dumps(
+        {
+            "urls": [
+                {
+                    "filename": wheel_filename,
+                    "packagetype": "bdist_wheel",
+                    "digests": {"sha256": wheel_sha256},
+                    "url": "https://files.pythonhosted.org/packages/release/renamed.whl",
+                }
+            ]
+        }
+    ).encode()
+    script = bootstrap.render_linux_user_bootstrap_script(
+        cluster="cluster-a",
+        relay_install_spec=f"clio-relay=={__version__}",
+        relay_artifact_sha256=wheel_sha256,
+        source_archive_sha256="b" * 64,
+    )
+    marker = "<<'__CLIO_RELAY_CANDIDATE_PYPI_WHEEL__'\n"
+    program = script.split(marker, 1)[1].split("\n__CLIO_RELAY_CANDIDATE_PYPI_WHEEL__", 1)[0]
+
+    def fake_urlopen(url: str, *, timeout: int) -> BytesIO:
+        assert url == f"https://pypi.org/pypi/clio-relay/{__version__}/json"
+        assert timeout == 30
+        return BytesIO(metadata)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "candidate-wheel-download",
+            f"clio-relay=={__version__}",
+            wheel_sha256,
+            str(tmp_path),
+        ],
+    )
+
+    with pytest.raises(
+        SystemExit,
+        match="PyPI relay wheel URL does not preserve its verified filename",
+    ):
+        exec(
+            compile(program, "<candidate-wheel-download>", "exec"),
+            {"__name__": "__main__"},
+        )
+
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_same_release_version_with_different_wheels_has_different_identity(

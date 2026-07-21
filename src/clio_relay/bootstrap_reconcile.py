@@ -45,6 +45,8 @@ from clio_relay.worker_lifetime_lock import (
 BOOTSTRAP_DESIRED_STATE_SCHEMA = "clio-relay.bootstrap-desired-state.v1"
 BOOTSTRAP_RECEIPT_SCHEMA = "clio-relay.bootstrap-receipt.v2"
 BOOTSTRAP_TRANSACTION_SCHEMA = "clio-relay.bootstrap-transaction.v1"
+MANAGED_JARVIS_REPO_PATH = "~/.local/share/clio-relay/clio_relay"
+LEGACY_MANAGED_JARVIS_REPO_PATH = "~/.local/share/clio-relay/managed-jarvis-repo"
 MAX_JARVIS_CONFIG_BYTES = 1024 * 1024
 MAX_JARVIS_REPOS_BYTES = 4 * 1024 * 1024
 MAX_JARVIS_GRAPH_BYTES = 64 * 1024 * 1024
@@ -193,7 +195,7 @@ class BootstrapDesiredState(BaseModel):
     jarvis_config_dir: str = "~/.local/share/clio-relay/jarvis-config"
     jarvis_private_dir: str = "~/.local/share/clio-relay/jarvis-private"
     jarvis_shared_dir: str = "~/.local/share/clio-relay/jarvis-shared"
-    managed_jarvis_repo: str = "~/.local/share/clio-relay/managed-jarvis-repo"
+    managed_jarvis_repo: str = MANAGED_JARVIS_REPO_PATH
 
     @model_validator(mode="after")
     def validate_identity(self) -> BootstrapDesiredState:
@@ -1238,12 +1240,13 @@ def finish_staged_activation(
         raise ConfigurationError("prepared generation inspection did not bind its manifest")
     activation = reconcile_staged_activation_links(plan, generation=generation, home=home)
     lexical_home = Path(os.path.abspath((home or Path.home()).expanduser()))
-    managed_repo = lexical_home / ".local/share/clio-relay/managed-jarvis-repo"
+    managed_repo = _expand_home(desired.managed_jarvis_repo, lexical_home)
+    legacy_managed_repo = _expand_home(LEGACY_MANAGED_JARVIS_REPO_PATH, lexical_home)
     previous_repo = lexical_home / ".local/src/clio-relay/jarvis-packages/clio_relay"
     repositories = reconcile_managed_jarvis_repository(
         _expand_home(desired.jarvis_root, lexical_home) / "repos.yaml",
         managed_repo,
-        previous_managed_repos=(previous_repo,),
+        previous_managed_repos=(legacy_managed_repo, previous_repo),
         exchange_identity=desired.fingerprint,
     )
     expected_managed_target = (
@@ -1255,7 +1258,7 @@ def finish_staged_activation(
         label="relay-managed repository",
     )
     canonical_home = lexical_home.resolve(strict=True)
-    reported_managed_repo = canonical_home / ".local/share/clio-relay/managed-jarvis-repo"
+    reported_managed_repo = _expand_home(desired.managed_jarvis_repo, canonical_home)
     reported_managed_target = (
         canonical_home / ".local/share/clio-relay/current/source/jarvis-packages/clio_relay"
     )
@@ -2489,6 +2492,10 @@ def reconcile_managed_jarvis_repository(
     bootstrap lock; the final byte-and-file-identity comparison also detects
     non-cooperating writers before the atomic replacement.
     """
+    if managed_repo.name != "clio_relay":
+        raise ConfigurationError(
+            "relay-managed JARVIS repository basename must match its clio_relay namespace"
+        )
     lexical_managed = str(Path(os.path.abspath(managed_repo.expanduser())))
     managed = str(_canonical_path_preserving_final(managed_repo))
     managed_aliases = {lexical_managed, managed}
@@ -2707,16 +2714,17 @@ def repair_managed_jarvis_binding(
         exchange_identity=desired.fingerprint,
     )
     repos_file = _expand_home(desired.jarvis_root, lexical_home) / "repos.yaml"
+    legacy_managed_repo = _expand_home(LEGACY_MANAGED_JARVIS_REPO_PATH, lexical_home)
     repo_evidence = reconcile_managed_jarvis_repository(
         repos_file,
         managed,
-        previous_managed_repos=previous_managed_repos,
+        previous_managed_repos=(*previous_managed_repos, legacy_managed_repo),
         exchange_identity=desired.fingerprint,
     )
     canonical_home = lexical_home.resolve(strict=True)
     return {
         "link_action": link_action,
-        "link": str(canonical_home / ".local/share/clio-relay/managed-jarvis-repo"),
+        "link": str(_expand_home(desired.managed_jarvis_repo, canonical_home)),
         "target": str(
             canonical_home / ".local/share/clio-relay/current/source/jarvis-packages/clio_relay"
         ),
@@ -2850,7 +2858,7 @@ def _inspect_active_generation(
                 label=f"stable {executable} launcher",
             )
         _verify_stable_symlink(
-            home / ".local/share/clio-relay/managed-jarvis-repo",
+            _expand_home(desired.managed_jarvis_repo, home),
             expected=expected_target / "source/jarvis-packages/clio_relay",
             label="relay-managed JARVIS repository",
         )
@@ -3362,7 +3370,7 @@ def _capture_reconcile_activation_paths(
                 "active generation pointer does not name one managed generation"
             )
     managed = _capture_activation_path(
-        share / "managed-jarvis-repo",
+        _expand_home(MANAGED_JARVIS_REPO_PATH, lexical_home),
         kind="symlink",
         maximum=4096,
         allow_absent=True,
@@ -3644,7 +3652,7 @@ def reconcile_staged_activation_links(
         "install_receipt": lexical_home / ".local/share/clio-relay/install-receipt.json",
         "relay_launcher": lexical_home / ".local/bin/clio-relay",
         "jarvis_launcher": lexical_home / ".local/bin/jarvis",
-        "managed_repo": lexical_home / ".local/share/clio-relay/managed-jarvis-repo",
+        "managed_repo": _expand_home(MANAGED_JARVIS_REPO_PATH, lexical_home),
     }.items():
         if Path(plan.activation_paths[name].path) != target_path:
             raise ConfigurationError(f"staged activation path destination changed: {name}")
