@@ -547,6 +547,21 @@ class ClioCoreQueue:
         )
         self._initialized = False
         self._migration_lifetime_guarded = False
+        self._locked_storage_root_descriptor: int | None = None
+        self._locked_storage_root_identity: tuple[int, int] | None = None
+
+    def _storage_root_stat(self) -> os.stat_result:
+        """Inspect the queue root through its held descriptor when migration-pinned."""
+        descriptor = self._locked_storage_root_descriptor
+        if descriptor is None:
+            return os.lstat(self._storage_root)
+        try:
+            details = os.fstat(descriptor)
+        except OSError as exc:
+            raise ConfigurationError("migration queue-root descriptor is unavailable") from exc
+        if (details.st_dev, details.st_ino) != self._locked_storage_root_identity:
+            raise ConfigurationError("migration queue-root descriptor identity changed")
+        return details
 
     def _legacy_record_audit_marker_path(self) -> Path:
         return self._storage_root / "migrations" / "legacy-record-audit-v1.json"
@@ -554,11 +569,11 @@ class ClioCoreQueue:
     def _prepare_queue_root_for_lock(self) -> None:
         """Create only a missing queue root and reject an unsafe lock path."""
         try:
-            root_stat = os.lstat(self._storage_root)
+            root_stat = self._storage_root_stat()
         except FileNotFoundError:
             try:
                 ensure_private_configuration_directory(self._storage_root)
-                root_stat = os.lstat(self._storage_root)
+                root_stat = self._storage_root_stat()
             except OSError as error:
                 raise LegacyQueueStateError(
                     family="root",
@@ -620,7 +635,7 @@ class ClioCoreQueue:
     def _require_indexed_queue_layout(self) -> None:
         """Validate the fixed queue layout without enumerating record history."""
         try:
-            root_stat = os.lstat(self._storage_root)
+            root_stat = self._storage_root_stat()
         except OSError as error:
             raise LegacyQueueStateError(
                 family="root",
@@ -977,7 +992,7 @@ class ClioCoreQueue:
     def _audit_legacy_state_before_initialization(self) -> _LegacyOutputAudit:
         """Refuse unsafe v0.9 canonical state before creating or changing files."""
         try:
-            root_stat = os.lstat(self._storage_root)
+            root_stat = self._storage_root_stat()
         except FileNotFoundError:
             return _LegacyOutputAudit(
                 marker_complete=False,
@@ -2406,14 +2421,17 @@ class ClioCoreQueue:
                             exist_ok=True,
                         )
                     for family in _GLOBAL_ORDER_FAMILIES:
-                        (self._storage_root / "global_order" / family / "by_id").mkdir(
+                        family_root = self._storage_root / "global_order" / family
+                        family_root.mkdir(
                             mode=0o700,
-                            parents=True,
                             exist_ok=True,
                         )
-                        (self._storage_root / "global_order" / family / "entries").mkdir(
+                        (family_root / "by_id").mkdir(
                             mode=0o700,
-                            parents=True,
+                            exist_ok=True,
+                        )
+                        (family_root / "entries").mkdir(
+                            mode=0o700,
                             exist_ok=True,
                         )
                 else:
@@ -2566,6 +2584,8 @@ class ClioCoreQueue:
         original_root = self.root
         original_storage_root = self._storage_root
         original_lock = self._lock
+        original_storage_root_descriptor = self._locked_storage_root_descriptor
+        original_storage_root_identity = self._locked_storage_root_identity
         try:
             queue_root_before = os.stat(original_storage_root)
         except OSError as exc:
@@ -2583,6 +2603,8 @@ class ClioCoreQueue:
             locked_core.filesystem_root,
             force_extended=True,
         )
+        self._locked_storage_root_descriptor = locked_core.filesystem_root_descriptor
+        self._locked_storage_root_identity = expected_identity
         self._lock = _FairBoundedFileLock(
             str(self._storage_root / ".lock"),
             timeout=self._lock_timeout_seconds,
@@ -2596,6 +2618,8 @@ class ClioCoreQueue:
             self.root = original_root
             self._storage_root = original_storage_root
             self._lock = original_lock
+            self._locked_storage_root_descriptor = original_storage_root_descriptor
+            self._locked_storage_root_identity = original_storage_root_identity
             try:
                 queue_root_after = os.stat(original_storage_root)
             except OSError as exc:
@@ -2607,37 +2631,62 @@ class ClioCoreQueue:
         """Privatize only fixed, owned queue directories under exclusive ownership."""
         if os.name == "nt":
             return
-        paths = [self._storage_root]
-        paths.extend(self._storage_root / family for family in _INITIALIZED_QUEUE_FAMILIES)
-        paths.extend(
-            self._storage_root / "global_order" / family / child
+        root_descriptor = self._locked_storage_root_descriptor
+        if root_descriptor is None:
+            raise ConfigurationError("locked queue permission repair has no pinned root descriptor")
+        relative_paths = [Path()]
+        relative_paths.extend(Path(family) for family in _INITIALIZED_QUEUE_FAMILIES)
+        relative_paths.extend(Path("global_order") / family for family in _GLOBAL_ORDER_FAMILIES)
+        relative_paths.extend(
+            Path("global_order") / family / child
             for family in _GLOBAL_ORDER_FAMILIES
             for child in ("by_id", "entries")
         )
         getuid = getattr(os, "getuid", None)
         current_uid = getuid() if callable(getuid) else None
-        for path in paths:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        for relative_path in relative_paths:
+            descriptor = os.dup(root_descriptor)
             try:
-                details = os.lstat(path)
-            except FileNotFoundError:
-                continue
+                os.set_inheritable(descriptor, False)
+                missing = False
+                for component in relative_path.parts:
+                    try:
+                        child_descriptor = os.open(component, flags, dir_fd=descriptor)
+                    except FileNotFoundError:
+                        missing = True
+                        break
+                    try:
+                        os.set_inheritable(child_descriptor, False)
+                    except BaseException:
+                        with suppress(OSError):
+                            os.close(child_descriptor)
+                        raise
+                    os.close(descriptor)
+                    descriptor = child_descriptor
+                if missing:
+                    continue
+                details = os.fstat(descriptor)
+                if (
+                    not stat.S_ISDIR(details.st_mode)
+                    or _record_is_reparse(details)
+                    or (current_uid is not None and details.st_uid != current_uid)
+                ):
+                    raise ConfigurationError(
+                        "queue directory cannot be safely privatized: "
+                        f"{self._storage_root / relative_path}"
+                    )
+                if stat.S_IMODE(details.st_mode) != 0o700:
+                    os.fchmod(descriptor, 0o700)
             except OSError as exc:
                 raise ConfigurationError(
-                    f"queue directory protections cannot be inspected: {path}: {exc}"
+                    "queue directory protections cannot be repaired through the pinned root: "
+                    f"{self._storage_root / relative_path}: {exc}"
                 ) from exc
-            if (
-                not stat.S_ISDIR(details.st_mode)
-                or _record_is_reparse(details)
-                or (current_uid is not None and details.st_uid != current_uid)
-            ):
-                raise ConfigurationError(f"queue directory cannot be safely privatized: {path}")
-            if stat.S_IMODE(details.st_mode) != 0o700:
-                try:
-                    os.chmod(path, 0o700, follow_symlinks=False)
-                except OSError as exc:
-                    raise ConfigurationError(
-                        f"queue directory could not be privatized: {path}: {exc}"
-                    ) from exc
+            finally:
+                with suppress(OSError):
+                    os.close(descriptor)
 
     def reconcile_pending_transitions(self) -> None:
         """Replay bounded write-ahead transitions left by another process."""
@@ -4913,7 +4962,7 @@ class ClioCoreQueue:
         }:
             raise QueueConflictError(f"unsupported lease index directory: {directory}")
         try:
-            root_stat = os.lstat(self._storage_root)
+            root_stat = self._storage_root_stat()
         except FileNotFoundError as exc:
             raise QueueConflictError(f"queue root is missing: {self.root}") from exc
         if not stat.S_ISDIR(root_stat.st_mode) or _record_is_reparse(root_stat):

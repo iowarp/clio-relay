@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import sys
 import time
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from io import StringIO
 from pathlib import Path
 from typing import Any, Literal
@@ -814,3 +815,91 @@ def test_locked_initialization_never_writes_replacement_root_after_path_swap(
         assert not (displaced_core / "migrations").exists()
     else:
         assert (displaced_core / "migrations").is_dir()
+
+
+def test_locked_initialization_accepts_its_kernel_descriptor_alias(tmp_path: Path) -> None:
+    """A kernel fd alias is authenticated by fstat, never rejected as a user symlink."""
+    if os.name != "posix":
+        return
+    core_dir = tmp_path / "core"
+    core_dir.mkdir(mode=0o755)
+
+    with exclusive_migration_lifetime(core_dir) as locked_core:
+        descriptor = locked_core.filesystem_root_descriptor
+        assert descriptor is not None
+        assert locked_core.filesystem_root in {
+            Path("/proc/self/fd") / str(descriptor),
+            Path("/dev/fd") / str(descriptor),
+        }
+        ClioCoreQueue(core_dir).initialize(locked_core=locked_core)
+
+    assert stat.S_IMODE(core_dir.stat().st_mode) == 0o700
+    assert (core_dir / "migrations" / "legacy-record-audit-v1.json").is_file()
+    for family in ("endpoints", "jobs", "gateway_sessions", "monitor_rules"):
+        assert stat.S_IMODE((core_dir / "global_order" / family).stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize(
+    "relative_link",
+    (Path("jobs"), Path("global_order") / "endpoints"),
+)
+def test_locked_permission_repair_rejects_links_below_pinned_root(
+    tmp_path: Path,
+    relative_link: Path,
+) -> None:
+    """Every repaired child is opened relative to the root fd with no link following."""
+    if os.name != "posix":
+        return
+    core_dir = tmp_path / "core"
+    core_dir.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    link = core_dir / relative_link
+    link.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    link.symlink_to(outside, target_is_directory=True)
+
+    with (
+        exclusive_migration_lifetime(core_dir) as locked_core,
+        pytest.raises(
+            ConfigurationError,
+            match="queue directory protections cannot be repaired through the pinned root",
+        ),
+    ):
+        ClioCoreQueue(core_dir).initialize(locked_core=locked_core)
+
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize("failure_mode", ["closed", "reused"])
+def test_locked_core_descriptor_failure_is_fail_closed(
+    tmp_path: Path,
+    failure_mode: str,
+) -> None:
+    """A closed or reused borrowed root descriptor cannot authorize queue I/O."""
+    if os.name != "posix":
+        return
+    core_dir = tmp_path / "core"
+    core_dir.mkdir(mode=0o700)
+    other_dir = tmp_path / "other"
+    other_dir.mkdir(mode=0o700)
+
+    with exclusive_migration_lifetime(core_dir) as locked_core:
+        descriptor = locked_core.filesystem_root_descriptor
+        assert descriptor is not None
+        os.close(descriptor)
+        replacement: int | None = None
+        try:
+            if failure_mode == "reused":
+                flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                replacement = os.open(other_dir, flags)
+                if replacement != descriptor:
+                    os.dup2(replacement, descriptor)
+            message = "identity changed" if failure_mode == "reused" else "unavailable"
+            with pytest.raises(ConfigurationError, match=message):
+                _ = locked_core.filesystem_root_descriptor
+        finally:
+            if replacement is not None and replacement != descriptor:
+                os.close(replacement)
+            with suppress(OSError):
+                os.close(descriptor)

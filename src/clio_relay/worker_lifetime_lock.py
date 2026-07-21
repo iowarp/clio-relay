@@ -133,6 +133,21 @@ class LockedCoreIdentity:
             raise ConfigurationError("migration pinned-core descriptor identity changed")
         return pinned_root
 
+    @property
+    def filesystem_root_descriptor(self) -> int | None:
+        """Return the borrowed descriptor that pins authorized POSIX root I/O."""
+        self.require_active()
+        descriptor = self._directory_fd
+        if descriptor is None:
+            return None
+        try:
+            descriptor_stat = os.fstat(descriptor)
+        except OSError as exc:
+            raise ConfigurationError("migration pinned-core descriptor is unavailable") from exc
+        if (descriptor_stat.st_dev, descriptor_stat.st_ino) != (self.device, self.inode):
+            raise ConfigurationError("migration pinned-core descriptor identity changed")
+        return descriptor
+
 
 def require_active_locked_core(identity: LockedCoreIdentity) -> None:
     """Reject forged or out-of-scope migration lock identities."""
