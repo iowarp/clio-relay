@@ -776,7 +776,7 @@ def test_managed_repo_atomic_exchange_preserves_or_recovers_racing_state(
     repos_file.write_text("repos:\n  - /operator/original\n", encoding="utf-8")
     operator_update = b"repos:\n  - /operator/concurrent\n"
     managed = tmp_path / "managed-jarvis-repo"
-    original_exchange = bootstrap_reconcile_module._atomic_exchange_paths  # noqa: SLF001
+    original_exchange = bootstrap_reconcile_module._atomic_exchange_paths  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     exchanged = False
 
     def raced_exchange(left: Path, right: Path) -> None:
@@ -852,7 +852,7 @@ def test_stable_link_atomic_exchange_preserves_or_recovers_racing_state(
     target.write_bytes(b"new")
     target.chmod(0o755)
     operator_update = b"operator-concurrent"
-    original_exchange = bootstrap_reconcile_module._atomic_exchange_paths  # noqa: SLF001
+    original_exchange = bootstrap_reconcile_module._atomic_exchange_paths  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     simulated_links: dict[Path, Path] = {}
     if os.name == "nt":
         real_is_symlink = Path.is_symlink
@@ -877,7 +877,7 @@ def test_stable_link_atomic_exchange_preserves_or_recovers_racing_state(
             candidate = Path(path)
             if candidate in simulated_links:
                 return str(simulated_links[candidate])
-            return cast(str, real_readlink(path))
+            return real_readlink(path)
 
         def simulated_resolve(path: Path, strict: bool = False) -> Path:
             candidate = path
@@ -1058,7 +1058,7 @@ def test_staged_activation_adopts_legacy_paths_idempotently(
             candidate = Path(path)
             if candidate in simulated_links:
                 return str(simulated_links[candidate])
-            return cast(str, original_readlink(path))
+            return original_readlink(path)
 
         def simulated_replace(source: Path | str, destination: Path | str) -> None:
             source_path = Path(source)
@@ -1349,7 +1349,7 @@ def test_staged_activation_resumes_across_repository_crash_boundaries(
     def simulated_readlink(path: Path | str) -> str:
         if Path(path) == managed_repo:
             return str(managed_target)
-        return cast(str, original_readlink(path))
+        return original_readlink(path)
 
     monkeypatch.setattr(
         bootstrap_reconcile_module.os,
@@ -1459,7 +1459,7 @@ def test_managed_repo_repair_refuses_unproven_broken_link(
     def simulated_readlink(path: Path | str) -> str:
         if Path(path) == managed:
             return str(tmp_path / "attacker-controlled/missing")
-        return cast(str, original_readlink(path))
+        return original_readlink(path)
 
     monkeypatch.setattr(Path, "lstat", simulated_lstat)
     monkeypatch.setattr(Path, "resolve", simulated_resolve)
