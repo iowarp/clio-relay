@@ -13,7 +13,10 @@ import clio_relay.bootstrap_journal as journal_module
 from clio_relay.bootstrap_journal import (
     BootstrapJournalError,
     advance_journal,
+    copy_owned_file,
     create_journal,
+    create_owned_directory,
+    create_owned_symlink,
     discard_full_transaction,
     load_journal,
     record_owned_path,
@@ -474,3 +477,54 @@ def test_interrupted_discard_is_idempotently_resumed(
 
     assert recovered["state"] == "recovered"
     assert not target.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="owned path publication is POSIX-only")
+@pytest.mark.parametrize("kind", ("directory", "file", "symlink"))
+def test_owned_publication_never_claims_a_racing_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    """Exclusive creation detects a swap before its identity reaches the journal."""
+    target = tmp_path / ".local/share/clio-relay/owned"
+    journal_path = _reversible_owned_journal(tmp_path, target, kind=kind)
+    source = tmp_path / "source"
+    source.write_text("relay\n", encoding="utf-8")
+    displaced = target.with_name("relay-created-displaced")
+    original = journal_module._owned_identity_at
+    swapped = False
+
+    def swap_before_claim(
+        parent_descriptor: int,
+        name: str,
+        details: os.stat_result,
+        *,
+        display: Path,
+    ) -> dict[str, Any]:
+        nonlocal swapped
+        if display == target and not swapped:
+            target.rename(displaced)
+            if kind == "directory":
+                target.mkdir()
+                (target / "operator.txt").write_text("operator\n", encoding="utf-8")
+            elif kind == "file":
+                target.write_text("operator\n", encoding="utf-8")
+            else:
+                target.symlink_to(tmp_path / "operator-target")
+            swapped = True
+        return original(parent_descriptor, name, details, display=display)
+
+    monkeypatch.setattr(journal_module, "_owned_identity_at", swap_before_claim)
+
+    with pytest.raises(BootstrapJournalError, match="changed"):
+        if kind == "directory":
+            create_owned_directory(journal_path, "target")
+        elif kind == "file":
+            copy_owned_file(journal_path, "target", source, mode=0o600)
+        else:
+            create_owned_symlink(journal_path, "target", str(tmp_path / "relay-target"))
+
+    entry = load_journal(journal_path)["owned_paths"]["target"]
+    assert entry["identity"] is None
+    assert target.exists() or target.is_symlink()

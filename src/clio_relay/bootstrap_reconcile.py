@@ -18,7 +18,7 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal, cast
 from urllib.parse import unquote, urlsplit
 
@@ -107,6 +107,8 @@ class BootstrapDesiredState(BaseModel):
     jarvis_cd_version: str
     jarvis_cd_wheel_url: str
     jarvis_cd_wheel_sha256: str
+    jarvis_resource_graph_profile: str | None = None
+    allow_jarvis_resource_graph_build: bool = False
     clio_kit_install_spec: str
     clio_kit_version: str
     clio_kit_artifact_sha256: str
@@ -143,6 +145,19 @@ class BootstrapDesiredState(BaseModel):
             raise ValueError("an unmanaged bootstrap cannot name a worker service")
         if self.cluster is not None and not self.worker_service:
             raise ValueError("a managed cluster bootstrap must name its worker service")
+        profile = self.jarvis_resource_graph_profile
+        if profile is not None and (
+            not profile
+            or profile != profile.strip()
+            or len(profile) > 256
+            or profile in {".", ".."}
+            or "/" in profile
+            or "\\" in profile
+            or any(ord(character) < 32 or ord(character) == 127 for character in profile)
+        ):
+            raise ValueError("JARVIS resource graph profile must be one safe exact name")
+        if self.allow_jarvis_resource_graph_build and profile is None:
+            raise ValueError("JARVIS graph build fallback requires an exact requested profile")
         return self
 
     @property
@@ -200,7 +215,7 @@ class BootstrapReconcilePlan(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    mode: Literal["repair", "relay-only", "full"]
+    mode: Literal["repair", "relay-only", "component-upgrade", "full"]
     desired_fingerprint: str
     reasons: list[str] = Field(default_factory=list)
     component_actions: dict[str, Literal["reuse", "replace"]]
@@ -340,7 +355,7 @@ class BootstrapTransactionJournal(BaseModel):
     schema_version: Literal["clio-relay.bootstrap-transaction.v1"] = BOOTSTRAP_TRANSACTION_SCHEMA
     invocation_id: str
     desired_fingerprint: str
-    mode: Literal["repair", "relay-only", "full"] = "relay-only"
+    mode: Literal["repair", "relay-only", "component-upgrade", "full"] = "relay-only"
     state: BootstrapTransactionState = BootstrapTransactionState.LOCKED
     started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -408,7 +423,9 @@ class BootstrapTransactionJournal(BaseModel):
                 f"invalid bootstrap transaction transition: {self.state.value} -> {state.value}"
             )
         self.state = state
-        if state is BootstrapTransactionState.MIGRATION_STARTED:
+        if state is BootstrapTransactionState.MIGRATION_STARTED or (
+            state is BootstrapTransactionState.ACTIVATING and self.mode != "full"
+        ):
             self.irreversible_boundary = True
         self.updated_at = datetime.now(UTC)
 
@@ -913,6 +930,7 @@ def plan_bootstrap_reconcile(
     """
     resolved_home = (home or Path.home()).resolve()
     reasons: list[str] = []
+    upgrade_reasons: list[str] = []
     reusable_paths: dict[str, str] = {}
     receipt_path = resolved_home / ".local/share/clio-relay/install-receipt.json"
     try:
@@ -938,10 +956,24 @@ def plan_bootstrap_reconcile(
         "jarvis-cd": (desired.jarvis_cd_version, desired.jarvis_cd_wheel_sha256),
     }
     for component, (expected_version, expected_digest) in expected_components.items():
-        if components.get(component) != expected_version:
-            reasons.append(f"{component} version is not reusable")
-            continue
         raw_artifact = artifacts.get(component)
+        if isinstance(raw_artifact, dict):
+            artifact = cast(dict[str, object], raw_artifact)
+            raw_interpreters = artifact.get("runtime_interpreters")
+            raw_executables = artifact.get("runtime_executables")
+            if isinstance(raw_interpreters, dict):
+                for name, value in cast(dict[str, object], raw_interpreters).items():
+                    if isinstance(value, str) and value:
+                        reusable_paths[f"{component}_{name}_interpreter"] = value
+            if isinstance(raw_executables, dict):
+                for name, value in cast(dict[str, object], raw_executables).items():
+                    if isinstance(value, str) and value:
+                        reusable_paths[f"{component}_{name}_executable"] = value
+        if components.get(component) != expected_version:
+            reason = f"{component} version requires a staged upgrade"
+            reasons.append(reason)
+            upgrade_reasons.append(reason)
+            continue
         if not isinstance(raw_artifact, dict):
             reasons.append(f"{component} artifact identity is missing")
             continue
@@ -964,16 +996,6 @@ def plan_bootstrap_reconcile(
             reasons.append(f"{component} artifact did not reverify")
             continue
         reusable_paths[f"{component}_artifact"] = str(path)
-        raw_interpreters = artifact.get("runtime_interpreters")
-        raw_executables = artifact.get("runtime_executables")
-        if isinstance(raw_interpreters, dict):
-            for name, value in cast(dict[str, object], raw_interpreters).items():
-                if isinstance(value, str) and value:
-                    reusable_paths[f"{component}_{name}_interpreter"] = value
-        if isinstance(raw_executables, dict):
-            for name, value in cast(dict[str, object], raw_executables).items():
-                if isinstance(value, str) and value:
-                    reusable_paths[f"{component}_{name}_executable"] = value
     if components.get("jarvis-util") != desired.jarvis_util_commit:
         reasons.append("jarvis-util commit is not reusable")
     else:
@@ -1024,15 +1046,51 @@ def plan_bootstrap_reconcile(
         ) from exc
     if not jarvis_state.initialized:
         reasons.append("JARVIS is not initialized")
-    legacy_venv = resolved_home / ".local/share/clio-relay/jarvis-venv"
-    legacy_python = legacy_venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    if legacy_venv.is_symlink() or not legacy_python.is_file():
+    elif upgrade_reasons and not jarvis_state.managed_repo_registered:
+        reasons.append("JARVIS managed repository binding requires separate reconciliation")
+    legacy_python_text = reusable_paths.get("jarvis-cd_execution_interpreter")
+    legacy_executable_text = reusable_paths.get("jarvis-cd_jarvis_executable")
+    legacy_python = (
+        Path(legacy_python_text).expanduser()
+        if legacy_python_text is not None
+        else resolved_home
+        / ".local/share/clio-relay/jarvis-venv"
+        / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    )
+    legacy_executable = (
+        Path(legacy_executable_text).expanduser()
+        if legacy_executable_text is not None
+        else legacy_python.parent / ("jarvis.exe" if os.name == "nt" else "jarvis")
+    )
+    legacy_venv = legacy_python.parent.parent
+    if (
+        legacy_venv.is_symlink()
+        or not legacy_python.is_file()
+        or not legacy_executable.is_file()
+        or legacy_executable.parent != legacy_python.parent
+    ):
         reasons.append("legacy JARVIS execution environment is not reusable")
     else:
         reusable_paths["jarvis_execution_environment"] = str(legacy_venv.resolve())
         reusable_paths["jarvis_execution_python"] = str(legacy_python.resolve())
+        reusable_paths["jarvis_execution_executable"] = str(legacy_executable.resolve())
 
     if reasons:
+        if upgrade_reasons and reasons == upgrade_reasons:
+            return BootstrapReconcilePlan(
+                mode="component-upgrade",
+                desired_fingerprint=desired.fingerprint,
+                reasons=upgrade_reasons,
+                component_actions={
+                    "clio-relay": "replace",
+                    "jarvis-cd": "replace",
+                    "jarvis-util": "reuse",
+                    "clio-kit": "replace",
+                    "frp": "reuse",
+                    "uv": "reuse",
+                },
+                reusable_paths=reusable_paths,
+            )
         return BootstrapReconcilePlan(
             mode="full",
             desired_fingerprint=desired.fingerprint,
@@ -1198,6 +1256,84 @@ def _bounded_subprocess(command: list[str], *, maximum: int) -> str:
     return completed.stdout.strip()
 
 
+def validate_jarvis_builtin_result(
+    result: dict[str, object],
+    *,
+    requested_profile: str,
+) -> None:
+    """Validate the bounded JARVIS builtin resource-graph result contract."""
+    expected_fields = {
+        "schema_version",
+        "profile",
+        "action",
+        "available",
+        "source",
+        "source_sha256",
+        "catalog",
+    }
+    if set(result) != expected_fields:
+        raise ValueError("JARVIS builtin graph result has an unexpected shape")
+    if (
+        result.get("schema_version") != "jarvis.resource-graph-builtin.v1"
+        or result.get("profile") != requested_profile
+    ):
+        raise ValueError("JARVIS builtin graph result does not match the requested profile")
+    raw_catalog = result.get("catalog")
+    if not isinstance(raw_catalog, list):
+        raise ValueError("JARVIS builtin graph catalog is invalid")
+    catalog = cast(list[object], raw_catalog)
+    if len(catalog) > 128 or any(
+        not isinstance(profile, str)
+        or not profile
+        or len(profile) > 256
+        or profile != profile.strip()
+        or profile in {".", ".."}
+        or "/" in profile
+        or "\\" in profile
+        or any(ord(character) < 32 or ord(character) == 127 for character in profile)
+        for profile in catalog
+    ):
+        raise ValueError("JARVIS builtin graph catalog is invalid")
+    typed_catalog = cast(list[str], catalog)
+    if typed_catalog != sorted(set(typed_catalog)):
+        raise ValueError("JARVIS builtin graph catalog is invalid")
+    action = result.get("action")
+    available = result.get("available")
+    source = result.get("source")
+    source_sha256 = result.get("source_sha256")
+    if action == "loaded":
+        if (
+            available is not True
+            or not isinstance(source, str)
+            or not source
+            or len(source) > 4096
+            or not PurePosixPath(source).is_absolute()
+            or any(character in source for character in "\x00\r\n")
+            or not _is_sha256(source_sha256)
+            or requested_profile not in typed_catalog
+        ):
+            raise ValueError("loaded JARVIS builtin graph evidence is invalid")
+    elif action == "unavailable":
+        if (
+            available is not False
+            or source is not None
+            or source_sha256 is not None
+            or requested_profile in typed_catalog
+        ):
+            raise ValueError("unavailable JARVIS builtin graph evidence is invalid")
+    else:
+        raise ValueError("JARVIS builtin graph result has an invalid action")
+
+
+def _is_sha256(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 64
+        and value == value.lower()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def make_bootstrap_receipt(
     *,
     invocation_id: str,
@@ -1226,8 +1362,9 @@ def make_bootstrap_receipt(
     queue_duration_seconds: float = 0.0,
     jarvis_init_action: Literal["preserved", "initialized"] = "preserved",
     jarvis_init_duration_seconds: float = 0.0,
-    jarvis_graph_action: Literal["preserved", "built"] = "preserved",
+    jarvis_graph_action: Literal["preserved", "loaded", "built"] = "preserved",
     jarvis_graph_duration_seconds: float = 0.0,
+    jarvis_builtin_result: dict[str, object] | None = None,
     jarvis_commands: list[list[str]] | None = None,
     jarvis_state_before: JarvisStateEvidence | None = None,
     jarvis_repo_reconciliation: dict[str, object] | None = None,
@@ -1271,6 +1408,27 @@ def make_bootstrap_receipt(
     commands = jarvis_commands or []
     if any(not command or any(not value for value in command) for command in commands):
         raise ValueError("JARVIS command evidence must contain non-empty argument vectors")
+    if jarvis_graph_action == "preserved":
+        if jarvis_builtin_result is not None:
+            raise ValueError("a preserved JARVIS graph cannot claim builtin activation")
+    else:
+        if desired.jarvis_resource_graph_profile is None or jarvis_builtin_result is None:
+            raise ValueError("JARVIS graph activation requires exact builtin result evidence")
+        validate_jarvis_builtin_result(
+            jarvis_builtin_result,
+            requested_profile=desired.jarvis_resource_graph_profile,
+        )
+        expected_builtin_action = "loaded" if jarvis_graph_action == "loaded" else "unavailable"
+        if jarvis_builtin_result["action"] != expected_builtin_action:
+            raise ValueError("JARVIS graph action does not match builtin activation evidence")
+        if (
+            jarvis_graph_action == "loaded"
+            and jarvis_builtin_result["source_sha256"]
+            != inspection.jarvis_state.resource_graph_sha256
+        ):
+            raise ValueError("loaded JARVIS graph does not match the packaged source digest")
+        if jarvis_graph_action == "built" and not desired.allow_jarvis_resource_graph_build:
+            raise ValueError("JARVIS graph build was not enabled by the desired state")
     before = jarvis_state_before or inspection.jarvis_state
     repo_evidence = jarvis_repo_reconciliation or {
         "link_action": "reused",
@@ -1334,6 +1492,9 @@ def make_bootstrap_receipt(
             "action": jarvis_graph_action,
             "duration_seconds": jarvis_graph_duration_seconds,
             "benchmark_enabled": False,
+            "selected_profile": desired.jarvis_resource_graph_profile,
+            "allow_build_fallback": desired.allow_jarvis_resource_graph_build,
+            "builtin_result": jarvis_builtin_result,
         },
         "jarvis_commands": {
             "count": len(commands),
@@ -1347,6 +1508,9 @@ def make_bootstrap_receipt(
             ),
             "resource_graph_byte_identical": (
                 before.resource_graph_sha256 == inspection.jarvis_state.resource_graph_sha256
+            ),
+            "repositories_byte_identical": (
+                before.repos_sha256 == inspection.jarvis_state.repos_sha256
             ),
             "repositories": repo_evidence,
         },

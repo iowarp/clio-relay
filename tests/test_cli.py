@@ -210,6 +210,8 @@ def _write_test_cluster(
     *,
     frp_server_addr: str = "relay.example.test",
     scheduler_provider: str = "external",
+    jarvis_resource_graph_profile: str | None = None,
+    allow_jarvis_resource_graph_build: bool = False,
 ) -> None:
     ClusterRegistry(
         clusters={
@@ -217,10 +219,40 @@ def _write_test_cluster(
                 name=name,
                 ssh_host=name,
                 scheduler_provider=scheduler_provider,
+                jarvis_resource_graph_profile=jarvis_resource_graph_profile,
+                allow_jarvis_resource_graph_build=allow_jarvis_resource_graph_build,
                 frp_transport=FrpTransportConfig(server_addr=frp_server_addr),
             )
         }
     ).save(root / ".clio-relay" / "clusters.json")
+
+
+def test_cluster_add_persists_explicit_jarvis_graph_policy(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The operator-selected profile and build policy cross the CLI boundary unchanged."""
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "add",
+            "--name",
+            "ares",
+            "--ssh-host",
+            "ares-login",
+            "--jarvis-resource-graph-profile",
+            "ares",
+            "--allow-jarvis-resource-graph-build",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    definition = ClusterRegistry.load(tmp_path / ".clio-relay/clusters.json").clusters["ares"]
+    assert definition.jarvis_resource_graph_profile == "ares"
+    assert definition.allow_jarvis_resource_graph_build is True
 
 
 def _verified_jarvis_nested_runtime() -> dict[str, object]:
@@ -9097,7 +9129,11 @@ def test_cli_cluster_bootstrap_uses_package_source_root(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
+    _write_test_cluster(
+        tmp_path,
+        jarvis_resource_graph_profile="ares",
+        allow_jarvis_resource_graph_build=True,
+    )
     package_root = tmp_path / "package-root"
     wheel = tmp_path / "clio_relay-0.0.0-py3-none-any.whl"
     wheel.write_bytes(b"wheel")
@@ -9232,6 +9268,8 @@ def test_cli_cluster_bootstrap_uses_package_source_root(
     assert captured["source_root"] != tmp_path
     assert captured["relay_artifact_sha256"] == hashlib.sha256(b"wheel").hexdigest()
     assert captured["relay_wheel"] == wheel
+    assert captured["jarvis_resource_graph_profile"] == "ares"
+    assert captured["allow_jarvis_resource_graph_build"] is True
 
 
 def test_cli_remote_task_event_passthrough_uses_cluster_core(

@@ -429,6 +429,8 @@ class ClusterDefinition(BaseModel):
     core_dir: str = "$HOME/.local/share/clio-relay/core"
     spool_dir: str = "$HOME/.local/share/clio-relay/spool"
     jarvis_bin: str | None = None
+    jarvis_resource_graph_profile: str | None = None
+    allow_jarvis_resource_graph_build: bool = Field(default=False, strict=True)
     spack_executable: str | None = None
     frpc_bin: str | None = None
     agent_bin: str | None = None
@@ -501,6 +503,25 @@ class ClusterDefinition(BaseModel):
             raise ValueError("scheduler_provider must be a lowercase provider identifier")
         return normalized
 
+    @field_validator("jarvis_resource_graph_profile")
+    @classmethod
+    def _validate_jarvis_resource_graph_profile(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if (
+            not value
+            or value != value.strip()
+            or len(value) > 256
+            or value in {".", ".."}
+            or "/" in value
+            or "\\" in value
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
+            raise ValueError(
+                "jarvis_resource_graph_profile must be one safe exact JARVIS profile name"
+            )
+        return value
+
     @field_validator("spack_executable")
     @classmethod
     def _validate_spack_executable(cls, value: str | None) -> str | None:
@@ -520,6 +541,10 @@ class ClusterDefinition(BaseModel):
 
     @model_validator(mode="after")
     def _remote_mcp_must_not_reference_transport_credentials(self) -> ClusterDefinition:
+        if self.allow_jarvis_resource_graph_build and self.jarvis_resource_graph_profile is None:
+            raise ValueError(
+                "allow_jarvis_resource_graph_build requires jarvis_resource_graph_profile"
+            )
         forbidden = {
             self.frp_transport.token_env,
             self.frp_transport.stcp_secret_env,

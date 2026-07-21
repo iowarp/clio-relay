@@ -46,7 +46,6 @@ from clio_relay.bootstrap_reconcile import (
     bootstrap_invocation_lock,
     inspect_exact_bootstrap_noop,
     make_bootstrap_receipt,
-    repair_managed_jarvis_binding,
     write_bootstrap_receipt,
 )
 from clio_relay.bounded_process import BoundedProcessError, run_bounded_process
@@ -1786,6 +1785,25 @@ def cluster_add(
         str | None,
         typer.Option(help="Remote JARVIS-CD executable path."),
     ] = None,
+    jarvis_resource_graph_profile: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "Exact JARVIS builtin resource-graph profile selected by the operator; "
+                "relay never derives this from the cluster name."
+            )
+        ),
+    ] = None,
+    allow_jarvis_resource_graph_build: Annotated[
+        bool,
+        typer.Option(
+            "--allow-jarvis-resource-graph-build/--no-allow-jarvis-resource-graph-build",
+            help=(
+                "Allow one benchmark-free first-install graph build only after JARVIS "
+                "returns structured unavailable for the selected builtin profile."
+            ),
+        ),
+    ] = False,
     spack_executable: Annotated[
         str | None,
         typer.Option(help="Absolute remote Spack executable used by the cluster-side JARVIS MCP."),
@@ -1902,6 +1920,8 @@ def cluster_add(
             core_dir=core_dir,
             spool_dir=spool_dir,
             jarvis_bin=jarvis_bin,
+            jarvis_resource_graph_profile=_none_if_blank(jarvis_resource_graph_profile),
+            allow_jarvis_resource_graph_build=allow_jarvis_resource_graph_build,
             spack_executable=_none_if_blank(spack_executable),
             frpc_bin=frpc_bin,
             agent_bin=_none_if_blank(agent_bin),
@@ -3503,6 +3523,10 @@ def cluster_bootstrap(
                     agent_npm_package=definition.agent_npm_package,
                     agent_npm_bin=definition.agent_npm_bin,
                     agent_args=definition.agent_args,
+                    jarvis_resource_graph_profile=(definition.jarvis_resource_graph_profile),
+                    allow_jarvis_resource_graph_build=(
+                        definition.allow_jarvis_resource_graph_build
+                    ),
                 )
                 receipt_lines = [
                     line for line in lines if line.startswith("bootstrap_receipt_json=")
@@ -10829,8 +10853,15 @@ def bootstrap_inspect(
         str,
         typer.Option(help="Unique bootstrap invocation identity."),
     ],
+    repair: Annotated[
+        bool,
+        typer.Option(
+            "--repair/--inspect-only",
+            help="Apply only the typed payload-free repair returned by an inspect-only call.",
+        ),
+    ] = False,
 ) -> None:
-    """Perform one payload-free, read-only exact bootstrap inspection."""
+    """Perform a bounded payload-free inspection or explicit typed repair."""
 
     def _inspect_locked() -> None:
         encoded = os.environ.get("CLIO_RELAY_BOOTSTRAP_DESIRED_STATE_BASE64", "")
@@ -10847,7 +10878,11 @@ def bootstrap_inspect(
             raise ConfigurationError("bootstrap desired state is invalid") from exc
         started_at = datetime.now(UTC)
         started = monotonic()
-        deadline = started + BOOTSTRAP_EXACT_INSPECTION_DEADLINE_SECONDS
+        deadline = started + (
+            BOOTSTRAP_REPAIR_DEADLINE_SECONDS
+            if repair
+            else BOOTSTRAP_EXACT_INSPECTION_DEADLINE_SECONDS
+        )
 
         def run_systemctl(
             arguments: list[str], *, timeout_seconds: float
@@ -10912,46 +10947,19 @@ def bootstrap_inspect(
         service_start_count = 0
         service_enable_count = 0
         service_restart_count = 0
-        repository_reconciliation: dict[str, object] | None = None
         repair_attempted = False
         repairable_reasons = {
             "managed endpoint service is inactive",
             "managed endpoint service is disabled",
             "active endpoint worker readiness did not verify",
         }
-        repository_reasons = [
-            reason
-            for reason in inspection.reasons
-            if reason == "the exact relay-managed JARVIS repository is not registered"
-            or reason.startswith("relay-managed JARVIS repository")
-        ]
-        if repository_reasons and all(
-            reason in repairable_reasons or reason in repository_reasons
-            for reason in inspection.reasons
-        ):
-            repair_attempted = True
-            deadline = started + BOOTSTRAP_REPAIR_DEADLINE_SECONDS
-            binding = repair_managed_jarvis_binding(desired)
-            if not isinstance(binding.get("repositories"), dict):
-                raise ConfigurationError("managed JARVIS repair omitted repository evidence")
-            repository_reconciliation = {
-                str(key): value for key, value in cast(dict[object, object], binding).items()
-            }
-            inspection = inspect_exact_bootstrap_noop(
-                desired,
-                service_was_active=service_active,
-                service_was_enabled=service_enabled,
-                queue_evidence=queue_evidence,
-                worker_evidence=worker_evidence,
-                installation_snapshot=current_installation,
-            )
         if (
-            desired.worker_service is not None
+            repair
+            and desired.worker_service is not None
             and inspection.reasons
             and set(inspection.reasons).issubset(repairable_reasons)
         ):
             repair_attempted = True
-            deadline = started + BOOTSTRAP_REPAIR_DEADLINE_SECONDS
             load_state = run_systemctl(
                 [
                     "show",
@@ -11034,10 +11042,7 @@ def bootstrap_inspect(
             inspection_duration = monotonic() - inspection_started
             outcome: Literal["noop_verified", "repaired"] = (
                 "repaired"
-                if service_start_count
-                or service_enable_count
-                or service_restart_count
-                or repository_reconciliation is not None
+                if service_start_count or service_enable_count or service_restart_count
                 else "noop_verified"
             )
             receipt = make_bootstrap_receipt(
@@ -11056,7 +11061,6 @@ def bootstrap_inspect(
                 service_restart_count=service_restart_count,
                 initial_inspection_reasons=initial_inspection_reasons,
                 jarvis_state_before=initial_jarvis_state,
-                jarvis_repo_reconciliation=repository_reconciliation,
                 service_active_before=initial_service_active,
                 service_enabled_before=initial_service_enabled,
                 service_active_after=service_active,
@@ -11069,7 +11073,14 @@ def bootstrap_inspect(
             payload["receipt"] = receipt
             payload["action"] = outcome
         else:
-            payload["action"] = "payload_required"
+            repairable = bool(inspection.reasons) and all(
+                reason in repairable_reasons for reason in inspection.reasons
+            )
+            payload["action"] = (
+                "repair_required" if not repair and repairable else "payload_required"
+            )
+            if payload["action"] == "repair_required":
+                payload["repair_reasons"] = inspection.reasons
         typer.echo(
             "bootstrap_preflight_json=" + json.dumps(payload, sort_keys=True, separators=(",", ":"))
         )

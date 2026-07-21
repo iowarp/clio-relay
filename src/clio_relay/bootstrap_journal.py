@@ -81,7 +81,7 @@ def create_journal(
         raise BootstrapJournalError("bootstrap invocation identity is invalid")
     if not _SHA256.fullmatch(desired_fingerprint):
         raise BootstrapJournalError("bootstrap desired fingerprint is invalid")
-    if mode not in {"full", "relay-only", "repair"}:
+    if mode not in {"full", "relay-only", "component-upgrade", "repair"}:
         raise BootstrapJournalError("bootstrap transaction mode is invalid")
     normalized_owned_paths = _coerce_owned_paths(owned_paths)
     for item in normalized_owned_paths.values():
@@ -244,6 +244,196 @@ def record_owned_path(path: Path, owned_name: str) -> dict[str, Any]:
         return value
 
 
+def create_owned_directory(path: Path, owned_name: str) -> dict[str, Any]:
+    """Exclusively create and durably bind one empty owned directory."""
+
+    def create(parent_descriptor: int, target_name: str) -> None:
+        os.mkdir(target_name, mode=0o700, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+
+    return _create_and_record_owned_path(path, owned_name, create=create)
+
+
+def create_owned_symlink(path: Path, owned_name: str, target: str) -> dict[str, Any]:
+    """Exclusively create and durably bind one owned symbolic link."""
+    if not target or any(character in target for character in "\x00\r\n"):
+        raise BootstrapJournalError("bootstrap owned symlink target is invalid")
+
+    def create(parent_descriptor: int, target_name: str) -> None:
+        os.symlink(target, target_name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+
+    return _create_and_record_owned_path(path, owned_name, create=create)
+
+
+def copy_owned_file(
+    path: Path,
+    owned_name: str,
+    source: Path,
+    *,
+    mode: int,
+) -> dict[str, Any]:
+    """Exclusively copy one regular file and durably bind its identity."""
+    if mode not in {0o600, 0o700, 0o755}:
+        raise BootstrapJournalError("bootstrap owned file mode is invalid")
+    normalized_source = _normalized_absolute(source, "bootstrap owned file source")
+
+    def create(parent_descriptor: int, target_name: str) -> None:
+        with _open_absolute_directory(normalized_source.parent) as source_parent:
+            source_descriptor = os.open(
+                normalized_source.name,
+                os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC,
+                dir_fd=source_parent,
+            )
+            target_descriptor: int | None = None
+            target_identity: tuple[int, int, int] | None = None
+            try:
+                source_details = os.fstat(source_descriptor)
+                if not stat.S_ISREG(source_details.st_mode):
+                    raise BootstrapJournalError("bootstrap owned file source is not regular")
+                linked_source = os.stat(
+                    normalized_source.name,
+                    dir_fd=source_parent,
+                    follow_symlinks=False,
+                )
+                if _stat_identity(source_details) != _stat_identity(linked_source):
+                    raise BootstrapJournalError("bootstrap owned file source identity changed")
+                target_descriptor = os.open(
+                    target_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_CLOEXEC,
+                    mode,
+                    dir_fd=parent_descriptor,
+                )
+                if _FCHMOD is not None:
+                    _FCHMOD(target_descriptor, mode)
+                target_identity = _stat_identity(os.fstat(target_descriptor))
+                while chunk := os.read(source_descriptor, 1024 * 1024):
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(target_descriptor, view)
+                        view = view[written:]
+                os.fsync(target_descriptor)
+                source_after = os.stat(
+                    normalized_source.name,
+                    dir_fd=source_parent,
+                    follow_symlinks=False,
+                )
+                if (
+                    _stat_identity(source_details) != _stat_identity(source_after)
+                    or source_details.st_size != source_after.st_size
+                    or source_details.st_ctime_ns != source_after.st_ctime_ns
+                ):
+                    raise BootstrapJournalError("bootstrap owned file source identity changed")
+            except BaseException:
+                if target_descriptor is not None and target_identity is not None:
+                    with suppress(OSError):
+                        observed = os.stat(
+                            target_name,
+                            dir_fd=parent_descriptor,
+                            follow_symlinks=False,
+                        )
+                        if _stat_identity(observed) == target_identity:
+                            os.unlink(target_name, dir_fd=parent_descriptor)
+                            os.fsync(parent_descriptor)
+                raise
+            finally:
+                if target_descriptor is not None:
+                    os.close(target_descriptor)
+                os.close(source_descriptor)
+        os.fsync(parent_descriptor)
+
+    return _create_and_record_owned_path(path, owned_name, create=create)
+
+
+def _create_and_record_owned_path(
+    path: Path,
+    owned_name: str,
+    *,
+    create: Callable[[int, str], None],
+) -> dict[str, Any]:
+    if os.name == "nt":
+        raise BootstrapJournalError("owned path publication requires POSIX")
+    if not _IDENTIFIER.fullmatch(owned_name):
+        raise BootstrapJournalError("bootstrap owned path name is invalid")
+    with _open_journal_parent(path) as (journal_fd, journal_parent, journal_name):
+        value, journal_identity = _load_journal_at(journal_fd, journal_parent, journal_name)
+        if _string(value, "state") in _TERMINAL_STATES:
+            raise BootstrapJournalError("terminal bootstrap transaction cannot create a path")
+        owned = _coerce_owned_paths(value["owned_paths"])
+        item = owned.get(owned_name)
+        if item is None:
+            raise BootstrapJournalError(f"bootstrap owned path is unknown: {owned_name}")
+        if item["identity"] is not None:
+            raise BootstrapJournalError(f"bootstrap owned path was already created: {owned_name}")
+        target = Path(item["path"])
+        home = _home_for_journal_parent(journal_parent)
+        _validate_recovery_target(target, kind=item["kind"], home=home, name=owned_name)
+        try:
+            relative = target.relative_to(home)
+        except ValueError as exc:
+            raise BootstrapJournalError("bootstrap owned path escaped its home") from exc
+        with _open_absolute_directory(home) as home_descriptor:
+            _require_current_owner(home_descriptor, "bootstrap ownership home")
+            _verify_journal_parent_from_home(
+                home_descriptor,
+                home,
+                journal_fd,
+                journal_parent,
+            )
+            target_parent = _open_target_parent_at(home_descriptor, relative.parent)
+            if target_parent is None:
+                raise BootstrapJournalError(f"bootstrap owned path parent is unavailable: {target}")
+            try:
+                _verify_target_parent_identity(home_descriptor, relative.parent, target_parent)
+                try:
+                    os.stat(relative.name, dir_fd=target_parent, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise BootstrapJournalError(f"bootstrap-owned path already exists: {target}")
+                create(target_parent, relative.name)
+                details = os.stat(relative.name, dir_fd=target_parent, follow_symlinks=False)
+                observed = _owned_identity_at(
+                    target_parent,
+                    relative.name,
+                    details,
+                    display=target,
+                )
+                if not _kind_accepts_identity(item["kind"], observed):
+                    raise BootstrapJournalError(f"bootstrap owned path kind changed: {target}")
+                item["identity"] = observed
+                value["owned_paths"] = owned
+                value["updated_at"] = datetime.now(UTC).isoformat()
+                _validate_journal(value)
+                _atomic_json_at(
+                    journal_fd,
+                    journal_parent,
+                    journal_name,
+                    value,
+                    expected_identity=journal_identity,
+                )
+                current = _owned_identity_at(
+                    target_parent,
+                    relative.name,
+                    os.stat(relative.name, dir_fd=target_parent, follow_symlinks=False),
+                    display=target,
+                )
+                if not _owned_identity_matches(observed, current):
+                    raise BootstrapJournalError(
+                        f"bootstrap owned path changed during publication: {target}"
+                    )
+                _verify_target_parent_identity(home_descriptor, relative.parent, target_parent)
+            finally:
+                os.close(target_parent)
+            _verify_journal_parent_from_home(
+                home_descriptor,
+                home,
+                journal_fd,
+                journal_parent,
+            )
+        return value
+
+
 def recovery_plan(path: Path) -> dict[str, Any]:
     """Return one strict journal plus its only safe recovery direction."""
     value = load_journal(path)
@@ -338,7 +528,7 @@ def _validate_journal(value: dict[str, Any]) -> None:
         raise BootstrapJournalError("bootstrap invocation identity is invalid")
     if not _SHA256.fullmatch(_string(value, "desired_fingerprint")):
         raise BootstrapJournalError("bootstrap desired fingerprint is invalid")
-    if value["mode"] not in {"full", "relay-only", "repair"}:
+    if value["mode"] not in {"full", "relay-only", "component-upgrade", "repair"}:
         raise BootstrapJournalError("bootstrap transaction mode is invalid")
     state = _string(value, "state")
     if state not in _TRANSITIONS:
@@ -1276,6 +1466,18 @@ def main(arguments: list[str] | None = None) -> int:
             if len(argv) != 2:
                 _fail("bootstrap journal ownership arguments are invalid")
             record_owned_path(Path(argv[0]), argv[1])
+        elif action == "mkdir-owned":
+            if len(argv) != 2:
+                _fail("bootstrap owned directory arguments are invalid")
+            create_owned_directory(Path(argv[0]), argv[1])
+        elif action == "symlink-owned":
+            if len(argv) != 3:
+                _fail("bootstrap owned symlink arguments are invalid")
+            create_owned_symlink(Path(argv[0]), argv[1], argv[2])
+        elif action == "copy-owned":
+            if len(argv) != 4 or not re.fullmatch(r"0?[0-7]{3}", argv[3]):
+                _fail("bootstrap owned file arguments are invalid")
+            copy_owned_file(Path(argv[0]), argv[1], Path(argv[2]), mode=int(argv[3], 8))
         elif action == "recovery-plan":
             if len(argv) != 1:
                 _fail("bootstrap journal recovery arguments are invalid")

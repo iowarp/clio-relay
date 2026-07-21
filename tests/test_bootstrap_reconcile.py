@@ -31,6 +31,7 @@ from clio_relay.bootstrap_reconcile import (
     plan_bootstrap_reconcile,
     reconcile_managed_jarvis_repository,
     repair_managed_jarvis_binding,
+    validate_jarvis_builtin_result,
     write_jarvis_wrapper,
 )
 from clio_relay.errors import ConfigurationError
@@ -281,6 +282,9 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
     legacy_python.parent.mkdir(parents=True)
     legacy_python.write_bytes(b"python")
     legacy_python.chmod(0o755)
+    legacy_jarvis = legacy_python.parent / ("jarvis.exe" if os.name == "nt" else "jarvis")
+    legacy_jarvis.write_bytes(b"jarvis")
+    legacy_jarvis.chmod(0o755)
     jarvis_util_checkout = tmp_path / ".local/src/jarvis-util"
     (jarvis_util_checkout / ".git").mkdir(parents=True)
     receipt_path = tmp_path / ".local/share/clio-relay/install-receipt.json"
@@ -311,7 +315,7 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
             "artifact_sha256": desired.jarvis_cd_wheel_sha256,
             "runtime_artifact_path": str(jarvis_wheel),
             "runtime_interpreters": {"execution": str(legacy_python)},
-            "runtime_executables": {"jarvis": str(legacy_python.parent / "jarvis")},
+            "runtime_executables": {"jarvis": str(legacy_jarvis)},
         },
     }
     monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", lambda _path: info)
@@ -359,6 +363,108 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
     assert plan.reusable_paths["jarvis_execution_environment"] == str(
         (tmp_path / ".local/share/clio-relay/jarvis-venv").resolve()
     )
+
+
+def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A released runtime upgrade preserves state instead of falling into fresh bootstrap."""
+    bin_dir = tmp_path / ".local/bin"
+    bin_dir.mkdir(parents=True)
+    for name, content in (("uv", b"uv"), ("frpc", b"frpc"), ("frps", b"frps")):
+        path = bin_dir / name
+        path.write_bytes(content)
+        path.chmod(0o755)
+    desired = _desired(
+        uv_sha256=_digest(b"uv"),
+        frpc_sha256=_digest(b"frpc"),
+        frps_sha256=_digest(b"frps"),
+    )
+    desired = desired.model_copy(
+        update={
+            "jarvis_cd_version": "1.4.8",
+            "jarvis_cd_wheel_url": (
+                "https://github.com/grc-iit/jarvis-cd/releases/download/"
+                "v1.4.8/jarvis_cd-1.4.8-py3-none-any.whl"
+            ),
+            "jarvis_cd_wheel_sha256": (
+                "ebf5e5f375b921f20c79075d461926431a5a017ca8b45e598878a89b229b3935"
+            ),
+        }
+    )
+    _write_jarvis_state(tmp_path, desired)
+    legacy_python = (
+        tmp_path
+        / ".local/share/clio-relay/jarvis-venv"
+        / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    )
+    legacy_python.parent.mkdir(parents=True)
+    legacy_python.write_bytes(b"python")
+    legacy_python.chmod(0o755)
+    legacy_jarvis = legacy_python.parent / ("jarvis.exe" if os.name == "nt" else "jarvis")
+    legacy_jarvis.write_bytes(b"jarvis")
+    legacy_jarvis.chmod(0o755)
+    jarvis_util_checkout = tmp_path / ".local/src/jarvis-util"
+    (jarvis_util_checkout / ".git").mkdir(parents=True)
+    receipt_path = tmp_path / ".local/share/clio-relay/install-receipt.json"
+    receipt_path.write_text("{}\n", encoding="utf-8")
+    info = _installation_info(desired)
+    receipt = info["receipt"]
+    assert isinstance(receipt, dict)
+    components = receipt["components"]
+    assert isinstance(components, dict)
+    components["jarvis-cd"] = "1.4.4"
+    components["clio-kit"] = "2.5.21"
+    receipt["component_artifacts"] = {
+        "clio-kit": {
+            "runtime_interpreters": {"provider": "/old/clio-kit/python"},
+            "runtime_executables": {"clio-kit": "/old/clio-kit/clio-kit"},
+        },
+        "jarvis-cd": {
+            "runtime_interpreters": {"execution": str(legacy_python)},
+            "runtime_executables": {"jarvis": str(legacy_jarvis)},
+        },
+    }
+    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", lambda _path: info)
+
+    def identity_command(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert command[:2] == [str(bin_dir / "uv"), "--version"]
+        return subprocess.CompletedProcess(command, 0, "uv 0.11.28\n", "")
+
+    def bounded_identity(command: list[str], *, maximum: int) -> str:
+        assert maximum > 0
+        if command[:3] == ["git", "-C", str(jarvis_util_checkout)]:
+            return "commit" if "rev-parse" in command else ""
+        if command[0] == str(legacy_python):
+            return json.dumps(
+                {
+                    "name": "jarvis-util",
+                    "direct_url": json.dumps({"url": jarvis_util_checkout.resolve().as_uri()}),
+                    "record": True,
+                }
+            )
+        raise AssertionError(command)  # pragma: no cover
+
+    monkeypatch.setattr(bootstrap_reconcile_module, "run_bounded_process", identity_command)
+    monkeypatch.setattr(
+        "clio_relay.bootstrap_reconcile._bounded_subprocess",
+        bounded_identity,
+    )
+
+    plan = plan_bootstrap_reconcile(desired, home=tmp_path)
+
+    assert desired.jarvis_cd_version == "1.4.8"
+    assert plan.mode == "component-upgrade", plan.reasons
+    assert plan.component_actions == {
+        "clio-relay": "replace",
+        "jarvis-cd": "replace",
+        "jarvis-util": "reuse",
+        "clio-kit": "replace",
+        "frp": "reuse",
+        "uv": "reuse",
+    }
+    assert plan.reusable_paths["jarvis_execution_python"] == str(legacy_python.resolve())
 
 
 def test_existing_operator_jarvis_roots_are_adopted_without_mutation(tmp_path: Path) -> None:
@@ -485,7 +591,7 @@ def test_managed_repo_repair_refuses_unproven_broken_link(
         repair_managed_jarvis_binding(desired, home=tmp_path)
 
 
-def test_transaction_journal_enforces_irreversible_forward_recovery(tmp_path: Path) -> None:
+def test_transaction_journal_makes_relay_activation_forward_only(tmp_path: Path) -> None:
     path = tmp_path / "transaction.json"
     journal = BootstrapTransactionJournal(
         invocation_id="bootstrap-1",
@@ -504,7 +610,8 @@ def test_transaction_journal_enforces_irreversible_forward_recovery(tmp_path: Pa
             journal.prepared_generation = "a" * 64
         journal.advance(state)
         journal.persist(path)
-    assert journal.recovery_mode == "rollback"
+    assert journal.irreversible_boundary is True
+    assert journal.recovery_mode == "forward"
 
     journal.advance(BootstrapTransactionState.MIGRATION_STARTED)
     journal.persist(path)
@@ -613,6 +720,33 @@ def test_desired_fingerprint_is_canonical_and_field_sensitive() -> None:
 
     assert reconstructed.fingerprint == desired.fingerprint
     assert changed.fingerprint != desired.fingerprint
+
+
+def test_desired_fingerprint_binds_jarvis_graph_profile_and_build_policy() -> None:
+    """Graph activation policy is explicit deployment identity, not a cluster-name guess."""
+    desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
+    profiled = desired.model_copy(update={"jarvis_resource_graph_profile": "ares"})
+    fallback = profiled.model_copy(update={"allow_jarvis_resource_graph_build": True})
+
+    assert desired.fingerprint != profiled.fingerprint
+    assert profiled.fingerprint != fallback.fingerprint
+
+
+def test_builtin_graph_result_rejects_unavailable_profile_still_in_catalog() -> None:
+    """Only a genuine catalog miss may authorize the explicit build fallback."""
+    with pytest.raises(ValueError, match="unavailable JARVIS builtin graph evidence"):
+        validate_jarvis_builtin_result(
+            {
+                "schema_version": "jarvis.resource-graph-builtin.v1",
+                "profile": "ares",
+                "action": "unavailable",
+                "available": False,
+                "source": None,
+                "source_sha256": None,
+                "catalog": ["ares"],
+            },
+            requested_profile="ares",
+        )
 
 
 def test_prepared_generation_refuses_a_tampered_relay_owned_jarvis_wrapper(

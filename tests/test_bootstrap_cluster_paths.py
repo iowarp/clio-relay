@@ -60,7 +60,7 @@ def test_managed_bootstrap_fences_worker_around_migration() -> None:
     relay_replace = "uv tool install --force --python 3.12 --no-config"
     migrate = "clio-relay init --migrate-legacy-output"
     restart = 'systemctl --user "$CLIO_RELAY_ENDPOINT_ACTIVATION_ACTION" --no-block'
-    full = script[script.index('BOOTSTRAP_FULL_PREPARE_STARTED_NS="$(') :]
+    full = script[script.rindex("bootstrap_journal_action create") :]
     first_proof = full.index(writer_proof)
     second_proof = full.index(writer_proof, first_proof + 1)
     relay_replacement = full.index(relay_replace)
@@ -900,11 +900,13 @@ def test_bootstrap_over_ssh_forwards_configured_data_directories(
         core_dir="$HOME/custom/core",
         spool_dir="/srv/custom/spool",
         relay_artifact_sha256="a" * 64,
+        jarvis_resource_graph_profile="test-profile",
     )
 
     assert captured["cluster"] == "custom"
     assert captured["core_dir"] == "$HOME/custom/core"
     assert captured["spool_dir"] == "/srv/custom/spool"
+    assert captured["jarvis_resource_graph_profile"] == "test-profile"
 
 
 def test_cluster_bootstrap_cli_uses_configured_data_directories(

@@ -24,6 +24,7 @@ from clio_relay.bootstrap_reconcile import (
     make_bootstrap_receipt,
 )
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
+from clio_relay.errors import ConfigurationError
 
 
 def test_exact_remote_bootstrap_never_reads_or_builds_payload(
@@ -51,6 +52,7 @@ def test_exact_remote_bootstrap_never_reads_or_builds_payload(
         agent_npm_package=None,
         agent_npm_bin=None,
         agent_args=[],
+        jarvis_resource_graph_profile="ares",
     )
     jarvis_state = JarvisStateEvidence(
         initialized=True,
@@ -99,11 +101,15 @@ def test_exact_remote_bootstrap_never_reads_or_builds_payload(
     )
     observed_desired: list[str] = []
 
-    def preflight(**kwargs: object) -> tuple[dict[str, object], list[str]]:
+    def preflight(**kwargs: object) -> bootstrap.BootstrapPreflightResult:
         requested = kwargs["desired"]
         assert hasattr(requested, "fingerprint")
         observed_desired.append(requested.fingerprint)  # type: ignore[attr-defined]
-        return receipt, ["bootstrap_preflight_json={}"]
+        return bootstrap.BootstrapPreflightResult(
+            action="exact",
+            receipt=receipt,
+            lines=["bootstrap_preflight_json={}"],
+        )
 
     def poison(*_args: object, **_kwargs: object) -> NoReturn:
         raise AssertionError("the exact no-op touched bootstrap payload code")
@@ -122,6 +128,7 @@ def test_exact_remote_bootstrap_never_reads_or_builds_payload(
         cluster="ares",
         relay_wheel=wheel,
         relay_artifact_sha256=digest,
+        jarvis_resource_graph_profile="ares",
     )
 
     assert observed_desired == [desired.fingerprint]
@@ -150,7 +157,7 @@ def test_public_cluster_bootstrap_noop_never_touches_nonexistent_wheel(
     digest = "a" * 64
     wheel = tmp_path / f"clio_relay-{__version__}-py3-none-any.whl"
 
-    def preflight(**kwargs: object) -> tuple[dict[str, object], list[str]]:
+    def preflight(**kwargs: object) -> bootstrap.BootstrapPreflightResult:
         desired = kwargs["desired"]
         invocation_id = kwargs["invocation_id"]
         assert isinstance(desired, BootstrapDesiredState)
@@ -200,7 +207,11 @@ def test_public_cluster_bootstrap_noop_never_touches_nonexistent_wheel(
             previous_generation=desired.fingerprint,
             active_generation=desired.fingerprint,
         )
-        return receipt, ["bootstrap_preflight_json={}"]
+        return bootstrap.BootstrapPreflightResult(
+            action="exact",
+            receipt=receipt,
+            lines=["bootstrap_preflight_json={}"],
+        )
 
     def poison(*_args: object, **_kwargs: object) -> NoReturn:
         raise AssertionError("the public exact no-op touched bootstrap payload code")
@@ -234,6 +245,37 @@ def test_public_cluster_bootstrap_noop_never_touches_nonexistent_wheel(
 
     assert result.exit_code == 0, result.output
     assert not wheel.exists()
+
+
+def test_payload_reconcile_requires_profile_before_building_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only exact reuse may omit a profile; fresh state needs operator graph policy."""
+    monkeypatch.setattr(
+        bootstrap,
+        "_bootstrap_preflight_over_ssh",
+        lambda **_kwargs: bootstrap.BootstrapPreflightResult(
+            action="payload_required",
+            receipt=None,
+            lines=["bootstrap_preflight_json={}"],
+        ),
+    )
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda executable: executable)
+
+    def poison(*_args: object, **_kwargs: object) -> NoReturn:
+        raise AssertionError("missing profile reached payload construction")
+
+    monkeypatch.setattr(bootstrap, "create_bootstrap_archive", poison)
+
+    with pytest.raises(ConfigurationError, match="operator-selected"):
+        bootstrap.bootstrap_cluster_over_ssh(
+            bootstrap_profile="linux-user",
+            ssh_host="cluster-a",
+            source_root=tmp_path / "not-a-checkout",
+            cluster="cluster-a",
+            relay_artifact_sha256="a" * 64,
+        )
 
 
 def test_public_release_bootstrap_requires_artifact_digest(
@@ -284,6 +326,7 @@ def test_payload_free_inspector_fails_closed_after_repair_does_not_converge(
         agent_npm_package=None,
         agent_npm_bin=None,
         agent_args=[],
+        jarvis_resource_graph_profile="ares",
     )
     monkeypatch.setenv(
         "CLIO_RELAY_BOOTSTRAP_DESIRED_STATE_BASE64",
@@ -358,7 +401,7 @@ def test_payload_free_inspector_fails_closed_after_repair_does_not_converge(
 
     result = CliRunner().invoke(
         cli.app,
-        ["bootstrap-inspect", "--invocation-id", "bootstrap_fail_closed"],
+        ["bootstrap-inspect", "--invocation-id", "bootstrap_fail_closed", "--repair"],
     )
 
     assert result.exit_code != 0
@@ -394,6 +437,7 @@ def test_fresh_bootstrap_receipt_allows_explicit_pending_service_install(
         agent_npm_package=None,
         agent_npm_bin=None,
         agent_args=[],
+        jarvis_resource_graph_profile="ares",
     )
     jarvis_state = JarvisStateEvidence(
         initialized=True,
@@ -436,6 +480,15 @@ def test_fresh_bootstrap_receipt_allows_explicit_pending_service_install(
         }
         for name in ("clio-relay", "clio-kit", "jarvis-cd", "jarvis-util", "frp", "uv")
     }
+    loaded_builtin_result: dict[str, object] = {
+        "schema_version": "jarvis.resource-graph-builtin.v1",
+        "profile": "ares",
+        "action": "loaded",
+        "available": True,
+        "source": "/opt/jarvis/resource_graphs/ares.yaml",
+        "source_sha256": "d" * 64,
+        "catalog": ["ares"],
+    }
     receipt = make_bootstrap_receipt(
         invocation_id="bootstrap_fresh",
         desired=desired,
@@ -448,11 +501,12 @@ def test_fresh_bootstrap_receipt_allows_explicit_pending_service_install(
         components=components,
         jarvis_init_action="initialized",
         jarvis_init_duration_seconds=1.0,
-        jarvis_graph_action="built",
+        jarvis_graph_action="loaded",
         jarvis_graph_duration_seconds=1.0,
+        jarvis_builtin_result=loaded_builtin_result,
         jarvis_commands=[
             ["jarvis", "init", "/config", "/private", "/shared"],
-            ["jarvis", "rg", "build", "+no_benchmark"],
+            ["jarvis", "rg", "load-builtin", "ares", "+json"],
         ],
         jarvis_state_before=JarvisStateEvidence(
             initialized=False,
@@ -470,11 +524,88 @@ def test_fresh_bootstrap_receipt_allows_explicit_pending_service_install(
         bootstrap_profile="linux-user",
         relay_install_spec=desired.relay_install_spec,
         desired_fingerprint=desired.fingerprint,
+        expected_jarvis_resource_graph_profile="ares",
+        expected_allow_jarvis_resource_graph_build=False,
         expected_worker_service=desired.worker_service,
     )
     service = receipt["service"]
     assert isinstance(service, dict)
     assert service["pending_install"] is True
+
+    with pytest.raises(ValueError, match="packaged source digest"):
+        make_bootstrap_receipt(
+            invocation_id="bootstrap_mismatched_builtin",
+            desired=desired,
+            outcome="full",
+            inspection=inspection,
+            started_at=datetime.now(UTC),
+            transaction=None,
+            previous_generation=None,
+            active_generation=desired.fingerprint,
+            components=components,
+            jarvis_init_action="initialized",
+            jarvis_init_duration_seconds=1.0,
+            jarvis_graph_action="loaded",
+            jarvis_graph_duration_seconds=1.0,
+            jarvis_builtin_result={
+                **loaded_builtin_result,
+                "source_sha256": "e" * 64,
+            },
+        )
+
+    unavailable = {
+        "schema_version": "jarvis.resource-graph-builtin.v1",
+        "profile": "ares",
+        "action": "unavailable",
+        "available": False,
+        "source": None,
+        "source_sha256": None,
+        "catalog": [],
+    }
+    with pytest.raises(ValueError, match="build was not enabled"):
+        make_bootstrap_receipt(
+            invocation_id="bootstrap_unauthorized_build",
+            desired=desired,
+            outcome="full",
+            inspection=inspection,
+            started_at=datetime.now(UTC),
+            transaction=None,
+            previous_generation=None,
+            active_generation=desired.fingerprint,
+            components=components,
+            jarvis_init_action="initialized",
+            jarvis_init_duration_seconds=1.0,
+            jarvis_graph_action="built",
+            jarvis_graph_duration_seconds=1.0,
+            jarvis_builtin_result=unavailable,
+        )
+
+    allowed = desired.model_copy(update={"allow_jarvis_resource_graph_build": True})
+    built = make_bootstrap_receipt(
+        invocation_id="bootstrap_allowed_build",
+        desired=allowed,
+        outcome="full",
+        inspection=inspection,
+        started_at=datetime.now(UTC),
+        transaction=None,
+        previous_generation=None,
+        active_generation=allowed.fingerprint,
+        components=components,
+        jarvis_init_action="initialized",
+        jarvis_init_duration_seconds=1.0,
+        jarvis_graph_action="built",
+        jarvis_graph_duration_seconds=1.0,
+        jarvis_builtin_result=unavailable,
+        jarvis_commands=[
+            ["jarvis", "init", "/config", "/private", "/shared"],
+            ["jarvis", "rg", "load-builtin", "ares", "+json"],
+            ["jarvis", "rg", "build", "+no_benchmark"],
+        ],
+    )
+    graph = built["jarvis_resource_graph"]
+    assert isinstance(graph, dict)
+    assert graph["action"] == "built"
+    assert graph["builtin_result"] == unavailable
 
 
 def test_release_identity_is_canonical_across_wheel_and_pypi_transport(
@@ -582,9 +713,9 @@ def test_fresh_journal_precedes_every_mutation_boundary() -> None:
         'uv venv --python 3.12 --seed "$JARVIS_VENV"',
         '"$JARVIS_VENV/bin/jarvis" init',
         '"$JARVIS_VENV/bin/jarvis" rg build +no_benchmark',
-        'ln -s "$MANAGED_JARVIS_REPO_TARGET" "$MANAGED_JARVIS_REPO"',
-        'mkdir -m 0700 -p "$BOOTSTRAP_GENERATION/bin"',
-        'ln -s "$BOOTSTRAP_GENERATION" "$HOME/.local/share/clio-relay/current"',
+        'managed_repo "$MANAGED_JARVIS_REPO_TARGET"',
+        'mkdir -m 0700 "$BOOTSTRAP_GENERATION/bin"',
+        'current "$BOOTSTRAP_GENERATION"',
         'bootstrap_journal_action advance "$BOOTSTRAP_TRANSACTION_JOURNAL" migration_started',
     )
 
@@ -592,11 +723,15 @@ def test_fresh_journal_precedes_every_mutation_boundary() -> None:
     assert 'rm -rf "$DEST"' not in script
     assert '--clear "$JARVIS_VENV"' not in script
     assert 'bootstrap_journal_action discard-full "$BOOTSTRAP_TRANSACTION_JOURNAL"' in script
+    assert 'mkdir -m 0700 -p "$BOOTSTRAP_TRANSACTION_ROOT/downloads"' not in script
+    assert 'bootstrap_journal_action own "$BOOTSTRAP_TRANSACTION_JOURNAL"' not in script
+    for owned_action in ("mkdir-owned", "copy-owned", "symlink-owned"):
+        assert f"bootstrap_journal_action {owned_action}" in script[journal:]
     for phase in (
         "ownership_manifest",
         "components_prepared",
         "jarvis_initialized",
-        "resource_graph_built",
+        "resource_graph_$JARVIS_GRAPH_ACTION",
         "managed_repository_reconciled",
         "generation_prepared",
         "generation_activated",
