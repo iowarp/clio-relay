@@ -5246,6 +5246,8 @@ def execute_owned_session_start(
                         identity=attempt_identity,
                         error=cleanup_detail,
                     )
+                if startup_detail and isinstance(exc, RelayError):
+                    raise RelayError(cleanup_detail) from exc
             raise
         finally:
             os.close(log_descriptor)
