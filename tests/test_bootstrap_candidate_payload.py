@@ -7,6 +7,7 @@ import json
 import shutil
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -121,3 +122,104 @@ print(json.dumps({
         == (candidate_package / "process_containment.py").resolve()
     )
     assert len(evidence["reconcile_digest"]) == 64
+
+
+def test_candidate_overlay_preserves_legacy_provider_install_identity(
+    tmp_path: Path,
+) -> None:
+    """Candidate reconciliation must inspect the installed provider as itself."""
+    sources = _extract_candidate_sources(
+        bootstrap.render_linux_user_bootstrap_script(cluster="candidate-test")
+    )
+    candidate_root = tmp_path / "candidate-python"
+    candidate_package = candidate_root / "clio_relay"
+    candidate_package.mkdir(parents=True)
+    for name, payload in sources.items():
+        (candidate_package / name).write_bytes(payload)
+
+    legacy_version = "1.4.12"
+    legacy_root = tmp_path / "legacy-provider"
+    installed_package = Path(bootstrap.__file__).resolve().parent
+    shutil.copytree(
+        installed_package,
+        legacy_root / "clio_relay",
+        ignore=shutil.ignore_patterns("__pycache__", *sources),
+    )
+    distribution_metadata = legacy_root / f"clio_relay-{legacy_version}.dist-info"
+    distribution_metadata.mkdir()
+    (distribution_metadata / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: clio-relay\nVersion: {legacy_version}\n",
+        encoding="utf-8",
+    )
+    receipt = tmp_path / "install-receipt.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "schema_version": "clio-relay.install-receipt.v1",
+                "installed_at": datetime.now(UTC).isoformat(),
+                "install_spec": f"clio-relay=={legacy_version}",
+                "requested_source": "wheel",
+                "artifact_filename": None,
+                "artifact_sha256": None,
+                "distribution_version": legacy_version,
+                "software": {
+                    "version": legacy_version,
+                    "commit": None,
+                    "tag": None,
+                    "dirty": None,
+                },
+                "components": {},
+                "component_artifacts": {},
+                "deployment_fingerprint": None,
+                "deployment_manifest": None,
+                "generation": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    probe = r"""
+import json
+import sys
+from pathlib import Path
+
+candidate_root = Path(sys.argv[1]).resolve()
+legacy_root = Path(sys.argv[2]).resolve()
+receipt = Path(sys.argv[3]).resolve()
+sys.path.insert(0, str(legacy_root))
+sys.path.insert(0, str(candidate_root))
+
+import clio_relay
+from clio_relay.installation import installation_info
+
+info = installation_info(receipt)
+print(json.dumps({
+    "package_version": clio_relay.__version__,
+    "distribution_version": info["distribution_version"],
+    "software_version": info["software"]["version"],
+    "receipt_matches_install": info["receipt_matches_install"],
+}, sort_keys=True))
+"""
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            probe,
+            str(candidate_root),
+            str(legacy_root),
+            str(receipt),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    evidence = json.loads(completed.stdout)
+    assert evidence == {
+        "distribution_version": legacy_version,
+        "package_version": legacy_version,
+        "receipt_matches_install": True,
+        "software_version": legacy_version,
+    }
