@@ -81,7 +81,13 @@ BOOTSTRAP_PUBLIC_EXACT_DEADLINE_SECONDS = 29.0
 BOOTSTRAP_PUBLIC_REPAIR_DEADLINE_SECONDS = 58.0
 
 _BOOTSTRAP_CANDIDATE_PACKAGE_OVERLAY = (
-    b"\nfrom pkgutil import extend_path\n\n__path__ = extend_path(__path__, __name__)\n"
+    b"\nfrom importlib import metadata as _clio_relay_metadata\n"
+    b"from pkgutil import extend_path\n\n"
+    b"__path__ = extend_path(__path__, __name__)\n"
+    b"try:\n"
+    b"    __version__ = _clio_relay_metadata.version('clio-relay')\n"
+    b"except _clio_relay_metadata.PackageNotFoundError:\n"
+    b"    pass\n"
 )
 _BOOTSTRAP_CANDIDATE_SOURCE_NAMES = (
     "bootstrap_reconcile.py",

@@ -1,6 +1,6 @@
 [project]
 name = "clio-relay"
-version = "1.4.15"
+version = "1.4.16"
 description = "Cluster relay endpoints backed by clio-core and JARVIS-CD."
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
