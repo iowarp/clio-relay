@@ -12,11 +12,14 @@ from typing import Any, cast
 import pytest
 from pytest import MonkeyPatch
 
+import clio_relay.session_lifecycle as session_lifecycle
 import clio_relay.transport_probe as transport_probe
 from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.session_lifecycle import (
     CleanupResource,
+    OwnedSessionRecoveryStatus,
+    OwnedSessionStartStatusSelector,
     RemoteSessionStateEvidence,
     SessionLifecycleReport,
 )
@@ -35,6 +38,21 @@ def _frp_cluster_definition() -> ClusterDefinition:
         ssh_host="test-host",
         frp_transport=FrpTransportConfig(server_addr="relay.example.test"),
     )
+
+
+def _ready_owned_session_start_lines(kwargs: dict[str, object]) -> list[str]:
+    operation_id = cast(str, kwargs["start_operation_id"])
+    session_id = cast(str, kwargs["session_id"])
+    remote_api_port = cast(int, kwargs["remote_api_port"])
+    assert operation_id.startswith("start_")
+    assert kwargs["expected_cluster_route_revision"]
+    return [
+        f"session_started={session_id}",
+        f"start_operation_id={operation_id}",
+        "session_generation_id=generation-1",
+        f"remote_api_port={remote_api_port}",
+        "api_pid=123",
+    ]
 
 
 def test_frp_http_probe_starts_remote_proxy_and_local_visitor(monkeypatch: MonkeyPatch) -> None:
@@ -522,11 +540,8 @@ def test_ssh_forward_http_probe_starts_owned_remote_api_and_local_forward(
     def fake_start(**kwargs: object) -> list[str]:
         assert kwargs["session_id"] == "session-1"
         assert kwargs["remote_api_port"] == 9001
-        return [
-            "session_started=session-1",
-            "session_generation_id=generation-1",
-            "api_pid=123",
-        ]
+        assert kwargs["api_token"] == "token"
+        return _ready_owned_session_start_lines(kwargs)
 
     def fake_teardown(**kwargs: object) -> SessionLifecycleReport:
         teardowns.append(str(kwargs["session_id"]))
@@ -575,7 +590,7 @@ def test_ssh_forward_http_probe_starts_owned_remote_api_and_local_forward(
         http_bindings.append((local_url, session_id, generation_id))
         return ["transport.http_binding=verified"]
 
-    monkeypatch.setattr("clio_relay.transport_probe.start_remote_session", fake_start)
+    monkeypatch.setattr(session_lifecycle, "start_remote_session", fake_start)
     monkeypatch.setattr("clio_relay.transport_probe.teardown_remote_session", fake_teardown)
     monkeypatch.setattr("clio_relay.transport_probe._wait_for_healthz", fake_healthz)
 
@@ -612,7 +627,7 @@ def test_ssh_forward_http_probe_can_detach_remote_session(monkeypatch: MonkeyPat
     detaches: list[str] = []
 
     def fake_start(**_kwargs: object) -> list[str]:
-        return ["session_started=session-1", "session_generation_id=generation-1"]
+        return _ready_owned_session_start_lines(_kwargs)
 
     def fake_teardown(**kwargs: object) -> SessionLifecycleReport:
         teardowns.append(str(kwargs["session_id"]))
@@ -649,7 +664,8 @@ def test_ssh_forward_http_probe_can_detach_remote_session(monkeypatch: MonkeyPat
         return FakeProcess(command)
 
     monkeypatch.setattr(
-        "clio_relay.transport_probe.start_remote_session",
+        session_lifecycle,
+        "start_remote_session",
         fake_start,
     )
     monkeypatch.setattr(
@@ -680,60 +696,98 @@ def test_ssh_forward_http_probe_can_detach_remote_session(monkeypatch: MonkeyPat
     assert "transport.remote_session_ownership=verified" in lines
 
 
-def test_ssh_probe_recovers_generation_from_authoritative_status(
+@pytest.mark.parametrize(
+    ("expected_state", "attempt_verified"),
+    [("starting", True), ("ambiguous", False)],
+)
+def test_ssh_forward_probe_preserves_nonterminal_start_after_transport_deadline(
     monkeypatch: MonkeyPatch,
+    expected_state: str,
+    attempt_verified: bool,
 ) -> None:
     definition = ClusterDefinition(name="test-cluster", ssh_host="test-host")
+    start_invocations: list[dict[str, object]] = []
+    status_selectors: list[OwnedSessionStartStatusSelector] = []
 
-    def fake_status(**kwargs: object) -> dict[str, object]:
-        assert kwargs == {"definition": definition, "session_id": "session-1"}
-        return {
-            "session_id": "session-1",
-            "owner": "clio-relay",
-            "session_generation_id": "generation-from-status",
-            "running": True,
-            "ownership_verified": True,
-        }
-
-    monkeypatch.setattr(transport_probe, "status_remote_session", fake_status)
-
-    assert (
-        transport_probe._started_session_generation_id(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            ["session_started=session-1"],
-            definition=definition,
-            session_id="session-1",
+    def deadline(**kwargs: object) -> list[str]:
+        start_invocations.append(kwargs)
+        raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            "start transport deadline"
         )
-        == "generation-from-status"
-    )
 
-
-def test_ssh_probe_refuses_unverifiable_session_generation(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    definition = ClusterDefinition(name="test-cluster", ssh_host="test-host")
-
-    def fake_status(**_kwargs: object) -> dict[str, object]:
-        return {"session_generation_id": None}
-
-    monkeypatch.setattr(
-        transport_probe,
-        "status_remote_session",
-        fake_status,
-    )
-
-    with pytest.raises(RelayError, match="verifiable session generation id"):
-        transport_probe._started_session_generation_id(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            ["session_started=session-1"],
-            definition=definition,
-            session_id="session-1",
+    def fake_status(
+        *,
+        definition: ClusterDefinition,
+        selector: OwnedSessionStartStatusSelector,
+    ) -> OwnedSessionRecoveryStatus:
+        assert definition == ClusterDefinition(name="test-cluster", ssh_host="test-host")
+        status_selectors.append(selector)
+        return OwnedSessionRecoveryStatus(
+            cluster=selector.cluster,
+            session_id=selector.session_id,
+            session_generation_id=("generation-starting" if attempt_verified else None),
+            start_operation_id=selector.start_operation_id,
+            cluster_route_revision=selector.cluster_route_revision,
+            remote_api_port=selector.remote_api_port if attempt_verified else None,
+            start_state="starting",
+            start_phase="admitted" if attempt_verified else None,
+            start_attempt_verified=attempt_verified,
+            start_retryable=True,
+            start_replace=selector.replace if attempt_verified else None,
+            start_require_token=selector.require_token if attempt_verified else None,
+            start_expected_api_release_identity_sha256=(
+                selector.expected_api_release_identity_sha256 if attempt_verified else None
+            ),
+            errors=[] if attempt_verified else ["start transition is not yet observable"],
         )
+
+    monkeypatch.setattr(session_lifecycle, "start_remote_session", deadline)
+    monkeypatch.setattr(session_lifecycle, "status_remote_session_start", fake_status)
+
+    with pytest.raises(RelayError, match=f"state={expected_state}") as raised:
+        run_ssh_forward_http_probe(
+            cluster="test-cluster",
+            definition=definition,
+            local_bind_port=19001,
+            remote_api_port=9001,
+            session_id="session-1",
+            api_token="token",
+            process_factory=_unexpected_process_factory,
+        )
+
+    assert len(start_invocations) == 1
+    assert len(status_selectors) == 1
+    operation_id = cast(str, start_invocations[0]["start_operation_id"])
+    assert operation_id == status_selectors[0].start_operation_id
+    evidence_lines = transport_evidence_lines_from_error(raised.value)
+    assert len(evidence_lines) == 1
+    evidence = parse_transport_probe_evidence(evidence_lines[0].partition("=")[2])
+    assert evidence.cleanup_mode == "transport_probe_start_observation"
+    resource = evidence.resources[0]
+    assert resource.kind == "relay_session_start_operation"
+    assert resource.resource_id == operation_id
+    assert resource.action == "retain"
+    assert resource.ownership_verified is True
+    assert resource.outcome == "retained"
+    assert resource.verified_after_operation is True
+    assert resource.observed_state == expected_state
+    assert resource.residual is False
+    assert resource.metadata["terminal"] is False
+    assert resource.metadata["retryable"] is True
+    assert resource.metadata["transport_deadline_exceeded"] is True
+    assert resource.metadata["start_operation_id"] == operation_id
+    assert resource.metadata["status_selector"] == status_selectors[0].model_dump(mode="json")
+    assert resource.metadata["retry_selector"] == {
+        **status_selectors[0].model_dump(mode="json"),
+        "operation": "session.start",
+    }
 
 
 def test_ssh_forward_http_probe_rejects_residual_remote_session(
     monkeypatch: MonkeyPatch,
 ) -> None:
     def fake_start(**_kwargs: object) -> list[str]:
-        return ["session_started=session-1", "session_generation_id=generation-1"]
+        return _ready_owned_session_start_lines(_kwargs)
 
     def fake_teardown(**_kwargs: object) -> SessionLifecycleReport:
         return SessionLifecycleReport(
@@ -758,7 +812,7 @@ def test_ssh_forward_http_probe_rejects_residual_remote_session(
     def fake_healthz(_url: str, *, timeout_seconds: float) -> None:
         del timeout_seconds
 
-    monkeypatch.setattr(transport_probe, "start_remote_session", fake_start)
+    monkeypatch.setattr(session_lifecycle, "start_remote_session", fake_start)
     monkeypatch.setattr(transport_probe, "teardown_remote_session", fake_teardown)
     monkeypatch.setattr(transport_probe, "_wait_for_healthz", fake_healthz)
 
