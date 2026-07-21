@@ -3512,36 +3512,86 @@ import sys
 from pathlib import Path
 
 directory = Path.home() / ".local/share/clio-relay"
-lock_path = directory / "bootstrap.lock"
-directory_details = directory.lstat()
-if (
-    not stat.S_ISDIR(directory_details.st_mode)
-    or directory_details.st_uid != os.getuid()
-    or stat.S_IMODE(directory_details.st_mode) & 0o077
-):
-    raise SystemExit("bootstrap lock directory must be owner-private")
-flags = os.O_RDWR | os.O_CREAT
-if hasattr(os, "O_NOFOLLOW"):
-    flags |= os.O_NOFOLLOW
-descriptor = os.open(lock_path, flags, 0o600)
-os.fchmod(descriptor, 0o600)
-opened = os.fstat(descriptor)
-linked = lock_path.lstat()
-if (
-    not stat.S_ISREG(opened.st_mode)
-    or opened.st_nlink != 1
-    or opened.st_uid != os.getuid()
-    or stat.S_IMODE(opened.st_mode) & 0o077
-    or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
-):
-    raise SystemExit("bootstrap lock must be one owner-private regular file")
+directory_flags = os.O_RDONLY
+for flag_name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW"):
+    directory_flags |= getattr(os, flag_name, 0)
 try:
-    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except BlockingIOError as exc:
-    raise SystemExit("another clio-relay bootstrap is already running") from exc
-os.dup2(descriptor, 9, inheritable=True)
-if descriptor != 9:
-    os.close(descriptor)
+    directory_descriptor = os.open(directory, directory_flags)
+except OSError as exc:
+    raise SystemExit("bootstrap lock directory must be a real directory") from exc
+if directory_descriptor == 9:
+    replacement_descriptor = os.dup(directory_descriptor)
+    os.close(directory_descriptor)
+    directory_descriptor = replacement_descriptor
+descriptor = None
+try:
+    opened_directory = os.fstat(directory_descriptor)
+    linked_directory = directory.lstat()
+    if (
+        not stat.S_ISDIR(opened_directory.st_mode)
+        or not stat.S_ISDIR(linked_directory.st_mode)
+        or opened_directory.st_uid != os.getuid()
+        or (opened_directory.st_dev, opened_directory.st_ino)
+        != (linked_directory.st_dev, linked_directory.st_ino)
+    ):
+        raise SystemExit("bootstrap lock directory must be an owned real directory")
+    if stat.S_IMODE(opened_directory.st_mode) != 0o700:
+        os.fchmod(directory_descriptor, 0o700)
+    repaired_directory = os.fstat(directory_descriptor)
+    relinked_directory = directory.lstat()
+    if (
+        not stat.S_ISDIR(repaired_directory.st_mode)
+        or not stat.S_ISDIR(relinked_directory.st_mode)
+        or repaired_directory.st_uid != os.getuid()
+        or stat.S_IMODE(repaired_directory.st_mode) != 0o700
+        or (repaired_directory.st_dev, repaired_directory.st_ino)
+        != (relinked_directory.st_dev, relinked_directory.st_ino)
+    ):
+        raise SystemExit("bootstrap lock directory could not be made owner-private")
+    flags = os.O_RDWR | os.O_CREAT
+    for flag_name in ("O_CLOEXEC", "O_NOFOLLOW"):
+        flags |= getattr(os, flag_name, 0)
+    descriptor = os.open("bootstrap.lock", flags, 0o600, dir_fd=directory_descriptor)
+    opened = os.fstat(descriptor)
+    linked = os.stat(
+        "bootstrap.lock",
+        dir_fd=directory_descriptor,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(linked.st_mode)
+        or opened.st_nlink != 1
+        or opened.st_uid != os.getuid()
+        or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+    ):
+        raise SystemExit("bootstrap lock must be one owned regular file")
+    if stat.S_IMODE(opened.st_mode) != 0o600:
+        os.fchmod(descriptor, 0o600)
+    repaired = os.fstat(descriptor)
+    relinked = os.stat(
+        "bootstrap.lock",
+        dir_fd=directory_descriptor,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISREG(repaired.st_mode)
+        or not stat.S_ISREG(relinked.st_mode)
+        or repaired.st_nlink != 1
+        or repaired.st_uid != os.getuid()
+        or stat.S_IMODE(repaired.st_mode) != 0o600
+        or (repaired.st_dev, repaired.st_ino) != (relinked.st_dev, relinked.st_ino)
+    ):
+        raise SystemExit("bootstrap lock could not be made owner-private")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        raise SystemExit("another clio-relay bootstrap is already running") from exc
+    os.dup2(descriptor, 9, inheritable=True)
+finally:
+    os.close(directory_descriptor)
+    if descriptor is not None and descriptor != 9:
+        os.close(descriptor)
 environment = dict(os.environ)
 environment["CLIO_RELAY_BOOTSTRAP_LOCK_FD"] = "9"
 script = str(Path(sys.argv[1]).resolve(strict=True))
@@ -3555,18 +3605,41 @@ import os
 import stat
 from pathlib import Path
 
-lock_path = Path.home() / ".local/share/clio-relay/bootstrap.lock"
+directory = Path.home() / ".local/share/clio-relay"
+directory_flags = os.O_RDONLY
+for flag_name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW"):
+    directory_flags |= getattr(os, flag_name, 0)
+try:
+    directory_descriptor = os.open(directory, directory_flags)
+except OSError as exc:
+    raise SystemExit("inherited bootstrap lock directory changed") from exc
 opened = os.fstat(9)
-linked = lock_path.lstat()
-if (
-    not stat.S_ISREG(opened.st_mode)
-    or opened.st_nlink != 1
-    or opened.st_uid != os.getuid()
-    or stat.S_IMODE(opened.st_mode) & 0o077
-    or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
-):
-    raise SystemExit("inherited bootstrap lock identity changed")
-fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+try:
+    opened_directory = os.fstat(directory_descriptor)
+    linked_directory = directory.lstat()
+    linked = os.stat(
+        "bootstrap.lock",
+        dir_fd=directory_descriptor,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISDIR(opened_directory.st_mode)
+        or not stat.S_ISDIR(linked_directory.st_mode)
+        or opened_directory.st_uid != os.getuid()
+        or stat.S_IMODE(opened_directory.st_mode) != 0o700
+        or (opened_directory.st_dev, opened_directory.st_ino)
+        != (linked_directory.st_dev, linked_directory.st_ino)
+        or not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(linked.st_mode)
+        or opened.st_nlink != 1
+        or opened.st_uid != os.getuid()
+        or stat.S_IMODE(opened.st_mode) != 0o600
+        or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+    ):
+        raise SystemExit("inherited bootstrap lock identity changed")
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+finally:
+    os.close(directory_descriptor)
 __CLIO_RELAY_BOOTSTRAP_LOCK_VERIFY__
 BOOTSTRAP_INVOCATION_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
 BOOTSTRAP_INVOCATION_STARTED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
