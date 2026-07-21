@@ -76,7 +76,9 @@ def test_managed_bootstrap_fences_worker_around_migration() -> None:
     assert '"$CLIO_RELAY_ENDPOINT_SERVICE_NAME"' in script
     assert "WORKER_WRITER_PROOF=1" in script
     assert 'environment["CLIO_RELAY_BOOTSTRAP_LOCK_FD"] = "9"' in script
-    assert "flags |= os.O_NOFOLLOW" in script
+    assert 'flag_name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW")' in script
+    assert "os.fchmod(directory_descriptor, 0o700)" in script
+    assert 'os.open("bootstrap.lock", flags, 0o600, dir_fd=directory_descriptor)' in script
     assert "fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)" in script
     assert 'exec 8<>"$WORKER_LIFETIME_LOCK_PATH"' in script
     assert "WORKER_LIFETIME_GUARD_FD=8" in script
