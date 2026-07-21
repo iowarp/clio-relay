@@ -785,7 +785,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PATH=%h/.local/share/clio-relay/current/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 {core_line}
 {spool_line}
 {jarvis_line}
