@@ -53,6 +53,7 @@ from clio_relay.models import (
     McpAdmissionClass,
     McpCallSpec,
     McpOperation,
+    OwnerSessionClosure,
     RelayJob,
     RelayTask,
     SchedulerPhase,
@@ -83,6 +84,23 @@ from tests.queue_validation_fixtures import (
 _REAL_PERSIST_VERIFIED_CLEANUP_REPORT = (
     cli._persist_verified_cleanup_report_before_closure  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
+
+
+def _owner_session_closure_payload(
+    *,
+    owner_session_id: str = "session-1",
+    session_generation_id: str = "generation-1",
+    residual_resource_ids: list[str] | None = None,
+) -> dict[str, object]:
+    """Build canonical authoritative closure evidence for teardown tests."""
+    return cast(
+        dict[str, object],
+        OwnerSessionClosure(
+            owner_session_id=owner_session_id,
+            session_generation_id=session_generation_id,
+            residual_resource_ids=residual_resource_ids or [],
+        ).model_dump(mode="json"),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -133,11 +151,23 @@ def _default_cli_mode(  # pyright: ignore[reportUnusedFunction]
             ownership_verified=True,
             recovery_verified=True,
             admission_status={
+                "schema_version": "clio-relay.owner-session-admission-status.v1",
+                "owner_session_id": report.session_id,
+                "session_generation_id": generation_id,
                 "active_generation_id": generation_id,
                 "closing_generation_id": generation_id,
+                "active": True,
                 "closing": True,
                 "closed": False,
-                "cleanup_intent": {"operation_id": operation_id, **report.cleanup_policy},
+                "open": False,
+                "cleanup_intent": {
+                    "schema_version": "clio-relay.owner-session-cleanup-intent.v1",
+                    "owner_session_id": report.session_id,
+                    "session_generation_id": generation_id,
+                    "operation_id": operation_id,
+                    **report.cleanup_policy,
+                },
+                "closure": None,
             },
         )
         finalized_statuses[report.session_id] = status
@@ -1699,9 +1729,16 @@ def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch
     assert torn_down[0]["expected_session_generation_id"] == "generation-1"
 
 
+@pytest.mark.parametrize(
+    ("remote_already_closed", "local_already_closed", "closed_admission_drift"),
+    [(False, False, False), (True, False, False), (True, True, False), (True, True, True)],
+)
 def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    remote_already_closed: bool,
+    local_already_closed: bool,
+    closed_admission_drift: bool,
 ) -> None:
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
     queue = ClioCoreQueue(tmp_path / "core")
@@ -1722,6 +1759,12 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
         session_generation_id="generation-1",
         operation_id="cleanup_reconnect",
     )
+    if local_already_closed:
+        queue.set_owner_session_closed(
+            local_session_id,
+            session_generation_id="generation-1",
+            residual_resource_ids=[],
+        )
     report = _verified_teardown_report()
     report.cleanup_operation_id = "cleanup_reconnect"
     report.cleanup_policy = {
@@ -1740,7 +1783,7 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
     def fake_status(**_kwargs: object) -> dict[str, object]:
         nonlocal status_calls
         status_calls += 1
-        closed = status_calls > 1
+        closed = remote_already_closed or status_calls > 1
         return OwnedSessionRecoveryStatus(
             cluster="ares",
             session_id="session-1",
@@ -1763,6 +1806,11 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
             ownership_verified=True,
             recovery_verified=True,
             admission_status={
+                "schema_version": (
+                    "clio-relay.owner-session-admission-status.v0"
+                    if closed_admission_drift and closed
+                    else "clio-relay.owner-session-admission-status.v1"
+                ),
                 "owner_session_id": "session-1",
                 "session_generation_id": "generation-1",
                 "active_generation_id": None if closed else "generation-1",
@@ -1772,11 +1820,15 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
                 "closed": closed,
                 "open": False,
                 "cleanup_intent": {
+                    "schema_version": "clio-relay.owner-session-cleanup-intent.v1",
+                    "owner_session_id": "session-1",
+                    "session_generation_id": "generation-1",
                     "operation_id": "cleanup_reconnect",
                     "stop_worker": False,
                     "cancel_jobs": False,
                     "cancel_scheduler_jobs": False,
                 },
+                "closure": (_owner_session_closure_payload() if closed else None),
             },
         ).model_dump(mode="json")
 
@@ -1800,6 +1852,31 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
     )
     monkeypatch.setattr(cli, "run_remote_clio", fake_remote)
     monkeypatch.setattr(cli, "should_execute_on_cluster", lambda _definition: True)
+    real_set_closed = ClioCoreQueue.set_owner_session_closed
+    local_mutations = 0
+
+    def count_local_mutation(
+        self: ClioCoreQueue,
+        owner_session_id: str,
+        **kwargs: object,
+    ) -> object:
+        nonlocal local_mutations
+        if owner_session_id == local_session_id:
+            local_mutations += 1
+        return real_set_closed(self, owner_session_id, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(ClioCoreQueue, "set_owner_session_closed", count_local_mutation)
+
+    if closed_admission_drift:
+        with pytest.raises(RelayError, match="admission evidence"):
+            cli._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                definition=ClusterDefinition(name="ares", ssh_host="ares"),
+                cluster="ares",
+                session_id="session-1",
+            )
+        assert remote_calls == []
+        assert local_mutations == 0
+        return
 
     cli._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
@@ -1807,16 +1884,22 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
         session_id="session-1",
     )
 
-    assert remote_calls == [
-        [
-            "session",
-            "mark-closed",
-            "--session-id",
-            "session-1",
-            "--session-generation-id",
-            "generation-1",
+    expected_remote_calls = (
+        []
+        if remote_already_closed
+        else [
+            [
+                "session",
+                "mark-closed",
+                "--session-id",
+                "session-1",
+                "--session-generation-id",
+                "generation-1",
+            ]
         ]
-    ]
+    )
+    assert remote_calls == expected_remote_calls
+    assert local_mutations == (0 if local_already_closed else 1)
     closure = queue.get_owner_session_closed(
         local_session_id,
         session_generation_id="generation-1",
@@ -1890,7 +1973,7 @@ def test_cleanup_report_is_persisted_and_reread_before_authoritative_closure(
 
     monkeypatch.setattr(cli, "read_remote_session_cleanup_report", read_report)
 
-    observed = _REAL_PERSIST_VERIFIED_CLEANUP_REPORT(
+    observed_report, observed_status = _REAL_PERSIST_VERIFIED_CLEANUP_REPORT(
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
         cluster="ares",
         session_id="session-1",
@@ -1898,7 +1981,8 @@ def test_cleanup_report_is_persisted_and_reread_before_authoritative_closure(
         report=report,
     )
 
-    assert observed == report
+    assert observed_report == report
+    assert observed_status == finalized_status
     assert len(calls) == 1
     assert calls[0]["cleanup_operation_id"] == "cleanup_reconnect"
     assert calls[0]["cleanup_policy"] == report.cleanup_policy
@@ -2200,6 +2284,158 @@ def test_cleanup_evidence_state_parent_rejects_cwd_relative_install_receipt(
         cli._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
+def test_cleanup_artifact_parent_swap_after_lock_has_zero_replacement_mutation(
+    tmp_path: Path,
+) -> None:
+    lock = cli._acquire_cleanup_evidence_lock()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    parent = cli._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    displaced = tmp_path / "displaced-state"
+    try:
+        if os.name == "nt":
+            with pytest.raises(OSError):
+                parent.rename(displaced)
+            assert {path.name for path in parent.iterdir()} == {lock.path.name}
+            return
+        parent.rename(displaced)
+        parent.mkdir(mode=0o700)
+        with pytest.raises(RelayError, match="lock identity changed|validation parent"):
+            cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                _verified_teardown_report(),
+                validation_report_path=tmp_path / "report.json",
+                evidence_lock=lock,
+            )
+        assert list(parent.iterdir()) == []
+        assert {path.name for path in displaced.iterdir()} == {lock.path.name}
+    finally:
+        cli._release_cleanup_evidence_lock(lock)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+
+def test_windows_cleanup_lock_guard_blocks_parent_swap_before_lock_open(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    if os.name != "nt":
+        return
+    parent = cli._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    displaced = tmp_path / "displaced-lock-parent"
+    rename_errors: list[OSError] = []
+    original = cli._open_windows_pinned_directory  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def try_swap_after_pin(*args: object, **kwargs: object) -> object:
+        anchor = original(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+        try:
+            parent.rename(displaced)
+            parent.mkdir(mode=0o700)
+        except OSError as exc:
+            rename_errors.append(exc)
+        return anchor
+
+    monkeypatch.setattr(cli, "_open_windows_pinned_directory", try_swap_after_pin)
+    lock = cli._acquire_cleanup_evidence_lock()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    try:
+        assert rename_errors
+        assert not displaced.exists()
+        assert {path.name for path in parent.iterdir()} == {lock.path.name}
+    finally:
+        cli._release_cleanup_evidence_lock(lock)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+
+def test_windows_parent_guard_blocks_rename_and_auto_deletes(
+    tmp_path: Path,
+) -> None:
+    if os.name != "nt":
+        return
+    parent = tmp_path / "guarded"
+    parent.mkdir(mode=0o700)
+    displaced = tmp_path / "displaced-guarded"
+    guard = cli.acquire_private_configuration_windows_parent_guard(parent)
+    try:
+        assert guard[0].is_file()
+        with pytest.raises(OSError):
+            parent.rename(displaced)
+    finally:
+        cli.release_private_configuration_windows_parent_guard(guard)
+    assert not guard[0].exists()
+    parent.rename(displaced)
+    assert displaced.is_dir()
+
+
+def test_windows_cleanup_lock_swap_before_guard_creation_leaves_replacement_empty(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    if os.name != "nt":
+        return
+    parent = cli._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    displaced = tmp_path / "displaced-before-guard"
+    original = cli.acquire_private_configuration_windows_parent_guard
+
+    def swap_then_guard(path: Path) -> tuple[Path, object]:
+        path.rename(displaced)
+        path.mkdir(mode=0o700)
+        guard_path, handle = original(path)
+        return guard_path, handle
+
+    monkeypatch.setattr(
+        cli,
+        "acquire_private_configuration_windows_parent_guard",
+        swap_then_guard,
+    )
+    with pytest.raises(RelayError, match="changed while pinning"):
+        cli._acquire_cleanup_evidence_lock()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    assert list(parent.iterdir()) == []
+    assert list(displaced.iterdir()) == []
+
+
+def test_windows_cleanup_artifact_guard_blocks_child_swap_before_pending_write(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    if os.name != "nt":
+        return
+    seed = _verified_teardown_report()
+    seed.cleanup_operation_id = "cleanup-child-guard-seed"
+    first = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        seed,
+        validation_report_path=tmp_path / "seed.json",
+    )
+    artifact_directory = first.manifest_path.parent
+    displaced = tmp_path / "displaced-artifacts"
+    rename_errors: list[OSError] = []
+    attempted = False
+    original = cli.open_private_atomic_file
+
+    def try_swap_before_pending(path: Path) -> object:
+        nonlocal attempted
+        if not attempted:
+            attempted = True
+            try:
+                artifact_directory.rename(displaced)
+                artifact_directory.mkdir(mode=0o700)
+            except OSError as exc:
+                rename_errors.append(exc)
+        return original(path)
+
+    monkeypatch.setattr(cli, "open_private_atomic_file", try_swap_before_pending)
+    replacement = seed.model_copy(deep=True)
+    replacement.cleanup_operation_id = "cleanup-child-guard-replacement"
+    replacement.resources[0].detail = "replacement"
+
+    result = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        replacement,
+        validation_report_path=tmp_path / "replacement.json",
+    )
+
+    assert result.manifest_path.is_file()
+    assert attempted
+    assert rename_errors
+    assert not displaced.exists()
+    assert not any(
+        path.name.startswith(".clio-parent-guard-") for path in artifact_directory.iterdir()
+    )
+
+
 def test_local_cleanup_report_artifact_rejects_consistently_tampered_prior_report(
     tmp_path: Path,
 ) -> None:
@@ -2364,7 +2600,10 @@ def test_local_cleanup_report_artifact_rejects_external_aliases(
 
     with pytest.raises(
         RelayError,
-        match="exact regular file|candidate is unsafe|not one regular owned file",
+        match=(
+            "exact regular file|candidate is unsafe|not one regular owned file|"
+            "cannot be opened safely"
+        ),
     ):
         cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report,
@@ -2567,18 +2806,23 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
 
     def authoritative_admission() -> dict[str, object]:
         return {
+            "schema_version": "clio-relay.owner-session-admission-status.v1",
             "owner_session_id": "session-1",
             "session_generation_id": "generation-1",
-            "active_generation_id": "generation-1",
+            "active_generation_id": None if remote_closed else "generation-1",
             "closing_generation_id": "generation-1",
+            "active": not remote_closed,
             "open": False,
             "closing": True,
             "closed": remote_closed,
             "cleanup_intent": {
+                "schema_version": "clio-relay.owner-session-cleanup-intent.v1",
+                "owner_session_id": "session-1",
                 "session_generation_id": "generation-1",
                 "operation_id": operation_id,
                 **policy,
             },
+            "closure": (_owner_session_closure_payload() if remote_closed else None),
         }
 
     def recovered_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
@@ -2713,8 +2957,8 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
     assert failed_validation["cleanup"]["remaining_resources"][0]["state"] == "pending"
     assert result.exit_code == 0, result.output
     assert already_closed.exit_code == 0, already_closed.output
-    assert remote_closure_attempts == 3
-    assert local_closure_attempts == 3
+    assert remote_closure_attempts == 1
+    assert local_closure_attempts == 2
     assert remote_closed is True
     assert len(report_reads) == 3
     assert destructive_calls == []
@@ -2832,6 +3076,349 @@ def test_session_start_never_closes_from_remote_only_cleanup_receipt(
     )
     assert local_status["closing"] is True
     assert local_status["closed"] is False
+
+
+def test_local_owner_session_closure_replay_is_read_only_after_split_failure(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+    session_id = "session-1"
+    generation_id = "generation-1"
+    operation_id = "cleanup_local_split"
+    local_session_id = cli._desktop_owner_session_admission_id(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster="ares",
+        session_id=session_id,
+    )
+    queue.prepare_owner_session_start(
+        session_id,
+        recorded_generation_id=None,
+        candidate_generation_id=generation_id,
+    )
+    queue.set_owner_session_closing(
+        session_id,
+        session_generation_id=generation_id,
+        operation_id=operation_id,
+    )
+    queue.mirror_owner_session_generation_open(
+        local_session_id,
+        session_generation_id=generation_id,
+    )
+    queue.set_owner_session_closing(
+        local_session_id,
+        session_generation_id=generation_id,
+        operation_id=operation_id,
+    )
+    report = _verified_teardown_report()
+    report.cleanup_operation_id = operation_id
+    report.cleanup_policy = {
+        "stop_worker": False,
+        "cancel_jobs": False,
+        "cancel_scheduler_jobs": False,
+    }
+    report.relay_cancel_requested = False
+    report.scheduler_cancel_requested = False
+    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report
+    )
+
+    def recovery(process_state: str) -> OwnedSessionRecoveryStatus:
+        return OwnedSessionRecoveryStatus(
+            cluster="ares",
+            session_id=session_id,
+            session_generation_id=generation_id,
+            owner="clio-relay",
+            api_pid=4321,
+            process_start_marker="123456",
+            leader_process_state="absent",
+            process_state=process_state,
+            process_absence_verified=True,
+            generation_process_absence_verified=True,
+            metadata_verified=True,
+            cluster_registry_verified=True,
+            durable_generation_verified=True,
+            cleanup_receipt=True,
+            cleanup_paths_pending=False,
+            coordinator_report_ref=report_reference,
+            coordinator_report_sha256=session_lifecycle_report_sha256(report),
+            coordinator_report_bound=True,
+            ownership_verified=True,
+            recovery_verified=True,
+            admission_status=queue.owner_session_generation_status(
+                session_id,
+                session_generation_id=generation_id,
+            ),
+        )
+
+    real_set_closed = ClioCoreQueue.set_owner_session_closed
+    setter_calls = {session_id: 0, local_session_id: 0}
+
+    def fail_first_mirror_close(
+        self: ClioCoreQueue,
+        owner_session_id: str,
+        **kwargs: object,
+    ) -> object:
+        setter_calls[owner_session_id] += 1
+        if owner_session_id == local_session_id and setter_calls[owner_session_id] == 1:
+            raise RelayError("simulated local mirror crash")
+        return real_set_closed(self, owner_session_id, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(ClioCoreQueue, "set_owner_session_closed", fail_first_mirror_close)
+    arguments = {
+        "queue": queue,
+        "definition": ClusterDefinition(name="ares", ssh_host="ares"),
+        "cluster": "ares",
+        "remote_execution": False,
+        "session_id": session_id,
+        "local_admission_session_id": local_session_id,
+        "session_generation_id": generation_id,
+        "legacy_unversioned_job_ids": [],
+        "finalized_report": report,
+    }
+
+    with pytest.raises(RelayError, match="simulated local mirror crash"):
+        cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            **arguments,
+            finalized_recovery=recovery("cleanup_pending"),
+        )
+    assert (
+        queue.owner_session_generation_status(
+            session_id,
+            session_generation_id=generation_id,
+        )["closed"]
+        is True
+    )
+    assert (
+        queue.owner_session_generation_status(
+            local_session_id,
+            session_generation_id=generation_id,
+        )["closed"]
+        is False
+    )
+
+    closed_recovery = recovery("already_closed")
+    cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        **arguments,
+        finalized_recovery=closed_recovery,
+    )
+    cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        **arguments,
+        finalized_recovery=closed_recovery,
+    )
+
+    assert setter_calls[session_id] == 1
+    assert setter_calls[local_session_id] == 2
+    assert (
+        queue.owner_session_generation_status(
+            local_session_id,
+            session_generation_id=generation_id,
+        )["closed"]
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    ("drift", "value"),
+    [
+        ("schema", "clio-relay.owner-session-admission-status.v0"),
+        ("owner", "other-session"),
+        ("generation", "other-generation"),
+        ("policy", True),
+    ],
+)
+def test_owner_session_closure_rejects_pending_admission_drift_before_mutation(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    drift: str,
+    value: object,
+) -> None:
+    report = _verified_teardown_report()
+    report.cleanup_operation_id = "cleanup_pending_drift"
+    report.cleanup_policy = {
+        "stop_worker": False,
+        "cancel_jobs": False,
+        "cancel_scheduler_jobs": False,
+    }
+    report.relay_cancel_requested = False
+    report.scheduler_cancel_requested = False
+    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report
+    )
+    admission: dict[str, object] = {
+        "schema_version": "clio-relay.owner-session-admission-status.v1",
+        "owner_session_id": "session-1",
+        "session_generation_id": "generation-1",
+        "active_generation_id": "generation-1",
+        "closing_generation_id": "generation-1",
+        "active": True,
+        "closing": True,
+        "closed": False,
+        "open": False,
+        "cleanup_intent": {
+            "schema_version": "clio-relay.owner-session-cleanup-intent.v1",
+            "owner_session_id": "session-1",
+            "session_generation_id": "generation-1",
+            "operation_id": "cleanup_pending_drift",
+            "stop_worker": False,
+            "cancel_jobs": False,
+            "cancel_scheduler_jobs": False,
+        },
+        "closure": None,
+    }
+    if drift == "schema":
+        admission["schema_version"] = value
+    elif drift == "owner":
+        admission["owner_session_id"] = value
+    elif drift == "generation":
+        admission["session_generation_id"] = value
+    else:
+        intent = cast(dict[str, object], admission["cleanup_intent"])
+        intent["stop_worker"] = value
+    recovery = OwnedSessionRecoveryStatus(
+        cluster="ares",
+        session_id="session-1",
+        session_generation_id="generation-1",
+        owner="clio-relay",
+        api_pid=4321,
+        process_start_marker="123456",
+        leader_process_state="absent",
+        process_state="cleanup_pending",
+        process_absence_verified=True,
+        generation_process_absence_verified=True,
+        metadata_verified=True,
+        cluster_registry_verified=True,
+        durable_generation_verified=True,
+        cleanup_receipt=True,
+        cleanup_paths_pending=False,
+        coordinator_report_ref=report_reference,
+        coordinator_report_sha256=session_lifecycle_report_sha256(report),
+        coordinator_report_bound=True,
+        ownership_verified=True,
+        recovery_verified=True,
+        admission_status=admission,
+    )
+    mutation_calls: list[str] = []
+
+    def forbidden_remote(*_args: object, **_kwargs: object) -> str:
+        mutation_calls.append("remote")
+        raise AssertionError("pending admission drift reached remote mutation")
+
+    def forbidden_local(*_args: object, **_kwargs: object) -> object:
+        mutation_calls.append("local")
+        raise AssertionError("pending admission drift reached local mutation")
+
+    monkeypatch.setattr(cli, "run_remote_clio", forbidden_remote)
+    monkeypatch.setattr(ClioCoreQueue, "set_owner_session_closed", forbidden_local)
+
+    with pytest.raises(RelayError, match="admission evidence|immutable cleanup intent"):
+        cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            queue=ClioCoreQueue(tmp_path / "core"),
+            definition=ClusterDefinition(name="ares", ssh_host="ares"),
+            cluster="ares",
+            remote_execution=True,
+            session_id="session-1",
+            local_admission_session_id="desktop-unused",
+            session_generation_id="generation-1",
+            legacy_unversioned_job_ids=[],
+            finalized_recovery=recovery,
+            finalized_report=report,
+        )
+    assert mutation_calls == []
+
+
+@pytest.mark.parametrize("invalid_closure", [None, "residual"])
+def test_owner_session_closure_rejects_invalid_closed_evidence_before_mutation(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    invalid_closure: str | None,
+) -> None:
+    report = _verified_teardown_report()
+    report.cleanup_operation_id = "cleanup_closed_evidence"
+    report.cleanup_policy = {
+        "stop_worker": False,
+        "cancel_jobs": False,
+        "cancel_scheduler_jobs": False,
+    }
+    report.relay_cancel_requested = False
+    report.scheduler_cancel_requested = False
+    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report
+    )
+    closure = (
+        None
+        if invalid_closure is None
+        else _owner_session_closure_payload(residual_resource_ids=["gateway-1"])
+    )
+    recovery = OwnedSessionRecoveryStatus(
+        cluster="ares",
+        session_id="session-1",
+        session_generation_id="generation-1",
+        owner="clio-relay",
+        api_pid=4321,
+        process_start_marker="123456",
+        leader_process_state="absent",
+        process_state="already_closed",
+        process_absence_verified=True,
+        generation_process_absence_verified=True,
+        metadata_verified=True,
+        cluster_registry_verified=True,
+        durable_generation_verified=True,
+        cleanup_receipt=True,
+        cleanup_paths_pending=False,
+        coordinator_report_ref=report_reference,
+        coordinator_report_sha256=session_lifecycle_report_sha256(report),
+        coordinator_report_bound=True,
+        ownership_verified=True,
+        recovery_verified=True,
+        admission_status={
+            "schema_version": "clio-relay.owner-session-admission-status.v1",
+            "owner_session_id": "session-1",
+            "session_generation_id": "generation-1",
+            "active_generation_id": None,
+            "closing_generation_id": "generation-1",
+            "active": False,
+            "closing": True,
+            "closed": True,
+            "open": False,
+            "cleanup_intent": {
+                "schema_version": "clio-relay.owner-session-cleanup-intent.v1",
+                "owner_session_id": "session-1",
+                "session_generation_id": "generation-1",
+                "operation_id": "cleanup_closed_evidence",
+                "stop_worker": False,
+                "cancel_jobs": False,
+                "cancel_scheduler_jobs": False,
+            },
+            "closure": closure,
+        },
+    )
+    mutation_calls: list[str] = []
+
+    def forbidden_remote(*_args: object, **_kwargs: object) -> str:
+        mutation_calls.append("remote")
+        raise AssertionError("invalid closed evidence reached remote mutation")
+
+    def forbidden_local(*_args: object, **_kwargs: object) -> object:
+        mutation_calls.append("local")
+        raise AssertionError("invalid closed evidence reached local mutation")
+
+    monkeypatch.setattr(cli, "run_remote_clio", forbidden_remote)
+    monkeypatch.setattr(ClioCoreQueue, "set_owner_session_closed", forbidden_local)
+
+    with pytest.raises(RelayError, match="admission closure evidence|admission evidence"):
+        cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            queue=ClioCoreQueue(tmp_path / "core"),
+            definition=ClusterDefinition(name="ares", ssh_host="ares"),
+            cluster="ares",
+            remote_execution=True,
+            session_id="session-1",
+            local_admission_session_id="desktop-unused",
+            session_generation_id="generation-1",
+            legacy_unversioned_job_ids=[],
+            finalized_recovery=recovery,
+            finalized_report=report,
+        )
+    assert mutation_calls == []
 
 
 @pytest.mark.parametrize("invalid_kind", ["connector", "scheduler"])

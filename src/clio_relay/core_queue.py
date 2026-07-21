@@ -9139,6 +9139,7 @@ class ClioCoreQueue:
                 "closed": False,
                 "open": True,
                 "cleanup_intent": None,
+                "closure": None,
             }
 
     def owner_session_generation_status(
@@ -9177,13 +9178,11 @@ class ClioCoreQueue:
                 if closing_generation == session_generation_id and closing is not None
                 else None
             )
-            closed = (
-                self.get_owner_session_closed(
-                    owner_session_id,
-                    session_generation_id=session_generation_id,
-                )
-                is not None
+            closure = self.get_owner_session_closed(
+                owner_session_id,
+                session_generation_id=session_generation_id,
             )
+            closed = closure is not None
             exact_active = active_generation == session_generation_id
             exact_closing = closing_generation == session_generation_id
             return {
@@ -9197,6 +9196,7 @@ class ClioCoreQueue:
                 "closed": closed,
                 "open": exact_active and closing_generation is None and not closed,
                 "cleanup_intent": cleanup_intent,
+                "closure": None if closure is None else closure.model_dump(mode="json"),
             }
 
     def prepare_owner_session_start(

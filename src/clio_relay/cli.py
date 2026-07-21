@@ -61,10 +61,12 @@ from clio_relay.cluster_config import (
     RemoteMcpProfile,
     RemoteMcpServerConfig,
     WorkerCapacityPolicy,
+    acquire_private_configuration_windows_parent_guard,
     default_registry_path,
     ensure_private_configuration_windows_handle,
     open_private_atomic_file,
     open_private_configuration_windows_descriptor,
+    release_private_configuration_windows_parent_guard,
 )
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
@@ -130,6 +132,7 @@ from clio_relay.models import (
     McpOperation,
     MonitorRule,
     MonitorRuleAction,
+    OwnerSessionClosure,
     ProgressRecord,
     RelayJob,
     RemoteAgentTaskSpec,
@@ -384,6 +387,13 @@ class _CleanupEvidenceLock:
     windows_parent: _WindowsPinnedDirectory | None = None
 
 
+def _windows_parent_guard_names(
+    guard: tuple[Path, ctypes.c_void_p] | None,
+) -> frozenset[str]:
+    """Return the one exact internal guard name ignored by bounded enumeration."""
+    return frozenset() if guard is None else frozenset({guard[0].name})
+
+
 def _open_windows_pinned_directory(
     path: Path,
     *,
@@ -590,7 +600,9 @@ def _acquire_cleanup_evidence_lock() -> _CleanupEvidenceLock:
 
     windows_parent: _WindowsPinnedDirectory | None = None
     windows_handle: ctypes.c_void_p | None = None
+    windows_parent_guard: tuple[Path, ctypes.c_void_p] | None = None
     try:
+        windows_parent_guard = acquire_private_configuration_windows_parent_guard(parent_directory)
         windows_parent = _open_windows_pinned_directory(
             parent_directory,
             expected=parent_status,
@@ -660,11 +672,15 @@ def _acquire_cleanup_evidence_lock() -> _CleanupEvidenceLock:
             directory=False,
         )
         _verify_windows_pinned_directory(windows_parent)
-        return _CleanupEvidenceLock(
+        result = _CleanupEvidenceLock(
             path=lock_path,
             windows_handle=windows_handle,
             windows_parent=windows_parent,
         )
+        acquired_parent_guard = windows_parent_guard
+        windows_parent_guard = None
+        release_private_configuration_windows_parent_guard(acquired_parent_guard)
+        return result
     except BaseException:
         if windows_handle is not None:
             close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
@@ -672,6 +688,7 @@ def _acquire_cleanup_evidence_lock() -> _CleanupEvidenceLock:
             close_handle.restype = ctypes.c_int
             close_handle(windows_handle)
         _close_windows_pinned_directory(windows_parent)
+        release_private_configuration_windows_parent_guard(windows_parent_guard)
         raise
 
 
@@ -3821,7 +3838,6 @@ def _finalize_completed_cleanup_receipt_before_start(
         session_generation_id=generation_id,
     )
     remote_closed = admission.get("closed") is True
-    local_closed = local_status.get("closed") is True
     local_closing = bool(
         local_status.get("closing") is True
         and local_status.get("closing_generation_id") == generation_id
@@ -3831,43 +3847,43 @@ def _finalize_completed_cleanup_receipt_before_start(
             "completed remote cleanup receipt has no exact desktop closing mirror; "
             "automatic reconnect recovery was refused before mutation"
         )
-    if not (remote_closed and local_closed):
-        _mark_owner_session_closed(
-            queue=queue,
-            definition=definition,
-            remote_execution=should_execute_on_cluster(definition),
-            session_id=session_id,
-            local_admission_session_id=local_admission_session_id,
-            session_generation_id=generation_id,
-            legacy_unversioned_job_ids=[],
+    _mark_owner_session_closed(
+        queue=queue,
+        definition=definition,
+        cluster=cluster,
+        remote_execution=should_execute_on_cluster(definition),
+        session_id=session_id,
+        local_admission_session_id=local_admission_session_id,
+        session_generation_id=generation_id,
+        legacy_unversioned_job_ids=[],
+        finalized_recovery=status,
+        finalized_report=report,
+    )
+    refreshed = OwnedSessionRecoveryStatus.model_validate(
+        status_remote_session(definition=definition, session_id=session_id)
+    )
+    if not (
+        refreshed.recovery_verified
+        and refreshed.cleanup_receipt
+        and refreshed.cleanup_paths_pending is False
+        and refreshed.coordinator_report_bound
+        and isinstance(refreshed.admission_status, dict)
+        and refreshed.admission_status.get("closed") is True
+    ):
+        raise RelayError(
+            "owned session cleanup closure was not authoritative after reconnect recovery"
         )
-        refreshed = OwnedSessionRecoveryStatus.model_validate(
-            status_remote_session(definition=definition, session_id=session_id)
-        )
-        if not (
-            refreshed.recovery_verified
-            and refreshed.cleanup_receipt
-            and refreshed.cleanup_paths_pending is False
-            and refreshed.coordinator_report_bound
-            and isinstance(refreshed.admission_status, dict)
-            and refreshed.admission_status.get("closed") is True
-        ):
-            raise RelayError(
-                "owned session cleanup closure was not authoritative after reconnect recovery"
-            )
-        if refreshed.coordinator_report_ref != status.coordinator_report_ref:
-            raise RelayError(
-                "coordinator cleanup report reference changed during reconnect closure"
-            )
-        _verified_finalized_cleanup_report(
-            refreshed,
-            report=report,
-            cluster=cluster,
-            session_id=session_id,
-            expected_generation_id=generation_id,
-            expected_cleanup_operation_id=operation_id,
-            expected_cleanup_policy=report.cleanup_policy,
-        )
+    if refreshed.coordinator_report_ref != status.coordinator_report_ref:
+        raise RelayError("coordinator cleanup report reference changed during reconnect closure")
+    _verified_finalized_cleanup_report(
+        refreshed,
+        report=report,
+        cluster=cluster,
+        session_id=session_id,
+        expected_generation_id=generation_id,
+        expected_cleanup_operation_id=operation_id,
+        expected_cleanup_policy=report.cleanup_policy,
+    )
 
 
 def _verified_finalized_cleanup_report(
@@ -3988,20 +4004,36 @@ def _persist_local_cleanup_report_artifact(
     if not validation_report_path.name or validation_report_path.name in {".", ".."}:
         raise RelayError("validation report path has no safe artifact identity")
     requested_parent = _cleanup_evidence_state_parent()
-    durably_ensure_validation_directory(requested_parent)
-    requested_parent_status = os.lstat(requested_parent)
-    if stat.S_ISLNK(requested_parent_status.st_mode):
-        raise RelayError("local cleanup report artifact parent cannot be a symlink")
-    if os.name == "nt":
-        requested_anchor = _open_windows_pinned_directory(
-            requested_parent,
-            expected=requested_parent_status,
+    if evidence_lock is not None:
+        _verify_cleanup_evidence_lock(
+            evidence_lock,
+            expected_parent=requested_parent,
         )
-        _close_windows_pinned_directory(requested_anchor)
-    parent_directory = requested_parent.resolve(strict=True)
-    if os.path.normcase(str(parent_directory)) != os.path.normcase(str(requested_parent)):
-        raise RelayError("local cleanup report artifact parent cannot traverse a reparse point")
-    parent_linked = os.lstat(parent_directory)
+    locked_posix_parent_fd = (
+        evidence_lock.parent_fd if evidence_lock is not None and os.name == "posix" else None
+    )
+    if os.name == "posix" and evidence_lock is not None and locked_posix_parent_fd is None:
+        raise RelayError("cleanup evidence lock omitted its pinned POSIX parent")
+    if locked_posix_parent_fd is not None:
+        if evidence_lock is None:  # pragma: no cover - narrowed by descriptor selection
+            raise RelayError("cleanup evidence lock disappeared while binding its parent")
+        parent_directory = evidence_lock.path.parent
+        parent_linked = os.fstat(locked_posix_parent_fd)
+    else:
+        durably_ensure_validation_directory(requested_parent)
+        requested_parent_status = os.lstat(requested_parent)
+        if stat.S_ISLNK(requested_parent_status.st_mode):
+            raise RelayError("local cleanup report artifact parent cannot be a symlink")
+        if os.name == "nt":
+            requested_anchor = _open_windows_pinned_directory(
+                requested_parent,
+                expected=requested_parent_status,
+            )
+            _close_windows_pinned_directory(requested_anchor)
+        parent_directory = requested_parent.resolve(strict=True)
+        if os.path.normcase(str(parent_directory)) != os.path.normcase(str(requested_parent)):
+            raise RelayError("local cleanup report artifact parent cannot traverse a reparse point")
+        parent_linked = os.lstat(parent_directory)
     if not stat.S_ISDIR(parent_linked.st_mode) or stat.S_ISLNK(parent_linked.st_mode):
         raise RelayError("local cleanup report artifact parent is not a real directory")
     if os.name == "posix" and not (
@@ -4015,14 +4047,19 @@ def _persist_local_cleanup_report_artifact(
     directory_fd: int | None = None
     parent_windows_anchor: _WindowsPinnedDirectory | None = None
     directory_windows_anchor: _WindowsPinnedDirectory | None = None
+    directory_windows_guard: tuple[Path, ctypes.c_void_p] | None = None
     if os.name == "posix":
         try:
-            parent_fd = os.open(
-                parent_directory,
-                os.O_RDONLY
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-                | getattr(os, "O_CLOEXEC", 0),
+            parent_fd = (
+                os.dup(locked_posix_parent_fd)
+                if locked_posix_parent_fd is not None
+                else os.open(
+                    parent_directory,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                )
             )
             if not os.path.samestat(parent_linked, os.fstat(parent_fd)):
                 raise RelayError("local cleanup report artifact parent changed while opening")
@@ -4093,6 +4130,9 @@ def _persist_local_cleanup_report_artifact(
                 handle=directory_windows_anchor.handle,
                 directory=True,
             )
+            directory_windows_guard = acquire_private_configuration_windows_parent_guard(
+                artifact_directory
+            )
             _verify_windows_pinned_directory(directory_windows_anchor)
             if evidence_lock is not None:
                 _verify_cleanup_evidence_lock(
@@ -4110,8 +4150,13 @@ def _persist_local_cleanup_report_artifact(
             try:
                 _close_windows_pinned_directory(directory_windows_anchor)
             finally:
-                _close_windows_pinned_directory(parent_windows_anchor)
+                try:
+                    _close_windows_pinned_directory(parent_windows_anchor)
+                finally:
+                    release_private_configuration_windows_parent_guard(directory_windows_guard)
             raise
+
+    ignored_internal_names = _windows_parent_guard_names(directory_windows_guard)
 
     def verify_directory() -> None:
         try:
@@ -4309,6 +4354,8 @@ def _persist_local_cleanup_report_artifact(
             with os.scandir(directory_fd if directory_fd is not None else artifact_directory) as it:
                 for entry in it:
                     name = entry.name
+                    if name in ignored_internal_names:
+                        continue
                     if not (
                         _LOCAL_CLEANUP_REPORT_ARTIFACT_PATTERN.fullmatch(name)
                         or _LOCAL_CLEANUP_REPORT_PENDING_PATTERN.fullmatch(name)
@@ -4715,7 +4762,10 @@ def _persist_local_cleanup_report_artifact(
         try:
             _close_windows_pinned_directory(directory_windows_anchor)
         finally:
-            _close_windows_pinned_directory(parent_windows_anchor)
+            try:
+                _close_windows_pinned_directory(parent_windows_anchor)
+            finally:
+                release_private_configuration_windows_parent_guard(directory_windows_guard)
 
 
 def _persist_verified_cleanup_report_before_closure(
@@ -6243,11 +6293,14 @@ def session_teardown(
             _mark_owner_session_closed(
                 queue=queue,
                 definition=definition,
+                cluster=cluster,
                 remote_execution=remote_execution,
                 session_id=session_id,
                 local_admission_session_id=local_admission_session_id,
                 session_generation_id=session_generation_id,
                 legacy_unversioned_job_ids=[],
+                finalized_recovery=recovery_status,
+                finalized_report=finalized_retry_report,
             )
             closed_recovery = _owned_session_recovery_status(
                 queue=queue,
@@ -6747,11 +6800,14 @@ def session_teardown(
         _mark_owner_session_closed(
             queue=queue,
             definition=definition,
+            cluster=cluster,
             remote_execution=remote_execution,
             session_id=session_id,
             local_admission_session_id=local_admission_session_id,
             session_generation_id=session_generation_id,
             legacy_unversioned_job_ids=legacy_unversioned_job_ids,
+            finalized_recovery=finalized_recovery,
+            finalized_report=report,
         )
         closed_recovery = _owned_session_recovery_status(
             queue=queue,
@@ -13592,18 +13648,116 @@ def _verify_owner_session_teardown(
         raise RelayError("session teardown reported worker cleanup when it was not requested")
 
 
+def _require_exact_owner_session_admission(
+    status: dict[str, object],
+    *,
+    owner_session_id: str,
+    session_generation_id: str,
+    cleanup_operation_id: str,
+    cleanup_policy: dict[str, bool],
+    closed: bool,
+    label: str,
+) -> dict[str, object] | None:
+    """Require one exact closing or closed admission record before closure handling."""
+    raw_intent = status.get("cleanup_intent")
+    intent = cast(dict[str, object], raw_intent) if isinstance(raw_intent, dict) else None
+    expected_policy = {
+        key: cleanup_policy[key] for key in ("stop_worker", "cancel_jobs", "cancel_scheduler_jobs")
+    }
+    raw_closure = status.get("closure")
+    closure: dict[str, object] | None = None
+    closure_matches = False
+    if closed:
+        try:
+            closure_model = OwnerSessionClosure.model_validate(raw_closure)
+        except ValidationError as exc:
+            raise RelayError(f"{label} admission closure evidence was invalid") from exc
+        closure_matches = (
+            closure_model.schema_version == "clio-relay.owner-session-closure.v1"
+            and closure_model.owner_session_id == owner_session_id
+            and closure_model.session_generation_id == session_generation_id
+            and closure_model.covered_by_session_generation_id is None
+            and closure_model.covered_legacy_job_ids == []
+            and closure_model.residual_resource_ids == []
+        )
+        closure = cast(dict[str, object], closure_model.model_dump(mode="json"))
+    if not (
+        status.get("schema_version") == "clio-relay.owner-session-admission-status.v1"
+        and status.get("owner_session_id") == owner_session_id
+        and status.get("session_generation_id") == session_generation_id
+        and status.get("active_generation_id") == (None if closed else session_generation_id)
+        and status.get("closing_generation_id") == session_generation_id
+        and status.get("active") is (not closed)
+        and status.get("closing") is True
+        and status.get("closed") is closed
+        and status.get("open") is False
+        and intent is not None
+        and intent.get("schema_version") == "clio-relay.owner-session-cleanup-intent.v1"
+        and intent.get("owner_session_id") == owner_session_id
+        and intent.get("session_generation_id") == session_generation_id
+        and intent.get("operation_id") == cleanup_operation_id
+        and {
+            key: intent.get(key) for key in ("stop_worker", "cancel_jobs", "cancel_scheduler_jobs")
+        }
+        == expected_policy
+        and (closure_matches if closed else raw_closure is None)
+    ):
+        raise RelayError(f"{label} admission evidence was incomplete or inconsistent")
+    return closure if closed else None
+
+
 def _mark_owner_session_closed(
     *,
     queue: ClioCoreQueue,
     definition: ClusterDefinition,
+    cluster: str,
     remote_execution: bool,
     session_id: str,
     local_admission_session_id: str,
     session_generation_id: str,
     legacy_unversioned_job_ids: list[str],
+    finalized_recovery: OwnedSessionRecoveryStatus,
+    finalized_report: SessionLifecycleReport,
 ) -> None:
     """Close the authoritative generation, then its cluster-scoped desktop mirror."""
-    if remote_execution:
+    if definition.name != cluster:
+        raise RelayError("owner-session closure cluster identity changed")
+    verified_report = _verified_finalized_cleanup_report(
+        finalized_recovery,
+        report=finalized_report,
+        cluster=cluster,
+        session_id=session_id,
+        expected_generation_id=session_generation_id,
+        expected_cleanup_operation_id=finalized_report.cleanup_operation_id,
+        expected_cleanup_policy=finalized_report.cleanup_policy,
+    )
+    cleanup_operation_id = verified_report.cleanup_operation_id
+    if cleanup_operation_id is None:
+        raise RelayError("finalized owner-session closure omitted its operation identity")
+    raw_authoritative_admission = finalized_recovery.admission_status
+    if not isinstance(raw_authoritative_admission, dict):
+        raise RelayError("finalized owner-session closure omitted authoritative admission evidence")
+    authoritative_admission = raw_authoritative_admission
+    authoritative_already_closed = authoritative_admission.get("closed") is True
+    authoritative_closure_evidence = _require_exact_owner_session_admission(
+        authoritative_admission,
+        owner_session_id=session_id,
+        session_generation_id=session_generation_id,
+        cleanup_operation_id=cleanup_operation_id,
+        cleanup_policy=verified_report.cleanup_policy,
+        closed=authoritative_already_closed,
+        label="authoritative owner-session",
+    )
+    if authoritative_already_closed:
+        if finalized_recovery.process_state != "already_closed":
+            raise RelayError("authoritative closure evidence disagreed with recovery process state")
+        if remote_execution and legacy_unversioned_job_ids:
+            raise RelayError(
+                "authoritative closure retry cannot infer legacy job coverage from admission status"
+            )
+
+    payload: dict[str, object]
+    if remote_execution and not authoritative_already_closed:
         args = [
             "session",
             "mark-closed",
@@ -13621,6 +13775,26 @@ def _mark_owner_session_closed(
         if not isinstance(raw_payload, dict):
             raise RelayError("remote owner-session closure did not return a JSON object")
         payload = cast(dict[str, object], raw_payload)
+    elif remote_execution:
+        if authoritative_closure_evidence is None:  # pragma: no cover - verifier invariant
+            raise RelayError("authoritative owner-session closure evidence disappeared")
+        payload = authoritative_closure_evidence
+    elif authoritative_already_closed:
+        closure = queue.get_owner_session_closed(
+            session_id,
+            session_generation_id=session_generation_id,
+        )
+        if closure is None:
+            raise RelayError("authoritative owner-session closure disappeared after admission read")
+        payload = cast(dict[str, object], closure.model_dump(mode="json"))
+        if legacy_unversioned_job_ids:
+            legacy_closure = queue.get_owner_session_closed(
+                session_id,
+                session_generation_id=None,
+            )
+            if legacy_closure is None:
+                raise RelayError("legacy owner-session closure disappeared after admission read")
+            payload["legacy_closure"] = legacy_closure.model_dump(mode="json")
     else:
         closure = queue.set_owner_session_closed(
             session_id,
@@ -13628,7 +13802,7 @@ def _mark_owner_session_closed(
             residual_resource_ids=[],
             legacy_unversioned_job_ids=legacy_unversioned_job_ids,
         )
-        payload = closure.model_dump(mode="json")
+        payload = cast(dict[str, object], closure.model_dump(mode="json"))
         if legacy_unversioned_job_ids:
             legacy_closure = queue.get_owner_session_closed(
                 session_id,
@@ -13655,11 +13829,35 @@ def _mark_owner_session_closed(
             != sorted(set(legacy_unversioned_job_ids))
         ):
             raise RelayError("owner-session legacy coverage did not match verified job ids")
-    local_closure = queue.set_owner_session_closed(
+    local_status = queue.owner_session_generation_status(
         local_admission_session_id,
         session_generation_id=session_generation_id,
-        residual_resource_ids=[],
     )
+    local_already_closed = local_status.get("closed") is True
+    local_closure_evidence = _require_exact_owner_session_admission(
+        local_status,
+        owner_session_id=local_admission_session_id,
+        session_generation_id=session_generation_id,
+        cleanup_operation_id=cleanup_operation_id,
+        cleanup_policy=verified_report.cleanup_policy,
+        closed=local_already_closed,
+        label="desktop owner-session mirror",
+    )
+    if local_already_closed:
+        local_closure = queue.get_owner_session_closed(
+            local_admission_session_id,
+            session_generation_id=session_generation_id,
+        )
+        if local_closure is None:
+            raise RelayError("desktop owner-session closure disappeared after admission read")
+        if local_closure.model_dump(mode="json") != local_closure_evidence:
+            raise RelayError("desktop owner-session closure changed after admission read")
+    else:
+        local_closure = queue.set_owner_session_closed(
+            local_admission_session_id,
+            session_generation_id=session_generation_id,
+            residual_resource_ids=[],
+        )
     if (
         local_closure.owner_session_id != local_admission_session_id
         or local_closure.session_generation_id != session_generation_id

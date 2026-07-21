@@ -168,7 +168,11 @@ def test_validation_writer_refuses_a_concurrent_writer_without_corruption(
     assert target.read_text(encoding="utf-8") == "first"
 
 
-def test_posix_validation_writer_rejects_parent_swap_after_lock(tmp_path: Path) -> None:
+@pytest.mark.parametrize("create_replacement", [False, True])
+def test_posix_validation_writer_rejects_parent_swap_after_lock(
+    tmp_path: Path,
+    create_replacement: bool,
+) -> None:
     if os.name != "posix":
         return
     parent = tmp_path / "reports"
@@ -179,8 +183,9 @@ def test_posix_validation_writer_rejects_parent_swap_after_lock(tmp_path: Path) 
     )
     try:
         parent.rename(displaced)
-        parent.mkdir(mode=0o700)
-        with pytest.raises(OSError, match="differs from its writer lock"):
+        if create_replacement:
+            parent.mkdir(mode=0o700)
+        with pytest.raises(OSError, match="differs from its writer lock|disappeared"):
             validation_report_module._atomic_write_text_locked(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 parent / "report.json",
                 "outside",
@@ -191,8 +196,79 @@ def test_posix_validation_writer_rejects_parent_swap_after_lock(tmp_path: Path) 
             writer_lock
         )
 
-    assert not (parent / "report.json").exists()
+    assert parent.exists() is create_replacement
+    if create_replacement:
+        assert list(parent.iterdir()) == []
     assert not (displaced / "report.json").exists()
+    assert {path.name for path in displaced.iterdir()} == {writer_lock.path.name}
+
+
+def test_windows_validation_lock_guard_blocks_parent_swap_before_lock_open(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    if os.name != "nt":
+        return
+    parent = tmp_path / "reports"
+    parent.mkdir(mode=0o700)
+    displaced = tmp_path / "displaced-reports"
+    rename_errors: list[OSError] = []
+    original = validation_report_module._open_windows_validation_directory  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def try_swap_after_pin(*args: object, **kwargs: object) -> object:
+        anchor = original(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+        try:
+            parent.rename(displaced)
+            parent.mkdir(mode=0o700)
+        except OSError as exc:
+            rename_errors.append(exc)
+        return anchor
+
+    monkeypatch.setattr(
+        validation_report_module,
+        "_open_windows_validation_directory",
+        try_swap_after_pin,
+    )
+    writer_lock = validation_report_module._acquire_validation_writer_lock(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        parent
+    )
+    try:
+        assert rename_errors
+        assert not displaced.exists()
+        assert {path.name for path in parent.iterdir()} == {writer_lock.path.name}
+    finally:
+        validation_report_module._release_validation_writer_lock(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            writer_lock
+        )
+
+
+def test_windows_validation_lock_swap_before_guard_creation_leaves_replacement_empty(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    if os.name != "nt":
+        return
+    parent = tmp_path / "reports"
+    parent.mkdir(mode=0o700)
+    displaced = tmp_path / "displaced-before-guard"
+    original = validation_report_module.acquire_private_configuration_windows_parent_guard
+
+    def swap_then_guard(path: Path) -> tuple[Path, object]:
+        path.rename(displaced)
+        path.mkdir(mode=0o700)
+        guard_path, handle = original(path)
+        return guard_path, handle
+
+    monkeypatch.setattr(
+        validation_report_module,
+        "acquire_private_configuration_windows_parent_guard",
+        swap_then_guard,
+    )
+    with pytest.raises((OSError, ConfigurationError), match="changed|path"):
+        validation_report_module._acquire_validation_writer_lock(parent)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    assert list(parent.iterdir()) == []
+    assert list(displaced.iterdir()) == []
 
 
 def test_install_source_records_unverified_uvx_without_crashing_report_creation(

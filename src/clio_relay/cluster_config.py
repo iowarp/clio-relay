@@ -41,6 +41,7 @@ _WINDOWS_WRITE_DAC = 0x00040000
 _WINDOWS_WRITE_OWNER = 0x00080000
 _WINDOWS_GENERIC_READ = 0x80000000
 _WINDOWS_GENERIC_WRITE = 0x40000000
+_WINDOWS_DELETE = 0x00010000
 _WINDOWS_FILE_SHARE_READ = 0x00000001
 _WINDOWS_CREATE_NEW = 1
 _WINDOWS_OPEN_EXISTING = 3
@@ -49,6 +50,7 @@ _WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 _WINDOWS_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_WINDOWS_FILE_FLAG_DELETE_ON_CLOSE = 0x04000000
 _WINDOWS_SE_FILE_OBJECT = 1
 _WINDOWS_OWNER_SECURITY_INFORMATION = 0x00000001
 _WINDOWS_DACL_SECURITY_INFORMATION = 0x00000004
@@ -1574,6 +1576,99 @@ def ensure_private_configuration_windows_handle(
         directory=directory,
         existing_handle=handle,
     )
+
+
+def acquire_private_configuration_windows_parent_guard(
+    parent: Path,
+) -> tuple[Path, ctypes.c_void_p]:
+    """Create an auto-deleting private child that prevents parent rename on Windows."""
+    if os.name != "nt":  # pragma: no cover - explicit platform contract
+        raise ConfigurationError("Windows parent guarding is unavailable")
+    guard_path = parent / f".clio-parent-guard-{os.getpid()}-{uuid4().hex}.pending"
+    storage_path = internal_filesystem_path(guard_path, force_extended=True)
+    kernel32 = _load_windows_library("kernel32")
+    advapi32 = _load_windows_library("advapi32")
+    owner_sid = _current_windows_user_sid(
+        advapi32=advapi32,
+        kernel32=kernel32,
+        path=storage_path,
+    )
+    security_descriptor = _build_private_windows_security_descriptor(
+        directory=False,
+        advapi32=advapi32,
+        owner_sid=owner_sid,
+        path=storage_path,
+    )
+    security_attributes = _WindowsSecurityAttributes(
+        length=ctypes.sizeof(_WindowsSecurityAttributes),
+        security_descriptor=security_descriptor,
+        inherit_handle=0,
+    )
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(_WindowsSecurityAttributes),
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    raw_handle: int | None = None
+    try:
+        raw_value = create_file(
+            str(storage_path),
+            _WINDOWS_GENERIC_READ
+            | _WINDOWS_GENERIC_WRITE
+            | _WINDOWS_DELETE
+            | _WINDOWS_READ_CONTROL
+            | _WINDOWS_WRITE_DAC
+            | _WINDOWS_WRITE_OWNER,
+            0,
+            ctypes.byref(security_attributes),
+            _WINDOWS_CREATE_NEW,
+            _WINDOWS_FILE_ATTRIBUTE_NORMAL
+            | _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT
+            | _WINDOWS_FILE_FLAG_DELETE_ON_CLOSE,
+            None,
+        )
+        if raw_value in (None, ctypes.c_void_p(-1).value):
+            raise ConfigurationError(
+                f"could not create private Windows parent guard ({_windows_last_error()}): {parent}"
+            )
+        raw_handle = cast(int, raw_value)
+        handle = ctypes.c_void_p(raw_handle)
+        _validate_windows_configuration_handle(
+            handle,
+            directory=False,
+            kernel32=kernel32,
+            path=storage_path,
+        )
+        ensure_private_configuration_windows_handle(
+            storage_path,
+            handle=handle,
+            directory=False,
+        )
+        return guard_path, handle
+    except BaseException:
+        if raw_handle is not None:
+            _close_windows_handle(ctypes.c_void_p(raw_handle), kernel32=kernel32)
+        raise
+    finally:
+        _free_windows_local(security_descriptor, kernel32=kernel32)
+
+
+def release_private_configuration_windows_parent_guard(
+    guard: tuple[Path, ctypes.c_void_p] | None,
+) -> None:
+    """Close one auto-deleting Windows parent guard."""
+    if guard is None:
+        return
+    if os.name != "nt":  # pragma: no cover - explicit platform contract
+        raise ConfigurationError("Windows parent guarding is unavailable")
+    _path, handle = guard
+    _close_windows_handle(handle, kernel32=_load_windows_library("kernel32"))
 
 
 def open_private_configuration_windows_descriptor(

@@ -39,10 +39,12 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError,
 from clio_relay import __version__
 from clio_relay.ci_validation import ProvenanceError, load_release_acceptance_matrix
 from clio_relay.cluster_config import (
+    acquire_private_configuration_windows_parent_guard,
     create_private_configuration_directory,
     ensure_private_configuration_windows_handle,
     open_private_atomic_file,
     open_private_configuration_windows_descriptor,
+    release_private_configuration_windows_parent_guard,
 )
 from clio_relay.errors import ConfigurationError
 from clio_relay.filesystem_paths import (
@@ -4628,12 +4630,15 @@ def _acquire_validation_writer_lock(parent: Path) -> _ValidationWriterLock:
             os.close(parent_fd)
             raise
 
-    windows_parent = _open_windows_validation_directory(
-        parent,
-        expected_status=parent_status,
-    )
+    windows_parent: _WindowsValidationDirectoryAnchor | None = None
+    windows_parent_guard: tuple[Path, ctypes.c_void_p] | None = None
     descriptor: int | None = None
     try:
+        windows_parent_guard = acquire_private_configuration_windows_parent_guard(parent)
+        windows_parent = _open_windows_validation_directory(
+            parent,
+            expected_status=parent_status,
+        )
         storage_lock_path = internal_filesystem_path(lock_path, force_extended=True)
         try:
             os.lstat(storage_lock_path)
@@ -4652,15 +4657,20 @@ def _acquire_validation_writer_lock(parent: Path) -> _ValidationWriterLock:
         except ConfigurationError as exc:
             raise OSError("validation writer lock could not be acquired") from exc
         _verify_windows_validation_directory(windows_parent)
-        return _ValidationWriterLock(
+        result = _ValidationWriterLock(
             path=lock_path,
             descriptor=descriptor,
             windows_parent=windows_parent,
         )
+        acquired_parent_guard = windows_parent_guard
+        windows_parent_guard = None
+        release_private_configuration_windows_parent_guard(acquired_parent_guard)
+        return result
     except BaseException:
         if descriptor is not None:
             os.close(descriptor)
         _close_windows_validation_directory(windows_parent)
+        release_private_configuration_windows_parent_guard(windows_parent_guard)
         raise
 
 
@@ -4687,6 +4697,47 @@ def _release_validation_writer_lock(lock: _ValidationWriterLock) -> None:
         release_error = release_error or exc
     if release_error is not None:
         raise OSError(f"validation writer lock could not be released: {release_error}")
+
+
+def _verify_validation_writer_lock_parent(
+    lock: _ValidationWriterLock,
+    parent: Path,
+) -> os.stat_result:
+    """Verify the named parent against the retained writer lock without mutation."""
+    requested_parent = parent.absolute()
+    if os.path.normcase(str(requested_parent)) != os.path.normcase(str(lock.path.parent)):
+        raise OSError("validation report parent differs from its writer lock")
+    if lock.parent_fd is not None:
+        try:
+            linked_parent = os.stat(requested_parent, follow_symlinks=False)
+            linked_lock = os.stat(
+                lock.path.name,
+                dir_fd=lock.parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            raise OSError("validation report parent disappeared after writer lock") from None
+        opened_parent = os.fstat(lock.parent_fd)
+        opened_lock = os.fstat(lock.descriptor)
+        if not (
+            stat.S_ISDIR(linked_parent.st_mode)
+            and not stat.S_ISLNK(linked_parent.st_mode)
+            and os.path.samestat(opened_parent, linked_parent)
+            and stat.S_ISREG(opened_lock.st_mode)
+            and stat.S_ISREG(linked_lock.st_mode)
+            and opened_lock.st_nlink == 1
+            and linked_lock.st_nlink == 1
+            and os.path.samestat(opened_lock, linked_lock)
+        ):
+            raise OSError("validation report parent differs from its writer lock")
+        return opened_parent
+    if lock.windows_parent is None:
+        raise OSError("validation writer lock omitted its parent ownership handle")
+    _verify_windows_validation_directory(lock.windows_parent)
+    linked_parent = os.lstat(internal_filesystem_path(requested_parent, force_extended=True))
+    if not os.path.samestat(lock.windows_parent.status, linked_parent):
+        raise OSError("validation report parent differs from its writer lock")
+    return linked_parent
 
 
 def _prune_stale_validation_pending_files(
@@ -5027,22 +5078,13 @@ def _atomic_write_text_locked(
     """Durably replace one text file through a pinned, revalidated parent."""
     logical_path = logical_filesystem_path(path)
     requested_parent = logical_path.parent.absolute()
-    durably_ensure_validation_directory(requested_parent)
-    requested_parent_status = os.stat(requested_parent, follow_symlinks=False)
-    if stat.S_ISLNK(requested_parent_status.st_mode):
-        raise OSError(f"validation report parent cannot be a symlink: {requested_parent}")
-    resolved_parent = requested_parent.resolve(strict=True)
-    if os.path.normcase(str(resolved_parent)) != os.path.normcase(str(requested_parent)):
-        raise OSError(
-            f"validation report parent cannot traverse a symlink or reparse point: "
-            f"{requested_parent}"
-        )
+    parent_status = _verify_validation_writer_lock_parent(writer_lock, requested_parent)
+    resolved_parent = writer_lock.path.parent
     logical_path = resolved_parent / logical_path.name
     storage_path = internal_filesystem_path(logical_path, force_extended=True)
     payload = text.encode("utf-8")
     if len(payload) > MAX_VALIDATION_REPORT_WRITE_BYTES:
         raise OSError(f"validation report exceeds {MAX_VALIDATION_REPORT_WRITE_BYTES} bytes")
-    parent_status = os.stat(storage_path.parent, follow_symlinks=False)
     if not stat.S_ISDIR(parent_status.st_mode) or stat.S_ISLNK(parent_status.st_mode):
         raise OSError(f"validation report parent is not a real directory: {storage_path.parent}")
     pending_identity = hashlib.sha256(storage_path.name.encode("utf-8")).hexdigest()[:32]
@@ -5054,18 +5096,12 @@ def _atomic_write_text_locked(
     )
 
     if os.name == "posix":
-        directory_fd = os.open(
-            storage_path.parent,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-        )
+        if writer_lock.parent_fd is None:  # pragma: no cover - platform invariant
+            raise OSError("validation writer lock omitted its POSIX parent descriptor")
+        directory_fd = os.dup(writer_lock.parent_fd)
         output_fd: int | None = None
         try:
-            if not os.path.samestat(parent_status, os.fstat(directory_fd)):
-                raise OSError("validation report parent changed while opening")
-            if writer_lock.parent_fd is None or not os.path.samestat(
+            if not os.path.samestat(
                 os.fstat(writer_lock.parent_fd),
                 os.fstat(directory_fd),
             ):
