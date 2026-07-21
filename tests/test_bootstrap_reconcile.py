@@ -178,7 +178,10 @@ def _installation_info(desired: BootstrapDesiredState) -> dict[str, object]:
             },
         },
         "component_runtime": {
-            "clio-relay": {"persistent_tool_verified": True},
+            "clio-relay": {
+                "persistent_tool_verified": True,
+                "execution_runtime_verified": True,
+            },
             "clio-kit": {
                 "artifact_identity_verified": True,
                 "command_matches_receipt": True,
@@ -396,12 +399,39 @@ def test_matching_receipt_with_tampered_runtime_is_not_a_noop(
     assert "clio-relay persistent tool identity did not verify" in inspection.reasons
     assert "managed endpoint service is inactive" in inspection.reasons
 
+    runtime["clio-relay"] = {
+        "persistent_tool_verified": True,
+        "execution_runtime_verified": False,
+    }
+    execution_mismatch = inspect_exact_bootstrap_noop(
+        desired,
+        home=tmp_path,
+        service_was_active=False,
+        service_was_enabled=True,
+        queue_evidence={
+            "schema_version": "clio-relay.queue-readiness.v1",
+            "complete": True,
+            "sealed": True,
+            "repair_required": False,
+        },
+        worker_evidence=None,
+    )
+
+    assert execution_mismatch.exact_match is False
+    assert "clio-relay JARVIS execution runtime did not verify" in execution_mismatch.reasons
+
 
 @pytest.mark.parametrize(
     "relay_provider",
-    ["verified-old", "unverified-old", "staged-candidate", "tampered-candidate"],
+    [
+        "verified-current-execution",
+        "verified-old",
+        "unverified-old",
+        "staged-candidate",
+        "tampered-candidate",
+    ],
 )
-def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
+def test_first_legacy_upgrade_stages_an_unbound_relay_execution_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     relay_provider: str,
@@ -481,16 +511,21 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
     receipt_path.write_text("{}\n", encoding="utf-8")
     clio_kit_wheel = tmp_path / "clio-kit.whl"
     jarvis_wheel = tmp_path / "jarvis-cd.whl"
+    relay_wheel = tmp_path / "clio-relay.whl"
     clio_kit_wheel.write_bytes(b"clio-kit")
     jarvis_wheel.write_bytes(b"jarvis")
+    relay_wheel.write_bytes(b"relay-wheel")
+    relay_digest = _digest(b"relay-wheel")
     desired = desired.model_copy(
         update={
+            "relay_artifact_sha256": relay_digest,
+            "relay_source_identity": f"wheel:sha256:{relay_digest}",
             "clio_kit_artifact_sha256": _digest(b"clio-kit"),
             "jarvis_cd_wheel_sha256": _digest(b"jarvis"),
         }
     )
     info = _installation_info(desired)
-    if relay_provider != "verified-old":
+    if relay_provider not in {"verified-current-execution", "verified-old"}:
         component_runtime = cast(dict[str, object], info["component_runtime"])
         component_runtime["clio-relay"] = {
             "persistent_tool_verified": False,
@@ -530,16 +565,26 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
         receipt["generation"] = managed_generation
     receipt.pop("deployment_fingerprint")
     receipt.pop("deployment_manifest")
-    receipt["component_artifacts"] = {
-        "clio-relay": {
-            "runtime_executables": {
-                "clio-relay": (
-                    "/stale/unbound/clio-relay"
-                    if relay_provider == "staged-candidate"
-                    else str(bin_dir / "clio-relay")
-                )
-            },
+    relay_component: dict[str, object] = {
+        "runtime_executables": {
+            "clio-relay": (
+                "/stale/unbound/clio-relay"
+                if relay_provider == "staged-candidate"
+                else str(bin_dir / "clio-relay")
+            )
         },
+    }
+    if relay_provider == "verified-current-execution":
+        relay_component.update(
+            {
+                "install_spec": desired.relay_install_spec,
+                "artifact_sha256": desired.relay_artifact_sha256,
+                "runtime_artifact_path": str(relay_wheel),
+                "runtime_interpreters": {"execution": str(legacy_python)},
+            }
+        )
+    receipt["component_artifacts"] = {
+        "clio-relay": relay_component,
         "clio-kit": {
             "artifact_sha256": desired.clio_kit_artifact_sha256,
             "runtime_artifact_path": str(clio_kit_wheel),
@@ -607,16 +652,23 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
         ]
         return
 
-    assert plan.mode == "relay-only", plan.reasons
+    expected_mode = (
+        "relay-only" if relay_provider == "verified-current-execution" else "component-upgrade"
+    )
+    assert plan.mode == expected_mode, plan.reasons
     assert plan.component_actions == {
         "clio-relay": "replace",
-        "jarvis-cd": "reuse",
+        "jarvis-cd": "reuse" if expected_mode == "relay-only" else "replace",
         "jarvis-util": "reuse",
-        "clio-kit": "reuse",
+        "clio-kit": "reuse" if expected_mode == "relay-only" else "replace",
         "frp": "reuse",
         "uv": "reuse",
     }
     assert plan.reusable_paths["jarvis_execution_environment"] == str(execution_root.resolve())
+    if expected_mode == "relay-only":
+        assert plan.reusable_paths["clio-relay_artifact"] == str(relay_wheel.resolve())
+    else:
+        assert plan.reasons == ["relay JARVIS execution runtime requires a staged replacement"]
     assert plan.activation_paths["current"].before is None
     assert plan.activation_paths["managed_repo"].before is None
     if managed_generation is None:
@@ -634,7 +686,7 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
         )
         assert rejected.mode == "full"
         assert rejected.reasons == ["clio-kit live runtime is not reusable"]
-    elif relay_provider == "verified-old":
+    elif relay_provider in {"verified-current-execution", "verified-old"}:
         relay_artifact = cast(
             dict[str, object],
             cast(dict[str, object], receipt["component_artifacts"])["clio-relay"],
@@ -2546,6 +2598,39 @@ def test_managed_jarvis_interpreter_fails_closed_on_unverified_runtime(
     )
 
     with pytest.raises(ConfigurationError, match="runtime did not verify"):
+        resolve_receipt_bound_jarvis_python(
+            str(tmp_path / ".local/bin/jarvis"),
+            home=tmp_path,
+        )
+
+
+def test_managed_jarvis_interpreter_requires_relay_execution_packages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker selection rejects a JARVIS venv without receipt-bound relay packages."""
+    desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
+    installation = _installation_info(desired)
+    runtime = cast(dict[str, object], installation["component_runtime"])
+    runtime["clio-relay"] = {
+        "persistent_tool_verified": True,
+        "execution_runtime_verified": False,
+    }
+
+    def read_installation(_path: Path | None = None) -> dict[str, object]:
+        return installation
+
+    def classify_launcher(_path: Path, *, lexical_home: Path) -> bool:
+        return lexical_home == tmp_path
+
+    monkeypatch.setattr(bootstrap_reconcile_module, "installation_info", read_installation)
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "_relay_managed_jarvis_launcher_selected",
+        classify_launcher,
+    )
+
+    with pytest.raises(ConfigurationError, match="execution runtime did not verify"):
         resolve_receipt_bound_jarvis_python(
             str(tmp_path / ".local/bin/jarvis"),
             home=tmp_path,

@@ -1199,7 +1199,10 @@ with tempfile.TemporaryDirectory() as value:
             },
         },
         "component_runtime": {
-            "clio-relay": {"persistent_tool_verified": True},
+            "clio-relay": {
+                "persistent_tool_verified": True,
+                "execution_runtime_verified": True,
+            },
             "clio-kit": {
                 "artifact_identity_verified": True,
                 "command_matches_receipt": True,

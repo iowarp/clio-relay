@@ -2106,10 +2106,12 @@ def _component_runtime_identity(receipt: InstallReceipt) -> dict[str, object]:
     identities: dict[str, object] = {}
     relay_component = receipt.component_artifacts.get("clio-relay")
     if relay_component is not None and relay_component.persistent_tool is not None:
-        identities["clio-relay"] = persistent_component_runtime_identity(
+        relay_identity = persistent_component_runtime_identity(
             relay_component,
             entry_point="clio-relay",
         )
+        relay_identity.update(_relay_execution_runtime_identity(relay_component))
+        identities["clio-relay"] = relay_identity
     if "clio-kit" in receipt.component_artifacts:
         from clio_relay.jarvis_mcp import jarvis_mcp_runtime_identity
 
@@ -2201,6 +2203,158 @@ def persistent_component_runtime_identity(
         "observed": observed.model_dump(mode="json"),
         "error": None if observed == expected else "persistent uv tool identity changed",
     }
+
+
+def _relay_execution_runtime_identity(
+    component: ComponentArtifactIdentity,
+) -> dict[str, object]:
+    """Verify relay package bytes and imports in the JARVIS execution interpreter."""
+    execution_python = component.runtime_interpreters.get("execution")
+    runtime_path: Path | None = None
+    try:
+        if component.runtime_artifact_path is not None:
+            runtime_path = Path(component.runtime_artifact_path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        runtime_path = None
+    artifact_sha256_verified = (
+        runtime_path is not None
+        and runtime_path.is_file()
+        and component.artifact_filename == runtime_path.name
+        and component.artifact_sha256 is not None
+        and sha256_file(runtime_path) == component.artifact_sha256
+    )
+    execution = _probe_python_distribution(execution_python, component.distribution)
+    execution_distribution_identity_verified = (
+        execution.get("distribution") is not None
+        and _normalized_distribution_name(str(execution["distribution"]))
+        == _normalized_distribution_name(component.distribution)
+        and execution.get("distribution_version") == component.distribution_version
+    )
+    execution_source_verified = runtime_path is not None and _direct_url_source_matches(
+        execution.get("direct_url"),
+        expected_artifact=runtime_path,
+    )
+    try:
+        execution_interpreter_verified = (
+            execution_python is not None
+            and execution.get("executable") is not None
+            and Path(str(execution["executable"])).resolve(strict=True)
+            == Path(execution_python).expanduser().resolve(strict=True)
+            and execution_distribution_identity_verified
+            and execution_source_verified
+        )
+    except (OSError, RuntimeError, ValueError):
+        execution_interpreter_verified = False
+    execution_record_closure = (
+        _probe_python_distribution_record_closure(
+            execution_python,
+            component.distribution,
+            runtime_path,
+        )
+        if artifact_sha256_verified
+        else {
+            "verified": False,
+            "error": "retained relay wheel artifact identity is not verified",
+            "tree_scanned": False,
+            "tree_copied": False,
+        }
+    )
+    import_probe = _probe_relay_execution_imports(
+        execution_python,
+        expected_version=component.distribution_version,
+    )
+    execution_runtime_verified = (
+        artifact_sha256_verified
+        and execution_interpreter_verified
+        and execution_record_closure.get("verified") is True
+        and import_probe.get("verified") is True
+    )
+    return {
+        "execution_runtime_verified": execution_runtime_verified,
+        "execution_interpreter": execution_python,
+        "execution_interpreter_verified": execution_interpreter_verified,
+        "execution_distribution_identity_verified": (execution_distribution_identity_verified),
+        "execution_source_verified": execution_source_verified,
+        "execution_artifact_sha256_verified": artifact_sha256_verified,
+        "execution_record_closure": execution_record_closure,
+        "execution_record_closure_verified": (execution_record_closure.get("verified") is True),
+        "execution_imports": import_probe,
+        "execution_imports_verified": import_probe.get("verified") is True,
+    }
+
+
+def _probe_relay_execution_imports(
+    python: str | None,
+    *,
+    expected_version: str | None,
+) -> dict[str, object]:
+    """Import the exact relay packages JARVIS executes in one isolated interpreter."""
+    if python is None or expected_version is None:
+        return {
+            "verified": False,
+            "error": "relay execution interpreter or version is not configured",
+        }
+    script = """
+import json
+import sys
+from importlib.metadata import version
+
+import clio_relay
+import clio_relay.bounded_command.pkg
+import clio_relay.mcp_call.pkg
+import clio_relay.remote_agent.pkg
+import jarvis_cd
+
+observed = version("clio-relay")
+print(json.dumps({
+    "executable": sys.executable,
+    "distribution_version": observed,
+    "imports": [
+        "clio_relay",
+        "clio_relay.bounded_command.pkg",
+        "clio_relay.mcp_call.pkg",
+        "clio_relay.remote_agent.pkg",
+        "jarvis_cd",
+    ],
+}, sort_keys=True))
+"""
+    try:
+        completed = run_bounded_process(
+            [python, "-I", "-c", script],
+            timeout_seconds=10,
+            stdout_maximum_bytes=64 * 1024,
+            stderr_maximum_bytes=16 * 1024,
+        )
+    except (OSError, BoundedProcessError) as exc:
+        return {"verified": False, "error": f"{type(exc).__name__}: {exc}"}
+    if completed.returncode != 0:
+        return {
+            "verified": False,
+            "error": completed.stderr.strip() or completed.stdout.strip(),
+        }
+    try:
+        loaded = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        return {"verified": False, "error": f"invalid relay import probe JSON: {exc}"}
+    if not isinstance(loaded, dict):
+        return {"verified": False, "error": "relay import probe was not an object"}
+    result = {str(key): value for key, value in cast(dict[object, object], loaded).items()}
+    expected_imports = [
+        "clio_relay",
+        "clio_relay.bounded_command.pkg",
+        "clio_relay.mcp_call.pkg",
+        "clio_relay.remote_agent.pkg",
+        "jarvis_cd",
+    ]
+    result["verified"] = (
+        result.get("distribution_version") == expected_version
+        and result.get("imports") == expected_imports
+    )
+    if result["verified"] is not True:
+        result["error"] = "relay execution imports did not match the receipt"
+    else:
+        result["error"] = None
+    return result
 
 
 def _native_jarvis_component_runtime_identity(

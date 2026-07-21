@@ -269,6 +269,22 @@ def test_fresh_bootstrap_loads_packaged_graph_before_explicit_build_fallback() -
     assert 'JARVIS_MCP_PROVIDER_PYTHON="$UV_TOOL_DIR/clio-kit/bin/python"' in script
     assert 'RELAY_PROVIDER_PYTHON="$BOOTSTRAP_GENERATION/tools/clio-relay/bin/python"' in script
     assert 'CLIO_KIT_PROVIDER_PYTHON="$BOOTSTRAP_GENERATION/tools/clio-kit/bin/python"' in script
+    reconcile_install = (
+        '"$HOME/.local/bin/uv" pip install --python "$ACTIVE_JARVIS_PYTHON" '
+        "        --default-index https://pypi.org/simple "
+        '        --refresh-package clio-relay "$RELAY_INSTALL_TARGET"'
+    )
+    component_guard = 'if [ "$BOOTSTRAP_PLAN_MODE" = "component-upgrade" ]; then'
+    assert script.count(reconcile_install) == 1
+    assert script.rindex(component_guard, 0, script.index(reconcile_install)) < script.index(
+        reconcile_install
+    )
+    assert script.index(reconcile_install) < script.index(
+        '"$ACTIVE_JARVIS_PYTHON" -I -c "$JARVIS_PACKAGE_PROBE"'
+    )
+    assert 'RELAY_ARTIFACT_PATH="$REUSED_RELAY_ARTIFACT"' in script
+    assert '"execution": os.environ["ACTIVE_JARVIS_PYTHON"]' in script
+    assert '"clio-relay.execution_runtime_verified"' in script
     assert "sed -n '1{s/^#!//;p;}'" not in script
     assert "relay-venv312" not in script
     assert 'uv pip install --refresh-package clio-relay "$RELAY_INSTALL_TARGET"' not in script

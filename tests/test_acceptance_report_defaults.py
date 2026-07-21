@@ -327,6 +327,24 @@ ACCEPTANCE_COMMANDS = (
         scenario="gateway-runtime",
     ),
     AcceptanceCommandCase(
+        name="gateway-resume-runtime",
+        success_command=(
+            "gateway",
+            "resume-runtime",
+            "gateway-owned",
+            "--cluster",
+            "test-cluster",
+        ),
+        failure_command=(
+            "gateway",
+            "resume-runtime",
+            "gateway-owned",
+            "--cluster",
+            "missing",
+        ),
+        scenario="gateway-runtime",
+    ),
+    AcceptanceCommandCase(
         name="gateway-stop-runtime",
         success_command=(
             "gateway",
@@ -536,7 +554,21 @@ def _gateway_session(*, state: GatewaySessionState) -> GatewaySession:
         state=state,
         scheduler="external",
         queue_state="running" if state is not GatewaySessionState.CLOSED else "completed",
-        gateway={"runtime_kind": "test-runtime"},
+        gateway={
+            "runtime_kind": "test-runtime",
+            "runtime_spec": {
+                "kind": "test-runtime",
+                "submit_command": ["runtime-submit"],
+                "service_port": 19010,
+                "desktop_bind_port": 19010,
+            },
+            "ownership_intents": {
+                "scheduler_submission": {
+                    "schema_version": "clio-relay.gateway-ownership-intent.v1",
+                    "state": "absent_verified",
+                }
+            },
+        },
     )
 
 
@@ -786,6 +818,13 @@ def _detach_gateway(
     return _gateway_stop_result(mode="detach")
 
 
+def _resume_gateway(
+    _self: ServiceRuntimeSupervisor,
+    **_kwargs: object,
+) -> ServiceRuntimeStartResult:
+    return _gateway_start_result()
+
+
 def _stop_gateway(
     _self: ServiceRuntimeSupervisor,
     **_kwargs: object,
@@ -803,8 +842,28 @@ def _persist_jarvis_contract(**_kwargs: object) -> None:
     return None
 
 
-def _post_run_jarvis_query(**_kwargs: object) -> SimpleNamespace:
-    return SimpleNamespace(
+class _PostRunJarvisQuery(SimpleNamespace):
+    """Minimal terminal execution query accepted by the CLI report adapter."""
+
+    def retry_selector(self) -> dict[str, object]:
+        """Return the exact identity represented by this test query."""
+        return {
+            "cluster": "test-cluster",
+            "scheduler_cluster": None,
+            "pipeline_id": "pipeline",
+            "execution_id": "execution",
+            "scheduler_provider": None,
+            "scheduler_native_id": None,
+            "last_query_job_id": "query-job",
+        }
+
+
+def _post_run_jarvis_query(**_kwargs: object) -> _PostRunJarvisQuery:
+    return _PostRunJarvisQuery(
+        cluster="test-cluster",
+        pipeline_id="pipeline",
+        execution_id="execution",
+        outcome="terminal",
         tools_list_response={},
         call_response={},
         call_job_id="query-job",
@@ -814,7 +873,44 @@ def _post_run_jarvis_query(**_kwargs: object) -> SimpleNamespace:
         provenance={},
         initialize_response={},
         stdio_evidence={},
+        lifecycle_observations=[{}],
     )
+
+
+def _complete_jarvis_dispatch(
+    *,
+    checkpoint: dict[str, object],
+    **_kwargs: object,
+) -> dict[str, object]:
+    """Complete the acceptance fixture's durable dispatch without remote I/O."""
+    builder_inputs = checkpoint["builder_inputs"]
+    assert isinstance(builder_inputs, dict)
+    return {
+        **builder_inputs,
+        "call_status": {"terminal": True},
+        "artifacts": [],
+        "mcp_result": {},
+        "provenance": {},
+        "runtime_metadata": {
+            "pipeline_id": "pipeline",
+            "execution_id": "execution",
+        },
+        "progress": [],
+        "live_progress_observation": None,
+    }
+
+
+def _jarvis_retry_selector(*_args: object, **_kwargs: object) -> dict[str, object]:
+    """Return the exact execution selector represented by the fixture metadata."""
+    return {
+        "cluster": "test-cluster",
+        "scheduler_cluster": None,
+        "pipeline_id": "pipeline",
+        "execution_id": "execution",
+        "scheduler_provider": None,
+        "scheduler_native_id": None,
+        "last_query_job_id": None,
+    }
 
 
 def _jarvis_package_search(**_kwargs: object) -> SimpleNamespace:
@@ -1002,6 +1098,12 @@ def _install_success_fakes(
     if case.name == "gateway-detach-runtime":
         monkeypatch.setattr(ServiceRuntimeSupervisor, "detach", _detach_gateway)
         return
+    if case.name == "gateway-resume-runtime":
+        ClioCoreQueue(root / "core").create_gateway_session(
+            _gateway_session(state=GatewaySessionState.READY)
+        )
+        monkeypatch.setattr(ServiceRuntimeSupervisor, "resume_start", _resume_gateway)
+        return
     if case.name == "gateway-stop-runtime":
         monkeypatch.setattr(ServiceRuntimeSupervisor, "stop", _stop_gateway)
         return
@@ -1018,19 +1120,12 @@ def _install_success_fakes(
         )
         monkeypatch.setattr(cli, "run_packaged_mcp_stdio_session", _packaged_mcp_session)
         monkeypatch.setattr(cli, "_mcp_response_job_id", _relay_job_id)
-        monkeypatch.setattr(cli, "_wait_for_local_job_terminal", _terminal_job_status)
-        monkeypatch.setattr(cli, "_complete_local_progress_records", _empty_artifacts)
-        monkeypatch.setattr(cli, "_complete_local_artifact_records", _empty_artifacts)
-
-        def read_jarvis_artifact(
-            *_args: object,
-            kind: str,
-        ) -> dict[str, object]:
-            if kind == "runtime_metadata":
-                return {"pipeline_id": "pipeline", "execution_id": "execution"}
-            return {}
-
-        monkeypatch.setattr(cli, "_read_local_json_artifact_kind", read_jarvis_artifact)
+        monkeypatch.setattr(cli, "_complete_jarvis_run_dispatch", _complete_jarvis_dispatch)
+        monkeypatch.setattr(
+            cli,
+            "_jarvis_execution_retry_selector_from_runtime_metadata",
+            _jarvis_retry_selector,
+        )
         monkeypatch.setattr(
             cli,
             "_run_post_run_jarvis_execution_query",

@@ -317,6 +317,85 @@ def test_native_jarvis_runtime_accepts_canonical_source_aliases(
     assert substituted["verified"] is False
 
 
+def test_relay_execution_runtime_requires_exact_wheel_closure_and_imports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retained JARVIS interpreter must prove the exact relay package runtime."""
+    wheel = tmp_path / "clio_relay-1.5.0-py3-none-any.whl"
+    wheel.write_bytes(b"verified-relay-wheel")
+    import_verified = {"value": True}
+
+    def probe_execution(_python: str | None, _distribution: str) -> dict[str, object]:
+        return {
+            "executable": sys.executable,
+            "distribution": "clio-relay",
+            "distribution_version": "1.5.0",
+            "direct_url": wheel.as_uri(),
+            "entry_points": [],
+        }
+
+    def probe_record_closure(
+        _python: str | None,
+        _distribution_name: str,
+        _expected_artifact: Path | None,
+        *,
+        environment: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        del environment
+        return {
+            "schema_version": "clio-relay.python-record-closure.v1",
+            "verified": True,
+            "tree_scanned": False,
+            "tree_copied": False,
+        }
+
+    def probe_imports(
+        _python: str | None,
+        *,
+        expected_version: str | None,
+    ) -> dict[str, object]:
+        assert expected_version == "1.5.0"
+        return {"verified": import_verified["value"], "error": None}
+
+    monkeypatch.setattr(installation_module, "_probe_python_distribution", probe_execution)
+    monkeypatch.setattr(
+        installation_module,
+        "_probe_python_distribution_record_closure",
+        probe_record_closure,
+    )
+    monkeypatch.setattr(
+        installation_module,
+        "_probe_relay_execution_imports",
+        probe_imports,
+    )
+    component = ComponentArtifactIdentity(
+        distribution="clio-relay",
+        distribution_version="1.5.0",
+        install_spec=str(wheel),
+        requested_source="wheel",
+        artifact_filename=wheel.name,
+        artifact_sha256=hashlib.sha256(wheel.read_bytes()).hexdigest(),
+        runtime_artifact_path=str(wheel),
+        runtime_interpreters={"provider": sys.executable, "execution": sys.executable},
+    )
+
+    identity = installation_module._relay_execution_runtime_identity(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        component
+    )
+
+    assert identity["execution_runtime_verified"] is True
+    assert identity["execution_record_closure_verified"] is True
+    assert identity["execution_imports_verified"] is True
+
+    import_verified["value"] = False
+    rejected = installation_module._relay_execution_runtime_identity(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        component
+    )
+    assert rejected["execution_runtime_verified"] is False
+    assert rejected["execution_imports_verified"] is False
+
+
 def _record_row(relative: str, payload: bytes) -> str:
     digest = urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
     return f"{relative},sha256={digest},{len(payload)}"

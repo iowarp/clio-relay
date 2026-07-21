@@ -4398,10 +4398,14 @@ bootstrap_relay_only_reconcile() {{
   JARVIS_MCP_ARTIFACT_SHA256=""
   JARVIS_MCP_ARTIFACT_PATH=""
   CLIO_KIT_PROVIDER_PYTHON=""
+  REUSED_RELAY_ARTIFACT=""
   if [ "$BOOTSTRAP_PLAN_MODE" = "relay-only" ]; then
     JARVIS_CD_WHEEL="$(bootstrap_plan_value reusable_paths.jarvis-cd_artifact)"
     CLIO_KIT_EXECUTABLE="$(
       bootstrap_plan_value reusable_paths.clio-kit_clio-kit_executable
+    )"
+    REUSED_RELAY_ARTIFACT="$(
+      bootstrap_plan_value reusable_paths.clio-relay_artifact
     )"
   else
     JARVIS_CD_WHEEL="$BOOTSTRAP_GENERATION/artifacts/{JARVIS_CD_WHEEL_FILENAME}"
@@ -4481,29 +4485,33 @@ bootstrap_relay_only_reconcile() {{
     RELAY_ARTIFACT_SHA256={rendered_relay_artifact_sha256}
     RELAY_INSTALL_TARGET="$RELAY_INSTALL_SPEC"
     RELAY_ARTIFACT_PATH=""
-    case "$RELAY_INSTALL_SPEC" in
-      clio-relay==*)
-        DOWNLOAD_DIR="$DEST/downloaded-wheels"
-        mkdir -p "$DOWNLOAD_DIR"
-        "$LEGACY_JARVIS_PYTHON" -m pip download --isolated \
-          --disable-pip-version-check --no-cache-dir --index-url https://pypi.org/simple \
-          --no-deps --only-binary=:all: --dest "$DOWNLOAD_DIR" "$RELAY_INSTALL_SPEC"
-        mapfile -t RELAY_WHEELS < <(
-          find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name 'clio_relay-*.whl' -print
-        )
-        if [ "${{#RELAY_WHEELS[@]}}" -ne 1 ]; then
-          echo "expected exactly one downloaded clio-relay wheel" >&2
-          return 1
-        fi
-        RELAY_ARTIFACT_PATH="${{RELAY_WHEELS[0]}}"
-        RELAY_INSTALL_TARGET="$RELAY_ARTIFACT_PATH"
-        BOOTSTRAP_RELAY_DOWNLOAD_COUNT=1
-        if [ -z "$RELAY_ARTIFACT_SHA256" ]; then
-          RELAY_VERSION="${{RELAY_INSTALL_SPEC#clio-relay==}}"
-          RELAY_ARTIFACT_SHA256="$(
-            "$LEGACY_JARVIS_PYTHON" - \
-              "$RELAY_VERSION" "$(basename "$RELAY_ARTIFACT_PATH")" \
-              <<'__CLIO_RELAY_RECONCILE_PYPI_DIGEST__'
+    if [ "$BOOTSTRAP_PLAN_MODE" = "relay-only" ]; then
+      RELAY_ARTIFACT_PATH="$REUSED_RELAY_ARTIFACT"
+      RELAY_INSTALL_TARGET="$RELAY_ARTIFACT_PATH"
+    else
+      case "$RELAY_INSTALL_SPEC" in
+        clio-relay==*)
+          DOWNLOAD_DIR="$DEST/downloaded-wheels"
+          mkdir -p "$DOWNLOAD_DIR"
+          "$LEGACY_JARVIS_PYTHON" -m pip download --isolated \
+            --disable-pip-version-check --no-cache-dir --index-url https://pypi.org/simple \
+            --no-deps --only-binary=:all: --dest "$DOWNLOAD_DIR" "$RELAY_INSTALL_SPEC"
+          mapfile -t RELAY_WHEELS < <(
+            find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name 'clio_relay-*.whl' -print
+          )
+          if [ "${{#RELAY_WHEELS[@]}}" -ne 1 ]; then
+            echo "expected exactly one downloaded clio-relay wheel" >&2
+            return 1
+          fi
+          RELAY_ARTIFACT_PATH="${{RELAY_WHEELS[0]}}"
+          RELAY_INSTALL_TARGET="$RELAY_ARTIFACT_PATH"
+          BOOTSTRAP_RELAY_DOWNLOAD_COUNT=1
+          if [ -z "$RELAY_ARTIFACT_SHA256" ]; then
+            RELAY_VERSION="${{RELAY_INSTALL_SPEC#clio-relay==}}"
+            RELAY_ARTIFACT_SHA256="$(
+              "$LEGACY_JARVIS_PYTHON" - \
+                "$RELAY_VERSION" "$(basename "$RELAY_ARTIFACT_PATH")" \
+                <<'__CLIO_RELAY_RECONCILE_PYPI_DIGEST__'
 import json
 import re
 import sys
@@ -4531,13 +4539,14 @@ if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{{64}}", digest) is Non
     raise SystemExit("PyPI clio-relay wheel identity omitted a valid SHA-256")
 print(digest)
 __CLIO_RELAY_RECONCILE_PYPI_DIGEST__
-          )"
-        fi
-        ;;
-      *.whl)
-        RELAY_ARTIFACT_PATH="$RELAY_INSTALL_SPEC"
-        ;;
-    esac
+            )"
+          fi
+          ;;
+        *.whl)
+          RELAY_ARTIFACT_PATH="$RELAY_INSTALL_SPEC"
+          ;;
+      esac
+    fi
     if [ -n "$RELAY_ARTIFACT_PATH" ]; then
       test -n "$RELAY_ARTIFACT_SHA256"
       echo "$RELAY_ARTIFACT_SHA256 *$RELAY_ARTIFACT_PATH" | \
@@ -4551,6 +4560,11 @@ __CLIO_RELAY_RECONCILE_PYPI_DIGEST__
     RELAY_EXECUTABLE="$BOOTSTRAP_GENERATION/bin/clio-relay"
     RELAY_PROVIDER_PYTHON="$BOOTSTRAP_GENERATION/tools/clio-relay/bin/python"
     test -x "$RELAY_EXECUTABLE" -a -x "$RELAY_PROVIDER_PYTHON"
+    if [ "$BOOTSTRAP_PLAN_MODE" = "component-upgrade" ]; then
+      "$HOME/.local/bin/uv" pip install --python "$ACTIVE_JARVIS_PYTHON" \
+        --default-index https://pypi.org/simple \
+        --refresh-package clio-relay "$RELAY_INSTALL_TARGET"
+    fi
     bootstrap_candidate_action jarvis-wrapper \
       "$BOOTSTRAP_GENERATION/bin/jarvis" "$ACTIVE_JARVIS_PYTHON"
     ACTIVE_JARVIS_EXECUTABLE="$ACTIVE_JARVIS_VENV/bin/jarvis"
@@ -4562,8 +4576,12 @@ __CLIO_RELAY_RECONCILE_PYPI_DIGEST__
     if [ "$BOOTSTRAP_PLAN_MODE" = "relay-only" ]; then
       ln -s "$CLIO_KIT_EXECUTABLE" "$BOOTSTRAP_GENERATION/bin/clio-kit"
     fi
-    "$RELAY_PROVIDER_PYTHON" -c \
-      'import clio_relay,jarvis_cd,clio_relay.bounded_command.pkg,clio_relay.mcp_call.pkg'
+    JARVIS_PACKAGE_PROBE='import clio_relay, jarvis_cd; '
+    JARVIS_PACKAGE_PROBE+='import clio_relay.bounded_command.pkg; '
+    JARVIS_PACKAGE_PROBE+='import clio_relay.mcp_call.pkg; '
+    JARVIS_PACKAGE_PROBE+='import clio_relay.remote_agent.pkg'
+    "$RELAY_PROVIDER_PYTHON" -I -c "$JARVIS_PACKAGE_PROBE"
+    "$ACTIVE_JARVIS_PYTHON" -I -c "$JARVIS_PACKAGE_PROBE"
 
     export BOOTSTRAP_GENERATION RELAY_INSTALL_SPEC RELAY_ARTIFACT_PATH
     export RELAY_ARTIFACT_SHA256 RELAY_EXECUTABLE RELAY_PROVIDER_PYTHON
@@ -4626,7 +4644,10 @@ relay_component = ComponentArtifactIdentity(
     artifact_sha256=(sha256_file(relay_artifact) if relay_artifact is not None else None),
     runtime_artifact_path=(str(relay_artifact) if relay_artifact is not None else None),
     runtime_command=[os.environ["RELAY_EXECUTABLE"], "installation-info"],
-    runtime_interpreters={{"provider": os.environ["RELAY_PROVIDER_PYTHON"]}},
+    runtime_interpreters={{
+        "provider": os.environ["RELAY_PROVIDER_PYTHON"],
+        "execution": os.environ["ACTIVE_JARVIS_PYTHON"],
+    }},
     runtime_executables={{
         "clio-relay": os.environ["RELAY_EXECUTABLE"],
         "uv": str(Path.home() / ".local/bin/uv"),
@@ -4734,6 +4755,9 @@ checks = {{
     "receipt_matches_install": info.get("receipt_matches_install") is True,
     "clio-relay.persistent_tool_verified": (
         runtime.get("clio-relay", {{}}).get("persistent_tool_verified") is True
+    ),
+    "clio-relay.execution_runtime_verified": (
+        runtime.get("clio-relay", {{}}).get("execution_runtime_verified") is True
     ),
     "clio-kit.persistent_tool_verified": (
         runtime.get("clio-kit", {{}}).get("persistent_tool_verified") is True
@@ -7261,6 +7285,9 @@ receipt = write_install_receipt(
             ],
             runtime_interpreters={{
                 "provider": os.environ["CLIO_RELAY_BOOTSTRAP_RELAY_PROVIDER_PYTHON"],
+                "execution": os.environ[
+                    "CLIO_RELAY_BOOTSTRAP_JARVIS_CD_EXECUTION_PYTHON"
+                ],
             }},
             runtime_executables={{
                 "clio-relay": os.environ["CLIO_RELAY_BOOTSTRAP_RELAY_EXECUTABLE"],
