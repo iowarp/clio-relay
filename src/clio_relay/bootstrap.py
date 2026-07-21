@@ -78,6 +78,408 @@ JARVIS_CD_WHEEL_URL = (
 JARVIS_CD_WHEEL_SHA256 = "ebf5e5f375b921f20c79075d461926431a5a017ca8b45e598878a89b229b3935"
 DEFAULT_REMOTE_CORE_DIR = "$HOME/.local/share/clio-relay/core"
 DEFAULT_REMOTE_SPOOL_DIR = "$HOME/.local/share/clio-relay/spool"
+_STAGED_PROVIDER_ENVIRONMENT_SANITIZER = r"""
+while IFS= read -r bootstrap_environment_name; do
+  case "$bootstrap_environment_name" in
+    LD_*|PYTHON*) unset "$bootstrap_environment_name" ;;
+  esac
+done < <(compgen -e)
+""".strip()
+_STAGED_PROVIDER_EXEC_PROGRAM = r"""
+import ctypes
+import fcntl
+import hashlib
+import json
+import os
+import stat
+import struct
+import sys
+
+MAX_STATE = 4 * 1024 * 1024
+MAX_PROVIDER = 256 * 1024 * 1024
+MAX_RUNTIME_LIBRARY = 512 * 1024 * 1024
+
+
+def create_memfd(name, flags):
+    creator = getattr(os, "memfd_create", None)
+    if creator is not None:
+        return creator(name, flags)
+    library = ctypes.CDLL(None, use_errno=True)
+    creator = library.memfd_create
+    creator.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+    creator.restype = ctypes.c_int
+    descriptor = creator(name.encode(), flags)
+    if descriptor < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return descriptor
+
+
+def read_bounded(descriptor, maximum, label):
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode) or before.st_size < 1 or before.st_size > maximum:
+        raise SystemExit(f"{label} is not one bounded regular file")
+    chunks = []
+    remaining = maximum + 1
+    while remaining:
+        chunk = os.read(descriptor, min(1024 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    payload = b"".join(chunks)
+    after = os.fstat(descriptor)
+    identity = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+    if (
+        len(payload) != before.st_size
+        or len(payload) > maximum
+        or identity(before) != identity(after)
+    ):
+        raise SystemExit(f"{label} changed while it was read")
+    return payload
+
+
+def origin_dependency_relocations(payload):
+    if payload[:4] != b"\x7fELF":
+        return []
+    if len(payload) < 64 or payload[4:6] != b"\x02\x01":
+        raise SystemExit("staged provider is not a supported ELF64 executable")
+    program_offset = struct.unpack_from("<Q", payload, 32)[0]
+    program_entry_size = struct.unpack_from("<H", payload, 54)[0]
+    program_count = struct.unpack_from("<H", payload, 56)[0]
+    if (
+        program_entry_size < 56
+        or program_count < 1
+        or program_offset + program_entry_size * program_count > len(payload)
+    ):
+        raise SystemExit("staged provider ELF program table is invalid")
+    load_segments = []
+    dynamic_segment = None
+    for index in range(program_count):
+        offset = program_offset + index * program_entry_size
+        (
+            program_type,
+            _flags,
+            file_offset,
+            virtual_address,
+            _physical_address,
+            file_size,
+            _memory_size,
+            _alignment,
+        ) = struct.unpack_from("<IIQQQQQQ", payload, offset)
+        if file_offset + file_size > len(payload):
+            raise SystemExit("staged provider ELF segment is out of bounds")
+        if program_type == 1:
+            load_segments.append((file_offset, virtual_address, file_size))
+        elif program_type == 2:
+            if dynamic_segment is not None:
+                raise SystemExit("staged provider has multiple ELF dynamic segments")
+            dynamic_segment = (file_offset, file_size)
+    if dynamic_segment is None:
+        return []
+    dynamic_offset, dynamic_size = dynamic_segment
+    if dynamic_size % 16:
+        raise SystemExit("staged provider ELF dynamic segment is invalid")
+    string_address = None
+    string_size = None
+    needed_offsets = []
+    for offset in range(dynamic_offset, dynamic_offset + dynamic_size, 16):
+        tag, value = struct.unpack_from("<qQ", payload, offset)
+        if tag == 0:
+            break
+        if tag == 1:
+            needed_offsets.append(value)
+        elif tag == 5:
+            string_address = value
+        elif tag == 10:
+            string_size = value
+    if not needed_offsets:
+        return []
+    if string_address is None or string_size is None or string_size < 1:
+        raise SystemExit("staged provider ELF string table is missing")
+    string_candidates = [
+        file_offset + string_address - virtual_address
+        for file_offset, virtual_address, file_size in load_segments
+        if virtual_address <= string_address
+        and string_address + string_size <= virtual_address + file_size
+    ]
+    if len(string_candidates) != 1:
+        raise SystemExit("staged provider ELF string table is ambiguous")
+    string_offset = string_candidates[0]
+    string_end = string_offset + string_size
+    origin_prefix = b"$ORIGIN/../lib/"
+    relocations = []
+    for needed_offset in needed_offsets:
+        start = string_offset + needed_offset
+        if start < string_offset or start >= string_end:
+            raise SystemExit("staged provider ELF dependency is out of bounds")
+        end = payload.find(b"\0", start, string_end)
+        if end < 0:
+            raise SystemExit("staged provider ELF dependency is unterminated")
+        dependency = payload[start:end]
+        if not dependency.startswith(origin_prefix):
+            continue
+        library_name_bytes = dependency[len(origin_prefix) :]
+        try:
+            library_name = library_name_bytes.decode("ascii")
+        except UnicodeDecodeError as error:
+            raise SystemExit("staged provider ELF origin dependency is invalid") from error
+        if (
+            not library_name
+            or library_name != os.path.basename(library_name)
+            or any(
+                character
+                not in (
+                    "abcdefghijklmnopqrstuvwxyz"
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                    "0123456789._+-"
+                )
+                for character in library_name
+            )
+        ):
+            raise SystemExit("staged provider ELF origin dependency is unsafe")
+        relocations.append((start, len(dependency), library_name))
+    return relocations
+
+
+def sealed_memfd(name, payload, *, inheritable):
+    flags = getattr(os, "MFD_ALLOW_SEALING", 2) | getattr(os, "MFD_EXEC", 0)
+    if not inheritable:
+        flags |= getattr(os, "MFD_CLOEXEC", 1)
+    descriptor = create_memfd(name, flags)
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written < 1:
+                raise SystemExit(f"could not copy {name} into sealed memory")
+            view = view[written:]
+        os.fchmod(descriptor, 0o500)
+        seals = (
+            getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+            | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+            | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+            | getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+        )
+        add_seals = getattr(fcntl, "F_ADD_SEALS", 1033)
+        get_seals = getattr(fcntl, "F_GET_SEALS", 1034)
+        fcntl.fcntl(descriptor, add_seals, seals)
+        if fcntl.fcntl(descriptor, get_seals) & seals != seals:
+            raise SystemExit(f"{name} memfd did not seal")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.set_inheritable(descriptor, inheritable)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+generation, expected_manifest_sha256, *provider_arguments = sys.argv[1:]
+if len(expected_manifest_sha256) != 64 or any(
+    character not in "0123456789abcdef" for character in expected_manifest_sha256
+):
+    raise SystemExit("staged manifest digest is invalid")
+generation = os.path.abspath(generation)
+generation_descriptor = os.open(
+    generation,
+    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    manifest_descriptor = os.open(
+        "manifest.json",
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=generation_descriptor,
+    )
+    try:
+        manifest_payload = read_bounded(manifest_descriptor, MAX_STATE, "staged manifest")
+    finally:
+        os.close(manifest_descriptor)
+    if hashlib.sha256(manifest_payload).hexdigest() != expected_manifest_sha256:
+        raise SystemExit("staged manifest changed before provider execution")
+    manifest = json.loads(manifest_payload)
+    receipt_path = os.path.join(generation, "install-receipt.json")
+    if manifest.get("install_receipt") != receipt_path:
+        raise SystemExit("staged receipt path is not bound to its manifest")
+    receipt_descriptor = os.open(
+        "install-receipt.json",
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=generation_descriptor,
+    )
+    try:
+        receipt_payload = read_bounded(receipt_descriptor, MAX_STATE, "staged receipt")
+    finally:
+        os.close(receipt_descriptor)
+    if manifest.get("install_receipt_sha256") != hashlib.sha256(receipt_payload).hexdigest():
+        raise SystemExit("staged receipt is not bound to its manifest")
+    receipt = json.loads(receipt_payload)
+    component = receipt["component_artifacts"]["clio-relay"]
+    persistent = component["persistent_tool"]
+    provider = component["runtime_interpreters"]["provider"]
+    relay = component["runtime_executables"]["clio-relay"]
+    provider_sha256 = persistent["provider_interpreter_sha256"]
+    relay_sha256 = persistent["tool_executable_sha256"]
+    if provider != persistent["provider_interpreter"]:
+        raise SystemExit("staged provider receipt paths disagree")
+    expected_relay = os.path.join(generation, "bin", "clio-relay")
+    if relay != persistent["tool_executable"] or relay != expected_relay:
+        raise SystemExit("staged relay receipt paths disagree")
+    provider_prefix = os.path.join(generation, "tools") + os.sep
+    if (
+        not isinstance(provider, str)
+        or not provider.startswith(provider_prefix)
+        or os.path.normpath(provider) != provider
+        or any(character in provider for character in "\x00\r\n")
+    ):
+        raise SystemExit("staged provider path is outside its generation")
+    for digest, label in (
+        (provider_sha256, "provider"),
+        (relay_sha256, "relay"),
+    ):
+        if not isinstance(digest, str) or len(digest) != 64 or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            raise SystemExit(f"staged {label} digest is invalid")
+    relay_descriptor = os.open(
+        os.path.relpath(relay, generation),
+        os.O_RDONLY,
+        dir_fd=generation_descriptor,
+    )
+    try:
+        relay_payload = read_bounded(relay_descriptor, MAX_STATE, "staged relay launcher")
+    finally:
+        os.close(relay_descriptor)
+    if hashlib.sha256(relay_payload).hexdigest() != relay_sha256:
+        raise SystemExit("staged relay launcher digest changed")
+    first_line = relay_payload.splitlines()[0].decode("utf-8")
+    if first_line != "#!" + provider:
+        raise SystemExit("staged relay launcher is not bound to its provider")
+    provider_descriptor = os.open(
+        os.path.relpath(provider, generation),
+        os.O_RDONLY,
+        dir_fd=generation_descriptor,
+    )
+    try:
+        provider_details = os.fstat(provider_descriptor)
+        if provider_details.st_mode & 0o111 == 0:
+            raise SystemExit("staged provider is not executable")
+        descriptor_path = f"/proc/self/fd/{provider_descriptor}"
+        source_provider = os.path.realpath(descriptor_path)
+        if (
+            not source_provider
+            or source_provider.endswith(" (deleted)")
+            or not os.path.isfile(source_provider)
+        ):
+            raise SystemExit("staged provider backing path is unavailable")
+        source_details = os.stat(source_provider, follow_symlinks=False)
+        if (source_details.st_dev, source_details.st_ino) != (
+            provider_details.st_dev,
+            provider_details.st_ino,
+        ):
+            raise SystemExit("staged provider backing path changed")
+        provider_library = os.path.normpath(
+            os.path.join(os.path.dirname(source_provider), "..", "lib")
+        )
+        runtime_library_memfds = []
+        try:
+            provider_payload = read_bounded(
+                provider_descriptor,
+                MAX_PROVIDER,
+                "staged provider",
+            )
+            if hashlib.sha256(provider_payload).hexdigest() != provider_sha256:
+                raise SystemExit("staged provider digest changed")
+            relocations = origin_dependency_relocations(provider_payload)
+            relocated_provider = bytearray(provider_payload)
+            library_memfds_by_name = {}
+            if relocations:
+                try:
+                    library_directory_descriptor = os.open(
+                        provider_library,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | getattr(os, "O_NOFOLLOW", 0),
+                    )
+                except OSError as error:
+                    raise SystemExit(
+                        "staged provider origin library directory is unavailable"
+                    ) from error
+                try:
+                    for _start, _size, library_name in relocations:
+                        if library_name in library_memfds_by_name:
+                            continue
+                        try:
+                            library_descriptor = os.open(
+                                library_name,
+                                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                                dir_fd=library_directory_descriptor,
+                            )
+                        except OSError as error:
+                            raise SystemExit(
+                                f"staged provider origin dependency is unavailable: {library_name}"
+                            ) from error
+                        try:
+                            library_payload = read_bounded(
+                                library_descriptor,
+                                MAX_RUNTIME_LIBRARY,
+                                f"staged provider origin dependency {library_name}",
+                            )
+                        finally:
+                            os.close(library_descriptor)
+                        library_memfd = sealed_memfd(
+                            f"clio-relay-{library_name}",
+                            library_payload,
+                            inheritable=True,
+                        )
+                        runtime_library_memfds.append(library_memfd)
+                        library_memfds_by_name[library_name] = library_memfd
+                finally:
+                    os.close(library_directory_descriptor)
+                for start, size, library_name in relocations:
+                    replacement = (
+                        f"/proc/self/fd/{library_memfds_by_name[library_name]}".encode()
+                    )
+                    if len(replacement) > size:
+                        raise SystemExit(
+                            "staged provider origin dependency fd path is too long"
+                        )
+                    relocated_provider[start : start + size] = replacement + b"\0" * (
+                        size - len(replacement)
+                    )
+            provider_memfd = sealed_memfd(
+                "clio-relay-staged-provider",
+                relocated_provider,
+                inheritable=False,
+            )
+            try:
+                if os.execve not in os.supports_fd:
+                    raise SystemExit("provider fd execution is unavailable")
+                provider_environment = {
+                    name: value
+                    for name, value in os.environ.items()
+                    if not name.startswith("LD_") and not name.startswith("PYTHON")
+                }
+                os.execve(
+                    provider_memfd,
+                    [provider, "-I", *provider_arguments],
+                    provider_environment,
+                )
+            finally:
+                os.close(provider_memfd)
+        finally:
+            for runtime_library_memfd in runtime_library_memfds:
+                os.close(runtime_library_memfd)
+    finally:
+        os.close(provider_descriptor)
+finally:
+    os.close(generation_descriptor)
+"""
 MAX_RELAY_WHEEL_METADATA_BYTES = 1024 * 1024
 BOOTSTRAP_REMOTE_SCRIPT_TIMEOUT_SECONDS = 1800.0
 BOOTSTRAP_PUBLIC_EXACT_DEADLINE_SECONDS = 29.0
@@ -1692,54 +2094,63 @@ def _validate_bootstrap_receipt(
             raise RelayError("staged reconcile reported JARVIS initialization")
         if jarvis_graph_action != "preserved" or command_count != 0:
             raise RelayError("staged reconcile reported JARVIS commands")
-        if transaction_mode == "component-upgrade":
+        previous_generation = typed_generation.get("previous")
+        link_action = binding.get("link_action")
+        previous_generation_is_proven = bool(
+            previous_generation == "legacy" or _is_sha256_value(previous_generation)
+        )
+        link_action_is_proven = bool(
+            link_action == "reused"
+            or (link_action in {"created", "retargeted"} and previous_generation_is_proven)
+        )
+        if (
+            typed_jarvis_preservation.get("config_byte_identical") is not True
+            or typed_jarvis_preservation.get("resource_graph_byte_identical") is not True
+            or not link_action_is_proven
+        ):
+            raise RelayError("staged reconcile did not preserve existing JARVIS state")
+        managed_repo = repository_update.get("managed_repo")
+        added_repositories = repository_update.get("added_managed_repos")
+        removed_repositories = repository_update.get("removed_previous_managed_repos")
+        if (
+            not isinstance(managed_repo, str)
+            or not PurePosixPath(managed_repo).is_absolute()
+            or any(character in managed_repo for character in "\x00\r\n")
+            or binding.get("link") != managed_repo
+        ):
+            raise RelayError("staged reconcile repository binding is invalid")
+        managed_suffix = "/.local/share/clio-relay/managed-jarvis-repo"
+        if not managed_repo.endswith(managed_suffix):
+            raise RelayError("staged reconcile repository binding is invalid")
+        remote_home = managed_repo[: -len(managed_suffix)]
+        expected_target = (
+            remote_home + "/.local/share/clio-relay/current/source/jarvis-packages/clio_relay"
+        )
+        expected_previous = remote_home + "/.local/src/clio-relay/jarvis-packages/clio_relay"
+        repository_action = repository_update.get("action")
+        if (
+            binding.get("target") != expected_target
+            or not isinstance(added_repositories, list)
+            or not isinstance(removed_repositories, list)
+        ):
+            raise RelayError("staged reconcile repository binding is invalid")
+        if repository_action == "reused":
             if (
-                typed_jarvis_preservation.get("config_byte_identical") is not True
-                or typed_jarvis_preservation.get("resource_graph_byte_identical") is not True
-                or binding.get("link_action") != "reused"
+                typed_jarvis_preservation.get("repositories_byte_identical") is not True
+                or added_repositories
+                or removed_repositories
             ):
-                raise RelayError("component upgrade did not preserve existing JARVIS state")
-            managed_repo = repository_update.get("managed_repo")
-            added_repositories = repository_update.get("added_managed_repos")
-            removed_repositories = repository_update.get("removed_previous_managed_repos")
+                raise RelayError("staged reconcile repository reuse is invalid")
+        elif repository_action == "updated":
             if (
-                not isinstance(managed_repo, str)
-                or not PurePosixPath(managed_repo).is_absolute()
-                or any(character in managed_repo for character in "\x00\r\n")
-                or binding.get("link") != managed_repo
+                typed_jarvis_preservation.get("repositories_byte_identical") is not False
+                or added_repositories not in ([], [managed_repo])
+                or removed_repositories not in ([], [expected_previous])
+                or (not added_repositories and removed_repositories != [expected_previous])
             ):
-                raise RelayError("component upgrade repository binding is invalid")
-            managed_suffix = "/.local/share/clio-relay/managed-jarvis-repo"
-            if not managed_repo.endswith(managed_suffix):
-                raise RelayError("component upgrade repository binding is invalid")
-            remote_home = managed_repo[: -len(managed_suffix)]
-            expected_target = (
-                remote_home + "/.local/share/clio-relay/current/source/jarvis-packages/clio_relay"
-            )
-            expected_previous = remote_home + "/.local/src/clio-relay/jarvis-packages/clio_relay"
-            repository_action = repository_update.get("action")
-            if (
-                binding.get("target") != expected_target
-                or not isinstance(added_repositories, list)
-                or not isinstance(removed_repositories, list)
-            ):
-                raise RelayError("component upgrade repository binding is invalid")
-            if repository_action == "reused":
-                if (
-                    typed_jarvis_preservation.get("repositories_byte_identical") is not True
-                    or added_repositories
-                    or removed_repositories
-                ):
-                    raise RelayError("component upgrade repository reuse is invalid")
-            elif repository_action == "updated":
-                if (
-                    typed_jarvis_preservation.get("repositories_byte_identical") is not False
-                    or added_repositories != [managed_repo]
-                    or removed_repositories not in ([], [expected_previous])
-                ):
-                    raise RelayError("component upgrade repository migration is invalid")
-            else:  # pragma: no cover - rejected by the generic evidence contract above
-                raise RelayError("component upgrade repository action is invalid")
+                raise RelayError("staged reconcile repository migration is invalid")
+        else:  # pragma: no cover - rejected by the generic evidence contract above
+            raise RelayError("staged reconcile repository action is invalid")
         if payload_count != 2 or payload_bytes <= 0:
             raise RelayError("staged reconcile omitted its transferred payload evidence")
     elif outcome == "full":
@@ -2063,6 +2474,8 @@ def _relay_only_reconcile_script(
     invocation_id: str,
 ) -> str:
     """Render the staged relay-only generation transaction."""
+    staged_provider_exec_program = shlex.quote(_STAGED_PROVIDER_EXEC_PROGRAM)
+    staged_provider_environment_sanitizer = _STAGED_PROVIDER_ENVIRONMENT_SANITIZER
     return f"""
 bootstrap_plan_value() {{
   local field="$1"
@@ -2080,10 +2493,21 @@ print(value)
 __CLIO_RELAY_PLAN_VALUE__
 }}
 
+bootstrap_provider_exec() (
+{staged_provider_environment_sanitizer}
+  if [ -n "${{BOOTSTRAP_STAGED_GENERATION:-}}" ]; then
+    exec python3 -I -c {staged_provider_exec_program} \
+      "$BOOTSTRAP_STAGED_GENERATION" \
+      "$BOOTSTRAP_STAGED_MANIFEST_SHA256" "$@"
+  else
+    exec "$BOOTSTRAP_PLAN_PROVIDER" "$@"
+  fi
+)
+
 bootstrap_candidate_action() {{
   local action="$1"
   shift
-  "$BOOTSTRAP_PLAN_PROVIDER" - "$BOOTSTRAP_CANDIDATE_RECONCILE" "$action" "$@" \
+  bootstrap_provider_exec - "$BOOTSTRAP_CANDIDATE_RECONCILE" "$action" "$@" \
     <<'__CLIO_RELAY_CANDIDATE_ACTION__'
 import importlib.util
 import json
@@ -2172,9 +2596,57 @@ elif action == "jarvis-wrapper":
             separators=(",", ":"),
         )
     )
+elif action == "finish-activation":
+    desired_payload = json.loads(os.environ["BOOTSTRAP_DESIRED_STATE"])
+    desired_payload["agent_npm_package"] = os.environ["AGENT_NPM_PACKAGE"] or None
+    desired_payload["agent_npm_bin"] = os.environ["AGENT_NPM_BIN"] or None
+    desired = module.BootstrapDesiredState.model_validate(desired_payload)
+    print(
+        json.dumps(
+            module.finish_staged_activation(
+                desired,
+                generation=Path(arguments[0]),
+                expected_manifest_sha256=arguments[1],
+            ),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+elif action == "exchange-preflight":
+    print(
+        json.dumps(
+            module.verify_atomic_exchange_support(
+                tuple(Path(value) for value in arguments),
+                identity=os.environ["BOOTSTRAP_DESIRED_FINGERPRINT"],
+            ),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
 else:
     raise SystemExit(f"unknown candidate bootstrap action: {{action}}")
 __CLIO_RELAY_CANDIDATE_ACTION__
+}}
+
+bootstrap_use_staged_provider() {{
+  local generation="$1"
+  local expected_manifest_sha256="$2"
+  if [ -L "$generation" ] || [ ! -d "$generation" ]; then
+    echo "staged bootstrap generation is not one owned directory" >&2
+    return 1
+  fi
+  case "$expected_manifest_sha256" in
+    (*[!0-9a-f]*|'') echo "staged manifest digest is invalid" >&2; return 1 ;;
+  esac
+  if [ "${{#expected_manifest_sha256}}" -ne 64 ]; then
+    echo "staged manifest digest has an invalid length" >&2
+    return 1
+  fi
+  BOOTSTRAP_STAGED_GENERATION="$generation"
+  BOOTSTRAP_STAGED_MANIFEST_SHA256="$expected_manifest_sha256"
+  export BOOTSTRAP_STAGED_GENERATION BOOTSTRAP_STAGED_MANIFEST_SHA256
+  bootstrap_provider_exec -c \
+    'import clio_relay,jarvis_cd; print("staged_provider=sealed_memfd")' >/dev/null
 }}
 
 bootstrap_require_stable_link() {{
@@ -2196,7 +2668,36 @@ bootstrap_verify_stable_activation_links() {{
     "$HOME/.local/share/clio-relay/current/bin/jarvis"
   bootstrap_require_stable_link \
     "$HOME/.local/share/clio-relay/managed-jarvis-repo" \
-    "$HOME/.local/share/clio-relay/current/source/jarvis-packages/clio_relay"
+      "$HOME/.local/share/clio-relay/current/source/jarvis-packages/clio_relay"
+}}
+
+bootstrap_active_generation_identity() {{
+  local current target prefix identity
+  current="$HOME/.local/share/clio-relay/current"
+  if [ ! -L "$current" ]; then
+    echo "bootstrap current generation pointer is not a symbolic link" >&2
+    return 1
+  fi
+  target="$(readlink -f "$current")"
+  prefix="$HOME/.local/share/clio-relay/generations/"
+  case "$target" in
+    "$prefix"*) identity="${{target#"$prefix"}}" ;;
+    *)
+      echo "bootstrap current pointer does not name one managed generation" >&2
+      return 1
+      ;;
+  esac
+  case "$identity" in
+    (*[!0-9a-f]*|'')
+      echo "bootstrap current generation identity is invalid" >&2
+      return 1
+      ;;
+  esac
+  if [ "${{#identity}}" -ne 64 ]; then
+    echo "bootstrap current generation identity has an invalid length" >&2
+    return 1
+  fi
+  echo "$identity"
 }}
 
 bootstrap_reconcile_transaction_exit() {{
@@ -2296,7 +2797,7 @@ bootstrap_recover_previous_transaction() {{
       return 1
       ;;
     forward)
-      local prepared_generation current_target
+      local prepared_generation prepared_manifest_sha256 recovery_generation
       prepared_generation="$(bootstrap_recovery_value prepared_generation)"
       case "$prepared_generation" in
         (*[!0-9a-f]*|'')
@@ -2305,17 +2806,48 @@ bootstrap_recover_previous_transaction() {{
           ;;
       esac
       [ "${{#prepared_generation}}" -eq 64 ] || return 1
-      [ -L "$HOME/.local/share/clio-relay/current" ] || {{
-        echo "bootstrap forward recovery has no active generation pointer" >&2
-        return 1
-      }}
-      current_target="$(readlink -f "$HOME/.local/share/clio-relay/current")"
-      if [ "$current_target" != \
-           "$HOME/.local/share/clio-relay/generations/$prepared_generation" ]; then
+      prepared_manifest_sha256="$(
+        python3 - <<'__CLIO_RELAY_RECOVERY_MANIFEST__'
+import json
+import os
+
+value = json.loads(os.environ["BOOTSTRAP_RECOVERY_JSON"])
+identity = value.get("phase_identities", {{}}).get("prepared_manifest")
+if not isinstance(identity, str):
+    raise SystemExit("bootstrap recovery omitted prepared manifest identity")
+print(identity)
+__CLIO_RELAY_RECOVERY_MANIFEST__
+      )"
+      case "$prepared_manifest_sha256" in
+        (*[!0-9a-f]*|'')
+          echo "bootstrap forward recovery has an invalid manifest identity" >&2
+          return 1
+          ;;
+      esac
+      [ "${{#prepared_manifest_sha256}}" -eq 64 ] || return 1
+      recovery_generation="$HOME/.local/share/clio-relay/generations/$prepared_generation"
+      if [ -L "$recovery_generation" ] || [ ! -d "$recovery_generation" ]; then
         echo "bootstrap forward recovery generation identity changed" >&2
         return 1
       fi
+      if [ "$JARVIS_EXISTING_FILE_COUNT" -ne 3 ] || \
+         [ -z "$BOOTSTRAP_JARVIS_CONFIG_SHA256_BEFORE" ] || \
+         [ -z "$BOOTSTRAP_JARVIS_GRAPH_SHA256_BEFORE" ]; then
+        echo "bootstrap forward recovery cannot prove preserved JARVIS state" >&2
+        return 1
+      fi
+      echo "$BOOTSTRAP_JARVIS_CONFIG_SHA256_BEFORE *$JARVIS_CONFIG_FILE" | \
+        sha256sum --check --strict -
+      echo "$BOOTSTRAP_JARVIS_GRAPH_SHA256_BEFORE *$JARVIS_GRAPH_FILE" | \
+        sha256sum --check --strict -
+      bootstrap_use_staged_provider "$recovery_generation" "$prepared_manifest_sha256"
+      bootstrap_candidate_action finish-activation \
+        "$recovery_generation" "$prepared_manifest_sha256" >/dev/null
       bootstrap_verify_stable_activation_links
+      echo "$BOOTSTRAP_JARVIS_CONFIG_SHA256_BEFORE *$JARVIS_CONFIG_FILE" | \
+        sha256sum --check --strict -
+      echo "$BOOTSTRAP_JARVIS_GRAPH_SHA256_BEFORE *$JARVIS_GRAPH_FILE" | \
+        sha256sum --check --strict -
       mkdir -p -- {rendered_core_dir}
       exec 8<>"{rendered_core_dir}/{WORKER_LIFETIME_LOCK_NAME}"
       if ! flock -n 8; then
@@ -2389,7 +2921,7 @@ bootstrap_relay_only_reconcile() {{
   BOOTSTRAP_ROLLBACK_DIR="$BOOTSTRAP_TRANSACTION_ROOT/rollback"
   BOOTSTRAP_PREVIOUS_GENERATION="legacy"
   if [ -L "$HOME/.local/share/clio-relay/current" ]; then
-    BOOTSTRAP_PREVIOUS_GENERATION="$(readlink "$HOME/.local/share/clio-relay/current")"
+    BOOTSTRAP_PREVIOUS_GENERATION="$(bootstrap_active_generation_identity)"
   elif [ -e "$HOME/.local/share/clio-relay/current" ]; then
     echo "bootstrap current generation pointer is not a symbolic link" >&2
     return 1
@@ -2421,10 +2953,19 @@ bootstrap_relay_only_reconcile() {{
 
   if [ -e "$BOOTSTRAP_GENERATION" ]; then
     if [ ! -f "$BOOTSTRAP_GENERATION/.prepared" ]; then
-      if [ -L "$HOME/.local/share/clio-relay/current" ] && \
-         [ "$(readlink "$HOME/.local/share/clio-relay/current")" = "$BOOTSTRAP_GENERATION" ]; then
-        echo "incomplete generation is active; recovery is required" >&2
-        return 1
+      if [ -L "$HOME/.local/share/clio-relay/current" ]; then
+        BOOTSTRAP_INCOMPLETE_CURRENT_TARGET="$(
+          readlink -f "$HOME/.local/share/clio-relay/current" || true
+        )"
+        if [ -z "$BOOTSTRAP_INCOMPLETE_CURRENT_TARGET" ]; then
+          echo "active generation pointer could not be resolved" >&2
+          return 1
+        fi
+        if [ "$BOOTSTRAP_INCOMPLETE_CURRENT_TARGET" = \
+             "$(readlink -f "$BOOTSTRAP_GENERATION")" ]; then
+          echo "incomplete generation is active; recovery is required" >&2
+          return 1
+        fi
       fi
       rm -rf -- "$BOOTSTRAP_GENERATION"
     fi
@@ -2442,6 +2983,7 @@ bootstrap_relay_only_reconcile() {{
   fi
   JARVIS_CD_WHEEL=""
   CLIO_KIT_EXECUTABLE=""
+  ACTIVE_JARVIS_VENV="$LEGACY_JARVIS_VENV"
   ACTIVE_JARVIS_PYTHON="$LEGACY_JARVIS_PYTHON"
   JARVIS_MCP_INSTALL_SPEC=""
   JARVIS_MCP_ARTIFACT_SHA256=""
@@ -2455,6 +2997,7 @@ bootstrap_relay_only_reconcile() {{
   else
     JARVIS_CD_WHEEL="$BOOTSTRAP_GENERATION/artifacts/{JARVIS_CD_WHEEL_FILENAME}"
     CLIO_KIT_EXECUTABLE="$BOOTSTRAP_GENERATION/bin/clio-kit"
+    ACTIVE_JARVIS_VENV="$BOOTSTRAP_GENERATION/jarvis-venv"
     ACTIVE_JARVIS_PYTHON="$BOOTSTRAP_GENERATION/jarvis-venv/bin/python"
     JARVIS_MCP_INSTALL_SPEC={rendered_jarvis_mcp_install_spec}
     JARVIS_MCP_ARTIFACT_SHA256={rendered_jarvis_mcp_artifact_sha256}
@@ -2601,6 +3144,12 @@ __CLIO_RELAY_RECONCILE_PYPI_DIGEST__
     test -x "$RELAY_EXECUTABLE" -a -x "$RELAY_PROVIDER_PYTHON"
     bootstrap_candidate_action jarvis-wrapper \
       "$BOOTSTRAP_GENERATION/bin/jarvis" "$ACTIVE_JARVIS_PYTHON"
+    ACTIVE_JARVIS_EXECUTABLE="$ACTIVE_JARVIS_VENV/bin/jarvis"
+    BOOTSTRAP_ACTIVE_IDENTITY="$(
+      bootstrap_candidate_action execution-boundary \
+        "$ACTIVE_JARVIS_VENV" "$ACTIVE_JARVIS_PYTHON" "$ACTIVE_JARVIS_EXECUTABLE"
+    )"
+    export BOOTSTRAP_ACTIVE_IDENTITY
     if [ "$BOOTSTRAP_PLAN_MODE" = "relay-only" ]; then
       ln -s "$CLIO_KIT_EXECUTABLE" "$BOOTSTRAP_GENERATION/bin/clio-kit"
     fi
@@ -2802,8 +3351,10 @@ manifest = {{
     "fingerprint": os.environ["BOOTSTRAP_DESIRED_FINGERPRINT"],
     "plan": json.loads(os.environ["BOOTSTRAP_PLAN_JSON"]),
     "legacy_execution_identity": json.loads(os.environ["BOOTSTRAP_LEGACY_IDENTITY"]),
+    "active_execution_identity": json.loads(os.environ["BOOTSTRAP_ACTIVE_IDENTITY"]),
     "jarvis_wrapper_sha256": sha256_file(generation / "bin/jarvis"),
     "install_receipt": str(generation / "install-receipt.json"),
+    "install_receipt_sha256": sha256_file(generation / "install-receipt.json"),
 }}
 path = generation / "manifest.json"
 temporary = generation / ".manifest.tmp"
@@ -2852,8 +3403,9 @@ __CLIO_RELAY_GENERATION_MANIFEST__
     echo "legacy JARVIS execution environment changed before activation" >&2
     return 1
   fi
-  CLIO_RELAY_INSTALL_RECEIPT="$BOOTSTRAP_GENERATION/install-receipt.json" \
-    "$RELAY_PROVIDER_PYTHON" - <<'__CLIO_RELAY_VERIFY_PREPARED_GENERATION__'
+  BOOTSTRAP_PREPARED_INSPECTION="$(
+    CLIO_RELAY_INSTALL_RECEIPT="$BOOTSTRAP_GENERATION/install-receipt.json" \
+      "$RELAY_PROVIDER_PYTHON" - <<'__CLIO_RELAY_VERIFY_PREPARED_GENERATION__'
 import json
 import os
 from pathlib import Path
@@ -2867,12 +3419,43 @@ desired_payload = json.loads(os.environ["BOOTSTRAP_DESIRED_STATE"])
 desired_payload["agent_npm_package"] = os.environ["AGENT_NPM_PACKAGE"] or None
 desired_payload["agent_npm_bin"] = os.environ["AGENT_NPM_BIN"] or None
 desired = BootstrapDesiredState.model_validate(desired_payload)
-inspect_prepared_generation(
+inspection = inspect_prepared_generation(
     desired,
     generation=Path(os.environ["BOOTSTRAP_GENERATION"]),
     legacy_execution_identity=json.loads(os.environ["BOOTSTRAP_LEGACY_IDENTITY"]),
 )
+print(json.dumps(inspection, sort_keys=True, separators=(",", ":")))
 __CLIO_RELAY_VERIFY_PREPARED_GENERATION__
+  )"
+  export BOOTSTRAP_PREPARED_INSPECTION
+  BOOTSTRAP_PREPARED_MANIFEST_SHA256="$(
+    python3 - <<'__CLIO_RELAY_PREPARED_MANIFEST_SHA256__'
+import json
+import os
+
+print(json.loads(os.environ["BOOTSTRAP_PREPARED_INSPECTION"])["manifest_sha256"])
+__CLIO_RELAY_PREPARED_MANIFEST_SHA256__
+  )"
+  case "$BOOTSTRAP_PREPARED_MANIFEST_SHA256" in
+    (*[!0-9a-f]*|'') echo "prepared manifest identity is invalid" >&2; return 1 ;;
+  esac
+  if [ "${{#BOOTSTRAP_PREPARED_MANIFEST_SHA256}}" -ne 64 ]; then
+    echo "prepared manifest identity has an invalid length" >&2
+    return 1
+  fi
+  (
+    BOOTSTRAP_STAGED_GENERATION="$BOOTSTRAP_GENERATION"
+    BOOTSTRAP_STAGED_MANIFEST_SHA256="$BOOTSTRAP_PREPARED_MANIFEST_SHA256"
+    export BOOTSTRAP_STAGED_GENERATION BOOTSTRAP_STAGED_MANIFEST_SHA256
+    bootstrap_provider_exec -c \
+      'import clio_relay,jarvis_cd; print("staged_provider=sealed_memfd")'
+  ) >/dev/null
+  bootstrap_candidate_action journal-phase prepared_manifest \
+    "$BOOTSTRAP_PREPARED_MANIFEST_SHA256"
+  bootstrap_candidate_action exchange-preflight \
+    "$HOME/.local/share/clio-relay" \
+    "$HOME/.local/bin" \
+    "$(dirname "$JARVIS_REPOS_FILE")" >/dev/null
   BOOTSTRAP_PREPARE_COMPLETED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
   export BOOTSTRAP_PREPARE_STARTED_NS BOOTSTRAP_PREPARE_COMPLETED_NS
   bootstrap_candidate_action journal-advance prepared
@@ -2890,64 +3473,37 @@ __CLIO_RELAY_VERIFY_PREPARED_GENERATION__
   fi
   bootstrap_candidate_action journal-advance fenced
   trap bootstrap_reconcile_transaction_exit EXIT
+  echo "$BOOTSTRAP_JARVIS_CONFIG_SHA256_BEFORE *$JARVIS_CONFIG_FILE" | \
+    sha256sum --check --strict -
+  echo "$BOOTSTRAP_JARVIS_GRAPH_SHA256_BEFORE *$JARVIS_GRAPH_FILE" | \
+    sha256sum --check --strict -
   bootstrap_candidate_action journal-advance activating
 
-  bootstrap_verify_stable_activation_links
-  if [ "$(readlink -f "$HOME/.local/share/clio-relay/current")" != \
-       "$HOME/.local/share/clio-relay/generations/$BOOTSTRAP_PREVIOUS_GENERATION" ]; then
-    echo "bootstrap previous generation pointer changed before activation" >&2
-    return 1
-  fi
-  ln -s "$BOOTSTRAP_GENERATION" \
-    "$HOME/.local/share/clio-relay/.current.$BOOTSTRAP_INVOCATION_ID"
-  if [ "$(readlink -f "$HOME/.local/share/clio-relay/current")" != \
-       "$HOME/.local/share/clio-relay/generations/$BOOTSTRAP_PREVIOUS_GENERATION" ]; then
-    echo "bootstrap previous generation pointer changed during activation" >&2
-    return 1
-  fi
-  mv -Tf "$HOME/.local/share/clio-relay/.current.$BOOTSTRAP_INVOCATION_ID" \
-    "$HOME/.local/share/clio-relay/current"
-  bootstrap_candidate_action journal-advance activated
-
-  export MANAGED_JARVIS_REPO="$HOME/.local/share/clio-relay/managed-jarvis-repo"
-  export JARVIS_REPOS_FILE="$JARVIS_STATE_ROOT/repos.yaml"
-  "$HOME/.local/share/clio-relay/current/bin/clio-relay" installation-info >/dev/null
-  "$HOME/.local/share/clio-relay/current/bin/clio-relay" --help >/dev/null
-  CURRENT_RELAY_PROVIDER="$(
-    sed -n '1{{s/^#!//;p;}}' "$HOME/.local/share/clio-relay/current/bin/clio-relay"
+  bootstrap_use_staged_provider \
+    "$BOOTSTRAP_GENERATION" "$BOOTSTRAP_PREPARED_MANIFEST_SHA256"
+  BOOTSTRAP_STAGED_ACTIVATION="$(
+    bootstrap_candidate_action finish-activation \
+      "$BOOTSTRAP_GENERATION" "$BOOTSTRAP_PREPARED_MANIFEST_SHA256"
   )"
+  export BOOTSTRAP_STAGED_ACTIVATION
   BOOTSTRAP_JARVIS_REPO_RECONCILIATION="$(
-    "$CURRENT_RELAY_PROVIDER" - "$HOME/.local/src/clio-relay/jarvis-packages/clio_relay" \
-      <<'__CLIO_RELAY_GENERATION_REPO__'
+    python3 - <<'__CLIO_RELAY_STAGED_REPOSITORY_EVIDENCE__'
 import json
 import os
-import sys
-from pathlib import Path
 
-from clio_relay.bootstrap_reconcile import reconcile_managed_jarvis_repository
-
-managed_repo = Path(os.environ["MANAGED_JARVIS_REPO"])
-repositories = reconcile_managed_jarvis_repository(
-    Path(os.environ["JARVIS_REPOS_FILE"]),
-    managed_repo,
-    previous_managed_repos=(Path(sys.argv[1]),),
-)
-result = {{
-    "link_action": "reused",
-    "link": str(managed_repo),
-    "target": os.readlink(managed_repo),
-    "repositories": repositories,
-}}
-print(json.dumps(result, sort_keys=True, separators=(",", ":")))
-__CLIO_RELAY_GENERATION_REPO__
+activation = json.loads(os.environ["BOOTSTRAP_STAGED_ACTIVATION"])
+print(json.dumps(activation["jarvis_repository"], sort_keys=True, separators=(",", ":")))
+__CLIO_RELAY_STAGED_REPOSITORY_EVIDENCE__
   )"
   export BOOTSTRAP_JARVIS_REPO_RECONCILIATION
-  if [ "$BOOTSTRAP_PLAN_MODE" = "component-upgrade" ]; then
-    echo "$BOOTSTRAP_JARVIS_CONFIG_SHA256_BEFORE *$JARVIS_CONFIG_FILE" | \
-      sha256sum --check --strict -
-    echo "$BOOTSTRAP_JARVIS_GRAPH_SHA256_BEFORE *$JARVIS_GRAPH_FILE" | \
-      sha256sum --check --strict -
-  fi
+  bootstrap_verify_stable_activation_links
+  "$HOME/.local/share/clio-relay/current/bin/clio-relay" installation-info >/dev/null
+  "$HOME/.local/share/clio-relay/current/bin/clio-relay" --help >/dev/null
+  bootstrap_candidate_action journal-advance activated
+  echo "$BOOTSTRAP_JARVIS_CONFIG_SHA256_BEFORE *$JARVIS_CONFIG_FILE" | \
+    sha256sum --check --strict -
+  echo "$BOOTSTRAP_JARVIS_GRAPH_SHA256_BEFORE *$JARVIS_GRAPH_FILE" | \
+    sha256sum --check --strict -
 
   bootstrap_candidate_action journal-advance migration_started
 {worker_recheck}
@@ -3212,7 +3768,7 @@ bootstrap_reuse_repair() {{
   BOOTSTRAP_TRANSACTION_JOURNAL="$HOME/.local/share/clio-relay/bootstrap-transaction.json"
   BOOTSTRAP_PREVIOUS_GENERATION="legacy"
   if [ -L "$HOME/.local/share/clio-relay/current" ]; then
-    BOOTSTRAP_PREVIOUS_GENERATION="$(readlink "$HOME/.local/share/clio-relay/current")"
+    BOOTSTRAP_PREVIOUS_GENERATION="$(bootstrap_active_generation_identity)"
   fi
   BOOTSTRAP_SERVICE_ACTIVE_BEFORE="unknown"
   BOOTSTRAP_SERVICE_ENABLED_BEFORE=0
@@ -5165,7 +5721,7 @@ else
   BOOTSTRAP_JARVIS_COMMANDS_JSON='[]'
 fi
 MANAGED_JARVIS_REPO="$HOME/.local/share/clio-relay/managed-jarvis-repo"
-MANAGED_JARVIS_REPO_TARGET="$DEST/jarvis-packages/clio_relay"
+MANAGED_JARVIS_REPO_TARGET="$HOME/.local/share/clio-relay/current/source/jarvis-packages/clio_relay"
 if [ -L "$MANAGED_JARVIS_REPO" ]; then
   if [ "$(readlink "$MANAGED_JARVIS_REPO")" != "$MANAGED_JARVIS_REPO_TARGET" ]; then
     echo "relay-managed JARVIS repository link points to an unexpected target" >&2
@@ -5238,6 +5794,7 @@ from clio_relay.bootstrap_reconcile import (
     execution_environment_identity,
     write_jarvis_wrapper,
 )
+from clio_relay.validation_report import sha256_file
 
 generation = Path(sys.argv[1])
 execution_root = Path(os.environ["JARVIS_VENV"])
@@ -5270,8 +5827,10 @@ manifest = {{
     "fingerprint": fingerprint,
     "plan": plan.model_dump(mode="json"),
     "legacy_execution_identity": execution_identity,
+    "active_execution_identity": execution_identity,
     "jarvis_wrapper_sha256": wrapper["sha256"],
     "install_receipt": str(generation / "install-receipt.json"),
+    "install_receipt_sha256": sha256_file(generation / "install-receipt.json"),
 }}
 for name, payload in (
     ("manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\\n"),

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
+import json
+import os
+import shutil
 import subprocess
+import sys
 import tarfile
 from contextlib import nullcontext
 from datetime import UTC, datetime
@@ -38,6 +43,147 @@ def _which(executable: str) -> str:
     """Return a deterministic executable resolution for bootstrap tests."""
 
     return executable
+
+
+def test_staged_provider_exec_is_hash_bound_sealed_and_venv_aware(tmp_path: Path) -> None:
+    """The staged provider is executed from sealed bytes with lexical venv semantics."""
+    if sys.platform != "linux":
+        result = subprocess.run(
+            [
+                "wsl.exe",
+                "-e",
+                "bash",
+                "-lc",
+                (
+                    "export UV_PROJECT_ENVIRONMENT="
+                    "/tmp/clio-relay-staged-provider-test-venv; "
+                    "uv run pytest -q "
+                    "tests/test_bootstrap_fast_path.py::"
+                    "test_staged_provider_exec_is_hash_bound_sealed_and_venv_aware"
+                ),
+            ],
+            cwd=Path(__file__).parents[1],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return
+    generation = tmp_path / "generation"
+    provider_root = generation / "tools/clio-relay"
+    subprocess.run(
+        [sys.executable, "-m", "venv", str(provider_root)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    provider = provider_root / "bin/python"
+    relay = generation / "bin/clio-relay"
+    relay.parent.mkdir(parents=True)
+    relay_payload = f"#!{provider}\n# staged relay launcher\n".encode()
+    relay.write_bytes(relay_payload)
+    relay.chmod(0o755)
+    provider_sha256 = hashlib.sha256(provider.resolve(strict=True).read_bytes()).hexdigest()
+    receipt = {
+        "component_artifacts": {
+            "clio-relay": {
+                "runtime_interpreters": {"provider": str(provider)},
+                "runtime_executables": {"clio-relay": str(relay)},
+                "persistent_tool": {
+                    "provider_interpreter": str(provider),
+                    "provider_interpreter_sha256": provider_sha256,
+                    "tool_executable": str(relay),
+                    "tool_executable_sha256": hashlib.sha256(relay_payload).hexdigest(),
+                },
+            }
+        }
+    }
+    receipt_path = generation / "install-receipt.json"
+    receipt_payload = json.dumps(receipt, sort_keys=True).encode()
+    receipt_path.write_bytes(receipt_payload)
+    manifest = {
+        "install_receipt": str(receipt_path),
+        "install_receipt_sha256": hashlib.sha256(receipt_payload).hexdigest(),
+    }
+    manifest_payload = json.dumps(manifest, sort_keys=True).encode()
+    (generation / "manifest.json").write_bytes(manifest_payload)
+    expected_manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
+    poisoned_python_path = tmp_path / "poisoned-python-path"
+    poisoned_python_path.mkdir()
+    (poisoned_python_path / "sitecustomize.py").write_text(
+        "raise SystemExit('poisoned PYTHONPATH was imported')\n",
+        encoding="utf-8",
+    )
+    compiler = shutil.which("cc")
+    assert compiler is not None, "the sealed-provider test requires a C compiler"
+    preload_library = tmp_path / "preload-sentinel.so"
+    subprocess.run(
+        [compiler, "-shared", "-fPIC", "-x", "c", "-o", str(preload_library), "-"],
+        input=(
+            "#include <fcntl.h>\n"
+            "#include <stdlib.h>\n"
+            "#include <unistd.h>\n"
+            "__attribute__((constructor)) static void mark_loaded(void) {\n"
+            '  const char *marker = getenv("CLIO_PRELOAD_MARKER");\n'
+            "  if (marker == NULL) return;\n"
+            "  int descriptor = open(marker, O_WRONLY | O_CREAT | O_APPEND, 0600);\n"
+            "  if (descriptor < 0) return;\n"
+            '  (void)write(descriptor, "loaded\\n", 7);\n'
+            "  (void)close(descriptor);\n"
+            "}\n"
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    preload_marker = tmp_path / "preload-sentinel.marker"
+    provider_environment = os.environ.copy()
+    provider_environment.update(
+        {
+            "CLIO_PRELOAD_MARKER": str(preload_marker),
+            "LD_PRELOAD": str(preload_library),
+            "LD_LIBRARY_PATH": "/clio-relay/poisoned-library-path",
+            "PYTHONHOME": "/clio-relay/poisoned-python-home",
+            "PYTHONPATH": str(poisoned_python_path),
+        }
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            (
+                "set -euo pipefail\n"
+                ': > "$CLIO_PRELOAD_MARKER"\n'
+                f"{bootstrap._STAGED_PROVIDER_ENVIRONMENT_SANITIZER}\n"  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                'exec "$@"\n'
+            ),
+            "bootstrap-provider-test",
+            sys.executable,
+            "-I",
+            "-c",
+            bootstrap._STAGED_PROVIDER_EXEC_PROGRAM,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            str(generation),
+            expected_manifest_sha256,
+            "-c",
+            (
+                "import os, sys; "
+                f"assert sys.prefix == {str(provider_root)!r}; "
+                f"assert sys.executable == {str(provider)!r}; "
+                "assert sys.flags.isolated == 1; "
+                "assert not any(name.startswith('LD_') for name in os.environ); "
+                "assert not any(name.startswith('PYTHON') for name in os.environ); "
+                "print('sealed-provider-ok')"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=provider_environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "sealed-provider-ok"
+    assert preload_marker.read_bytes() == b""
 
 
 def test_exact_remote_bootstrap_never_reads_or_builds_payload(
@@ -527,7 +673,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
     }
     managed_repo = "/home/operator/.local/share/clio-relay/managed-jarvis-repo"
     repository_update: dict[str, object] = {
-        "link_action": "reused",
+        "link_action": "created",
         "link": managed_repo,
         "target": (
             "/home/operator/.local/share/clio-relay/current/source/jarvis-packages/clio_relay"
@@ -570,6 +716,41 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
         expected_worker_service=desired.worker_service,
     )
 
+    relay_only = copy.deepcopy(receipt)
+    relay_transaction = cast(dict[str, object], relay_only["transaction"])
+    relay_transaction["mode"] = "relay-only"
+    relay_components = cast(dict[str, object], relay_only["components"])
+    for name, action in {
+        "clio-relay": "prepared",
+        "clio-kit": "reused",
+        "jarvis-cd": "reused",
+    }.items():
+        evidence = cast(dict[str, object], relay_components[name])
+        evidence["action"] = action
+    bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        relay_only,
+        bootstrap_profile="linux-user",
+        relay_install_spec=desired.relay_install_spec,
+        desired_fingerprint=desired.fingerprint,
+        expected_jarvis_resource_graph_profile="ares",
+        expected_allow_jarvis_resource_graph_build=False,
+        expected_worker_service=desired.worker_service,
+    )
+    invalid_relay_binding = copy.deepcopy(relay_only)
+    relay_preservation = cast(dict[str, object], invalid_relay_binding["jarvis_preservation"])
+    relay_binding = cast(dict[str, object], relay_preservation["repositories"])
+    relay_binding["target"] = "/operator/unrelated-repository"
+    with pytest.raises(RelayError, match="repository binding is invalid"):
+        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            invalid_relay_binding,
+            bootstrap_profile="linux-user",
+            relay_install_spec=desired.relay_install_spec,
+            desired_fingerprint=desired.fingerprint,
+            expected_jarvis_resource_graph_profile="ares",
+            expected_allow_jarvis_resource_graph_build=False,
+            expected_worker_service=desired.worker_service,
+        )
+
     tampered = copy.deepcopy(receipt)
     preservation = cast(dict[str, object], tampered["jarvis_preservation"])
     binding = cast(dict[str, object], preservation["repositories"])
@@ -606,9 +787,22 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
     preservation = cast(dict[str, object], replaced_link["jarvis_preservation"])
     binding = cast(dict[str, object], preservation["repositories"])
     binding["link_action"] = "retargeted"
+    bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        replaced_link,
+        bootstrap_profile="linux-user",
+        relay_install_spec=desired.relay_install_spec,
+        desired_fingerprint=desired.fingerprint,
+        expected_jarvis_resource_graph_profile="ares",
+        expected_allow_jarvis_resource_graph_build=False,
+        expected_worker_service=desired.worker_service,
+    )
+
+    unproven_retarget = copy.deepcopy(replaced_link)
+    generation = cast(dict[str, object], unproven_retarget["generation"])
+    generation["previous"] = "unproven"
     with pytest.raises(RelayError, match="did not preserve existing JARVIS state"):
         bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            replaced_link,
+            unproven_retarget,
             bootstrap_profile="linux-user",
             relay_install_spec=desired.relay_install_spec,
             desired_fingerprint=desired.fingerprint,
@@ -885,6 +1079,42 @@ def test_payload_script_uses_digest_bound_safe_extractor() -> None:
     assert "from clio_relay.safe_archive import safe_extract_tar" in script
     assert "candidate_safe_archive" not in script
     assert "BOOTSTRAP_CANDIDATE_PACKAGE/safe_archive.py" in script
+
+
+def test_staged_upgrade_uses_journal_bound_idempotent_forward_activation() -> None:
+    """Legacy adoption and recovery share one staged-provider activation path."""
+    script = bootstrap.render_linux_user_bootstrap_script(cluster="cluster-a")
+    provider_start = script.index("bootstrap_provider_exec() (")
+    provider_end = script.index("\n)\n\nbootstrap_candidate_action", provider_start)
+    provider_function = script[provider_start:provider_end]
+    activation = script.index("  bootstrap_candidate_action journal-advance activating")
+    finish = script.index("bootstrap_candidate_action finish-activation", activation)
+    verify = script.index("  bootstrap_verify_stable_activation_links", finish)
+    activated = script.index(
+        "  bootstrap_candidate_action journal-advance activated",
+        verify,
+    )
+    migration = script.index(
+        "  bootstrap_candidate_action journal-advance migration_started",
+        activated,
+    )
+    recovery = script[script.index("bootstrap_recover_previous_transaction()") : activation]
+
+    assert "bootstrap_use_staged_provider()" in script
+    assert "journal-phase prepared_manifest" in script
+    assert provider_function.index("compgen -e") < provider_function.index("exec python3 -I -c")
+    assert 'LD_*|PYTHON*) unset "$bootstrap_environment_name"' in provider_function
+    assert activation < finish < verify < activated < migration
+    assert "bootstrap_candidate_action finish-activation" in recovery
+    assert "phase_identities" in recovery
+    assert "sha256sum --check --strict -" in recovery
+    assert 'mv -Tf "$HOME/.local/share/clio-relay/.current.' not in script
+    assert 'readlink "$HOME/.local/share/clio-relay/current"' not in script
+    assert (
+        'MANAGED_JARVIS_REPO_TARGET="$HOME/.local/share/clio-relay/current/'
+        'source/jarvis-packages/clio_relay"'
+    ) in script
+    assert "scancel" not in script
 
 
 def test_fresh_jarvis_hardware_graph_commands_are_exact_and_ordered() -> None:

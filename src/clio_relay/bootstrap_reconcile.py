@@ -8,12 +8,14 @@ and the fsync-backed transaction journal.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
 import shlex
 import stat
 import subprocess
+import sys
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
@@ -51,6 +53,8 @@ _FCHMOD = cast(
     Callable[[int, int], None] | None,
     getattr(os, "fchmod", None),  # noqa: B009 - absent from Windows typing/runtime
 )
+_AT_FDCWD = -100
+_RENAME_EXCHANGE = 2
 
 
 @contextmanager
@@ -210,6 +214,62 @@ class BootstrapInspection(BaseModel):
     readiness: BootstrapReadinessEvidence
 
 
+class BootstrapActivationPathIdentity(BaseModel):
+    """Immutable identity of one pre-activation path."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    device: int = Field(ge=0)
+    inode: int = Field(ge=0)
+    mode: int = Field(ge=0)
+    size: int = Field(ge=0)
+    modified_ns: int = Field(ge=0)
+    changed_ns: int = Field(ge=0)
+    file_type: Literal["file", "symlink"]
+    sha256: str | None = None
+    symlink_target: str | None = None
+
+    @model_validator(mode="after")
+    def validate_content_identity(self) -> BootstrapActivationPathIdentity:
+        """Require content evidence appropriate to the captured file type."""
+        if self.file_type == "file":
+            if self.sha256 is None or self.symlink_target is not None:
+                raise ValueError("bootstrap activation file identity is incomplete")
+            _require_sha256(self.sha256, field="activation_path.sha256")
+        elif self.sha256 is not None or not self.symlink_target:
+            raise ValueError("bootstrap activation symlink identity is incomplete")
+        return self
+
+
+class BootstrapActivationPath(BaseModel):
+    """One stable activation path and its exact state before fencing."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    path: str
+    kind: Literal["file", "file_or_symlink", "symlink"]
+    before: BootstrapActivationPathIdentity | None = None
+
+    @model_validator(mode="after")
+    def validate_path(self) -> BootstrapActivationPath:
+        """Require an absolute normalized path and a compatible identity."""
+        candidate = Path(self.path)
+        if (
+            not candidate.is_absolute()
+            or ".." in candidate.parts
+            or os.path.normpath(self.path) != self.path
+            or any(character in self.path for character in "\x00\r\n")
+        ):
+            raise ValueError("bootstrap activation path must be absolute and normalized")
+        if self.before is not None and not (
+            (self.kind == "file" and self.before.file_type == "file")
+            or (self.kind == "symlink" and self.before.file_type == "symlink")
+            or self.kind == "file_or_symlink"
+        ):
+            raise ValueError("bootstrap activation path identity has an invalid type")
+        return self
+
+
 class BootstrapReconcilePlan(BaseModel):
     """Read-only component plan produced before preparation or fencing."""
 
@@ -220,6 +280,7 @@ class BootstrapReconcilePlan(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     component_actions: dict[str, Literal["reuse", "replace"]]
     reusable_paths: dict[str, str] = Field(default_factory=dict)
+    activation_paths: dict[str, BootstrapActivationPath] = Field(default_factory=dict)
 
 
 class BootstrapTransactionState(StrEnum):
@@ -560,15 +621,22 @@ def execution_environment_identity(
 
 def jarvis_wrapper_payload(execution_python: Path) -> bytes:
     """Return the deterministic relay-owned JARVIS launcher payload."""
+    lexical_python = Path(os.path.abspath(execution_python.expanduser()))
     try:
-        resolved_python = execution_python.resolve(strict=True)
+        before = lexical_python.lstat()
+        resolved_python = lexical_python.resolve(strict=True)
     except (OSError, RuntimeError, ValueError) as exc:
         raise ConfigurationError("JARVIS execution interpreter is unavailable") from exc
-    if not resolved_python.is_file() or not os.access(resolved_python, os.X_OK):
+    if (
+        any(character in str(lexical_python) for character in "\x00\r\n")
+        or not resolved_python.is_file()
+        or not os.access(lexical_python, os.X_OK)
+        or _stat_identity(lexical_python.lstat()) != _stat_identity(before)
+    ):
         raise ConfigurationError("JARVIS execution interpreter is not executable")
     invocation = "from jarvis_cd.core.cli import main; raise SystemExit(main())"
     return (
-        f'#!/bin/sh\nexec {shlex.quote(str(resolved_python))} -c {shlex.quote(invocation)} "$@"\n'
+        f'#!/bin/sh\nexec {shlex.quote(str(lexical_python))} -c {shlex.quote(invocation)} "$@"\n'
     ).encode()
 
 
@@ -822,8 +890,10 @@ def inspect_prepared_generation(
         "fingerprint",
         "plan",
         "legacy_execution_identity",
+        "active_execution_identity",
         "jarvis_wrapper_sha256",
         "install_receipt",
+        "install_receipt_sha256",
     }:
         raise ConfigurationError("prepared generation manifest has an unknown shape")
     if not (
@@ -831,6 +901,7 @@ def inspect_prepared_generation(
         and manifest.get("fingerprint") == desired.fingerprint
         and manifest.get("legacy_execution_identity") == legacy_execution_identity
         and manifest.get("install_receipt") == str(receipt_path)
+        and manifest.get("install_receipt_sha256") == sha256_file(receipt_path)
     ):
         raise ConfigurationError("prepared generation manifest identity changed")
     plan = manifest.get("plan")
@@ -839,19 +910,40 @@ def inspect_prepared_generation(
         or cast(dict[str, object], plan).get("desired_fingerprint") != desired.fingerprint
     ):
         raise ConfigurationError("prepared generation plan identity changed")
-    raw_executables = legacy_execution_identity.get("executables")
-    raw_python = (
-        cast(dict[str, object], raw_executables).get("python")
-        if isinstance(raw_executables, dict)
-        else None
-    )
+    raw_active_identity = manifest.get("active_execution_identity")
+    if not isinstance(raw_active_identity, dict):
+        raise ConfigurationError("prepared generation omitted active execution identity")
+    active_identity = cast(dict[str, object], raw_active_identity)
+    raw_active_root = active_identity.get("root")
+    raw_executables = active_identity.get("executables")
+    if not isinstance(raw_active_root, str) or not isinstance(raw_executables, dict):
+        raise ConfigurationError("prepared generation omitted active execution boundary")
+    typed_executables = cast(dict[str, object], raw_executables)
+    if set(typed_executables) != {"python", "jarvis"}:
+        raise ConfigurationError("prepared generation active executable set changed")
+    raw_python = typed_executables.get("python")
+    raw_jarvis = typed_executables.get("jarvis")
     raw_python_path = (
-        cast(dict[str, object], raw_python).get("resolved_path")
+        cast(dict[str, object], raw_python).get("lexical_path")
         if isinstance(raw_python, dict)
         else None
     )
-    if not isinstance(raw_python_path, str):
-        raise ConfigurationError("prepared generation omitted JARVIS interpreter identity")
+    raw_jarvis_path = (
+        cast(dict[str, object], raw_jarvis).get("lexical_path")
+        if isinstance(raw_jarvis, dict)
+        else None
+    )
+    if not isinstance(raw_python_path, str) or not isinstance(raw_jarvis_path, str):
+        raise ConfigurationError("prepared generation omitted active interpreter identity")
+    recomputed_active_identity = execution_environment_identity(
+        Path(raw_active_root),
+        executables={
+            "python": Path(raw_python_path),
+            "jarvis": Path(raw_jarvis_path),
+        },
+    )
+    if recomputed_active_identity != active_identity:
+        raise ConfigurationError("prepared generation active execution identity changed")
     jarvis_payload = jarvis_wrapper_payload(Path(raw_python_path))
     jarvis_wrapper = generation / "bin/jarvis"
     wrapper_bytes = _read_regular_bounded(jarvis_wrapper, maximum=64 * 1024)
@@ -877,6 +969,32 @@ def inspect_prepared_generation(
         and typed_receipt.get("generation") == desired.fingerprint
     ):
         raise ConfigurationError("prepared generation install receipt identity changed")
+    raw_artifacts = typed_receipt.get("component_artifacts")
+    raw_jarvis_artifact = (
+        cast(dict[str, object], raw_artifacts).get("jarvis-cd")
+        if isinstance(raw_artifacts, dict)
+        else None
+    )
+    raw_interpreters = (
+        cast(dict[str, object], raw_jarvis_artifact).get("runtime_interpreters")
+        if isinstance(raw_jarvis_artifact, dict)
+        else None
+    )
+    receipt_execution_python = (
+        cast(dict[str, object], raw_interpreters).get("execution")
+        if isinstance(raw_interpreters, dict)
+        else None
+    )
+    if (
+        not isinstance(receipt_execution_python, str)
+        or receipt_execution_python != raw_python_path
+        or not Path(receipt_execution_python).is_absolute()
+        or os.path.normpath(receipt_execution_python) != receipt_execution_python
+        or any(character in receipt_execution_python for character in "\x00\r\n")
+    ):
+        raise ConfigurationError(
+            "prepared active JARVIS interpreter is not bound to its install receipt"
+        )
     relay_runtime = typed_runtime.get("clio-relay")
     clio_kit_runtime = typed_runtime.get("clio-kit")
     jarvis_runtime = typed_runtime.get("jarvis-cd")
@@ -917,6 +1035,94 @@ def inspect_prepared_generation(
     }
 
 
+def finish_staged_activation(
+    desired: BootstrapDesiredState,
+    *,
+    generation: Path,
+    expected_manifest_sha256: str,
+    home: Path | None = None,
+) -> dict[str, object]:
+    """Reverify and idempotently finish activation plus exact repo migration."""
+    try:
+        _require_sha256(expected_manifest_sha256, field="expected_manifest_sha256")
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
+    raw_manifest = _read_regular_bounded(generation / "manifest.json", maximum=4 * 1024 * 1024)
+    if hashlib.sha256(raw_manifest).hexdigest() != expected_manifest_sha256:
+        raise ConfigurationError("prepared generation manifest changed before activation")
+    try:
+        raw_value = cast(object, json.loads(raw_manifest))
+    except json.JSONDecodeError as exc:
+        raise ConfigurationError("prepared generation manifest is invalid") from exc
+    if not isinstance(raw_value, dict):
+        raise ConfigurationError("prepared generation manifest is not an object")
+    manifest = cast(dict[str, object], raw_value)
+    try:
+        plan = BootstrapReconcilePlan.model_validate(manifest.get("plan"))
+    except ValueError as exc:
+        raise ConfigurationError("prepared generation reconcile plan is invalid") from exc
+    if plan.desired_fingerprint != desired.fingerprint or plan.mode not in {
+        "relay-only",
+        "component-upgrade",
+    }:
+        raise ConfigurationError("prepared generation reconcile plan changed")
+    legacy_venv = plan.reusable_paths.get("jarvis_execution_environment")
+    legacy_python = plan.reusable_paths.get("jarvis_execution_python")
+    legacy_jarvis = plan.reusable_paths.get("jarvis_execution_executable")
+    if not all(
+        isinstance(value, str) and value for value in (legacy_venv, legacy_python, legacy_jarvis)
+    ):
+        raise ConfigurationError("prepared generation omitted its legacy execution boundary")
+    assert legacy_venv is not None
+    assert legacy_python is not None
+    assert legacy_jarvis is not None
+    legacy_identity = execution_environment_identity(
+        Path(legacy_venv),
+        executables={"python": Path(legacy_python), "jarvis": Path(legacy_jarvis)},
+    )
+    if manifest.get("legacy_execution_identity") != legacy_identity:
+        raise ConfigurationError("legacy execution environment changed before activation")
+    inspection = inspect_prepared_generation(
+        desired,
+        generation=generation,
+        legacy_execution_identity=legacy_identity,
+    )
+    if inspection.get("manifest_sha256") != expected_manifest_sha256:
+        raise ConfigurationError("prepared generation inspection did not bind its manifest")
+    activation = reconcile_staged_activation_links(plan, generation=generation, home=home)
+    lexical_home = Path(os.path.abspath((home or Path.home()).expanduser()))
+    managed_repo = lexical_home / ".local/share/clio-relay/managed-jarvis-repo"
+    previous_repo = lexical_home / ".local/src/clio-relay/jarvis-packages/clio_relay"
+    repositories = reconcile_managed_jarvis_repository(
+        _expand_home(desired.jarvis_root, lexical_home) / "repos.yaml",
+        managed_repo,
+        previous_managed_repos=(previous_repo,),
+        exchange_identity=desired.fingerprint,
+    )
+    expected_managed_target = (
+        lexical_home / ".local/share/clio-relay/current/source/jarvis-packages/clio_relay"
+    )
+    _verify_stable_symlink(
+        managed_repo,
+        expected=expected_managed_target,
+        label="relay-managed repository",
+    )
+    actions = activation.get("actions")
+    if not isinstance(actions, dict):  # pragma: no cover - produced above
+        raise ConfigurationError("staged activation omitted link actions")
+    return {
+        "schema_version": "clio-relay.bootstrap-staged-activation.v1",
+        "prepared_inspection": inspection,
+        "activation": activation,
+        "jarvis_repository": {
+            "link_action": cast(dict[str, object], actions).get("managed_repo"),
+            "link": str(managed_repo),
+            "target": os.readlink(managed_repo),
+            "repositories": repositories,
+        },
+    }
+
+
 def plan_bootstrap_reconcile(
     desired: BootstrapDesiredState,
     *,
@@ -928,7 +1134,8 @@ def plan_bootstrap_reconcile(
     an older receipt need not contain a deployment manifest, but every reusable
     component must have exact artifact and live-runtime evidence.
     """
-    resolved_home = (home or Path.home()).resolve()
+    lexical_home = Path(os.path.abspath((home or Path.home()).expanduser()))
+    resolved_home = lexical_home.resolve()
     reasons: list[str] = []
     upgrade_reasons: list[str] = []
     upgrade_components: set[str] = set()
@@ -946,12 +1153,29 @@ def plan_bootstrap_reconcile(
         return _full_plan(desired, "installation identity omitted component evidence")
     receipt = cast(dict[str, object], raw_receipt)
     runtime = cast(dict[str, object], raw_runtime)
+    relay_runtime = runtime.get("clio-relay")
+    if (
+        not isinstance(relay_runtime, dict)
+        or cast(dict[str, object], relay_runtime).get("persistent_tool_verified") is not True
+    ):
+        return _full_plan(desired, "clio-relay live provider is not reusable")
     raw_components = receipt.get("components")
     raw_artifacts = receipt.get("component_artifacts")
     if not isinstance(raw_components, dict) or not isinstance(raw_artifacts, dict):
         return _full_plan(desired, "install receipt omitted reusable component artifacts")
     components = cast(dict[str, object], raw_components)
     artifacts = cast(dict[str, object], raw_artifacts)
+    raw_relay_artifact = artifacts.get("clio-relay")
+    relay_executable = None
+    if isinstance(raw_relay_artifact, dict):
+        raw_relay_executables = cast(dict[str, object], raw_relay_artifact).get(
+            "runtime_executables"
+        )
+        if isinstance(raw_relay_executables, dict):
+            relay_executable = cast(dict[str, object], raw_relay_executables).get("clio-relay")
+    expected_relay_executable = lexical_home / ".local/bin/clio-relay"
+    if not isinstance(relay_executable, str) or relay_executable != str(expected_relay_executable):
+        return _full_plan(desired, "clio-relay launcher is not bound to its install receipt")
     expected_components = {
         "clio-kit": (desired.clio_kit_version, desired.clio_kit_artifact_sha256),
         "jarvis-cd": (desired.jarvis_cd_version, desired.jarvis_cd_wheel_sha256),
@@ -1116,6 +1340,10 @@ def plan_bootstrap_reconcile(
 
     if reasons:
         if upgrade_reasons and reasons == upgrade_reasons:
+            try:
+                activation_paths = _capture_reconcile_activation_paths(home=lexical_home)
+            except (ConfigurationError, OSError, RuntimeError, ValueError) as exc:
+                return _full_plan(desired, f"legacy activation boundary is not reusable: {exc}")
             return BootstrapReconcilePlan(
                 mode="component-upgrade",
                 desired_fingerprint=desired.fingerprint,
@@ -1129,6 +1357,7 @@ def plan_bootstrap_reconcile(
                     "uv": "reuse",
                 },
                 reusable_paths=reusable_paths,
+                activation_paths=activation_paths,
             )
         return BootstrapReconcilePlan(
             mode="full",
@@ -1160,6 +1389,10 @@ def plan_bootstrap_reconcile(
             },
             reusable_paths=reusable_paths,
         )
+    try:
+        activation_paths = _capture_reconcile_activation_paths(home=lexical_home)
+    except (ConfigurationError, OSError, RuntimeError, ValueError) as exc:
+        return _full_plan(desired, f"legacy activation boundary is not reusable: {exc}")
     return BootstrapReconcilePlan(
         mode="relay-only",
         desired_fingerprint=desired.fingerprint,
@@ -1173,6 +1406,7 @@ def plan_bootstrap_reconcile(
             "uv": "reuse",
         },
         reusable_paths=reusable_paths,
+        activation_paths=activation_paths,
     )
 
 
@@ -1634,11 +1868,50 @@ def write_bootstrap_receipt(path: Path, receipt: dict[str, object]) -> None:
     _atomic_json(path, receipt)
 
 
+def _managed_repository_payload(
+    raw: bytes,
+    *,
+    managed: str,
+    previous: set[str],
+) -> tuple[bytes, list[str], list[str]]:
+    """Return the exact converged repository bytes and mutation evidence."""
+    document = _yaml_mapping(raw, label="JARVIS repositories")
+    raw_repos = document.get("repos")
+    typed_repos = cast(list[object], raw_repos) if isinstance(raw_repos, list) else []
+    if not isinstance(raw_repos, list) or any(
+        not isinstance(value, str) or not value for value in typed_repos
+    ):
+        raise ConfigurationError("JARVIS repositories must contain a string list")
+    repos = list(cast(list[str], raw_repos))
+    managed_count = repos.count(managed)
+    if managed_count > 1:
+        raise ConfigurationError("relay-managed JARVIS repository is registered more than once")
+    if any(repos.count(value) > 1 for value in previous):
+        raise ConfigurationError(
+            "a proven previous relay-managed JARVIS repository is registered more than once"
+        )
+    removed_previous = sorted(previous.intersection(repos))
+    if managed_count == 1 and not removed_previous:
+        return raw, [], []
+    updated = [value for value in repos if value not in previous]
+    added_managed: list[str] = []
+    if managed_count == 0:
+        updated.insert(0, managed)
+        added_managed.append(managed)
+    document["repos"] = updated
+    return (
+        yaml.safe_dump(document, sort_keys=False).encode("utf-8"),
+        added_managed,
+        removed_previous,
+    )
+
+
 def reconcile_managed_jarvis_repository(
     repos_file: Path,
     managed_repo: Path,
     *,
     previous_managed_repos: tuple[Path, ...] = (),
+    exchange_identity: str | None = None,
 ) -> dict[str, object]:
     """Register only the exact relay-owned repository without basename matching.
 
@@ -1651,20 +1924,54 @@ def reconcile_managed_jarvis_repository(
     bootstrap lock; the final byte-and-file-identity comparison also detects
     non-cooperating writers before the atomic replacement.
     """
+    managed = str(managed_repo.absolute())
+    previous = {str(path.absolute()) for path in previous_managed_repos}
+    previous.discard(managed)
+    token = exchange_identity or hashlib.sha256(managed.encode("utf-8")).hexdigest()
+    try:
+        _require_sha256(token, field="repository_exchange_identity")
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
+    temporary = repos_file.with_name(f".{repos_file.name}.{token}.exchange")
     raw, before_identity = _read_regular_bounded_with_identity(
         repos_file,
         maximum=MAX_JARVIS_REPOS_BYTES,
     )
-    document = _yaml_mapping(raw, label="JARVIS repositories")
-    raw_repos = document.get("repos")
-    typed_repos = cast(list[object], raw_repos) if isinstance(raw_repos, list) else []
-    if not isinstance(raw_repos, list) or any(
-        not isinstance(value, str) or not value for value in typed_repos
-    ):
-        raise ConfigurationError("JARVIS repositories must contain a string list")
-    repos = list(cast(list[str], raw_repos))
-    managed = str(managed_repo.absolute())
-    if repos.count(managed) == 1:
+    payload, added_managed, removed_previous = _managed_repository_payload(
+        raw,
+        managed=managed,
+        previous=previous,
+    )
+    if temporary.exists() or temporary.is_symlink():
+        displaced, _displaced_identity = _read_regular_bounded_with_identity(
+            temporary,
+            maximum=MAX_JARVIS_REPOS_BYTES,
+        )
+        displaced_payload, displaced_added, displaced_removed = _managed_repository_payload(
+            displaced,
+            managed=managed,
+            previous=previous,
+        )
+        if displaced != displaced_payload and displaced_payload == raw:
+            temporary.unlink()
+            _fsync_directory(repos_file.parent)
+            return {
+                "action": "updated",
+                "managed_repo": managed,
+                "added_managed_repos": displaced_added,
+                "removed_previous_managed_repos": displaced_removed,
+                "before_sha256": hashlib.sha256(displaced).hexdigest(),
+                "after_sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        if raw != payload and payload == displaced:
+            temporary.unlink()
+            _fsync_directory(repos_file.parent)
+        else:
+            raise ConfigurationError(
+                "JARVIS repository exchange recovery found unproven path states: "
+                f"{repos_file}, {temporary}"
+            )
+    if payload == raw:
         return {
             "action": "reused",
             "managed_repo": managed,
@@ -1673,42 +1980,80 @@ def reconcile_managed_jarvis_repository(
             "before_sha256": hashlib.sha256(raw).hexdigest(),
             "after_sha256": hashlib.sha256(raw).hexdigest(),
         }
-    if repos.count(managed) > 1:
-        raise ConfigurationError("relay-managed JARVIS repository is registered more than once")
-    previous = {str(path.absolute()) for path in previous_managed_repos}
-    previous.discard(managed)
-    if any(repos.count(value) > 1 for value in previous):
-        raise ConfigurationError(
-            "a proven previous relay-managed JARVIS repository is registered more than once"
-        )
-    updated = [value for value in repos if value not in previous]
-    updated.insert(0, managed)
-    document["repos"] = updated
-    payload = yaml.safe_dump(document, sort_keys=False).encode("utf-8")
-    temporary = repos_file.with_name(f".{repos_file.name}.{os.getpid()}.tmp")
+    exchanged = False
     try:
         with temporary.open("xb") as stream:
             os.chmod(temporary, 0o600)
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        current, current_identity = _read_regular_bounded_with_identity(
-            repos_file,
-            maximum=MAX_JARVIS_REPOS_BYTES,
-        )
-        if current != raw or current_identity != before_identity:
+        desired_identity = _stat_identity(temporary.lstat())
+        exchanged = True
+        _atomic_exchange_paths(temporary, repos_file)
+        try:
+            displaced, displaced_identity = _read_regular_bounded_with_identity(
+                temporary,
+                maximum=MAX_JARVIS_REPOS_BYTES,
+            )
+        except ConfigurationError:
+            displaced = b""
+            displaced_identity = (-1, -1, -1, -1, -1, -1)
+        if displaced != raw or not _identity_matches_after_rename(
+            before_identity, displaced_identity
+        ):
+            try:
+                active, active_identity = _read_regular_bounded_with_identity(
+                    repos_file,
+                    maximum=MAX_JARVIS_REPOS_BYTES,
+                )
+            except ConfigurationError as exc:
+                raise ConfigurationError(
+                    "JARVIS repositories changed during atomic reconciliation; "
+                    f"displaced state retained at {temporary}"
+                ) from exc
+            if active != payload or not _identity_matches_after_rename(
+                desired_identity, active_identity
+            ):
+                raise ConfigurationError(
+                    "JARVIS repositories changed during atomic reconciliation; "
+                    f"displaced state retained at {temporary}"
+                )
+            _atomic_exchange_paths(temporary, repos_file)
+            exchanged = False
+            _fsync_directory(repos_file.parent)
             raise ConfigurationError("JARVIS repositories changed during reconciliation")
-        os.replace(temporary, repos_file)
+        try:
+            active, active_identity = _read_regular_bounded_with_identity(
+                repos_file,
+                maximum=MAX_JARVIS_REPOS_BYTES,
+            )
+        except ConfigurationError as exc:
+            temporary.unlink()
+            exchanged = False
+            _fsync_directory(repos_file.parent)
+            raise ConfigurationError(
+                "JARVIS repositories changed after atomic reconciliation"
+            ) from exc
+        if active != payload or not _identity_matches_after_rename(
+            desired_identity, active_identity
+        ):
+            temporary.unlink()
+            exchanged = False
+            _fsync_directory(repos_file.parent)
+            raise ConfigurationError("JARVIS repositories changed after atomic reconciliation")
+        temporary.unlink()
+        exchanged = False
         _fsync_directory(repos_file.parent)
     except BaseException:
-        with suppress(OSError):
-            temporary.unlink(missing_ok=True)
+        if not exchanged:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
         raise
     return {
         "action": "updated",
         "managed_repo": managed,
-        "added_managed_repos": [managed],
-        "removed_previous_managed_repos": sorted(previous.intersection(repos)),
+        "added_managed_repos": added_managed,
+        "removed_previous_managed_repos": removed_previous,
         "before_sha256": hashlib.sha256(raw).hexdigest(),
         "after_sha256": hashlib.sha256(payload).hexdigest(),
     }
@@ -1721,65 +2066,50 @@ def repair_managed_jarvis_binding(
     previous_managed_repos: tuple[Path, ...] = (),
 ) -> dict[str, object]:
     """Repair only relay's stable package link and exact repository registration."""
-    resolved_home = (home or Path.home()).resolve()
-    generation = (
-        resolved_home / ".local/share/clio-relay/generations" / desired.fingerprint
-    ).resolve(strict=True)
-    expected_target = (generation / "source/jarvis-packages/clio_relay").resolve(strict=True)
-    if not expected_target.is_dir():
+    lexical_home = Path(os.path.abspath((home or Path.home()).expanduser()))
+    resolved_home = lexical_home.resolve(strict=True)
+    generation_path = lexical_home / ".local/share/clio-relay/generations" / desired.fingerprint
+    generation = generation_path.resolve(strict=True)
+    if generation_path.is_symlink() or generation != generation_path:
+        raise ConfigurationError("desired generation path is not one owned directory")
+    current = lexical_home / ".local/share/clio-relay/current"
+    _verify_stable_symlink(current, expected=generation, label="active generation")
+    expected_target = current / "source/jarvis-packages/clio_relay"
+    if not expected_target.resolve(strict=True).is_dir():
         raise ConfigurationError("desired generation has no relay JARVIS package repository")
-    managed = _expand_home(desired.managed_jarvis_repo, resolved_home)
+    managed = _expand_home(desired.managed_jarvis_repo, lexical_home)
     managed.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    link_action = "reused"
-    try:
-        managed_details = managed.lstat()
-    except FileNotFoundError:
-        link_action = "created"
-    except OSError as exc:
-        raise ConfigurationError("relay-managed repository link could not be classified") from exc
-    else:
-        if not stat.S_ISLNK(managed_details.st_mode):
-            raise ConfigurationError(
-                "relay-managed repository path is not a replaceable symbolic link"
-            )
-        raw_target = Path(os.readlink(managed))
-        if not raw_target.is_absolute():
-            raw_target = managed.parent / raw_target
-        lexical_target = Path(os.path.abspath(raw_target))
-        if lexical_target == expected_target:
-            _verify_stable_symlink(
-                managed,
-                expected=expected_target,
-                label="relay-managed repository",
-            )
-        else:
+    snapshot = _capture_activation_path(
+        managed,
+        kind="symlink",
+        maximum=4096,
+        allow_absent=True,
+    )
+    if snapshot.before is not None:
+        lexical_target = _activation_symlink_lexical_target(snapshot)
+        if lexical_target != expected_target:
             proven_targets = {
                 Path(os.path.abspath(path.expanduser())) for path in previous_managed_repos
             }
             if lexical_target not in proven_targets or not _is_generation_repository_target(
-                lexical_target,
+                lexical_target.resolve(strict=True),
                 home=resolved_home,
             ):
                 raise ConfigurationError(
                     "relay-managed repository link target is not proven by an earlier receipt"
                 )
-            link_action = "retargeted"
-    if link_action != "reused":
-        temporary = managed.with_name(f".{managed.name}.{os.getpid()}.tmp")
-        try:
-            temporary.symlink_to(expected_target, target_is_directory=True)
-            os.replace(temporary, managed)
-            _fsync_directory(managed.parent)
-        except BaseException:
-            with suppress(OSError):
-                temporary.unlink(missing_ok=True)
-            raise
-        _verify_stable_symlink(managed, expected=expected_target, label="relay-managed repository")
-    repos_file = _expand_home(desired.jarvis_root, resolved_home) / "repos.yaml"
+    link_action = _reconcile_activation_symlink(
+        snapshot,
+        expected_target=expected_target,
+        label="relay-managed repository",
+        exchange_identity=desired.fingerprint,
+    )
+    repos_file = _expand_home(desired.jarvis_root, lexical_home) / "repos.yaml"
     repo_evidence = reconcile_managed_jarvis_repository(
         repos_file,
         managed,
         previous_managed_repos=previous_managed_repos,
+        exchange_identity=desired.fingerprint,
     )
     return {
         "link_action": link_action,
@@ -1948,8 +2278,10 @@ def _verify_active_generation_jarvis_wrapper(
         "fingerprint",
         "plan",
         "legacy_execution_identity",
+        "active_execution_identity",
         "jarvis_wrapper_sha256",
         "install_receipt",
+        "install_receipt_sha256",
     }
     if set(manifest) != expected_manifest_keys:
         raise ConfigurationError("active generation manifest has an unknown shape")
@@ -1958,6 +2290,7 @@ def _verify_active_generation_jarvis_wrapper(
         manifest.get("schema_version") == "clio-relay.bootstrap-generation.v1"
         and manifest.get("fingerprint") == desired.fingerprint
         and manifest.get("install_receipt") == str(expected_receipt_path)
+        and manifest.get("install_receipt_sha256") == sha256_file(expected_receipt_path)
     ):
         raise ConfigurationError("active generation manifest identity changed")
     raw_plan = manifest.get("plan")
@@ -1967,17 +2300,17 @@ def _verify_active_generation_jarvis_wrapper(
         raise ConfigurationError("active generation reconcile plan is invalid") from exc
     if plan.desired_fingerprint != desired.fingerprint:
         raise ConfigurationError("active generation reconcile plan identity changed")
-    raw_identity = manifest.get("legacy_execution_identity")
+    raw_identity = manifest.get("active_execution_identity")
     if not isinstance(raw_identity, dict):
-        raise ConfigurationError("active generation omitted JARVIS execution identity")
+        raise ConfigurationError("active generation omitted active execution identity")
     identity = cast(dict[str, object], raw_identity)
     raw_root = identity.get("root")
     raw_executables = identity.get("executables")
     if not isinstance(raw_root, str) or not isinstance(raw_executables, dict):
-        raise ConfigurationError("active generation omitted JARVIS execution boundary")
+        raise ConfigurationError("active generation omitted active execution boundary")
     typed_executables = cast(dict[str, object], raw_executables)
     if set(typed_executables) != {"python", "jarvis"}:
-        raise ConfigurationError("active generation JARVIS executable set changed")
+        raise ConfigurationError("active generation executable set changed")
     raw_python = typed_executables.get("python")
     raw_jarvis = typed_executables.get("jarvis")
     python_path = (
@@ -2022,9 +2355,12 @@ def _verify_active_generation_jarvis_wrapper(
         if isinstance(raw_interpreters, dict)
         else None
     )
-    if not isinstance(receipt_execution_python, str) or (
-        Path(receipt_execution_python).resolve(strict=True)
-        != Path(python_path).resolve(strict=True)
+    if (
+        not isinstance(receipt_execution_python, str)
+        or receipt_execution_python != python_path
+        or not Path(receipt_execution_python).is_absolute()
+        or os.path.normpath(receipt_execution_python) != receipt_execution_python
+        or any(character in receipt_execution_python for character in "\x00\r\n")
     ):
         raise ConfigurationError("active JARVIS interpreter is not bound to its install receipt")
     expected_payload = jarvis_wrapper_payload(Path(python_path))
@@ -2055,6 +2391,456 @@ def _verify_stable_symlink(path: Path, *, expected: Path, label: str) -> Path:
     if _stat_identity(path.lstat()) != _stat_identity(before):
         raise ConfigurationError(f"{label} changed during inspection")
     return resolved
+
+
+def _capture_activation_path(
+    path: Path,
+    *,
+    kind: Literal["file", "file_or_symlink", "symlink"],
+    maximum: int,
+    allow_absent: bool,
+) -> BootstrapActivationPath:
+    """Capture one exact pre-fence path without following its final link."""
+    lexical = Path(os.path.abspath(path.expanduser()))
+    try:
+        before = lexical.lstat()
+    except FileNotFoundError:
+        if not allow_absent:
+            raise ConfigurationError(
+                f"required activation path is unavailable: {lexical}"
+            ) from None
+        return BootstrapActivationPath(path=str(lexical), kind=kind)
+    except OSError as exc:
+        raise ConfigurationError(f"activation path could not be classified: {lexical}") from exc
+    file_type: Literal["file", "symlink"]
+    digest: str | None = None
+    link_target: str | None = None
+    if stat.S_ISLNK(before.st_mode):
+        if kind == "file":
+            raise ConfigurationError(f"activation path must be a regular file: {lexical}")
+        try:
+            link_target = os.readlink(lexical)
+            after = lexical.lstat()
+        except OSError as exc:
+            raise ConfigurationError(f"activation symlink could not be read: {lexical}") from exc
+        if (
+            not link_target
+            or any(character in link_target for character in "\x00\r\n")
+            or _stat_identity(before) != _stat_identity(after)
+        ):
+            raise ConfigurationError(f"activation symlink changed while inspected: {lexical}")
+        file_type = "symlink"
+    elif stat.S_ISREG(before.st_mode):
+        if kind == "symlink":
+            raise ConfigurationError(f"activation path must be a symbolic link: {lexical}")
+        raw, _identity = _read_regular_bounded_with_identity(lexical, maximum=maximum)
+        try:
+            after = lexical.lstat()
+        except OSError as exc:
+            raise ConfigurationError(f"activation file changed while inspected: {lexical}") from exc
+        if _stat_identity(before) != _stat_identity(after):
+            raise ConfigurationError(f"activation file changed while inspected: {lexical}")
+        digest = hashlib.sha256(raw).hexdigest()
+        file_type = "file"
+    else:
+        raise ConfigurationError(f"activation path has an unsafe type: {lexical}")
+    return BootstrapActivationPath(
+        path=str(lexical),
+        kind=kind,
+        before=BootstrapActivationPathIdentity(
+            device=before.st_dev,
+            inode=before.st_ino,
+            mode=before.st_mode,
+            size=before.st_size,
+            modified_ns=before.st_mtime_ns,
+            changed_ns=before.st_ctime_ns,
+            file_type=file_type,
+            sha256=digest,
+            symlink_target=link_target,
+        ),
+    )
+
+
+def _activation_path_identity(path: BootstrapActivationPath) -> BootstrapActivationPathIdentity:
+    """Re-capture an existing activation path using its original contract."""
+    captured = _capture_activation_path(
+        Path(path.path),
+        kind=path.kind,
+        maximum=4 * 1024 * 1024,
+        allow_absent=False,
+    )
+    if captured.before is None:  # pragma: no cover - excluded by allow_absent
+        raise ConfigurationError(f"activation path disappeared: {path.path}")
+    return captured.before
+
+
+def _capture_activation_object(
+    path: Path,
+    *,
+    kind: Literal["file", "file_or_symlink", "symlink"],
+    maximum: int,
+) -> BootstrapActivationPathIdentity:
+    """Capture a file or link, including the Windows symlink test representation."""
+    lexical = Path(os.path.abspath(path.expanduser()))
+    try:
+        before = lexical.lstat()
+        raw_target = os.readlink(lexical)
+        after = lexical.lstat()
+    except OSError:
+        captured = _capture_activation_path(
+            lexical,
+            kind=kind,
+            maximum=maximum,
+            allow_absent=False,
+        )
+        if captured.before is None:  # pragma: no cover - excluded by allow_absent
+            raise ConfigurationError(f"activation path disappeared: {lexical}") from None
+        return captured.before
+    if (
+        kind == "file"
+        or not raw_target
+        or any(character in raw_target for character in "\x00\r\n")
+        or _stat_identity(before) != _stat_identity(after)
+    ):
+        raise ConfigurationError(f"activation symlink changed while inspected: {lexical}")
+    return BootstrapActivationPathIdentity(
+        device=before.st_dev,
+        inode=before.st_ino,
+        mode=before.st_mode,
+        size=before.st_size,
+        modified_ns=before.st_mtime_ns,
+        changed_ns=before.st_ctime_ns,
+        file_type="symlink",
+        symlink_target=raw_target,
+    )
+
+
+def _capture_reconcile_activation_paths(
+    *,
+    home: Path,
+) -> dict[str, BootstrapActivationPath]:
+    """Capture the exact legacy/stable paths a staged activation may replace."""
+    lexical_home = Path(os.path.abspath(home.expanduser()))
+    share = lexical_home / ".local/share/clio-relay"
+    current = _capture_activation_path(
+        share / "current",
+        kind="symlink",
+        maximum=4096,
+        allow_absent=True,
+    )
+    if current.before is not None:
+        current_target = _activation_symlink_lexical_target(current)
+        try:
+            relative = current_target.resolve(strict=True).relative_to(
+                (share / "generations").resolve(strict=True)
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ConfigurationError(
+                "active generation pointer does not name one managed generation"
+            ) from exc
+        if (
+            len(relative.parts) != 1
+            or len(relative.name) != 64
+            or any(character not in "0123456789abcdef" for character in relative.name)
+        ):
+            raise ConfigurationError(
+                "active generation pointer does not name one managed generation"
+            )
+    managed = _capture_activation_path(
+        share / "managed-jarvis-repo",
+        kind="symlink",
+        maximum=4096,
+        allow_absent=True,
+    )
+    if managed.before is not None:
+        managed_target = _activation_symlink_lexical_target(managed)
+        allowed_targets = {
+            lexical_home / ".local/src/clio-relay/jarvis-packages/clio_relay",
+            share / "current/source/jarvis-packages/clio_relay",
+        }
+        if managed_target not in allowed_targets and not _is_generation_repository_target(
+            managed_target.resolve(strict=True),
+            home=lexical_home.resolve(strict=True),
+        ):
+            raise ConfigurationError(
+                "relay-managed repository link is not one proven legacy binding"
+            )
+    paths = {
+        "current": current,
+        "install_receipt": _capture_activation_path(
+            share / "install-receipt.json",
+            kind="file_or_symlink",
+            maximum=4 * 1024 * 1024,
+            allow_absent=False,
+        ),
+        "relay_launcher": _capture_activation_path(
+            lexical_home / ".local/bin/clio-relay",
+            kind="file_or_symlink",
+            maximum=1024 * 1024,
+            allow_absent=False,
+        ),
+        "jarvis_launcher": _capture_activation_path(
+            lexical_home / ".local/bin/jarvis",
+            kind="file_or_symlink",
+            maximum=1024 * 1024,
+            allow_absent=False,
+        ),
+        "managed_repo": managed,
+    }
+    for name in ("relay_launcher", "jarvis_launcher"):
+        launcher = Path(paths[name].path)
+        try:
+            target = launcher.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ConfigurationError(f"legacy activation launcher is unavailable: {name}") from exc
+        if not target.is_file() or not os.access(target, os.X_OK):
+            raise ConfigurationError(f"legacy activation launcher is not executable: {name}")
+    return paths
+
+
+def _activation_symlink_lexical_target(path: BootstrapActivationPath) -> Path:
+    """Return one captured symlink target without resolving its final object."""
+    if path.before is None or path.before.file_type != "symlink":
+        raise ConfigurationError(f"activation path is not a captured symlink: {path.path}")
+    raw_target = path.before.symlink_target
+    if raw_target is None:  # pragma: no cover - enforced by the model
+        raise ConfigurationError(f"activation path omitted its symlink target: {path.path}")
+    candidate = Path(raw_target)
+    if not candidate.is_absolute():
+        candidate = Path(path.path).parent / candidate
+    return Path(os.path.abspath(candidate))
+
+
+def _reconcile_activation_symlink(
+    snapshot: BootstrapActivationPath,
+    *,
+    expected_target: Path,
+    label: str,
+    exchange_identity: str | None = None,
+) -> str:
+    """Atomically publish one stable link from either its snapshot or desired state."""
+    path = Path(snapshot.path)
+    target = Path(os.path.abspath(expected_target.expanduser()))
+    token = exchange_identity or hashlib.sha256(f"{snapshot.path}\0{target}".encode()).hexdigest()
+    try:
+        _require_sha256(token, field="activation_exchange_identity")
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
+    temporary = path.with_name(f".{path.name}.{token}.exchange")
+    action = "created" if snapshot.before is None else "retargeted"
+    if temporary.exists() or temporary.is_symlink():
+        try:
+            active = _capture_activation_object(
+                path,
+                kind=snapshot.kind,
+                maximum=4 * 1024 * 1024,
+            )
+            displaced = _capture_activation_object(
+                temporary,
+                kind=snapshot.kind,
+                maximum=4 * 1024 * 1024,
+            )
+        except ConfigurationError as exc:
+            raise ConfigurationError(
+                f"{label} exchange recovery found an invalid path state"
+            ) from exc
+        active_is_desired = bool(
+            active.file_type == "symlink" and active.symlink_target == str(target)
+        )
+        displaced_is_desired = bool(
+            displaced.file_type == "symlink" and displaced.symlink_target == str(target)
+        )
+        active_is_before = bool(
+            snapshot.before is not None
+            and _activation_identity_matches_after_rename(snapshot.before, active)
+        )
+        displaced_is_before = bool(
+            snapshot.before is not None
+            and _activation_identity_matches_after_rename(snapshot.before, displaced)
+        )
+        if active_is_desired and displaced_is_before:
+            _verify_stable_symlink(path, expected=target, label=label)
+            temporary.unlink()
+            _fsync_directory(path.parent)
+            return action
+        if active_is_before and displaced_is_desired:
+            temporary.unlink()
+            _fsync_directory(path.parent)
+        else:
+            raise ConfigurationError(
+                f"{label} exchange recovery found unproven path states: {path}, {temporary}"
+            )
+    try:
+        before = path.lstat()
+        raw_target = os.readlink(path)
+        if raw_target != str(target):
+            raise ConfigurationError(f"{label} does not use its canonical target")
+        _verify_stable_symlink(path, expected=target, label=label)
+        if _stat_identity(path.lstat()) != _stat_identity(before):
+            raise ConfigurationError(f"{label} changed during inspection")
+    except (ConfigurationError, OSError, RuntimeError, ValueError):
+        pass
+    else:
+        return "reused"
+    try:
+        observed = _activation_path_identity(snapshot)
+    except ConfigurationError:
+        if snapshot.before is not None:
+            raise ConfigurationError(f"{label} changed after bootstrap inspection") from None
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            observed = None
+        except OSError as exc:
+            raise ConfigurationError(f"{label} could not be classified") from exc
+        else:
+            raise ConfigurationError(f"{label} appeared after bootstrap inspection") from None
+    else:
+        if snapshot.before is None or observed != snapshot.before:
+            raise ConfigurationError(f"{label} changed after bootstrap inspection")
+    if snapshot.before is None:
+        try:
+            path.symlink_to(target, target_is_directory=target.is_dir())
+            _fsync_directory(path.parent)
+        except FileExistsError as exc:
+            raise ConfigurationError(f"{label} appeared before activation") from exc
+        _verify_stable_symlink(path, expected=target, label=label)
+        if os.readlink(path) != str(target):  # pragma: no cover - written above
+            raise ConfigurationError(f"{label} did not use its canonical target")
+        return action
+    exchanged = False
+    try:
+        temporary.symlink_to(target, target_is_directory=target.is_dir())
+        desired = _capture_activation_object(
+            temporary,
+            kind="symlink",
+            maximum=4096,
+        )
+        if _activation_path_identity(snapshot) != snapshot.before:
+            raise ConfigurationError(f"{label} changed before activation")
+        exchanged = True
+        _atomic_exchange_paths(temporary, path)
+        try:
+            displaced = _capture_activation_object(
+                temporary,
+                kind=snapshot.kind,
+                maximum=4 * 1024 * 1024,
+            )
+        except ConfigurationError:
+            displaced = None
+        if displaced is None or not _activation_identity_matches_after_rename(
+            snapshot.before, displaced
+        ):
+            try:
+                active = _capture_activation_object(
+                    path,
+                    kind="symlink",
+                    maximum=4096,
+                )
+            except ConfigurationError as exc:
+                raise ConfigurationError(
+                    f"{label} changed during atomic activation; "
+                    f"displaced state retained at {temporary}"
+                ) from exc
+            if not _activation_identity_matches_after_rename(desired, active):
+                raise ConfigurationError(
+                    f"{label} changed during atomic activation; "
+                    f"displaced state retained at {temporary}"
+                )
+            _atomic_exchange_paths(temporary, path)
+            exchanged = False
+            _fsync_directory(path.parent)
+            raise ConfigurationError(f"{label} changed before atomic activation")
+        try:
+            active = _capture_activation_object(
+                path,
+                kind="symlink",
+                maximum=4096,
+            )
+        except ConfigurationError as exc:
+            temporary.unlink()
+            exchanged = False
+            _fsync_directory(path.parent)
+            raise ConfigurationError(f"{label} changed after atomic activation") from exc
+        if not _activation_identity_matches_after_rename(desired, active):
+            temporary.unlink()
+            exchanged = False
+            _fsync_directory(path.parent)
+            raise ConfigurationError(f"{label} changed after atomic activation")
+        temporary.unlink()
+        exchanged = False
+        _fsync_directory(path.parent)
+    except BaseException:
+        if not exchanged:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
+        raise
+    _verify_stable_symlink(path, expected=target, label=label)
+    if os.readlink(path) != str(target):  # pragma: no cover - written above
+        raise ConfigurationError(f"{label} did not use its canonical target")
+    return action
+
+
+def reconcile_staged_activation_links(
+    plan: BootstrapReconcilePlan,
+    *,
+    generation: Path,
+    home: Path | None = None,
+) -> dict[str, object]:
+    """Idempotently finish one fenced generation activation after any crash boundary."""
+    if plan.mode not in {"relay-only", "component-upgrade"}:
+        raise ConfigurationError("staged activation requires a replacement reconcile plan")
+    expected_names = {
+        "current",
+        "install_receipt",
+        "relay_launcher",
+        "jarvis_launcher",
+        "managed_repo",
+    }
+    if set(plan.activation_paths) != expected_names:
+        raise ConfigurationError("staged activation plan omitted its path identities")
+    lexical_home = Path(os.path.abspath((home or Path.home()).expanduser()))
+    expected_generation = (
+        lexical_home / ".local/share/clio-relay/generations" / plan.desired_fingerprint
+    )
+    if generation != expected_generation or generation.is_symlink() or not generation.is_dir():
+        raise ConfigurationError("staged activation generation path is invalid")
+    targets = {
+        "current": generation,
+        "install_receipt": lexical_home / ".local/share/clio-relay/current/install-receipt.json",
+        "relay_launcher": lexical_home / ".local/share/clio-relay/current/bin/clio-relay",
+        "jarvis_launcher": lexical_home / ".local/share/clio-relay/current/bin/jarvis",
+        "managed_repo": lexical_home
+        / ".local/share/clio-relay/current/source/jarvis-packages/clio_relay",
+    }
+    for name, target_path in {
+        "current": lexical_home / ".local/share/clio-relay/current",
+        "install_receipt": lexical_home / ".local/share/clio-relay/install-receipt.json",
+        "relay_launcher": lexical_home / ".local/bin/clio-relay",
+        "jarvis_launcher": lexical_home / ".local/bin/jarvis",
+        "managed_repo": lexical_home / ".local/share/clio-relay/managed-jarvis-repo",
+    }.items():
+        if Path(plan.activation_paths[name].path) != target_path:
+            raise ConfigurationError(f"staged activation path destination changed: {name}")
+    actions: dict[str, str] = {}
+    for name in (
+        "current",
+        "install_receipt",
+        "relay_launcher",
+        "jarvis_launcher",
+        "managed_repo",
+    ):
+        actions[name] = _reconcile_activation_symlink(
+            plan.activation_paths[name],
+            expected_target=targets[name],
+            label=f"bootstrap stable activation path {name}",
+            exchange_identity=plan.desired_fingerprint,
+        )
+    return {
+        "schema_version": "clio-relay.bootstrap-activation.v1",
+        "generation": plan.desired_fingerprint,
+        "actions": actions,
+    }
 
 
 def _queue_readiness_verified(evidence: dict[str, object] | None) -> bool:
@@ -2246,6 +3032,162 @@ def _cross_handle_stat_identity(value: os.stat_result) -> tuple[int, ...]:
             value.st_mtime_ns,
         )
     return _stat_identity(value)
+
+
+def _atomic_exchange_paths(left: Path, right: Path) -> None:
+    """Atomically exchange two existing pathnames without dropping either object."""
+    if sys.platform == "linux":
+        library = ctypes.CDLL(None, use_errno=True)
+        renameat2 = library.renameat2
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            _AT_FDCWD,
+            os.fsencode(left),
+            _AT_FDCWD,
+            os.fsencode(right),
+            _RENAME_EXCHANGE,
+        )
+        if result != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), f"{left} <-> {right}")
+        return
+    if os.name != "nt":
+        raise ConfigurationError("atomic bootstrap path exchange requires Linux")
+    # The staged bootstrap runs on Linux. This fallback keeps the path contract
+    # testable on Windows without weakening the supported cluster operation.
+    holding = right.with_name(f".{right.name}.{os.getpid()}.exchange")
+    if holding.exists() or holding.is_symlink():
+        raise ConfigurationError(f"atomic exchange holding path already exists: {holding}")
+    os.replace(right, holding)
+    try:
+        os.replace(left, right)
+    except BaseException:
+        os.replace(holding, right)
+        raise
+    os.replace(holding, left)
+
+
+def _identity_matches_after_rename(
+    before: tuple[int, int, int, int, int, int],
+    after: tuple[int, int, int, int, int, int],
+) -> bool:
+    """Compare file identity while excluding ctime, which rename changes on Linux."""
+    return before[:5] == after[:5]
+
+
+def _activation_identity_matches_after_rename(
+    before: BootstrapActivationPathIdentity,
+    after: BootstrapActivationPathIdentity,
+) -> bool:
+    """Compare a captured activation object after an atomic pathname exchange."""
+    return bool(
+        before.device == after.device
+        and before.inode == after.inode
+        and before.mode == after.mode
+        and before.size == after.size
+        and before.modified_ns == after.modified_ns
+        and before.file_type == after.file_type
+        and before.sha256 == after.sha256
+        and before.symlink_target == after.symlink_target
+    )
+
+
+def verify_atomic_exchange_support(
+    directories: tuple[Path, ...],
+    *,
+    identity: str,
+) -> dict[str, object]:
+    """Exercise and restore atomic exchange on every staged-mutation filesystem."""
+    try:
+        _require_sha256(identity, field="exchange_preflight_identity")
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
+    verified: list[str] = []
+    seen: set[Path] = set()
+    for raw_directory in directories:
+        directory = Path(os.path.abspath(raw_directory.expanduser()))
+        try:
+            details = directory.lstat()
+            resolved = directory.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ConfigurationError(
+                f"atomic exchange preflight directory is unavailable: {directory}"
+            ) from exc
+        if directory.is_symlink() or not stat.S_ISDIR(details.st_mode):
+            raise ConfigurationError(
+                f"atomic exchange preflight path is not one directory: {directory}"
+            )
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        left = directory / f".clio-relay-exchange-{identity}.left"
+        right = directory / f".clio-relay-exchange-{identity}.right"
+        left_payload = f"left:{identity}\n".encode("ascii")
+        right_payload = f"right:{identity}\n".encode("ascii")
+        if left.exists() or left.is_symlink() or right.exists() or right.is_symlink():
+            try:
+                observed = {
+                    _read_regular_bounded(left, maximum=256),
+                    _read_regular_bounded(right, maximum=256),
+                }
+            except ConfigurationError as exc:
+                raise ConfigurationError(
+                    f"atomic exchange preflight recovery is unproven: {directory}"
+                ) from exc
+            if observed != {left_payload, right_payload}:
+                raise ConfigurationError(
+                    f"atomic exchange preflight recovery is unproven: {directory}"
+                )
+            left.unlink()
+            right.unlink()
+            _fsync_directory(directory)
+        try:
+            for path, payload in ((left, left_payload), (right, right_payload)):
+                with path.open("xb") as stream:
+                    os.chmod(path, 0o600)
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            _fsync_directory(directory)
+            _atomic_exchange_paths(left, right)
+            if (
+                _read_regular_bounded(left, maximum=256) != right_payload
+                or _read_regular_bounded(right, maximum=256) != left_payload
+            ):
+                raise ConfigurationError(
+                    f"atomic exchange preflight produced invalid state: {directory}"
+                )
+            _atomic_exchange_paths(left, right)
+            if (
+                _read_regular_bounded(left, maximum=256) != left_payload
+                or _read_regular_bounded(right, maximum=256) != right_payload
+            ):
+                raise ConfigurationError(
+                    f"atomic exchange preflight did not restore state: {directory}"
+                )
+            left.unlink()
+            right.unlink()
+            _fsync_directory(directory)
+        except BaseException:
+            with suppress(OSError):
+                left.unlink(missing_ok=True)
+            with suppress(OSError):
+                right.unlink(missing_ok=True)
+            _fsync_directory(directory)
+            raise
+        verified.append(str(directory))
+    return {
+        "schema_version": "clio-relay.atomic-exchange-preflight.v1",
+        "identity": identity,
+        "directories": verified,
+    }
 
 
 def _atomic_json(path: Path, value: object) -> None:
