@@ -8,6 +8,7 @@ import ctypes
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import shlex
@@ -77,7 +78,12 @@ from clio_relay.deployment import (
 )
 from clio_relay.doctor import run_cluster_doctor, run_doctor
 from clio_relay.endpoint import EndpointWorker
-from clio_relay.errors import ConfigurationError, NotFoundError, RelayError
+from clio_relay.errors import (
+    ConfigurationError,
+    NotFoundError,
+    ObservationTimeoutError,
+    RelayError,
+)
 from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.frp_check import run_frpc_connection_check
 from clio_relay.identifiers import validate_durable_record_id
@@ -125,6 +131,7 @@ from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
     JobState,
+    JobWaitResult,
     McpAdmissionClass,
     McpCallSpec,
     McpControlQueryEvidence,
@@ -184,7 +191,9 @@ from clio_relay.relay_ops import (
 )
 from clio_relay.relay_ops import (
     evaluate_monitor_rules,
+    job_wait_result,
     monitor_job,
+    observe_until_terminal,
     read_artifact_bytes,
     read_job_log,
     wait_for_terminal,
@@ -232,7 +241,10 @@ from clio_relay.scheduler_providers import (
 )
 from clio_relay.scheduler_validation import run_scheduler_lifecycle_validation
 from clio_relay.service_runtime import ServiceRuntimeSupervisor
-from clio_relay.session_api import submit_owned_session_job
+from clio_relay.session_api import (
+    OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS,
+    submit_owned_session_job,
+)
 from clio_relay.session_lifecycle import (
     MAX_OWNED_SESSION_CLEANUP_FINALIZE_BYTES,
     MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
@@ -306,6 +318,7 @@ DEFAULT_RELAY_CANCEL_POLL_SECONDS = 0.25
 MAX_RELAY_CANCEL_TIMEOUT_SECONDS = 3_600.0
 REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS = 120.0
 REMOTE_CLEANUP_WORKER_INFO_TIMEOUT_SECONDS = 20.0
+REMOTE_JOB_WAIT_STATUS_TIMEOUT_SECONDS = 30.0
 MAX_FINALIZED_CLEANUP_RETRY_OUTPUT_BYTES = 1024 * 1024
 MAX_CLEANUP_VALIDATION_REPORT_BYTES = 8 * 1024 * 1024
 MAX_LOCAL_CLEANUP_REPORT_CHUNK_BYTES = 8 * 1024 * 1024
@@ -7470,26 +7483,24 @@ def job_wait(
     ] = None,
     timeout_seconds: Annotated[
         float,
-        typer.Option(help="Maximum seconds to wait for terminal state."),
+        typer.Option(help="Maximum seconds for this terminal-state observation."),
     ] = 600,
     poll_seconds: Annotated[float, typer.Option(help="Polling interval.")] = 2,
 ) -> None:
-    """Wait until a job reaches terminal state."""
-    if _try_remote_cluster_passthrough(
+    """Observe until terminal, returning current durable state when the bound expires."""
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise typer.BadParameter("timeout-seconds must be positive and finite")
+    if not math.isfinite(poll_seconds) or poll_seconds <= 0:
+        raise typer.BadParameter("poll-seconds must be positive and finite")
+    if _try_remote_job_wait_passthrough(
         cluster,
-        [
-            "job",
-            "wait",
-            job_id,
-            "--timeout-seconds",
-            str(timeout_seconds),
-            "--poll-seconds",
-            str(poll_seconds),
-        ],
+        job_id=job_id,
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
     ):
         return
     queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
-    job = wait_for_terminal(
+    job = observe_until_terminal(
         queue,
         job_id,
         timeout_seconds=timeout_seconds,
@@ -15997,6 +16008,79 @@ def _try_remote_cluster_passthrough(cluster: str | None, args: list[str]) -> boo
     if not should_execute_on_cluster(definition):
         return False
     _run_remote_or_exit(definition, args)
+    return True
+
+
+def _try_remote_job_wait_passthrough(
+    cluster: str | None,
+    *,
+    job_id: str,
+    timeout_seconds: float,
+    poll_seconds: float,
+) -> bool:
+    """Run one bounded remote wait and preserve its durable receipt on observation expiry."""
+    if cluster is None:
+        return False
+    if os.getenv("CLIO_RELAY_CLI_MODE", "auto").strip().lower() == "local":
+        return False
+    definition = _require_cluster(cluster)
+    if not should_execute_on_cluster(definition):
+        return False
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise typer.BadParameter("timeout-seconds must be positive and finite")
+    if not math.isfinite(poll_seconds) or poll_seconds <= 0:
+        raise typer.BadParameter("poll-seconds must be positive and finite")
+
+    def action() -> None:
+        try:
+            with remote_command_timeout(
+                timeout_seconds + OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS
+            ):
+                payload = run_remote_clio(
+                    definition,
+                    [
+                        "job",
+                        "wait",
+                        job_id,
+                        "--timeout-seconds",
+                        str(timeout_seconds),
+                        "--poll-seconds",
+                        str(poll_seconds),
+                    ],
+                )
+            document = _json_output(payload, "remote job wait")
+            if "observation" in document:
+                try:
+                    result = JobWaitResult.model_validate(document)
+                except ValidationError as exc:
+                    raise RelayError("remote job wait returned an invalid result") from exc
+            else:
+                result = job_wait_result(
+                    RelayJob.model_validate(document),
+                    timeout_seconds=timeout_seconds,
+                )
+        except ObservationTimeoutError as observation_error:
+            with remote_command_timeout(REMOTE_JOB_WAIT_STATUS_TIMEOUT_SECONDS):
+                status = _json_output(
+                    run_remote_clio(definition, ["job", "status", job_id]),
+                    "remote job status after bounded wait",
+                )
+            job = RelayJob.model_validate(status.get("job"))
+            terminal = job.state in {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELED}
+            if status.get("terminal") is not terminal:
+                raise RelayError(
+                    "remote job status disagrees with its durable job state"
+                ) from observation_error
+            result = job_wait_result(
+                job,
+                timeout_seconds=timeout_seconds,
+            )
+
+        if result.job_id != job_id or result.cluster != cluster:
+            raise RelayError("remote job wait returned a different durable receipt")
+        typer.echo(result.model_dump_json(indent=2))
+
+    _run_or_exit(action)
     return True
 
 

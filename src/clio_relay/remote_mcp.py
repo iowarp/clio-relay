@@ -324,6 +324,29 @@ VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA: JSON = {
             ),
         },
         "last_error": {"type": ["string", "null"]},
+        "observation": {
+            "type": "object",
+            "properties": {
+                "outcome": {
+                    "type": "string",
+                    "enum": ["terminal", "observation_unknown"],
+                },
+                "timeout_seconds": {"type": "number", "exclusiveMinimum": 0},
+                "scheduler_action": {"type": "string", "const": "none"},
+                "relay_action": {"type": "string", "const": "none"},
+            },
+            "required": [
+                "outcome",
+                "timeout_seconds",
+                "scheduler_action",
+                "relay_action",
+            ],
+            "additionalProperties": False,
+            "description": (
+                "Result of the bounded observation requested by this call. "
+                "observation_unknown preserves the durable job for later observation."
+            ),
+        },
         "mcp_result": {"type": "object"},
         "mcp_result_artifact": {"type": "object"},
         "logs": {"type": "object"},

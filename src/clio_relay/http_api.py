@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import secrets
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
@@ -67,6 +68,7 @@ from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
     JobState,
+    JobWaitResult,
     McpAdmissionAuthority,
     McpAdmissionClass,
     McpCallSpec,
@@ -105,9 +107,9 @@ from clio_relay.relay_ops import (
 from clio_relay.relay_ops import (
     evaluate_monitor_rules,
     monitor_job,
+    observe_until_terminal,
     read_artifact_bytes,
     read_job_log,
-    wait_for_terminal,
 )
 from clio_relay.relay_ops import (
     job_status as get_job_status_operation,
@@ -1431,16 +1433,30 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         except WebSocketDisconnect:
             return
 
-    @app.post("/jobs/{job_id}/wait", response_model=RelayJob, dependencies=[auth_dependency])
+    @app.post(
+        "/jobs/{job_id}/wait",
+        response_model=JobWaitResult,
+        dependencies=[auth_dependency],
+    )
     def wait(
         job_id: DurableRecordId,
         timeout_seconds: float = 600,
         poll_seconds: float = 2,
-    ) -> RelayJob:
+    ) -> JobWaitResult:
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise HTTPException(
+                status_code=422,
+                detail="timeout_seconds must be positive and finite",
+            )
+        if not math.isfinite(poll_seconds) or poll_seconds <= 0:
+            raise HTTPException(
+                status_code=422,
+                detail="poll_seconds must be positive and finite",
+            )
         try:
             require_owned_job(job_id)
             return _public_record(
-                wait_for_terminal(
+                observe_until_terminal(
                     queue,
                     job_id,
                     timeout_seconds=timeout_seconds,
@@ -1449,8 +1465,6 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             )
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except TimeoutError as exc:
-            raise HTTPException(status_code=408, detail=str(exc)) from exc
 
     @app.get("/jobs/{job_id}/logs/{stream_name}", dependencies=[auth_dependency])
     def get_log(

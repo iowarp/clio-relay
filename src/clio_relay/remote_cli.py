@@ -19,7 +19,7 @@ from typing import cast
 import yaml
 
 from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.errors import ConfigurationError, ObservationTimeoutError, RelayError
 from clio_relay.jarvis_mcp import JARVIS_MCP_SPACK_COMMAND_ENV
 from clio_relay.remote_values import render_remote_shell_path, render_remote_shell_value
 
@@ -205,7 +205,7 @@ def run_remote_shell(definition: ClusterDefinition, script: str) -> str:
                 timeout=timeout_seconds,
             )
     except subprocess.TimeoutExpired as exc:
-        raise RelayError(
+        raise ObservationTimeoutError(
             f"remote command timed out after {timeout_seconds:g} seconds: {definition.ssh_host}"
         ) from exc
     except OSError as exc:

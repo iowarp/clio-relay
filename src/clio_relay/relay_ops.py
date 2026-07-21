@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hmac
+import math
 import os
 import re
 import time
@@ -20,12 +21,14 @@ from clio_relay.models import (
     Cursor,
     JobKind,
     JobState,
+    JobWaitResult,
     MonitorRule,
     MonitorRuleAction,
     ProgressRecord,
     RelayEvent,
     RelayJob,
     RemoteAgentTaskSpec,
+    WaitObservation,
     utc_now,
 )
 from clio_relay.pagination import validate_response_page_limit
@@ -50,10 +53,10 @@ def wait_for_terminal(
     poll_seconds: float = 2.0,
 ) -> RelayJob:
     """Poll a job until it reaches a terminal state or timeout expires."""
-    if timeout_seconds <= 0:
-        raise ConfigurationError("timeout_seconds must be positive")
-    if poll_seconds <= 0:
-        raise ConfigurationError("poll_seconds must be positive")
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ConfigurationError("timeout_seconds must be positive and finite")
+    if not math.isfinite(poll_seconds) or poll_seconds <= 0:
+        raise ConfigurationError("poll_seconds must be positive and finite")
     deadline = time.monotonic() + timeout_seconds
     while True:
         job = queue.get_job(job_id)
@@ -62,6 +65,39 @@ def wait_for_terminal(
         if time.monotonic() >= deadline:
             raise TimeoutError(f"job did not reach terminal state before timeout: {job_id}")
         time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+
+
+def observe_until_terminal(
+    queue: ClioCoreQueue,
+    job_id: str,
+    *,
+    timeout_seconds: float,
+    poll_seconds: float = 2.0,
+) -> JobWaitResult:
+    """Return a terminal job or its current durable state when this observation expires."""
+    try:
+        job = wait_for_terminal(
+            queue,
+            job_id,
+            timeout_seconds=timeout_seconds,
+            poll_seconds=poll_seconds,
+        )
+    except TimeoutError:
+        job = queue.get_job(job_id)
+    return job_wait_result(job, timeout_seconds=timeout_seconds)
+
+
+def job_wait_result(job: RelayJob, *, timeout_seconds: float) -> JobWaitResult:
+    """Attach a no-side-effect observation outcome to one exact durable job snapshot."""
+    return JobWaitResult.model_validate(
+        {
+            **job.model_dump(mode="python"),
+            "observation": WaitObservation(
+                outcome=("terminal" if job.state in TERMINAL_STATES else "observation_unknown"),
+                timeout_seconds=timeout_seconds,
+            ).model_dump(mode="python"),
+        }
+    )
 
 
 def monitor_job(
