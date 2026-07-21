@@ -836,7 +836,7 @@ def test_future_release_identity_does_not_require_network_or_a_digest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(bootstrap, "__version__", "1.4.17")
+    monkeypatch.setattr(bootstrap, "__version__", "1.4.18")
 
     identity = bootstrap.bootstrap_relay_identity(
         source_root=tmp_path / "not-a-checkout",
@@ -844,8 +844,8 @@ def test_future_release_identity_does_not_require_network_or_a_digest(
         relay_artifact_sha256="1" * 64,
     )
 
-    assert identity.install_spec == "clio-relay==1.4.17"
-    assert identity.source_identity == f"release:clio-relay==1.4.17:sha256:{'1' * 64}"
+    assert identity.install_spec == "clio-relay==1.4.18"
+    assert identity.source_identity == f"release:clio-relay==1.4.18:sha256:{'1' * 64}"
     assert identity.deployment_artifact_sha256 == "1" * 64
 
 
