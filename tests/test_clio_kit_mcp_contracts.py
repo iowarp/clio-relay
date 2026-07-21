@@ -689,7 +689,10 @@ def test_real_uv_tool_install_binds_external_launcher_to_receipt_and_record(
             )
         },
     )
-    runtime_identity = jarvis_mcp_runtime_identity(install_receipt)
+    with monkeypatch.context() as unrelated_environment:
+        unrelated_environment.setenv("UV_TOOL_DIR", str(tmp_path / "unrelated-tools"))
+        unrelated_environment.setenv("UV_TOOL_BIN_DIR", str(tmp_path / "unrelated-bin"))
+        runtime_identity = jarvis_mcp_runtime_identity(install_receipt)
     assert runtime_identity["persistent_tool_verified"] is True
     assert runtime_identity["artifact_identity_verified"] is True
 

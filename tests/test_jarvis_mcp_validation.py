@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from copy import deepcopy
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
+import clio_relay.cli as relay_cli
 import clio_relay.jarvis_mcp_validation as jarvis_validation
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_MCP_VERSION,
@@ -25,7 +28,7 @@ from clio_relay.jarvis_mcp import (
 from clio_relay.jarvis_mcp_validation import build_jarvis_mcp_validation_report
 from clio_relay.remote_mcp import remote_mcp_server_artifact_digest
 from clio_relay.runtime_metadata import RUNTIME_METADATA_SCHEMA
-from clio_relay.validation_report import ValidationStatus
+from clio_relay.validation_report import ValidationStatus, write_validation_report
 
 
 @pytest.fixture(autouse=True)
@@ -165,6 +168,12 @@ def test_jarvis_mcp_validation_accepts_structured_durable_run() -> None:
         "pagination_coherent": True,
         "artifact_filters_coherent": True,
         "runner_semantic_validation_verified": True,
+        "resumable_query_job_verified": True,
+        "resumable_result_transport_verified": True,
+        "resumable_result_envelope_verified": True,
+        "resumable_identity_coherent": True,
+        "resumable_lifecycle_coherent": True,
+        "resumable_runner_semantic_validation_verified": True,
     }
     execution_id = "jarvis-execution-acceptance"
     for check_id in {
@@ -184,6 +193,309 @@ def test_jarvis_mcp_validation_accepts_structured_durable_run() -> None:
     assert {resource.metadata.get("execution_id") for resource in execution_scoped} == {
         execution_id
     }
+
+
+@pytest.mark.parametrize(
+    ("outcome", "state", "terminal"),
+    [
+        ("observation_unknown", "submitted", False),
+        ("terminal_artifacts_pending", "completed", True),
+    ],
+)
+def test_progress_only_execution_query_is_strictly_resumable_but_not_passed(
+    outcome: str,
+    state: str,
+    terminal: bool,
+) -> None:
+    """Real progress-only evidence can resume but cannot satisfy artifact acceptance."""
+    inputs = _acceptance_inputs()
+    _make_progress_only_execution_query(inputs, state=state, terminal=terminal)
+
+    report = build_jarvis_mcp_validation_report(**inputs)
+    query_check = next(
+        check for check in report.checks if check.check_id == "remote-mcp.jarvis-execution-query"
+    )
+    assertions = query_check.evidence[0].metadata["assertions"]
+    assert query_check.status is ValidationStatus.FAILED
+    assert assertions["durable_query_job_verified"] is False
+    assert assertions["terminal_success_verified"] is False
+    assert assertions["resumable_query_job_verified"] is True
+    assert assertions["resumable_result_transport_verified"] is True
+    assert assertions["resumable_result_envelope_verified"] is True
+    assert assertions["resumable_identity_coherent"] is True
+    assert assertions["resumable_lifecycle_coherent"] is True
+    assert assertions["resumable_runner_semantic_validation_verified"] is True
+
+    observation = _query_lifecycle_observation(
+        state,
+        sequence=2,
+        terminal=terminal,
+    )
+    query = relay_cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster="ares",
+        pipeline_id="acceptance",
+        execution_id="jarvis-execution-acceptance",
+        outcome=cast(Any, outcome),
+        tools_list_response=cast(dict[str, Any], inputs["query_tools_list_response"]),
+        call_response=cast(dict[str, Any], inputs["query_call_response"]),
+        call_job_id=cast(str, inputs["query_call_job_id"]),
+        call_status=cast(dict[str, Any], inputs["query_call_status"]),
+        artifacts=cast(list[dict[str, Any]], inputs["query_artifacts"]),
+        mcp_result=cast(dict[str, Any], inputs["query_mcp_result"]),
+        provenance=cast(dict[str, Any], inputs["query_provenance"]),
+        initialize_response={},
+        stdio_evidence={},
+        lifecycle_observations=[observation],
+    )
+
+    pending = relay_cli._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report,
+        execution_query=query,
+    )
+
+    assert pending.status is ValidationStatus.PENDING
+    assert all(check.status is not ValidationStatus.FAILED for check in pending.checks)
+
+
+def test_real_builder_pending_checkpoints_round_trip_across_resumes(tmp_path: Path) -> None:
+    """Every checkpoint produced by the real builder is accepted by the strict loader."""
+
+    def set_initial_runtime_pre_assignment(inputs: dict[str, Any]) -> None:
+        runtime = cast(dict[str, Any], inputs["runtime_metadata"])
+        runtime["scheduler_job_id"] = None
+        runtime["scheduler_phase"] = "submitting"
+        terminal = cast(dict[str, Any], runtime["terminal"])
+        terminal.update({"state": "submitting", "terminal": False, "returncode": None})
+        details = cast(dict[str, Any], runtime["details"])
+        native = cast(dict[str, Any], details["native_execution"])
+        handle = cast(dict[str, Any], native["execution_handle"])
+        record = cast(dict[str, Any], native["execution_record"])
+        progress = cast(dict[str, Any], native["progress"])
+        handle["scheduler_native_id"] = None
+        handle["cluster"] = None
+        record.update(
+            {
+                "scheduler_native_id": None,
+                "cluster": None,
+                "state": "submitting",
+                "submitted": False,
+                "terminal": False,
+                "return_code": None,
+                "error": None,
+            }
+        )
+        metadata = cast(dict[str, Any], record["metadata"])
+        submission = cast(dict[str, Any], metadata["submission"])
+        submission.update(
+            {
+                "scheduler_job_id": None,
+                "scheduler_cluster": None,
+                "submitted": False,
+                "identity_source": None,
+            }
+        )
+        progress.update({"execution_state": "submitting", "terminal": False})
+
+    def set_query_job_id(inputs: dict[str, Any], job_id: str) -> None:
+        response = cast(dict[str, Any], inputs["query_call_response"])
+        response_result = cast(dict[str, Any], response["result"])
+        structured_content = cast(dict[str, Any], response_result["structuredContent"])
+        structured_content["job_id"] = job_id
+        inputs["query_call_job_id"] = job_id
+        status = cast(dict[str, Any], inputs["query_call_status"])
+        status_job = cast(dict[str, Any], status["job"])
+        status_job["job_id"] = job_id
+        provenance = cast(dict[str, Any], inputs["query_provenance"])
+        provenance_job = cast(dict[str, Any], provenance["job"])
+        provenance_job["job_id"] = job_id
+
+    def query_acceptance(
+        inputs: dict[str, Any],
+        observation: dict[str, Any],
+        lifecycle: list[dict[str, Any]],
+    ) -> relay_cli._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return relay_cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cluster="ares",
+            pipeline_id="acceptance",
+            execution_id="jarvis-execution-acceptance",
+            outcome="observation_unknown",
+            tools_list_response=cast(dict[str, Any], inputs["query_tools_list_response"]),
+            call_response=cast(dict[str, Any], inputs["query_call_response"]),
+            call_job_id=cast(str, inputs["query_call_job_id"]),
+            call_status=cast(dict[str, Any], inputs["query_call_status"]),
+            artifacts=cast(list[dict[str, Any]], inputs["query_artifacts"]),
+            mcp_result=cast(dict[str, Any], inputs["query_mcp_result"]),
+            provenance=cast(dict[str, Any], inputs["query_provenance"]),
+            initialize_response={},
+            stdio_evidence={},
+            lifecycle_observations=[*lifecycle, observation],
+        )
+
+    first_inputs = _acceptance_inputs()
+    set_initial_runtime_pre_assignment(first_inputs)
+    _make_progress_only_execution_query(
+        first_inputs,
+        state="submitting",
+        terminal=False,
+    )
+    first_observation = _query_lifecycle_observation(
+        "submitting",
+        sequence=1,
+        terminal=False,
+    )
+    _set_scheduler_native_id(first_observation, None)
+    _set_scheduler_cluster(first_observation, None)
+    first_result = cast(dict[str, Any], first_inputs["query_mcp_result"])
+    first_structured = cast(dict[str, Any], first_result["structured_result"])
+    for key in ("execution_handle", "execution_record"):
+        document = cast(dict[str, Any], first_structured[key])
+        document["scheduler_native_id"] = None
+        document["cluster"] = None
+    first_observation["query_job_id"] = first_inputs["query_call_job_id"]
+    first_inputs["query_lifecycle_observations"] = [first_observation]
+    first_inputs["scheduler_cluster"] = None
+    first_report = build_jarvis_mcp_validation_report(**first_inputs)
+    first_query = query_acceptance(first_inputs, first_observation, [])
+    builder_inputs = {
+        key: deepcopy(value) for key, value in first_inputs.items() if not key.startswith("query_")
+    }
+    first_checkpoint = {
+        "schema_version": relay_cli._JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "phase": "execution_query",
+        "observation_state": "observed",
+        "profile": "user",
+        "retry_selector": first_query.retry_selector(),
+        "builder_inputs": builder_inputs,
+        "lifecycle_observations": first_query.lifecycle_observations,
+    }
+    first_pending = relay_cli._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        first_report,
+        execution_query=first_query,
+        resume_checkpoint=first_checkpoint,
+    )
+    first_path = tmp_path / "first-pending.json"
+    write_validation_report(first_pending, first_path)
+
+    first_loaded = relay_cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        first_path,
+        cluster="ares",
+    )
+    assert first_pending.status is ValidationStatus.PENDING
+    assert first_loaded["retry_selector"] == first_query.retry_selector()
+    assert first_loaded["retry_selector"]["scheduler_native_id"] is None
+    assert first_loaded["retry_selector"]["cluster"] == "ares"
+    assert first_loaded["retry_selector"]["scheduler_cluster"] is None
+
+    second_inputs = _acceptance_inputs()
+    set_initial_runtime_pre_assignment(second_inputs)
+    _make_progress_only_execution_query(
+        second_inputs,
+        state="running",
+        terminal=False,
+    )
+    set_query_job_id(second_inputs, "job-jarvis-query-resume")
+    second_observation = _query_lifecycle_observation(
+        "running",
+        sequence=2,
+        terminal=False,
+    )
+    second_observation["query_job_id"] = second_inputs["query_call_job_id"]
+    lifecycle = [first_observation]
+    second_inputs["query_lifecycle_observations"] = [*lifecycle, second_observation]
+    second_inputs["scheduler_cluster"] = "linux"
+    second_report = build_jarvis_mcp_validation_report(**second_inputs)
+    second_query = query_acceptance(second_inputs, second_observation, lifecycle)
+    second_checkpoint = {
+        **first_loaded,
+        "retry_selector": second_query.retry_selector(),
+        "builder_inputs": {
+            **cast(dict[str, Any], first_loaded["builder_inputs"]),
+            "scheduler_cluster": "linux",
+        },
+        "lifecycle_observations": second_query.lifecycle_observations,
+    }
+    second_pending = relay_cli._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        second_report,
+        execution_query=second_query,
+        resume_checkpoint=second_checkpoint,
+    )
+    second_path = tmp_path / "second-pending.json"
+    write_validation_report(second_pending, second_path)
+
+    second_loaded = relay_cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        second_path,
+        cluster="ares",
+    )
+    assert second_pending.status is ValidationStatus.PENDING
+    assert second_loaded["retry_selector"] == second_query.retry_selector()
+    assert second_loaded["retry_selector"]["scheduler_native_id"] == "12345"
+    assert second_loaded["retry_selector"]["cluster"] == "ares"
+    assert second_loaded["retry_selector"]["scheduler_cluster"] == "linux"
+    assert [observation["state"] for observation in second_loaded["lifecycle_observations"]] == [
+        "submitting",
+        "running",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("state", "return_code", "error"),
+    [
+        ("failed", 1, "workload failed"),
+        ("canceled", None, "workload canceled"),
+        ("completed", 1, None),
+    ],
+)
+def test_terminal_artifacts_pending_never_masks_terminal_workload_failure(
+    state: str,
+    return_code: int | None,
+    error: str | None,
+) -> None:
+    """Only a proven successful terminal execution may defer artifact collection."""
+    inputs = _acceptance_inputs()
+    _make_progress_only_execution_query(inputs, state=state, terminal=True)
+    result = cast(dict[str, Any], inputs["query_mcp_result"])
+    structured = cast(dict[str, Any], result["structured_result"])
+    record = cast(dict[str, Any], structured["execution_record"])
+    record["return_code"] = return_code
+    record["error"] = error
+    observations = [
+        _query_lifecycle_observation("submitted", sequence=1, terminal=False),
+        _query_lifecycle_observation("running", sequence=2, terminal=False),
+        _query_lifecycle_observation(state, sequence=3, terminal=True),
+    ]
+    terminal_record = cast(dict[str, Any], observations[-1]["execution_record"])
+    terminal_record["return_code"] = return_code
+    terminal_record["error"] = error
+    inputs["query_lifecycle_observations"] = observations
+    report = build_jarvis_mcp_validation_report(**inputs)
+    query = relay_cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster="ares",
+        pipeline_id="acceptance",
+        execution_id="jarvis-execution-acceptance",
+        outcome="terminal_artifacts_pending",
+        tools_list_response=cast(dict[str, Any], inputs["query_tools_list_response"]),
+        call_response=cast(dict[str, Any], inputs["query_call_response"]),
+        call_job_id=cast(str, inputs["query_call_job_id"]),
+        call_status=cast(dict[str, Any], inputs["query_call_status"]),
+        artifacts=cast(list[dict[str, Any]], inputs["query_artifacts"]),
+        mcp_result=cast(dict[str, Any], inputs["query_mcp_result"]),
+        provenance=cast(dict[str, Any], inputs["query_provenance"]),
+        initialize_response={},
+        stdio_evidence={},
+        lifecycle_observations=observations,
+    )
+
+    unchanged = relay_cli._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        report,
+        execution_query=query,
+    )
+    query_check = next(
+        check for check in report.checks if check.check_id == "remote-mcp.jarvis-execution-query"
+    )
+
+    assert report.status is ValidationStatus.FAILED
+    assert unchanged.status is ValidationStatus.FAILED
+    assert query_check.evidence[0].metadata["assertions"]["resumable_lifecycle_coherent"] is False
 
 
 def test_jarvis_mcp_validation_does_not_require_spack_for_non_spack_run() -> None:
@@ -504,6 +816,7 @@ def test_query_lifecycle_accepts_running_progress_and_no_scheduler_identity() ->
             document["mode"] = "direct"
             document["scheduler_provider"] = None
             document["scheduler_native_id"] = None
+            document["cluster"] = None
 
     evidence, passed, resource = jarvis_validation._jarvis_query_lifecycle_progress_evidence(
         observations=observations,
@@ -517,7 +830,8 @@ def test_query_lifecycle_accepts_running_progress_and_no_scheduler_identity() ->
         "observation_count_bounded": True,
         "query_identities_coherent": True,
         "scheduler_identity_optional_coherent_and_stable": True,
-        "lifecycle_monotonic_and_completed": True,
+        "lifecycle_prefix_coherent": True,
+        "terminal_success_verified": True,
         "in_flight_package_progress_observed": True,
         "package_progress_nonregressing": True,
         "terminal_package_progress_bound": True,
@@ -542,6 +856,322 @@ def test_query_lifecycle_accepts_one_way_scheduler_native_id_assignment() -> Non
     assert passed is True
     assert resource is not None
     assert evidence["assertions"]["scheduler_identity_optional_coherent_and_stable"] is True
+
+
+@pytest.mark.parametrize(
+    ("clusters", "expected"),
+    [
+        ([None, None, None, None], True),
+        ([None, "linux", "linux", "linux"], True),
+        ([None, "linux", None, None], False),
+        ([None, "linux", "different", "different"], False),
+    ],
+)
+def test_query_lifecycle_scheduler_cluster_is_optional_one_way_identity(
+    clusters: list[str | None],
+    expected: bool,
+) -> None:
+    """The scheduler-native cluster may appear once, but never revert or change."""
+    observations = [
+        _query_lifecycle_observation("submitting", sequence=1, terminal=False),
+        _query_lifecycle_observation("submitted", sequence=2, terminal=False),
+        _query_lifecycle_observation("running", sequence=3, terminal=False),
+        _query_lifecycle_observation("completed", sequence=4, terminal=True),
+    ]
+    for observation, cluster in zip(observations, clusters, strict=True):
+        _set_scheduler_cluster(observation, cluster)
+
+    evidence, _passed, _resource = jarvis_validation._jarvis_query_lifecycle_progress_evidence(
+        observations=observations,
+        pipeline_id="acceptance",
+        execution_id="jarvis-execution-acceptance",
+    )
+
+    assert evidence["assertions"]["scheduler_identity_optional_coherent_and_stable"] is expected
+
+
+def _query_lifecycle_with_repeated_terminal_snapshot() -> list[dict[str, Any]]:
+    observations = [
+        _query_lifecycle_observation("submitted", sequence=1, terminal=False),
+        _query_lifecycle_observation("running", sequence=2, terminal=False),
+        _query_lifecycle_observation("completed", sequence=3, terminal=True),
+    ]
+    repeated = deepcopy(observations[-1])
+    repeated["query_job_id"] = "job-query-artifact-resume"
+    observations.append(repeated)
+    return observations
+
+
+def test_real_builder_accepts_immutable_terminal_snapshot_after_artifact_resume() -> None:
+    """A query-only terminal checkpoint can be followed by its artifact-bearing snapshot."""
+    inputs = _acceptance_inputs()
+    inputs["query_lifecycle_observations"] = _query_lifecycle_with_repeated_terminal_snapshot()
+
+    report = build_jarvis_mcp_validation_report(**inputs)
+
+    lifecycle = next(
+        check for check in report.checks if check.check_id == "remote-mcp.jarvis-live-progress"
+    )
+    assertions = lifecycle.evidence[0].metadata["assertions"]
+    assert report.status is ValidationStatus.PASSED
+    assert assertions["lifecycle_prefix_coherent"] is True
+    assert assertions["terminal_success_verified"] is True
+
+
+@pytest.mark.parametrize(
+    ("mutation", "field", "value", "failed_assertion"),
+    [
+        (
+            "cluster",
+            "cluster",
+            "different-cluster",
+            "scheduler_identity_optional_coherent_and_stable",
+        ),
+        ("mode", "mode", "direct", "query_identities_coherent"),
+        ("provider", "scheduler_provider", "pbs", "query_identities_coherent"),
+    ],
+)
+def test_real_builder_anchors_native_execution_identity(
+    mutation: str,
+    field: str,
+    value: str,
+    failed_assertion: str,
+) -> None:
+    """Coordinated native-document drift cannot escape its durable identity."""
+    inputs = _acceptance_inputs()
+    observations = _query_lifecycle_with_repeated_terminal_snapshot()
+    inputs["query_lifecycle_observations"] = observations
+    for observation in observations:
+        for document_name in ("execution_handle", "execution_record"):
+            document = cast(dict[str, Any], observation[document_name])
+            document[field] = value
+        if mutation == "mode":
+            for document_name in ("execution_handle", "execution_record"):
+                document = cast(dict[str, Any], observation[document_name])
+                document["scheduler_provider"] = None
+                document["scheduler_native_id"] = None
+
+    report = build_jarvis_mcp_validation_report(**inputs)
+
+    lifecycle = next(
+        check for check in report.checks if check.check_id == "remote-mcp.jarvis-live-progress"
+    )
+    assertions = lifecycle.evidence[0].metadata["assertions"]
+    assert report.status is ValidationStatus.FAILED
+    assert assertions[failed_assertion] is False
+
+
+@pytest.mark.parametrize(
+    ("mutation", "failed_assertion"),
+    [
+        ("identity", "scheduler_identity_optional_coherent_and_stable"),
+        ("state", "lifecycle_prefix_coherent"),
+        ("result", "lifecycle_prefix_coherent"),
+    ],
+)
+def test_repeated_terminal_snapshot_must_be_immutable(
+    mutation: str,
+    failed_assertion: str,
+) -> None:
+    observations = _query_lifecycle_with_repeated_terminal_snapshot()
+    repeated = observations[-1]
+    record = cast(dict[str, Any], repeated["execution_record"])
+    if mutation == "identity":
+        _set_scheduler_native_id(repeated, "different-job")
+    elif mutation == "state":
+        repeated["state"] = "failed"
+        record["state"] = "failed"
+        record["return_code"] = 1
+        record["error"] = "failed"
+        progress = cast(dict[str, Any], repeated["progress"])
+        progress["execution_state"] = "failed"
+    else:
+        record["return_code"] = 1
+
+    evidence, passed, _resource = jarvis_validation._jarvis_query_lifecycle_progress_evidence(
+        observations=observations,
+        pipeline_id="acceptance",
+        execution_id="jarvis-execution-acceptance",
+    )
+
+    assert passed is False
+    assert evidence["assertions"][failed_assertion] is False
+
+
+def test_query_lifecycle_rejects_running_to_submitted_regression() -> None:
+    observations = [
+        _query_lifecycle_observation("submitted", sequence=1, terminal=False),
+        _query_lifecycle_observation("running", sequence=2, terminal=False),
+        _query_lifecycle_observation("submitted", sequence=3, terminal=False),
+    ]
+
+    evidence, passed, _resource = jarvis_validation._jarvis_query_lifecycle_progress_evidence(
+        observations=observations,
+        pipeline_id="acceptance",
+        execution_id="jarvis-execution-acceptance",
+    )
+
+    assert passed is False
+    assert evidence["assertions"]["lifecycle_prefix_coherent"] is False
+
+
+def test_compaction_persists_lifecycle_regression_beyond_observation_bound() -> None:
+    """Sampling cannot erase a transition violation observed days earlier."""
+    observations: list[dict[str, Any]] = []
+    for sequence in range(1, 521):
+        if sequence == 1 or sequence == 3:
+            state, terminal = "submitted", False
+        elif sequence == 520:
+            state, terminal = "completed", True
+        else:
+            state, terminal = "running", False
+        relay_cli._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            observations,
+            _query_lifecycle_observation(state, sequence=sequence, terminal=terminal),
+        )
+
+    evidence, passed, _resource = jarvis_validation._jarvis_query_lifecycle_progress_evidence(
+        observations=observations,
+        pipeline_id="acceptance",
+        execution_id="jarvis-execution-acceptance",
+    )
+
+    assert len(observations) <= 512
+    assert any("relay_query_integrity" in observation for observation in observations)
+    assert passed is False
+    assert evidence["assertions"]["lifecycle_prefix_coherent"] is False
+    assert evidence["query_integrity_violations"] == [
+        {
+            "schema_version": "clio-relay.jarvis-query-integrity.v1",
+            "valid": False,
+            "reason": "state_regression",
+            "previous_state": "running",
+            "current_state": "submitted",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        ("identity", "scheduler_cluster_changed"),
+        ("scheduler", "scheduler_native_id_changed"),
+        ("progress", "package_progress_regressed"),
+        ("progress_execution", "package_progress_invalid"),
+        ("return_code", "nonterminal_result_present"),
+        ("error", "nonterminal_result_present"),
+        ("query_id", "query_identity_changed"),
+        ("marker", "integrity_marker_invalid"),
+        ("gap_marker", "verified_gap_invalid"),
+    ],
+)
+def test_compaction_persists_every_query_integrity_violation(
+    mutation: str,
+    reason: str,
+) -> None:
+    """Identity and progress corruption cannot vanish from a multi-day sampled run."""
+    observations: list[dict[str, Any]] = []
+    for sequence in range(1, 521):
+        state = "submitted" if sequence == 1 else "running"
+        terminal = False
+        if sequence == 520:
+            state, terminal = "completed", True
+        observation = _query_lifecycle_observation(
+            state,
+            sequence=sequence,
+            terminal=terminal,
+        )
+        if sequence == 3 and mutation == "identity":
+            for key in ("execution_handle", "execution_record"):
+                document = cast(dict[str, Any], observation[key])
+                document["cluster"] = "different-cluster"
+        elif sequence == 3 and mutation == "scheduler":
+            _set_scheduler_native_id(observation, "different-job")
+        elif sequence == 3 and mutation == "progress":
+            progress = cast(dict[str, Any], observation["progress"])
+            package = cast(dict[str, Any], cast(list[object], progress["packages"])[0])
+            package["event_count"] = 1
+            _query_progress_latest(observation)["sequence"] = 1
+        elif sequence == 3 and mutation == "progress_execution":
+            _query_progress_latest(observation)["execution_id"] = "different-execution"
+        elif sequence == 3 and mutation == "return_code":
+            record = cast(dict[str, Any], observation["execution_record"])
+            record["return_code"] = 1
+        elif sequence == 3 and mutation == "error":
+            record = cast(dict[str, Any], observation["execution_record"])
+            record["error"] = "oops"
+        elif sequence == 3 and mutation == "query_id":
+            observation["query_job_id"] = ""
+        elif sequence == 3 and mutation == "marker":
+            observation["relay_query_integrity"] = {}
+        elif sequence == 3 and mutation == "gap_marker":
+            observation["relay_query_verified_gap"] = {}
+        relay_cli._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            observations,
+            observation,
+        )
+
+    evidence, passed, _resource = jarvis_validation._jarvis_query_lifecycle_progress_evidence(
+        observations=observations,
+        pipeline_id="acceptance",
+        execution_id="jarvis-execution-acceptance",
+    )
+
+    assert len(observations) <= 512
+    assert passed is False
+    assert evidence["assertions"]["lifecycle_prefix_coherent"] is False
+    violations = cast(list[dict[str, Any]], evidence["query_integrity_violations"])
+    assert len(violations) == 1
+    assert violations[0]["reason"] == reason
+
+
+def test_compaction_preserves_healthy_multi_phase_progress_semantics() -> None:
+    """Verified sampled gaps prevent false adjacency across a discarded short phase."""
+    observations: list[dict[str, Any]] = []
+    for sequence in range(1, 601):
+        state = "submitted" if sequence == 1 else "running"
+        terminal = False
+        if sequence == 600:
+            state, terminal = "completed", True
+        observation = _query_lifecycle_observation(
+            state,
+            sequence=sequence,
+            terminal=terminal,
+        )
+        latest = _query_progress_latest(observation)
+        latest["total"] = 1_000.0
+        if sequence <= 9:
+            latest["label"] = "phase-a"
+            latest["current"] = float(sequence)
+        elif sequence == 10:
+            latest["label"] = "phase-b"
+            latest["current"] = 0.0
+        else:
+            latest["label"] = "phase-a"
+            latest["current"] = float(sequence - 10)
+        relay_cli._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            observations,
+            observation,
+        )
+
+    observations = relay_cli._merge_jarvis_execution_query_observations(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        observations,
+        [],
+    )
+
+    evidence, passed, resource = jarvis_validation._jarvis_query_lifecycle_progress_evidence(
+        observations=observations,
+        pipeline_id="acceptance",
+        execution_id="jarvis-execution-acceptance",
+    )
+
+    assert len(observations) <= 512
+    assert passed is True
+    assert resource is not None
+    assert evidence["verified_gap_count"] > 0
+    assert evidence["invalid_verified_gaps"] == []
+    assert evidence["query_integrity_violations"] == []
+    assert evidence["assertions"]["package_progress_nonregressing"] is True
 
 
 @pytest.mark.parametrize("mutation", ["removed_after_assignment", "changed_after_assignment"])
@@ -678,7 +1308,7 @@ def _change_terminal_handle_scheduler_identity(
         ),
         (
             _set_terminal_return_code_failure,
-            "lifecycle_monotonic_and_completed",
+            "terminal_success_verified",
         ),
         (
             _regress_terminal_progress_sequence,
@@ -1221,6 +1851,36 @@ def _execution_query_mcp_result(
     }
 
 
+def _make_progress_only_execution_query(
+    inputs: dict[str, Any],
+    *,
+    state: str,
+    terminal: bool,
+) -> None:
+    """Replace terminal artifact-query evidence with one exact progress-only query."""
+    status = cast(dict[str, Any], inputs["query_call_status"])
+    job = cast(dict[str, Any], status["job"])
+    spec = cast(dict[str, Any], job["spec"])
+    arguments = cast(dict[str, Any], spec["arguments"])
+    arguments.pop("artifacts")
+    result = cast(dict[str, Any], inputs["query_mcp_result"])
+    structured = cast(dict[str, Any], result["structured_result"])
+    structured["artifact_page"] = None
+    record = cast(dict[str, Any], structured["execution_record"])
+    record["state"] = state
+    record["terminal"] = terminal
+    record["return_code"] = 0 if terminal else None
+    record["error"] = None
+    progress = cast(dict[str, Any], structured["progress"])
+    progress["execution_state"] = state
+    progress["terminal"] = terminal
+    validation = cast(dict[str, Any], result["result_validation"])
+    validation["artifacts_requested"] = False
+    validation["artifact_filters"] = {}
+    validation["returned_artifact_count"] = 0
+    validation["next_cursor_present"] = False
+
+
 def _native_execution_documents(execution_id: str) -> dict[str, object]:
     return {
         "execution_handle": {
@@ -1248,7 +1908,17 @@ def _native_execution_documents(execution_id: str) -> dict[str, object]:
             "error": None,
             "created_at": "2026-07-11T10:00:00Z",
             "updated_at": "2026-07-11T10:00:02Z",
-            "metadata": {},
+            "metadata": {
+                "submission": {
+                    "schema_version": "jarvis.scheduler.submission.v1",
+                    "execution_id": execution_id,
+                    "provider": "slurm",
+                    "scheduler_job_id": "12345",
+                    "scheduler_cluster": "linux",
+                    "submitted": True,
+                    "identity_source": "scheduler_submit_api",
+                }
+            },
         },
         "progress": {
             "schema_version": "jarvis.execution.progress.v1",
@@ -1320,6 +1990,12 @@ def _set_scheduler_native_id(observation: dict[str, Any], native_id: str | None)
     for key in ("execution_handle", "execution_record"):
         document = cast(dict[str, Any], observation[key])
         document["scheduler_native_id"] = native_id
+
+
+def _set_scheduler_cluster(observation: dict[str, Any], cluster: str | None) -> None:
+    for key in ("execution_handle", "execution_record"):
+        document = cast(dict[str, Any], observation[key])
+        document["cluster"] = cluster
 
 
 def _query_progress_latest(observation: dict[str, Any]) -> dict[str, Any]:

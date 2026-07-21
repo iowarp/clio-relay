@@ -473,6 +473,8 @@ def _persistent_clio_kit_tool_identity(
             distribution="clio-kit",
             distribution_version=component.distribution_version or "",
             entry_point="clio-kit",
+            tool_directory=expected_identity.tool_directory,
+            tool_bin_directory=expected_identity.tool_bin_directory,
         )
     except ConfigurationError as exc:
         evidence["error"] = str(exc)

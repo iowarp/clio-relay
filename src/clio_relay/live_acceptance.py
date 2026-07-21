@@ -21,7 +21,7 @@ from base64 import b64decode
 from collections.abc import Generator, Iterable
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 from uuid import uuid4
@@ -34,7 +34,7 @@ from clio_relay.browser_gateway import BrowserAttachmentGrant
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.doctor import run_cluster_doctor
-from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.errors import ConfigurationError, ObservationTimeoutError, RelayError
 from clio_relay.identifiers import DurableRecordId, validate_durable_record_id
 from clio_relay.installation import (
     verify_remote_clio_kit_native_execution_component,
@@ -85,9 +85,13 @@ from clio_relay.transport_probe import (
 from clio_relay.validation_report import (
     CleanupEvidence,
     EvidenceReference,
+    LiveValidationReport,
+    ValidationCheck,
     ValidationRecorder,
     ValidationResource,
+    ValidationStatus,
     detect_software_identity,
+    load_validation_report,
     new_live_validation_report,
     redact_sensitive_values,
 )
@@ -111,6 +115,124 @@ MAX_SECURE_RUNTIME_RESPONSE_BYTES = 1024 * 1024
 MAX_SECURE_RUNTIME_SSE_EVENT_BYTES = 256 * 1024
 SECURE_RUNTIME_ACCEPTANCE_SCHEMA = "clio-relay.secure-runtime-acceptance.v1"
 SECURE_RUNTIME_HTTP_EVIDENCE_SCHEMA = "clio-relay.secure-runtime-http-evidence.v1"
+LIVE_ACCEPTANCE_CHECKPOINT_SCHEMA = "clio-relay.live-acceptance-checkpoint.v1"
+LIVE_ACCEPTANCE_CHECKPOINT_RESOURCE_KIND = "live_acceptance_checkpoint"
+LiveAcceptancePendingPhase = Literal[
+    "primary_job_wait",
+    "secure_runtime_metadata",
+    "secure_runtime_query",
+    "secure_runtime_bind",
+    "agent_job_wait",
+    "agent_child_job_wait",
+]
+
+
+class LiveAcceptanceCheckpoint(BaseModel):
+    """Strict, non-expiring selector for resuming one exact live acceptance run."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["clio-relay.live-acceptance-checkpoint.v1"] = (
+        LIVE_ACCEPTANCE_CHECKPOINT_SCHEMA
+    )
+    source_report_id: DurableRecordId
+    cluster: str = Field(min_length=1, max_length=256)
+    scenario: str = Field(min_length=1, max_length=256)
+    run_id: str = Field(min_length=1, max_length=512)
+    phase: LiveAcceptancePendingPhase
+    intent_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    pipeline_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    remote_pipeline_path: str = Field(min_length=1, max_length=4096)
+    primary_job_id: str = Field(min_length=1, max_length=256)
+    primary_idempotency_key: str = Field(min_length=1, max_length=512)
+    agent_prompt: str | None = Field(default=None, max_length=4096)
+    agent_job_id: str | None = Field(default=None, min_length=1, max_length=256)
+    agent_child_job_id: str | None = Field(default=None, min_length=1, max_length=256)
+    pipeline_id: str | None = Field(default=None, min_length=1, max_length=512)
+    execution_id: str | None = Field(default=None, min_length=1, max_length=512)
+    source_job_id: str | None = Field(default=None, min_length=1, max_length=256)
+    source_artifact_id: str | None = Field(default=None, min_length=1, max_length=256)
+    service_instance_id: str | None = Field(default=None, min_length=1, max_length=512)
+    gateway_session_id: str | None = Field(default=None, min_length=1, max_length=256)
+    scheduler_action: Literal["none"] = "none"
+    relay_action: Literal["observe_existing"] = "observe_existing"
+    integrity_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_phase_and_integrity(self) -> LiveAcceptanceCheckpoint:
+        """Reject incomplete selectors and any altered checkpoint field."""
+        if not self.primary_job_id.startswith("job_"):
+            raise ValueError("live acceptance checkpoint primary job id is invalid")
+        expected_idempotency = f"live-test:{self.cluster}:{self.run_id}:jarvis"
+        if self.primary_idempotency_key != expected_idempotency:
+            raise ValueError("live acceptance checkpoint idempotency identity changed")
+        if self.phase in {"secure_runtime_query", "secure_runtime_bind"} and (
+            self.pipeline_id is None or self.execution_id is None
+        ):
+            raise ValueError("secure runtime checkpoint omitted pipeline or execution identity")
+        if self.phase == "secure_runtime_bind" and (
+            self.source_job_id is None
+            or self.source_artifact_id is None
+            or self.service_instance_id is None
+        ):
+            raise ValueError("secure runtime bind checkpoint omitted its exact source identity")
+        if self.phase in {"agent_job_wait", "agent_child_job_wait"} and self.agent_job_id is None:
+            raise ValueError("agent checkpoint omitted its exact relay job identity")
+        if self.phase == "agent_child_job_wait" and self.agent_child_job_id is None:
+            raise ValueError("agent child checkpoint omitted its exact relay job identity")
+        expected_integrity = _live_acceptance_checkpoint_sha256(
+            self.model_dump(mode="json", exclude={"integrity_sha256"})
+        )
+        if self.integrity_sha256 != expected_integrity:
+            raise ValueError("live acceptance checkpoint integrity digest changed")
+        return self
+
+    def retry_selector(self) -> dict[str, object]:
+        """Return the exact non-mutating selector to observe on the next invocation."""
+        selector: dict[str, object] = {
+            "cluster": self.cluster,
+            "run_id": self.run_id,
+            "phase": self.phase,
+            "primary_job_id": self.primary_job_id,
+            "primary_idempotency_key": self.primary_idempotency_key,
+        }
+        for name in (
+            "agent_job_id",
+            "agent_child_job_id",
+            "pipeline_id",
+            "execution_id",
+            "source_job_id",
+            "source_artifact_id",
+            "service_instance_id",
+            "gateway_session_id",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                selector[name] = value
+        return selector
+
+
+class _AcceptanceObservationPending(RelayError):
+    """A bounded observation expired while the durable workload remains nonterminal."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        phase: LiveAcceptancePendingPhase,
+        identifiers: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.phase = phase
+        self.identifiers = dict(identifiers or {})
+
+
+class _LiveAcceptancePending(RelayError):
+    """Internal control result carrying one fully bound resumable checkpoint."""
+
+    def __init__(self, message: str, *, checkpoint: LiveAcceptanceCheckpoint) -> None:
+        super().__init__(message)
+        self.checkpoint = checkpoint
 
 
 class SecureRuntimeEndpointAdapter(BaseModel):
@@ -400,6 +522,397 @@ class LiveAcceptanceOptions:
     validation_scenario: str = "live-test"
     verify_cluster_deployment: bool = False
     report_id: DurableRecordId | None = None
+    resume_report_path: Path | None = None
+
+
+@dataclass
+class _LiveAcceptanceState:
+    """Mutable identities accumulated before a bounded observation can expire."""
+
+    run_id: str
+    intent_sha256: str
+    pipeline_sha256: str
+    remote_pipeline_path: str
+    primary_idempotency_key: str
+    primary_job_id: str | None = None
+    agent_prompt: str | None = None
+    agent_job_id: str | None = None
+    agent_child_job_id: str | None = None
+    pipeline_id: str | None = None
+    execution_id: str | None = None
+    source_job_id: str | None = None
+    source_artifact_id: str | None = None
+    service_instance_id: str | None = None
+    gateway_session_id: str | None = None
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint: LiveAcceptanceCheckpoint) -> _LiveAcceptanceState:
+        """Restore every durable identity without inventing a new run or submission."""
+        return cls(
+            run_id=checkpoint.run_id,
+            intent_sha256=checkpoint.intent_sha256,
+            pipeline_sha256=checkpoint.pipeline_sha256,
+            remote_pipeline_path=checkpoint.remote_pipeline_path,
+            primary_idempotency_key=checkpoint.primary_idempotency_key,
+            primary_job_id=checkpoint.primary_job_id,
+            agent_prompt=checkpoint.agent_prompt,
+            agent_job_id=checkpoint.agent_job_id,
+            agent_child_job_id=checkpoint.agent_child_job_id,
+            pipeline_id=checkpoint.pipeline_id,
+            execution_id=checkpoint.execution_id,
+            source_job_id=checkpoint.source_job_id,
+            source_artifact_id=checkpoint.source_artifact_id,
+            service_instance_id=checkpoint.service_instance_id,
+            gateway_session_id=checkpoint.gateway_session_id,
+        )
+
+
+def _live_acceptance_checkpoint_sha256(value: object) -> str:
+    """Hash one finite checkpoint payload using its canonical wire representation."""
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _live_acceptance_intent_sha256(
+    options: LiveAcceptanceOptions,
+    *,
+    jarvis_yaml: Path,
+    pipeline_sha256: str,
+    monitor_pattern: str | None,
+    progress_pattern: str | None,
+    progress_action_payload: dict[str, object],
+    agent_prompt: str | None,
+    agent_mcp_config: str | None,
+    agent_child_jarvis_yaml: Path | None,
+    require_agent_child_job: bool,
+    verify_transport: bool,
+    verify_direct_transport: bool,
+    allow_direct_transport_fallback: bool,
+) -> str:
+    """Bind a checkpoint to every semantic input while allowing a new wait window."""
+    child_sha256 = (
+        hashlib.sha256(agent_child_jarvis_yaml.read_bytes()).hexdigest()
+        if agent_child_jarvis_yaml is not None
+        else None
+    )
+    intent = {
+        "cluster": options.cluster,
+        "definition": options.definition.model_dump(mode="json"),
+        "jarvis_yaml": str(jarvis_yaml.resolve()),
+        "pipeline_sha256": pipeline_sha256,
+        "monitor_pattern": monitor_pattern,
+        "progress_pattern": progress_pattern,
+        "progress_action_payload": progress_action_payload,
+        "agent_prompt": agent_prompt,
+        "agent_mcp_config": agent_mcp_config,
+        "agent_child_jarvis_yaml": (
+            str(agent_child_jarvis_yaml.resolve()) if agent_child_jarvis_yaml is not None else None
+        ),
+        "agent_child_jarvis_sha256": child_sha256,
+        "require_agent_child_job": require_agent_child_job,
+        "verify_transport": verify_transport,
+        "verify_direct_transport": verify_direct_transport,
+        "verify_ssh_transport": options.verify_ssh_transport,
+        "allow_direct_transport_fallback": allow_direct_transport_fallback,
+        "transport_local_bind_port": options.transport_local_bind_port,
+        "transport_remote_api_port": options.transport_remote_api_port,
+        "transport_proxy_name": options.transport_proxy_name,
+        "ssh_transport_local_bind_port": options.ssh_transport_local_bind_port,
+        "ssh_transport_remote_api_port": options.ssh_transport_remote_api_port,
+        "ssh_transport_session_id": options.ssh_transport_session_id,
+        "require_structured_runtime_metadata": options.require_structured_runtime_metadata,
+        "validation_scenario": options.validation_scenario,
+        "verify_cluster_deployment": options.verify_cluster_deployment,
+    }
+    return _live_acceptance_checkpoint_sha256(intent)
+
+
+def _current_live_acceptance_intent(
+    options: LiveAcceptanceOptions,
+) -> tuple[str, str]:
+    """Resolve and hash all local resume inputs without performing remote work."""
+    jarvis_yaml = options.jarvis_yaml or _configured_path(options.definition.live_test.jarvis_yaml)
+    if jarvis_yaml is None or not jarvis_yaml.exists():
+        raise ConfigurationError("resume report requires the original live-test JARVIS YAML")
+    source_pipeline = jarvis_yaml.read_text(encoding="utf-8")
+    pipeline_sha256 = hashlib.sha256(source_pipeline.encode("utf-8")).hexdigest()
+    monitor_pattern = options.monitor_pattern or options.definition.live_test.monitor_pattern
+    progress_pattern = options.progress_pattern or options.definition.live_test.progress_pattern
+    progress_action_payload = (
+        options.progress_action_payload
+        if options.progress_action_payload
+        else options.definition.live_test.progress_action_payload
+    )
+    agent_prompt = options.agent_prompt or options.definition.live_test.agent_prompt
+    child_yaml = options.agent_child_jarvis_yaml or _configured_path(
+        options.definition.live_test.agent_child_jarvis_yaml
+    )
+    agent_mcp_config = options.agent_mcp_config or options.definition.live_test.agent_mcp_config
+    require_agent_child_job = (
+        agent_mcp_config is not None
+        if options.require_agent_child_job is None
+        else options.require_agent_child_job
+    )
+    verify_transport = (
+        options.definition.live_test.verify_transport
+        if options.verify_transport is None
+        else options.verify_transport
+    )
+    verify_direct = (
+        options.definition.live_test.verify_direct_transport
+        if options.verify_direct_transport is None
+        else options.verify_direct_transport
+    )
+    allow_direct_fallback = (
+        options.definition.live_test.allow_direct_transport_fallback
+        if options.allow_direct_transport_fallback is None
+        else options.allow_direct_transport_fallback
+    )
+    return pipeline_sha256, _live_acceptance_intent_sha256(
+        options,
+        jarvis_yaml=jarvis_yaml,
+        pipeline_sha256=pipeline_sha256,
+        monitor_pattern=monitor_pattern,
+        progress_pattern=progress_pattern,
+        progress_action_payload=progress_action_payload,
+        agent_prompt=agent_prompt,
+        agent_mcp_config=agent_mcp_config,
+        agent_child_jarvis_yaml=child_yaml,
+        require_agent_child_job=require_agent_child_job,
+        verify_transport=verify_transport,
+        verify_direct_transport=verify_direct,
+        allow_direct_transport_fallback=allow_direct_fallback,
+    )
+
+
+def _load_live_acceptance_resume(
+    options: LiveAcceptanceOptions,
+) -> tuple[LiveValidationReport, LiveAcceptanceCheckpoint]:
+    """Validate one pending checkpoint completely before any remote command executes."""
+    assert options.resume_report_path is not None
+    report = load_validation_report(options.resume_report_path)
+    if report.status is not ValidationStatus.PENDING:
+        raise ConfigurationError("--resume-report must contain a pending live-test report")
+    if report.cluster != options.cluster or report.scenario != options.validation_scenario:
+        raise ConfigurationError("resume report cluster or scenario changed")
+    checkpoint_resources = [
+        resource
+        for resource in report.resources
+        if resource.kind == LIVE_ACCEPTANCE_CHECKPOINT_RESOURCE_KIND
+        and resource.role == "resume_checkpoint"
+    ]
+    if len(checkpoint_resources) != 1:
+        raise ConfigurationError("resume report must contain exactly one live-test checkpoint")
+    resource = checkpoint_resources[0]
+    raw_checkpoint = resource.metadata.get("checkpoint")
+    try:
+        checkpoint = LiveAcceptanceCheckpoint.model_validate(raw_checkpoint)
+    except ValueError as exc:
+        raise ConfigurationError(f"live-test resume checkpoint is invalid: {exc}") from exc
+    if (
+        checkpoint.source_report_id != report.report_id
+        or checkpoint.cluster != report.cluster
+        or checkpoint.scenario != report.scenario
+        or resource.resource_id != checkpoint.run_id
+        or resource.cluster != checkpoint.cluster
+        or resource.state != ValidationStatus.PENDING.value
+        or resource.metadata.get("retry_selector") != checkpoint.retry_selector()
+        or resource.metadata.get("scheduler_action") != "none"
+        or resource.metadata.get("relay_action") != "observe_existing"
+    ):
+        raise ConfigurationError("live-test resume checkpoint disagrees with its report evidence")
+    pipeline_sha256, intent_sha256 = _current_live_acceptance_intent(options)
+    if checkpoint.pipeline_sha256 != pipeline_sha256 or checkpoint.intent_sha256 != intent_sha256:
+        raise ConfigurationError("live-test resume inputs changed from the pending checkpoint")
+    primary_resources = [
+        item
+        for item in report.resources
+        if item.kind == "relay_job"
+        and item.resource_id == checkpoint.primary_job_id
+        and item.cluster == checkpoint.cluster
+    ]
+    if len(primary_resources) != 1:
+        raise ConfigurationError("resume report omitted its exact primary relay job evidence")
+    primary = primary_resources[0]
+    if (
+        primary.metadata.get("idempotency_key") != checkpoint.primary_idempotency_key
+        or primary.metadata.get("retained") is not True
+        or primary.metadata.get("scheduler_cancel_requested") is not False
+    ):
+        raise ConfigurationError("resume report primary relay job evidence was altered")
+    matching_checks = [
+        check
+        for check in report.checks
+        if check.check_id == "live-test.observation"
+        and check.status is ValidationStatus.PENDING
+        and any(
+            evidence.metadata.get("retry_selector") == checkpoint.retry_selector()
+            for evidence in check.evidence
+        )
+    ]
+    if len(matching_checks) != 1:
+        raise ConfigurationError("resume report omitted its exact pending observation evidence")
+    if report.cleanup.cancel_scheduler_jobs:
+        raise ConfigurationError("pending live-test report unexpectedly requested job cancellation")
+    return report, checkpoint
+
+
+def _resumed_live_acceptance_report(
+    source: LiveValidationReport,
+    *,
+    report_id: DurableRecordId | None,
+) -> LiveValidationReport:
+    """Create a sibling observation report while preserving the original checkpoint."""
+    return source.model_copy(
+        deep=True,
+        update={
+            "report_id": report_id or f"validation_{uuid4().hex}",
+            "started_at": datetime.now(UTC),
+            "completed_at": None,
+            "status": ValidationStatus.FAILED,
+            "error": None,
+            "checks": [check for check in source.checks if check.status is ValidationStatus.PASSED],
+            "resources": [
+                resource
+                for resource in source.resources
+                if resource.kind != LIVE_ACCEPTANCE_CHECKPOINT_RESOURCE_KIND
+            ],
+        },
+    )
+
+
+def _live_acceptance_pending(
+    options: LiveAcceptanceOptions,
+    *,
+    state: _LiveAcceptanceState,
+    recorder: ValidationRecorder | None,
+    pending: _AcceptanceObservationPending,
+) -> _LiveAcceptancePending:
+    """Bind a bounded observation to the exact durable acceptance identities."""
+    if recorder is None or state.primary_job_id is None:
+        raise ConfigurationError("pending live acceptance omitted durable report or job identity")
+    for name, value in pending.identifiers.items():
+        if not hasattr(state, name):
+            raise RelayError(f"pending live acceptance used an unknown identity: {name}")
+        prior = getattr(state, name)
+        if prior is not None and prior != value:
+            raise RelayError(f"pending live acceptance changed its {name}")
+        setattr(state, name, value)
+    payload: dict[str, object] = {
+        "schema_version": LIVE_ACCEPTANCE_CHECKPOINT_SCHEMA,
+        "source_report_id": recorder.report.report_id,
+        "cluster": options.cluster,
+        "scenario": options.validation_scenario,
+        "run_id": state.run_id,
+        "phase": pending.phase,
+        "intent_sha256": state.intent_sha256,
+        "pipeline_sha256": state.pipeline_sha256,
+        "remote_pipeline_path": state.remote_pipeline_path,
+        "primary_job_id": state.primary_job_id,
+        "primary_idempotency_key": state.primary_idempotency_key,
+        "agent_prompt": state.agent_prompt,
+        "agent_job_id": state.agent_job_id,
+        "agent_child_job_id": state.agent_child_job_id,
+        "pipeline_id": state.pipeline_id,
+        "execution_id": state.execution_id,
+        "source_job_id": state.source_job_id,
+        "source_artifact_id": state.source_artifact_id,
+        "service_instance_id": state.service_instance_id,
+        "gateway_session_id": state.gateway_session_id,
+        "scheduler_action": "none",
+        "relay_action": "observe_existing",
+    }
+    payload["integrity_sha256"] = _live_acceptance_checkpoint_sha256(payload)
+    checkpoint = LiveAcceptanceCheckpoint.model_validate(payload)
+    return _LiveAcceptancePending(str(pending), checkpoint=checkpoint)
+
+
+def _record_live_acceptance_pending(
+    recorder: ValidationRecorder,
+    pending: _LiveAcceptancePending,
+) -> None:
+    """Persist a nonterminal observation without manufacturing failure or cleanup."""
+    checkpoint = pending.checkpoint
+    recorder.report.checks = [
+        check
+        for check in recorder.report.checks
+        if not (
+            check.status is ValidationStatus.FAILED
+            and check.error is not None
+            and str(pending) in check.error
+        )
+    ]
+    now = datetime.now(UTC)
+    retry_selector = checkpoint.retry_selector()
+    recorder.report.checks.append(
+        ValidationCheck(
+            check_id="live-test.observation",
+            summary="bounded live acceptance observation remains resumable",
+            status=ValidationStatus.PENDING,
+            started_at=now,
+            completed_at=now,
+            evidence=[
+                EvidenceReference(
+                    kind="live_acceptance_resume_selector",
+                    reference=(f"relay-job://{checkpoint.cluster}/{checkpoint.primary_job_id}"),
+                    excerpt=str(pending),
+                    metadata={
+                        "retry_selector": retry_selector,
+                        "scheduler_action": "none",
+                        "relay_action": "observe_existing",
+                        "checkpoint_has_ttl": False,
+                    },
+                )
+            ],
+        )
+    )
+    recorder.report.resources = [
+        resource
+        for resource in recorder.report.resources
+        if resource.kind != LIVE_ACCEPTANCE_CHECKPOINT_RESOURCE_KIND
+    ]
+    recorder.add_resource(
+        ValidationResource(
+            kind=LIVE_ACCEPTANCE_CHECKPOINT_RESOURCE_KIND,
+            resource_id=checkpoint.run_id,
+            role="resume_checkpoint",
+            cluster=checkpoint.cluster,
+            state=ValidationStatus.PENDING.value,
+            metadata={
+                "checkpoint": checkpoint.model_dump(mode="json"),
+                "retry_selector": retry_selector,
+                "scheduler_action": "none",
+                "relay_action": "observe_existing",
+                "checkpoint_has_ttl": False,
+            },
+        )
+    )
+    recorder.add_resource(
+        ValidationResource(
+            kind="relay_job",
+            resource_id=checkpoint.primary_job_id,
+            role="primary",
+            cluster=checkpoint.cluster,
+            state="pending",
+            metadata={
+                "idempotency_key": checkpoint.primary_idempotency_key,
+                "retained": True,
+                "scheduler_cancel_requested": False,
+                "resume_phase": checkpoint.phase,
+            },
+        )
+    )
+    recorder.report.status = ValidationStatus.PENDING
+    recorder.report.completed_at = now
+    recorder.report.error = None
+    recorder.report.cleanup.cancel_scheduler_jobs = False
 
 
 def run_live_acceptance(
@@ -409,6 +922,16 @@ def run_live_acceptance(
 ) -> list[str]:
     """Run live checks and persist a report even when acceptance fails."""
     command_runner = runner or _run_command
+    resume_report: LiveValidationReport | None = None
+    resume_checkpoint: LiveAcceptanceCheckpoint | None = None
+    if options.resume_report_path is not None:
+        if options.report_path is None:
+            raise ConfigurationError("resuming live acceptance requires a new report path")
+        if options.report_path.resolve() == options.resume_report_path.resolve():
+            raise ConfigurationError(
+                "--report must differ from --resume-report so the checkpoint is preserved"
+            )
+        resume_report, resume_checkpoint = _load_live_acceptance_resume(options)
     recorder: ValidationRecorder | None = None
     if options.report_path is not None:
         transport_modes: list[str] = []
@@ -428,8 +951,13 @@ def run_live_acceptance(
             transport_modes.append("frp-direct")
         if options.verify_ssh_transport:
             transport_modes.append("ssh-forward")
-        recorder = ValidationRecorder(
-            new_live_validation_report(
+        report = (
+            _resumed_live_acceptance_report(
+                resume_report,
+                report_id=options.report_id,
+            )
+            if resume_report is not None
+            else new_live_validation_report(
                 scenario=options.validation_scenario,
                 cluster=options.cluster,
                 transport_modes=transport_modes,
@@ -439,6 +967,7 @@ def run_live_acceptance(
                 report_id=options.report_id,
             )
         )
+        recorder = ValidationRecorder(report)
         if transport_modes:
             recorder.report.cleanup = CleanupEvidence(
                 requested=True,
@@ -446,7 +975,28 @@ def run_live_acceptance(
                 cancel_scheduler_jobs=False,
             )
     try:
-        lines = _run_live_acceptance(options, runner=command_runner, recorder=recorder)
+        lines = _run_live_acceptance(
+            options,
+            runner=command_runner,
+            recorder=recorder,
+            resume_checkpoint=resume_checkpoint,
+        )
+    except _LiveAcceptancePending as pending:
+        if recorder is None or options.report_path is None:
+            raise ConfigurationError(
+                "a pending live acceptance observation requires a machine-readable report"
+            ) from pending
+        _record_live_acceptance_pending(recorder, pending)
+        recorder.write(options.report_path, options.markdown_report_path)
+        return [
+            "validation.status=pending",
+            f"acceptance.run_id={pending.checkpoint.run_id}",
+            f"acceptance.job_id={pending.checkpoint.primary_job_id}",
+            f"acceptance.pending_phase={pending.checkpoint.phase}",
+            "acceptance.scheduler_action=none",
+            "acceptance.relay_action=observe_existing",
+            f"validation.report={options.report_path.resolve()}",
+        ]
     except BaseException as exc:
         if recorder is not None:
             for evidence_line in transport_evidence_lines_from_error(exc):
@@ -478,6 +1028,7 @@ def _run_live_acceptance(
     *,
     runner: CommandRunner,
     recorder: ValidationRecorder | None,
+    resume_checkpoint: LiveAcceptanceCheckpoint | None = None,
 ) -> list[str]:
     """Execute the acceptance workflow while emitting structured facts."""
     command_runner = runner
@@ -540,15 +1091,47 @@ def _run_live_acceptance(
             token=options.transport_token,
             secret_key=options.transport_secret_key,
         )
-    run_id = _acceptance_run_id(jarvis_yaml)
-    pipeline_yaml_text = jarvis_yaml.read_text(encoding="utf-8")
-    secure_runtime_probe = _secure_runtime_probe_config(pipeline_yaml_text)
+    source_pipeline_yaml = jarvis_yaml.read_text(encoding="utf-8")
+    pipeline_sha256 = hashlib.sha256(source_pipeline_yaml.encode("utf-8")).hexdigest()
+    intent_sha256 = _live_acceptance_intent_sha256(
+        options,
+        jarvis_yaml=jarvis_yaml,
+        pipeline_sha256=pipeline_sha256,
+        monitor_pattern=monitor_pattern,
+        progress_pattern=progress_pattern,
+        progress_action_payload=progress_action_payload,
+        agent_prompt=agent_prompt,
+        agent_mcp_config=agent_mcp_config,
+        agent_child_jarvis_yaml=agent_child_jarvis_yaml,
+        require_agent_child_job=require_agent_child_job,
+        verify_transport=verify_transport,
+        verify_direct_transport=verify_direct_transport,
+        allow_direct_transport_fallback=allow_direct_transport_fallback,
+    )
+    if resume_checkpoint is None:
+        run_id = _acceptance_run_id(jarvis_yaml)
+        remote_yaml = f".local/share/clio-relay/live-tests/{run_id}/pipeline.yaml"
+        state = _LiveAcceptanceState(
+            run_id=run_id,
+            intent_sha256=intent_sha256,
+            pipeline_sha256=pipeline_sha256,
+            remote_pipeline_path=remote_yaml,
+            primary_idempotency_key=f"live-test:{options.cluster}:{run_id}:jarvis",
+            agent_prompt=agent_prompt,
+        )
+    else:
+        state = _LiveAcceptanceState.from_checkpoint(resume_checkpoint)
+        run_id = state.run_id
+        remote_yaml = state.remote_pipeline_path
+        agent_prompt = state.agent_prompt
+    secure_runtime_probe = _secure_runtime_probe_config(source_pipeline_yaml)
     pipeline_yaml_text = _stage_acceptance_files(
         options.definition,
         jarvis_yaml=jarvis_yaml,
-        pipeline_yaml_text=pipeline_yaml_text,
+        pipeline_yaml_text=source_pipeline_yaml,
         run_id=run_id,
         runner=command_runner,
+        write_remote=resume_checkpoint is None,
     )
     expected_progress_adapter = _expected_progress_adapter(pipeline_yaml_text)
     expected_progress_package = _expected_progress_package(pipeline_yaml_text)
@@ -562,9 +1145,13 @@ def _run_live_acceptance(
         lines.append(f"acceptance.package_adapter={expected_progress_adapter}")
         lines.append(f"acceptance.package_owner={expected_progress_package}")
 
-    lines.extend(run_cluster_doctor(options.definition))
-    lines.append("acceptance.cluster_doctor=passed")
-    if options.verify_cluster_deployment:
+    if resume_checkpoint is None:
+        lines.extend(run_cluster_doctor(options.definition))
+        lines.append("acceptance.cluster_doctor=passed")
+    else:
+        lines.append(f"acceptance.resume_run_id={run_id}")
+        lines.append(f"acceptance.resume_phase={resume_checkpoint.phase}")
+    if options.verify_cluster_deployment and resume_checkpoint is None:
         lines.extend(
             _verify_cluster_deployment(
                 options.definition,
@@ -575,7 +1162,7 @@ def _run_live_acceptance(
                 ),
             )
         )
-    if secure_runtime_probe is not None:
+    if secure_runtime_probe is not None and resume_checkpoint is None:
         if recorder is None:
             raise ConfigurationError(
                 "secure runtime acceptance requires a machine-readable report path"
@@ -593,7 +1180,7 @@ def _run_live_acceptance(
                 evidence=evidence,
             )
         lines.append("secure-runtime.control_query_capacity=ready")
-    if verify_transport:
+    if verify_transport and resume_checkpoint is None:
         assert transport_token is not None
         assert transport_secret_key is not None
         lines.extend(
@@ -606,7 +1193,7 @@ def _run_live_acceptance(
                 expected_progress_package=expected_progress_package,
             )
         )
-    if verify_direct_transport:
+    if verify_direct_transport and resume_checkpoint is None:
         assert transport_token is not None
         assert transport_secret_key is not None
         direct_lines = _verify_direct_transport(
@@ -621,17 +1208,17 @@ def _run_live_acceptance(
         if not allow_direct_transport_fallback:
             _assert_direct_xtcp_acceptance(direct_lines)
         lines.extend(direct_lines)
-    if options.verify_ssh_transport:
+    if options.verify_ssh_transport and resume_checkpoint is None:
         lines.extend(_verify_ssh_transport(options, pipeline_yaml=pipeline_yaml_text))
-    remote_yaml = f".local/share/clio-relay/live-tests/{run_id}/pipeline.yaml"
-    _remote_write_file(
-        options.definition.ssh_host,
-        remote_yaml,
-        pipeline_yaml_text.encode("utf-8"),
-        runner=command_runner,
-    )
+    if resume_checkpoint is None:
+        _remote_write_file(
+            options.definition.ssh_host,
+            remote_yaml,
+            pipeline_yaml_text.encode("utf-8"),
+            runner=command_runner,
+        )
     lines.append(f"acceptance.pipeline={remote_yaml}")
-    if agent_child_jarvis_yaml is not None:
+    if agent_child_jarvis_yaml is not None and resume_checkpoint is None:
         agent_prompt = _write_generated_agent_prompt(
             options.definition,
             cluster=options.cluster,
@@ -639,29 +1226,46 @@ def _run_live_acceptance(
             child_yaml=agent_child_jarvis_yaml,
             runner=command_runner,
         )
+        state.agent_prompt = agent_prompt
+        lines.append(f"acceptance.agent_prompt={agent_prompt}")
+    elif agent_prompt is not None:
         lines.append(f"acceptance.agent_prompt={agent_prompt}")
 
-    submit = _remote_clio_json(
-        options.definition,
-        [
-            "job",
-            "submit",
-            "--cluster",
-            options.cluster,
-            "--jarvis-yaml",
-            remote_yaml,
-            "--idempotency-key",
-            f"live-test:{options.cluster}:{run_id}:jarvis",
-        ],
-        runner=command_runner,
-        raw_text=True,
-    )
-    job_id = submit.strip().splitlines()[-1]
-    if not job_id.startswith("job_"):
-        raise RelayError(f"live-test submit did not return a job id: {submit}")
+    if resume_checkpoint is None:
+        submit = _remote_clio_json(
+            options.definition,
+            [
+                "job",
+                "submit",
+                "--cluster",
+                options.cluster,
+                "--jarvis-yaml",
+                remote_yaml,
+                "--idempotency-key",
+                state.primary_idempotency_key,
+            ],
+            runner=command_runner,
+            raw_text=True,
+        )
+        job_id = submit.strip().splitlines()[-1]
+        if not job_id.startswith("job_"):
+            raise RelayError(f"live-test submit did not return a job id: {submit}")
+        state.primary_job_id = job_id
+    else:
+        assert state.primary_job_id is not None
+        job_id = state.primary_job_id
     lines.append(f"acceptance.job_id={job_id}")
 
-    if expected_progress_adapter is not None:
+    resume_phase = resume_checkpoint.phase if resume_checkpoint is not None else None
+    post_primary_phases = {
+        "secure_runtime_metadata",
+        "secure_runtime_query",
+        "secure_runtime_bind",
+        "agent_job_wait",
+        "agent_child_job_wait",
+    }
+
+    if expected_progress_adapter is not None and resume_checkpoint is None:
         _verify_live_package_progress(
             options.definition,
             job_id,
@@ -675,82 +1279,118 @@ def _run_live_acceptance(
 
     secure_runtime_forbidden_values: set[str] = set()
     if secure_runtime_probe is None:
-        _wait_for_success(
-            options.definition,
-            job_id,
-            timeout_seconds=options.timeout_seconds,
-            poll_seconds=options.poll_seconds,
-            runner=command_runner,
-        )
-        lines.append("acceptance.job_state=succeeded")
-        if options.verify_cluster_deployment:
-            lines.append("worker.execute=passed")
+        if resume_phase not in post_primary_phases:
+            try:
+                _wait_for_success(
+                    options.definition,
+                    job_id,
+                    timeout_seconds=options.timeout_seconds,
+                    poll_seconds=options.poll_seconds,
+                    runner=command_runner,
+                    pending_phase="primary_job_wait",
+                )
+            except _AcceptanceObservationPending as pending:
+                raise _live_acceptance_pending(
+                    options,
+                    state=state,
+                    recorder=recorder,
+                    pending=pending,
+                ) from None
+            lines.append("acceptance.job_state=succeeded")
+            if options.verify_cluster_deployment:
+                lines.append("worker.execute=passed")
 
-        _verify_completed_job(
-            options.definition,
-            job_id,
-            line_prefix="acceptance",
-            lines=lines,
-            runner=command_runner,
-            expected_progress_adapter=expected_progress_adapter,
-            expected_progress_package=expected_progress_package,
-            recorder=recorder,
-            require_structured_runtime_metadata=options.require_structured_runtime_metadata,
-        )
-    else:
-        assert recorder is not None
-        with _validation_check(
-            recorder,
-            "secure-runtime.source-live-metadata",
-            "observe trusted runtime metadata while retaining the running source job",
-            forbidden_values=set(),
-        ) as evidence:
-            runtime_metadata = _wait_for_live_structured_runtime_metadata(
+            _verify_completed_job(
                 options.definition,
                 job_id,
                 line_prefix="acceptance",
                 lines=lines,
-                timeout_seconds=options.timeout_seconds,
-                poll_seconds=options.poll_seconds,
                 runner=command_runner,
+                expected_progress_adapter=expected_progress_adapter,
+                expected_progress_package=expected_progress_package,
+                recorder=recorder,
+                require_structured_runtime_metadata=options.require_structured_runtime_metadata,
             )
-            runtime_document = runtime_metadata.document
-            runtime_source = str(runtime_document["source"])
-            evidence.append(
-                EvidenceReference(
-                    kind="relay_job_status",
-                    reference=f"relay-job://{options.cluster}/{job_id}",
-                    metadata={
-                        "state": JobState.RUNNING.value,
-                        "runtime_metadata_source": runtime_source,
-                        "source_job_retained": True,
-                        "cancel_scheduler_job": False,
-                    },
-                )
+    else:
+        assert recorder is not None
+        if resume_phase in {"secure_runtime_query", "secure_runtime_bind"}:
+            assert state.pipeline_id is not None and state.execution_id is not None
+            runtime_document = {
+                "pipeline_id": state.pipeline_id,
+                "execution_id": state.execution_id,
+            }
+        else:
+            try:
+                with _validation_check(
+                    recorder,
+                    "secure-runtime.source-live-metadata",
+                    "observe trusted runtime metadata while retaining the running source job",
+                    forbidden_values=set(),
+                ) as evidence:
+                    runtime_metadata = _wait_for_live_structured_runtime_metadata(
+                        options.definition,
+                        job_id,
+                        line_prefix="acceptance",
+                        lines=lines,
+                        timeout_seconds=options.timeout_seconds,
+                        poll_seconds=options.poll_seconds,
+                        runner=command_runner,
+                    )
+                    runtime_document = runtime_metadata.document
+                    runtime_source = str(runtime_document["source"])
+                    evidence.append(
+                        EvidenceReference(
+                            kind="relay_job_status",
+                            reference=f"relay-job://{options.cluster}/{job_id}",
+                            metadata={
+                                "state": JobState.RUNNING.value,
+                                "runtime_metadata_source": runtime_source,
+                                "source_job_retained": True,
+                                "cancel_scheduler_job": False,
+                            },
+                        )
+                    )
+                    recorder.add_resource(
+                        ValidationResource(
+                            kind="relay_job",
+                            resource_id=job_id,
+                            role="secure_runtime_source",
+                            cluster=options.cluster,
+                            state=JobState.RUNNING.value,
+                            metadata={
+                                "runtime_metadata_source": runtime_source,
+                                "retained": True,
+                                "cancel_scheduler_job": False,
+                            },
+                        )
+                    )
+            except _AcceptanceObservationPending as pending:
+                raise _live_acceptance_pending(
+                    options,
+                    state=state,
+                    recorder=recorder,
+                    pending=pending,
+                ) from None
+            state.pipeline_id = cast(str, runtime_document["pipeline_id"])
+            state.execution_id = cast(str, runtime_document["execution_id"])
+        try:
+            secure_runtime_forbidden_values = _verify_secure_runtime_acceptance(
+                options,
+                config=secure_runtime_probe,
+                runtime_metadata=runtime_document,
+                recorder=recorder,
             )
-            recorder.add_resource(
-                ValidationResource(
-                    kind="relay_job",
-                    resource_id=job_id,
-                    role="secure_runtime_source",
-                    cluster=options.cluster,
-                    state=JobState.RUNNING.value,
-                    metadata={
-                        "runtime_metadata_source": runtime_source,
-                        "retained": True,
-                        "cancel_scheduler_job": False,
-                    },
-                )
-            )
-        secure_runtime_forbidden_values = _verify_secure_runtime_acceptance(
-            options,
-            config=secure_runtime_probe,
-            runtime_metadata=runtime_metadata.document,
-            recorder=recorder,
-        )
+        except _AcceptanceObservationPending as pending:
+            raise _live_acceptance_pending(
+                options,
+                state=state,
+                recorder=recorder,
+                pending=pending,
+            ) from None
         lines.append("secure-runtime.acceptance=ok")
 
-    if monitor_pattern is not None:
+    resuming_agent_phase = resume_phase in {"agent_job_wait", "agent_child_job_wait"}
+    if monitor_pattern is not None and not resuming_agent_phase:
         _remote_clio_json(
             options.definition,
             [
@@ -773,7 +1413,7 @@ def _run_live_acceptance(
             raise RelayError(f"acceptance monitor pattern did not match: {monitor_pattern}")
         lines.append("acceptance.monitor=ok")
 
-    if progress_pattern is not None:
+    if progress_pattern is not None and not resuming_agent_phase:
         _verify_progress_monitor(
             options.definition,
             job_id,
@@ -784,48 +1424,81 @@ def _run_live_acceptance(
         )
 
     if agent_prompt is not None:
-        agent_args = [
-            "agent",
-            "run",
-            "--cluster",
-            options.cluster,
-            "--prompt",
-            agent_prompt,
-            "--idempotency-key",
-            f"live-test:{options.cluster}:{run_id}:agent",
-        ]
-        if agent_mcp_config is not None:
-            agent_args.extend(["--mcp-config", agent_mcp_config])
-        agent_submit = _remote_clio_json(
-            options.definition,
-            agent_args,
-            runner=command_runner,
-            raw_text=True,
-        )
-        agent_job_id = agent_submit.strip().splitlines()[-1]
-        agent_job = _wait_for_success(
-            options.definition,
-            agent_job_id,
-            timeout_seconds=options.timeout_seconds,
-            poll_seconds=options.poll_seconds,
-            runner=command_runner,
-        )
+        if resuming_agent_phase:
+            assert state.agent_job_id is not None
+            agent_job_id = state.agent_job_id
+        else:
+            agent_args = [
+                "agent",
+                "run",
+                "--cluster",
+                options.cluster,
+                "--prompt",
+                agent_prompt,
+                "--idempotency-key",
+                f"live-test:{options.cluster}:{run_id}:agent",
+            ]
+            if agent_mcp_config is not None:
+                agent_args.extend(["--mcp-config", agent_mcp_config])
+            agent_submit = _remote_clio_json(
+                options.definition,
+                agent_args,
+                runner=command_runner,
+                raw_text=True,
+            )
+            agent_job_id = agent_submit.strip().splitlines()[-1]
+            if not agent_job_id.startswith("job_"):
+                raise RelayError(f"live-test agent submit did not return a job id: {agent_submit}")
+            state.agent_job_id = agent_job_id
+        if resume_phase != "agent_child_job_wait":
+            try:
+                agent_job = _wait_for_success(
+                    options.definition,
+                    agent_job_id,
+                    timeout_seconds=options.timeout_seconds,
+                    poll_seconds=options.poll_seconds,
+                    runner=command_runner,
+                    pending_phase="agent_job_wait",
+                )
+            except _AcceptanceObservationPending as pending:
+                raise _live_acceptance_pending(
+                    options,
+                    state=state,
+                    recorder=recorder,
+                    pending=pending,
+                ) from None
+        else:
+            agent_job = {}
         lines.append(f"acceptance.agent_job_id={agent_job_id}")
         lines.append("acceptance.agent_state=succeeded")
         if require_agent_child_job:
-            child_job_id = _find_agent_child_job(
-                options.definition,
-                agent_job_id,
-                agent_created_at=str(agent_job["created_at"]),
-                runner=command_runner,
-            )
-            _wait_for_success(
-                options.definition,
-                child_job_id,
-                timeout_seconds=options.timeout_seconds,
-                poll_seconds=options.poll_seconds,
-                runner=command_runner,
-            )
+            if resume_phase == "agent_child_job_wait":
+                assert state.agent_child_job_id is not None
+                child_job_id = state.agent_child_job_id
+            else:
+                child_job_id = _find_agent_child_job(
+                    options.definition,
+                    agent_job_id,
+                    agent_created_at=str(agent_job["created_at"]),
+                    runner=command_runner,
+                )
+                state.agent_child_job_id = child_job_id
+            try:
+                _wait_for_success(
+                    options.definition,
+                    child_job_id,
+                    timeout_seconds=options.timeout_seconds,
+                    poll_seconds=options.poll_seconds,
+                    runner=command_runner,
+                    pending_phase="agent_child_job_wait",
+                )
+            except _AcceptanceObservationPending as pending:
+                raise _live_acceptance_pending(
+                    options,
+                    state=state,
+                    recorder=recorder,
+                    pending=pending,
+                ) from None
             lines.append(f"acceptance.agent_child_job_id={child_job_id}")
             _verify_completed_job(
                 options.definition,
@@ -840,8 +1513,10 @@ def _run_live_acceptance(
             )
 
     lines.append("live acceptance passed")
-    expected_transport_cleanups = sum(
-        [verify_transport, verify_direct_transport, options.verify_ssh_transport]
+    expected_transport_cleanups = (
+        0
+        if resume_checkpoint is not None
+        else sum([verify_transport, verify_direct_transport, options.verify_ssh_transport])
     )
     observed_transport_cleanups = lines.count("transport.cleanup=passed")
     if observed_transport_cleanups < expected_transport_cleanups:
@@ -1388,30 +2063,51 @@ def _verify_secure_runtime_acceptance(
             while True:
                 remaining = query_deadline - time.monotonic()
                 if remaining <= 0:
-                    raise RelayError(
+                    raise _AcceptanceObservationPending(
                         "timed out waiting for one ready JARVIS service runtime binding: "
-                        f"{execution_id}"
+                        f"{execution_id}",
+                        phase="secure_runtime_query",
+                        identifiers={
+                            "pipeline_id": pipeline_id,
+                            "execution_id": execution_id,
+                        },
                     )
                 query_attempt += 1
-                query_session = run_packaged_mcp_stdio_session(
-                    profile="user",
-                    tool="jarvis_get_execution",
-                    arguments={
-                        "cluster": options.cluster,
-                        "pipeline_id": pipeline_id,
-                        "execution_id": execution_id,
-                        "include_service_runtimes": True,
-                        "wait_for_terminal": True,
-                        "wait_timeout_seconds": remaining,
-                        "poll_seconds": options.poll_seconds,
-                    },
-                    timeout_seconds=remaining + 30.0,
-                    require_enforceable_containment=True,
-                )
+                try:
+                    query_session = run_packaged_mcp_stdio_session(
+                        profile="user",
+                        tool="jarvis_get_execution",
+                        arguments={
+                            "cluster": options.cluster,
+                            "pipeline_id": pipeline_id,
+                            "execution_id": execution_id,
+                            "include_service_runtimes": True,
+                            "wait_for_terminal": True,
+                            "wait_timeout_seconds": remaining,
+                            "poll_seconds": options.poll_seconds,
+                        },
+                        timeout_seconds=remaining + 30.0,
+                        require_enforceable_containment=True,
+                    )
+                except (ObservationTimeoutError, TimeoutError):
+                    raise _AcceptanceObservationPending(
+                        "timed out observing one ready JARVIS service runtime binding: "
+                        f"{execution_id}",
+                        phase="secure_runtime_query",
+                        identifiers={
+                            "pipeline_id": pipeline_id,
+                            "execution_id": execution_id,
+                        },
+                    ) from None
                 if time.monotonic() >= query_deadline:
-                    raise RelayError(
+                    raise _AcceptanceObservationPending(
                         "timed out waiting for one ready JARVIS service runtime binding: "
-                        f"{execution_id}"
+                        f"{execution_id}",
+                        phase="secure_runtime_query",
+                        identifiers={
+                            "pipeline_id": pipeline_id,
+                            "execution_id": execution_id,
+                        },
                     )
                 query_result = _packaged_mcp_structured_result(
                     query_session,
@@ -1453,9 +2149,14 @@ def _verify_secure_runtime_acceptance(
                 )
                 remaining = query_deadline - time.monotonic()
                 if remaining <= 0:
-                    raise RelayError(
+                    raise _AcceptanceObservationPending(
                         "timed out waiting for one ready JARVIS service runtime binding: "
-                        f"{execution_id}"
+                        f"{execution_id}",
+                        phase="secure_runtime_query",
+                        identifiers={
+                            "pipeline_id": pipeline_id,
+                            "execution_id": execution_id,
+                        },
                     )
                 time.sleep(min(options.poll_seconds, remaining))
 
@@ -1527,18 +2228,31 @@ def _verify_secure_runtime_acceptance(
                 "resolve exact private authority and bind authenticated relay connectors",
                 forbidden_values=forbidden_values,
             ) as evidence:
-                bind_session = run_packaged_mcp_stdio_session(
-                    profile="user",
-                    tool="relay_bind_jarvis_runtime",
-                    arguments={
-                        "binding": handoff.model_dump(mode="json"),
-                        "readiness_timeout_seconds": options.timeout_seconds,
-                        "poll_seconds": options.poll_seconds,
-                    },
-                    timeout_seconds=options.timeout_seconds + 30.0,
-                    extra_environment=runtime_child_environment,
-                    require_enforceable_containment=True,
-                )
+                try:
+                    bind_session = run_packaged_mcp_stdio_session(
+                        profile="user",
+                        tool="relay_bind_jarvis_runtime",
+                        arguments={
+                            "binding": handoff.model_dump(mode="json"),
+                            "readiness_timeout_seconds": options.timeout_seconds,
+                            "poll_seconds": options.poll_seconds,
+                        },
+                        timeout_seconds=options.timeout_seconds + 30.0,
+                        extra_environment=runtime_child_environment,
+                        require_enforceable_containment=True,
+                    )
+                except (ObservationTimeoutError, TimeoutError):
+                    raise _AcceptanceObservationPending(
+                        "timed out observing the exact secure runtime bind",
+                        phase="secure_runtime_bind",
+                        identifiers={
+                            "pipeline_id": pipeline_id,
+                            "execution_id": execution_id,
+                            "source_job_id": handoff.source_job_id,
+                            "source_artifact_id": handoff.source_artifact_id,
+                            "service_instance_id": handoff.service_instance_id,
+                        },
+                    ) from None
                 bind_result = _packaged_mcp_structured_result(
                     bind_session,
                     expected_tool="relay_bind_jarvis_runtime",
@@ -1556,6 +2270,23 @@ def _verify_secure_runtime_acceptance(
                 ):
                     raise RelayError("packaged MCP identity changed between query and bind")
                 public_documents.append(bind_result)
+                if bind_result.get("outcome") == "pending":
+                    gateway_session_id = _validated_secure_runtime_pending_bind(
+                        bind_result,
+                        handoff=handoff,
+                    )
+                    raise _AcceptanceObservationPending(
+                        "secure runtime bind remained pending at the observation boundary",
+                        phase="secure_runtime_bind",
+                        identifiers={
+                            "pipeline_id": pipeline_id,
+                            "execution_id": execution_id,
+                            "source_job_id": handoff.source_job_id,
+                            "source_artifact_id": handoff.source_artifact_id,
+                            "service_instance_id": handoff.service_instance_id,
+                            "gateway_session_id": gateway_session_id,
+                        },
+                    )
                 gateway_session_id = _secure_runtime_cleanup_candidate(
                     bind_result,
                     handoff=handoff,
@@ -2094,7 +2825,12 @@ def _verify_secure_runtime_acceptance(
                         "secure runtime cleanup discovery: "
                         + _redacted_error_text(cleanup_discovery_exc, forbidden_values)
                     )
-        if supervisor is not None and cleanup_session_ids and not teardown_complete:
+        if (
+            supervisor is not None
+            and cleanup_session_ids
+            and not teardown_complete
+            and not isinstance(primary_error, _AcceptanceObservationPending)
+        ):
             cleanup_errors: list[str] = []
             if active_attachment is not None and gateway_session_id is not None:
                 try:
@@ -2474,6 +3210,50 @@ def _gateway_sessions_for_acceptance(
         if next_cursor <= cursor:
             raise RelayError("secure runtime acceptance gateway pagination did not advance")
         cursor = next_cursor
+
+
+def _validated_secure_runtime_pending_bind(
+    bind_result: dict[str, Any],
+    *,
+    handoff: JarvisServiceRuntimeHandoff,
+) -> str:
+    """Validate a durable bind observation without treating it as a ready endpoint."""
+    if (
+        bind_result.get("outcome") != "pending"
+        or bind_result.get("scheduler_cancel_requested") is not False
+        or bind_result.get("scheduler_action") != "none"
+        or bind_result.get("relay_action") != "none"
+    ):
+        raise RelayError("secure runtime pending bind changed its no-action contract")
+    gateway_session_id = _secure_runtime_cleanup_candidate(bind_result, handoff=handoff)
+    gateway = cast(dict[str, Any], bind_result["gateway_session"])
+    if gateway.get("state") not in {"created", "pending", "allocated", "starting", "degraded"}:
+        raise RelayError("secure runtime pending bind reported an invalid gateway state")
+    retry_selector = bind_result.get("retry_selector")
+    if not isinstance(retry_selector, dict):
+        raise RelayError("secure runtime pending bind omitted its retry selector")
+    typed_selector = cast(dict[str, object], retry_selector)
+    if (
+        typed_selector.get("cluster") != handoff.cluster
+        or typed_selector.get("gateway_session_id") != gateway_session_id
+    ):
+        raise RelayError("secure runtime pending bind changed its retry identity")
+    for key in (
+        "connect_url",
+        "health_url",
+        "stream_url",
+        "events_url",
+        "state_url",
+        "command_url",
+    ):
+        if bind_result.get(key) is not None:
+            raise RelayError(f"secure runtime pending bind exposed unverified {key}")
+    _assert_secret_free_document(
+        bind_result,
+        forbidden_values=set(),
+        label="secure runtime pending bind",
+    )
+    return gateway_session_id
 
 
 def _validated_secure_runtime_bind(
@@ -3500,8 +4280,12 @@ def _wait_for_live_structured_runtime_metadata(
                 if job.state is not JobState.RUNNING:
                     if time.monotonic() >= deadline:
                         lines.append(f"{line_prefix}.job_state={job.state.value}")
-                        raise RelayError(
-                            f"timed out waiting for the secure runtime source job to run: {job_id}"
+                        raise _AcceptanceObservationPending(
+                            "timed out waiting for the secure runtime source job to run; "
+                            "the bounded observation expired while the retained job remained "
+                            f"{job.state.value}: {job_id}",
+                            phase="secure_runtime_metadata",
+                            identifiers={"primary_job_id": job_id},
                         )
                     time.sleep(poll_seconds)
                     continue
@@ -3518,9 +4302,11 @@ def _wait_for_live_structured_runtime_metadata(
 
         if time.monotonic() >= deadline:
             lines.append(f"{line_prefix}.job_state={job.state.value}")
-            raise RelayError(
-                "timed out waiting for structured runtime metadata from secure runtime "
-                f"source job: {job_id}"
+            raise _AcceptanceObservationPending(
+                "timed out waiting for structured runtime metadata from secure runtime source "
+                f"job; the bounded observation expired without changing the workload: {job_id}",
+                phase="secure_runtime_metadata",
+                identifiers={"primary_job_id": job_id},
             )
         time.sleep(poll_seconds)
 
@@ -3532,6 +4318,11 @@ def _wait_for_success(
     timeout_seconds: float,
     poll_seconds: float,
     runner: CommandRunner,
+    pending_phase: Literal[
+        "primary_job_wait",
+        "agent_job_wait",
+        "agent_child_job_wait",
+    ] = "primary_job_wait",
 ) -> dict[str, Any]:
     job = _remote_clio_json(
         definition,
@@ -3546,10 +4337,30 @@ def _wait_for_success(
         ],
         runner=runner,
     )
+    if not isinstance(job, dict):
+        raise RelayError("acceptance job wait did not return a JSON object")
     typed = cast(dict[str, Any], job)
-    if typed["state"] != "succeeded":
-        raise RelayError(f"acceptance job did not succeed: {typed['state']}")
-    return typed
+    observed_job_id = typed.get("job_id")
+    state = typed.get("state")
+    if observed_job_id != job_id or not isinstance(state, str):
+        raise RelayError("acceptance job wait changed or omitted its durable identity")
+    if state == "succeeded":
+        return typed
+    if state in {"failed", "canceled"}:
+        raise RelayError(f"acceptance job did not succeed: {state}")
+    raise _AcceptanceObservationPending(
+        f"bounded observation expired while acceptance job remained {state}: {job_id}",
+        phase=pending_phase,
+        identifiers={
+            (
+                "primary_job_id"
+                if pending_phase == "primary_job_wait"
+                else "agent_job_id"
+                if pending_phase == "agent_job_wait"
+                else "agent_child_job_id"
+            ): job_id
+        },
+    )
 
 
 def _verify_live_package_progress(
@@ -4256,6 +5067,7 @@ def _stage_acceptance_files(
     pipeline_yaml_text: str,
     run_id: str,
     runner: CommandRunner,
+    write_remote: bool = True,
 ) -> str:
     loaded = cast(object, yaml.safe_load(pipeline_yaml_text))
     if not isinstance(loaded, dict):
@@ -4286,12 +5098,13 @@ def _stage_acceptance_files(
         if not local_path.exists():
             raise ConfigurationError(f"staged acceptance file does not exist: {local_path}")
         remote_path = remote_path_value.format(run_id=run_id)
-        _remote_write_file(
-            definition.ssh_host,
-            remote_path,
-            local_path.read_bytes(),
-            runner=runner,
-        )
+        if write_remote:
+            _remote_write_file(
+                definition.ssh_host,
+                remote_path,
+                local_path.read_bytes(),
+                runner=runner,
+            )
     formatted_document = _format_run_id(document, run_id)
     return yaml.safe_dump(formatted_document, sort_keys=False)
 

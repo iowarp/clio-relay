@@ -667,6 +667,16 @@ adapters, stdout scraping, and `clio-kit.jarvis-package-progress.v1`
 notifications remain legacy compatibility paths and are invalid as 1.0
 acceptance evidence.
 
+`--wait-timeout-seconds` bounds one validation observation window; it is not a
+workload deadline. If the exact execution is still queued or running, or its
+terminal artifact page is not observable yet, the command writes a `pending`
+report containing a query-only resume checkpoint. Resume it with
+`jarvis-mcp-validate --cluster <cluster> --resume-report <report.json>` after any
+delay. Resume never calls `jarvis_run`, cancels the scheduler job, or creates a
+replacement execution. A pending report is useful operational evidence but
+cannot satisfy the release gate until the same execution reaches a validated
+terminal result with its requested artifacts.
+
 Cluster bootstrap stores the exact clio-kit wheel path, digest, persistent-tool
 environment, and JARVIS MCP command in the installation receipt. The worker
 service reads that receipt and invokes the installed executable directly; it
@@ -865,6 +875,14 @@ connector and desktop visitor and persists an
 immutable `clio-relay.jarvis-service-runtime-binding.v2` provenance record in the
 gateway session. The result returns the gateway session plus `connect_url`,
 `health_url`, `stream_url`, `events_url`, `state_url`, and `command_url`.
+Those URLs are strings only when `outcome` is `ready`. A connector or health
+observation miss returns a normal `outcome: "pending"` result with all six URLs
+null, `scheduler_action` and `relay_action` both `none`, and an exact
+`retry_selector`. Repeat `relay_bind_jarvis_runtime` with the same binding, name,
+and transport policy to resume the deterministic gateway; observation timeout
+never authorizes a second connector, scheduler submission, cancellation, or
+gateway. Immutable policy drift is rejected before mutation. The CLI
+`gateway attach-runtime` command preserves the same pending outcome and selector.
 
 Detach stops only the owned desktop connector. Stop removes the owned relay
 connectors while retaining the JARVIS scheduler job by default. An explicit
@@ -1163,5 +1181,27 @@ clio-relay live-test --cluster my-cluster --jarvis-yaml .\path\to\site-acceptanc
 ```
 
 A complete live acceptance should verify the cluster bootstrap, worker service, transport, JARVIS package execution, logs, artifacts, provenance, progress, and agent tool submission path.
+
+`--timeout-seconds` bounds one observation, not the lifetime of an HPC job. If
+the primary relay job remains queued or running, live JARVIS metadata is not yet
+available, or a secure-runtime query/bind remains nonterminal, `live-test`
+writes a `pending` report. Its strict checkpoint records the exact cluster,
+run id, relay job, idempotency key, phase, and any known pipeline, execution,
+source-artifact, service, or gateway identities. It has no TTL and requests no
+scheduler or relay cancellation.
+
+Resume that exact observation after any delay while passing the same semantic
+inputs:
+
+```powershell
+clio-relay live-test --cluster my-cluster --jarvis-yaml .\path\to\site-acceptance.yaml --resume-report .clio-relay\validation-reports\pending-live-test.json --timeout-seconds 900
+```
+
+The resume writes a new sibling report and preserves the source checkpoint. It
+queries the recorded phase/job in place; it does not submit another primary
+JARVIS run. Changed cluster configuration, pipeline content, validation intent,
+or checkpoint evidence is rejected before any remote command. A deterministic
+failed/canceled workload or malformed/integrity-invalid runtime result remains
+a failed validation. The release gate continues to reject `pending` reports.
 
 When a package adapter or runtime metadata artifact is present, the text and machine-readable reports also record `application_boundary`, `application_profile`, `package_adapter`, `package_owner`, `runtime_metadata_source`, `runtime_scheduler_provider`, `runtime_scheduler_job_id`, its field-level source, and the runtime artifact id. `structured_runtime_metadata=legacy_fallback` is evidence of a compatibility path, not proof that structured runtime ingestion passed the 1.0 gate.

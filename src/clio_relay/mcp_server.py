@@ -129,7 +129,10 @@ from clio_relay.remote_mcp import (
     unavailable_virtual_remote_mcp_catalog,
 )
 from clio_relay.retention import TerminalRetentionCoordinator
-from clio_relay.service_runtime import ServiceRuntimeSupervisor
+from clio_relay.service_runtime import (
+    ServiceRuntimePendingResult,
+    ServiceRuntimeSupervisor,
+)
 from clio_relay.session_api import (
     OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS,
     OwnedSessionApiClient,
@@ -1377,9 +1380,12 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                 "source, and a JARVIS execution_id is not a gateway_session_id. "
                 "Runtime host, paths, scheduler identity, and dataset metadata are read "
                 "only from the durable JARVIS result. The relay allocates the desktop "
-                "loopback port. On success, copy the top-level gateway_session_id "
-                "unchanged into the viewer-opening tool; service_instance_id is not a "
-                "gateway identity."
+                "loopback port. A bounded readiness miss returns outcome=pending with "
+                "nullable URLs and an exact retry_selector; it does not fail, cancel, or "
+                "replace the JARVIS execution or its connectors. Reissue this tool with "
+                "the same binding, name, and policy to resume the same gateway. When "
+                "outcome=ready, copy the top-level gateway_session_id unchanged into the "
+                "viewer-opening tool; service_instance_id is not a gateway identity."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1433,6 +1439,12 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
             "outputSchema": {
                 "type": "object",
                 "properties": {
+                    "outcome": {"type": "string", "enum": ["ready", "pending"]},
+                    "retry_selector": {
+                        "anyOf": [{"type": "object"}, {"type": "null"}],
+                    },
+                    "scheduler_action": {"const": "none"},
+                    "relay_action": {"const": "none"},
                     "gateway_session_id": {
                         **durable_record_id_json_schema(),
                         "pattern": r"^gateway_[0-9a-f]{32}$",
@@ -1442,15 +1454,19 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                         ),
                     },
                     "gateway_session": {"type": "object"},
-                    "connect_url": {"type": "string"},
-                    "health_url": {"type": "string"},
-                    "stream_url": {"type": "string"},
-                    "events_url": {"type": "string"},
-                    "state_url": {"type": "string"},
-                    "command_url": {"type": "string"},
+                    "connect_url": {"type": ["string", "null"]},
+                    "health_url": {"type": ["string", "null"]},
+                    "stream_url": {"type": ["string", "null"]},
+                    "events_url": {"type": ["string", "null"]},
+                    "state_url": {"type": ["string", "null"]},
+                    "command_url": {"type": ["string", "null"]},
                     "scheduler_cancel_requested": {"const": False},
                 },
                 "required": [
+                    "outcome",
+                    "retry_selector",
+                    "scheduler_action",
+                    "relay_action",
                     "gateway_session_id",
                     "gateway_session",
                     "connect_url",
@@ -1460,6 +1476,36 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     "state_url",
                     "command_url",
                     "scheduler_cancel_requested",
+                ],
+                "allOf": [
+                    {
+                        "if": {"properties": {"outcome": {"const": "ready"}}},
+                        "then": {
+                            "properties": {
+                                "retry_selector": {"type": "null"},
+                                "connect_url": {"type": "string"},
+                                "health_url": {"type": "string"},
+                                "stream_url": {"type": "string"},
+                                "events_url": {"type": "string"},
+                                "state_url": {"type": "string"},
+                                "command_url": {"type": "string"},
+                            }
+                        },
+                    },
+                    {
+                        "if": {"properties": {"outcome": {"const": "pending"}}},
+                        "then": {
+                            "properties": {
+                                "retry_selector": {"type": "object"},
+                                "connect_url": {"type": "null"},
+                                "health_url": {"type": "null"},
+                                "stream_url": {"type": "null"},
+                                "events_url": {"type": "null"},
+                                "state_url": {"type": "null"},
+                                "command_url": {"type": "null"},
+                            }
+                        },
+                    },
                 ],
                 "additionalProperties": False,
             },
@@ -4856,6 +4902,39 @@ def _bind_jarvis_runtime(
                 readiness_timeout_seconds=readiness_timeout_seconds,
                 poll_seconds=poll_seconds,
             )
+    gateway_session = public_gateway_session(started.session)
+    gateway_session_id = gateway_session.get("session_id")
+    if gateway_session_id != started.session.session_id:
+        raise ValueError("public gateway session identity did not match the bound runtime")
+    if isinstance(started, ServiceRuntimePendingResult):
+        pending_gateway = dict(gateway_session)
+        nested_gateway = _object(pending_gateway.get("gateway", {}))
+        for key in (
+            "connect_url",
+            "health_url",
+            "stream_url",
+            "events_url",
+            "state_url",
+            "command_url",
+            "compatibility_urls",
+        ):
+            nested_gateway.pop(key, None)
+        pending_gateway["gateway"] = nested_gateway
+        return {
+            "outcome": started.outcome,
+            "retry_selector": started.retry_selector(),
+            "scheduler_action": started.scheduler_action,
+            "relay_action": started.relay_action,
+            "gateway_session_id": gateway_session_id,
+            "gateway_session": pending_gateway,
+            "connect_url": None,
+            "health_url": None,
+            "stream_url": None,
+            "events_url": None,
+            "state_url": None,
+            "command_url": None,
+            "scheduler_cancel_requested": False,
+        }
     if any(
         value is None
         for value in (
@@ -4866,11 +4945,11 @@ def _bind_jarvis_runtime(
         )
     ):
         raise ValueError("verified JARVIS runtime did not produce the complete URL contract")
-    gateway_session = public_gateway_session(started.session)
-    gateway_session_id = gateway_session.get("session_id")
-    if gateway_session_id != started.session.session_id:
-        raise ValueError("public gateway session identity did not match the bound runtime")
     return {
+        "outcome": "ready",
+        "retry_selector": None,
+        "scheduler_action": "none",
+        "relay_action": "none",
         "gateway_session_id": gateway_session_id,
         "gateway_session": gateway_session,
         "connect_url": started.connect_url,

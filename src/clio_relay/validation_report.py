@@ -104,10 +104,11 @@ def _utc_now() -> datetime:
 
 
 class ValidationStatus(StrEnum):
-    """Terminal status for a report or one validation check."""
+    """Outcome status for a report or one validation check."""
 
     PASSED = "passed"
     FAILED = "failed"
+    PENDING = "pending"
 
 
 class InstallSourceKind(StrEnum):

@@ -1157,6 +1157,7 @@ def worker_runtime_info(
     cluster: str,
     freshness_seconds: float = 120.0,
     current_installation: dict[str, object] | None = None,
+    readiness_only: bool = False,
 ) -> dict[str, object]:
     """Prove the active worker process loaded the same exact installation receipt."""
     from clio_relay.config import RelaySettings
@@ -1196,7 +1197,7 @@ def worker_runtime_info(
     process_running = _worker_process_matches(endpoint.pid)
     identity_matches_current = endpoint_installation == current
     scheduler_provider = endpoint.metadata.get("scheduler_provider")
-    return {
+    readiness: dict[str, object] = {
         "schema_version": "clio-relay.worker-runtime-info.v1",
         "cluster": cluster,
         "observed_at": observed_at.isoformat(),
@@ -1207,6 +1208,12 @@ def worker_runtime_info(
         "identity_matches_current": identity_matches_current,
         "scheduler_provider": scheduler_provider,
         "running": fresh and process_running and identity_matches_current,
+    }
+    if readiness_only:
+        readiness["schema_version"] = "clio-relay.worker-readiness.v1"
+        return readiness
+    return {
+        **readiness,
         "endpoint": endpoint.model_dump(mode="json"),
         "installation": current,
         "endpoint_installation": endpoint_installation,
@@ -2456,6 +2463,37 @@ print(json.dumps({
     return {str(key): value for key, value in cast(dict[object, object], loaded).items()}
 
 
+_PYTHON_RECORD_CLOSURE_SAFE_ERRORS = frozenset(
+    {
+        "execution environment has no scripts installation path",
+        "execution scripts path is outside its environment",
+        "installed console script is not a canonical declared wrapper",
+        "installed wheel script body does not match its wheel member",
+        "installed wheel script disagrees with distribution RECORD",
+        "installed wheel script exceeds the byte bound",
+        "installed wheel script has an invalid POSIX shell trampoline",
+        "installed wheel script is not bound to the execution interpreter",
+        "installed wheel script is not executable",
+        "installed wheel script is not owned by distribution RECORD",
+        "installed wheel script must not be a symbolic link",
+        "wheel script does not use an exact #!python shebang",
+        "wheel script has an ambiguous console_scripts declaration",
+        "wheel script has an unsafe member name",
+        "wheel script is not installed in the execution environment",
+        "wheel script console_scripts target is not canonical",
+        "wheel script exceeds the byte bound",
+        "wheel scripts must use one flat member name",
+    }
+)
+
+
+def _python_record_closure_error_code(error: str) -> str:
+    """Return a bounded public diagnostic code for one known script error."""
+    if error not in _PYTHON_RECORD_CLOSURE_SAFE_ERRORS:
+        return "unclassified-record-closure-error"
+    return error.replace("#!", "hashbang-").replace("_", "-").replace(" ", "-")
+
+
 def _probe_python_distribution_record_closure(
     python: str | None,
     distribution_name: str,
@@ -2477,15 +2515,19 @@ import csv
 import hashlib
 import io
 import json
+import keyword
 import os
+import shlex
 import stat
 import sys
+import sysconfig
 import zipfile
 from importlib import metadata
 from pathlib import Path, PurePosixPath
 
 MAX_FILES = 100_000
 MAX_BYTES = 4 * 1024 * 1024 * 1024
+MAX_SCRIPT_BYTES = 16 * 1024 * 1024
 
 
 def digest_stream(stream):
@@ -2517,11 +2559,15 @@ allowed_roots = (distribution_root, environment_prefix)
 installed_closure = hashlib.sha256()
 installed_bytes = 0
 installed_record_paths = []
+installed_record_locations = {}
 for item in sorted(installed_files, key=lambda value: str(value)):
     relative = str(item).replace("\\", "/")
     location = Path(installed.locate_file(item)).resolve(strict=True)
     if not within(location, allowed_roots) or not location.is_file():
         raise SystemExit("installed RECORD contains a file outside its environment")
+    location_key = os.path.normcase(str(location))
+    if location_key in installed_record_locations:
+        raise SystemExit("installed RECORD maps multiple members to one file")
     with location.open("rb") as stream:
         digest, size = digest_stream(stream)
     installed_bytes += size
@@ -2538,6 +2584,11 @@ for item in sorted(installed_files, key=lambda value: str(value)):
         raise SystemExit("installed RECORD member omitted its digest")
     if relative.endswith(".dist-info/RECORD"):
         installed_record_paths.append(location)
+    installed_record_locations[location_key] = {
+        "relative": relative,
+        "sha256": digest.digest(),
+        "size": size,
+    }
     installed_closure.update(relative.encode("utf-8"))
     installed_closure.update(b"\0")
     installed_closure.update(digest.hexdigest().encode("ascii"))
@@ -2547,9 +2598,172 @@ for item in sorted(installed_files, key=lambda value: str(value)):
 if len(installed_record_paths) != 1:
     raise SystemExit("installed distribution RECORD ownership is ambiguous")
 
+console_scripts = {}
+for entry_point in installed.entry_points:
+    if entry_point.group == "console_scripts":
+        console_scripts.setdefault(entry_point.name, []).append(entry_point.value)
+
+
+def console_script_target(script_name):
+    values = console_scripts.get(script_name, [])
+    if not values:
+        return None
+    if len(values) != 1:
+        raise SystemExit("wheel script has an ambiguous console_scripts declaration")
+    value = values[0]
+    if not isinstance(value, str) or value != value.strip() or "[" in value or "]" in value:
+        raise SystemExit("wheel script console_scripts target is not canonical")
+    module, separator, attribute = value.partition(":")
+    identifiers = [*module.split("."), attribute]
+    if (
+        separator != ":"
+        or not module
+        or not attribute
+        or "." in attribute
+        or any(not item.isidentifier() or keyword.iskeyword(item) for item in identifiers)
+    ):
+        raise SystemExit("wheel script console_scripts target is not canonical")
+    return module, attribute, value
+
+
+def canonical_console_script_bodies(module, attribute):
+    current = (
+        "import sys\n"
+        f"from {module} import {attribute}\n"
+        "if __name__ == '__main__':\n"
+        "    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n"
+        f"    sys.exit({attribute}())\n"
+    ).encode("utf-8")
+    legacy = (
+        "# -*- coding: utf-8 -*-\n"
+        "import re\n"
+        "import sys\n"
+        f"from {module} import {attribute}\n"
+        "if __name__ == '__main__':\n"
+        r"    sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])"
+        "\n"
+        f"    sys.exit({attribute}())\n"
+    ).encode("utf-8")
+    return current, legacy
+
+
+def wheel_script_body(payload):
+    for shebang in (b"#!python\n", b"#!python\r\n", b"#!pythonw\n", b"#!pythonw\r\n"):
+        if payload.startswith(shebang):
+            return payload[len(shebang):], shebang.rstrip(b"\r\n").decode("ascii")
+    raise SystemExit("wheel script does not use an exact #!python shebang")
+
+
+def installed_launcher_body(payload):
+    executable = os.fsencode(sys.executable)
+    for shebang in (b"#!" + executable + b"\n", b"#!" + executable + b"\r\n"):
+        if payload.startswith(shebang):
+            return payload[len(shebang):], "direct-interpreter"
+    if os.name != "posix":
+        raise SystemExit("installed wheel script is not bound to the execution interpreter")
+    lines = payload.split(b"\n", 3)
+    if len(lines) != 4 or lines[0] != b"#!/bin/sh":
+        raise SystemExit("installed wheel script is not bound to the execution interpreter")
+    if any(len(line) > 4096 for line in lines[:3]):
+        raise SystemExit("installed wheel script trampoline exceeds its byte bound")
+    try:
+        execution_line = lines[1].decode("utf-8")
+        closing_line = lines[2].decode("utf-8")
+        execution = shlex.split(execution_line, posix=True)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise SystemExit("installed wheel script has an invalid POSIX shell trampoline") from exc
+    quoted_executable = "'" + sys.executable.replace("'", "'\"'\"'") + "'"
+    canonical_uv_line = f"'''exec' {quoted_executable} \"$0\" \"$@\""
+    canonical_pip_line = f"'''exec' {sys.executable} \"$0\" \"$@\""
+    if (
+        len(execution) != 4
+        or execution[0] != "exec"
+        or execution[1] != sys.executable
+        or execution[2:] != ["$0", "$@"]
+        or closing_line != "' '''"
+    ):
+        raise SystemExit("installed wheel script has an invalid POSIX shell trampoline")
+    if execution_line == canonical_uv_line:
+        launcher_kind = "uv-posix-trampoline"
+    elif shlex.quote(sys.executable) == sys.executable and execution_line == canonical_pip_line:
+        launcher_kind = "pip-posix-trampoline"
+    else:
+        raise SystemExit("installed wheel script has an invalid POSIX shell trampoline")
+    return lines[3], launcher_kind
+
+
+def verify_wheel_script(archive, info, member, path):
+    if len(path.parts) != 3:
+        raise SystemExit("wheel scripts must use one flat member name")
+    script_name = path.parts[2]
+    if (
+        not script_name
+        or script_name.startswith(".")
+        or not script_name.isascii()
+        or any(not (character.isalnum() or character in "._+-") for character in script_name)
+    ):
+        raise SystemExit("wheel script has an unsafe member name")
+    scripts_value = sysconfig.get_path("scripts")
+    if not isinstance(scripts_value, str) or not scripts_value:
+        raise SystemExit("execution environment has no scripts installation path")
+    scripts_root = Path(scripts_value).resolve(strict=True)
+    if not within(scripts_root, (environment_prefix,)):
+        raise SystemExit("execution scripts path is outside its environment")
+    candidate = scripts_root / script_name
+    if candidate.is_symlink():
+        raise SystemExit("installed wheel script must not be a symbolic link")
+    installed_location = candidate.resolve(strict=True)
+    if not within(installed_location, (environment_prefix,)) or not installed_location.is_file():
+        raise SystemExit("wheel script is not installed in the execution environment")
+    if os.name == "posix" and installed_location.stat().st_mode & 0o111 == 0:
+        raise SystemExit("installed wheel script is not executable")
+    installed_record = installed_record_locations.get(
+        os.path.normcase(str(installed_location))
+    )
+    if installed_record is None:
+        raise SystemExit("installed wheel script is not owned by distribution RECORD")
+    if info.file_size > MAX_SCRIPT_BYTES:
+        raise SystemExit("wheel script exceeds the byte bound")
+    with archive.open(info) as stream:
+        wheel_payload = stream.read(MAX_SCRIPT_BYTES + 1)
+    if len(wheel_payload) > MAX_SCRIPT_BYTES:
+        raise SystemExit("wheel script exceeds the byte bound")
+    with installed_location.open("rb") as stream:
+        installed_payload = stream.read(MAX_SCRIPT_BYTES + 1)
+    if len(installed_payload) > MAX_SCRIPT_BYTES:
+        raise SystemExit("installed wheel script exceeds the byte bound")
+    installed_digest = hashlib.sha256(installed_payload).digest()
+    if (
+        installed_record["size"] != len(installed_payload)
+        or installed_record["sha256"] != installed_digest
+    ):
+        raise SystemExit("installed wheel script disagrees with distribution RECORD")
+    source_body, source_shebang = wheel_script_body(wheel_payload)
+    installed_body, launcher_kind = installed_launcher_body(installed_payload)
+    target = console_script_target(script_name)
+    if target is None:
+        if installed_body != source_body:
+            raise SystemExit("installed wheel script body does not match its wheel member")
+        transform_kind = "interpreter-shebang"
+        entry_point = None
+    else:
+        module, attribute, entry_point = target
+        if installed_body not in canonical_console_script_bodies(module, attribute):
+            raise SystemExit("installed console script is not a canonical declared wrapper")
+        transform_kind = "declared-console-wrapper"
+    return {
+        "member": member,
+        "installed_record_member": installed_record["relative"],
+        "transform": transform_kind,
+        "launcher": launcher_kind,
+        "source_shebang": source_shebang,
+        "entry_point": entry_point,
+    }
+
 wheel_closure = hashlib.sha256()
 wheel_bytes = 0
 wheel_members = 0
+wheel_script_transforms = []
 with zipfile.ZipFile(wheel) as archive:
     infos = archive.infolist()
     if not infos or len(infos) > MAX_FILES:
@@ -2613,21 +2827,29 @@ with zipfile.ZipFile(wheel) as archive:
         if encoded != expected_digest.removeprefix("sha256="):
             raise SystemExit("retained wheel member digest does not match RECORD")
         parts = path.parts
-        if len(parts) >= 3 and parts[0].endswith(".data"):
-            if parts[1] not in {"purelib", "platlib"}:
+        script_transform = None
+        if parts and parts[0].endswith(".data"):
+            if len(parts) < 3:
                 raise SystemExit("retained wheel uses an unsupported installation scheme")
-            installed_relative = PurePosixPath(*parts[2:])
+            if parts[1] == "scripts":
+                script_transform = verify_wheel_script(archive, info, member, path)
+                wheel_script_transforms.append(script_transform)
+            elif parts[1] in {"purelib", "platlib"}:
+                installed_relative = PurePosixPath(*parts[2:])
+            else:
+                raise SystemExit("retained wheel uses an unsupported installation scheme")
         else:
             installed_relative = path
-        installed_location = Path(
-            installed.locate_file(str(installed_relative))
-        ).resolve(strict=True)
-        if not within(installed_location, allowed_roots) or not installed_location.is_file():
-            raise SystemExit("wheel-owned distribution member is not installed")
-        with installed_location.open("rb") as stream:
-            installed_digest, installed_size = digest_stream(stream)
-        if installed_size != size or installed_digest.digest() != digest.digest():
-            raise SystemExit("wheel-owned installed member digest mismatch")
+        if script_transform is None:
+            installed_location = Path(
+                installed.locate_file(str(installed_relative))
+            ).resolve(strict=True)
+            if not within(installed_location, allowed_roots) or not installed_location.is_file():
+                raise SystemExit("wheel-owned distribution member is not installed")
+            with installed_location.open("rb") as stream:
+                installed_digest, installed_size = digest_stream(stream)
+            if installed_size != size or installed_digest.digest() != digest.digest():
+                raise SystemExit("wheel-owned installed member digest mismatch")
         wheel_closure.update(member.encode("utf-8"))
         wheel_closure.update(b"\0")
         wheel_closure.update(digest.hexdigest().encode("ascii"))
@@ -2650,6 +2872,8 @@ print(json.dumps({
     "wheel_payload_closure_sha256": wheel_closure.hexdigest(),
     "wheel_payload_file_count": wheel_members,
     "wheel_payload_bytes": wheel_bytes,
+    "wheel_script_transform_count": len(wheel_script_transforms),
+    "wheel_script_transforms": wheel_script_transforms,
     "tree_scanned": False,
     "tree_copied": False,
 }, sort_keys=True))
@@ -2670,9 +2894,11 @@ print(json.dumps({
             "tree_copied": False,
         }
     if completed.returncode != 0:
+        error = completed.stderr.strip() or completed.stdout.strip()
         return {
             "verified": False,
-            "error": completed.stderr.strip() or completed.stdout.strip(),
+            "error": error,
+            "error_code": _python_record_closure_error_code(error),
             "tree_scanned": False,
             "tree_copied": False,
         }

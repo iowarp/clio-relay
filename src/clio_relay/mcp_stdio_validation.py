@@ -19,7 +19,7 @@ from typing import Any, BinaryIO, cast
 
 from clio_relay import __version__
 from clio_relay.command_evidence import bounded_error_detail
-from clio_relay.errors import RelayError
+from clio_relay.errors import ObservationTimeoutError, RelayError
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_USER_CONTRACT_ID,
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
@@ -443,7 +443,7 @@ def _run_bounded_process(
         )
     except OwnedProcessSpawnError as exc:
         if monotonic() >= deadline:
-            raise RelayError(
+            raise ObservationTimeoutError(
                 "packaged MCP stdio validation exceeded its total wall-clock deadline"
             ) from None
         cleanup_errors = ",".join(exc.cleanup_errors) or "none"
@@ -454,7 +454,7 @@ def _run_bounded_process(
         ) from None
     except (OSError, RuntimeError) as exc:
         if monotonic() >= deadline:
-            raise RelayError(
+            raise ObservationTimeoutError(
                 "packaged MCP stdio validation exceeded its total wall-clock deadline"
             ) from None
         raise RelayError(
@@ -488,6 +488,7 @@ def _run_bounded_process(
         reader.start()
 
     failure: str | None = None
+    deadline_expired = False
     if staged_mcp:
         try:
             _exchange_staged_mcp(
@@ -501,6 +502,9 @@ def _run_bounded_process(
                 called_tool=cast(str, called_tool),
                 profile=cast(str, profile),
             )
+        except ObservationTimeoutError as exc:
+            failure = str(exc)
+            deadline_expired = True
         except RelayError as exc:
             failure = str(exc)
     while failure is None and process.poll() is None:
@@ -523,6 +527,7 @@ def _run_bounded_process(
         remaining = deadline - monotonic()
         if remaining <= 0:
             failure = "packaged MCP stdio validation exceeded its total wall-clock deadline"
+            deadline_expired = True
             break
         activity.wait(min(_PROCESS_POLL_SECONDS, remaining))
         activity.clear()
@@ -536,6 +541,7 @@ def _run_bounded_process(
         except RuntimeError as exc:
             containment_error = exc
             failure = "packaged MCP child process containment could not be verified"
+            deadline_expired = False
     join_deadline = (
         deadline if failure is None else min(deadline, monotonic() + _PROCESS_POLL_SECONDS)
     )
@@ -545,6 +551,7 @@ def _run_bounded_process(
     stderr, stderr_overflow, stderr_error = stderr_capture.snapshot()
     if failure is None and monotonic() >= deadline:
         failure = "packaged MCP stdio validation exceeded its total wall-clock deadline"
+        deadline_expired = True
     if failure is None and (stdout_overflow or stderr_overflow):
         streams = [
             label
@@ -556,6 +563,7 @@ def _run_bounded_process(
         failure = "packaged MCP stdio validation could not read its child pipes"
     if failure is None and any(reader.is_alive() for reader in readers):
         failure = "packaged MCP stdio validation exceeded its total wall-clock deadline"
+        deadline_expired = True
     if failure is None and any(
         value and value.encode("utf-8") in payload
         for value in private_values
@@ -570,20 +578,24 @@ def _run_bounded_process(
     except RuntimeError as exc:
         containment_error = exc
         failure = "packaged MCP child process containment could not be verified"
+        deadline_expired = False
     finally:
         try:
             release_owned_process(cast(subprocess.Popen[str], cast(object, process)))
         except RuntimeError as exc:
             containment_error = exc
             failure = "packaged MCP child process containment could not be released"
+            deadline_expired = False
     # Provider cleanup is part of a successful acceptance run. Safety cleanup may
     # finish after the deadline, but an over-budget run is never accepted.
     if failure is None and monotonic() >= deadline:
         failure = "packaged MCP stdio validation exceeded its total wall-clock deadline"
+        deadline_expired = True
     if failure is not None:
         detail = _sanitized_diagnostic(stderr, forbidden_values=private_values)
         cause = "" if containment_error is None else f" cause={type(containment_error).__name__}"
-        raise RelayError(
+        error_type = ObservationTimeoutError if deadline_expired else RelayError
+        raise error_type(
             f"{failure}; stdout_bytes={len(stdout)} stderr_bytes={len(stderr)} "
             f"stderr={detail!r}{cause}"
         ) from None
@@ -694,7 +706,9 @@ def _write_mcp_frame(
     )
     writer.start()
     if not completed.wait(max(0.0, deadline - monotonic())):
-        raise RelayError("packaged MCP stdio validation exceeded its total wall-clock deadline")
+        raise ObservationTimeoutError(
+            "packaged MCP stdio validation exceeded its total wall-clock deadline"
+        )
     if errors:
         raise RelayError("packaged MCP stdio validation could not write its request pipe")
 
@@ -743,7 +757,9 @@ def _await_mcp_response(
             raise RelayError(f"packaged MCP exited before correlated response {response_id}")
         remaining = deadline - monotonic()
         if remaining <= 0:
-            raise RelayError("packaged MCP stdio validation exceeded its total wall-clock deadline")
+            raise ObservationTimeoutError(
+                "packaged MCP stdio validation exceeded its total wall-clock deadline"
+            )
         activity.wait(min(_PROCESS_POLL_SECONDS, remaining))
         activity.clear()
 

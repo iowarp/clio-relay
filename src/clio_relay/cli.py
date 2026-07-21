@@ -19,7 +19,7 @@ import sys
 from collections import Counter
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from importlib import import_module
 from json import JSONDecodeError
@@ -234,13 +234,17 @@ from clio_relay.remote_mcp import (
     resolve_registered_remote_mcp_admission,
 )
 from clio_relay.retention import TerminalRetentionCoordinator
+from clio_relay.runtime_metadata import RUNTIME_METADATA_SCHEMA, native_execution_documents
 from clio_relay.scheduler_providers import (
     allocation_connector_provider_for_scheduler,
     provider_for_scheduler,
     validation_provider_for_scheduler,
 )
 from clio_relay.scheduler_validation import run_scheduler_lifecycle_validation
-from clio_relay.service_runtime import ServiceRuntimeSupervisor
+from clio_relay.service_runtime import (
+    ServiceRuntimePendingResult,
+    ServiceRuntimeSupervisor,
+)
 from clio_relay.session_api import (
     OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS,
     submit_owned_session_job,
@@ -295,6 +299,7 @@ from clio_relay.validation_report import (
     EvidenceReference,
     LiveValidationReport,
     SoftwareIdentity,
+    ValidationCheck,
     ValidationRecorder,
     ValidationResource,
     ValidationStatus,
@@ -1728,6 +1733,10 @@ def endpoint_worker_info(
         float,
         typer.Option(help="Maximum acceptable durable worker heartbeat age."),
     ] = 120.0,
+    readiness_only: Annotated[
+        bool,
+        typer.Option(help="Return bounded readiness flags without detailed installation records."),
+    ] = False,
 ) -> None:
     """Report fresh process-bound identity for the active cluster worker."""
     _run_or_exit(
@@ -1736,6 +1745,7 @@ def endpoint_worker_info(
                 worker_runtime_info(
                     cluster=cluster,
                     freshness_seconds=freshness_seconds,
+                    readiness_only=readiness_only,
                 ),
                 indent=2,
             )
@@ -9776,8 +9786,19 @@ def gateway_start_runtime(
             ),
         )
         report_id[0] = canonical.report_id
-        _write_remote_verified_report(canonical, definition, canonical_report_path)
+        if isinstance(result, ServiceRuntimePendingResult):
+            # A nonterminal report cannot satisfy the release gate. Persist and
+            # return its exact retry selector without adding another fallible
+            # remote observation that could hide the already-durable result.
+            write_validation_report(canonical, canonical_report_path)
+        else:
+            _write_remote_verified_report(canonical, definition, canonical_report_path)
         payload = public_gateway_session(result.session)
+        if isinstance(result, ServiceRuntimePendingResult):
+            payload["outcome"] = result.outcome
+            payload["retry_selector"] = result.retry_selector()
+            payload["scheduler_action"] = result.scheduler_action
+            payload["relay_action"] = result.relay_action
         payload["validation_report"] = str(canonical_report_path.resolve())
         typer.echo(_public_json(payload))
 
@@ -9807,6 +9828,155 @@ def gateway_start_runtime(
                 recorder.record_failure(
                     "gateway.start-runtime",
                     "start scheduler-backed gateway runtime",
+                    exc,
+                )
+                recorder.finish(exc)
+                recorder.write(canonical_report_path)
+            raise
+
+    _run_or_exit(guarded_action)
+
+
+@gateway_app.command("resume-runtime")
+@_acceptance_report_command
+def gateway_resume_runtime(
+    session_id: str,
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    token: Annotated[
+        str | None,
+        typer.Option(help="frp authentication token. Defaults to cluster token_env."),
+    ] = None,
+    secret_key: Annotated[
+        str | None,
+        typer.Option(help="stcp shared secret. Defaults to cluster stcp_secret_env."),
+    ] = None,
+    validation_report: Annotated[
+        Path | None,
+        typer.Option(
+            help="Canonical gateway-runtime validation JSON path. Defaults under .clio-relay."
+        ),
+    ] = None,
+    validation_launcher: Annotated[
+        str | None,
+        typer.Option(help="Launcher evidence, such as uv-tool."),
+    ] = None,
+    validation_install_source: Annotated[
+        str | None,
+        typer.Option(help="Explicit kind:reference install evidence."),
+    ] = None,
+    validation_artifact: Annotated[
+        Path | None,
+        typer.Option(
+            help="Optional wheel whose SHA-256 is recorded in gateway evidence.",
+            exists=True,
+            dir_okay=False,
+        ),
+    ] = None,
+) -> None:
+    """Advance one exact submitted runtime without creating another scheduler job."""
+    canonical_report_path = validation_report or default_report_path(cluster)
+    report_id: list[str | None] = [None]
+
+    def action() -> None:
+        definition = _require_cluster(cluster)
+        settings = RelaySettings.from_env()
+        queue = storage_managed_queue(settings)
+        supervisor = ServiceRuntimeSupervisor(
+            settings=settings,
+            queue=queue,
+            cluster=cluster,
+            definition=definition,
+            token=_resolve_env_secret(token, definition.frp_transport.token_env, "frp token"),
+            secret_key=_resolve_env_secret(
+                secret_key,
+                definition.frp_transport.stcp_secret_env,
+                "stcp secret",
+            ),
+        )
+        session = queue.get_gateway_session(session_id)
+        owner_session_id = session.metadata.get("owner_session_id")
+        owner_generation_id = session.metadata.get("owner_session_generation_id")
+        owner_admission_id = session.metadata.get("owner_session_admission_id")
+        owner_values = (owner_session_id, owner_generation_id, owner_admission_id)
+        if all(value is None for value in owner_values):
+            result = supervisor.resume_start(session_id=session_id)
+        else:
+            if not all(isinstance(value, str) and value for value in owner_values):
+                raise RelayError(
+                    "owned gateway runtime omitted its exact owner-session admission identity"
+                )
+            typed_owner_session_id = cast(str, owner_session_id)
+            typed_owner_generation_id = cast(str, owner_generation_id)
+            typed_owner_admission_id = cast(str, owner_admission_id)
+            expected_admission_id = _desktop_owner_session_admission_id(
+                cluster=cluster,
+                session_id=typed_owner_session_id,
+            )
+            if typed_owner_admission_id != expected_admission_id:
+                raise RelayError("owned gateway runtime admission identity changed")
+            with owner_session_gateway_admission(
+                queue=queue,
+                definition=definition,
+                cluster=cluster,
+                session_id=typed_owner_session_id,
+                session_generation_id=typed_owner_generation_id,
+                transition_lock_factory=_session_transition_lock,
+                session_status_reader=status_remote_session,
+                admission_status_reader=_owner_session_admission_status,
+            ) as admission:
+                if admission.owner_session_admission_id != typed_owner_admission_id:
+                    raise RelayError("owned gateway runtime admission identity changed")
+                result = supervisor.resume_start(session_id=session_id)
+        canonical = result.to_live_validation_report(
+            launcher=validation_launcher,
+            install_source=validation_install_source,
+            artifact_sha256=(
+                sha256_file(validation_artifact) if validation_artifact is not None else None
+            ),
+        )
+        report_id[0] = canonical.report_id
+        if isinstance(result, ServiceRuntimePendingResult):
+            # Pending is an operational checkpoint, not release evidence. Its
+            # successful return must not depend on a second worker-provenance
+            # observation after the exact runtime query already completed.
+            write_validation_report(canonical, canonical_report_path)
+        else:
+            _write_remote_verified_report(canonical, definition, canonical_report_path)
+        payload = public_gateway_session(result.session)
+        if isinstance(result, ServiceRuntimePendingResult):
+            payload["outcome"] = result.outcome
+            payload["retry_selector"] = result.retry_selector()
+            payload["scheduler_action"] = result.scheduler_action
+            payload["relay_action"] = result.relay_action
+        payload["validation_report"] = str(canonical_report_path.resolve())
+        typer.echo(_public_json(payload))
+
+    def guarded_action() -> None:
+        try:
+            action()
+        except BaseException as exc:
+            report_already_written = False
+            if report_id[0] is not None:
+                with suppress(ConfigurationError):
+                    report_already_written = (
+                        load_validation_report(canonical_report_path).report_id == report_id[0]
+                    )
+            if not report_already_written:
+                artifact_sha256: str | None = None
+                if validation_artifact is not None:
+                    with suppress(OSError):
+                        artifact_sha256 = sha256_file(validation_artifact)
+                failed_report = new_live_validation_report(
+                    scenario="gateway-runtime",
+                    cluster=cluster,
+                    launcher=validation_launcher,
+                    install_source=validation_install_source,
+                    artifact_sha256=artifact_sha256,
+                )
+                recorder = ValidationRecorder(failed_report)
+                recorder.record_failure(
+                    "gateway.resume-runtime",
+                    "resume exact scheduler-backed gateway runtime",
                     exc,
                 )
                 recorder.finish(exc)
@@ -10015,9 +10185,37 @@ def gateway_attach_runtime(
                 "stcp secret",
             ),
         )
-        typer.echo(
-            _public_json(public_gateway_session(supervisor.attach(session_id=session_id).session))
+        result = supervisor.attach(session_id=session_id)
+        payload = public_gateway_session(result.session)
+        if isinstance(result, ServiceRuntimePendingResult):
+            gateway = cast(dict[str, object], payload.get("gateway", {}))
+            for key in (
+                "connect_url",
+                "health_url",
+                "stream_url",
+                "events_url",
+                "state_url",
+                "command_url",
+                "compatibility_urls",
+            ):
+                gateway.pop(key, None)
+            payload["gateway"] = gateway
+        payload.update(
+            {
+                "outcome": (
+                    result.outcome if isinstance(result, ServiceRuntimePendingResult) else "ready"
+                ),
+                "retry_selector": (
+                    result.retry_selector()
+                    if isinstance(result, ServiceRuntimePendingResult)
+                    else None
+                ),
+                "scheduler_action": "none",
+                "relay_action": "none",
+                "scheduler_cancel_requested": False,
+            }
         )
+        typer.echo(_public_json(payload))
 
     _run_or_exit(action)
 
@@ -10756,13 +10954,31 @@ def jarvis_mcp_validate(
         Path | None,
         typer.Option(help="Path to a JSON object argument file for virtual jarvis_run."),
     ] = None,
+    resume_report: Annotated[
+        Path | None,
+        typer.Option(
+            help=(
+                "Pending report to resume its exact idempotent jarvis_run dispatch or "
+                "JARVIS execution query; never creates a new workload identity."
+            ),
+            exists=True,
+            dir_okay=False,
+        ),
+    ] = None,
     profile: Annotated[
         str,
         typer.Option(help="Local MCP profile used for tools/list and tools/call."),
     ] = "user",
     wait_timeout_seconds: Annotated[
         float,
-        typer.Option(help="Maximum time to wait for the durable JARVIS MCP call.", min=1),
+        typer.Option(
+            help=(
+                "Maximum observation window for durable JARVIS MCP calls, not the workload "
+                "lifetime. Expiry after an idempotent intent, relay receipt, or execution "
+                "identity writes a resumable pending checkpoint without cancellation."
+            ),
+            min=1,
+        ),
     ] = 600,
     poll_seconds: Annotated[
         float,
@@ -10790,12 +11006,34 @@ def jarvis_mcp_validate(
     ] = None,
 ) -> None:
     """Exercise JARVIS run/query semantics and persist release acceptance evidence."""
-    report_path = report or default_report_path(cluster)
+    report_path = report or resume_report or default_report_path(cluster)
+    failure_report_path = report_path
+    if resume_report is not None and report_path.resolve() == resume_report.resolve():
+        suffix = report_path.suffix or ".json"
+        failure_report_path = report_path.with_name(
+            f"{report_path.stem}.resume-failure-{uuid4().hex}{suffix}"
+        )
     report_written = [False]
 
-    def preflight() -> tuple[dict[str, Any], ClusterDefinition, str]:
+    def preflight() -> tuple[
+        dict[str, Any],
+        ClusterDefinition,
+        str,
+        dict[str, Any] | None,
+    ]:
         if profile not in {"user", "admin", "operator", "all"}:
             raise typer.BadParameter("--profile must be user, admin, operator, or all")
+        definition = _require_cluster(cluster)
+        if resume_report is not None:
+            if package_search_query or arguments_json != "{}" or arguments_json_file is not None:
+                raise typer.BadParameter(
+                    "--resume-report cannot be combined with run or package-search arguments"
+                )
+            checkpoint = _load_jarvis_validation_resume_checkpoint(
+                resume_report,
+                cluster=cluster,
+            )
+            return {}, definition, "", checkpoint
         normalized_package_search_query = " ".join(package_search_query.split())
         if not normalized_package_search_query:
             raise typer.BadParameter("--package-search-query must not be blank")
@@ -10803,6 +11041,11 @@ def jarvis_mcp_validate(
             raise typer.BadParameter("--package-search-query must not exceed 256 characters")
         arguments_source = _json_text_from_option(arguments_json, arguments_json_file)
         arguments = _json_object(arguments_source)
+        if redact_sensitive_values(arguments) != arguments:
+            raise typer.BadParameter(
+                "JARVIS validation arguments cannot contain credential-valued fields because "
+                "durable resume reports are always credential-redacted"
+            )
         if "cluster" in arguments:
             raise typer.BadParameter(
                 "JARVIS tool arguments must not contain reserved key 'cluster'"
@@ -10815,13 +11058,18 @@ def jarvis_mcp_validate(
             )
         if not isinstance(arguments.get("pipeline_id"), str):
             raise typer.BadParameter("jarvis-mcp-validate requires a string pipeline_id argument")
-        return arguments, _require_cluster(cluster), normalized_package_search_query
+        return arguments, definition, normalized_package_search_query, None
 
     try:
-        arguments, definition, normalized_package_search_query = preflight()
+        (
+            arguments,
+            definition,
+            normalized_package_search_query,
+            resume_checkpoint,
+        ) = preflight()
     except BaseException as exc:
         _write_failed_acceptance_report(
-            path=report_path,
+            path=failure_report_path,
             scenario="remote-mcp",
             cluster=cluster,
             check_id="jarvis-mcp.preflight",
@@ -10837,151 +11085,281 @@ def jarvis_mcp_validate(
         settings = RelaySettings.from_env()
         queue = storage_managed_queue(settings)
         queue.initialize()
-        (
-            remote_discovery_job_id,
-            remote_tools_list_result,
-            remote_discovery_artifacts,
-            remote_discovery_payload,
-        ) = _run_jarvis_remote_contract_discovery(
-            cluster=cluster,
-            definition=definition,
-            queue=queue,
-            wait_timeout_seconds=wait_timeout_seconds,
-            poll_seconds=poll_seconds,
-        )
-        _persist_jarvis_remote_contract_discovery(
-            cluster=cluster,
-            discovery_job_id=remote_discovery_job_id,
-            result=remote_tools_list_result,
-            artifacts=remote_discovery_artifacts,
-            artifact_payload=remote_discovery_payload,
-        )
-        package_search = _run_jarvis_package_search_query(
-            cluster=cluster,
-            definition=definition,
-            queue=queue,
-            profile=profile,
-            query=normalized_package_search_query,
-            wait_timeout_seconds=wait_timeout_seconds,
-            poll_seconds=poll_seconds,
-        )
-        stdio_session = run_packaged_mcp_stdio_session(
-            profile=profile,
-            tool="jarvis_run",
-            arguments={"cluster": cluster, **arguments},
-            timeout_seconds=min(60.0, max(0.001, wait_timeout_seconds)),
-        )
-        tools_list_response = stdio_session.tools_list_response
-        call_response = stdio_session.tools_call_response
-        job_id = _mcp_response_job_id(call_response)
-        remote_install_info: dict[str, object] | None = None
-        if should_execute_on_cluster(definition):
-            remote_install_info = _remote_worker_info(definition)
-            call_status = _wait_for_remote_job_terminal(
-                definition,
-                job_id,
-                timeout_seconds=wait_timeout_seconds,
+
+        def emit(validation: LiveValidationReport, *, attach_worker: bool = False) -> None:
+            if attach_worker and should_execute_on_cluster(definition):
+                attach_verified_worker_identity(validation, _remote_worker_info(definition))
+            write_validation_report(validation, report_path)
+            report_written[0] = True
+            typer.echo(validation.model_dump_json(indent=2))
+            if validation.status is ValidationStatus.FAILED:
+                raise typer.Exit(code=1)
+
+        def retain_existing_pending_report() -> None:
+            if resume_report is None:  # pragma: no cover - guarded by resume_checkpoint
+                raise RelayError("JARVIS validation resume source disappeared")
+            emit(load_validation_report(resume_report))
+
+        def finish_execution_query(
+            *,
+            builder_inputs: dict[str, Any],
+            execution_query: _JarvisExecutionQueryAcceptance | _JarvisExecutionQueryPending,
+            checkpoint_profile: str,
+        ) -> None:
+            selector = execution_query.retry_selector()
+            builder_inputs = {
+                **builder_inputs,
+                "scheduler_cluster": selector["scheduler_cluster"],
+            }
+            observations = (
+                []
+                if isinstance(execution_query, _JarvisExecutionQueryPending)
+                else list(execution_query.lifecycle_observations)
+            )
+            checkpoint = {
+                "schema_version": _JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA,
+                "phase": _JARVIS_VALIDATION_PHASE_QUERY,
+                "observation_state": "not_observed" if not observations else "observed",
+                "profile": checkpoint_profile,
+                "retry_selector": selector,
+                "builder_inputs": builder_inputs,
+                "lifecycle_observations": observations,
+            }
+            if isinstance(execution_query, _JarvisExecutionQueryPending):
+                validation = _build_unobserved_jarvis_query_pending_report(
+                    builder_inputs=builder_inputs,
+                    execution_query=execution_query,
+                    checkpoint=checkpoint,
+                )
+            else:
+                validation = build_jarvis_mcp_validation_report(
+                    **builder_inputs,
+                    query_tools_list_response=execution_query.tools_list_response,
+                    query_call_response=execution_query.call_response,
+                    query_call_job_id=execution_query.call_job_id,
+                    query_call_status=execution_query.call_status,
+                    query_artifacts=execution_query.artifacts,
+                    query_mcp_result=execution_query.mcp_result,
+                    query_provenance=execution_query.provenance,
+                    query_initialize_response=execution_query.initialize_response,
+                    query_stdio_evidence=execution_query.stdio_evidence,
+                    query_lifecycle_observations=observations,
+                )
+                if execution_query.outcome != "terminal":
+                    validation = _mark_jarvis_validation_pending(
+                        validation,
+                        execution_query=execution_query,
+                        resume_checkpoint=checkpoint,
+                    )
+            emit(validation, attach_worker=validation.status is not ValidationStatus.PENDING)
+
+        checkpoint = resume_checkpoint
+        checkpoint_profile = profile
+        if checkpoint is not None:
+            checkpoint_profile = cast(str, checkpoint["profile"])
+            phase = checkpoint.get("phase", _JARVIS_VALIDATION_PHASE_QUERY)
+            if phase == _JARVIS_VALIDATION_PHASE_QUERY:
+                selector = cast(dict[str, Any], checkpoint["retry_selector"])
+                query_selector: dict[str, object] = {
+                    **cast(dict[str, object], selector),
+                    "last_query_job_id": None,
+                }
+                execution_query = _run_post_run_jarvis_execution_query(
+                    cluster=cluster,
+                    definition=definition,
+                    queue=queue,
+                    profile=checkpoint_profile,
+                    pipeline_id=cast(str, selector["pipeline_id"]),
+                    execution_id=cast(str, selector["execution_id"]),
+                    retry_selector=query_selector,
+                    wait_timeout_seconds=wait_timeout_seconds,
+                    poll_seconds=poll_seconds,
+                )
+                _require_same_jarvis_resume_identity(
+                    expected=selector,
+                    observed=execution_query.retry_selector(),
+                )
+                if isinstance(execution_query, _JarvisExecutionQueryPending):
+                    retain_existing_pending_report()
+                    return
+                prior_observations = [
+                    cast(dict[str, Any], observation)
+                    for observation in cast(list[object], checkpoint["lifecycle_observations"])
+                    if isinstance(observation, dict)
+                ]
+                execution_query = replace(
+                    execution_query,
+                    lifecycle_observations=_merge_jarvis_execution_query_observations(
+                        prior_observations,
+                        execution_query.lifecycle_observations,
+                    ),
+                )
+                finish_execution_query(
+                    builder_inputs=cast(dict[str, Any], checkpoint["builder_inputs"]),
+                    execution_query=execution_query,
+                    checkpoint_profile=checkpoint_profile,
+                )
+                return
+
+        if checkpoint is None:
+            (
+                remote_discovery_job_id,
+                remote_tools_list_result,
+                remote_discovery_artifacts,
+                remote_discovery_payload,
+            ) = _run_jarvis_remote_contract_discovery(
+                cluster=cluster,
+                definition=definition,
+                queue=queue,
+                wait_timeout_seconds=wait_timeout_seconds,
                 poll_seconds=poll_seconds,
             )
-            progress = _complete_remote_collection(
-                definition,
-                ["job", "progress", job_id],
-                record_key="progress",
-                label=f"JARVIS MCP dispatch progress for {job_id}",
+            _persist_jarvis_remote_contract_discovery(
+                cluster=cluster,
+                discovery_job_id=remote_discovery_job_id,
+                result=remote_tools_list_result,
+                artifacts=remote_discovery_artifacts,
+                artifact_payload=remote_discovery_payload,
             )
-            live_progress_observation = None
-            artifacts = _remote_artifact_records(definition, job_id)
-            mcp_result = _read_remote_json_artifact_kind(definition, artifacts, kind="mcp_result")
-            provenance = _read_remote_json_artifact_kind(definition, artifacts, kind="provenance")
-            runtime_metadata = _read_remote_json_artifact_kind(
-                definition, artifacts, kind="runtime_metadata"
+            package_search = _run_jarvis_package_search_query(
+                cluster=cluster,
+                definition=definition,
+                queue=queue,
+                profile=profile,
+                query=normalized_package_search_query,
+                wait_timeout_seconds=wait_timeout_seconds,
+                poll_seconds=poll_seconds,
             )
+            validation_artifact_sha256 = (
+                sha256_file(validation_artifact) if validation_artifact is not None else None
+            )
+            pre_dispatch_inputs: dict[str, Any] = {
+                "cluster": cluster,
+                "tool": "jarvis_run",
+                "remote_tools_list_result": remote_tools_list_result,
+                "remote_discovery_job_id": remote_discovery_job_id,
+                "remote_discovery_artifacts": remote_discovery_artifacts,
+                "package_search_query": normalized_package_search_query,
+                "package_search_tools_list_response": package_search.tools_list_response,
+                "package_search_call_response": package_search.call_response,
+                "package_search_call_job_id": package_search.call_job_id,
+                "package_search_call_status": package_search.call_status,
+                "package_search_artifacts": package_search.artifacts,
+                "package_search_mcp_result": package_search.mcp_result,
+                "package_search_provenance": package_search.provenance,
+                "package_search_initialize_response": package_search.initialize_response,
+                "package_search_stdio_evidence": package_search.stdio_evidence,
+                "launcher": validation_launcher,
+                "install_source": validation_install_source,
+                "artifact_sha256": validation_artifact_sha256,
+            }
+            idempotency_key = _new_jarvis_validation_idempotency_key(
+                cluster=cluster,
+                profile=profile,
+                arguments=arguments,
+            )
+            execution_intent = _jarvis_run_execution_intent(
+                cluster=cluster,
+                profile=profile,
+                arguments=arguments,
+                idempotency_key=idempotency_key,
+            )
+            checkpoint = _new_jarvis_intent_resume_checkpoint(
+                execution_intent=execution_intent,
+                pre_dispatch_inputs=pre_dispatch_inputs,
+            )
+            # Persist the replayable identity before crossing the ambiguous stdio boundary.
+            # A process or host failure can therefore resume with this exact key.
+            write_validation_report(_new_jarvis_intent_pending_report(checkpoint), report_path)
         else:
-            call_status = _wait_for_local_job_terminal(
-                queue,
-                job_id,
-                timeout_seconds=wait_timeout_seconds,
+            execution_intent = cast(dict[str, object], checkpoint["execution_intent"])
+            pre_dispatch_inputs = cast(dict[str, Any], checkpoint["pre_dispatch_inputs"])
+
+        if checkpoint["phase"] == _JARVIS_VALIDATION_PHASE_INTENT:
+            try:
+                stdio_session = run_packaged_mcp_stdio_session(
+                    profile=checkpoint_profile,
+                    tool="jarvis_run",
+                    arguments=cast(dict[str, Any], execution_intent["arguments"]),
+                    timeout_seconds=min(60.0, max(0.001, wait_timeout_seconds)),
+                )
+            except ObservationTimeoutError:
+                if resume_checkpoint is not None:
+                    retain_existing_pending_report()
+                else:
+                    emit(_new_jarvis_intent_pending_report(checkpoint))
+                return
+            call_response = stdio_session.tools_call_response
+            job_id = _mcp_response_job_id(call_response)
+            builder_inputs: dict[str, Any] = {
+                **pre_dispatch_inputs,
+                "scheduler_cluster": None,
+                "tools_list_response": stdio_session.tools_list_response,
+                "call_response": call_response,
+                "call_job_id": job_id,
+                "call_status": {},
+                "artifacts": [],
+                "mcp_result": None,
+                "provenance": None,
+                "runtime_metadata": None,
+                "progress": [],
+                "live_progress_observation": None,
+                "initialize_response": stdio_session.initialize_response,
+                "stdio_evidence": stdio_session.evidence(),
+            }
+            checkpoint = _promote_jarvis_intent_to_dispatch_checkpoint(
+                checkpoint,
+                job_id=job_id,
+                builder_inputs=builder_inputs,
+            )
+
+        try:
+            builder_inputs = _complete_jarvis_run_dispatch(
+                definition=definition,
+                queue=queue,
+                checkpoint=checkpoint,
+                wait_timeout_seconds=wait_timeout_seconds,
                 poll_seconds=poll_seconds,
             )
-            progress = _complete_local_progress_records(queue, job_id)
-            live_progress_observation = None
-            artifacts = _complete_local_artifact_records(queue, job_id)
-            mcp_result = _read_local_json_artifact_kind(queue, artifacts, kind="mcp_result")
-            provenance = _read_local_json_artifact_kind(queue, artifacts, kind="provenance")
-            runtime_metadata = _read_local_json_artifact_kind(
-                queue, artifacts, kind="runtime_metadata"
-            )
-        pipeline_id = runtime_metadata.get("pipeline_id") if runtime_metadata else None
-        execution_id = runtime_metadata.get("execution_id") if runtime_metadata else None
+        except ObservationTimeoutError:
+            emit(_build_jarvis_dispatch_pending_report(checkpoint))
+            return
+        raw_runtime_metadata = builder_inputs.get("runtime_metadata")
+        runtime_metadata = (
+            cast(dict[str, Any], raw_runtime_metadata)
+            if isinstance(raw_runtime_metadata, dict)
+            else None
+        )
+        if runtime_metadata is None:
+            raise RelayError("JARVIS run metadata artifact is unavailable")
+        pipeline_id = runtime_metadata.get("pipeline_id")
+        execution_id = runtime_metadata.get("execution_id")
         if not isinstance(pipeline_id, str) or not pipeline_id:
             raise RelayError("JARVIS run metadata omitted the pipeline_id required for its query")
         if not isinstance(execution_id, str) or not execution_id:
             raise RelayError("JARVIS run metadata omitted the execution_id required for its query")
+        retry_selector = _jarvis_execution_retry_selector_from_runtime_metadata(
+            runtime_metadata,
+            cluster=cluster,
+            pipeline_id=pipeline_id,
+            execution_id=execution_id,
+        )
         execution_query = _run_post_run_jarvis_execution_query(
             cluster=cluster,
             definition=definition,
             queue=queue,
-            profile=profile,
+            profile=checkpoint_profile,
             pipeline_id=pipeline_id,
             execution_id=execution_id,
+            retry_selector=retry_selector,
             wait_timeout_seconds=wait_timeout_seconds,
             poll_seconds=poll_seconds,
         )
-        validation = build_jarvis_mcp_validation_report(
-            cluster=cluster,
-            tool="jarvis_run",
-            tools_list_response=tools_list_response,
-            call_response=call_response,
-            call_job_id=job_id,
-            call_status=call_status,
-            artifacts=artifacts,
-            mcp_result=mcp_result,
-            provenance=provenance,
-            runtime_metadata=runtime_metadata,
-            progress=progress,
-            live_progress_observation=live_progress_observation,
-            remote_tools_list_result=remote_tools_list_result,
-            remote_discovery_job_id=remote_discovery_job_id,
-            remote_discovery_artifacts=remote_discovery_artifacts,
-            initialize_response=stdio_session.initialize_response,
-            stdio_evidence=stdio_session.evidence(),
-            package_search_query=normalized_package_search_query,
-            package_search_tools_list_response=package_search.tools_list_response,
-            package_search_call_response=package_search.call_response,
-            package_search_call_job_id=package_search.call_job_id,
-            package_search_call_status=package_search.call_status,
-            package_search_artifacts=package_search.artifacts,
-            package_search_mcp_result=package_search.mcp_result,
-            package_search_provenance=package_search.provenance,
-            package_search_initialize_response=package_search.initialize_response,
-            package_search_stdio_evidence=package_search.stdio_evidence,
-            query_tools_list_response=execution_query.tools_list_response,
-            query_call_response=execution_query.call_response,
-            query_call_job_id=execution_query.call_job_id,
-            query_call_status=execution_query.call_status,
-            query_artifacts=execution_query.artifacts,
-            query_mcp_result=execution_query.mcp_result,
-            query_provenance=execution_query.provenance,
-            query_initialize_response=execution_query.initialize_response,
-            query_stdio_evidence=execution_query.stdio_evidence,
-            query_lifecycle_observations=getattr(
-                execution_query,
-                "lifecycle_observations",
-                [],
-            ),
-            launcher=validation_launcher,
-            install_source=validation_install_source,
-            artifact_sha256=(
-                sha256_file(validation_artifact) if validation_artifact is not None else None
-            ),
+        finish_execution_query(
+            builder_inputs=builder_inputs,
+            execution_query=execution_query,
+            checkpoint_profile=checkpoint_profile,
         )
-        if remote_install_info is not None:
-            attach_verified_worker_identity(validation, remote_install_info)
-        write_validation_report(validation, report_path)
-        report_written[0] = True
-        typer.echo(validation.model_dump_json(indent=2))
-        if validation.status.value != "passed":
-            raise typer.Exit(code=1)
 
     def guarded_action() -> None:
         try:
@@ -11004,7 +11382,7 @@ def jarvis_mcp_validate(
                     "jarvis-mcp.completed", "complete virtual JARVIS MCP acceptance", exc
                 )
                 recorder.finish(exc)
-                recorder.write(report_path)
+                recorder.write(failure_report_path)
             raise
 
     _run_or_exit(guarded_action)
@@ -11446,6 +11824,17 @@ def live_test(
         Path | None,
         typer.Option(help="Optional human-readable Markdown rendering of the JSON report."),
     ] = None,
+    resume_report: Annotated[
+        Path | None,
+        typer.Option(
+            help=(
+                "Resume the exact nonterminal workload recorded by a PENDING live-test report. "
+                "The source checkpoint is never overwritten."
+            ),
+            exists=True,
+            dir_okay=False,
+        ),
+    ] = None,
     validation_launcher: Annotated[
         str | None,
         typer.Option(
@@ -11491,7 +11880,15 @@ def live_test(
     poll_seconds: Annotated[float, typer.Option(help="Polling interval.")] = 2,
 ) -> None:
     """Run configurable live acceptance checks for a cluster."""
-    report_path = report or default_report_path(cluster)
+    report_path = report or (
+        _live_acceptance_resume_output_path(resume_report)
+        if resume_report is not None
+        else default_report_path(cluster)
+    )
+    if resume_report is not None and report_path.resolve() == resume_report.resolve():
+        raise typer.BadParameter(
+            "--report must differ from --resume-report so the checkpoint is preserved"
+        )
     seed_report = new_live_validation_report(
         scenario=validation_scenario,
         cluster=cluster,
@@ -11501,7 +11898,8 @@ def live_test(
             sha256_file(validation_artifact) if validation_artifact is not None else None
         ),
     )
-    write_validation_report(seed_report, report_path)
+    if resume_report is None:
+        write_validation_report(seed_report, report_path)
     try:
         definition = _require_cluster(cluster)
         should_verify_transport = (
@@ -11597,6 +11995,7 @@ def live_test(
                     validation_scenario=validation_scenario,
                     verify_cluster_deployment=verify_cluster_deployment,
                     report_id=seed_report.report_id,
+                    resume_report_path=resume_report,
                 )
             )
             current_report = _load_current_acceptance_report(
@@ -11605,7 +12004,9 @@ def live_test(
             )
             if current_report is None:
                 raise RelayError("live acceptance did not persist the current invocation report")
-            if should_execute_on_cluster(definition):
+            if current_report.status is ValidationStatus.PASSED and should_execute_on_cluster(
+                definition
+            ):
                 _write_remote_verified_report(
                     current_report,
                     definition,
@@ -11638,6 +12039,11 @@ def live_test(
 def _file_idempotency_key(path: Path, text: str) -> str:
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return f"jarvis:{path.resolve()}:{digest}"
+
+
+def _live_acceptance_resume_output_path(source: Path) -> Path:
+    """Return a collision-resistant sibling without altering the source checkpoint."""
+    return source.with_name(f"{source.stem}.resume-{uuid4().hex[:8]}{source.suffix}")
 
 
 def _none_if_blank(value: str | None) -> str | None:
@@ -14562,6 +14968,10 @@ def _run_jarvis_package_search_query(
 class _JarvisExecutionQueryAcceptance:
     """Durable evidence from one post-run unified JARVIS execution query."""
 
+    cluster: str
+    pipeline_id: str
+    execution_id: str
+    outcome: Literal["terminal", "observation_unknown", "terminal_artifacts_pending"]
     tools_list_response: dict[str, Any]
     call_response: dict[str, Any]
     call_job_id: str
@@ -14572,6 +14982,57 @@ class _JarvisExecutionQueryAcceptance:
     initialize_response: dict[str, Any]
     stdio_evidence: dict[str, Any]
     lifecycle_observations: list[dict[str, Any]]
+    scheduler_action: Literal["none"] = "none"
+    relay_action: Literal["none"] = "none"
+
+    def retry_selector(self) -> dict[str, object]:
+        """Return the exact execution identity for a later query-only observation."""
+        if not self.lifecycle_observations:
+            raise RelayError("JARVIS execution observation omitted durable lifecycle evidence")
+        latest = self.lifecycle_observations[-1]
+        handle = latest.get("execution_handle")
+        if not isinstance(handle, dict):
+            raise RelayError("JARVIS execution observation omitted its durable handle")
+        typed_handle = cast(dict[str, object], handle)
+        scheduler_cluster = typed_handle.get("cluster")
+        if scheduler_cluster is not None and (
+            not isinstance(scheduler_cluster, str) or not scheduler_cluster
+        ):
+            raise RelayError("JARVIS execution observation returned an invalid scheduler cluster")
+        return {
+            "cluster": self.cluster,
+            "scheduler_cluster": scheduler_cluster,
+            "pipeline_id": self.pipeline_id,
+            "execution_id": self.execution_id,
+            "scheduler_provider": typed_handle.get("scheduler_provider"),
+            "scheduler_native_id": typed_handle.get("scheduler_native_id"),
+            "last_query_job_id": self.call_job_id,
+        }
+
+
+@dataclass(frozen=True)
+class _JarvisExecutionQueryPending:
+    """Exact query-only resume identity before the first execution snapshot arrives."""
+
+    cluster: str
+    pipeline_id: str
+    execution_id: str
+    selector: dict[str, object]
+    outcome: Literal["observation_pending"] = "observation_pending"
+    lifecycle_observations: tuple[()] = ()
+    scheduler_action: Literal["none"] = "none"
+    relay_action: Literal["retain"] = "retain"
+
+    def retry_selector(self) -> dict[str, object]:
+        """Return the exact execution identity without inventing query evidence."""
+        if (
+            self.selector.get("cluster") != self.cluster
+            or self.selector.get("pipeline_id") != self.pipeline_id
+            or self.selector.get("execution_id") != self.execution_id
+            or self.selector.get("last_query_job_id") is not None
+        ):
+            raise RelayError("unobserved JARVIS execution selector is inconsistent")
+        return dict(self.selector)
 
 
 @dataclass(frozen=True)
@@ -14586,7 +15047,1054 @@ class _JarvisExecutionQueryAttempt:
     provenance: dict[str, Any] | None
 
 
+_JARVIS_NONTERMINAL_VALIDATION_CHECKS = frozenset(
+    {
+        "remote-mcp.jarvis-live-progress",
+        "remote-mcp.jarvis-execution-query",
+    }
+)
+_JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA_V1 = "clio-relay.jarvis-mcp-validation-resume.v1"
+_JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA = "clio-relay.jarvis-mcp-validation-resume.v2"
+_JARVIS_VALIDATION_PHASE_INTENT = "jarvis_run_intent"
+_JARVIS_VALIDATION_PHASE_DISPATCH = "jarvis_run_dispatch"
+_JARVIS_VALIDATION_PHASE_QUERY = "execution_query"
+
+
+def _canonical_jarvis_validation_digest(value: object) -> str:
+    """Hash one finite JSON value using the checkpoint's canonical encoding."""
+    try:
+        payload = json.dumps(
+            value,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise RelayError("JARVIS validation checkpoint evidence must be finite JSON") from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _new_jarvis_validation_idempotency_key(
+    *,
+    cluster: str,
+    profile: str,
+    arguments: dict[str, Any],
+) -> str:
+    """Create a run-specific stable key before crossing the stdio dispatch boundary."""
+    intent_digest = _canonical_jarvis_validation_digest(
+        {
+            "cluster": cluster,
+            "profile": profile,
+            "tool": "jarvis_run",
+            "arguments": arguments,
+        }
+    )
+    return f"validation:jarvis-run:{cluster}:{intent_digest}:{uuid4().hex}"
+
+
+def _jarvis_run_execution_intent(
+    *,
+    cluster: str,
+    profile: str,
+    arguments: dict[str, Any],
+    idempotency_key: str,
+) -> dict[str, object]:
+    """Return the exact replayable virtual-tool request, including relay idempotency."""
+    return {
+        "cluster": cluster,
+        "profile": profile,
+        "tool": "jarvis_run",
+        "arguments": {
+            "cluster": cluster,
+            **arguments,
+            "idempotency_key": idempotency_key,
+        },
+    }
+
+
+def _new_jarvis_intent_resume_checkpoint(
+    *,
+    execution_intent: dict[str, object],
+    pre_dispatch_inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist an idempotent intent before a relay receipt is observable."""
+    cluster = cast(str, execution_intent["cluster"])
+    profile = cast(str, execution_intent["profile"])
+    arguments = cast(dict[str, object], execution_intent["arguments"])
+    idempotency_key = cast(str, arguments["idempotency_key"])
+    pipeline_id = cast(str, arguments["pipeline_id"])
+    selector: dict[str, object] = {
+        "cluster": cluster,
+        "pipeline_id": pipeline_id,
+        "relay_job_id": None,
+        "idempotency_key": idempotency_key,
+        "idempotency_key_sha256": hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest(),
+        "execution_intent_sha256": _canonical_jarvis_validation_digest(execution_intent),
+        "pre_dispatch_inputs_sha256": _canonical_jarvis_validation_digest(pre_dispatch_inputs),
+        "call_response_sha256": None,
+        "dispatch_evidence_sha256": None,
+    }
+    return {
+        "schema_version": _JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA,
+        "phase": _JARVIS_VALIDATION_PHASE_INTENT,
+        "profile": profile,
+        "retry_selector": selector,
+        "execution_intent": execution_intent,
+        "pre_dispatch_inputs": pre_dispatch_inputs,
+    }
+
+
+def _promote_jarvis_intent_to_dispatch_checkpoint(
+    intent_checkpoint: dict[str, Any],
+    *,
+    job_id: str,
+    builder_inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind a pre-dispatch intent to the one durable relay receipt it returned."""
+    checkpoint = dict(intent_checkpoint)
+    selector = dict(cast(dict[str, object], checkpoint["retry_selector"]))
+    call_response = builder_inputs.get("call_response")
+    typed_call_response = (
+        cast(dict[str, Any], call_response) if isinstance(call_response, dict) else None
+    )
+    if typed_call_response is None or _mcp_response_job_id(typed_call_response) != job_id:
+        raise RelayError("JARVIS validation dispatch response changed its relay job identity")
+    selector.update(
+        {
+            "relay_job_id": job_id,
+            "call_response_sha256": _canonical_jarvis_validation_digest(typed_call_response),
+            "dispatch_evidence_sha256": _canonical_jarvis_validation_digest(builder_inputs),
+        }
+    )
+    checkpoint.update(
+        {
+            "phase": _JARVIS_VALIDATION_PHASE_DISPATCH,
+            "retry_selector": selector,
+            "builder_inputs": builder_inputs,
+        }
+    )
+    return checkpoint
+
+
+def _new_jarvis_intent_pending_report(
+    checkpoint: dict[str, Any],
+) -> LiveValidationReport:
+    """Represent an ambiguous stdio response as replayable intent, never workload failure."""
+    selector = cast(dict[str, object], checkpoint["retry_selector"])
+    inputs = cast(dict[str, object], checkpoint["pre_dispatch_inputs"])
+    report = new_live_validation_report(
+        scenario="remote-mcp",
+        cluster=cast(str, selector["cluster"]),
+        launcher=cast(str | None, inputs.get("launcher")),
+        install_source=cast(str | None, inputs.get("install_source")),
+        artifact_sha256=cast(str | None, inputs.get("artifact_sha256")),
+    )
+    now = datetime.now(UTC)
+    report.completed_at = now
+    report.status = ValidationStatus.PENDING
+    report.checks = [
+        ValidationCheck(
+            check_id="remote-mcp.jarvis-run-intent",
+            summary="idempotent jarvis_run dispatch response remains observable",
+            status=ValidationStatus.PENDING,
+            started_at=report.started_at,
+            completed_at=now,
+            evidence=[
+                EvidenceReference(
+                    kind="jarvis_run_intent_resume_selector",
+                    excerpt=json.dumps(selector, sort_keys=True),
+                    metadata={
+                        **selector,
+                        "scheduler_action": "none",
+                        "relay_action": "replay_same_idempotency_key",
+                    },
+                )
+            ],
+        )
+    ]
+    report.resources = [
+        ValidationResource(
+            kind="jarvis_dispatch_intent",
+            resource_id=cast(str, selector["execution_intent_sha256"]),
+            role="resumable_jarvis_run_intent",
+            cluster=cast(str, selector["cluster"]),
+            state="response_unobserved",
+            metadata={
+                "retry_selector": selector,
+                "outcome": "observation_pending",
+                "scheduler_action": "none",
+                "relay_action": "replay_same_idempotency_key",
+                "resume_checkpoint": checkpoint,
+            },
+        )
+    ]
+    return report
+
+
+def _convert_jarvis_checks_to_pending(
+    report: LiveValidationReport,
+    *,
+    pending_check_ids: frozenset[str],
+    resource: ValidationResource,
+) -> LiveValidationReport:
+    """Downgrade only checks whose evidence is unavailable within this observation window."""
+    failed_ids = {
+        check.check_id for check in report.checks if check.status is ValidationStatus.FAILED
+    }
+    if not failed_ids or failed_ids - pending_check_ids:
+        return report
+    updated_checks = [
+        check.model_copy(update={"status": ValidationStatus.PENDING, "error": None})
+        if check.status is ValidationStatus.FAILED and check.check_id in pending_check_ids
+        else check
+        for check in report.checks
+    ]
+    return report.model_copy(
+        update={
+            "status": ValidationStatus.PENDING,
+            "error": None,
+            "checks": updated_checks,
+            "resources": [*report.resources, resource],
+        }
+    )
+
+
+def _build_jarvis_dispatch_pending_report(
+    checkpoint: dict[str, Any],
+) -> LiveValidationReport:
+    """Retain one accepted relay job while its terminal result remains unobserved."""
+    builder_inputs = cast(dict[str, Any], checkpoint["builder_inputs"])
+    selector = cast(dict[str, object], checkpoint["retry_selector"])
+    report = build_jarvis_mcp_validation_report(
+        **builder_inputs,
+        query_tools_list_response=None,
+        query_call_response=None,
+        query_call_job_id="",
+        query_call_status={},
+        query_artifacts=[],
+        query_mcp_result=None,
+        query_provenance=None,
+        query_initialize_response=None,
+        query_stdio_evidence=None,
+        query_lifecycle_observations=[],
+    )
+    resource = ValidationResource(
+        kind="relay_job",
+        resource_id=cast(str, selector["relay_job_id"]),
+        role="resumable_jarvis_run_dispatch",
+        cluster=cast(str, selector["cluster"]),
+        state="observation_pending",
+        metadata={
+            "retry_selector": selector,
+            "outcome": "observation_pending",
+            "scheduler_action": "none",
+            "relay_action": "retain",
+            "resume_checkpoint": checkpoint,
+        },
+    )
+    return _convert_jarvis_checks_to_pending(
+        report,
+        pending_check_ids=frozenset(
+            {
+                "remote-mcp.jarvis-call",
+                "remote-mcp.server-artifact",
+                "remote-mcp.durable-result",
+                "remote-mcp.jarvis-live-progress",
+                "jarvis.spack-runtime-environment",
+                "jarvis.structured-runtime-metadata",
+                "remote-mcp.jarvis-execution-query",
+            }
+        ),
+        resource=resource,
+    )
+
+
+def _build_unobserved_jarvis_query_pending_report(
+    *,
+    builder_inputs: dict[str, Any],
+    execution_query: _JarvisExecutionQueryPending,
+    checkpoint: dict[str, Any],
+) -> LiveValidationReport:
+    """Retain exact execution identity when no query result arrives in the window."""
+    selector = execution_query.retry_selector()
+    report = build_jarvis_mcp_validation_report(
+        **builder_inputs,
+        query_tools_list_response=None,
+        query_call_response=None,
+        query_call_job_id="",
+        query_call_status={},
+        query_artifacts=[],
+        query_mcp_result=None,
+        query_provenance=None,
+        query_initialize_response=None,
+        query_stdio_evidence=None,
+        query_lifecycle_observations=[],
+    )
+    provider = selector.get("scheduler_provider")
+    resource = ValidationResource(
+        kind="jarvis_execution",
+        resource_id=execution_query.execution_id,
+        role="resumable_acceptance_workload",
+        cluster=execution_query.cluster,
+        provider=provider if isinstance(provider, str) else None,
+        state="observation_pending",
+        metadata={
+            "retry_selector": selector,
+            "outcome": execution_query.outcome,
+            "scheduler_action": execution_query.scheduler_action,
+            "relay_action": execution_query.relay_action,
+            "resume_checkpoint": checkpoint,
+        },
+    )
+    return _convert_jarvis_checks_to_pending(
+        report,
+        pending_check_ids=_JARVIS_NONTERMINAL_VALIDATION_CHECKS,
+        resource=resource,
+    )
+
+
+def _mark_jarvis_validation_pending(
+    report: LiveValidationReport,
+    *,
+    execution_query: _JarvisExecutionQueryAcceptance,
+    resume_checkpoint: dict[str, Any] | None = None,
+) -> LiveValidationReport:
+    """Convert only terminal-dependent failures into honest resumable evidence."""
+    failed_check_ids = {
+        check.check_id for check in report.checks if check.status is ValidationStatus.FAILED
+    }
+    unexpected_failures = failed_check_ids - _JARVIS_NONTERMINAL_VALIDATION_CHECKS
+    if unexpected_failures or not _jarvis_nonterminal_failures_are_resumable(
+        report,
+        execution_query=execution_query,
+    ):
+        return report
+    selector = execution_query.retry_selector()
+    latest = execution_query.lifecycle_observations[-1]
+    updated_checks = [
+        check.model_copy(
+            update={
+                "status": ValidationStatus.PENDING,
+                "error": None,
+                "evidence": [
+                    *check.evidence,
+                    EvidenceReference(
+                        kind="jarvis_execution_resume_selector",
+                        excerpt=json.dumps(selector, sort_keys=True),
+                        metadata={
+                            **selector,
+                            "scheduler_action": execution_query.scheduler_action,
+                            "relay_action": execution_query.relay_action,
+                        },
+                    ),
+                ],
+            }
+        )
+        if check.check_id in _JARVIS_NONTERMINAL_VALIDATION_CHECKS
+        and check.status is ValidationStatus.FAILED
+        else check
+        for check in report.checks
+    ]
+    provider = selector.get("scheduler_provider")
+    resource = ValidationResource(
+        kind="jarvis_execution",
+        resource_id=execution_query.execution_id,
+        role="resumable_acceptance_workload",
+        cluster=execution_query.cluster,
+        provider=provider if isinstance(provider, str) else None,
+        state=str(latest.get("state")) if latest.get("state") is not None else None,
+        metadata={
+            "retry_selector": selector,
+            "outcome": execution_query.outcome,
+            "scheduler_action": execution_query.scheduler_action,
+            "relay_action": execution_query.relay_action,
+            **({"resume_checkpoint": resume_checkpoint} if resume_checkpoint is not None else {}),
+        },
+    )
+    return report.model_copy(
+        update={
+            "status": ValidationStatus.PENDING,
+            "error": None,
+            "checks": updated_checks,
+            "resources": [*report.resources, resource],
+        }
+    )
+
+
+def _jarvis_nonterminal_failures_are_resumable(
+    report: LiveValidationReport,
+    *,
+    execution_query: _JarvisExecutionQueryAcceptance,
+) -> bool:
+    """Require all nonterminal integrity assertions before downgrading terminal checks."""
+    required_assertions = {
+        "remote-mcp.jarvis-live-progress": {
+            "observation_count_bounded",
+            "query_identities_coherent",
+            "scheduler_identity_optional_coherent_and_stable",
+            "lifecycle_prefix_coherent",
+            "package_progress_nonregressing",
+        },
+        "remote-mcp.jarvis-execution-query": {
+            "local_query_surface_verified",
+            "server_artifact_binding_verified",
+            "resumable_query_job_verified",
+            "resumable_result_transport_verified",
+            "resumable_result_envelope_verified",
+            "resumable_identity_coherent",
+            "resumable_lifecycle_coherent",
+            "resumable_runner_semantic_validation_verified",
+        },
+    }
+    if not execution_query.lifecycle_observations:
+        return False
+    latest = execution_query.lifecycle_observations[-1]
+    terminal = latest.get("terminal")
+    if execution_query.outcome == "observation_unknown" and terminal is not False:
+        return False
+    if execution_query.outcome == "terminal_artifacts_pending" and terminal is not True:
+        return False
+    for check in report.checks:
+        required = required_assertions.get(check.check_id)
+        if check.status is not ValidationStatus.FAILED or required is None:
+            continue
+        if len(check.evidence) != 1:
+            return False
+        assertions = check.evidence[0].metadata.get("assertions")
+        if not isinstance(assertions, dict) or not all(
+            cast(dict[str, object], assertions).get(name) is True for name in required
+        ):
+            return False
+    return True
+
+
+def _load_jarvis_validation_resume_checkpoint(
+    path: Path,
+    *,
+    cluster: str,
+) -> dict[str, Any]:
+    """Load one exact pending acceptance checkpoint without trusting caller selectors."""
+    report = load_validation_report(path)
+    if report.scenario != "remote-mcp" or report.cluster != cluster:
+        raise ConfigurationError(
+            "JARVIS validation resume report does not match the requested cluster/scenario"
+        )
+    if report.status is not ValidationStatus.PENDING:
+        raise ConfigurationError("JARVIS validation resume requires a pending report")
+    candidates = [
+        (resource, resource.metadata.get("resume_checkpoint"))
+        for resource in report.resources
+        if isinstance(resource.metadata.get("resume_checkpoint"), dict)
+        and (
+            (
+                resource.kind == "jarvis_execution"
+                and resource.role == "resumable_acceptance_workload"
+            )
+            or (resource.kind == "relay_job" and resource.role == "resumable_jarvis_run_dispatch")
+            or (
+                resource.kind == "jarvis_dispatch_intent"
+                and resource.role == "resumable_jarvis_run_intent"
+            )
+        )
+    ]
+    if len(candidates) != 1:
+        raise ConfigurationError(
+            "pending JARVIS validation report must contain one resume checkpoint"
+        )
+    resource, raw_checkpoint = candidates[0]
+    checkpoint = cast(dict[str, Any], raw_checkpoint)
+    schema_version = checkpoint.get("schema_version")
+    if schema_version == _JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA_V1:
+        phase = _JARVIS_VALIDATION_PHASE_QUERY
+    elif schema_version == _JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA:
+        phase = checkpoint.get("phase")
+    else:
+        raise ConfigurationError("pending JARVIS validation resume checkpoint is invalid")
+    if phase in {_JARVIS_VALIDATION_PHASE_INTENT, _JARVIS_VALIDATION_PHASE_DISPATCH}:
+        return _validate_jarvis_dispatch_resume_checkpoint(
+            checkpoint,
+            resource=resource,
+            cluster=cluster,
+        )
+    if phase != _JARVIS_VALIDATION_PHASE_QUERY:
+        raise ConfigurationError("pending JARVIS validation resume checkpoint phase is invalid")
+    selector = checkpoint.get("retry_selector")
+    builder_inputs = checkpoint.get("builder_inputs")
+    observations = checkpoint.get("lifecycle_observations")
+    profile = checkpoint.get("profile")
+    unobserved = (
+        schema_version == _JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA
+        and checkpoint.get("observation_state") == "not_observed"
+    )
+    if (
+        not isinstance(selector, dict)
+        or resource.kind != "jarvis_execution"
+        or resource.role != "resumable_acceptance_workload"
+        or cast(dict[str, object], selector).get("cluster") != cluster
+        or not isinstance(cast(dict[str, object], selector).get("pipeline_id"), str)
+        or not cast(str, cast(dict[str, object], selector).get("pipeline_id"))
+        or not isinstance(cast(dict[str, object], selector).get("execution_id"), str)
+        or not cast(str, cast(dict[str, object], selector).get("execution_id"))
+        or not isinstance(builder_inputs, dict)
+        or cast(dict[str, object], builder_inputs).get("cluster") != cluster
+        or "scheduler_cluster" not in cast(dict[str, object], builder_inputs)
+        or cast(dict[str, object], builder_inputs).get("tool") != "jarvis_run"
+        or not isinstance(cast(dict[str, object], builder_inputs).get("runtime_metadata"), dict)
+        or not isinstance(observations, list)
+        or (not observations and not unobserved)
+        or (bool(cast(list[object], observations)) and unobserved)
+        or len(cast(list[object], observations)) > _MAX_JARVIS_EXECUTION_QUERY_OBSERVATIONS
+        or profile not in {"user", "admin", "operator", "all"}
+        or (
+            schema_version == _JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA
+            and checkpoint.get("observation_state") not in {"not_observed", "observed"}
+        )
+    ):
+        raise ConfigurationError("pending JARVIS validation resume checkpoint is invalid")
+    typed_selector = cast(dict[str, object], selector)
+    pipeline_id = cast(str, typed_selector["pipeline_id"])
+    execution_id = cast(str, typed_selector["execution_id"])
+    scheduler_cluster = typed_selector.get("scheduler_cluster")
+    scheduler_provider = typed_selector.get("scheduler_provider")
+    scheduler_native_id = typed_selector.get("scheduler_native_id")
+    last_query_job_id = typed_selector.get("last_query_job_id")
+    builder_scheduler_cluster = cast(dict[str, object], builder_inputs).get("scheduler_cluster")
+    expected_mode = "scheduler" if scheduler_provider is not None else "direct"
+    if (
+        "scheduler_cluster" not in typed_selector
+        or builder_scheduler_cluster != scheduler_cluster
+        or (
+            scheduler_cluster is not None
+            and (not isinstance(scheduler_cluster, str) or not scheduler_cluster)
+        )
+        or (
+            scheduler_provider is not None
+            and (not isinstance(scheduler_provider, str) or not scheduler_provider)
+        )
+        or (
+            scheduler_native_id is not None
+            and (not isinstance(scheduler_native_id, str) or not scheduler_native_id)
+        )
+        or (scheduler_provider is None and scheduler_native_id is not None)
+        or (
+            unobserved
+            and (
+                last_query_job_id is not None
+                or resource.state != "observation_pending"
+                or resource.metadata.get("outcome") != "observation_pending"
+            )
+        )
+        or (not unobserved and (not isinstance(last_query_job_id, str) or not last_query_job_id))
+        or resource.resource_id != execution_id
+        or resource.cluster != cluster
+        or resource.provider != scheduler_provider
+        or resource.metadata.get("retry_selector") != selector
+    ):
+        raise ConfigurationError("pending JARVIS validation resume identity is invalid")
+    typed_observations: list[dict[str, object]] = []
+    validated_prefix: list[dict[str, Any]] = []
+    scheduler_native_id_assigned = False
+    scheduler_cluster_assigned = False
+    for raw_observation in cast(list[object], observations):
+        if not isinstance(raw_observation, dict):
+            raise ConfigurationError("pending JARVIS validation observation is invalid")
+        observation = {
+            str(key): value for key, value in cast(dict[object, object], raw_observation).items()
+        }
+        handle = observation.get("execution_handle")
+        if not isinstance(handle, dict):
+            raise ConfigurationError("pending JARVIS validation observation is invalid")
+        typed_handle = cast(dict[str, object], handle)
+        observation_scheduler_cluster = typed_handle.get("cluster")
+        observation_native_id = typed_handle.get("scheduler_native_id")
+        if (
+            observation.get("pipeline_id") != pipeline_id
+            or observation.get("execution_id") != execution_id
+            or not isinstance(observation.get("query_job_id"), str)
+            or not observation.get("query_job_id")
+            or typed_handle.get("pipeline_id") != pipeline_id
+            or typed_handle.get("execution_id") != execution_id
+            or typed_handle.get("mode") != expected_mode
+            or typed_handle.get("scheduler_provider") != scheduler_provider
+        ):
+            raise ConfigurationError("pending JARVIS validation observation identity changed")
+        if scheduler_native_id is None:
+            if observation_native_id is not None:
+                raise ConfigurationError("pending JARVIS validation observation identity changed")
+        elif observation_native_id is None:
+            if scheduler_native_id_assigned:
+                raise ConfigurationError("pending JARVIS validation observation identity changed")
+        elif observation_native_id != scheduler_native_id:
+            raise ConfigurationError("pending JARVIS validation observation identity changed")
+        else:
+            scheduler_native_id_assigned = True
+        if scheduler_cluster is None:
+            if observation_scheduler_cluster is not None:
+                raise ConfigurationError("pending JARVIS validation observation identity changed")
+        elif observation_scheduler_cluster is None:
+            if scheduler_cluster_assigned:
+                raise ConfigurationError("pending JARVIS validation observation identity changed")
+        elif observation_scheduler_cluster != scheduler_cluster:
+            raise ConfigurationError("pending JARVIS validation observation identity changed")
+        else:
+            scheduler_cluster_assigned = True
+        if observation.get(_JARVIS_QUERY_INTEGRITY_KEY) is not None:
+            raise ConfigurationError("pending JARVIS validation observation integrity failed")
+        gap_marker = observation.get(_JARVIS_VERIFIED_GAP_KEY)
+        crossed_verified_gap = gap_marker is not None
+        if crossed_verified_gap and (
+            not validated_prefix
+            or not _valid_jarvis_verified_gap_marker(
+                gap_marker,
+                previous=validated_prefix[-1],
+                current=cast(dict[str, Any], observation),
+            )
+        ):
+            raise ConfigurationError("pending JARVIS validation observation gap is invalid")
+        integrity_violation = _jarvis_query_integrity_violation(
+            validated_prefix,
+            cast(dict[str, Any], observation),
+            crossed_verified_gap=crossed_verified_gap,
+        )
+        if integrity_violation is not None:
+            raise ConfigurationError(
+                "pending JARVIS validation observation integrity failed: "
+                f"{integrity_violation['reason']}"
+            )
+        validated_prefix.append(cast(dict[str, Any], observation))
+        typed_observations.append(observation)
+    if typed_observations:
+        latest = typed_observations[-1]
+        latest_handle = cast(dict[str, object], latest["execution_handle"])
+        if (
+            latest.get("query_job_id") != last_query_job_id
+            or resource.state != latest.get("state")
+            or latest_handle.get("cluster") != scheduler_cluster
+            or latest_handle.get("scheduler_native_id") != scheduler_native_id
+        ):
+            raise ConfigurationError("pending JARVIS validation latest observation changed")
+    typed_runtime = cast(
+        dict[str, Any],
+        cast(dict[str, object], builder_inputs)["runtime_metadata"],
+    )
+    runtime_scheduler_job_id = typed_runtime.get("scheduler_job_id")
+    runtime_details = typed_runtime.get("details")
+    runtime_native_execution = (
+        cast(dict[str, object], runtime_details).get("native_execution")
+        if isinstance(runtime_details, dict)
+        else None
+    )
+    if (
+        typed_runtime.get("schema_version") != RUNTIME_METADATA_SCHEMA
+        or typed_runtime.get("source") != "jarvis_mcp"
+        or typed_runtime.get("pipeline_id") != pipeline_id
+        or typed_runtime.get("execution_id") != execution_id
+        or typed_runtime.get("scheduler_provider") != scheduler_provider
+        or (
+            runtime_scheduler_job_id is not None and runtime_scheduler_job_id != scheduler_native_id
+        )
+    ):
+        raise ConfigurationError("pending JARVIS validation runtime identity changed")
+    if not isinstance(runtime_native_execution, dict):
+        raise ConfigurationError("pending JARVIS validation runtime identity changed")
+    try:
+        native_documents = native_execution_documents(
+            cast(dict[str, Any], runtime_native_execution)
+        )
+    except (ValidationError, ValueError) as exc:
+        raise ConfigurationError("pending JARVIS validation runtime identity changed") from exc
+    if native_documents is None:
+        raise ConfigurationError("pending JARVIS validation runtime identity changed")
+    runtime_handle = native_documents.execution_handle
+    runtime_record = native_documents.execution_record
+    runtime_progress = native_documents.progress
+    runtime_terminal = typed_runtime.get("terminal")
+    if not isinstance(runtime_terminal, dict):
+        raise ConfigurationError("pending JARVIS validation runtime identity changed")
+    typed_runtime_terminal = cast(dict[str, object], runtime_terminal)
+    first_state = typed_observations[0].get("state") if typed_observations else runtime_record.state
+    runtime_rank = _JARVIS_EXECUTION_STATE_RANK.get(runtime_record.state)
+    first_rank = (
+        _JARVIS_EXECUTION_STATE_RANK.get(first_state) if isinstance(first_state, str) else None
+    )
+    if (
+        runtime_handle.pipeline_id != pipeline_id
+        or runtime_handle.execution_id != execution_id
+        or runtime_handle.mode != expected_mode
+        or runtime_handle.scheduler_provider != scheduler_provider
+        or runtime_handle.scheduler_native_id != runtime_scheduler_job_id
+        or (
+            runtime_handle.scheduler_native_id is not None
+            and runtime_handle.scheduler_native_id != scheduler_native_id
+        )
+        or (runtime_handle.cluster is not None and runtime_handle.cluster != scheduler_cluster)
+        or typed_runtime_terminal.get("state") != runtime_record.state
+        or typed_runtime_terminal.get("terminal") is not runtime_record.terminal
+        or typed_runtime_terminal.get("returncode") != runtime_record.return_code
+        or typed_runtime_terminal.get("reason") != runtime_record.error
+        or runtime_progress.pipeline_id != pipeline_id
+        or runtime_progress.execution_id != execution_id
+        or (runtime_rank is not None and first_rank is not None and first_rank < runtime_rank)
+        or (
+            typed_observations
+            and runtime_record.terminal
+            and (
+                typed_observations[0].get("terminal") is not True
+                or first_state != runtime_record.state
+            )
+        )
+    ):
+        raise ConfigurationError("pending JARVIS validation runtime identity changed")
+    return checkpoint
+
+
+def _validate_jarvis_dispatch_resume_checkpoint(
+    checkpoint: dict[str, Any],
+    *,
+    resource: ValidationResource,
+    cluster: str,
+) -> dict[str, Any]:
+    """Fail closed on any change to a pre-query JARVIS dispatch identity."""
+    phase = checkpoint.get("phase")
+    profile = checkpoint.get("profile")
+    selector = checkpoint.get("retry_selector")
+    intent = checkpoint.get("execution_intent")
+    pre_dispatch_inputs = checkpoint.get("pre_dispatch_inputs")
+    if (
+        checkpoint.get("schema_version") != _JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA
+        or phase not in {_JARVIS_VALIDATION_PHASE_INTENT, _JARVIS_VALIDATION_PHASE_DISPATCH}
+        or profile not in {"user", "admin", "operator", "all"}
+        or not isinstance(selector, dict)
+        or not isinstance(intent, dict)
+        or not isinstance(pre_dispatch_inputs, dict)
+    ):
+        raise ConfigurationError("pending JARVIS dispatch checkpoint is invalid")
+    typed_selector = cast(dict[str, object], selector)
+    typed_intent = cast(dict[str, object], intent)
+    typed_pre_dispatch_inputs = cast(dict[str, Any], pre_dispatch_inputs)
+    raw_arguments = typed_intent.get("arguments")
+    if not isinstance(raw_arguments, dict):
+        raise ConfigurationError("pending JARVIS dispatch intent is invalid")
+    arguments = cast(dict[str, object], raw_arguments)
+    idempotency_key = arguments.get("idempotency_key")
+    pipeline_id = arguments.get("pipeline_id")
+    expected_selector_fields = {
+        "cluster",
+        "pipeline_id",
+        "relay_job_id",
+        "idempotency_key",
+        "idempotency_key_sha256",
+        "execution_intent_sha256",
+        "pre_dispatch_inputs_sha256",
+        "call_response_sha256",
+        "dispatch_evidence_sha256",
+    }
+    if (
+        set(typed_selector) != expected_selector_fields
+        or typed_intent.get("cluster") != cluster
+        or typed_intent.get("profile") != profile
+        or typed_intent.get("tool") != "jarvis_run"
+        or arguments.get("cluster") != cluster
+        or not isinstance(pipeline_id, str)
+        or not pipeline_id
+        or not isinstance(idempotency_key, str)
+        or not idempotency_key
+        or len(idempotency_key) > 512
+        or typed_selector.get("cluster") != cluster
+        or typed_selector.get("pipeline_id") != pipeline_id
+        or typed_selector.get("idempotency_key") != idempotency_key
+        or typed_selector.get("execution_intent_sha256")
+        != _canonical_jarvis_validation_digest(typed_intent)
+        or typed_selector.get("pre_dispatch_inputs_sha256")
+        != _canonical_jarvis_validation_digest(typed_pre_dispatch_inputs)
+        or typed_selector.get("idempotency_key_sha256")
+        != hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+        or typed_pre_dispatch_inputs.get("cluster") != cluster
+        or typed_pre_dispatch_inputs.get("tool") != "jarvis_run"
+        or not isinstance(typed_pre_dispatch_inputs.get("package_search_query"), str)
+        or not typed_pre_dispatch_inputs.get("package_search_query")
+    ):
+        raise ConfigurationError("pending JARVIS dispatch identity changed")
+    if (
+        resource.cluster != cluster
+        or resource.provider is not None
+        or resource.metadata.get("retry_selector") != selector
+        or resource.metadata.get("resume_checkpoint") != checkpoint
+        or resource.metadata.get("outcome") != "observation_pending"
+        or resource.metadata.get("scheduler_action") != "none"
+    ):
+        raise ConfigurationError("pending JARVIS dispatch resource identity changed")
+    relay_job_id = typed_selector.get("relay_job_id")
+    if phase == _JARVIS_VALIDATION_PHASE_INTENT:
+        if (
+            relay_job_id is not None
+            or typed_selector.get("call_response_sha256") is not None
+            or typed_selector.get("dispatch_evidence_sha256") is not None
+            or "builder_inputs" in checkpoint
+            or resource.kind != "jarvis_dispatch_intent"
+            or resource.role != "resumable_jarvis_run_intent"
+            or resource.resource_id != typed_selector.get("execution_intent_sha256")
+            or resource.state != "response_unobserved"
+            or resource.metadata.get("relay_action") != "replay_same_idempotency_key"
+        ):
+            raise ConfigurationError("pending JARVIS dispatch intent changed")
+        return checkpoint
+    builder_inputs = checkpoint.get("builder_inputs")
+    if (
+        not isinstance(builder_inputs, dict)
+        or not isinstance(relay_job_id, str)
+        or not relay_job_id
+    ):
+        raise ConfigurationError("pending JARVIS relay dispatch checkpoint is invalid")
+    typed_builder = cast(dict[str, Any], builder_inputs)
+    call_response = typed_builder.get("call_response")
+    typed_call_response = (
+        cast(dict[str, Any], call_response) if isinstance(call_response, dict) else None
+    )
+    try:
+        response_job_id = (
+            _mcp_response_job_id(typed_call_response) if typed_call_response is not None else None
+        )
+    except RelayError as exc:
+        raise ConfigurationError("pending JARVIS relay dispatch response is invalid") from exc
+    if (
+        response_job_id != relay_job_id
+        or typed_builder.get("cluster") != cluster
+        or typed_builder.get("tool") != "jarvis_run"
+        or typed_builder.get("call_job_id") != relay_job_id
+        or typed_builder.get("scheduler_cluster") is not None
+        or typed_builder.get("call_status") != {}
+        or typed_builder.get("artifacts") != []
+        or typed_builder.get("mcp_result") is not None
+        or typed_builder.get("provenance") is not None
+        or typed_builder.get("runtime_metadata") is not None
+        or typed_builder.get("progress") != []
+        or typed_builder.get("live_progress_observation") is not None
+        or any(typed_builder.get(key) != value for key, value in typed_pre_dispatch_inputs.items())
+        or typed_selector.get("call_response_sha256")
+        != _canonical_jarvis_validation_digest(typed_call_response)
+        or typed_selector.get("dispatch_evidence_sha256")
+        != _canonical_jarvis_validation_digest(typed_builder)
+        or resource.kind != "relay_job"
+        or resource.role != "resumable_jarvis_run_dispatch"
+        or resource.resource_id != relay_job_id
+        or resource.state != "observation_pending"
+        or resource.metadata.get("relay_action") != "retain"
+    ):
+        raise ConfigurationError("pending JARVIS relay dispatch identity changed")
+    return checkpoint
+
+
+def _require_same_jarvis_resume_identity(
+    *,
+    expected: dict[str, Any],
+    observed: dict[str, object],
+) -> None:
+    """Reject a resume snapshot whose durable workload identity changed."""
+    for field in ("cluster", "pipeline_id", "execution_id", "scheduler_provider"):
+        if observed.get(field) != expected.get(field):
+            raise RelayError(f"JARVIS validation resume changed {field}")
+    expected_native_id = expected.get("scheduler_native_id")
+    observed_native_id = observed.get("scheduler_native_id")
+    if expected_native_id is not None and observed_native_id != expected_native_id:
+        raise RelayError("JARVIS validation resume changed scheduler_native_id")
+    if observed_native_id is not None and (
+        not isinstance(observed_native_id, str) or not observed_native_id
+    ):
+        raise RelayError("JARVIS validation resume returned an invalid scheduler_native_id")
+    expected_scheduler_cluster = expected.get("scheduler_cluster")
+    observed_scheduler_cluster = observed.get("scheduler_cluster")
+    if (
+        expected_scheduler_cluster is not None
+        and observed_scheduler_cluster != expected_scheduler_cluster
+    ):
+        raise RelayError("JARVIS validation resume changed scheduler_cluster")
+    if observed_scheduler_cluster is not None and (
+        not isinstance(observed_scheduler_cluster, str) or not observed_scheduler_cluster
+    ):
+        raise RelayError("JARVIS validation resume returned an invalid scheduler_cluster")
+
+
+def _jarvis_execution_retry_selector_from_runtime_metadata(
+    runtime_metadata: dict[str, Any],
+    *,
+    cluster: str,
+    pipeline_id: str,
+    execution_id: str,
+) -> dict[str, object]:
+    """Bind a query-only selector to JARVIS's structured native execution authority."""
+    details = runtime_metadata.get("details")
+    native_execution = (
+        cast(dict[str, object], details).get("native_execution")
+        if isinstance(details, dict)
+        else None
+    )
+    if (
+        runtime_metadata.get("schema_version") != RUNTIME_METADATA_SCHEMA
+        or runtime_metadata.get("source") != "jarvis_mcp"
+        or runtime_metadata.get("pipeline_id") != pipeline_id
+        or runtime_metadata.get("execution_id") != execution_id
+        or not isinstance(native_execution, dict)
+    ):
+        raise RelayError("JARVIS run metadata omitted its structured execution identity")
+    try:
+        documents = native_execution_documents(cast(dict[str, Any], native_execution))
+    except (ValidationError, ValueError) as exc:
+        raise RelayError(
+            "JARVIS run metadata contains an invalid native execution identity"
+        ) from exc
+    if documents is None:
+        raise RelayError("JARVIS run metadata omitted its native execution identity")
+    handle = documents.execution_handle
+    scheduler_provider = runtime_metadata.get("scheduler_provider")
+    scheduler_native_id = runtime_metadata.get("scheduler_job_id")
+    if (
+        handle.pipeline_id != pipeline_id
+        or handle.execution_id != execution_id
+        or handle.scheduler_provider != scheduler_provider
+        or handle.scheduler_native_id != scheduler_native_id
+        or (scheduler_provider is None and scheduler_native_id is not None)
+    ):
+        raise RelayError("JARVIS run metadata contains inconsistent scheduler identity")
+    return {
+        "cluster": cluster,
+        "scheduler_cluster": handle.cluster,
+        "pipeline_id": pipeline_id,
+        "execution_id": execution_id,
+        "scheduler_provider": scheduler_provider,
+        "scheduler_native_id": scheduler_native_id,
+        "last_query_job_id": None,
+    }
+
+
+def _require_jarvis_run_dispatch_job_identity(
+    status: dict[str, object],
+    *,
+    cluster: str,
+    job_id: str,
+    pipeline_id: str,
+    idempotency_key: str,
+) -> None:
+    """Verify that a resumed receipt still denotes the exact accepted jarvis_run call."""
+    raw_job = status.get("job")
+    job = cast(dict[str, object], raw_job) if isinstance(raw_job, dict) else {}
+    raw_spec = job.get("spec")
+    spec = cast(dict[str, object], raw_spec) if isinstance(raw_spec, dict) else {}
+    raw_arguments = spec.get("arguments")
+    arguments = cast(dict[str, object], raw_arguments) if isinstance(raw_arguments, dict) else {}
+    if (
+        status.get("terminal") is not True
+        or job.get("job_id") != job_id
+        or job.get("cluster") != cluster
+        or job.get("kind") != "mcp_call"
+        or job.get("idempotency_key") != idempotency_key
+        or spec.get("operation") != "tools/call"
+        or spec.get("tool") != "jarvis_run"
+        or arguments.get("pipeline_id") != pipeline_id
+    ):
+        raise RelayError("resumed JARVIS relay job changed its dispatch identity")
+
+
+def _complete_jarvis_run_dispatch(
+    *,
+    definition: ClusterDefinition,
+    queue: ClioCoreQueue,
+    checkpoint: dict[str, Any],
+    wait_timeout_seconds: float,
+    poll_seconds: float,
+) -> dict[str, Any]:
+    """Wait and collect one exact relay dispatch without ever resubmitting it."""
+    selector = cast(dict[str, object], checkpoint["retry_selector"])
+    cluster = cast(str, selector["cluster"])
+    job_id = cast(str, selector["relay_job_id"])
+    pipeline_id = cast(str, selector["pipeline_id"])
+    idempotency_key = cast(str, selector["idempotency_key"])
+    if should_execute_on_cluster(definition):
+        call_status = _wait_for_remote_job_terminal(
+            definition,
+            job_id,
+            timeout_seconds=wait_timeout_seconds,
+            poll_seconds=poll_seconds,
+        )
+        _require_jarvis_run_dispatch_job_identity(
+            call_status,
+            cluster=cluster,
+            job_id=job_id,
+            pipeline_id=pipeline_id,
+            idempotency_key=idempotency_key,
+        )
+        progress = _complete_remote_collection(
+            definition,
+            ["job", "progress", job_id],
+            record_key="progress",
+            label=f"JARVIS MCP dispatch progress for {job_id}",
+        )
+        artifacts = _remote_artifact_records(definition, job_id)
+        mcp_result = _read_remote_json_artifact_kind(definition, artifacts, kind="mcp_result")
+        provenance = _read_remote_json_artifact_kind(definition, artifacts, kind="provenance")
+        runtime_metadata = _read_remote_json_artifact_kind(
+            definition, artifacts, kind="runtime_metadata"
+        )
+    else:
+        call_status = _wait_for_local_job_terminal(
+            queue,
+            job_id,
+            timeout_seconds=wait_timeout_seconds,
+            poll_seconds=poll_seconds,
+        )
+        _require_jarvis_run_dispatch_job_identity(
+            call_status,
+            cluster=cluster,
+            job_id=job_id,
+            pipeline_id=pipeline_id,
+            idempotency_key=idempotency_key,
+        )
+        progress = _complete_local_progress_records(queue, job_id)
+        artifacts = _complete_local_artifact_records(queue, job_id)
+        mcp_result = _read_local_json_artifact_kind(queue, artifacts, kind="mcp_result")
+        provenance = _read_local_json_artifact_kind(queue, artifacts, kind="provenance")
+        runtime_metadata = _read_local_json_artifact_kind(queue, artifacts, kind="runtime_metadata")
+    return {
+        **cast(dict[str, Any], checkpoint["builder_inputs"]),
+        "call_status": call_status,
+        "artifacts": artifacts,
+        "mcp_result": mcp_result,
+        "provenance": provenance,
+        "runtime_metadata": runtime_metadata,
+        "progress": progress,
+        "live_progress_observation": None,
+    }
+
+
+def _merge_jarvis_execution_query_observations(
+    prior: list[dict[str, Any]],
+    current: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge bounded query snapshots while preserving lifecycle order across retries."""
+    merged: list[dict[str, Any]] = []
+    for observation in [*prior, *current]:
+        _append_bounded_jarvis_execution_query_observation(merged, observation)
+    return merged
+
+
 _MAX_JARVIS_EXECUTION_QUERY_OBSERVATIONS = 512
+_JARVIS_QUERY_INTEGRITY_KEY = "relay_query_integrity"
+_JARVIS_QUERY_INTEGRITY_SCHEMA = "clio-relay.jarvis-query-integrity.v1"
+_JARVIS_VERIFIED_GAP_KEY = "relay_query_verified_gap"
+_JARVIS_VERIFIED_GAP_SCHEMA = "clio-relay.jarvis-query-verified-gap.v1"
+_JARVIS_EXECUTION_STATE_RANK = {
+    "preparing": 0,
+    "scripted": 1,
+    "submitting": 2,
+    "submitted": 3,
+    "running": 4,
+    "completed": 5,
+    "failed": 5,
+    "canceled": 5,
+}
+_JARVIS_PACKAGE_PROGRESS_STATES = frozenset(
+    {"pending", "starting", "running", "ready", "completed", "failed", "canceled"}
+)
 
 
 def _append_bounded_jarvis_execution_query_observation(
@@ -14594,6 +16102,46 @@ def _append_bounded_jarvis_execution_query_observation(
     observation: dict[str, Any],
 ) -> None:
     """Retain ordered lifecycle evidence without failing a healthy long run."""
+    prior_violation = any(
+        _valid_jarvis_query_integrity_marker(item.get(_JARVIS_QUERY_INTEGRITY_KEY))
+        for item in observations
+    )
+    incoming_marker = observation.get(_JARVIS_QUERY_INTEGRITY_KEY)
+    incoming_gap = observation.get(_JARVIS_VERIFIED_GAP_KEY)
+    gap_invalid = incoming_gap is not None and (
+        not observations
+        or not _valid_jarvis_verified_gap_marker(
+            incoming_gap,
+            previous=observations[-1],
+            current=observation,
+        )
+    )
+    if gap_invalid:
+        observation = {
+            **observation,
+            _JARVIS_QUERY_INTEGRITY_KEY: _jarvis_query_integrity_summary(
+                "verified_gap_invalid",
+                observations[-1].get("state") if observations else None,
+                observation.get("state"),
+            ),
+        }
+    elif incoming_marker is not None and not _valid_jarvis_query_integrity_marker(incoming_marker):
+        observation = {
+            **observation,
+            _JARVIS_QUERY_INTEGRITY_KEY: _jarvis_query_integrity_summary(
+                "integrity_marker_invalid",
+                observations[-1].get("state") if observations else None,
+                observation.get("state"),
+            ),
+        }
+    elif not prior_violation and incoming_marker is None:
+        violation = _jarvis_query_integrity_violation(
+            observations,
+            observation,
+            crossed_verified_gap=incoming_gap is not None,
+        )
+        if violation is not None:
+            observation = {**observation, _JARVIS_QUERY_INTEGRITY_KEY: violation}
     observations.append(observation)
     if len(observations) <= _MAX_JARVIS_EXECUTION_QUERY_OBSERVATIONS:
         return
@@ -14610,6 +16158,8 @@ def _append_bounded_jarvis_execution_query_observation(
         )
         state_key = (state, item.get("terminal"))
         first_state_indexes.setdefault(state_key, index)
+        if _valid_jarvis_query_integrity_marker(item.get(_JARVIS_QUERY_INTEGRITY_KEY)):
+            protected_indexes.add(index)
         if first_live_progress_index is None and _has_live_jarvis_package_progress(item):
             first_live_progress_index = index
     protected_indexes.update(first_state_indexes.values())
@@ -14625,9 +16175,562 @@ def _append_bounded_jarvis_execution_query_observation(
             for index in range(available_slots)
         }
         protected_indexes.update(selected)
-    observations[:] = [
-        item for index, item in enumerate(observations) if index in protected_indexes
-    ]
+    selected_indexes = sorted(protected_indexes)
+    compacted: list[dict[str, Any]] = []
+    prior_selected_index: int | None = None
+    for index in selected_indexes:
+        item = observations[index]
+        if prior_selected_index is not None and index > prior_selected_index + 1:
+            discarded = observations[prior_selected_index + 1 : index]
+            item = {
+                **item,
+                _JARVIS_VERIFIED_GAP_KEY: _jarvis_verified_gap_marker(
+                    previous=observations[prior_selected_index],
+                    current=item,
+                    discarded=discarded,
+                ),
+            }
+        compacted.append(item)
+        prior_selected_index = index
+    observations[:] = compacted
+
+
+def _jarvis_verified_gap_marker(
+    *,
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    discarded: list[dict[str, Any]],
+) -> dict[str, object]:
+    """Record a relay-trusted summary after checking every sampled transition."""
+    nested_gap = current.get(_JARVIS_VERIFIED_GAP_KEY)
+    nested_discarded_count = (
+        cast(dict[str, Any], nested_gap).get("discarded_observation_count")
+        if isinstance(nested_gap, dict)
+        else 0
+    )
+    if (
+        not isinstance(nested_discarded_count, int)
+        or isinstance(nested_discarded_count, bool)
+        or nested_discarded_count < 0
+    ):
+        nested_discarded_count = 0
+    canonical = json.dumps(
+        {"discarded": discarded, "nested_current_gap": nested_gap},
+        allow_nan=False,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "schema_version": _JARVIS_VERIFIED_GAP_SCHEMA,
+        "verified": True,
+        "discarded_observation_count": len(discarded) + nested_discarded_count,
+        "discarded_observations_sha256": hashlib.sha256(canonical).hexdigest(),
+        "previous_query_job_id": previous.get("query_job_id"),
+        "current_query_job_id": current.get("query_job_id"),
+    }
+
+
+def _valid_jarvis_verified_gap_marker(
+    value: object,
+    *,
+    previous: dict[str, Any],
+    current: dict[str, Any],
+) -> bool:
+    """Accept one exact relay-trusted local summary bound to adjacent retained snapshots."""
+    if not isinstance(value, dict):
+        return False
+    marker = cast(dict[str, object], value)
+    digest = marker.get("discarded_observations_sha256")
+    count = marker.get("discarded_observation_count")
+    return bool(
+        set(marker)
+        == {
+            "schema_version",
+            "verified",
+            "discarded_observation_count",
+            "discarded_observations_sha256",
+            "previous_query_job_id",
+            "current_query_job_id",
+        }
+        and marker.get("schema_version") == _JARVIS_VERIFIED_GAP_SCHEMA
+        and marker.get("verified") is True
+        and isinstance(count, int)
+        and not isinstance(count, bool)
+        and count > 0
+        and isinstance(digest, str)
+        and len(digest) == 64
+        and all(character in "0123456789abcdef" for character in digest)
+        and marker.get("previous_query_job_id") == previous.get("query_job_id")
+        and marker.get("current_query_job_id") == current.get("query_job_id")
+    )
+
+
+def _jarvis_query_integrity_violation(
+    observations: list[dict[str, Any]],
+    current: dict[str, Any],
+    *,
+    crossed_verified_gap: bool = False,
+) -> dict[str, object] | None:
+    """Return a sticky summary when compaction must not erase an integrity failure."""
+    handle = current.get("execution_handle")
+    record = current.get("execution_record")
+    progress = current.get("progress")
+    if (
+        not isinstance(handle, dict)
+        or not isinstance(record, dict)
+        or not isinstance(progress, dict)
+    ):
+        return _jarvis_query_integrity_summary("native_document_missing", None, None)
+    handle = cast(dict[str, Any], handle)
+    record = cast(dict[str, Any], record)
+    progress = cast(dict[str, Any], progress)
+    expected_pipeline_id = current.get("pipeline_id")
+    expected_execution_id = current.get("execution_id")
+    if observations:
+        expected_pipeline_id = observations[0].get("pipeline_id")
+        expected_execution_id = observations[0].get("execution_id")
+    if not (
+        isinstance(current.get("query_job_id"), str)
+        and bool(current.get("query_job_id"))
+        and current.get("pipeline_id") == expected_pipeline_id
+        and current.get("execution_id") == expected_execution_id
+        and handle.get("pipeline_id") == expected_pipeline_id
+        and handle.get("execution_id") == expected_execution_id
+        and record.get("pipeline_id") == expected_pipeline_id
+        and record.get("execution_id") == expected_execution_id
+        and progress.get("pipeline_id") == expected_pipeline_id
+        and progress.get("execution_id") == expected_execution_id
+        and handle.get("schema_version") == "jarvis.execution.handle.v1"
+        and record.get("schema_version") == "jarvis.execution.record.v1"
+        and progress.get("schema_version") == "jarvis.execution.progress.v1"
+        and record.get("state") == current.get("state")
+        and record.get("terminal") is current.get("terminal")
+        and progress.get("execution_state") == current.get("state")
+        and progress.get("terminal") is current.get("terminal")
+    ):
+        return _jarvis_query_integrity_summary(
+            "query_identity_changed",
+            observations[-1].get("state") if observations else None,
+            current.get("state"),
+        )
+
+    stable_fields = ("execution_id", "pipeline_id", "mode", "scheduler_provider")
+    snapshot_fields = (*stable_fields, "scheduler_native_id", "cluster")
+    if any(handle.get(field) != record.get(field) for field in snapshot_fields):
+        return _jarvis_query_integrity_summary(
+            "handle_record_identity_changed",
+            observations[-1].get("state") if observations else None,
+            current.get("state"),
+        )
+    if observations:
+        first_handle = observations[0].get("execution_handle")
+        if not isinstance(first_handle, dict):
+            return _jarvis_query_integrity_summary(
+                "durable_identity_changed",
+                observations[-1].get("state"),
+                current.get("state"),
+            )
+        typed_first_handle = cast(dict[str, Any], first_handle)
+        if any(handle.get(field) != typed_first_handle.get(field) for field in stable_fields):
+            return _jarvis_query_integrity_summary(
+                "durable_identity_changed",
+                observations[-1].get("state"),
+                current.get("state"),
+            )
+    mode = handle.get("mode")
+    provider = handle.get("scheduler_provider")
+    native_id = handle.get("scheduler_native_id")
+    scheduler_cluster = handle.get("cluster")
+    if mode == "direct":
+        if provider is not None or native_id is not None or scheduler_cluster is not None:
+            return _jarvis_query_integrity_summary(
+                "direct_scheduler_identity_present",
+                observations[-1].get("state") if observations else None,
+                current.get("state"),
+            )
+    elif mode == "scheduler":
+        if not isinstance(provider, str) or not provider:
+            return _jarvis_query_integrity_summary(
+                "scheduler_provider_invalid",
+                observations[-1].get("state") if observations else None,
+                current.get("state"),
+            )
+        assigned_native_id: object = None
+        assigned_scheduler_cluster: object = None
+        for item in observations:
+            prior_handle = item.get("execution_handle")
+            if not isinstance(prior_handle, dict):
+                continue
+            typed_prior_handle = cast(dict[str, Any], prior_handle)
+            candidate_native_id = typed_prior_handle.get("scheduler_native_id")
+            if candidate_native_id is not None:
+                assigned_native_id = candidate_native_id
+            candidate_scheduler_cluster = typed_prior_handle.get("cluster")
+            if candidate_scheduler_cluster is not None:
+                assigned_scheduler_cluster = candidate_scheduler_cluster
+        if native_id is not None and (not isinstance(native_id, str) or not native_id):
+            return _jarvis_query_integrity_summary(
+                "scheduler_native_id_invalid",
+                observations[-1].get("state") if observations else None,
+                current.get("state"),
+            )
+        if assigned_native_id is not None and native_id != assigned_native_id:
+            return _jarvis_query_integrity_summary(
+                "scheduler_native_id_changed",
+                observations[-1].get("state"),
+                current.get("state"),
+            )
+        if scheduler_cluster is not None and (
+            not isinstance(scheduler_cluster, str) or not scheduler_cluster
+        ):
+            return _jarvis_query_integrity_summary(
+                "scheduler_cluster_invalid",
+                observations[-1].get("state") if observations else None,
+                current.get("state"),
+            )
+        if (
+            assigned_scheduler_cluster is not None
+            and scheduler_cluster != assigned_scheduler_cluster
+        ):
+            return _jarvis_query_integrity_summary(
+                "scheduler_cluster_changed",
+                observations[-1].get("state"),
+                current.get("state"),
+            )
+    else:
+        return _jarvis_query_integrity_summary(
+            "execution_mode_invalid",
+            observations[-1].get("state") if observations else None,
+            current.get("state"),
+        )
+
+    current_state = current.get("state")
+    current_terminal = current.get("terminal")
+    current_rank = (
+        _JARVIS_EXECUTION_STATE_RANK.get(current_state) if isinstance(current_state, str) else None
+    )
+    if current_state != "unknown" and current_rank is None:
+        return _jarvis_query_integrity_summary("invalid_state", None, current_state)
+    if current_terminal is True:
+        if current_state not in {"completed", "failed", "canceled"}:
+            return _jarvis_query_integrity_summary(
+                "terminal_state_invalid",
+                observations[-1].get("state") if observations else None,
+                current_state,
+            )
+    elif current_terminal is False:
+        if (
+            current_state in {"completed", "failed", "canceled"}
+            or record.get("return_code") is not None
+            or record.get("error") is not None
+        ):
+            return _jarvis_query_integrity_summary(
+                "nonterminal_result_present",
+                observations[-1].get("state") if observations else None,
+                current_state,
+            )
+    else:
+        return _jarvis_query_integrity_summary(
+            "terminal_flag_invalid",
+            observations[-1].get("state") if observations else None,
+            current_state,
+        )
+
+    prior_known = next(
+        (
+            item
+            for item in reversed(observations)
+            if item.get("state") in _JARVIS_EXECUTION_STATE_RANK
+        ),
+        None,
+    )
+    if prior_known is not None and current_rank is not None:
+        prior_state = cast(str, prior_known["state"])
+        if current_rank < _JARVIS_EXECUTION_STATE_RANK[prior_state]:
+            return _jarvis_query_integrity_summary(
+                "state_regression",
+                prior_state,
+                current_state,
+            )
+
+    prior_terminal = next(
+        (item for item in observations if item.get("terminal") is True),
+        None,
+    )
+    if prior_terminal is None:
+        return _jarvis_package_progress_integrity_violation(
+            observations,
+            current,
+            crossed_verified_gap=crossed_verified_gap,
+        )
+    if current_terminal is not True:
+        return _jarvis_query_integrity_summary(
+            "terminal_regression",
+            prior_terminal.get("state"),
+            current_state,
+        )
+    prior_record = prior_terminal.get("execution_record")
+    current_record = current.get("execution_record")
+    if not isinstance(prior_record, dict) or not isinstance(current_record, dict):
+        return _jarvis_query_integrity_summary(
+            "terminal_record_missing",
+            prior_terminal.get("state"),
+            current_state,
+        )
+    typed_prior_record = cast(dict[str, Any], prior_record)
+    typed_current_record = cast(dict[str, Any], current_record)
+    prior_result = (
+        prior_terminal.get("state"),
+        typed_prior_record.get("return_code"),
+        typed_prior_record.get("error"),
+    )
+    current_result = (
+        current_state,
+        typed_current_record.get("return_code"),
+        typed_current_record.get("error"),
+    )
+    if current_result != prior_result:
+        return _jarvis_query_integrity_summary(
+            "terminal_snapshot_changed",
+            prior_terminal.get("state"),
+            current_state,
+        )
+    return _jarvis_package_progress_integrity_violation(
+        observations,
+        current,
+        crossed_verified_gap=crossed_verified_gap,
+    )
+
+
+def _jarvis_package_progress_integrity_violation(
+    observations: list[dict[str, Any]],
+    current: dict[str, Any],
+    *,
+    crossed_verified_gap: bool,
+) -> dict[str, object] | None:
+    """Reject package-progress corruption before bounded observation sampling."""
+    progress = cast(dict[str, Any], current["progress"])
+    packages = progress.get("packages")
+    if not isinstance(packages, list):
+        return _jarvis_query_integrity_summary(
+            "package_progress_invalid",
+            observations[-1].get("state") if observations else None,
+            current.get("state"),
+        )
+    prior_packages: dict[tuple[object, object], tuple[int, int, dict[str, Any] | None]] = {}
+    for observation in observations:
+        prior_progress = observation.get("progress")
+        if not isinstance(prior_progress, dict):
+            continue
+        typed_prior_progress = cast(dict[str, Any], prior_progress)
+        if not isinstance(typed_prior_progress.get("packages"), list):
+            continue
+        for raw_package in cast(list[object], typed_prior_progress["packages"]):
+            if not isinstance(raw_package, dict):
+                continue
+            package = cast(dict[str, Any], raw_package)
+            summary = _jarvis_package_progress_summary(
+                package,
+                expected_execution_id=observation.get("execution_id"),
+            )
+            if summary is not None:
+                prior_packages[(package.get("package_id"), package.get("package_name"))] = summary
+    for raw_package in cast(list[object], packages):
+        if not isinstance(raw_package, dict):
+            return _jarvis_query_integrity_summary(
+                "package_progress_invalid",
+                observations[-1].get("state") if observations else None,
+                current.get("state"),
+            )
+        package = cast(dict[str, Any], raw_package)
+        summary = _jarvis_package_progress_summary(
+            package,
+            expected_execution_id=current.get("execution_id"),
+        )
+        if summary is None:
+            return _jarvis_query_integrity_summary(
+                "package_progress_invalid",
+                observations[-1].get("state") if observations else None,
+                current.get("state"),
+            )
+        key = (package.get("package_id"), package.get("package_name"))
+        prior = prior_packages.get(key)
+        if prior is None:
+            continue
+        event_count, sequence, latest = summary
+        prior_event_count, prior_sequence, prior_latest = prior
+        if event_count < prior_event_count or sequence < prior_sequence:
+            return _jarvis_query_integrity_summary(
+                "package_progress_regressed",
+                observations[-1].get("state"),
+                current.get("state"),
+            )
+        if latest is not None and prior_latest is not None:
+            current_signature = _jarvis_package_progress_signature(latest)
+            prior_signature = _jarvis_package_progress_signature(prior_latest)
+            if sequence == prior_sequence and (
+                event_count != prior_event_count or current_signature != prior_signature
+            ):
+                return _jarvis_query_integrity_summary(
+                    "package_progress_changed_without_sequence",
+                    observations[-1].get("state"),
+                    current.get("state"),
+                )
+            if sequence > prior_sequence and (
+                event_count <= prior_event_count
+                or (
+                    not crossed_verified_gap
+                    and not _jarvis_package_progress_transition_nonregressing(
+                        prior_latest,
+                        latest,
+                    )
+                )
+            ):
+                return _jarvis_query_integrity_summary(
+                    "package_progress_regressed",
+                    observations[-1].get("state"),
+                    current.get("state"),
+                )
+    return None
+
+
+def _jarvis_package_progress_summary(
+    package: dict[str, Any],
+    *,
+    expected_execution_id: object,
+) -> tuple[int, int, dict[str, Any] | None] | None:
+    """Return validated counters used by the query-integrity accumulator."""
+    package_id = package.get("package_id")
+    package_name = package.get("package_name")
+    event_count = package.get("event_count")
+    latest = package.get("latest")
+    if (
+        not isinstance(package_id, str)
+        or not package_id
+        or not isinstance(package_name, str)
+        or not package_name
+        or not isinstance(event_count, int)
+        or isinstance(event_count, bool)
+        or event_count < 0
+    ):
+        return None
+    if event_count == 0 and latest is None:
+        return 0, -1, None
+    if not isinstance(latest, dict):
+        return None
+    typed_latest = cast(dict[str, Any], latest)
+    sequence = typed_latest.get("sequence")
+    if (
+        typed_latest.get("schema_version") != "jarvis.progress.v1"
+        or typed_latest.get("execution_id") != expected_execution_id
+        or typed_latest.get("package_id") != package_id
+        or typed_latest.get("package_name") != package_name
+        or not isinstance(sequence, int)
+        or isinstance(sequence, bool)
+        or sequence < 0
+        or not _jarvis_package_progress_semantics_valid(typed_latest)
+    ):
+        return None
+    return event_count, sequence, typed_latest
+
+
+def _jarvis_package_progress_semantics_valid(progress: dict[str, Any]) -> bool:
+    """Validate package progress fields that could otherwise disappear during sampling."""
+    state = progress.get("state")
+    label = progress.get("label")
+    if (
+        state not in _JARVIS_PACKAGE_PROGRESS_STATES
+        or not isinstance(label, str)
+        or not label.strip()
+        or len(label) > 256
+    ):
+        return False
+    current = progress.get("current")
+    total = progress.get("total")
+    if current is not None and (
+        isinstance(current, bool)
+        or not isinstance(current, (int, float))
+        or not math.isfinite(current)
+        or current < 0
+    ):
+        return False
+    if total is not None and (
+        isinstance(total, bool)
+        or not isinstance(total, (int, float))
+        or not math.isfinite(total)
+        or total <= 0
+        or current is None
+        or current > total
+    ):
+        return False
+    unit = progress.get("unit")
+    if unit is not None and (not isinstance(unit, str) or not unit.strip() or len(unit) > 256):
+        return False
+    determinate = progress.get("determinate")
+    return isinstance(determinate, bool) and determinate is (
+        current is not None and total is not None
+    )
+
+
+def _jarvis_package_progress_signature(progress: dict[str, Any]) -> tuple[object, ...]:
+    """Return fields that cannot change without a new native progress sequence."""
+    return tuple(
+        progress.get(field)
+        for field in ("state", "label", "determinate", "current", "total", "unit")
+    )
+
+
+def _jarvis_package_progress_transition_nonregressing(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+) -> bool:
+    """Allow quantitative reset only after an explicit package phase change."""
+    if (previous.get("state"), previous.get("label")) != (
+        current.get("state"),
+        current.get("label"),
+    ):
+        return True
+    if previous.get("unit") is not None and current.get("unit") != previous.get("unit"):
+        return False
+    if previous.get("total") is not None and current.get("total") != previous.get("total"):
+        return False
+    previous_value = previous.get("current")
+    current_value = current.get("current")
+    return previous_value is None or bool(
+        current_value is not None and cast(float, current_value) >= cast(float, previous_value)
+    )
+
+
+def _jarvis_query_integrity_summary(
+    reason: str,
+    previous_state: object,
+    current_state: object,
+) -> dict[str, object]:
+    """Create one bounded machine-readable integrity accumulator entry."""
+    return {
+        "schema_version": _JARVIS_QUERY_INTEGRITY_SCHEMA,
+        "valid": False,
+        "reason": reason,
+        "previous_state": previous_state,
+        "current_state": current_state,
+    }
+
+
+def _valid_jarvis_query_integrity_marker(value: object) -> bool:
+    """Accept only relay-generated, fail-closed query-integrity summaries."""
+    if not isinstance(value, dict):
+        return False
+    marker = cast(dict[str, object], value)
+    return bool(
+        set(marker) == {"schema_version", "valid", "reason", "previous_state", "current_state"}
+        and marker.get("schema_version") == _JARVIS_QUERY_INTEGRITY_SCHEMA
+        and marker.get("valid") is False
+        and isinstance(marker.get("reason"), str)
+        and marker.get("reason")
+        and (marker.get("previous_state") is None or isinstance(marker.get("previous_state"), str))
+        and (marker.get("current_state") is None or isinstance(marker.get("current_state"), str))
+    )
 
 
 def _has_live_jarvis_package_progress(observation: dict[str, Any]) -> bool:
@@ -14663,10 +16766,11 @@ def _run_post_run_jarvis_execution_query(
     profile: str,
     pipeline_id: str,
     execution_id: str,
+    retry_selector: dict[str, object] | None = None,
     wait_timeout_seconds: float,
     poll_seconds: float,
-) -> _JarvisExecutionQueryAcceptance:
-    """Observe one handle-first JARVIS run to terminal through durable queries."""
+) -> _JarvisExecutionQueryAcceptance | _JarvisExecutionQueryPending:
+    """Observe one handle-first run without treating a bounded wait as execution failure."""
     _validate_progress_wait(timeout_seconds=wait_timeout_seconds, poll_seconds=poll_seconds)
     query_arguments: dict[str, Any] = {
         "cluster": cluster,
@@ -14676,21 +16780,49 @@ def _run_post_run_jarvis_execution_query(
     }
     deadline = monotonic() + wait_timeout_seconds
     lifecycle_observations: list[dict[str, Any]] = []
+    latest_attempt: _JarvisExecutionQueryAttempt | None = None
     while True:
         remaining = deadline - monotonic()
         if remaining <= 0:
-            raise TimeoutError(
-                "JARVIS execution did not reach terminal state through "
-                f"jarvis_get_execution before timeout: {execution_id}"
+            if latest_attempt is not None:
+                return _nonterminal_jarvis_execution_query_acceptance(
+                    cluster=cluster,
+                    pipeline_id=pipeline_id,
+                    execution_id=execution_id,
+                    attempt=latest_attempt,
+                    lifecycle_observations=lifecycle_observations,
+                )
+            return _unobserved_jarvis_execution_query_pending(
+                cluster=cluster,
+                pipeline_id=pipeline_id,
+                execution_id=execution_id,
+                retry_selector=retry_selector,
             )
-        attempt = _execute_jarvis_execution_query(
-            definition=definition,
-            queue=queue,
-            profile=profile,
-            arguments=query_arguments,
-            deadline=deadline,
-            poll_seconds=poll_seconds,
-        )
+        try:
+            attempt = _execute_jarvis_execution_query(
+                definition=definition,
+                queue=queue,
+                profile=profile,
+                arguments=query_arguments,
+                deadline=deadline,
+                poll_seconds=poll_seconds,
+            )
+        except ObservationTimeoutError:
+            if latest_attempt is None:
+                return _unobserved_jarvis_execution_query_pending(
+                    cluster=cluster,
+                    pipeline_id=pipeline_id,
+                    execution_id=execution_id,
+                    retry_selector=retry_selector,
+                )
+            return _nonterminal_jarvis_execution_query_acceptance(
+                cluster=cluster,
+                pipeline_id=pipeline_id,
+                execution_id=execution_id,
+                attempt=latest_attempt,
+                lifecycle_observations=lifecycle_observations,
+            )
+        latest_attempt = attempt
         observation = _jarvis_execution_lifecycle_observation(
             attempt.mcp_result,
             query_job_id=attempt.call_job_id,
@@ -14704,18 +16836,32 @@ def _run_post_run_jarvis_execution_query(
         if observation["terminal"] is True:
             remaining = deadline - monotonic()
             if remaining <= 0:
-                raise TimeoutError(
-                    "JARVIS execution reached terminal state without enough time for its "
-                    f"bounded artifact query: {execution_id}"
+                return _nonterminal_jarvis_execution_query_acceptance(
+                    cluster=cluster,
+                    pipeline_id=pipeline_id,
+                    execution_id=execution_id,
+                    attempt=attempt,
+                    lifecycle_observations=lifecycle_observations,
+                    outcome="terminal_artifacts_pending",
                 )
-            terminal_attempt = _execute_jarvis_execution_query(
-                definition=definition,
-                queue=queue,
-                profile=profile,
-                arguments={**query_arguments, "artifacts": {"page_size": 25}},
-                deadline=deadline,
-                poll_seconds=poll_seconds,
-            )
+            try:
+                terminal_attempt = _execute_jarvis_execution_query(
+                    definition=definition,
+                    queue=queue,
+                    profile=profile,
+                    arguments={**query_arguments, "artifacts": {"page_size": 25}},
+                    deadline=deadline,
+                    poll_seconds=poll_seconds,
+                )
+            except ObservationTimeoutError:
+                return _nonterminal_jarvis_execution_query_acceptance(
+                    cluster=cluster,
+                    pipeline_id=pipeline_id,
+                    execution_id=execution_id,
+                    attempt=attempt,
+                    lifecycle_observations=lifecycle_observations,
+                    outcome="terminal_artifacts_pending",
+                )
             terminal_observation = _jarvis_execution_lifecycle_observation(
                 terminal_attempt.mcp_result,
                 query_job_id=terminal_attempt.call_job_id,
@@ -14726,8 +16872,15 @@ def _run_post_run_jarvis_execution_query(
                 raise RelayError(
                     "JARVIS execution regressed from terminal during its artifact query"
                 )
-            lifecycle_observations[-1] = terminal_observation
+            _append_bounded_jarvis_execution_query_observation(
+                lifecycle_observations,
+                terminal_observation,
+            )
             return _JarvisExecutionQueryAcceptance(
+                cluster=cluster,
+                pipeline_id=pipeline_id,
+                execution_id=execution_id,
+                outcome="terminal",
                 tools_list_response=terminal_attempt.session.tools_list_response,
                 call_response=terminal_attempt.session.tools_call_response,
                 call_job_id=terminal_attempt.call_job_id,
@@ -14741,8 +16894,76 @@ def _run_post_run_jarvis_execution_query(
             )
         remaining = deadline - monotonic()
         if remaining <= 0:
-            continue
+            return _nonterminal_jarvis_execution_query_acceptance(
+                cluster=cluster,
+                pipeline_id=pipeline_id,
+                execution_id=execution_id,
+                attempt=attempt,
+                lifecycle_observations=lifecycle_observations,
+            )
         sleep(min(poll_seconds, remaining))
+
+
+def _unobserved_jarvis_execution_query_pending(
+    *,
+    cluster: str,
+    pipeline_id: str,
+    execution_id: str,
+    retry_selector: dict[str, object] | None,
+) -> _JarvisExecutionQueryPending:
+    """Preserve an exact query selector when the first observation window expires."""
+    selector: dict[str, object] = {
+        "cluster": cluster,
+        "scheduler_cluster": None,
+        "pipeline_id": pipeline_id,
+        "execution_id": execution_id,
+        "scheduler_provider": None,
+        "scheduler_native_id": None,
+        "last_query_job_id": None,
+    }
+    if retry_selector is not None:
+        selector.update(retry_selector)
+    if (
+        selector.get("cluster") != cluster
+        or selector.get("pipeline_id") != pipeline_id
+        or selector.get("execution_id") != execution_id
+        or selector.get("last_query_job_id") is not None
+    ):
+        raise RelayError("JARVIS execution query retry selector changed its durable identity")
+    return _JarvisExecutionQueryPending(
+        cluster=cluster,
+        pipeline_id=pipeline_id,
+        execution_id=execution_id,
+        selector=selector,
+    )
+
+
+def _nonterminal_jarvis_execution_query_acceptance(
+    *,
+    cluster: str,
+    pipeline_id: str,
+    execution_id: str,
+    attempt: _JarvisExecutionQueryAttempt,
+    lifecycle_observations: list[dict[str, Any]],
+    outcome: Literal["observation_unknown", "terminal_artifacts_pending"] = "observation_unknown",
+) -> _JarvisExecutionQueryAcceptance:
+    """Return the last proven snapshot with a query-only retry selector."""
+    return _JarvisExecutionQueryAcceptance(
+        cluster=cluster,
+        pipeline_id=pipeline_id,
+        execution_id=execution_id,
+        outcome=outcome,
+        tools_list_response=attempt.session.tools_list_response,
+        call_response=attempt.session.tools_call_response,
+        call_job_id=attempt.call_job_id,
+        call_status=attempt.call_status,
+        artifacts=attempt.artifacts,
+        mcp_result=attempt.mcp_result,
+        provenance=attempt.provenance,
+        initialize_response=attempt.session.initialize_response,
+        stdio_evidence=attempt.session.evidence(),
+        lifecycle_observations=lifecycle_observations,
+    )
 
 
 def _execute_jarvis_execution_query(
@@ -14757,7 +16978,7 @@ def _execute_jarvis_execution_query(
     """Execute one query with the workload deadline applied to every boundary."""
     remaining = deadline - monotonic()
     if remaining <= 0:
-        raise TimeoutError("JARVIS execution query deadline expired before MCP dispatch")
+        raise ObservationTimeoutError("JARVIS execution query deadline expired before MCP dispatch")
     timeout_seconds = min(60.0, max(0.001, remaining))
     session = run_packaged_mcp_stdio_session(
         profile=profile,
@@ -14768,7 +16989,9 @@ def _execute_jarvis_execution_query(
     call_job_id = _mcp_response_job_id(session.tools_call_response)
     timeout_seconds = deadline - monotonic()
     if timeout_seconds <= 0:
-        raise TimeoutError(f"JARVIS execution query dispatch exceeded its deadline: {call_job_id}")
+        raise ObservationTimeoutError(
+            f"JARVIS execution query dispatch exceeded its deadline: {call_job_id}"
+        )
     if should_execute_on_cluster(definition):
         call_status = _wait_for_remote_job_terminal(
             definition,
@@ -14903,7 +17126,9 @@ def _wait_for_remote_job_terminal(
             return status
         remaining = effective_deadline - monotonic()
         if remaining <= 0:
-            raise TimeoutError(f"job did not reach terminal state before timeout: {job_id}")
+            raise ObservationTimeoutError(
+                f"job did not reach terminal state before timeout: {job_id}"
+            )
         sleep(min(poll_seconds, remaining))
 
 
@@ -14923,7 +17148,9 @@ def _wait_for_local_job_terminal(
             return status
         remaining = deadline - monotonic()
         if remaining <= 0:
-            raise TimeoutError(f"job did not reach terminal state before timeout: {job_id}")
+            raise ObservationTimeoutError(
+                f"job did not reach terminal state before timeout: {job_id}"
+            )
         sleep(min(poll_seconds, remaining))
 
 
@@ -15212,7 +17439,7 @@ def _run_remote_clio_before_deadline(
         return run_remote_clio(definition, args)
     remaining = deadline - monotonic()
     if remaining <= 0:
-        raise RelayError("remote worker identity observation timed out")
+        raise ObservationTimeoutError("remote worker identity observation timed out")
     with remote_command_timeout(remaining):
         return run_remote_clio(definition, args)
 

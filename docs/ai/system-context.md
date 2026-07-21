@@ -109,7 +109,10 @@ metadata and lifecycle commands are rejected. A waited execution query emits a
 compact selector-only `service_runtime_bindings` handoff which is copied unchanged
 into the bind call; the source artifact is still re-read and fully verified.
 Binding starts no application or
-scheduler work; it starts only the relay connectors. Any later explicit scheduler
+scheduler work; it starts only the relay connectors. The binding and owner identity
+derive one deterministic gateway ID. Connector or health ambiguity remains a
+durable pending observation and identical bind calls reconcile that exact intent;
+they never replace it merely because a client observation expired. Any later explicit scheduler
 cancellation re-verifies the immutable source before invoking the provider.
 The public v2 report carries only the execution-owned capability's scheme and
 SHA-256; the raw bearer remains in JARVIS's owner-private sidecar. After re-reading
@@ -132,7 +135,9 @@ launcher if registration cannot be proven. Relay never treats the login-node `sr
 launcher PID as frpc. Detach proves the exact step remains active with
 `squeue --steps`, while stop uses `scancel job.step` and confirms step absence.
 The parent job remains retained unless scheduler-job cancellation is separately
-and explicitly requested. Placement or step ambiguity fails closed.
+and explicitly requested. Placement or step observation ambiguity stays pending
+without a replacement side effect; identity/integrity mismatch or provider-proven
+terminal state fails closed.
 Readiness is provenance-bearing and application-neutral: relay re-verifies the
 exact JARVIS execution, package, service, endpoint, dataset-descriptor, revision,
 and authorization identities, then proves authenticated v2 health is both protected

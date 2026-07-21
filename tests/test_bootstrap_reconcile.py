@@ -38,6 +38,7 @@ from clio_relay.bootstrap_reconcile import (
     reconcile_managed_jarvis_repository,
     reconcile_staged_activation_links,
     repair_managed_jarvis_binding,
+    resolve_receipt_bound_jarvis_python,
     validate_jarvis_builtin_result,
     write_jarvis_wrapper,
 )
@@ -48,6 +49,55 @@ from clio_relay.validation_report import sha256_file
 
 def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _create_directory_alias(alias: Path, target: Path) -> None:
+    """Create an ancestor-path alias on POSIX or unprivileged Windows."""
+    if os.name == "nt":
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(alias), str(target)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise AssertionError(result.stdout + result.stderr)
+        return
+    alias.symlink_to(target, target_is_directory=True)
+
+
+def _simulate_file_symlink(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    path: Path,
+    target: Path,
+) -> None:
+    """Expose one file as a symlink without requiring Windows symlink privilege."""
+    details = path.lstat()
+    symlink_details = SimpleNamespace(
+        st_dev=details.st_dev,
+        st_ino=details.st_ino,
+        st_mode=stat.S_IFLNK | 0o777,
+        st_size=len(str(target)),
+        st_mtime_ns=details.st_mtime_ns,
+        st_ctime_ns=details.st_ctime_ns,
+        st_nlink=details.st_nlink,
+    )
+    original_lstat = Path.lstat
+    original_readlink = os.readlink
+
+    def simulated_lstat(candidate: Path) -> os.stat_result:
+        if candidate == path:
+            return cast(os.stat_result, symlink_details)
+        return original_lstat(candidate)
+
+    def simulated_readlink(candidate: Any, *args: Any, **kwargs: Any) -> Any:
+        if Path(candidate) == path:
+            return str(target)
+        return original_readlink(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", simulated_lstat)
+    monkeypatch.setattr(os, "readlink", simulated_readlink)
 
 
 def _desired(*, uv_sha256: str, frpc_sha256: str, frps_sha256: str) -> BootstrapDesiredState:
@@ -229,6 +279,66 @@ def test_exact_noop_is_read_only_and_preserves_operator_jarvis_bytes(
     assert {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in before} == before
 
 
+def test_managed_repository_converges_home_alias_to_one_canonical_stable_path(
+    tmp_path: Path,
+) -> None:
+    """Repository migration neither loses nor duplicates a stable path through HOME aliases."""
+    desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
+    canonical_home = tmp_path / "canonical-home"
+    canonical_home.mkdir()
+    lexical_home = tmp_path / "home-alias"
+    _create_directory_alias(lexical_home, canonical_home)
+    root, _config, _graph = _write_jarvis_state(lexical_home, desired)
+    managed = lexical_home / ".local/share/clio-relay/managed-jarvis-repo"
+    previous = lexical_home / ".local/src/clio-relay/jarvis-packages/clio_relay"
+    previous.mkdir(parents=True)
+    operator = "/operator/clio_relay"
+    repos_file = root / "repos.yaml"
+    repos_file.write_text(
+        yaml.safe_dump(
+            {"repos": [str(managed.absolute()), str(previous.absolute()), operator]},
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    evidence = reconcile_managed_jarvis_repository(
+        repos_file,
+        managed,
+        previous_managed_repos=(previous,),
+        exchange_identity=desired.fingerprint,
+    )
+
+    canonical_managed = str(canonical_home / ".local/share/clio-relay/managed-jarvis-repo")
+    canonical_previous = str(canonical_home / ".local/src/clio-relay/jarvis-packages/clio_relay")
+    assert yaml.safe_load(repos_file.read_text(encoding="utf-8"))["repos"] == [
+        canonical_managed,
+        operator,
+    ]
+    assert evidence["managed_repo"] == canonical_managed
+    assert evidence["added_managed_repos"] == [canonical_managed]
+    assert evidence["removed_previous_managed_repos"] == [canonical_previous]
+    assert inspect_jarvis_state(desired, home=lexical_home).managed_repo_registered is True
+
+    repeated = reconcile_managed_jarvis_repository(
+        repos_file,
+        managed,
+        previous_managed_repos=(previous,),
+        exchange_identity=desired.fingerprint,
+    )
+    assert repeated["action"] == "reused"
+
+    repos_file.write_text(
+        yaml.safe_dump(
+            {"repos": [str(managed.absolute()), canonical_managed, operator]},
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigurationError, match="multiple path aliases"):
+        reconcile_managed_jarvis_repository(repos_file, managed)
+
+
 def test_matching_receipt_with_tampered_runtime_is_not_a_noop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -314,11 +424,48 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
     )
     _write_jarvis_state(tmp_path, desired)
     (tmp_path / ".local/share/clio-relay/managed-jarvis-repo").rmdir()
-    legacy_python = (
-        tmp_path
-        / ".local/share/clio-relay/jarvis-venv"
-        / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    )
+    managed_generation = "b" * 64 if relay_provider == "staged-candidate" else None
+    execution_root = tmp_path / ".local/share/clio-relay/jarvis-venv"
+    if managed_generation is not None:
+        generation_root = tmp_path / ".local/share/clio-relay/generations" / managed_generation
+        execution_root = generation_root / "jarvis-venv"
+        execution_root.mkdir(parents=True)
+        _create_directory_alias(
+            tmp_path / ".local/share/clio-relay/current",
+            generation_root,
+        )
+
+        def captured_activation_paths(*, home: Path) -> dict[str, BootstrapActivationPath]:
+            assert home == tmp_path
+            return {
+                "current": BootstrapActivationPath(
+                    path=str(home / ".local/share/clio-relay/current"),
+                    kind="symlink",
+                ),
+                "install_receipt": BootstrapActivationPath(
+                    path=str(home / ".local/share/clio-relay/install-receipt.json"),
+                    kind="file_or_symlink",
+                ),
+                "relay_launcher": BootstrapActivationPath(
+                    path=str(home / ".local/bin/clio-relay"),
+                    kind="file_or_symlink",
+                ),
+                "jarvis_launcher": BootstrapActivationPath(
+                    path=str(home / ".local/bin/jarvis"),
+                    kind="file_or_symlink",
+                ),
+                "managed_repo": BootstrapActivationPath(
+                    path=str(home / ".local/share/clio-relay/managed-jarvis-repo"),
+                    kind="symlink",
+                ),
+            }
+
+        monkeypatch.setattr(
+            bootstrap_reconcile_module,
+            "_capture_reconcile_activation_paths",
+            captured_activation_paths,
+        )
+    legacy_python = execution_root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     legacy_python.parent.mkdir(parents=True)
     legacy_python.write_bytes(b"python")
     legacy_python.chmod(0o755)
@@ -379,11 +526,19 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
             verify_replacement,
         )
     receipt = cast(dict[str, object], info["receipt"])
+    if managed_generation is not None:
+        receipt["generation"] = managed_generation
     receipt.pop("deployment_fingerprint")
     receipt.pop("deployment_manifest")
     receipt["component_artifacts"] = {
         "clio-relay": {
-            "runtime_executables": {"clio-relay": str(bin_dir / "clio-relay")},
+            "runtime_executables": {
+                "clio-relay": (
+                    "/stale/unbound/clio-relay"
+                    if relay_provider == "staged-candidate"
+                    else str(bin_dir / "clio-relay")
+                )
+            },
         },
         "clio-kit": {
             "artifact_sha256": desired.clio_kit_artifact_sha256,
@@ -461,12 +616,13 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
         "frp": "reuse",
         "uv": "reuse",
     }
-    assert plan.reusable_paths["jarvis_execution_environment"] == str(
-        (tmp_path / ".local/share/clio-relay/jarvis-venv").resolve()
-    )
+    assert plan.reusable_paths["jarvis_execution_environment"] == str(execution_root.resolve())
     assert plan.activation_paths["current"].before is None
     assert plan.activation_paths["managed_repo"].before is None
-    assert plan.activation_paths["install_receipt"].before is not None
+    if managed_generation is None:
+        assert plan.activation_paths["install_receipt"].before is not None
+    else:
+        assert plan.activation_paths["install_receipt"].before is None
     if relay_provider == "staged-candidate":
         component_runtime = cast(dict[str, object], info["component_runtime"])
         clio_kit_runtime = cast(dict[str, object], component_runtime["clio-kit"])
@@ -478,6 +634,105 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
         )
         assert rejected.mode == "full"
         assert rejected.reasons == ["clio-kit live runtime is not reusable"]
+    elif relay_provider == "verified-old":
+        relay_artifact = cast(
+            dict[str, object],
+            cast(dict[str, object], receipt["component_artifacts"])["clio-relay"],
+        )
+        relay_artifact["runtime_executables"] = {"clio-relay": "/stale/unbound/clio-relay"}
+        rejected = plan_bootstrap_reconcile(desired, home=tmp_path)
+        assert rejected.mode == "full"
+        assert rejected.reasons == ["clio-relay launcher is not bound to its install receipt"]
+
+
+def test_active_managed_generation_jarvis_environment_is_reusable(tmp_path: Path) -> None:
+    """A retained generation tool is reusable only while its generation is active."""
+    generation = "a" * 64
+    relay_root = tmp_path / ".local/share/clio-relay"
+    generation_root = relay_root / "generations" / generation
+    environment = generation_root / "jarvis-venv"
+    environment.mkdir(parents=True)
+    current = relay_root / "current"
+    _create_directory_alias(current, generation_root)
+
+    observed = bootstrap_reconcile_module._managed_generation_jarvis_environment(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        {"generation": generation},
+        execution_environment=environment,
+        home=tmp_path,
+    )
+
+    assert observed == environment.resolve(strict=True)
+    assert (
+        bootstrap_reconcile_module._managed_generation_jarvis_environment(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            {"generation": "not-a-generation"},
+            execution_environment=environment,
+            home=tmp_path,
+        )
+        is None
+    )
+
+
+def test_retained_generation_jarvis_environment_is_reusable(tmp_path: Path) -> None:
+    """A relay-only generation may retain a receipt-bound prior JARVIS environment."""
+    active_generation = "a" * 64
+    execution_generation = "b" * 64
+    relay_root = tmp_path / ".local/share/clio-relay"
+    active_root = relay_root / "generations" / active_generation
+    environment = relay_root / "generations" / execution_generation / "jarvis-venv"
+    active_root.mkdir(parents=True)
+    environment.mkdir(parents=True)
+    _create_directory_alias(relay_root / "current", active_root)
+
+    observed = bootstrap_reconcile_module._managed_generation_jarvis_environment(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        {"generation": active_generation},
+        execution_environment=environment,
+        home=tmp_path,
+    )
+
+    assert observed == environment.resolve(strict=True)
+
+
+def test_generation_jarvis_environment_accepts_home_directory_alias(tmp_path: Path) -> None:
+    """Receipt paths may use a lexical home alias that resolves to the managed root."""
+    generation = "a" * 64
+    relay_root = tmp_path / ".local/share/clio-relay"
+    generation_root = relay_root / "generations" / generation
+    environment = generation_root / "jarvis-venv"
+    environment.mkdir(parents=True)
+    _create_directory_alias(relay_root / "current", generation_root)
+    alias = tmp_path / "home-alias"
+    _create_directory_alias(alias, tmp_path)
+
+    observed = bootstrap_reconcile_module._managed_generation_jarvis_environment(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        {"generation": generation},
+        execution_environment=alias
+        / ".local/share/clio-relay/generations"
+        / generation
+        / "jarvis-venv",
+        home=tmp_path,
+    )
+
+    assert observed == environment.resolve(strict=True)
+
+
+def test_generation_jarvis_environment_rejects_unowned_layout(tmp_path: Path) -> None:
+    """A receipt cannot reuse a JARVIS directory outside the managed generation shape."""
+    active_generation = "a" * 64
+    relay_root = tmp_path / ".local/share/clio-relay"
+    active_root = relay_root / "generations" / active_generation
+    active_root.mkdir(parents=True)
+    environment = tmp_path / "jarvis-venv"
+    environment.mkdir()
+    _create_directory_alias(relay_root / "current", active_root)
+
+    assert (
+        bootstrap_reconcile_module._managed_generation_jarvis_environment(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            {"generation": active_generation},
+            execution_environment=environment,
+            home=tmp_path,
+        )
+        is None
+    )
 
 
 def test_replacement_provider_attests_real_private_uv_tool(
@@ -500,7 +755,10 @@ def test_replacement_provider_attests_real_private_uv_tool(
     assert len(wheels) == 1
     version = wheels[0].name.removeprefix("clio_relay-").removesuffix("-py3-none-any.whl")
 
+    canonical_home = tmp_path / "canonical-home"
+    canonical_home.mkdir()
     home = tmp_path / "home"
+    _create_directory_alias(home, canonical_home)
     preparing_parent = home / ".local/share/clio-relay/preparing"
     preparing_root = preparing_parent / "active"
     preparing_root.mkdir(parents=True, mode=0o700)
@@ -710,6 +968,10 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
         "error": "uv tool directory is unavailable",
         "persistent_tool_verified": False,
     }
+    component_runtime["jarvis-cd"] = {
+        "error": "installed JARVIS-CD version is stale",
+        "verified": False,
+    }
     component_artifacts: dict[str, object] = {
         "clio-relay": {
             "runtime_executables": {"clio-relay": str(bin_dir / "clio-relay")},
@@ -876,6 +1138,8 @@ def test_managed_repo_reconcile_preserves_same_name_operator_repository(tmp_path
     operator_repo = tmp_path / "operator/clio_relay"
     previous_managed = tmp_path / "legacy/clio_relay"
     managed_repo = tmp_path / "relay/managed-jarvis-repo"
+    previous_managed.parent.mkdir(parents=True)
+    managed_repo.parent.mkdir(parents=True)
     repos_file.write_text(
         yaml.safe_dump(
             {
@@ -914,6 +1178,8 @@ def test_managed_repo_reconcile_refuses_concurrent_operator_edit(
 ) -> None:
     repos_file = tmp_path / "repos.yaml"
     repos_file.write_text("repos:\n  - /operator/original\n", encoding="utf-8")
+    managed_repo = tmp_path / "relay/managed-jarvis-repo"
+    managed_repo.parent.mkdir(parents=True)
     operator_update = b"repos:\n  - /operator/concurrent\n"
     original_read = bootstrap_reconcile_module._read_regular_bounded_with_identity  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     call_count = 0
@@ -938,7 +1204,7 @@ def test_managed_repo_reconcile_refuses_concurrent_operator_edit(
     with pytest.raises(ConfigurationError, match="changed .*reconciliation"):
         reconcile_managed_jarvis_repository(
             repos_file,
-            tmp_path / "relay/managed-jarvis-repo",
+            managed_repo,
         )
 
     assert repos_file.read_bytes() == operator_update
@@ -2086,6 +2352,203 @@ def test_active_generation_rejects_coordinated_manifest_and_wrapper_tamper(
             generation,
             desired=desired,
             installation=installation,
+        )
+
+
+def test_managed_jarvis_interpreter_is_bound_to_receipt_and_lexical_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Managed selection preserves the lexical venv while proving canonical identity."""
+    desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
+    canonical_home = tmp_path / "canonical-home"
+    canonical_home.mkdir()
+    lexical_home = tmp_path / "home-alias"
+    _create_directory_alias(lexical_home, canonical_home)
+
+    generation = lexical_home / ".local/share/clio-relay/generations" / desired.fingerprint
+    execution_root = generation / "jarvis-venv"
+    execution_bin = execution_root / ("Scripts" if os.name == "nt" else "bin")
+    execution_bin.mkdir(parents=True)
+    execution_python = execution_bin / ("python.exe" if os.name == "nt" else "python")
+    execution_jarvis = execution_bin / ("jarvis.exe" if os.name == "nt" else "jarvis")
+    for path in (execution_python, execution_jarvis):
+        path.write_bytes(path.name.encode())
+        path.chmod(0o755)
+    execution_identity = execution_environment_identity(
+        execution_root,
+        executables={"python": execution_python, "jarvis": execution_jarvis},
+    )
+    generation_bin = generation / "bin"
+    generation_bin.mkdir()
+    (lexical_home / ".local/bin").mkdir(parents=True)
+    wrapper = write_jarvis_wrapper(generation_bin / "jarvis", execution_python)
+    receipt_path = generation / "install-receipt.json"
+    receipt_path.write_text("{}\n", encoding="utf-8")
+    manifest = {
+        "schema_version": "clio-relay.bootstrap-generation.v1",
+        "fingerprint": desired.fingerprint,
+        "plan": {
+            "mode": "component-upgrade",
+            "desired_fingerprint": desired.fingerprint,
+            "component_actions": {"jarvis-cd": "replace"},
+        },
+        "legacy_execution_identity": execution_identity,
+        "active_execution_identity": execution_identity,
+        "jarvis_wrapper_sha256": wrapper["sha256"],
+        "install_receipt": str(receipt_path),
+        "install_receipt_sha256": _digest(receipt_path.read_bytes()),
+    }
+    (generation / "manifest.json").write_text(
+        json.dumps(manifest, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    installation = _installation_info(desired)
+    receipt = cast(dict[str, object], installation["receipt"])
+    receipt["component_artifacts"] = {
+        "jarvis-cd": {"runtime_interpreters": {"execution": str(execution_python)}}
+    }
+
+    bootstrap_reconcile_module._verify_active_generation_jarvis_wrapper(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        generation.resolve(strict=True),
+        desired=desired,
+        installation=installation,
+    )
+
+    stable_paths: list[tuple[Path, Path]] = []
+
+    def verify_stable(path: Path, *, expected: Path, label: str) -> Path:
+        del label
+        stable_paths.append((path, expected))
+        return expected.resolve(strict=True)
+
+    def read_installation(path: Path | None = None) -> dict[str, object]:
+        assert path == lexical_home / ".local/share/clio-relay/install-receipt.json"
+        return installation
+
+    def classify_launcher(path: Path, *, lexical_home: Path) -> bool:
+        assert path == lexical_home / ".local/bin/jarvis"
+        assert lexical_home == tmp_path / "home-alias"
+        return True
+
+    monkeypatch.setattr(bootstrap_reconcile_module, "_verify_stable_symlink", verify_stable)
+    monkeypatch.setattr(bootstrap_reconcile_module, "installation_info", read_installation)
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "_relay_managed_jarvis_launcher_selected",
+        classify_launcher,
+    )
+
+    selected = resolve_receipt_bound_jarvis_python(
+        str(canonical_home / ".local/bin/jarvis"),
+        home=lexical_home,
+    )
+
+    assert selected == str(execution_python)
+    assert len(stable_paths) == 3
+    assert Path(cast(str, selected)).resolve().is_relative_to(canonical_home.resolve())
+    assert cast(str, selected).startswith(str(lexical_home))
+
+
+def test_conventional_home_jarvis_launcher_without_relay_ownership_is_unmanaged(
+    tmp_path: Path,
+) -> None:
+    """A normal user-installed launcher may use the conventional local-bin path."""
+    launcher = tmp_path / ".local/bin/jarvis"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    launcher.chmod(0o755)
+
+    selected = resolve_receipt_bound_jarvis_python(
+        str(launcher),
+        home=tmp_path,
+    )
+
+    assert selected is None
+
+
+def test_conventional_home_jarvis_external_symlink_is_unmanaged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A uv- or pipx-style local-bin symlink remains outside relay ownership."""
+    launcher = tmp_path / ".local/bin/jarvis"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("external-link-placeholder\n", encoding="utf-8")
+    external_target = tmp_path / ".local/share/uv/tools/jarvis-cd/bin/jarvis"
+    _simulate_file_symlink(
+        monkeypatch,
+        path=launcher,
+        target=external_target,
+    )
+
+    selected = resolve_receipt_bound_jarvis_python(
+        str(launcher),
+        home=tmp_path,
+    )
+
+    assert selected is None
+
+
+@pytest.mark.parametrize("receipt_payload", [None, "not-json\n"])
+def test_proven_managed_jarvis_launcher_fails_closed_on_missing_or_corrupt_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    receipt_payload: str | None,
+) -> None:
+    """Receipt loss cannot downgrade an already proven relay activation to unmanaged."""
+    launcher = tmp_path / ".local/bin/jarvis"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("relay-managed-placeholder\n", encoding="utf-8")
+    receipt = tmp_path / ".local/share/clio-relay/install-receipt.json"
+    receipt.parent.mkdir(parents=True)
+    if receipt_payload is not None:
+        receipt.write_text(receipt_payload, encoding="utf-8")
+    _simulate_file_symlink(
+        monkeypatch,
+        path=launcher,
+        target=tmp_path / ".local/share/clio-relay/current/bin/jarvis",
+    )
+
+    with pytest.raises(ConfigurationError, match="installation receipt is invalid"):
+        resolve_receipt_bound_jarvis_python(
+            str(launcher),
+            home=tmp_path,
+        )
+
+
+def test_managed_jarvis_interpreter_fails_closed_on_unverified_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A managed launcher cannot fall back to ambient Python after receipt failure."""
+    desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
+    installation = _installation_info(desired)
+    runtime = cast(dict[str, object], installation["component_runtime"])
+    runtime["jarvis-cd"] = {"verified": False}
+
+    def read_installation(_path: Path | None = None) -> dict[str, object]:
+        return installation
+
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "installation_info",
+        read_installation,
+    )
+
+    def classify_launcher(_path: Path, *, lexical_home: Path) -> bool:
+        return lexical_home == tmp_path
+
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "_relay_managed_jarvis_launcher_selected",
+        classify_launcher,
+    )
+
+    with pytest.raises(ConfigurationError, match="runtime did not verify"):
+        resolve_receipt_bound_jarvis_python(
+            str(tmp_path / ".local/bin/jarvis"),
+            home=tmp_path,
         )
 
 

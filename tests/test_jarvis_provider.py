@@ -810,3 +810,27 @@ def test_scheduled_pipeline_uses_wrapper_shebang_when_sibling_python_is_missing(
     command = provider.pipeline_command(pipeline)
 
     assert command[0] == "/opt/clio-relay/jarvis-venv/bin/python"
+
+
+def test_receipt_bound_python_bypasses_unmanaged_sibling_discovery(tmp_path: Path) -> None:
+    """A managed provider must never select an unrelated sibling interpreter."""
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text("name: direct\npkgs: []\n", encoding="utf-8")
+    stable_bin = tmp_path / ".local/bin"
+    stable_bin.mkdir(parents=True)
+    jarvis = stable_bin / "jarvis"
+    jarvis.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    unrelated_python = stable_bin / "python"
+    unrelated_python.write_text("unrelated", encoding="utf-8")
+    execution_python = tmp_path / "generation/jarvis-venv/bin/python"
+    execution_python.parent.mkdir(parents=True)
+    execution_python.write_text("managed", encoding="utf-8")
+    provider = JarvisCdProvider(
+        jarvis_bin=str(jarvis),
+        execution_python=str(execution_python),
+    )
+
+    command = provider.pipeline_command(pipeline)
+
+    assert command[0] == str(execution_python)
+    assert command[0] != str(unrelated_python)

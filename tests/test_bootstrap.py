@@ -265,7 +265,11 @@ def test_fresh_bootstrap_loads_packaged_graph_before_explicit_build_fallback() -
     assert "uv tool install --force --python 3.12 --no-config" in script
     assert '--with "$JARVIS_CD_WHEEL" "$RELAY_INSTALL_TARGET"' in script
     assert 'RELAY_EXECUTABLE="$(uv tool dir --bin --no-config)/clio-relay"' in script
-    assert 'RELAY_PROVIDER_PYTHON="$(sed -n' in script
+    assert 'RELAY_PROVIDER_PYTHON="$UV_TOOL_DIR/clio-relay/bin/python"' in script
+    assert 'JARVIS_MCP_PROVIDER_PYTHON="$UV_TOOL_DIR/clio-kit/bin/python"' in script
+    assert 'RELAY_PROVIDER_PYTHON="$BOOTSTRAP_GENERATION/tools/clio-relay/bin/python"' in script
+    assert 'CLIO_KIT_PROVIDER_PYTHON="$BOOTSTRAP_GENERATION/tools/clio-kit/bin/python"' in script
+    assert "sed -n '1{s/^#!//;p;}'" not in script
     assert "relay-venv312" not in script
     assert 'uv pip install --refresh-package clio-relay "$RELAY_INSTALL_TARGET"' not in script
     assert "uv pip install --no-deps --refresh-package jarvis-cd" not in script
@@ -307,6 +311,22 @@ def test_fresh_bootstrap_loads_packaged_graph_before_explicit_build_fallback() -
     assert '"execution": os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_CD_EXECUTION_PYTHON"]' in script
     assert "native_execution=clio_kit_native_execution" in script
     assert "persistent_tool=persistent_clio_kit_tool" in script
+    assert '"clio-relay.persistent_tool_verified"' in script
+    assert '"clio-kit.persistent_tool_verified"' in script
+    assert '"clio-kit.native_execution_capability_verified"' in script
+    assert '"jarvis-cd.verified"' in script
+    assert '"jarvis-cd.distribution_identity_verified"' in script
+    assert '"jarvis-cd.runtime_artifact_path_verified"' in script
+    assert '"jarvis-cd.artifact_sha256_verified"' in script
+    assert '"jarvis-cd.execution_interpreter_verified"' in script
+    assert '"jarvis-cd.execution_record_closure_verified"' in script
+    assert '"jarvis-cd.native_execution_capability_verified"' in script
+    assert '"jarvis-cd.jarvis_executable_verified"' in script
+    assert '"jarvis-cd.execution_record_closure_error."' in script
+    assert (
+        "failed_checks = sorted(name for name, verified in checks.items() if not verified)"
+        in script
+    )
     assert "native_execution=jarvis_execution_native_execution" in script
     assert "jarvis_cd_entry_points" not in script
     assert 'requested_source=os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_SOURCE"]' in script

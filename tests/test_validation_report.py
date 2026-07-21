@@ -2009,6 +2009,17 @@ def test_release_gate_rejects_dirty_or_untagged_build() -> None:
     assert "report source tag must be v1.0.0, got None" in reasons
 
 
+def test_release_gate_rejects_resumable_pending_report() -> None:
+    """Durable queue evidence remains useful but can never satisfy acceptance."""
+    report = _report()
+    report.status = ValidationStatus.PENDING
+
+    result = _evaluate(_policy(), [report])
+
+    assert result.passed is False
+    assert "report did not pass" in result.unsatisfied_requirements["remote-mcp-primary"]
+
+
 def test_release_gate_binds_candidate_wheel_reports_to_independent_digest() -> None:
     policy = _policy()
     policy.artifact_stage = "immutable_candidate"
@@ -2343,13 +2354,13 @@ def test_local_release_policy_rejects_missing_critical_boundary_checks(
     report.resources = [
         ValidationResource(
             kind="wheel",
-            resource_id="clio-relay-1.4.20-py3-none-any.whl",
+            resource_id="clio-relay-1.4.21-py3-none-any.whl",
             cluster="local",
             state="built",
         ),
         ValidationResource(
             kind="source_distribution",
-            resource_id="clio_relay-1.4.20.tar.gz",
+            resource_id="clio_relay-1.4.21.tar.gz",
             cluster="local",
             state="built",
         ),
@@ -2488,7 +2499,7 @@ def test_default_report_path_sanitizes_cluster_name(tmp_path: Path) -> None:
 def test_repository_release_policy_is_machine_readable() -> None:
     policy = load_release_gate_policy(Path("docs/release-gate-1.0.yaml"))
 
-    assert policy.release_version == "1.4.20"
+    assert policy.release_version == "1.4.21"
     assert policy.acceptance_matrix is not None
     assert policy.acceptance_matrix["report_count_per_stage"] == 19
     assert policy.acceptance_matrix["matrix_sha256"] == policy.acceptance_matrix_sha256

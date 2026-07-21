@@ -59,7 +59,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.4.20"
+$Version = "1.4.21"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }
@@ -1638,20 +1638,26 @@ This scenario polls the released remote `clio-relay job status` contract for
 valid structured runtime metadata while the outer relay/JARVIS/SLURM source job
 is still `running`. It must not call the outer `job wait` or the completed-job
 artifact verifier before exercising the service. A failed or canceled source
-job, invalid metadata, or the same bounded timeout fails the report. The inner
+job or invalid metadata fails the report. A bounded observation timeout instead
+writes a non-gating `pending` report with the exact source job and any known
+pipeline, execution, source-artifact, service, or gateway identities. Resume it
+with the same live-test arguments plus `--resume-report <pending.json>`; the
+checkpoint has no TTL, retains the scheduler allocation, and cannot submit a
+replacement JARVIS run. The inner
 `jarvis_get_execution(wait_for_terminal=true)` remains required because it waits
 for that MCP dispatch and durable result, not for the source scheduler job to
 finish. A zero-binding result is retried within the same deadline while a
 nonempty selector mismatch or ambiguous match fails immediately. The report
 records the source relay job as retained and never requests scheduler
-cancellation.
+cancellation. Only a later `passed` sibling report can satisfy the release gate.
 
 Detach and teardown inside this probe always pass
 `cancel_scheduler_job=false`. A naturally completed allocation is acceptable
 only when its exact identity and verified terminal disposition are recorded;
 the report must never claim that relay cancelled it. The probe cleans up any
-gateway or connector it created on a failed bind while retaining the scheduler
-job.
+gateway or connector it created on a deterministic failed bind while retaining
+the scheduler job. An observation-expired or explicitly pending bind retains its
+exact gateway and connector intents for idempotent resume.
 
 ## Verify and upload the exact report set
 

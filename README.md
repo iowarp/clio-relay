@@ -8,7 +8,7 @@
 
 It is a piece of the federation layer for [`clio-agent`](https://github.com/iowarp/clio-agent): a local CLIO experience can delegate work to a remote machine, keep observing it, detach, reconnect, and clean up after itself. The project is also designed for use outside CLIO. Any client that can call the CLI, HTTP API, or MCP tools can use the same relay model.
 
-> Version `1.4.20` uses a release-first patch process. A maintainer builds the
+> Version `1.4.21` uses a release-first patch process. A maintainer builds the
 > wheel and source distribution once, attaches those exact bytes and their
 > checksums to a GitHub Release, and publishes the release immediately. Tag
 > regression jobs and the trusted PyPI upload then run asynchronously; they do
@@ -138,6 +138,17 @@ The HTTP API exposes `/gateway-sessions`, `/gateway-sessions/{session_id}`, and 
 
 These generic gateway operations manage ordinary endpoint metadata only. They cannot write scheduler identity, relay runtime specifications or ownership intents, connector ownership, or relay owner metadata. Use `gateway start-runtime`, `detach-runtime`, and `stop-runtime` for relay-owned scheduler-backed services.
 
+`gateway start-runtime` submits at most once and makes one bounded readiness
+observation. A workload that is queued, allocated but not healthy yet, or temporarily
+unobservable returns `outcome: "pending"` with its durable gateway-session selector.
+Before the scheduler response is known, that selector contains the exact submission ID
+and marker; after acceptance, it contains the native scheduler job ID. Advance that
+exact submission with `gateway resume-runtime <gateway_session_id>` after any delay;
+hours or days of scheduler residence never become a relay failure, cancellation, or
+resubmission. Only provider-proven terminal scheduler state is terminal.
+`observation_unknown` records missing observation evidence without claiming that the
+scheduler job is still queued.
+
 When JARVIS already owns a live application, agents use the user-profile
 `relay_bind_jarvis_runtime` MCP tool instead of supplying a runtime specification.
 The relay verifies a completed `jarvis_get_execution` MCP result produced with
@@ -149,6 +160,15 @@ dataset identities, starts only
 the connector path, and returns local connect, health, stream, events, state, and
 command URLs. Detach and stop retain the scheduler job unless cancellation is
 explicitly requested and the original binding can be re-verified.
+The immutable JARVIS binding plus owner identity deterministically names one
+gateway. If connector delivery or the bounded health observation is inconclusive,
+the tool returns `outcome: "pending"`, an exact `retry_selector`,
+`scheduler_action: "none"`, `relay_action: "none"`, and null URLs. Reissue the
+same bind arguments after any delay to advance that gateway in place; it does not
+create another gateway, connector generation, scheduler job, cancellation, or
+resubmission. Changing its name, transport, or desktop-port policy is rejected.
+Only use the URLs after `outcome: "ready"`. Proven binding/authentication/integrity
+violations and provider-proven terminal scheduler states fail closed.
 New live services use `jarvis.service-runtime.v2`: every cluster-side endpoint
 requires an execution-owned bearer capability, but the public JARVIS report exposes
 only `authorization.scheme` and `authorization.token_sha256`. After re-verifying the

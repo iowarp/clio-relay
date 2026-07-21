@@ -5,8 +5,10 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import inspect
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -29,6 +31,7 @@ from clio_relay.bootstrap_reconcile import (
     BootstrapTransactionJournal,
     BootstrapTransactionState,
     JarvisStateEvidence,
+    execution_environment_identity,
     make_bootstrap_receipt,
 )
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
@@ -61,6 +64,63 @@ def _run_posix_embedded_driver(
     return subprocess.run(
         [*executable, "-I", "-c", launcher],
         input=json.dumps({"driver": driver, "arguments": encoded}),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+    )
+
+
+def _run_posix_project_driver(
+    driver: str,
+    *,
+    timeout_seconds: float = 120,
+) -> subprocess.CompletedProcess[str]:
+    """Run a Linux-only bootstrap integration probe against this checkout's source."""
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    launcher = (
+        "import json,sys; payload=json.load(sys.stdin); "
+        "sys.path.insert(0,payload['source_root']); "
+        "exec(compile(payload['driver'],'<project-driver>','exec'))"
+    )
+    if os.name != "nt":
+        command = [sys.executable, "-c", launcher]
+        posix_source_root = str(source_root)
+    else:
+        converted = subprocess.run(
+            ["wsl.exe", "-e", "wslpath", "-a", str(source_root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        posix_source_root = converted.stdout.strip()
+        discovered_uv = subprocess.run(
+            ["wsl.exe", "-e", "sh", "-lc", "command -v uv"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        command = [
+            "wsl.exe",
+            "-e",
+            discovered_uv,
+            "run",
+            "--no-project",
+            "--with",
+            "pydantic",
+            "--with",
+            "pyyaml",
+            "--with",
+            "packaging",
+            "--with",
+            "filelock",
+            "python",
+            "-c",
+            launcher,
+        ]
+    return subprocess.run(
+        command,
+        input=json.dumps({"driver": driver, "source_root": posix_source_root}),
         check=False,
         capture_output=True,
         text=True,
@@ -321,7 +381,7 @@ print("swapped-wheel-rejected")
 
 
 def test_candidate_verifier_accepts_pinned_uv_metadata_subset_only() -> None:
-    """Pinned uv metadata may vary by build path, while unknown members fail closed."""
+    """Pinned uv metadata and long-path launchers verify while unknown members fail closed."""
     driver = r"""
 import base64
 import csv
@@ -345,9 +405,14 @@ with tempfile.TemporaryDirectory() as value:
         capture_output=True,
     )
     wheel = next(built.glob("clio_relay-*.whl"))
-    tool_directory = workspace / "tools"
-    tool_bin_directory = workspace / "bin"
-    cache_directory = workspace / "cache"
+    real_home = workspace / "real-home"
+    real_home.mkdir()
+    home_alias = workspace / "home-alias"
+    home_alias.symlink_to(real_home, target_is_directory=True)
+    generation = home_alias / "share/clio-relay/generations" / ("f" * 128)
+    tool_directory = generation / "tools"
+    tool_bin_directory = generation / "bin"
+    cache_directory = generation / "cache"
     python_directory = Path.home() / ".local/share/clio-relay/uv-python"
     arguments = [
         sys.executable,
@@ -367,6 +432,22 @@ with tempfile.TemporaryDirectory() as value:
     accepted = subprocess.run(arguments, check=False, capture_output=True, text=True)
     if accepted.returncode != 0:
         raise SystemExit(accepted.stdout + accepted.stderr)
+
+    internal_launcher = tool_directory / "clio-relay/bin/clio-relay"
+    launcher_lines = internal_launcher.read_bytes().splitlines()
+    if not launcher_lines or launcher_lines[0] != b"#!/bin/sh":
+        raise SystemExit("the long uv tool path did not produce its shell trampoline")
+    provider = tool_directory / "clio-relay/bin/python"
+    subprocess.run(
+        [
+            provider,
+            "-I",
+            "-c",
+            'from importlib.metadata import version; assert version("clio-relay")',
+        ],
+        check=True,
+        capture_output=True,
+    )
 
     site_packages = next((tool_directory / "clio-relay").glob("lib/python*/site-packages"))
     record = next(site_packages.glob("clio_relay-*.dist-info/RECORD"))
@@ -683,7 +764,9 @@ def test_staged_provider_exec_is_hash_bound_sealed_and_venv_aware(tmp_path: Path
     provider = provider_root / "bin/python"
     relay = generation / "bin/clio-relay"
     relay.parent.mkdir(parents=True)
-    relay_payload = f"#!{provider}\n# staged relay launcher\n".encode()
+    relay_payload = (
+        f"#!/bin/sh\n'''exec' '{provider}' \"$0\" \"$@\"\n' '''\n# staged relay launcher\n"
+    ).encode()
     relay.write_bytes(relay_payload)
     relay.chmod(0o755)
     provider_sha256 = hashlib.sha256(provider.resolve(strict=True).read_bytes()).hexdigest()
@@ -787,6 +870,409 @@ def test_staged_provider_exec_is_hash_bound_sealed_and_venv_aware(tmp_path: Path
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "sealed-provider-ok"
     assert preload_marker.read_bytes() == b""
+
+
+def test_active_generation_identity_accepts_lexical_home_alias() -> None:
+    """A managed generation and provider survive a lexical HOME mount alias."""
+    script = bootstrap.render_linux_user_bootstrap_script(cluster="cluster-a")
+    start = script.index("bootstrap_active_generation_identity() {")
+    provider_start = script.index("bootstrap_active_generation_provider() {", start)
+    end = script.index("\n}\n", provider_start) + len("\n}\n")
+    function_source = script[start:end]
+    provider_discovery = script.index(
+        'BOOTSTRAP_CURRENT_PROVIDER="$(bootstrap_active_generation_provider',
+    )
+    assert start < provider_start < provider_discovery
+    driver = r"""
+import base64
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+function_source = base64.b64decode(sys.argv[1]).decode()
+with tempfile.TemporaryDirectory() as value:
+    workspace = Path(value)
+    canonical_home = workspace / "canonical-home"
+    canonical_home.mkdir()
+    lexical_home = workspace / "home-alias"
+    lexical_home.symlink_to(canonical_home, target_is_directory=True)
+    identity = "a" * 64
+    generation = lexical_home / ".local/share/clio-relay/generations" / identity
+    generation.mkdir(parents=True)
+    provider = generation / "tools/clio-relay/bin/python"
+    provider.parent.mkdir(parents=True)
+    provider.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    provider.chmod(0o755)
+    current = lexical_home / ".local/share/clio-relay/current"
+    current.symlink_to(generation, target_is_directory=True)
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            function_source
+            + "\nbootstrap_active_generation_identity"
+            + "\nbootstrap_active_generation_provider",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HOME": str(lexical_home)},
+    )
+    if result.returncode != 0:
+        raise SystemExit(result.stdout + result.stderr)
+    values = result.stdout.splitlines()
+    if values != [identity, str(provider.resolve())]:
+        raise SystemExit(
+            "active generation identity/provider did not survive the HOME alias: "
+            + repr(values)
+        )
+print("active-generation-alias-ok")
+"""
+    result = _run_posix_embedded_driver(driver, function_source)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "active-generation-alias-ok"
+
+
+def test_execution_boundary_round_trips_real_uv_venv_through_home_alias() -> None:
+    """A real uv Python symlink remains inside the lexical venv boundary."""
+    function_source = inspect.getsource(execution_environment_identity)
+    driver = r"""
+import base64
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+class ConfigurationError(Exception):
+    pass
+
+def sha256_file(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+def _stat_identity(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+source = base64.b64decode(sys.argv[1]).decode()
+exec(compile(source, "<execution-environment-identity>", "exec"), globals())
+uv = shutil.which("uv") or str(Path.home() / ".local/bin/uv")
+if not Path(uv).is_file():
+    raise SystemExit("uv is unavailable in the Linux acceptance runtime")
+with tempfile.TemporaryDirectory() as value:
+    workspace = Path(value)
+    canonical_home = workspace / "canonical-home"
+    canonical_home.mkdir()
+    lexical_home = workspace / "home-alias"
+    lexical_home.symlink_to(canonical_home, target_is_directory=True)
+    root = lexical_home / ".local/share/clio-relay/jarvis-venv"
+    subprocess.run(
+        [uv, "venv", "--python", sys.executable, "--no-project", str(root)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    python = root / "bin/python"
+    if not python.is_symlink() or python.resolve().is_relative_to(root.resolve()):
+        raise SystemExit("uv did not create the required external Python symlink")
+    jarvis = root / "bin/jarvis"
+    jarvis.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    jarvis.chmod(0o755)
+    identity = execution_environment_identity(
+        root,
+        executables={"python": python, "jarvis": jarvis},
+    )
+    executables = identity["executables"]
+    repeated = execution_environment_identity(
+        Path(identity["root"]),
+        executables={
+            "python": Path(executables["python"]["lexical_path"]),
+            "jarvis": Path(executables["jarvis"]["lexical_path"]),
+        },
+    )
+    if repeated != identity:
+        raise SystemExit("aliased uv execution identity did not round trip")
+    if not identity["root"].startswith(str(lexical_home)):
+        raise SystemExit("execution identity discarded the lexical HOME alias")
+print("uv-venv-alias-ok")
+"""
+    result = _run_posix_embedded_driver(driver, function_source, timeout_seconds=120)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "uv-venv-alias-ok"
+
+
+def test_aliased_home_generation_activation_reaches_exact_noop() -> None:
+    """Real Linux links activate once and then inspect as an exact warm no-op."""
+    driver = r"""
+import hashlib
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+import yaml
+
+from clio_relay.bootstrap_reconcile import (
+    BootstrapActivationPath,
+    BootstrapDesiredState,
+    BootstrapReconcilePlan,
+    execution_environment_identity,
+    inspect_exact_bootstrap_noop,
+    reconcile_managed_jarvis_repository,
+    reconcile_staged_activation_links,
+    write_jarvis_wrapper,
+)
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+with tempfile.TemporaryDirectory() as value:
+    workspace = Path(value)
+    canonical_home = workspace / "canonical-home"
+    canonical_home.mkdir()
+    home = workspace / "home-alias"
+    home.symlink_to(canonical_home, target_is_directory=True)
+    local_bin = home / ".local/bin"
+    local_bin.mkdir(parents=True)
+    binaries = {}
+    for name, payload in {
+        "uv": b"#!/bin/sh\necho 'uv 0.11.28'\n",
+        "frpc": b"#!/bin/sh\nexit 0\n",
+        "frps": b"#!/bin/sh\nexit 0\n",
+    }.items():
+        path = local_bin / name
+        path.write_bytes(payload)
+        path.chmod(0o755)
+        binaries[name] = path
+    desired = BootstrapDesiredState(
+        cluster="cluster-a",
+        core_dir="~/.local/share/clio-relay/core",
+        spool_dir="~/.local/share/clio-relay/spool",
+        worker_service="clio-relay-endpoint-cluster-a.service",
+        relay_install_spec="clio-relay==1.5.0",
+        relay_artifact_sha256="a" * 64,
+        relay_source_identity="wheel:sha256:" + "a" * 64,
+        frp_version="0.69.1",
+        frpc_sha256=digest(binaries["frpc"]),
+        frps_sha256=digest(binaries["frps"]),
+        uv_version="0.11.28",
+        uv_sha256=digest(binaries["uv"]),
+        jarvis_util_commit="commit",
+        jarvis_cd_version="1.4.4",
+        jarvis_cd_wheel_url="https://example.test/jarvis.whl",
+        jarvis_cd_wheel_sha256="c" * 64,
+        clio_kit_install_spec="https://example.test/clio-kit.whl",
+        clio_kit_version="2.3.1",
+        clio_kit_artifact_sha256="d" * 64,
+        agent_adapter="exec",
+    )
+    generation = home / ".local/share/clio-relay/generations" / desired.fingerprint
+    execution_root = generation / "jarvis-venv"
+    execution_bin = execution_root / "bin"
+    execution_bin.mkdir(parents=True)
+    execution_python = execution_bin / "python"
+    execution_python.symlink_to(sys.executable)
+    execution_jarvis = execution_bin / "jarvis"
+    execution_jarvis.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    execution_jarvis.chmod(0o755)
+    execution_identity = execution_environment_identity(
+        execution_root,
+        executables={"python": execution_python, "jarvis": execution_jarvis},
+    )
+    generation_bin = generation / "bin"
+    generation_bin.mkdir()
+    relay = generation_bin / "clio-relay"
+    relay.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    relay.chmod(0o755)
+    wrapper = write_jarvis_wrapper(generation_bin / "jarvis", execution_python)
+    (generation / "source/jarvis-packages/clio_relay").mkdir(parents=True)
+    receipt = generation / "install-receipt.json"
+    receipt.write_text("{}\n", encoding="utf-8")
+    activation_paths = {
+        "current": BootstrapActivationPath(
+            path=str(home / ".local/share/clio-relay/current"), kind="symlink"
+        ),
+        "install_receipt": BootstrapActivationPath(
+            path=str(home / ".local/share/clio-relay/install-receipt.json"),
+            kind="file_or_symlink",
+        ),
+        "relay_launcher": BootstrapActivationPath(
+            path=str(home / ".local/bin/clio-relay"), kind="file_or_symlink"
+        ),
+        "jarvis_launcher": BootstrapActivationPath(
+            path=str(home / ".local/bin/jarvis"), kind="file_or_symlink"
+        ),
+        "managed_repo": BootstrapActivationPath(
+            path=str(home / ".local/share/clio-relay/managed-jarvis-repo"),
+            kind="symlink",
+        ),
+    }
+    plan = BootstrapReconcilePlan(
+        mode="component-upgrade",
+        desired_fingerprint=desired.fingerprint,
+        component_actions={"clio-relay": "replace"},
+        activation_paths=activation_paths,
+    )
+    manifest = {
+        "schema_version": "clio-relay.bootstrap-generation.v1",
+        "fingerprint": desired.fingerprint,
+        "plan": plan.model_dump(mode="json"),
+        "legacy_execution_identity": execution_identity,
+        "active_execution_identity": execution_identity,
+        "jarvis_wrapper_sha256": wrapper["sha256"],
+        "install_receipt": str(receipt),
+        "install_receipt_sha256": digest(receipt),
+    }
+    (generation / "manifest.json").write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    first_activation = reconcile_staged_activation_links(
+        plan, generation=generation, home=home
+    )
+    jarvis_root = home / ".ppi-jarvis"
+    jarvis_root.mkdir()
+    roots = {}
+    for name in ("jarvis-config", "jarvis-private", "jarvis-shared"):
+        path = home / ".local/share/clio-relay" / name
+        path.mkdir(parents=True)
+        roots[name] = str(path.resolve())
+    (jarvis_root / "jarvis_config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "config_dir": roots["jarvis-config"],
+                "private_dir": roots["jarvis-private"],
+                "shared_dir": roots["jarvis-shared"],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    previous_repo = home / ".local/src/clio-relay/jarvis-packages/clio_relay"
+    previous_repo.mkdir(parents=True)
+    repos_file = jarvis_root / "repos.yaml"
+    repos_file.write_text(
+        yaml.safe_dump({"repos": [str(previous_repo), "/operator/clio_relay"]}),
+        encoding="utf-8",
+    )
+    (jarvis_root / "resource_graph.yaml").write_text(
+        "storage:\n  nvme:\n    capacity: 100\n", encoding="utf-8"
+    )
+    managed_repo = home / ".local/share/clio-relay/managed-jarvis-repo"
+    first_repository = reconcile_managed_jarvis_repository(
+        repos_file,
+        managed_repo,
+        previous_managed_repos=(previous_repo,),
+        exchange_identity=desired.fingerprint,
+    )
+    installation = {
+        "schema_version": "clio-relay.installation-info.v1",
+        "receipt_matches_install": True,
+        "receipt": {
+            "install_spec": desired.relay_install_spec,
+            "artifact_sha256": desired.relay_artifact_sha256,
+            "deployment_fingerprint": desired.fingerprint,
+            "deployment_manifest": desired.model_dump(mode="json"),
+            "generation": desired.fingerprint,
+            "components": {
+                "clio-relay": "1.5.0",
+                "clio-kit": desired.clio_kit_version,
+                "jarvis-cd": desired.jarvis_cd_version,
+                "jarvis-util": desired.jarvis_util_commit,
+            },
+            "component_artifacts": {
+                "jarvis-cd": {
+                    "runtime_interpreters": {"execution": str(execution_python)}
+                }
+            },
+        },
+        "component_runtime": {
+            "clio-relay": {"persistent_tool_verified": True},
+            "clio-kit": {
+                "artifact_identity_verified": True,
+                "command_matches_receipt": True,
+                "locked_server_runtime_verified": True,
+                "native_execution_capability_verified": True,
+                "persistent_tool_verified": True,
+            },
+            "jarvis-cd": {"verified": True},
+        },
+    }
+    queue = {
+        "schema_version": "clio-relay.queue-readiness.v1",
+        "complete": True,
+        "sealed": True,
+        "repair_required": False,
+    }
+    worker = {
+        "schema_version": "clio-relay.worker-readiness.v1",
+        "cluster": "cluster-a",
+        "fresh": True,
+        "process_running": True,
+        "identity_matches_current": True,
+        "running": True,
+    }
+    first = inspect_exact_bootstrap_noop(
+        desired,
+        home=home,
+        service_was_active=True,
+        service_was_enabled=True,
+        queue_evidence=queue,
+        worker_evidence=worker,
+        installation_snapshot=installation,
+    )
+    second_activation = reconcile_staged_activation_links(
+        plan, generation=generation, home=home
+    )
+    second_repository = reconcile_managed_jarvis_repository(
+        repos_file,
+        managed_repo,
+        previous_managed_repos=(previous_repo,),
+        exchange_identity=desired.fingerprint,
+    )
+    second = inspect_exact_bootstrap_noop(
+        desired,
+        home=home,
+        service_was_active=True,
+        service_was_enabled=True,
+        queue_evidence=queue,
+        worker_evidence=worker,
+        installation_snapshot=installation,
+    )
+    if not first.exact_match or not second.exact_match:
+        raise SystemExit("exact inspection failed: " + repr(first.reasons + second.reasons))
+    if set(first_activation["actions"].values()) != {"created"}:
+        raise SystemExit("first activation did not create the stable paths")
+    if set(second_activation["actions"].values()) != {"reused"}:
+        raise SystemExit("warm activation was not a no-op")
+    if first_repository["action"] != "updated" or second_repository["action"] != "reused":
+        raise SystemExit("repository alias did not converge exactly once")
+    canonical_managed = str(
+        canonical_home / ".local/share/clio-relay/managed-jarvis-repo"
+    )
+    if yaml.safe_load(repos_file.read_text(encoding="utf-8"))["repos"] != [
+        canonical_managed,
+        "/operator/clio_relay",
+    ]:
+        raise SystemExit("repository registration did not retain one canonical stable path")
+print("aliased-activation-noop-ok")
+"""
+    result = _run_posix_project_driver(driver, timeout_seconds=180)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "aliased-activation-noop-ok"
 
 
 def test_exact_remote_bootstrap_never_reads_or_builds_payload(
@@ -1033,6 +1519,196 @@ print("legacy-preflight-ok")
     execution = _run_posix_embedded_driver(execution_driver, remote_script)
     assert execution.returncode == 0, execution.stdout + execution.stderr
     assert execution.stdout.strip() == "legacy-preflight-ok"
+
+
+def test_preflight_allows_only_exact_repairable_queue_permission_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A current provider may defer one exact owner-repairable queue-root audit."""
+    identity = bootstrap.bootstrap_relay_identity(
+        source_root=tmp_path / "release",
+        relay_wheel=None,
+        relay_artifact_sha256="a" * 64,
+    )
+    desired = bootstrap._bootstrap_desired_state(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        identity=identity,
+        cluster="ares",
+        core_dir=bootstrap.DEFAULT_REMOTE_CORE_DIR,
+        spool_dir=bootstrap.DEFAULT_REMOTE_SPOOL_DIR,
+        frp_version=bootstrap.FRP_VERSION,
+        clio_kit_install_spec=bootstrap.CLIO_KIT_JARVIS_MCP_WHEEL_URL,
+        clio_kit_artifact_sha256=bootstrap.CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
+        agent_adapter="exec",
+        agent_npm_package=None,
+        agent_npm_bin=None,
+        agent_args=[],
+        jarvis_resource_graph_profile="ares",
+    )
+    observed: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "bootstrap_preflight_unsupported=repairable_queue_permissions\n",
+            "",
+        )
+
+    monkeypatch.setattr(bootstrap, "_run", run)
+    result = bootstrap._bootstrap_preflight_over_ssh(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        ssh_host="ares",
+        invocation_id="bootstrap_test",
+        desired=desired,
+        core_dir=bootstrap.DEFAULT_REMOTE_CORE_DIR,
+        spool_dir=bootstrap.DEFAULT_REMOTE_SPOOL_DIR,
+        repair=False,
+        timeout_seconds=30,
+    )
+
+    assert result.action == "payload_required"
+    assert len(observed) == 1
+    remote_script = observed[0][-1]
+    execution_driver = r"""
+import base64
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+script = base64.b64decode(sys.argv[1]).decode()
+expected = {
+    "schema_version": "clio-relay.legacy-state-audit.v1",
+    "family": "root",
+    "reason": "queue directory is readable or writable by another user",
+    "action": (
+        "move the unsafe state aside or export records with portable durable IDs "
+        "before retrying"
+    ),
+}
+
+
+def execute(report_path, *, action=None):
+    with tempfile.TemporaryDirectory() as value:
+        home = Path(value)
+        core = home / ".local/share/clio-relay/core"
+        core.mkdir(parents=True)
+        relay = home / ".local/bin/clio-relay"
+        relay.parent.mkdir(parents=True)
+        report = {**expected, "path": str(report_path(home, core))}
+        if action is not None:
+            report["action"] = action
+        output = "error: " + json.dumps(report, sort_keys=True, separators=(",", ":"))
+        relay.write_text(
+            "#!/bin/sh\nprintf '%s\\n' " + shlex.quote(output) + " >&2\nexit 1\n",
+            encoding="utf-8",
+        )
+        relay.chmod(0o700)
+        receipt = home / ".local/share/clio-relay/install-receipt.json"
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(
+            json.dumps(
+                {
+                    "component_artifacts": {
+                        "clio-relay": {"persistent_tool": {"kind": "uv-tool"}}
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        environment = {**os.environ, "HOME": str(home)}
+        return subprocess.run(
+            ["bash"],
+            input=script,
+            text=True,
+            capture_output=True,
+            env=environment,
+            check=False,
+        )
+
+
+accepted = execute(lambda _home, core: core)
+if accepted.returncode != 0:
+    raise SystemExit(accepted.stdout + accepted.stderr)
+if accepted.stdout.strip() != (
+    "bootstrap_preflight_unsupported=repairable_queue_permissions"
+):
+    raise SystemExit("exact repairable audit did not select the candidate payload path")
+
+wrong_path = execute(lambda home, _core: home / ".local/share/clio-relay/not-core")
+if wrong_path.returncode == 0 or "repairable_queue_permissions" in wrong_path.stdout:
+    raise SystemExit("a mismatched queue-root path was classified as repairable")
+
+wrong_action = execute(lambda _home, core: core, action="repair it automatically")
+if wrong_action.returncode == 0 or "repairable_queue_permissions" in wrong_action.stdout:
+    raise SystemExit("a non-contract audit action was classified as repairable")
+
+print("repairable-preflight-ok")
+"""
+    execution = _run_posix_embedded_driver(execution_driver, remote_script)
+    assert execution.returncode == 0, execution.stdout + execution.stderr
+    assert execution.stdout.strip() == "repairable-preflight-ok"
+
+
+def test_locked_recovery_privatizes_legacy_cursor_directory_on_posix() -> None:
+    """Recovery repairs the fixed legacy-only cursor family before auditing it."""
+    driver = r"""
+import stat
+import tempfile
+from pathlib import Path
+
+from clio_relay.bootstrap_reconcile import repair_legacy_cursor_permissions_for_upgrade
+from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.errors import ConfigurationError
+from clio_relay.worker_lifetime_lock import exclusive_migration_lifetime
+
+with tempfile.TemporaryDirectory() as value:
+    core = Path(value) / "core"
+    core.mkdir(mode=0o755)
+    cursors = core / "cursors"
+    cursors.mkdir(mode=0o755)
+    with exclusive_migration_lifetime(core) as locked_core:
+        ClioCoreQueue(core).initialize(locked_core=locked_core)
+    if stat.S_IMODE(core.stat().st_mode) != 0o700:
+        raise SystemExit("queue root was not privatized")
+    if stat.S_IMODE(cursors.stat().st_mode) != 0o700:
+        raise SystemExit("legacy cursor directory was not privatized")
+    if not (core / "migrations/legacy-record-audit-v1.json").is_file():
+        raise SystemExit("legacy audit seal was not written")
+
+    compatibility_core = Path(value) / "compatibility-core"
+    compatibility_core.mkdir(mode=0o700)
+    compatibility_cursor = compatibility_core / "cursors"
+    compatibility_cursor.mkdir(mode=0o755)
+    repair = repair_legacy_cursor_permissions_for_upgrade(compatibility_core)
+    if repair.get("action") != "repaired":
+        raise SystemExit("compatibility repair did not report its mutation")
+    if stat.S_IMODE(compatibility_cursor.stat().st_mode) != 0o700:
+        raise SystemExit("compatibility repair did not privatize cursors")
+
+    unsafe_core = Path(value) / "unsafe-core"
+    unsafe_core.mkdir(mode=0o700)
+    outside = Path(value) / "outside"
+    outside.mkdir(mode=0o755)
+    (unsafe_core / "cursors").symlink_to(outside, target_is_directory=True)
+    try:
+        repair_legacy_cursor_permissions_for_upgrade(unsafe_core)
+    except ConfigurationError:
+        pass
+    else:
+        raise SystemExit("compatibility repair followed a cursor symlink")
+    if stat.S_IMODE(outside.stat().st_mode) != 0o755:
+        raise SystemExit("compatibility repair changed the symlink target")
+print("legacy-cursor-permissions-ok")
+"""
+    result = _run_posix_project_driver(driver)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "legacy-cursor-permissions-ok"
 
 
 def test_public_cluster_bootstrap_noop_never_touches_nonexistent_wheel(
@@ -1905,6 +2581,10 @@ def test_staged_upgrade_uses_journal_bound_idempotent_forward_activation() -> No
     recovery = script[script.index("bootstrap_recover_previous_transaction()") : activation]
 
     assert "bootstrap_use_staged_provider()" in script
+    assert 'if os.environ.get("BOOTSTRAP_STAGED_GENERATION"):' in script
+    assert "from clio_relay import bootstrap_reconcile as module" in script
+    assert 'receipt_document.get("deployment_manifest")' in script
+    assert "staged install receipt omitted its desired state" in script
     assert "journal-phase prepared_manifest" in script
     assert provider_function.index("compgen -e") < provider_function.index("exec python3 -I -c")
     assert 'LD_*|PYTHON*|BASH_ENV|ENV) unset "$bootstrap_environment_name"' in provider_function
@@ -1912,6 +2592,22 @@ def test_staged_upgrade_uses_journal_bound_idempotent_forward_activation() -> No
     assert "bootstrap_candidate_action finish-activation" in recovery
     assert "phase_identities" in recovery
     assert "sha256sum --check --strict -" in recovery
+    assert "WORKER_LIFETIME_GUARD_FD=8" in recovery
+    assert 'CLIO_RELAY_WORKER_LIFETIME_GUARD_FD="$WORKER_LIFETIME_GUARD_FD"' in recovery
+    cursor_repair = recovery.index("bootstrap_candidate_action repair-legacy-cursors")
+    recovery_fence = recovery.index('bootstrap_fence_recovered_service "$service_name"')
+    recovery_lock = recovery.index("exec 8<>")
+    queue_init = recovery.index('"$HOME/.local/bin/clio-relay" init --migrate-legacy-output')
+    assert recovery_fence < recovery_lock < cursor_repair < queue_init
+    cursor_repair_prefix = recovery[max(0, cursor_repair - 160) : cursor_repair]
+    assert 'CLIO_RELAY_WORKER_LIFETIME_GUARD_FD="$WORKER_LIFETIME_GUARD_FD"' in (
+        cursor_repair_prefix
+    )
+    assert 'action != "repair-legacy-cursors"' in script
+    assert "export recovery_worker" not in recovery
+    assert "printf '%s\\n' \"$recovery_worker\" | python3 -c" in recovery
+    assert script.count("endpoint worker-info") == 6
+    assert script.count("--readiness-only") == 4
     assert "printf '%s\\n' \"bootstrap_reconcile_plan=$BOOTSTRAP_PLAN_JSON\" >&2" in script
     assert 'mv -Tf "$HOME/.local/share/clio-relay/.current.' not in script
     assert 'readlink "$HOME/.local/share/clio-relay/current"' not in script
@@ -1920,6 +2616,151 @@ def test_staged_upgrade_uses_journal_bound_idempotent_forward_activation() -> No
         'source/jarvis-packages/clio_relay"'
     ) in script
     assert "scancel" not in script
+
+
+def test_forward_recovery_fence_is_idempotent_after_prior_restart() -> None:
+    """A crash after restart is fenced again before forward migration resumes."""
+    script = bootstrap.render_linux_user_bootstrap_script(cluster="cluster-a")
+    start = script.index("bootstrap_fence_recovered_service() {")
+    end = script.index("\n}\n\nbootstrap_recover_interrupted_repair()", start) + 3
+    fence = script[start:end]
+    driver = r"""
+import base64
+import subprocess
+import sys
+
+fence = base64.b64decode(sys.argv[1]).decode()
+harness = r'''set -euo pipefail
+state=active
+stops=0
+systemctl() {
+  case " $* " in
+    *" stop "*) state=inactive; stops=$((stops + 1)) ;;
+    *" --property=LoadState "*) printf '%s\n' loaded ;;
+    *" --property=ActiveState "*) printf '%s\n' "$state" ;;
+    *) return 97 ;;
+  esac
+}
+''' + fence + r'''
+bootstrap_fence_recovered_service clio-relay-endpoint-cluster-a.service
+[ "$state" = inactive ]
+[ "$stops" = 1 ]
+bootstrap_fence_recovered_service clio-relay-endpoint-cluster-a.service
+[ "$stops" = 1 ]
+printf '%s\n' recovery-fence-ok
+'''
+result = subprocess.run(
+    ["bash"],
+    input=harness,
+    text=True,
+    capture_output=True,
+    check=False,
+)
+if result.returncode != 0:
+    raise SystemExit(result.stdout + result.stderr)
+print(result.stdout, end="")
+"""
+    execution = _run_posix_embedded_driver(driver, fence)
+
+    assert execution.returncode == 0, execution.stdout + execution.stderr
+    assert execution.stdout.strip() == "recovery-fence-ok"
+
+
+@pytest.mark.parametrize(
+    "interrupted_state",
+    (
+        BootstrapTransactionState.ACTIVATING,
+        BootstrapTransactionState.ACTIVATED,
+        BootstrapTransactionState.MIGRATION_STARTED,
+        BootstrapTransactionState.MIGRATED,
+        BootstrapTransactionState.STARTING,
+        BootstrapTransactionState.SERVICE_VERIFIED,
+    ),
+)
+def test_interrupted_repair_forward_recovery_does_not_require_staged_evidence(
+    interrupted_state: BootstrapTransactionState,
+) -> None:
+    """Every repair crash boundary dispatches its idempotent non-staged recovery."""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.fail("bash is required to validate bootstrap repair recovery dispatch")
+    digest = "a" * 64
+    journal = BootstrapTransactionJournal(
+        invocation_id=f"repair-{interrupted_state.value}",
+        desired_fingerprint=digest,
+        mode="repair",
+        state=interrupted_state,
+        prepared_generation=digest,
+        service_name="clio-relay-endpoint-cluster-a.service",
+        service_was_active=True,
+        irreversible_boundary=True,
+    )
+    recovery_payload = journal.model_dump(mode="json")
+    recovery_payload["recovery_mode"] = journal.recovery_mode
+    assert recovery_payload["recovery_mode"] == "forward"
+
+    script = bootstrap.render_linux_user_bootstrap_script(cluster="cluster-a")
+    value_start = script.index("bootstrap_recovery_value() {")
+    value_end = script.index("\n}\n\nbootstrap_recover_service()", value_start) + 3
+    recover_start = script.index("bootstrap_recover_previous_transaction() {")
+    recover_end = script.index("\n}\n\nbootstrap_relay_only_reconcile()", recover_start) + 3
+    functions = (script[value_start:value_end] + script[recover_start:recover_end]).replace(
+        "\r\n", "\n"
+    )
+    harness = f"""set -euo pipefail
+export HOME="$(mktemp -d)"
+export BOOTSTRAP_DESIRED_STATE='{{"cluster":"cluster-a"}}'
+export BOOTSTRAP_TEST_RECOVERY_JSON={shlex.quote(json.dumps(recovery_payload))}
+bootstrap_candidate_action() {{
+  case "$1" in
+    recovery-plan) printf '%s\n' "$BOOTSTRAP_TEST_RECOVERY_JSON" ;;
+    recovery-complete) echo "recovery-complete" ;;
+    *) echo "unexpected-candidate-action=$1" >&2; return 91 ;;
+  esac
+}}
+bootstrap_recover_interrupted_repair() {{
+  echo "repair-recovery=$1:$2:$3"
+  BOOTSTRAP_REPAIR_RECOVERY_ACTIVE=1
+}}
+bootstrap_release_worker_lifetime_guard() {{ echo "lifetime-guard=released"; }}
+{functions}
+bootstrap_recover_previous_transaction
+"""
+    result = subprocess.run(
+        [bash, "-s"],
+        input=harness.encode("utf-8"),
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    assert result.returncode == 0, stderr
+    assert "repair-recovery=1:cluster-a:clio-relay-endpoint-cluster-a.service" in stdout
+    assert stdout.count("recovery-complete") == 1
+    assert stdout.count("lifetime-guard=released") == 1
+    assert "prepared manifest" not in stderr
+
+
+def test_repair_recovery_replays_only_binding_queue_and_readiness_work() -> None:
+    """Repair recovery has no staged generation, download, or scheduler boundary."""
+    script = bootstrap.render_linux_user_bootstrap_script(cluster="cluster-a")
+    start = script.index("bootstrap_recover_interrupted_repair() {")
+    end = script.index("\n}\n\nbootstrap_recover_previous_transaction()", start)
+    recovery = script[start:end]
+    binding = recovery.index("bootstrap_candidate_action repair-managed-binding")
+    queue_check = recovery.index('"$HOME/.local/bin/clio-relay" queue readiness-info')
+    queue_repair = recovery.index("clio-relay init --migrate-legacy-output")
+    restart = recovery.index("if ! bootstrap_bounded_worker_restart", queue_repair)
+
+    assert binding < queue_check < queue_repair < restart
+    assert "bootstrap_require_worker_lifetime_guard" in recovery
+    assert "finish-activation" not in recovery
+    assert "prepared_manifest" not in recovery
+    assert "curl " not in recovery
+    assert "scancel" not in recovery
+    assert "sbatch" not in recovery
 
 
 def test_fresh_jarvis_hardware_graph_commands_are_exact_and_ordered() -> None:
