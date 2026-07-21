@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
-import subprocess
 import sys
 import tomllib
 from datetime import UTC, datetime
@@ -18,6 +18,7 @@ from urllib.parse import unquote, urlsplit
 from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from clio_relay.bounded_process import BoundedProcessError, run_bounded_process
 from clio_relay.errors import ConfigurationError
 from clio_relay.validation_report import (
     EvidenceReference,
@@ -214,6 +215,26 @@ class InstallReceipt(BaseModel):
     software: SoftwareIdentity
     components: dict[str, str] = Field(default_factory=dict)
     component_artifacts: dict[str, ComponentArtifactIdentity] = Field(default_factory=dict)
+    deployment_fingerprint: str | None = None
+    deployment_manifest: dict[str, object] | None = None
+    generation: str | None = None
+
+    @model_validator(mode="after")
+    def validate_deployment_identity(self) -> InstallReceipt:
+        """Require deployment identity fields to be present as one complete set."""
+        manifest_present = self.deployment_manifest is not None
+        fingerprint_present = self.deployment_fingerprint is not None
+        if manifest_present is not fingerprint_present:
+            raise ValueError(
+                "deployment fingerprint and manifest must either both be present or both be absent"
+            )
+        if self.deployment_fingerprint is not None and not _is_sha256_text(
+            self.deployment_fingerprint
+        ):
+            raise ValueError("deployment fingerprint must be one lowercase SHA-256 digest")
+        if self.generation is not None and not _is_sha256_text(self.generation):
+            raise ValueError("install generation must be one lowercase SHA-256 digest")
+        return self
 
 
 def default_install_receipt_path() -> Path:
@@ -283,6 +304,9 @@ def write_install_receipt(
     path: Path | None = None,
     components: dict[str, str] | None = None,
     component_artifacts: dict[str, ComponentArtifactIdentity] | None = None,
+    deployment_fingerprint: str | None = None,
+    deployment_manifest: dict[str, object] | None = None,
+    generation: str | None = None,
 ) -> InstallReceipt:
     """Atomically record the installed distribution and optional wheel digest."""
     resolved_artifact = artifact_path.resolve() if artifact_path is not None else None
@@ -298,6 +322,9 @@ def write_install_receipt(
         software=detect_software_identity(),
         components=components or {},
         component_artifacts=component_artifacts or {},
+        deployment_fingerprint=deployment_fingerprint,
+        deployment_manifest=deployment_manifest,
+        generation=generation,
     )
     destination = path or default_install_receipt_path()
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -329,8 +356,24 @@ def probe_persistent_uv_tool_identity(
     distribution: str,
     distribution_version: str,
     entry_point: str,
+    tool_directory: str | None = None,
+    tool_bin_directory: str | None = None,
 ) -> PersistentUvToolIdentity:
     """Capture and verify an install-once uv tool environment and wheel closure."""
+    if (tool_directory is None) is not (tool_bin_directory is None):
+        raise ConfigurationError(
+            "persistent tool directory and bin directory must be specified together"
+        )
+    uv_environment = (
+        {
+            "UV_TOOL_DIR": str(_absolute_path(tool_directory, label="uv tool directory")),
+            "UV_TOOL_BIN_DIR": str(
+                _absolute_path(tool_bin_directory, label="uv tool bin directory")
+            ),
+        }
+        if tool_directory is not None and tool_bin_directory is not None
+        else None
+    )
     uv_path = _required_regular_file(uv_executable, label="uv executable")
     executable_location = _absolute_path(tool_executable, label="tool executable")
     executable_path = _required_regular_file(executable_location, label="tool executable")
@@ -355,15 +398,21 @@ def probe_persistent_uv_tool_identity(
     if version_match is None:
         raise ConfigurationError("persistent tool uv executable returned no exact version")
     uv_version = version_match.group(1)
-    tool_directory = _required_directory_output(
-        _bounded_identity_command([str(uv_path), "tool", "dir", "--no-config"]),
+    observed_tool_directory = _required_directory_output(
+        _bounded_identity_command(
+            [str(uv_path), "tool", "dir", "--no-config"],
+            environment=uv_environment,
+        ),
         label="uv tool directory",
     )
-    tool_bin_directory = _required_directory_output(
-        _bounded_identity_command([str(uv_path), "tool", "dir", "--bin", "--no-config"]),
+    observed_tool_bin_directory = _required_directory_output(
+        _bounded_identity_command(
+            [str(uv_path), "tool", "dir", "--bin", "--no-config"],
+            environment=uv_environment,
+        ),
         label="uv tool bin directory",
     )
-    if executable_location.parent.resolve() != tool_bin_directory:
+    if executable_location.parent.resolve() != observed_tool_bin_directory:
         raise ConfigurationError("persistent tool executable is outside uv's tool bin directory")
 
     probe_source = r"""
@@ -522,7 +571,7 @@ print(json.dumps({
         raise ConfigurationError("persistent uv tool probe used the wrong interpreter")
     if not _path_within(provider_environment_location, environment_prefix):
         raise ConfigurationError("persistent uv tool provider is outside its environment")
-    if not _path_within(environment_prefix, tool_directory):
+    if not _path_within(environment_prefix, observed_tool_directory):
         raise ConfigurationError("persistent tool environment is outside uv's tool directory")
     if not _path_within(metadata_path, environment_prefix) or not _path_within(
         record_path,
@@ -581,8 +630,8 @@ print(json.dumps({
             uv_executable=str(uv_path),
             uv_version=uv_version,
             uv_executable_sha256=sha256_file(uv_path),
-            tool_directory=str(tool_directory),
-            tool_bin_directory=str(tool_bin_directory),
+            tool_directory=str(observed_tool_directory),
+            tool_bin_directory=str(observed_tool_bin_directory),
             environment_prefix=str(environment_prefix),
             provider_interpreter=str(provider_location),
             provider_interpreter_sha256=sha256_file(provider_path),
@@ -615,20 +664,21 @@ def _bounded_identity_command(
     *,
     maximum_bytes: int = 65_536,
     timeout_seconds: int = 30,
+    environment: dict[str, str] | None = None,
 ) -> str:
     """Run one identity command and return one bounded non-empty line."""
     try:
-        completed = subprocess.run(
+        completed = run_bounded_process(
             command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
+            timeout_seconds=timeout_seconds,
+            stdout_maximum_bytes=maximum_bytes,
+            stderr_maximum_bytes=4096,
+            environment=({**os.environ, **environment} if environment is not None else None),
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, BoundedProcessError) as exc:
         raise ConfigurationError(f"persistent tool identity command failed: {exc}") from exc
     encoded = completed.stdout.encode("utf-8")
-    if completed.returncode != 0 or not encoded or len(encoded) > maximum_bytes:
+    if completed.returncode != 0 or not encoded:
         detail = completed.stderr.strip()
         suffix = f": {detail}" if detail else ""
         raise ConfigurationError(f"persistent tool identity command failed{suffix}")
@@ -895,23 +945,31 @@ def worker_runtime_info(
     *,
     cluster: str,
     freshness_seconds: float = 120.0,
+    current_installation: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Prove the active worker process loaded the same exact installation receipt."""
     from clio_relay.config import RelaySettings
-    from clio_relay.core_queue import ClioCoreQueue
+    from clio_relay.core_queue import MAX_ENDPOINT_FRESH_SECONDS, ClioCoreQueue
     from clio_relay.models import EndpointRole
 
     if freshness_seconds <= 0:
         raise ConfigurationError("worker freshness_seconds must be positive")
-    current = installation_info()
+    if freshness_seconds > MAX_ENDPOINT_FRESH_SECONDS:
+        raise ConfigurationError(
+            "worker freshness_seconds exceeds the bounded fresh endpoint window"
+        )
+    current = installation_info() if current_installation is None else current_installation
+    if current.get("schema_version") != "clio-relay.installation-info.v1":
+        raise ConfigurationError("current installation snapshot is invalid")
     queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
-    endpoint_records, endpoints_truncated = queue.scan_endpoints(
+    endpoint_records, endpoints_truncated = queue.scan_fresh_endpoints_read_only(
         limit=MAX_WORKER_ENDPOINT_RECORDS,
+        fresh_seconds=math.ceil(freshness_seconds),
         cluster=cluster,
     )
     if endpoints_truncated:
         raise ConfigurationError(
-            "worker endpoint discovery exceeds the bounded limit "
+            "fresh worker endpoint discovery exceeds the bounded limit "
             f"{MAX_WORKER_ENDPOINT_RECORDS}: {cluster}"
         )
     endpoints = [endpoint for endpoint in endpoint_records if endpoint.role is EndpointRole.WORKER]
@@ -1471,21 +1529,17 @@ print(json.dumps({{
 def _run_json_probe(command: list[str], *, label: str) -> dict[str, object]:
     """Run one bounded component probe and require exactly one JSON object."""
     try:
-        completed = subprocess.run(
+        completed = run_bounded_process(
             command,
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=30,
+            timeout_seconds=30,
+            stdout_maximum_bytes=4 * 1024 * 1024,
+            stderr_maximum_bytes=64 * 1024,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, BoundedProcessError) as exc:
         raise ConfigurationError(f"{label} failed: {type(exc).__name__}: {exc}") from exc
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic"
         raise ConfigurationError(f"{label} failed: {detail[:2000]}")
-    encoded = completed.stdout.encode("utf-8")
-    if len(encoded) > 4 * 1024 * 1024:
-        raise ConfigurationError(f"{label} exceeded the output limit")
     try:
         loaded = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
@@ -1832,6 +1886,12 @@ def _is_sha256_text(value: object) -> bool:
 def _component_runtime_identity(receipt: InstallReceipt) -> dict[str, object]:
     """Return current process evidence for receipt-bound component launchers."""
     identities: dict[str, object] = {}
+    relay_component = receipt.component_artifacts.get("clio-relay")
+    if relay_component is not None and relay_component.persistent_tool is not None:
+        identities["clio-relay"] = persistent_component_runtime_identity(
+            relay_component,
+            entry_point="clio-relay",
+        )
     if "clio-kit" in receipt.component_artifacts:
         from clio_relay.jarvis_mcp import jarvis_mcp_runtime_identity
 
@@ -1874,6 +1934,55 @@ def _component_runtime_identity(receipt: InstallReceipt) -> dict[str, object]:
         if component.native_execution is not None and component_name != "clio-kit":
             identities[component_name] = _native_jarvis_component_runtime_identity(component)
     return identities
+
+
+def persistent_component_runtime_identity(
+    component: ComponentArtifactIdentity,
+    *,
+    entry_point: str,
+) -> dict[str, object]:
+    """Re-probe one receipt-bound persistent uv tool without mutating it."""
+    expected = component.persistent_tool
+    if expected is None:
+        return {
+            "persistent_tool_verified": False,
+            "error": "component receipt omitted persistent uv tool identity",
+        }
+    uv_executable = component.runtime_executables.get("uv")
+    tool_executable = component.runtime_executables.get(entry_point)
+    provider_interpreter = component.runtime_interpreters.get("provider")
+    artifact_path = component.runtime_artifact_path
+    if (
+        uv_executable is None
+        or tool_executable is None
+        or provider_interpreter is None
+        or artifact_path is None
+        or component.distribution_version is None
+    ):
+        return {
+            "persistent_tool_verified": False,
+            "error": "component receipt omitted persistent uv tool runtime fields",
+        }
+    try:
+        observed = probe_persistent_uv_tool_identity(
+            uv_executable=uv_executable,
+            tool_executable=tool_executable,
+            provider_interpreter=provider_interpreter,
+            source_artifact=Path(artifact_path),
+            distribution=component.distribution,
+            distribution_version=component.distribution_version,
+            entry_point=entry_point,
+            tool_directory=expected.tool_directory,
+            tool_bin_directory=expected.tool_bin_directory,
+        )
+    except ConfigurationError as exc:
+        return {"persistent_tool_verified": False, "error": str(exc)}
+    return {
+        "persistent_tool_verified": observed == expected,
+        "expected": expected.model_dump(mode="json"),
+        "observed": observed.model_dump(mode="json"),
+        "error": None if observed == expected else "persistent uv tool identity changed",
+    }
 
 
 def _native_jarvis_component_runtime_identity(
@@ -1924,6 +2033,20 @@ def _native_jarvis_component_runtime_identity(
     )
     execution_python = component.runtime_interpreters.get("execution")
     execution = _probe_python_distribution(execution_python, component.distribution)
+    execution_record_closure = (
+        _probe_python_distribution_record_closure(
+            execution_python,
+            component.distribution,
+            runtime_path,
+        )
+        if artifact_sha256_verified
+        else {
+            "verified": False,
+            "error": "retained wheel artifact identity is not verified",
+            "tree_scanned": False,
+            "tree_copied": False,
+        }
+    )
     execution_distribution_identity_verified = (
         execution.get("distribution") is not None
         and _normalized_distribution_name(str(execution["distribution"]))
@@ -1983,6 +2106,7 @@ def _native_jarvis_component_runtime_identity(
         and runtime_artifact_path_verified
         and artifact_sha256_verified
         and execution_interpreter_verified
+        and execution_record_closure.get("verified") is True
         and native_execution_capability_verified
         and jarvis_executable_verified
     )
@@ -2012,6 +2136,8 @@ def _native_jarvis_component_runtime_identity(
         "execution_entry_points_visible": execution_entry_points_visible,
         "execution_source_verified": execution_source_verified,
         "execution": execution,
+        "execution_record_closure": execution_record_closure,
+        "execution_record_closure_verified": (execution_record_closure.get("verified") is True),
         "native_execution_capability": (
             expected_native_capability.model_dump(mode="json")
             if expected_native_capability is not None
@@ -2097,14 +2223,13 @@ print(json.dumps({
 }, sort_keys=True))
 """
     try:
-        completed = subprocess.run(
+        completed = run_bounded_process(
             [python, "-c", script, distribution_name],
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=10,
+            timeout_seconds=10,
+            stdout_maximum_bytes=1024 * 1024,
+            stderr_maximum_bytes=16 * 1024,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, BoundedProcessError) as exc:
         return {"verified": False, "error": f"{type(exc).__name__}: {exc}"}
     if completed.returncode != 0:
         return {
@@ -2117,6 +2242,246 @@ print(json.dumps({
         return {"verified": False, "error": f"invalid interpreter probe JSON: {exc}"}
     if not isinstance(loaded, dict):
         return {"verified": False, "error": "interpreter probe was not an object"}
+    return {str(key): value for key, value in cast(dict[object, object], loaded).items()}
+
+
+def _probe_python_distribution_record_closure(
+    python: str | None,
+    distribution_name: str,
+    expected_artifact: Path | None,
+    *,
+    environment: dict[str, str] | None = None,
+) -> dict[str, object]:
+    """Verify wheel-owned installed bytes through one bounded RECORD closure."""
+    if python is None or expected_artifact is None:
+        return {
+            "verified": False,
+            "error": "execution interpreter or source wheel is not configured",
+            "tree_scanned": False,
+            "tree_copied": False,
+        }
+    script = r"""
+import base64
+import csv
+import hashlib
+import io
+import json
+import os
+import stat
+import sys
+import zipfile
+from importlib import metadata
+from pathlib import Path, PurePosixPath
+
+MAX_FILES = 100_000
+MAX_BYTES = 4 * 1024 * 1024 * 1024
+
+
+def digest_stream(stream):
+    digest = hashlib.sha256()
+    size = 0
+    while chunk := stream.read(1024 * 1024):
+        digest.update(chunk)
+        size += len(chunk)
+        if size > MAX_BYTES:
+            raise SystemExit("distribution RECORD member exceeds the byte bound")
+    return digest, size
+
+
+def within(path, roots):
+    return any(path == root or root in path.parents for root in roots)
+
+
+distribution_name, wheel_text = sys.argv[1:]
+wheel = Path(wheel_text).resolve(strict=True)
+if not wheel.is_file():
+    raise SystemExit("retained distribution wheel is not a regular file")
+installed = metadata.distribution(distribution_name)
+installed_files = installed.files
+if not installed_files or len(installed_files) > MAX_FILES:
+    raise SystemExit("installed distribution has no bounded RECORD closure")
+distribution_root = Path(installed.locate_file("")).resolve(strict=True)
+environment_prefix = Path(sys.prefix).resolve(strict=True)
+allowed_roots = (distribution_root, environment_prefix)
+installed_closure = hashlib.sha256()
+installed_bytes = 0
+installed_record_paths = []
+for item in sorted(installed_files, key=lambda value: str(value)):
+    relative = str(item).replace("\\", "/")
+    location = Path(installed.locate_file(item)).resolve(strict=True)
+    if not within(location, allowed_roots) or not location.is_file():
+        raise SystemExit("installed RECORD contains a file outside its environment")
+    with location.open("rb") as stream:
+        digest, size = digest_stream(stream)
+    installed_bytes += size
+    if installed_bytes > MAX_BYTES:
+        raise SystemExit("installed distribution RECORD closure exceeds the byte bound")
+    expected_hash = item.hash
+    if expected_hash is not None:
+        if expected_hash.mode != "sha256":
+            raise SystemExit("installed RECORD uses an unsupported digest")
+        encoded = base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode("ascii")
+        if encoded != expected_hash.value:
+            raise SystemExit("installed RECORD member digest mismatch")
+    elif not (relative.endswith(".dist-info/RECORD") or relative.endswith(".pyc")):
+        raise SystemExit("installed RECORD member omitted its digest")
+    if relative.endswith(".dist-info/RECORD"):
+        installed_record_paths.append(location)
+    installed_closure.update(relative.encode("utf-8"))
+    installed_closure.update(b"\0")
+    installed_closure.update(digest.hexdigest().encode("ascii"))
+    installed_closure.update(b"\0")
+    installed_closure.update(str(size).encode("ascii"))
+    installed_closure.update(b"\n")
+if len(installed_record_paths) != 1:
+    raise SystemExit("installed distribution RECORD ownership is ambiguous")
+
+wheel_closure = hashlib.sha256()
+wheel_bytes = 0
+wheel_members = 0
+with zipfile.ZipFile(wheel) as archive:
+    infos = archive.infolist()
+    if not infos or len(infos) > MAX_FILES:
+        raise SystemExit("retained wheel has no bounded member closure")
+    record_names = [
+        info.filename
+        for info in infos
+        if not info.is_dir() and info.filename.endswith(".dist-info/RECORD")
+    ]
+    if len(record_names) != 1:
+        raise SystemExit("retained wheel RECORD ownership is ambiguous")
+    record_name = record_names[0]
+    record_info = archive.getinfo(record_name)
+    if record_info.file_size > 16 * 1024 * 1024:
+        raise SystemExit("retained wheel RECORD exceeds the byte bound")
+    with archive.open(record_info) as record_stream:
+        record_bytes = record_stream.read(16 * 1024 * 1024 + 1)
+    if len(record_bytes) > 16 * 1024 * 1024:
+        raise SystemExit("retained wheel RECORD exceeds the byte bound")
+    rows = list(csv.reader(io.StringIO(record_bytes.decode("utf-8"))))
+    if len(rows) > MAX_FILES or any(len(row) != 3 for row in rows):
+        raise SystemExit("retained wheel RECORD has an invalid shape")
+    record = {row[0]: (row[1], row[2]) for row in rows}
+    if len(record) != len(rows):
+        raise SystemExit("retained wheel RECORD contains duplicate members")
+    archive_files = {info.filename for info in infos if not info.is_dir()}
+    if set(record) != archive_files:
+        raise SystemExit("retained wheel RECORD does not cover every member")
+    for info in sorted(infos, key=lambda value: value.filename):
+        if info.is_dir():
+            continue
+        member = info.filename
+        path = PurePosixPath(member)
+        if (
+            not member
+            or "\\" in member
+            or path.is_absolute()
+            or ".." in path.parts
+            or "\x00" in member
+        ):
+            raise SystemExit("retained wheel contains an unsafe member path")
+        mode = (info.external_attr >> 16) & 0o177777
+        file_type = stat.S_IFMT(mode)
+        if file_type not in {0, stat.S_IFREG}:
+            raise SystemExit("retained wheel contains a non-regular member")
+        expected_digest, expected_size = record[member]
+        with archive.open(info) as stream:
+            digest, size = digest_stream(stream)
+        wheel_bytes += size
+        if wheel_bytes > MAX_BYTES:
+            raise SystemExit("retained wheel closure exceeds the byte bound")
+        if expected_size and int(expected_size) != size:
+            raise SystemExit("retained wheel member size does not match RECORD")
+        if member == record_name:
+            if expected_digest or expected_size:
+                raise SystemExit("retained wheel RECORD self-entry is invalid")
+            continue
+        if not expected_digest.startswith("sha256="):
+            raise SystemExit("retained wheel member omitted a SHA-256 digest")
+        encoded = base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode("ascii")
+        if encoded != expected_digest.removeprefix("sha256="):
+            raise SystemExit("retained wheel member digest does not match RECORD")
+        parts = path.parts
+        if len(parts) >= 3 and parts[0].endswith(".data"):
+            if parts[1] not in {"purelib", "platlib"}:
+                raise SystemExit("retained wheel uses an unsupported installation scheme")
+            installed_relative = PurePosixPath(*parts[2:])
+        else:
+            installed_relative = path
+        installed_location = Path(
+            installed.locate_file(str(installed_relative))
+        ).resolve(strict=True)
+        if not within(installed_location, allowed_roots) or not installed_location.is_file():
+            raise SystemExit("wheel-owned distribution member is not installed")
+        with installed_location.open("rb") as stream:
+            installed_digest, installed_size = digest_stream(stream)
+        if installed_size != size or installed_digest.digest() != digest.digest():
+            raise SystemExit("wheel-owned installed member digest mismatch")
+        wheel_closure.update(member.encode("utf-8"))
+        wheel_closure.update(b"\0")
+        wheel_closure.update(digest.hexdigest().encode("ascii"))
+        wheel_closure.update(b"\0")
+        wheel_closure.update(str(size).encode("ascii"))
+        wheel_closure.update(b"\n")
+        wheel_members += 1
+
+installed_record = installed_record_paths[0]
+print(json.dumps({
+    "schema_version": "clio-relay.python-record-closure.v1",
+    "verified": True,
+    "distribution": installed.name,
+    "distribution_version": installed.version,
+    "record_path": str(installed_record),
+    "record_sha256": hashlib.sha256(installed_record.read_bytes()).hexdigest(),
+    "installed_record_closure_sha256": installed_closure.hexdigest(),
+    "installed_record_file_count": len(installed_files),
+    "installed_record_bytes": installed_bytes,
+    "wheel_payload_closure_sha256": wheel_closure.hexdigest(),
+    "wheel_payload_file_count": wheel_members,
+    "wheel_payload_bytes": wheel_bytes,
+    "tree_scanned": False,
+    "tree_copied": False,
+}, sort_keys=True))
+"""
+    try:
+        completed = run_bounded_process(
+            [python, "-I", "-c", script, distribution_name, str(expected_artifact)],
+            timeout_seconds=60,
+            stdout_maximum_bytes=64 * 1024,
+            stderr_maximum_bytes=64 * 1024,
+            environment=({**os.environ, **environment} if environment is not None else None),
+        )
+    except (OSError, BoundedProcessError) as exc:
+        return {
+            "verified": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "tree_scanned": False,
+            "tree_copied": False,
+        }
+    if completed.returncode != 0:
+        return {
+            "verified": False,
+            "error": completed.stderr.strip() or completed.stdout.strip(),
+            "tree_scanned": False,
+            "tree_copied": False,
+        }
+    try:
+        loaded = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        return {
+            "verified": False,
+            "error": f"invalid RECORD closure probe JSON: {exc}",
+            "tree_scanned": False,
+            "tree_copied": False,
+        }
+    typed_loaded = cast(dict[object, object], loaded) if isinstance(loaded, dict) else {}
+    if not isinstance(loaded, dict) or typed_loaded.get("verified") is not True:
+        return {
+            "verified": False,
+            "error": "distribution RECORD closure probe was not verified",
+            "tree_scanned": False,
+            "tree_copied": False,
+        }
     return {str(key): value for key, value in cast(dict[object, object], loaded).items()}
 
 

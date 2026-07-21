@@ -59,7 +59,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.4.12"
+$Version = "1.4.13"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }
@@ -234,7 +234,10 @@ if ($Stage -eq "candidate") {
   if ($LASTEXITCODE -ne 0) { throw "candidate uv tool installation failed" }
   $InstallSource = "wheel:$([Uri]::new($Wheel).AbsoluteUri)"
   $ArtifactEvidence = @("--validation-artifact", $Wheel)
-  $BootstrapArtifact = @("--relay-wheel", $Wheel)
+  $BootstrapArtifact = @(
+    "--relay-wheel", $Wheel,
+    "--relay-artifact-sha256", $ExpectedWheelSha256
+  )
   $env:CLIO_RELAY_VALIDATION_ARTIFACT_SHA256 = $Observed
 } else {
   $PublishedRoot = Join-Path $StageRoot "published-artifact"
@@ -256,7 +259,9 @@ if ($Stage -eq "candidate") {
   if ($LASTEXITCODE -ne 0) { throw "released uv tool installation failed" }
   $InstallSource = "pypi:clio-relay==$Version"
   $ArtifactEvidence = @()
-  $BootstrapArtifact = @()
+  $BootstrapArtifact = @(
+    "--relay-artifact-sha256", ([string]$Promotion.wheel_sha256)
+  )
   $env:CLIO_RELAY_VALIDATION_ARTIFACT_SHA256 = $Promotion.wheel_sha256
 }
 $Relay = (Get-Command clio-relay -ErrorAction Stop).Source
@@ -295,6 +300,67 @@ function Invoke-RelayReport {
   if ($Report.status -ne "passed") { throw "report did not pass: $Path" }
   if (-not $Diagnostic) { $PolicyReports.Add((Resolve-Path $Path).Path) }
   [pscustomobject]@{ Path = (Resolve-Path $Path).Path; Output = ($Output -join "`n"); Report = $Report }
+}
+
+function Get-BootstrapReceipt {
+  param([Parameter(Mandatory)] [pscustomobject] $Result)
+  $ReceiptPrefix = "bootstrap_receipt_json="
+  $ReceiptLines = @(
+    $Result.Output -split "`n" | Where-Object {
+      $_.StartsWith($ReceiptPrefix, [StringComparison]::Ordinal)
+    }
+  )
+  if ($ReceiptLines.Count -ne 1) {
+    throw "bootstrap output did not contain exactly one machine-readable receipt"
+  }
+  $Receipt = $ReceiptLines[0].Substring($ReceiptPrefix.Length) | ConvertFrom-Json
+  if ([string]$Receipt.schema_version -cne "clio-relay.bootstrap-receipt.v2") {
+    throw "bootstrap returned an unsupported receipt schema"
+  }
+  $Receipt
+}
+
+function Assert-BootstrapReuse {
+  param(
+    [Parameter(Mandatory)] [pscustomobject] $Receipt,
+    [Parameter(Mandatory)] [string] $ExpectedOutcome,
+    [Parameter(Mandatory)] [double] $MaximumSeconds,
+    [Parameter(Mandatory)] [double] $ObservedSeconds
+  )
+  if ([string]$Receipt.outcome -cne $ExpectedOutcome) {
+    throw "bootstrap outcome was $($Receipt.outcome), expected $ExpectedOutcome"
+  }
+  if ($ObservedSeconds -gt $MaximumSeconds) {
+    throw "bootstrap exceeded the $MaximumSeconds-second end-to-end reuse gate: $ObservedSeconds"
+  }
+  if ([int64]$Receipt.operations.payload_transfer_count -ne 0 -or
+      [int64]$Receipt.operations.payload_transfer_bytes -ne 0 -or
+      [int64]$Receipt.operations.download_count -ne 0) {
+    throw "bootstrap reuse transferred or downloaded a payload"
+  }
+  if ([int64]$Receipt.operations.scheduler_submission_count -ne 0 -or
+      [int64]$Receipt.operations.scheduler_cancellation_count -ne 0 -or
+      [int64]$Receipt.operations.generation_gc_count -ne 0) {
+    throw "bootstrap reuse touched scheduler or generation state"
+  }
+  if ([int64]$Receipt.jarvis_commands.count -ne 0 -or
+      [string]$Receipt.jarvis_initialization.action -cne "preserved" -or
+      [string]$Receipt.jarvis_resource_graph.action -cne "preserved") {
+    throw "bootstrap reuse invoked or rebuilt JARVIS"
+  }
+  if (-not [bool]$Receipt.jarvis_preservation.config_byte_identical -or
+      -not [bool]$Receipt.jarvis_preservation.resource_graph_byte_identical) {
+    throw "bootstrap reuse changed the existing JARVIS configuration or hardware graph"
+  }
+  if ([string]$Receipt.jarvis_preservation.repositories.link_action -cne "reused" -or
+      [string]$Receipt.jarvis_preservation.repositories.repositories.action -cne "reused") {
+    throw "bootstrap reuse changed the JARVIS repository binding"
+  }
+  foreach ($Component in @($Receipt.components.PSObject.Properties)) {
+    if ([string]$Component.Value.action -cne "reused") {
+      throw "bootstrap reuse replaced component $($Component.Name)"
+    }
+  }
 }
 
 function ConvertTo-LfText {
@@ -591,6 +657,54 @@ foreach ($Cluster in @($AresCluster, $HomelabCluster)) {
   if ($LASTEXITCODE -ne 0) { throw "worker service installation failed: $Cluster" }
 }
 
+# Re-running the exact artifact is an explicit reconciliation diagnostic, not
+# a desktop reconnect requirement. It must prove a true no-op rather than hide
+# a reinstall; normal startup talks directly to the persistent endpoint.
+$BootstrapReuseTimer = [Diagnostics.Stopwatch]::StartNew()
+$BootstrapReuse = Invoke-RelayReport -Id "ares-bootstrap-exact-reuse" -Diagnostic -NoArtifactOption `
+  -ReportOption "--report" `
+  -Command (@("cluster", "bootstrap", "--cluster", $AresCluster) + $BootstrapArtifact)
+$BootstrapReuseTimer.Stop()
+$BootstrapReuseReceipt = Get-BootstrapReceipt $BootstrapReuse
+Assert-BootstrapReuse $BootstrapReuseReceipt "noop_verified" 30 $BootstrapReuseTimer.Elapsed.TotalSeconds
+if ([int64]$BootstrapReuseReceipt.operations.service_start_count -ne 0 -or
+    [int64]$BootstrapReuseReceipt.operations.service_restart_count -ne 0 -or
+    [int64]$BootstrapReuseReceipt.operations.service_stop_count -ne 0 -or
+    [int64]$BootstrapReuseReceipt.operations.service_enable_count -ne 0) {
+  throw "exact bootstrap reuse changed the managed endpoint service"
+}
+
+# Stop only the receipt-named managed unit to exercise bounded service repair.
+# This fixture mutation is not a scheduler operation and never cancels jobs.
+$AresServiceName = [string]$BootstrapReuseReceipt.service.name
+if ($AresServiceName -cnotmatch '^clio-relay-worker-[a-z0-9_-]+\.service$') {
+  throw "bootstrap receipt returned an unsafe managed service name"
+}
+& $OpenSsh $AresSshHost "systemctl --user stop '$AresServiceName'"
+if ($LASTEXITCODE -ne 0) { throw "could not stop the managed endpoint service fixture" }
+& $OpenSsh $AresSshHost "systemctl --user is-active --quiet '$AresServiceName'"
+if ($LASTEXITCODE -ne 3) {
+  throw "managed endpoint service did not reach the expected inactive state"
+}
+
+$BootstrapRepairTimer = [Diagnostics.Stopwatch]::StartNew()
+$BootstrapRepair = Invoke-RelayReport -Id "ares-bootstrap-service-repair" -Diagnostic -NoArtifactOption `
+  -ReportOption "--report" `
+  -Command (@("cluster", "bootstrap", "--cluster", $AresCluster) + $BootstrapArtifact)
+$BootstrapRepairTimer.Stop()
+$BootstrapRepairReceipt = Get-BootstrapReceipt $BootstrapRepair
+Assert-BootstrapReuse $BootstrapRepairReceipt "repaired" 60 $BootstrapRepairTimer.Elapsed.TotalSeconds
+if (-not [bool]$BootstrapRepairReceipt.service.active_after -or
+    -not [bool]$BootstrapRepairReceipt.service.enabled_after) {
+  throw "bootstrap service repair did not restore the persistent managed endpoint"
+}
+if (([int64]$BootstrapRepairReceipt.operations.service_start_count +
+     [int64]$BootstrapRepairReceipt.operations.service_restart_count) -ne 1 -or
+    [int64]$BootstrapRepairReceipt.operations.service_stop_count -ne 0 -or
+    [int64]$BootstrapRepairReceipt.operations.service_enable_count -ne 0) {
+  throw "bootstrap service repair performed work outside one bounded service activation"
+}
+
 $BootstrapYaml = Join-Path $RenderedRoot "ares-bootstrap.yaml"
 Render-Template "examples/release-gate/ares-bootstrap-echo.yaml.tmpl" $BootstrapYaml @{
   RUN_ID = $RunId
@@ -840,7 +954,7 @@ cannot satisfy either requirement.
 
 ## Run the scientific catalog v1.1 contract
 
-Use the exact clio-kit 2.5.22 persistent executable installed and receipt-bound
+Use the exact clio-kit 2.5.23 persistent executable installed and receipt-bound
 by bootstrap. The catalog file is operator-owned site metadata supplied through
 `CLIO_RELAY_VALIDATION_ARES_SCIENTIFIC_CATALOG_FILE`; it is not copied into the
 relay release. This policy uses

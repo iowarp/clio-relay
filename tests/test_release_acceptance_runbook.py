@@ -53,7 +53,7 @@ def test_release_identity_is_consistent_across_package_policy_matrix_and_runbook
     init_source = (ROOT / "src" / "clio_relay" / "__init__.py").read_text(encoding="utf-8")
     release_process = RELEASE_PROCESS.read_text(encoding="utf-8")
 
-    assert version == "1.4.12"
+    assert version == "1.4.13"
     assert relay_lock["version"] == version
     assert f'__version__ = "{version}"' in init_source
     assert policy["release_version"] == version
@@ -82,6 +82,125 @@ def test_candidate_manifest_parser_accepts_the_exact_gnu_checksum_separator() ->
         assert match.groups() == (digest, wheel_name)
 
     assert selector.fullmatch(f"{digest}*{wheel_name}") is None
+
+
+def test_release_bootstrap_arguments_bind_candidate_and_pypi_wheel_sha256() -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+
+    assert '"--relay-wheel", $Wheel,' in runbook
+    assert '"--relay-artifact-sha256", $ExpectedWheelSha256' in runbook
+    assert '"--relay-artifact-sha256", ([string]$Promotion.wheel_sha256)' in runbook
+    assert runbook.count("+ $BootstrapArtifact)") == 4
+
+
+def test_release_bootstrap_acceptance_proves_bounded_reuse_and_service_repair() -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+
+    assert "function Get-BootstrapReceipt {" in runbook
+    assert "function Assert-BootstrapReuse {" in runbook
+    assert '-Id "ares-bootstrap-exact-reuse" -Diagnostic' in runbook
+    assert '-Id "ares-bootstrap-service-repair" -Diagnostic' in runbook
+    assert (
+        'Assert-BootstrapReuse $BootstrapReuseReceipt "noop_verified" 30 '
+        "$BootstrapReuseTimer.Elapsed.TotalSeconds"
+    ) in runbook
+    assert (
+        'Assert-BootstrapReuse $BootstrapRepairReceipt "repaired" 60 '
+        "$BootstrapRepairTimer.Elapsed.TotalSeconds"
+    ) in runbook
+    assert "operations.payload_transfer_count" in runbook
+    assert "operations.scheduler_submission_count" in runbook
+    assert "operations.generation_gc_count" in runbook
+    assert "jarvis_preservation.config_byte_identical" in runbook
+    assert "jarvis_preservation.resource_graph_byte_identical" in runbook
+    assert "jarvis_preservation.repositories.link_action" in runbook
+    assert "jarvis_preservation.repositories.repositories.action" in runbook
+    assert "systemctl --user stop '$AresServiceName'" in runbook
+    assert 'Assert-BootstrapReuse $BootstrapReuseReceipt "noop_verified" 30' in runbook
+    assert 'Assert-BootstrapReuse $BootstrapRepairReceipt "repaired" 60' in runbook
+
+
+def test_bootstrap_reuse_runbook_helpers_execute_under_powershell(tmp_path: Path) -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    function_sources: list[str] = []
+    for name in ("Get-BootstrapReceipt", "Assert-BootstrapReuse"):
+        function_match = re.search(
+            rf"^function {re.escape(name)} \{{.*?^\}}",
+            runbook,
+            flags=re.DOTALL | re.MULTILINE,
+        )
+        assert function_match is not None
+        function_sources.append(function_match.group(0))
+    powershell = next(
+        (
+            executable
+            for name in ("powershell.exe", "pwsh", "powershell")
+            if (executable := shutil.which(name)) is not None
+        ),
+        None,
+    )
+    assert powershell is not None, "PowerShell is required to validate the release runbook"
+    receipt = {
+        "schema_version": "clio-relay.bootstrap-receipt.v2",
+        "outcome": "noop_verified",
+        "operations": {
+            "payload_transfer_count": 0,
+            "payload_transfer_bytes": 0,
+            "download_count": 0,
+            "scheduler_submission_count": 0,
+            "scheduler_cancellation_count": 0,
+            "generation_gc_count": 0,
+        },
+        "jarvis_commands": {"count": 0},
+        "jarvis_initialization": {"action": "preserved"},
+        "jarvis_resource_graph": {"action": "preserved"},
+        "jarvis_preservation": {
+            "config_byte_identical": True,
+            "resource_graph_byte_identical": True,
+            "repositories": {
+                "link_action": "reused",
+                "repositories": {"action": "reused"},
+            },
+        },
+        "components": {"clio-relay": {"action": "reused"}},
+    }
+    receipt_json = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    script_path = tmp_path / "bootstrap-reuse-helpers.ps1"
+    script_path.write_text(
+        "\n".join(
+            (
+                "param([string] $ReceiptJson)",
+                "Set-StrictMode -Version Latest",
+                "$ErrorActionPreference = 'Stop'",
+                *function_sources,
+                '$Result = [pscustomobject]@{ Output = "bootstrap_receipt_json=$ReceiptJson" }',
+                "$Receipt = Get-BootstrapReceipt $Result",
+                'Assert-BootstrapReuse $Receipt "noop_verified" 30 1.25',
+                'Write-Output "ok"',
+            )
+        ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            powershell,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script_path),
+            receipt_json,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
 
 
 def test_spack_json_array_fallback_is_safe_under_powershell_strict_mode() -> None:

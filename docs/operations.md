@@ -11,9 +11,31 @@ homelab relay to a cluster worker and remote agent, see
 ```powershell
 uv tool install --python 3.12 --no-config clio-relay
 clio-relay cluster add --name my-cluster --ssh-host my-cluster-login --scheduler-provider slurm --agent-adapter exec --agent-bin agent
-clio-relay cluster bootstrap --cluster my-cluster
+$RelayWheelSha256 = "REPLACE_WITH_SHA256_FROM_THE_RELEASE"
+clio-relay cluster bootstrap --cluster my-cluster --relay-artifact-sha256 $RelayWheelSha256
 clio-relay cluster install-endpoint-service --cluster my-cluster --start --enable
 ```
+
+Use the SHA-256 published for the exact wheel installed on the desktop (from
+the GitHub Release `SHA256SUMS` asset or PyPI file details). Release-mode
+bootstrap requires this value even when `--relay-wheel` is omitted. It lets an
+unchanged cluster complete its preflight offline without reading, building, or
+transferring local payload bytes, while distinguishing rebuilt wheels that
+share a version string. A fresh bootstrap may finish with the endpoint service
+reported as `pending_install`; the explicit `install-endpoint-service` command
+above owns unit creation and activation.
+
+Bootstrap is an install/reconcile operation, not a desktop-session startup
+requirement. An ordinary reconnect reuses the persistent endpoint directly.
+When an operator explicitly repeats bootstrap with the same release artifact,
+an exact healthy deployment must finish end to end within 30 seconds without
+reading or transferring the wheel, downloading components, invoking JARVIS,
+changing its configuration or resource graph, or touching scheduler state. If
+only the already-installed managed endpoint service is stopped, bootstrap may
+perform one bounded service activation and must converge within 60 seconds;
+that repair still performs no payload, component, JARVIS, or scheduler work.
+The bootstrap validation report records the observed outcome, total duration,
+operation counts, component actions, and byte-preservation evidence.
 
 An enabled endpoint worker is expected to survive every desktop disconnect and
 the operator's final cluster logout. Before installing it, verify the cluster's
@@ -31,7 +53,8 @@ worker. It may stop after the last login and is not eligible for live release
 claims. Desktop detach and default teardown never stop either service; only an
 explicit `session teardown --stop-worker` does. The persistent unit restarts
 after both clean and failed worker-process exits; an explicit systemd stop is
-still respected and remains stopped until an operator starts it again.
+still respected and remains stopped until an operator starts it again or runs
+an explicit bootstrap reconciliation that reports the bounded service repair.
 
 Worker capacity is part of the cluster definition, not a property reconstructed
 from whichever restart command happened to run last. New and legacy cluster
@@ -313,7 +336,7 @@ For the legacy clio-kit 2.2.6 compatibility path, a successful synchronous
 `jarvis_run` MCP return is normalized to a terminal `completed` record even
 though that release labels the result `status=running`; the original status and
 completion basis remain in `details.completion_normalization` for auditability.
-The pinned clio-kit 2.5.22 production path removes that ambiguity upstream and
+The pinned clio-kit 2.5.23 production path removes that ambiguity upstream and
 returns a structured durable execution handle immediately. The legacy normalization is
 diagnostic compatibility evidence and cannot satisfy the 1.0 gate. Scheduler
 submissions remain non-terminal and are observed through `jarvis_get_execution`.
@@ -561,7 +584,7 @@ Install the cluster-side server once, then launch its persistent executable:
 
 ```bash
 uv tool install --python 3.12 --no-config \
-  https://github.com/iowarp/clio-kit/releases/download/v2.5.22/clio_kit-2.5.22-py3-none-any.whl
+  https://github.com/iowarp/clio-kit/releases/download/v2.5.23/clio_kit-2.5.23-py3-none-any.whl
 clio-kit mcp-server jarvis
 ```
 
@@ -998,6 +1021,28 @@ clio-relay session detach --cluster my-cluster --session-id desktop-session
 clio-relay session teardown --cluster my-cluster --session-id desktop-session
 ```
 
+For a recorder or other client that must survive loss of the initiating process,
+run `session plan-start` first and persist its JSON. Pass the plan's operation id,
+route revision, and release digest to `session start --json`. The returned
+`status_selector` is self-contained and can be submitted to `session start-status`
+one observation at a time. A start result has one of these states:
+
+- `starting`: the exact durable transition is accepted; poll again whenever the
+  client chooses.
+- `ambiguous`: transport or lock evidence cannot yet prove acceptance or failure;
+  retry or query with the exact same selector.
+- `ready`: the transition completed and `session_generation_id` is the durable
+  session handle.
+- `failed`: the exact journal proves terminal failure; do not retry that operation.
+- `not_current`: another operation owns the current transition, so this selector
+  was never accepted or is no longer current; it is not retryable.
+
+There is deliberately no aggregate start wait deadline in the relay contract.
+Each SSH/status observation is bounded so a client remains responsive, but a
+deadline produces `starting` or `ambiguous`, never a fabricated terminal failure.
+The same operation id and immutable route/port/auth/release policy must be reused
+until it becomes terminal. A changed route or policy fails closed before mutation.
+
 Detach succeeds only after the exact owned remote API generation is observed
 running after the desktop resources are removed. Teardown closes the owner
 generation only after the API, connectors, gateway records, scheduler
@@ -1017,6 +1062,23 @@ and remote connector result for each owned gateway record. Closed-gateway retrie
 recreate that evidence idempotently. Remote session commands are wall-clock
 bounded, so an unavailable host produces an explicit failed report instead of an
 unbounded shutdown.
+
+If `session start` reaches its local transport deadline after the remote command was
+accepted, query `session start-status` with the persisted selector. A later ready
+transition is adopted only after the signed startup receipt, exact systemd scope,
+API leader, auth policy, generation-scoped registry, and durable core admission all
+agree. A concurrent transition lock remains `starting` or `ambiguous`; it is not
+converted into terminal failure. A later `session teardown` also waits on that
+protected transition lock before reading metadata. Successful cleanup replaces
+secret-bearing metadata with a sanitized generation receipt, removes only the
+verified session PID, log, and cluster-registry files, and uses that receipt for
+same-policy idempotent retries.
+
+Owned-session start/status is control-plane lifecycle only. It does not wait for,
+cancel, or assign a terminal deadline to scheduler or JARVIS work. A scheduler job
+may remain queued or `PENDING` for hours or days and remains queryable by its own
+durable execution/job handle. Scheduler cancellation is performed only by the
+explicit teardown flags documented below; the default remains to preserve jobs.
 
 `session start` requires `CLIO_RELAY_API_TOKEN` by default and fails before opening
 the remote API when it is absent. An unauthenticated API requires the explicit

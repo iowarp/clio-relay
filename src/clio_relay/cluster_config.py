@@ -18,6 +18,7 @@ from filelock import FileLock
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from clio_relay.errors import ConfigurationError
+from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.models import JobKind, validate_mcp_env_from
 from clio_relay.remote_values import validate_remote_path
 
@@ -40,6 +41,7 @@ _WINDOWS_WRITE_DAC = 0x00040000
 _WINDOWS_WRITE_OWNER = 0x00080000
 _WINDOWS_GENERIC_READ = 0x80000000
 _WINDOWS_GENERIC_WRITE = 0x40000000
+_WINDOWS_DELETE = 0x00010000
 _WINDOWS_FILE_SHARE_READ = 0x00000001
 _WINDOWS_CREATE_NEW = 1
 _WINDOWS_OPEN_EXISTING = 3
@@ -48,6 +50,7 @@ _WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 _WINDOWS_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_WINDOWS_FILE_FLAG_DELETE_ON_CLOSE = 0x04000000
 _WINDOWS_SE_FILE_OBJECT = 1
 _WINDOWS_OWNER_SECURITY_INFORMATION = 0x00000001
 _WINDOWS_DACL_SECURITY_INFORMATION = 0x00000004
@@ -426,6 +429,8 @@ class ClusterDefinition(BaseModel):
     core_dir: str = "$HOME/.local/share/clio-relay/core"
     spool_dir: str = "$HOME/.local/share/clio-relay/spool"
     jarvis_bin: str | None = None
+    jarvis_resource_graph_profile: str | None = None
+    allow_jarvis_resource_graph_build: bool = Field(default=False, strict=True)
     spack_executable: str | None = None
     frpc_bin: str | None = None
     agent_bin: str | None = None
@@ -498,6 +503,25 @@ class ClusterDefinition(BaseModel):
             raise ValueError("scheduler_provider must be a lowercase provider identifier")
         return normalized
 
+    @field_validator("jarvis_resource_graph_profile")
+    @classmethod
+    def _validate_jarvis_resource_graph_profile(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if (
+            not value
+            or value != value.strip()
+            or len(value) > 256
+            or value in {".", ".."}
+            or "/" in value
+            or "\\" in value
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
+            raise ValueError(
+                "jarvis_resource_graph_profile must be one safe exact JARVIS profile name"
+            )
+        return value
+
     @field_validator("spack_executable")
     @classmethod
     def _validate_spack_executable(cls, value: str | None) -> str | None:
@@ -517,6 +541,10 @@ class ClusterDefinition(BaseModel):
 
     @model_validator(mode="after")
     def _remote_mcp_must_not_reference_transport_credentials(self) -> ClusterDefinition:
+        if self.allow_jarvis_resource_graph_build and self.jarvis_resource_graph_profile is None:
+            raise ValueError(
+                "allow_jarvis_resource_graph_build requires jarvis_resource_graph_profile"
+            )
         forbidden = {
             self.frp_transport.token_env,
             self.frp_transport.stcp_secret_env,
@@ -819,7 +847,7 @@ def _create_private_windows_atomic_descriptor(path: Path) -> int:
     create_error = 0
     try:
         raw_handle = create_file(
-            str(path),
+            str(internal_filesystem_path(path, force_extended=True)),
             _WINDOWS_GENERIC_WRITE
             | _WINDOWS_READ_CONTROL
             | _WINDOWS_WRITE_DAC
@@ -922,7 +950,17 @@ def ensure_private_configuration_directory(path: Path) -> None:
             _close_windows_handle(handle, kernel32=kernel32)
 
 
-def _create_private_windows_directory(path: Path) -> None:
+def create_private_configuration_directory(path: Path) -> None:
+    """Create exactly one owner-private directory without accepting an existing path."""
+    if os.name != "nt":
+        os.mkdir(path, 0o700)
+        ensure_private_configuration_path(path, directory=True)
+        return
+    _create_private_windows_directory(path, exist_ok=False)
+    ensure_private_configuration_path(path, directory=True)
+
+
+def _create_private_windows_directory(path: Path, *, exist_ok: bool = True) -> None:
     kernel32 = _load_windows_library("kernel32")
     advapi32 = _load_windows_library("advapi32")
     owner_sid = _current_windows_user_sid(
@@ -948,10 +986,11 @@ def _create_private_windows_directory(path: Path) -> None:
     ]
     create_directory.restype = ctypes.c_int
     try:
-        created = create_directory(str(path), ctypes.byref(security_attributes))
+        storage_path = internal_filesystem_path(path, force_extended=True)
+        created = create_directory(str(storage_path), ctypes.byref(security_attributes))
         if not created:
             error = _windows_last_error()
-            if error != _WINDOWS_ERROR_ALREADY_EXISTS:
+            if error != _WINDOWS_ERROR_ALREADY_EXISTS or not exist_ok:
                 raise ConfigurationError(
                     f"could not create private Windows configuration directory ({error}): {path}"
                 )
@@ -984,7 +1023,7 @@ def _open_windows_configuration_handle(
     if write_owner:
         desired_access |= _WINDOWS_WRITE_OWNER
     raw_handle = create_file(
-        str(path),
+        str(internal_filesystem_path(path, force_extended=True)),
         desired_access,
         _WINDOWS_FILE_SHARE_READ,
         None,
@@ -1546,6 +1585,196 @@ def ensure_private_configuration_path(path: Path, *, directory: bool) -> None:
             )
         return
     _set_private_windows_acl(path, directory=directory)
+
+
+def ensure_private_configuration_windows_handle(
+    path: Path,
+    *,
+    handle: ctypes.c_void_p,
+    directory: bool,
+) -> None:
+    """Enforce and verify a private ACL through an exact open Windows handle."""
+    if os.name != "nt":  # pragma: no cover - explicit platform contract
+        raise ConfigurationError("Windows handle ACL enforcement is unavailable")
+    _set_private_windows_acl(
+        path,
+        directory=directory,
+        existing_handle=handle,
+    )
+
+
+def acquire_private_configuration_windows_parent_guard(
+    parent: Path,
+) -> tuple[Path, ctypes.c_void_p]:
+    """Create an auto-deleting private child that prevents parent rename on Windows."""
+    if os.name != "nt":  # pragma: no cover - explicit platform contract
+        raise ConfigurationError("Windows parent guarding is unavailable")
+    guard_path = parent / f".clio-parent-guard-{os.getpid()}-{uuid4().hex}.pending"
+    storage_path = internal_filesystem_path(guard_path, force_extended=True)
+    kernel32 = _load_windows_library("kernel32")
+    advapi32 = _load_windows_library("advapi32")
+    owner_sid = _current_windows_user_sid(
+        advapi32=advapi32,
+        kernel32=kernel32,
+        path=storage_path,
+    )
+    security_descriptor = _build_private_windows_security_descriptor(
+        directory=False,
+        advapi32=advapi32,
+        owner_sid=owner_sid,
+        path=storage_path,
+    )
+    security_attributes = _WindowsSecurityAttributes(
+        length=ctypes.sizeof(_WindowsSecurityAttributes),
+        security_descriptor=security_descriptor,
+        inherit_handle=0,
+    )
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(_WindowsSecurityAttributes),
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    raw_handle: int | None = None
+    try:
+        raw_value = create_file(
+            str(storage_path),
+            _WINDOWS_GENERIC_READ
+            | _WINDOWS_GENERIC_WRITE
+            | _WINDOWS_DELETE
+            | _WINDOWS_READ_CONTROL
+            | _WINDOWS_WRITE_DAC
+            | _WINDOWS_WRITE_OWNER,
+            0,
+            ctypes.byref(security_attributes),
+            _WINDOWS_CREATE_NEW,
+            _WINDOWS_FILE_ATTRIBUTE_NORMAL
+            | _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT
+            | _WINDOWS_FILE_FLAG_DELETE_ON_CLOSE,
+            None,
+        )
+        if raw_value in (None, ctypes.c_void_p(-1).value):
+            raise ConfigurationError(
+                f"could not create private Windows parent guard ({_windows_last_error()}): {parent}"
+            )
+        raw_handle = cast(int, raw_value)
+        handle = ctypes.c_void_p(raw_handle)
+        _validate_windows_configuration_handle(
+            handle,
+            directory=False,
+            kernel32=kernel32,
+            path=storage_path,
+        )
+        ensure_private_configuration_windows_handle(
+            storage_path,
+            handle=handle,
+            directory=False,
+        )
+        return guard_path, handle
+    except BaseException:
+        if raw_handle is not None:
+            _close_windows_handle(ctypes.c_void_p(raw_handle), kernel32=kernel32)
+        raise
+    finally:
+        _free_windows_local(security_descriptor, kernel32=kernel32)
+
+
+def release_private_configuration_windows_parent_guard(
+    guard: tuple[Path, ctypes.c_void_p] | None,
+) -> None:
+    """Close one auto-deleting Windows parent guard."""
+    if guard is None:
+        return
+    if os.name != "nt":  # pragma: no cover - explicit platform contract
+        raise ConfigurationError("Windows parent guarding is unavailable")
+    _path, handle = guard
+    _close_windows_handle(handle, kernel32=_load_windows_library("kernel32"))
+
+
+def open_private_configuration_windows_descriptor(
+    path: Path,
+    *,
+    exclusive: bool = False,
+    expected_nlink: int = 1,
+) -> int:
+    """Open one exact Windows file and enforce its private ACL in place."""
+    if os.name != "nt":  # pragma: no cover - explicit platform contract
+        raise ConfigurationError("Windows private descriptor opening is unavailable")
+    storage_path = internal_filesystem_path(path, force_extended=True)
+    before = os.lstat(storage_path)
+    if not (
+        stat.S_ISREG(before.st_mode)
+        and not _is_reparse_stat(before)
+        and before.st_nlink == expected_nlink
+    ):
+        raise ConfigurationError(f"configuration path is not one regular owned file: {path}")
+    kernel32 = _load_windows_library("kernel32")
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    raw_handle = create_file(
+        str(storage_path),
+        _WINDOWS_GENERIC_READ | _WINDOWS_READ_CONTROL | _WINDOWS_WRITE_DAC | _WINDOWS_WRITE_OWNER,
+        0 if exclusive else _WINDOWS_FILE_SHARE_READ,
+        None,
+        _WINDOWS_OPEN_EXISTING,
+        _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if raw_handle in (None, ctypes.c_void_p(-1).value):
+        error = _windows_last_error()
+        raise ConfigurationError(f"could not open private Windows file ({error}): {path}")
+    handle = ctypes.c_void_p(raw_handle)
+    try:
+        get_information = kernel32.GetFileInformationByHandle
+        get_information.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_WindowsFileInformation),
+        ]
+        get_information.restype = ctypes.c_int
+        information = _WindowsFileInformation()
+        if not get_information(handle, ctypes.byref(information)):
+            error = _windows_last_error()
+            raise ConfigurationError(f"could not inspect private Windows file ({error}): {path}")
+        file_index = (int(information.file_index_high) << 32) | int(information.file_index_low)
+        after = os.lstat(storage_path)
+        if not (
+            not information.attributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+            and not information.attributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+            and information.number_of_links == expected_nlink
+            and before.st_ino == file_index
+            and os.path.samestat(before, after)
+            and after.st_nlink == expected_nlink
+        ):
+            raise ConfigurationError(f"private Windows file changed while opening: {path}")
+        ensure_private_configuration_windows_handle(
+            storage_path,
+            handle=handle,
+            directory=False,
+        )
+        confirmed = os.lstat(storage_path)
+        if not os.path.samestat(after, confirmed) or confirmed.st_nlink != expected_nlink:
+            raise ConfigurationError(f"private Windows file changed while securing: {path}")
+        descriptor_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        descriptor = _open_windows_os_file_handle(cast(int, raw_handle), descriptor_flags)
+        raw_handle = None
+        return descriptor
+    finally:
+        if raw_handle not in (None, ctypes.c_void_p(-1).value):
+            _close_windows_handle(handle, kernel32=kernel32)
 
 
 def default_registry_path() -> Path:

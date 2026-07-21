@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import zipfile
@@ -17,6 +18,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
+from threading import Event, Thread
 from typing import cast
 
 import pytest
@@ -79,6 +81,194 @@ _uv_executable_identity = cast(
 
 def _timestamp() -> datetime:
     return datetime(2026, 7, 10, 18, 0, tzinfo=UTC)
+
+
+def test_validation_writer_recovers_current_pending_and_prunes_stale_pending(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "reports"
+    parent.mkdir(mode=0o700)
+    target = parent / "current.json"
+
+    def pending_path(name: str) -> Path:
+        identity = hashlib.sha256(name.encode("utf-8")).hexdigest()[:32]
+        return parent / f".clio-validation-{identity}.pending"
+
+    stale = pending_path("stale.json")
+    current = pending_path(target.name)
+    stale.write_bytes(b"stale")
+    current.write_bytes(b"partial")
+    if os.name == "posix":
+        stale.chmod(0o600)
+        current.chmod(0o600)
+
+    validation_report_module._atomic_write_text(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        target,
+        "exact",
+    )
+
+    assert target.read_text(encoding="utf-8") == "exact"
+    assert not stale.exists()
+    assert not current.exists()
+
+
+def test_validation_writer_refuses_a_concurrent_writer_without_corruption(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    target = tmp_path / "report.json"
+    entered = Event()
+    release = Event()
+    thread_errors: list[BaseException] = []
+    original = validation_report_module._atomic_write_text_locked  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def blocking_writer(
+        path: Path,
+        text: str,
+        *,
+        writer_lock: object,
+    ) -> None:
+        entered.set()
+        if not release.wait(timeout=5):
+            raise AssertionError("concurrent validation writer test timed out")
+        original(path, text, writer_lock=writer_lock)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(validation_report_module, "_atomic_write_text_locked", blocking_writer)
+
+    def first_writer() -> None:
+        try:
+            validation_report_module._atomic_write_text(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                target,
+                "first",
+            )
+        except BaseException as exc:  # pragma: no cover - asserted through the parent thread
+            thread_errors.append(exc)
+
+    thread = Thread(target=first_writer)
+    thread.start()
+    assert entered.wait(timeout=2)
+    try:
+        with pytest.raises(
+            (OSError, ConfigurationError),
+            match=(
+                "another validation writer|could not open private Windows file|"
+                "validation writer lock could not be acquired"
+            ),
+        ):
+            validation_report_module._atomic_write_text(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                target,
+                "second",
+            )
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert thread_errors == []
+    assert target.read_text(encoding="utf-8") == "first"
+
+
+@pytest.mark.parametrize("create_replacement", [False, True])
+def test_posix_validation_writer_rejects_parent_swap_after_lock(
+    tmp_path: Path,
+    create_replacement: bool,
+) -> None:
+    if os.name != "posix":
+        return
+    parent = tmp_path / "reports"
+    parent.mkdir(mode=0o700)
+    displaced = tmp_path / "displaced-reports"
+    writer_lock = validation_report_module._acquire_validation_writer_lock(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        parent
+    )
+    try:
+        parent.rename(displaced)
+        if create_replacement:
+            parent.mkdir(mode=0o700)
+        with pytest.raises(OSError, match="differs from its writer lock|disappeared"):
+            validation_report_module._atomic_write_text_locked(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                parent / "report.json",
+                "outside",
+                writer_lock=writer_lock,
+            )
+    finally:
+        validation_report_module._release_validation_writer_lock(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            writer_lock
+        )
+
+    assert parent.exists() is create_replacement
+    if create_replacement:
+        assert list(parent.iterdir()) == []
+    assert not (displaced / "report.json").exists()
+    assert {path.name for path in displaced.iterdir()} == {writer_lock.path.name}
+
+
+def test_windows_validation_lock_guard_blocks_parent_swap_before_lock_open(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    if os.name != "nt":
+        return
+    parent = tmp_path / "reports"
+    parent.mkdir(mode=0o700)
+    displaced = tmp_path / "displaced-reports"
+    rename_errors: list[OSError] = []
+    original = validation_report_module._open_windows_validation_directory  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def try_swap_after_pin(*args: object, **kwargs: object) -> object:
+        anchor = original(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+        try:
+            parent.rename(displaced)
+            parent.mkdir(mode=0o700)
+        except OSError as exc:
+            rename_errors.append(exc)
+        return anchor
+
+    monkeypatch.setattr(
+        validation_report_module,
+        "_open_windows_validation_directory",
+        try_swap_after_pin,
+    )
+    writer_lock = validation_report_module._acquire_validation_writer_lock(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        parent
+    )
+    try:
+        assert rename_errors
+        assert not displaced.exists()
+        assert {path.name for path in parent.iterdir()} == {writer_lock.path.name}
+    finally:
+        validation_report_module._release_validation_writer_lock(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            writer_lock
+        )
+
+
+def test_windows_validation_lock_swap_before_guard_creation_leaves_replacement_empty(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    if os.name != "nt":
+        return
+    parent = tmp_path / "reports"
+    parent.mkdir(mode=0o700)
+    displaced = tmp_path / "displaced-before-guard"
+    original = validation_report_module.acquire_private_configuration_windows_parent_guard
+
+    def swap_then_guard(path: Path) -> tuple[Path, object]:
+        path.rename(displaced)
+        path.mkdir(mode=0o700)
+        guard_path, handle = original(path)
+        return guard_path, handle
+
+    monkeypatch.setattr(
+        validation_report_module,
+        "acquire_private_configuration_windows_parent_guard",
+        swap_then_guard,
+    )
+    with pytest.raises((OSError, ConfigurationError), match="changed|path"):
+        validation_report_module._acquire_validation_writer_lock(parent)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    assert list(parent.iterdir()) == []
+    assert list(displaced.iterdir()) == []
 
 
 def test_install_source_records_unverified_uvx_without_crashing_report_creation(
@@ -432,22 +622,45 @@ def test_uv_tool_receipt_binds_exact_remote_url_and_launcher(tmp_path: Path) -> 
     assert rejected["verified"] is False
 
 
-def test_persistent_uv_tool_discovers_uv_from_path_and_requires_receipt(
+@pytest.mark.parametrize(
+    ("launcher_case", "expected_verified"),
+    [
+        ("scoped", True),
+        ("missing", False),
+        ("invalid-override", False),
+        *([("non-executable", False)] if os.name != "nt" else []),
+    ],
+)
+def test_persistent_uv_tool_scopes_launcher_discovery_and_fails_closed(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    launcher_case: str,
+    expected_verified: bool,
 ) -> None:
     tool_directory = tmp_path / "uv" / "tools"
     environment = tool_directory / "clio-relay"
     tool_bin = tmp_path / "uv" / "bin"
     package = environment / "Lib" / "site-packages" / "clio_relay"
     interpreter = environment / "Scripts" / "python.exe"
-    launcher = tool_bin / "clio-relay.exe"
+    launcher_name = "clio-relay.exe" if os.name == "nt" else "clio-relay"
+    launcher = tool_bin / launcher_name
+    stale_launcher = tmp_path / "path-bin" / launcher_name
     uv = tmp_path / "bin" / "uv.exe"
     base_prefix = tmp_path / "python"
-    for directory in (package, interpreter.parent, tool_bin, uv.parent, base_prefix):
+    for directory in (
+        package,
+        interpreter.parent,
+        tool_bin,
+        stale_launcher.parent,
+        uv.parent,
+        base_prefix,
+    ):
         directory.mkdir(parents=True, exist_ok=True)
     interpreter.write_bytes(b"python")
     launcher.write_bytes(b"launcher")
+    launcher.chmod(0o755)
+    stale_launcher.write_bytes(b"stale launcher from PATH")
+    stale_launcher.chmod(0o755)
     uv.write_bytes(b"uv")
     source_url = (
         "https://github.com/iowarp/clio-relay/releases/download/"
@@ -478,9 +691,22 @@ def test_persistent_uv_tool_discovers_uv_from_path_and_requires_receipt(
             return None
 
     launcher_digest = hashlib.sha256(launcher.read_bytes()).hexdigest()
+    if launcher_case == "missing":
+        launcher.unlink()
+    elif launcher_case == "non-executable":
+        launcher.chmod(0o644)
+    real_which = shutil.which
 
-    def find_executable(name: str) -> str:
-        return str(uv) if name == "uv" else str(launcher)
+    def find_executable(
+        name: str,
+        mode: int = os.F_OK | os.X_OK,
+        path: str | None = None,
+    ) -> str | None:
+        if name == "uv":
+            assert path is None
+            return str(uv)
+        assert Path(name) == launcher
+        return real_which(name, mode=mode, path=path)
 
     def uv_identity(_path: str | None) -> tuple[bool, str | None, str | None]:
         return True, "0.11.28", hashlib.sha256(uv.read_bytes()).hexdigest()
@@ -499,6 +725,14 @@ def test_persistent_uv_tool_discovers_uv_from_path_and_requires_receipt(
         }
 
     monkeypatch.delenv("UV", raising=False)
+    if launcher_case == "invalid-override":
+        monkeypatch.setenv(
+            "CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE",
+            str(stale_launcher),
+        )
+    else:
+        monkeypatch.delenv("CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE", raising=False)
+    monkeypatch.chdir(stale_launcher.parent)
     monkeypatch.setattr(
         validation_report_module.shutil,
         "which",
@@ -534,10 +768,19 @@ def test_persistent_uv_tool_discovers_uv_from_path_and_requires_receipt(
         distribution=cast(metadata.Distribution, Distribution()),
     )
 
-    assert verified is True
+    assert verified is expected_verified
     assert receipt["uv_executable"] == str(uv)
-    assert receipt["uv_tool_receipt"]["verified"] is True
-    assert receipt["verified"] is True
+    assert receipt["verified"] is expected_verified
+    assert receipt["uv_tool_receipt"]["verified"] is expected_verified
+    if launcher_case == "scoped":
+        assert receipt["tool_executable"] == str(launcher)
+        assert receipt["tool_bin_bound"] is True
+    elif launcher_case in {"missing", "non-executable"}:
+        assert receipt["tool_executable"] is None
+        assert receipt["tool_bin_bound"] is False
+    else:
+        assert receipt["tool_executable"] == str(stale_launcher)
+        assert receipt["tool_bin_bound"] is False
 
 
 def test_uv_launcher_identity_hashes_exact_regular_executable(
@@ -580,8 +823,8 @@ def test_uv_launcher_identity_rejects_executable_replaced_during_probe(
 
 
 @pytest.fixture(scope="module")
-def real_uvx_relay_wheel(tmp_path_factory: pytest.TempPathFactory) -> tuple[str, Path]:
-    """Build one real wheel for cache-backed and no-cache uvx receipt probes."""
+def real_uv_relay_wheel(tmp_path_factory: pytest.TempPathFactory) -> tuple[str, str, Path]:
+    """Build one real wheel for persistent-tool and uvx receipt probes."""
     uv = shutil.which("uv")
     uvx = shutil.which("uvx")
     assert uv is not None and uvx is not None, "the production test suite requires uv and uvx"
@@ -610,14 +853,95 @@ def real_uvx_relay_wheel(tmp_path_factory: pytest.TempPathFactory) -> tuple[str,
     )
     wheels = list(artifact_dir.glob("clio_relay-*.whl"))
     assert len(wheels) == 1
-    return uvx, wheels[0].resolve()
+    return uv, uvx, wheels[0].resolve()
+
+
+def test_real_uv_tool_scopes_launcher_to_isolated_bin(
+    tmp_path: Path,
+    real_uv_relay_wheel: tuple[str, str, Path],
+) -> None:
+    uv, _uvx, wheel = real_uv_relay_wheel
+    tool_directory = tmp_path / "tools"
+    tool_bin_directory = tmp_path / "tool-bin"
+    isolated_home = tmp_path / "home"
+    uv_cache = tmp_path / "uv-cache"
+    collision_directory = tmp_path / "cwd-collision"
+    for directory in (
+        tool_directory,
+        tool_bin_directory,
+        isolated_home,
+        uv_cache,
+        collision_directory,
+    ):
+        directory.mkdir(parents=True)
+    collision_executable = collision_directory / (
+        "clio-relay.exe" if os.name == "nt" else "clio-relay"
+    )
+    collision_executable.write_bytes(b"unrelated current-directory launcher")
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(isolated_home),
+            "USERPROFILE": str(isolated_home),
+            "UV": uv,
+            "UV_CACHE_DIR": str(uv_cache),
+            "UV_TOOL_BIN_DIR": str(tool_bin_directory),
+            "UV_TOOL_DIR": str(tool_directory),
+        }
+    )
+    environment.pop("CLIO_RELAY_INSTALL_RECEIPT", None)
+    environment.pop("CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE", None)
+    environment["PATH"] = os.pathsep.join(
+        entry
+        for entry in environment.get("PATH", "").split(os.pathsep)
+        if entry and Path(entry).resolve() != tool_bin_directory.resolve()
+    )
+    subprocess.run(
+        [
+            uv,
+            "tool",
+            "install",
+            "--force",
+            "--no-config",
+            "--python",
+            f"{sys.version_info.major}.{sys.version_info.minor}",
+            str(wheel),
+        ],
+        capture_output=True,
+        check=True,
+        env=environment,
+        text=True,
+        timeout=180,
+    )
+    executable = tool_bin_directory / ("clio-relay.exe" if os.name == "nt" else "clio-relay")
+
+    completed = subprocess.run(
+        [str(executable), "installation-info"],
+        capture_output=True,
+        check=False,
+        cwd=collision_directory,
+        env=environment,
+        text=True,
+        timeout=60,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    installation = json.loads(completed.stdout)
+    source = installation["install_source"]
+    assert installation["receipt_origin"] == "uv-tool"
+    assert installation["receipt_matches_install"] is True
+    assert source["artifact_identity_verified"] is True
+    assert source["launcher_verified"] is True
+    assert Path(source["launcher_receipt"]["tool_executable"]).resolve() == executable.resolve()
+    assert source["launcher_receipt"]["tool_bin_bound"] is True
+    assert source["launcher_receipt"]["uv_tool_receipt"]["launcher_bound"] is True
 
 
 def test_real_uvx_0_11_28_produces_verified_os_bound_launcher_receipt(
     tmp_path: Path,
-    real_uvx_relay_wheel: tuple[str, Path],
+    real_uv_relay_wheel: tuple[str, str, Path],
 ) -> None:
-    uvx, wheel = real_uvx_relay_wheel
+    _uv, uvx, wheel = real_uv_relay_wheel
     report = tmp_path / "uvx-receipt.json"
     environment = os.environ.copy()
     environment["CLIO_RELAY_VALIDATION_INVOCATION_ID"] = "real-uvx-receipt-test"
@@ -680,9 +1004,9 @@ def test_real_uvx_0_11_28_produces_verified_os_bound_launcher_receipt(
 
 def test_real_uvx_no_cache_temporary_environment_is_not_a_verified_receipt(
     tmp_path: Path,
-    real_uvx_relay_wheel: tuple[str, Path],
+    real_uv_relay_wheel: tuple[str, str, Path],
 ) -> None:
-    uvx, wheel = real_uvx_relay_wheel
+    _uv, uvx, wheel = real_uv_relay_wheel
     report = tmp_path / "uvx-no-cache-receipt.json"
     environment = os.environ.copy()
     environment["CLIO_RELAY_VALIDATION_INVOCATION_ID"] = "real-uvx-no-cache-test"
@@ -947,6 +1271,162 @@ def test_report_json_round_trip_is_stable(tmp_path: Path) -> None:
     assert payload["evidence_trust"]["invocation_id"] == "run-20260710-0001"
     assert path.read_text(encoding="utf-8").endswith("\n")
     assert not list(tmp_path.glob("*.tmp"))
+    assert not list(tmp_path.glob(".clio-validation-*.pending"))
+
+
+def test_atomic_report_writer_replaces_exactly_and_supports_new_nested_parent(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "nested" / "reports" / "report.json"
+    validation_report_module._atomic_write_text(path, "old\n")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    outside = tmp_path / "old-hardlink.json"
+    os.link(path, outside)
+
+    validation_report_module._atomic_write_text(path, "new\n")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    assert path.read_text(encoding="utf-8") == "new\n"
+    assert outside.read_text(encoding="utf-8") == "old\n"
+    assert path.stat().st_nlink == 1
+    if os.name == "posix":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+
+def test_atomic_report_writer_recovers_one_deterministic_partial_pending(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "report.json"
+    pending_digest = hashlib.sha256(path.name.encode("utf-8")).hexdigest()[:32]
+    pending = tmp_path / f".clio-validation-{pending_digest}.pending"
+    pending.write_bytes(b"partial")
+    if os.name == "posix":
+        pending.chmod(0o600)
+
+    validation_report_module._atomic_write_text(path, "complete\n")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    assert path.read_text(encoding="utf-8") == "complete\n"
+    assert not pending.exists()
+    assert not list(tmp_path.glob(".clio-validation-*.pending"))
+
+
+def test_atomic_report_writer_refuses_concurrent_same_parent_writer(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    entered = Event()
+    release = Event()
+    failures: list[BaseException] = []
+    original = validation_report_module._atomic_write_text_locked  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def blocked_writer(*args: object, **kwargs: object) -> None:
+        entered.set()
+        if not release.wait(10):
+            raise TimeoutError("test writer was not released")
+        original(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(validation_report_module, "_atomic_write_text_locked", blocked_writer)
+
+    def first_writer() -> None:
+        try:
+            validation_report_module._atomic_write_text(tmp_path / "first.json", "first\n")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        except BaseException as exc:
+            failures.append(exc)
+
+    thread = Thread(target=first_writer)
+    thread.start()
+    assert entered.wait(10)
+    try:
+        with pytest.raises((OSError, ConfigurationError), match="writer|lock"):
+            validation_report_module._atomic_write_text(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                tmp_path / "second.json",
+                "second\n",
+            )
+    finally:
+        release.set()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert failures == []
+    assert (tmp_path / "first.json").read_text(encoding="utf-8") == "first\n"
+    assert not (tmp_path / "second.json").exists()
+
+
+def test_validation_directory_creation_is_bound_to_pinned_ancestor(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    trusted = tmp_path / "trusted"
+    outside = tmp_path / "outside"
+    displaced = tmp_path / "displaced"
+    trusted.mkdir(mode=0o700)
+    outside.mkdir(mode=0o700)
+    requested = trusted / "a" / "b"
+
+    if os.name == "posix":
+        original = validation_report_module._create_posix_validation_directory_child  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        swapped = False
+
+        def swap_then_create(parent_fd: int, child_name: str) -> int:
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                trusted.rename(displaced)
+                trusted.symlink_to(outside, target_is_directory=True)
+            return original(parent_fd, child_name)
+
+        monkeypatch.setattr(
+            validation_report_module,
+            "_create_posix_validation_directory_child",
+            swap_then_create,
+        )
+        with pytest.raises(OSError, match="changed"):
+            validation_report_module.durably_ensure_validation_directory(requested)
+        assert not (outside / "a").exists()
+        assert (displaced / "a").is_dir()
+        return
+
+    original_windows = validation_report_module._create_windows_validation_directory_child  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    rename_errors: list[OSError] = []
+
+    def try_swap_then_create(parent: object, child_name: str) -> object:
+        try:
+            trusted.rename(displaced)
+        except OSError as exc:
+            rename_errors.append(exc)
+        return original_windows(parent, child_name)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(
+        validation_report_module,
+        "_create_windows_validation_directory_child",
+        try_swap_then_create,
+    )
+    with pytest.raises(OSError, match="changed|find the file"):
+        validation_report_module.durably_ensure_validation_directory(requested)
+    assert not rename_errors
+    assert displaced.is_dir()
+    assert not (outside / "a").exists()
+
+
+def test_report_writer_rejects_symlink_or_junction_parent(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real"
+    linked_parent = tmp_path / "linked"
+    real_parent.mkdir()
+    if os.name == "nt":
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(linked_parent), str(real_parent)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+    else:
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(OSError, match="symlink|reparse|not a real directory"):
+        validation_report_module._atomic_write_text(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            linked_parent / "report.json",
+            "blocked\n",
+        )
+    assert not (real_parent / "report.json").exists()
 
 
 def test_report_writer_redacts_nested_capability_values(tmp_path: Path) -> None:
@@ -1860,13 +2340,13 @@ def test_local_release_policy_rejects_missing_critical_boundary_checks(
     report.resources = [
         ValidationResource(
             kind="wheel",
-            resource_id="clio-relay-1.4.12-py3-none-any.whl",
+            resource_id="clio-relay-1.4.13-py3-none-any.whl",
             cluster="local",
             state="built",
         ),
         ValidationResource(
             kind="source_distribution",
-            resource_id="clio_relay-1.4.12.tar.gz",
+            resource_id="clio_relay-1.4.13.tar.gz",
             cluster="local",
             state="built",
         ),
@@ -2005,7 +2485,7 @@ def test_default_report_path_sanitizes_cluster_name(tmp_path: Path) -> None:
 def test_repository_release_policy_is_machine_readable() -> None:
     policy = load_release_gate_policy(Path("docs/release-gate-1.0.yaml"))
 
-    assert policy.release_version == "1.4.12"
+    assert policy.release_version == "1.4.13"
     assert policy.acceptance_matrix is not None
     assert policy.acceptance_matrix["report_count_per_stage"] == 19
     assert policy.acceptance_matrix["matrix_sha256"] == policy.acceptance_matrix_sha256

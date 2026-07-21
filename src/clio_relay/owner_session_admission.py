@@ -11,10 +11,12 @@ from dataclasses import dataclass
 from typing import cast
 
 from filelock import FileLock
+from pydantic import ValidationError
 
 from clio_relay.cluster_config import ClusterDefinition, default_registry_path
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import RelayError
+from clio_relay.models import OwnerSessionClosure
 from clio_relay.remote_cli import run_remote_clio, should_execute_on_cluster
 from clio_relay.session_lifecycle import status_remote_session
 
@@ -112,6 +114,23 @@ def owner_session_admission_status(
             raise RelayError("owner-session admission cleanup intent was invalid")
     elif raw_intent is not None:
         raise RelayError("open owner-session admission status contained a cleanup intent")
+    raw_closure = status.get("closure")
+    if status.get("closed") is True:
+        try:
+            closure = OwnerSessionClosure.model_validate(raw_closure)
+        except ValidationError as exc:
+            raise RelayError("closed owner-session admission status omitted valid closure") from exc
+        if (
+            closure.schema_version != "clio-relay.owner-session-closure.v1"
+            or closure.owner_session_id != session_id
+            or closure.session_generation_id != session_generation_id
+            or closure.residual_resource_ids
+        ):
+            raise RelayError(
+                "owner-session admission closure identity or residual set did not match"
+            )
+    elif raw_closure is not None:
+        raise RelayError("unclosed owner-session admission status contained closure evidence")
     return status
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import tarfile
@@ -46,14 +47,14 @@ from tests.plugin_fakes import FakeEntryPoint, FakeEntryPoints
 
 def test_bootstrap_uses_exact_public_jarvis_cd_release_pin() -> None:
     """Keep bootstrap and the locked MCP child on the same public JARVIS wheel."""
-    assert JARVIS_CD_VERSION == "1.4.4"
-    assert JARVIS_CD_WHEEL_FILENAME == "jarvis_cd-1.4.4-py3-none-any.whl"
+    assert JARVIS_CD_VERSION == "1.4.8"
+    assert JARVIS_CD_WHEEL_FILENAME == "jarvis_cd-1.4.8-py3-none-any.whl"
     assert JARVIS_CD_WHEEL_URL == (
         "https://github.com/grc-iit/jarvis-cd/releases/download/"
-        "v1.4.4/jarvis_cd-1.4.4-py3-none-any.whl"
+        "v1.4.8/jarvis_cd-1.4.8-py3-none-any.whl"
     )
     assert JARVIS_CD_WHEEL_SHA256 == (
-        "321ee1a23e96a4c97b3b0d6107c5f5299d7db362396dd748e87a44d2a30d3db3"
+        "ebf5e5f375b921f20c79075d461926431a5a017ca8b45e598878a89b229b3935"
     )
 
 
@@ -85,7 +86,7 @@ def _assert_bootstrap_rejected_before_remote_call(
     expected_error: str,
     relay_artifact_sha256: str | None = None,
 ) -> None:
-    """Require local wheel validation to fail before any remote command."""
+    """Require wheel rejection after inspection but before any payload transport."""
     from clio_relay import bootstrap
 
     remote_calls: list[list[str]] = []
@@ -94,21 +95,36 @@ def _assert_bootstrap_rejected_before_remote_call(
         command: list[str],
         *,
         cwd: Path | None = None,
+        **_kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
         del cwd
         remote_calls.append(command)
-        return subprocess.CompletedProcess(command, 0, "", "")
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "bootstrap_preflight_unsupported=not_installed\n",
+            "",
+        )
 
     monkeypatch.setattr(bootstrap, "_run", record_remote_call)
+    expected_sha256 = relay_artifact_sha256
+    if expected_sha256 is None:
+        expected_sha256 = (
+            hashlib.sha256(wheel.read_bytes()).hexdigest() if wheel.is_file() else "a" * 64
+        )
     with pytest.raises(ConfigurationError, match=expected_error):
         bootstrap.bootstrap_cluster_over_ssh(
             bootstrap_profile="linux-user",
             ssh_host="ares",
             source_root=tmp_path,
             relay_wheel=wheel,
-            relay_artifact_sha256=relay_artifact_sha256,
+            relay_artifact_sha256=expected_sha256,
+            jarvis_resource_graph_profile="ares",
         )
-    assert remote_calls == []
+    assert all(
+        command[0] == "ssh" and "bootstrap-inspect" in command[-1] for command in remote_calls
+    )
+    assert not any(command[0] == "scp" or "mkdir --" in command[-1] for command in remote_calls)
 
 
 @dataclass(frozen=True)
@@ -148,16 +164,15 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert f'UV_SHA256="{UV_LINUX_AMD64_SHA256}"' in script
     assert "https://astral.sh/uv/install.sh" not in script
     assert "uv python install 3.12" in script
-    assert 'export UV_TOOL_DIR="$HOME/.local/share/uv/tools"' in script
-    assert 'export UV_TOOL_BIN_DIR="$HOME/.local/bin"' in script
-    assert 'uv venv --python 3.12 --seed --clear "$JARVIS_VENV"' in script
+    assert 'export UV_TOOL_DIR="$HOME/.local/share/clio-relay/uv-tools"' in script
+    assert 'export UV_TOOL_BIN_DIR="$HOME/.local/share/clio-relay/uv-bin"' in script
+    assert 'export UV_PYTHON_INSTALL_DIR="$HOME/.local/share/clio-relay/uv-python"' in script
+    assert 'uv venv --python 3.12 --seed "$JARVIS_VENV"' in script
+    assert "--clear" not in script
     assert "python3 -m venv" not in script
-    assert "CLIO_RELAY_AGENT_NPM_PACKAGE" in script
-    assert "CLIO_RELAY_AGENT_NPM_BIN" in script
     assert 'npm install -g "$AGENT_NPM_PACKAGE"' in script
-    assert "CLIO_RELAY_AGENT_BIN" in script
-    assert "AGENT_NPM_PACKAGE=${CLIO_RELAY_AGENT_NPM_PACKAGE:-''}" in script
-    assert "AGENT_NPM_BIN=${CLIO_RELAY_AGENT_NPM_BIN:-''}" in script
+    assert "AGENT_NPM_PACKAGE=''" in script
+    assert "AGENT_NPM_BIN=''" in script
     assert "CLIO_RELAY_AGENT_ADAPTER=exec" in script
     assert "CLIO_RELAY_AGENT_ARGS=''" in script
     assert "github.com/grc-iit/jarvis-cd.git" not in script
@@ -205,6 +220,28 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert 'locked_server_runtime.get("server_name") == "jarvis"' in script
     assert 'jarvis_cd_lock_binding.get("resolved_dependency_entry_count") == 1' in script
     assert 'jarvis_cd_lock_binding.get("observed_resolved_dependency_entries")' in script
+
+
+def test_fresh_bootstrap_loads_packaged_graph_before_explicit_build_fallback() -> None:
+    """Fresh activation consumes JARVIS's release artifact and never guesses from Ares."""
+    script = render_linux_user_bootstrap_script(
+        cluster="operator-target",
+        jarvis_resource_graph_profile="ares",
+    )
+
+    load = '"$JARVIS_VENV/bin/jarvis" rg load-builtin       "$JARVIS_RESOURCE_GRAPH_PROFILE" +json'
+    assert "JARVIS_RESOURCE_GRAPH_PROFILE=ares" in script
+    assert load in script
+    assert "validate_jarvis_builtin_result(result, requested_profile=requested_profile)" in script
+    assert 'JARVIS_GRAPH_ACTION="loaded"' in script
+    assert 'BOOTSTRAP_JARVIS_BUILTIN_RESULT_FILE=""' in script
+    assert "BOOTSTRAP_JARVIS_COMMANDS_JSON='[]'" in script
+    nonzero_failure = script.index("JARVIS builtin resource graph activation failed")
+    fallback_gate = script.index('if [ "$ALLOW_JARVIS_RESOURCE_GRAPH_BUILD" != "1" ]; then')
+    build = script.index('"$JARVIS_VENV/bin/jarvis" rg build +no_benchmark')
+    assert script.index(load) < nonzero_failure < fallback_gate < build
+    assert "resource graph is unavailable;" in script
+    assert "build fallback is disabled" in script
     assert 'jarvis_cd_lock_binding.get("observed_version") == expected_jarvis_cd_version' in script
     assert 'jarvis_cd_lock_binding.get("observed_source_url") == expected_jarvis_cd_url' in script
     assert (
@@ -254,13 +291,10 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert "clio_relay.mcp_call.pkg" in script
     assert "clio_relay.remote_agent.pkg" in script
     assert "write_install_receipt" in script
-    assert '"schema_version": "clio-relay.bootstrap-receipt.v1"' in script
-    assert "\"invocation_id\": 'manual'" in script
-    assert "install_receipt_sha256 = hashlib.sha256" in script
-    assert "temporary.write_text" in script
-    assert "os.chmod(temporary, 0o600)" in script
-    assert "os.replace(temporary, destination)" in script
-    assert "bootstrap_invocation_id=" in script
+    assert "receipt = make_bootstrap_receipt(" in script
+    assert 'invocation_id=os.environ["BOOTSTRAP_INVOCATION_ID"]' in script
+    assert "write_bootstrap_receipt(destination, receipt)" in script
+    assert "bootstrap_receipt_json=" in script
     assert "ComponentArtifactIdentity" in script
     assert '"jarvis-cd": ComponentArtifactIdentity(' in script
     assert 'requested_source="github_release"' in script
@@ -274,7 +308,7 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert "jarvis_cd_entry_points" not in script
     assert 'requested_source=os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_SOURCE"]' in script
     assert "relay_artifact_sha256=" in script
-    assert 'jarvis repo add "$DEST/jarvis-packages/clio_relay" --force true' in script
+    assert "reconcile_managed_jarvis_repository(" in script
     assert '"$HOME/.local/share/clio-relay/jarvis-shared" || true' not in script
     assert "python -m pip install --upgrade pip setuptools wheel" not in script
     assert "spack install" not in script
@@ -312,14 +346,14 @@ def test_linux_user_bootstrap_embedded_python_programs_compile() -> None:
     )
     programs = list(pattern.finditer(script))
 
-    assert {program.group("marker") for program in programs} == {
+    assert {
         "__CLIO_RELAY_BOOTSTRAP_RECEIPT__",
         "__CLIO_RELAY_INSTALL_RECEIPT__",
         "__CLIO_RELAY_NATIVE_JARVIS_PROBE__",
         "__CLIO_RELAY_PYPI_DIGEST__",
         "__CLIO_RELAY_WORKER_LIFETIME_FD__",
         "__CLIO_RELAY_WORKER_WRITER_PROOF__",
-    }
+    }.issubset({program.group("marker") for program in programs})
     for program in programs:
         marker = program.group("marker")
         compile(program.group("body"), f"bootstrap:{marker}", "exec")
@@ -400,8 +434,8 @@ def test_linux_user_bootstrap_script_accepts_explicit_npm_agent() -> None:
         agent_args=["--model", "gpt-5-codex"],
     )
 
-    assert "AGENT_NPM_PACKAGE=${CLIO_RELAY_AGENT_NPM_PACKAGE:-@openai/codex}" in script
-    assert "AGENT_NPM_BIN=${CLIO_RELAY_AGENT_NPM_BIN:-codex}" in script
+    assert "AGENT_NPM_PACKAGE=@openai/codex" in script
+    assert "AGENT_NPM_BIN=codex" in script
     assert 'AGENT_BIN="$HOME/.local/bin/$AGENT_NPM_BIN"' in script
     assert "CLIO_RELAY_AGENT_ADAPTER=codex" in script
     assert "CLIO_RELAY_AGENT_ARGS='--model gpt-5-codex'" in script
@@ -448,7 +482,7 @@ def test_cluster_app_install_sends_lf_script_bytes(monkeypatch: pytest.MonkeyPat
     assert calls[0]["capture_output"] is True
 
 
-def test_bootstrap_runner_decodes_remote_output_as_utf8(
+def test_bootstrap_runner_uses_bounded_process_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, Any]] = []
@@ -458,15 +492,17 @@ def test_bootstrap_runner_decodes_remote_output_as_utf8(
         calls.append(kwargs)
         return subprocess.CompletedProcess(["ssh", "host"], 0, stdout="ok", stderr="")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
     from clio_relay import bootstrap
+
+    monkeypatch.setattr(bootstrap, "run_bounded_process", fake_run)
 
     result = bootstrap._run(["ssh", "host"])  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     assert result.stdout == "ok"
-    assert calls[0]["encoding"] == "utf-8"
-    assert calls[0]["errors"] == "replace"
+    assert calls[0]["timeout_seconds"] == 120
+    assert calls[0]["stdout_maximum_bytes"] == 2 * 1024 * 1024
+    assert calls[0]["stderr_maximum_bytes"] == 64 * 1024
+    assert isinstance(calls[0]["environment"], dict)
 
 
 def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
@@ -481,7 +517,7 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
         "schema_version": "clio-relay.bootstrap-receipt.v1",
         "invocation_id": "bootstrap_abc",
         "bootstrap_profile": "linux-user",
-        "relay_install_spec": "clio-relay==1.0.0",
+        "relay_install_spec": f"clio-relay=={__version__}",
         "install_receipt_sha256": "a" * 64,
         "completed_at": "2026-07-11T00:00:00Z",
     }
@@ -495,7 +531,10 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
         assert source_root == tmp_path
         assert relay_wheel is None
         archive.write_bytes(b"bootstrap archive")
-        return bootstrap.BootstrapArchive(archive=archive, install_spec="clio-relay==1.0.0")
+        return bootstrap.BootstrapArchive(
+            archive=archive,
+            install_spec=f"clio-relay=={__version__}",
+        )
 
     observed_timeouts: list[float | None] = []
 
@@ -503,9 +542,17 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
         command: list[str],
         *,
         timeout_seconds: float | None = None,
+        **_kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
         calls.append(command)
         observed_timeouts.append(timeout_seconds)
+        if command[0] == "ssh" and "bootstrap-inspect" in command[-1]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "bootstrap_preflight_unsupported=not_installed\n",
+                "",
+            )
         if command[0] == "scp" and command[-1].endswith("/clio-relay-bootstrap.sh"):
             uploaded_scripts.append(Path(command[1]).read_text(encoding="utf-8"))
         if command[-2:] == [
@@ -527,7 +574,17 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
             )
         return subprocess.CompletedProcess(command, 0, "", "")
 
+    def validate_receipt(
+        receipt: dict[str, object],
+        *,
+        relay_install_spec: str,
+        **_kwargs: object,
+    ) -> None:
+        if receipt.get("relay_install_spec") != relay_install_spec:
+            raise RelayError("bootstrap receipt relay_install_spec changed")
+
     monkeypatch.setattr(bootstrap, "create_bootstrap_archive", fake_create_bootstrap_archive)
+    monkeypatch.setattr(bootstrap, "_validate_bootstrap_receipt", validate_receipt)
     monkeypatch.setattr(bootstrap, "_run", fake_run)
     monkeypatch.setattr(bootstrap, "uuid4", lambda: type("Uuid", (), {"hex": "abc"})())
 
@@ -540,6 +597,7 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
         bootstrap_profile="linux-user",
         ssh_host="ares",
         source_root=tmp_path,
+        relay_artifact_sha256="a" * 64,
     )
 
     assert lines[0].startswith("bootstrap_receipt=")
@@ -584,6 +642,7 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
             bootstrap_profile="linux-user",
             ssh_host="ares",
             source_root=tmp_path,
+            relay_artifact_sha256="a" * 64,
         )
     assert calls[-1][-1] == "/tmp/clio-relay-bootstrap_abc"
 
@@ -609,7 +668,7 @@ def test_bootstrap_over_ssh_rejects_invalid_relay_wheel_filename_before_ssh(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         wheel=wheel,
-        expected_error="wheel filename is not canonical",
+        expected_error="wheel filename is invalid",
     )
 
 
@@ -638,7 +697,7 @@ def test_bootstrap_over_ssh_rejects_foreign_wheel_distribution_before_ssh(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         wheel=wheel,
-        expected_error="distribution must be clio-relay",
+        expected_error="must match the running clio-relay release",
     )
 
 
@@ -878,6 +937,30 @@ def test_bootstrap_archive_can_include_local_relay_wheel(tmp_path: Path) -> None
         names = archive.getnames()
     assert f"wheels/{wheel.name}" in names
     assert any(name.startswith("jarvis-packages/clio_relay/") for name in names)
+
+
+def test_packaged_bootstrap_archive_is_identical_across_source_mtime_changes(
+    tmp_path: Path,
+) -> None:
+    wheel = tmp_path / f"clio_relay-{__version__}-py3-none-any.whl"
+    _write_test_relay_wheel(wheel)
+    first = create_bootstrap_archive(
+        source_root=tmp_path / "not-a-repo",
+        archive=tmp_path / "first.tar",
+        relay_wheel=wheel,
+    )
+    first_digest = hashlib.sha256(first.archive.read_bytes()).hexdigest()
+
+    os.utime(wheel, ns=(1_800_000_000_000_000_000, 1_800_000_000_000_000_000))
+    second = create_bootstrap_archive(
+        source_root=tmp_path / "not-a-repo",
+        archive=tmp_path / "second.tar",
+        relay_wheel=wheel,
+    )
+    second_digest = hashlib.sha256(second.archive.read_bytes()).hexdigest()
+
+    assert second.archive.read_bytes() == first.archive.read_bytes()
+    assert second_digest == first_digest
 
 
 def test_bootstrap_archive_ignores_unrelated_git_checkout(tmp_path: Path) -> None:

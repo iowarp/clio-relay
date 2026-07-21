@@ -131,6 +131,9 @@ DEFAULT_RECORD_MAX_BYTES = 1_048_576
 LEGACY_OUTPUT_MIGRATION_SCHEMA = "clio-relay.legacy-output-migration.v1"
 LEGACY_OUTPUT_COMPATIBILITY_SCHEMA = "clio-relay.legacy-output-compatibility.v1"
 LEGACY_OUTPUT_RECEIPT_SCHEMA = "clio-relay.legacy-output-receipt.v1"
+LEGACY_RECORD_AUDIT_SCHEMA = "clio-relay.legacy-record-audit.v1"
+CANONICAL_RECORD_ACCESS_SCHEMA = "clio-relay.canonical-record-access.v1"
+QUEUE_LAYOUT_SCHEMA = "clio-relay.queue-layout.v1"
 # v0.9 wrote one complete subprocess callback twice in every output event: once
 # as ``message`` and once as ``payload.text``.  Keep the compatibility reader
 # bounded independently from the ordinary event limit.  New events remain
@@ -225,6 +228,10 @@ class LegacyQueueStateError(QueueConflictError):
         super().__init__(json.dumps(self.report, sort_keys=True))
 
 
+class QueueSealRequiresExclusive(ConfigurationError):
+    """Refuse to create the indexed-era seal without exclusive writer fencing."""
+
+
 _ORDER_FAMILIES = ("tasks", "artifacts", "progress")
 _GLOBAL_ORDER_FAMILIES = (
     "endpoints",
@@ -244,6 +251,66 @@ _OPERATIONAL_INDEX_FAMILIES = (
     "jobs",
     "gateway_sessions",
     "leases",
+)
+_INITIALIZED_QUEUE_FAMILIES = (
+    "endpoints",
+    "endpoints_fresh",
+    "endpoints_fresh_by_id",
+    "jobs",
+    "tasks",
+    "leases",
+    "lease_indexes",
+    "lease_identity_refs",
+    "leases_by_endpoint",
+    "leases_by_cluster_kind",
+    "leases_by_expiry",
+    "lease_capacity",
+    "events",
+    "legacy_output_archives",
+    "legacy_output_receipts",
+    "legacy_output_retired",
+    "artifacts",
+    "artifact_user_order",
+    "artifact_users",
+    "progress",
+    "task_events",
+    "gateway_sessions",
+    "gateway_reverse_refs_by_session",
+    "gateways_by_artifact",
+    "gateways_by_scheduler",
+    "active_gateway_refs_by_job",
+    "active_gateway_refs_by_session",
+    "idempotency",
+    "monitor_rules",
+    "monitor_rules_by_job",
+    "active_monitor_rules_by_job",
+    "owner_sessions",
+    "owner_session_jobs",
+    "owner_session_legacy_jobs",
+    "job_indexes",
+    "tasks_by_job",
+    "leases_by_job",
+    "artifacts_by_job",
+    "used_artifacts_by_job",
+    "progress_by_job",
+    "jobs_active",
+    "jobs_queued",
+    "task_event_heads",
+    "migrations",
+    "task_order_by_job",
+    "transition_intents",
+    "artifact_order_by_job",
+    "progress_order_by_job",
+    "active_tasks_by_job",
+    "scheduler_refs_by_job",
+    "scheduler_protections_by_job",
+    "scheduler_jobs",
+    "scheduler_cancel_pending",
+    "scheduler_cancel_dispositions",
+    "job_tombstones",
+    "gc_runs",
+    "gc_trash",
+    "global_order",
 )
 _GC_TERMINAL_SCHEDULER_PHASES = {
     SchedulerPhase.COMPLETED.value,
@@ -480,11 +547,452 @@ class ClioCoreQueue:
         )
         self._initialized = False
         self._migration_lifetime_guarded = False
+        self._locked_storage_root_descriptor: int | None = None
+        self._locked_storage_root_identity: tuple[int, int] | None = None
+
+    def _storage_root_stat(self) -> os.stat_result:
+        """Inspect the queue root through its held descriptor when migration-pinned."""
+        descriptor = self._locked_storage_root_descriptor
+        if descriptor is None:
+            return os.lstat(self._storage_root)
+        try:
+            details = os.fstat(descriptor)
+        except OSError as exc:
+            raise ConfigurationError("migration queue-root descriptor is unavailable") from exc
+        if (details.st_dev, details.st_ino) != self._locked_storage_root_identity:
+            raise ConfigurationError("migration queue-root descriptor identity changed")
+        return details
+
+    def _legacy_record_audit_marker_path(self) -> Path:
+        return self._storage_root / "migrations" / "legacy-record-audit-v1.json"
+
+    def _prepare_queue_root_for_lock(self) -> None:
+        """Create only a missing queue root and reject an unsafe lock path."""
+        try:
+            root_stat = self._storage_root_stat()
+        except FileNotFoundError:
+            try:
+                ensure_private_configuration_directory(self._storage_root)
+                root_stat = self._storage_root_stat()
+            except OSError as error:
+                raise LegacyQueueStateError(
+                    family="root",
+                    path=self._storage_root,
+                    reason=f"cannot create queue root: {type(error).__name__}",
+                ) from error
+        except OSError as error:
+            raise LegacyQueueStateError(
+                family="root",
+                path=self._storage_root,
+                reason=f"cannot inspect queue root: {type(error).__name__}",
+            ) from error
+        if not stat.S_ISDIR(root_stat.st_mode) or _record_is_reparse(root_stat):
+            raise LegacyQueueStateError(
+                family="root",
+                path=self._storage_root,
+                reason="queue root is not an owned directory",
+            )
+        self._require_owner_private_queue_directory("root", self._storage_root, root_stat)
+        lock_path = self._storage_root / ".lock"
+        try:
+            lock_stat = os.lstat(lock_path)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise LegacyQueueStateError(
+                family="root",
+                path=lock_path,
+                reason=f"cannot inspect queue lock: {type(error).__name__}",
+            ) from error
+        if not stat.S_ISREG(lock_stat.st_mode) or _record_is_reparse(lock_stat):
+            raise LegacyQueueStateError(
+                family="root",
+                path=lock_path,
+                reason="queue lock is not an owned regular file",
+            )
+
+    @staticmethod
+    def _legacy_record_audit_marker() -> dict[str, object]:
+        """Return the exact durable seal for the indexed queue era.
+
+        The seal intentionally contains no record counts or record digests. Those
+        would require a history-sized verification scan at every process start.
+        It is cooperative migration evidence inside an owner-private directory,
+        not cryptographic proof against deletion or replay by another process
+        running as that owner. Its contract is that every pre-seal record passed
+        the bounded legacy audit, cooperative post-seal writers use the canonical
+        access contract, and individual records are validated whenever read.
+        """
+        return {
+            "schema_version": LEGACY_RECORD_AUDIT_SCHEMA,
+            "complete": True,
+            "queue_layout_schema": QUEUE_LAYOUT_SCHEMA,
+            "canonical_record_access_schema": CANONICAL_RECORD_ACCESS_SCHEMA,
+            "index_migration_schema": INDEX_MIGRATION_SCHEMA,
+            "legacy_output_migration_schema": LEGACY_OUTPUT_MIGRATION_SCHEMA,
+        }
+
+    def _require_indexed_queue_layout(self) -> None:
+        """Validate the fixed queue layout without enumerating record history."""
+        try:
+            root_stat = self._storage_root_stat()
+        except OSError as error:
+            raise LegacyQueueStateError(
+                family="root",
+                path=self._storage_root,
+                reason=f"cannot inspect indexed queue root: {type(error).__name__}",
+            ) from error
+        if not stat.S_ISDIR(root_stat.st_mode) or _record_is_reparse(root_stat):
+            raise LegacyQueueStateError(
+                family="root",
+                path=self._storage_root,
+                reason="indexed queue root is not an owned directory",
+            )
+        self._require_owner_private_queue_directory("root", self._storage_root, root_stat)
+        lock_path = self._storage_root / ".lock"
+        try:
+            lock_stat = os.lstat(lock_path)
+        except FileNotFoundError:
+            # Windows file locks remove their lock file on release. Its absence
+            # is therefore a valid idle state; FileLock recreates it atomically.
+            lock_stat = None
+        except OSError as error:
+            raise LegacyQueueStateError(
+                family="root",
+                path=lock_path,
+                reason=f"cannot inspect indexed queue lock: {type(error).__name__}",
+            ) from error
+        if lock_stat is not None and (
+            not stat.S_ISREG(lock_stat.st_mode) or _record_is_reparse(lock_stat)
+        ):
+            raise LegacyQueueStateError(
+                family="root",
+                path=lock_path,
+                reason="indexed queue lock is not an owned regular file",
+            )
+        for family in _INITIALIZED_QUEUE_FAMILIES:
+            directory = self._storage_root / family
+            if self._require_legacy_family_directory(family) is None:
+                raise LegacyQueueStateError(
+                    family=family,
+                    path=directory,
+                    reason="indexed queue seal requires its owned record directory",
+                )
+        global_order_root = self._storage_root / "global_order"
+        self._require_indexed_queue_directory(
+            family="global_order",
+            directory=global_order_root,
+        )
+        for family in _GLOBAL_ORDER_FAMILIES:
+            family_root = global_order_root / family
+            self._require_indexed_queue_directory(
+                family="global_order",
+                directory=family_root,
+            )
+            for child in ("by_id", "entries"):
+                self._require_indexed_queue_directory(
+                    family="global_order",
+                    directory=family_root / child,
+                )
+
+    def _require_indexed_queue_directory(self, *, family: str, directory: Path) -> None:
+        """Require one fixed indexed-layout path to be an owned real directory."""
+        try:
+            directory_stat = os.lstat(directory)
+        except OSError as error:
+            raise LegacyQueueStateError(
+                family=family,
+                path=directory,
+                reason=f"cannot inspect indexed queue directory: {type(error).__name__}",
+            ) from error
+        if not stat.S_ISDIR(directory_stat.st_mode) or _record_is_reparse(directory_stat):
+            raise LegacyQueueStateError(
+                family=family,
+                path=directory,
+                reason="indexed queue path is not an owned directory",
+            )
+        self._require_owner_private_queue_directory(family, directory, directory_stat)
+
+    @staticmethod
+    def _require_owner_private_queue_directory(
+        family: str,
+        path: Path,
+        details: os.stat_result,
+    ) -> None:
+        """Require an exact owner-private POSIX directory for seal trust."""
+        if os.name == "nt":
+            return
+        getuid = getattr(os, "getuid", None)
+        current_uid = getuid() if callable(getuid) else None
+        if current_uid is not None and details.st_uid != current_uid:
+            raise LegacyQueueStateError(
+                family=family,
+                path=path,
+                reason="queue directory is not owned by the current user",
+            )
+        if stat.S_IMODE(details.st_mode) & 0o077:
+            raise LegacyQueueStateError(
+                family=family,
+                path=path,
+                reason="queue directory is readable or writable by another user",
+            )
+
+    def _read_legacy_record_audit_marker(self) -> _LegacyOutputAudit | None:
+        """Return constant-size indexed-era evidence, or ``None`` for bounded repair."""
+        marker_path = self._legacy_record_audit_marker_path()
+        if _path_lstat(marker_path) is None:
+            # An existing index marker proves this is an initialized layout, not
+            # a sparse v0.9 root. Validate its fixed owned directories before a
+            # missing-seal audit is allowed to create or repair anything.
+            index_path = self._storage_root / "migrations" / "index-v1.json"
+            if _path_lstat(index_path) is not None:
+                self._require_indexed_queue_layout()
+                try:
+                    self._read_index_migration_state()
+                except (OSError, ValueError, QueueConflictError) as error:
+                    raise LegacyQueueStateError(
+                        family="migrations",
+                        path=index_path,
+                        reason=(
+                            f"missing-seal queue migration state is invalid: {type(error).__name__}"
+                        ),
+                    ) from error
+            return None
+        self._require_indexed_queue_layout()
+        try:
+            raw = _read_unique_json_document(marker_path)
+        except (OSError, ValueError, QueueConflictError) as error:
+            raise LegacyQueueStateError(
+                family="migrations",
+                path=marker_path,
+                reason=f"legacy-record audit marker is invalid: {type(error).__name__}",
+            ) from error
+        if raw != self._legacy_record_audit_marker():
+            raise LegacyQueueStateError(
+                family="migrations",
+                path=marker_path,
+                reason="legacy-record audit marker has an unknown or incomplete contract",
+            )
+        self._read_sealed_index_migration_state()
+        legacy_output = self._read_legacy_output_marker()
+        if legacy_output is None:
+            raise LegacyQueueStateError(
+                family="migrations",
+                path=self._legacy_output_marker_path(),
+                reason="indexed queue seal requires the legacy-output completion marker",
+            )
+        return legacy_output
+
+    def _write_legacy_record_audit_marker_unlocked(self) -> None:
+        """Durably seal one completed bounded audit for O(1) future startup."""
+        if not self._lock.is_locked:
+            raise RuntimeError("legacy-record audit seal requires the queue lock")
+        if not self._migration_lifetime_guarded:
+            raise QueueSealRequiresExclusive(
+                "legacy-record audit seal requires exclusive writer-lifetime ownership"
+            )
+        marker_path = self._legacy_record_audit_marker_path()
+        existing = self._read_legacy_record_audit_marker()
+        if existing is not None:
+            return
+        self._read_sealed_index_migration_state()
+        self._write_json(marker_path, self._legacy_record_audit_marker())
+        self._after_legacy_record_audit_phase("marker", marker_path)
+        if self._read_legacy_record_audit_marker() is None:
+            raise QueueConflictError("legacy-record audit marker was not durable")
+
+    @staticmethod
+    def _after_legacy_record_audit_phase(_phase: str, _path: Path) -> None:
+        """Fault-injection seam after the indexed-era seal becomes durable."""
+
+    @staticmethod
+    def _require_sealed_checkpoint(
+        raw: object,
+        *,
+        label: str,
+        schema_version: str | None = None,
+    ) -> dict[str, object]:
+        """Validate one constant-size migration checkpoint without filesystem scans."""
+        if not isinstance(raw, dict):
+            raise QueueConflictError(f"sealed {label} checkpoint is not an object")
+        checkpoint = cast(dict[str, object], raw)
+        expected_keys = {"cursor", "complete"}
+        if schema_version is not None:
+            expected_keys.add("schema_version")
+        if set(checkpoint) != expected_keys:
+            raise QueueConflictError(f"sealed {label} checkpoint has an unknown shape")
+        if not isinstance(checkpoint.get("complete"), bool):
+            raise QueueConflictError(f"sealed {label} checkpoint completion is invalid")
+        cursor = checkpoint.get("cursor")
+        if cursor is not None:
+            if (
+                not isinstance(cursor, str)
+                or len(cursor) > 512
+                or Path(cursor).name != cursor
+                or not cursor.endswith(".json")
+            ):
+                raise QueueConflictError(f"sealed {label} checkpoint cursor is invalid")
+            try:
+                validate_durable_record_id(cursor.removesuffix(".json"))
+            except ValueError as error:
+                raise QueueConflictError(
+                    f"sealed {label} checkpoint cursor identity is invalid"
+                ) from error
+        if schema_version is not None and checkpoint.get("schema_version") != schema_version:
+            raise QueueConflictError(f"sealed {label} checkpoint schema is invalid")
+        return checkpoint
+
+    @classmethod
+    def _require_sealed_checkpoint_group(
+        cls,
+        raw: object,
+        *,
+        label: str,
+        families: tuple[str, ...],
+        schema_by_family: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        """Validate one exact fixed-family checkpoint group."""
+        if not isinstance(raw, dict):
+            raise QueueConflictError(f"sealed {label} checkpoints are not an object")
+        group = cast(dict[str, object], raw)
+        if set(group) != set(families):
+            raise QueueConflictError(f"sealed {label} checkpoints have an unknown shape")
+        schemas = schema_by_family or {}
+        for family in families:
+            cls._require_sealed_checkpoint(
+                group[family],
+                label=f"{label} {family}",
+                schema_version=schemas.get(family),
+            )
+        return group
+
+    @staticmethod
+    def _require_optional_bounded_record_count(
+        checkpoint: dict[str, object],
+        *,
+        label: str,
+    ) -> None:
+        """Validate an optional bounded migration record count."""
+        record_count = checkpoint.get("record_count")
+        if record_count is None:
+            return
+        if (
+            isinstance(record_count, bool)
+            or not isinstance(record_count, int)
+            or not 0 <= record_count <= MAX_LIVE_LEASE_RECORDS
+        ):
+            raise QueueConflictError(f"sealed {label} record count is invalid")
+
+    def _read_sealed_index_migration_state(self) -> dict[str, object]:
+        """Read and strictly validate indexed-era state without repairing or scanning."""
+        path = self._storage_root / "migrations" / "index-v1.json"
+        try:
+            raw_state = _read_unique_json_document(path)
+            if not isinstance(raw_state, dict):
+                raise QueueConflictError("sealed index migration state is not an object")
+            state = cast(dict[str, object], raw_state)
+            if state.get("schema_version") != INDEX_MIGRATION_SCHEMA:
+                raise QueueConflictError("sealed index migration state schema is unsupported")
+            expected_keys = {
+                "schema_version",
+                "complete",
+                "families",
+                "finalize",
+                "order_families",
+                "global_order_families",
+                "retention_families",
+                "operational_families",
+                "lease_operational_repair",
+                "lease_capacity_aggregate",
+            }
+            if set(state) != expected_keys or not isinstance(state.get("complete"), bool):
+                raise QueueConflictError("sealed index migration state has an unknown shape")
+            self._require_sealed_checkpoint_group(
+                state.get("families"),
+                label="canonical family",
+                families=("jobs", "tasks", "leases", "artifacts", "progress"),
+            )
+            self._require_sealed_checkpoint(
+                state.get("finalize"),
+                label="finalize",
+            )
+            self._require_sealed_checkpoint_group(
+                state.get("order_families"),
+                label="order family",
+                families=_ORDER_FAMILIES,
+            )
+            self._require_sealed_checkpoint_group(
+                state.get("global_order_families"),
+                label="global-order family",
+                families=_GLOBAL_ORDER_FAMILIES,
+            )
+            self._require_sealed_checkpoint_group(
+                state.get("retention_families"),
+                label="retention family",
+                families=_RETENTION_INDEX_FAMILIES,
+            )
+            self._require_sealed_checkpoint_group(
+                state.get("operational_families"),
+                label="operational family",
+                families=_OPERATIONAL_INDEX_FAMILIES,
+                schema_by_family={"leases": LEASE_OPERATIONAL_INDEX_SCHEMA},
+            )
+            raw_repair = state.get("lease_operational_repair")
+            if not isinstance(raw_repair, dict):
+                raise QueueConflictError("sealed lease repair checkpoint is not an object")
+            repair = cast(dict[str, object], raw_repair)
+            if set(repair) not in (
+                {"complete", "schema_version"},
+                {"complete", "schema_version", "record_count"},
+            ):
+                raise QueueConflictError("sealed lease repair checkpoint has an unknown shape")
+            if (
+                not isinstance(repair.get("complete"), bool)
+                or repair.get("schema_version") != LEASE_OPERATIONAL_INDEX_SCHEMA
+            ):
+                raise QueueConflictError("sealed lease repair checkpoint is invalid")
+            self._require_optional_bounded_record_count(repair, label="lease repair")
+
+            raw_capacity = state.get("lease_capacity_aggregate")
+            if not isinstance(raw_capacity, dict):
+                raise QueueConflictError("sealed lease capacity checkpoint is not an object")
+            capacity = cast(dict[str, object], raw_capacity)
+            if not isinstance(capacity.get("complete"), bool):
+                raise QueueConflictError("sealed lease capacity completion is invalid")
+            capacity_complete = capacity["complete"] is True
+            capacity_keys = {"complete", "schema_version"}
+            if capacity_complete:
+                capacity_keys.update({"epoch_id", "generation", "record_count"})
+            if set(capacity) != capacity_keys:
+                raise QueueConflictError("sealed lease capacity checkpoint has an unknown shape")
+            generation = capacity.get("generation")
+            if capacity.get("schema_version") != LEASE_CAPACITY_AGGREGATE_SCHEMA or (
+                capacity_complete
+                and (
+                    not _is_capacity_identity(capacity.get("epoch_id"))
+                    or isinstance(generation, bool)
+                    or not isinstance(generation, int)
+                    or generation < 0
+                )
+            ):
+                raise QueueConflictError("sealed lease capacity checkpoint is invalid")
+            self._require_optional_bounded_record_count(capacity, label="lease capacity")
+            if state.get("complete") is True and not _index_migration_components_complete(state):
+                raise QueueConflictError(
+                    "sealed complete index migration has incomplete components"
+                )
+        except (OSError, ValueError, QueueConflictError) as error:
+            raise LegacyQueueStateError(
+                family="migrations",
+                path=path,
+                reason=f"sealed index migration state is invalid: {type(error).__name__}",
+            ) from error
+        return state
 
     def _audit_legacy_state_before_initialization(self) -> _LegacyOutputAudit:
         """Refuse unsafe v0.9 canonical state before creating or changing files."""
         try:
-            root_stat = os.lstat(self._storage_root)
+            root_stat = self._storage_root_stat()
         except FileNotFoundError:
             return _LegacyOutputAudit(
                 marker_complete=False,
@@ -571,6 +1079,7 @@ class ClioCoreQueue:
                 path=directory,
                 reason="canonical family is not an owned directory",
             )
+        self._require_owner_private_queue_directory(family, directory, directory_stat)
         return directory
 
     def _bounded_legacy_family_entries(self, family: str) -> list[Path]:
@@ -648,7 +1157,7 @@ class ClioCoreQueue:
                 reason="legacy-output marker has no owned migrations directory",
             )
         try:
-            raw = self._read_json_document(marker_path)
+            raw = _read_unique_json_document(marker_path)
         except (OSError, ValueError, QueueConflictError) as error:
             raise LegacyQueueStateError(
                 family="migrations",
@@ -1211,6 +1720,34 @@ class ClioCoreQueue:
         if _path_lstat(receipt_path) is not None:
             self._validate_legacy_output_receipt(receipt_path, record)
         return record
+
+    def _validate_legacy_output_event_access(self, path: Path, event: RelayEvent) -> None:
+        """Validate one compatibility archive and receipt when its event is read."""
+        if "legacy_output" not in event.payload:
+            return
+        try:
+            event_bytes = _read_bounded_record_bytes(path)
+        except (OSError, ValueError, QueueConflictError) as error:
+            raise LegacyQueueStateError(
+                family="events",
+                path=path,
+                reason=f"legacy output event is invalid on access: {type(error).__name__}",
+            ) from error
+        record = self._record_from_legacy_compatibility_event(
+            path,
+            event,
+            event_bytes,
+            job_id=event.job_id,
+            seq=event.seq,
+        )
+        receipt_path = self._legacy_output_receipt_path(event.job_id, event.seq)
+        if _path_lstat(receipt_path) is None:
+            raise LegacyQueueStateError(
+                family="legacy_output_receipts",
+                path=receipt_path,
+                reason="legacy output compatibility event has no durable receipt",
+            )
+        self._validate_legacy_output_receipt(receipt_path, record)
 
     def _iter_legacy_output_auxiliary_paths(
         self,
@@ -1818,15 +2355,19 @@ class ClioCoreQueue:
         *,
         migrate_legacy_output: bool = False,
         locked_core: LockedCoreIdentity | None = None,
+        allow_exclusive_seal: bool = True,
     ) -> None:
         """Create the record families used by the queue."""
         if locked_core is not None:
-            if not migrate_legacy_output or self._migration_lifetime_guarded:
+            if self._migration_lifetime_guarded:
                 raise ConfigurationError(
-                    "locked-core authority is only valid for the outer migration scope"
+                    "locked-core authority is only valid for the outer initialization scope"
                 )
             require_active_locked_core(locked_core)
-            self._initialize_under_locked_core(locked_core)
+            self._initialize_under_locked_core(
+                locked_core,
+                migrate_legacy_output=migrate_legacy_output,
+            )
             return
         if migrate_legacy_output and not self._migration_lifetime_guarded:
             with exclusive_migration_lifetime(self.root) as locked_core:
@@ -1837,213 +2378,214 @@ class ClioCoreQueue:
             return
         if self._initialized:
             with self._lock:
-                self._ensure_extended_migration_state()
-            return
-        # The first pass is deliberately read-only: an unsafe family must fail
-        # before initialize creates even the migration/archive directories.
-        legacy_output_audit = self._audit_legacy_state_before_initialization()
-        self._require_legacy_output_migration_authorized(
-            legacy_output_audit,
-            migrate_legacy_output=migrate_legacy_output,
-        )
-        for family in (
-            "endpoints",
-            "endpoints_fresh",
-            "endpoints_fresh_by_id",
-            "jobs",
-            "tasks",
-            "leases",
-            "lease_indexes",
-            "lease_identity_refs",
-            "leases_by_endpoint",
-            "leases_by_cluster_kind",
-            "leases_by_expiry",
-            "lease_capacity",
-            "events",
-            "legacy_output_archives",
-            "legacy_output_receipts",
-            "legacy_output_retired",
-            "artifacts",
-            "artifact_user_order",
-            "artifact_users",
-            "progress",
-            "task_events",
-            "gateway_sessions",
-            "gateway_reverse_refs_by_session",
-            "gateways_by_artifact",
-            "gateways_by_scheduler",
-            "active_gateway_refs_by_job",
-            "active_gateway_refs_by_session",
-            "idempotency",
-            "monitor_rules",
-            "monitor_rules_by_job",
-            "active_monitor_rules_by_job",
-            "owner_sessions",
-            "owner_session_jobs",
-            "owner_session_legacy_jobs",
-            "job_indexes",
-            "tasks_by_job",
-            "leases_by_job",
-            "artifacts_by_job",
-            "used_artifacts_by_job",
-            "progress_by_job",
-            "jobs_active",
-            "jobs_queued",
-            "task_event_heads",
-            "migrations",
-            "task_order_by_job",
-            "transition_intents",
-            "artifact_order_by_job",
-            "progress_order_by_job",
-            "active_tasks_by_job",
-            "scheduler_refs_by_job",
-            "scheduler_protections_by_job",
-            "scheduler_jobs",
-            "scheduler_cancel_pending",
-            "scheduler_cancel_dispositions",
-            "job_tombstones",
-            "gc_runs",
-            "gc_trash",
-            "global_order",
+                indexed_audit = self._read_legacy_record_audit_marker()
+            if indexed_audit is not None:
+                return
+            self._initialized = False
+        if (
+            not self._migration_lifetime_guarded
+            and _path_lstat(self._legacy_record_audit_marker_path()) is None
         ):
-            (self._storage_root / family).mkdir(parents=True, exist_ok=True)
-        for family in _GLOBAL_ORDER_FAMILIES:
-            (self._storage_root / "global_order" / family / "by_id").mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-            (self._storage_root / "global_order" / family / "entries").mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-        with self._lock:
-            # Revalidate once under the cross-process lock before the one-time
-            # migration.  This closes the audit/write race without retaining an
-            # unbounded path plan in memory; only the independently bounded set of
-            # migration keys is retained, so writes do not require a third history
-            # scan.  The durable completion marker makes both passes skip deep
-            # event history on every later startup.
-            legacy_output_audit = self._audit_legacy_state_before_initialization()
-            self._require_legacy_output_migration_authorized(
-                legacy_output_audit,
-                migrate_legacy_output=migrate_legacy_output,
-            )
-            self._purge_write_staging_unlocked()
-            self._migrate_legacy_output_events_unlocked(legacy_output_audit)
-            migration_path = self._storage_root / "migrations" / "index-v1.json"
-            if not migration_path.exists():
-                has_legacy_jobs = (
-                    next((self._storage_root / "jobs").glob("*.json"), None) is not None
+            if not allow_exclusive_seal:
+                raise QueueSealRequiresExclusive(
+                    "missing legacy-record audit seal requires exclusive writer-lifetime ownership"
                 )
-                retention_checkpoints = {
-                    family: {
-                        "cursor": None,
-                        "complete": (
-                            next((self._storage_root / family).glob("*.json"), None) is None
-                        ),
-                    }
-                    for family in _RETENTION_INDEX_FAMILIES
-                }
-                has_legacy_retention = any(
-                    checkpoint["complete"] is not True
-                    for checkpoint in retention_checkpoints.values()
+            with exclusive_migration_lifetime(self.root) as locked_core:
+                self.initialize(
+                    migrate_legacy_output=migrate_legacy_output,
+                    locked_core=locked_core,
                 )
-                global_order_checkpoints = {
-                    family: {
-                        "cursor": None,
-                        "complete": (
-                            next((self._storage_root / family).glob("*.json"), None) is None
-                        ),
-                    }
-                    for family in _GLOBAL_ORDER_FAMILIES
-                }
-                has_legacy_global_order = any(
-                    checkpoint["complete"] is not True
-                    for checkpoint in global_order_checkpoints.values()
-                )
-                operational_checkpoints = {
-                    family: {
-                        "cursor": None,
-                        "complete": (
-                            next((self._storage_root / family).glob("*.json"), None) is None
-                        ),
-                        **(
-                            {"schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA}
-                            if family == "leases"
-                            else {}
-                        ),
-                    }
-                    for family in _OPERATIONAL_INDEX_FAMILIES
-                }
-                has_legacy_operational = any(
-                    checkpoint["complete"] is not True
-                    for checkpoint in operational_checkpoints.values()
-                )
-                has_canonical_leases = (
-                    next((self._storage_root / "leases").glob("*.json"), None) is not None
-                )
-                lease_capacity_complete = (
-                    not has_canonical_leases
-                    and not _lease_operational_records_present(self._storage_root)
-                )
-                lease_capacity_checkpoint: dict[str, object] = {
-                    "complete": lease_capacity_complete,
-                    "schema_version": LEASE_CAPACITY_AGGREGATE_SCHEMA,
-                }
-                if lease_capacity_complete:
-                    empty_capacity = _new_lease_capacity_pair({}, generation=0)
-                    self._write_lease_capacity_pair_unlocked(empty_capacity)
-                    lease_capacity_checkpoint.update(
-                        {
-                            "epoch_id": empty_capacity.aggregate.epoch_id,
-                            "generation": empty_capacity.aggregate.generation,
-                            "record_count": 0,
-                        }
+            return
+        # The root and lock path are the only pre-lock filesystem state. A
+        # missing seal is audited exactly once after taking that lock and before
+        # any record-family, migration, or archive write.
+        self._prepare_queue_root_for_lock()
+        try:
+            with self._lock:
+                locked_indexed_audit = self._read_legacy_record_audit_marker()
+                if locked_indexed_audit is None:
+                    if not self._migration_lifetime_guarded:
+                        raise QueueSealRequiresExclusive(
+                            "missing legacy-record audit seal requires exclusive "
+                            "writer-lifetime ownership"
+                        )
+                    legacy_output_audit = self._audit_legacy_state_before_initialization()
+                    self._require_legacy_output_migration_authorized(
+                        legacy_output_audit,
+                        migrate_legacy_output=migrate_legacy_output,
                     )
-                self._write_json(
-                    migration_path,
-                    {
-                        "schema_version": INDEX_MIGRATION_SCHEMA,
-                        "complete": (
-                            not has_legacy_jobs
-                            and not has_legacy_retention
-                            and not has_legacy_global_order
-                            and not has_legacy_operational
-                            and lease_capacity_complete
-                            and not _lease_operational_records_present(self._storage_root)
-                        ),
-                        "families": {
-                            family: {"cursor": None, "complete": not has_legacy_jobs}
-                            for family in ("jobs", "tasks", "leases", "artifacts", "progress")
-                        },
-                        "finalize": {"cursor": None, "complete": not has_legacy_jobs},
-                        "order_families": {
-                            family: {"cursor": None, "complete": not has_legacy_jobs}
-                            for family in _ORDER_FAMILIES
-                        },
-                        "global_order_families": global_order_checkpoints,
-                        "retention_families": retention_checkpoints,
-                        "operational_families": operational_checkpoints,
-                        "lease_operational_repair": {
-                            "complete": not _lease_operational_records_present(self._storage_root),
-                            "schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA,
-                        },
-                        "lease_capacity_aggregate": lease_capacity_checkpoint,
-                    },
+                    for family in _INITIALIZED_QUEUE_FAMILIES:
+                        (self._storage_root / family).mkdir(
+                            mode=0o700,
+                            parents=True,
+                            exist_ok=True,
+                        )
+                    for family in _GLOBAL_ORDER_FAMILIES:
+                        family_root = self._storage_root / "global_order" / family
+                        family_root.mkdir(
+                            mode=0o700,
+                            exist_ok=True,
+                        )
+                        (family_root / "by_id").mkdir(
+                            mode=0o700,
+                            exist_ok=True,
+                        )
+                        (family_root / "entries").mkdir(
+                            mode=0o700,
+                            exist_ok=True,
+                        )
+                else:
+                    legacy_output_audit = locked_indexed_audit
+                self._require_legacy_output_migration_authorized(
+                    legacy_output_audit,
+                    migrate_legacy_output=migrate_legacy_output,
                 )
-            else:
-                # A torn aggregate/checkpoint pair is valid only while its exact
-                # transition intent remains durable. Replay that authorization
-                # before deciding the migration checkpoint itself is corrupt.
+                self._purge_write_staging_unlocked()
+                self._migrate_legacy_output_events_unlocked(legacy_output_audit)
+                migration_path = self._storage_root / "migrations" / "index-v1.json"
+                if not migration_path.exists():
+                    has_legacy_jobs = (
+                        next((self._storage_root / "jobs").glob("*.json"), None) is not None
+                    )
+                    retention_checkpoints = {
+                        family: {
+                            "cursor": None,
+                            "complete": (
+                                next((self._storage_root / family).glob("*.json"), None) is None
+                            ),
+                        }
+                        for family in _RETENTION_INDEX_FAMILIES
+                    }
+                    has_legacy_retention = any(
+                        checkpoint["complete"] is not True
+                        for checkpoint in retention_checkpoints.values()
+                    )
+                    global_order_checkpoints = {
+                        family: {
+                            "cursor": None,
+                            "complete": (
+                                next((self._storage_root / family).glob("*.json"), None) is None
+                            ),
+                        }
+                        for family in _GLOBAL_ORDER_FAMILIES
+                    }
+                    has_legacy_global_order = any(
+                        checkpoint["complete"] is not True
+                        for checkpoint in global_order_checkpoints.values()
+                    )
+                    operational_checkpoints = {
+                        family: {
+                            "cursor": None,
+                            "complete": (
+                                next((self._storage_root / family).glob("*.json"), None) is None
+                            ),
+                            **(
+                                {"schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA}
+                                if family == "leases"
+                                else {}
+                            ),
+                        }
+                        for family in _OPERATIONAL_INDEX_FAMILIES
+                    }
+                    has_legacy_operational = any(
+                        checkpoint["complete"] is not True
+                        for checkpoint in operational_checkpoints.values()
+                    )
+                    has_canonical_leases = (
+                        next((self._storage_root / "leases").glob("*.json"), None) is not None
+                    )
+                    lease_capacity_complete = (
+                        not has_canonical_leases
+                        and not _lease_operational_records_present(self._storage_root)
+                    )
+                    lease_capacity_checkpoint: dict[str, object] = {
+                        "complete": lease_capacity_complete,
+                        "schema_version": LEASE_CAPACITY_AGGREGATE_SCHEMA,
+                    }
+                    if lease_capacity_complete:
+                        empty_capacity = _new_lease_capacity_pair({}, generation=0)
+                        self._write_lease_capacity_pair_unlocked(empty_capacity)
+                        lease_capacity_checkpoint.update(
+                            {
+                                "epoch_id": empty_capacity.aggregate.epoch_id,
+                                "generation": empty_capacity.aggregate.generation,
+                                "record_count": 0,
+                            }
+                        )
+                    self._write_json(
+                        migration_path,
+                        {
+                            "schema_version": INDEX_MIGRATION_SCHEMA,
+                            "complete": (
+                                not has_legacy_jobs
+                                and not has_legacy_retention
+                                and not has_legacy_global_order
+                                and not has_legacy_operational
+                                and lease_capacity_complete
+                                and not _lease_operational_records_present(self._storage_root)
+                            ),
+                            "families": {
+                                family: {"cursor": None, "complete": not has_legacy_jobs}
+                                for family in (
+                                    "jobs",
+                                    "tasks",
+                                    "leases",
+                                    "artifacts",
+                                    "progress",
+                                )
+                            },
+                            "finalize": {"cursor": None, "complete": not has_legacy_jobs},
+                            "order_families": {
+                                family: {"cursor": None, "complete": not has_legacy_jobs}
+                                for family in _ORDER_FAMILIES
+                            },
+                            "global_order_families": global_order_checkpoints,
+                            "retention_families": retention_checkpoints,
+                            "operational_families": operational_checkpoints,
+                            "lease_operational_repair": {
+                                "complete": not _lease_operational_records_present(
+                                    self._storage_root
+                                ),
+                                "schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA,
+                            },
+                            "lease_capacity_aggregate": lease_capacity_checkpoint,
+                        },
+                    )
+                else:
+                    # A torn aggregate/checkpoint pair is valid only while its exact
+                    # transition intent remains durable. Replay that authorization
+                    # before deciding the migration checkpoint itself is corrupt.
+                    if locked_indexed_audit is None:
+                        self._recover_pending_transitions_unlocked()
+                        self._ensure_extended_migration_state()
                 self._recover_pending_transitions_unlocked()
-                self._ensure_extended_migration_state()
-            self._recover_pending_transitions_unlocked()
-            self._initialized = True
+                if locked_indexed_audit is None:
+                    self._write_legacy_record_audit_marker_unlocked()
+                else:
+                    self._read_sealed_index_migration_state()
+                self._initialized = True
+        except QueueSealRequiresExclusive:
+            if not allow_exclusive_seal:
+                raise
+            with exclusive_migration_lifetime(self.root) as locked_core:
+                self.initialize(
+                    migrate_legacy_output=migrate_legacy_output,
+                    locked_core=locked_core,
+                )
 
-    def _initialize_under_locked_core(self, locked_core: LockedCoreIdentity) -> None:
-        """Pin all migration I/O to one authenticated locked core identity."""
+    def _initialize_under_locked_core(
+        self,
+        locked_core: LockedCoreIdentity,
+        *,
+        migrate_legacy_output: bool,
+    ) -> None:
+        """Pin initialization I/O to one authenticated exclusively locked core."""
         require_active_locked_core(locked_core)
+        original_root = self.root
         original_storage_root = self._storage_root
+        original_lock = self._lock
+        original_storage_root_descriptor = self._locked_storage_root_descriptor
+        original_storage_root_identity = self._locked_storage_root_identity
         try:
             queue_root_before = os.stat(original_storage_root)
         except OSError as exc:
@@ -2058,24 +2600,93 @@ class ClioCoreQueue:
         # in-flight alias retarget can never redirect writes to an unlocked root.
         self.root = logical_filesystem_path(locked_core.root)
         self._storage_root = internal_filesystem_path(
-            locked_core.root,
+            locked_core.filesystem_root,
             force_extended=True,
         )
+        self._locked_storage_root_descriptor = locked_core.filesystem_root_descriptor
+        self._locked_storage_root_identity = expected_identity
         self._lock = _FairBoundedFileLock(
             str(self._storage_root / ".lock"),
             timeout=self._lock_timeout_seconds,
         )
         self._migration_lifetime_guarded = True
         try:
-            self.initialize(migrate_legacy_output=True)
+            self._repair_locked_queue_directory_permissions()
+            self.initialize(migrate_legacy_output=migrate_legacy_output)
         finally:
             self._migration_lifetime_guarded = False
-        try:
-            queue_root_after = os.stat(original_storage_root)
-        except OSError as exc:
-            raise ConfigurationError(f"migration queue root identity changed: {exc}") from exc
-        if (queue_root_after.st_dev, queue_root_after.st_ino) != expected_identity:
-            raise ConfigurationError("migration queue root identity changed while locked")
+            self.root = original_root
+            self._storage_root = original_storage_root
+            self._lock = original_lock
+            self._locked_storage_root_descriptor = original_storage_root_descriptor
+            self._locked_storage_root_identity = original_storage_root_identity
+            try:
+                queue_root_after = os.stat(original_storage_root)
+            except OSError as exc:
+                raise ConfigurationError(f"migration queue root identity changed: {exc}") from exc
+            if (queue_root_after.st_dev, queue_root_after.st_ino) != expected_identity:
+                raise ConfigurationError("migration queue root identity changed while locked")
+
+    def _repair_locked_queue_directory_permissions(self) -> None:
+        """Privatize only fixed, owned queue directories under exclusive ownership."""
+        if os.name == "nt":
+            return
+        root_descriptor = self._locked_storage_root_descriptor
+        if root_descriptor is None:
+            raise ConfigurationError("locked queue permission repair has no pinned root descriptor")
+        relative_paths = [Path()]
+        relative_paths.extend(Path(family) for family in _INITIALIZED_QUEUE_FAMILIES)
+        relative_paths.extend(Path("global_order") / family for family in _GLOBAL_ORDER_FAMILIES)
+        relative_paths.extend(
+            Path("global_order") / family / child
+            for family in _GLOBAL_ORDER_FAMILIES
+            for child in ("by_id", "entries")
+        )
+        getuid = getattr(os, "getuid", None)
+        current_uid = getuid() if callable(getuid) else None
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        for relative_path in relative_paths:
+            descriptor = os.dup(root_descriptor)
+            try:
+                os.set_inheritable(descriptor, False)
+                missing = False
+                for component in relative_path.parts:
+                    try:
+                        child_descriptor = os.open(component, flags, dir_fd=descriptor)
+                    except FileNotFoundError:
+                        missing = True
+                        break
+                    try:
+                        os.set_inheritable(child_descriptor, False)
+                    except BaseException:
+                        with suppress(OSError):
+                            os.close(child_descriptor)
+                        raise
+                    os.close(descriptor)
+                    descriptor = child_descriptor
+                if missing:
+                    continue
+                details = os.fstat(descriptor)
+                if (
+                    not stat.S_ISDIR(details.st_mode)
+                    or _record_is_reparse(details)
+                    or (current_uid is not None and details.st_uid != current_uid)
+                ):
+                    raise ConfigurationError(
+                        "queue directory cannot be safely privatized: "
+                        f"{self._storage_root / relative_path}"
+                    )
+                if stat.S_IMODE(details.st_mode) != 0o700:
+                    os.fchmod(descriptor, 0o700)
+            except OSError as exc:
+                raise ConfigurationError(
+                    "queue directory protections cannot be repaired through the pinned root: "
+                    f"{self._storage_root / relative_path}: {exc}"
+                ) from exc
+            finally:
+                with suppress(OSError):
+                    os.close(descriptor)
 
     def reconcile_pending_transitions(self) -> None:
         """Replay bounded write-ahead transitions left by another process."""
@@ -2087,6 +2698,44 @@ class ClioCoreQueue:
         """Return the crash-safe v0.9 queue-index migration checkpoint."""
         self.initialize()
         return self._read_index_migration_state()
+
+    def readiness_info(self) -> dict[str, object]:
+        """Verify the fixed indexed layout and durable audit seal without writes."""
+        audit = self._read_legacy_record_audit_marker()
+        trust_contract = {
+            "seal_trust_model": "owner_private_cooperative_same_uid_writers",
+            "cryptographic_replay_protection": False,
+            "record_integrity_verification": "on_access",
+        }
+        if audit is None:
+            return {
+                "schema_version": "clio-relay.queue-readiness.v1",
+                "complete": False,
+                "sealed": False,
+                "repair_required": True,
+                "inspection_mode": "fixed_layout_and_seal",
+                "record_history_scanned": False,
+                "records_examined": 0,
+                **trust_contract,
+                "bounds": {
+                    "fixed_queue_family_count": len(_INITIALIZED_QUEUE_FAMILIES),
+                    "fixed_global_order_family_count": len(_GLOBAL_ORDER_FAMILIES),
+                },
+            }
+        return {
+            "schema_version": "clio-relay.queue-readiness.v1",
+            "complete": True,
+            "sealed": True,
+            "repair_required": False,
+            "inspection_mode": "fixed_layout_and_seal",
+            "record_history_scanned": False,
+            "records_examined": 0,
+            **trust_contract,
+            "bounds": {
+                "fixed_queue_family_count": len(_INITIALIZED_QUEUE_FAMILIES),
+                "fixed_global_order_family_count": len(_GLOBAL_ORDER_FAMILIES),
+            },
+        }
 
     def migrate_indexes_batch(self, *, batch_size: int = 500) -> dict[str, object]:
         """Migrate at most one bounded record batch from the v0.9 flat layout."""
@@ -2124,7 +2773,7 @@ class ClioCoreQueue:
                     limit=batch_size,
                 )
                 for path in paths:
-                    record = self._read_json_file(path, model)
+                    record = self._read_canonical_record(path, model)
                     self._migrate_record_unlocked(family, record)
                 if paths:
                     checkpoint["cursor"] = paths[-1].name
@@ -2158,7 +2807,7 @@ class ClioCoreQueue:
                     limit=batch_size,
                 )
                 for path in paths:
-                    record = self._read_json_file(path, model)
+                    record = self._read_canonical_record(path, model)
                     self._migrate_order_record_unlocked(family, record)
                 if paths:
                     checkpoint["cursor"] = paths[-1].name
@@ -2193,7 +2842,7 @@ class ClioCoreQueue:
                     limit=batch_size,
                 )
                 for path in paths:
-                    record = self._read_json_file(path, model)
+                    record = self._read_canonical_record(path, model)
                     record_id = getattr(record, identity_field, None)
                     if not isinstance(record_id, str) or not record_id:
                         raise QueueConflictError(f"global-order record identity is invalid: {path}")
@@ -2234,7 +2883,7 @@ class ClioCoreQueue:
                     limit=batch_size,
                 )
                 for path in paths:
-                    record = self._read_json_file(path, model)
+                    record = self._read_canonical_record(path, model)
                     self._migrate_retention_record_unlocked(family, record)
                 if paths:
                     checkpoint["cursor"] = paths[-1].name
@@ -2318,7 +2967,7 @@ class ClioCoreQueue:
                     limit=batch_size,
                 )
                 for path in paths:
-                    record = self._read_json_file(path, model)
+                    record = self._read_canonical_record(path, model)
                     self._migrate_operational_record_unlocked(family, record)
                 if paths:
                     checkpoint["cursor"] = paths[-1].name
@@ -2339,7 +2988,7 @@ class ClioCoreQueue:
                     limit=batch_size,
                 )
                 for path in paths:
-                    job = self._read_json_file(path, RelayJob)
+                    job = self._read_canonical_record(path, RelayJob)
                     self._finalize_job_index_unlocked(job.job_id)
                 if paths:
                     finalize["cursor"] = paths[-1].name
@@ -3597,14 +4246,55 @@ class ClioCoreQueue:
         now: datetime | None = None,
     ) -> tuple[list[EndpointRegistration], bool]:
         """Read only recent endpoint buckets, independent of endpoint history size."""
+        self.initialize()
+        self._require_index_migration_complete()
+        return self._scan_fresh_endpoint_index(
+            limit=limit,
+            fresh_seconds=fresh_seconds,
+            cluster=cluster,
+            now=now,
+        )
+
+    def scan_fresh_endpoints_read_only(
+        self,
+        *,
+        limit: int,
+        fresh_seconds: int,
+        cluster: str,
+        now: datetime | None = None,
+    ) -> tuple[list[EndpointRegistration], bool]:
+        """Read one cluster's sealed fresh-endpoint index without initialization.
+
+        This path is for bootstrap/readiness probes. It proves the fixed queue
+        layout and audit seal first, then reads only the requested cluster's
+        bounded recent time buckets. It never creates, repairs, or migrates
+        queue state and never scans the historical endpoint family.
+        """
+        readiness = self.readiness_info()
+        if readiness.get("complete") is not True or readiness.get("sealed") is not True:
+            raise QueueConflictError("fresh endpoint readiness requires a sealed indexed queue")
+        return self._scan_fresh_endpoint_index(
+            limit=limit,
+            fresh_seconds=fresh_seconds,
+            cluster=cluster,
+            now=now,
+        )
+
+    def _scan_fresh_endpoint_index(
+        self,
+        *,
+        limit: int,
+        fresh_seconds: int,
+        cluster: str | None,
+        now: datetime | None,
+    ) -> tuple[list[EndpointRegistration], bool]:
+        """Read bounded fresh endpoint buckets after the caller proves readiness."""
         if limit < 1 or limit > MAX_BOUNDED_SCAN_RECORDS:
             raise ValueError(
                 f"endpoint scan limit must be between 1 and {MAX_BOUNDED_SCAN_RECORDS}"
             )
         if fresh_seconds < 1 or fresh_seconds > MAX_ENDPOINT_FRESH_SECONDS:
             raise ValueError(f"fresh_seconds must be between 1 and {MAX_ENDPOINT_FRESH_SECONDS}")
-        self.initialize()
-        self._require_index_migration_complete()
         observed_at = now or utc_now()
         cutoff = observed_at - timedelta(seconds=fresh_seconds)
         first_bucket = _endpoint_fresh_bucket(cutoff)
@@ -4272,7 +4962,7 @@ class ClioCoreQueue:
         }:
             raise QueueConflictError(f"unsupported lease index directory: {directory}")
         try:
-            root_stat = os.lstat(self._storage_root)
+            root_stat = self._storage_root_stat()
         except FileNotFoundError as exc:
             raise QueueConflictError(f"queue root is missing: {self.root}") from exc
         if not stat.S_ISDIR(root_stat.st_mode) or _record_is_reparse(root_stat):
@@ -8498,6 +9188,7 @@ class ClioCoreQueue:
                 "closed": False,
                 "open": True,
                 "cleanup_intent": None,
+                "closure": None,
             }
 
     def owner_session_generation_status(
@@ -8536,13 +9227,11 @@ class ClioCoreQueue:
                 if closing_generation == session_generation_id and closing is not None
                 else None
             )
-            closed = (
-                self.get_owner_session_closed(
-                    owner_session_id,
-                    session_generation_id=session_generation_id,
-                )
-                is not None
+            closure = self.get_owner_session_closed(
+                owner_session_id,
+                session_generation_id=session_generation_id,
             )
+            closed = closure is not None
             exact_active = active_generation == session_generation_id
             exact_closing = closing_generation == session_generation_id
             return {
@@ -8556,6 +9245,7 @@ class ClioCoreQueue:
                 "closed": closed,
                 "open": exact_active and closing_generation is None and not closed,
                 "cleanup_intent": cleanup_intent,
+                "closure": None if closure is None else closure.model_dump(mode="json"),
             }
 
     def prepare_owner_session_start(
@@ -10318,9 +11008,7 @@ class ClioCoreQueue:
 
     def _recover_pending_transitions_unlocked(self) -> list[RelayJob]:
         """Replay pending intents when the bounded journal is nonempty."""
-        if next((self._storage_root / "transition_intents").glob("*.json"), None) is not None:
-            return self._reconcile_transition_intents_unlocked()
-        return []
+        return self._reconcile_transition_intents_unlocked()
 
     def _reconcile_transition_intents_unlocked(self) -> list[RelayJob]:
         """Replay interrupted queue transitions from canonical records or exact intents."""
@@ -11482,8 +12170,12 @@ class ClioCoreQueue:
                     }
                 )
                 changed = True
-        pending_transition = (
-            next((self._storage_root / "transition_intents").glob("*.json"), None) is not None
+        pending_transition = bool(
+            self._bounded_json_record_paths(
+                self._storage_root / "transition_intents",
+                limit=MAX_TRANSITION_INTENT_RECORDS,
+                label="queue transition intent directory",
+            )
         )
         raw_capacity = state.get("lease_capacity_aggregate")
         if not isinstance(raw_capacity, dict):
@@ -12196,14 +12888,26 @@ class ClioCoreQueue:
         finally:
             os.close(directory_fd)
 
-    @staticmethod
-    def _read_optional(path: Path, model: type[Record]) -> Record | None:
-        if not path.exists():
+    def _read_canonical_record(self, path: Path, model: type[Record]) -> Record:
+        """Read one canonical record and bind its content to its storage identity."""
+        record = self._read_json_file(path, model)
+        _validate_canonical_record_access(self._storage_root, path, record)
+        return record
+
+    def _read_optional(self, path: Path, model: type[Record]) -> Record | None:
+        if _path_lstat(path) is None:
             return None
         try:
-            return ClioCoreQueue._read_json_file(path, model)
+            record = self._read_canonical_record(path, model)
         except FileNotFoundError:
             return None
+        if isinstance(record, RelayEvent) and _is_canonical_event_path(
+            self._storage_root,
+            path,
+            "events",
+        ):
+            self._validate_legacy_output_event_access(path, record)
+        return record
 
     @classmethod
     def _read_many(
@@ -12410,6 +13114,94 @@ def _record_identity_field(model: type[BaseModel]) -> str:
         raise QueueConflictError(
             f"canonical record model has no filename identity contract: {model.__name__}"
         ) from error
+
+
+_CANONICAL_FLAT_RECORD_IDENTITIES: dict[
+    str,
+    tuple[type[BaseModel], str, str],
+] = {
+    "artifacts": (ArtifactRef, "artifact_id", "artifact"),
+    "cursors": (Cursor, "job_id", "cursor"),
+    "endpoints": (EndpointRegistration, "endpoint_id", "endpoint"),
+    "gateway_sessions": (GatewaySession, "session_id", "gateway session"),
+    "job_tombstones": (JobTombstone, "job_id", "job tombstone"),
+    "jobs": (RelayJob, "job_id", "job"),
+    "leases": (Lease, "lease_id", "lease"),
+    "monitor_rules": (MonitorRule, "rule_id", "monitor rule"),
+    "progress": (ProgressRecord, "progress_id", "progress"),
+    "tasks": (RelayTask, "task_id", "task"),
+}
+
+
+def _is_canonical_event_path(storage_root: Path, path: Path, family: str) -> bool:
+    """Return whether ``path`` has one canonical identity/sequence event layout."""
+    try:
+        relative = path.relative_to(storage_root)
+    except ValueError:
+        return False
+    return len(relative.parts) == 3 and relative.parts[0] == family
+
+
+def _validate_canonical_record_access(
+    storage_root: Path,
+    path: Path,
+    record: BaseModel,
+) -> None:
+    """Validate filename-bound canonical identity for every individual record read."""
+    try:
+        relative = path.relative_to(storage_root)
+    except ValueError:
+        return
+    flat_contract = (
+        _CANONICAL_FLAT_RECORD_IDENTITIES.get(relative.parts[0])
+        if len(relative.parts) == 2
+        else None
+    )
+    if flat_contract is not None:
+        expected_model, identity_field, label = flat_contract
+        if not isinstance(record, expected_model):
+            raise QueueConflictError(f"canonical {label} record type mismatch: {path}")
+        identity = getattr(record, identity_field, None)
+        try:
+            filename_identity = validate_durable_record_id(path.stem)
+        except ValueError as error:
+            raise QueueConflictError(
+                f"canonical {label} filename identity is invalid: {path}"
+            ) from error
+        if path.name != f"{filename_identity}.json" or identity != filename_identity:
+            raise QueueConflictError(f"canonical {label} identity mismatch: {path}")
+        return
+
+    event_contract: tuple[str, type[BaseModel], str, str] | None = None
+    if isinstance(record, RelayEvent) and _is_canonical_event_path(storage_root, path, "events"):
+        event_contract = ("events", RelayEvent, "job_id", "event")
+    elif isinstance(record, TaskTimelineEvent) and _is_canonical_event_path(
+        storage_root,
+        path,
+        "task_events",
+    ):
+        event_contract = ("task_events", TaskTimelineEvent, "task_id", "task event")
+    if event_contract is None:
+        return
+    _family, expected_model, identity_field, label = event_contract
+    if not isinstance(record, expected_model):
+        raise QueueConflictError(f"canonical {label} record type mismatch: {path}")
+    try:
+        directory_identity = validate_durable_record_id(path.parent.name)
+    except ValueError as error:
+        raise QueueConflictError(
+            f"canonical {label} directory identity is invalid: {path.parent}"
+        ) from error
+    sequence_text = path.name.removesuffix(".json")
+    if (
+        path.name != f"{sequence_text}.json"
+        or len(sequence_text) != 20
+        or not sequence_text.isascii()
+        or not sequence_text.isdigit()
+        or getattr(record, identity_field, None) != directory_identity
+        or getattr(record, "seq", None) != int(sequence_text)
+    ):
+        raise QueueConflictError(f"canonical {label} identity mismatch: {path}")
 
 
 def _require_browser_attachment_session_ready(session: GatewaySession) -> None:

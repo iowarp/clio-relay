@@ -100,7 +100,7 @@ def test_linux_containment_discovery_uses_one_absolute_startup_deadline(
     process = SimpleNamespace(poll=lambda: None, stderr=None, returncode=None)
     started = time.monotonic()
     with pytest.raises(RuntimeError, match="scope setup timed out"):
-        private._wait_for_systemd_control_group(
+        private._wait_for_systemd_scope_identity(
             "test.scope",
             process=process,
             startup_deadline=started + 0.02,
@@ -342,9 +342,20 @@ def test_registration_failure_cleans_new_process_without_touching_stale_owner(
             _popen_kwargs: dict[str, Any],
             *,
             startup_deadline: float,
-        ) -> tuple[object, str, Path, object]:
+            unit_base: str | None = None,
+            description: str | None = None,
+        ) -> tuple[object, str, Path, str, str | None, object]:
             del startup_deadline
-            return process, "clio-relay-new.scope", scope, readiness
+            assert unit_base is None
+            assert description is None
+            return (
+                process,
+                "clio-relay-new.scope",
+                scope,
+                "1" * 32,
+                "test scope",
+                readiness,
+            )
 
         def terminate_linux(unit: str, observed_scope: Path) -> None:
             actions.append(f"terminate-new:{unit}:{observed_scope}")
@@ -396,6 +407,153 @@ def test_registration_failure_cleans_new_process_without_touching_stale_owner(
             assert actions[:2] == ["kill-new", "readiness"]
     finally:
         private._OWNED_PROCESSES.pop(process_id, None)
+
+
+def test_deferred_credentials_are_built_after_persistent_scope_is_registered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The durable containment callback completes before child secrets are released."""
+    private = cast(Any, process_containment)
+    process = SimpleNamespace(pid=7416)
+    readiness = SimpleNamespace()
+    scope = Path("/test/cgroup/clio-relay-session-generation.scope")
+    unit = "clio-relay-session-generation.scope"
+    description = "clio-relay-owned-session:test:generation:identity"
+    invocation = "1" * 32
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        process_containment,
+        "containment_capability",
+        lambda **_kwargs: {
+            "mode": "linux_systemd_scope",
+            "enforceable": True,
+            "reason": "test",
+        },
+    )
+    monkeypatch.setattr(process_containment.sys, "platform", "linux")
+    monkeypatch.setattr(
+        process_containment,
+        "_validate_broker_credential_payload",
+        lambda _payload: None,
+    )
+    monkeypatch.setattr(
+        process_containment,
+        "_spawn_linux_systemd_scope",
+        lambda *_args, **_kwargs: (
+            process,
+            unit,
+            scope,
+            invocation,
+            description,
+            readiness,
+        ),
+    )
+
+    def on_ready(process_id: int, metadata: dict[str, object]) -> None:
+        assert process_id == process.pid
+        assert metadata["systemd_invocation_id"] == invocation
+        events.append("persisted")
+
+    def credential_factory(process_id: int, metadata: dict[str, object]) -> str:
+        assert process_id == process.pid
+        assert metadata["systemd_description"] == description
+        events.append("credential")
+        return '{"schema_version":"test.v1"}'
+
+    def release_broker(*_args: object, credential_payload: str, **_kwargs: object) -> None:
+        assert credential_payload == '{"schema_version":"test.v1"}'
+        events.append("released")
+
+    monkeypatch.setattr(process_containment, "_release_broker", release_broker)
+    try:
+        observed = process_containment.spawn_owned_process(
+            ["test-command"],
+            require_enforceable=True,
+            linux_systemd_unit_base="clio-relay-session-generation",
+            linux_systemd_description=description,
+            on_ready=on_ready,
+            credential_payload_factory=credential_factory,
+        )
+        assert observed is process
+        assert events == ["persisted", "credential", "released"]
+    finally:
+        private._OWNED_PROCESSES.pop(process.pid, None)
+
+
+def test_recorded_scope_rejects_invocation_reuse_before_reading_processes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process_reads: list[Path] = []
+    monkeypatch.setattr(
+        process_containment,
+        "_systemctl_user",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [],
+            0,
+            "ControlGroup=/user.slice/test.scope\n"
+            "InvocationID=" + "2" * 32 + "\n"
+            "Description=expected\n"
+            "LoadState=loaded\n",
+            "",
+        ),
+    )
+    monkeypatch.setattr(
+        process_containment,
+        "_linux_cgroup_process_ids",
+        lambda path: process_reads.append(path) or [4321],
+    )
+
+    with pytest.raises(RuntimeError, match="drifted or was reused"):
+        process_containment.recorded_linux_systemd_scope_process_ids(
+            unit="clio-relay-session-generation.scope",
+            cgroup_path="/sys/fs/cgroup/user.slice/test.scope",
+            invocation_id="1" * 32,
+            description="expected",
+        )
+
+    assert process_reads == []
+
+
+def test_recorded_scope_returns_only_exact_cgroup_members(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = "clio-relay-session-generation.scope"
+    scope = tmp_path / unit
+    scope.mkdir()
+    invocation = "1" * 32
+    description = "expected"
+    monkeypatch.setattr(
+        process_containment,
+        "_systemctl_user",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [],
+            0,
+            f"ControlGroup=/user.slice/{unit}\n"
+            f"InvocationID={invocation}\n"
+            f"Description={description}\n"
+            "LoadState=loaded\n",
+            "",
+        ),
+    )
+    monkeypatch.setattr(
+        process_containment,
+        "_validated_systemd_cgroup_path",
+        lambda *_args, **_kwargs: scope.resolve(),
+    )
+    monkeypatch.setattr(
+        process_containment,
+        "_linux_cgroup_process_ids",
+        lambda path: [4321, 4322] if path == scope.resolve() else [],
+    )
+
+    assert process_containment.recorded_linux_systemd_scope_process_ids(
+        unit=unit,
+        cgroup_path=str(scope),
+        invocation_id=invocation,
+        description=description,
+    ) == [4321, 4322]
 
 
 def test_windows_recorded_cleanup_accepts_taskkill_failure_only_after_pid_absence(

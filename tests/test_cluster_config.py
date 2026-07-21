@@ -33,6 +33,27 @@ from clio_relay.errors import ConfigurationError
 from clio_relay.remote_mcp import default_remote_mcp_cache_path
 
 
+@pytest.mark.parametrize("profile", ["", " ares", "ares ", ".", "..", "a/res", "a\\res"])
+def test_cluster_definition_rejects_unsafe_jarvis_graph_profile(profile: str) -> None:
+    """A profile is one explicit JARVIS catalog key, never a relay-owned path."""
+    with pytest.raises(ValueError, match="safe exact JARVIS profile"):
+        ClusterDefinition(
+            name="cluster-a",
+            ssh_host="cluster-a",
+            jarvis_resource_graph_profile=profile,
+        )
+
+
+def test_cluster_definition_requires_profile_for_graph_build_fallback() -> None:
+    """An operator cannot enable an unscoped hardware-discovery fallback."""
+    with pytest.raises(ValueError, match="requires jarvis_resource_graph_profile"):
+        ClusterDefinition(
+            name="cluster-a",
+            ssh_host="cluster-a",
+            allow_jarvis_resource_graph_build=True,
+        )
+
+
 def test_registry_and_schema_cache_defaults_are_absolute_and_stable(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

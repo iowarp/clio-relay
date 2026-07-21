@@ -8,7 +8,7 @@
 
 It is a piece of the federation layer for [`clio-agent`](https://github.com/iowarp/clio-agent): a local CLIO experience can delegate work to a remote machine, keep observing it, detach, reconnect, and clean up after itself. The project is also designed for use outside CLIO. Any client that can call the CLI, HTTP API, or MCP tools can use the same relay model.
 
-> Version `1.4.12` uses a release-first patch process. A maintainer builds the
+> Version `1.4.13` uses a release-first patch process. A maintainer builds the
 > wheel and source distribution once, attaches those exact bytes and their
 > checksums to a GitHub Release, and publishes the release immediately. Tag
 > regression jobs and the trusted PyPI upload then run asynchronously; they do
@@ -55,7 +55,8 @@ Add a cluster. The cluster name and agent executable are local configuration.
 
 ```powershell
 clio-relay cluster add --name my-cluster --ssh-host my-cluster-login --agent-adapter exec --agent-bin agent
-clio-relay cluster bootstrap --cluster my-cluster
+$RelayWheelSha256 = "REPLACE_WITH_SHA256_FROM_THE_RELEASE"
+clio-relay cluster bootstrap --cluster my-cluster --relay-artifact-sha256 $RelayWheelSha256
 clio-relay cluster install-endpoint-service --cluster my-cluster --concurrency 4 --kind-concurrency remote_agent=2 --kind-concurrency mcp_call=1 --start --enable
 ```
 
@@ -197,6 +198,12 @@ clio-relay session status --cluster my-cluster --session-id desktop-session
 clio-relay session detach --cluster my-cluster --session-id desktop-session
 clio-relay session teardown --cluster my-cluster --session-id desktop-session
 ```
+
+Automation that must recover an interrupted start should persist the JSON from
+`session plan-start`, invoke `session start --json` with those exact selectors,
+and query the returned current-transition `status_selector`. Per-observation
+transport deadlines never imply terminal failure, and session lifecycle operations
+never cancel or time out queued scheduler/JARVIS jobs.
 
 Use `session teardown --stop-worker` only when the user chooses to clean up the persistent remote worker too. Teardown keeps relay and scheduler jobs running without prompting. Use `--cancel-jobs` only for an explicit user choice, and add `--cancel-scheduler-jobs` only when the scheduler allocation should also be canceled. The JSON result identifies verified ownership and any residual resources.
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -59,22 +60,24 @@ def test_managed_bootstrap_fences_worker_around_migration() -> None:
     relay_replace = "uv tool install --force --python 3.12 --no-config"
     migrate = "clio-relay init --migrate-legacy-output"
     restart = 'systemctl --user "$CLIO_RELAY_ENDPOINT_ACTIVATION_ACTION" --no-block'
-    first_proof = script.index(writer_proof)
-    second_proof = script.index(writer_proof, first_proof + 1)
-    relay_replacement = script.rindex(relay_replace)
-    assert f"WORKER_SERVICE_NAME={service_name}" in script
-    assert script.index(stop) < first_proof < script.index(install)
-    assert script.index(install) < relay_replacement < second_proof
+    full = script[script.rindex("bootstrap_journal_action create") :]
+    first_proof = full.index(writer_proof)
+    second_proof = full.index(writer_proof, first_proof + 1)
+    relay_replacement = full.index(relay_replace)
+    assert f"WORKER_SERVICE_NAME={service_name}" in full
+    assert full.index(stop) < first_proof < full.index(install)
+    assert full.index(install) < relay_replacement < second_proof
     assert (
         second_proof
-        < script.index(migrate)
-        < script.rindex("if ! bootstrap_bounded_worker_restart; then")
+        < full.index(migrate)
+        < full.rindex("if ! bootstrap_bounded_worker_restart; then")
     )
     assert restart in script
     assert '"$CLIO_RELAY_ENDPOINT_SERVICE_NAME"' in script
     assert "WORKER_WRITER_PROOF=1" in script
-    assert 'exec 9>"$HOME/.local/share/clio-relay/bootstrap.lock"' in script
-    assert "if ! flock -n 9; then" in script
+    assert 'environment["CLIO_RELAY_BOOTSTRAP_LOCK_FD"] = "9"' in script
+    assert "flags |= os.O_NOFOLLOW" in script
+    assert "fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)" in script
     assert 'exec 8<>"$WORKER_LIFETIME_LOCK_PATH"' in script
     assert "WORKER_LIFETIME_GUARD_FD=8" in script
     assert 'exec 9<>"$WORKER_LIFETIME_LOCK_PATH"' not in script
@@ -828,7 +831,10 @@ def test_bootstrap_over_ssh_forwards_configured_data_directories(
         assert source_root == tmp_path
         assert relay_wheel is None
         archive.write_bytes(b"archive")
-        return BootstrapArchive(archive=archive, install_spec="clio-relay==1.0.0")
+        return BootstrapArchive(
+            archive=archive,
+            install_spec=f"clio-relay=={bootstrap.__version__}",
+        )
 
     def fake_render_linux_user_bootstrap_script(**kwargs: object) -> str:
         captured.update(kwargs)
@@ -858,11 +864,12 @@ def test_bootstrap_over_ssh_forwards_configured_data_directories(
         timeout_seconds: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         del timeout_seconds
-        stdout = (
-            json.dumps(receipt)
-            if command[-2:] == ["cat", "$HOME/.local/share/clio-relay/bootstrap-receipt.json"]
-            else ""
-        )
+        if command[0] == "ssh" and "bootstrap-inspect" in command[-1]:
+            stdout = "bootstrap_preflight_unsupported=not_installed\n"
+        elif command[0] == "ssh" and command[-2].endswith("bash"):
+            stdout = "bootstrap_receipt_json=" + json.dumps(receipt) + "\n"
+        else:
+            stdout = ""
         return subprocess.CompletedProcess(command, 0, stdout, "")
 
     monkeypatch.setattr(bootstrap, "create_bootstrap_archive", fake_create_bootstrap_archive)
@@ -872,6 +879,12 @@ def test_bootstrap_over_ssh_forwards_configured_data_directories(
         fake_render_linux_user_bootstrap_script,
     )
     monkeypatch.setattr(bootstrap, "_run", fake_run)
+    monkeypatch.setattr(bootstrap, "_validate_bootstrap_receipt", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        bootstrap,
+        "_verify_persistent_bootstrap_receipt",
+        lambda **_kwargs: None,
+    )
     monkeypatch.setattr(bootstrap, "uuid4", lambda: SimpleNamespace(hex="paths"))
 
     def fake_which(executable: str) -> str:
@@ -886,11 +899,14 @@ def test_bootstrap_over_ssh_forwards_configured_data_directories(
         cluster="custom",
         core_dir="$HOME/custom/core",
         spool_dir="/srv/custom/spool",
+        relay_artifact_sha256="a" * 64,
+        jarvis_resource_graph_profile="test-profile",
     )
 
     assert captured["cluster"] == "custom"
     assert captured["core_dir"] == "$HOME/custom/core"
     assert captured["spool_dir"] == "/srv/custom/spool"
+    assert captured["jarvis_resource_graph_profile"] == "test-profile"
 
 
 def test_cluster_bootstrap_cli_uses_configured_data_directories(
@@ -944,6 +960,8 @@ def test_cluster_bootstrap_cli_uses_configured_data_directories(
             "custom",
             "--relay-wheel",
             str(wheel),
+            "--relay-artifact-sha256",
+            hashlib.sha256(b"wheel").hexdigest(),
         ],
     )
 
@@ -951,3 +969,4 @@ def test_cluster_bootstrap_cli_uses_configured_data_directories(
     assert captured["cluster"] == "custom"
     assert captured["core_dir"] == "$HOME/operator core"
     assert captured["spool_dir"] == "/srv/operator spool"
+    assert captured["relay_artifact_sha256"] == hashlib.sha256(b"wheel").hexdigest()
