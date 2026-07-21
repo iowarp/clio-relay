@@ -30,6 +30,8 @@ from packaging.version import InvalidVersion, Version
 
 from clio_relay import __version__
 from clio_relay.bootstrap_reconcile import (
+    LEGACY_MANAGED_JARVIS_REPO_PATH,
+    MANAGED_JARVIS_REPO_PATH,
     BootstrapDesiredState,
     validate_jarvis_builtin_result,
 )
@@ -3214,7 +3216,7 @@ def _validate_bootstrap_receipt(
             or not _is_sha256_value(typed_generation.get("previous"))
         ):
             raise RelayError("bootstrap managed JARVIS binding repair is invalid")
-        managed_suffix = "/.local/share/clio-relay/managed-jarvis-repo"
+        managed_suffix = MANAGED_JARVIS_REPO_PATH.removeprefix("~")
         if not managed_repo.endswith(managed_suffix):
             raise RelayError("bootstrap managed JARVIS binding repair is invalid")
         remote_home = managed_repo[: -len(managed_suffix)]
@@ -3222,6 +3224,15 @@ def _validate_bootstrap_receipt(
             remote_home + "/.local/share/clio-relay/current/source/jarvis-packages/clio_relay"
         )
         expected_previous = remote_home + "/.local/src/clio-relay/jarvis-packages/clio_relay"
+        expected_legacy = remote_home + LEGACY_MANAGED_JARVIS_REPO_PATH.removeprefix("~")
+        typed_removed_repositories = cast(list[object], removed_repositories)
+        removed_repositories_are_proven = bool(
+            all(isinstance(value, str) for value in typed_removed_repositories)
+            and typed_removed_repositories
+            == sorted(set(cast(list[str], typed_removed_repositories)))
+            and set(cast(list[str], typed_removed_repositories))
+            <= {expected_previous, expected_legacy}
+        )
         repository_action = repository_update.get("action")
         if binding.get("target") != expected_target:
             raise RelayError("bootstrap managed JARVIS binding repair is invalid")
@@ -3236,7 +3247,7 @@ def _validate_bootstrap_receipt(
             if (
                 typed_jarvis_preservation.get("repositories_byte_identical") is not False
                 or added_repositories not in ([], [managed_repo])
-                or removed_repositories not in ([], [expected_previous])
+                or not removed_repositories_are_proven
                 or (not added_repositories and not removed_repositories)
             ):
                 raise RelayError("bootstrap managed JARVIS repository repair is invalid")
@@ -3300,7 +3311,7 @@ def _validate_bootstrap_receipt(
             or binding.get("link") != managed_repo
         ):
             raise RelayError("staged reconcile repository binding is invalid")
-        managed_suffix = "/.local/share/clio-relay/managed-jarvis-repo"
+        managed_suffix = MANAGED_JARVIS_REPO_PATH.removeprefix("~")
         if not managed_repo.endswith(managed_suffix):
             raise RelayError("staged reconcile repository binding is invalid")
         remote_home = managed_repo[: -len(managed_suffix)]
@@ -3308,6 +3319,15 @@ def _validate_bootstrap_receipt(
             remote_home + "/.local/share/clio-relay/current/source/jarvis-packages/clio_relay"
         )
         expected_previous = remote_home + "/.local/src/clio-relay/jarvis-packages/clio_relay"
+        expected_legacy = remote_home + LEGACY_MANAGED_JARVIS_REPO_PATH.removeprefix("~")
+        typed_removed_repositories = cast(list[object], removed_repositories)
+        removed_repositories_are_proven = bool(
+            all(isinstance(value, str) for value in typed_removed_repositories)
+            and typed_removed_repositories
+            == sorted(set(cast(list[str], typed_removed_repositories)))
+            and set(cast(list[str], typed_removed_repositories))
+            <= {expected_previous, expected_legacy}
+        )
         repository_action = repository_update.get("action")
         if (
             binding.get("target") != expected_target
@@ -3326,8 +3346,8 @@ def _validate_bootstrap_receipt(
             if (
                 typed_jarvis_preservation.get("repositories_byte_identical") is not False
                 or added_repositories not in ([], [managed_repo])
-                or removed_repositories not in ([], [expected_previous])
-                or (not added_repositories and removed_repositories != [expected_previous])
+                or not removed_repositories_are_proven
+                or (not added_repositories and not removed_repositories)
             ):
                 raise RelayError("staged reconcile repository migration is invalid")
         else:  # pragma: no cover - rejected by the generic evidence contract above
@@ -3918,7 +3938,7 @@ bootstrap_verify_stable_activation_links() {{
   bootstrap_require_stable_link "$HOME/.local/bin/jarvis" \
     "$HOME/.local/share/clio-relay/current/bin/jarvis"
   bootstrap_require_stable_link \
-    "$HOME/.local/share/clio-relay/managed-jarvis-repo" \
+    "$HOME/.local/share/clio-relay/clio_relay" \
       "$HOME/.local/share/clio-relay/current/source/jarvis-packages/clio_relay"
 }}
 
@@ -6415,19 +6435,19 @@ __CLIO_RELAY_CANDIDATE_WHEEL_PATH__
       )"
       ;;
     clio-relay==*)
-      BOOTSTRAP_CANDIDATE_ARTIFACT="$BOOTSTRAP_PREPARING_ROOT/candidate-relay.whl"
-      timeout --signal=TERM --kill-after=5s 180 \
-        python3 -I - "$BOOTSTRAP_CANDIDATE_INSTALL_SPEC" \
-        "$BOOTSTRAP_CANDIDATE_ARTIFACT_SHA256" \
-        "$BOOTSTRAP_CANDIDATE_ARTIFACT" <<'__CLIO_RELAY_CANDIDATE_PYPI_WHEEL__'
+      BOOTSTRAP_CANDIDATE_ARTIFACT="$(
+        timeout --signal=TERM --kill-after=5s 180 \
+          python3 -I - "$BOOTSTRAP_CANDIDATE_INSTALL_SPEC" \
+          "$BOOTSTRAP_CANDIDATE_ARTIFACT_SHA256" \
+          "$BOOTSTRAP_PREPARING_ROOT" <<'__CLIO_RELAY_CANDIDATE_PYPI_WHEEL__'
 import hashlib
 import json
 import sys
-from pathlib import Path
-from urllib.parse import quote, urlsplit
+from pathlib import Path, PurePosixPath
+from urllib.parse import quote, unquote, urlsplit
 from urllib.request import urlopen
 
-specification, expected_sha256, destination_value = sys.argv[1:]
+specification, expected_sha256, destination_root_value = sys.argv[1:]
 version = specification.removeprefix("clio-relay==")
 if not version or specification != f"clio-relay=={{version}}":
     raise SystemExit("candidate PyPI install spec is not exact")
@@ -6450,6 +6470,14 @@ matches = [
 ]
 if len(matches) != 1:
     raise SystemExit("PyPI did not return the exact digest-pinned relay wheel")
+filename = matches[0].get("filename")
+if (
+    not isinstance(filename, str)
+    or not filename.endswith(".whl")
+    or Path(filename).name != filename
+    or any(character in filename for character in "\\x00\\r\\n")
+):
+    raise SystemExit("PyPI relay wheel filename is unsafe")
 url = matches[0].get("url")
 if not isinstance(url, str):
     raise SystemExit("PyPI relay wheel URL is missing")
@@ -6458,7 +6486,19 @@ if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswi
     ".pythonhosted.org"
 ):
     raise SystemExit("PyPI relay wheel URL has an unsupported origin")
-destination = Path(destination_value)
+if PurePosixPath(unquote(parsed.path)).name != filename:
+    raise SystemExit("PyPI relay wheel URL does not preserve its verified filename")
+destination_root = Path(destination_root_value)
+if (
+    not destination_root.is_absolute()
+    or destination_root.is_symlink()
+    or not destination_root.is_dir()
+):
+    raise SystemExit("candidate relay wheel destination root is unsafe")
+destination_root = destination_root.resolve(strict=True)
+destination = destination_root / filename
+if destination.parent != destination_root:
+    raise SystemExit("candidate relay wheel destination escaped its private root")
 digest = hashlib.sha256()
 size = 0
 with urlopen(url, timeout=60) as response, destination.open("xb") as stream:
@@ -6471,7 +6511,9 @@ with urlopen(url, timeout=60) as response, destination.open("xb") as stream:
 if size < 1 or digest.hexdigest() != expected_sha256:
     destination.unlink(missing_ok=True)
     raise SystemExit("downloaded candidate relay wheel did not match its digest")
+print(destination)
 __CLIO_RELAY_CANDIDATE_PYPI_WHEEL__
+      )"
       ;;
     *)
       echo "retained-state reconcile supports only an exact released relay wheel" >&2
@@ -6756,7 +6798,7 @@ for name, path, kind in (
         home / ".local/share/clio-relay/install-receipt.json",
         "symlink",
     ),
-    ("managed_repo", home / ".local/share/clio-relay/managed-jarvis-repo", "symlink"),
+    ("managed_repo", home / ".local/share/clio-relay/clio_relay", "symlink"),
     ("relay_launcher", home / ".local/bin/clio-relay", "symlink"),
     ("jarvis_launcher", home / ".local/bin/jarvis", "symlink"),
 ):
@@ -7513,7 +7555,7 @@ else
   JARVIS_GRAPH_ACTION="preserved"
   BOOTSTRAP_JARVIS_COMMANDS_JSON='[]'
 fi
-MANAGED_JARVIS_REPO="$HOME/.local/share/clio-relay/managed-jarvis-repo"
+MANAGED_JARVIS_REPO="$HOME/.local/share/clio-relay/clio_relay"
 MANAGED_JARVIS_REPO_TARGET="$HOME/.local/share/clio-relay/current/source/jarvis-packages/clio_relay"
 if [ -L "$MANAGED_JARVIS_REPO" ]; then
   if [ "$(readlink "$MANAGED_JARVIS_REPO")" != "$MANAGED_JARVIS_REPO_TARGET" ]; then
@@ -7529,6 +7571,7 @@ else
 fi
 export MANAGED_JARVIS_REPO JARVIS_REPOS_FILE
 "$RELAY_PROVIDER_PYTHON" - "$DEST/jarvis-packages/clio_relay" \
+  "$HOME/.local/share/clio-relay/managed-jarvis-repo" \
   <<'__CLIO_RELAY_JARVIS_REPO_RECONCILE__'
 import os
 import sys
@@ -7539,7 +7582,7 @@ from clio_relay.bootstrap_reconcile import reconcile_managed_jarvis_repository
 evidence = reconcile_managed_jarvis_repository(
     Path(os.environ["JARVIS_REPOS_FILE"]),
     Path(os.environ["MANAGED_JARVIS_REPO"]),
-    previous_managed_repos=(Path(sys.argv[1]),),
+    previous_managed_repos=(Path(sys.argv[1]), Path(sys.argv[2])),
 )
 print(f"jarvis_managed_repo={{evidence['action']}}")
 __CLIO_RELAY_JARVIS_REPO_RECONCILE__
@@ -7665,7 +7708,7 @@ BOOTSTRAP_ACTIVATION_IDENTITY="$(bootstrap_path_set_identity \
   "$HOME/.local/share/clio-relay/install-receipt.json" \
   "$HOME/.local/bin/clio-relay" \
   "$HOME/.local/bin/jarvis" \
-  "$HOME/.local/share/clio-relay/managed-jarvis-repo")"
+  "$HOME/.local/share/clio-relay/clio_relay")"
 bootstrap_journal_action phase "$BOOTSTRAP_TRANSACTION_JOURNAL" \
   generation_activated "$BOOTSTRAP_ACTIVATION_IDENTITY"
 bootstrap_journal_action advance "$BOOTSTRAP_TRANSACTION_JOURNAL" activated

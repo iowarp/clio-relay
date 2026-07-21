@@ -132,7 +132,7 @@ def _write_jarvis_state(home: Path, desired: BootstrapDesiredState) -> tuple[Pat
         ".local/share/clio-relay/jarvis-config",
         ".local/share/clio-relay/jarvis-private",
         ".local/share/clio-relay/jarvis-shared",
-        ".local/share/clio-relay/managed-jarvis-repo",
+        ".local/share/clio-relay/clio_relay",
     ):
         (home / relative).mkdir(parents=True)
     config = {
@@ -147,7 +147,7 @@ def _write_jarvis_state(home: Path, desired: BootstrapDesiredState) -> tuple[Pat
     repos_bytes = yaml.safe_dump(
         {
             "repos": [
-                str((home / ".local/share/clio-relay/managed-jarvis-repo").absolute()),
+                str((home / ".local/share/clio-relay/clio_relay").absolute()),
                 "/operator/clio_relay",
             ]
         },
@@ -292,7 +292,7 @@ def test_managed_repository_converges_home_alias_to_one_canonical_stable_path(
     lexical_home = tmp_path / "home-alias"
     _create_directory_alias(lexical_home, canonical_home)
     root, _config, _graph = _write_jarvis_state(lexical_home, desired)
-    managed = lexical_home / ".local/share/clio-relay/managed-jarvis-repo"
+    managed = lexical_home / ".local/share/clio-relay/clio_relay"
     previous = lexical_home / ".local/src/clio-relay/jarvis-packages/clio_relay"
     previous.mkdir(parents=True)
     operator = "/operator/clio_relay"
@@ -312,7 +312,7 @@ def test_managed_repository_converges_home_alias_to_one_canonical_stable_path(
         exchange_identity=desired.fingerprint,
     )
 
-    canonical_managed = str(canonical_home / ".local/share/clio-relay/managed-jarvis-repo")
+    canonical_managed = str(canonical_home / ".local/share/clio-relay/clio_relay")
     canonical_previous = str(canonical_home / ".local/src/clio-relay/jarvis-packages/clio_relay")
     assert yaml.safe_load(repos_file.read_text(encoding="utf-8"))["repos"] == [
         canonical_managed,
@@ -453,7 +453,7 @@ def test_first_legacy_upgrade_stages_an_unbound_relay_execution_runtime(
         frps_sha256=_digest(b"frps"),
     )
     _write_jarvis_state(tmp_path, desired)
-    (tmp_path / ".local/share/clio-relay/managed-jarvis-repo").rmdir()
+    (tmp_path / ".local/share/clio-relay/clio_relay").rmdir()
     managed_generation = "b" * 64 if relay_provider == "staged-candidate" else None
     execution_root = tmp_path / ".local/share/clio-relay/jarvis-venv"
     if managed_generation is not None:
@@ -485,7 +485,7 @@ def test_first_legacy_upgrade_stages_an_unbound_relay_execution_runtime(
                     kind="file_or_symlink",
                 ),
                 "managed_repo": BootstrapActivationPath(
-                    path=str(home / ".local/share/clio-relay/managed-jarvis-repo"),
+                    path=str(home / ".local/share/clio-relay/clio_relay"),
                     kind="symlink",
                 ),
             }
@@ -972,7 +972,7 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
         }
     )
     jarvis_root, _config_before, _graph_before = _write_jarvis_state(tmp_path, desired)
-    (tmp_path / ".local/share/clio-relay/managed-jarvis-repo").rmdir()
+    (tmp_path / ".local/share/clio-relay/clio_relay").rmdir()
     (jarvis_root / "repos.yaml").write_text(
         yaml.safe_dump({"repos": ["/operator/clio_relay"]}, sort_keys=False),
         encoding="utf-8",
@@ -1185,13 +1185,38 @@ def test_existing_operator_jarvis_roots_are_adopted_without_mutation(tmp_path: P
     assert (root / "resource_graph.yaml").read_bytes() == graph_before
 
 
-def test_managed_repo_reconcile_preserves_same_name_operator_repository(tmp_path: Path) -> None:
-    repos_file = tmp_path / "repos.yaml"
+def test_managed_repo_migration_preserves_operator_repo_and_resolves_jarvis_package(
+    tmp_path: Path,
+) -> None:
+    """The stable basename satisfies JARVIS while migration removes only relay's old path."""
+    jarvis_root = tmp_path / "jarvis-root"
+    jarvis_root.mkdir()
+    repos_file = jarvis_root / "repos.yaml"
     operator_repo = tmp_path / "operator/clio_relay"
-    previous_managed = tmp_path / "legacy/clio_relay"
-    managed_repo = tmp_path / "relay/managed-jarvis-repo"
+    previous_managed = tmp_path / ".local/share/clio-relay/managed-jarvis-repo"
+    managed_repo = tmp_path / ".local/share/clio-relay/clio_relay"
+    operator_repo.mkdir(parents=True)
     previous_managed.parent.mkdir(parents=True)
-    managed_repo.parent.mkdir(parents=True)
+    shutil.copytree(Path("jarvis-packages/clio_relay"), managed_repo)
+    for name in ("config", "private", "shared"):
+        (tmp_path / name).mkdir()
+    (jarvis_root / "jarvis_config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "config_dir": str((tmp_path / "config").resolve()),
+                "private_dir": str((tmp_path / "private").resolve()),
+                "shared_dir": str((tmp_path / "shared").resolve()),
+                "current_pipeline": None,
+                "hostfile": None,
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (jarvis_root / "resource_graph.yaml").write_text(
+        yaml.safe_dump({"storage": {}, "network": {}}, sort_keys=False),
+        encoding="utf-8",
+    )
     repos_file.write_text(
         yaml.safe_dump(
             {
@@ -1218,6 +1243,12 @@ def test_managed_repo_reconcile_preserves_same_name_operator_repository(tmp_path
         str(operator_repo.absolute()),
     ]
     assert document["operator_extension"] == {"preserve": True}
+    registered_repo = next(
+        Path(value) for value in document["repos"] if Path(value).name == "clio_relay"
+    )
+    package_source = registered_repo / registered_repo.name / "mcp_call/pkg.py"
+    assert registered_repo == managed_repo.absolute()
+    assert package_source.is_file()
     before = repos_file.read_bytes()
     reused = reconcile_managed_jarvis_repository(repos_file, managed_repo)
     assert reused["action"] == "reused"
@@ -1230,7 +1261,7 @@ def test_managed_repo_reconcile_refuses_concurrent_operator_edit(
 ) -> None:
     repos_file = tmp_path / "repos.yaml"
     repos_file.write_text("repos:\n  - /operator/original\n", encoding="utf-8")
-    managed_repo = tmp_path / "relay/managed-jarvis-repo"
+    managed_repo = tmp_path / "relay/clio_relay"
     managed_repo.parent.mkdir(parents=True)
     operator_update = b"repos:\n  - /operator/concurrent\n"
     original_read = bootstrap_reconcile_module._read_regular_bounded_with_identity  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
@@ -1266,7 +1297,7 @@ def test_managed_repo_reconcile_refuses_concurrent_operator_edit(
 def test_managed_repo_reconcile_cleans_a_proven_previous_registration(tmp_path: Path) -> None:
     """An existing managed alias does not prevent exact legacy-path cleanup."""
     repos_file = tmp_path / "repos.yaml"
-    managed = tmp_path / "managed-jarvis-repo"
+    managed = tmp_path / "clio_relay"
     previous = tmp_path / "legacy/clio_relay"
     operator = tmp_path / "operator/clio_relay"
     repos_file.write_text(
@@ -1309,7 +1340,7 @@ def test_managed_repo_atomic_exchange_preserves_or_recovers_racing_state(
     repos_file = tmp_path / "repos.yaml"
     repos_file.write_text("repos:\n  - /operator/original\n", encoding="utf-8")
     operator_update = b"repos:\n  - /operator/concurrent\n"
-    managed = tmp_path / "managed-jarvis-repo"
+    managed = tmp_path / "clio_relay"
     original_exchange = bootstrap_reconcile_module._atomic_exchange_paths  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     exchanged = False
 
@@ -1625,7 +1656,7 @@ def test_staged_activation_adopts_legacy_paths_idempotently(
         share / "install-receipt.json": share / "current/install-receipt.json",
         bin_dir / "clio-relay": share / "current/bin/clio-relay",
         bin_dir / "jarvis": share / "current/bin/jarvis",
-        share / "managed-jarvis-repo": share / "current/source/jarvis-packages/clio_relay",
+        share / "clio_relay": share / "current/source/jarvis-packages/clio_relay",
     }
     assert {path: bootstrap_reconcile_module.os.readlink(path) for path in expected_targets} == {
         path: str(target) for path, target in expected_targets.items()
@@ -1659,7 +1690,7 @@ def test_staged_activation_rejects_manifest_path_substitution_before_writes(
             kind="file_or_symlink",
         ),
         "managed_repo": BootstrapActivationPath(
-            path=str(share / "managed-jarvis-repo"),
+            path=str(share / "clio_relay"),
             kind="symlink",
         ),
     }
@@ -1877,7 +1908,7 @@ def test_staged_activation_resumes_across_repository_crash_boundaries(
         simulated_stable_link,
     )
     original_readlink = os.readlink
-    managed_repo = tmp_path / ".local/share/clio-relay/managed-jarvis-repo"
+    managed_repo = tmp_path / ".local/share/clio-relay/clio_relay"
     managed_target = tmp_path / ".local/share/clio-relay/current/source/jarvis-packages/clio_relay"
 
     def simulated_readlink(path: Path | str) -> str:
@@ -1961,7 +1992,7 @@ def test_managed_repo_repair_refuses_unproven_broken_link(
     expected = generation / "source/jarvis-packages/clio_relay"
     expected.mkdir(parents=True)
     current = tmp_path / ".local/share/clio-relay/current"
-    managed = tmp_path / ".local/share/clio-relay/managed-jarvis-repo"
+    managed = tmp_path / ".local/share/clio-relay/clio_relay"
     original_lstat = Path.lstat
     original_readlink = os.readlink
     original_resolve = Path.resolve
