@@ -64,7 +64,10 @@ FRPS_LINUX_AMD64_SHA256 = "68d2908bb73fe7a03c29d9227d2acc2104bff3fea6b1cece0b838
 FRPC_WINDOWS_AMD64_SHA256 = "1d1c4f988b1808bb458a4ba38f00359052d14636023a504520e0afed127d636d"
 FRPS_WINDOWS_AMD64_SHA256 = "bd463ef89370abc6973c86258256fa65776baa5f515ef91ebeabd6070b92e229"
 UV_VERSION = "0.11.28"
-UV_LINUX_AMD64_SHA256 = "e490a6464492183c5d4534a5527fb4440f7f2bb2f228162ad7e4afe076dc0224"
+UV_LINUX_AMD64_ARCHIVE_SHA256 = "e490a6464492183c5d4534a5527fb4440f7f2bb2f228162ad7e4afe076dc0224"
+UV_LINUX_AMD64_EXECUTABLE_SHA256 = (
+    "1cb9cd0a1749debf6049d7d2bb933882cc52d81016326ee6d99a786d6c988b03"
+)
 JARVIS_UTIL_COMMIT = "c91bfdc9bba802e4b03bfb1babe614ffa3e09644"
 JARVIS_CD_VERSION = "1.4.8"
 JARVIS_CD_WHEEL_FILENAME = f"jarvis_cd-{JARVIS_CD_VERSION}-py3-none-any.whl"
@@ -756,7 +759,7 @@ def _bootstrap_desired_state(
         frpc_sha256=FRPC_LINUX_AMD64_SHA256,
         frps_sha256=FRPS_LINUX_AMD64_SHA256,
         uv_version=UV_VERSION,
-        uv_sha256=UV_LINUX_AMD64_SHA256,
+        uv_sha256=UV_LINUX_AMD64_EXECUTABLE_SHA256,
         jarvis_util_commit=JARVIS_UTIL_COMMIT,
         jarvis_cd_version=JARVIS_CD_VERSION,
         jarvis_cd_wheel_url=JARVIS_CD_WHEEL_URL,
@@ -1689,14 +1692,54 @@ def _validate_bootstrap_receipt(
             raise RelayError("staged reconcile reported JARVIS initialization")
         if jarvis_graph_action != "preserved" or command_count != 0:
             raise RelayError("staged reconcile reported JARVIS commands")
-        if transaction_mode == "component-upgrade" and (
-            typed_jarvis_preservation.get("config_byte_identical") is not True
-            or typed_jarvis_preservation.get("resource_graph_byte_identical") is not True
-            or typed_jarvis_preservation.get("repositories_byte_identical") is not True
-            or binding.get("link_action") != "reused"
-            or repository_update.get("action") != "reused"
-        ):
-            raise RelayError("component upgrade did not preserve existing JARVIS state")
+        if transaction_mode == "component-upgrade":
+            if (
+                typed_jarvis_preservation.get("config_byte_identical") is not True
+                or typed_jarvis_preservation.get("resource_graph_byte_identical") is not True
+                or binding.get("link_action") != "reused"
+            ):
+                raise RelayError("component upgrade did not preserve existing JARVIS state")
+            managed_repo = repository_update.get("managed_repo")
+            added_repositories = repository_update.get("added_managed_repos")
+            removed_repositories = repository_update.get("removed_previous_managed_repos")
+            if (
+                not isinstance(managed_repo, str)
+                or not PurePosixPath(managed_repo).is_absolute()
+                or any(character in managed_repo for character in "\x00\r\n")
+                or binding.get("link") != managed_repo
+            ):
+                raise RelayError("component upgrade repository binding is invalid")
+            managed_suffix = "/.local/share/clio-relay/managed-jarvis-repo"
+            if not managed_repo.endswith(managed_suffix):
+                raise RelayError("component upgrade repository binding is invalid")
+            remote_home = managed_repo[: -len(managed_suffix)]
+            expected_target = (
+                remote_home + "/.local/share/clio-relay/current/source/jarvis-packages/clio_relay"
+            )
+            expected_previous = remote_home + "/.local/src/clio-relay/jarvis-packages/clio_relay"
+            repository_action = repository_update.get("action")
+            if (
+                binding.get("target") != expected_target
+                or not isinstance(added_repositories, list)
+                or not isinstance(removed_repositories, list)
+            ):
+                raise RelayError("component upgrade repository binding is invalid")
+            if repository_action == "reused":
+                if (
+                    typed_jarvis_preservation.get("repositories_byte_identical") is not True
+                    or added_repositories
+                    or removed_repositories
+                ):
+                    raise RelayError("component upgrade repository reuse is invalid")
+            elif repository_action == "updated":
+                if (
+                    typed_jarvis_preservation.get("repositories_byte_identical") is not False
+                    or added_repositories != [managed_repo]
+                    or removed_repositories not in ([], [expected_previous])
+                ):
+                    raise RelayError("component upgrade repository migration is invalid")
+            else:  # pragma: no cover - rejected by the generic evidence contract above
+                raise RelayError("component upgrade repository action is invalid")
         if payload_count != 2 or payload_bytes <= 0:
             raise RelayError("staged reconcile omitted its transferred payload evidence")
     elif outcome == "full":
@@ -2901,8 +2944,6 @@ __CLIO_RELAY_GENERATION_REPO__
   export BOOTSTRAP_JARVIS_REPO_RECONCILIATION
   if [ "$BOOTSTRAP_PLAN_MODE" = "component-upgrade" ]; then
     echo "$BOOTSTRAP_JARVIS_CONFIG_SHA256_BEFORE *$JARVIS_CONFIG_FILE" | \
-      sha256sum --check --strict -
-    echo "$BOOTSTRAP_JARVIS_REPOS_SHA256_BEFORE *$JARVIS_REPOS_FILE" | \
       sha256sum --check --strict -
     echo "$BOOTSTRAP_JARVIS_GRAPH_SHA256_BEFORE *$JARVIS_GRAPH_FILE" | \
       sha256sum --check --strict -
@@ -4310,7 +4351,7 @@ if classify(uv) is None and classify(uvx) is None:
     owned["uv"] = {{"path": str(uv), "kind": "file"}}
     owned["uvx"] = {{"path": str(uvx), "kind": "file"}}
 else:
-    require_regular_executable(uv, "{UV_LINUX_AMD64_SHA256}")
+    require_regular_executable(uv, "{UV_LINUX_AMD64_EXECUTABLE_SHA256}")
     require_regular_executable(uvx)
     completed = subprocess.run(
         [str(uv), "--version"],
@@ -4454,13 +4495,16 @@ if [ ! -x "$HOME/.local/bin/frpc" ] \
 fi
 
 UV_VERSION="{UV_VERSION}"
-UV_SHA256="{UV_LINUX_AMD64_SHA256}"
+UV_ARCHIVE_SHA256="{UV_LINUX_AMD64_ARCHIVE_SHA256}"
+UV_EXECUTABLE_SHA256="{UV_LINUX_AMD64_EXECUTABLE_SHA256}"
 UV_ARCHIVE="uv-x86_64-unknown-linux-gnu.tar.gz"
 if [ ! -x "$HOME/.local/bin/uv" ] \
-  || [ "$("$HOME/.local/bin/uv" --version | awk '{{print $1 " " $2}}')" != "uv $UV_VERSION" ]; then
+  || [ "$("$HOME/.local/bin/uv" --version | awk '{{print $1 " " $2}}')" != "uv $UV_VERSION" ] \
+  || ! echo "$UV_EXECUTABLE_SHA256 *$HOME/.local/bin/uv" | \
+       sha256sum --check --status -; then
   curl -L --fail --retry 3 -o "$UV_ARCHIVE" \
     "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/$UV_ARCHIVE"
-  echo "$UV_SHA256 *$UV_ARCHIVE" | sha256sum --check --strict -
+  echo "$UV_ARCHIVE_SHA256 *$UV_ARCHIVE" | sha256sum --check --strict -
   tar -xzf "$UV_ARCHIVE"
   install -m 0755 "uv-x86_64-unknown-linux-gnu/uv" \
     "$BOOTSTRAP_TRANSACTION_ROOT/downloads/uv.install"
@@ -4470,6 +4514,7 @@ if [ ! -x "$HOME/.local/bin/uv" ] \
     "$BOOTSTRAP_TRANSACTION_ROOT/downloads/uv.install" 0755
   bootstrap_journal_action copy-owned "$BOOTSTRAP_TRANSACTION_JOURNAL" uvx \
     "$BOOTSTRAP_TRANSACTION_ROOT/downloads/uvx.install" 0755
+  echo "$UV_EXECUTABLE_SHA256 *$HOME/.local/bin/uv" | sha256sum --check --strict -
   BOOTSTRAP_UV_DOWNLOADED=1
 fi
 bootstrap_journal_action mkdir-owned "$BOOTSTRAP_TRANSACTION_JOURNAL" uv_python

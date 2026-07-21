@@ -931,6 +931,7 @@ def plan_bootstrap_reconcile(
     resolved_home = (home or Path.home()).resolve()
     reasons: list[str] = []
     upgrade_reasons: list[str] = []
+    upgrade_components: set[str] = set()
     reusable_paths: dict[str, str] = {}
     receipt_path = resolved_home / ".local/share/clio-relay/install-receipt.json"
     try:
@@ -973,6 +974,7 @@ def plan_bootstrap_reconcile(
             reason = f"{component} version requires a staged upgrade"
             reasons.append(reason)
             upgrade_reasons.append(reason)
+            upgrade_components.add(component)
             continue
         if not isinstance(raw_artifact, dict):
             reasons.append(f"{component} artifact identity is missing")
@@ -1006,18 +1008,19 @@ def plan_bootstrap_reconcile(
             reasons=reasons,
         )
 
-    clio_kit_runtime = runtime.get("clio-kit")
-    if not isinstance(clio_kit_runtime, dict) or any(
-        cast(dict[str, object], clio_kit_runtime).get(flag) is not True
-        for flag in (
-            "artifact_identity_verified",
-            "command_matches_receipt",
-            "locked_server_runtime_verified",
-            "native_execution_capability_verified",
-            "persistent_tool_verified",
-        )
-    ):
-        reasons.append("clio-kit live runtime is not reusable")
+    if "clio-kit" not in upgrade_components:
+        clio_kit_runtime = runtime.get("clio-kit")
+        if not isinstance(clio_kit_runtime, dict) or any(
+            cast(dict[str, object], clio_kit_runtime).get(flag) is not True
+            for flag in (
+                "artifact_identity_verified",
+                "command_matches_receipt",
+                "locked_server_runtime_verified",
+                "native_execution_capability_verified",
+                "persistent_tool_verified",
+            )
+        ):
+            reasons.append("clio-kit live runtime is not reusable")
     jarvis_runtime = runtime.get("jarvis-cd")
     if (
         not isinstance(jarvis_runtime, dict)
@@ -1046,8 +1049,6 @@ def plan_bootstrap_reconcile(
         ) from exc
     if not jarvis_state.initialized:
         reasons.append("JARVIS is not initialized")
-    elif upgrade_reasons and not jarvis_state.managed_repo_registered:
-        reasons.append("JARVIS managed repository binding requires separate reconciliation")
     legacy_python_text = reusable_paths.get("jarvis-cd_execution_interpreter")
     legacy_executable_text = reusable_paths.get("jarvis-cd_jarvis_executable")
     legacy_python = (
@@ -1062,18 +1063,56 @@ def plan_bootstrap_reconcile(
         if legacy_executable_text is not None
         else legacy_python.parent / ("jarvis.exe" if os.name == "nt" else "jarvis")
     )
-    legacy_venv = legacy_python.parent.parent
-    if (
-        legacy_venv.is_symlink()
-        or not legacy_python.is_file()
-        or not legacy_executable.is_file()
-        or legacy_executable.parent != legacy_python.parent
-    ):
+    lexical_legacy_venv = legacy_python.parent.parent
+    supported_legacy_venv = resolved_home / ".local/share/clio-relay/jarvis-venv"
+    expected_legacy_executable = legacy_python.parent / (
+        "jarvis.exe" if os.name == "nt" else "jarvis"
+    )
+    resolved_legacy_executable: Path | None = None
+    try:
+        legacy_python_before = legacy_python.lstat()
+        legacy_executable_before = legacy_executable.lstat()
+        expected_executable_before = expected_legacy_executable.lstat()
+        resolved_legacy_venv = lexical_legacy_venv.resolve(strict=True)
+        resolved_supported_venv = supported_legacy_venv.resolve(strict=True)
+        resolved_legacy_python_target = legacy_python.resolve(strict=True)
+        legacy_python_target_before = resolved_legacy_python_target.lstat()
+        resolved_legacy_executable = legacy_executable.resolve(strict=True)
+        resolved_expected_executable = expected_legacy_executable.resolve(strict=True)
+        executable_target_before = resolved_expected_executable.lstat()
+        executable_payload, _executable_target_identity = _read_regular_bounded_with_identity(
+            resolved_expected_executable,
+            maximum=1024 * 1024,
+        )
+        legacy_boundary_reusable = (
+            lexical_legacy_venv.is_absolute()
+            and ".." not in lexical_legacy_venv.parts
+            and not lexical_legacy_venv.is_symlink()
+            and resolved_legacy_venv == resolved_supported_venv
+            and legacy_python.is_file()
+            and expected_legacy_executable.is_file()
+            and bool(executable_payload)
+            and os.access(legacy_python, os.X_OK)
+            and os.access(expected_legacy_executable, os.X_OK)
+            and resolved_legacy_executable == resolved_expected_executable
+            and _stat_identity(legacy_python.lstat()) == _stat_identity(legacy_python_before)
+            and _stat_identity(legacy_executable.lstat())
+            == _stat_identity(legacy_executable_before)
+            and _stat_identity(expected_legacy_executable.lstat())
+            == _stat_identity(expected_executable_before)
+            and _stat_identity(resolved_legacy_python_target.lstat())
+            == _stat_identity(legacy_python_target_before)
+            and _stat_identity(resolved_expected_executable.lstat())
+            == _stat_identity(executable_target_before)
+        )
+    except (ConfigurationError, OSError, RuntimeError, ValueError):
+        legacy_boundary_reusable = False
+    if not legacy_boundary_reusable or resolved_legacy_executable is None:
         reasons.append("legacy JARVIS execution environment is not reusable")
     else:
-        reusable_paths["jarvis_execution_environment"] = str(legacy_venv.resolve())
-        reusable_paths["jarvis_execution_python"] = str(legacy_python.resolve())
-        reusable_paths["jarvis_execution_executable"] = str(legacy_executable.resolve())
+        reusable_paths["jarvis_execution_environment"] = str(lexical_legacy_venv)
+        reusable_paths["jarvis_execution_python"] = str(legacy_python)
+        reusable_paths["jarvis_execution_executable"] = str(expected_legacy_executable)
 
     if reasons:
         if upgrade_reasons and reasons == upgrade_reasons:
@@ -2159,13 +2198,14 @@ def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]
 def _cross_handle_stat_identity(value: os.stat_result) -> tuple[int, ...]:
     """Return fields stable across descriptor/path stat handles on this platform."""
     if os.name == "nt":
-        # Windows may report ctime_ns with different rounding through fstat and
-        # lstat for the same open file. Device/inode still bind the file object;
-        # size and mtime retain change detection across the two handles.
+        # Windows may report ctime_ns with different rounding and synthesize
+        # execute permission bits from a path's extension only for lstat.
+        # Device/inode and file type still bind the file object; size and mtime
+        # retain change detection across descriptor and path handles.
         return (
             value.st_dev,
             value.st_ino,
-            value.st_mode,
+            stat.S_IFMT(value.st_mode),
             value.st_size,
             value.st_mtime_ns,
         )

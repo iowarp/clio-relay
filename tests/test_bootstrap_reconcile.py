@@ -392,13 +392,15 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A released runtime upgrade preserves state instead of falling into fresh bootstrap."""
+    """The exact legacy Ares layout enters the fenced staged-upgrade path."""
     bin_dir = tmp_path / ".local/bin"
     bin_dir.mkdir(parents=True)
     for name, content in (("uv", b"uv"), ("frpc", b"frpc"), ("frps", b"frps")):
         path = bin_dir / name
         path.write_bytes(content)
         path.chmod(0o755)
+    clio_kit_wheel = tmp_path / "clio_kit-2.5.23-py3-none-any.whl"
+    clio_kit_wheel.write_bytes(b"clio-kit-2.5.23")
     desired = _desired(
         uv_sha256=_digest(b"uv"),
         frpc_sha256=_digest(b"frpc"),
@@ -414,9 +416,15 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
             "jarvis_cd_wheel_sha256": (
                 "ebf5e5f375b921f20c79075d461926431a5a017ca8b45e598878a89b229b3935"
             ),
+            "clio_kit_version": "2.5.23",
+            "clio_kit_artifact_sha256": _digest(b"clio-kit-2.5.23"),
         }
     )
-    _write_jarvis_state(tmp_path, desired)
+    jarvis_root, _config_before, _graph_before = _write_jarvis_state(tmp_path, desired)
+    (jarvis_root / "repos.yaml").write_text(
+        yaml.safe_dump({"repos": ["/operator/clio_relay"]}, sort_keys=False),
+        encoding="utf-8",
+    )
     legacy_python = (
         tmp_path
         / ".local/share/clio-relay/jarvis-venv"
@@ -425,9 +433,26 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
     legacy_python.parent.mkdir(parents=True)
     legacy_python.write_bytes(b"python")
     legacy_python.chmod(0o755)
-    legacy_jarvis = legacy_python.parent / ("jarvis.exe" if os.name == "nt" else "jarvis")
-    legacy_jarvis.write_bytes(b"jarvis")
+    base_python = tmp_path / "uv-python" / legacy_python.name
+    base_python.parent.mkdir()
+    base_python.write_bytes(b"base-python")
+    base_python.chmod(0o755)
+    legacy_jarvis_target = legacy_python.parent / ("jarvis.exe" if os.name == "nt" else "jarvis")
+    legacy_jarvis_target.write_bytes(b"jarvis")
+    legacy_jarvis_target.chmod(0o755)
+    legacy_jarvis = bin_dir / legacy_jarvis_target.name
+    legacy_jarvis.write_bytes(b"stable-wrapper-link")
     legacy_jarvis.chmod(0o755)
+    resolve_path = Path.resolve
+
+    def resolve_stable_wrapper(path: Path, strict: bool = False) -> Path:
+        if path == legacy_python:
+            return resolve_path(base_python, strict=strict)
+        if path == legacy_jarvis:
+            return resolve_path(legacy_jarvis_target, strict=strict)
+        return resolve_path(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve_stable_wrapper)
     jarvis_util_checkout = tmp_path / ".local/src/jarvis-util"
     (jarvis_util_checkout / ".git").mkdir(parents=True)
     receipt_path = tmp_path / ".local/share/clio-relay/install-receipt.json"
@@ -437,7 +462,13 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
     components = cast(dict[str, object], receipt["components"])
     components["jarvis-cd"] = "1.4.4"
     components["clio-kit"] = "2.5.22"
-    receipt["component_artifacts"] = {
+    component_runtime = info["component_runtime"]
+    assert isinstance(component_runtime, dict)
+    component_runtime["clio-kit"] = {
+        "error": "uv tool directory is unavailable",
+        "persistent_tool_verified": False,
+    }
+    component_artifacts: dict[str, object] = {
         "clio-kit": {
             "runtime_interpreters": {"provider": "/old/clio-kit/python"},
             "runtime_executables": {"clio-kit": "/old/clio-kit/clio-kit"},
@@ -447,6 +478,7 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
             "runtime_executables": {"jarvis": str(legacy_jarvis)},
         },
     }
+    receipt["component_artifacts"] = component_artifacts
 
     def read_installation(_path: Path | None = None) -> dict[str, object]:
         return info
@@ -489,7 +521,61 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
         "frp": "reuse",
         "uv": "reuse",
     }
-    assert plan.reusable_paths["jarvis_execution_python"] == str(legacy_python.resolve())
+    assert plan.reusable_paths["jarvis_execution_python"] == str(legacy_python)
+    assert plan.reusable_paths["jarvis_execution_executable"] == str(legacy_jarvis_target.resolve())
+    assert plan.reasons == [
+        "clio-kit version requires a staged upgrade",
+        "jarvis-cd version requires a staged upgrade",
+    ]
+
+    read_regular = bootstrap_reconcile_module._read_regular_bounded_with_identity  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    swapped = False
+
+    def swap_launcher_after_read(
+        path: Path,
+        *,
+        maximum: int,
+    ) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
+        nonlocal swapped
+        payload, identity = read_regular(path, maximum=maximum)
+        if path == legacy_jarvis_target.resolve() and not swapped:
+            swapped = True
+            path.unlink()
+            path.write_bytes(b"replacement-jarvis")
+            path.chmod(0o755)
+        return payload, identity
+
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "_read_regular_bounded_with_identity",
+        swap_launcher_after_read,
+    )
+    raced = plan_bootstrap_reconcile(desired, home=tmp_path)
+    monkeypatch.setattr(
+        bootstrap_reconcile_module,
+        "_read_regular_bounded_with_identity",
+        read_regular,
+    )
+
+    assert raced.mode == "full"
+    assert "legacy JARVIS execution environment is not reusable" in raced.reasons
+
+    components["clio-kit"] = desired.clio_kit_version
+    artifacts = cast(dict[str, object], receipt["component_artifacts"])
+    artifacts["clio-kit"] = {
+        "artifact_sha256": desired.clio_kit_artifact_sha256,
+        "runtime_artifact_path": str(clio_kit_wheel),
+        "runtime_interpreters": {"provider": "/old/clio-kit/python"},
+        "runtime_executables": {"clio-kit": "/old/clio-kit/clio-kit"},
+    }
+
+    unsafe_reuse = plan_bootstrap_reconcile(desired, home=tmp_path)
+
+    assert unsafe_reuse.mode == "full"
+    assert unsafe_reuse.reasons == [
+        "jarvis-cd version requires a staged upgrade",
+        "clio-kit live runtime is not reusable",
+    ]
 
 
 def test_existing_operator_jarvis_roots_are_adopted_without_mutation(tmp_path: Path) -> None:

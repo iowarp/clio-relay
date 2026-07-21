@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import base64
+import copy
 import subprocess
 import tarfile
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, cast
 
 import pytest
 from typer.testing import CliRunner
@@ -20,11 +21,13 @@ from clio_relay.bootstrap_reconcile import (
     BootstrapDesiredState,
     BootstrapInspection,
     BootstrapReadinessEvidence,
+    BootstrapTransactionJournal,
+    BootstrapTransactionState,
     JarvisStateEvidence,
     make_bootstrap_receipt,
 )
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
-from clio_relay.errors import ConfigurationError
+from clio_relay.errors import ConfigurationError, RelayError
 
 
 def _verify_persistent_receipt(**_kwargs: object) -> None:
@@ -436,6 +439,183 @@ def test_bootstrap_inspection_deadlines_match_acceptance_contract() -> None:
     assert (
         cli.BOOTSTRAP_EXACT_INSPECTION_DEADLINE_SECONDS < cli.BOOTSTRAP_REPAIR_DEADLINE_SECONDS < 60
     )
+
+
+def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration() -> None:
+    """A fenced upgrade may register relay's exact repository without changing other state."""
+    desired = bootstrap._bootstrap_desired_state(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        identity=bootstrap.BootstrapRelayIdentity(
+            install_spec=f"clio-relay=={__version__}",
+            transport_install_spec=f"clio-relay=={__version__}",
+            source_identity=f"release:clio-relay=={__version__}:sha256:{'a' * 64}",
+            deployment_artifact_sha256="a" * 64,
+        ),
+        cluster="ares",
+        core_dir=bootstrap.DEFAULT_REMOTE_CORE_DIR,
+        spool_dir=bootstrap.DEFAULT_REMOTE_SPOOL_DIR,
+        frp_version=bootstrap.FRP_VERSION,
+        clio_kit_install_spec=bootstrap.CLIO_KIT_JARVIS_MCP_WHEEL_URL,
+        clio_kit_artifact_sha256=bootstrap.CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
+        agent_adapter="exec",
+        agent_npm_package=None,
+        agent_npm_bin=None,
+        agent_args=[],
+        jarvis_resource_graph_profile="ares",
+    )
+    before = JarvisStateEvidence(
+        initialized=True,
+        root="/home/operator/.ppi-jarvis",
+        roots={
+            "config_dir": "/operator/jarvis/config",
+            "private_dir": "/operator/jarvis/private",
+            "shared_dir": "/operator/jarvis/shared",
+        },
+        config_sha256="b" * 64,
+        repos_sha256="c" * 64,
+        resource_graph_sha256="d" * 64,
+        managed_repo_registered=False,
+    )
+    after = before.model_copy(update={"repos_sha256": "e" * 64, "managed_repo_registered": True})
+    inspection = BootstrapInspection(
+        exact_match=True,
+        desired_fingerprint=desired.fingerprint,
+        install_receipt_sha256="f" * 64,
+        active_generation=desired.fingerprint,
+        current_generation_target=f"/home/operator/generations/{desired.fingerprint}",
+        jarvis_state=after,
+        readiness=BootstrapReadinessEvidence(
+            service_name=desired.worker_service,
+            service_was_active=True,
+            service_was_enabled=True,
+            queue_ready=True,
+            queue={
+                "schema_version": "clio-relay.queue-readiness.v1",
+                "complete": True,
+                "sealed": True,
+                "repair_required": False,
+            },
+            worker_ready=True,
+        ),
+    )
+    transaction = BootstrapTransactionJournal(
+        invocation_id="bootstrap_component_upgrade",
+        desired_fingerprint=desired.fingerprint,
+        mode="component-upgrade",
+        state=BootstrapTransactionState.COMMITTED,
+        previous_generation="legacy",
+        prepared_generation=desired.fingerprint,
+        service_name=desired.worker_service,
+        service_was_active=True,
+        service_was_enabled=True,
+        irreversible_boundary=True,
+    )
+    actions = {
+        "clio-relay": "replaced",
+        "clio-kit": "replaced",
+        "jarvis-cd": "replaced",
+        "jarvis-util": "reused",
+        "frp": "reused",
+        "uv": "reused",
+    }
+    components: dict[str, dict[str, object]] = {
+        name: {
+            "action": action,
+            "observed_identity": {},
+            "duration_seconds": 1.0,
+        }
+        for name, action in actions.items()
+    }
+    managed_repo = "/home/operator/.local/share/clio-relay/managed-jarvis-repo"
+    repository_update: dict[str, object] = {
+        "link_action": "reused",
+        "link": managed_repo,
+        "target": (
+            "/home/operator/.local/share/clio-relay/current/source/jarvis-packages/clio_relay"
+        ),
+        "repositories": {
+            "action": "updated",
+            "managed_repo": managed_repo,
+            "added_managed_repos": [managed_repo],
+            "removed_previous_managed_repos": [
+                "/home/operator/.local/src/clio-relay/jarvis-packages/clio_relay"
+            ],
+            "before_sha256": before.repos_sha256,
+            "after_sha256": after.repos_sha256,
+        },
+    }
+    receipt = make_bootstrap_receipt(
+        invocation_id=transaction.invocation_id,
+        desired=desired,
+        outcome="reconciled",
+        inspection=inspection,
+        started_at=datetime.now(UTC),
+        transaction=transaction,
+        previous_generation="legacy",
+        active_generation=desired.fingerprint,
+        components=components,
+        duration_seconds=1.0,
+        jarvis_state_before=before,
+        jarvis_repo_reconciliation=repository_update,
+        payload_transfer_count=2,
+        payload_transfer_bytes=1,
+    )
+
+    bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        receipt,
+        bootstrap_profile="linux-user",
+        relay_install_spec=desired.relay_install_spec,
+        desired_fingerprint=desired.fingerprint,
+        expected_jarvis_resource_graph_profile="ares",
+        expected_allow_jarvis_resource_graph_build=False,
+        expected_worker_service=desired.worker_service,
+    )
+
+    tampered = copy.deepcopy(receipt)
+    preservation = cast(dict[str, object], tampered["jarvis_preservation"])
+    binding = cast(dict[str, object], preservation["repositories"])
+    update = cast(dict[str, object], binding["repositories"])
+    update["after_sha256"] = "0" * 64
+    with pytest.raises(RelayError, match="hashes do not bind"):
+        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            tampered,
+            bootstrap_profile="linux-user",
+            relay_install_spec=desired.relay_install_spec,
+            desired_fingerprint=desired.fingerprint,
+            expected_jarvis_resource_graph_profile="ares",
+            expected_allow_jarvis_resource_graph_build=False,
+            expected_worker_service=desired.worker_service,
+        )
+
+    unauthorized_removal = copy.deepcopy(receipt)
+    preservation = cast(dict[str, object], unauthorized_removal["jarvis_preservation"])
+    binding = cast(dict[str, object], preservation["repositories"])
+    update = cast(dict[str, object], binding["repositories"])
+    update["removed_previous_managed_repos"] = ["/operator/unrelated-repository"]
+    with pytest.raises(RelayError, match="repository migration is invalid"):
+        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            unauthorized_removal,
+            bootstrap_profile="linux-user",
+            relay_install_spec=desired.relay_install_spec,
+            desired_fingerprint=desired.fingerprint,
+            expected_jarvis_resource_graph_profile="ares",
+            expected_allow_jarvis_resource_graph_build=False,
+            expected_worker_service=desired.worker_service,
+        )
+
+    replaced_link = copy.deepcopy(receipt)
+    preservation = cast(dict[str, object], replaced_link["jarvis_preservation"])
+    binding = cast(dict[str, object], preservation["repositories"])
+    binding["link_action"] = "retargeted"
+    with pytest.raises(RelayError, match="did not preserve existing JARVIS state"):
+        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            replaced_link,
+            bootstrap_profile="linux-user",
+            relay_install_spec=desired.relay_install_spec,
+            desired_fingerprint=desired.fingerprint,
+            expected_jarvis_resource_graph_profile="ares",
+            expected_allow_jarvis_resource_graph_build=False,
+            expected_worker_service=desired.worker_service,
+        )
 
 
 def test_fresh_bootstrap_receipt_allows_explicit_pending_service_install(

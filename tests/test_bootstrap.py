@@ -34,7 +34,8 @@ from clio_relay.bootstrap import (
     JARVIS_CD_WHEEL_SHA256,
     JARVIS_CD_WHEEL_URL,
     JARVIS_UTIL_COMMIT,
-    UV_LINUX_AMD64_SHA256,
+    UV_LINUX_AMD64_ARCHIVE_SHA256,
+    UV_LINUX_AMD64_EXECUTABLE_SHA256,
     UV_VERSION,
     assert_clean_git_checkout,
     create_bootstrap_archive,
@@ -161,7 +162,9 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert f'FRPS_SHA256="{FRPS_LINUX_AMD64_SHA256}"' in script
     assert "sha256sum --check --strict -" in script
     assert f'UV_VERSION="{UV_VERSION}"' in script
-    assert f'UV_SHA256="{UV_LINUX_AMD64_SHA256}"' in script
+    assert f'UV_ARCHIVE_SHA256="{UV_LINUX_AMD64_ARCHIVE_SHA256}"' in script
+    assert f'UV_EXECUTABLE_SHA256="{UV_LINUX_AMD64_EXECUTABLE_SHA256}"' in script
+    assert "UV_EXECUTABLE_SHA256 *$HOME/.local/bin/uv" in script
     assert "https://astral.sh/uv/install.sh" not in script
     assert "uv python install 3.12" in script
     assert 'export UV_TOOL_DIR="$HOME/.local/share/clio-relay/uv-tools"' in script
@@ -309,6 +312,9 @@ def test_fresh_bootstrap_loads_packaged_graph_before_explicit_build_fallback() -
     assert 'requested_source=os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_SOURCE"]' in script
     assert "relay_artifact_sha256=" in script
     assert "reconcile_managed_jarvis_repository(" in script
+    assert 'echo "$BOOTSTRAP_JARVIS_REPOS_SHA256_BEFORE *$JARVIS_REPOS_FILE"' not in script
+    assert 'echo "$BOOTSTRAP_JARVIS_CONFIG_SHA256_BEFORE *$JARVIS_CONFIG_FILE"' in script
+    assert 'echo "$BOOTSTRAP_JARVIS_GRAPH_SHA256_BEFORE *$JARVIS_GRAPH_FILE"' in script
     assert '"$HOME/.local/share/clio-relay/jarvis-shared" || true' not in script
     assert "python -m pip install --upgrade pip setuptools wheel" not in script
     assert "spack install" not in script
@@ -400,8 +406,11 @@ def test_bootstrap_uv_pin_matches_release_policy() -> None:
     policy = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
 
     assert policy["required_uv_version"] == UV_VERSION
-    assert UV_LINUX_AMD64_SHA256 == (
+    assert UV_LINUX_AMD64_ARCHIVE_SHA256 == (
         "e490a6464492183c5d4534a5527fb4440f7f2bb2f228162ad7e4afe076dc0224"
+    )
+    assert UV_LINUX_AMD64_EXECUTABLE_SHA256 == (
+        "1cb9cd0a1749debf6049d7d2bb933882cc52d81016326ee6d99a786d6c988b03"
     )
 
 
