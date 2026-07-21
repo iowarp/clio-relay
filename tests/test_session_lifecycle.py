@@ -3806,8 +3806,54 @@ def test_status_remote_session_returns_json(monkeypatch: MonkeyPatch) -> None:
     )
 
     assert status == {"session_id": "session-1", "running": True}
-    assert "clio-relay session recovery-status" in scripts[0]
-    assert "metadata.json" not in scripts[0]
+    script = scripts[0]
+    command_index = script.index("clio-relay session recovery-status")
+    for export in (
+        'export PATH="$HOME/.local/bin:$PATH";',
+        "export CLIO_RELAY_CLI_MODE=local;",
+        "export CLIO_RELAY_REMOTE_CLUSTER=ares;",
+        "export CLIO_RELAY_CORE_DIR=",
+        "export CLIO_RELAY_SPOOL_DIR=",
+    ):
+        assert script.index(export) < command_index
+    assert "metadata.json" not in script
+
+
+def test_remote_session_start_status_uses_cluster_environment(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    scripts: list[str] = []
+    definition, _release, plan = _durable_start_plan()
+    expected = _durable_start_status(plan)
+
+    def fake_ssh(
+        _definition: ClusterDefinition,
+        script: str,
+        *,
+        timeout_seconds: float,
+    ) -> str:
+        assert timeout_seconds > 0
+        scripts.append(script)
+        return expected.model_dump_json()
+
+    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+
+    observed = session_lifecycle.status_remote_session_start(
+        definition=definition,
+        selector=plan.status_selector,
+    )
+
+    assert observed == expected
+    script = scripts[0]
+    command_index = script.index("clio-relay session start-status-owned")
+    for export in (
+        'export PATH="$HOME/.local/bin:$PATH";',
+        "export CLIO_RELAY_CLI_MODE=local;",
+        "export CLIO_RELAY_REMOTE_CLUSTER=ares;",
+        "export CLIO_RELAY_CORE_DIR=",
+        "export CLIO_RELAY_SPOOL_DIR=",
+    ):
+        assert script.index(export) < command_index
 
 
 def test_remote_session_identity_challenge_binds_process_cluster_and_nonce(

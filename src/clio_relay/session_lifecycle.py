@@ -6108,7 +6108,11 @@ def status_remote_session(
     _validate_session(session_id=session_id, remote_api_port=1)
     output = _ssh_script(
         definition,
-        _owned_status_script(cluster=definition.name, session_id=session_id),
+        _owned_status_script(
+            definition=definition,
+            cluster=definition.name,
+            session_id=session_id,
+        ),
     )
     return cast(dict[str, object], json.loads(output))
 
@@ -6124,7 +6128,7 @@ def status_remote_session_start(
     try:
         output = _ssh_script(
             definition,
-            _owned_start_status_script(selector),
+            _owned_start_status_script(definition=definition, selector=selector),
             timeout_seconds=_REMOTE_SESSION_START_RECOVERY_TIMEOUT_SECONDS,
         )
     except _RemoteSessionCommandDeadline as exc:
@@ -6740,19 +6744,30 @@ def _session_cluster_registry_authority(
     )
 
 
-def _owned_status_script(*, cluster: str, session_id: str) -> str:
+def _owned_status_script(
+    *,
+    definition: ClusterDefinition,
+    cluster: str,
+    session_id: str,
+) -> str:
     """Use the bounded, lock-coordinated recovery contract for public status."""
     return (
         "set -euo pipefail\n"
+        f"{remote_env(definition)}\n"
         f"clio-relay session recovery-status --cluster {shlex.quote(cluster)} "
         f"--session-id {shlex.quote(session_id)}\n"
     )
 
 
-def _owned_start_status_script(selector: OwnedSessionStartStatusSelector) -> str:
+def _owned_start_status_script(
+    *,
+    definition: ClusterDefinition,
+    selector: OwnedSessionStartStatusSelector,
+) -> str:
     """Render the nonblocking exact-operation start-status command."""
     return (
         "set -euo pipefail\n"
+        f"{remote_env(definition)}\n"
         f"clio-relay session start-status-owned --cluster {shlex.quote(selector.cluster)} "
         f"--session-id {shlex.quote(selector.session_id)} "
         f"--start-operation-id {shlex.quote(selector.start_operation_id)} "
