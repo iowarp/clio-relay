@@ -7,6 +7,7 @@ import copy
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import sys
@@ -146,6 +147,23 @@ MCP_RESULT_INLINE_LIMIT_MESSAGE = (
     "inline response limit and is unavailable to the agent. Immutable private evidence was "
     "preserved for operator diagnosis. Remote side effects may have occurred; inspect the "
     "job before retrying."
+)
+JARVIS_WAIT_FOR_TERMINAL_DESCRIPTION = (
+    "Observe this submission until it becomes terminal within the current call. "
+    "The observation bound never becomes a relay, JARVIS, or scheduler execution "
+    "deadline and never fails, cancels, or resubmits the underlying job."
+)
+JARVIS_WAIT_TIMEOUT_DESCRIPTION = (
+    "Maximum seconds to observe this submission in the current call when "
+    "wait_for_terminal is true. Observation expiry never fails, cancels, or "
+    "resubmits the underlying relay, JARVIS, or scheduler job; preserve the job "
+    "receipt and observe it again later."
+)
+JARVIS_LEGACY_WAIT_TIMEOUT_DESCRIPTION = (
+    "Deprecated observation-only alias for wait_timeout_seconds. It is not an "
+    "execution deadline and never fails, cancels, or resubmits the underlying "
+    "relay, JARVIS, or scheduler job. If both aliases are supplied, their values "
+    "must be equal."
 )
 MAX_OBSERVE_MATCHES = 100
 MAX_OBSERVE_MATCH_TEXT_CHARS = 1_024
@@ -581,8 +599,11 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
         {
             "name": "relay_wait",
             "description": (
-                "Wait for a relay job to finish and return final status, verified MCP result "
-                "evidence, and optional logs. For a remote job, copy cluster, job_id, and "
+                "Observe a relay job for a bounded period and return final status, verified "
+                "MCP result evidence, and optional logs if it finishes. Observation expiry "
+                "never fails, cancels, or resubmits the underlying relay, JARVIS, or scheduler "
+                "job. Preserve the receipt and call relay_wait again later. For a remote job, "
+                "copy cluster, job_id, and "
                 "route_revision unchanged from its submission receipt on every follow-up "
                 "call, including on the same MCP connection. job_id alone is only for a "
                 "local relay job. Treat mcp_result.structured_result as the authoritative "
@@ -598,7 +619,16 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     "job_id": durable_record_id_json_schema(),
                     "cluster": {"type": "string"},
                     "route_revision": cluster_route_revision_json_schema(),
-                    "timeout_seconds": {"type": "number", "default": 600},
+                    "timeout_seconds": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "default": 600,
+                        "description": (
+                            "Maximum seconds for this observation call. Expiry never changes "
+                            "the underlying relay, JARVIS, or scheduler job state and never "
+                            "fails, cancels, or resubmits that work."
+                        ),
+                    },
                     "poll_seconds": {"type": "number", "default": 2},
                     "include_logs": {"type": "boolean", "default": False},
                     "log_limit": {
@@ -618,7 +648,12 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
         },
         {
             "name": "relay_submit_jarvis_pipeline",
-            "description": "Submit a JARVIS pipeline YAML document to a configured relay cluster.",
+            "description": (
+                "Submit a JARVIS pipeline YAML document to a configured relay cluster. "
+                "Submission is asynchronous by default. Any requested wait bounds only the "
+                "current observation; it never limits, fails, cancels, or resubmits the "
+                "underlying relay, JARVIS, or scheduler job."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -626,8 +661,23 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     "pipeline_yaml": {"type": "string"},
                     "idempotency_key": {"type": "string"},
                     "used_artifact_refs": _artifact_use_refs_json_schema(),
-                    "wait_for_terminal": {"type": "boolean", "default": False},
-                    "timeout_seconds": {"type": "number", "default": 600},
+                    "wait_for_terminal": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": JARVIS_WAIT_FOR_TERMINAL_DESCRIPTION,
+                    },
+                    "wait_timeout_seconds": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "default": 600,
+                        "description": JARVIS_WAIT_TIMEOUT_DESCRIPTION,
+                    },
+                    "timeout_seconds": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "deprecated": True,
+                        "description": JARVIS_LEGACY_WAIT_TIMEOUT_DESCRIPTION,
+                    },
                     "poll_seconds": {"type": "number", "default": 2},
                 },
                 "required": ["cluster", "pipeline_yaml"],
@@ -637,7 +687,10 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
         {
             "name": "relay_submit_jarvis_job",
             "description": (
-                "Submit an existing JARVIS pipeline by name on a configured relay cluster."
+                "Submit an existing JARVIS pipeline by name on a configured relay cluster. "
+                "Submission is asynchronous by default. Any requested wait bounds only the "
+                "current observation; it never limits, fails, cancels, or resubmits the "
+                "underlying relay, JARVIS, or scheduler job."
             ),
             "inputSchema": {
                 "type": "object",
@@ -646,8 +699,23 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                     "pipeline_name": {"type": "string"},
                     "idempotency_key": {"type": "string"},
                     "used_artifact_refs": _artifact_use_refs_json_schema(),
-                    "wait_for_terminal": {"type": "boolean", "default": False},
-                    "timeout_seconds": {"type": "number", "default": 600},
+                    "wait_for_terminal": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": JARVIS_WAIT_FOR_TERMINAL_DESCRIPTION,
+                    },
+                    "wait_timeout_seconds": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "default": 600,
+                        "description": JARVIS_WAIT_TIMEOUT_DESCRIPTION,
+                    },
+                    "timeout_seconds": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "deprecated": True,
+                        "description": JARVIS_LEGACY_WAIT_TIMEOUT_DESCRIPTION,
+                    },
                     "poll_seconds": {"type": "number", "default": 2},
                 },
                 "required": ["cluster", "pipeline_name"],
@@ -3542,6 +3610,7 @@ def _submit_jarvis_pipeline(
 ) -> JSON:
     cluster = _required_str(arguments, "cluster")
     pipeline_yaml = _required_str(arguments, "pipeline_yaml")
+    wait_timeout_seconds = _jarvis_submission_wait_timeout_seconds(arguments)
     used_artifact_refs = _artifact_use_refs(arguments)
     digest = hashlib.sha256(pipeline_yaml.encode("utf-8")).hexdigest()
     dependency_digest = _stable_digest(
@@ -3573,7 +3642,7 @@ def _submit_jarvis_pipeline(
             definition=definition,
             settings=settings,
             wait_for_terminal_result=bool(arguments.get("wait_for_terminal", False)),
-            wait_timeout_seconds=float(arguments.get("timeout_seconds", 600)),
+            wait_timeout_seconds=wait_timeout_seconds,
             poll_seconds=float(arguments.get("poll_seconds", 2)),
         )
     job = _submit_local_job(
@@ -3591,7 +3660,7 @@ def _submit_jarvis_pipeline(
         job = wait_for_terminal(
             queue,
             job.job_id,
-            timeout_seconds=float(arguments.get("timeout_seconds", 600)),
+            timeout_seconds=wait_timeout_seconds,
             poll_seconds=float(arguments.get("poll_seconds", 2)),
         )
     return {
@@ -3609,6 +3678,7 @@ def _submit_jarvis_job(
     settings: RelaySettings,
 ) -> JSON:
     cluster = _required_str(arguments, "cluster")
+    wait_timeout_seconds = _jarvis_submission_wait_timeout_seconds(arguments)
     used_artifact_refs = _artifact_use_refs(arguments)
     dependency_digest = _stable_digest(
         {"used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs]}
@@ -3640,8 +3710,15 @@ def _submit_jarvis_job(
                 definition=definition,
                 settings=settings,
                 wait_for_terminal_result=bool(arguments.get("wait_for_terminal", False)),
-                wait_timeout_seconds=float(arguments.get("timeout_seconds", 600)),
+                wait_timeout_seconds=wait_timeout_seconds,
                 poll_seconds=float(arguments.get("poll_seconds", 2)),
+            )
+        if bool(arguments.get("wait_for_terminal", False)):
+            raise ValueError(
+                "wait_for_terminal is unavailable for a direct remote JARVIS pipeline "
+                "submission without an owned relay session; submit asynchronously, preserve "
+                "the remote receipt, and call relay_wait with its cluster, job_id, and "
+                "route_revision"
             )
         remote_args = [
             "job",
@@ -3675,7 +3752,7 @@ def _submit_jarvis_job(
     )
     wait_arguments = {
         **arguments,
-        "wait_timeout_seconds": arguments.get("timeout_seconds", 600),
+        "wait_timeout_seconds": wait_timeout_seconds,
     }
     return _submission_result(job, wait_arguments, queue=queue, definition=definition)
 
@@ -4925,6 +5002,33 @@ def _positive_float_argument(
     if value <= 0 or value > maximum:
         raise ValueError(f"{field_name} must be greater than 0 and at most {maximum:g}")
     return value
+
+
+def _jarvis_submission_wait_timeout_seconds(arguments: JSON) -> float:
+    """Resolve canonical and legacy JARVIS submission observation bounds."""
+    resolved: dict[str, float] = {}
+    for field_name in ("wait_timeout_seconds", "timeout_seconds"):
+        if field_name not in arguments:
+            continue
+        raw = arguments[field_name]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValueError(f"{field_name} must be a number")
+        value = float(raw)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{field_name} must be a finite number greater than 0")
+        resolved[field_name] = value
+    canonical = resolved.get("wait_timeout_seconds")
+    legacy = resolved.get("timeout_seconds")
+    if canonical is not None and legacy is not None and canonical != legacy:
+        raise ValueError(
+            "wait_timeout_seconds and legacy timeout_seconds must be equal when both are "
+            "provided; both fields bound observation only"
+        )
+    if canonical is not None:
+        return canonical
+    if legacy is not None:
+        return legacy
+    return 600.0
 
 
 def _required_environment_secret(name: str, label: str) -> str:

@@ -548,6 +548,40 @@ def test_mcp_admin_profile_lists_operational_tools(tmp_path: Path) -> None:
     assert "scheduler_job_id" not in update_gateway_tool["inputSchema"]["properties"]
 
 
+def test_mcp_jarvis_wait_schemas_are_explicitly_observation_only(tmp_path: Path) -> None:
+    """Agent schemas must not imply that bounded observation limits scheduler work."""
+    response = handle_request(
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        queue=ClioCoreQueue(tmp_path / "core"),
+        profile="admin",
+    )
+
+    assert response is not None
+    tools = {tool["name"]: tool for tool in response["result"]["tools"]}
+    relay_wait = tools["relay_wait"]
+    assert "never fails, cancels, or resubmits" in relay_wait["description"]
+    assert (
+        "underlying relay, JARVIS, or scheduler job state"
+        in (relay_wait["inputSchema"]["properties"]["timeout_seconds"]["description"])
+    )
+    for name in ("relay_submit_jarvis_pipeline", "relay_submit_jarvis_job"):
+        tool = tools[name]
+        properties = tool["inputSchema"]["properties"]
+        canonical = properties["wait_timeout_seconds"]
+        legacy = properties["timeout_seconds"]
+        assert canonical["default"] == 600
+        assert canonical["exclusiveMinimum"] == 0
+        assert "Observation expiry never fails, cancels, or resubmits" in (canonical["description"])
+        assert legacy["deprecated"] is True
+        assert "default" not in legacy
+        assert "observation-only alias" in legacy["description"]
+        assert "execution deadline" in legacy["description"]
+        assert (
+            "never becomes a relay, JARVIS, or scheduler execution deadline"
+            in (properties["wait_for_terminal"]["description"])
+        )
+
+
 def test_mcp_event_monitor_and_log_schemas_publish_strict_maximums(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path / "core")
 
@@ -748,11 +782,20 @@ def test_mcp_submit_jarvis_job_creates_named_pipeline_job(tmp_path: Path) -> Non
         ),
     ],
 )
+@pytest.mark.parametrize(
+    "wait_arguments",
+    [
+        {"wait_timeout_seconds": 1},
+        {"timeout_seconds": 1},
+        {"wait_timeout_seconds": 1, "timeout_seconds": 1.0},
+    ],
+)
 def test_mcp_jarvis_wait_timeout_never_becomes_an_execution_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     tool_name: str,
     source_arguments: dict[str, object],
+    wait_arguments: dict[str, object],
 ) -> None:
     """Agent wait bounds must not become JARVIS or scheduler runtime limits."""
     queue = ClioCoreQueue(tmp_path / "core")
@@ -781,7 +824,7 @@ def test_mcp_jarvis_wait_timeout_never_becomes_an_execution_deadline(
                     "cluster": "test-cluster",
                     **source_arguments,
                     "wait_for_terminal": True,
-                    "timeout_seconds": 1,
+                    **wait_arguments,
                     "poll_seconds": 0.25,
                 },
             },
@@ -798,6 +841,224 @@ def test_mcp_jarvis_wait_timeout_never_becomes_an_execution_deadline(
     assert job.spec.timeout_seconds is None
     assert job.state is JobState.QUEUED
     assert "cancellation_request" not in job.metadata
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "source_arguments"),
+    [
+        (
+            "relay_submit_jarvis_pipeline",
+            {"pipeline_yaml": "name: conflicting-observation\npkgs: []\n"},
+        ),
+        (
+            "relay_submit_jarvis_job",
+            {"pipeline_name": "conflicting-observation"},
+        ),
+    ],
+)
+def test_mcp_jarvis_wait_timeout_alias_conflict_fails_before_submission(
+    tmp_path: Path,
+    tool_name: str,
+    source_arguments: dict[str, object],
+) -> None:
+    queue = ClioCoreQueue(tmp_path / "core")
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 121,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": {
+                    "cluster": "test-cluster",
+                    **source_arguments,
+                    "wait_for_terminal": True,
+                    "wait_timeout_seconds": 1,
+                    "timeout_seconds": 2,
+                },
+            },
+        },
+        queue=queue,
+    )
+
+    assert response is not None and "error" in response
+    assert response["error"]["message"] == (
+        "wait_timeout_seconds and legacy timeout_seconds must be equal when both are "
+        "provided; both fields bound observation only"
+    )
+    assert queue.list_jobs() == []
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "source_arguments", "path", "source_key"),
+    [
+        (
+            "relay_submit_jarvis_pipeline",
+            {"pipeline_yaml": "name: owned-observation\npkgs: []\n"},
+            "/jobs/jarvis",
+            "pipeline_yaml",
+        ),
+        (
+            "relay_submit_jarvis_job",
+            {"pipeline_name": "owned-observation"},
+            "/jobs/jarvis-pipeline",
+            "pipeline_name",
+        ),
+    ],
+)
+def test_owned_mcp_jarvis_wait_uses_only_the_canonical_observation_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    source_arguments: dict[str, object],
+    path: str,
+    source_key: str,
+) -> None:
+    definition = ClusterDefinition(name="cluster-a", ssh_host="cluster-login")
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(clusters={"cluster-a": definition}).save(registry_path)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    captured: dict[str, object] = {}
+
+    def submit_owned(**kwargs: object) -> RelayJob:
+        captured["submission"] = kwargs
+        payload = cast(dict[str, object], kwargs["payload"])
+        source_value = cast(str, payload[source_key])
+        spec = (
+            JarvisRunSpec(pipeline_yaml=source_value)
+            if source_key == "pipeline_yaml"
+            else JarvisRunSpec(pipeline_name=source_value)
+        )
+        return RelayJob(
+            cluster="cluster-a",
+            kind=JobKind.JARVIS,
+            spec=spec,
+            idempotency_key=cast(str, payload["idempotency_key"]),
+            metadata={
+                "owner_session_id": "desktop-session-1",
+                "owner_session_generation_id": "generation-1",
+            },
+        )
+
+    def submission_result(job: RelayJob, **kwargs: object) -> dict[str, object]:
+        captured["result"] = kwargs
+        captured["job"] = job
+        return {"job_id": job.job_id, "state": job.state.value}
+
+    monkeypatch.setattr(mcp_server_module, "submit_owned_session_job", submit_owned)
+    monkeypatch.setattr(
+        mcp_server_module,
+        "_owned_session_submission_result",
+        submission_result,
+    )
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+    )
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 122,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": {
+                    "cluster": "cluster-a",
+                    **source_arguments,
+                    "wait_for_terminal": True,
+                    "wait_timeout_seconds": 1,
+                    "timeout_seconds": 1.0,
+                    "poll_seconds": 0.25,
+                },
+            },
+        },
+        queue=ClioCoreQueue(settings.core_dir),
+        settings=settings,
+        profile="admin",
+    )
+
+    assert response is not None and "error" not in response, response
+    submission = cast(dict[str, object], captured["submission"])
+    payload = cast(dict[str, object], submission["payload"])
+    result = cast(dict[str, object], captured["result"])
+    job = cast(RelayJob, captured["job"])
+    assert submission["path"] == path
+    assert "timeout_seconds" not in payload
+    assert "wait_timeout_seconds" not in payload
+    assert result["wait_timeout_seconds"] == 1.0
+    assert result["poll_seconds"] == 0.25
+    assert isinstance(job.spec, JarvisRunSpec)
+    assert job.spec.timeout_seconds is None
+
+
+def test_direct_remote_named_jarvis_wait_is_rejected_before_submission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = ClusterDefinition(name="cluster-a", ssh_host="cluster-login")
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(clusters={"cluster-a": definition}).save(registry_path)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    commands: list[list[str]] = []
+
+    def run_remote(_definition: ClusterDefinition, arguments: list[str]) -> str:
+        commands.append(arguments)
+        return "job_1234567890abcdef1234567890abcdef\n"
+
+    monkeypatch.setattr(mcp_server_module, "run_remote_clio", run_remote)
+    queue = ClioCoreQueue(tmp_path / "core")
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 123,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_submit_jarvis_job",
+                "arguments": {
+                    "cluster": "cluster-a",
+                    "pipeline_name": "durable-pipeline",
+                    "wait_for_terminal": True,
+                    "wait_timeout_seconds": 1,
+                },
+            },
+        },
+        queue=queue,
+        profile="admin",
+    )
+
+    assert response is not None and "error" in response
+    assert "submit asynchronously" in response["error"]["message"]
+    assert "call relay_wait" in response["error"]["message"]
+    assert commands == []
+    assert queue.list_jobs() == []
+
+    asynchronous = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 124,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_submit_jarvis_job",
+                "arguments": {
+                    "cluster": "cluster-a",
+                    "pipeline_name": "durable-pipeline",
+                    "wait_for_terminal": False,
+                },
+            },
+        },
+        queue=queue,
+        profile="admin",
+    )
+    assert asynchronous is not None and "error" not in asynchronous
+    receipt = asynchronous["result"]["structuredContent"]
+    assert receipt["job_id"] == "job_1234567890abcdef1234567890abcdef"
+    assert receipt["terminal"] is False
+    assert commands[0][:2] == ["job", "submit-pipeline"]
 
 
 def test_mcp_submit_remote_agent_creates_real_job(tmp_path: Path) -> None:
