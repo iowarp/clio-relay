@@ -3961,7 +3961,11 @@ def _finalize_completed_cleanup_receipt_before_start(
     session_id: str,
 ) -> None:
     """Finish the exact teardown commit if reconnect observes its completed receipt."""
-    raw_status = status_remote_session(definition=definition, session_id=session_id)
+    raw_status = status_remote_session(
+        definition=definition,
+        session_id=session_id,
+        pre_start_cleanup_probe=True,
+    )
     try:
         status = OwnedSessionRecoveryStatus.model_validate(raw_status)
     except ValidationError:
@@ -5230,14 +5234,32 @@ def session_admission_status(
 def session_recovery_status(
     cluster: Annotated[str, typer.Option(help="Exact cluster recorded by the owned session.")],
     session_id: Annotated[str, typer.Option(help="Exact owned relay session id.")],
+    pre_start_cleanup_probe: Annotated[
+        bool,
+        typer.Option(
+            help=(
+                "Return a structured unverified observation when no transition exists yet; "
+                "reserved for the read-only pre-start cleanup probe."
+            )
+        ),
+    ] = False,
 ) -> None:
     """Return fail-closed recovery evidence for an ambiguous or dead session start."""
 
     def action() -> None:
-        status = _inspect_owned_session_recovery_after_transition(
-            cluster=cluster,
-            session_id=session_id,
-            core_dir=RelaySettings.from_env().core_dir,
+        settings_core_dir = RelaySettings.from_env().core_dir
+        status = (
+            _inspect_owned_session_recovery_before_start(
+                cluster=cluster,
+                session_id=session_id,
+                core_dir=settings_core_dir,
+            )
+            if pre_start_cleanup_probe
+            else _inspect_owned_session_recovery_after_transition(
+                cluster=cluster,
+                session_id=session_id,
+                core_dir=settings_core_dir,
+            )
         )
         typer.echo(status.model_dump_json(indent=2))
 
@@ -5451,6 +5473,54 @@ def _inspect_owned_session_recovery_after_transition(
         raise RelayError(
             "owned session start is still in progress after the bounded recovery wait"
         ) from exc
+
+
+def _inspect_owned_session_recovery_before_start(
+    *,
+    cluster: str,
+    session_id: str,
+    core_dir: Path,
+    home: Path | None = None,
+    timeout_seconds: float = OWNED_SESSION_RECOVERY_TRANSITION_TIMEOUT_SECONDS,
+) -> OwnedSessionRecoveryStatus:
+    """Observe cleanup state without requiring a fresh session transition to exist."""
+    if re.fullmatch(r"[A-Za-z0-9_-]+", session_id) is None:
+        raise RelayError("session_id must contain only letters, numbers, hyphen, or underscore")
+    if not cluster:
+        raise RelayError("cluster must not be empty")
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    selected_home = home or Path.home()
+    transition_path = (
+        selected_home
+        / ".local"
+        / "share"
+        / "clio-relay"
+        / "sessions"
+        / session_id
+        / "transition.lock"
+    )
+    try:
+        transition_path.lstat()
+    except FileNotFoundError:
+        return OwnedSessionRecoveryStatus(
+            cluster=cluster,
+            session_id=session_id,
+            cleanup_receipt=False,
+            ownership_verified=False,
+            recovery_verified=False,
+            errors=[
+                "owned session transition is not currently observable; "
+                "start-owned remains the mutation authority"
+            ],
+        )
+    return _inspect_owned_session_recovery_after_transition(
+        cluster=cluster,
+        session_id=session_id,
+        core_dir=core_dir,
+        home=selected_home,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 @session_app.command("prepare-start", hidden=True)

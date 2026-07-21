@@ -6103,8 +6103,14 @@ def status_remote_session(
     *,
     definition: ClusterDefinition,
     session_id: str,
+    pre_start_cleanup_probe: bool = False,
 ) -> dict[str, object]:
-    """Return status for a previously started remote relay session."""
+    """Return status for a previously started remote relay session.
+
+    The pre-start cleanup probe is an internal, read-only observation that may
+    report an uninitialized transition.  It must not be used as authoritative
+    absence evidence by teardown or cleanup callers.
+    """
     _validate_session(session_id=session_id, remote_api_port=1)
     output = _ssh_script(
         definition,
@@ -6112,6 +6118,7 @@ def status_remote_session(
             definition=definition,
             cluster=definition.name,
             session_id=session_id,
+            pre_start_cleanup_probe=pre_start_cleanup_probe,
         ),
     )
     return cast(dict[str, object], json.loads(output))
@@ -6749,13 +6756,15 @@ def _owned_status_script(
     definition: ClusterDefinition,
     cluster: str,
     session_id: str,
+    pre_start_cleanup_probe: bool = False,
 ) -> str:
     """Use the bounded, lock-coordinated recovery contract for public status."""
+    probe_argument = " --pre-start-cleanup-probe" if pre_start_cleanup_probe else ""
     return (
         "set -euo pipefail\n"
         f"{remote_env(definition)}\n"
         f"clio-relay session recovery-status --cluster {shlex.quote(cluster)} "
-        f"--session-id {shlex.quote(session_id)}\n"
+        f"--session-id {shlex.quote(session_id)}{probe_argument}\n"
     )
 
 

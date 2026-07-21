@@ -3817,6 +3817,38 @@ def test_status_remote_session_returns_json(monkeypatch: MonkeyPatch) -> None:
     ):
         assert script.index(export) < command_index
     assert "metadata.json" not in script
+    assert "--pre-start-cleanup-probe" not in script
+
+
+def test_status_remote_session_marks_pre_start_cleanup_probe_explicitly(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    scripts: list[str] = []
+
+    def fake_ssh(_definition: ClusterDefinition, script: str) -> str:
+        scripts.append(script)
+        return OwnedSessionRecoveryStatus(
+            cluster="ares",
+            session_id="fresh-session",
+            cleanup_receipt=False,
+            recovery_verified=False,
+            errors=["owned session transition is not currently observable"],
+        ).model_dump_json()
+
+    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+
+    status = status_remote_session(
+        definition=ClusterDefinition(name="ares", ssh_host="ares"),
+        session_id="fresh-session",
+        pre_start_cleanup_probe=True,
+    )
+
+    assert status["cleanup_receipt"] is False
+    assert status["recovery_verified"] is False
+    assert (
+        "clio-relay session recovery-status --cluster ares "
+        "--session-id fresh-session --pre-start-cleanup-probe"
+    ) in scripts[0]
 
 
 def test_remote_session_start_status_uses_cluster_environment(
