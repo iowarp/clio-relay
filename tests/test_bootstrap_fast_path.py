@@ -27,6 +27,16 @@ from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
 from clio_relay.errors import ConfigurationError
 
 
+def _verify_persistent_receipt(**_kwargs: object) -> None:
+    """Model a successfully re-read persistent receipt."""
+
+
+def _which(executable: str) -> str:
+    """Return a deterministic executable resolution for bootstrap tests."""
+
+    return executable
+
+
 def test_exact_remote_bootstrap_never_reads_or_builds_payload(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -115,10 +125,14 @@ def test_exact_remote_bootstrap_never_reads_or_builds_payload(
         raise AssertionError("the exact no-op touched bootstrap payload code")
 
     monkeypatch.setattr(bootstrap, "_bootstrap_preflight_over_ssh", preflight)
-    monkeypatch.setattr(bootstrap, "_verify_persistent_bootstrap_receipt", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        bootstrap,
+        "_verify_persistent_bootstrap_receipt",
+        _verify_persistent_receipt,
+    )
     monkeypatch.setattr(bootstrap, "create_bootstrap_archive", poison)
     monkeypatch.setattr(bootstrap, "_validate_relay_bootstrap_wheel", poison)
-    monkeypatch.setattr(bootstrap.shutil, "which", lambda executable: executable)
+    monkeypatch.setattr(bootstrap.shutil, "which", _which)
     monkeypatch.setattr(bootstrap, "uuid4", lambda: type("Uuid", (), {"hex": "test"})())
 
     lines = bootstrap.bootstrap_cluster_over_ssh(
@@ -217,17 +231,21 @@ def test_public_cluster_bootstrap_noop_never_touches_nonexistent_wheel(
         raise AssertionError("the public exact no-op touched bootstrap payload code")
 
     monkeypatch.setattr(bootstrap, "_bootstrap_preflight_over_ssh", preflight)
-    monkeypatch.setattr(bootstrap, "_verify_persistent_bootstrap_receipt", lambda **_: None)
+    monkeypatch.setattr(
+        bootstrap,
+        "_verify_persistent_bootstrap_receipt",
+        _verify_persistent_receipt,
+    )
     monkeypatch.setattr(bootstrap, "create_bootstrap_archive", poison)
     monkeypatch.setattr(bootstrap, "_validate_relay_bootstrap_wheel", poison)
-    monkeypatch.setattr(bootstrap.shutil, "which", lambda executable: executable)
+    monkeypatch.setattr(bootstrap.shutil, "which", _which)
     monkeypatch.setattr(bootstrap, "uuid4", lambda: type("Uuid", (), {"hex": "cli_test"})())
     monkeypatch.setattr(cli, "package_source_root", lambda: tmp_path / "missing-source")
-    monkeypatch.setattr(
-        cli,
-        "_remote_target_identity",
-        lambda _definition: {"verified": True},
-    )
+
+    def remote_target_identity(_definition: ClusterDefinition) -> dict[str, object]:
+        return {"verified": True}
+
+    monkeypatch.setattr(cli, "_remote_target_identity", remote_target_identity)
 
     result = CliRunner().invoke(
         cli.app,
@@ -252,16 +270,16 @@ def test_payload_reconcile_requires_profile_before_building_archive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Only exact reuse may omit a profile; fresh state needs operator graph policy."""
-    monkeypatch.setattr(
-        bootstrap,
-        "_bootstrap_preflight_over_ssh",
-        lambda **_kwargs: bootstrap.BootstrapPreflightResult(
+
+    def preflight(**_kwargs: object) -> bootstrap.BootstrapPreflightResult:
+        return bootstrap.BootstrapPreflightResult(
             action="payload_required",
             receipt=None,
             lines=["bootstrap_preflight_json={}"],
-        ),
-    )
-    monkeypatch.setattr(bootstrap.shutil, "which", lambda executable: executable)
+        )
+
+    monkeypatch.setattr(bootstrap, "_bootstrap_preflight_over_ssh", preflight)
+    monkeypatch.setattr(bootstrap.shutil, "which", _which)
 
     def poison(*_args: object, **_kwargs: object) -> NoReturn:
         raise AssertionError("missing profile reached payload construction")
@@ -293,7 +311,7 @@ def test_public_release_bootstrap_requires_artifact_digest(
         }
     ).save(tmp_path / ".clio-relay/clusters.json")
     monkeypatch.setattr(cli, "package_source_root", lambda: tmp_path / "installed-package")
-    monkeypatch.setattr(bootstrap.shutil, "which", lambda executable: executable)
+    monkeypatch.setattr(bootstrap.shutil, "which", _which)
 
     result = CliRunner().invoke(
         cli.app,
@@ -384,20 +402,24 @@ def test_payload_free_inspector_fails_closed_after_repair_does_not_converge(
         stdout = "loaded\n" if "show" in command else ""
         return subprocess.CompletedProcess(command, 0, stdout, "")
 
-    monkeypatch.setattr(cli, "installation_info", lambda: {})
+    def installation_info() -> dict[str, object]:
+        return {}
+
+    def inspect(*_args: object, **_kwargs: object) -> BootstrapInspection:
+        return next(inspections)
+
+    def worker_info(**_kwargs: object) -> dict[str, object]:
+        return {"running": True}
+
+    def invocation_lock(**_kwargs: object) -> nullcontext[Path]:
+        return nullcontext(tmp_path / "bootstrap.lock")
+
+    monkeypatch.setattr(cli, "installation_info", installation_info)
     monkeypatch.setattr(cli, "ClioCoreQueue", ReadyQueue)
-    monkeypatch.setattr(
-        cli,
-        "inspect_exact_bootstrap_noop",
-        lambda *_args, **_kwargs: next(inspections),
-    )
+    monkeypatch.setattr(cli, "inspect_exact_bootstrap_noop", inspect)
     monkeypatch.setattr(cli, "run_bounded_process", systemctl)
-    monkeypatch.setattr(cli, "worker_runtime_info", lambda **_kwargs: {"running": True})
-    monkeypatch.setattr(
-        cli,
-        "bootstrap_invocation_lock",
-        lambda **_kwargs: nullcontext(tmp_path / "bootstrap.lock"),
-    )
+    monkeypatch.setattr(cli, "worker_runtime_info", worker_info)
+    monkeypatch.setattr(cli, "bootstrap_invocation_lock", invocation_lock)
 
     result = CliRunner().invoke(
         cli.app,
@@ -472,7 +494,7 @@ def test_fresh_bootstrap_receipt_allows_explicit_pending_service_install(
             worker_ready=False,
         ),
     )
-    components = {
+    components: dict[str, dict[str, object]] = {
         name: {
             "action": "prepared",
             "observed_identity": {},
@@ -553,7 +575,7 @@ def test_fresh_bootstrap_receipt_allows_explicit_pending_service_install(
             },
         )
 
-    unavailable = {
+    unavailable: dict[str, object] = {
         "schema_version": "jarvis.resource-graph-builtin.v1",
         "profile": "ares",
         "action": "unavailable",

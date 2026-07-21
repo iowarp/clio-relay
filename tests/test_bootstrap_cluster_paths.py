@@ -874,6 +874,12 @@ def test_bootstrap_over_ssh_forwards_configured_data_directories(
             stdout = ""
         return subprocess.CompletedProcess(command, 0, stdout, "")
 
+    def validate_receipt(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    def verify_persistent_receipt(**_kwargs: object) -> None:
+        return None
+
     monkeypatch.setattr(bootstrap, "create_bootstrap_archive", fake_create_bootstrap_archive)
     monkeypatch.setattr(
         bootstrap,
@@ -881,11 +887,11 @@ def test_bootstrap_over_ssh_forwards_configured_data_directories(
         fake_render_linux_user_bootstrap_script,
     )
     monkeypatch.setattr(bootstrap, "_run", fake_run)
-    monkeypatch.setattr(bootstrap, "_validate_bootstrap_receipt", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bootstrap, "_validate_bootstrap_receipt", validate_receipt)
     monkeypatch.setattr(
         bootstrap,
         "_verify_persistent_bootstrap_receipt",
-        lambda **_kwargs: None,
+        verify_persistent_receipt,
     )
     monkeypatch.setattr(bootstrap, "uuid4", lambda: SimpleNamespace(hex="paths"))
 

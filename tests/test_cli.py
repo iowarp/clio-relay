@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import Thread
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
@@ -85,6 +85,18 @@ from tests.queue_validation_fixtures import (
 _REAL_PERSIST_VERIFIED_CLEANUP_REPORT = (
     cli._persist_verified_cleanup_report_before_closure  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
+
+
+def _fake_no_worker_observation(
+    _definition: ClusterDefinition,
+) -> tuple[None, None]:
+    """Return the typed no-worker observation used by teardown tests."""
+
+    return None, None
+
+
+def _fake_no_completed_cleanup(**_kwargs: object) -> None:
+    """Model an absent completed cleanup receipt without untyped lambdas."""
 
 
 def _owner_session_closure_payload(
@@ -1882,14 +1894,20 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
             }
         )
 
+    def read_report(**_kwargs: object) -> SessionLifecycleReport:
+        return report
+
+    def execute_on_cluster(_definition: ClusterDefinition) -> bool:
+        return True
+
     monkeypatch.setattr(cli, "status_remote_session", fake_status)
     monkeypatch.setattr(
         cli,
         "read_remote_session_cleanup_report",
-        lambda **_kwargs: report,
+        read_report,
     )
     monkeypatch.setattr(cli, "run_remote_clio", fake_remote)
-    monkeypatch.setattr(cli, "should_execute_on_cluster", lambda _definition: True)
+    monkeypatch.setattr(cli, "should_execute_on_cluster", execute_on_cluster)
     real_set_closed = ClioCoreQueue.set_owner_session_closed
     local_mutations = 0
 
@@ -2143,7 +2161,7 @@ def test_session_teardown_never_closes_before_finalized_sidecar_reread(
     monkeypatch.setattr(cli, "status_remote_session", _fake_owned_session_status)
     monkeypatch.setattr(cli, "teardown_remote_session", _fake_verified_teardown)
     monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
-    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", lambda _definition: (None, None))
+    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", _fake_no_worker_observation)
     monkeypatch.setattr(
         cli,
         "_persist_verified_cleanup_report_before_closure",
@@ -2672,8 +2690,12 @@ def test_normal_session_teardown_uses_compact_projection_for_large_report(
     report = _verified_teardown_report()
     report.resources[0].detail = "large-normal-report:" + ("x" * (9 * 1024 * 1024))
     monkeypatch.setattr(cli, "status_remote_session", _fake_owned_session_status)
-    monkeypatch.setattr(cli, "teardown_remote_session", lambda **_kwargs: report)
-    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", lambda _definition: (None, None))
+
+    def teardown(**_kwargs: object) -> SessionLifecycleReport:
+        return report
+
+    monkeypatch.setattr(cli, "teardown_remote_session", teardown)
+    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", _fake_no_worker_observation)
     validation_path = tmp_path / "large-normal.json"
 
     result = CliRunner().invoke(
@@ -2877,6 +2899,9 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
     ) -> tuple[dict[str, object] | None, Exception | None]:
         return None, None
 
+    def read_authoritative_admission(**_kwargs: object) -> dict[str, object]:
+        return authoritative_admission()
+
     monkeypatch.setattr(cli, "should_execute_on_cluster", remote_execution)
     monkeypatch.setattr(
         cli,
@@ -2887,7 +2912,7 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
     monkeypatch.setattr(
         cli,
         "_owner_session_admission_status",
-        lambda **_kwargs: authoritative_admission(),
+        read_authoritative_admission,
     )
     monkeypatch.setattr(cli, "_observe_worker_before_cleanup", no_worker_observation)
     report_reads: list[OwnedSessionRecoveryStatus] = []
@@ -3094,7 +3119,11 @@ def test_session_start_never_closes_from_remote_only_cleanup_receipt(
             },
         },
     ).model_dump(mode="json")
-    monkeypatch.setattr(cli, "status_remote_session", lambda **_kwargs: status)
+
+    def read_status(**_kwargs: object) -> dict[str, object]:
+        return status
+
+    monkeypatch.setattr(cli, "status_remote_session", read_status)
 
     def forbidden_remote(*_args: object, **_kwargs: object) -> str:
         raise AssertionError("remote-only cleanup evidence must not close admission")
@@ -3160,7 +3189,9 @@ def test_local_owner_session_closure_replay_is_read_only_after_split_failure(
         report
     )
 
-    def recovery(process_state: str) -> OwnedSessionRecoveryStatus:
+    def recovery(
+        process_state: Literal["cleanup_pending", "already_closed"],
+    ) -> OwnedSessionRecoveryStatus:
         return OwnedSessionRecoveryStatus(
             cluster="ares",
             session_id=session_id,
@@ -3202,23 +3233,23 @@ def test_local_owner_session_closure_replay_is_read_only_after_split_failure(
         return real_set_closed(self, owner_session_id, **kwargs)  # pyright: ignore[reportArgumentType]
 
     monkeypatch.setattr(ClioCoreQueue, "set_owner_session_closed", fail_first_mirror_close)
-    arguments = {
-        "queue": queue,
-        "definition": ClusterDefinition(name="ares", ssh_host="ares"),
-        "cluster": "ares",
-        "remote_execution": False,
-        "session_id": session_id,
-        "local_admission_session_id": local_session_id,
-        "session_generation_id": generation_id,
-        "legacy_unversioned_job_ids": [],
-        "finalized_report": report,
-    }
+
+    def mark_closed(finalized_recovery: OwnedSessionRecoveryStatus) -> None:
+        cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            queue=queue,
+            definition=ClusterDefinition(name="ares", ssh_host="ares"),
+            cluster="ares",
+            remote_execution=False,
+            session_id=session_id,
+            local_admission_session_id=local_session_id,
+            session_generation_id=generation_id,
+            legacy_unversioned_job_ids=[],
+            finalized_recovery=finalized_recovery,
+            finalized_report=report,
+        )
 
     with pytest.raises(RelayError, match="simulated local mirror crash"):
-        cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            **arguments,
-            finalized_recovery=recovery("cleanup_pending"),
-        )
+        mark_closed(recovery("cleanup_pending"))
     assert (
         queue.owner_session_generation_status(
             session_id,
@@ -3235,14 +3266,8 @@ def test_local_owner_session_closure_replay_is_read_only_after_split_failure(
     )
 
     closed_recovery = recovery("already_closed")
-    cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        **arguments,
-        finalized_recovery=closed_recovery,
-    )
-    cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        **arguments,
-        finalized_recovery=closed_recovery,
-    )
+    mark_closed(closed_recovery)
+    mark_closed(closed_recovery)
 
     assert setter_calls[session_id] == 1
     assert setter_calls[local_session_id] == 2
@@ -3556,11 +3581,17 @@ def test_session_start_rejects_invalid_finalized_cleanup_before_closure(
         },
     ).model_dump(mode="json")
 
-    monkeypatch.setattr(cli, "status_remote_session", lambda **_kwargs: status)
+    def read_status(**_kwargs: object) -> dict[str, object]:
+        return status
+
+    def read_report(**_kwargs: object) -> SessionLifecycleReport:
+        return report
+
+    monkeypatch.setattr(cli, "status_remote_session", read_status)
     monkeypatch.setattr(
         cli,
         "read_remote_session_cleanup_report",
-        lambda **_kwargs: report,
+        read_report,
     )
 
     def forbidden_remote(*_args: object, **_kwargs: object) -> str:
@@ -3912,7 +3943,7 @@ def test_cli_session_start_verifies_exact_worker_inside_lock_before_mutation(
     monkeypatch.setattr(
         cli,
         "_finalize_completed_cleanup_receipt_before_start",
-        lambda **_kwargs: None,
+        _fake_no_completed_cleanup,
     )
 
     result = CliRunner().invoke(
@@ -3950,16 +3981,21 @@ def test_cli_session_start_json_returns_self_contained_current_selector(
             f"remote_api_port={kwargs['remote_api_port']}",
         ]
 
+    def verify_worker_compatibility(
+        _definition: ClusterDefinition,
+    ) -> SessionApiReleaseIdentity:
+        return release
+
     monkeypatch.setattr(cli, "start_remote_session", start)
     monkeypatch.setattr(
         cli,
         "_verify_session_start_worker_compatibility",
-        lambda _definition: release,
+        verify_worker_compatibility,
     )
     monkeypatch.setattr(
         cli,
         "_finalize_completed_cleanup_receipt_before_start",
-        lambda **_kwargs: None,
+        _fake_no_completed_cleanup,
     )
 
     result = CliRunner().invoke(
@@ -4024,10 +4060,15 @@ def test_cli_session_start_rejects_stale_plan_before_cleanup_mutation(
         starts += 1
         return []
 
+    def verify_worker_compatibility(
+        _definition: ClusterDefinition,
+    ) -> SessionApiReleaseIdentity:
+        return release
+
     monkeypatch.setattr(
         cli,
         "_verify_session_start_worker_compatibility",
-        lambda _definition: release,
+        verify_worker_compatibility,
     )
     monkeypatch.setattr(cli, "_finalize_completed_cleanup_receipt_before_start", finalize)
     monkeypatch.setattr(cli, "start_remote_session", start)

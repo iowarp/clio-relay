@@ -422,32 +422,44 @@ def test_deferred_credentials_are_built_after_persistent_scope_is_registered(
     invocation = "1" * 32
     events: list[str] = []
 
-    monkeypatch.setattr(
-        process_containment,
-        "containment_capability",
-        lambda **_kwargs: {
+    def capability(**_kwargs: object) -> dict[str, object]:
+        return {
             "mode": "linux_systemd_scope",
             "enforceable": True,
             "reason": "test",
-        },
-    )
-    monkeypatch.setattr(process_containment.sys, "platform", "linux")
-    monkeypatch.setattr(
-        process_containment,
-        "_validate_broker_credential_payload",
-        lambda _payload: None,
-    )
-    monkeypatch.setattr(
-        process_containment,
-        "_spawn_linux_systemd_scope",
-        lambda *_args, **_kwargs: (
+        }
+
+    def validate_credential_payload(_payload: str | None) -> None:
+        return None
+
+    def spawn_scope(
+        *_args: object,
+        **_kwargs: object,
+    ) -> tuple[SimpleNamespace, str, Path, str, str, SimpleNamespace]:
+        return (
             process,
             unit,
             scope,
             invocation,
             description,
             readiness,
-        ),
+        )
+
+    monkeypatch.setattr(
+        process_containment,
+        "containment_capability",
+        capability,
+    )
+    monkeypatch.setattr(process_containment.sys, "platform", "linux")
+    monkeypatch.setattr(
+        process_containment,
+        "_validate_broker_credential_payload",
+        validate_credential_payload,
+    )
+    monkeypatch.setattr(
+        process_containment,
+        "_spawn_linux_systemd_scope",
+        spawn_scope,
     )
 
     def on_ready(process_id: int, metadata: dict[str, object]) -> None:
@@ -485,10 +497,14 @@ def test_recorded_scope_rejects_invocation_reuse_before_reading_processes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     process_reads: list[Path] = []
-    monkeypatch.setattr(
-        process_containment,
-        "_systemctl_user",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+
+    def systemctl_user(
+        _arguments: list[str],
+        *,
+        timeout_seconds: float,
+    ) -> subprocess.CompletedProcess[str]:
+        assert timeout_seconds > 0
+        return subprocess.CompletedProcess(
             [],
             0,
             "ControlGroup=/user.slice/test.scope\n"
@@ -496,12 +512,21 @@ def test_recorded_scope_rejects_invocation_reuse_before_reading_processes(
             "Description=expected\n"
             "LoadState=loaded\n",
             "",
-        ),
+        )
+
+    def cgroup_process_ids(path: Path) -> list[int]:
+        process_reads.append(path)
+        return [4321]
+
+    monkeypatch.setattr(
+        process_containment,
+        "_systemctl_user",
+        systemctl_user,
     )
     monkeypatch.setattr(
         process_containment,
         "_linux_cgroup_process_ids",
-        lambda path: process_reads.append(path) or [4321],
+        cgroup_process_ids,
     )
 
     with pytest.raises(RuntimeError, match="drifted or was reused"):
@@ -524,10 +549,14 @@ def test_recorded_scope_returns_only_exact_cgroup_members(
     scope.mkdir()
     invocation = "1" * 32
     description = "expected"
-    monkeypatch.setattr(
-        process_containment,
-        "_systemctl_user",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+
+    def systemctl_user(
+        _arguments: list[str],
+        *,
+        timeout_seconds: float,
+    ) -> subprocess.CompletedProcess[str]:
+        assert timeout_seconds > 0
+        return subprocess.CompletedProcess(
             [],
             0,
             f"ControlGroup=/user.slice/{unit}\n"
@@ -535,17 +564,35 @@ def test_recorded_scope_returns_only_exact_cgroup_members(
             f"Description={description}\n"
             "LoadState=loaded\n",
             "",
-        ),
+        )
+
+    def validated_cgroup_path(
+        _control_group: str,
+        *,
+        unit: str,
+        cgroup_root: Path = Path("/sys/fs/cgroup"),
+    ) -> Path:
+        del cgroup_root
+        assert unit == "clio-relay-session-generation.scope"
+        return scope.resolve()
+
+    def cgroup_process_ids(path: Path) -> list[int]:
+        return [4321, 4322] if path == scope.resolve() else []
+
+    monkeypatch.setattr(
+        process_containment,
+        "_systemctl_user",
+        systemctl_user,
     )
     monkeypatch.setattr(
         process_containment,
         "_validated_systemd_cgroup_path",
-        lambda *_args, **_kwargs: scope.resolve(),
+        validated_cgroup_path,
     )
     monkeypatch.setattr(
         process_containment,
         "_linux_cgroup_process_ids",
-        lambda path: [4321, 4322] if path == scope.resolve() else [],
+        cgroup_process_ids,
     )
 
     assert process_containment.recorded_linux_systemd_scope_process_ids(

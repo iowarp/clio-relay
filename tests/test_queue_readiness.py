@@ -94,7 +94,7 @@ def test_read_only_fresh_endpoint_lookup_never_scans_history_or_writes(
         )
     )
     before = _tree_identity(root)
-    original_scan = ClioCoreQueue._scan_json_record_paths  # noqa: SLF001
+    original_scan = ClioCoreQueue._scan_json_record_paths  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     def reject_historical_scan(
         directory: Path,

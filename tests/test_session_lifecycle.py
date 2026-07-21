@@ -185,8 +185,57 @@ class _FakeSessionTransaction:
         return True
 
 
+def _fake_transaction_opener(
+    transaction: _FakeSessionTransaction,
+) -> Callable[..., _FakeSessionTransaction]:
+    """Return a fully typed replacement for the owned-session transaction factory."""
+
+    def open_transaction(
+        *,
+        session_id: str,
+        create: bool,
+        timeout_seconds: float,
+        home: Path | None = None,
+    ) -> _FakeSessionTransaction:
+        del session_id, create, timeout_seconds, home
+        return transaction
+
+    return open_transaction
+
+
+def _ignore_remote_port(_port: int) -> None:
+    """Represent an available port without introducing an unknown lambda parameter."""
+
+
+def _fixed_process_start_identity(_pid: int) -> str:
+    """Return the process identity used by replacement-session tests."""
+
+    return "linux-proc:7000"
+
+
+def _successful_process_wait(**_kwargs: object) -> int:
+    """Represent a test process that exits successfully when waited on."""
+
+    return 0
+
+
+def _fixed_api_readiness(elapsed_seconds: float) -> Callable[..., float]:
+    """Return a typed API-readiness replacement with a fixed elapsed time."""
+
+    def ready(
+        *,
+        process: subprocess.Popen[bytes],
+        port: int,
+        require_token: bool,
+    ) -> float:
+        del process, port, require_token
+        return elapsed_seconds
+
+    return ready
+
+
 @pytest.fixture(autouse=True)
-def _use_fake_recorded_scope(monkeypatch: MonkeyPatch) -> None:
+def use_fake_recorded_scope(monkeypatch: MonkeyPatch) -> None:
     """Represent exact cgroup membership without consulting the host's systemd."""
 
     def recorded_scope_processes(
@@ -208,7 +257,7 @@ def _use_fake_recorded_scope(monkeypatch: MonkeyPatch) -> None:
             if membership.exists()
             else []
         )
-        processes = []
+        processes: list[object] = []
         for process_id in process_ids:
             try:
                 processes.append(
@@ -600,10 +649,12 @@ def test_start_persists_candidate_before_core_admission(
         "_current_session_api_release_identity",
         _api_release_identity,
     )
-    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", lambda _port: None)
-    monkeypatch.setattr(
-        os, "geteuid", lambda: os.getuid() if hasattr(os, "getuid") else 0, raising=False
-    )
+    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", _ignore_remote_port)
+
+    def effective_user_id() -> int:
+        return tmp_path.stat().st_uid
+
+    monkeypatch.setattr(os, "geteuid", effective_user_id, raising=False)
     transaction = _FakeSessionTransaction(
         tmp_path / "home" / ".local" / "share" / "clio-relay" / "sessions" / request.session_id,
         session_id=request.session_id,
@@ -611,7 +662,7 @@ def test_start_persists_candidate_before_core_admission(
     monkeypatch.setattr(
         session_lifecycle,
         "open_owned_session_transaction",
-        lambda **_kwargs: transaction,
+        _fake_transaction_opener(transaction),
     )
 
     def crash_before_admission(*_args: object, **_kwargs: object) -> str:
@@ -704,13 +755,13 @@ def test_start_attempt_accepts_every_durable_crash_boundary(
             "containment_broker_start_identity": broker_start,
         }
         session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            transaction,
+            cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             operation="start",
             identity=identity,
         )
 
         recovered = session_lifecycle._validated_resumable_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            transaction,
+            cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             request=request,
             release_identity_sha256="b" * 64,
         )
@@ -767,7 +818,7 @@ def test_distinct_operation_cannot_overwrite_nonterminal_start_transition(
     monkeypatch.setattr(
         session_lifecycle,
         "open_owned_session_transaction",
-        lambda **_kwargs: transaction,
+        _fake_transaction_opener(transaction),
     )
     monkeypatch.setattr(
         session_lifecycle,
@@ -843,7 +894,7 @@ def test_same_completed_operation_cannot_create_a_second_generation(
     monkeypatch.setattr(
         session_lifecycle,
         "open_owned_session_transaction",
-        lambda **_kwargs: transaction,
+        _fake_transaction_opener(transaction),
     )
     monkeypatch.setattr(
         session_lifecycle,
@@ -851,10 +902,9 @@ def test_same_completed_operation_cannot_create_a_second_generation(
         _api_release_identity,
     )
     monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
-    monkeypatch.setattr(
-        session_lifecycle,
-        "inspect_owned_session_recovery_status",
-        lambda **_kwargs: OwnedSessionRecoveryStatus(
+
+    def completed_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        return OwnedSessionRecoveryStatus(
             cluster=request.cluster,
             session_id=request.session_id,
             session_generation_id=generation,
@@ -868,7 +918,12 @@ def test_same_completed_operation_cannot_create_a_second_generation(
             start_phase="contained",
             start_attempt_verified=True,
             api_release_identity=_api_release_identity(),
-        ),
+        )
+
+    monkeypatch.setattr(
+        session_lifecycle,
+        "inspect_owned_session_recovery_status",
+        completed_status,
     )
     mutation_attempted = False
 
@@ -1028,7 +1083,7 @@ def test_executor_replaces_exact_legacy_old_release_session(
     monkeypatch.setattr(
         session_lifecycle,
         "open_owned_session_transaction",
-        lambda **_kwargs: transaction,
+        _fake_transaction_opener(transaction),
     )
     monkeypatch.setattr(
         session_lifecycle,
@@ -1077,12 +1132,12 @@ def test_executor_replaces_exact_legacy_old_release_session(
         )
 
     monkeypatch.setattr(session_lifecycle, "inspect_owned_session_recovery_status", inspect)
-    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", lambda _port: None)
+    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", _ignore_remote_port)
     containment_module = importlib.import_module("clio_relay.process_containment")
     monkeypatch.setattr(
         containment_module,
         "process_start_identity",
-        lambda _pid: "linux-proc:7000",
+        _fixed_process_start_identity,
     )
 
     def spawn(*_args: object, **kwargs: object) -> object:
@@ -1106,7 +1161,7 @@ def test_executor_replaces_exact_legacy_old_release_session(
             pid=7000,
             poll=lambda: None,
             terminate=lambda: None,
-            wait=lambda **_kwargs: 0,
+            wait=_successful_process_wait,
         )
 
     monkeypatch.setattr(containment_module, "spawn_owned_process", spawn)
@@ -1120,7 +1175,7 @@ def test_executor_replaces_exact_legacy_old_release_session(
         )
 
     monkeypatch.setattr(session_lifecycle, "_wait_for_api_startup_receipt", receipt)
-    monkeypatch.setattr(session_lifecycle, "_wait_for_api_ready", lambda **_kwargs: 0.125)
+    monkeypatch.setattr(session_lifecycle, "_wait_for_api_ready", _fixed_api_readiness(0.125))
 
     lines = execute_owned_session_start(
         request,
@@ -1163,7 +1218,7 @@ def test_executor_refuses_mismatched_legacy_journal_without_mutation(
     monkeypatch.setattr(
         session_lifecycle,
         "open_owned_session_transaction",
-        lambda **_kwargs: transaction,
+        _fake_transaction_opener(transaction),
     )
     monkeypatch.setattr(
         session_lifecycle,
@@ -1171,15 +1226,19 @@ def test_executor_refuses_mismatched_legacy_journal_without_mutation(
         _api_release_identity,
     )
     monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
-    monkeypatch.setattr(
-        session_lifecycle,
-        "inspect_owned_session_recovery_status",
-        lambda **_kwargs: _legacy_existing_status(
+
+    def legacy_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        return _legacy_existing_status(
             request=request,
             metadata=metadata,
             old_release=old_release,
             journal_bound=False,
-        ),
+        )
+
+    monkeypatch.setattr(
+        session_lifecycle,
+        "inspect_owned_session_recovery_status",
+        legacy_status,
     )
     mutation_attempted = False
 
@@ -1216,8 +1275,12 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
     )
     current_release = _api_release_identity()
     old_release = current_release.model_copy(update={"artifact_sha256": "f" * 64})
-    metadata = json.loads((session_dir / "metadata.json").read_text(encoding="utf-8"))
-    assert isinstance(metadata, dict)
+    raw_metadata = cast(
+        object,
+        json.loads((session_dir / "metadata.json").read_text(encoding="utf-8")),
+    )
+    assert isinstance(raw_metadata, dict)
+    metadata = cast(dict[str, object], raw_metadata)
     owner_token = cast(str, metadata["owner_token"])
     registry_path = Path(cast(str, metadata["cluster_registry_path"]))
     registry_document = json.loads(registry_path.read_bytes())
@@ -1230,8 +1293,9 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
     registry_path.write_bytes(registry_payload)
     registry_sha256 = session_lifecycle.hashlib.sha256(registry_payload).hexdigest()
     receipt_path = Path(cast(str, metadata["api_startup_receipt_path"]))
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    assert isinstance(receipt, dict)
+    raw_receipt = cast(object, json.loads(receipt_path.read_text(encoding="utf-8")))
+    assert isinstance(raw_receipt, dict)
+    receipt = cast(dict[str, object], raw_receipt)
     receipt["api_release_identity_sha256"] = old_release.sha256()
     receipt["cluster_registry_sha256"] = registry_sha256
     receipt["hmac_sha256"] = session_lifecycle._startup_receipt_signature(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
@@ -1259,7 +1323,7 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
         cluster_registry_sha256=registry_sha256,
         cluster_route_revision=cast(str, metadata["cluster_route_revision"]),
     )
-    legacy = {
+    legacy: dict[str, object] = {
         "schema_version": "clio-relay.owner-session-attempt.v1",
         "operation": "start",
         "cluster": request.cluster,
@@ -1290,7 +1354,7 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
     monkeypatch.setattr(
         session_lifecycle,
         "open_owned_session_transaction",
-        lambda **_kwargs: transaction,
+        _fake_transaction_opener(transaction),
     )
     monkeypatch.setattr(
         session_lifecycle,
@@ -1303,8 +1367,19 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
     class MigrationCrash(RuntimeError):
         """Simulated process loss immediately after the durable v2 write."""
 
-    def migrate_then_crash(*args: object, **kwargs: object) -> object:
-        migrated = migrate(*args, **kwargs)
+    def migrate_then_crash(
+        selected_transaction: session_lifecycle._OwnedSessionTransaction,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        *,
+        request: OwnedSessionStartRequest,
+        release_identity_sha256: str,
+        replacement_identity_verified: bool = False,
+    ) -> dict[str, object] | None:
+        migrated = migrate(
+            selected_transaction,
+            request=request,
+            release_identity_sha256=release_identity_sha256,
+            replacement_identity_verified=replacement_identity_verified,
+        )
         assert migrated is not None
         raise MigrationCrash
 
@@ -1343,7 +1418,7 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
     assert status.start_retryable is True
 
     monkeypatch.setattr(session_lifecycle, "_migrate_legacy_start_attempt", migrate)
-    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", lambda _port: None)
+    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", _ignore_remote_port)
 
     class ReplacementResumed(RuntimeError):
         """The retry reached replacement admission instead of terminal refusal."""
@@ -1381,10 +1456,13 @@ def test_durable_start_deadline_observes_late_ready_transition(
             "start transport deadline"
         )
 
+    def ready_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        return _durable_start_status(plan, state="ready")
+
     monkeypatch.setattr(
         session_lifecycle,
         "status_remote_session_start",
-        lambda **_kwargs: _durable_start_status(plan, state="ready"),
+        ready_status,
     )
 
     result = session_lifecycle.start_remote_session_durable(
@@ -1536,14 +1614,26 @@ def test_exact_start_rejection_during_lock_contention_is_not_terminal(
 def test_unstructured_ssh_nonzero_is_ambiguous_not_terminal(
     monkeypatch: MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        session_lifecycle,
-        "_run_bounded_command",
-        lambda *_args, **_kwargs: session_lifecycle._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def connection_reset(
+        _command: list[str],
+        *,
+        input_bytes: bytes = b"",
+        timeout_seconds: float,
+        stdout_limit: int,
+        stderr_limit: int,
+        environment: dict[str, str] | None = None,
+    ) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        del input_bytes, timeout_seconds, stdout_limit, stderr_limit, environment
+        return session_lifecycle._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             returncode=255,
             stdout=b"",
             stderr=b"connection reset after remote acceptance",
-        ),
+        )
+
+    monkeypatch.setattr(
+        session_lifecycle,
+        "_run_bounded_command",
+        connection_reset,
     )
 
     with pytest.raises(
@@ -1566,10 +1656,13 @@ def test_durable_start_projects_terminal_failure_and_stops_retrying(
             "start transport deadline"
         )
 
+    def failed_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        return _durable_start_status(plan, state="failed")
+
     monkeypatch.setattr(
         session_lifecycle,
         "status_remote_session_start",
-        lambda **_kwargs: _durable_start_status(plan, state="failed"),
+        failed_status,
     )
 
     result = session_lifecycle.start_remote_session_durable(
@@ -1675,12 +1768,29 @@ def test_api_readiness_rejects_wrong_auth_policy(monkeypatch: MonkeyPatch) -> No
             return b'{"ok":true,"auth":false}'
 
     moments = iter((0.0, 0.0, 61.0))
+
+    def ignore_sleep(_seconds: float) -> None:
+        return None
+
+    def open_response(
+        _url: str,
+        data: bytes | None = None,
+        timeout: float | None = None,
+        *,
+        cafile: str | None = None,
+        capath: str | None = None,
+        cadefault: bool = False,
+        context: object | None = None,
+    ) -> Response:
+        del data, timeout, cafile, capath, cadefault, context
+        return Response()
+
     monkeypatch.setattr(session_lifecycle.time, "monotonic", lambda: next(moments))
-    monkeypatch.setattr(session_lifecycle.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(session_lifecycle.time, "sleep", ignore_sleep)
     monkeypatch.setattr(
         session_lifecycle.urllib.request,
         "urlopen",
-        lambda *_args, **_kwargs: Response(),
+        open_response,
     )
     process = cast(subprocess.Popen[bytes], SimpleNamespace(poll=lambda: None))
 
@@ -1787,7 +1897,7 @@ def test_contained_start_crash_is_promoted_only_after_full_identity_recheck(
         return process_identity
 
     monkeypatch.setattr(session_lifecycle, "_wait_for_api_startup_receipt", verify_receipt)
-    monkeypatch.setattr(session_lifecycle, "_wait_for_api_ready", lambda **_kwargs: 0.25)
+    monkeypatch.setattr(session_lifecycle, "_wait_for_api_ready", _fixed_api_readiness(0.25))
 
     lines = session_lifecycle._promote_resumable_contained_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
@@ -2184,7 +2294,7 @@ def test_cleanup_deletes_oversized_api_log_by_pinned_inode(tmp_path: Path) -> No
 
     with _FakeSessionTransaction(session_dir, session_id="session-1") as transaction:
         target = session_lifecycle._capture_cleanup_target(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            transaction,
+            cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             name="api.log",
             maximum_bytes=None,
         )
@@ -2192,7 +2302,7 @@ def test_cleanup_deletes_oversized_api_log_by_pinned_inode(tmp_path: Path) -> No
         assert target.sha256 is None
         assert target.size == 20 * 1024 * 1024
         session_lifecycle._delete_cleanup_targets(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            transaction,
+            cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             [target],
         )
 
@@ -2239,11 +2349,40 @@ def test_owned_session_read_revalidates_descriptor_and_path_after_read(
     fstats = iter([initial_opened, final_opened])
     stats = iter([initial_linked, final_linked])
     reads = iter([payload, b""])
-    monkeypatch.setattr(os, "open", lambda *_args, **_kwargs: 41)
-    monkeypatch.setattr(os, "fstat", lambda _descriptor: next(fstats))
-    monkeypatch.setattr(os, "stat", lambda *_args, **_kwargs: next(stats))
-    monkeypatch.setattr(os, "read", lambda _descriptor, _size: next(reads))
-    monkeypatch.setattr(os, "close", lambda _descriptor: None)
+
+    def open_file(
+        _path: str,
+        _flags: int,
+        _mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        del dir_fd
+        return 41
+
+    def fstat_file(_descriptor: int) -> SimpleNamespace:
+        return next(fstats)
+
+    def stat_file(
+        _path: str,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> SimpleNamespace:
+        del dir_fd, follow_symlinks
+        return next(stats)
+
+    def read_file(_descriptor: int, _size: int) -> bytes:
+        return next(reads)
+
+    def close_file(_descriptor: int) -> None:
+        return None
+
+    monkeypatch.setattr(os, "open", open_file)
+    monkeypatch.setattr(os, "fstat", fstat_file)
+    monkeypatch.setattr(os, "stat", stat_file)
+    monkeypatch.setattr(os, "read", read_file)
+    monkeypatch.setattr(os, "close", close_file)
     transaction = session_lifecycle._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         session_id="session-1",
         path=tmp_path,
@@ -2398,10 +2537,20 @@ def test_cleanup_report_finalization_is_immutable_and_idempotent(
             recovery_verified=True,
         )
 
+    def open_transaction(
+        *,
+        session_id: str,
+        create: bool,
+        timeout_seconds: float,
+        home: Path | None = None,
+    ) -> FakeTransaction:
+        del session_id, create, timeout_seconds, home
+        return transaction
+
     monkeypatch.setattr(
         session_lifecycle,
         "open_owned_session_transaction",
-        lambda **_kwargs: transaction,
+        open_transaction,
     )
     monkeypatch.setattr(session_lifecycle, "inspect_owned_session_recovery_status", inspect)
     monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)
@@ -3043,7 +3192,10 @@ def test_cleanup_report_candidate_scan_is_bounded_and_strict(
         def __exit__(self, *_args: object) -> None:
             return None
 
-    monkeypatch.setattr(os, "scandir", lambda _path: FakeScan())
+    def scan_directory(_path: int) -> FakeScan:
+        return FakeScan()
+
+    monkeypatch.setattr(os, "scandir", scan_directory)
     transaction = session_lifecycle._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         session_id="session-1",
         path=tmp_path,

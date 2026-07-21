@@ -241,7 +241,7 @@ def test_journal_parent_swap_during_create_fails_closed(
     relocated = parent.with_name("clio-relay-relocated")
     outside = tmp_path / "outside"
     outside.mkdir()
-    original = journal_module._atomic_json_at
+    original = journal_module._atomic_json_at  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     def swapped_atomic(
         parent_descriptor: int | None,
@@ -318,7 +318,7 @@ def test_parent_swap_after_journal_open_never_reaches_replacement_tree(
     replacement_target.mkdir(parents=True)
     sentinel = replacement_target / "operator.txt"
     sentinel.write_text("operator\n", encoding="utf-8")
-    original = journal_module._require_current_owner
+    original = journal_module._require_current_owner  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     swapped = False
 
     def swap_after_home_open(descriptor: int, description: str) -> None:
@@ -353,7 +353,7 @@ def test_target_swap_to_symlink_is_rejected_without_following(
     outside.mkdir()
     sentinel = outside / "operator.txt"
     sentinel.write_text("operator\n", encoding="utf-8")
-    original = journal_module._discard_owned_entry_at
+    original = journal_module._discard_owned_entry_at  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     def swap_target(
         parent_descriptor: int,
@@ -451,7 +451,7 @@ def test_interrupted_discard_is_idempotently_resumed(
     (target / "one").write_text("one", encoding="utf-8")
     (target / "two").write_text("two", encoding="utf-8")
     record_owned_path(journal_path, "target")
-    original = journal_module._unlink_entry_at
+    original = journal_module._unlink_entry_at  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     interrupted = False
 
     def interrupt_after_unlink(
@@ -492,7 +492,7 @@ def test_owned_publication_never_claims_a_racing_replacement(
     source = tmp_path / "source"
     source.write_text("relay\n", encoding="utf-8")
     displaced = target.with_name("relay-created-displaced")
-    original = journal_module._owned_identity_at
+    original = journal_module._owned_identity_at  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     swapped = False
 
     def swap_before_claim(

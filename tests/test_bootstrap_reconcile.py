@@ -11,7 +11,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -151,9 +151,16 @@ def test_exact_noop_is_read_only_and_preserves_operator_jarvis_bytes(
     root, config_before, graph_before = _write_jarvis_state(tmp_path, desired)
     generation = tmp_path / ".local/share/clio-relay/generations" / desired.fingerprint
     generation.mkdir(parents=True)
+
+    def inspect_active_generation(
+        *_args: object,
+        **_kwargs: object,
+    ) -> tuple[str, str]:
+        return desired.fingerprint, str(generation.resolve())
+
     monkeypatch.setattr(
         "clio_relay.bootstrap_reconcile._inspect_active_generation",
-        lambda *_args, **_kwargs: (desired.fingerprint, str(generation.resolve())),
+        inspect_active_generation,
     )
     receipt_path = tmp_path / ".local/share/clio-relay/install-receipt.json"
     receipt_path.write_text("{}\n", encoding="utf-8")
@@ -166,16 +173,21 @@ def test_exact_noop_is_read_only_and_preserves_operator_jarvis_bytes(
             root / "resource_graph.yaml",
         )
     }
-    monkeypatch.setattr(
-        "clio_relay.bootstrap_reconcile.installation_info",
-        lambda _path: _installation_info(desired),
-    )
+
+    def read_installation(_path: Path | None = None) -> dict[str, object]:
+        return _installation_info(desired)
+
+    def run_identity(
+        *_args: object,
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(["uv", "--version"], 0, "uv 0.11.28\n", "")
+
+    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", read_installation)
     monkeypatch.setattr(
         bootstrap_reconcile_module,
         "run_bounded_process",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(
-            ["uv", "--version"], 0, "uv 0.11.28\n", ""
-        ),
+        run_identity,
     )
 
     inspection = inspect_exact_bootstrap_noop(
@@ -230,13 +242,21 @@ def test_matching_receipt_with_tampered_runtime_is_not_a_noop(
     runtime = info["component_runtime"]
     assert isinstance(runtime, dict)
     runtime["clio-relay"] = {"persistent_tool_verified": False}
-    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", lambda _path: info)
+
+    def read_installation(_path: Path | None = None) -> dict[str, object]:
+        return info
+
+    def run_identity(
+        *_args: object,
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(["uv", "--version"], 0, "uv 0.11.28\n", "")
+
+    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", read_installation)
     monkeypatch.setattr(
         subprocess,
         "run",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(
-            ["uv", "--version"], 0, "uv 0.11.28\n", ""
-        ),
+        run_identity,
     )
 
     inspection = inspect_exact_bootstrap_noop(
@@ -300,8 +320,7 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
         }
     )
     info = _installation_info(desired)
-    receipt = info["receipt"]
-    assert isinstance(receipt, dict)
+    receipt = cast(dict[str, object], info["receipt"])
     receipt.pop("deployment_fingerprint")
     receipt.pop("deployment_manifest")
     receipt["component_artifacts"] = {
@@ -318,7 +337,11 @@ def test_first_legacy_upgrade_plans_relay_only_and_reuses_verified_components(
             "runtime_executables": {"jarvis": str(legacy_jarvis)},
         },
     }
-    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", lambda _path: info)
+
+    def read_installation(_path: Path | None = None) -> dict[str, object]:
+        return info
+
+    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", read_installation)
 
     def identity_command(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         if command[:2] != [str(bin_dir / "uv"), "--version"]:
@@ -410,10 +433,8 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
     receipt_path = tmp_path / ".local/share/clio-relay/install-receipt.json"
     receipt_path.write_text("{}\n", encoding="utf-8")
     info = _installation_info(desired)
-    receipt = info["receipt"]
-    assert isinstance(receipt, dict)
-    components = receipt["components"]
-    assert isinstance(components, dict)
+    receipt = cast(dict[str, object], info["receipt"])
+    components = cast(dict[str, object], receipt["components"])
     components["jarvis-cd"] = "1.4.4"
     components["clio-kit"] = "2.5.22"
     receipt["component_artifacts"] = {
@@ -426,7 +447,11 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
             "runtime_executables": {"jarvis": str(legacy_jarvis)},
         },
     }
-    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", lambda _path: info)
+
+    def read_installation(_path: Path | None = None) -> dict[str, object]:
+        return info
+
+    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", read_installation)
 
     def identity_command(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         assert command[:2] == [str(bin_dir / "uv"), "--version"]
@@ -529,7 +554,7 @@ def test_managed_repo_reconcile_refuses_concurrent_operator_edit(
     repos_file = tmp_path / "repos.yaml"
     repos_file.write_text("repos:\n  - /operator/original\n", encoding="utf-8")
     operator_update = b"repos:\n  - /operator/concurrent\n"
-    original_read = bootstrap_reconcile_module._read_regular_bounded_with_identity  # noqa: SLF001
+    original_read = bootstrap_reconcile_module._read_regular_bounded_with_identity  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     call_count = 0
 
     def mutate_before_compare(
@@ -580,11 +605,14 @@ def test_managed_repo_repair_refuses_unproven_broken_link(
             return SimpleNamespace(st_mode=stat.S_IFLNK)
         return original_lstat(path)
 
+    def redirected_readlink(_path: os.PathLike[str] | str) -> str:
+        return str(tmp_path / "attacker-controlled/missing")
+
     monkeypatch.setattr(Path, "lstat", simulated_lstat)
     monkeypatch.setattr(
         bootstrap_reconcile_module.os,
         "readlink",
-        lambda path: str(tmp_path / "attacker-controlled/missing"),
+        redirected_readlink,
     )
 
     with pytest.raises(ConfigurationError, match="not proven by an earlier receipt"):
@@ -809,10 +837,11 @@ def test_prepared_generation_refuses_a_tampered_relay_owned_jarvis_wrapper(
     )
     with (generation / ".prepared").open("w", encoding="ascii", newline="\n") as stream:
         stream.write(desired.fingerprint + "\n")
-    monkeypatch.setattr(
-        "clio_relay.bootstrap_reconcile.installation_info",
-        lambda _path: _installation_info(desired),
-    )
+
+    def read_installation(_path: Path | None = None) -> dict[str, object]:
+        return _installation_info(desired)
+
+    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", read_installation)
 
     evidence = inspect_prepared_generation(
         desired,
@@ -820,7 +849,8 @@ def test_prepared_generation_refuses_a_tampered_relay_owned_jarvis_wrapper(
         legacy_execution_identity=execution_identity,
     )
 
-    assert evidence["launcher_targets"]["jarvis"] == str(wrapper)
+    launcher_targets = cast(dict[str, object], evidence["launcher_targets"])
+    assert launcher_targets["jarvis"] == str(wrapper)
     assert wrapper.read_bytes() == jarvis_wrapper_payload(execution_python)
 
     wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
