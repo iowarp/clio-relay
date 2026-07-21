@@ -1588,7 +1588,9 @@ def test_durable_start_projects_terminal_failure_and_stops_retrying(
 
 def test_completed_ready_operation_stays_terminal_after_api_exit() -> None:
     _definition, _release, plan = _durable_start_plan()
-    status = _durable_start_status(plan, state="ready").model_copy(update={"running": False})
+    status = _durable_start_status(plan, state="ready").model_copy(
+        update={"leader_process_state": "absent", "running": False}
+    )
 
     result = session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         plan=plan,
