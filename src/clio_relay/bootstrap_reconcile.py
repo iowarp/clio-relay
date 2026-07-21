@@ -2107,8 +2107,44 @@ def _verify_uv(path: Path, *, desired: BootstrapDesiredState, reasons: list[str]
     except (OSError, BoundedProcessError) as exc:
         reasons.append(f"uv version probe failed: {exc}")
         return
-    if completed.returncode != 0 or completed.stdout.strip() != f"uv {desired.uv_version}":
+    if completed.returncode != 0 or not _uv_version_output_matches(
+        completed.stdout,
+        expected_version=desired.uv_version,
+    ):
         reasons.append("uv version changed")
+
+
+def _uv_version_output_matches(value: str, *, expected_version: str) -> bool:
+    """Match uv's pinned version with its optional bounded build target."""
+    observed = value
+    if observed.endswith("\r\n"):
+        observed = observed[:-2]
+    elif observed.endswith("\n"):
+        observed = observed[:-1]
+    if (
+        not observed
+        or observed != observed.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in observed)
+    ):
+        return False
+    exact = f"uv {expected_version}"
+    if observed == exact:
+        return True
+    prefix = exact + " ("
+    if (
+        len(observed) > len(prefix) + 128
+        or not observed.startswith(prefix)
+        or not observed.endswith(")")
+    ):
+        return False
+    target = observed[len(prefix) : -1]
+    return bool(
+        target
+        and all(
+            character.isascii() and (character.isalnum() or character in {"-", "_", "."})
+            for character in target
+        )
+    )
 
 
 def _expand_home(value: str, home: Path) -> Path:

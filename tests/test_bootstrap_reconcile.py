@@ -578,6 +578,32 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
     ]
 
 
+def test_uv_version_output_accepts_only_pinned_bounded_target_triple() -> None:
+    """Accept uv's real target suffix without weakening the pinned version boundary."""
+    matches = bootstrap_reconcile_module._uv_version_output_matches  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    for accepted in (
+        "uv 0.11.28",
+        "uv 0.11.28\n",
+        "uv 0.11.28\r\n",
+        "uv 0.11.28 (x86_64-unknown-linux-gnu)",
+        "uv 0.11.28 (x86_64-unknown-linux-gnu)\n",
+    ):
+        assert matches(accepted, expected_version="0.11.28")
+
+    for rejected in (
+        "uv 0.11.27",
+        "uv 0.11.28 ()",
+        "uv 0.11.28 (x86_64 unknown linux gnu)",
+        "uv 0.11.28 (x86_64-unknown-linux-gnu) extra",
+        "uv 0.11.28 (x86_64-unknown-linux-gnu)(extra)",
+        "uv 0.11.28\n\n",
+        " uv 0.11.28",
+        "uv 0.11.28\x00",
+        "uv 0.11.28 (" + "a" * 129 + ")",
+    ):
+        assert not matches(rejected, expected_version="0.11.28")
+
+
 def test_existing_operator_jarvis_roots_are_adopted_without_mutation(tmp_path: Path) -> None:
     desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
     root, config_before, graph_before = _write_jarvis_state(tmp_path, desired)
